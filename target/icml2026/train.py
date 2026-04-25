@@ -10,6 +10,7 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
@@ -30,7 +31,7 @@ from core.features import (
     compute_vortex_panel_velocity,
     compute_wake_deficit_features,
 )
-from core.optim import Lion, Lookahead
+from core.optim import EMA as FixedEMA, Lion, Lookahead
 
 
 class EMAWithWarmup:
@@ -166,8 +167,19 @@ class TrainConfig:
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
+    volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
+    load_checkpoint: str = ""
+    eval_interval: int = 1
+    skip_update_grad_norm: float = 0.0
+    ema_mode: str = "warmup"
+    ema_start_step: int = 50
+    kill_if_best_val_above: str = ""
+    kill_if_no_improvement: str = ""
+    kill_if_grad_nonfinite_steps: int = 0
     seed: int = 0
+    dm_loss: str = "mse"
+    dm_rel_l2_weight: float = 0.05
 
 
 @dataclass
@@ -489,6 +501,12 @@ def build_bundle(config: TrainConfig) -> DatasetBundle:
 def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | None:
     if not config.enable_cp_panel or not config.enable_pressure_prior_addition:
         return None
+    # Only tandemfoilset and airfrans bundles actually include cp_panel features
+    # in their tensors.  Other datasets (tandemfoilset_paper, drivaerml) silently
+    # ignore the enable_cp_panel flag, so computing an index would point to a
+    # wrong column (e.g. a Fourier feature) and cause numeric overflow.
+    if bundle.spec.name not in {"tandemfoilset", "airfrans"}:
+        return None
     base_dim = bundle.spec.surface_input_dim
     if config.enable_vortex_panel_velocity:
         base_dim -= 4
@@ -761,6 +779,9 @@ def loss_grouped(
     batch: GroupedBatch,
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
+    volume_loss_weight: float = 1.0,
+    dm_loss: str = "mse",
+    dm_rel_l2_weight: float = 0.05,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
@@ -769,10 +790,25 @@ def loss_grouped(
         surf_loss = F.mse_loss(outputs["surface_preds"][batch.surface_mask], target[batch.surface_mask])
         total = total + surf_loss
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
+        if dm_loss == "mse_plus_raw_rel_l2":
+            raw_pred = transform.invert(outputs["surface_preds"])
+            raw_target = batch.surface_y
+            mask = batch.surface_mask
+            B = raw_pred.shape[0]
+            rel_l2_sum = raw_pred.new_zeros(())
+            for b in range(B):
+                m = mask[b]
+                err = (raw_pred[b][m] - raw_target[b][m]).pow(2).sum()
+                ref = raw_target[b][m].pow(2).sum().clamp(min=1e-8)
+                rel_l2_sum = rel_l2_sum + (err / ref).sqrt()
+            raw_rel_l2 = rel_l2_sum / max(B, 1)
+            total = total + dm_rel_l2_weight * raw_rel_l2
+            metrics["raw_rel_l2_loss"] = float(raw_rel_l2.detach().cpu().item())
+            metrics["rel_l2_contribution"] = float((dm_rel_l2_weight * raw_rel_l2).detach().cpu().item())
     if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
         target = transform.apply(batch.volume_y)
         vol_loss = F.mse_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask])
-        total = total + vol_loss
+        total = total + vol_loss * volume_loss_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
     return total, metrics
@@ -781,6 +817,7 @@ def loss_grouped(
 def loss_grouped_tandem(
     prepared: TandemPreparedBatch,
     outputs: dict[str, torch.Tensor | None],
+    volume_loss_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=prepared.surface_x.device)
     metrics: dict[str, float] = {}
@@ -790,7 +827,7 @@ def loss_grouped_tandem(
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if prepared.volume_target is not None and outputs["volume_preds"] is not None and prepared.volume_mask is not None:
         vol_loss = F.mse_loss(outputs["volume_preds"][prepared.volume_mask], prepared.volume_target[prepared.volume_mask])
-        total = total + vol_loss
+        total = total + vol_loss * volume_loss_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
     return total, metrics
@@ -800,6 +837,7 @@ def loss_abupt(
     batch: ABUPTBatch,
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
+    volume_loss_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.geometry_position.device)
     metrics: dict[str, float] = {}
@@ -811,7 +849,7 @@ def loss_abupt(
     if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
         vol_target = transform.apply(batch.volume_anchor_target)
         vol_loss = F.mse_loss(outputs["volume_preds"], vol_target)
-        total = total + vol_loss
+        total = total + vol_loss * volume_loss_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
     return total, metrics
@@ -969,10 +1007,10 @@ def evaluate_grouped(
                     train_transform=transform,
                     metric_transform=metric_transform,
                 )
-                case_values = (surface_pred - surface_target).square()
-                valid = batch.surface_mask.unsqueeze(-1)
+                case_values = (surface_pred.double() - surface_target.double()).square()
+                valid = batch.surface_mask.unsqueeze(-1).double()
                 if paper_surface_sq_sum is None:
-                    paper_surface_sq_sum = torch.zeros(case_values.shape[-1], device=device)
+                    paper_surface_sq_sum = torch.zeros(case_values.shape[-1], device=device, dtype=torch.float64)
                 paper_surface_sq_sum += (case_values * valid).sum(dim=(0, 1)).to(device)
                 paper_surface_nodes += int(batch.surface_mask.sum().detach().cpu().item())
             if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
@@ -982,10 +1020,10 @@ def evaluate_grouped(
                     train_transform=transform,
                     metric_transform=metric_transform,
                 )
-                case_values = (volume_pred - volume_target).square()
-                valid = batch.volume_mask.unsqueeze(-1)
+                case_values = (volume_pred.double() - volume_target.double()).square()
+                valid = batch.volume_mask.unsqueeze(-1).double()
                 if paper_volume_sq_sum is None:
-                    paper_volume_sq_sum = torch.zeros(case_values.shape[-1], device=device)
+                    paper_volume_sq_sum = torch.zeros(case_values.shape[-1], device=device, dtype=torch.float64)
                 paper_volume_sq_sum += (case_values * valid).sum(dim=(0, 1)).to(device)
                 paper_volume_nodes += int(batch.volume_mask.sum().detach().cpu().item())
             continue
@@ -1266,6 +1304,10 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    volume_loss_weight: float = 1.0,
+    skip_update_grad_norm: float = 0.0,
+    dm_loss: str = "mse",
+    dm_rel_l2_weight: float = 0.05,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1299,7 +1341,7 @@ def train_one_epoch(
                         surface_anchor_position=batch.surface_anchor_position,
                         volume_anchor_position=batch.volume_anchor_position,
                     )
-                    loss, _ = loss_abupt(batch, outputs, transform)
+                    loss, _ = loss_abupt(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
             else:
                 batch = batch.to(device)
                 if isinstance(transform, TandemTargetTransform):
@@ -1312,7 +1354,7 @@ def train_one_epoch(
                             volume_mask=prepared.volume_mask,
                         )
                         outputs = maybe_apply_anp(outputs, prepared, anp_head)
-                        loss, _ = loss_grouped_tandem(prepared, outputs)
+                        loss, _ = loss_grouped_tandem(prepared, outputs, volume_loss_weight=volume_loss_weight)
                 else:
                     with autocast_context(device, amp_mode):
                         outputs = model(
@@ -1321,7 +1363,11 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform)
+                        loss, loss_metrics = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight, dm_loss=dm_loss, dm_rel_l2_weight=dm_rel_l2_weight)
+                        for k in ("raw_rel_l2_loss", "rel_l2_contribution"):
+                            if k in loss_metrics:
+                                running.setdefault(k, 0.0)
+                                running[k] += loss_metrics[k]
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1334,18 +1380,32 @@ def train_one_epoch(
         if anp_head is not None:
             all_params += list(anp_head.parameters())
         grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=grad_clip if grad_clip > 0 else float("inf"))
+        grad_norm_val = float(grad_norm)
         running.setdefault("grad_norm_mean", 0.0)
-        running["grad_norm_mean"] += float(grad_norm)
-        if grad_clip > 0 and float(grad_norm) > grad_clip:
+        running["grad_norm_mean"] += grad_norm_val
+        if grad_clip > 0 and grad_norm_val > grad_clip:
             running.setdefault("grad_clip_events", 0.0)
             running["grad_clip_events"] += 1.0
-        optimizer.step()
+        if not math.isfinite(grad_norm_val):
+            running.setdefault("grad_nonfinite", 0.0)
+            running["grad_nonfinite"] += 1.0
+        skip_step = skip_update_grad_norm > 0 and (not math.isfinite(grad_norm_val) or grad_norm_val > skip_update_grad_norm)
+        if skip_step:
+            optimizer.zero_grad(set_to_none=True)
+            running.setdefault("skipped_updates", 0.0)
+            running["skipped_updates"] += 1.0
+        else:
+            optimizer.step()
         if scheduler is not None:
             scheduler.step()
-        if ema is not None:
+        if ema is not None and not skip_step:
             ema.update(model)
-            running["ema_decay_actual"] = min(ema.decay, (1 + ema.step_counter) / (10 + ema.step_counter))
-        if anp_head is not None and anp_ema is not None:
+        if ema is not None:
+            if isinstance(ema, FixedEMA):
+                running["ema_decay_actual"] = ema.decay if ema.step_counter >= ema.start_step else 0.0
+            else:
+                running["ema_decay_actual"] = min(ema.decay, (1 + ema.step_counter) / (10 + ema.step_counter))
+        if anp_head is not None and anp_ema is not None and not skip_step:
             anp_ema.update(anp_head)
         running["loss"] += accum_loss / micro_count
         micro_batches_total += micro_count
@@ -1354,6 +1414,9 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    for k in ("raw_rel_l2_loss", "rel_l2_contribution"):
+        if k in running:
+            running[k] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1597,7 +1660,7 @@ def main() -> None:
             asinh_scale=config.asinh_scale,
         )
         metric_transform = None
-        if bundle.spec.name in {"airfrans", "tandemfoilset_paper"}:
+        if bundle.spec.name in {"airfrans"}:
             # Keep literature-facing metrics in the dataset's raw z-score space
             # even when training applies an auxiliary target transform.
             metric_transform = TargetTransform(
@@ -1627,15 +1690,33 @@ def main() -> None:
         base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
 
-    ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
-    anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
+    if not config.use_ema:
+        ema = None
+    elif config.ema_mode == "fixed":
+        ema = FixedEMA(model, decay=config.ema_decay, start_step=config.ema_start_step)
+    else:
+        ema = EMAWithWarmup(model, decay=config.ema_decay)
+    if not config.use_ema or anp_head is None:
+        anp_ema = None
+    elif config.ema_mode == "fixed":
+        anp_ema = FixedEMA(anp_head, decay=config.ema_decay, start_step=config.ema_start_step)
+    else:
+        anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay)
     history: list[dict[str, float]] = []
     best_epoch: int | None = None
     best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
+    if bundle.spec.name == "tandemfoilset":
+        val_primary_key = "val_primary/surface_pressure_mae"
+    else:
+        val_primary_key = f"val_primary/{bundle.spec.default_metric}"
+    best_val_metric = float("inf")
     best_val_primary_metric: float | None = None
     best_val_metrics: dict[str, float] = {}
+    best_epoch: int = 0
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
+    best_ema_shadow: dict[str, torch.Tensor] | None = None
+    best_anp_ema_shadow: dict[str, torch.Tensor] | None = None
 
     run = None
     if config.wandb_name:
@@ -1650,8 +1731,36 @@ def main() -> None:
             tags=[config.dataset, config.model],
         )
 
+    if config.load_checkpoint:
+        ckpt = torch.load(config.load_checkpoint, map_location=device, weights_only=True)
+        state = ckpt.get("model_state_dict", ckpt)
+        model.load_state_dict(state, strict=False)
+        print(f"[LoadCheckpoint] Loaded from {config.load_checkpoint}")
+        for phase, loaders in [("val", val_loaders), ("test", test_loaders)]:
+            if not loaders:
+                continue
+            metrics = evaluate_phase_metrics(
+                bundle=bundle, config=config, forward_model=forward_model,
+                anp_head=anp_head, loaders=loaders, transform=transform,
+                metric_transform=metric_transform, device=device, phase=phase,
+            )
+            print(json.dumps({f"load_checkpoint_{phase}": metrics}, sort_keys=True), flush=True)
+            if run is not None:
+                wandb.log(metrics)
+                run.summary.update(metrics)
+        if run is not None:
+            wandb.finish()
+        return
+
     start_time = time.monotonic()
     timeout_seconds = None if not timeout_env else float(timeout_env) * 60.0
+    grad_nonfinite_count = 0
+    last_eval_epoch = 0
+    kill_patience, kill_min_delta = 0, 0.0
+    kill_ref_metric, kill_ref_epoch = float("inf"), 0
+    if config.kill_if_no_improvement:
+        _p, _d = config.kill_if_no_improvement.split(":")
+        kill_patience, kill_min_delta = int(_p), float(_d)
 
     for epoch in range(1, config.epochs + 1):
         if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
@@ -1671,48 +1780,152 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            volume_loss_weight=config.volume_loss_weight,
+            skip_update_grad_norm=config.skip_update_grad_norm,
+            dm_loss=config.dm_loss,
+            dm_rel_l2_weight=config.dm_rel_l2_weight,
         )
 
+        grad_nonfinite_count += int(train_metrics.get("grad_nonfinite", 0))
+
+        should_eval = (epoch == 1 or epoch % config.eval_interval == 0 or epoch == config.epochs)
+        if should_eval:
+            if ema is not None:
+                ema.store(model)
+                ema.copy_to(model)
+            if anp_head is not None and anp_ema is not None:
+                anp_ema.store(anp_head)
+                anp_ema.copy_to(anp_head)
+
+            eval_metrics = evaluate_phase_metrics(
+                bundle=bundle,
+                config=config,
+                forward_model=forward_model,
+                anp_head=anp_head,
+                loaders=val_loaders,
+                transform=transform,
+                metric_transform=metric_transform,
+                device=device,
+                phase="val",
+            )
+
+            current_val = eval_metrics.get(val_primary_key)
+            if current_val is not None and current_val < best_val_metric:
+                best_val_metric = current_val
+                best_val_primary_metric = current_val
+                best_val_metrics = dict(eval_metrics)
+                best_epoch = epoch
+                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                best_anp_state = snapshot_module_state(anp_head)
+                if ema is not None:
+                    best_ema_shadow = {k: v.cpu().clone() for k, v in ema.shadow.items()}
+                if anp_ema is not None:
+                    best_anp_ema_shadow = {k: v.cpu().clone() for k, v in anp_ema.shadow.items()}
+
+            if current_val is not None and current_val < kill_ref_metric - kill_min_delta:
+                kill_ref_metric = current_val
+                kill_ref_epoch = epoch
+
+            kill_reason = None
+            if config.kill_if_best_val_above and best_val_metric is not None:
+                gate_epoch_str, gate_threshold_str = config.kill_if_best_val_above.split(":")
+                gate_epoch, gate_threshold = int(gate_epoch_str), float(gate_threshold_str)
+                if epoch >= gate_epoch and best_val_metric > gate_threshold:
+                    kill_reason = (
+                        f"best_val {best_val_metric:.4f} exceeded kill gate {gate_threshold} "
+                        f"after epoch {gate_epoch}"
+                    )
+            if kill_reason is None and config.kill_if_no_improvement:
+                if epoch - kill_ref_epoch >= kill_patience:
+                    kill_reason = (
+                        f"no significant improvement (>{kill_min_delta}) for "
+                        f"{epoch - kill_ref_epoch} epochs (patience={kill_patience})"
+                    )
+            if kill_reason is None and config.kill_if_grad_nonfinite_steps > 0:
+                if grad_nonfinite_count >= config.kill_if_grad_nonfinite_steps:
+                    kill_reason = (
+                        f"grad nonfinite for {grad_nonfinite_count} cumulative steps "
+                        f"(threshold={config.kill_if_grad_nonfinite_steps})"
+                    )
+
+            if ema is not None:
+                ema.restore(model)
+            if anp_head is not None and anp_ema is not None:
+                anp_ema.restore(anp_head)
+
+            if kill_reason is not None:
+                wandb_info = f"group={config.wandb_group or 'none'} name={config.wandb_name or 'none'}"
+                kill_msg = (
+                    f"EXPERIMENT_KILLED: dataset={config.dataset} {wandb_info} "
+                    f"epoch={epoch} best_val={best_val_metric:.4f} "
+                    f"best_epoch={best_epoch} reason={kill_reason}"
+                )
+                epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+                epoch_metrics["best_val_metric"] = best_val_metric
+                epoch_metrics["best_epoch"] = float(best_epoch)
+                epoch_metrics["kill_reason"] = kill_reason
+                history.append(epoch_metrics)
+                if run is not None:
+                    wandb.log(epoch_metrics, step=epoch)
+                    run.summary["kill_reason"] = kill_reason
+                    run.summary["kill_epoch"] = epoch
+                    run.finish()
+                kill_output_dir = Path(config.output_dir)
+                kill_output_dir.mkdir(parents=True, exist_ok=True)
+                (kill_output_dir / "KILLED.md").write_text(kill_msg + "\n")
+                print(kill_msg, file=sys.stderr, flush=True)
+                raise RuntimeError(kill_msg)
+
+            last_eval_epoch = epoch
+        else:
+            eval_metrics = {}
+
+        epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        epoch_metrics["best_val_metric"] = best_val_metric
+        epoch_metrics["best_epoch"] = float(best_epoch)
+        history.append(epoch_metrics)
+        if run is not None:
+            wandb.log(epoch_metrics, step=epoch)
+            run.summary["epoch"] = epoch
+            run.summary["best_epoch"] = best_epoch
+            run.summary["best_val_metric"] = best_val_metric
+        print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
+
+    if config.eval_interval > 1 and history and last_eval_epoch < int(history[-1]["epoch"]):
+        final_trained_epoch = int(history[-1]["epoch"])
         if ema is not None:
             ema.store(model)
             ema.copy_to(model)
         if anp_head is not None and anp_ema is not None:
             anp_ema.store(anp_head)
             anp_ema.copy_to(anp_head)
-
         eval_metrics = evaluate_phase_metrics(
-            bundle=bundle,
-            config=config,
-            forward_model=forward_model,
-            anp_head=anp_head,
-            loaders=val_loaders,
-            transform=transform,
-            metric_transform=metric_transform,
-            device=device,
-            phase="val",
+            bundle=bundle, config=config, forward_model=forward_model,
+            anp_head=anp_head, loaders=val_loaders, transform=transform,
+            metric_transform=metric_transform, device=device, phase="val",
         )
-
-        current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
-        if current_primary_metric is not None and (
-            best_val_primary_metric is None or current_primary_metric < best_val_primary_metric
-        ):
-            best_epoch = epoch
-            best_val_primary_metric = current_primary_metric
+        current_val = eval_metrics.get(val_primary_key)
+        if current_val is not None and current_val < best_val_metric:
+            best_val_metric = current_val
+            best_val_primary_metric = current_val
             best_val_metrics = dict(eval_metrics)
-            best_model_state = snapshot_module_state(model)
+            best_epoch = final_trained_epoch
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             best_anp_state = snapshot_module_state(anp_head)
-
+            if ema is not None:
+                best_ema_shadow = {k: v.cpu().clone() for k, v in ema.shadow.items()}
+            if anp_ema is not None:
+                best_anp_ema_shadow = {k: v.cpu().clone() for k, v in anp_ema.shadow.items()}
         if ema is not None:
             ema.restore(model)
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
-
-        epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
-        history.append(epoch_metrics)
+        final_eval_log = {"epoch": float(final_trained_epoch), **eval_metrics,
+                          "best_val_metric": best_val_metric, "best_epoch": float(best_epoch)}
+        history[-1].update(eval_metrics)
         if run is not None:
-            wandb.log(epoch_metrics, step=epoch)
-            run.summary["epoch"] = epoch
-        print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
+            wandb.log(final_eval_log, step=final_trained_epoch)
+        print(json.dumps({"final_epoch_eval": final_eval_log}, sort_keys=True), flush=True)
 
     if best_epoch is not None:
         print(
@@ -1761,7 +1974,9 @@ def main() -> None:
         if run is not None:
             wandb.log(final_test_metrics, step=int(history[-1]["epoch"]) if history else 0)
             run.summary.update(final_test_metrics)
-        print(json.dumps({"final_test_metrics": final_test_metrics}, sort_keys=True), flush=True)
+            run.summary["best_epoch"] = best_epoch
+            run.summary["best_val_metric"] = best_val_metric
+        print(json.dumps({"final_test_metrics": final_test_metrics, "best_epoch": best_epoch, "best_val_metric": best_val_metric}, sort_keys=True), flush=True)
 
         if best_model_state is not None:
             restore_module_state(model, best_model_state)
@@ -1826,15 +2041,36 @@ def main() -> None:
             torch.save(terminal_model_state, output_dir / f"{config.dataset}_{config.model}.pt")
         else:
             torch.save(model.state_dict(), output_dir / f"{config.dataset}_{config.model}.pt")
+        best_ckpt_path = output_dir / f"{config.dataset}_{config.model}_best.pt"
         if best_model_state is not None:
-            torch.save(best_model_state, output_dir / f"{config.dataset}_{config.model}_best.pt")
+            ckpt_payload = {
+                "model_state_dict": best_model_state,
+                "epoch": best_epoch,
+                "val_metric": best_val_metric,
+                "val_primary_metric_name": best_val_primary_metric_name,
+                "val_primary_metric": best_val_primary_metric,
+                "config": {k: v for k, v in vars(config).items() if not k.startswith("_")},
+            }
+            if best_anp_state is not None:
+                ckpt_payload["anp_state_dict"] = best_anp_state
+            if best_ema_shadow is not None:
+                ckpt_payload["ema_shadow"] = best_ema_shadow
+            if best_anp_ema_shadow is not None:
+                ckpt_payload["anp_ema_shadow"] = best_anp_ema_shadow
+            torch.save(ckpt_payload, best_ckpt_path)
+            print(f"[SaveCheckpoint] Best model saved to {best_ckpt_path} (epoch={best_epoch}, val={best_val_metric:.6f})")
+            if run is not None:
+                artifact = wandb.Artifact(
+                    f"best-checkpoint-{config.dataset}", type="model",
+                    metadata={"epoch": best_epoch, "val_metric": best_val_metric},
+                )
+                artifact.add_file(str(best_ckpt_path))
+                run.log_artifact(artifact)
         if anp_head is not None:
             if terminal_anp_state is not None:
                 torch.save(terminal_anp_state, output_dir / f"{config.dataset}_{config.model}_anp.pt")
             else:
                 torch.save(anp_head.state_dict(), output_dir / f"{config.dataset}_{config.model}_anp.pt")
-            if best_anp_state is not None:
-                torch.save(best_anp_state, output_dir / f"{config.dataset}_{config.model}_anp_best.pt")
     if run is not None:
         run.finish()
 
