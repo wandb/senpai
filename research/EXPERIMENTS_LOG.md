@@ -1,5 +1,15 @@
 # SENPAI Research Results
 
+## 2026-04-25 02:30 — Cycle 128 (1 PR)
+
+### PR #3309: AF champion vol-10x seed=42 extended 600-min (spike) — CLOSED (CONFIG ERROR)
+- spike/af-champion-seed42-extended
+- **Config error:** Used AdamW lr=6e-4 + 2 layers instead of Lion lr=1.25e-4 + 4 layers + Lookahead + compile
+- Both seeds diverged (seed=42 @ep600, seed=7 @ep576) but results not comparable to baseline
+- Spike reassigned to DM metric-aware w=0.05 T_max=25 (#3358)
+
+---
+
 ## 2026-04-25 02:15 — Cycle 127 (1 PR)
 
 ### PR #3345: AF vol-12x + eval-every-3 + WD=5e-3 (edward) — CLOSED
