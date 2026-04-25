@@ -1,5 +1,15 @@
 # SENPAI Research Results
 
+## 2026-04-25 02:15 — Cycle 127 (1 PR)
+
+### PR #3345: AF vol-12x + eval-every-3 + WD=5e-3 (edward) — CLOSED
+- edward/af-vol12x-eval3-wd5e3
+- Surface 4.6x worse, vol 3.4x worse, diverged ep196 (gradient explosion at cosine restart)
+- Possible flag name issue (--volume-loss-weight vs --vol-loss-weight)
+- WD=5e-3 + high vol-weight unstable. Edward reassigned to DM metric-aware w=0.06 (#3357)
+
+---
+
 ## 2026-04-25 02:00 — Cycle 126 (1 PR)
 
 ### PR #3342: AF vol-14x + eval-every-3 (gohan) — CLOSED
