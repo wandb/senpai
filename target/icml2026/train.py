@@ -168,6 +168,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
     checkpoint_metric: str = "surface"
+    eval_interval: int = 1
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -1691,54 +1692,59 @@ def main() -> None:
             volume_loss_weight=config.volume_loss_weight,
         )
 
-        if ema is not None:
-            ema.store(model)
-            ema.copy_to(model)
-        if anp_head is not None and anp_ema is not None:
-            anp_ema.store(anp_head)
-            anp_ema.copy_to(anp_head)
+        do_eval = (epoch % config.eval_interval == 0) or (epoch == config.epochs)
+        eval_metrics: dict[str, float] = {}
+        current_val = None
 
-        eval_metrics = evaluate_phase_metrics(
-            bundle=bundle,
-            config=config,
-            forward_model=forward_model,
-            anp_head=anp_head,
-            loaders=val_loaders,
-            transform=transform,
-            metric_transform=metric_transform,
-            device=device,
-            phase="val",
-        )
-
-        current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
-        if current_primary_metric is not None and (
-            best_val_primary_metric is None or current_primary_metric < best_val_primary_metric
-        ):
-            best_val_primary_metric = current_primary_metric
-            best_val_metrics = dict(eval_metrics)
-
-        if config.checkpoint_metric == "joint":
-            _surf = next((v for k, v in eval_metrics.items() if k.endswith("/surface_mse")), None)
-            _vol = next((v for k, v in eval_metrics.items() if k.endswith("/volume_mse")), None)
-            current_val = (_surf + _vol) if (_surf is not None and _vol is not None) else eval_metrics.get(val_primary_key)
-        else:
-            current_val = eval_metrics.get(val_primary_key)
-
-        if current_val is not None and current_val < best_val_metric:
-            best_val_metric = current_val
-            best_epoch = epoch
-            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            if anp_head is not None:
-                best_anp_state = {k: v.cpu().clone() for k, v in anp_head.state_dict().items()}
+        if do_eval:
             if ema is not None:
-                best_ema_shadow = {k: v.cpu().clone() for k, v in ema.shadow.items()}
-            if anp_ema is not None:
-                best_anp_ema_shadow = {k: v.cpu().clone() for k, v in anp_ema.shadow.items()}
+                ema.store(model)
+                ema.copy_to(model)
+            if anp_head is not None and anp_ema is not None:
+                anp_ema.store(anp_head)
+                anp_ema.copy_to(anp_head)
 
-        if ema is not None:
-            ema.restore(model)
-        if anp_head is not None and anp_ema is not None:
-            anp_ema.restore(anp_head)
+            eval_metrics = evaluate_phase_metrics(
+                bundle=bundle,
+                config=config,
+                forward_model=forward_model,
+                anp_head=anp_head,
+                loaders=val_loaders,
+                transform=transform,
+                metric_transform=metric_transform,
+                device=device,
+                phase="val",
+            )
+
+            current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
+            if current_primary_metric is not None and (
+                best_val_primary_metric is None or current_primary_metric < best_val_primary_metric
+            ):
+                best_val_primary_metric = current_primary_metric
+                best_val_metrics = dict(eval_metrics)
+
+            if config.checkpoint_metric == "joint":
+                _surf = next((v for k, v in eval_metrics.items() if k.endswith("/surface_mse")), None)
+                _vol = next((v for k, v in eval_metrics.items() if k.endswith("/volume_mse")), None)
+                current_val = (_surf + _vol) if (_surf is not None and _vol is not None) else eval_metrics.get(val_primary_key)
+            else:
+                current_val = eval_metrics.get(val_primary_key)
+
+            if current_val is not None and current_val < best_val_metric:
+                best_val_metric = current_val
+                best_epoch = epoch
+                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                if anp_head is not None:
+                    best_anp_state = {k: v.cpu().clone() for k, v in anp_head.state_dict().items()}
+                if ema is not None:
+                    best_ema_shadow = {k: v.cpu().clone() for k, v in ema.shadow.items()}
+                if anp_ema is not None:
+                    best_anp_ema_shadow = {k: v.cpu().clone() for k, v in anp_ema.shadow.items()}
+
+            if ema is not None:
+                ema.restore(model)
+            if anp_head is not None and anp_ema is not None:
+                anp_ema.restore(anp_head)
 
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
         if config.checkpoint_metric == "joint" and current_val is not None:
