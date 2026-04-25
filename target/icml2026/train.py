@@ -1843,6 +1843,24 @@ def main() -> None:
                 kill_output_dir = Path(config.output_dir)
                 kill_output_dir.mkdir(parents=True, exist_ok=True)
                 (kill_output_dir / "KILLED.md").write_text(kill_msg + "\n")
+                if config.save_checkpoint and best_model_state is not None:
+                    best_ckpt_path = kill_output_dir / f"{config.dataset}_{config.model}_best.pt"
+                    ckpt_payload = {
+                        "model_state_dict": best_model_state,
+                        "epoch": best_epoch,
+                        "val_metric": best_val_metric,
+                        "val_primary_metric_name": best_val_primary_metric_name,
+                        "val_primary_metric": best_val_primary_metric,
+                        "config": {k: v for k, v in vars(config).items() if not k.startswith("_")},
+                    }
+                    if best_anp_state is not None:
+                        ckpt_payload["anp_state_dict"] = best_anp_state
+                    if best_ema_shadow is not None:
+                        ckpt_payload["ema_shadow"] = best_ema_shadow
+                    if best_anp_ema_shadow is not None:
+                        ckpt_payload["anp_ema_shadow"] = best_anp_ema_shadow
+                    torch.save(ckpt_payload, best_ckpt_path)
+                    print(f"[SaveCheckpoint] Best model saved to {best_ckpt_path} (epoch={best_epoch}, val={best_val_metric:.6f})")
                 print(kill_msg, file=sys.stderr, flush=True)
                 raise RuntimeError(kill_msg)
 
