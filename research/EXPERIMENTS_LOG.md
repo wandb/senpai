@@ -1,5 +1,29 @@
 # SENPAI Research Results
 
+## 2026-04-25 05:55 — Cycle 149 (2 PRs — CRITICAL LR FINDING)
+
+### PR #3308: DM lr=4.8e-4 narrow LR sweep (gojo) — CLOSED (CRITICAL FINDING)
+- gojo/dm-lr-48e4-narrow-sweep, T_max=30
+- Trial 1 (lr=4.8e-4): val=3.657% @ep820 (close to 3.622% but doesn't beat)
+- **FULL-EVAL TEST=4.117% — BEST IN ENTIRE PROGRAMME** (vs 4.218% canute, -2.4%)
+- Trial 2 (lr=5.2e-4): val=3.762%, full-eval test=4.180%
+- W&B: kfxsxmw2 (train), l5h1s2p7 (full-eval)
+- LR curve at T_max=30: 4.8e-4 (3.657%) > 5.0e-4 (3.833%) > 5.2e-4 (3.762%)
+- Bug: --skip-update-grad-norm 100 blocked all updates on DM (grad norms ~369). Removed.
+- **CRITICAL: T_max=36 + lr=4.8e-4 compound is now HIGHEST PRIORITY**
+
+### PR #3347: TFP 4L/192d lr=5e-5 T_max=20 (usopp) — CLOSED
+- usopp/tfp-4l-lr5e5-tmax20
+- val=0.002296 — 23.6% worse than new TFP baseline (0.001857, haku lr=7.5e-5)
+- 4L + lower LR converges too slowly, not competitive
+- W&B: ycfp82os
+
+### Cycle 149 New Assignments (HIGHEST PRIORITY)
+- #3380 gojo: **DM T_max=36 + lr=4.8e-4 MSE-only** (LR+schedule compound + mandatory full-eval)
+- #3381 usopp: **DM T_max=36 + lr=4.8e-4 + metric-aware w=0.05** (triple compound)
+
+---
+
 ## 2026-04-25 05:40 — Cycle 148 (1 PR)
 
 ### PR #3317: DM 4H/128d wide heads (nobara) — CLOSED
