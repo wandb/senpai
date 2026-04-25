@@ -1,5 +1,16 @@
 # SENPAI Research Results
 
+## 2026-04-25 08:35 — Cycle 161 (post-harvest)
+
+### HUMAN COST-CONTROL HARVEST PASS
+- morganmcg1 stopped 42 student pods, closed ~40 PRs (no results — training never completed)
+- 17 experiments kept running for final test-metric harvesting
+- Key survivors: gojo #3380 (DM compound HIGHEST), yuji #3346 (TFP 4L), chihiro #3257 (AF)
+- Closed without data: lr=4.8e-4+T_max=36 seeds (#3383/3385/3386/3387/3389/3390/3391/3392/3393/3394/3395), T_max=36+lr=5e-4 fleet (#3359/3361/3363-3370/3374-3376/3378), AF variants (#3354/3368/3372), TFP (#3379), DM misc (#3349/3357/3358/3398/3399/3400/3404)
+- Idle students NOT to be reassigned — pods stopped intentionally
+
+---
+
 ## 2026-04-25 08:25 — Cycle 160 (1 review, 0 closures)
 
 ### PR #3346: TFP 4L/192d at lr=4e-5 T_max=15 (yuji) — SENT BACK (**NEW TFP TEST BEST**)
