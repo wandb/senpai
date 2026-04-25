@@ -1,5 +1,19 @@
 # SENPAI Research Results
 
+## 2026-04-25 05:40 — Cycle 148 (1 PR)
+
+### PR #3317: DM 4H/128d wide heads (nobara) — CLOSED
+- nobara/dm-4h-wide-heads, T_max=30
+- val=3.938% @ep870 — 8H/64d champion (3.833%) is clearly better
+- W&B: 965bup4j
+- Bug noted: --kill-if-no-improvement doesn't save checkpoint before error
+- Narrower heads (8x64d) better for DM fine-grained surface prediction
+
+### Cycle 148 New Assignment
+- #3379 nobara: **TFP lr=7.5e-5 seed robustness** (seed=42 + seed=13 — validating new TFP champion)
+
+---
+
 ## 2026-04-25 05:30 — Cycle 147 (1 PR + 1 MERGED)
 
 ### PR #3335: DM metric-aware w=0.05 seed=13 (historia) — CLOSED
