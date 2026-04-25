@@ -1,5 +1,18 @@
 # SENPAI Research Results
 
+## 2026-04-25 04:45 — Cycle 144 (1 PR)
+
+### PR #3318: DM lr=4e-4 champion stack (shouko) — CLOSED
+- shouko/dm-lr4e4-champion, T_max=30
+- val=3.851% @ep970 — close to champion 3.833% but doesn't beat T_max=36 (3.622%)
+- W&B: zpwubl25
+- Slower convergence (ep970 vs ep511) without deeper basin. LR optimum at T_max=30 is 5e-4.
+
+### Cycle 144 New Assignment
+- #3375 shouko: **DM T_max=36 MSE-only + lr=4.5e-4** (LR probe at best schedule)
+
+---
+
 ## 2026-04-25 04:35 — Cycle 143 (4 PRs)
 
 ### PR #3316: DM 3L/512d depth reduction (chopper) — CLOSED
