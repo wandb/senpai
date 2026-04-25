@@ -15,37 +15,31 @@ description: >
 
 # Experiment Status Check
 
-Create a timestamped `analysis/STATUS_*.md` report that answers two questions:
+Create a timestamped `analysis/STATUS_*.md` report that answers:
 
-1. What are the best paper-facing **test** results right now, and how do they
-   compare to the benchmark targets?
+1. What are the best paper-facing **test** results, and how do they compare to
+   benchmark targets?
 2. Is the advisor/student system actually doing useful work, or is it stalled,
    mislabeled, sleeping, or optimizing the wrong thing?
 
 The core distinction is "is the fleet alive?" versus "is useful science
 happening?" Keep those separate throughout the report.
 
-Use this skill with `wandb-primary` for W&B data and the GitHub skill or `gh`
-for PR state.
-
 ## Why this skill exists
 
-The status check is an intervention tool, not a newsletter. The system spends
-real GPU time and real researcher attention, so the report must help decide
-whether to keep training, harvest results, repair operations, or restart with
-new instructions.
-
-The recurring failure modes this skill guards against:
+This is an intervention tool, not a newsletter. It should help decide whether
+to keep training, harvest results, repair operations, or restart with new
+instructions. It guards against:
 
 - **Validation drift:** agents find plausible validation wins and accidentally
   report them like paper wins. The paper needs test metrics.
-- **Fleet illusion:** Kubernetes pods can be Running while student Claude
-  sessions are idle, sleeping, mis-assigned, or done.
+- **Fleet illusion:** pods can be Running while student sessions are idle,
+  sleeping, mis-assigned, or done.
 - **Assignment invisibility:** a PR without the right `student:<name>` and
   branch labels can look assigned to the advisor while being invisible to the
   student pod.
-- **Advisor state staleness:** `CURRENT_RESEARCH_STATE.md` is useful steering
-  context, but it can lag behind GitHub, W&B, and pod reality.
+- **Stale advisor state:** `CURRENT_RESEARCH_STATE.md` can lag behind GitHub,
+  W&B, and pod reality.
 - **Experiment sprawl:** many PRs can be active while only a few have a
   credible path to improving paper-facing test results.
 
@@ -55,166 +49,75 @@ The recurring failure modes this skill guards against:
   not the paper result. This prevents the report from overstating progress.
 - Always pair a test metric with its benchmark target/reference and a gap/read:
   "beats", "misses by X", "internal benchmark only", or "no external scalar".
-  This makes the next decision obvious instead of leaving the reader to infer
-  whether a number matters.
-- Always include source and caveat columns for metrics: W&B run ID, PR number,
+- Include source and caveat columns for metrics: W&B run ID, PR number,
   full-eval vs batch-limited, best-checkpoint vs final epoch, truncated vs full.
-  This protects the paper from mixing incompatible evaluation protocols.
 - Do not trust advisor state files as source of truth until cross-checked
-  against GitHub labels, W&B, and pod/process state. The advisor can be wrong
-  precisely when a status check is most needed.
-- Do not treat a Running pod as active training. Check for real Python
-  `train.py` processes and recent W&B runs. A pod can be healthy while the
-  experiment loop is stalled.
-- Do not hide operational failures below science detail. If labels, pods, or
-  polling are broken, surface that in the executive read. Broken control flow
-  invalidates otherwise good scientific planning.
+  against GitHub labels, W&B, and pod/process state.
+- Do not treat a Running pod as active training. Check for real `train.py`
+  processes and recent W&B runs.
+- Surface broken labels, pods, polling, or advisor state in the executive read.
 - Do not report "SOTA" from validation unless the benchmark contract is
   validation-based. For this programme, most paper claims are test-facing.
 
-## Evidence order
+## Evidence order and why
 
-For metric claims, prefer:
+- **Metrics:** W&B summary/history first, then PR comments with run IDs, then
+  advisor state, then old status files. W&B is closest to the run; old status
+  files are continuity, not truth.
+- **Operations:** Kubernetes process state first, then raw `.claude` JSONL logs,
+  then GitHub labels/timestamps, then advisor state. Pod/process truth shows
+  what is actually happening now.
 
-1. Direct W&B summary/history from the target W&B project.
-2. PR result comments that include W&B run IDs.
-3. Current `research/CURRENT_RESEARCH_STATE.md`, only after cross-checking.
-4. Older `analysis/STATUS_*.md` files, only as historical context.
+## Questions to answer
 
-Why: metric values are easy to transpose across runs, PR comments, and status
-files. W&B is closest to the training run; old statuses are useful for
-continuity but should not override live evidence.
+| Area | Ask | Why |
+| --- | --- | --- |
+| Scope | Which branch, repo, W&B project, k8s context, and prior statuses are in scope? What was checked live? | Prevents stale or cross-branch evidence from driving decisions. |
+| Science | What is the best verified test result per dataset, the exact metric contract, the benchmark target, and the gap? Which results are val-only or truncated? | Separates paper-ready wins from internal steering signals. |
+| Harvest | Which live or recent runs deserve full-test harvest before shutdown? Which negative results stop whole families? | Spends remaining GPU on paper-facing upside. |
+| PR queue | How many PRs are WIP/review/draft/stale? Are WIP PRs labeled with branch + exactly one `student:*`? | Finds invisible work before pods sit idle. |
+| Fleet | Which pods are Ready, which have real `train.py`, and which are Running but not training? | Avoids mistaking infrastructure health for useful experiments. |
+| Raw logs | Do student/advisor logs show active training, no-PR loops, submitted/done states, setup failures, or sleep/monitor loops? | Explains why work is or is not moving. |
+| Advisor | What does `CURRENT_RESEARCH_STATE.md` claim, and what do GitHub/W&B/pods contradict? | Stops stale or validation-heavy steering from consuming the budget. |
 
-For operational claims, prefer:
+## Command patterns
 
-1. Kubernetes process state on the active fleet context. Use the context named
-   in the user's request or the latest status file; if unclear, inspect
-   available contexts before reporting pod health.
-2. Student/advisor raw `.claude` JSONL logs.
-3. GitHub PR labels and timestamps.
-4. Advisor state file claims.
-
-Why: operational reality is determined by what the pods and labels are doing
-now, not by what the advisor believes should be happening.
-
-## Core questions to answer
-
-Start by establishing scope and source freshness:
-
-- What branch/program, GitHub repo, W&B project, and Kubernetes context are in
-  scope?
-- Which previous status files are the continuity anchors?
-- Which sources were checked live versus reused from history?
-- Did this pass modify anything, or was it read-only?
-
-### Paper-facing science
-
-- What is the best verified test result for each dataset?
-- What exact metric contract applies to each dataset?
-- Does the best test result beat the benchmark target? By how much?
-- Which results are validation-only, truncated-eval, batch-limited, or otherwise
-  not paper-ready?
-- Which live or recent validation runs deserve final/full test harvest before
-  shutdown?
-- Which closed/merged PRs changed the frontier since the last status?
-- Which negative results are decision-useful enough to stop whole families?
-
-Why: this section tells the researcher whether the programme is producing
-paper-useful improvements or merely accumulating plausible training stories.
-
-### PR queue and assignment health
-
-- How many PRs are open, review-ready, WIP, stale, draft, merged, or closed?
-- Are all WIP PRs labeled with the advisor branch label and exactly one
-  `student:<name>` label?
-- Are any PRs invisible to students because they have `status:wip` but no
-  `student:*` label?
-- Are any PRs invisible to advisor accounting because they lack the branch
-  label, for example `radford`?
-- Do head branch prefixes imply an intended student that labels failed to
-  encode?
-- Are old PRs stale because the student is still training, because Claude is
-  stuck in a monitor/sleep loop, or because the PR is invisible?
-
-Why: the most expensive failure is an apparently full queue that no student can
-actually see or advance.
-
-### Fleet and raw logs
-
-- Which Kubernetes context is actually hosting the fleet?
-- How many advisor and student pods are Running/Ready?
-- How many student pods have a real Python `train.py` process?
-- Which pods are Running but not training?
-- Do recent student logs end in "no open PR", "submitted", sleep/monitor text,
-  setup failure, or active training/log tailing?
-- Are W&B run names appearing for newly assigned PRs?
-- Does the advisor log show recent review/assignment cycles, or repeated idle
-  cycles from a false fleet model?
-
-Why: process tables and raw logs distinguish "work is happening" from "the
-automation is alive but no experiment is moving."
-
-### Advisor state and steering
-
-- What does `research/CURRENT_RESEARCH_STATE.md` claim?
-- Which claims are contradicted by GitHub labels, W&B, or pod processes?
-- Is the advisor over-weighting validation relative to test?
-- Is the advisor spending capacity on low-EV breadth instead of final test
-  harvest?
-- Does the current queue match the user's active directive and remaining time?
-
-Why: the advisor is part of the experiment system. Its state can amplify a good
-frontier, but stale or validation-heavy state can spend the remaining budget on
-the wrong questions.
-
-## Useful commands
-
-Adjust repo, branch, context, and project names if the user specifies different
-ones.
+Adjust repo, branch, context, and project names to the request. These are
+patterns, not mandatory copy-paste blocks.
 
 ```bash
-# Status history
+# Status history and headings
 rg --files -g 'STATUS*.md' -g 'analysis/STATUS*.md' | sort
-for f in $(rg --files -g 'STATUS*.md' -g 'analysis/STATUS*.md' | sort); do
-  echo "### $f"
-  rg -n '^#{1,3} ' "$f" | head -40
-done
+rg -n '^#{1,3} ' analysis/STATUS*.md
 
 # PR queue
 gh pr list --repo wandb/senpai --base radford --state open --limit 200 \
   --json number,title,state,createdAt,updatedAt,isDraft,headRefName,labels,url
 
-# Detect WIP PRs invisible to students or advisor accounting
+# Detect WIP PRs missing student/branch labels
 gh pr list --repo wandb/senpai --base radford --state open --limit 200 \
-  --json number,headRefName,labels,createdAt,updatedAt \
-  > /tmp/radford_open_prs.json
+  --json number,headRefName,labels,createdAt > /tmp/open_prs.json
 uv run python - <<'PY'
 import json, datetime
-prs = json.load(open('/tmp/radford_open_prs.json'))
+prs = json.load(open('/tmp/open_prs.json'))
 now = datetime.datetime.now(datetime.timezone.utc)
 for p in sorted(prs, key=lambda x: x["number"]):
     labels = sorted(l["name"] for l in p["labels"])
-    if "status:wip" not in labels:
-        continue
-    missing_student = not any(x.startswith("student:") for x in labels)
-    missing_branch = "radford" not in labels
-    if missing_student or missing_branch:
-        created = datetime.datetime.fromisoformat(p["createdAt"].replace("Z", "+00:00"))
-        age = (now - created).total_seconds() / 3600
-        intended = p["headRefName"].split("/")[0]
+    bad = "status:wip" in labels and (
+        "radford" not in labels or not any(x.startswith("student:") for x in labels)
+    )
+    if bad:
+        age = (now - datetime.datetime.fromisoformat(p["createdAt"].replace("Z","+00:00"))).total_seconds()/3600
+        intended = p["headRefName"].split("/", 1)[0]
         print(f"#{p['number']} age={age:.1f}h intended={intended} labels={labels} head={p['headRefName']}")
 PY
 
-# Fleet overview
+# Fleet overview and real training process sweep
 kubectl --context pai-2 get pods -l app=senpai -o wide
-kubectl --context pai-2 get deploy -l app=senpai
-
-# Real training process sweep
 for podref in $(kubectl --context pai-2 get pods -l app=senpai,role=student -o name | sort); do
   pod=${podref#pod/}
   student=${pod#senpai-}; student=${student%-*}; student=${student%-*}
-  out=$(kubectl --context pai-2 exec "$pod" -- sh -lc \
-    "ps -eo pid,etime,comm,args | awk '\$3 ~ /python/ && /train.py/ {print; exit}'" 2>/dev/null || true)
+  out=$(kubectl --context pai-2 exec "$pod" -- sh -lc "ps -eo pid,etime,comm,args | awk '\$3 ~ /python/ && /train.py/ {print; exit}'" 2>/dev/null || true)
   if [ -n "$out" ]; then
     printf "%-10s PYTRAIN %s\n" "$student" "$(printf "%s" "$out" | sed 's/^[[:space:]]*//; s/[[:space:]][[:space:]]*/ /g' | cut -c1-180)"
   else
@@ -222,28 +125,18 @@ for podref in $(kubectl --context pai-2 get pods -l app=senpai,role=student -o n
   fi
 done
 
-# Advisor state file
+# Advisor state and raw log locations
 gh api 'repos/wandb/senpai/contents/research/CURRENT_RESEARCH_STATE.md?ref=radford' \
   --jq .content | base64 --decode | sed -n '1,220p'
-
-# Advisor raw log locations
 kubectl --context pai-2 exec deploy/senpai-advisor -- sh -lc \
   "find /root/.claude -type f -name '*.jsonl' -printf '%T@ %p %s\n' | sort -nr | head -10"
 
-# Student raw log locations
+# Student raw log locations and latest tails
 for podref in $(kubectl --context pai-2 get pods -l app=senpai,role=student -o name | sort); do
   pod=${podref#pod/}
   echo "### $pod"
   kubectl --context pai-2 exec "$pod" -- sh -lc \
-    "find /root/.claude -type f -name '*.jsonl' -printf '%T@ %p %s\n' | sort -nr | head -3"
-done
-
-# Tail latest student Claude log messages for stuck/sleeping/active-training reads
-for podref in $(kubectl --context pai-2 get pods -l app=senpai,role=student -o name | sort); do
-  pod=${podref#pod/}
-  echo "### $pod"
-  kubectl --context pai-2 exec "$pod" -- sh -lc \
-    "latest=\$(find /root/.claude -type f -name '*.jsonl' -printf '%T@ %p\n' | sort -nr | awk 'NR==1{sub(/^[^ ]+ /, \"\"); print}'); [ -n \"\$latest\" ] && tail -40 \"\$latest\""
+    "latest=\$(find /root/.claude -type f -name '*.jsonl' -printf '%T@ %p\n' | sort -nr | awk 'NR==1{sub(/^[^ ]+ /,\"\"); print}'); [ -n \"\$latest\" ] && tail -40 \"\$latest\""
 done
 ```
 
@@ -253,22 +146,16 @@ Use the `wandb-primary` skill. Directly fetch known run IDs from PRs, then scan
 recent runs only as needed. Keep dataset classification conservative; do not mix
 TFP `surface_mse` with AirfRANS `surface_mse`.
 
-Minimum fields to extract:
+Minimum metric keys:
 
-- DrivAerML: `test_primary/surface_rel_l2_pct`, full-eval preferred.
+- DrivAerML: `test_primary/surface_rel_l2_pct`
 - TandemFoil Paper: `best_test_primary/field_mse`, `test_primary/field_mse`.
 - AirfRANS: `full_test/surface_mse`, `full_test/volume_mse`,
   `best_full_test/surface_mse`, `best_full_test/volume_mse`.
 - TandemFoil: `best_test_primary/surface_pressure_mae`,
   `test_primary/surface_pressure_mae`.
 
-Always record:
-
-- W&B run name and ID
-- PR number if known
-- run state
-- metric key used
-- selection caveat
+Always record W&B run name/ID, PR if known, run state, metric key, and caveat.
 
 ## Status file template
 
@@ -278,27 +165,20 @@ Write to:
 analysis/STATUS_<YYYY-MM-DD-HHMM>_<branch>_<short_topic>.md
 ```
 
-Use this wireframe:
+Use this compact wireframe:
 
 ```markdown
 # STATUS <YYYY-MM-DD HH:MM TZ> - <branch> <short title>
 
 Collected at `<UTC timestamp>`.
 
-Sources checked:
-- GitHub PRs on `<repo>`, base `<branch>`
-- W&B project `<entity/project>`
-- Kubernetes context `<context>`
-- Advisor/student raw logs, if inspected
-- Prior `analysis/STATUS_*.md` files
-
-No PR labels, branches, pods, or W&B runs were modified during this pass.
-<!-- If you did modify anything because the user explicitly asked, say exactly what. -->
+Sources checked: GitHub `<repo>/<branch>`, W&B `<entity/project>`, k8s
+`<context>`, raw logs `<yes/no>`, prior statuses `<paths>`.
+Changes made during this pass: `<none, or exact labels/pods/branches touched>`.
 
 ## Executive read
 
-<5-10 bullets. Lead with test frontier and any operational stall. Do not bury
-label, pod, or advisor-state failures.>
+<5-10 bullets. Lead with test frontier and operational stalls.>
 
 ## Test metric frontier
 
@@ -309,57 +189,32 @@ label, pod, or advisor-state failures.>
 | AirfRANS | `full_test/surface_mse`, `full_test/volume_mse` |  |  |  | W&B `<id>`, PR `#` | pair metric |
 | TandemFoil | `test_primary/surface_pressure_mae` |  |  |  | W&B `<id>`, PR `#` | val-selected / final |
 
-## What changed since last status
-
-| Item | Evidence | Test impact | Action |
-| --- | --- | --- | --- |
-
 ## PR queue and label audit
 
-- Open PRs:
-- `status:wip`:
-- `status:review`:
-- Draft:
-- Older than 6h:
-- Missing `student:*`:
-- Missing branch label:
+Counts: open `<n>`, WIP `<n>`, review `<n>`, draft `<n>`, older than 6h `<n>`,
+missing `student:*` `<n>`, missing branch label `<n>`.
 
-Include a table for malformed/stale PRs when nonzero:
-
-| PR | Age | Intended student | Labels | Head branch | Risk | Fix |
-| --- | ---: | --- | --- | --- | --- | --- |
+| PR | Age | Student/read | Labels | Risk | Fix |
+| --- | ---: | --- | --- | --- | --- |
 
 ## Fleet and raw-log health
 
-| Student/pod group | Count | Evidence | Read |
+| Signal | Count/examples | Evidence | Read |
 | --- | ---: | --- | --- |
-| Student pods Running/Ready |  | `kubectl` |  |
-| Real `train.py` processes |  | process sweep |  |
+| Pods Running/Ready |  | `kubectl` |  |
+| Real `train.py` |  | process sweep |  |
 | Running but not training |  | process sweep + `.claude` tail |  |
 | Recent W&B runs |  | W&B scan |  |
 
-Call out specific stuck pods or suspicious logs.
-
 ## Advisor state risks
 
-- What `CURRENT_RESEARCH_STATE.md` says.
-- What GitHub/W&B/pods contradict.
-- Whether the advisor is emphasizing validation over test.
-- Whether intervention is needed.
+State what `CURRENT_RESEARCH_STATE.md` says, what GitHub/W&B/pods contradict,
+whether validation is over-weighted, and what intervention is needed.
 
-## Running jobs needing test harvest
+## Harvest / keep / kill
 
 | Priority | Run/PR | Current signal | Missing test metric | Why it matters | Action |
 | --- | --- | --- | --- | --- | --- |
-
-## Keep / kill / fix now
-
-| Action | Targets | Reason | Owner/command |
-| --- | --- | --- | --- |
-| Keep running |  |  |  |
-| Full-test harvest |  |  |  |
-| Kill/close |  |  |  |
-| Relabel/restart/fix control plane |  |  |  |
 
 ## Bottom line
 
