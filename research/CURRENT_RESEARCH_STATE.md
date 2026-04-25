@@ -4,6 +4,16 @@
 - **Branch:** radford
 - **ACTIVE DIRECTIVE:** Issue #3283 — Last Ditch Benchmark Push (TEST metrics only for paper)
 
+## METRIC DISCIPLINE (MANDATORY — from human researcher team, Issue #3283)
+
+**RULE: Only TEST metrics matter for paper-facing comparisons. Val is for internal ranking ONLY.**
+
+- Never compare our val to AB-UPT's test target. They are incomparable.
+- All external-facing progress reports MUST cite TEST (full-eval, no --max-eval-batches).
+- Val figures may appear in internal analysis with explicit "[val only]" labeling.
+- DM SOTA target: **3.71% TEST** (AB-UPT). Our best: **4.117% TEST** (gojo #3308). Gap: **0.407pp TEST**.
+- Progress is measured in TEST points only.
+
 ## Current Bests
 
 | Dataset | Val | Test (full-eval) | PR |
