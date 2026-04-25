@@ -1,5 +1,19 @@
 # SENPAI Research Results
 
+## 2026-04-25 07:10 — Cycle 156 (2 PRs)
+
+### PR #3336: DM metric-aware w=0.03+EMA=0.999 (bulma) — CLOSED
+- val=3.648% @T_max=30. 0.026pp short. W&B: q9fuvz4l
+
+### PR #3328: DM metric-aware w=0.05+WD=1e-3 (mugen) — CLOSED
+- val=3.634% @T_max=30. Only 0.012pp short! WD slightly helps. W&B: ufhl077m
+
+### Cycle 156 Assignments
+- #3392 bulma: T_max=36 + lr=4.8e-4 + w=0.05 + WD=1e-3 (quad compound)
+- #3393 mugen: T_max=36 + lr=4.8e-4 MSE-only + seed=13 (3rd seed point)
+
+---
+
 ## 2026-04-25 06:50 — Cycle 154 (4 PRs)
 
 ### PR #3333: DM metric-aware w=0.05 T_max=40 (alphonse) — CLOSED
