@@ -1,5 +1,16 @@
 # SENPAI Research Results
 
+## 2026-04-25 01:45 — Cycle 125 (1 PR)
+
+### PR #3344: AF vol-10x + eval-every-3 + T_max=75 (piccolo) — CLOSED
+- piccolo/af-vol10x-eval3-tmax75
+- Catastrophic divergence: surface 9.8x worse, vol 5.7x worse, grad explosion ep107
+- W&B: (see PR). Lion warm restart at T_max=75 boundary causes instability.
+- T_max=75 TRIPLE CONFIRMED dead for AF (#3241, #3344). T_max=50 is definitive.
+- Piccolo reassigned to vol-10x + eval-3 + seed=42 (#3355)
+
+---
+
 ## 2026-04-25 01:30 — Cycle 124 (1 PR)
 
 ### PR #3341: AF vol-13x + eval-every-3 (casca) — CLOSED
