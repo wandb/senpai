@@ -451,14 +451,25 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 3.622% (val) at epoch 874 — test 4.631% (batch-limited; full-eval TEST PENDING)
-- **Best PR:** #3298 (chrome — MSE-only, T_max=36, 4L/512d/8H, AdamW lr=5e-4, EMA=0.9995, gc=0.5)
+- **Current best:** 3.521% (val, 200-batch) at epoch 850 — full-eval TEST 4.119% — full-eval val 4.456%
+- **Best PR:** #3380 (gojo — MSE-only, T_max=36, 4L/512d/8H, AdamW lr=4.8e-4, EMA=0.9995, gc=0.5)
 - **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
-- **External target:** <3.71% (AB-UPT, ~500 epochs) — **val 3.622% BREAKS BELOW SOTA TARGET by 0.088pp**
-- **Key insight:** T_max=36 beats T_max=30 by -5.5% on MSE-only config, and beats metric-aware w=0.05 T_max=30 (3.700%) by -2.1%. Still improving at ep874 (600-min timeout). T_max=36 + metric-aware loss is the obvious compounding experiment. Full-eval TEST pending.
-- **Reproduce:** `cd target/icml2026 && SENPAI_TIMEOUT_MINUTES=600 python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine-t-max 36 --grad-clip 0.5 --enable-fourier --model-layers 4 --model-hidden-dim 512 --model-heads 8 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200 --ema-decay 0.9995 --ema-mode fixed --no-compile-model --save-checkpoint`
+- **EVAL BIAS WARNING:** 200-batch val has ~0.9pp optimistic bias vs full-eval val (3.521% vs 4.456%). All paper-facing numbers must use `--max-eval-batches 0`.
+- **External target:** <3.71% TEST (AB-UPT). Our best full-eval TEST: 4.119% (gojo #3380). Gap: 0.409pp.
+- **Key insight:** lr=4.8e-4 + T_max=36 MSE-only is the DM val champion. Lower LR at same T_max = deeper val basin. Metric-aware loss, alternate T_max (38/40), gc=0.3 all failed — MSE-only + lr=4.8e-4 + T_max=36 is the optimal compound.
+- **Reproduce:** `cd target/icml2026 && SENPAI_TIMEOUT_MINUTES=600 python train.py --dataset drivaerml --optimizer adamw --lr 4.8e-4 --cosine-t-max 36 --grad-clip 0.5 --enable-fourier --model-layers 4 --model-hidden-dim 512 --model-heads 8 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200 --ema-decay 0.9995 --ema-mode fixed --no-compile-model --save-checkpoint`
 
-### 2026-04-25 02:45 — PR #3298: DrivAerML: T_max=36 MSE-only — NEW BEST (CURRENT)
+### 2026-04-25 19:07 — PR #3380: DrivAerML: T_max=36 + lr=4.8e-4 MSE-only — NEW BEST (CURRENT)
+
+- **val_primary/surface_rel_l2_pct (200-batch):** 3.521% (-2.8% vs 3.622%) at epoch 850
+- **val_primary/surface_rel_l2_pct (full-eval):** 4.456% — confirms ~0.9pp eval-subset optimistic bias
+- **test_primary/surface_rel_l2_pct (full-eval):** **4.119%** (tied with 4.117% reference)
+- **W&B runs:** 5x2to2p8 (training), 4z3ya8t9 (full-eval)
+- **Config:** 4L/512d/8H, AdamW **lr=4.8e-4**, T_max=36, EMA=0.9995, gc=0.5, Fourier, MSE-only
+- **Key insight:** lr=4.8e-4 (lower than lr=5e-4) at T_max=36 pushes val baseline 0.101pp lower. The 200-batch val improvement does not translate to full-eval test improvement, suggesting the 200-batch subset and test set probe different aspects of model quality. Val improvement useful for internal ranking; TEST must be used for paper comparisons.
+- **Reproduce:** `cd target/icml2026 && SENPAI_TIMEOUT_MINUTES=600 python train.py --dataset drivaerml --optimizer adamw --lr 4.8e-4 --cosine-t-max 36 --grad-clip 0.5 --enable-fourier --model-layers 4 --model-hidden-dim 512 --model-heads 8 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200 --ema-decay 0.9995 --ema-mode fixed --no-compile-model --save-checkpoint`
+
+### 2026-04-25 02:45 — PR #3298: DrivAerML: T_max=36 MSE-only — PREVIOUS BEST
 
 - **val_primary/surface_rel_l2_pct:** 3.622% (-5.5% vs 3.833% T_max=30) at epoch 874
 - **test_primary/surface_rel_l2_pct:** 4.631% batch-limited (-1.2% vs 4.685%)
