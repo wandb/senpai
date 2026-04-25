@@ -1,5 +1,43 @@
 # SENPAI Research Results
 
+## 2026-04-25 ~16:00 — Cycle 163 (monitoring, fleet status update)
+
+### GOJO #3380 LIVE TRACKING (lr=4.8e-4+T_max=36 MSE-only)
+- W&B run: 5x2to2p8 (running)
+- **Best val: 3.598% at ep672** — BEATS 3.622% val baseline!
+- Current: ep710, val=3.745% (cosine peak). Next trough ~ep720.
+- Trough progression: 3.696% → 3.644% → 3.643% → 3.601% → **3.598%**
+- Loss spike at ep707 (0.005925) — typical cosine noise, not a problem.
+- Student has NOT yet posted results. Training still running.
+
+### Fleet Status Check
+| Student | PR | W&B State | Latest Metrics |
+|---------|-----|-----------|----------------|
+| gojo | #3380 | running ep710 | val=3.745% best=3.598% |
+| einar | #3382 | running ep703 | val=3.935% |
+| canute | #3403 | running ep733 | val=3.808% |
+| franky | #3396 | running ep759 | val=3.845% |
+| alphonse | #3388 | running ep727 | val=4.028% |
+| chopper | #3371 | **finished** | val=4.647% **test=4.213%** |
+| jet | #3362 | **finished** | val=4.043% test=4.453% |
+| hinata | #3401 | finished (may be old run) | val=3.816% test=4.395% |
+| usopp | #3381 | **crashed** ep8 | — |
+| vegeta | #3300 | running ep5 | val=144.86% (diverging) |
+| yuji | #3346 | sent back for lr=5e-5 | test=0.001712 (previous best) |
+| vash | #3397 | **crashed** ep163 | — |
+| chihiro | #3257 | sent back for test eval | val=0.000266 (previous best) |
+| gohan | #3402 | **crashed** ep250 | diverged |
+
+### Analysis
+- 5 DM experiments still running. Gojo is the clear leader.
+- chopper's test=4.213% is interesting — 3L/512d (wider) gets close to gojo's 4.117% TEST best.
+- Metric-aware variants (einar w=0.03 at 3.935%, franky gc=0.3 at 3.845%) all underperform gojo MSE-only.
+- canute T_max=38 at 3.808% — schedule probe tracking but unlikely to beat gojo's 3.598%.
+- 4 experiments crashed/diverged: usopp, vash, gohan, vegeta.
+- No PRs at status:review. Waiting for students to post results.
+
+---
+
 ## 2026-04-25 15:10 — Cycle 162 (3 closures, gojo tracking)
 
 ### PR #3384: DM T_max=36 + lr=4.8e-4 + w=0.04 (fern) — CLOSED
