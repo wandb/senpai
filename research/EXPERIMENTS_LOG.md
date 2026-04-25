@@ -1,5 +1,45 @@
 # SENPAI Research Results
 
+## 2026-04-25 04:35 — Cycle 143 (4 PRs)
+
+### PR #3316: DM 3L/512d depth reduction (chopper) — CLOSED
+- chopper/dm-3l-depth-reduction, T_max=30
+- val=3.880% @ep999 (worse than 3.622% T_max=36 baseline)
+- **Full-eval TEST=4.213%** (marginally better than canute 4.218% — interesting)
+- **2x throughput** (0.51 vs 1.0 min/ep), trained 999 eps vs 4L's 511
+- W&B: qo8aqlsp (train), fyhevgyk (full-eval)
+- 3L throughput is compelling — worth testing at T_max=36
+
+### PR #3315: DM T_max=50 (emma) — CLOSED
+- emma/dm-tmax50-champion
+- val=3.914% @ep990 (worse than T_max=36 3.622% and T_max=30 3.833%)
+- Full-eval TEST=4.212% (similar to canute 4.218%)
+- Still improving at ep999 but T_max=50 converges too slowly
+- W&B: maf97m58 (train), xhe9kuud (full-eval)
+- Schedule optimum firmly at T_max=36
+
+### PR #3314: DM EMA=0.999 (thorfinn) — CLOSED
+- thorfinn/dm-ema-999-champion, T_max=30
+- val=4.048% @ep720, full-eval TEST=4.275%
+- EMA=0.999 slower convergence and worse val than EMA=0.9995 (3.833%)
+- W&B: bp1fpl6u (train), 8j2rl7ly (full-eval)
+
+### PR #3240: AF joint checkpoint + vol-weight sweep (gilbert) — CLOSED
+- gilbert/af-joint-ckpt-vol12x
+- AdamW 2L: vol-12x surface=0.000271 (-8.4% programme-best!), but vol=0.002881 (+41%)
+- Lion 4L follow-up catastrophically bad (wrong config)
+- Added `--checkpoint-metric joint` feature to train.py
+- W&B: 2stj38hx (best trial)
+- **KEY:** `--volume-loss-weight` confirmed as correct flag name (not `--vol-loss-weight`)
+
+### Cycle 143 New Assignments
+- #3371 chopper: **DM 3L/512d + T_max=36** (throughput + best schedule, ~1800+ epochs)
+- #3372 emma: **AF eval-every-3 + AdamW 2L + vol-weight=11x** (correct AF config)
+- #3373 gilbert: **AF eval-every-3 + AdamW 2L + vol-weight=12x** (correct AF config)
+- #3374 thorfinn: **DM metric-aware w=0.05 + T_max=36 + lr=5.5e-4** (higher LR probe)
+
+---
+
 ## 2026-04-25 04:20 — Cycle 142 (2 PRs)
 
 ### PR #3329: DM metric-aware w=0.03 + lr=4e-4 (sanji) — CLOSED
