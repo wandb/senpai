@@ -1,5 +1,18 @@
 # SENPAI Research Results
 
+## 2026-04-25 05:30 — Cycle 147 (1 PR + 1 MERGED)
+
+### PR #3335: DM metric-aware w=0.05 seed=13 (historia) — CLOSED
+- historia/dm-metric-aware-w005-seed13, T_max=30
+- val=3.763% @ep830 — 0.063pp worse than seed=42 (3.700%). Moderate seed sensitivity.
+- W&B: q5fu3srn
+- Killed by no-improvement guard at ep840
+
+### Cycle 147 New Assignment
+- #3378 historia: **DM T_max=36 MSE-only + seed=42** (schedule seed robustness)
+
+---
+
 ## 2026-04-25 05:15 — Cycle 146b: TFP WINNER (1 PR MERGED)
 
 ### PR #3352: TFP LR bracket 6e-5/7.5e-5 (haku) — **MERGED (NEW TFP BASELINE)**
