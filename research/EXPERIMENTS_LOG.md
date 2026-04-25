@@ -1,5 +1,16 @@
 # SENPAI Research Results
 
+## 2026-04-25 02:00 — Cycle 126 (1 PR)
+
+### PR #3342: AF vol-14x + eval-every-3 (gohan) — CLOSED
+- gohan/af-vol14x-eval3
+- Surface 6.5x worse, vol 3.4x worse, diverged ep191 (cosine restart gradient explosion)
+- W&B: (see PR). Vol-14x near instability boundary — confirms stable range is 10-12x.
+- Vol-13x (#3341), vol-14x (#3342), vol-15x/20x (#3238) all unstable.
+- Gohan reassigned to vol-11x + eval-3 + WD=5e-3 (#3356)
+
+---
+
 ## 2026-04-25 01:45 — Cycle 125 (1 PR)
 
 ### PR #3344: AF vol-10x + eval-every-3 + T_max=75 (piccolo) — CLOSED
