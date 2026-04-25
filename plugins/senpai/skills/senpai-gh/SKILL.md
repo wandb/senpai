@@ -54,14 +54,24 @@ GitHub's `gh pr edit --remove-label X --add-label Y` silently strips **all other
 
 ### Queries (both roles)
 
+The default repo for `gh` is set via the injected `GH_REPO` env var, so no `--repo` flag is needed.
+
 | Function | What it does |
 |---|---|
-| `print_gh_repo` | Print `owner/repo` from the git remote (cached). |
 | `check_gh_issues <role_label>` | List open human issues for a role label + team issues, deduplicated. Returns JSON array. |
+| `issue_body <issue#>` | Read one issue body through REST. Returns JSON. |
+| `issue_comments <issue#>` | Read all issue comments through REST pagination. Returns JSON array. |
+| `issue_with_comments <issue#>` | Read one issue and all comments through REST pagination. Returns JSON object. |
 | `list_ready_for_review_prs <branch>` | List PRs with `status:review` on a branch. Returns JSON array. |
 | `list_all_prs <branch>` | List all open PRs on a branch (any status). Returns JSON array. |
 | `student_poll_for_work <student_name>` | List WIP PRs assigned to a student. Returns JSON array. |
 | `list_idle_students <names_csv> <branch>` | Print names of students with no `status:wip` PR, one per line. |
+| `pr_body <pr#>` | Read one PR body through REST. Returns JSON. |
+| `pr_issue_comments <pr#>` | Read all PR conversation comments through REST pagination. Returns JSON array. |
+| `pr_reviews <pr#>` | Read all PR review submissions through REST pagination. Returns JSON array. |
+| `pr_review_comments <pr#>` | Read all inline PR review comments through REST pagination. Returns JSON array. |
+| `pr_all_comments <pr#>` | Read all PR conversation, review, and inline comments through REST pagination. Returns JSON array. |
+| `training_log_status <logfile> [more-logfiles...]` | Summarize recent training-log state after a sparse wakeup. Use this instead of `tail -f` or Monitor callbacks for epoch progress. |
 
 ## Usage examples
 

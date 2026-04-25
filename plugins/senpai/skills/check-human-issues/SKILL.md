@@ -45,7 +45,7 @@ This returns a deduplicated JSON array of issues addressed to you and the whole 
 2. **For each issue**, read the full body and comments:
 
 ```bash
-gh issue view <number> --json body,comments
+issue_with_comments <number>
 ```
 
 3. **Decide whether to respond:**

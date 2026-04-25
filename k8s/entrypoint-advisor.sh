@@ -10,16 +10,25 @@ set -o pipefail
 WORKDIR="/workspace/senpai"
 
 echo "=== Senpai Advisor ==="
-echo "Repo:     $REPO_URL (branch: $REPO_BRANCH)"
-echo "Tag:      $RESEARCH_TAG"
-echo "Students: $STUDENT_NAMES"
+echo "Runner repo:  $REPO_URL (branch: $REPO_BRANCH)"
+echo "Target repo:  $TARGET_REPO_URL (branch: $ADVISOR_BRANCH)"
+echo "Problem dir:  $PROBLEM_DIR"
+echo "Tag:          $RESEARCH_TAG"
+echo "Students:     $STUDENT_NAMES"
 
-# Repo already cloned by the deployment args block
+# Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
+
+# Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
+# agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
+if [ ! -d "$PROBLEM_DIR/.git" ]; then
+    git clone "$TARGET_REPO_URL" "$PROBLEM_DIR"
+fi
 
 uv pip install --system -e .
 
-# --- Git identity ---
+# --- Git identity (inside the problem-package repo) ---
+cd "$WORKDIR/$PROBLEM_DIR"
 git config user.name "senpai-advisor"
 git config user.email "senpai-advisor@senpai"
 
@@ -53,6 +62,11 @@ source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
 
+# $GH_REPO comes from the ConfigMap (set by launch.py = owner/repo of the
+# problem-package repo). The gh CLI honours it natively, so every `gh`
+# command and `gh api` call targets the problem-package repo, not senpai,
+# regardless of the agent's cwd.
+
 # --- Build prompts (CC auto-discovers CLAUDE.md for role instructions) ---
 TASK_INSTRUCTIONS="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-advisor.md" | sed '/^<!--$/,/^-->$/d')"
 PROMPT="${TASK_INSTRUCTIONS}"
@@ -63,7 +77,7 @@ if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
 fi
 
 # Add "$KEY_INFO" (reminder of student names etc) to PROMPT
-KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | Tag: '"$RESEARCH_TAG"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
+KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | Tag: '"$RESEARCH_TAG"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 # Heartbeat prompt for polling
@@ -75,8 +89,8 @@ LAST_CHECK_FILE="$LOGDIR/.last_check_ts"
 # --- Launch Claude Code Loop ---
 export IS_SANDBOX=1
 
-SLEEP_TIME_S=600
-MAX_TURNS=10000
+SLEEP_TIME_S=300
+MAX_TURNS=100000
 
 ITERATION=0
 while true; do
@@ -84,10 +98,16 @@ while true; do
     ITERATION=$((ITERATION + 1))
     LOGFILE="$LOGDIR/iteration_${ITERATION}_$(date +%Y%m%d_%H%M%S).log"
     echo "=== Advisor Heartbeat iteration $ITERATION ($(date)) ==="
-    echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
+    cd "$WORKDIR/$PROBLEM_DIR"
+    echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) in $PROBLEM_DIR ==="
 
-    # Overwrite CLAUDE.md with advisor-specific one — CC's git operations may clobber it with the developer copy
-    envsubst '$PROBLEM_DIR' < "$WORKDIR/system_instructions/CLAUDE-ADVISOR.md" | sed '/^<!--$/,/^-->$/d' > "$WORKDIR/CLAUDE.md"
+    # Overwrite CLAUDE.md with advisor-specific one — CC's git operations may clobber it with the developer copy.
+    # Whitelist vars so envsubst substitutes pod env vars but leaves Claude Code runtime vars
+    # like ${CLAUDE_PLUGIN_ROOT} alone (those get expanded by the agent's shell at call time).
+    envsubst '$PROBLEM_DIR $TARGET_REPO_URL $GH_REPO $ADVISOR_BRANCH $RESEARCH_TAG $WANDB_ENTITY $WANDB_PROJECT' \
+        < "$WORKDIR/system_instructions/CLAUDE-ADVISOR.md" \
+        | sed '/^<!--$/,/^-->$/d' \
+        > "$WORKDIR/CLAUDE.md"
 
     # --- Read last-check timestamp for filtering PRs and issues (empty on first run = no filtering) ---
     SINCE=""
@@ -133,7 +153,7 @@ while true; do
         echo "=== Iteration $ITERATION: Using heartbeat (HEARTBEAT_PROMPT) prompt ==="
         echo "$HEARTBEAT_PROMPT"
         echo "$TRIAGE_INFO"
-        
+
         CONTINUE_PROMPT="${HEARTBEAT_PROMPT}"$'\n\n'"${TRIAGE_INFO}"
         run_senpai_claude 1000 "$CONTINUE_PROMPT" -c || EXIT_CODE=$?
     fi

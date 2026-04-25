@@ -1,12 +1,18 @@
 # senpai project configuration
 # All fields can be overridden via CLI: python k8s/launch.py --tag <tag> [--field value]
 
-# active problem directory (repo-relative path)
-problem: target/icml2026
+# active problem directory
+# The entrypoint clones target_repo_url into this path at pod startup, so the
+# problem-package repo's root ends up at ./target/ in the pod workspace.
+problem_dir: target/
 
-# git
+# git (senpai itself)
 repo_url: https://github.com/wandb/senpai.git
-repo_branch: kaiming
+repo_branch: main
+
+# problem-package repo is REQUIRED and must be passed on the CLI
+#   python k8s/launch.py --tag <tag> --target_repo_url https://github.com/<org>/<repo>.git
+# The entrypoint clones it into $PROBLEM_DIR and checks out advisor_branch.
 
 # docker image
 image: ghcr.io/wandb/senpai:latest
@@ -19,8 +25,8 @@ pvc_mount_path: /mnt/new-pvc
 wandb_entity: wandb-applied-ai-team
 wandb_project: senpai-v1
 
-# advisor
-advisor_branch: kaiming
+# advisor — the integration branch inside the problem-package repo that advisor PRs merge into
+advisor_branch: schmidhuber
 
 # training limits
 timeout_minutes: 30.0
