@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-25 04:00 — Cycle 140 (1 PR)
+
+### PR #3152: DM EMA decay sweep 0.999 vs 0.9995 (eren) — CLOSED
+- eren/dm-ema-decay-sweep
+- EMA=0.999: val=4.196% @ep487 — stable but worse than all baselines (3.622%, 3.700%, 3.833%)
+- EMA=0.9995: val=5.081% @ep227, diverged NaN at ep245
+- Both at T_max=30, missing --ema-mode fixed and --no-compile-model flags
+- W&B: to3am773 (0.999), 5xiqshk9 (0.9995)
+- Finding: EMA=0.999 more stable than 0.9995 but not competitive at T_max=30. Champion 0.9995 is stable for 874ep at T_max=36.
+- Student noted code was stale and had to reset to latest radford HEAD
+
+### Cycle 140 New Assignment
+- #3367 eren: **DM metric-aware w=0.07 + T_max=36** (upper-weight bracket)
+
+---
+
 ## 2026-04-25 03:50 — Cycle 135 (1 PR)
 
 ### PR #3338: AF vol-10x + eval-every-3 (rei) — CLOSED
