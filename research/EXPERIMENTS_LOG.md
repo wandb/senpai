@@ -1,5 +1,27 @@
 # SENPAI Research Results
 
+## 2026-04-25 06:50 — Cycle 154 (4 PRs)
+
+### PR #3333: DM metric-aware w=0.05 T_max=40 (alphonse) — CLOSED
+- val=3.651% — only 0.029pp short of 3.622%! T_max=40+lr=4.8e-4 could tip it. W&B: ks83q05n
+
+### PR #3331: DM metric-aware w=0.05 EMA=0.999 (stark) — CLOSED
+- val=3.986%. EMA=0.999 not competitive. W&B: g72bwznw
+
+### PR #3324: DM metric-aware w=0.04 (frieren) — CLOSED
+- val=3.866%, full-eval test=4.126% (close to 4.117% best). W&B: cf6e1fah
+
+### PR #3319: DM champion dense-eval seed=2024 (senku) — CLOSED
+- val=3.848%, full-eval test=4.508%. W&B: yqlqyoob
+
+### Cycle 154 New Assignments (lr=4.8e-4 continued)
+- #3388 alphonse: **T_max=40 + lr=4.8e-4 MSE-only** (schedule+LR compound — T_max=40 was 0.029pp short)
+- #3389 stark: T_max=36 + lr=4.8e-4 + metric-aware w=0.05 + seed=0
+- #3390 frieren: T_max=36 + lr=4.8e-4 + metric-aware w=0.02
+- #3391 senku: T_max=36 + lr=4.8e-4 + WD=1e-3 MSE-only
+
+---
+
 ## 2026-04-25 06:30 — Cycle 153 (6 PRs — batch T_max=30 closures)
 
 ### PR #3323: DM metric-aware w=0.03 (einar) — CLOSED
