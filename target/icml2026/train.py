@@ -168,6 +168,8 @@ class TrainConfig:
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
+    load_checkpoint: str = ""
+    eval_only: bool = False
     seed: int = 0
 
 
@@ -1621,6 +1623,12 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+
+    if config.load_checkpoint:
+        ckpt = torch.load(config.load_checkpoint, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt)
+        print(f"Loaded checkpoint from {config.load_checkpoint}", flush=True)
+
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
@@ -1628,6 +1636,40 @@ def main() -> None:
             hidden_dim=getattr(model, "n_hidden", 192),
             output_dim=bundle.spec.surface_output_dim,
         ).to(device)
+
+    if config.eval_only:
+        if not test_loaders:
+            print("No test loaders available for eval-only mode", flush=True)
+            return
+        model.eval()
+        with torch.no_grad():
+            test_metrics = evaluate_phase_metrics(
+                bundle=bundle,
+                config=config,
+                forward_model=forward_model,
+                anp_head=anp_head,
+                loaders=test_loaders,
+                transform=transform,
+                metric_transform=metric_transform,
+                device=device,
+                phase="test",
+            )
+        run = None
+        if config.wandb_name:
+            run_config = asdict(config)
+            run = wandb.init(
+                project=os.getenv("WANDB_PROJECT", "senpai-v1"),
+                entity=os.getenv("WANDB_ENTITY"),
+                name=config.wandb_name,
+                group=config.wandb_group or None,
+                config=run_config,
+                tags=[config.dataset, config.model, "eval-only"],
+            )
+            wandb.log(test_metrics, step=0)
+            run.summary.update(test_metrics)
+            run.finish()
+        print(json.dumps({"eval_only_test_metrics": test_metrics}, sort_keys=True), flush=True)
+        return
 
     params = list(model.parameters())
     if anp_head is not None:
