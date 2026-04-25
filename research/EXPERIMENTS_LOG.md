@@ -1,5 +1,19 @@
 # SENPAI Research Results
 
+## 2026-04-25 05:05 — Cycle 146 (1 PR)
+
+### PR #3320: DM lr=3e-4 champion stack (brook) — CLOSED
+- brook/dm-lr3e4-champion, T_max=30
+- val=3.872% @ep960 — doesn't beat 3.622% T_max=36 or 3.700% metric-aware
+- Batch-limited test=4.151% (optimistic bias, not paper-facing)
+- W&B: 121iywgs
+- Still improving at ep999 but too slow at T_max=30
+
+### Cycle 146 New Assignment
+- #3376 brook: **DM T_max=36 MSE-only + lr=5.5e-4** (higher LR bracket; shouko #3375 tests lr=4.5e-4)
+
+---
+
 ## 2026-04-25 04:45 — Cycle 144 (1 PR)
 
 ### PR #3318: DM lr=4e-4 champion stack (shouko) — CLOSED
