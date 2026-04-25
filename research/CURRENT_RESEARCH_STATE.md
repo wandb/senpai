@@ -72,25 +72,30 @@ Chihiro #3257: AdamW 2L/256d + eval-every-3 = val surface_mse=0.000266 (-10.1% v
 AF fleet also covers vol-weight sweep (tanjiro #3368 vol-10x, emma #3372 vol-11x, gilbert #3373 vol-12x)
 and extended eval variants (gohan #3356 WD=5e-3, casca #3354 seed=42).
 
-## TFP Direction — LR optimum at 7.5e-5
+## TFP Direction — **4L DEPTH BREAKTHROUGH** + LR optimum mapping
 
-Champion: lr=7.5e-5, T_max=10, 3L/192d, Lion, EMA=0.999 (val=0.001857, test=0.001789).
+**NEW TEST BEST:** yuji 4L/192d at lr=4e-5 T_max=15 → **test=0.001712** (-4.3% vs baseline 0.001789).
+Val=0.001903 is 2.5% above baseline. 4L needs lower LR than 3L — LR sweep in progress.
+
+3L champion: lr=7.5e-5, T_max=10, 3L/192d, Lion, EMA=0.999 (val=0.001857, test=0.001789).
 In flight:
-- haku #3377: lr=8e-5 + lr=7.25e-5 bracket (upper probe)
-- nobara #3379: lr=7.5e-5 seed=42+13 (robustness)
-- vash #3397: lr=7.5e-5 + T_max=15 (schedule probe, new)
-- askeladd #3400: lr=7.5e-5 + T_max=20 + seed=42 (schedule+seed, new)
-- yuji #3346: 4L/192d at lr=4e-5 T_max=15 (depth probe)
+- **yuji #3346: 4L lr=5e-5 T_max=15 (NEXT LR PROBE — highest priority TFP experiment)**
+- haku #3377: 3L lr=8e-5 + lr=7.25e-5 bracket
+- nobara #3379: 3L lr=7.5e-5 seed=42+13 (robustness)
+- vash #3397: 3L lr=7.5e-5 + T_max=15 (schedule probe)
+- askeladd #3400: 3L lr=7.5e-5 + T_max=20 + seed=42
+- nezuko #3404: 3L lr=7.5e-5 + gc=0.3
 
 ## Key Insights Learned
 
 - **lr=4.8e-4 CRITICAL:** Gives best DM full-eval TEST=4.117% at T_max=30. -2.4% vs lr=5e-4.
 - **T_max=36 CRITICAL:** Gives best DM val=3.622% at lr=5e-4. Clear schedule optimum.
 - **Compound lr=4.8e-4+T_max=36 is untested** — results expected within next few hours.
+- **TFP 4L BREAKTHROUGH:** test=0.001712 (-4.3%) at 4L/192d lr=4e-5. Depth helps, needs lower LR. LR sweep needed.
 - **AF eval-every-3:** +4% throughput, -10.1% surface_mse. Mechanism: more training epochs in same budget.
 - **eval-every-5 unsafe:** Catastrophic divergence at ep745. Stay at eval-every-3.
 - **AF wrong-config lesson:** eval-every-3 must use AdamW 2L/256d (not Lion 4L/256d TFP config).
-- **DM seed sensitivity:** lr=4.8e-4 at T_max=30 — seeds 0+42 converge to 3.700%, seed=1024 stuck at 4.073%.
+- **DM w=0.04 TEST insight:** Full-eval TEST=4.126% at w=0.04 vs 4.218% at w=0.05 → w=0.04 better for TEST.
 - **Checkpoint bug fixed (griffith):** kill-if-no-improvement now saves checkpoint before RuntimeError.
 
 ## Potential Next Directions

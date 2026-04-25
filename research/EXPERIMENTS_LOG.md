@@ -1,5 +1,19 @@
 # SENPAI Research Results
 
+## 2026-04-25 08:25 — Cycle 160 (1 review, 0 closures)
+
+### PR #3346: TFP 4L/192d at lr=4e-5 T_max=15 (yuji) — SENT BACK (**NEW TFP TEST BEST**)
+- **val/field_mse = 0.001903** @ep710 — does NOT beat val baseline 0.001857 (+2.5%)
+- **test/field_mse = 0.001712** @ep710 — **BEATS test baseline 0.001789 by -4.3%! NEW TEST BEST!**
+- 4L architecture at lower LR (4e-5 vs 7.5e-5 for 3L) finds deeper test basin
+- Model still improving at 600-min timeout (best ep710 of 778 total)
+- W&B: gux6cdib
+- **CRITICAL INSIGHT:** Depth helps TFP. 4L needs different (lower) LR than 3L. TEST generalizes better than val at 4L.
+- Sent back for 4L LR sweep: next trial lr=5e-5 T_max=15 (probing toward 3L optimum)
+- **This opens a major new TFP direction: 4L LR optimization**
+
+---
+
 ## 2026-04-25 08:15 — Cycle 159 (4 closures, 4 new assignments)
 
 ### PR #3360: DM metric-aware w=0.05 + T_max=36 + seed=0 (hinata) — CLOSED
