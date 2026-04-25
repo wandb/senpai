@@ -1,5 +1,35 @@
 # SENPAI Research Results
 
+## 2026-04-25 06:30 — Cycle 153 (6 PRs — batch T_max=30 closures)
+
+### PR #3323: DM metric-aware w=0.03 (einar) — CLOSED
+- val=3.648% @T_max=30, full-eval TEST=4.192%. Best metric-aware weight at T_max=30 but below T_max=36 (3.622%). W&B: wg14nxjj
+
+### PR #3326: DM metric-aware w=0.05 seed=0 (sukuna) — CLOSED
+- val=3.668% @T_max=30. Confirms metric-aware seed-robust at T_max=30 (seed=0: 3.668%, seed=42: 3.700%). W&B: q3j0kslh
+
+### PR #3334: DM metric-aware w=0.04+WD (fern) — CLOSED
+- val=3.874% @T_max=30. WD+metric-aware not competitive. W&B: rus8uqqm
+
+### PR #3330: DM metric-aware w=0.015 (shinobu) — CLOSED
+- val=3.942% @T_max=30. Too low weight, insufficient signal. W&B: ygpxx068
+
+### PR #3332: DM metric-aware T_max=20 (mitsuha) — CLOSED
+- val=4.019% @T_max=20. Consistently worse schedule. W&B: r6bo7elk
+
+### PR #3098: TFP clean test eval (shoya) — CLOSED
+- test=0.001862. Doesn't beat new TFP baseline (0.001789). W&B: puszkx9h
+
+### Cycle 153 New Assignments (lr=4.8e-4 + T_max=36 focused)
+- #3382 einar: T_max=36 + lr=4.8e-4 + metric-aware w=0.03
+- #3383 sukuna: T_max=36 + lr=4.8e-4 MSE-only + seed=42 (seed robustness)
+- #3384 fern: T_max=36 + lr=4.8e-4 + metric-aware w=0.04
+- #3385 mitsuha: T_max=36 + lr=4.6e-4 MSE-only (deeper LR probe)
+- #3386 shinobu: T_max=36 + lr=4.8e-4 + metric-aware w=0.06
+- #3387 shoya: T_max=36 + lr=4.8e-4 + metric-aware w=0.07
+
+---
+
 ## 2026-04-25 05:55 — Cycle 149 (2 PRs — CRITICAL LR FINDING)
 
 ### PR #3308: DM lr=4.8e-4 narrow LR sweep (gojo) — CLOSED (CRITICAL FINDING)
