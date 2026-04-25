@@ -1,5 +1,22 @@
 # SENPAI Research Results
 
+## 2026-04-25 ~18:05 — Cycle 164 (1 closure, gojo new best 3.555%)
+
+### PR #3396: DM T_max=36 + lr=4.8e-4 + gc=0.3 MSE-only (franky) — CLOSED
+- val=3.754% @ep858 (+3.6% vs baseline). gc=0.3 too aggressive.
+- 392-394/394 steps clipped in early epochs — over-constrained optimization.
+- gc=0.5 default confirmed optimal at lr=4.8e-4.
+- W&B: p37o4bft
+
+### GOJO #3380 LIVE TRACKING — NEW BEST 3.555%!
+- W&B run: 5x2to2p8 (running, ep825)
+- **Best val: 3.555% at ep822** — 0.067pp below 3.622% baseline!
+- Trough progression: 3.696→3.644→3.643→3.601→3.598→3.590→3.576→**3.555**
+- Decline accelerating: ep813(3.608)→ep818(3.578)→ep822(3.555)
+- ep828 trough 3 epochs away. Still improving.
+
+---
+
 ## 2026-04-25 ~16:00 — Cycle 163 (monitoring, fleet status update)
 
 ### GOJO #3380 LIVE TRACKING (lr=4.8e-4+T_max=36 MSE-only)
