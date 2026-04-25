@@ -1,5 +1,20 @@
 # SENPAI Research Results
 
+## 2026-04-25 04:10 — Cycle 141 (1 PR)
+
+### PR #3343: AF vol-12x + eval-every-3 + seed=42 (tanjiro) — CLOSED
+- tanjiro/af-vol12x-eval3-seed42
+- **Wrong config (SYSTEMATIC):** Lion 4L/256d instead of AdamW 2L/256d champion
+- Surface 0.000730 (2.5x worse), vol 0.003568 (1.75x worse), diverged at ep365
+- W&B: ot10h2qx
+- **KEY FINDING:** Student confirms `--volume-loss-weight` IS the correct CLI flag (not `--vol-loss-weight`). The flag concern was unfounded — poor results purely from wrong optimizer/architecture.
+- All AF eval-every-3 experiments (#3338, #3343, #3355) used wrong config. Need correct AdamW 2L champion.
+
+### Cycle 141 New Assignment
+- #3368 tanjiro: **AF eval-every-3 + AdamW 2L champion** (correct config throughput test, vol-weight=10x)
+
+---
+
 ## 2026-04-25 04:00 — Cycle 140 (1 PR)
 
 ### PR #3152: DM EMA decay sweep 0.999 vs 0.9995 (eren) — CLOSED
