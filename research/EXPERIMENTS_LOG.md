@@ -1,5 +1,36 @@
 # SENPAI Research Results
 
+## 2026-04-25 08:15 — Cycle 159 (4 closures, 4 new assignments)
+
+### PR #3360: DM metric-aware w=0.05 + T_max=36 + seed=0 (hinata) — CLOSED
+- val=3.786% @ep710 (360-min cap, not 600-min). Still converging but above 3.622% baseline.
+- Metric-aware w=0.05 at T_max=36+lr=5e-4 tracks ~0.16pp worse than MSE-only T_max=36.
+- TEST=4.424% (above 4.117%). W&B: apcored6
+
+### PR #3356: AF vol-11x + eval-every-3 + WD=5e-3 (gohan) — CLOSED (WRONG CONFIG)
+- Lion 4L/256d instead of AdamW 2L/256d. Diverged ep220 with gradient explosion.
+- Same systematic error as #3338/#3343/#3355. W&B: 5uyihi7e
+
+### PR #3351: DM metric-aware w=0.04 + full-eval TEST (canute) — CLOSED
+- val=3.866% @T_max=30. **Full-eval TEST=4.126%** — very close to 4.117% best but doesn't beat it.
+- KEY: w=0.04 TEST=4.126% vs w=0.05 TEST=4.218% → w=0.04 is better for TEST by 0.092pp.
+- Fern #3384 already testing compound (lr=4.8e-4+T_max=36+w=0.04).
+- W&B train: 4td1mrgm, full-eval: 0r6o9jva
+
+### PR #3287: TFP haku replication seed=0 (nezuko) — CLOSED
+- seed=0 failed: best val field_mse=0.003608 (46% above baseline 0.001857)
+- T_max=10 at seed=0 killed by kill gate (val=0.004137 at ep346)
+- Bug: --asinh-pressure causes divergence at lr=1e-4. Physics flags are no-ops for tandemfoil_paper.
+- Config is seed-sensitive at lr=1e-4. W&B: 09m3mxah, 158say04, 6nqnsrq1
+
+### Cycle 159 Assignments
+- #3401 hinata: DM T_max=36 + lr=4.9e-4 MSE-only (fine LR probe above 4.8e-4)
+- #3402 gohan: AF eval-every-3 + AdamW 2L/256d + vol-11x (CORRECT config!)
+- #3403 canute: DM T_max=38 + lr=4.8e-4 MSE-only (fine schedule probe above T_max=36)
+- #3404 nezuko: TFP lr=7.5e-5 + gc=0.3 (softer clipping)
+
+---
+
 ## 2026-04-25 08:00 — Cycle 158 (5 closures, 1 send-back, 5 new assignments)
 
 ### PR #3257: AF eval-every-3 AdamW 2L champion (chihiro) — SENT BACK (NEW AF BEST PENDING)
