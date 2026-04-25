@@ -1,5 +1,35 @@
 # SENPAI Research Results
 
+## 2026-04-25 ~18:35 — Cycle 165 (3 closures, gojo FINISHED best=3.521%)
+
+### GOJO #3380 — TRAINING COMPLETE
+- **Best val: 3.521% at ep850** — 0.101pp below 3.622% baseline. NEW DM VAL RECORD.
+- Final epoch: 865 (600-min timeout). W&B run: 5x2to2p8 (finished).
+- Trough progression: 3.696→3.644→3.643→3.601→3.598→3.590→3.576→3.555→3.542→3.521
+- **AWAITING FULL-EVAL TEST** — student hasn't posted results yet.
+- Student session ended ~09:45Z. Training ran unattended ~9 hours. Needs student re-activation to run full-eval.
+
+### PR #3403: DM T_max=38 + lr=4.8e-4 MSE (canute) — CLOSED
+- Sampled val=3.705% but full-eval val=4.617% (!), test=4.201%. Massive eval-subset bias.
+- T_max=38 does not improve over T_max=36. Dead end.
+- W&B: t8xn82d9 (train), cz4fso50 (eval)
+
+### PR #3388: DM T_max=40 + lr=4.8e-4 MSE (alphonse) — CLOSED
+- val=3.898% @ep733 (+0.276pp vs baseline). Plateaued at ep732 with no further gains.
+- Longer cosine cycle (T_max=40) worse than T_max=36.
+- W&B: uwyig0cw
+
+### PR #3382: DM T_max=36 + lr=4.8e-4 + w=0.03 (einar) — CLOSED
+- val=3.782% (+0.160pp), test=4.450% (+0.333pp). Metric-aware loss underperforms MSE-only at lr=4.8e-4.
+- Confirms pattern: ALL w variants (0.03, 0.04, 0.05) worse than MSE-only at this LR.
+- W&B: c9deksoa
+
+### DM Compound Summary
+At lr=4.8e-4 + T_max=36, MSE-only dominates. Metric-aware loss, alternate T_max (38/40), and softer gc (0.3) all fail.
+The ONLY successful compound is gojo's lr=4.8e-4 + T_max=36 + MSE-only → val=3.521%.
+
+---
+
 ## 2026-04-25 ~18:05 — Cycle 164 (1 closure, gojo new best 3.555%)
 
 ### PR #3396: DM T_max=36 + lr=4.8e-4 + gc=0.3 MSE-only (franky) — CLOSED
