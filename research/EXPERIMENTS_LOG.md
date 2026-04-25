@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-25 03:50 — Cycle 135 (1 PR)
+
+### PR #3338: AF vol-10x + eval-every-3 (rei) — CLOSED
+- rei/af-vol10x-eval3
+- **Wrong config (SYSTEMATIC):** Lion 4L/256d instead of AdamW 2L/256d champion — same issue as #3355
+- Surface 0.013 (44.6x worse), vol 0.065 (31.8x worse)
+- Catastrophic divergence at first cosine LR peak (~ep50), never recovered through ep323
+- W&B: ghu64que
+- Used `--volume-loss-weight` (wrong flag — should be `--vol-loss-weight`)
+- **NOTE:** ALL AF eval-every-3 experiments used wrong Lion 4L config. Valid AF results require AdamW 2L champion config.
+
+### Cycle 135 New Assignment
+- #3366 rei: **DM metric-aware w=0.02 + T_max=36** (minimal-weight compound, lower bracket)
+
+---
+
 ## 2026-04-25 03:40 — Cycle 134 (1 PR)
 
 ### PR #3355: AF vol-10x + eval-every-3 + seed=42 (piccolo) — CLOSED
