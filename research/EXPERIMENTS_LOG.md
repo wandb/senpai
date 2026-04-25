@@ -1,5 +1,24 @@
 # SENPAI Research Results
 
+## 2026-04-25 07:40 — Cycle 157 (2 PRs)
+
+### PR #3350: DM metric-aware w=0.05 + lr=4.5e-4 (taki) — CLOSED
+- val=3.787% @ep900, test=4.357% (batch-limited). W&B: dj9zz7dk
+- Metric-aware rescues lr=4.5e-4 from MSE-only cliff (4.134%→3.787%) but doesn't match champion lr=5e-4 (3.700%)
+- Confirms lr=5e-4 remains optimal for metric-aware at T_max=30; gap narrows but doesn't close
+
+### PR #3293: DM champion recovery seed=0 no-compile (norman) — CLOSED
+- val=3.886% @ep866, test=4.250% (batch-limited), **full-eval TEST=4.186%** (W&B: rb5ytk0h)
+- Full-eval TEST=4.186% beats faye's 4.324% but doesn't beat gojo's 4.117%
+- Norman added `--load-checkpoint` and `--eval-only` flags to train.py (useful for future full-evals)
+- Training: W&B u66gq4mc. Model still improving at 600-min cutoff
+
+### Cycle 157 Assignments
+- #3394 taki: T_max=36 + lr=4.8e-4 + metric-aware w=0.05 + seed=42
+- #3395 norman: T_max=36 + lr=4.8e-4 MSE-only + seed=0
+
+---
+
 ## 2026-04-25 07:10 — Cycle 156 (2 PRs)
 
 ### PR #3336: DM metric-aware w=0.03+EMA=0.999 (bulma) — CLOSED
