@@ -19,8 +19,9 @@ from launch_helpers import (
     kubectl_apply,
     preflight_check_target_repo_access,
     render_configmap,
+    render_launch_secret,
     render_template,
-    render_token_secret,
+    resolve_anthropic_api_key,
     resolve_github_token,
     target_repo_slug,
 )
@@ -82,7 +83,7 @@ def render_student(template: str, student_name: str, tag: str, secret_name: str,
         "ADVISOR_BRANCH": args.advisor_branch,
         "PVC_CLAIM_NAME": args.pvc_claim_name,
         "PVC_MOUNT_PATH": args.pvc_mount_path,
-        "GITHUB_TOKEN_SECRET_NAME": secret_name,
+        "LAUNCH_SECRET_NAME": secret_name,
     })
     return configmap + "\n---\n" + deployment
 
@@ -114,17 +115,18 @@ def render_advisor(template: str, tag: str, student_list: list[str], secret_name
         "RESEARCH_TAG": tag,
         "PVC_CLAIM_NAME": args.pvc_claim_name,
         "PVC_MOUNT_PATH": args.pvc_mount_path,
-        "GITHUB_TOKEN_SECRET_NAME": secret_name,
+        "LAUNCH_SECRET_NAME": secret_name,
     })
     return configmap + "\n---\n" + deployment
 
 
 def main():
     args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
-    token = resolve_github_token(DOTENV_PATH)
+    github_token = resolve_github_token(DOTENV_PATH)
+    anthropic_api_key = resolve_anthropic_api_key(DOTENV_PATH)
 
     if not args.dry_run:
-        preflight_check_target_repo_access(args.target_repo_url, token)
+        preflight_check_target_repo_access(args.target_repo_url, github_token)
 
     # Resolve student list
     if args.names:
@@ -134,15 +136,15 @@ def main():
 
     student_template = STUDENT_TEMPLATE.read_text()
     advisor_template = ADVISOR_TEMPLATE.read_text()
-    secret_name = f"senpai-github-token-{args.tag}"
+    secret_name = f"senpai-launch-secrets-{args.tag}"
 
     # --- Apply per-launch token secret first (pods reference it on startup) ---
     if args.dry_run:
         print(f"--- Secret: {secret_name} ---")
-        print(render_token_secret(args.tag, "<REDACTED>"))
+        print(render_launch_secret(args.tag, "<REDACTED_GITHUB_TOKEN>", "<REDACTED_ANTHROPIC_API_KEY>"))
         print()
     else:
-        kubectl_apply(render_token_secret(args.tag, token), f"secret {secret_name}")
+        kubectl_apply(render_launch_secret(args.tag, github_token, anthropic_api_key), f"secret {secret_name}")
 
     # --- Deploy students ---
     for name in student_list:

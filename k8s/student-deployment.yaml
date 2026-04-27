@@ -52,18 +52,18 @@ spec:
         - name: GITHUB_TOKEN
           valueFrom:
             secretKeyRef:
-              name: {{GITHUB_TOKEN_SECRET_NAME}}
+              name: {{LAUNCH_SECRET_NAME}}
               key: github-token
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{LAUNCH_SECRET_NAME}}
+              key: anthropic-api-key
         - name: EXA_API_KEY
           valueFrom:
             secretKeyRef:
               name: senpai-secrets
               key: exa-api-key
-        - name: CLAUDE_CODE_OAUTH_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: senpai-secrets
-              key: claude-code-oauth-token
         resources:
           requests:
             cpu: "120"

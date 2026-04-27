@@ -114,20 +114,35 @@ def resolve_github_token(dotenv_path: Path) -> str:
              "at the senpai repo root, or run `gh auth login`.")
 
 
-def render_token_secret(tag: str, token: str) -> str:
-    """Per-launch k8s Secret holding only the github-token key."""
-    enc = base64.b64encode(token.encode()).decode()
+def resolve_anthropic_api_key(dotenv_path: Path) -> str:
+    """Resolve the Anthropic API key: $ANTHROPIC_API_KEY → .env → hard error."""
+    # Treat empty $ANTHROPIC_API_KEY as unset so .env fallback still kicks in.
+    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+    _load_dotenv(dotenv_path)
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if key:
+        return key
+    sys.exit("ERROR: no Anthropic API key. Set $ANTHROPIC_API_KEY in your shell "
+             "or add ANTHROPIC_API_KEY=<key> to .env at the senpai repo root.")
+
+
+def render_launch_secret(tag: str, github_token: str, anthropic_api_key: str) -> str:
+    """Per-launch k8s Secret holding API credentials used by advisor/student pods."""
+    github_enc = base64.b64encode(github_token.encode()).decode()
+    anthropic_enc = base64.b64encode(anthropic_api_key.encode()).decode()
     return (
         "apiVersion: v1\n"
         "kind: Secret\n"
         "metadata:\n"
-        f"  name: senpai-github-token-{tag}\n"
+        f"  name: senpai-launch-secrets-{tag}\n"
         "  labels:\n"
         "    app: senpai\n"
         f"    research-tag: {tag}\n"
         "type: Opaque\n"
         "data:\n"
-        f"  github-token: {enc}\n"
+        f"  github-token: {github_enc}\n"
+        f"  anthropic-api-key: {anthropic_enc}\n"
     )
 
 

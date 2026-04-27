@@ -110,49 +110,48 @@ n_students: 4
 
 `launch.py` reads this via `simple_parsing` — every field can be overridden on the CLI.
 
-### GitHub token (per-launch)
+### Launch credentials (per-launch)
 
-`launch.py` resolves your GitHub token at launch time and materialises it as an ephemeral, per-tag k8s Secret (`senpai-github-token-<tag>`) that the pods reference for `GITHUB_TOKEN`. Resolution order:
+`launch.py` resolves your GitHub token and Anthropic API key at launch time and materialises them as an ephemeral, per-tag k8s Secret (`senpai-launch-secrets-<tag>`) that the pods reference for `GITHUB_TOKEN` and `ANTHROPIC_API_KEY`.
+
+GitHub token resolution order:
 
 1. `$GITHUB_TOKEN` in your shell env (shell or [`direnv`](https://direnv.net/) wins).
 2. `.env` at the senpai repo root (`GITHUB_TOKEN=ghp_...`). Not committed; don't paste into a shared file.
 3. `gh auth token` — works out-of-the-box if you're already logged into the `gh` CLI.
 
-If none resolves, `launch.py` exits with instructions. The launch-scoped Secret is labelled with your research tag and is cleaned up by `kubectl delete deployments,configmaps,secrets -l research-tag=<tag>` (see [Running](#running)).
+Anthropic API key resolution order:
 
-The repo ships an `example.env` template — copy it to `.env` and paste your token:
+1. `$ANTHROPIC_API_KEY` in your shell env.
+2. `.env` at the senpai repo root (`ANTHROPIC_API_KEY=sk-ant-...`).
+
+If either credential is missing, `launch.py` exits with instructions. The launch-scoped Secret is labelled with your research tag and is cleaned up by `kubectl delete deployments,configmaps,secrets -l research-tag=<tag>` (see [Running](#running)).
+
+The repo ships an `example.env` template — copy it to `.env` and paste your credentials:
 
 ```bash
 cp example.env .env
-# then edit .env and set GITHUB_TOKEN=ghp_...
+# then edit .env and set GITHUB_TOKEN=ghp_... and ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-`.env` is already gitignored, so the token stays local.
+`.env` is already gitignored, so the credentials stay local.
 
-> **Target-repo permissions.** Prefer a deliberately created classic PAT (`ghp_...`) with `repo` and `read:org`; copied GitHub CLI OAuth tokens (`gho_...`) are easy to launch with stale or insufficient scopes. The token must be able to **clone** `target_repo_url` and **push branches + open/merge PRs** against it. `launch.py` preflights this against the GitHub API before spinning up pods and fails loudly if `permissions.push` is false. Same applies to the `CLAUDE_CODE_OAUTH_TOKEN` user (still in `senpai-secrets`) if you rely on `gh auth status` inside the pod.
+> **Target-repo permissions.** Prefer a deliberately created classic PAT (`ghp_...`) with `repo` and `read:org`; copied GitHub CLI OAuth tokens (`gho_...`) are easy to launch with stale or insufficient scopes. The token must be able to **clone** `target_repo_url` and **push branches + open/merge PRs** against it. `launch.py` preflights this against the GitHub API before spinning up pods and fails loudly if `permissions.push` is false.
 
 ### Shared cluster secrets (`senpai-secrets`)
 
-Every pod also reads three keys from the shared, cluster-wide `senpai-secrets` Secret. Unlike the GitHub token these are not per-launch — set them once on the cluster and every tag reuses them:
+Every pod also reads shared, cluster-wide keys from the `senpai-secrets` Secret. Unlike launch credentials these are not per-launch — set them once on the cluster and every tag reuses them:
 
 | Key in `senpai-secrets` | Used for |
 |---|---|
 | `wandb-api-key` | `WANDB_API_KEY` — all W&B logging from advisor + students |
-| `claude-code-oauth-token` | `CLAUDE_CODE_OAUTH_TOKEN` — Claude Code auth. Prefer this over `ANTHROPIC_API_KEY` (much cheaper) |
 | `exa-api-key` | `EXA_API_KEY` — Exa web search used by the research agent |
 
-If you don't already have a Claude Code OAuth token, generate one interactively:
-
-```bash
-claude setup-token
-```
-
-Then create the secret (the `$(claude setup-token)` inline below works too if you'd rather skip the separate step):
+Create the shared secret:
 
 ```bash
 kubectl create secret generic senpai-secrets \
   --from-literal=wandb-api-key="$WANDB_API_KEY" \
-  --from-literal=claude-code-oauth-token="$(claude setup-token)" \
   --from-literal=exa-api-key="$EXA_API_KEY"
 ```
 
@@ -160,10 +159,10 @@ Rotate a single key without recreating the whole secret:
 
 ```bash
 kubectl patch secret senpai-secrets \
-  --type=merge -p "{\"stringData\":{\"claude-code-oauth-token\":\"$(claude setup-token)\"}}"
+  --type=merge -p "{\"stringData\":{\"exa-api-key\":\"$EXA_API_KEY\"}}"
 ```
 
-`launch.py` does **not** preflight these — if a key is missing, pods will crash-loop on startup. `kubectl get secret senpai-secrets -o jsonpath='{.data}' | jq` confirms all three keys are present.
+`launch.py` does **not** preflight these — if a key is missing, pods will crash-loop on startup. `kubectl get secret senpai-secrets -o jsonpath='{.data}' | jq` confirms the keys are present.
 
 ## Running
 
