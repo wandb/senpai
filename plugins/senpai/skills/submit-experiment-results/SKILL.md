@@ -26,7 +26,7 @@ You've run the experiment, posted a results comment on the experiment PR — now
 
 ## Before you call this
 
-Make sure you've already posted a results comment on the experiment PR with metrics, any local metric summary path, analysis, and suggested follow-ups
+Make sure you've already posted a results comment on the experiment PR with metrics, the committed JSONL metrics path, any local metric summary path, analysis, and suggested follow-ups.
 
 ## Steps
 
@@ -34,7 +34,8 @@ Make sure you've already posted a results comment on the experiment PR with metr
 
 ```bash
 git add "$1/train.py"
-# Also add any other files you modified (pyproject.toml if you added packages, etc.)
+# Also add committed metric JSONL files and any other files you modified
+# (pyproject.toml if you added packages, etc.).
 git commit -m "<concise description of what you changed>"
 ```
 

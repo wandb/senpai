@@ -80,12 +80,13 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
 
 4. **Run experiments**
    ```bash
-   cd "$PROBLEM_DIR" && python train.py --dataset <dataset> --agent <your-name> --run_name "<your-name>/<description>"
+   cd "$PROBLEM_DIR" && python train.py --dataset <dataset> --agent <your-name> --experiment_name "<your-name>/<description>"
    ```
    - Before the first run in a target, read `python train.py --help` and use the exact flag names it exposes.
    - **Timeout**: The `SENPAI_MAX_EPOCHS` and `SENPAI_TIMEOUT_MINUTES` env vars control the max epochs and timeout for each training run in train.py. Ensure training runs do not exceed these limits.
    - Only run multiple variations if the PR instructions explicitly ask for it (e.g. "try surface weight 5, 10, 20"). Otherwise, run the single experiment described.
    - For active training, prefer `ScheduleWakeup` every 10-30 minutes plus `training_log_status <logfile>`. Do not stream per-epoch training logs into `Monitor`.
+   - Ensure the training script writes metrics to JSONL files and commit those metric files as part of the PR. It is very important to log metrics well: include all required validation/test metrics, relevant config values, and enough context for the advisor to compare the experiment later.
    - **After each run finishes**, check for new advisor comments before continuing:
      ```bash
      pr_all_comments <number>
@@ -106,7 +107,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    - Comparison against the baseline numbers from the PR body
    - Exact train.py command used to run the experiment
    - Peak memory usage
-   - Local metrics summary path, if one was written
+   - Committed metrics JSONL path and any local metrics summary path
    - **What happened** — honest analysis: did it work? why or why not?
    - **Suggested follow-ups** — what would you try next based on what you learned?
 
