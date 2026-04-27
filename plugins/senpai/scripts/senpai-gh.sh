@@ -172,14 +172,24 @@ mark_ready_for_review() {
 
 # Create a real assignment branch before opening a PR.
 #   create_assignment_branch <student> <hypothesis-slug>
+#   create_assignment_branch <student>/<hypothesis-slug>
 create_assignment_branch() {
-    local student="$1" slug="$2" branch="${student}/${slug}"
+    local student="$1" slug="${2:-}"
+    if [ -z "$slug" ] && [[ "$student" == */* ]]; then
+        slug="${student#*/}"
+        student="${student%%/*}"
+    fi
+    if [ -z "$student" ] || [ -z "$slug" ]; then
+        echo "create_assignment_branch: usage: <student> <hypothesis-slug> or <student>/<hypothesis-slug>" >&2
+        return 2
+    fi
+    local branch="${student}/${slug}"
     require_target_repo || return
-    git checkout "$ADVISOR_BRANCH"
-    git pull origin "$ADVISOR_BRANCH"
-    git checkout -b "$branch"
-    git commit --allow-empty -m "assign ${student}: ${slug}"
-    git push -u origin "$branch"
+    git checkout "$ADVISOR_BRANCH" || return
+    git pull origin "$ADVISOR_BRANCH" || return
+    git checkout -b "$branch" || return
+    git commit --allow-empty -m "assign ${student}: ${slug}" || return
+    git push -u origin "$branch" || return
     git rev-list --count "${ADVISOR_BRANCH}..HEAD" | grep -vq '^0$'
 }
 
