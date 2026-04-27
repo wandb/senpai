@@ -159,7 +159,7 @@ while true; do
     if [ "$ASSIGNED_COUNT" -eq 1 ]; then
         ASSIGNED_HEAD=$(printf '%s' "$ASSIGNED_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["headRefName"])')
         git fetch origin "$ASSIGNED_HEAD"
-        git checkout -B "$ASSIGNED_HEAD" "origin/$ASSIGNED_HEAD"
+        git checkout -B "$ASSIGNED_HEAD" FETCH_HEAD
     fi
 
     # --- Build triage info ---
