@@ -36,7 +36,7 @@ spec:
         - |
           set -e
           git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
-          git clone --branch "$REPO_BRANCH" "$REPO_URL" /workspace/senpai
+          git clone --branch "$REPO_BRANCH" --single-branch --depth 1 --no-tags "$REPO_URL" /workspace/senpai
           cd /workspace/senpai
           bash k8s/entrypoint-advisor.sh
         envFrom:

@@ -8,21 +8,32 @@ set -e
 set -o pipefail
 
 WORKDIR="/workspace/senpai"
+GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 
 echo "=== Senpai Student: $STUDENT_NAME ==="
 echo "Runner repo:  $REPO_URL (branch: $REPO_BRANCH)"
 echo "Target repo:  $TARGET_REPO_URL (branch: $ADVISOR_BRANCH)"
 echo "Problem dir:  $PROBLEM_DIR"
+echo "GitHub history: $GH_HISTORY_SCOPE"
 echo "GPUs:         $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l) x $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
 
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
+git remote set-url --push origin DISABLED
+
+clone_target_repo() {
+    local depth=()
+    [ "$GH_HISTORY_SCOPE" = "fresh" ] && depth=(--depth 1)
+    case "$GH_HISTORY_SCOPE" in
+        branch|fresh) git clone --branch "$ADVISOR_BRANCH" --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$PROBLEM_DIR" ;;
+        repo) git clone "$TARGET_REPO_URL" "$PROBLEM_DIR" ;;
+        *) echo "ERROR: GH_HISTORY_SCOPE must be one of: branch, repo, fresh" >&2; exit 2 ;;
+    esac
+}
 
 # Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
 # agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
-if [ ! -d "$PROBLEM_DIR/.git" ]; then
-    git clone "$TARGET_REPO_URL" "$PROBLEM_DIR"
-fi
+[ -d "$PROBLEM_DIR/.git" ] || clone_target_repo
 
 uv pip install --system -e .
 
@@ -30,6 +41,10 @@ uv pip install --system -e .
 cd "$WORKDIR/$PROBLEM_DIR"
 git config user.name "senpai-$STUDENT_NAME"
 git config user.email "senpai-$STUDENT_NAME@senpai"
+if [ "$GH_HISTORY_SCOPE" != "repo" ]; then
+    git remote set-branches origin "$ADVISOR_BRANCH"
+    git config remote.origin.tagOpt --no-tags
+fi
 
 # --- Start Hivemind (streams CC session logs to hivemind.wandb.tools) ---
 mkdir -p ~/.claude/projects
@@ -78,7 +93,7 @@ while true; do
     # Return to latest advisor branch so student starts from the current baseline
     cd "$WORKDIR/$PROBLEM_DIR"
     git checkout "$ADVISOR_BRANCH" 2>/dev/null || true
-    git pull origin "$ADVISOR_BRANCH" 2>/dev/null || true
+    git pull --ff-only origin "$ADVISOR_BRANCH" 2>/dev/null || true
 
     # Overwrite CLAUDE.md with the student role instructions — git checkout/pull clobbers it with the developer copy.
     # Whitelist vars so envsubst substitutes pod env vars but leaves Claude Code runtime vars

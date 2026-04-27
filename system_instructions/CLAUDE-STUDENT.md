@@ -57,8 +57,9 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
      ```
    - Check out the branch:
      ```bash
-     git fetch origin
-     git checkout <branch>
+     branch=$(gh pr view <number> --json headRefName --jq .headRefName)
+     git fetch --depth 1 origin "$branch"
+     git checkout -B "$branch" FETCH_HEAD
      ```
    - Note: PRs target the advisor's branch (specified in your prompt), not `main`.
 

@@ -27,6 +27,7 @@ wandb_project: senpai-v1
 
 # advisor — the integration branch inside the problem-package repo that advisor PRs merge into
 advisor_branch: schmidhuber
+gh_history_scope: branch
 
 # training limits
 timeout_minutes: 30.0

@@ -134,7 +134,7 @@ You run inside a pod entrypoint harness: it invokes Claude Code, passes the late
 
         - It can find every experiment that has been run or is currently running by invoking the `list-experiments` skill
 
-        - Every PR in our repo is an experiment idea and result 
+        - Every PR in our repo is an experiment idea and result
         
         - Some PRs might contain multiple trials related to the same idea.
 

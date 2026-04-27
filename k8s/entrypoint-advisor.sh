@@ -8,6 +8,7 @@ set -e
 set -o pipefail
 
 WORKDIR="/workspace/senpai"
+GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 
 echo "=== Senpai Advisor ==="
 echo "Runner repo:  $REPO_URL (branch: $REPO_BRANCH)"
@@ -15,14 +16,33 @@ echo "Target repo:  $TARGET_REPO_URL (branch: $ADVISOR_BRANCH)"
 echo "Problem dir:  $PROBLEM_DIR"
 echo "Tag:          $RESEARCH_TAG"
 echo "Students:     $STUDENT_NAMES"
+echo "GitHub history: $GH_HISTORY_SCOPE"
 
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
+git remote set-url --push origin DISABLED
+
+clone_target_repo() {
+    local depth=()
+    [ "$GH_HISTORY_SCOPE" = "fresh" ] && depth=(--depth 1)
+    case "$GH_HISTORY_SCOPE" in
+        branch|fresh) git clone --branch "$ADVISOR_BRANCH" --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$PROBLEM_DIR" ;;
+        repo) git clone "$TARGET_REPO_URL" "$PROBLEM_DIR" ;;
+        *) echo "ERROR: GH_HISTORY_SCOPE must be one of: branch, repo, fresh" >&2; exit 2 ;;
+    esac
+}
 
 # Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
 # agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
-if [ ! -d "$PROBLEM_DIR/.git" ]; then
-    git clone "$TARGET_REPO_URL" "$PROBLEM_DIR"
+if [ ! -d "$PROBLEM_DIR/.git" ] && ! clone_target_repo; then
+    [ "$GH_HISTORY_SCOPE" = "repo" ] && exit 1
+    depth=()
+    [ "$GH_HISTORY_SCOPE" = "fresh" ] && depth=(--depth 1)
+    git clone --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$PROBLEM_DIR"
+    cd "$WORKDIR/$PROBLEM_DIR"
+    git checkout -b "$ADVISOR_BRANCH"
+    git push -u origin "$ADVISOR_BRANCH"
+    cd "$WORKDIR"
 fi
 
 uv pip install --system -e .
@@ -33,10 +53,13 @@ git config user.name "senpai-advisor"
 git config user.email "senpai-advisor@senpai"
 
 # --- Create or checkout advisor branch ---
-git fetch origin
+if [ "$GH_HISTORY_SCOPE" != "repo" ]; then
+    git remote set-branches origin "$ADVISOR_BRANCH"
+    git config remote.origin.tagOpt --no-tags
+fi
 if git rev-parse --verify "origin/$ADVISOR_BRANCH" >/dev/null 2>&1; then
     git checkout "$ADVISOR_BRANCH"
-    git pull origin "$ADVISOR_BRANCH"
+    git pull --ff-only origin "$ADVISOR_BRANCH"
 else
     git checkout -b "$ADVISOR_BRANCH"
     git push -u origin "$ADVISOR_BRANCH"
