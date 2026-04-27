@@ -158,6 +158,10 @@ python k8s/launch.py --tag <research-tag> --advisor --n_students 7 --pvc_mount_p
 python k8s/launch.py --tag <research-tag> --n_students 7 --dry_run
 python k8s/launch.py --tag <research-tag> --advisor --extra_instructions "Only consider optimizer changes."
 
+# Parallel launches: use unique tags, plus --student_prefix when runs share student names
+python k8s/launch.py --tag <tag-a> --advisor --student_prefix a
+python k8s/launch.py --tag <tag-b> --advisor --student_prefix b
+
 # Stop a launch
 kubectl delete deployments,configmaps,secrets -l research-tag=<research-tag>
 ```
