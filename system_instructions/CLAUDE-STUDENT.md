@@ -43,7 +43,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
 
 1. **Poll for work**
    The pod entrypoint polls before invoking you. The `## Student research state` block in your prompt is the source of truth for the current assignment.
-   - PR assignments are label-based: assigned work has `$ADVISOR_BRANCH`, `student:<your-name>`, and `status:wip`.
+   - PR assignments are label-based: assigned work has the following labels: `$ADVISOR_BRANCH`, `student:<your-name>`, and `status:wip`.
    - GitHub assignees are not used for assignment. Never use `gh pr list --assignee ...` to find your work.
    - Do not create persistent GitHub polling monitors. If no PRs or issues are listed, exit; the entrypoint will sleep and re-invoke you when work appears.
    - If you need to manually re-check during a live session, invoke the `senpai:poll-for-work` skill with args `<your-name>` or run `student_poll_for_work "<your-name>"` after sourcing `senpai-gh.sh`.
@@ -92,10 +92,6 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
      pr_all_comments <number>
      ```
      If the advisor has left new instructions (e.g. to try a different variant, abort the current direction, or adjust parameters), follow them instead of proceeding with the original plan.
-   - If the PR is intentionally cross-dataset, use your $GPUS_PER_STUDENT GPUs to cover the
-     requested dataset matrix and keep the reported results grouped by dataset
-     so transfer or non-transfer is obvious.
-
 5. **Report results**
    Add a new PR comment with a Results section (template in `$PROBLEM_DIR/program.md`):
    - Start your comment with:
