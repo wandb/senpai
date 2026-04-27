@@ -10,21 +10,17 @@ Autonomous ML research loop powered by Claude Code agents coordinated through Gi
 
 ## How it works
 
-An **advisor** agent (no GPU) creates hypothesis PRs and assigns them to **student** agents (GPU nodes). Students implement the hypothesis, run experiments, and report results. The advisor reviews: merges winners, iterates on promising ideas, closes dead ends. All coordination happens through GitHub labels and PRs. W&B tracks metrics.
+An **advisor** pod creates experiment PRs and assigns them to **student** GPU pods. Students implement, train, and report; the advisor merges winners and closes dead ends. GitHub labels route work, and W&B tracks metrics.
 
-The repo is **problem-agnostic** — `target/` is empty by default. You bring your own problem-package repo (model, training script, data pipeline, instructions) and the pod entrypoint clones it into `target/` at startup, so the problem-package's repo root lands at `./target/`. `senpai.yaml` sets `target_repo_url:` to the repo to clone.
+`senpai` is **problem-agnostic**. The pod entrypoint clones the configured problem-package repo into `target/`, so agent commits and PRs land in that external repo, not here.
 
-### Current problem
+### Problem packages
 
-TandemFoilSet 3D velocity-field prediction, seeded from the [`tcapelle/kagent`](https://github.com/tcapelle/kagent/tree/main/tandemfoil-competition) competition as a clean Transolver-based implementation. Lives in [`morganmcg1/tandemfoil2`](https://github.com/morganmcg1/tandemfoil2) on branch `kagent_royal_rumble`. The entrypoint clones it into `target/` at pod startup.
-
-### Reference problem packages
-
-Problem packages are self-contained external repos:
-
-- [`morganmcg1/tandemfoil2`](https://github.com/morganmcg1/tandemfoil2) — **ACTIVE**. TandemFoilSet velocity prediction, kagent-seeded. Default branch `kagent_royal_rumble`.
-- [`morganmcg1/icml2026`](https://github.com/morganmcg1/icml2026) — archival. Full ICML 2026 CFD multi-dataset harness (TandemFoil, AirfRANS, DrivAerML, TandemFoil paper).
-- [`morganmcg1/cfd_tandemfoil_v1`](https://github.com/morganmcg1/cfd_tandemfoil_v1) — archival. Original v1 TandemFoil problem package, pre-ICML-2026 sprint.
+| Repo | Status | Notes |
+|---|---|---|
+| [`morganmcg1/tandemfoil2`](https://github.com/morganmcg1/tandemfoil2) | Active | TandemFoilSet velocity prediction, branch `kagent_royal_rumble` |
+| [`morganmcg1/icml2026`](https://github.com/morganmcg1/icml2026) | Archive | ICML 2026 CFD multi-dataset harness |
+| [`morganmcg1/cfd_tandemfoil_v1`](https://github.com/morganmcg1/cfd_tandemfoil_v1) | Archive | Original v1 TandemFoil package |
 
 ![val/loss over time](animated_chart.gif)
 
@@ -66,8 +62,8 @@ graph TD
 ```
 senpai/
 ├── senpai.yaml                    # Project config: problem-package repo/branch + launch defaults
-├── target/                        # Empty by default. Entrypoint clones target_repo_url here at pod startup, so the problem-package repo's root lands at ./target/.
-│   ├── train.py                   #   Training script + model (students modify this)
+├── target/                        # Problem package clone (empty by default)
+│   ├── train.py                   #   Training script + model
 │   ├── program.md                 #   Research context, metrics, constraints
 │   ├── data.py / data/            #   Data pipeline
 │   └── instructions/              #   Task-specific Claude Code prompt templates
@@ -80,24 +76,24 @@ senpai/
 │   ├── launch.py                  #   Deploy advisor + student pods
 │   ├── advisor-deployment.yaml
 │   ├── student-deployment.yaml
-│   ├── entrypoint-advisor.sh      #   Clones target_repo_url into $PROBLEM_DIR; advisor git/PRs scoped to that repo
-│   └── entrypoint-student.sh      #   Clones target_repo_url into $PROBLEM_DIR; student git/PRs scoped to that repo
+│   ├── entrypoint-advisor.sh
+│   └── entrypoint-student.sh
 ├── Dockerfile
 └── .claude/                       # Claude Code skills and agents
 ```
 
-**Important**: the senpai parent repo is problem-agnostic. Agent commits and PRs land in the **problem-package repo** (e.g. `morganmcg1/tandemfoil2`) on its working branch, never in `wandb/senpai`.
+**Important**: agent commits and PRs land in the problem-package repo, never in `wandb/senpai`.
 
 ## Configuration
 
 All project settings live in `senpai.yaml`:
 
 ```yaml
-problem_dir: target/                      # active problem directory — entrypoint clones target_repo_url here
+problem_dir: target/
 repo_url: https://github.com/wandb/senpai.git
 repo_branch: main
-target_repo_url: https://github.com/morganmcg1/tandemfoil2.git   # problem-package repo: agent commits/PRs target this
-advisor_branch: schmidhuber                                      # integration branch inside the problem-package repo (advisor PRs merge here; students branch off it)
+target_repo_url: https://github.com/morganmcg1/tandemfoil2.git
+advisor_branch: schmidhuber
 image: ghcr.io/wandb/senpai:latest
 pvc_claim_name: new-pvc
 pvc_mount_path: /mnt/new-pvc
@@ -110,64 +106,40 @@ n_students: 4
 
 `launch.py` reads this via `simple_parsing` — every field can be overridden on the CLI.
 
-### Launch credentials (per-launch)
+### Launch credentials
 
-`launch.py` resolves your GitHub token, Anthropic API key, and Exa API key at launch time and materialises them as an ephemeral, per-tag k8s Secret (`senpai-launch-secrets-<tag>`) that the pods reference for `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, and `EXA_API_KEY`.
+`launch.py` resolves these at launch time, preflights them (including `--dry_run`), and writes them to a per-tag Secret named `senpai-launch-secrets-<tag>`:
 
-GitHub token resolution order:
+| Env var | Pod env | Resolution |
+|---|---|---|
+| `GITHUB_TOKEN` | `GITHUB_TOKEN` | shell env -> `.env` -> `gh auth token` |
+| `ANTHROPIC_API_KEY` | `ANTHROPIC_API_KEY` | shell env -> `.env` |
+| `EXA_API_KEY` | `EXA_API_KEY` | shell env -> `.env` |
 
-1. `$GITHUB_TOKEN` in your shell env (shell or [`direnv`](https://direnv.net/) wins).
-2. `.env` at the senpai repo root (`GITHUB_TOKEN=ghp_...`). Not committed; don't paste into a shared file.
-3. `gh auth token` — works out-of-the-box if you're already logged into the `gh` CLI.
-
-Anthropic API key resolution order:
-
-1. `$ANTHROPIC_API_KEY` in your shell env.
-2. `.env` at the senpai repo root (`ANTHROPIC_API_KEY=sk-ant-...`).
-
-Exa API key resolution order:
-
-1. `$EXA_API_KEY` in your shell env.
-2. `.env` at the senpai repo root (`EXA_API_KEY=...`).
-
-If any credential is missing or fails preflight, `launch.py` exits with instructions. This check also runs for `--dry_run`, so dry runs confirm the rendered manifests and credential usability without mutating the cluster. Anthropic preflight uses the auth-only models endpoint; Exa preflight runs one fast, single-result search with no contents and a generic query. The launch-scoped Secret is labelled with your research tag and is cleaned up by `kubectl delete deployments,configmaps,secrets -l research-tag=<tag>` (see [Running](#running)).
-
-The repo ships an `example.env` template — copy it to `.env` and paste your credentials:
+Use `example.env` for local setup:
 
 ```bash
 cp example.env .env
-# then edit .env and set GITHUB_TOKEN=ghp_..., ANTHROPIC_API_KEY=sk-ant-..., and EXA_API_KEY=...
+# edit .env and set GITHUB_TOKEN, ANTHROPIC_API_KEY, and EXA_API_KEY
 ```
 
-`.env` is already gitignored, so the credentials stay local.
+Notes: `--dry_run` prints redacted Secret values only. Real launches pass the Secret manifest to `kubectl apply` via stdin, but Kubernetes Secrets are still readable to anyone with namespace Secret read access. Delete launch resources when done: `kubectl delete deployments,configmaps,secrets -l research-tag=<tag>`.
 
-Security notes: `--dry_run` prints only redacted placeholder Secret values. Real launches pass the Secret manifest to `kubectl apply` over stdin, not as command-line arguments, but Kubernetes Secrets are still readable by anyone with Secret read access in the namespace; use least-privilege per-launch keys where possible and delete the launch resources when the run is over.
-
-> **Target-repo permissions.** Prefer a deliberately created classic PAT (`ghp_...`) with `repo` and `read:org`; copied GitHub CLI OAuth tokens (`gho_...`) are easy to launch with stale or insufficient scopes. The token must be able to **clone** `target_repo_url` and **push branches + open/merge PRs** against it. `launch.py` preflights this against the GitHub API before spinning up pods and fails loudly if `permissions.push` is false.
+GitHub token requirements: use a PAT with `repo` and `read:org`; it must clone `target_repo_url` and push/open PRs there.
 
 ### Shared cluster secret (`senpai-secrets`)
 
-Every pod also reads the shared, cluster-wide W&B key from the `senpai-secrets` Secret. Unlike launch credentials this is not per-launch — set it once on the cluster and every tag reuses it:
-
-| Key in `senpai-secrets` | Used for |
-|---|---|
-| `wandb-api-key` | `WANDB_API_KEY` — all W&B logging from advisor + students |
-
-Create the shared secret:
+Every pod also reads `WANDB_API_KEY` from the shared `senpai-secrets` Secret:
 
 ```bash
-kubectl create secret generic senpai-secrets \
-  --from-literal=wandb-api-key="$WANDB_API_KEY"
+# Create
+kubectl create secret generic senpai-secrets --from-literal=wandb-api-key="$WANDB_API_KEY"
+
+# Rotate
+kubectl patch secret senpai-secrets --type=merge -p "{\"stringData\":{\"wandb-api-key\":\"$WANDB_API_KEY\"}}"
 ```
 
-Rotate a single key without recreating the whole secret:
-
-```bash
-kubectl patch secret senpai-secrets \
-  --type=merge -p "{\"stringData\":{\"wandb-api-key\":\"$WANDB_API_KEY\"}}"
-```
-
-`launch.py` does **not** preflight this — if the key is missing, pods will crash-loop on startup. `kubectl get secret senpai-secrets -o jsonpath='{.data}' | jq` confirms the key is present.
+`launch.py` does not preflight W&B; missing keys crash-loop pods.
 
 ## Running
 
@@ -182,16 +154,11 @@ cd target/ && python train.py --wandb_name "<name>/<description>"
 # Deploy to k8s (reads defaults from senpai.yaml, only --tag is required)
 python k8s/launch.py --tag <research-tag> --advisor
 
-# Override config via CLI
 python k8s/launch.py --tag <research-tag> --advisor --n_students 7 --pvc_mount_path "/mnt/pai-amf1-cfd"
-
-# Dry-run (print manifests, don't apply)
 python k8s/launch.py --tag <research-tag> --n_students 7 --dry_run
-
-# Pass extra instructions to the advisor
 python k8s/launch.py --tag <research-tag> --advisor --extra_instructions "Only consider optimizer changes."
 
-# Stop a launch (tears down deployments, configmaps, and the per-tag token Secret)
+# Stop a launch
 kubectl delete deployments,configmaps,secrets -l research-tag=<research-tag>
 ```
 
