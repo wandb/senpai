@@ -56,7 +56,7 @@ source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
 TASK_INSTRUCTIONS="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
 PROMPT="${TASK_INSTRUCTIONS}"
 
-KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | GPUs: '"$STUDENT_GPU_COUNT"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
+KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 HEARTBEAT_PROMPT="Continue your student loop using the assigned PRs and GitHub issues listed in the Student research state below. The entrypoint owns assignment polling; do not start persistent GitHub polling monitors. For active training, use sparse wakeups plus training_log_status; do not stream per-epoch logs into Monitor."
@@ -83,7 +83,7 @@ while true; do
     # Overwrite CLAUDE.md with the student role instructions — git checkout/pull clobbers it with the developer copy.
     # Whitelist vars so envsubst substitutes pod env vars but leaves Claude Code runtime vars
     # like ${CLAUDE_PLUGIN_ROOT} alone (those get expanded by the agent's shell at call time).
-    envsubst '$PROBLEM_DIR $TARGET_REPO_URL $GH_REPO $ADVISOR_BRANCH $RESEARCH_TAG $STUDENT_NAME $STUDENT_GPU_COUNT $WANDB_ENTITY $WANDB_PROJECT' \
+    envsubst '$PROBLEM_DIR $TARGET_REPO_URL $GH_REPO $ADVISOR_BRANCH $RESEARCH_TAG $STUDENT_NAME $GPUS_PER_STUDENT $WANDB_ENTITY $WANDB_PROJECT' \
         < "$WORKDIR/system_instructions/CLAUDE-STUDENT.md" \
         | sed '/^<!--$/,/^-->$/d' \
         > "$WORKDIR/CLAUDE.md"

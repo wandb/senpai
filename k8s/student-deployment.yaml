@@ -70,11 +70,11 @@ spec:
           requests:
             cpu: "{{STUDENT_CPU}}"
             memory: "{{STUDENT_MEMORY}}"
-            nvidia.com/gpu: "{{STUDENT_GPUS}}"
+            nvidia.com/gpu: "{{GPUS_PER_STUDENT}}"
           limits:
             cpu: "{{STUDENT_CPU}}"
             memory: "{{STUDENT_MEMORY}}"
-            nvidia.com/gpu: "{{STUDENT_GPUS}}"
+            nvidia.com/gpu: "{{GPUS_PER_STUDENT}}"
         volumeMounts:
         - name: dshm
           mountPath: /dev/shm

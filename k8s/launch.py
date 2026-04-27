@@ -36,7 +36,6 @@ ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-deployment.yaml"
 SENPAI_CONFIG = Path(__file__).parent.parent / "senpai.yaml"
 DOTENV_PATH = Path(__file__).parent.parent / ".env"
 
-
 @dataclass
 class Args:
     """Launch senpai advisor and/or student agents on Kubernetes."""

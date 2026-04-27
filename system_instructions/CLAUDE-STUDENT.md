@@ -92,7 +92,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
      pr_all_comments <number>
      ```
      If the advisor has left new instructions (e.g. to try a different variant, abort the current direction, or adjust parameters), follow them instead of proceeding with the original plan.
-   - If the PR is intentionally cross-dataset, use your $STUDENT_GPU_COUNT GPUs to cover the
+   - If the PR is intentionally cross-dataset, use your $GPUS_PER_STUDENT GPUs to cover the
      requested dataset matrix and keep the reported results grouped by dataset
      so transfer or non-transfer is obvious.
 
