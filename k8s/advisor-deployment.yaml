@@ -35,9 +35,10 @@ spec:
         args:
         - |
           set -e
-          git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
-          git clone --branch "$REPO_BRANCH" --single-branch --depth 1 --no-tags "$REPO_URL" /workspace/senpai
+          repo_auth_url="$(printf '%s' "$REPO_URL" | sed "s#https://github.com/#https://${GITHUB_TOKEN}@github.com/#")"
+          git clone --branch "$REPO_BRANCH" --single-branch --depth 1 --no-tags "$repo_auth_url" /workspace/senpai
           cd /workspace/senpai
+          git remote set-url origin "$REPO_URL"
           bash k8s/entrypoint-advisor.sh
         envFrom:
         - configMapRef:
