@@ -146,6 +146,36 @@ def render_launch_secret(tag: str, github_token: str, anthropic_api_key: str) ->
     )
 
 
+def preflight_check_anthropic_api_key(api_key: str) -> None:
+    """Verify the supplied Anthropic API key can authenticate to the API."""
+    print("Preflight: checking Anthropic API key", flush=True)
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/models",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "User-Agent": "senpai-launch-preflight",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        hint = ""
+        if e.code == 401:
+            hint = (
+                "\n  Your Anthropic API key is invalid or expired.\n"
+                "  Fix: create a fresh key and put it in .env as ANTHROPIC_API_KEY=<key>."
+            )
+        sys.exit(
+            f"ERROR: Anthropic API {e.code} for /v1/models: "
+            f"{e.read().decode(errors='replace')}{hint}"
+        )
+    except urllib.error.URLError as e:
+        sys.exit(f"ERROR: could not reach Anthropic API: {e.reason}")
+    print("  OK — Anthropic API key authenticated")
+
+
 def _oauth_scopes(header_value: str | None) -> set[str]:
     return {scope.strip() for scope in (header_value or "").split(",") if scope.strip()}
 

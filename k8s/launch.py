@@ -17,6 +17,7 @@ from launch_helpers import (
     existing_student_names,
     expand_student_names,
     kubectl_apply,
+    preflight_check_anthropic_api_key,
     preflight_check_target_repo_access,
     render_configmap,
     render_launch_secret,
@@ -125,8 +126,8 @@ def main():
     github_token = resolve_github_token(DOTENV_PATH)
     anthropic_api_key = resolve_anthropic_api_key(DOTENV_PATH)
 
-    if not args.dry_run:
-        preflight_check_target_repo_access(args.target_repo_url, github_token)
+    preflight_check_target_repo_access(args.target_repo_url, github_token)
+    preflight_check_anthropic_api_key(anthropic_api_key)
 
     # Resolve student list
     if args.names:

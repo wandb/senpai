@@ -125,7 +125,7 @@ Anthropic API key resolution order:
 1. `$ANTHROPIC_API_KEY` in your shell env.
 2. `.env` at the senpai repo root (`ANTHROPIC_API_KEY=sk-ant-...`).
 
-If either credential is missing, `launch.py` exits with instructions. The launch-scoped Secret is labelled with your research tag and is cleaned up by `kubectl delete deployments,configmaps,secrets -l research-tag=<tag>` (see [Running](#running)).
+If either credential is missing or fails preflight, `launch.py` exits with instructions. This check also runs for `--dry_run`, so dry runs confirm the rendered manifests and credential usability without mutating the cluster. The launch-scoped Secret is labelled with your research tag and is cleaned up by `kubectl delete deployments,configmaps,secrets -l research-tag=<tag>` (see [Running](#running)).
 
 The repo ships an `example.env` template — copy it to `.env` and paste your credentials:
 
