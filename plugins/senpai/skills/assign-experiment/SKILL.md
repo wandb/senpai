@@ -60,7 +60,7 @@ include links to papers or code that support the hypothesis.>
 <Current best metrics from BASELINE.md:
 - val/loss: X.XXX
 - Surface MAE metrics: p_in | p_oodc | p_tan | p_re
-- Baseline W&B run: <run-id> (<wandb-link>)
+- Baseline metric summary: <path or PR comment reference>
 - Reproduce command: `cd "$2" && python train.py ...`>
 PREOF
 ```
@@ -83,7 +83,6 @@ rm -f "$BODY_FILE"
 - **Do not skip `create_assignment_branch`.** GitHub rejects PRs with no commits between the advisor branch and head.
 - **Pass the active problem dir as the third argument.** Example: `senpai:assign-experiment fern cosine-annealing target/cfd_tandemfoil`.
 - **Be specific in instructions.** The student implements exactly what you write. Vague instructions waste GPU time.
-- **Use `--wandb_group`** in instructions when a hypothesis needs multiple iterations (e.g. "try surface weight 5, 10, 20") so related runs are grouped in W&B.
 - **One hypothesis per PR.** Bundling multiple changes makes it impossible to attribute what worked.
 - **Use `create_assignment_pr_from_file`.** It fails if the PR is not draft, targets the wrong base or head, or is missing `$ADVISOR_BRANCH`, `student:$0`, or `status:wip`.
 - If the PR body is too long, keep the core info in the body file and add supplementary details as a follow-up comment.
