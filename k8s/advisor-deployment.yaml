@@ -60,7 +60,7 @@ spec:
         - name: EXA_API_KEY
           valueFrom:
             secretKeyRef:
-              name: senpai-secrets
+              name: {{LAUNCH_SECRET_NAME}}
               key: exa-api-key
         resources:
           requests:

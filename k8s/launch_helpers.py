@@ -53,7 +53,9 @@ def expand_student_names(n: int, names: list[str] = STUDENT_NAMES) -> list[str]:
 def existing_student_names(tag: str) -> list[str]:
     result = subprocess.run(
         ["kubectl", "get", "deployments", "-l", f"app=senpai,role=student,research-tag={tag}", "-o", "name"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     return [line.split("/senpai-", 1)[1] for line in result.stdout.splitlines()]
 
@@ -82,30 +84,52 @@ def target_repo_slug(url: str) -> str:
     return url.split("github.com", 1)[-1].lstrip(":/").removesuffix(".git")
 
 
-def _load_dotenv(path: Path) -> None:
-    """Read KEY=VAL lines from path into os.environ (doesn't override existing)."""
+LAUNCH_CREDENTIAL_ENV_NAMES = ("GITHUB_TOKEN", "ANTHROPIC_API_KEY", "EXA_API_KEY")
+
+
+def _dotenv_values(path: Path) -> dict[str, str]:
+    """Read KEY=VAL lines from path."""
+    values = {}
     if not path.exists():
-        return
+        return values
     for line in path.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
         v = v.strip().strip('"').strip("'")
-        os.environ.setdefault(k.strip(), v)
+        values[k.strip()] = v
+    return values
+
+
+def _subprocess_env_without_launch_credentials() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k not in LAUNCH_CREDENTIAL_ENV_NAMES}
+
+
+def resolve_required_secret(dotenv_path: Path, env_name: str, label: str) -> str:
+    """Resolve a required secret from the shell env, then .env."""
+    value = os.environ.get(env_name, "").strip()
+    if not value:
+        value = _dotenv_values(dotenv_path).get(env_name, "").strip()
+    if value:
+        return value
+    sys.exit(f"ERROR: no {label}. Set ${env_name} in your shell or add {env_name}=<key> to .env.")
 
 
 def resolve_github_token(dotenv_path: Path) -> str:
     """Resolve the GitHub token: $GITHUB_TOKEN → .env → `gh auth token` → hard error."""
-    # Treat empty $GITHUB_TOKEN as unset so .env fallback still kicks in.
-    if not os.environ.get("GITHUB_TOKEN", "").strip():
-        os.environ.pop("GITHUB_TOKEN", None)
-    _load_dotenv(dotenv_path)
     tok = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not tok:
+        tok = _dotenv_values(dotenv_path).get("GITHUB_TOKEN", "").strip()
     if tok:
         return tok
     try:
-        res = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True)
+        res = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env_without_launch_credentials(),
+        )
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip()
     except FileNotFoundError:
@@ -116,21 +140,24 @@ def resolve_github_token(dotenv_path: Path) -> str:
 
 def resolve_anthropic_api_key(dotenv_path: Path) -> str:
     """Resolve the Anthropic API key: $ANTHROPIC_API_KEY → .env → hard error."""
-    # Treat empty $ANTHROPIC_API_KEY as unset so .env fallback still kicks in.
-    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
-        os.environ.pop("ANTHROPIC_API_KEY", None)
-    _load_dotenv(dotenv_path)
-    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if key:
-        return key
-    sys.exit("ERROR: no Anthropic API key. Set $ANTHROPIC_API_KEY in your shell "
-             "or add ANTHROPIC_API_KEY=<key> to .env at the senpai repo root.")
+    return resolve_required_secret(dotenv_path, "ANTHROPIC_API_KEY", "Anthropic API key")
 
 
-def render_launch_secret(tag: str, github_token: str, anthropic_api_key: str) -> str:
+def resolve_exa_api_key(dotenv_path: Path) -> str:
+    """Resolve the Exa API key: $EXA_API_KEY → .env → hard error."""
+    return resolve_required_secret(dotenv_path, "EXA_API_KEY", "Exa API key")
+
+
+def render_launch_secret(
+    tag: str,
+    github_token: str,
+    anthropic_api_key: str,
+    exa_api_key: str,
+) -> str:
     """Per-launch k8s Secret holding API credentials used by advisor/student pods."""
     github_enc = base64.b64encode(github_token.encode()).decode()
     anthropic_enc = base64.b64encode(anthropic_api_key.encode()).decode()
+    exa_enc = base64.b64encode(exa_api_key.encode()).decode()
     return (
         "apiVersion: v1\n"
         "kind: Secret\n"
@@ -143,12 +170,46 @@ def render_launch_secret(tag: str, github_token: str, anthropic_api_key: str) ->
         "data:\n"
         f"  github-token: {github_enc}\n"
         f"  anthropic-api-key: {anthropic_enc}\n"
+        f"  exa-api-key: {exa_enc}\n"
     )
+
+
+def _api_error_summary(error: urllib.error.HTTPError, *secrets: str) -> str:
+    body = error.read().decode(errors="replace").strip()
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        summary = body
+    else:
+        err = payload.get("error", payload)
+        if isinstance(err, dict):
+            parts = [str(err[k]) for k in ("type", "tag", "message") if err.get(k)]
+            summary = ": ".join(parts) if parts else json.dumps(err, sort_keys=True)
+        else:
+            summary = str(err)
+        request_id = payload.get("request_id") or payload.get("requestId")
+        if request_id:
+            summary = f"{summary} (request id: {request_id})"
+    for secret in secrets:
+        if secret:
+            summary = summary.replace(secret, "<redacted>")
+    return (summary or "<empty response>")[:1000]
+
+
+def _preflight_http(name: str, req: urllib.request.Request, secret: str, timeout: int) -> None:
+    print(f"Preflight: checking {name}", flush=True)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        sys.exit(f"ERROR: {name} failed: HTTP {e.code}: {_api_error_summary(e, secret)}")
+    except urllib.error.URLError as e:
+        sys.exit(f"ERROR: {name} failed: {e.reason}")
+    print(f"  OK — {name} authenticated")
 
 
 def preflight_check_anthropic_api_key(api_key: str) -> None:
     """Verify the supplied Anthropic API key can authenticate to the API."""
-    print("Preflight: checking Anthropic API key", flush=True)
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/models",
         headers={
@@ -157,23 +218,27 @@ def preflight_check_anthropic_api_key(api_key: str) -> None:
             "User-Agent": "senpai-launch-preflight",
         },
     )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        hint = ""
-        if e.code == 401:
-            hint = (
-                "\n  Your Anthropic API key is invalid or expired.\n"
-                "  Fix: create a fresh key and put it in .env as ANTHROPIC_API_KEY=<key>."
-            )
-        sys.exit(
-            f"ERROR: Anthropic API {e.code} for /v1/models: "
-            f"{e.read().decode(errors='replace')}{hint}"
-        )
-    except urllib.error.URLError as e:
-        sys.exit(f"ERROR: could not reach Anthropic API: {e.reason}")
-    print("  OK — Anthropic API key authenticated")
+    _preflight_http("Anthropic API key", req, api_key, timeout=10)
+
+
+def preflight_check_exa_api_key(api_key: str) -> None:
+    """Verify the supplied Exa API key can authenticate and run a minimal search."""
+    payload = json.dumps({
+        "query": "api credential preflight",
+        "type": "fast",
+        "numResults": 1,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.exa.ai/search",
+        data=payload,
+        headers={
+            "x-api-key": api_key,
+            "Content-Type": "application/json",
+            "User-Agent": "senpai-launch-preflight",
+        },
+        method="POST",
+    )
+    _preflight_http("Exa API key", req, api_key, timeout=15)
 
 
 def _oauth_scopes(header_value: str | None) -> set[str]:
@@ -209,7 +274,7 @@ def preflight_check_target_repo_access(target_repo_url: str, token: str) -> None
                 )
             sys.exit(
                 f"ERROR: GitHub API {e.code} for {path}: "
-                f"{e.read().decode(errors='replace')}{hint}"
+                f"{_api_error_summary(e, token)}{hint}"
             )
 
     perms = gh_api(f"/repos/{slug}").get("permissions", {})

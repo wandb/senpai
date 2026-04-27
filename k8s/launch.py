@@ -18,11 +18,13 @@ from launch_helpers import (
     expand_student_names,
     kubectl_apply,
     preflight_check_anthropic_api_key,
+    preflight_check_exa_api_key,
     preflight_check_target_repo_access,
     render_configmap,
     render_launch_secret,
     render_template,
     resolve_anthropic_api_key,
+    resolve_exa_api_key,
     resolve_github_token,
     target_repo_slug,
 )
@@ -125,9 +127,11 @@ def main():
     args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
     github_token = resolve_github_token(DOTENV_PATH)
     anthropic_api_key = resolve_anthropic_api_key(DOTENV_PATH)
+    exa_api_key = resolve_exa_api_key(DOTENV_PATH)
 
     preflight_check_target_repo_access(args.target_repo_url, github_token)
     preflight_check_anthropic_api_key(anthropic_api_key)
+    preflight_check_exa_api_key(exa_api_key)
 
     # Resolve student list
     if args.names:
@@ -142,10 +146,20 @@ def main():
     # --- Apply per-launch token secret first (pods reference it on startup) ---
     if args.dry_run:
         print(f"--- Secret: {secret_name} ---")
-        print(render_launch_secret(args.tag, "<REDACTED_GITHUB_TOKEN>", "<REDACTED_ANTHROPIC_API_KEY>"))
+        print(
+            render_launch_secret(
+                args.tag,
+                "<REDACTED_GITHUB_TOKEN>",
+                "<REDACTED_ANTHROPIC_API_KEY>",
+                "<REDACTED_EXA_API_KEY>",
+            )
+        )
         print()
     else:
-        kubectl_apply(render_launch_secret(args.tag, github_token, anthropic_api_key), f"secret {secret_name}")
+        kubectl_apply(
+            render_launch_secret(args.tag, github_token, anthropic_api_key, exa_api_key),
+            f"secret {secret_name}",
+        )
 
     # --- Deploy students ---
     for name in student_list:

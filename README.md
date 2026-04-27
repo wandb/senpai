@@ -112,7 +112,7 @@ n_students: 4
 
 ### Launch credentials (per-launch)
 
-`launch.py` resolves your GitHub token and Anthropic API key at launch time and materialises them as an ephemeral, per-tag k8s Secret (`senpai-launch-secrets-<tag>`) that the pods reference for `GITHUB_TOKEN` and `ANTHROPIC_API_KEY`.
+`launch.py` resolves your GitHub token, Anthropic API key, and Exa API key at launch time and materialises them as an ephemeral, per-tag k8s Secret (`senpai-launch-secrets-<tag>`) that the pods reference for `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, and `EXA_API_KEY`.
 
 GitHub token resolution order:
 
@@ -125,44 +125,49 @@ Anthropic API key resolution order:
 1. `$ANTHROPIC_API_KEY` in your shell env.
 2. `.env` at the senpai repo root (`ANTHROPIC_API_KEY=sk-ant-...`).
 
-If either credential is missing or fails preflight, `launch.py` exits with instructions. This check also runs for `--dry_run`, so dry runs confirm the rendered manifests and credential usability without mutating the cluster. The launch-scoped Secret is labelled with your research tag and is cleaned up by `kubectl delete deployments,configmaps,secrets -l research-tag=<tag>` (see [Running](#running)).
+Exa API key resolution order:
+
+1. `$EXA_API_KEY` in your shell env.
+2. `.env` at the senpai repo root (`EXA_API_KEY=...`).
+
+If any credential is missing or fails preflight, `launch.py` exits with instructions. This check also runs for `--dry_run`, so dry runs confirm the rendered manifests and credential usability without mutating the cluster. Anthropic preflight uses the auth-only models endpoint; Exa preflight runs one fast, single-result search with no contents and a generic query. The launch-scoped Secret is labelled with your research tag and is cleaned up by `kubectl delete deployments,configmaps,secrets -l research-tag=<tag>` (see [Running](#running)).
 
 The repo ships an `example.env` template — copy it to `.env` and paste your credentials:
 
 ```bash
 cp example.env .env
-# then edit .env and set GITHUB_TOKEN=ghp_... and ANTHROPIC_API_KEY=sk-ant-...
+# then edit .env and set GITHUB_TOKEN=ghp_..., ANTHROPIC_API_KEY=sk-ant-..., and EXA_API_KEY=...
 ```
 
 `.env` is already gitignored, so the credentials stay local.
 
+Security notes: `--dry_run` prints only redacted placeholder Secret values. Real launches pass the Secret manifest to `kubectl apply` over stdin, not as command-line arguments, but Kubernetes Secrets are still readable by anyone with Secret read access in the namespace; use least-privilege per-launch keys where possible and delete the launch resources when the run is over.
+
 > **Target-repo permissions.** Prefer a deliberately created classic PAT (`ghp_...`) with `repo` and `read:org`; copied GitHub CLI OAuth tokens (`gho_...`) are easy to launch with stale or insufficient scopes. The token must be able to **clone** `target_repo_url` and **push branches + open/merge PRs** against it. `launch.py` preflights this against the GitHub API before spinning up pods and fails loudly if `permissions.push` is false.
 
-### Shared cluster secrets (`senpai-secrets`)
+### Shared cluster secret (`senpai-secrets`)
 
-Every pod also reads shared, cluster-wide keys from the `senpai-secrets` Secret. Unlike launch credentials these are not per-launch — set them once on the cluster and every tag reuses them:
+Every pod also reads the shared, cluster-wide W&B key from the `senpai-secrets` Secret. Unlike launch credentials this is not per-launch — set it once on the cluster and every tag reuses it:
 
 | Key in `senpai-secrets` | Used for |
 |---|---|
 | `wandb-api-key` | `WANDB_API_KEY` — all W&B logging from advisor + students |
-| `exa-api-key` | `EXA_API_KEY` — Exa web search used by the research agent |
 
 Create the shared secret:
 
 ```bash
 kubectl create secret generic senpai-secrets \
-  --from-literal=wandb-api-key="$WANDB_API_KEY" \
-  --from-literal=exa-api-key="$EXA_API_KEY"
+  --from-literal=wandb-api-key="$WANDB_API_KEY"
 ```
 
 Rotate a single key without recreating the whole secret:
 
 ```bash
 kubectl patch secret senpai-secrets \
-  --type=merge -p "{\"stringData\":{\"exa-api-key\":\"$EXA_API_KEY\"}}"
+  --type=merge -p "{\"stringData\":{\"wandb-api-key\":\"$WANDB_API_KEY\"}}"
 ```
 
-`launch.py` does **not** preflight these — if a key is missing, pods will crash-loop on startup. `kubectl get secret senpai-secrets -o jsonpath='{.data}' | jq` confirms the keys are present.
+`launch.py` does **not** preflight this — if the key is missing, pods will crash-loop on startup. `kubectl get secret senpai-secrets -o jsonpath='{.data}' | jq` confirms the key is present.
 
 ## Running
 
