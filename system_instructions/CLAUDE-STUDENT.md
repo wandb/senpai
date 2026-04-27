@@ -81,13 +81,12 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
 
 4. **Run experiments**
    ```bash
-   cd "$PROBLEM_DIR" && python train.py --dataset <dataset> --agent <your-name> --wandb_name "<your-name>/<description>" [--wandb_group "<idea>"]
+   cd "$PROBLEM_DIR" && python train.py --dataset <dataset> --agent <your-name> --run_name "<your-name>/<description>"
    ```
    - Before the first run in a target, read `python train.py --help` and use the exact flag names it exposes.
    - **Timeout**: The `SENPAI_MAX_EPOCHS` and `SENPAI_TIMEOUT_MINUTES` env vars control the max epochs and timeout for each training run in train.py. Ensure training runs do not exceed these limits.
-   - Use `--wandb_group` only when the PR instructions say to (the advisor sets this for multi-iteration ideas).
    - Only run multiple variations if the PR instructions explicitly ask for it (e.g. "try surface weight 5, 10, 20"). Otherwise, run the single experiment described.
-   - For active training, prefer `ScheduleWakeup` every 10-30 minutes plus `training_log_status <logfile>` or W&B queries. Do not stream per-epoch training logs into `Monitor`.
+   - For active training, prefer `ScheduleWakeup` every 10-30 minutes plus `training_log_status <logfile>`. Do not stream per-epoch training logs into `Monitor`.
    - **After each run finishes**, check for new advisor comments before continuing:
      ```bash
      pr_all_comments <number>
@@ -108,7 +107,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    - Comparison against the baseline numbers from the PR body
    - Exact train.py command used to run the experiment
    - Peak memory usage
-   - W&B run ID
+   - Local metrics summary path, if one was written
    - **What happened** — honest analysis: did it work? why or why not?
    - **Suggested follow-ups** — what would you try next based on what you learned?
 
@@ -125,7 +124,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
 - Do not run foreground waits such as `sleep 60 && gh ...`.
 - If you are only waiting for new work, exit and let the entrypoint re-enter.
 - Use `ScheduleWakeup` only for bounded continuation of active local work, such as checking a training run you already launched.
-- Avoid `Monitor` for normal training progress. If you must monitor a run, trigger only on terminal events such as process exit, `Traceback`, OOM, NaN, or explicit completion; never monitor `Epoch`, validation metrics, best-checkpoint updates, W&B updates, or `tail -f` output.
+- Avoid `Monitor` for normal training progress. If you must monitor a run, trigger only on terminal events such as process exit, `Traceback`, OOM, NaN, or explicit completion; never monitor `Epoch`, validation metrics, best-checkpoint updates, or `tail -f` output.
 - Do not use `Monitor` for GitHub assignment polling. Assignment polling belongs to the entrypoint and the `senpai:poll-for-work` helper.
 - Use a background `until ...; do sleep N; done` loop only for a bounded local check.
 
@@ -142,10 +141,6 @@ Note: Don't try to fix errors or failures that arise from our hard, fixed experi
 ### If you find bugs, you fix them
 
 You are at the front line of this codebase. If you find bugs, including bugs not immediately related to the experiments you are running, it is your responsibility as a diligent team member to fix them. Ensure you alert the advisor clearly in a separate bug-fix PR comment about any bug fixes you made so that they can review and merge them. Run the bug fixes before you start your experiments.
-
-### Always have rich wandb logging for every experiment
-
-Ensure that you log all relevant metrics and configs to wandb, especially when adding new metrics or configs particular to an experiment. We want to ensure we leave behind a rich record of logging for future analysis.
 
 ### You can install new packages if necessary for an experiment
 

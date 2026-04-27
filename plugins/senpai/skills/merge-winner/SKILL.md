@@ -50,14 +50,14 @@ Then stop — don't proceed with baseline update.
 git checkout "$ADVISOR_BRANCH" && git pull origin "$ADVISOR_BRANCH"
 ```
 
-3. **Update BASELINE.md** by appending the new baseline entry. Read the winning metrics from the PR comments and the W&B run metrics. The entry should include:
+3. **Update BASELINE.md** by appending the new baseline entry. Read the winning metrics from the PR comments and any local metric summaries. The entry should include:
 
 ```markdown
 ## <YYYY-MM-DD HH:MM> — PR #<number>: <title>
 
 - **Surface MAE:** Ux=X.XXXX, Uy=X.XXXX, p=X.XXXX
 - **val/loss:** X.XXX
-- **W&B run:** <run-id>
+- **Metric summary:** <path or PR comment reference>
 - **Reproduce:** `cd "$1" && python train.py <full command>`
 ```
 

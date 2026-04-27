@@ -26,7 +26,7 @@ You've run the experiment, posted a results comment on the experiment PR — now
 
 ## Before you call this
 
-Make sure you've already posted a results comment on the experiment PR with metrics, W&B run ID, analysis, and suggested follow-ups
+Make sure you've already posted a results comment on the experiment PR with metrics, any local metric summary path, analysis, and suggested follow-ups
 
 ## Steps
 
