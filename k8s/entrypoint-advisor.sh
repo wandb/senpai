@@ -9,6 +9,8 @@ set -o pipefail
 
 WORKDIR="/workspace/senpai"
 GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
+export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
+GIT_CREDENTIAL_FILE="$WORKDIR/.git-credentials"
 
 echo "=== Senpai Advisor ==="
 echo "Runner repo:  $REPO_URL (branch: $REPO_BRANCH)"
@@ -21,6 +23,34 @@ echo "GitHub history: $GH_HISTORY_SCOPE"
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
 git remote set-url --push origin DISABLED
+git config remote.origin.pushurl DISABLED
+git config --unset-all url."https://${GITHUB_TOKEN}@github.com/".insteadOf 2>/dev/null || true
+export SENPAI_REAL_GIT="$(command -v git)"
+mkdir -p .git/hooks
+cat > .git/hooks/pre-push <<'EOF'
+#!/bin/sh
+echo "ERROR: refusing to push from the senpai runner repo; use the cloned target repo instead." >&2
+exit 1
+EOF
+chmod +x .git/hooks/pre-push
+mkdir -p "$WORKDIR/git-guard-bin"
+cat > "$WORKDIR/git-guard-bin/git" <<'EOF'
+#!/bin/sh
+real_git="${SENPAI_REAL_GIT:-/usr/bin/git}"
+if [ "$1" = "push" ]; then
+    top="$("$real_git" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "${TARGET_WORKDIR:-}" ] && [ "$top" != "${TARGET_WORKDIR%/}" ]; then
+        echo "ERROR: refusing git push outside target repo; cwd=$(pwd), top=${top:-none}, target=$TARGET_WORKDIR" >&2
+        exit 2
+    fi
+fi
+exec "$real_git" "$@"
+EOF
+chmod +x "$WORKDIR/git-guard-bin/git"
+export PATH="$WORKDIR/git-guard-bin:$PATH"
+printf 'https://x-access-token:%s@github.com\n' "$GITHUB_TOKEN" > "$GIT_CREDENTIAL_FILE"
+chmod 600 "$GIT_CREDENTIAL_FILE"
+git config --global credential.helper "store --file=$GIT_CREDENTIAL_FILE"
 
 clone_target_repo() {
     local depth=()
@@ -44,6 +74,7 @@ if [ ! -d "$PROBLEM_DIR/.git" ] && ! clone_target_repo; then
     git push -u origin "$ADVISOR_BRANCH"
     cd "$WORKDIR"
 fi
+git config --global --unset-all credential.helper 2>/dev/null || true
 
 uv pip install --system -e .
 
@@ -51,6 +82,8 @@ uv pip install --system -e .
 cd "$WORKDIR/$PROBLEM_DIR"
 git config user.name "senpai-advisor"
 git config user.email "senpai-advisor@senpai"
+gh repo set-default "$GH_REPO"
+git config credential.helper "store --file=$GIT_CREDENTIAL_FILE"
 
 # --- Create or checkout advisor branch ---
 if [ "$GH_HISTORY_SCOPE" != "repo" ]; then
@@ -70,16 +103,22 @@ LOGDIR="$WORKDIR/advisor_logs"
 mkdir -p "$LOGDIR"
 
 # --- Start Hivemind logging service (streams CC session logs to hivemind.wandb.tools) ---
-mkdir -p ~/.claude/projects
-uvx --from wandb-hivemind hivemind run &
-echo "=== Hivemind started (PID=$!) ==="
+if [ "${SENPAI_ENABLE_AGENT_TRACING:-true}" = "true" ]; then
+    mkdir -p ~/.claude/projects
+    uvx --from wandb-hivemind hivemind run &
+    echo "=== Hivemind started (PID=$!) ==="
+else
+    echo "=== Hivemind disabled ==="
+fi
 
 # --- Load CC run command helper function ---
 source "$WORKDIR/k8s/run-senpai-claude.sh"
 
 # --- Register Weave CC plugin (tools already baked into Docker image) ---
 export PATH="$HOME/.claude/bin:$PATH"
-source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
+if [ "${SENPAI_ENABLE_AGENT_TRACING:-true}" = "true" ]; then
+    source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
+fi
 
 # --- Register Senpai CC plugin (skills + tools for common git tasks; CC uses --plugin-dir SENPAI_PLUGIN for tools) ---
 SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
@@ -100,7 +139,12 @@ if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
 fi
 
 # Add "$KEY_INFO" (reminder of student names etc) to PROMPT
-KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Tag: '"$RESEARCH_TAG"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
+if [ "${WANDB_MODE:-online}" = "disabled" ]; then
+    LOGGING_INFO="Experiment logging: local JSONL metrics only"
+else
+    LOGGING_INFO="W&B entity/project: ${WANDB_ENTITY}/${WANDB_PROJECT}"
+fi
+KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Tag: '"$RESEARCH_TAG"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | '"$LOGGING_INFO"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 # Heartbeat prompt for polling
@@ -137,11 +181,11 @@ while true; do
     [ -f "$LAST_CHECK_FILE" ] && SINCE=$(cat "$LAST_CHECK_FILE")
 
     # --- Check research state before invoking CC ---
-    REVIEW_JSON=$(list_ready_for_review_prs "$ADVISOR_BRANCH" "$SINCE")
+    REVIEW_JSON=$(list_ready_for_review_prs "$ADVISOR_BRANCH" "$SINCE" || printf '[]')
     REVIEW_COUNT=$(printf '%s' "$REVIEW_JSON" | json_len)
-    ISSUE_JSON=$(check_gh_issues "$ADVISOR_BRANCH" "$SINCE")
+    ISSUE_JSON=$(check_gh_issues "$ADVISOR_BRANCH" "$SINCE" || printf '[]')
     ISSUE_COUNT=$(printf '%s' "$ISSUE_JSON" | json_len)
-    IDLE_JSON=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH")
+    IDLE_JSON=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH" || printf '[]')
     IDLE_COUNT=$(printf '%s' "$IDLE_JSON" | json_len)
 
     # --- Derive watermark from the data we actually fetched (no gap, no overlap) ---

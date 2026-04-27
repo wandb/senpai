@@ -33,6 +33,16 @@ gh_retry() {
     return 1
 }
 
+require_target_repo() {
+    local origin
+    origin=$(git config --get remote.origin.url || true)
+    case "$origin" in
+        *"${GH_REPO}"*|*"${TARGET_REPO_URL:-__unset__}"*) return 0 ;;
+    esac
+    echo "ERROR: refusing git operation outside target repo; cwd=$(pwd), origin=${origin:-none}, target=${GH_REPO}" >&2
+    return 2
+}
+
 # ---------------------------------------------------------------------------
 # Label operations
 # ---------------------------------------------------------------------------
@@ -67,8 +77,8 @@ swap_gh_pr_label() {
 #   send_pr_back_to_student_with_comment <number> <comment_body>
 send_pr_back_to_student_with_comment() {
     local num="$1" body="$2"
-    gh_retry gh pr comment "$num" --body "$body"
-    gh_retry gh pr ready "$num" --undo
+    gh_retry gh pr comment "$num" --repo "$GH_REPO" --body "$body"
+    gh_retry gh pr ready "$num" --repo "$GH_REPO" --undo
     swap_gh_pr_label "$num" "status:review" "status:wip"
 }
 
@@ -76,8 +86,8 @@ send_pr_back_to_student_with_comment() {
 #   close_pr_with_comment <number> <reason>
 close_pr_with_comment() {
     local num="$1" reason="$2"
-    gh_retry gh pr comment "$num" --body "ADVISOR: Closing PR #${num} because ${reason}."
-    gh_retry gh pr close "$num" --delete-branch
+    gh_retry gh pr comment "$num" --repo "$GH_REPO" --body "ADVISOR: Closing PR #${num} because ${reason}."
+    gh_retry gh pr close "$num" --repo "$GH_REPO" --delete-branch
 }
 
 # Create an assignment PR through the one path that verifies student routing.
@@ -104,7 +114,7 @@ create_assignment_pr_from_file() {
         return 2
     fi
 
-    pr_url=$(gh_retry gh pr create --draft \
+    pr_url=$(gh_retry gh pr create --repo "$GH_REPO" --draft \
         --title "$title" \
         --body-file "$body_file" \
         --label "$base_branch" \
@@ -119,7 +129,7 @@ create_assignment_pr_from_file() {
         return 1
     fi
 
-    details=$(gh_retry gh pr view "$num" --json number,baseRefName,headRefName,labels,isDraft)
+    details=$(gh_retry gh pr view "$num" --repo "$GH_REPO" --json number,baseRefName,headRefName,labels,isDraft)
     python3 - "$student" "$base_branch" "$head_branch" "$details" <<'PY' || return
 import json
 import sys
@@ -156,7 +166,7 @@ PY
 #   mark_ready_for_review <number>
 mark_ready_for_review() {
     local num="$1"
-    gh_retry gh pr ready "$num"
+    gh_retry gh pr ready "$num" --repo "$GH_REPO"
     swap_gh_pr_label "$num" "status:wip" "status:review"  # swap_gh_pr_label uses gh_retry internally
 }
 
@@ -164,6 +174,7 @@ mark_ready_for_review() {
 #   create_assignment_branch <student> <hypothesis-slug>
 create_assignment_branch() {
     local student="$1" slug="$2" branch="${student}/${slug}"
+    require_target_repo || return
     git checkout "$ADVISOR_BRANCH"
     git pull origin "$ADVISOR_BRANCH"
     git checkout -b "$branch"
@@ -184,12 +195,17 @@ json_numbers() { python3 -c "import sys,json; print(','.join(f'#{i[\"number\"]}'
 # Returns empty string if all arrays are empty.  Usage:
 #   max_updated_at "$JSON_BLOB1" "$JSON_BLOB2" ...
 max_updated_at() {
-    python3 -c "
-import json, sys
-items = [i for blob in sys.argv[1:] if blob for i in json.loads(blob)]
-ts = [i['updatedAt'] for i in items if 'updatedAt' in i]
-print(max(ts) if ts else '')
-" "$@"
+    printf '%s\0' "$@" | python3 -c '
+import json
+import sys
+
+items = []
+for blob in sys.stdin.buffer.read().split(b"\0"):
+    if blob:
+        items.extend(json.loads(blob))
+ts = [i["updatedAt"] for i in items if "updatedAt" in i]
+print(max(ts) if ts else "")
+'
 }
 
 # Merge the JSON values emitted by `gh api --paginate --jq '[...]' into one
@@ -352,12 +368,16 @@ GH_LIST_LIMIT="${GH_LIST_LIMIT:-999}"
 check_gh_issues() {
     local role="$1" since="${2:-}"
     local role_issues team_issues
-    role_issues=$(gh_retry gh issue list --label "human" --label "$role" --state open \
+    if [ "${SENPAI_ENABLE_HUMAN_ISSUES:-true}" = "false" ]; then
+        printf '[]\n'
+        return
+    fi
+    role_issues=$(gh_retry gh issue list --repo "$GH_REPO" --label "human" --label "$role" --state open \
         --limit "$GH_LIST_LIMIT" \
-        --json number,title,updatedAt,comments)
-    team_issues=$(gh_retry gh issue list --label "human" --label "team" --state open \
+        --json number,title,updatedAt)
+    team_issues=$(gh_retry gh issue list --repo "$GH_REPO" --label "human" --label "team" --state open \
         --limit "$GH_LIST_LIMIT" \
-        --json number,title,updatedAt,comments)
+        --json number,title,updatedAt)
     printf '[%s,%s]' "$role_issues" "$team_issues" | python3 -c "
 import json, sys
 a, b = json.loads(sys.stdin.read())
@@ -380,7 +400,7 @@ print(json.dumps(merged))
 list_ready_for_review_prs() {
     local branch="$1" since="${2:-}"
     local prs
-    prs=$(gh_retry gh pr list --label "$branch" --label "status:review" \
+    prs=$(gh_retry gh pr list --repo "$GH_REPO" --label "$branch" --label "status:review" \
         --limit "$GH_LIST_LIMIT" \
         --json number,title,headRefName,labels,updatedAt)
     if [ -z "$since" ]; then
@@ -399,7 +419,7 @@ print(json.dumps([p for p in prs if p.get('updatedAt', '') > sys.argv[1]]))
 #   list_all_prs <branch>
 list_all_prs() {
     local branch="$1"
-    gh_retry gh pr list --label "$branch" \
+    gh_retry gh pr list --repo "$GH_REPO" --label "$branch" \
         --limit "$GH_LIST_LIMIT" \
         --json number,title,state,labels,headRefName,updatedAt,isDraft
 }
@@ -413,7 +433,7 @@ student_poll_for_work() {
         echo "student_poll_for_work: missing advisor branch" >&2
         return 2
     fi
-    gh_retry gh pr list --label "$branch" --label "student:${name}" --label "status:wip" \
+    gh_retry gh pr list --repo "$GH_REPO" --label "$branch" --label "student:${name}" --label "status:wip" \
         --limit "$GH_LIST_LIMIT" \
         --json number,title,headRefName,updatedAt,body
 }
@@ -425,7 +445,7 @@ student_poll_for_work() {
 list_idle_students() {
     local students_csv="$1" branch="$2"
     local all_prs
-    all_prs=$(gh_retry gh pr list --label "$branch" --label "status:wip" \
+    all_prs=$(gh_retry gh pr list --repo "$GH_REPO" --label "$branch" --label "status:wip" \
         --limit "$GH_LIST_LIMIT" \
         --json labels)
     printf '%s' "$all_prs" | python3 -c "

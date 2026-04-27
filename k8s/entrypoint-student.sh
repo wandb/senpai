@@ -9,6 +9,8 @@ set -o pipefail
 
 WORKDIR="/workspace/senpai"
 GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
+export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
+GIT_CREDENTIAL_FILE="$WORKDIR/.git-credentials"
 
 echo "=== Senpai Student: $STUDENT_NAME ==="
 echo "Runner repo:  $REPO_URL (branch: $REPO_BRANCH)"
@@ -20,6 +22,34 @@ echo "GPUs:         $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/n
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
 git remote set-url --push origin DISABLED
+git config remote.origin.pushurl DISABLED
+git config --unset-all url."https://${GITHUB_TOKEN}@github.com/".insteadOf 2>/dev/null || true
+export SENPAI_REAL_GIT="$(command -v git)"
+mkdir -p .git/hooks
+cat > .git/hooks/pre-push <<'EOF'
+#!/bin/sh
+echo "ERROR: refusing to push from the senpai runner repo; use the cloned target repo instead." >&2
+exit 1
+EOF
+chmod +x .git/hooks/pre-push
+mkdir -p "$WORKDIR/git-guard-bin"
+cat > "$WORKDIR/git-guard-bin/git" <<'EOF'
+#!/bin/sh
+real_git="${SENPAI_REAL_GIT:-/usr/bin/git}"
+if [ "$1" = "push" ]; then
+    top="$("$real_git" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "${TARGET_WORKDIR:-}" ] && [ "$top" != "${TARGET_WORKDIR%/}" ]; then
+        echo "ERROR: refusing git push outside target repo; cwd=$(pwd), top=${top:-none}, target=$TARGET_WORKDIR" >&2
+        exit 2
+    fi
+fi
+exec "$real_git" "$@"
+EOF
+chmod +x "$WORKDIR/git-guard-bin/git"
+export PATH="$WORKDIR/git-guard-bin:$PATH"
+printf 'https://x-access-token:%s@github.com\n' "$GITHUB_TOKEN" > "$GIT_CREDENTIAL_FILE"
+chmod 600 "$GIT_CREDENTIAL_FILE"
+git config --global credential.helper "store --file=$GIT_CREDENTIAL_FILE"
 
 clone_target_repo() {
     local depth=()
@@ -34,6 +64,7 @@ clone_target_repo() {
 # Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
 # agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
 [ -d "$PROBLEM_DIR/.git" ] || clone_target_repo
+git config --global --unset-all credential.helper 2>/dev/null || true
 
 uv pip install --system -e .
 
@@ -41,22 +72,30 @@ uv pip install --system -e .
 cd "$WORKDIR/$PROBLEM_DIR"
 git config user.name "senpai-$STUDENT_NAME"
 git config user.email "senpai-$STUDENT_NAME@senpai"
+gh repo set-default "$GH_REPO"
+git config credential.helper "store --file=$GIT_CREDENTIAL_FILE"
 if [ "$GH_HISTORY_SCOPE" != "repo" ]; then
     git remote set-branches origin "$ADVISOR_BRANCH"
     git config remote.origin.tagOpt --no-tags
 fi
 
 # --- Start Hivemind (streams CC session logs to hivemind.wandb.tools) ---
-mkdir -p ~/.claude/projects
-uvx --from wandb-hivemind hivemind run &
-echo "=== Hivemind started (PID=$!) ==="
+if [ "${SENPAI_ENABLE_AGENT_TRACING:-true}" = "true" ]; then
+    mkdir -p ~/.claude/projects
+    uvx --from wandb-hivemind hivemind run &
+    echo "=== Hivemind started (PID=$!) ==="
+else
+    echo "=== Hivemind disabled ==="
+fi
 
 # --- Load CC run command helper function ---
 source "$WORKDIR/k8s/run-senpai-claude.sh"
 
 # --- Register Weave Claude Code Plugin (tools already baked into Docker image) ---
 export PATH="$HOME/.claude/bin:$PATH"
-source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
+if [ "${SENPAI_ENABLE_AGENT_TRACING:-true}" = "true" ]; then
+    source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
+fi
 
 # --- Register Senpai CC plugin ---
 SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
@@ -71,7 +110,12 @@ source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
 TASK_INSTRUCTIONS="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
 PROMPT="${TASK_INSTRUCTIONS}"
 
-KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
+if [ "${WANDB_MODE:-online}" = "disabled" ]; then
+    LOGGING_INFO="Experiment logging: local JSONL metrics only"
+else
+    LOGGING_INFO="W&B entity/project: ${WANDB_ENTITY}/${WANDB_PROJECT}"
+fi
+KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | '"$LOGGING_INFO"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 HEARTBEAT_PROMPT="Continue your student loop using the assigned PRs and GitHub issues listed in the Student research state below. The entrypoint owns assignment polling; do not start persistent GitHub polling monitors. For active training, use sparse wakeups plus training_log_status; do not stream per-epoch logs into Monitor."
@@ -107,10 +151,16 @@ while true; do
     echo "=== GPU: $(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null) ==="
 
     # --- Check for work before invoking CC ---
-    ASSIGNED_JSON=$(student_poll_for_work "$STUDENT_NAME")
+    ASSIGNED_JSON=$(student_poll_for_work "$STUDENT_NAME" || printf '[]')
     ASSIGNED_COUNT=$(printf '%s' "$ASSIGNED_JSON" | json_len)
-    ISSUE_JSON=$(check_gh_issues "student:$STUDENT_NAME")
+    ISSUE_JSON=$(check_gh_issues "student:$STUDENT_NAME" || printf '[]')
     ISSUE_COUNT=$(printf '%s' "$ISSUE_JSON" | json_len)
+
+    if [ "$ASSIGNED_COUNT" -eq 1 ]; then
+        ASSIGNED_HEAD=$(printf '%s' "$ASSIGNED_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["headRefName"])')
+        git fetch origin "$ASSIGNED_HEAD"
+        git checkout -B "$ASSIGNED_HEAD" "origin/$ASSIGNED_HEAD"
+    fi
 
     # --- Build triage info ---
     TRIAGE_INFO="## Student research state"

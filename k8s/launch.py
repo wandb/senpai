@@ -52,6 +52,9 @@ class Args:
     image: str = "ghcr.io/wandb/senpai:latest"  # container image for students
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
     wandb_project: str = "senpai-v1"  # W&B project name
+    wandb_mode: str = "online"  # online for W&B runs, disabled for local-only training
+    agent_tracing: bool = True  # stream Claude session traces via Hivemind/Weave
+    human_issues: bool = True  # allow human GitHub issue triage; disable for isolated launches
     advisor_branch: str = "schmidhuber"  # branch the advisor works on inside the problem-package repo (students PR into it; created from the problem-package default branch if missing)
     gh_history_scope: str = "branch"  # branch=normal track memory, fresh=clean ablation, repo=whole-repo memory
     pvc_claim_name: str = "new-pvc"  # PVC name mounted into pods
@@ -82,9 +85,12 @@ def render_student(template: str, student_name: str, tag: str, secret_name: str,
             "GPUS_PER_STUDENT": str(args.gpus_per_student),
             "WANDB_ENTITY": args.wandb_entity,
             "WANDB_PROJECT": args.wandb_project,
+            "WANDB_MODE": args.wandb_mode,
+            "WANDB_DISABLED": "true" if args.wandb_mode == "disabled" else "false",
+            "SENPAI_ENABLE_AGENT_TRACING": "true" if args.agent_tracing and args.wandb_mode != "disabled" else "false",
             "ADVISOR_BRANCH": args.advisor_branch,
             "GH_HISTORY_SCOPE": args.gh_history_scope,
-            "WANDB_MODE": "online",
+            "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
             "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
             "SENPAI_MAX_EPOCHS": str(args.max_epochs),
             "PROBLEM_DIR": args.problem_dir,
@@ -121,8 +127,12 @@ def render_advisor(template: str, tag: str, student_list: list[str], secret_name
         "GPUS_PER_STUDENT": str(args.gpus_per_student),
         "WANDB_ENTITY": args.wandb_entity,
         "WANDB_PROJECT": args.wandb_project,
+        "WANDB_MODE": args.wandb_mode,
+        "WANDB_DISABLED": "true" if args.wandb_mode == "disabled" else "false",
+        "SENPAI_ENABLE_AGENT_TRACING": "true" if args.agent_tracing and args.wandb_mode != "disabled" else "false",
         "ADVISOR_BRANCH": args.advisor_branch,
         "GH_HISTORY_SCOPE": args.gh_history_scope,
+        "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
         "PROBLEM_DIR": args.problem_dir,
         "PVC_MOUNT_PATH": args.pvc_mount_path,
     }
@@ -152,6 +162,10 @@ def main():
         sys.exit("ERROR: --gpus_per_student, --cpu_per_gpu, and --memory_gi_per_gpu must all be at least 1")
     if args.gh_history_scope not in {"branch", "repo", "fresh"}:
         sys.exit("ERROR: --gh_history_scope must be one of: branch, repo, fresh")
+    if args.wandb_mode not in {"online", "offline", "disabled"}:
+        sys.exit("ERROR: --wandb_mode must be one of: online, offline, disabled")
+    if target_repo_slug(args.target_repo_url) == target_repo_slug(args.repo_url):
+        sys.exit("ERROR: --target_repo_url must be a different repo from --repo_url")
 
     github_token = anthropic_api_key = exa_api_key = ""
     if not args.dry_run or args.preflight_only:
