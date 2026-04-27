@@ -404,12 +404,16 @@ list_all_prs() {
         --json number,title,state,labels,headRefName,updatedAt,isDraft
 }
 
-# List WIP PRs assigned to a specific student.
+# List WIP PRs assigned to a specific student on the current advisor branch.
 # Returns a JSON array.
-#   student_poll_for_work <student_name>
+#   student_poll_for_work <student_name> [advisor_branch]
 student_poll_for_work() {
-    local name="$1"
-    gh_retry gh pr list --label "student:${name}" --label "status:wip" \
+    local name="$1" branch="${2:-${ADVISOR_BRANCH:-}}"
+    if [ -z "$branch" ]; then
+        echo "student_poll_for_work: missing advisor branch" >&2
+        return 2
+    fi
+    gh_retry gh pr list --label "$branch" --label "student:${name}" --label "status:wip" \
         --limit "$GH_LIST_LIMIT" \
         --json number,title,headRefName,updatedAt,body
 }

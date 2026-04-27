@@ -117,7 +117,7 @@ You run inside a pod entrypoint harness: it invokes Claude Code, passes the late
 
    In multi-benchmark targets like `target/icml2026`, the default unit of work
    should be a hypothesis family that is tested across all relevant datasets,
-   not a one-off single-benchmark tweak. Use the student's 8 GPUs to cover a
+   not a one-off single-benchmark tweak. Use the student's $STUDENT_GPU_COUNT GPUs to cover a
    small matrix across datasets and nearby variants unless a single-dataset
    frontier closure or best-checkpoint recovery run is clearly the highest-value
    use of that slot.

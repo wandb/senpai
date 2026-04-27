@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -33,6 +34,11 @@ STUDENT_NAMES = [
     "himmel", "mugen", "jin",
 ]
 
+LABEL_COLOR_ADVISOR_BRANCH = "0075ca"
+LABEL_COLOR_STATUS_WIP = "fbca04"
+LABEL_COLOR_STATUS_REVIEW = "0e8a16"
+LABEL_COLOR_STUDENT = "f9d0c4"
+
 
 def expand_student_names(n: int, names: list[str] = STUDENT_NAMES) -> list[str]:
     """Return n student names, cycling through `names` with a numeric suffix
@@ -50,14 +56,33 @@ def expand_student_names(n: int, names: list[str] = STUDENT_NAMES) -> list[str]:
     return out
 
 
+def routing_labels(advisor_branch: str, student_names: list[str]) -> dict[str, tuple[str, str]]:
+    """Labels required for advisor/student PR routing."""
+    return {
+        advisor_branch: (LABEL_COLOR_ADVISOR_BRANCH, f"Advisor branch: {advisor_branch}"),
+        "status:wip": (LABEL_COLOR_STATUS_WIP, "Work in progress"),
+        "status:review": (LABEL_COLOR_STATUS_REVIEW, "Ready for advisor review"),
+        **{
+            f"student:{name}": (LABEL_COLOR_STUDENT, f"Assigned to student {name}")
+            for name in student_names
+        },
+    }
+
+
 def existing_student_names(tag: str) -> list[str]:
     result = subprocess.run(
-        ["kubectl", "get", "deployments", "-l", f"app=senpai,role=student,research-tag={tag}", "-o", "name"],
-        capture_output=True,
-        text=True,
-        check=True,
+        [
+            "kubectl",
+            "get",
+            "deployments",
+            "-l",
+            f"app=senpai,role=student,research-tag={tag}",
+            "-o",
+            'jsonpath={range .items[*]}{.metadata.labels.student}{"\\n"}{end}',
+        ],
+        capture_output=True, text=True, check=True,
     )
-    return [line.split("/senpai-", 1)[1] for line in result.stdout.splitlines()]
+    return [line for line in result.stdout.splitlines() if line]
 
 
 def render_template(template: str, replacements: dict[str, str]) -> str:
@@ -292,6 +317,46 @@ def preflight_check_target_repo_access(target_repo_url: str, token: str) -> None
              f"  permissions: {perms}\n"
              f"  Fix: supply a token with write on {slug} via $GITHUB_TOKEN / .env / gh auth, "
              f"or grant '{user}' collaborator write on {slug}.")
+
+
+def ensure_target_repo_labels(target_repo_url: str, token: str, labels: dict[str, tuple[str, str]]) -> None:
+    """Create missing GitHub labels used for Senpai assignment routing."""
+    slug = target_repo_slug(target_repo_url)
+    print(f"Preflight: ensuring routing labels on {slug}")
+
+    def gh_api(path: str, method: str = "GET", data: bytes | None = None) -> dict:
+        req = urllib.request.Request(
+            f"https://api.github.com{path}",
+            data=data,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+                "User-Agent": "senpai-launch-preflight",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read() or b"{}")
+
+    for name, (color, description) in labels.items():
+        encoded = urllib.parse.quote(name, safe="")
+        try:
+            gh_api(f"/repos/{slug}/labels/{encoded}")
+            continue
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                payload = json.dumps({
+                    "name": name,
+                    "color": color,
+                    "description": description,
+                }).encode()
+                gh_api(f"/repos/{slug}/labels", method="POST", data=payload)
+                print(f"  created label {name}")
+                continue
+
+            print(f"GitHub label check failed for {name!r}", file=sys.stderr)
+            raise
 
 
 def kubectl_apply(manifest: str, name: str) -> None:

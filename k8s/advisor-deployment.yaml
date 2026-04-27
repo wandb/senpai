@@ -8,7 +8,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: senpai-advisor
+  name: {{ADVISOR_DEPLOYMENT_NAME}}
   labels:
     app: senpai
     role: advisor
@@ -19,6 +19,7 @@ spec:
     matchLabels:
       app: senpai
       role: advisor
+      research-tag: {{RESEARCH_TAG}}
   template:
     metadata:
       labels:
@@ -40,7 +41,7 @@ spec:
           bash k8s/entrypoint-advisor.sh
         envFrom:
         - configMapRef:
-            name: senpai-config-advisor
+            name: {{ADVISOR_CONFIGMAP_NAME}}
         env:
         - name: WANDB_API_KEY
           valueFrom:

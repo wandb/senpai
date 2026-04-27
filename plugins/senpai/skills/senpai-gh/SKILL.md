@@ -65,7 +65,7 @@ The default repo for `gh` is set via the injected `GH_REPO` env var, so no `--re
 | `issue_with_comments <issue#>` | Read one issue and all comments through REST pagination. Returns JSON object. |
 | `list_ready_for_review_prs <branch>` | List PRs with `status:review` on a branch. Returns JSON array. |
 | `list_all_prs <branch>` | List all open PRs on a branch (any status). Returns JSON array. |
-| `student_poll_for_work <student_name>` | List WIP PRs assigned to a student. Returns JSON array. |
+| `student_poll_for_work <student_name> [branch]` | List branch-scoped WIP PRs assigned to a student. Returns JSON array. |
 | `list_idle_students <names_csv> <branch>` | Print names of students with no `status:wip` PR, one per line. |
 | `pr_body <pr#>` | Read one PR body through REST. Returns JSON. |
 | `pr_issue_comments <pr#>` | Read all PR conversation comments through REST pagination. Returns JSON array. |

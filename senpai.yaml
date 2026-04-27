@@ -34,3 +34,6 @@ max_epochs: 50
 
 # students
 n_students: 4
+student_prefix: ""
+gpus_per_student: 8
+preflight_only: false

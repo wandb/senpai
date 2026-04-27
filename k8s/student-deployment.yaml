@@ -8,10 +8,11 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: senpai-{{STUDENT_NAME}}
+  name: {{STUDENT_DEPLOYMENT_NAME}}
   labels:
     app: senpai
     role: student
+    student: {{STUDENT_NAME}}
     research-tag: {{RESEARCH_TAG}}
 spec:
   replicas: 1
@@ -21,6 +22,7 @@ spec:
     matchLabels:
       app: senpai
       student: {{STUDENT_NAME}}
+      research-tag: {{RESEARCH_TAG}}
   template:
     metadata:
       labels:
@@ -42,7 +44,7 @@ spec:
           bash k8s/entrypoint-student.sh
         envFrom:
         - configMapRef:
-            name: senpai-config-student-{{STUDENT_NAME}}
+            name: {{STUDENT_CONFIGMAP_NAME}}
         env:
         - name: WANDB_API_KEY
           valueFrom:
@@ -66,13 +68,13 @@ spec:
               key: exa-api-key
         resources:
           requests:
-            cpu: "120"
-            memory: "960Gi"
-            nvidia.com/gpu: "8"
+            cpu: "{{STUDENT_CPU}}"
+            memory: "{{STUDENT_MEMORY}}"
+            nvidia.com/gpu: "{{STUDENT_GPUS}}"
           limits:
-            cpu: "120"
-            memory: "960Gi"
-            nvidia.com/gpu: "8"
+            cpu: "{{STUDENT_CPU}}"
+            memory: "{{STUDENT_MEMORY}}"
+            nvidia.com/gpu: "{{STUDENT_GPUS}}"
         volumeMounts:
         - name: dshm
           mountPath: /dev/shm

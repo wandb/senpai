@@ -19,7 +19,7 @@ Check whether the advisor has assigned you an experiment PR to work on. This is 
 
 Assignments are Github labels, not GitHub assignees:
 
-- A PR is assigned to you only when it has both `student:$0` and `status:wip`.
+- A PR is assigned to you only when it has `$ADVISOR_BRANCH`, `student:$0`, and `status:wip`.
 - Never use `gh pr list --assignee ...`, `--author`, or a hand-written replacement query for assignment polling.
 - Do not use the Claude Code `Monitor` tool for assignment polling. The pod entrypoint owns waiting and re-entry.
 
