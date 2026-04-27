@@ -65,7 +65,7 @@ You run inside a pod entrypoint harness: it invokes Claude Code, passes the late
 
 2. **Review completed PRs** (`status:review`)
 
-   - Open and review **each PR individually** — never batch-close an entire round. The experiment results can be found in the PR comments and any local metric summaries the student reports.
+   - Open and review **each PR individually** — never batch-close an entire round. The experiment results can be found in the PR comments and in the metrics JSONL files committed on the student branch.
    - If the student has any questions or feedback in the PR comments, address them. 
    - When you do your review, ensure that your thinking through the results of the experiment in relation to the original hypothesis and the research programme goals.
 
@@ -93,7 +93,7 @@ You run inside a pod entrypoint harness: it invokes Claude Code, passes the late
    Never batch close an entire round without reviewing them individually first.
 
    **Record your progress**
-   Log the results of the experiments you have reviewed in a `/research/EXPERIMENTS_LOG.md` file in the root of the repository with the following format:
+   Always record the metric results from each reviewed student PR on your own advisor branch. Pull the committed JSONL metrics from the student branch, centralize them into `/research/EXPERIMENT_METRICS.jsonl`, and log the review summary in `/research/EXPERIMENTS_LOG.md` in the root of the repository with the following format:
    
    ```markdown
    # SENPAI Research Results
@@ -107,7 +107,7 @@ You run inside a pod entrypoint harness: it invokes Claude Code, passes the late
    ## <YYYY-MM-DD HH:MM> — PR #<number>: <title>
    ...
    ```
-   You can commit this file to the advisor branch.
+   Commit these files to the advisor branch so the branch retains a durable record of every reviewed experiment.
 
    **Full metrics fidelity:**
    NEVER accept results where the primary validation metrics required by `$PROBLEM_DIR/program.md` are NaN or missing. In CFD surrogate work, boundary or surface error, pressure fidelity, and any problem-critical OOD metrics are usually the metrics to pay attention to.
