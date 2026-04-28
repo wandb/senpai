@@ -16,8 +16,6 @@ dependencies = [
     "rich",
     "python-dotenv",
     "simple-parsing",
-    "wandb",
-    "weave",
     "tqdm",
     "matplotlib",
 ]

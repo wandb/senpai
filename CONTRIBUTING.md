@@ -1,8 +1,8 @@
-# Contributing to wandb senpai
+# Contributing to senpai
 
 ## Contributions 
 
-Contributions to the main autoresearch loop are welcome! We would ask that you share wandb links or other evidence in your PR that the changes have improved the loop if possible :) 
+Contributions to the main autoresearch loop are welcome. Please share local metric files, PR evidence, or other reproducible evidence that the change improves the loop.
 
 ## Contributors Licence Agreement - CLA
 

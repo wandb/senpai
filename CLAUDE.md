@@ -31,7 +31,7 @@ When asked for a large piece of work which seems vague or needs clarification, p
 
 ## Architecture
 
-- **Advisor pod** — no GPU, runs Claude Code in a loop. Queries W&B, reviews student PRs, generates new hypotheses, and creates draft PRs to assign work.
+- **Advisor pod** — no GPU, runs Claude Code in a loop. Reviews student PRs, reads committed local metrics, generates new hypotheses, and creates draft PRs to assign work.
 - **Student pods** — GPU workers, each running Claude Code. Poll for assigned PRs, implement the hypothesis, run training, report results.
 - **GitHub Issues** — human-to-agent communication channel. Agents poll for and respond to these alongside their normal PR workflow.
 

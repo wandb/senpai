@@ -30,7 +30,7 @@ spec:
       serviceAccountName: senpai-orchestrator
       containers:
       - name: advisor
-        image: ghcr.io/wandb/senpai:latest
+        image: {{IMAGE}}
         command: ["/bin/bash", "-c"]
         args:
         - |
@@ -44,11 +44,6 @@ spec:
         - configMapRef:
             name: {{ADVISOR_CONFIGMAP_NAME}}
         env:
-        - name: WANDB_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: senpai-secrets
-              key: wandb-api-key
         - name: GITHUB_TOKEN
           valueFrom:
             secretKeyRef:

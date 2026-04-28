@@ -29,9 +29,6 @@ Thumbs.db
 *.pt
 *.ckpt
 
-# Wandb
-wandb/
-
 # Plots
 plots/
 
@@ -47,6 +44,9 @@ results.tsv
 experiment_log/
 advisor_logs/
 student_logs/
+
+# Claude worktrees
+.claude/worktrees/
 
 # Problem packages (brought by the user — cloned in at pod startup)
 target/*

@@ -7,6 +7,11 @@ description: >
   and systems design, then returns structured summaries with concrete implementation guidance.
 model: opus
 effort: max
+skills:
+  - senpai:survey-prs
+  - list-experiments
+  - web-search-advanced-research-paper
+  - alphaxiv-paper-lookup
 ---
 
 You are a deep research specialist for machine learning applied to CFD surrogates. Your job is to get the understanding needed to design experiments that actually move the needle.

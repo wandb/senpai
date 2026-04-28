@@ -20,7 +20,6 @@ source "$WORKDIR/plugins/senpai/scripts/senpai-gh.sh"
 export ADVISOR_BRANCH="test-advisor"
 export STUDENT_NAMES="alice,bob,charlie"
 export RESEARCH_TAG="test"
-export WANDB_ENTITY="test" WANDB_PROJECT="test"
 
 # --- Mock: CC just logs and returns ---
 run_senpai_claude() {
@@ -67,6 +66,12 @@ case "$SCENARIO" in
         check_gh_issues() { echo '[]'; }
         list_idle_students() { echo '[]'; }
         ;;
+    pollfail)
+        # A partial poll with work should run CC but should not advance the watermark.
+        list_ready_for_review_prs() { echo '[{"number":42,"updatedAt":"2026-04-01T20:00:00Z"}]'; }
+        check_gh_issues() { return 1; }
+        list_idle_students() { echo '[]'; }
+        ;;
 esac
 
 # --- JSON helpers (copied from entrypoint) ---
@@ -103,12 +108,14 @@ while true; do
     [ -f "$LAST_CHECK_FILE" ] && SINCE=$(cat "$LAST_CHECK_FILE")
 
     # --- Check research state ---
-    REVIEW_JSON=$(list_ready_for_review_prs "$ADVISOR_BRANCH" "$SINCE")
+    POLL_OK=1
+    REVIEW_JSON=$(poll_or_empty "review-ready PR poll" list_ready_for_review_prs "$ADVISOR_BRANCH" "$SINCE") || POLL_OK=0
     REVIEW_COUNT=$(printf '%s' "$REVIEW_JSON" | json_len)
-    ISSUE_JSON=$(check_gh_issues "$ADVISOR_BRANCH" "$SINCE")
+    ISSUE_JSON=$(poll_or_empty "GitHub issue poll" check_gh_issues "$ADVISOR_BRANCH" "$SINCE") || POLL_OK=0
     ISSUE_COUNT=$(printf '%s' "$ISSUE_JSON" | json_len)
-    IDLE_JSON=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH")
+    IDLE_JSON=$(poll_or_empty "idle-student poll" list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH") || POLL_OK=0
     IDLE_COUNT=$(printf '%s' "$IDLE_JSON" | json_len)
+    WATERMARK=$(max_updated_at "$REVIEW_JSON" "$ISSUE_JSON")
 
     TRIAGE_INFO="=== Research state (since ${SINCE:-boot}): reviews=$REVIEW_COUNT | issues=$ISSUE_COUNT | idle=$IDLE_COUNT ==="
     echo "$TRIAGE_INFO"
@@ -152,9 +159,11 @@ while true; do
     fi
     DURATION=$(( $(date +%s) - START_TS ))
 
-    # --- Update last-check timestamp (only on success) ---
-    if [ "$EXIT_CODE" -eq 0 ]; then
-        date -u +%Y-%m-%dT%H:%M:%SZ > "$LAST_CHECK_FILE"
+    # --- Update last-check timestamp (only after complete poll and success) ---
+    if [ "$EXIT_CODE" -eq 0 ] && [ "$POLL_OK" -eq 1 ] && [ -n "$WATERMARK" ]; then
+        echo "$WATERMARK" > "$LAST_CHECK_FILE"
+    elif [ "$EXIT_CODE" -eq 0 ] && [ "$POLL_OK" -ne 1 ]; then
+        echo "=== Poll incomplete; not advancing last-check timestamp ==="
     fi
 
     echo "=== Exited code=$EXIT_CODE after ${DURATION}s, next check in $SLEEP_TIME_S seconds ==="

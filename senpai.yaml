@@ -7,7 +7,7 @@
 problem_dir: target/
 
 # git (senpai itself)
-repo_url: https://github.com/wandb/senpai.git
+repo_url: ""
 repo_branch: main
 
 # problem-package repo is REQUIRED and must be passed on the CLI
@@ -15,15 +15,11 @@ repo_branch: main
 # The entrypoint clones it into $PROBLEM_DIR and checks out advisor_branch.
 
 # docker image
-image: ghcr.io/wandb/senpai:latest
+image: ""
 
 # dataset PVC mount
 pvc_claim_name: new-pvc
 pvc_mount_path: /mnt/new-pvc
-
-# W&B
-wandb_entity: wandb-applied-ai-team
-wandb_project: senpai-v1
 
 # advisor — the integration branch inside the problem-package repo that advisor PRs merge into
 advisor_branch: schmidhuber

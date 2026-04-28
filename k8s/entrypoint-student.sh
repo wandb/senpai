@@ -11,6 +11,7 @@ WORKDIR="/workspace/senpai"
 GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
 GIT_CREDENTIAL_FILE="$WORKDIR/.git-credentials"
+SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 
 echo "=== Senpai Student: $STUDENT_NAME ==="
 echo "Runner repo:  $REPO_URL (branch: $REPO_BRANCH)"
@@ -21,35 +22,8 @@ echo "GPUs:         $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/n
 
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
-git remote set-url --push origin DISABLED
-git config remote.origin.pushurl DISABLED
-git config --unset-all url."https://${GITHUB_TOKEN}@github.com/".insteadOf 2>/dev/null || true
-export SENPAI_REAL_GIT="$(command -v git)"
-mkdir -p .git/hooks
-cat > .git/hooks/pre-push <<'EOF'
-#!/bin/sh
-echo "ERROR: refusing to push from the senpai runner repo; use the cloned target repo instead." >&2
-exit 1
-EOF
-chmod +x .git/hooks/pre-push
-mkdir -p "$WORKDIR/git-guard-bin"
-cat > "$WORKDIR/git-guard-bin/git" <<'EOF'
-#!/bin/sh
-real_git="${SENPAI_REAL_GIT:-/usr/bin/git}"
-if [ "$1" = "push" ]; then
-    top="$("$real_git" rev-parse --show-toplevel 2>/dev/null || true)"
-    if [ -n "${TARGET_WORKDIR:-}" ] && [ "$top" != "${TARGET_WORKDIR%/}" ]; then
-        echo "ERROR: refusing git push outside target repo; cwd=$(pwd), top=${top:-none}, target=$TARGET_WORKDIR" >&2
-        exit 2
-    fi
-fi
-exec "$real_git" "$@"
-EOF
-chmod +x "$WORKDIR/git-guard-bin/git"
-export PATH="$WORKDIR/git-guard-bin:$PATH"
-printf 'https://x-access-token:%s@github.com\n' "$GITHUB_TOKEN" > "$GIT_CREDENTIAL_FILE"
-chmod 600 "$GIT_CREDENTIAL_FILE"
-git config --global credential.helper "store --file=$GIT_CREDENTIAL_FILE"
+source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
+install_senpai_git_guard "$WORKDIR" "$TARGET_WORKDIR" "$GIT_CREDENTIAL_FILE"
 
 clone_target_repo() {
     local depth=()
@@ -62,7 +36,7 @@ clone_target_repo() {
 }
 
 # Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
-# agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
+# agent commits/PRs live in $TARGET_REPO_URL, not the runner repo).
 [ -d "$PROBLEM_DIR/.git" ] || clone_target_repo
 git config --global --unset-all credential.helper 2>/dev/null || true
 
@@ -79,27 +53,17 @@ if [ "$GH_HISTORY_SCOPE" != "repo" ]; then
     git config remote.origin.tagOpt --no-tags
 fi
 
-# --- Start Hivemind (streams CC session logs to hivemind.wandb.tools) ---
-if [ "${SENPAI_ENABLE_AGENT_TRACING:-true}" = "true" ]; then
-    mkdir -p ~/.claude/projects
-    uvx --from wandb-hivemind hivemind run &
-    echo "=== Hivemind started (PID=$!) ==="
-else
-    echo "=== Hivemind disabled ==="
-fi
+# --- Install checked-in Claude Code config into user scope ---
+mkdir -p "$HOME/.claude"
+cp -a "$WORKDIR/.claude/." "$HOME/.claude/"
+
+echo "=== Claude config installed ==="
+find "$HOME/.claude/skills" -mindepth 2 -maxdepth 2 -name SKILL.md | sort
 
 # --- Load CC run command helper function ---
 source "$WORKDIR/k8s/run-senpai-claude.sh"
 
-# --- Register Weave Claude Code Plugin (tools already baked into Docker image) ---
 export PATH="$HOME/.claude/bin:$PATH"
-if [ "${SENPAI_ENABLE_AGENT_TRACING:-true}" = "true" ]; then
-    source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
-fi
-
-# --- Register Senpai CC plugin ---
-SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
-source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
 
 # $GH_REPO comes from the ConfigMap (set by launch.py = owner/repo of the
 # problem-package repo). The gh CLI honours it natively, so every `gh`
@@ -110,11 +74,7 @@ source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
 TASK_INSTRUCTIONS="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
 PROMPT="${TASK_INSTRUCTIONS}"
 
-if [ "${WANDB_MODE:-online}" = "disabled" ]; then
-    LOGGING_INFO="Experiment logging: local JSONL metrics only"
-else
-    LOGGING_INFO="W&B entity/project: ${WANDB_ENTITY}/${WANDB_PROJECT}"
-fi
+LOGGING_INFO="Experiment logging: local JSONL metrics only"
 KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | '"$LOGGING_INFO"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
@@ -142,7 +102,7 @@ while true; do
     # Overwrite CLAUDE.md with the student role instructions — git checkout/pull clobbers it with the developer copy.
     # Whitelist vars so envsubst substitutes pod env vars but leaves Claude Code runtime vars
     # like ${CLAUDE_PLUGIN_ROOT} alone (those get expanded by the agent's shell at call time).
-    envsubst '$PROBLEM_DIR $TARGET_REPO_URL $GH_REPO $ADVISOR_BRANCH $RESEARCH_TAG $STUDENT_NAME $GPUS_PER_STUDENT $WANDB_ENTITY $WANDB_PROJECT' \
+    envsubst '$PROBLEM_DIR $TARGET_REPO_URL $GH_REPO $ADVISOR_BRANCH $RESEARCH_TAG $STUDENT_NAME $GPUS_PER_STUDENT' \
         < "$WORKDIR/system_instructions/CLAUDE-STUDENT.md" \
         | sed '/^<!--$/,/^-->$/d' \
         > "$WORKDIR/CLAUDE.md"

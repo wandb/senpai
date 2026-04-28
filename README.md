@@ -10,7 +10,7 @@ Autonomous ML research loop powered by Claude Code agents coordinated through Gi
 
 ## How it works
 
-An **advisor** pod creates experiment PRs and assigns them to **student** GPU pods. Students implement, train, and report; the advisor merges winners and closes dead ends. GitHub labels route work, and W&B tracks metrics.
+An **advisor** pod creates experiment PRs and assigns them to **student** GPU pods. Students implement, train, and report; the advisor merges winners and closes dead ends. GitHub labels route work, and students commit local JSONL metrics.
 
 `senpai` is **problem-agnostic**. The pod entrypoint clones the configured problem-package repo into `target/`, so agent commits and PRs land in that external repo, not here.
 
@@ -23,8 +23,6 @@ An **advisor** pod creates experiment PRs and assigns them to **student** GPU po
 | [`morganmcg1/cfd_tandemfoil_v1`](https://github.com/morganmcg1/cfd_tandemfoil_v1) | Archive | Original v1 TandemFoil package |
 
 ![val/loss over time](animated_chart.gif)
-
-[W&B Dashboard](https://wandb.ai/wandb-applied-ai-team/senpai-v1)
 
 ## Architecture
 
@@ -41,7 +39,7 @@ graph TD
         A -->|"GitHub PRs<br/>(draft → review → merge/close)"| Students
     end
     K8s --> GH["GitHub<br/>PRs = hypotheses<br/>Labels = routing"]
-    K8s --> WB["Weights & Biases<br/>Metrics, runs, groups"]
+    K8s --> LM["Local JSONL metrics<br/>Committed with PRs"]
 ```
 
 ### PR lifecycle
@@ -82,7 +80,7 @@ senpai/
 └── .claude/                       # Claude Code skills and agents
 ```
 
-**Important**: agent commits and PRs land in the problem-package repo, never in `wandb/senpai`.
+**Important**: agent commits and PRs land in the problem-package repo, never in the runner repo.
 
 ## Configuration
 
@@ -90,16 +88,15 @@ All project settings live in `senpai.yaml`:
 
 ```yaml
 problem_dir: target/
-repo_url: https://github.com/wandb/senpai.git
+repo_url: <runner-repo-url>
 repo_branch: main
 target_repo_url: https://github.com/morganmcg1/tandemfoil2.git
 advisor_branch: schmidhuber
 gh_history_scope: branch
-image: ghcr.io/wandb/senpai:latest
+image: <runner-image>
 pvc_claim_name: new-pvc
 pvc_mount_path: /mnt/new-pvc
-wandb_entity: wandb-applied-ai-team
-wandb_project: senpai-v1
+experiment_metrics: local-jsonl
 timeout_minutes: 30.0
 max_epochs: 50
 n_students: 4
@@ -137,19 +134,10 @@ GitHub token requirements: use a PAT with `repo` and `read:org`; it must clone `
 
 `--gh_history_scope branch` is the default: pods clone only the advisor branch while keeping that branch's history. Use `--gh_history_scope repo` to clone the full target repo, or `--gh_history_scope fresh` for a shallow single-branch clone. Use `--extra_instructions` for any agent-facing guidance about what history to use or ignore.
 
-### Shared cluster secret (`senpai-secrets`)
+### Experiment Metrics
 
-Every pod also reads `WANDB_API_KEY` from the shared `senpai-secrets` Secret:
-
-```bash
-# Create
-kubectl create secret generic senpai-secrets --from-literal=wandb-api-key="$WANDB_API_KEY"
-
-# Rotate
-kubectl patch secret senpai-secrets --type=merge -p "{\"stringData\":{\"wandb-api-key\":\"$WANDB_API_KEY\"}}"
-```
-
-`launch.py` does not preflight W&B; missing keys crash-loop pods.
+This branch is configured for local-only experiment metrics. Students should
+commit JSONL metric files and reference those paths in PR result comments.
 
 ## Running
 
@@ -159,7 +147,7 @@ git clone -b kagent_royal_rumble https://github.com/morganmcg1/tandemfoil2.git t
 
 # Train locally (inside the active problem package; copy exact flags from --help)
 cd target/ && python train.py --help
-cd target/ && python train.py --wandb_name "<name>/<description>"
+cd target/ && python train.py --experiment_name "<name>/<description>"
 
 # Deploy to k8s (reads defaults from senpai.yaml, only --tag is required)
 python k8s/launch.py --tag <research-tag> --advisor
