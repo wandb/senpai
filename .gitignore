@@ -48,5 +48,8 @@ experiment_log/
 advisor_logs/
 student_logs/
 
+# Claude worktrees
+.claude/worktrees/
+
 # Problem packages (brought by the user — cloned in at pod startup)
 target/*

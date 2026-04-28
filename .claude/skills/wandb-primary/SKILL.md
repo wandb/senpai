@@ -74,8 +74,11 @@ This skill covers everything an agent needs to work with Weights & Biases:
 ### Helper libraries
 
 ```python
+import os
 import sys
-sys.path.insert(0, "skills/wandb-primary/scripts")
+from pathlib import Path
+
+sys.path.insert(0, str(Path(os.environ["CLAUDE_SKILL_DIR"]) / "scripts"))
 
 # Weave helpers (traces, evals, GenAI)
 from weave_helpers import (

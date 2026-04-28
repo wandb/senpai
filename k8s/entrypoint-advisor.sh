@@ -69,8 +69,15 @@ fi
 LOGDIR="$WORKDIR/advisor_logs"
 mkdir -p "$LOGDIR"
 
+# --- Install checked-in Claude Code config into user scope ---
+mkdir -p "$HOME/.claude"
+cp -a "$WORKDIR/.claude/." "$HOME/.claude/"
+
+echo "=== Claude config installed ==="
+ls "$HOME/.claude/skills/wandb-primary/SKILL.md" "$HOME/.claude/agents/researcher-agent.md"
+
 # --- Start Hivemind logging service (streams CC session logs to hivemind.wandb.tools) ---
-mkdir -p ~/.claude/projects
+mkdir -p "$HOME/.claude/projects"
 uvx --from wandb-hivemind hivemind run &
 echo "=== Hivemind started (PID=$!) ==="
 
