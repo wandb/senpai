@@ -37,15 +37,15 @@
   \icmlsetsymbol{equal}{*}
 
   \begin{icmlauthorlist}
-    \icmlauthor{Thomas Capelle}{equal,wandb}
-    \icmlauthor{Morgan McGuire}{equal,wandb}
+    \icmlauthor{Thomas Capelle}{equal,local}
+    \icmlauthor{Morgan McGuire}{equal,local}
     \icmlauthor{Justin Hodges}{coreweave}
   \end{icmlauthorlist}
 
-  \icmlaffiliation{wandb}{Weights \& Biases, San Francisco, CA, USA}
+  \icmlaffiliation{local}{local experiment logging, San Francisco, CA, USA}
   \icmlaffiliation{coreweave}{CoreWeave, Roseland, NJ, USA}
-  \icmlcorrespondingauthor{Thomas Capelle}{tcapelle@wandb.com}
-  \icmlcorrespondingauthor{Morgan McGuire}{morgan@wandb.com}
+  \icmlcorrespondingauthor{Thomas Capelle}{tcapelle@local.com}
+  \icmlcorrespondingauthor{Morgan McGuire}{morgan@local.com}
   \icmlcorrespondingauthor{Justin Hodges}{jhodges@coreweave.com}
   \icmlkeywords{Autonomous research, CFD surrogates, ML systems, agent observability, AI for science}
 
@@ -66,13 +66,13 @@ In practice, adoption remains difficult for many small and mid-size engineering 
 
 Recent autonomous-research systems show that LLM agents can search literature, propose hypotheses, edit code, run experiments, and produce research reports. The AI Scientist generates ideas, implements experiments, writes papers, and runs automated review \citep{lu2024aiscientist,sakana2024aiscientist}; AI Scientist-v2 extends this with agentic tree search and workshop-level paper generation \citep{yamada2025aiscientistv2,sakana2025aiscientistv2}; Agent Laboratory structures literature review, experimentation, and report writing around a human-provided idea \citep{schmidgall2025agentlaboratory,schmidgall2025agentlaboratorycode}; and Jr. AI Scientist iteratively improves a baseline paper using modern coding agents \citep{miyai2026jraiscientist}. Other systems emphasize collaboration or external tooling: ResearchAgent generates and revises research ideas over scientific-literature graphs \citep{baek2024researchagent}, AgentRxiv lets agent laboratories upload and retrieve generated reports from a shared preprint server \citep{schmidgall2025agentrxiv}, ChemCrow and Coscientist connect LLM planners to chemistry tools and laboratory workflows \citep{bran2024chemcrow,boiko2023coscientist}, and FunSearch couples an LLM generator to a verifiable evaluator and scored program database \citep{romeraparedes2024funsearch}. These systems establish the value of tool use, execution, and persistent artifacts in autonomous research, but their state is typically organized as agent-owned files, generated papers, report stores, search populations, or conversation traces rather than as the ordinary audit trail of a multi-experiment ML research program.
 
-The closest recent systems to SENPAI also recognize that long-horizon agents need to store state outside model context, but they store that state in different substrates. Kosmos maintains internal structured memory of literature-search and data-analysis summaries to choose later tasks \citep{mitchener2025kosmos}; AiScientist uses a permission-scoped File-as-Bus workspace so agents re-ground on file-based analyses, plans, code, logs, and experimental evidence \citep{chen2026aiscientist}; and grounded autonomous research externalizes state as rerunnable simulation artifacts within a single-paper reproduction loop \citep{huang2026groundedautonomousresearch}. SENPAI takes a complementary systems position: the authoritative state is the substrate human ML teams already inspect, namely pull requests for code review and discussion \citep{githubdocs_pullrequests}, git history for ordered code provenance \citep{chacon2014progit}, and an experiment tracker for metrics, hyperparameters, system metrics, checkpoints, and agent traces \citep{biewald2020wandb,wandbdocs_experiments}.
+The closest recent systems to SENPAI also recognize that long-horizon agents need to store state outside model context, but they store that state in different substrates. Kosmos maintains internal structured memory of literature-search and data-analysis summaries to choose later tasks \citep{mitchener2025kosmos}; AiScientist uses a permission-scoped File-as-Bus workspace so agents re-ground on file-based analyses, plans, code, logs, and experimental evidence \citep{chen2026aiscientist}; and grounded autonomous research externalizes state as rerunnable simulation artifacts within a single-paper reproduction loop \citep{huang2026groundedautonomousresearch}. SENPAI takes a complementary systems position: the authoritative state is the substrate human ML teams already inspect, namely pull requests for code review and discussion \citep{githubdocs_pullrequests}, git history for ordered code provenance \citep{chacon2014progit}, and an experiment tracker for metrics, hyperparameters, system metrics, checkpoints, and agent traces \citep{biewald2020local,localdocs_experiments}.
 
-Long-running ML-engineering agents have also begun to appear outside the paper-generation setting. Hugging Face's \texttt{ml-intern} is an open-source agent that researches papers, writes ML code, launches training through the Hugging Face ecosystem, and maintains session history with auto-compaction and optional session upload \citep{huggingface2026mlintern}. Like AiScientist's File-as-Bus and AI Scientist-v2's tree and journal artifacts, this is durable agent state, but it is not a PR-indexed experiment ledger coupled to an experiment tracker. Reviewability depends on inspecting session traces or generated files rather than following the same pull-request, git-history, and W\&B substrate used by human ML teams.
+Long-running ML-engineering agents have also begun to appear outside the paper-generation setting. Hugging Face's \texttt{ml-intern} is an open-source agent that researches papers, writes ML code, launches training through the Hugging Face ecosystem, and maintains session history with auto-compaction and optional session upload \citep{huggingface2026mlintern}. Like AiScientist's File-as-Bus and AI Scientist-v2's tree and journal artifacts, this is durable agent state, but it is not a PR-indexed experiment ledger coupled to an experiment tracker. Reviewability depends on inspecting session traces or generated files rather than following the same pull-request, git-history, and local logs substrate used by human ML teams.
 
-SENPAI is deliberately thin. A new research-program branch is created; an Advisor reads the current experiment state from GitHub and W\&B, proposes a literature-grounded hypothesis as a pull request, and assigns it to one of $N$ GPU-backed Student agents. Each Student polls for its labeled PR, checks out the branch, modifies the training loop for the requested hypothesis, runs the experiment, and writes metrics, commands, W\&B links, and analysis back into the PR. The Advisor then merges the result, requests a revision, or closes the line of inquiry. Both roles can call a shared literature-search sub-agent. Humans remain in the loop through ordinary GitHub issues and PR comments. Scratchpad files are used as rough, noisy research logs, and the Advisor maintains a brief high-level research-state file, but ground-truth experiment state is externalized in PRs, git history, and W\&B runs. This queryable ground-truth state made the system more robust to drift in large scratchpad files, context compaction, restarts, and file loss, while leaving behind a durable experiment ledger as a by-product.
+SENPAI is deliberately thin. A new research-program branch is created; an Advisor reads the current experiment state from GitHub and local logs, proposes a literature-grounded hypothesis as a pull request, and assigns it to one of $N$ GPU-backed Student agents. Each Student polls for its labeled PR, checks out the branch, modifies the training loop for the requested hypothesis, runs the experiment, and writes metrics, commands, local logs links, and analysis back into the PR. The Advisor then merges the result, requests a revision, or closes the line of inquiry. Both roles can call a shared literature-search sub-agent. Humans remain in the loop through ordinary GitHub issues and PR comments. Scratchpad files are used as rough, noisy research logs, and the Advisor maintains a brief high-level research-state file, but ground-truth experiment state is externalized in PRs, git history, and local logs runs. This queryable ground-truth state made the system more robust to drift in large scratchpad files, context compaction, restarts, and file loss, while leaving behind a durable experiment ledger as a by-product.
 
-Over the course of the research programme, SENPAI created more than 2,700 pull requests and recorded more than 10,700 W\&B runs while deploying, at peak, 59 distinct Student agents.
+Over the course of the research programme, SENPAI created more than 2,700 pull requests and recorded more than 10,700 local logs runs while deploying, at peak, 59 distinct Student agents.
 
 \begin{table}[t]
   \caption{Scale of the SENPAI research program. Token counts are medians per pull request.}
@@ -85,7 +85,7 @@ Over the course of the research programme, SENPAI created more than 2,700 pull r
     \midrule
     Agent-generated PRs & 2,700+ \\
     PRs with at least one completed run & 2,300+ \\
-    W\&B runs recorded & 10,700+ \\
+    local logs runs recorded & 10,700+ \\
     Peak concurrent Student agents & 59 \\
     Peak concurrent training runs & 347 \\
     Merged run-bearing PR latency, median & 48 min \\
@@ -99,26 +99,26 @@ Over the course of the research programme, SENPAI created more than 2,700 pull r
 \end{table}
 
 \textbf{Observability harness contribution.}
-SENPAI contributes a new observability-first harness for semi-autonomous research. By grounding state in structured, queryable units of data---GitHub PRs, commits, and W\&B runs---we produce an experiment ledger that is both researcher- and agent-friendly. This structured logging enables the harness to reproducibly query past experiments, check the status of current experiments, identify idle resources, and expose successful and unsuccessful experiments to researchers through ordinary tools.
+SENPAI contributes a new observability-first harness for semi-autonomous research. By grounding state in structured, queryable units of data---GitHub PRs, commits, and local logs runs---we produce an experiment ledger that is both researcher- and agent-friendly. This structured logging enables the harness to reproducibly query past experiments, check the status of current experiments, identify idle resources, and expose successful and unsuccessful experiments to researchers through ordinary tools.
 
 \textbf{Physical-AI contribution.}
 SENPAI autonomously improves multiple CFD surrogate benchmarks starting from a basic Transolver model. Under the directly comparable aggregate AirfRANS full-regime surface-MSE protocol, SENPAI generated the lowest surface error we found (0.0030 best run; 0.0062 three-seed mean), although volume-MSE remains higher than the strongest reported volume results at 0.00764 versus 0.0017 for SpiderSolver \citep{qi2025spidersolver}. On DrivAerML, surface-pressure relative-$L_2$ reaches 4.62\% on validation and 6.24\% on test, improving the validation-side Transolver-family band while still trailing Transolver++, AB-UPT, and Transolver-3 \citep{alkin2025abupt,zhou2026transolver3}. On TandemFoilSet, SENPAI reaches normalized full-field test MSE near the paper's best Experiment-4 range on one preliminary paper-contract split, and reaches 24.58 denormalized surface-pressure MAE on the TandemFoilSet-Balanced parity contract \citep{lim2026tandemfoilset,mcguire2026tandemfoilsetbalanced}.
 
 \textbf{Failure-mode taxonomy.}
-SENPAI also contributes an empirical failure-mode analysis of long-running agentic ML research systems. Because every agent trajectory, tool call, PR transition, W\&B run, monitor event, and context compaction was logged, we can audit the system as an experimental object rather than describe failures anecdotally. We audit a 24-hour fleet trace containing 53,022 model requests and 5.24B tokens across one Advisor and 57 token-emitting Student agents. The dominant failure case was monitor-driven context bloat: 28,247 model-facing monitor events consumed 3.25B cache-inclusive tokens. Tool-use errors accounted for 892 of 25,365 tool uses (3.5\%), and routine Student coordination checks were a small part of total workload at 3.8\% of usage records. These measurements motivate bounded monitoring, durable external state, and executable handoff protocols more than additional prompt prose.
+SENPAI also contributes an empirical failure-mode analysis of long-running agentic ML research systems. Because every agent trajectory, tool call, PR transition, local logs run, monitor event, and context compaction was logged, we can audit the system as an experimental object rather than describe failures anecdotally. We audit a 24-hour fleet trace containing 53,022 model requests and 5.24B tokens across one Advisor and 57 token-emitting Student agents. The dominant failure case was monitor-driven context bloat: 28,247 model-facing monitor events consumed 3.25B cache-inclusive tokens. Tool-use errors accounted for 892 of 25,365 tool uses (3.5\%), and routine Student coordination checks were a small part of total workload at 3.8\% of usage records. These measurements motivate bounded monitoring, durable external state, and executable handoff protocols more than additional prompt prose.
 
 \section{Methodology: System Design}
 
-State lives in pull requests and W\&B runs, not in agent memory or scratchpad files. Every other design choice follows from this constraint.
+State lives in pull requests and local logs runs, not in agent memory or scratchpad files. Every other design choice follows from this constraint.
 
 \begin{figure*}[t]
   \centering
   \includegraphics[width=0.78\textwidth]{section2_image.png}
-  \caption{SENPAI deployment architecture. A thin harness deploys one Advisor and $N$ Student pods; both roles can call a shared researcher agent. Program state lives outside the cluster in the experiment ledger: GitHub PRs, git history, and W\&B runs.}
+  \caption{SENPAI deployment architecture. A thin harness deploys one Advisor and $N$ Student pods; both roles can call a shared researcher agent. Program state lives outside the cluster in the experiment ledger: GitHub PRs, git history, and local logs runs.}
   \label{fig:architecture}
 \end{figure*}
 
-SENPAI organizes semi-autonomous CFD-surrogate research around artifacts human ML teams already produce---pull requests, git commits, and experiment-tracker runs---and two agent roles that read and write them (\cref{fig:architecture}). An Advisor runs a research sub-agent and proposes hypotheses by opening draft PRs; one of $N$ Students claims each PR, implements the hypothesis, runs training, and writes results back as PR comments linked to W\&B runs. A hypothesis's full trajectory---intent, metrics, and review---is therefore a standard GitHub PR log rather than an agent-internal trace. The rest of this section describes the research loop, the ledger, the harness loop, and the human-in-the-loop channels. Role prompts, the literature sub-agent design, the skill catalogue, and the Advisor's hypothesis-selection and merge rules are deferred to Appendix A.
+SENPAI organizes semi-autonomous CFD-surrogate research around artifacts human ML teams already produce---pull requests, git commits, and experiment-tracker runs---and two agent roles that read and write them (\cref{fig:architecture}). An Advisor runs a research sub-agent and proposes hypotheses by opening draft PRs; one of $N$ Students claims each PR, implements the hypothesis, runs training, and writes results back as PR comments linked to local logs runs. A hypothesis's full trajectory---intent, metrics, and review---is therefore a standard GitHub PR log rather than an agent-internal trace. The rest of this section describes the research loop, the ledger, the harness loop, and the human-in-the-loop channels. Role prompts, the literature sub-agent design, the skill catalogue, and the Advisor's hypothesis-selection and merge rules are deferred to Appendix A.
 
 \subsection{SENPAI's Research Loop}
 
@@ -126,17 +126,17 @@ Each experiment follows the same compact ledger-driven lifecycle:
 \begin{description}[leftmargin=4.8em,labelwidth=4.3em,labelsep=0.5em,itemsep=0.15ex,topsep=0.5ex,parsep=0pt]
   \item[Research] Advisor decides whether to run the research sub-agent for the next batch of experiments.
   \item[Assign] Advisor drafts a PR with a hypothesis, exact training-code guidance, metrics to improve, and a Student label.
-  \item[Run] Student polls for assigned PRs, checks out the PR branch, implements changes, and launches W\&B-logged training.
-  \item[Report] Student posts experiment results, W\&B run ID, code changes, and analysis, then marks the PR ready for review.
+  \item[Run] Student polls for assigned PRs, checks out the PR branch, implements changes, and launches local logs-logged training.
+  \item[Report] Student posts experiment results, local logs run ID, code changes, and analysis, then marks the PR ready for review.
   \item[Review] Advisor polls review-ready PRs and merges, requests follow-up work, or closes the inquiry.
   \item[Advance] If a PR is merged, Advisor updates the baseline against which subsequent PRs are compared.
 \end{description}
 
 \subsection{The Experiment Ledger: Pull Requests and Experiment Logger}
 
-Every experiment is a pull request plus a set of W\&B logs. The PR body holds the hypothesis, experiment instructions, and baseline metrics to improve upon; the comment thread carries Student results and Advisor review notes. W\&B carries the quantitative side: each run documents the training config, result metric, scalar curves, system metrics, checkpoints, and, when enabled, agent traces. The two systems together form an observable experiment ledger: researcher-inspectable through familiar GitHub and W\&B interfaces, and machine-queryable through mature CLIs.
+Every experiment is a pull request plus a set of local logs logs. The PR body holds the hypothesis, experiment instructions, and baseline metrics to improve upon; the comment thread carries Student results and Advisor review notes. local logs carries the quantitative side: each run documents the training config, result metric, scalar curves, system metrics, checkpoints, and, when enabled, agent traces. The two systems together form an observable experiment ledger: researcher-inspectable through familiar GitHub and local logs interfaces, and machine-queryable through mature CLIs.
 
-This design lowers the barrier for researchers to understand a system that can produce hundreds or thousands of experiments during a research program. Researchers can inspect an individual PR to understand the hypothesis and code diff, then open the associated W\&B run to inspect configs, curves, and checkpoints. Researchers' own agents can also query the same ledger to generate aggregate reports, detect stale branches, summarize failed lines of inquiry, and identify idle resources. Because the ledger is structured and external, pod restarts, context compactions, and fresh-container boots are less harmful: the next agent cycle can reconstruct the experiment state from PRs, git history, and W\&B rather than trusting local scratchpads.
+This design lowers the barrier for researchers to understand a system that can produce hundreds or thousands of experiments during a research program. Researchers can inspect an individual PR to understand the hypothesis and code diff, then open the associated local logs run to inspect configs, curves, and checkpoints. Researchers' own agents can also query the same ledger to generate aggregate reports, detect stale branches, summarize failed lines of inquiry, and identify idle resources. Because the ledger is structured and external, pod restarts, context compactions, and fresh-container boots are less harmful: the next agent cycle can reconstruct the experiment state from PRs, git history, and local logs rather than trusting local scratchpads.
 
 In contrast to AgentRxiv \citep{schmidgall2025agentrxiv}, which shares papers between agents, SENPAI shares experiments within an existing code-review substrate. In addition to the core experiment ledger, the Advisor keeps a small set of focus-aid markdown files for research-state summaries, baseline tracking, experiment scratchpads, and dataset notes. These files are caches, not authoritative state. Earlier harness iterations treated them as durable, which produced silent drift when summaries disagreed with the ledger.
 
@@ -202,7 +202,7 @@ To demonstrate SENPAI's CFD performance across multiple benchmarks, we train and
 
 \subsection{AirfRANS: Surface-MSE Below Published Transolver}
 
-The official AirfRANS \texttt{full} task benchmark is defined on the pair of surface-MSE and volume-MSE evaluated on train-statistic-normalized targets \citep{bonnet2022airfrans}. Our best configuration achieves surface-MSE $=0.003$ (W\&B run \texttt{3e0ce368}, PR \#2824), an improvement over the strongest published surface reference in this comparison set, SpiderSolver at 0.0043 \citep{qi2025spidersolver}. Volume-MSE on the same run is 0.00764, roughly $4.5\times$ SpiderSolver's 0.0017. We therefore report a surface result competitive with published references and do not claim a full-benchmark win; closing the volume gap is open work.
+The official AirfRANS \texttt{full} task benchmark is defined on the pair of surface-MSE and volume-MSE evaluated on train-statistic-normalized targets \citep{bonnet2022airfrans}. Our best configuration achieves surface-MSE $=0.003$ (local logs run \texttt{3e0ce368}, PR \#2824), an improvement over the strongest published surface reference in this comparison set, SpiderSolver at 0.0043 \citep{qi2025spidersolver}. Volume-MSE on the same run is 0.00764, roughly $4.5\times$ SpiderSolver's 0.0017. We therefore report a surface result competitive with published references and do not claim a full-benchmark win; closing the volume gap is open work.
 
 Across three independent seeds (PR \#2831), surface-MSE was $0.00333 / 0.00668 / 0.00857$ (mean $0.0062$), and volume-MSE was $0.00886 / 0.00901 / 0.01709$ (mean $0.0117$). The best seed beats SpiderSolver on surface error; the mean seed does not. Seed-level volume remains above all published references in \cref{tab:airfrans}.
 
@@ -265,11 +265,11 @@ Our best-checkpoint numbers on the public split are validation $=4.62\%$ and tes
 \end{table}
 
 \paragraph{Deferred artifact figure.}
-Figure 2, deferred to Appendix E, should reproduce a real SENPAI artifact: an anonymized PR conversation showing the Advisor hypothesis, Student result comment with best-checkpoint metrics, and Advisor merge decision, paired with a W\&B panel showing a surface-MSE curve annotated with PR-ledger events. This substantiates the paper's queryable-ledger claim.
+Figure 2, deferred to Appendix E, should reproduce a real SENPAI artifact: an anonymized PR conversation showing the Advisor hypothesis, Student result comment with best-checkpoint metrics, and Advisor merge decision, paired with a local logs panel showing a surface-MSE curve annotated with PR-ledger events. This substantiates the paper's queryable-ledger claim.
 
 \section{Discussion}
 
-\subsection{What the PR+W\&B Grounding Bought Us}
+\subsection{What the PR+local logs Grounding Bought Us}
 
 \begin{itemize}[leftmargin=*]
   \item \textbf{Lossless session boundaries.} Crashed pods, context-limit compactions, and preempted Students all resumed by re-reading PR state on the next cycle.
@@ -279,9 +279,9 @@ Figure 2, deferred to Appendix E, should reproduce a real SENPAI artifact: an an
 
 \subsection{Observable State as a Control Surface}
 
-The PR and W\&B ledger made SENPAI useful as a research assistant rather than just an autonomous executor. By placing the core experiment ledger in systems already used by ML teams, the harness kept researchers close to the work without requiring them to supervise every experiment. Agents could run large numbers of experiments independently while researchers could still see, question, and redirect the broader research program through the tools they use daily.
+The PR and local logs ledger made SENPAI useful as a research assistant rather than just an autonomous executor. By placing the core experiment ledger in systems already used by ML teams, the harness kept researchers close to the work without requiring them to supervise every experiment. Agents could run large numbers of experiments independently while researchers could still see, question, and redirect the broader research program through the tools they use daily.
 
-This externalized state also reduced the fragility of this long-running system. When agents compacted, restarted, or lost local scratchpad context, the next cycle could reconstruct the experiment from the PR, git history, and W\&B runs.
+This externalized state also reduced the fragility of this long-running system. When agents compacted, restarted, or lost local scratchpad context, the next cycle could reconstruct the experiment from the PR, git history, and local logs runs.
 
 Finally, the ledger turned a collection of individual experiments into a queryable research programme. Both researchers and agents could ask what had been tried, which failures were meaningful, which recipes transferred, and where progress had stalled. In this sense, SENPAI's core contribution is not replacing the researcher, but increasing the bandwidth at which researchers can understand, guide, and accelerate autonomous experimentation.
 
@@ -310,19 +310,19 @@ Your objective is to top the leaderboard. If you are stuck with a low scoring so
   \end{tabular}
 \end{table}
 
-On the same TandemFoilSet parity target, an eight-agent Opus 4.7 \texttt{kagent} cohort ran for 12 hours on the same dataset, split family, and primary metric as the SENPAI result in Section 3.2.2b. In that 12-hour head-to-head, \texttt{kagent} landed lower in absolute MAE, while SENPAI's multi-week PR-mediated anchor on the same benchmark remained lower at 24.58 MAE. The \texttt{kagent} winner scored 34.41 average surface-pressure MAE, a $3.5\times$ improvement over the Transolver starter. The decisive recipe---full-mesh training with small batch size, warm-started from a subsample-trained checkpoint---was independently rediscovered by three of the top four agents within a short window after leaderboard commits exposed it. The run artifacts are the \href{https://github.com/tcapelle/kagent/blob/6cfac55a619f3230a8549df3faabd058e2b402b6/leaderboard.md}{SHA-pinned leaderboard}, the \href{https://wandb.ai/wandb-applied-ai-team/kagent-tandemfoil}{W\&B project}, and the \href{https://github.com/tcapelle/kagent}{\texttt{tcapelle/kagent} repository}. The qualitative trade-off---review gating and indexed-into-the-ledger retrospection versus raw peer-diffusion speed---is the subject of Appendix G.1.
+On the same TandemFoilSet parity target, an eight-agent Opus 4.7 \texttt{kagent} cohort ran for 12 hours on the same dataset, split family, and primary metric as the SENPAI result in Section 3.2.2b. In that 12-hour head-to-head, \texttt{kagent} landed lower in absolute MAE, while SENPAI's multi-week PR-mediated anchor on the same benchmark remained lower at 24.58 MAE. The \texttt{kagent} winner scored 34.41 average surface-pressure MAE, a $3.5\times$ improvement over the Transolver starter. The decisive recipe---full-mesh training with small batch size, warm-started from a subsample-trained checkpoint---was independently rediscovered by three of the top four agents within a short window after leaderboard commits exposed it. The run artifacts are the \href{https://github.com/tcapelle/kagent/blob/6cfac55a619f3230a8549df3faabd058e2b402b6/leaderboard.md}{SHA-pinned leaderboard}, the \href{https://local.ai/local-applied-ai-team/kagent-tandemfoil}{local logs project}, and the \href{https://github.com/tcapelle/kagent}{\texttt{tcapelle/kagent} repository}. The qualitative trade-off---review gating and indexed-into-the-ledger retrospection versus raw peer-diffusion speed---is the subject of Appendix G.1.
 
 \subsection{Failure Modes: Where Long-Running Research Agents Break}
 
-The recurring problems SENPAI encountered were harness-engineering problems---monitoring long-running jobs, recovering across compaction or restart, enforcing brittle tool interfaces, and keeping PR and W\&B state consistent---not primarily failures of experimental reasoning.
+The recurring problems SENPAI encountered were harness-engineering problems---monitoring long-running jobs, recovering across compaction or restart, enforcing brittle tool interfaces, and keeping PR and local logs state consistent---not primarily failures of experimental reasoning.
 
 \textbf{Monitor-driven context bloat.} Students monitored training logs for progress, errors, checkpoint detection, and completion. Persistent log monitors caused small events to resume full long-lived agent sessions. In a 24-hour fleet trace, 615 Student monitor setups produced 28,247 model-facing monitor events and 28,246 direct model responses, consuming 3.25B cache-inclusive tokens. The median response reloaded roughly 110k cached tokens while adding only 347 uncached input tokens. Training logs should therefore be reduced by low-context processes that escalate only decision-relevant events: new-best checkpoints, milestones, errors, completion, or timeout.
 
 \textbf{Tool-interface errors.} Tool-use errors accounted for 892 of 25,365 tool uses, or 3.5\%. The main causes were failed shell commands, GitHub scope errors, blocked wait patterns, wrong paths, failed pushes, oversized reads, and edit guards. A broader scan found 2,156 failure-like tool results, or 8.5\%, but many were training outcomes such as NaNs, out-of-memory failures, tracebacks, killed jobs, or divergent metrics. Failed runs can be scientific evidence if metrics and logs are captured; failed control actions require narrower, idempotent tool contracts.
 
-\textbf{Compaction boundaries.} The trace contained 240 automatic compactions, with main Student contexts reduced from roughly 196k tokens to 3k-token continuation summaries. These summaries were sufficient for resumption but unsafe as ground truth. Decisions had to be revalidated against PR labels, PR comments, W\&B configuration, W\&B history, and live run state.
+\textbf{Compaction boundaries.} The trace contained 240 automatic compactions, with main Student contexts reduced from roughly 196k tokens to 3k-token continuation summaries. These summaries were sufficient for resumption but unsafe as ground truth. Decisions had to be revalidated against PR labels, PR comments, local logs configuration, local logs history, and live run state.
 
-The ledger mitigated these failures. Among 39 Student sessions with final-like monitor signals, 38 had explicit PR-comment result evidence and 33 had ready or review-status handoff evidence. Even when sessions compacted, restarted, or delegated work, experiments usually survived as inspectable PR/W\&B artifacts.
+The ledger mitigated these failures. Among 39 Student sessions with final-like monitor signals, 38 had explicit PR-comment result evidence and 33 had ready or review-status handoff evidence. Even when sessions compacted, restarted, or delegated work, experiments usually survived as inspectable PR/local logs artifacts.
 
 The lesson is that long-running research agents need observable infrastructure more than additional prompt prose. Monitor bloat requires bounded observation; tool errors require executable helpers; training failures require mandatory result and checkpoint capture; state drift requires a single authoritative ledger, with summaries treated as caches. SENPAI did not eliminate failure, but it made failure measurable, attributable, and repairable.
 
@@ -387,7 +387,7 @@ SENPAI's role prompts call a small catalogue of composable skills:
 
 \subsection{AirfRANS}
 
-For paper-facing AirfRANS claims, the safe comparison contract is the official normalized-target surface-MSE plus volume-MSE on the official test split. A surface-only score is insufficient for a full AirfRANS benchmark win. The relevant comparator chain is Transolver, GeoANF, and SpiderSolver. The full appendix table should include AirfRANS frontier rows with surface and volume MSE plus W\&B run IDs.
+For paper-facing AirfRANS claims, the safe comparison contract is the official normalized-target surface-MSE plus volume-MSE on the official test split. A surface-only score is insufficient for a full AirfRANS benchmark win. The relevant comparator chain is Transolver, GeoANF, and SpiderSolver. The full appendix table should include AirfRANS frontier rows with surface and volume MSE plus local logs run IDs.
 
 \subsection{TandemFoilSet}
 
@@ -410,25 +410,25 @@ The DrivAerML result is surface-first. The split and metric are comparable to AB
     Monitor bloat & Log tails, checkpoint probes, repeated progress notifications entering full agent context & Low-context reducers; escalate only milestones, new-best checkpoints, terminal errors, completion, and timeout \\
     Tool contract failures & GitHub scope errors, wrong paths, blocked waits, failed pushes, oversized reads, missing branch preconditions & Narrow executable helpers; idempotent operations; explicit status transitions \\
     Training failures & NaNs, OOMs, killed jobs, divergent metrics, missing checkpoints & Treat as scientific evidence if metrics/logs are captured; require best-checkpoint save and PR comment \\
-    State drift & Scratchpad summaries disagreeing with PR/W\&B state after compaction or restart & Treat summaries as caches; revalidate against PR labels, comments, W\&B configs, and run history \\
+    State drift & Scratchpad summaries disagreeing with PR/local logs state after compaction or restart & Treat summaries as caches; revalidate against PR labels, comments, local logs configs, and run history \\
     \bottomrule
   \end{tabular}
 \end{table*}
 
 \section{Experiment Ledger Sample}
 
-The released CSV schema records PR number, title, status, Student label, W\&B run IDs, primary metric name and value, baseline delta, era tag, merge-decision timestamp, and related metadata. This schema is intentionally close to the data already present in GitHub and W\&B so that no separate database is required for basic retrospection.
+The released CSV schema records PR number, title, status, Student label, local logs run IDs, primary metric name and value, baseline delta, era tag, merge-decision timestamp, and related metadata. This schema is intentionally close to the data already present in GitHub and local logs so that no separate database is required for basic retrospection.
 
 \section{Real SENPAI Artifact}
 
-A redacted artifact figure should include a PR conversation on top and a W\&B panel on the bottom. The PR side should show the Advisor hypothesis body, Student result comment with best-checkpoint metrics, and Advisor merge decision. The W\&B side should show a metric curve annotated with PR-ledger events. This figure substantiates the abstract's queryable-ledger claim.
+A redacted artifact figure should include a PR conversation on top and a local logs panel on the bottom. The PR side should show the Advisor hypothesis body, Student result comment with best-checkpoint metrics, and Advisor merge decision. The local logs side should show a metric curve annotated with PR-ledger events. This figure substantiates the abstract's queryable-ledger claim.
 
 \section{Sprint Evidence Log}
 
 The sprint evidence package consists of four artifact classes:
 \begin{itemize}[leftmargin=*]
   \item \texttt{fetch\_experiments.py} snapshots at the beginning and end of the window, showing run-count deltas.
-  \item Per-benchmark W\&B run panels from the window.
+  \item Per-benchmark local logs run panels from the window.
   \item \texttt{git log --oneline} on the Advisor branch, restricted to the sprint window.
   \item Two urgent-labeled GitHub issues with timestamps and Advisor actions.
 \end{itemize}
@@ -439,7 +439,7 @@ The sprint evidence package consists of four artifact classes:
 
 An eight-agent \texttt{kagent} cohort ran on the TandemFoilSet parity benchmark of Section 3.2.2b for roughly 12 hours without human intervention. The run used the same dataset, same public \texttt{kagent} v2 split family, and same primary metric: denormalized pressure-channel surface MAE averaged over \texttt{single\_in\_dist}, \texttt{geom\_camber\_rc}, \texttt{geom\_camber\_cruise}, and \texttt{re\_rand}. Each agent received a single GPU pod, a 30-minute-per-training-run budget, and the Transolver starter. Total activity was 330 agent commits and 223 scored leaderboard updates from the organiser.
 
-Agents and organiser communicate through three channels only: a shared volume for data, predictions, and logs; the git remote for code and leaderboard state; and a \href{https://wandb.ai/wandb-applied-ai-team/kagent-tandemfoil}{W\&B project} for telemetry. There is no network path between agents, and each agent sees only its own competition-facing working directory. The organiser area holding ground truth and scoring code is invisible from inside an agent pod; scoring is the only privileged operation in the system.
+Agents and organiser communicate through three channels only: a shared volume for data, predictions, and logs; the git remote for code and leaderboard state; and a \href{https://local.ai/local-applied-ai-team/kagent-tandemfoil}{local logs project} for telemetry. There is no network path between agents, and each agent sees only its own competition-facing working directory. The organiser area holding ground truth and scoring code is invisible from inside an agent pod; scoring is the only privileged operation in the system.
 
 \begin{table*}[h]
   \caption{Final \texttt{kagent} TandemFoilSet parity leaderboard. Lower is better.}
@@ -467,7 +467,7 @@ Two secondary findings were robust. First, ensembles from the same warm-start li
 
 The scorer-race incident is a sibling failure mode to SENPAI's checkpoint-contract failures. \texttt{predict.py} writes the four \texttt{test\_*.pt} files sequentially; the organiser's scorer stamped commit directories with a missing file as \texttt{incomplete}, and the ``already scored'' check then treated \texttt{incomplete} as terminal even once all files were present. Every agent accumulated at least one incomplete entry; at least one agent diagnosed the bug and submitted a fresh commit hash instead of chasing the infrastructure issue. The infrastructure fix is to re-score incomplete entries whose files are now all present.
 
-Core artifacts for this run are the \href{https://github.com/tcapelle/kagent/blob/apr23-leaderboard/leaderboard.md}{live leaderboard branch}, the \href{https://github.com/tcapelle/kagent/blob/6cfac55a619f3230a8549df3faabd058e2b402b6/leaderboard.md}{SHA-pinned leaderboard}, the \href{https://github.com/tcapelle/kagent/tree/apr23-leaderboard}{leaderboard tree}, the \href{https://github.com/tcapelle/kagent/tree/apr23/kaggler}{per-agent branches}, the \href{https://github.com/tcapelle/kagent/blob/cdfa5d78e04aa2b6977e3d5ab8a8f4d1c0dfcc91/tandemfoil-competition/kaggler/EXPERIMENT_JOURNAL.md}{winning Frieren journal}, and the \href{https://wandb.ai/wandb-applied-ai-team/kagent-tandemfoil}{W\&B project}.
+Core artifacts for this run are the \href{https://github.com/tcapelle/kagent/blob/apr23-leaderboard/leaderboard.md}{live leaderboard branch}, the \href{https://github.com/tcapelle/kagent/blob/6cfac55a619f3230a8549df3faabd058e2b402b6/leaderboard.md}{SHA-pinned leaderboard}, the \href{https://github.com/tcapelle/kagent/tree/apr23-leaderboard}{leaderboard tree}, the \href{https://github.com/tcapelle/kagent/tree/apr23/kaggler}{per-agent branches}, the \href{https://github.com/tcapelle/kagent/blob/cdfa5d78e04aa2b6977e3d5ab8a8f4d1c0dfcc91/tandemfoil-competition/kaggler/EXPERIMENT_JOURNAL.md}{winning Frieren journal}, and the \href{https://local.ai/local-applied-ai-team/kagent-tandemfoil}{local logs project}.
 
 \subsection{GRaM ICLR 2026 Open-Competition Run}
 

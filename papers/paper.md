@@ -1,7 +1,7 @@
 SENPAI: Self-ExperimentatioN for Physical AI - an observability-based research harness
 
 
-SENPAI (Self-Experimentation for Physical AI) is an observability-first research harness in which multi-agent state is grounded in pull requests and structured experiment logs rather than agent memory and scratchpads. Training CFD surrogates encompasses standard ML training considerations - architecture, optimizer, schedule, and loss design - but also physics-aware considerations such as boundary conditions, symmetries, and rollout stability. The harness orchestration is deliberately thin: an Advisor agent proposes hypotheses as GitHub pull requests; Student agents check out each PR, execute training based on the hypothesis, and write results back to the PR. Every hypothesis is grounded by a literature-search sub-agent callable by the advisor or student. A key contribution is the observability-first memory and orchestration that goes beyond scratchpad files and in-context memory; SENPAI also grounds state in the artifacts ML researchers already use - PRs, git history, and an experiment logger (Weights & Biases) - producing an experiment ledger queryable by agents, researchers, and the harness itself. This design enables the system to learn from past experiments, reflect on its own trajectories, and keeps humans meaningfully in the research loop - properties that are difficult to achieve simultaneously in prior agentic research systems. We run SENPAI on a Transolver model jointly across three aerodynamic benchmarks: TandemFoilSet, AirfRANS, and DrivAerML. On the AirfRANS benchmark the final recipe outperforms the reported Transolver baseline on surface-MSE; on TandemFoilSet dataset it is competitive with the normalized full-field MSE reported in the TandemFoilSet paper benchmark.; on DrivAerML, preliminary runs show surface pressure relative-L2 nearing reported Large Eddy Simulation (LES) references for the Transolver model. Taken together, our results demonstrate that AI scientists function best as near-autonomous co-workers that can run up to 72 hours unsupervised, with only minor course corrections required after these durations. We release the harness, the PR-indexed experiment ledger, and a failure-mode analysis. 
+SENPAI (Self-Experimentation for Physical AI) is an observability-first research harness in which multi-agent state is grounded in pull requests and structured experiment logs rather than agent memory and scratchpads. Training CFD surrogates encompasses standard ML training considerations - architecture, optimizer, schedule, and loss design - but also physics-aware considerations such as boundary conditions, symmetries, and rollout stability. The harness orchestration is deliberately thin: an Advisor agent proposes hypotheses as GitHub pull requests; Student agents check out each PR, execute training based on the hypothesis, and write results back to the PR. Every hypothesis is grounded by a literature-search sub-agent callable by the advisor or student. A key contribution is the observability-first memory and orchestration that goes beyond scratchpad files and in-context memory; SENPAI also grounds state in the artifacts ML researchers already use - PRs, git history, and an experiment logger (local experiment logging) - producing an experiment ledger queryable by agents, researchers, and the harness itself. This design enables the system to learn from past experiments, reflect on its own trajectories, and keeps humans meaningfully in the research loop - properties that are difficult to achieve simultaneously in prior agentic research systems. We run SENPAI on a Transolver model jointly across three aerodynamic benchmarks: TandemFoilSet, AirfRANS, and DrivAerML. On the AirfRANS benchmark the final recipe outperforms the reported Transolver baseline on surface-MSE; on TandemFoilSet dataset it is competitive with the normalized full-field MSE reported in the TandemFoilSet paper benchmark.; on DrivAerML, preliminary runs show surface pressure relative-L2 nearing reported Large Eddy Simulation (LES) references for the Transolver model. Taken together, our results demonstrate that AI scientists function best as near-autonomous co-workers that can run up to 72 hours unsupervised, with only minor course corrections required after these durations. We release the harness, the PR-indexed experiment ledger, and a failure-mode analysis.
 
 
 —--------------------
@@ -15,11 +15,11 @@ In practice, adoption remains difficult for many small/mid-size engineering orga
 
 Recent autonomous-research systems show that LLM agents can search literature, propose hypotheses, edit code, run experiments, and produce research reports: The AI Scientist generates ideas, implements experiments, writes papers, and runs automated review [Lu et al., 2024; SakanaAI/AI-Scientist], AI Scientist-v2 extends this with agentic tree search and workshop-level paper generation [Yamada et al., 2025; SakanaAI/AI-Scientist-v2], Agent Laboratory structures literature review, experimentation, and report writing around a human-provided idea [Schmidgall et al., 2025; AgentLaboratory], and Jr. AI Scientist iteratively improves a baseline paper using modern coding agents [Miyai et al., 2026]. Other systems emphasize collaboration or external tooling: ResearchAgent generates and revises research ideas over scientific-literature graphs [Baek et al., 2025], AgentRxiv lets agent laboratories upload and retrieve generated reports from a shared preprint server [Schmidgall & Moor, 2025], ChemCrow and Coscientist connect LLM planners to chemistry tools, web/documentation search, code execution, and automated or robotic laboratory workflows [Bran et al., 2024; Boiko et al., 2023], and FunSearch couples an LLM generator to a verifiable evaluator and a scored program database [Romera-Paredes et al., 2024]. These systems establish the value of tool use, execution, and persistent artifacts in autonomous research, but their state is typically organized as agent-owned files, generated papers, report stores, search populations, or conversation/workflow traces rather than as the ordinary audit trail of a multi-experiment ML research programme.
 
-The closest recent systems to SENPAI also recognize that long-horizon agents need to store state outside the model context, but they store that state in different substrates: Kosmos maintains an internal structured memory of literature-search and data-analysis summaries to choose later tasks, and cites final report claims with papers or generated Jupyter notebooks [Mitchener et al., 2025]; AiScientist uses a permission-scoped File-as-Bus workspace so agents re-ground on file-based analyses, plans, code, logs, and experimental evidence [Chen et al., 2026]; and grounded autonomous research externalizes state as rerunnable simulation artifacts and comparison results within a single-paper reproduction loop [Huang, 2026]. SENPAI takes a complementary systems position: the authoritative state is the substrate human ML teams already inspect, namely pull requests for code review and discussion [GitHub Docs, 2026], git history for ordered code provenance [Chacon & Straub, 2014], and an experiment logger (W&B) for runs for metrics, hyperparameters, system metrics, and checkpoints [Biewald, 2020; Weights & Biases, 2026]. This makes each hypothesis, code diff, training result, review decision, failed run, and baseline update both machine-queryable and human-reviewable through standard tools, rather than hidden inside agent memory or an agent-specific workspace.
+The closest recent systems to SENPAI also recognize that long-horizon agents need to store state outside the model context, but they store that state in different substrates: Kosmos maintains an internal structured memory of literature-search and data-analysis summaries to choose later tasks, and cites final report claims with papers or generated Jupyter notebooks [Mitchener et al., 2025]; AiScientist uses a permission-scoped File-as-Bus workspace so agents re-ground on file-based analyses, plans, code, logs, and experimental evidence [Chen et al., 2026]; and grounded autonomous research externalizes state as rerunnable simulation artifacts and comparison results within a single-paper reproduction loop [Huang, 2026]. SENPAI takes a complementary systems position: the authoritative state is the substrate human ML teams already inspect, namely pull requests for code review and discussion [GitHub Docs, 2026], git history for ordered code provenance [Chacon & Straub, 2014], and an experiment logger (local logs) for runs for metrics, hyperparameters, system metrics, and checkpoints [Biewald, 2020; local experiment logging, 2026]. This makes each hypothesis, code diff, training result, review decision, failed run, and baseline update both machine-queryable and human-reviewable through standard tools, rather than hidden inside agent memory or an agent-specific workspace.
 
-SENPAI is a deliberately thin research loop: a new research program git branch is first created, then a lightweight advisor agent reads the current experiment state from git (GitHub) and the experiment logger (Weights & Biases), proposes a literature-grounded hypothesis as a pull request, and assigns it to one of N GPU-backed student agents, with the students name as a label. Each student polls for its labeled PR, checks out the branch, modifies the training loop for the requested hypothesis, runs the experiment, and writes metrics, commands used, and analysis back into the PR as a comment. The student marks the PR as ready for review after which the advisor either merges the result, requests a revision, or closes the line of inquiry. Both roles can call a shared literature-search sub-agent to ground hypotheses and implementation choices, while humans stay in the loop through monitoring past and current experiments via GitHub PRs. If the advisor needs steering, a GitHub issue is opened and the advisor is tagged with a label. Scratchpad files are utilised as rough noisy and research logs and a brief, high-level research state file is maintained by the advisor. Ground-truth experiment state is externalized in PRs, git history, and W&B runs. This queryable ground-truth state has been found to make the system more robust to drift while updating large local scratchpad files, agent context compaction and file-loss due to restarts, and leaves behind a durable experiment ledger as a by-product.
+SENPAI is a deliberately thin research loop: a new research program git branch is first created, then a lightweight advisor agent reads the current experiment state from git (GitHub) and the experiment logger (local experiment logging), proposes a literature-grounded hypothesis as a pull request, and assigns it to one of N GPU-backed student agents, with the students name as a label. Each student polls for its labeled PR, checks out the branch, modifies the training loop for the requested hypothesis, runs the experiment, and writes metrics, commands used, and analysis back into the PR as a comment. The student marks the PR as ready for review after which the advisor either merges the result, requests a revision, or closes the line of inquiry. Both roles can call a shared literature-search sub-agent to ground hypotheses and implementation choices, while humans stay in the loop through monitoring past and current experiments via GitHub PRs. If the advisor needs steering, a GitHub issue is opened and the advisor is tagged with a label. Scratchpad files are utilised as rough noisy and research logs and a brief, high-level research state file is maintained by the advisor. Ground-truth experiment state is externalized in PRs, git history, and local logs runs. This queryable ground-truth state has been found to make the system more robust to drift while updating large local scratchpad files, agent context compaction and file-loss due to restarts, and leaves behind a durable experiment ledger as a by-product.
 
-Over the course of the research programme, SENPAI created 2,700+ PRs and recorded 10,700+ W&B runs while deploying at peak 59 distinct Student agents. 
+Over the course of the research programme, SENPAI created 2,700+ PRs and recorded 10,700+ local logs runs while deploying at peak 59 distinct Student agents.
 
 Metric
 Value
@@ -27,7 +27,7 @@ Total agent-generated PRs
 2,700+
 PRs with at least one completed run
 2,300+
-W&B runs recorded
+local logs runs recorded
 10,700+
 Peak concurrent Student agents deployed
 59
@@ -47,17 +47,17 @@ Median Advisor output tokens per PR
 
 
 
-Contributions 
+Contributions
 [Observability Harness contribution]
-SENPAI contributes a new observability-first harness for semi-autonomous research. By grounding state in structured, queryable units of data, GitHub PRs and commits and W&B runs, we produce and experiment ledger that is both researcher and agent-friendly. This structured logging of results enables the research harness to reproducibly query for past experiments, check the status of current experiments and identify idle resources. It also enables researchers to view the current experiments in flight as well as inspect successful and unsuccessful experiments. The centralisation of these results also enables researchers to do on-the-fly analysis of the current research progress which can then inform if the harness needs additional steering or guidance.
+SENPAI contributes a new observability-first harness for semi-autonomous research. By grounding state in structured, queryable units of data, GitHub PRs and commits and local logs runs, we produce and experiment ledger that is both researcher and agent-friendly. This structured logging of results enables the research harness to reproducibly query for past experiments, check the status of current experiments and identify idle resources. It also enables researchers to view the current experiments in flight as well as inspect successful and unsuccessful experiments. The centralisation of these results also enables researchers to do on-the-fly analysis of the current research progress which can then inform if the harness needs additional steering or guidance.
 
 [PAI contribution]
 SENPAI autonomously improves multiple CFD surrogate benchmarks starting from a basic Transolver model: Under the directly comparable aggregate AirfRANS full-regime Surface MSE protocol, SENPAI generated a solution with the lowest surface error we found (7.77e-4) however its volume MSE remains higher than the strongest reported volume results, at 3.33e-3 versus 1.1e-3 for LRSA (Yang et al., 2026) and 1.7e-3 for SpiderSolver (Qi et al., 2025). On DrivAerML, surface-pressure relative-L2 reaches 4.50%, improving on the reported Transolver DrivAerML baseline (4.81%) while still trailing Transolver++ (4.12%), AB-UPT (3.82%), and Transolver-3 (3.71%); On TandemFoilSet , SENPAI reaches normalized full-field test MSE of 1.78e-3, below the TandemFoilSet paper’s best Experiment-4 MSEs (0.10–0.36) across the Cruise Random and Race Car tasks (Lim et al., 2026), and on TandemFoilSet-Balanced (McGuire and Capelle, 2026), SENPAI reaches an average test surface-pressure MAE of 22.87 across the 4 sub-metics.
 
 
-Failure-mode taxonomy 
+Failure-mode taxonomy
 
-Finally, SENPAI contributes an empirical failure-mode analysis of long-running agentic ML research systems. Because every agent trajectory, tool call, PR transition, W&B run, monitor event, and context compaction was logged, we can audit the system as an experimental object rather than describe failures anecdotally. We audit a 24-hour fleet trace containing 53,022 real Claude requests and 5.24B tokens across one Advisor and 57 token-emitting Student agents. The dominant failure case was monitor-driven context bloat: 28,247 model-facing monitor events from Claude Code’s Monitor tool generated 28,246 direct model responses and consumed 3.25B cache-inclusive tokens as brief training-log updates were passed to the full, long-lived agent context. Tool-use errors accounted for 892 of 25,365 tool uses (3.5%), and Student agents spent 3.8% of their usage records checking whether a PR had been assigned to them or whether a human had opened an issue requiring attention.
+Finally, SENPAI contributes an empirical failure-mode analysis of long-running agentic ML research systems. Because every agent trajectory, tool call, PR transition, local logs run, monitor event, and context compaction was logged, we can audit the system as an experimental object rather than describe failures anecdotally. We audit a 24-hour fleet trace containing 53,022 real Claude requests and 5.24B tokens across one Advisor and 57 token-emitting Student agents. The dominant failure case was monitor-driven context bloat: 28,247 model-facing monitor events from Claude Code’s Monitor tool generated 28,246 direct model responses and consumed 3.25B cache-inclusive tokens as brief training-log updates were passed to the full, long-lived agent context. Tool-use errors accounted for 892 of 25,365 tool uses (3.5%), and Student agents spent 3.8% of their usage records checking whether a PR had been assigned to them or whether a human had opened an issue requiring attention.
 
 
 Routine coordination checks were a small part of the total workload: Student agents spent only 3.8% of their usage records checking whether a PR had been assigned to them or whether a human had opened an issue requiring attention.
@@ -67,11 +67,11 @@ These measurements inform the design lessons of this semi-autonomous system - ML
 
 
 2. Methodology: System Design
-State lives in pull requests and W&B runs, not in agent memory or scratchpad files. Every other design choice follows.
+State lives in pull requests and local logs runs, not in agent memory or scratchpad files. Every other design choice follows.
 
-Figure 1 — SENPAI deployment architecture. A thin harness deploys one Advisor and N Student pods; both roles can call a shared `researcher-agent`. All programme state lives outside the cluster in the experiment ledger (GitHub PRs, git history, W&B runs), through which humans steer the system.
+Figure 1 — SENPAI deployment architecture. A thin harness deploys one Advisor and N Student pods; both roles can call a shared `researcher-agent`. All programme state lives outside the cluster in the experiment ledger (GitHub PRs, git history, local logs runs), through which humans steer the system.
 
-SENPAI organises semi-autonomous CFD-surrogate research around artifacts human ML teams already produce — pull requests (PR), Git commits, and experiment-tracker runs — and two agent roles that read and write them (Figure 1). An Advisor runs a research subagent, proposes hypotheses by opening draft PRs; one of N Student agents claims each PR, implements the hypothesis, runs training, and writes results back as PR comments linked to W&B runs. A hypothesis's full trajectory — intent, metrics, review — is therefore a standard GitHub PR log rather than an agent-internal trace. 
+SENPAI organises semi-autonomous CFD-surrogate research around artifacts human ML teams already produce — pull requests (PR), Git commits, and experiment-tracker runs — and two agent roles that read and write them (Figure 1). An Advisor runs a research subagent, proposes hypotheses by opening draft PRs; one of N Student agents claims each PR, implements the hypothesis, runs training, and writes results back as PR comments linked to local logs runs. A hypothesis's full trajectory — intent, metrics, review — is therefore a standard GitHub PR log rather than an agent-internal trace.
 
 The rest of this section describes the ledger (§2.1), the harness loop and its observability daemons (§2.2), and the human-in-the-loop channels (§2.3). Role prompts, the literature sub-agent design, the skill catalogue, and the Advisor's hypothesis-selection and merge rules are deferred to Appendix A.
 2.1 SENPAI’s research loop
@@ -79,17 +79,17 @@ The rest of this section describes the ledger (§2.1), the harness loop and its 
 Each experiment follows six steps:
 
 0. Research. The Advisor decides whether or not to run the research sub-agent to design the next batch of experiments(s)
-1. Assignment. The Advisor drafts a PR containing a hypothesis, the exact training code guidelines to run against the current baseline, and the metrics to improve. A PR label names the target Student; 
-2. Implementation and training. The Student polls for PRs assigned to it, checks out the PR branch once it discovers one, implements the changes and launches training experiments, with logging performed by W&B.
+1. Assignment. The Advisor drafts a PR containing a hypothesis, the exact training code guidelines to run against the current baseline, and the metrics to improve. A PR label names the target Student;
+2. Implementation and training. The Student polls for PRs assigned to it, checks out the PR branch once it discovers one, implements the changes and launches training experiments, with logging performed by local logs.
 3. Reporting On experiment completion the Student posts PR comment with a summary of the experiment results and changes the PR status from wip to review in order to request a review from the Advisor.
 4. Review The Advisor polls for PRs that are ready for review and reviews the work and results against the proposed hypothesis and validation metric (§2.3). From there it decides whether to merge the change, comment and ask for follow up work, or close the PR.
 5. Baseline advance If a PR is merged then the Advisor also updates the current baseline metric on the Advisor branch, against which every subsequent PR is compared.
 
-2.2 The Experiment Ledger - Pull requests and Experiment Logger 
+2.2 The Experiment Ledger - Pull requests and Experiment Logger
 
-Every experiment is a pull request and a set of W&B logs. The PR body holds the hypothesis, the experiment instructions, and the baseline metrics to improve upon; the comments thread carries the Student's results and any Advisor review notes. The Experiment logger (W&B) carries the quantitative side: each run documents the training config and results metric. The two tools together form an observable experiment ledger - researcher-inspectable through the GitHub and W&B UIs, and machine-queryable through the CLI. When researchers want to investigate an individual experiment they can open the GitHub PR, read the hypothesis, setup and results and open the associated W&B training run to view the configs and metrics used. The ease of research observability using tools researchers use daily lowers the barriers for researchers to understand what is going on in the system - a key feature for autoresearch systems that can produce hundreds or thousands of experiments during a research program. 
+Every experiment is a pull request and a set of local logs logs. The PR body holds the hypothesis, the experiment instructions, and the baseline metrics to improve upon; the comments thread carries the Student's results and any Advisor review notes. The Experiment logger (local logs) carries the quantitative side: each run documents the training config and results metric. The two tools together form an observable experiment ledger - researcher-inspectable through the GitHub and local logs UIs, and machine-queryable through the CLI. When researchers want to investigate an individual experiment they can open the GitHub PR, read the hypothesis, setup and results and open the associated local logs training run to view the configs and metrics used. The ease of research observability using tools researchers use daily lowers the barriers for researchers to understand what is going on in the system - a key feature for autoresearch systems that can produce hundreds or thousands of experiments during a research program.
 
-By using an experiment logger with agent observability tooling and mature CLIs, researches’ agents can also query for SENPAI agent trajectories as well as experiment results and status’ and quickly generate aggregate reports for researchers, again providing researchers with more visibility and understanding into what these autoresearch systems are doing. 
+By using an experiment logger with agent observability tooling and mature CLIs, researches’ agents can also query for SENPAI agent trajectories as well as experiment results and status’ and quickly generate aggregate reports for researchers, again providing researchers with more visibility and understanding into what these autoresearch systems are doing.
 
 Finally, this structured, accessible logging also means that harness issues or failures such as pod restarts, context compactions, and fresh-container boots are less harmful for agent state and a research program can quickly recover even if agent context and local experiment scratchpad files are lost.
 
@@ -99,12 +99,12 @@ In addition to the core experiment ledger, the Advisor also keeps a small set of
 
 2.3 SENPAI’s harness loop
 
-SENPAI deploys as a small set of Kubernetes workloads: one Advisor CPU pod, N Student GPU pods, and a shared persistent data volume for datasets and checkpoints. The harness image is stable across problems; a task repository is swapped in per programme (bring-your-own-repo), so every agent commit, branch, and PR lives in a self-contained target repository that a researcher can inspect independent of the harness. 
+SENPAI deploys as a small set of Kubernetes workloads: one Advisor CPU pod, N Student GPU pods, and a shared persistent data volume for datasets and checkpoints. The harness image is stable across problems; a task repository is swapped in per programme (bring-your-own-repo), so every agent commit, branch, and PR lives in a self-contained target repository that a researcher can inspect independent of the harness.
 
 The outer harness loop is a shell wrapper, not an LLM. The Advisor entrypoint wraps Claude Code in a `while true` iteration, in the spirit of Huntley's "Ralph loop" pattern. We use programmatic triage to determine if Students are idle as well as new PRs, Issues and comments in order to remove the cost of using an LLM to do polling. We note elsewhere in this paper that despite this we still encountered high token usage via monitoring that we have subsequently addressed. The Claude Code agent is now encouraged to exit and the outer programmatic loop is used to identify updates that require the Claude Code session to be continued with the information from the update.
 
 ```
-# Advisor outer loop 
+# Advisor outer loop
 # entrypoint_advisor.sh
 iteration, last_check = 0, None
 while True:
@@ -142,11 +142,11 @@ Claude Code (v2.1.85 to v2.1.117) was run in headless mode as the agent harness 
 
 3.2 Data and Benchmarks
 
-To demonstrate SENPAI’s CFD performance across multiple benchmarks we train and evaluate on three CFD surrogate datasets spanning 2D tandem-airfoil flow, 2D airfoil RANS, and 3D automotive aerodynamics: TandemFoilSet (Lim et al., 2026), AirfRANS (Bonnet et al., 2022), and DrivAerML (Ashton et al., 2024). 
+To demonstrate SENPAI’s CFD performance across multiple benchmarks we train and evaluate on three CFD surrogate datasets spanning 2D tandem-airfoil flow, 2D airfoil RANS, and 3D automotive aerodynamics: TandemFoilSet (Lim et al., 2026), AirfRANS (Bonnet et al., 2022), and DrivAerML (Ashton et al., 2024).
 
 TandemFoilSet: we use the paper’s original Experiment 4 partition as one of two TandemFoilSet datasets and measure denormalized surface pressure MAE. We generate a second TandemFoilSet dataset split, named TandemFoilSet-Balanced (CITE https://github.com/morganmcg1/tandemfoil2), with 1,499 training cases and four balanced test splits: single-foil in-distribution, two unseen-front-camber geometry holdouts (race-car and cruise), and a Reynolds-number holdout - an average of these 4 splits is taken as the primary test metric.
 
-AirfRANS: we use the official full task with the last 10% of the official training list held out for validation, giving a 720/80/200 train/val/test split while keeping the official test set unchanged. We test on normalized targets on the official test split. 
+AirfRANS: we use the official full task with the last 10% of the official training list held out for validation, giving a 720/80/200 train/val/test split while keeping the official test set unchanged. We test on normalized targets on the official test split.
 
 DrivAerML: we use the public surface split on the available processed cases (400/34/50 train/val/test) and measure surface-pressure relative-L2 in percent, computed per case on unnormalized predictions and targets and then averaged over test cases.
 
@@ -154,7 +154,7 @@ DrivAerML: we use the public surface split on the available processed cases (400
 3.2.1 AirfRANS: surface-MSE below published Transolver
 < TO BE UPDATED>
 
-The official AirfRANS `full` task benchmark is defined on the pair (surface-MSE, volume-MSE) evaluated on train-statistic-normalised targets [Bonnet et al. 2022]. Our best configuration achieves surface-MSE = 0.003 (W&B run `3e0ce368`, PR #2824), an improvement over the strongest published surface reference (SpiderSolver, 0.0043). Volume-MSE on the same run is 0.00764, ~4.5× SpiderSolver's 0.0017. We therefore report a surface result competitive with published references and do not claim a full-benchmark win; closing the volume gap is open work.
+The official AirfRANS `full` task benchmark is defined on the pair (surface-MSE, volume-MSE) evaluated on train-statistic-normalised targets [Bonnet et al. 2022]. Our best configuration achieves surface-MSE = 0.003 (local logs run `3e0ce368`, PR #2824), an improvement over the strongest published surface reference (SpiderSolver, 0.0043). Volume-MSE on the same run is 0.00764, ~4.5× SpiderSolver's 0.0017. We therefore report a surface result competitive with published references and do not claim a full-benchmark win; closing the volume gap is open work.
 
 Across three independent seeds (PR #2831), surface-MSE distributes as 0.00333 / 0.00668 / 0.00857 (mean 0.0062) and volume-MSE as 0.00886 / 0.00901 / 0.01709 (mean 0.0117). Best-seed surface beats SpiderSolver; mean-seed does not. Seed-level volume remains above all published references.
 
@@ -201,7 +201,7 @@ At the time of writing this lane remains immature. The best observed number is `
 
 The packaged parity target (`target/icml2026/tandemfoil/`) uses the public `kagent` v2 split — four balanced val/test tracks (single-in-dist, geom-camber-rc, geom-camber-cruise, re-rand) — and reports denormalised pressure-channel surface MAE (`surface_pressure_mae`, aggregated globally over valid surface nodes). This is an internal SENPAI benchmark, not a literature comparator; we report it to quantify harness-driven improvement over SENPAI's own prior best.
 
-Test surface-pressure MAE improved from 33.88 (run `v6amjkh7`, PR #2810) to 24.58 (run `nrn0q3ct`, branch `robin/ema-warmup-tandem-0.999`) — a 27% reduction — entirely through PR-mediated Advisor–Student iteration, with zero manual intervention between the two numbers. The pathway is visible in the PR ledger. Early PRs stepped the learning rate down from 3e-4 to 1.25e-4 and added gradient clipping at 1.0; a subsequent EMA-warmup recipe family then crossed the 25.0 MAE threshold. Figure 2 overlays these milestones on the W&B loss curve.
+Test surface-pressure MAE improved from 33.88 (run `v6amjkh7`, PR #2810) to 24.58 (run `nrn0q3ct`, branch `robin/ema-warmup-tandem-0.999`) — a 27% reduction — entirely through PR-mediated Advisor–Student iteration, with zero manual intervention between the two numbers. The pathway is visible in the PR ledger. Early PRs stepped the learning rate down from 3e-4 to 1.25e-4 and added gradient clipping at 1.0; a subsequent EMA-warmup recipe family then crossed the 25.0 MAE threshold. Figure 2 overlays these milestones on the local logs loss curve.
 
 3.2.3 DrivAerML: preliminary surface-pressure transfer result
 < TO BE UPDATED>
@@ -232,29 +232,29 @@ SENPAI, best test
 Figure x — real SENPAI artifact (deferred to Appendix E)
 
 PR conversation (top): anonymised PR #X — Advisor hypothesis body, Student results comment with best-checkpoint metrics, Advisor merge decision
-W&B panel (bottom): run `[run-id]` — surface-MSE curve annotated with PR-ledger events
+local logs panel (bottom): run `[run-id]` — surface-MSE curve annotated with PR-ledger events
 - Substantiates abstract's "queryable ledger" claim
 
 ---
 
 4. Discussion
 
-4.1 What the PR+W&B grounding bought us
+4.1 What the PR+local logs grounding bought us
 
 Lossless session boundaries — crashed pods, context-limit compactions, preempted Students all resumed by re-reading PR state on the next cycle
 Human-interruptible autonomy — reviewers steer the Advisor by commenting on PRs, not by editing prompts or restarting services
 Queryable retrospection — `list-experiments` answered cross-benchmark questions (e.g. "has any prior run combined EMA warmup with grad-clip on AirfRANS?") directly against the ledger, enabling the §3.5 transfer
 
 4.1 Observable State as a Control Surface
-The PR and W&B ledger made SENPAI useful as a research assistant rather than just an autonomous executor. By placing the core experiment ledger in systems already used by ML teams, the harness kept researchers close to the work without requiring them to supervise every experiment. Agents could run large numbers of experiments independently while researchers could still see, question, and redirect the broader research program via the tools they use daily.
+The PR and local logs ledger made SENPAI useful as a research assistant rather than just an autonomous executor. By placing the core experiment ledger in systems already used by ML teams, the harness kept researchers close to the work without requiring them to supervise every experiment. Agents could run large numbers of experiments independently while researchers could still see, question, and redirect the broader research program via the tools they use daily.
 
-This externalized state also reduced the fragility of this long-running system. When agents compacted, restarted, or lost local scratchpad context, the next cycle could reconstruct the experiment from the PR, git history, and W&B runs. 
+This externalized state also reduced the fragility of this long-running system. When agents compacted, restarted, or lost local scratchpad context, the next cycle could reconstruct the experiment from the PR, git history, and local logs runs.
 
 Finally, the ledger turned a collection of individual experiments into a queryable research programme. Both researchers and agents could ask what had been tried, which failures were meaningful, which recipes transferred, and where progress had stalled. In this sense, SENPAI’s core contribution is not replacing the researcher, but increasing the bandwidth at which researchers can understand, guide, and accelerate autonomous experimentation.
 
 4.2 kagent: parallel autonomous agents under a lighter harness
 
-To contrast SENPAI's Advisor-mediated loop, we ran two cohorts under `kagent` — a lighter-weight harness that drops the Advisor/Student split and pull-request review logic in favour of a flat peer-competitive cohort and a scoring-driven leaderboard. Each kagent agent runs a *read-leaderboard → hypothesise → edit `train.py` → train → score → commit* loop with its own `EXPERIMENT_JOURNAL.md` as durable memory; agents see each other only through the shared leaderboard branch and their public commits — no pull-request review, no merges, no Advisor. We report these cohorts as comparators, not as benchmark claims. Every iteration the agents start by consulting the public leaderboard and are prompted to be competitive: 
+To contrast SENPAI's Advisor-mediated loop, we ran two cohorts under `kagent` — a lighter-weight harness that drops the Advisor/Student split and pull-request review logic in favour of a flat peer-competitive cohort and a scoring-driven leaderboard. Each kagent agent runs a *read-leaderboard → hypothesise → edit `train.py` → train → score → commit* loop with its own `EXPERIMENT_JOURNAL.md` as durable memory; agents see each other only through the shared leaderboard branch and their public commits — no pull-request review, no merges, no Advisor. We report these cohorts as comparators, not as benchmark claims. Every iteration the agents start by consulting the public leaderboard and are prompted to be competitive:
 
 > Your objective is to top the leaderboard. If you are stuck with a low scoring solution, don't be afraid to try radical changes, marginal improvements on your low scoring solution are not going to cut it!
 
@@ -272,15 +272,15 @@ SENPAI lands ~20% lower in absolute MAE; kagent reaches 3.5× over the Transolve
 
 4.3 Failure modes: where long-running research agents break
 
-The recurring problems SENPAI encountered were harness engineering monitoring long-running jobs, recovering across compaction or restart, enforcing brittle tool interfaces, and keeping PR and W&B state consistent - not failures of experimental reasoning.
+The recurring problems SENPAI encountered were harness engineering monitoring long-running jobs, recovering across compaction or restart, enforcing brittle tool interfaces, and keeping PR and local logs state consistent - not failures of experimental reasoning.
 
 The dominant cost was monitor-driven context bloat. Students monitored for progress, errors, checkpoint detection, and completion. However, persistent `tail -f | grep` monitor event over training logs caused small log events to resume full long-lived agent sessions. In a 24-hour fleet trace, 615 Student monitor setups produced 28,247 model-facing monitor events and 28,246 direct responses, consuming 3.25B cache-inclusive tokens. The median response reloaded roughly 110k cached tokens while adding only 347 uncached input tokens. This is an architectural failure mode: training logs should be reduced by low-context processes that escalate only decision-relevant events such as new-best checkpoints, milestones, errors, completion, or timeout.
 
 Tool-interface errors were smaller but systematic: 892 of 25,365 tool results, or 3.5%. The main causes were failed shell commands, GitHub scope errors, blocked wait patterns, wrong paths, failed pushes, oversized reads, and edit guards. A broader scan found 2,156 failure-like tool results, or 8.5%, but many were training outcomes such as NaNs, OOMs, tracebacks, killed jobs, or divergent metrics. This distinction matters: failed runs can be scientific evidence if they leave metrics and logs; failed control actions require narrower, idempotent tool contracts.
 
-Compaction introduced another boundary risk. The trace contained 240 automatic compactions, with main Student contexts reduced from roughly 196k tokens to 3k-token continuation summaries. These summaries were sufficient for resumption, but unsafe as ground truth. Decisions had to be revalidated against PR labels, PR comments, W&B configuration, W&B history, and live run state.
+Compaction introduced another boundary risk. The trace contained 240 automatic compactions, with main Student contexts reduced from roughly 196k tokens to 3k-token continuation summaries. These summaries were sufficient for resumption, but unsafe as ground truth. Decisions had to be revalidated against PR labels, PR comments, local logs configuration, local logs history, and live run state.
 
-The ledger mitigated these failures. Among 39 Student sessions with final-like monitor signals, 38 had explicit PR-comment result evidence and 33 had ready or status-review handoff evidence. Thus, even when sessions compacted, restarted, or delegated work, experiments often survived as inspectable PR/W&B artifacts.
+The ledger mitigated these failures. Among 39 Student sessions with final-like monitor signals, 38 had explicit PR-comment result evidence and 33 had ready or status-review handoff evidence. Thus, even when sessions compacted, restarted, or delegated work, experiments often survived as inspectable PR/local logs artifacts.
 
 The lesson is that long-running research agents need observable infrastructure more than additional prompt prose. Monitor bloat requires bounded observation; tool errors require executable helpers; training failures require mandatory result and checkpoint capture; state drift requires a single authoritative ledger, with summaries treated as caches. SENPAI did not eliminate failure, but it made failure measurable, attributable, and repairable.
 
@@ -314,7 +314,7 @@ Session mortality closed only by infrastructure fix (PR #3029 best-checkpoint sa
 Derived summary state drifted silently from the authoritative ledger
 ⇒ agentic research systems should be designed for these failure modes, not against them
 
-Release commitment: 
+Release commitment:
 harness, PR-indexed experiment ledger, failure-mode analysis all released as open source on <URL>
 
 ---
@@ -324,7 +324,7 @@ References
 Updated paragraph sentence with `ml-intern` included:
 
 ```text
-Long-running ML-engineering agents have also begun to appear outside the paper-generation setting: Hugging Face's `ml-intern` is an open-source agent that researches papers, writes ML code, launches training through the Hugging Face ecosystem, and maintains session history with auto-compaction and optional session upload [Hugging Face, 2026]. Like AiScientist's File-as-Bus and AI Scientist-v2's tree/journal artifacts, this is durable agent state, but it is not a PR-indexed experiment ledger coupled to an experiment tracker; reviewability depends on inspecting session traces or generated files rather than following the same pull-request, git-history, and W&B substrate used by human ML teams.
+Long-running ML-engineering agents have also begun to appear outside the paper-generation setting: Hugging Face's `ml-intern` is an open-source agent that researches papers, writes ML code, launches training through the Hugging Face ecosystem, and maintains session history with auto-compaction and optional session upload [Hugging Face, 2026]. Like AiScientist's File-as-Bus and AI Scientist-v2's tree/journal artifacts, this is durable agent state, but it is not a PR-indexed experiment ledger coupled to an experiment tracker; reviewability depends on inspecting session traces or generated files rather than following the same pull-request, git-history, and local logs substrate used by human ML teams.
 ```
 
 BibTeX-style raw citations:
@@ -497,11 +497,11 @@ BibTeX-style raw citations:
   url          = {https://git-scm.com/book/en/v2/Git-Basics-Viewing-the-Commit-History}
 }
 
-@misc{wandbdocs_experiments,
+@misc{localdocs_experiments,
   title        = {Experiments overview},
-  author       = {{Weights \& Biases}},
+  author       = {{local experiment logging}},
   year         = {2026},
-  url          = {https://docs.wandb.ai/models/track}
+  url          = {https://docs.local.ai/models/track}
 }
 
 @misc{githubdocs_pullrequests,
@@ -529,27 +529,27 @@ BibTeX-style raw citations:
   url          = {https://git-scm.com/book/en/v2}
 }
 
-@misc{biewald2020wandb,
-  title        = {Experiment Tracking with Weights and Biases},
+@misc{biewald2020local,
+  title        = {Experiment Tracking with local experiment logging},
   author       = {Biewald, Lukas},
   year         = {2020},
-  note         = {Software available from wandb.com},
-  url          = {https://www.wandb.com/}
+  note         = {Software available from local.com},
+  url          = {https://www.local.com/}
 }
 
-@software{wandb2026software,
-  title        = {Weights \& Biases},
-  author       = {{Weights \& Biases}},
+@software{local2026software,
+  title        = {local experiment logging},
+  author       = {{local experiment logging}},
   year         = {2026},
-  url          = {https://github.com/wandb/wandb},
+  url          = {https://github.com/local/local},
   note         = {Python SDK and platform documentation repository; accessed 2026-04-24}
 }
 
-@misc{wandbdocs_experiments,
+@misc{localdocs_experiments,
   title        = {Experiments overview},
-  author       = {{Weights \& Biases}},
+  author       = {{local experiment logging}},
   year         = {2026},
-  url          = {https://docs.wandb.ai/models/track},
+  url          = {https://docs.local.ai/models/track},
   note         = {Accessed 2026-04-24}
 }
 
@@ -597,7 +597,7 @@ A. Role prompts, sub-agent, and skill catalogue.**
 
 *A.1 Role prompts.* Advisor, Student, and `researcher-agent` prompt files — verbatim at repo release and pinned to the versions in effect at T=0 of the sprint. Includes the Advisor's plateau-escalation protocol (hyperparameter → architecture → loss reformulation → data representation after five non-improving experiments) and the Student's result-comment schema.
 
-*A.2 Skill catalogue.* The seven composable skills and the shared `senpai-gh` library referenced in §2.3. Each entry lists the caller, inputs, effect on the PR/W&B ledger, and label transitions.
+*A.2 Skill catalogue.* The seven composable skills and the shared `senpai-gh` library referenced in §2.3. Each entry lists the caller, inputs, effect on the PR/local logs ledger, and label transitions.
 
 - `survey-prs` — Advisor-side. Reads `$ADVISOR_BRANCH` and `$STUDENT_NAMES` from the pod environment and calls the `senpai-gh` queries `list_all_prs`, `list_ready_for_review_prs`, and `list_idle_students`. Returns a compact markdown summary categorising open PRs as review-ready (`status:review`), WIP (`status:wip` + `student:<name>`), or draft/stalled, followed by a list of idle Students. Read-only.
 
@@ -609,7 +609,7 @@ A. Role prompts, sub-agent, and skill catalogue.**
 
 - `assign-experiment` — Advisor-side. Takes `<student-name> <hypothesis-slug> <problem-dir>`. Pulls the Advisor branch, creates branch `<student>/<slug>`, pushes it, and opens a draft PR with labels `status:wip`, `student:<name>`, and the Advisor-branch tag. The PR body — authored by the Advisor — contains the hypothesis, full experiment instructions (typically a hyperparameter diff against `BASELINE.md`), and the current baseline metrics.
 
-- `submit-experiment-results` — Student-side. Takes `<pr-number> <problem-dir>`. Stages `<problem-dir>/train.py` and any other modified files (e.g. `pyproject.toml`), commits, pushes the branch, marks the PR ready for review, and swaps `status:wip` → `status:review`. Assumes the caller has already posted a results comment on the PR with metrics, W&B run ID, analysis, and suggested follow-ups.
+- `submit-experiment-results` — Student-side. Takes `<pr-number> <problem-dir>`. Stages `<problem-dir>/train.py` and any other modified files (e.g. `pyproject.toml`), commits, pushes the branch, marks the PR ready for review, and swaps `status:wip` → `status:review`. Assumes the caller has already posted a results comment on the PR with metrics, local logs run ID, analysis, and suggested follow-ups.
 
 - `merge-winner` — Advisor-side. Takes `<pr-number> <problem-dir>`. Squash-merges the PR (`gh pr merge --squash`), pulls the updated Advisor branch, appends the new best metrics to `BASELINE.md` as a dated entry, and commits and pushes. If the squash fails due to conflicts, the skill instead calls `send_pr_back_to_student_with_comment` with a rebase request and stops without updating the baseline.
 
@@ -626,24 +626,24 @@ A. Role prompts, sub-agent, and skill catalogue.**
 
 **A plateau is never a completion signal. It is a map telling you where not to look, which makes it an asset.**
 
-Use the researcher-agent to explore new ideas and research directions and other sub-agents to do reviews of large amounts of data such as W&B logs, PR logs or many code diffs.”
+Use the researcher-agent to explore new ideas and research directions and other sub-agents to do reviews of large amounts of data such as local logs logs, PR logs or many code diffs.”
 
 
 
 B. Full benchmark result tables
-AirfRANS frontier (surface + volume MSE, W&B run IDs)
+AirfRANS frontier (surface + volume MSE, local logs run IDs)
 TandemFoilSet parity progression by PR number
 TandemFoilSet paper-calibration row (sprint-populated)
 DrivAerML val/test trajectory (sprint-populated)
 C. Failure-mode full taxonomy — subcategories beneath each of the three main categories
 
-D. Experiment ledger sample — CSV schema: PR#, title, status, Student, W&B run IDs, primary metric name/value, baseline delta, era tag, merge-decision timestamp
+D. Experiment ledger sample — CSV schema: PR#, title, status, Student, local logs run IDs, primary metric name/value, baseline delta, era tag, merge-decision timestamp
 
-E. Real SENPAI artifact (Figure 2) — PR conversation + W&B panel, redacted for double-blind review
+E. Real SENPAI artifact (Figure 2) — PR conversation + local logs panel, redacted for double-blind review
 
 F. Sprint evidence log — four auditable artifacts:
 `fetch_experiments.py` snapshots at T=0 and T+72h (run-count delta)
-Per-benchmark W&B run panels from the window
+Per-benchmark local logs run panels from the window
 `git log --oneline` on advisor branch restricted to window
 Log of 2 urgent-labelled GitHub issues (T=0, T+48h) with timestamps and Advisor actions
 
@@ -651,11 +651,11 @@ G. kagent comparator case studies (§4.2).
 
 *G.1 TandemFoilSet parity apr23 completed run.* An eight-agent kagent cohort on the TandemFoilSet parity benchmark of §3.2.2b — same dataset, same public `kagent` v2 split family, same primary metric (denormalised pressure-channel surface MAE averaged over the four val/test tracks `single_in_dist`, `geom_camber_rc`, `geom_camber_cruise`, `re_rand`). Each agent received a single GPU pod, a 30-minute-per-training-run budget, and the Transolver starter (`n_hidden=128, n_layers=5`, ~120 MAE). The cohort ran from 2026-04-23 15:53 UTC to 2026-04-24 04:00 UTC (~12 h) without human intervention before the scheduled stop. Total activity: **330 agent commits**, **223 scored leaderboard updates** from the organiser (~one scored submission per 2.4 min), one launcher invocation, one scheduled kill, zero manual edits on any agent branch.
 
-Agents and organiser communicate through three channels only: a shared volume for data, predictions, and logs; the git remote for code and the leaderboard; and a W&B project for training telemetry. There is no network path between agents, and each agent sees only its own competition-facing working directory — the organiser area holding ground truth and scoring code is invisible from inside an agent pod. Scoring is the only privileged operation in the system.
+Agents and organiser communicate through three channels only: a shared volume for data, predictions, and logs; the git remote for code and the leaderboard; and a local logs project for training telemetry. There is no network path between agents, and each agent sees only its own competition-facing working directory — the organiser area holding ground truth and scoring code is invisible from inside an agent pod. Scoring is the only privileged operation in the system.
 
-At the scheduled stop, seven of eight agents finished below 70 avg-surf-p MAE and four below 50, versus the Transolver starter's ~120; the winning agent's 6-way weighted ensemble scored **34.41**, a 3.5× improvement over the starter in 13 wall-clock hours. SENPAI's multi-week PR-mediated anchor on the same benchmark is 24.58 (§3.2.2b) — ~40% lower in absolute terms but obtained over roughly 40× more wall clock with code review and merge gating. 
+At the scheduled stop, seven of eight agents finished below 70 avg-surf-p MAE and four below 50, versus the Transolver starter's ~120; the winning agent's 6-way weighted ensemble scored **34.41**, a 3.5× improvement over the starter in 13 wall-clock hours. SENPAI's multi-week PR-mediated anchor on the same benchmark is 24.58 (§3.2.2b) — ~40% lower in absolute terms but obtained over roughly 40× more wall clock with code review and merge gating.
 
-https://wandb.ai/wandb-applied-ai-team/kagent-tandemfoil
+https://local.ai/local-applied-ai-team/kagent-tandemfoil
 https://github.com/tcapelle/kagent
 
 **Final leaderboard** (lower is better; all splits in MAE):
@@ -683,9 +683,9 @@ Under kagent, the decisive recipe — full-mesh training with `batch_size=2` war
 
 **The defining finding — the subsampling trap, rediscovered three ways.** The slice-weight tensors inside Transolver's `PhysicsAttention` are computed across the full node population; training on 40K subsampled points per sample while evaluating on 240K silently caps `re_rand` generalisation. Three of the top four agents rediscovered this independently, with three different chains of reasoning:
 
-- *Frieren* (iter93, inference from askeladd's W&B config): *"bs=2 + no-subsample + warm-start = BREAKTHROUGH. Subsampling was the root cause of my re_rand weakness — dropping 60% of volume nodes left the model unable to learn Re-dependent field structure. With no subsampling the model sees the full 240K-node grid. Askeladd's edge was entirely this config difference."* [[journal L39–44]](https://github.com/tcapelle/kagent/blob/cdfa5d78e04aa2b6977e3d5ab8a8f4d1c0dfcc91/tandemfoil-competition/kaggler/EXPERIMENT_JOURNAL.md?plain=1#L39-L44) Scored 35.27 (was 52); `re_rand` dropped 73 → 33.43. Sixty further commits polished this into the 6-way ensemble at 34.41.
+- *Frieren* (iter93, inference from askeladd's local logs config): *"bs=2 + no-subsample + warm-start = BREAKTHROUGH. Subsampling was the root cause of my re_rand weakness — dropping 60% of volume nodes left the model unable to learn Re-dependent field structure. With no subsampling the model sees the full 240K-node grid. Askeladd's edge was entirely this config difference."* [[journal L39–44]](https://github.com/tcapelle/kagent/blob/cdfa5d78e04aa2b6977e3d5ab8a8f4d1c0dfcc91/tandemfoil-competition/kaggler/EXPERIMENT_JOURNAL.md?plain=1#L39-L44) Scored 35.27 (was 52); `re_rand` dropped 73 → 33.43. Sixty further commits polished this into the 6-way ensemble at 34.41.
 - *Alphonse* (v11, direct hypothesis about slice-weight distribution shift): *"The PhysicsAttention slice weights are computed on a different density of nodes between train and val … the hypothesis that subsampling 'just acts like a regulariser' was wrong in this domain; it creates a real train/eval distribution gap for attention models that pool over the node set."* [[journal L72–76]](https://github.com/tcapelle/kagent/blob/d145d312660459324e386042eaa69a14f3a48d48/tandemfoil-competition/kaggler/EXPERIMENT_JOURNAL.md?plain=1#L72-L76) 22% single-run gain; `val_re_rand` 2.70 → 1.25.
-- *Edward* (v13, inferred from askeladd's W&B runs): *"Sub40k was great for pre-training, but fine-tuning at full mesh preserves fine surface detail that's essential for pressure MAE … 9 epochs at full mesh beats 35 at sub40k in this regime."* [[journal L32]](https://github.com/tcapelle/kagent/blob/a76f87a17574d9490d868edad359460f22a1465c/tandemfoil-competition/kaggler/EXPERIMENT_JOURNAL.md?plain=1#L32) 15.7% drop in one run, lifting edward from rank 7 to rank 3.
+- *Edward* (v13, inferred from askeladd's local logs runs): *"Sub40k was great for pre-training, but fine-tuning at full mesh preserves fine surface detail that's essential for pressure MAE … 9 epochs at full mesh beats 35 at sub40k in this regime."* [[journal L32]](https://github.com/tcapelle/kagent/blob/a76f87a17574d9490d868edad359460f22a1465c/tandemfoil-competition/kaggler/EXPERIMENT_JOURNAL.md?plain=1#L32) 15.7% drop in one run, lifting edward from rank 7 to rank 3.
 
 The three agents who did not find the unlock stalled. *Thorfinn* documented the plateau precisely (*"clean logarithmic decay; we hit the architecture's capacity floor"* [[journal L37]](https://github.com/tcapelle/kagent/blob/aa76905ad4467a95bcd914b588ef077802ce6c88/tandemfoil-competition/kaggler/EXPERIMENT_JOURNAL.md?plain=1#L37)) without testing whether the floor was the subsampling, and fell from rank 3 to rank 6. *Tanjiro* never tried full-mesh. *Nezuko* went in the opposite direction, tuning `surf_weight` down from 10 → 1.5; her own earlier-formulated rule — *"compute-per-epoch is the binding constraint: any change that slows each batch needs a matching epochs adjustment and usually nets negative"* [[journal L151]](https://github.com/tcapelle/kagent/blob/4e69f0371b01da656cd1dc89a3295cc0be50e3f9/tandemfoil-competition/kaggler/EXPERIMENT_JOURNAL.md?plain=1#L151) — kept her away from a change (full mesh) that violated it.
 
@@ -696,7 +696,7 @@ The three agents who did not find the unlock stalled. *Thorfinn* documented the 
 
 **Scorer-race incident.** `predict.py` writes the four `test_*.pt` files sequentially (300–500 MB each); the organiser's 60 s scorer stamps any commit directory with a missing file as `"incomplete"` in `scores.json`, and the "already scored" check then treats `"incomplete"` as terminal even once all files are present. Every agent accumulated at least one `incomplete` entry; two agents lost roughly one hour of board time. At least one agent diagnosed the bug in its journal, correctly chose not to chase it, and submitted a fresh commit hash instead. We revisit this in §4.3 as a sibling of SENPAI's checkpoint-contract failure — in both cases the agent's correctness depends on an infrastructure contract the agent cannot inspect, and the fix is at the infrastructure layer (re-score any `incomplete` entries whose files are now all present).
 
-**References.** Per-agent branches: `github.com/tcapelle/kagent/tree/apr23/kaggler/<name>`; leaderboard: `github.com/tcapelle/kagent/tree/apr23-leaderboard`; W&B project: `wandb.ai/wandb-applied-ai-team/kagent-tandemfoil`. Per-agent journals totalling ~1,100 lines are retained on those branches at `tandemfoil-competition/kaggler/EXPERIMENT_JOURNAL.md`; every numeric claim in this appendix is traceable to the commit-pinned permalinks inline above.
+**References.** Per-agent branches: `github.com/tcapelle/kagent/tree/apr23/kaggler/<name>`; leaderboard: `github.com/tcapelle/kagent/tree/apr23-leaderboard`; local logs project: `local.ai/local-applied-ai-team/kagent-tandemfoil`. Per-agent journals totalling ~1,100 lines are retained on those branches at `tandemfoil-competition/kaggler/EXPERIMENT_JOURNAL.md`; every numeric claim in this appendix is traceable to the commit-pinned permalinks inline above.
 
 
 

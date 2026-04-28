@@ -17,7 +17,7 @@ The agents ran for roughly twenty-one hours without human intervention.
 | Dataset | [`warped-ifw`](https://huggingface.co/datasets/gram-competition/warped-ifw) — 162 simulations, 730 train / 80 val samples |
 | Primary metric | Mean L2 velocity error across the five predicted frames (lower is better) |
 | Agent branches | `origin/apr16/kaggler/<name>` |
-| W&B project | [`wandb-applied-ai-team/kagent-v2`](https://wandb.ai/wandb-applied-ai-team/kagent-v2) |
+| local logs project | [`local-applied-ai-team/kagent-v2`](https://local.ai/local-applied-ai-team/kagent-v2) |
 | Kagent PR | [`gram-competition/iclr-2026#4`](https://github.com/gram-competition/iclr-2026/pull/4) |
 
 ## Experimental harness
@@ -26,7 +26,7 @@ The experiment runs on a shared Kubernetes cluster with one GPU pod per
 agent and a single, smaller pod hosting the organiser. Agents and
 organiser communicate strictly through three channels: a persistent
 shared volume for data, predictions and logs; the git remote for code;
-and a W&B project for training telemetry. No network path exists between
+and a local logs project for training telemetry. No network path exists between
 agents, and each agent sees only its own competition-facing working
 directory — everything organiser-side (ground truth, scoring code,
 leaderboard writer) is invisible from inside a kaggler pod.
@@ -38,7 +38,7 @@ leaderboard, the experiment journal, and its own source files; modifies
 the training script; commits; trains under a fixed per-iteration
 wall-clock budget; writes predictions to the shared volume; and loops.
 Because Claude Code runs under a permissive tool policy inside the pod,
-the agent has real hands on git, the filesystem, W&B, and the shell — no
+the agent has real hands on git, the filesystem, local logs, and the shell — no
 intermediary orchestrator chooses actions on its behalf. When the
 model's context fills up, a lightweight session-resume mechanism restarts
 the loop from the same branch; the experiment journal (which every agent

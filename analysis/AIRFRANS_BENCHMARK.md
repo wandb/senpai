@@ -173,7 +173,7 @@ Important caveat:
 
 - this auxiliary table is useful for a `surface pressure only` comparison
 - it is **not** a substitute for the official full-test `Surf MSE` / `Vol MSE` table
-- the newer PR `#2824` comment also reports `surface_mse_p = 6.53e-3`, but its split labeling is less explicit than PR `#2771`, so `0.00588` is the cleaner field-level citation unless we re-pull the exact W&B summary
+- the newer PR `#2824` comment also reports `surface_mse_p = 6.53e-3`, but its split labeling is less explicit than PR `#2771`, so `0.00588` is the cleaner field-level citation unless we re-pull the exact local logs summary
 
 ### AB-UPT, Transolver++, and Transolver-3
 
