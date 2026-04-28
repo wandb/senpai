@@ -110,23 +110,11 @@ while true; do
 
     # --- Check research state ---
     POLL_OK=1
-    if ! REVIEW_JSON=$(list_ready_for_review_prs "$ADVISOR_BRANCH" "$SINCE"); then
-        echo "WARN: failed to list review-ready PRs; treating as empty for this iteration" >&2
-        REVIEW_JSON='[]'
-        POLL_OK=0
-    fi
+    REVIEW_JSON=$(poll_or_empty "review-ready PR poll" list_ready_for_review_prs "$ADVISOR_BRANCH" "$SINCE") || POLL_OK=0
     REVIEW_COUNT=$(printf '%s' "$REVIEW_JSON" | json_len)
-    if ! ISSUE_JSON=$(check_gh_issues "$ADVISOR_BRANCH" "$SINCE"); then
-        echo "WARN: failed to list GitHub issues; treating as empty for this iteration" >&2
-        ISSUE_JSON='[]'
-        POLL_OK=0
-    fi
+    ISSUE_JSON=$(poll_or_empty "GitHub issue poll" check_gh_issues "$ADVISOR_BRANCH" "$SINCE") || POLL_OK=0
     ISSUE_COUNT=$(printf '%s' "$ISSUE_JSON" | json_len)
-    if ! IDLE_JSON=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH"); then
-        echo "WARN: failed to list idle students; treating as empty for this iteration" >&2
-        IDLE_JSON='[]'
-        POLL_OK=0
-    fi
+    IDLE_JSON=$(poll_or_empty "idle-student poll" list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH") || POLL_OK=0
     IDLE_COUNT=$(printf '%s' "$IDLE_JSON" | json_len)
     WATERMARK=$(max_updated_at "$REVIEW_JSON" "$ISSUE_JSON")
 

@@ -11,6 +11,7 @@ WORKDIR="/workspace/senpai"
 GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
 GIT_CREDENTIAL_FILE="$WORKDIR/.git-credentials"
+SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 
 echo "=== Senpai Student: $STUDENT_NAME ==="
 echo "Runner repo:  $REPO_URL (branch: $REPO_BRANCH)"
@@ -21,35 +22,8 @@ echo "GPUs:         $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/n
 
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
-git remote set-url --push origin DISABLED
-git config remote.origin.pushurl DISABLED
-git config --unset-all url."https://${GITHUB_TOKEN}@github.com/".insteadOf 2>/dev/null || true
-export SENPAI_REAL_GIT="$(command -v git)"
-mkdir -p .git/hooks
-cat > .git/hooks/pre-push <<'EOF'
-#!/bin/sh
-echo "ERROR: refusing to push from the senpai runner repo; use the cloned target repo instead." >&2
-exit 1
-EOF
-chmod +x .git/hooks/pre-push
-mkdir -p "$WORKDIR/git-guard-bin"
-cat > "$WORKDIR/git-guard-bin/git" <<'EOF'
-#!/bin/sh
-real_git="${SENPAI_REAL_GIT:-/usr/bin/git}"
-if [ "$1" = "push" ]; then
-    top="$("$real_git" rev-parse --show-toplevel 2>/dev/null || true)"
-    if [ -n "${TARGET_WORKDIR:-}" ] && [ "$top" != "${TARGET_WORKDIR%/}" ]; then
-        echo "ERROR: refusing git push outside target repo; cwd=$(pwd), top=${top:-none}, target=$TARGET_WORKDIR" >&2
-        exit 2
-    fi
-fi
-exec "$real_git" "$@"
-EOF
-chmod +x "$WORKDIR/git-guard-bin/git"
-export PATH="$WORKDIR/git-guard-bin:$PATH"
-printf 'https://x-access-token:%s@github.com\n' "$GITHUB_TOKEN" > "$GIT_CREDENTIAL_FILE"
-chmod 600 "$GIT_CREDENTIAL_FILE"
-git config --global credential.helper "store --file=$GIT_CREDENTIAL_FILE"
+source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
+install_senpai_git_guard "$WORKDIR" "$TARGET_WORKDIR" "$GIT_CREDENTIAL_FILE"
 
 clone_target_repo() {
     local depth=()
@@ -91,9 +65,7 @@ source "$WORKDIR/k8s/run-senpai-claude.sh"
 export PATH="$HOME/.claude/bin:$PATH"
 source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 
-# --- Register Senpai CC plugin ---
-SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
-source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
+# --- Senpai CC plugin already sourced for setup; CC uses --plugin-dir SENPAI_PLUGIN for tools. ---
 
 # $GH_REPO comes from the ConfigMap (set by launch.py = owner/repo of the
 # problem-package repo). The gh CLI honours it natively, so every `gh`
@@ -104,8 +76,7 @@ source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
 TASK_INSTRUCTIONS="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
 PROMPT="${TASK_INSTRUCTIONS}"
 
-LOGGING_INFO="W&B entity/project: ${WANDB_ENTITY}/${WANDB_PROJECT}"
-KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | '"$LOGGING_INFO"$'\n'
+KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 HEARTBEAT_PROMPT="Continue your student loop using the assigned PRs and GitHub issues listed in the Student research state below. The entrypoint owns assignment polling; do not start persistent GitHub polling monitors. For active training, use sparse wakeups plus training_log_status; do not stream per-epoch logs into Monitor."

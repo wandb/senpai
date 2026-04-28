@@ -11,6 +11,7 @@ WORKDIR="/workspace/senpai"
 GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
 GIT_CREDENTIAL_FILE="$WORKDIR/.git-credentials"
+SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 
 echo "=== Senpai Advisor ==="
 echo "Runner repo:  $REPO_URL (branch: $REPO_BRANCH)"
@@ -22,35 +23,8 @@ echo "GitHub history: $GH_HISTORY_SCOPE"
 
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
-git remote set-url --push origin DISABLED
-git config remote.origin.pushurl DISABLED
-git config --unset-all url."https://${GITHUB_TOKEN}@github.com/".insteadOf 2>/dev/null || true
-export SENPAI_REAL_GIT="$(command -v git)"
-mkdir -p .git/hooks
-cat > .git/hooks/pre-push <<'EOF'
-#!/bin/sh
-echo "ERROR: refusing to push from the senpai runner repo; use the cloned target repo instead." >&2
-exit 1
-EOF
-chmod +x .git/hooks/pre-push
-mkdir -p "$WORKDIR/git-guard-bin"
-cat > "$WORKDIR/git-guard-bin/git" <<'EOF'
-#!/bin/sh
-real_git="${SENPAI_REAL_GIT:-/usr/bin/git}"
-if [ "$1" = "push" ]; then
-    top="$("$real_git" rev-parse --show-toplevel 2>/dev/null || true)"
-    if [ -n "${TARGET_WORKDIR:-}" ] && [ "$top" != "${TARGET_WORKDIR%/}" ]; then
-        echo "ERROR: refusing git push outside target repo; cwd=$(pwd), top=${top:-none}, target=$TARGET_WORKDIR" >&2
-        exit 2
-    fi
-fi
-exec "$real_git" "$@"
-EOF
-chmod +x "$WORKDIR/git-guard-bin/git"
-export PATH="$WORKDIR/git-guard-bin:$PATH"
-printf 'https://x-access-token:%s@github.com\n' "$GITHUB_TOKEN" > "$GIT_CREDENTIAL_FILE"
-chmod 600 "$GIT_CREDENTIAL_FILE"
-git config --global credential.helper "store --file=$GIT_CREDENTIAL_FILE"
+source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
+install_senpai_git_guard "$WORKDIR" "$TARGET_WORKDIR" "$GIT_CREDENTIAL_FILE"
 
 clone_target_repo() {
     local depth=()
@@ -114,9 +88,7 @@ source "$WORKDIR/k8s/run-senpai-claude.sh"
 export PATH="$HOME/.claude/bin:$PATH"
 source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 
-# --- Register Senpai CC plugin (skills + tools for common git tasks; CC uses --plugin-dir SENPAI_PLUGIN for tools) ---
-SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
-source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
+# --- Senpai CC plugin (skills + tools for common git tasks; CC uses --plugin-dir SENPAI_PLUGIN for tools) ---
 
 # $GH_REPO comes from the ConfigMap (set by launch.py = owner/repo of the
 # problem-package repo). The gh CLI honours it natively, so every `gh`
@@ -133,8 +105,7 @@ if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
 fi
 
 # Add "$KEY_INFO" (reminder of student names etc) to PROMPT
-LOGGING_INFO="W&B entity/project: ${WANDB_ENTITY}/${WANDB_PROJECT}"
-KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Tag: '"$RESEARCH_TAG"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | '"$LOGGING_INFO"$'\n'
+KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Tag: '"$RESEARCH_TAG"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 # Heartbeat prompt for polling
@@ -172,23 +143,11 @@ while true; do
 
     # --- Check research state before invoking CC ---
     POLL_OK=1
-    if ! REVIEW_JSON=$(list_ready_for_review_prs "$ADVISOR_BRANCH" "$SINCE"); then
-        echo "WARN: failed to list review-ready PRs; treating as empty for this iteration" >&2
-        REVIEW_JSON='[]'
-        POLL_OK=0
-    fi
+    REVIEW_JSON=$(poll_or_empty "review-ready PR poll" list_ready_for_review_prs "$ADVISOR_BRANCH" "$SINCE") || POLL_OK=0
     REVIEW_COUNT=$(printf '%s' "$REVIEW_JSON" | json_len)
-    if ! ISSUE_JSON=$(check_gh_issues "$ADVISOR_BRANCH" "$SINCE"); then
-        echo "WARN: failed to list GitHub issues; treating as empty for this iteration" >&2
-        ISSUE_JSON='[]'
-        POLL_OK=0
-    fi
+    ISSUE_JSON=$(poll_or_empty "GitHub issue poll" check_gh_issues "$ADVISOR_BRANCH" "$SINCE") || POLL_OK=0
     ISSUE_COUNT=$(printf '%s' "$ISSUE_JSON" | json_len)
-    if ! IDLE_JSON=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH"); then
-        echo "WARN: failed to list idle students; treating as empty for this iteration" >&2
-        IDLE_JSON='[]'
-        POLL_OK=0
-    fi
+    IDLE_JSON=$(poll_or_empty "idle-student poll" list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH") || POLL_OK=0
     IDLE_COUNT=$(printf '%s' "$IDLE_JSON" | json_len)
 
     # --- Derive watermark from the data we actually fetched (no gap, no overlap) ---
