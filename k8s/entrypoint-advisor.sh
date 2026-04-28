@@ -103,22 +103,16 @@ LOGDIR="$WORKDIR/advisor_logs"
 mkdir -p "$LOGDIR"
 
 # --- Start Hivemind logging service (streams CC session logs to hivemind.wandb.tools) ---
-if [ "${SENPAI_ENABLE_AGENT_TRACING:-true}" = "true" ]; then
-    mkdir -p ~/.claude/projects
-    uvx --from wandb-hivemind hivemind run &
-    echo "=== Hivemind started (PID=$!) ==="
-else
-    echo "=== Hivemind disabled ==="
-fi
+mkdir -p ~/.claude/projects
+uvx --from wandb-hivemind hivemind run &
+echo "=== Hivemind started (PID=$!) ==="
 
 # --- Load CC run command helper function ---
 source "$WORKDIR/k8s/run-senpai-claude.sh"
 
 # --- Register Weave CC plugin (tools already baked into Docker image) ---
 export PATH="$HOME/.claude/bin:$PATH"
-if [ "${SENPAI_ENABLE_AGENT_TRACING:-true}" = "true" ]; then
-    source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
-fi
+source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 
 # --- Register Senpai CC plugin (skills + tools for common git tasks; CC uses --plugin-dir SENPAI_PLUGIN for tools) ---
 SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
@@ -139,11 +133,7 @@ if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
 fi
 
 # Add "$KEY_INFO" (reminder of student names etc) to PROMPT
-if [ "${WANDB_MODE:-online}" = "disabled" ]; then
-    LOGGING_INFO="Experiment logging: local JSONL metrics only"
-else
-    LOGGING_INFO="W&B entity/project: ${WANDB_ENTITY}/${WANDB_PROJECT}"
-fi
+LOGGING_INFO="W&B entity/project: ${WANDB_ENTITY}/${WANDB_PROJECT}"
 KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Tag: '"$RESEARCH_TAG"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | '"$LOGGING_INFO"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 

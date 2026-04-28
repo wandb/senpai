@@ -80,22 +80,16 @@ if [ "$GH_HISTORY_SCOPE" != "repo" ]; then
 fi
 
 # --- Start Hivemind (streams CC session logs to hivemind.wandb.tools) ---
-if [ "${SENPAI_ENABLE_AGENT_TRACING:-true}" = "true" ]; then
-    mkdir -p ~/.claude/projects
-    uvx --from wandb-hivemind hivemind run &
-    echo "=== Hivemind started (PID=$!) ==="
-else
-    echo "=== Hivemind disabled ==="
-fi
+mkdir -p ~/.claude/projects
+uvx --from wandb-hivemind hivemind run &
+echo "=== Hivemind started (PID=$!) ==="
 
 # --- Load CC run command helper function ---
 source "$WORKDIR/k8s/run-senpai-claude.sh"
 
 # --- Register Weave Claude Code Plugin (tools already baked into Docker image) ---
 export PATH="$HOME/.claude/bin:$PATH"
-if [ "${SENPAI_ENABLE_AGENT_TRACING:-true}" = "true" ]; then
-    source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
-fi
+source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 
 # --- Register Senpai CC plugin ---
 SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
@@ -110,11 +104,7 @@ source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
 TASK_INSTRUCTIONS="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
 PROMPT="${TASK_INSTRUCTIONS}"
 
-if [ "${WANDB_MODE:-online}" = "disabled" ]; then
-    LOGGING_INFO="Experiment logging: local JSONL metrics only"
-else
-    LOGGING_INFO="W&B entity/project: ${WANDB_ENTITY}/${WANDB_PROJECT}"
-fi
+LOGGING_INFO="W&B entity/project: ${WANDB_ENTITY}/${WANDB_PROJECT}"
 KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | '"$LOGGING_INFO"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
