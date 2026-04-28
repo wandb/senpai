@@ -95,6 +95,7 @@ repo_branch: main
 target_repo_url: https://github.com/morganmcg1/tandemfoil2.git
 advisor_branch: schmidhuber
 gh_history_scope: branch
+human_issues: true
 image: ghcr.io/wandb/senpai:latest
 pvc_claim_name: new-pvc
 pvc_mount_path: /mnt/new-pvc
@@ -136,6 +137,12 @@ GitHub token requirements: use a PAT with `repo` and `read:org`; it must clone `
 ### GitHub History Scope
 
 `--gh_history_scope branch` is the default: pods clone only the advisor branch while keeping that branch's history. Use `--gh_history_scope repo` to clone the full target repo, or `--gh_history_scope fresh` for a shallow single-branch clone. Use `--extra_instructions` for any agent-facing guidance about what history to use or ignore.
+
+### Research Modes
+
+- **Isolated ablation:** use a unique `--tag`, unique `--advisor_branch`, `--gh_history_scope fresh`, `--student_prefix`, and `--nohuman_issues`. Agents see only the routed branch/PR stream unless explicitly told otherwise.
+- **Normal branch memory:** use `--gh_history_scope branch` with human issues enabled. Agents keep continuity on the active advisor branch while routine PR/issue polling stays scoped to the target repo.
+- **Deliberate exploration:** use `--gh_history_scope repo` or targeted `--extra_instructions` that ask the advisor/researcher-agent to inspect other branches, PRs, issues, W&B runs, or repos. Senpai helpers stay scoped to `GH_REPO`, but explicit `gh --repo owner/repo ...` reads are available when credentials allow.
 
 ### Shared cluster secret (`senpai-secrets`)
 

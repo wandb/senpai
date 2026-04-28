@@ -171,11 +171,24 @@ while true; do
     [ -f "$LAST_CHECK_FILE" ] && SINCE=$(cat "$LAST_CHECK_FILE")
 
     # --- Check research state before invoking CC ---
-    REVIEW_JSON=$(list_ready_for_review_prs "$ADVISOR_BRANCH" "$SINCE" || printf '[]')
+    POLL_OK=1
+    if ! REVIEW_JSON=$(list_ready_for_review_prs "$ADVISOR_BRANCH" "$SINCE"); then
+        echo "WARN: failed to list review-ready PRs; treating as empty for this iteration" >&2
+        REVIEW_JSON='[]'
+        POLL_OK=0
+    fi
     REVIEW_COUNT=$(printf '%s' "$REVIEW_JSON" | json_len)
-    ISSUE_JSON=$(check_gh_issues "$ADVISOR_BRANCH" "$SINCE" || printf '[]')
+    if ! ISSUE_JSON=$(check_gh_issues "$ADVISOR_BRANCH" "$SINCE"); then
+        echo "WARN: failed to list GitHub issues; treating as empty for this iteration" >&2
+        ISSUE_JSON='[]'
+        POLL_OK=0
+    fi
     ISSUE_COUNT=$(printf '%s' "$ISSUE_JSON" | json_len)
-    IDLE_JSON=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH" || printf '[]')
+    if ! IDLE_JSON=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH"); then
+        echo "WARN: failed to list idle students; treating as empty for this iteration" >&2
+        IDLE_JSON='[]'
+        POLL_OK=0
+    fi
     IDLE_COUNT=$(printf '%s' "$IDLE_JSON" | json_len)
 
     # --- Derive watermark from the data we actually fetched (no gap, no overlap) ---
@@ -216,9 +229,11 @@ while true; do
     fi
     DURATION=$(( $(date +%s) - START_TS ))
 
-    # --- Advance watermark to max updatedAt of items we fetched (only on success so failed runs retry) ---
-    if [ "$EXIT_CODE" -eq 0 ] && [ -n "$WATERMARK" ]; then
+    # --- Advance watermark only after a complete poll and successful CC run. ---
+    if [ "$EXIT_CODE" -eq 0 ] && [ "$POLL_OK" -eq 1 ] && [ -n "$WATERMARK" ]; then
         echo "$WATERMARK" > "$LAST_CHECK_FILE"
+    elif [ "$EXIT_CODE" -eq 0 ] && [ "$POLL_OK" -ne 1 ]; then
+        echo "=== Poll incomplete; not advancing last-check timestamp ==="
     fi
 
     echo "=== Advisor exited code=$EXIT_CODE after ${DURATION}s at $(date), next check in $SLEEP_TIME_S seconds ==="
