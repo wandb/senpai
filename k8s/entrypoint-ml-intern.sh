@@ -142,7 +142,8 @@ cat > "$ML_INTERN_CONFIG_FILE" <<'JSON'
   "session_dataset_repo": "smolagents/ml-intern-sessions",
   "auto_save_interval": 1,
   "heartbeat_interval_s": 30,
-  "auto_file_upload": true
+  "auto_file_upload": true,
+  "mcpServers": {}
 }
 JSON
 export ML_INTERN_CLI_CONFIG="$ML_INTERN_CONFIG_FILE"
