@@ -8,6 +8,7 @@ set -euo pipefail
 
 WORKDIR="/workspace/ml-intern-benchmark"
 ML_INTERN_DIR="$WORKDIR/ml-intern"
+ML_INTERN_VENV="$WORKDIR/ml-intern-venv"
 TARGET_DIR="$WORKDIR/target"
 PROMPT_FILE="$WORKDIR/prompt.md"
 LOGDIR="$WORKDIR/logs"
@@ -99,7 +100,10 @@ git -C "$ML_INTERN_DIR" remote add origin "$ML_INTERN_REPO_URL"
 git -C "$ML_INTERN_DIR" fetch --depth 1 --no-tags origin "$ML_INTERN_REPO_REF"
 git -C "$ML_INTERN_DIR" checkout --detach FETCH_HEAD
 echo "ML Intern resolved commit: $(git -C "$ML_INTERN_DIR" rev-parse HEAD)"
-uv pip install --system -e "$ML_INTERN_DIR"
+uv python install 3.12
+uv venv --python 3.12 "$ML_INTERN_VENV"
+uv pip install --python "$ML_INTERN_VENV/bin/python" -e "$ML_INTERN_DIR"
+"$ML_INTERN_VENV/bin/python" --version
 
 echo "=== Cloning target repo ==="
 target_auth_url="$(printf '%s' "$TARGET_REPO_URL" | sed "s#https://github.com/#https://${GITHUB_TOKEN}@github.com/#")"
@@ -155,7 +159,7 @@ PROMPT="$(cat "$PROMPT_FILE")"
 
 set +e
 timeout --preserve-status --kill-after=60s "${ML_INTERN_TIMEOUT_SECONDS}s" \
-  ml-intern \
+  "$ML_INTERN_VENV/bin/ml-intern" \
     --model "$ML_INTERN_MODEL" \
     --max-iterations "$ML_INTERN_MAX_ITERATIONS" \
     --no-stream \
