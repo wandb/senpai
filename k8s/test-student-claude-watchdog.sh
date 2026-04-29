@@ -38,6 +38,9 @@ run_assignment_changed_case() {
     student_poll_for_work() {
         printf '%s\n' "$ASSIGNED_39"
     }
+    student_has_active_training() {
+        return 1
+    }
     run_senpai_claude() {
         sleep 60
     }
@@ -47,12 +50,35 @@ run_assignment_changed_case() {
     assert_rc 124 "$rc" "assignment change stops Claude"
 }
 
+run_assignment_changed_with_training_case() {
+    LOGFILE="$TMPDIR/assignment_changed_with_training.log"
+    printf 'start\n' > "$LOGFILE"
+
+    student_poll_for_work() {
+        printf '%s\n' "$ASSIGNED_39"
+    }
+    student_has_active_training() {
+        return 0
+    }
+    run_senpai_claude() {
+        sleep 2
+        printf 'done\n' >> "$LOGFILE"
+    }
+
+    local rc=0
+    run_student_claude_with_watchdog "$ASSIGNED_36" 5 "prompt" || rc=$?
+    assert_rc 0 "$rc" "assignment change waits while training is active"
+}
+
 run_stale_log_case() {
     LOGFILE="$TMPDIR/stale_log.log"
     printf 'start\n' > "$LOGFILE"
 
     student_poll_for_work() {
         printf '%s\n' "$ASSIGNED_36"
+    }
+    student_has_active_training() {
+        return 1
     }
     run_senpai_claude() {
         sleep 60
@@ -70,6 +96,9 @@ run_clean_exit_case() {
     student_poll_for_work() {
         printf '%s\n' "$ASSIGNED_36"
     }
+    student_has_active_training() {
+        return 1
+    }
     run_senpai_claude() {
         sleep 1
         printf 'done\n' >> "$LOGFILE"
@@ -81,6 +110,6 @@ run_clean_exit_case() {
 }
 
 run_assignment_changed_case
+run_assignment_changed_with_training_case
 run_stale_log_case
 run_clean_exit_case
-

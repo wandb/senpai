@@ -32,36 +32,25 @@ print(",".join(f"#{number}" for number in numbers))
 
 student_has_active_training() {
     ps -eo pid,ppid,comm,args |
-        awk '$3 ~ /^(python|python3|torchrun)$/ && $0 ~ /train[.]py/ { found = 1 } END { exit !found }'
+        awk '$3 ~ /^(python[0-9.]*|torchrun)$/ && $0 ~ /train[.]py/ { found = 1 } END { exit !found }'
 }
 
 student_kill_process_tree() {
-    local pid="$1" child
+    local signal="$1" pid="$2" child
     [ -n "$pid" ] || return 0
 
     for child in $(pgrep -P "$pid" 2>/dev/null || true); do
-        student_kill_process_tree "$child"
+        student_kill_process_tree "$signal" "$child"
     done
 
-    kill -TERM "$pid" 2>/dev/null || true
-}
-
-student_force_kill_process_tree() {
-    local pid="$1" child
-    [ -n "$pid" ] || return 0
-
-    for child in $(pgrep -P "$pid" 2>/dev/null || true); do
-        student_force_kill_process_tree "$child"
-    done
-
-    kill -KILL "$pid" 2>/dev/null || true
+    kill "-$signal" "$pid" 2>/dev/null || true
 }
 
 student_stop_claude_tree() {
     local pid="$1"
-    student_kill_process_tree "$pid"
+    student_kill_process_tree TERM "$pid"
     sleep "$STUDENT_CLAUDE_KILL_GRACE_S"
-    kill -0 "$pid" 2>/dev/null && student_force_kill_process_tree "$pid"
+    kill -0 "$pid" 2>/dev/null && student_kill_process_tree KILL "$pid"
 }
 
 run_student_claude_with_watchdog() {
@@ -74,7 +63,7 @@ run_student_claude_with_watchdog() {
     run_senpai_claude "$@" &
     local claude_pid=$!
     local start_ts now_ts runtime log_mtime log_age
-    local current_json current_numbers poll_status reason rc
+    local current_json current_numbers poll_status reason rc active_training
     local watchdog_fired=0
     start_ts=$(date +%s)
 
@@ -87,20 +76,27 @@ run_student_claude_with_watchdog() {
         [ "$runtime" -lt "$STUDENT_CLAUDE_MIN_RUNTIME_S" ] && continue
 
         reason=""
+        active_training=0
+        student_has_active_training && active_training=1
+
         if [ -n "$start_numbers" ]; then
             poll_status=0
             current_json=$(student_poll_for_work "$STUDENT_NAME" 2>/dev/null) || poll_status=$?
             if [ "$poll_status" -eq 0 ]; then
                 current_numbers=$(printf '%s' "$current_json" | student_assignment_numbers)
                 if [ "$current_numbers" != "$start_numbers" ]; then
-                    reason="assignment changed from ${start_numbers:-none} to ${current_numbers:-none}"
+                    if [ "$active_training" -eq 0 ]; then
+                        reason="assignment changed from ${start_numbers:-none} to ${current_numbers:-none}"
+                    else
+                        echo "=== Claude watchdog: assignment changed but train.py is active; waiting ==="
+                    fi
                 fi
             else
                 echo "=== Claude watchdog: assignment poll failed; leaving Claude running ==="
             fi
         fi
 
-        if [ -z "$reason" ] && ! student_has_active_training; then
+        if [ -z "$reason" ] && [ "$active_training" -eq 0 ]; then
             log_mtime=$(student_file_mtime_s "$LOGFILE" 2>/dev/null || printf '%s' "$now_ts")
             log_age=$((now_ts - log_mtime))
             if [ "$log_age" -ge "$STUDENT_CLAUDE_STALE_LOG_S" ]; then
@@ -123,4 +119,3 @@ run_student_claude_with_watchdog() {
     fi
     return "$rc"
 }
-
