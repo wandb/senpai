@@ -128,6 +128,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
 - Avoid `Monitor` for normal training progress. If you must monitor a run, trigger only on terminal events such as process exit, `Traceback`, OOM, NaN, or explicit completion; never monitor `Epoch`, validation metrics, best-checkpoint updates, W&B updates, or `tail -f` output.
 - Do not use `Monitor` for GitHub assignment polling. Assignment polling belongs to the entrypoint and the `senpai:poll-for-work` helper.
 - Use a background `until ...; do sleep N; done` loop only for a bounded local check.
+- Do not wait for your own background commands with broad `pgrep -f "<wandb name or args>"` patterns. The waiting shell command line contains that pattern too, so `pgrep -f` can match the waiter itself forever. Capture the PID when you launch a background command and use `wait "$pid"`, a task id, or a pidfile instead.
 
 ### Give new experiments the best possible chance of success
 

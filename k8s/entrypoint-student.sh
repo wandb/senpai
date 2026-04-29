@@ -68,6 +68,7 @@ echo "=== Hivemind started (PID=$!) ==="
 
 # --- Load CC run command helper function ---
 source "$WORKDIR/k8s/run-senpai-claude.sh"
+source "$WORKDIR/k8s/student-claude-watchdog.sh"
 
 # --- Register Weave Claude Code Plugin (tools already baked into Docker image) ---
 export PATH="$HOME/.claude/bin:$PATH"
@@ -174,16 +175,22 @@ while true; do
         echo "=== Iteration $ITERATION: Using FULL prompt + triage ==="
         echo "$FULL_PROMPT"
         echo "$TRIAGE_INFO"
-        run_senpai_claude $MAX_TURNS "${FULL_PROMPT}"$'\n\n'"${TRIAGE_INFO}" || EXIT_CODE=$?
+        run_student_claude_with_watchdog "$ASSIGNED_JSON" \
+            $MAX_TURNS "${FULL_PROMPT}"$'\n\n'"${TRIAGE_INFO}" || EXIT_CODE=$?
     else
         echo "=== Iteration $ITERATION: Using heartbeat prompt ==="
         echo "$HEARTBEAT_PROMPT"
         echo "$TRIAGE_INFO"
         # Student should start fresh each iteration (no -c) — experiments are self-contained
-        run_senpai_claude $MAX_TURNS "${FULL_PROMPT}"$'\n\n'"${HEARTBEAT_PROMPT}"$'\n\n'"${TRIAGE_INFO}" || EXIT_CODE=$?
+        run_student_claude_with_watchdog "$ASSIGNED_JSON" \
+            $MAX_TURNS "${FULL_PROMPT}"$'\n\n'"${HEARTBEAT_PROMPT}"$'\n\n'"${TRIAGE_INFO}" || EXIT_CODE=$?
     fi
     DURATION=$(( $(date +%s) - START_TS ))
 
     echo "=== Claude exited code=$EXIT_CODE after ${DURATION}s at $(date), next check in $SLEEP_TIME_S seconds ==="
+    if [ "$EXIT_CODE" -eq 124 ]; then
+        echo "=== Claude watchdog fired; re-polling immediately ==="
+        continue
+    fi
     sleep "$SLEEP_TIME_S"
 done
