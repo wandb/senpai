@@ -102,7 +102,7 @@ git -C "$ML_INTERN_DIR" checkout --detach FETCH_HEAD
 echo "ML Intern resolved commit: $(git -C "$ML_INTERN_DIR" rev-parse HEAD)"
 uv python install 3.12
 uv venv --python 3.12 "$ML_INTERN_VENV"
-uv pip install --python "$ML_INTERN_VENV/bin/python" -e "$ML_INTERN_DIR"
+uv pip install --python "$ML_INTERN_VENV/bin/python" -e "$ML_INTERN_DIR" tzdata
 "$ML_INTERN_VENV/bin/python" --version
 
 echo "=== Cloning target repo ==="
@@ -142,8 +142,7 @@ cat > "$ML_INTERN_CONFIG_FILE" <<'JSON'
   "session_dataset_repo": "smolagents/ml-intern-sessions",
   "auto_save_interval": 1,
   "heartbeat_interval_s": 30,
-  "auto_file_upload": true,
-  "mcpServers": {}
+  "auto_file_upload": true
 }
 JSON
 export ML_INTERN_CLI_CONFIG="$ML_INTERN_CONFIG_FILE"
