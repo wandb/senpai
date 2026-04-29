@@ -80,6 +80,11 @@ else
   git checkout -B "$TARGET_BRANCH"
   git push -u origin "$TARGET_BRANCH"
 fi
+if [ "$(git branch --show-current)" != "$TARGET_BRANCH" ]; then
+  echo "ERROR: expected to be on target branch $TARGET_BRANCH before starting ML Intern" >&2
+  exit 1
+fi
+echo "Using isolated target branch: $TARGET_BRANCH"
 
 if [ -f pyproject.toml ]; then
   uv pip install --system -e .

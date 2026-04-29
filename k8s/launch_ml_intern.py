@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,7 @@ from launch_helpers import (
     resolve_anthropic_api_key,
     resolve_github_token,
     resolve_required_secret,
+    target_repo_slug,
 )
 
 TEMPLATE = Path(__file__).parent / "ml-intern-deployment.yaml"
@@ -129,6 +131,69 @@ def preflight_check_hf_token(hf_token: str) -> None:
     print("  OK - Hugging Face token authenticated")
 
 
+def github_api_json(
+    target_repo_url: str,
+    github_token: str,
+    path: str,
+    method: str = "GET",
+    payload: dict[str, str] | None = None,
+    allow_404: bool = False,
+) -> dict | None:
+    """Call the GitHub API for target-repo launch setup."""
+    data = None if payload is None else json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"https://api.github.com{path}",
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {github_token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "senpai-ml-intern-launch",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read()
+            return json.loads(body or b"{}")
+    except urllib.error.HTTPError as e:
+        if allow_404 and e.code == 404:
+            return None
+        body = e.read().decode(errors="replace").replace(github_token, "<redacted>")
+        sys.exit(f"ERROR: GitHub API {e.code} while setting up {target_repo_url}: {body[:500]}")
+
+
+def ensure_target_branches(args: Args, github_token: str, branches: list[str]) -> None:
+    """Create missing target branches from the requested base ref before pods start."""
+    slug = target_repo_slug(args.target_repo_url)
+    encoded_base = urllib.parse.quote(args.base_ref, safe="")
+    commit = github_api_json(args.target_repo_url, github_token, f"/repos/{slug}/commits/{encoded_base}")
+    if commit is None:
+        sys.exit(f"ERROR: unable to resolve base ref {args.base_ref!r} in {slug}.")
+    base_sha = commit["sha"]
+    print(f"Preflight: ensuring ML Intern target branches on {slug} from {args.base_ref} ({base_sha[:7]})")
+    for branch in branches:
+        ref_name = f"heads/{branch}"
+        encoded_ref = urllib.parse.quote(ref_name, safe="/")
+        existing = github_api_json(
+            args.target_repo_url,
+            github_token,
+            f"/repos/{slug}/git/ref/{encoded_ref}",
+            allow_404=True,
+        )
+        if existing is not None:
+            print(f"  OK - {branch} already exists")
+            continue
+        github_api_json(
+            args.target_repo_url,
+            github_token,
+            f"/repos/{slug}/git/refs",
+            method="POST",
+            payload={"ref": f"refs/{ref_name}", "sha": base_sha},
+        )
+        print(f"  created {branch}")
+
+
 def effective_replicates(args: Args) -> int:
     return 1 if args.smoke else args.replicates
 
@@ -172,12 +237,10 @@ def build_prompt(args: Args, replicate: int, branch: str) -> str:
 You are Hugging Face ML Intern running headlessly inside a Kubernetes Job on the pai2 cluster.
 
 ## Benchmark contract
-- Replicate: {replicate}
 - Target repository: {args.target_repo_url}
 - Base ref: {args.base_ref}
-- Working branch: {branch}
+- Working branch: {branch}. The startup script creates and checks out this branch before ML Intern starts. Work only from this branch. Ignore all other branches and pull requests in the target repo: do not inspect, check out, merge, cherry-pick, or use them for ideas, results, or history. Keep all commits and final pushes on this branch.
 - ML Intern model: {args.model}
-- ML Intern source ref: {args.ml_intern_repo_ref}
 - W&B project: {args.wandb_entity}/{args.wandb_project}
 - Visible GPU budget for this launch: {effective_gpus(args)} GPU(s)
 - Hard pod wall-clock budget: {wall_hours:g} hours
@@ -211,8 +274,6 @@ Before finishing, commit and push to `{branch}`:
 - The code/config changes you want credited to this replicate.
 - `research/MLINTERN_SUMMARY.md` with your strategy, commands, W&B run/group names, best validation metric, test metric if available, GPU usage strategy, and next recommendation.
 - `research/MLINTERN_RESULTS.jsonl` with one JSON object per meaningful run when possible.
-
-Keep the comparison fair to Senpai: use ML Intern defaults where they do not conflict with the local-compute rule, the 8-GPU budget, W&B project grouping, or the 12-hour kill switch.
 {smoke_instructions}
 """
 
@@ -330,22 +391,22 @@ def main() -> None:
     template = TEMPLATE.read_text()
     secret_name = f"ml-intern-launch-secrets-{args.tag}"
     count = effective_replicates(args)
+    branches = [branch_name(args, replicate) for replicate in range(1, count + 1)]
 
     if args.dry_run:
         print(f"--- Secret: {secret_name} ---")
         print(render_ml_intern_secret(secret_name, args.tag, "<REDACTED_GITHUB_TOKEN>", "<REDACTED_ANTHROPIC_API_KEY>", "<REDACTED_HF_TOKEN>"))
         print()
     else:
+        ensure_target_branches(args, github_token, branches)
         kubectl_apply(
             render_ml_intern_secret(secret_name, args.tag, github_token, anthropic_api_key, hf_token),
             f"secret {secret_name}",
         )
 
-    branches = []
     for replicate in range(1, count + 1):
         branch, manifest = render_replicate(template, args, secret_name, replicate)
         validate_manifest(manifest, args, branch, replicate)
-        branches.append(branch)
         if args.dry_run:
             print(f"--- ML Intern replicate {replicate}: {branch} ---")
             print(manifest)
