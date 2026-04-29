@@ -387,9 +387,9 @@ PY
 
 git status --short
 git add -A -- . \
-  ':!wandb' ':!wandb/**' \
-  ':!session_logs' ':!session_logs/**' \
-  ':!*.pt' ':!*.pth' ':!*.ckpt' ':!*.safetensors'
+  ':(exclude)wandb' ':(exclude)wandb/**' \
+  ':(exclude)session_logs' ':(exclude)session_logs/**' \
+  ':(exclude)*.pt' ':(exclude)*.pth' ':(exclude)*.ckpt' ':(exclude)*.safetensors'
 if git diff --cached --quiet; then
   echo "=== No target repo changes to commit ==="
 else
