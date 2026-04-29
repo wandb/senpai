@@ -31,6 +31,22 @@ assert_rc() {
     echo "PASS: $name"
 }
 
+run_active_training_detector_case() {
+    local py
+    for py in python3.10 python3.11 python3.12 python3.13 python3.14; do
+        ps() {
+            printf '123 1 %s %s train.py --epochs 1\n' "$py" "$py"
+        }
+        student_has_active_training || {
+            echo "FAIL: active training detector missed $py" >&2
+            exit 1
+        }
+    done
+    unset -f ps
+
+    echo "PASS: active training detector covers python3.10 through python3.14"
+}
+
 run_assignment_changed_case() {
     LOGFILE="$TMPDIR/assignment_changed.log"
     printf 'start\n' > "$LOGFILE"
@@ -109,6 +125,7 @@ run_clean_exit_case() {
     assert_rc 0 "$rc" "clean Claude exit passes through"
 }
 
+run_active_training_detector_case
 run_assignment_changed_case
 run_assignment_changed_with_training_case
 run_stale_log_case
