@@ -109,6 +109,93 @@ def target_repo_slug(url: str) -> str:
     return url.split("github.com", 1)[-1].lstrip(":/").removesuffix(".git")
 
 
+def _github_api(
+    path: str,
+    token: str,
+    *,
+    method: str = "GET",
+    data: bytes | None = None,
+    timeout: int = 10,
+) -> dict:
+    req = urllib.request.Request(
+        f"https://api.github.com{path}",
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "senpai-launch-preflight",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read()
+        return json.loads(body or b"{}")
+
+
+def _branch_api_path(slug: str, branch: str) -> str:
+    return f"/repos/{slug}/branches/{urllib.parse.quote(branch, safe='')}"
+
+
+def resolve_target_repo_branch(target_repo_url: str, token: str, target_repo_branch: str) -> str:
+    """Return the target repo branch used as the advisor-branch base."""
+    if target_repo_branch:
+        return target_repo_branch
+    slug = target_repo_slug(target_repo_url)
+    return _github_api(f"/repos/{slug}", token).get("default_branch", "")
+
+
+def preflight_check_target_repo_branch(target_repo_url: str, token: str, target_repo_branch: str) -> str:
+    """Verify the base branch exists and return the resolved branch name."""
+    slug = target_repo_slug(target_repo_url)
+    branch = resolve_target_repo_branch(target_repo_url, token, target_repo_branch)
+    if not branch:
+        sys.exit(f"ERROR: could not resolve default branch for {slug}")
+
+    print(f"Preflight: checking target repo base branch {slug}@{branch}")
+    try:
+        _github_api(_branch_api_path(slug, branch), token)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            sys.exit(f"ERROR: target repo branch {slug}@{branch} does not exist")
+        raise
+    print(f"  OK — target repo branch {branch} exists")
+    return branch
+
+
+def ensure_advisor_branch(
+    target_repo_url: str,
+    token: str,
+    target_repo_branch: str,
+    advisor_branch: str,
+) -> None:
+    """Create advisor_branch from target_repo_branch when it does not exist."""
+    slug = target_repo_slug(target_repo_url)
+    base_branch = preflight_check_target_repo_branch(target_repo_url, token, target_repo_branch)
+
+    if advisor_branch == base_branch:
+        print(f"Preflight: advisor branch is target base branch {slug}@{advisor_branch}")
+        return
+
+    print(f"Preflight: ensuring advisor branch {slug}@{advisor_branch} exists")
+    try:
+        _github_api(_branch_api_path(slug, advisor_branch), token)
+        print(f"  OK — advisor branch {advisor_branch} already exists")
+        return
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+
+    base_info = _github_api(_branch_api_path(slug, base_branch), token)
+    base_sha = base_info["commit"]["sha"]
+    payload = json.dumps({
+        "ref": f"refs/heads/{advisor_branch}",
+        "sha": base_sha,
+    }).encode()
+    _github_api(f"/repos/{slug}/git/refs", token, method="POST", data=payload)
+    print(f"  created {advisor_branch} from {base_branch} at {base_sha[:7]}")
+
+
 LAUNCH_CREDENTIAL_ENV_NAMES = ("GITHUB_TOKEN", "ANTHROPIC_API_KEY", "EXA_API_KEY")
 
 

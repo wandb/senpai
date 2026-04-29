@@ -12,7 +12,9 @@ repo_branch: main
 
 # problem-package repo is REQUIRED and must be passed on the CLI
 #   python k8s/launch.py --tag <tag> --target_repo_url https://github.com/<org>/<repo>.git
-# The entrypoint clones it into $PROBLEM_DIR and checks out advisor_branch.
+# The launcher creates advisor_branch from target_repo_branch when needed, then
+# the entrypoint clones it into $PROBLEM_DIR.
+target_repo_branch: ""
 
 # docker image
 image: ""

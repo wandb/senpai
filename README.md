@@ -91,6 +91,7 @@ problem_dir: target/
 repo_url: <runner-repo-url>
 repo_branch: main
 target_repo_url: https://github.com/morganmcg1/tandemfoil2.git
+target_repo_branch: main
 advisor_branch: schmidhuber
 gh_history_scope: branch
 image: <runner-image>
@@ -132,6 +133,8 @@ GitHub token requirements: use a PAT with `repo` and `read:org`; it must clone `
 
 ### GitHub History Scope
 
+`--target_repo_branch` is the branch in the problem-package repo used as the base when `--advisor_branch` does not already exist. Leave it empty to use the target repo's default branch.
+
 `--gh_history_scope branch` is the default: pods clone only the advisor branch while keeping that branch's history. Use `--gh_history_scope repo` to clone the full target repo, or `--gh_history_scope fresh` for a shallow single-branch clone. Use `--extra_instructions` for any agent-facing guidance about what history to use or ignore.
 
 ### Experiment Metrics
@@ -155,7 +158,7 @@ python k8s/launch.py --tag <research-tag> --advisor
 python k8s/launch.py --tag <research-tag> --advisor --n_students 7 --pvc_mount_path "/mnt/pai-amf1-cfd"
 python k8s/launch.py --tag <research-tag> --n_students 7 --dry_run
 python k8s/launch.py --tag <research-tag> --advisor --extra_instructions "Only consider optimizer changes."
-python k8s/launch.py --tag <research-tag> --advisor --gh_history_scope fresh --extra_instructions no-history.md
+python k8s/launch.py --tag <research-tag> --advisor --target_repo_branch icml-appendix-charlie --advisor_branch icml-appendix-charlie-rerun-r1 --gh_history_scope fresh --extra_instructions no-history.md
 
 # Parallel launches: use unique tags, plus --student_prefix when runs share student names
 python k8s/launch.py --tag <tag-a> --advisor --student_prefix a
@@ -177,10 +180,11 @@ kubectl delete deployments,configmaps,secrets -l research-tag=<research-tag>
    ```bash
    # edit senpai.yaml:
    #   target_repo_url: https://github.com/myorg/my_problem.git
-   #   advisor_branch: <branch>
+   #   target_repo_branch: <base-branch>
+   #   advisor_branch: <advisor-branch>
    git add senpai.yaml && git commit -m "Point senpai at my_problem"
    ```
-   Or pass on the CLI: `--target_repo_url ... --advisor_branch ...`.
+   Or pass on the CLI: `--target_repo_url ... --target_repo_branch ... --advisor_branch ...`.
 3. Deploy as usual — `python k8s/launch.py --tag <tag> --advisor`. Agent commits/PRs will land in `myorg/my_problem`, not senpai.
 
 ## References
