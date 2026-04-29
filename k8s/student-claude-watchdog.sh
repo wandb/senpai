@@ -35,6 +35,12 @@ student_has_active_training() {
         awk '$3 ~ /^(python[0-9.]*|torchrun)$/ && $0 ~ /train[.]py/ { found = 1 } END { exit !found }'
 }
 
+student_log_watchdog_trigger() {
+    local message="$1"
+    echo "$message"
+    printf '%s\n' "$message" >> "$LOGFILE"
+}
+
 student_kill_process_tree() {
     local signal="$1" pid="$2" child
     [ -n "$pid" ] || return 0
@@ -105,7 +111,7 @@ run_student_claude_with_watchdog() {
         fi
 
         if [ -n "$reason" ]; then
-            echo "=== Claude watchdog: stopping stale student invocation (${reason}) ==="
+            student_log_watchdog_trigger "=== Claude watchdog: stopping stale student invocation (${reason}) ==="
             student_stop_claude_tree "$claude_pid"
             watchdog_fired=1
             break

@@ -31,6 +31,15 @@ assert_rc() {
     echo "PASS: $name"
 }
 
+assert_log_contains() {
+    local logfile="$1" pattern="$2" name="$3"
+    if ! grep -q "$pattern" "$logfile"; then
+        echo "FAIL: $name missing '$pattern' in $logfile" >&2
+        exit 1
+    fi
+    echo "PASS: $name"
+}
+
 run_assignment_changed_case() {
     LOGFILE="$TMPDIR/assignment_changed.log"
     printf 'start\n' > "$LOGFILE"
@@ -48,6 +57,7 @@ run_assignment_changed_case() {
     local rc=0
     run_student_claude_with_watchdog "$ASSIGNED_36" 5 "prompt" || rc=$?
     assert_rc 124 "$rc" "assignment change stops Claude"
+    assert_log_contains "$LOGFILE" "Claude watchdog: stopping stale student invocation" "assignment trigger is written to logfile"
 }
 
 run_assignment_changed_with_training_case() {
@@ -87,6 +97,7 @@ run_stale_log_case() {
     local rc=0
     run_student_claude_with_watchdog "$ASSIGNED_36" 5 "prompt" || rc=$?
     assert_rc 124 "$rc" "stale log without training stops Claude"
+    assert_log_contains "$LOGFILE" "Claude watchdog: stopping stale student invocation" "stale-log trigger is written to logfile"
 }
 
 run_clean_exit_case() {
