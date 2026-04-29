@@ -74,10 +74,13 @@ senpai/
 │   └── CLAUDE-STUDENT.md
 ├── k8s/                           # Kubernetes deployment (problem-agnostic)
 │   ├── launch.py                  #   Deploy advisor + student pods
+│   ├── launch_ml_intern.py        #   Deploy ML Intern benchmark jobs
 │   ├── advisor-deployment.yaml
 │   ├── student-deployment.yaml
+│   ├── ml-intern-deployment.yaml
 │   ├── entrypoint-advisor.sh
-│   └── entrypoint-student.sh
+│   ├── entrypoint-student.sh
+│   └── entrypoint-ml-intern.sh
 ├── Dockerfile
 └── .claude/                       # Claude Code skills and agents
 ```
@@ -122,12 +125,13 @@ preflight_only: false
 | `GITHUB_TOKEN` | `GITHUB_TOKEN` | shell env -> `.env` -> `gh auth token` |
 | `ANTHROPIC_API_KEY` | `ANTHROPIC_API_KEY` | shell env -> `.env` |
 | `EXA_API_KEY` | `EXA_API_KEY` | shell env -> `.env` |
+| `HF_TOKEN` | `HF_TOKEN` | shell env -> `.env`; used by `launch_ml_intern.py` |
 
 Use `example.env` for local setup:
 
 ```bash
 cp example.env .env
-# edit .env and set GITHUB_TOKEN, ANTHROPIC_API_KEY, and EXA_API_KEY
+# edit .env and set GITHUB_TOKEN, ANTHROPIC_API_KEY, EXA_API_KEY, and HF_TOKEN when using ML Intern
 ```
 
 Notes: `--dry_run` renders redacted manifests without resolving or preflighting credentials. Real launches pass the Secret manifest to `kubectl apply` via stdin, but Kubernetes Secrets are still readable to anyone with namespace Secret read access. Delete launch resources when done: `kubectl delete deployments,configmaps,secrets -l research-tag=<tag>`.
@@ -183,6 +187,55 @@ python k8s/launch.py --tag <tag-b> --advisor --student_prefix b
 # Stop a launch
 kubectl delete deployments,configmaps,secrets -l research-tag=<research-tag>
 ```
+
+### ML Intern pai2 benchmark
+
+`k8s/launch_ml_intern.py` runs the TandemFoilSet-Balanced comparison against Hugging Face ML Intern on the pai2 cluster. The default full run creates five independent Kubernetes Jobs, each with one eight-GPU pod, a 12-hour `activeDeadlineSeconds` kill switch, the shared `new-pvc` mounted at `/mnt/new-pvc`, and a replicate branch named `mlintern-pai2-r1` through `mlintern-pai2-r5`. The entrypoint reserves five minutes inside that 12-hour window to commit and push the harvest files.
+
+Each job uses the Senpai CUDA image, installs `huggingface/ml-intern` at startup, clones the target repo from `main`, sets `SENPAI_TIMEOUT_MINUTES=720`, and prompts ML Intern to decide how to spend the visible GPUs. The prompt tells ML Intern to read the target repo's own `program.md` and split docs before planning, while treating `README.md` as setup/background rather than a source of prior-agent experiment ideas. It also avoids importing Senpai's advisor/student PR workflow or giving ML Intern preselected hypotheses. ML Intern is told that prior baselines used 30 minutes per experiment, but the only hard budget here is the 12-hour launch limit. The default training command shape uses `python train.py --epochs 999 ...`; ML Intern may choose another epoch count if it documents why. Training compute must stay on the local pai2 pod: no HF Jobs, Sandboxes, or remote training. HF Hub session upload/logging is allowed.
+
+```bash
+# Render and validate all manifests without touching credentials or the cluster.
+python k8s/launch_ml_intern.py \
+  --tag mlintern-pai2 \
+  --replicates 5 \
+  --target_repo_url https://github.com/morganmcg1/TandemFoilSet-Balanced.git \
+  --base_ref main \
+  --dry_run
+
+# Check GitHub push access, Anthropic auth, HF auth, W&B Secret, and pai2 context.
+python k8s/launch_ml_intern.py \
+  --tag mlintern-pai2 \
+  --target_repo_url https://github.com/morganmcg1/TandemFoilSet-Balanced.git \
+  --base_ref main \
+  --preflight_only
+
+# Optional 1-GPU smoke job with a tiny debug training command.
+python k8s/launch_ml_intern.py \
+  --tag mlintern-pai2-smoke \
+  --target_repo_url https://github.com/morganmcg1/TandemFoilSet-Balanced.git \
+  --base_ref main \
+  --smoke
+
+# Full five-replicate benchmark.
+python k8s/launch_ml_intern.py \
+  --tag mlintern-pai2 \
+  --replicates 5 \
+  --target_repo_url https://github.com/morganmcg1/TandemFoilSet-Balanced.git \
+  --base_ref main
+```
+
+ML Intern runs log to W&B under `wandb-applied-ai-team/senpai-v1-ml-intern`; prompts ask each replicate to use its branch as the W&B group. The launcher defaults to model `anthropic/claude-opus-4-7` and Kubernetes context `pai-2`.
+
+```bash
+kubectl get jobs,pods -l app=ml-intern,research-tag=mlintern-pai2
+kubectl logs -f job/ml-intern-mlintern-pai2-1
+
+# Stop/delete benchmark resources.
+kubectl delete jobs,configmaps,secrets -l app=ml-intern,research-tag=mlintern-pai2
+```
+
+Harvest results from `research/MLINTERN_SUMMARY.md`, `research/MLINTERN_RESULTS.jsonl`, and `research/MLINTERN_RUN_METADATA.json` on each replicate branch, then compare the W&B groups against the Senpai TandemFoilSet-Balanced baselines.
 
 ## Adding a new problem
 

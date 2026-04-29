@@ -1,0 +1,91 @@
+# SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-PackageName: senpai
+#
+# A single ML Intern benchmark replicate. The launcher renders one Job per
+# replicate so each ML Intern instance gets its own eight-GPU budget and branch
+# without restarting after the finite benchmark run completes.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{JOB_NAME}}
+  labels:
+    app: ml-intern
+    role: agent
+    replicate: "{{REPLICATE}}"
+    research-tag: {{RESEARCH_TAG}}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ACTIVE_DEADLINE_SECONDS}}
+  template:
+    metadata:
+      labels:
+        app: ml-intern
+        role: agent
+        replicate: "{{REPLICATE}}"
+        research-tag: {{RESEARCH_TAG}}
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: ml-intern
+        image: {{IMAGE}}
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -e
+          repo_auth_url="$(printf '%s' "$SENPAI_REPO_URL" | sed "s#https://github.com/#https://${GITHUB_TOKEN}@github.com/#")"
+          git clone --branch "$SENPAI_REPO_BRANCH" --single-branch --depth 1 --no-tags "$repo_auth_url" /workspace/senpai
+          cd /workspace/senpai
+          git remote set-url origin "$SENPAI_REPO_URL"
+          bash k8s/entrypoint-ml-intern.sh
+        envFrom:
+        - configMapRef:
+            name: {{CONFIGMAP_NAME}}
+        env:
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: senpai-secrets
+              key: wandb-api-key
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{LAUNCH_SECRET_NAME}}
+              key: github-token
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{LAUNCH_SECRET_NAME}}
+              key: anthropic-api-key
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{LAUNCH_SECRET_NAME}}
+              key: hf-token
+        resources:
+          requests:
+            cpu: "{{CPU}}"
+            memory: "{{MEMORY}}"
+            nvidia.com/gpu: "{{GPUS_PER_REPLICATE}}"
+          limits:
+            cpu: "{{CPU}}"
+            memory: "{{MEMORY}}"
+            nvidia.com/gpu: "{{GPUS_PER_REPLICATE}}"
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        - name: dataset
+          mountPath: {{PVC_MOUNT_PATH}}
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+      - name: dataset
+        persistentVolumeClaim:
+          claimName: {{PVC_CLAIM_NAME}}
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
