@@ -9,13 +9,14 @@ set -o pipefail
 
 WORKDIR="/workspace/senpai"
 GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
+TARGET_REPO_BRANCH="${TARGET_REPO_BRANCH:-}"
 export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
 GIT_CREDENTIAL_FILE="$WORKDIR/.git-credentials"
 SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 
 echo "=== Senpai Advisor ==="
 echo "Runner repo:  $REPO_URL (branch: $REPO_BRANCH)"
-echo "Target repo:  $TARGET_REPO_URL (branch: $ADVISOR_BRANCH)"
+echo "Target repo:  $TARGET_REPO_URL (base branch: ${TARGET_REPO_BRANCH:-<default>}; advisor branch: $ADVISOR_BRANCH)"
 echo "Problem dir:  $PROBLEM_DIR"
 echo "Tag:          $RESEARCH_TAG"
 echo "Students:     $STUDENT_NAMES"
@@ -26,11 +27,31 @@ cd "$WORKDIR"
 source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
 install_senpai_git_guard "$WORKDIR" "$TARGET_WORKDIR" "$GIT_CREDENTIAL_FILE"
 
-clone_target_repo() {
+clone_single_target_branch() {
+    local branch="$1"
     local depth=()
     [ "$GH_HISTORY_SCOPE" = "fresh" ] && depth=(--depth 1)
+    git clone --branch "$branch" --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$PROBLEM_DIR"
+}
+
+clone_target_repo() {
     case "$GH_HISTORY_SCOPE" in
-        branch|fresh) git clone --branch "$ADVISOR_BRANCH" --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$PROBLEM_DIR" ;;
+        branch|fresh)
+            if clone_single_target_branch "$ADVISOR_BRANCH"; then
+                return 0
+            fi
+            if [ -z "$TARGET_REPO_BRANCH" ]; then
+                return 1
+            fi
+            rm -rf "$PROBLEM_DIR"
+            if ! clone_single_target_branch "$TARGET_REPO_BRANCH"; then
+                return 1
+            fi
+            cd "$WORKDIR/$PROBLEM_DIR"
+            git checkout -b "$ADVISOR_BRANCH"
+            git push -u origin "$ADVISOR_BRANCH"
+            cd "$WORKDIR"
+            ;;
         repo) git clone "$TARGET_REPO_URL" "$PROBLEM_DIR" ;;
         *) echo "ERROR: GH_HISTORY_SCOPE must be one of: branch, repo, fresh" >&2; exit 2 ;;
     esac
@@ -39,6 +60,10 @@ clone_target_repo() {
 # Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
 # agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
 if [ ! -d "$PROBLEM_DIR/.git" ] && ! clone_target_repo; then
+    if [ -n "$TARGET_REPO_BRANCH" ]; then
+        echo "ERROR: could not clone advisor branch '$ADVISOR_BRANCH' or target base branch '$TARGET_REPO_BRANCH'" >&2
+        exit 1
+    fi
     [ "$GH_HISTORY_SCOPE" = "repo" ] && exit 1
     depth=()
     [ "$GH_HISTORY_SCOPE" = "fresh" ] && depth=(--depth 1)
@@ -68,7 +93,12 @@ if git rev-parse --verify "origin/$ADVISOR_BRANCH" >/dev/null 2>&1; then
     git checkout "$ADVISOR_BRANCH"
     git pull --ff-only origin "$ADVISOR_BRANCH"
 else
-    git checkout -b "$ADVISOR_BRANCH"
+    if [ -n "$TARGET_REPO_BRANCH" ]; then
+        git fetch origin "$TARGET_REPO_BRANCH"
+        git checkout -B "$ADVISOR_BRANCH" "origin/$TARGET_REPO_BRANCH"
+    else
+        git checkout -b "$ADVISOR_BRANCH"
+    fi
     git push -u origin "$ADVISOR_BRANCH"
 fi
 
@@ -110,7 +140,7 @@ if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
 fi
 
 # Add "$KEY_INFO" (reminder of student names etc) to PROMPT
-KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Tag: '"$RESEARCH_TAG"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
+KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Tag: '"$RESEARCH_TAG"' | Target repo: '"$GH_REPO"' | Target base branch: '"${TARGET_REPO_BRANCH:-<default>}"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 # Heartbeat prompt for polling

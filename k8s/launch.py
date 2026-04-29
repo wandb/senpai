@@ -14,12 +14,14 @@ from pathlib import Path
 import simple_parsing as sp
 
 from launch_helpers import (
+    ensure_advisor_branch,
     existing_student_names,
     expand_student_names,
     ensure_target_repo_labels,
     kubectl_apply,
     preflight_check_anthropic_api_key,
     preflight_check_exa_api_key,
+    preflight_check_target_repo_branch,
     preflight_check_target_repo_access,
     render_configmap,
     render_launch_secret,
@@ -40,6 +42,7 @@ class Args:
     """Launch senpai advisor and/or student agents on Kubernetes."""
     tag: str  # research tag (e.g. mar13)
     target_repo_url: str  # problem-package repo (entrypoint clones this into $PROBLEM_DIR; agent commits/PRs land here) — REQUIRED, no default
+    target_repo_branch: str = ""  # target repo branch used as the base when creating advisor_branch; empty = target repo default branch
     problem_dir: str = "target/"  # active problem directory — entrypoint clones target_repo_url here (from senpai.yaml)
     names: str = ""  # comma-separated student names (e.g. "frieren,fern")
     n_students: int = 4  # number of students to launch (ignored if --names is provided)
@@ -53,7 +56,7 @@ class Args:
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
     wandb_project: str = "senpai-v1"  # W&B project name
     human_issues: bool = True  # allow human GitHub issue triage; disable for isolated launches
-    advisor_branch: str = "schmidhuber"  # branch the advisor works on inside the problem-package repo (students PR into it; created from the problem-package default branch if missing)
+    advisor_branch: str = "schmidhuber"  # branch the advisor works on inside the problem-package repo (students PR into it; created from target_repo_branch if missing)
     gh_history_scope: str = "branch"  # branch=normal track memory, fresh=clean ablation, repo=whole-repo memory
     pvc_claim_name: str = "new-pvc"  # PVC name mounted into pods
     pvc_mount_path: str = "/mnt/new-pvc"  # mount path for the dataset PVC inside the containers
@@ -77,6 +80,7 @@ def render_student(template: str, student_name: str, tag: str, secret_name: str,
             "REPO_URL": args.repo_url,
             "REPO_BRANCH": args.repo_branch,
             "TARGET_REPO_URL": args.target_repo_url,
+            "TARGET_REPO_BRANCH": args.target_repo_branch,
             "GH_REPO": target_repo_slug(args.target_repo_url),
             "STUDENT_NAME": student_name,
             "RESEARCH_TAG": tag,
@@ -117,6 +121,7 @@ def render_advisor(template: str, tag: str, student_list: list[str], secret_name
         "REPO_URL": args.repo_url,
         "REPO_BRANCH": args.repo_branch,
         "TARGET_REPO_URL": args.target_repo_url,
+        "TARGET_REPO_BRANCH": args.target_repo_branch,
         "GH_REPO": target_repo_slug(args.target_repo_url),
         "RESEARCH_TAG": tag,
         "STUDENT_NAMES": ",".join(student_list),
@@ -165,6 +170,11 @@ def main():
         anthropic_api_key = resolve_anthropic_api_key(DOTENV_PATH)
         exa_api_key = resolve_exa_api_key(DOTENV_PATH)
         preflight_check_target_repo_access(args.target_repo_url, github_token)
+        args.target_repo_branch = preflight_check_target_repo_branch(
+            args.target_repo_url,
+            github_token,
+            args.target_repo_branch,
+        )
         preflight_check_anthropic_api_key(anthropic_api_key)
         preflight_check_exa_api_key(exa_api_key)
         if args.preflight_only:
@@ -180,6 +190,12 @@ def main():
         student_list = [f"{args.student_prefix}-{name}" for name in student_list]
 
     if not args.dry_run:
+        ensure_advisor_branch(
+            args.target_repo_url,
+            github_token,
+            args.target_repo_branch,
+            args.advisor_branch,
+        )
         ensure_target_repo_labels(args.target_repo_url, github_token, routing_labels(args.advisor_branch, student_list))
 
     student_template = STUDENT_TEMPLATE.read_text()
