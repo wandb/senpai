@@ -1,4 +1,4 @@
-FROM ghcr.io/coreweave/ml-containers/torch-extras:es-cuda-13-dev-99be449-base-cuda13.2.0-ubuntu22.04-torch2.10.0-vision0.25.0-audio2.10.0-abi1
+FROM ghcr.io/coreweave/ml-containers/torch-extras:bc8c66e-base-cuda13.2.1-ubuntu24.04-torch2.11.0-vision0.26.0-audio2.11.0-abi1
 
 # Install Node.js 22 + yq
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
@@ -13,11 +13,30 @@ RUN curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release
 # Install uv
 RUN pip install uv
 
-# Install project Python dependencies into the image from the lockfile.
-COPY pyproject.toml uv.lock /tmp/senpai/
+# Install project Python dependencies from pyproject.toml.
+# Keep the CoreWeave image's prebuilt CUDA/PyTorch stack instead of replacing it
+# with PyPI torch/CUDA wheels.
+COPY pyproject.toml /tmp/senpai/
 RUN cd /tmp/senpai && \
-    uv export --frozen --no-dev --no-emit-project --format requirements.txt > requirements.txt && \
-    uv pip install --system -r requirements.txt
+    uv pip compile pyproject.toml --format requirements.txt \
+      --no-header \
+      --no-annotate \
+      --no-emit-package torch \
+      --no-emit-package torchvision \
+      --no-emit-package torchaudio \
+      --no-emit-package triton \
+      | grep -Ev '^(torch|torchvision|torchaudio|triton|nvidia-)' \
+      > requirements.txt && \
+    uv pip install --system -r requirements.txt && \
+    python - <<'PY'
+import sys
+import torch
+import torchvision
+
+assert sys.version_info >= (3, 12), sys.version
+assert torch.__version__.startswith("2.11.0"), torch.__version__
+assert torchvision.__version__.startswith("0.26.0"), torchvision.__version__
+PY
 
 # Install Claude Code + gh
 RUN curl -fsSL https://claude.ai/install.sh | bash || true && \

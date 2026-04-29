@@ -109,10 +109,15 @@ def test_python_deps_and_icml_target_import(test_pod):
     """The image has the Python deps needed by the new ICML target."""
     cmd = (
         "python - <<'PY'\n"
+        "import sys\n"
         "import numpy\n"
         "import torch\n"
         "import torch_geometric\n"
+        "import torchvision\n"
         "import yaml\n"
+        "assert sys.version_info >= (3, 12), sys.version\n"
+        "assert torch.__version__.startswith('2.11.0'), torch.__version__\n"
+        "assert torchvision.__version__.startswith('0.26.0'), torchvision.__version__\n"
         "print('ok')\n"
         "PY"
     )
