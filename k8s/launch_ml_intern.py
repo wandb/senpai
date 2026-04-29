@@ -32,6 +32,7 @@ from launch_helpers import (
 TEMPLATE = Path(__file__).parent / "ml-intern-deployment.yaml"
 DOTENV_PATH = Path(__file__).parent.parent / ".env"
 DNS_LABEL_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+ML_INTERN_PINNED_REF = "c4ac4e6292e82094d1aebcbffaae7202b35083ab"
 
 
 @dataclass
@@ -53,7 +54,7 @@ class Args:
     senpai_repo_url: str = "https://github.com/wandb/senpai.git"  # runner repo cloned inside the job
     senpai_repo_branch: str = "main"  # runner repo branch
     ml_intern_repo_url: str = "https://github.com/huggingface/ml-intern.git"  # ML Intern source repo
-    ml_intern_repo_branch: str = "main"  # ML Intern source branch
+    ml_intern_repo_ref: str = ML_INTERN_PINNED_REF  # pinned ML Intern git ref; package version 0.1.0
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity
     wandb_project: str = "senpai-v1-ml-intern"  # W&B project
     model: str = "anthropic/claude-opus-4-7"  # ML Intern model
@@ -176,6 +177,7 @@ You are Hugging Face ML Intern running headlessly inside a Kubernetes Job on the
 - Base ref: {args.base_ref}
 - Working branch: {branch}
 - ML Intern model: {args.model}
+- ML Intern source ref: {args.ml_intern_repo_ref}
 - W&B project: {args.wandb_entity}/{args.wandb_project}
 - Visible GPU budget for this launch: {effective_gpus(args)} GPU(s)
 - Hard pod wall-clock budget: {wall_hours:g} hours
@@ -240,7 +242,7 @@ def render_replicate(template: str, args: Args, secret_name: str, replicate: int
             "REPLICATE": str(replicate),
             "RESEARCH_TAG": args.tag,
             "ML_INTERN_REPO_URL": args.ml_intern_repo_url,
-            "ML_INTERN_REPO_BRANCH": args.ml_intern_repo_branch,
+            "ML_INTERN_REPO_REF": args.ml_intern_repo_ref,
             "ML_INTERN_MODEL": args.model,
             "ML_INTERN_PROMPT_B64": prompt_b64,
             "ML_INTERN_TIMEOUT_SECONDS": str(agent_timeout_seconds),
