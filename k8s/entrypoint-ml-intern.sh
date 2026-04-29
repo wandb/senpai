@@ -115,7 +115,7 @@ git config user.email "ml-intern-$REPLICATE@senpai"
 
 if git ls-remote --exit-code --heads origin "$TARGET_BRANCH" >/dev/null 2>&1; then
   git fetch origin "$TARGET_BRANCH"
-  git checkout -B "$TARGET_BRANCH" "origin/$TARGET_BRANCH"
+  git checkout -B "$TARGET_BRANCH" FETCH_HEAD
 else
   git checkout -B "$TARGET_BRANCH"
   git push -u origin "$TARGET_BRANCH"
