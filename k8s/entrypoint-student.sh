@@ -62,9 +62,8 @@ echo "=== Claude config installed ==="
 ls "$HOME/.claude/skills/wandb-primary/SKILL.md" "$HOME/.claude/agents/researcher-agent.md"
 
 # --- Start Hivemind (streams CC session logs to hivemind.wandb.tools) ---
-mkdir -p "$HOME/.claude/projects"
-uvx --from wandb-hivemind hivemind run &
-echo "=== Hivemind started (PID=$!) ==="
+source "$WORKDIR/k8s/start-hivemind.sh"
+start_hivemind
 
 # --- Load CC run command helper function ---
 source "$WORKDIR/k8s/run-senpai-claude.sh"
