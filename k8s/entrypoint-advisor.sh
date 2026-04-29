@@ -150,8 +150,8 @@ while true; do
     POLL_OK=1
     REVIEW_JSON=$(poll_or_empty "review-ready PR poll" list_ready_for_review_prs "$ADVISOR_BRANCH") || POLL_OK=0
     REVIEW_COUNT=$(printf '%s' "$REVIEW_JSON" | json_len)
-    ATTENTION_JSON=$(poll_or_empty "attention PR poll" list_attention_prs "$ADVISOR_BRANCH") || POLL_OK=0
-    ATTENTION_COUNT=$(printf '%s' "$ATTENTION_JSON" | json_len)
+    ADVISOR_ACTION_JSON=$(poll_or_empty "advisor-action PR poll" list_prs_requiring_advisor_action "$ADVISOR_BRANCH") || POLL_OK=0
+    ADVISOR_ACTION_COUNT=$(printf '%s' "$ADVISOR_ACTION_JSON" | json_len)
     ISSUE_JSON=$(poll_or_empty "GitHub issue poll" check_gh_issues "$ADVISOR_BRANCH" "$SINCE") || POLL_OK=0
     ISSUE_COUNT=$(printf '%s' "$ISSUE_JSON" | json_len)
     IDLE_JSON=$(poll_or_empty "idle-student poll" list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH") || POLL_OK=0
@@ -163,7 +163,7 @@ while true; do
     # --- Build triage info (used in logs, CC prompt, and skip check) ---
     TRIAGE_INFO="## Research state (since ${SINCE:-boot})"
     [ "$REVIEW_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **GitHub PRs to review ($REVIEW_COUNT):** $(printf '%s' "$REVIEW_JSON" | json_numbers)"
-    [ "$ATTENTION_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **GitHub PRs needing attention ($ATTENTION_COUNT):** $(printf '%s' "$ATTENTION_JSON" | json_attention_summary)"
+    [ "$ADVISOR_ACTION_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **GitHub PRs requiring advisor action ($ADVISOR_ACTION_COUNT):** $(printf '%s' "$ADVISOR_ACTION_JSON" | json_advisor_action_summary)"
     [ "$ISSUE_COUNT" -gt 0 ]  && TRIAGE_INFO+=$'\n'"- **GitHub issues ($ISSUE_COUNT):** $(printf '%s' "$ISSUE_JSON" | json_numbers)"
     [ "$IDLE_COUNT" -gt 0 ]   && TRIAGE_INFO+=$'\n'"- **Idle students ($IDLE_COUNT):** $(printf '%s' "$IDLE_JSON" | json_join)"
     echo "$TRIAGE_INFO"
@@ -181,7 +181,7 @@ while true; do
         run_senpai_claude $MAX_TURNS "${FULL_PROMPT}"$'\n\n'"${TRIAGE_INFO}" || EXIT_CODE=$?
     else
         # --- Programmatic skip: skip rest of CC loop if nothing actionable ---
-        if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ATTENTION_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$IDLE_COUNT" -eq 0 ]; then
+        if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ADVISOR_ACTION_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$IDLE_COUNT" -eq 0 ]; then
             echo "=== Iteration $ITERATION: Nothing actionable, sleeping $SLEEP_TIME_S seconds ==="
             sleep "$SLEEP_TIME_S"
             continue

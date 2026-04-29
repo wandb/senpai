@@ -259,7 +259,7 @@ create_assignment_branch() {
 json_len() { python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))"; }
 json_join() { python3 -c "import sys,json; print(','.join(json.loads(sys.stdin.read())))"; }
 json_numbers() { python3 -c "import sys,json; print(','.join(f'#{i[\"number\"]}' for i in json.loads(sys.stdin.read())))"; }
-json_attention_summary() {
+json_advisor_action_summary() {
     python3 -c '
 import json
 import sys
@@ -497,11 +497,11 @@ list_all_prs() {
         --json number,title,state,labels,headRefName,updatedAt,isDraft
 }
 
-# List open PRs that should wake the advisor even when they have not been
-# updated since the last heartbeat.
+# List open PRs requiring advisor action, even when they have not been updated
+# since the last heartbeat.
 # Returns a JSON array with a `reasons` list on each PR.
-#   list_attention_prs <branch> [stale_wip_seconds]
-list_attention_prs() {
+#   list_prs_requiring_advisor_action <branch> [stale_wip_seconds]
+list_prs_requiring_advisor_action() {
     local branch="$1" stale_seconds="${2:-${SENPAI_STALE_WIP_SECONDS:-7200}}"
     local prs comments_by_pr num comments row
     prs=$(gh_retry gh pr list --repo "$GH_REPO" --base "$branch" --state open \
@@ -563,7 +563,7 @@ duplicate_wips = {
 }
 
 conflict_re = re.compile(r"merge conflict|rebase conflict|cannot automatically merge|can.t automatically merge|conflicts? with", re.I)
-attention = []
+prs_requiring_advisor_action = []
 for pr in prs:
     labels, students = metadata[pr["number"]]
     reasons = []
@@ -591,9 +591,9 @@ for pr in prs:
     if reasons:
         item = dict(pr)
         item["reasons"] = sorted(set(reasons), key=reasons.index)
-        attention.append(item)
+        prs_requiring_advisor_action.append(item)
 
-print(json.dumps(attention))
+print(json.dumps(prs_requiring_advisor_action))
 ' "$branch" "$stale_seconds"
 }
 
