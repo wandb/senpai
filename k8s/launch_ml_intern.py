@@ -274,6 +274,8 @@ Before finishing, commit and push to `{branch}`:
 - The code/config changes you want credited to this replicate.
 - `research/MLINTERN_SUMMARY.md` with your strategy, commands, W&B run/group names, best validation metric, test metric if available, GPU usage strategy, and next recommendation.
 - `research/MLINTERN_RESULTS.jsonl` with one JSON object per meaningful run when possible.
+
+Do not delete ML Intern's local `session_logs/` directory or temporary command-output logs. The pod entrypoint will harvest those conversation/tool-call artifacts into `research/` before shutdown.
 {smoke_instructions}
 """
 
@@ -347,6 +349,7 @@ def validate_manifest(manifest: str, args: Args, branch: str, replicate: int) ->
         "GPU request": f'nvidia.com/gpu: "{effective_gpus(args)}"',
         "PVC claim": f"claimName: {args.pvc_claim_name}",
         "PVC mount": f"mountPath: {args.pvc_mount_path}",
+        "active deadline": f"activeDeadlineSeconds: {effective_wall_seconds(args)}",
         "branch": f'TARGET_BRANCH: "{branch}"',
         "model": f'ML_INTERN_MODEL: "{args.model}"',
         "W&B project": f'WANDB_PROJECT: "{args.wandb_project}"',
