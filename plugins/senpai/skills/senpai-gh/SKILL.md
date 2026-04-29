@@ -45,7 +45,7 @@ GitHub's `gh pr edit --remove-label X --add-label Y` silently strips **all other
 |---|---|
 | `send_pr_back_to_student_with_comment <pr#> <comment>` | Send a PR back to the student with feedback. Comment on the PR, convert back to draft, swap `status:review` → `status:wip`. |
 | `close_pr_with_comment <pr#> <reason>` | Close a dead-end PR with a comment explaining why. Comment with reason, close the PR, delete the remote branch. |
-| `create_assignment_pr_from_file <student> <head-branch> <title> <body-file> [base-branch]` | Create a draft assignment PR, then fail if the required base/head, draft, or routing labels are missing. |
+| `create_assignment_pr_from_file <student> <head-branch> <title> <body-file> [base-branch]` | Create a draft assignment PR, then fail if the student already has a `status:wip` PR or if required base/head, draft, or routing labels are missing. |
 
 ### Student actions
 
@@ -64,6 +64,7 @@ The default repo for `gh` is set via the injected `GH_REPO` env var, so no `--re
 | `issue_comments <issue#>` | Read all issue comments through REST pagination. Returns JSON array. |
 | `issue_with_comments <issue#>` | Read one issue and all comments through REST pagination. Returns JSON object. |
 | `list_ready_for_review_prs <branch>` | List PRs with `status:review` on a branch. Returns JSON array. |
+| `list_attention_prs <branch>` | List open branch PRs that need advisor attention, with `reasons` such as stale WIP, duplicate student WIP, missing routing labels, or rebase conflicts. Returns JSON array. |
 | `list_all_prs <branch>` | List all open PRs on a branch (any status). Returns JSON array. |
 | `student_poll_for_work <student_name> [branch]` | List branch-scoped WIP PRs assigned to a student. Returns JSON array. |
 | `list_idle_students <names_csv> <branch>` | Print names of students with no `status:wip` PR, one per line. |

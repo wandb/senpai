@@ -155,7 +155,7 @@ close_pr_with_comment() {
 #   create_assignment_pr_from_file <student> <head-branch> <title> <body-file> [base-branch]
 create_assignment_pr_from_file() {
     local student="$1" head_branch="$2" title="$3" body_file="$4" base_branch="${5:-${ADVISOR_BRANCH:-}}"
-    local pr_url num details
+    local existing existing_count pr_url num details
 
     if [ -z "$student" ] || [ -z "$head_branch" ] || [ -z "$title" ] || [ -z "$body_file" ] || [ -z "$base_branch" ]; then
         echo "create_assignment_pr_from_file: usage: <student> <head-branch> <title> <body-file> [base-branch]" >&2
@@ -164,6 +164,13 @@ create_assignment_pr_from_file() {
     if [ ! -f "$body_file" ]; then
         echo "create_assignment_pr_from_file: body file not found: $body_file" >&2
         return 2
+    fi
+
+    existing=$(student_poll_for_work "$student" "$base_branch")
+    existing_count=$(printf '%s' "$existing" | json_len)
+    if [ "$existing_count" -gt 0 ]; then
+        echo "create_assignment_pr_from_file: student:${student} already has active status:wip PR(s): $(printf '%s' "$existing" | json_numbers)" >&2
+        return 1
     fi
 
     pr_url=$(gh_retry gh pr create --repo "$GH_REPO" --draft \
@@ -252,6 +259,19 @@ create_assignment_branch() {
 json_len() { python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))"; }
 json_join() { python3 -c "import sys,json; print(','.join(json.loads(sys.stdin.read())))"; }
 json_numbers() { python3 -c "import sys,json; print(','.join(f'#{i[\"number\"]}' for i in json.loads(sys.stdin.read())))"; }
+json_attention_summary() {
+    python3 -c '
+import json
+import sys
+
+items = json.loads(sys.stdin.read())
+parts = []
+for item in items:
+    reasons = ",".join(item.get("reasons", []))
+    parts.append("#{}[{}]".format(item["number"], reasons))
+print(",".join(parts))
+'
+}
 
 # Print the maximum updatedAt timestamp from one or more JSON arrays.
 # Returns empty string if all arrays are empty.  Usage:
@@ -457,23 +477,14 @@ print(json.dumps(merged))
 
 # List PRs that are ready for advisor review on a given branch.
 # Returns a JSON array.
-# Optional second arg: ISO timestamp — only return PRs updated after it.
+# Optional second arg is accepted for backward compatibility but intentionally
+# ignored: review-ready PRs are level-triggered until the advisor resolves them.
 #   list_ready_for_review_prs <branch> [since]
 list_ready_for_review_prs() {
-    local branch="$1" since="${2:-}"
-    local prs
-    prs=$(gh_retry gh pr list --repo "$GH_REPO" --label "$branch" --label "status:review" \
+    local branch="$1"
+    gh_retry gh pr list --repo "$GH_REPO" --label "$branch" --label "status:review" \
         --limit "$GH_LIST_LIMIT" \
-        --json number,title,headRefName,labels,updatedAt)
-    if [ -z "$since" ]; then
-        printf '%s' "$prs"
-    else
-        printf '%s' "$prs" | python3 -c "
-import json, sys
-prs = json.loads(sys.stdin.read())
-print(json.dumps([p for p in prs if p.get('updatedAt', '') > sys.argv[1]]))
-" "$since"
-    fi
+        --json number,title,headRefName,labels,updatedAt
 }
 
 # List all open PRs on a branch (any status).
@@ -484,6 +495,106 @@ list_all_prs() {
     gh_retry gh pr list --repo "$GH_REPO" --label "$branch" \
         --limit "$GH_LIST_LIMIT" \
         --json number,title,state,labels,headRefName,updatedAt,isDraft
+}
+
+# List open PRs that should wake the advisor even when they have not been
+# updated since the last heartbeat.
+# Returns a JSON array with a `reasons` list on each PR.
+#   list_attention_prs <branch> [stale_wip_seconds]
+list_attention_prs() {
+    local branch="$1" stale_seconds="${2:-${SENPAI_STALE_WIP_SECONDS:-7200}}"
+    local prs comments_by_pr num comments row
+    prs=$(gh_retry gh pr list --repo "$GH_REPO" --base "$branch" --state open \
+        --limit "$GH_LIST_LIMIT" \
+        --json number,title,baseRefName,headRefName,labels,updatedAt,isDraft,mergeStateStatus,mergeable)
+    comments_by_pr=""
+    while IFS= read -r num; do
+        [ -z "$num" ] && continue
+        comments=$(pr_issue_comments "$num") || return
+        row=$(printf '%s\0%s' "$num" "$comments" | python3 -c '
+import json
+import sys
+
+num, comments = sys.stdin.buffer.read().split(b"\0", 1)
+print(json.dumps({"number": int(num), "comments": json.loads(comments)}))
+')
+        comments_by_pr+="${row}"$'\n'
+    done < <(printf '%s' "$prs" | python3 -c 'import json,sys; print("\n".join(str(pr["number"]) for pr in json.loads(sys.stdin.read())))')
+
+    printf '%s\0%s' "$prs" "$comments_by_pr" | python3 -c '
+import json
+import re
+import sys
+from collections import defaultdict
+from datetime import datetime, timezone
+
+branch = sys.argv[1]
+stale_seconds = int(sys.argv[2])
+now = datetime.now(timezone.utc)
+raw_prs, raw_comments = sys.stdin.buffer.read().split(b"\0", 1)
+prs = json.loads(raw_prs)
+comments_by_pr = {}
+for line in raw_comments.decode().splitlines():
+    if line.strip():
+        row = json.loads(line)
+        comments_by_pr[row["number"]] = row["comments"]
+
+def parse_ts(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+def label_names(pr):
+    return {label.get("name", "") for label in pr.get("labels", [])}
+
+student_wips = defaultdict(list)
+metadata = {}
+for pr in prs:
+    labels = label_names(pr)
+    students = sorted(label.removeprefix("student:") for label in labels if label.startswith("student:"))
+    metadata[pr["number"]] = (labels, students)
+    if "status:wip" in labels:
+        for student in students:
+            student_wips[student].append(pr["number"])
+
+duplicate_wips = {
+    number
+    for numbers in student_wips.values()
+    if len(numbers) > 1
+    for number in numbers
+}
+
+conflict_re = re.compile(r"merge conflict|rebase conflict|cannot automatically merge|can.t automatically merge|conflicts? with", re.I)
+attention = []
+for pr in prs:
+    labels, students = metadata[pr["number"]]
+    reasons = []
+    if branch not in labels:
+        reasons.append("missing_branch_label")
+    if not students:
+        reasons.append("missing_student_label")
+    if pr["number"] in duplicate_wips:
+        reasons.append("duplicate_student_wip")
+    if "status:wip" in labels:
+        age = (now - parse_ts(pr["updatedAt"])).total_seconds()
+        if age > stale_seconds:
+            reasons.append("stale_wip")
+    if "status:needs-rebase" in labels:
+        reasons.append("needs_rebase")
+    if "status:blocked" in labels:
+        reasons.append("blocked_wip")
+    if pr.get("mergeStateStatus") in {"BEHIND", "DIRTY"} or pr.get("mergeable") == "CONFLICTING":
+        reasons.append("needs_rebase")
+    comment_text = "\n".join(comment.get("body", "") for comment in comments_by_pr.get(pr["number"], []))
+    if conflict_re.search(comment_text):
+        reasons.append("merge_conflict_comment")
+    if pr.get("isDraft") and "status:review" in labels:
+        reasons.append("draft_but_claimed_mergeable")
+    if reasons:
+        item = dict(pr)
+        item["reasons"] = sorted(set(reasons), key=reasons.index)
+        attention.append(item)
+
+print(json.dumps(attention))
+' "$branch" "$stale_seconds"
 }
 
 # List WIP PRs assigned to a specific student on the current advisor branch.

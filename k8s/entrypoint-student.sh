@@ -142,6 +142,22 @@ while true; do
     echo "=== Log: $LOGFILE ==="
     echo "$TRIAGE_INFO" > "$LOGFILE"
 
+    if [ "$ASSIGNED_COUNT" -gt 1 ]; then
+        DUPLICATE_NUMBERS=$(printf '%s' "$ASSIGNED_JSON" | json_numbers)
+        DUPLICATE_MARKER="STUDENT-DUPLICATE-ASSIGNMENT"
+        DUPLICATE_BODY="${DUPLICATE_MARKER}: student:${STUDENT_NAME} has ${ASSIGNED_COUNT} active status:wip PRs (${DUPLICATE_NUMBERS}) on ${ADVISOR_BRANCH}. The student loop is skipping work until the advisor leaves exactly one active assignment."
+        echo "ERROR: ${DUPLICATE_BODY}"
+        printf '%s' "$ASSIGNED_JSON" | python3 -c 'import json,sys; print("\n".join(str(pr["number"]) for pr in json.loads(sys.stdin.read())))' |
+        while IFS= read -r num; do
+            [ -z "$num" ] && continue
+            if ! pr_issue_comments "$num" | grep -q "$DUPLICATE_MARKER"; then
+                gh_retry gh pr comment "$num" --repo "$GH_REPO" --body "$DUPLICATE_BODY"
+            fi
+        done
+        sleep "$SLEEP_TIME_S"
+        continue
+    fi
+
     # The shell loop is the source of truth for assignment polling. If there
     # is no work, do not enter Claude Code; idle model sessions tend to invent
     # their own polling loops and can miss the label-based assignment contract.

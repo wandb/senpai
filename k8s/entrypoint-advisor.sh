@@ -116,7 +116,7 @@ FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 # Heartbeat prompt for polling
 HEARTBEAT_PROMPT="Continue your advisor loop. Attached is the current research state. Review any completed experiment PRs, assign work to all idle students, and check for human gh issues and comments."
 
-# --- Last-check timestamp state for filtering PRs and issues ---
+# --- Last-check timestamp state for filtering GitHub issues ---
 LAST_CHECK_FILE="$LOGDIR/.last_check_ts"
 
 # --- Launch Claude Code Loop ---
@@ -148,19 +148,22 @@ while true; do
 
     # --- Check research state before invoking CC ---
     POLL_OK=1
-    REVIEW_JSON=$(poll_or_empty "review-ready PR poll" list_ready_for_review_prs "$ADVISOR_BRANCH" "$SINCE") || POLL_OK=0
+    REVIEW_JSON=$(poll_or_empty "review-ready PR poll" list_ready_for_review_prs "$ADVISOR_BRANCH") || POLL_OK=0
     REVIEW_COUNT=$(printf '%s' "$REVIEW_JSON" | json_len)
+    ATTENTION_JSON=$(poll_or_empty "attention PR poll" list_attention_prs "$ADVISOR_BRANCH") || POLL_OK=0
+    ATTENTION_COUNT=$(printf '%s' "$ATTENTION_JSON" | json_len)
     ISSUE_JSON=$(poll_or_empty "GitHub issue poll" check_gh_issues "$ADVISOR_BRANCH" "$SINCE") || POLL_OK=0
     ISSUE_COUNT=$(printf '%s' "$ISSUE_JSON" | json_len)
     IDLE_JSON=$(poll_or_empty "idle-student poll" list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH") || POLL_OK=0
     IDLE_COUNT=$(printf '%s' "$IDLE_JSON" | json_len)
 
     # --- Derive watermark from the data we actually fetched (no gap, no overlap) ---
-    WATERMARK=$(max_updated_at "$REVIEW_JSON" "$ISSUE_JSON")
+    WATERMARK=$(max_updated_at "$ISSUE_JSON")
 
     # --- Build triage info (used in logs, CC prompt, and skip check) ---
     TRIAGE_INFO="## Research state (since ${SINCE:-boot})"
     [ "$REVIEW_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **GitHub PRs to review ($REVIEW_COUNT):** $(printf '%s' "$REVIEW_JSON" | json_numbers)"
+    [ "$ATTENTION_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **GitHub PRs needing attention ($ATTENTION_COUNT):** $(printf '%s' "$ATTENTION_JSON" | json_attention_summary)"
     [ "$ISSUE_COUNT" -gt 0 ]  && TRIAGE_INFO+=$'\n'"- **GitHub issues ($ISSUE_COUNT):** $(printf '%s' "$ISSUE_JSON" | json_numbers)"
     [ "$IDLE_COUNT" -gt 0 ]   && TRIAGE_INFO+=$'\n'"- **Idle students ($IDLE_COUNT):** $(printf '%s' "$IDLE_JSON" | json_join)"
     echo "$TRIAGE_INFO"
@@ -178,7 +181,7 @@ while true; do
         run_senpai_claude $MAX_TURNS "${FULL_PROMPT}"$'\n\n'"${TRIAGE_INFO}" || EXIT_CODE=$?
     else
         # --- Programmatic skip: skip rest of CC loop if nothing actionable ---
-        if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$IDLE_COUNT" -eq 0 ]; then
+        if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ATTENTION_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$IDLE_COUNT" -eq 0 ]; then
             echo "=== Iteration $ITERATION: Nothing actionable, sleeping $SLEEP_TIME_S seconds ==="
             sleep "$SLEEP_TIME_S"
             continue
