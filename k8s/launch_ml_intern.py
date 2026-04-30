@@ -228,7 +228,7 @@ def build_prompt(args: Args, replicate: int, branch: str) -> str:
         smoke_instructions = (
             "\nThis is a smoke run. Do not run a full search. Verify the local environment, "
             "confirm one GPU is visible, run one tiny debug training command such as "
-            f"`python train.py --debug --epochs 1 --agent ml-intern-r{replicate} "
+            f"`python ./train.py --debug --epochs 1 --agent ml-intern-r{replicate} "
             f"--wandb_group {branch} --wandb_name {branch}/smoke`, then commit a short summary.\n"
         )
 
@@ -249,7 +249,7 @@ You are Hugging Face ML Intern running headlessly inside a Kubernetes Job on the
 This is a fresh independent replicate. Do not inspect, query, or reuse any previous ML Intern or Senpai W&B groups/runs, old replicate branches, harvested result files, or prior PRs as evidence for experiment choices or metrics. Use this branch's own work, the target repo benchmark docs, public reference material, and the runs you launch inside this pod.
 
 ## Target repo context
-Before planning experiments or editing code, read the target repo's own benchmark docs: `program.md` and `data/SPLITS.md` if present. Treat those files as the source of truth for the CFD task, input/target shapes, split design, metrics, file boundaries, masking/padding rules, and any physics context. You may read `README.md` for setup/background, but do not mine historical leaderboard or prior-agent result sections for experiment ideas unless they are explicitly part of the benchmark contract. Also inspect `python train.py --help` before your first training run so you use the exact flags this repo exposes.
+Before planning experiments or editing code, read the target repo's own benchmark docs: `program.md` and `data/SPLITS.md` if present. Treat those files as the source of truth for the CFD task, input/target shapes, split design, metrics, file boundaries, masking/padding rules, and any physics context. You may read `README.md` for setup/background, but do not mine historical leaderboard or prior-agent result sections for experiment ideas unless they are explicitly part of the benchmark contract. Also inspect the training entrypoint's CLI help before your first training run so you use the exact flags this repo exposes.
 
 Do not try to follow Senpai's advisor/student PR workflow. You are one autonomous ML Intern launch on the branch above; use the repo docs to understand the benchmark, then choose your own experiment strategy.
 
@@ -259,15 +259,17 @@ Training compute must stay inside this local pai2 pod. Do not launch Hugging Fac
 You may decide how to use the visible GPUs: one experiment at a time, multiple parallel one-GPU jobs, or a mixed strategy. If you run jobs in parallel, explicitly pin each subprocess with `CUDA_VISIBLE_DEVICES` so two training jobs do not accidentally use the same GPU.
 
 ## Training budget
-There is no Senpai per-experiment timeout for this comparison. The environment sets `SENPAI_TIMEOUT_MINUTES={args.senpai_timeout_minutes:g}` only to prevent the TandemFoil training script from using the previous 30-minute cap. The hard budget is the Kubernetes 12-hour launch kill switch. A 30-minute per-experiment runtime was used elsewhere as an initial baseline; you may follow it, go shorter, or go longer if your strategy benefits.
+There is no Senpai per-experiment timeout for this comparison. The environment sets `SENPAI_TIMEOUT_MINUTES={args.senpai_timeout_minutes:g}` only to prevent the TandemFoil training script from using the previous 30-minute cap. The hard budget is the Kubernetes {wall_hours:g}-hour launch kill switch. A 30-minute per-experiment runtime was used elsewhere as an initial baseline; you may follow it, go shorter, or go longer if your strategy benefits.
 
-When you run the target training script, treat this as the default full command shape unless you deliberately choose otherwise:
+When you run the target training entrypoint, treat this as the default full command shape unless you deliberately choose otherwise:
 
 ```bash
-python train.py --epochs {args.default_epochs} --agent ml-intern-r{replicate} --wandb_group {branch} --wandb_name "{branch}/<short-description>"
+python ./train.py --epochs {args.default_epochs} --agent ml-intern-r{replicate} --wandb_group {branch} --wandb_name "{branch}/<short-description>"
 ```
 
 Use `--epochs {args.default_epochs}` as the no-epoch-limit default. If you pick a different epoch count, document why.
+
+When stopping your own background training jobs, track and kill the exact PIDs you launched. Do not use broad process-name matching to clean up training jobs, because the prompt text is part of the parent agent command line.
 
 ## Objective and reporting
 Optimize TandemFoilSet-Balanced under the target repo's own rules. Prioritize `val_avg/mae_surf_p` while preserving paper-facing `test_avg/mae_surf_p` reporting when final candidates are evaluated.

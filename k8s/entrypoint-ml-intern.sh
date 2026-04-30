@@ -386,10 +386,10 @@ with results.open("a") as f:
 PY
 
 git status --short
-git add -A -- . \
-  ':(exclude)wandb' ':(exclude)wandb/**' \
-  ':(exclude)session_logs' ':(exclude)session_logs/**' \
-  ':(exclude)*.pt' ':(exclude)*.pth' ':(exclude)*.ckpt' ':(exclude)*.safetensors'
+git add -A -- .
+git reset -q -- wandb session_logs \
+  '*.pt' '*.pth' '*.ckpt' '*.safetensors'
+git status --short
 if git diff --cached --quiet; then
   echo "=== No target repo changes to commit ==="
 else
