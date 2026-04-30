@@ -10,6 +10,8 @@
 run_senpai_claude() {
     local max_turns=$1 user_prompt=$2
     shift 2
+    export CLAUDE_PLUGIN_ROOT="$SENPAI_PLUGIN"
+
     # Pipe prompt via stdin instead of -p to keep prompt text out of the process
     # cmdline. Agents use `pkill -f "train.py"` to kill training runs, and -p
     # embeds the prompt (which mentions train.py) in the cmdline, causing the
