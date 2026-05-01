@@ -269,7 +269,7 @@ python ./train.py --epochs {args.default_epochs} --agent ml-intern-r{replicate} 
 
 Use `--epochs {args.default_epochs}` as the no-epoch-limit default. If you pick a different epoch count, document why.
 
-When stopping your own background training jobs, track and kill the exact PIDs you launched. Do not use broad process-name matching to clean up training jobs, because the prompt text is part of the parent agent command line.
+When stopping your own background training jobs, track and kill the exact PIDs you launched. Do not use broad process-name matching to clean up training jobs. In particular, do not use `pkill`, `killall`, `pgrep -f`, `ps ... | grep ... | xargs kill`, or any command-name scan to find training processes. Record `$!` immediately after each background launch, keep those PIDs in a file or shell variable, and only terminate those exact PIDs.
 
 ## Objective and reporting
 Optimize TandemFoilSet-Balanced under the target repo's own rules. Prioritize `val_avg/mae_surf_p` while preserving paper-facing `test_avg/mae_surf_p` reporting when final candidates are evaluated.

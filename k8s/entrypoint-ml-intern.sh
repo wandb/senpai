@@ -155,7 +155,7 @@ export ML_INTERN_LOGFILE="$LOGFILE"
 export ML_INTERN_WORKDIR="$WORKDIR"
 export ML_INTERN_CONFIG_FILE
 export ML_INTERN_START_EPOCH="$START_EPOCH"
-PROMPT="$(cat "$PROMPT_FILE")"
+BOOTSTRAP_PROMPT="Read and follow the full benchmark instructions in $PROMPT_FILE. The full prompt is stored in that file so this parent process command line stays short and safe for process cleanup. Start by reading that file, then do the benchmark task exactly as instructed there."
 
 set +e
 timeout --preserve-status --kill-after=60s "${ML_INTERN_TIMEOUT_SECONDS}s" \
@@ -163,7 +163,7 @@ timeout --preserve-status --kill-after=60s "${ML_INTERN_TIMEOUT_SECONDS}s" \
     --model "$ML_INTERN_MODEL" \
     --max-iterations "$ML_INTERN_MAX_ITERATIONS" \
     --no-stream \
-    "$PROMPT" 2>&1 | tee "$LOGFILE"
+    "$BOOTSTRAP_PROMPT" 2>&1 | tee "$LOGFILE"
 ML_INTERN_EXIT="${PIPESTATUS[0]}"
 set -e
 export ML_INTERN_EXIT_CODE="$ML_INTERN_EXIT"
