@@ -134,12 +134,14 @@ send_pr_back_to_student_with_comment() {
     swap_gh_pr_label "$num" "status:review" "status:wip"
 }
 
-# Close a dead-end PR: comment explaining why, close, delete remote branch.
+# Close a dead-end PR: comment explaining why and close it. Keep the remote
+# branch so humans can reopen/recover assignments without reconstructing refs.
 #   close_pr_with_comment <number> <reason>
 close_pr_with_comment() {
     local num="$1" reason="$2"
+
     gh_retry gh pr comment "$num" --repo "$GH_REPO" --body "ADVISOR: Closing PR #${num} because ${reason}."
-    gh_retry gh pr close "$num" --repo "$GH_REPO" --delete-branch
+    gh_retry gh pr close "$num" --repo "$GH_REPO"
 }
 
 # Create an assignment PR through the one path that verifies student routing.
