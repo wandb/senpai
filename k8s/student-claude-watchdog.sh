@@ -131,7 +131,7 @@ run_student_claude_with_watchdog() {
     local claude_pid=$!
     local start_ts now_ts runtime log_mtime log_age
     local current_json current_numbers poll_status reason rc active_training
-    local assignment_drift_numbers="" assignment_drift_first_ts=0 assignment_drift_age=0
+    local assignment_drift_active=0 assignment_drift_numbers="" assignment_drift_first_ts=0 assignment_drift_age=0
     local watchdog_fired=0
     start_ts=$(date +%s)
 
@@ -159,9 +159,10 @@ run_student_claude_with_watchdog() {
                             echo "=== Claude watchdog: assignment changed but no train.py is active; waiting until minimum runtime before stopping Claude ==="
                         fi
                     else
-                        if [ "$assignment_drift_numbers" != "$current_numbers" ]; then
+                        if [ "$assignment_drift_active" -eq 0 ] || [ "$assignment_drift_numbers" != "$current_numbers" ]; then
                             assignment_drift_numbers="$current_numbers"
                             assignment_drift_first_ts="$now_ts"
+                            assignment_drift_active=1
                         fi
                         assignment_drift_age=$((now_ts - assignment_drift_first_ts))
                         if [ "$assignment_drift_age" -ge "$STUDENT_ASSIGNMENT_DRIFT_GRACE_S" ]; then
@@ -171,11 +172,13 @@ run_student_claude_with_watchdog() {
                         fi
                     fi
                 else
+                    assignment_drift_active=0
                     assignment_drift_numbers=""
                     assignment_drift_first_ts=0
                 fi
             else
                 echo "=== Claude watchdog: assignment poll failed; leaving Claude running ==="
+                assignment_drift_active=0
                 assignment_drift_numbers=""
                 assignment_drift_first_ts=0
             fi

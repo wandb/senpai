@@ -44,6 +44,7 @@ GitHub's `gh pr edit --remove-label X --add-label Y` silently strips **all other
 | Function | What it does |
 |---|---|
 | `send_pr_back_to_student_with_comment <pr#> <comment>` | Send a PR back to the student with feedback. Comment on the PR, convert back to draft, swap `status:review` → `status:wip`. |
+| `senpai_merge_winner_preflight <pr#> [problem-dir]` | Refuse unsafe winner merges with a specific error if the PR lacks terminal `SENPAI-RESULT`, has a newer hold comment, is draft/WIP, has bad labels, or has merge conflicts. |
 | `close_pr_with_comment <pr#> <reason>` | Close a dead-end PR with a comment explaining why. Keeps the remote branch so the PR can be reopened or recovered if needed. |
 | `create_assignment_pr_from_file <student> <head-branch> <title> <body-file> [base-branch]` | Create a draft assignment PR, then fail if the student already has a `status:wip` PR or if required base/head, draft, or routing labels are missing. |
 
@@ -51,7 +52,7 @@ GitHub's `gh pr edit --remove-label X --add-label Y` silently strips **all other
 
 | Function | What it does |
 |---|---|
-| `mark_ready_for_review <pr#>` | Mark a PR as ready for advisor review. Mark the PR as ready + swap `status:wip` → `status:review`. |
+| `mark_ready_for_review <pr#>` | Require a terminal `SENPAI-RESULT` marker, then mark the PR as ready + swap `status:wip` → `status:review`. |
 
 ### Queries (both roles)
 

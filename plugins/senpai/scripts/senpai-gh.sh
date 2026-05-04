@@ -20,6 +20,8 @@
 # This library wraps that pattern so nobody has to remember (or get
 # bitten by) the footgun.
 
+SENPAI_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # ---------------------------------------------------------------------------
 # Retry helper: up to 6 attempts with 15s backoff, then fail loudly.
 # ---------------------------------------------------------------------------
@@ -85,6 +87,31 @@ EOF
     git config --global credential.helper "store --file=$credential_file"
 }
 
+install_senpai_target_git_guard() {
+    local target_workdir="$1"
+    if [ -z "$target_workdir" ] || [ ! -d "$target_workdir/.git" ]; then
+        echo "install_senpai_target_git_guard: target repo not found: ${target_workdir:-<missing>}" >&2
+        return 2
+    fi
+
+    mkdir -p "$target_workdir/.git/hooks"
+    cat > "$target_workdir/.git/hooks/pre-push" <<'EOF'
+#!/bin/sh
+while read -r local_ref _ remote_ref _; do
+    [ "$remote_ref" = "refs/heads/$ADVISOR_BRANCH" ] || continue
+    [ "$SENPAI_ROLE" != "student" ] || {
+        echo "SENPAI-GIT-GUARD: students must not push $ADVISOR_BRANCH" >&2
+        exit 2
+    }
+    [ "$SENPAI_ROLE" != "advisor" ] || [ "$local_ref" = "refs/heads/$ADVISOR_BRANCH" ] || {
+        echo "SENPAI-GIT-GUARD: advisor must push $ADVISOR_BRANCH from local $ADVISOR_BRANCH, not ${local_ref:-<unknown>}" >&2
+        exit 2
+    }
+done
+EOF
+    chmod +x "$target_workdir/.git/hooks/pre-push"
+}
+
 require_target_repo() {
     local origin
     origin=$(git config --get remote.origin.url || true)
@@ -132,6 +159,36 @@ send_pr_back_to_student_with_comment() {
     gh_retry gh pr comment "$num" --repo "$GH_REPO" --body "$body"
     gh_retry gh pr ready "$num" --repo "$GH_REPO" --undo
     swap_gh_pr_label "$num" "status:review" "status:wip"
+}
+
+# Require a terminal structured result comment before a student can hand a PR
+# to the advisor. This makes "ready for review" a durable workflow state rather
+# than a bare label flip.
+#   senpai_require_terminal_result <number>
+senpai_require_terminal_result() {
+    local num="$1" comments
+    comments=$(pr_all_comments "$num") || return
+    printf '%s' "$comments" | python3 "$SENPAI_SCRIPT_DIR/senpai-pr-guard.py" require-terminal-result "$num"
+}
+
+# Refuse unsafe merges before `senpai:merge-winner` can squash a PR. This guard
+# checks GitHub workflow state plus the latest structured student result marker.
+# It intentionally does not query or mutate W&B; runs already record their git
+# commit SHA, and the PR result comment remains the workflow contract.
+#   senpai_merge_winner_preflight <number> [problem-dir]
+senpai_merge_winner_preflight() {
+    local num="$1" pr comments
+    if [ -z "$num" ]; then
+        echo "senpai_merge_winner_preflight: usage: <pr-number> [problem-dir]" >&2
+        return 2
+    fi
+
+    pr=$(gh_retry gh pr view "$num" --repo "$GH_REPO" \
+        --json number,title,state,isDraft,labels,baseRefName,headRefName,mergeStateStatus,mergeable,files) || return
+    comments=$(pr_all_comments "$num") || return
+
+    printf '%s\0%s' "$pr" "$comments" |
+        python3 "$SENPAI_SCRIPT_DIR/senpai-pr-guard.py" merge-preflight "$num" "${ADVISOR_BRANCH:-}"
 }
 
 # Close a dead-end PR: comment explaining why and close it. Keep the remote
@@ -227,6 +284,7 @@ PY
 #   mark_ready_for_review <number>
 mark_ready_for_review() {
     local num="$1"
+    senpai_require_terminal_result "$num" || return
     gh_retry gh pr ready "$num" --repo "$GH_REPO"
     swap_gh_pr_label "$num" "status:wip" "status:review"  # swap_gh_pr_label uses gh_retry internally
 }

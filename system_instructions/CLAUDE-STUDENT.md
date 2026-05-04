@@ -98,10 +98,12 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    - Start your comment with:
    ```markdown
    STUDENT <your-name>:
+   SENPAI-RESULT: {"terminal":true,"status":"complete","pending_arms":false,"wandb_run_ids":["<run-id>"],"primary_metric":{"name":"<metric>","value":<number>},"test_metric":{"name":"<metric>","value":<number>}}
 
    ## Results
 
    ```
+   - The `SENPAI-RESULT` line must be valid single-line JSON. Set `terminal=true` only when every advisor-required arm/run is finished or intentionally aborted and no pending result could change the conclusion. Set `pending_arms=true` for partial updates and do not submit for review yet.
    - All key metrics required by `$PROBLEM_DIR/program.md` and the PR baseline.
    - When a dataset has a literature-facing test target or reference, include
      that reference beside your reported test metric.

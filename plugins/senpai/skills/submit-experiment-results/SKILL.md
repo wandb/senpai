@@ -26,7 +26,15 @@ You've run the experiment, posted a results comment on the experiment PR — now
 
 ## Before you call this
 
-Make sure you've already posted a results comment on the experiment PR with metrics, W&B run ID, analysis, and suggested follow-ups
+Make sure you've already posted a results comment on the experiment PR with metrics, W&B run ID, analysis, and suggested follow-ups.
+
+The comment must include a valid one-line terminal result marker before the Results section:
+
+```markdown
+SENPAI-RESULT: {"terminal":true,"status":"complete","pending_arms":false,"wandb_run_ids":["<run-id>"],"primary_metric":{"name":"<metric>","value":<number>},"test_metric":{"name":"<metric>","value":<number>}}
+```
+
+Use `terminal=true` only when every advisor-required arm/run is finished or intentionally aborted. If any arm or W&B run can still change the conclusion, leave the PR as `status:wip`.
 
 ## Steps
 
@@ -50,5 +58,7 @@ git push origin "$(git branch --show-current)"
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 mark_ready_for_review $0
 ```
+
+`mark_ready_for_review` refuses the handoff if the terminal `SENPAI-RESULT` marker is missing, invalid JSON, or still reports pending arms/runs. Read the error, fix the PR comment, and retry.
 
 That's it. The advisor will pick it up in their next review cycle.

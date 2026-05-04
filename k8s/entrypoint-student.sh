@@ -10,6 +10,7 @@ set -o pipefail
 WORKDIR="/workspace/senpai"
 GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 TARGET_REPO_BRANCH="${TARGET_REPO_BRANCH:-}"
+export SENPAI_ROLE="student"
 export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
 GIT_CREDENTIAL_FILE="$WORKDIR/.git-credentials"
 SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
@@ -49,6 +50,7 @@ git config user.name "senpai-$STUDENT_NAME"
 git config user.email "senpai-$STUDENT_NAME@senpai"
 gh repo set-default "$GH_REPO"
 git config credential.helper "store --file=$GIT_CREDENTIAL_FILE"
+install_senpai_target_git_guard "$TARGET_WORKDIR"
 if [ "$GH_HISTORY_SCOPE" != "repo" ]; then
     git remote set-branches origin "$ADVISOR_BRANCH"
     git config remote.origin.tagOpt --no-tags

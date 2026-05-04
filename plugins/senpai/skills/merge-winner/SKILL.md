@@ -29,10 +29,22 @@ Note: `$ADVISOR_BRANCH` is available as an environment variable.
 
 ## Steps
 
-1. **Squash-merge the PR:**
+1. **Run the merge preflight. Do not skip this.**
+
+The preflight refuses unsafe merges and prints a specific error explaining why:
+missing terminal results, active hold comments, WIP/draft state, bad labels, or
+merge conflicts. If it refuses, stop. Do not bypass it with raw `gh pr merge`;
+read the error and follow up on the PR.
 
 ```bash
-gh pr merge $0 --squash
+source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
+senpai_merge_winner_preflight $0 "$1"
+```
+
+2. **Squash-merge the PR:**
+
+```bash
+gh pr merge $0 --squash --repo "$GH_REPO"
 ```
 
 If this fails due to merge conflicts, send the PR back for rebase instead:
@@ -44,13 +56,13 @@ send_pr_back_to_student_with_comment $0 "ADVISOR: Rebasing needed — the adviso
 
 Then stop — don't proceed with baseline update.
 
-2. **Pull the updated branch:**
+3. **Pull the updated branch:**
 
 ```bash
 git checkout "$ADVISOR_BRANCH" && git pull origin "$ADVISOR_BRANCH"
 ```
 
-3. **Update BASELINE.md** by appending the new baseline entry. Read the winning metrics from the PR comments and the W&B run metrics. The entry should include:
+4. **Update BASELINE.md** by appending the new baseline entry. Read the winning metrics from the PR comments and the W&B run metrics. The entry should include:
 
 ```markdown
 ## <YYYY-MM-DD HH:MM> — PR #<number>: <title>
@@ -61,7 +73,7 @@ git checkout "$ADVISOR_BRANCH" && git pull origin "$ADVISOR_BRANCH"
 - **Reproduce:** `cd "$1" && python train.py <full command>`
 ```
 
-4. **Commit and push the baseline update:**
+5. **Commit and push the baseline update:**
 
 ```bash
 git add BASELINE.md
