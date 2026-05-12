@@ -84,7 +84,8 @@ def build_extra_instructions(args: Args, tag: str, student_list: list[str]) -> s
 
 - This launch is scoped to research tag `{tag}`, advisor branch `{args.advisor_branch}`, and target base branch `{target_base}`.
 - Only inspect, modify, or reason from `{args.advisor_branch}` plus PR branches assigned to these students in this launch: {students}.
-- Do not inspect, compare, summarize, cherry-pick, borrow from, or base decisions on any other PR, branch, issue, experiment run, or historical result unless the human explicitly names it during this launch.
+- Do not inspect, compare, summarize, cherry-pick, borrow from, or base decisions on any PR or branch outside `{args.advisor_branch}` and the assigned student PR branches for this launch.
+- Do not use unrelated experiment runs or historical results unless the human explicitly names them during this launch.
 - Students branch from `{args.advisor_branch}`. Do not rebase or retarget work onto unrelated branches.
 - This is the Charlie no-W&B experiment-metrics arm. Do not add, import, configure, query, or log experiment metrics to W&B/wandb. Use local JSONL metrics and local artifacts only.
 - If any stale target prompt or code comment mentions W&B/wandb experiment logging or `--wandb_name`, treat it as stale guidance and use the local JSONL contract instead.

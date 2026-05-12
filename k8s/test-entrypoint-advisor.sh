@@ -20,6 +20,7 @@ source "$WORKDIR/plugins/senpai/scripts/senpai-gh.sh"
 export ADVISOR_BRANCH="test-advisor"
 export STUDENT_NAMES="alice,bob,charlie"
 export RESEARCH_TAG="test"
+export WANDB_ENTITY="test" WANDB_PROJECT="test"
 
 # --- Mock: CC just logs and returns ---
 run_senpai_claude() {

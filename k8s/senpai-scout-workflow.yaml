@@ -14,6 +14,7 @@ spec:
     secrets:
       GITHUB_TOKEN: "REPLACE_ME_ghp_xxx"
       SLACK_WEBHOOK_URL: "REPLACE_ME_https://hooks.slack.com/services/..."
+      WANDB_API_KEY: "REPLACE_ME_wandb_xxx"
       KUBECONFIG_B64: "REPLACE_ME_base64_of_pai2_kubeconfig"
       SEMANTIC_SCHOLAR_API_KEY: ""
   parameters:

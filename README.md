@@ -110,6 +110,10 @@ preflight_only: false
 
 `launch.py` reads this via `simple_parsing` — every field can be overridden on the CLI.
 
+### Image rebuilds
+
+The published runner image is `ghcr.io/wandb/senpai:latest`. It is built by `.github/workflows/build.yaml` on pushes to `main` or `docker` when `Dockerfile`, `pyproject.toml`, `uv.lock`, or the workflow changes. It can also be rebuilt manually from the GitHub Actions `workflow_dispatch` button.
+
 ### Launch credentials
 
 `launch.py` resolves and preflights these for real launches and `--preflight_only`, then writes them to a per-tag Secret named `senpai-launch-secrets-<tag>`:

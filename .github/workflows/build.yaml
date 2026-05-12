@@ -6,6 +6,7 @@ on:
     paths:
       - Dockerfile
       - pyproject.toml
+      - uv.lock
       - .github/workflows/build.yaml
   workflow_dispatch:
 
@@ -58,5 +59,7 @@ jobs:
         with:
           context: .
           push: true
+          pull: true
+          no-cache: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

@@ -4,34 +4,49 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-PackageName: senpai
 -->
 
-# senpai — Development Context
+# senpai - Development Context
 
-Development of an Autonomous ML research loop on CFD surrogates
+Development of a problem-agnostic autonomous ML research loop for target ML
+problem repositories. The current research programs are often CFD surrogate
+experiments, but the runner should stay target-repo agnostic.
 
 ## User Clarifications
 
 ### Interviewing the developer about how to do a task:
-When asked for a large piece of work which seems vague or needs clarification, please interview me in detail using the AskUserQuestionTool about literally anything: technical implementation, UI & UX, concerns, tradeoffs, etc. but make sure the questions are not obvious. Be very in-depth and continue interviewing me continually until it's complete, then write the learnings to README.md
+When asked for a large piece of work that seems vague, consequential, or full
+of hidden tradeoffs, ask the user detailed clarifying questions about the real
+implementation choices: technical design, workflow, UX, risks, validation,
+operations, and tradeoffs. Prefer non-obvious questions that expose constraints
+or intent. When the answers change durable project behavior, write the learnings
+to README.md or SPEC.md as appropriate.
 
 
 ## Coding guidelines and philosophy
 
-- You should generate code that is simple and redable, avoid unnecesary abstractions and complexity. This is a research codebase so we want to be mantainable and readable.
-- Avoid overly defensive coding, no need for a lot of `try, except` patterns, no need for fallbacks or backups - I want the code to fail if something is wrong so that i can fix it.
+- You should generate code that is simple and readable. Avoid unnecessary abstractions and complexity. This is a research codebase, so maintainability and clarity matter.
+- Avoid overly defensive coding. No need for lots of `try`/`except` patterns, fallbacks, or backups. Prefer code that fails clearly when something is wrong so it can be fixed.
 - Do not add demo-only flags or placeholder CLI options that gate real functionality (e.g., `--run` just to toggle execution); scripts should run their main logic directly.
-- Adhere to python 3.12+ conventions
+- Adhere to Python 3.12+ conventions.
 
 ## Key docs
 
-- `cfd_tandemfoil/program.md` — research context, goals, metrics, file constraints
-- `system_instructions/Codex-ADVISOR.md` — advisor role workflow
-- `system_instructions/Codex-STUDENT.md` — student role workflow
+- `README.md` - operator-facing overview, launch examples, and problem-package layout.
+- `SPEC.md` - target architecture and rewrite contract for the senpai orchestration loop.
+- `senpai.yaml` - launch defaults, including the target repo, target branch, advisor branch, and `problem_dir`.
+- `$PROBLEM_DIR/program.md` - authoritative target research context, goals, metrics, training constraints, and file boundaries. With the default config this is `target/program.md` after the target repo is cloned.
+- `$PROBLEM_DIR/instructions/prompt-advisor.md` - target-specific advisor prompt.
+- `$PROBLEM_DIR/instructions/prompt-student.md` - target-specific student prompt.
+- `system_instructions/CLAUDE-ADVISOR.md` - advisor role workflow.
+- `system_instructions/CLAUDE-STUDENT.md` - student role workflow.
 
 ## Architecture
 
-- **Advisor pod** — no GPU, runs Codex in a loop. Reviews student PRs, reads committed local metrics, generates new hypotheses, and creates draft PRs to assign work.
-- **Student pods** — GPU workers, each running Codex. Poll for assigned PRs, implement the hypothesis, run training, report results.
-- **GitHub Issues** — human-to-agent communication channel. Agents poll for and respond to these alongside their normal PR workflow.
+- **Runner repo** - this repo. Owns orchestration, Kubernetes launch, role instructions, GitHub helpers, W&B integration, and operational docs.
+- **Target repo** - cloned into `$PROBLEM_DIR` from `target_repo_url`. Owns the data code, training code, evaluation code, `program.md`, target prompts, and experiment branches. Agent commits and PRs land in the target repo, not in the runner repo.
+- **Advisor pod** - no GPU, runs Claude Code in a loop. Queries W&B, reviews student PRs, generates new hypotheses, and creates draft PRs to assign work.
+- **Student pods** - GPU workers running Claude Code. Poll for assigned PRs, implement the hypothesis inside the target repo boundaries, run training, and report results.
+- **GitHub Issues** - human-to-agent communication channel. Agents poll for and respond to these alongside their normal PR workflow.
+- **W&B** - canonical experiment metrics store for training runs, comparisons, and merge decisions.
 
 ## k8s layout
 
@@ -41,6 +56,12 @@ When asked for a large piece of work which seems vague or needs clarification, p
 
 ## system_instructions/
 
-Role-specific AGENTS.md files. The Student and Advisor both use Codex. At pod launch, the appropriate role-specific file is copied over this AGENTS.md:
-- `system_instructions/Codex-ADVISOR.md` → advisor pods
-- `system_instructions/Codex-STUDENT.md` → student pods
+Role-specific runtime instruction files. At pod launch, the entrypoint renders
+the appropriate role file into the pod's root `CLAUDE.md` before invoking
+Claude Code:
+
+- `system_instructions/CLAUDE-ADVISOR.md` -> advisor pods
+- `system_instructions/CLAUDE-STUDENT.md` -> student pods
+
+The checked-in root `CLAUDE.md` and `AGENTS.md` share this development context
+for local agent work. They are not the role-specific pod instructions.

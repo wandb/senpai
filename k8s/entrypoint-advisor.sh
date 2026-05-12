@@ -229,7 +229,7 @@ while true; do
 
         CONTINUE_PROMPT="${HEARTBEAT_PROMPT}"
         if [ -n "$EXTRA_LAUNCH_INSTRUCTIONS" ]; then
-            CONTINUE_PROMPT="${CONTINUE_PROMPT}"$'\n\n# Launch isolation and cutoff reminder\n\n'"${EXTRA_LAUNCH_INSTRUCTIONS}"
+            CONTINUE_PROMPT="${CONTINUE_PROMPT}"$'\n\n# Launch isolation and run-limit reminder\n\n'"${EXTRA_LAUNCH_INSTRUCTIONS}"
         fi
         CONTINUE_PROMPT="${CONTINUE_PROMPT}"$'\n\n'"${TRIAGE_INFO}"
         run_senpai_claude 1000 "$CONTINUE_PROMPT" -c || EXIT_CODE=$?
