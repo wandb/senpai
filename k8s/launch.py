@@ -8,7 +8,6 @@
 
 import base64
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -56,6 +55,8 @@ class Args:
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL (senpai runner)
     repo_branch: str = "main"  # git branch to clone (senpai runner)
     image: str = "ghcr.io/wandb/senpai:latest"  # container image for students
+    wandb_entity: str = "wandb-applied-ai-team"  # developer telemetry entity; not used for Charlie experiment metrics
+    wandb_project: str = "senpai-v1"  # developer telemetry project; not used for Charlie experiment metrics
     human_issues: bool = True  # allow human GitHub issue triage; disable for isolated launches
     advisor_branch: str = "schmidhuber"  # branch the advisor works on inside the problem-package repo (students PR into it; created from target_repo_branch if missing)
     gh_history_scope: str = "branch"  # branch=normal track memory, fresh=clean ablation, repo=whole-repo memory
@@ -65,8 +66,6 @@ class Args:
     extra_instructions: str = ""  # extra prompt text for the advisor: a .md file path or a literal string
     timeout_minutes: float = 30.0  # training run wall-clock limit (SENPAI_TIMEOUT_MINUTES)
     max_epochs: int = 50  # maximum training epochs (SENPAI_MAX_EPOCHS)
-    run_duration_hours: float = 0.0  # optional strict launch cutoff, measured from this launch invocation
-    cutoff_at_epoch: int = 0  # optional strict UTC epoch-seconds cutoff; overrides local timers/launchd
     dry_run: bool = False  # render manifests only: do not apply them or validate credentials
     preflight_only: bool = False  # validate credentials/access only: do not render or apply manifests
 
@@ -78,33 +77,18 @@ def load_extra_instructions(extra_instructions: str) -> str:
     return p.read_text() if p.exists() else extra_instructions
 
 
-def cutoff_epoch(args: Args) -> int:
-    if args.cutoff_at_epoch:
-        return args.cutoff_at_epoch
-    if args.run_duration_hours:
-        return int(time.time() + args.run_duration_hours * 3600)
-    return 0
-
-
 def build_extra_instructions(args: Args, tag: str, student_list: list[str]) -> str:
     students = ", ".join(student_list)
     target_base = args.target_repo_branch or "<default>"
-    cutoff = cutoff_epoch(args)
-    cutoff_line = (
-        f"- The run cutoff is UTC epoch {cutoff}. Treat that as a hard boundary: "
-        "stop training/assignment activity at or before that time, and ignore any metric emitted after it."
-        if cutoff
-        else "- If an operator provides a cutoff deadline, treat it as a hard boundary and ignore any metric emitted after it."
-    )
-    isolation = f"""# Launch isolation and cutoff rules
+    isolation = f"""# Launch isolation and run-limit rules
 
 - This launch is scoped to research tag `{tag}`, advisor branch `{args.advisor_branch}`, and target base branch `{target_base}`.
 - Only inspect, modify, or reason from `{args.advisor_branch}` plus PR branches assigned to these students in this launch: {students}.
 - Do not inspect, compare, summarize, cherry-pick, borrow from, or base decisions on any other PR, branch, issue, experiment run, or historical result unless the human explicitly names it during this launch.
 - Students branch from `{args.advisor_branch}`. Do not rebase or retarget work onto unrelated branches.
-- This is the Charlie no-W&B arm. Do not add, import, install, configure, query, trace, or log to W&B/wandb/Weave/Hivemind. Use local JSONL metrics and local artifacts only.
-- If any stale target prompt or code comment mentions W&B/wandb/Weave or `--wandb_name`, treat it as stale guidance and use the local JSONL contract instead.
-{cutoff_line}
+- This is the Charlie no-W&B experiment-metrics arm. Do not add, import, configure, query, or log experiment metrics to W&B/wandb. Use local JSONL metrics and local artifacts only.
+- If any stale target prompt or code comment mentions W&B/wandb experiment logging or `--wandb_name`, treat it as stale guidance and use the local JSONL contract instead.
+- Treat `SENPAI_TIMEOUT_MINUTES` and `SENPAI_MAX_EPOCHS` as hard per-training-run bounds. Do not override them or continue a run past them.
 """
     user_extra = load_extra_instructions(args.extra_instructions)
     return isolation if not user_extra else isolation + "\n# Additional operator instructions\n\n" + user_extra
@@ -112,49 +96,6 @@ def build_extra_instructions(args: Args, tag: str, student_list: list[str]) -> s
 
 def encoded_extra_instructions(args: Args, tag: str, student_list: list[str]) -> str:
     return base64.b64encode(build_extra_instructions(args, tag, student_list).encode()).decode()
-
-
-def render_cutoff_job(tag: str, args: Args) -> str:
-    cutoff = cutoff_epoch(args)
-    if not cutoff:
-        return ""
-    job_name = f"senpai-cutoff-{tag}"
-    return f"""apiVersion: batch/v1
-kind: Job
-metadata:
-  name: {job_name}
-  labels:
-    app: senpai
-    role: cutoff
-    research-tag: {tag}
-spec:
-  backoffLimit: 0
-  ttlSecondsAfterFinished: 3600
-  template:
-    metadata:
-      labels:
-        app: senpai
-        role: cutoff
-        research-tag: {tag}
-    spec:
-      serviceAccountName: senpai-orchestrator
-      restartPolicy: Never
-      containers:
-      - name: cutoff
-        image: {args.image}
-        command: ["/bin/bash", "-c"]
-        args:
-        - |
-          set -euo pipefail
-          now="$(date -u +%s)"
-          sleep_for=$(( {cutoff} - now ))
-          echo "Strict cutoff for research-tag={tag}: UTC epoch {cutoff}; current epoch ${{now}}; sleep ${{sleep_for}}s"
-          if [ "$sleep_for" -gt 0 ]; then
-            sleep "$sleep_for"
-          fi
-          echo "Cutoff reached at $(date -u +%Y-%m-%dT%H:%M:%SZ); deleting senpai resources for research-tag={tag}"
-          kubectl delete deployments,configmaps,secrets,jobs -l "research-tag={tag}" --ignore-not-found=true
-"""
 
 
 def render_student(template: str, student_name: str, tag: str, secret_name: str, args: Args) -> str:
@@ -174,6 +115,9 @@ def render_student(template: str, student_name: str, tag: str, secret_name: str,
             "STUDENT_NAME": student_name,
             "RESEARCH_TAG": tag,
             "GPUS_PER_STUDENT": str(args.gpus_per_student),
+            "WANDB_ENTITY": args.wandb_entity,
+            "WANDB_PROJECT": args.wandb_project,
+            "WANDB_MODE": "online",
             "ADVISOR_BRANCH": args.advisor_branch,
             "GH_HISTORY_SCOPE": args.gh_history_scope,
             "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
@@ -213,6 +157,9 @@ def render_advisor(template: str, tag: str, student_list: list[str], secret_name
         "RESEARCH_TAG": tag,
         "STUDENT_NAMES": ",".join(student_list),
         "GPUS_PER_STUDENT": str(args.gpus_per_student),
+        "WANDB_ENTITY": args.wandb_entity,
+        "WANDB_PROJECT": args.wandb_project,
+        "WANDB_MODE": "online",
         "ADVISOR_BRANCH": args.advisor_branch,
         "GH_HISTORY_SCOPE": args.gh_history_scope,
         "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
@@ -244,13 +191,6 @@ def main():
         sys.exit("ERROR: --gh_history_scope must be one of: branch, repo, fresh")
     if target_repo_slug(args.target_repo_url) == target_repo_slug(args.repo_url):
         sys.exit("ERROR: --target_repo_url must be a different repo from --repo_url")
-    if args.run_duration_hours < 0 or args.cutoff_at_epoch < 0:
-        sys.exit("ERROR: --run_duration_hours and --cutoff_at_epoch must be non-negative")
-    if args.run_duration_hours and args.cutoff_at_epoch:
-        sys.exit("ERROR: set only one of --run_duration_hours or --cutoff_at_epoch")
-    if args.run_duration_hours:
-        args.cutoff_at_epoch = int(time.time() + args.run_duration_hours * 3600)
-        args.run_duration_hours = 0.0
 
     github_token = anthropic_api_key = exa_api_key = ""
     if not args.dry_run or args.preflight_only:
@@ -332,30 +272,18 @@ def main():
         else:
             kubectl_apply(manifest, "advisor")
 
-    cutoff_manifest = render_cutoff_job(args.tag, args)
-    if cutoff_manifest:
-        if args.dry_run:
-            print("--- Cutoff job ---")
-            print(cutoff_manifest)
-            print()
-        else:
-            kubectl_apply(cutoff_manifest, "cutoff job")
-
     if not args.dry_run:
         print(f"\nLaunched {len(student_list)} students: {', '.join(student_list)}")
         if args.advisor:
             print("Launched advisor pod")
-        if cutoff_manifest:
-            print(f"Installed strict cutoff job for UTC epoch {cutoff_epoch(args)}")
         print(f"\nMonitor:")
         print(f"  kubectl get deployments -l research-tag={args.tag}")
-        print(f"  kubectl get jobs -l research-tag={args.tag}")
         if args.advisor:
             print(f"  kubectl get deployment senpai-advisor-{args.tag}")
         if student_list:
             print(f"  kubectl logs -f deployment/senpai-{args.tag}-{student_list[0]}")
         print(f"\nStop:")
-        print(f"  kubectl delete deployments,configmaps,secrets,jobs -l research-tag={args.tag}")
+        print(f"  kubectl delete deployments,configmaps,secrets -l research-tag={args.tag}")
 
 
 if __name__ == "__main__":

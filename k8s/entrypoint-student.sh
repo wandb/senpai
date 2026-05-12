@@ -66,9 +66,17 @@ if [ -d "$HOME/.claude/skills" ]; then
     find "$HOME/.claude/skills" -maxdepth 2 -name SKILL.md -print
 fi
 
+# --- Start developer telemetry (not an experiment-metrics source for Charlie) ---
+source "$WORKDIR/k8s/start-hivemind.sh"
+start_hivemind
+
 # --- Load CC run command helper function ---
 source "$WORKDIR/k8s/run-senpai-claude.sh"
 source "$WORKDIR/k8s/student-claude-watchdog.sh"
+
+# --- Register Weave CC plugin for developer telemetry ---
+export PATH="$HOME/.claude/bin:$PATH"
+source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 
 # $GH_REPO comes from the ConfigMap (set by launch.py = owner/repo of the
 # problem-package repo). The gh CLI honours it natively, so every `gh`
@@ -83,7 +91,7 @@ if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
     PROMPT="${PROMPT}"$'\n\n# Finally, some additional instructions\n\n'"$(printf '%s' "$EXTRA_INSTRUCTIONS_B64" | base64 -d)"
 fi
 
-KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Target repo: '"$GH_REPO"' | Target base branch: '"${TARGET_REPO_BRANCH:-<default>}"' | Advisor Branch: '"$ADVISOR_BRANCH"' | Experiment logging: local JSONL metrics only; W&B/wandb/Weave/Hivemind disabled\n'
+KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Target repo: '"$GH_REPO"' | Target base branch: '"${TARGET_REPO_BRANCH:-<default>}"' | Advisor Branch: '"$ADVISOR_BRANCH"' | Experiment logging: local JSONL metrics only; W&B/wandb experiment metrics disabled\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 HEARTBEAT_PROMPT="Continue your student loop using the assigned PRs and GitHub issues listed in the Student research state below. The entrypoint owns assignment polling; do not start persistent GitHub polling monitors. For active training, use sparse wakeups plus training_log_status; do not stream per-epoch logs into Monitor."

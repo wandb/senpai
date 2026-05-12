@@ -44,6 +44,11 @@ spec:
         - configMapRef:
             name: {{ADVISOR_CONFIGMAP_NAME}}
         env:
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: senpai-secrets
+              key: wandb-api-key
         - name: GITHUB_TOKEN
           valueFrom:
             secretKeyRef:

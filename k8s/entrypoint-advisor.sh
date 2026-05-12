@@ -118,8 +118,16 @@ if [ -d "$HOME/.claude/skills" ]; then
     find "$HOME/.claude/skills" -maxdepth 2 -name SKILL.md -print
 fi
 
+# --- Start developer telemetry (not an experiment-metrics source for Charlie) ---
+source "$WORKDIR/k8s/start-hivemind.sh"
+start_hivemind
+
 # --- Load CC run command helper function ---
 source "$WORKDIR/k8s/run-senpai-claude.sh"
+
+# --- Register Weave CC plugin for developer telemetry ---
+export PATH="$HOME/.claude/bin:$PATH"
+source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 
 # $GH_REPO comes from the ConfigMap (set by launch.py = owner/repo of the
 # problem-package repo). The gh CLI honours it natively, so every `gh`
@@ -138,7 +146,7 @@ if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
 fi
 
 # Add "$KEY_INFO" (reminder of student names etc) to PROMPT
-KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Tag: '"$RESEARCH_TAG"' | Target repo: '"$GH_REPO"' | Target base branch: '"${TARGET_REPO_BRANCH:-<default>}"' | Advisor Branch: '"$ADVISOR_BRANCH"' | Experiment logging: local JSONL metrics only; W&B/wandb/Weave/Hivemind disabled\n'
+KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Tag: '"$RESEARCH_TAG"' | Target repo: '"$GH_REPO"' | Target base branch: '"${TARGET_REPO_BRANCH:-<default>}"' | Advisor Branch: '"$ADVISOR_BRANCH"' | Experiment logging: local JSONL metrics only; W&B/wandb experiment metrics disabled\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 # Heartbeat prompt for polling
