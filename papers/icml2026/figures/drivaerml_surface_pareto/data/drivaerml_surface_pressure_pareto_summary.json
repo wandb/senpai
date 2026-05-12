@@ -1,0 +1,2526 @@
+{
+  "metric_source": "W&B summary",
+  "metric_key": "test_primary/surface_pressure_rel_l2_pct",
+  "repo": "morganmcg1/DrivAerML",
+  "outputs": {
+    "points_csv": "/Users/mmcguire/ML/senpai/papers/icml2026/figures/drivaerml_surface_pareto/data/drivaerml_surface_pressure_pareto_points.csv",
+    "interventions_csv": "/Users/mmcguire/ML/senpai/papers/icml2026/figures/drivaerml_surface_pareto/data/drivaerml_surface_pressure_pareto_interventions.csv",
+    "png": "/Users/mmcguire/ML/senpai/papers/icml2026/figures/drivaerml_surface_pareto/drivaerml_surface_pressure_pareto.png",
+    "pdf": "/Users/mmcguire/ML/senpai/papers/icml2026/figures/drivaerml_surface_pareto/drivaerml_surface_pressure_pareto.pdf"
+  },
+  "labels": {
+    "yi": {
+      "pr_count": 299,
+      "test_point_count": 451,
+      "intervention_count": 12,
+      "best_surface_pressure_rel_l2_pct": 4.269709589440386,
+      "best_pr": 652,
+      "best_run_id": "qba8ykpy",
+      "best_wandb_url": "https://wandb.ai/wandb-applied-ai-team/senpai-v1-drivaerml/runs/qba8ykpy",
+      "frontier_points": [
+        {
+          "experiment_index": 1,
+          "value": 78.40494949474945
+        },
+        {
+          "experiment_index": 2,
+          "value": 9.452407745015758
+        },
+        {
+          "experiment_index": 3,
+          "value": 9.452407745015758
+        },
+        {
+          "experiment_index": 4,
+          "value": 9.452407745015758
+        },
+        {
+          "experiment_index": 5,
+          "value": 9.452407745015758
+        },
+        {
+          "experiment_index": 6,
+          "value": 9.452407745015758
+        },
+        {
+          "experiment_index": 7,
+          "value": 9.452407745015758
+        },
+        {
+          "experiment_index": 8,
+          "value": 9.452407745015758
+        },
+        {
+          "experiment_index": 9,
+          "value": 7.7629377937876916
+        },
+        {
+          "experiment_index": 10,
+          "value": 7.7629377937876916
+        },
+        {
+          "experiment_index": 11,
+          "value": 7.7629377937876916
+        },
+        {
+          "experiment_index": 12,
+          "value": 7.7629377937876916
+        },
+        {
+          "experiment_index": 13,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 14,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 15,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 16,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 17,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 18,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 19,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 20,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 21,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 22,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 23,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 24,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 25,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 26,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 27,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 28,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 29,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 30,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 31,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 32,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 33,
+          "value": 7.636054624076832
+        },
+        {
+          "experiment_index": 34,
+          "value": 7.548480190185751
+        },
+        {
+          "experiment_index": 35,
+          "value": 7.491338143123416
+        },
+        {
+          "experiment_index": 36,
+          "value": 7.491338143123416
+        },
+        {
+          "experiment_index": 37,
+          "value": 7.491338143123416
+        },
+        {
+          "experiment_index": 38,
+          "value": 7.491338143123416
+        },
+        {
+          "experiment_index": 39,
+          "value": 7.491338143123416
+        },
+        {
+          "experiment_index": 40,
+          "value": 7.491338143123416
+        },
+        {
+          "experiment_index": 41,
+          "value": 7.491338143123416
+        },
+        {
+          "experiment_index": 42,
+          "value": 7.491338143123416
+        },
+        {
+          "experiment_index": 43,
+          "value": 7.491338143123416
+        },
+        {
+          "experiment_index": 44,
+          "value": 6.636836121270578
+        },
+        {
+          "experiment_index": 45,
+          "value": 6.636836121270578
+        },
+        {
+          "experiment_index": 46,
+          "value": 6.636836121270578
+        },
+        {
+          "experiment_index": 47,
+          "value": 6.636836121270578
+        },
+        {
+          "experiment_index": 48,
+          "value": 6.636836121270578
+        },
+        {
+          "experiment_index": 49,
+          "value": 6.636836121270578
+        },
+        {
+          "experiment_index": 50,
+          "value": 6.636836121270578
+        },
+        {
+          "experiment_index": 51,
+          "value": 6.636836121270578
+        },
+        {
+          "experiment_index": 52,
+          "value": 6.636836121270578
+        },
+        {
+          "experiment_index": 53,
+          "value": 6.636836121270578
+        },
+        {
+          "experiment_index": 54,
+          "value": 6.636836121270578
+        },
+        {
+          "experiment_index": 55,
+          "value": 6.636836121270578
+        },
+        {
+          "experiment_index": 56,
+          "value": 6.636836121270578
+        },
+        {
+          "experiment_index": 57,
+          "value": 6.636836121270578
+        },
+        {
+          "experiment_index": 58,
+          "value": 6.444311724851004
+        },
+        {
+          "experiment_index": 59,
+          "value": 6.444311724851004
+        },
+        {
+          "experiment_index": 60,
+          "value": 6.444311724851004
+        },
+        {
+          "experiment_index": 61,
+          "value": 6.444311724851004
+        },
+        {
+          "experiment_index": 62,
+          "value": 6.444311724851004
+        },
+        {
+          "experiment_index": 63,
+          "value": 6.444311724851004
+        },
+        {
+          "experiment_index": 64,
+          "value": 6.444311724851004
+        },
+        {
+          "experiment_index": 65,
+          "value": 6.444311724851004
+        },
+        {
+          "experiment_index": 66,
+          "value": 6.444311724851004
+        },
+        {
+          "experiment_index": 67,
+          "value": 6.444311724851004
+        },
+        {
+          "experiment_index": 68,
+          "value": 6.444311724851004
+        },
+        {
+          "experiment_index": 69,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 70,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 71,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 72,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 73,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 74,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 75,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 76,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 77,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 78,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 79,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 80,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 81,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 82,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 83,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 84,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 85,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 86,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 87,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 88,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 89,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 90,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 91,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 92,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 93,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 94,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 95,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 96,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 97,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 98,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 99,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 100,
+          "value": 6.41756364002071
+        },
+        {
+          "experiment_index": 101,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 102,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 103,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 104,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 105,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 106,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 107,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 108,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 109,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 110,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 111,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 112,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 113,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 114,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 115,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 116,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 117,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 118,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 119,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 120,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 121,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 122,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 123,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 124,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 125,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 126,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 127,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 128,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 129,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 130,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 131,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 132,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 133,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 134,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 135,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 136,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 137,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 138,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 139,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 140,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 141,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 142,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 143,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 144,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 145,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 146,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 147,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 148,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 149,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 150,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 151,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 152,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 153,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 154,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 155,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 156,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 157,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 158,
+          "value": 6.21559221188934
+        },
+        {
+          "experiment_index": 159,
+          "value": 5.910462301167257
+        },
+        {
+          "experiment_index": 160,
+          "value": 5.910462301167257
+        },
+        {
+          "experiment_index": 161,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 162,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 163,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 164,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 165,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 166,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 167,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 168,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 169,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 170,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 171,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 172,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 173,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 174,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 175,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 176,
+          "value": 5.755832045765984
+        },
+        {
+          "experiment_index": 177,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 178,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 179,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 180,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 181,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 182,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 183,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 184,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 185,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 186,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 187,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 188,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 189,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 190,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 191,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 192,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 193,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 194,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 195,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 196,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 197,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 198,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 199,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 200,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 201,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 202,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 203,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 204,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 205,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 206,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 207,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 208,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 209,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 210,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 211,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 212,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 213,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 214,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 215,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 216,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 217,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 218,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 219,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 220,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 221,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 222,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 223,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 224,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 225,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 226,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 227,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 228,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 229,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 230,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 231,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 232,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 233,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 234,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 235,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 236,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 237,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 238,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 239,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 240,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 241,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 242,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 243,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 244,
+          "value": 4.996069062119772
+        },
+        {
+          "experiment_index": 245,
+          "value": 4.696800548595121
+        },
+        {
+          "experiment_index": 246,
+          "value": 4.696800548595121
+        },
+        {
+          "experiment_index": 247,
+          "value": 4.696800548595121
+        },
+        {
+          "experiment_index": 248,
+          "value": 4.696800548595121
+        },
+        {
+          "experiment_index": 249,
+          "value": 4.696800548595121
+        },
+        {
+          "experiment_index": 250,
+          "value": 4.696800548595121
+        },
+        {
+          "experiment_index": 251,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 252,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 253,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 254,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 255,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 256,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 257,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 258,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 259,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 260,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 261,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 262,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 263,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 264,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 265,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 266,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 267,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 268,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 269,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 270,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 271,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 272,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 273,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 274,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 275,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 276,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 277,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 278,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 279,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 280,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 281,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 282,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 283,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 284,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 285,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 286,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 287,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 288,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 289,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 290,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 291,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 292,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 293,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 294,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 295,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 296,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 297,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 298,
+          "value": 4.269709589440386
+        },
+        {
+          "experiment_index": 299,
+          "value": 4.269709589440386
+        }
+      ]
+    },
+    "tay": {
+      "pr_count": 293,
+      "test_point_count": 234,
+      "intervention_count": 24,
+      "best_surface_pressure_rel_l2_pct": 3.6934711715666735,
+      "best_pr": 602,
+      "best_run_id": "ydw7rxl2",
+      "best_wandb_url": "https://wandb.ai/wandb-applied-ai-team/senpai-v1-drivaerml-ddp8/runs/ydw7rxl2",
+      "frontier_points": [
+        {
+          "experiment_index": 1,
+          "value": 12.857060184147558
+        },
+        {
+          "experiment_index": 2,
+          "value": 11.83930701767384
+        },
+        {
+          "experiment_index": 3,
+          "value": 11.83930701767384
+        },
+        {
+          "experiment_index": 4,
+          "value": 11.200737612288252
+        },
+        {
+          "experiment_index": 5,
+          "value": 11.200737612288252
+        },
+        {
+          "experiment_index": 6,
+          "value": 11.200737612288252
+        },
+        {
+          "experiment_index": 7,
+          "value": 11.200737612288252
+        },
+        {
+          "experiment_index": 8,
+          "value": 11.200737612288252
+        },
+        {
+          "experiment_index": 9,
+          "value": 6.216317110576067
+        },
+        {
+          "experiment_index": 10,
+          "value": 6.216317110576067
+        },
+        {
+          "experiment_index": 11,
+          "value": 6.216317110576067
+        },
+        {
+          "experiment_index": 12,
+          "value": 6.216317110576067
+        },
+        {
+          "experiment_index": 13,
+          "value": 6.216317110576067
+        },
+        {
+          "experiment_index": 14,
+          "value": 6.216317110576067
+        },
+        {
+          "experiment_index": 15,
+          "value": 6.216317110576067
+        },
+        {
+          "experiment_index": 16,
+          "value": 6.216317110576067
+        },
+        {
+          "experiment_index": 17,
+          "value": 6.216317110576067
+        },
+        {
+          "experiment_index": 18,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 19,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 20,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 21,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 22,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 23,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 24,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 25,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 26,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 27,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 28,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 29,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 30,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 31,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 32,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 33,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 34,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 35,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 36,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 37,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 38,
+          "value": 6.193000181666404
+        },
+        {
+          "experiment_index": 39,
+          "value": 6.115571844973205
+        },
+        {
+          "experiment_index": 40,
+          "value": 6.115571844973205
+        },
+        {
+          "experiment_index": 41,
+          "value": 6.115571844973205
+        },
+        {
+          "experiment_index": 42,
+          "value": 5.689846376505508
+        },
+        {
+          "experiment_index": 43,
+          "value": 5.689846376505508
+        },
+        {
+          "experiment_index": 44,
+          "value": 5.689846376505508
+        },
+        {
+          "experiment_index": 45,
+          "value": 5.689846376505508
+        },
+        {
+          "experiment_index": 46,
+          "value": 5.689846376505508
+        },
+        {
+          "experiment_index": 47,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 48,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 49,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 50,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 51,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 52,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 53,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 54,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 55,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 56,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 57,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 58,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 59,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 60,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 61,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 62,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 63,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 64,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 65,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 66,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 67,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 68,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 69,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 70,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 71,
+          "value": 5.6424235389028805
+        },
+        {
+          "experiment_index": 72,
+          "value": 5.549959330129131
+        },
+        {
+          "experiment_index": 73,
+          "value": 5.549959330129131
+        },
+        {
+          "experiment_index": 74,
+          "value": 5.549959330129131
+        },
+        {
+          "experiment_index": 75,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 76,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 77,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 78,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 79,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 80,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 81,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 82,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 83,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 84,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 85,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 86,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 87,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 88,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 89,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 90,
+          "value": 5.460937181007837
+        },
+        {
+          "experiment_index": 91,
+          "value": 5.422603295408706
+        },
+        {
+          "experiment_index": 92,
+          "value": 5.422603295408706
+        },
+        {
+          "experiment_index": 93,
+          "value": 5.422603295408706
+        },
+        {
+          "experiment_index": 94,
+          "value": 5.3701232073915985
+        },
+        {
+          "experiment_index": 95,
+          "value": 5.350129718654791
+        },
+        {
+          "experiment_index": 96,
+          "value": 5.350129718654791
+        },
+        {
+          "experiment_index": 97,
+          "value": 5.350129718654791
+        },
+        {
+          "experiment_index": 98,
+          "value": 5.350129718654791
+        },
+        {
+          "experiment_index": 99,
+          "value": 5.350129718654791
+        },
+        {
+          "experiment_index": 100,
+          "value": 5.350129718654791
+        },
+        {
+          "experiment_index": 101,
+          "value": 5.350129718654791
+        },
+        {
+          "experiment_index": 102,
+          "value": 5.350129718654791
+        },
+        {
+          "experiment_index": 103,
+          "value": 5.350129718654791
+        },
+        {
+          "experiment_index": 104,
+          "value": 5.350129718654791
+        },
+        {
+          "experiment_index": 105,
+          "value": 5.350129718654791
+        },
+        {
+          "experiment_index": 106,
+          "value": 5.350129718654791
+        },
+        {
+          "experiment_index": 107,
+          "value": 4.485322400960246
+        },
+        {
+          "experiment_index": 108,
+          "value": 4.485322400960246
+        },
+        {
+          "experiment_index": 109,
+          "value": 4.485322400960246
+        },
+        {
+          "experiment_index": 110,
+          "value": 4.485322400960246
+        },
+        {
+          "experiment_index": 111,
+          "value": 4.485322400960246
+        },
+        {
+          "experiment_index": 112,
+          "value": 4.485322400960246
+        },
+        {
+          "experiment_index": 113,
+          "value": 4.485322400960246
+        },
+        {
+          "experiment_index": 114,
+          "value": 4.485322400960246
+        },
+        {
+          "experiment_index": 115,
+          "value": 4.485322400960246
+        },
+        {
+          "experiment_index": 116,
+          "value": 4.485322400960246
+        },
+        {
+          "experiment_index": 117,
+          "value": 4.485322400960246
+        },
+        {
+          "experiment_index": 118,
+          "value": 4.485322400960246
+        },
+        {
+          "experiment_index": 119,
+          "value": 4.462159000146388
+        },
+        {
+          "experiment_index": 120,
+          "value": 4.462159000146388
+        },
+        {
+          "experiment_index": 121,
+          "value": 4.462159000146388
+        },
+        {
+          "experiment_index": 122,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 123,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 124,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 125,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 126,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 127,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 128,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 129,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 130,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 131,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 132,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 133,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 134,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 135,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 136,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 137,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 138,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 139,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 140,
+          "value": 4.4376699251511385
+        },
+        {
+          "experiment_index": 141,
+          "value": 4.4083479191395405
+        },
+        {
+          "experiment_index": 142,
+          "value": 4.4083479191395405
+        },
+        {
+          "experiment_index": 143,
+          "value": 4.4083479191395405
+        },
+        {
+          "experiment_index": 144,
+          "value": 4.4083479191395405
+        },
+        {
+          "experiment_index": 145,
+          "value": 4.4083479191395405
+        },
+        {
+          "experiment_index": 146,
+          "value": 4.4083479191395405
+        },
+        {
+          "experiment_index": 147,
+          "value": 4.4083479191395405
+        },
+        {
+          "experiment_index": 148,
+          "value": 4.4083479191395405
+        },
+        {
+          "experiment_index": 149,
+          "value": 4.4083479191395405
+        },
+        {
+          "experiment_index": 150,
+          "value": 4.362797672034137
+        },
+        {
+          "experiment_index": 151,
+          "value": 4.264568641724893
+        },
+        {
+          "experiment_index": 152,
+          "value": 4.264568641724893
+        },
+        {
+          "experiment_index": 153,
+          "value": 4.264568641724893
+        },
+        {
+          "experiment_index": 154,
+          "value": 4.264568641724893
+        },
+        {
+          "experiment_index": 155,
+          "value": 4.264568641724893
+        },
+        {
+          "experiment_index": 156,
+          "value": 4.238083466139434
+        },
+        {
+          "experiment_index": 157,
+          "value": 4.238083466139434
+        },
+        {
+          "experiment_index": 158,
+          "value": 4.127548664658222
+        },
+        {
+          "experiment_index": 159,
+          "value": 4.127548664658222
+        },
+        {
+          "experiment_index": 160,
+          "value": 4.127548664658222
+        },
+        {
+          "experiment_index": 161,
+          "value": 4.127548664658222
+        },
+        {
+          "experiment_index": 162,
+          "value": 4.127548664658222
+        },
+        {
+          "experiment_index": 163,
+          "value": 4.127548664658222
+        },
+        {
+          "experiment_index": 164,
+          "value": 4.127548664658222
+        },
+        {
+          "experiment_index": 165,
+          "value": 4.127548664658222
+        },
+        {
+          "experiment_index": 166,
+          "value": 4.127548664658222
+        },
+        {
+          "experiment_index": 167,
+          "value": 4.127548664658222
+        },
+        {
+          "experiment_index": 168,
+          "value": 4.127548664658222
+        },
+        {
+          "experiment_index": 169,
+          "value": 4.127548664658222
+        },
+        {
+          "experiment_index": 170,
+          "value": 4.127548664658222
+        },
+        {
+          "experiment_index": 171,
+          "value": 4.127548664658222
+        },
+        {
+          "experiment_index": 172,
+          "value": 4.127548664658222
+        },
+        {
+          "experiment_index": 173,
+          "value": 3.7151164533039167
+        },
+        {
+          "experiment_index": 174,
+          "value": 3.7151164533039167
+        },
+        {
+          "experiment_index": 175,
+          "value": 3.7151164533039167
+        },
+        {
+          "experiment_index": 176,
+          "value": 3.7151164533039167
+        },
+        {
+          "experiment_index": 177,
+          "value": 3.7151164533039167
+        },
+        {
+          "experiment_index": 178,
+          "value": 3.7151164533039167
+        },
+        {
+          "experiment_index": 179,
+          "value": 3.6964451062952777
+        },
+        {
+          "experiment_index": 180,
+          "value": 3.6964451062952777
+        },
+        {
+          "experiment_index": 181,
+          "value": 3.6964451062952777
+        },
+        {
+          "experiment_index": 182,
+          "value": 3.6964451062952777
+        },
+        {
+          "experiment_index": 183,
+          "value": 3.6964451062952777
+        },
+        {
+          "experiment_index": 184,
+          "value": 3.6964451062952777
+        },
+        {
+          "experiment_index": 185,
+          "value": 3.6964451062952777
+        },
+        {
+          "experiment_index": 186,
+          "value": 3.6964451062952777
+        },
+        {
+          "experiment_index": 187,
+          "value": 3.6964451062952777
+        },
+        {
+          "experiment_index": 188,
+          "value": 3.6964451062952777
+        },
+        {
+          "experiment_index": 189,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 190,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 191,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 192,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 193,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 194,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 195,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 196,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 197,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 198,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 199,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 200,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 201,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 202,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 203,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 204,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 205,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 206,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 207,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 208,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 209,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 210,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 211,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 212,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 213,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 214,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 215,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 216,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 217,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 218,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 219,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 220,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 221,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 222,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 223,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 224,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 225,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 226,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 227,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 228,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 229,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 230,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 231,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 232,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 233,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 234,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 235,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 236,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 237,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 238,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 239,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 240,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 241,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 242,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 243,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 244,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 245,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 246,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 247,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 248,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 249,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 250,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 251,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 252,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 253,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 254,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 255,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 256,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 257,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 258,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 259,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 260,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 261,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 262,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 263,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 264,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 265,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 266,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 267,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 268,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 269,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 270,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 271,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 272,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 273,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 274,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 275,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 276,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 277,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 278,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 279,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 280,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 281,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 282,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 283,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 284,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 285,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 286,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 287,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 288,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 289,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 290,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 291,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 292,
+          "value": 3.6934711715666735
+        },
+        {
+          "experiment_index": 293,
+          "value": 3.6934711715666735
+        }
+      ]
+    },
+    "drivaerml-long-20260504": {
+      "pr_count": 29,
+      "test_point_count": 24,
+      "intervention_count": 0,
+      "best_surface_pressure_rel_l2_pct": 3.881152122847719,
+      "best_pr": 740,
+      "best_run_id": "5x8wofzm",
+      "best_wandb_url": "https://wandb.ai/wandb-applied-ai-team/senpai-v1-drivaerml-ddp8/runs/5x8wofzm",
+      "frontier_points": [
+        {
+          "experiment_index": 2,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 3,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 4,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 5,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 6,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 7,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 8,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 9,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 10,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 11,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 12,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 13,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 14,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 15,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 16,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 17,
+          "value": 4.031648784388161
+        },
+        {
+          "experiment_index": 18,
+          "value": 3.881152122847719
+        },
+        {
+          "experiment_index": 19,
+          "value": 3.881152122847719
+        },
+        {
+          "experiment_index": 20,
+          "value": 3.881152122847719
+        },
+        {
+          "experiment_index": 21,
+          "value": 3.881152122847719
+        },
+        {
+          "experiment_index": 22,
+          "value": 3.881152122847719
+        },
+        {
+          "experiment_index": 23,
+          "value": 3.881152122847719
+        },
+        {
+          "experiment_index": 24,
+          "value": 3.881152122847719
+        },
+        {
+          "experiment_index": 25,
+          "value": 3.881152122847719
+        },
+        {
+          "experiment_index": 26,
+          "value": 3.881152122847719
+        },
+        {
+          "experiment_index": 27,
+          "value": 3.881152122847719
+        },
+        {
+          "experiment_index": 28,
+          "value": 3.881152122847719
+        },
+        {
+          "experiment_index": 29,
+          "value": 3.881152122847719
+        }
+      ]
+    }
+  }
+}

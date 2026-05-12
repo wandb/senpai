@@ -84,10 +84,10 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    cd "$PROBLEM_DIR" && python train.py --dataset <dataset> --agent <your-name> --experiment_name "<your-name>/<description>"
    ```
    - Before the first run in a target, read `python train.py --help` and use the exact flag names it exposes.
-   - **Timeout**: The `SENPAI_MAX_EPOCHS` and `SENPAI_TIMEOUT_MINUTES` env vars control the max epochs and timeout for each training run in train.py. Ensure training runs do not exceed these limits.
+   - **Run limits**: `SENPAI_MAX_EPOCHS` and `SENPAI_TIMEOUT_MINUTES` are hard upper bounds, not targets. Choose epochs/steps that fit the evidence: tiny debug runs when useful, medium screening runs, and longer confirmation runs only for stable promising ideas. Ensure training runs do not exceed these limits.
    - Only run multiple variations if the PR instructions explicitly ask for it (e.g. "try surface weight 5, 10, 20"). Otherwise, run the single experiment described.
    - For active training, prefer `ScheduleWakeup` every 10-30 minutes plus `training_log_status <logfile>`. Do not stream per-epoch training logs into `Monitor`.
-   - Ensure the training script writes metrics to JSONL files and commit those metric files as part of the PR. It is very important to log metrics well: include all required validation/test metrics, relevant config values, and enough context for the advisor to compare the experiment later.
+   - Ensure the training script writes metrics to JSONL files and commit those metric files as part of the PR. Include all required validation/test metrics, relevant config values, and enough context for the advisor to compare the experiment later.
    - **After each run finishes**, check for new advisor comments before continuing:
      ```bash
      pr_all_comments <number>
@@ -98,10 +98,12 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    - Start your comment with:
    ```markdown
    STUDENT <your-name>:
+   SENPAI-RESULT: {"terminal":true,"status":"complete","pending_arms":false,"metric_artifacts":["<path-to-jsonl-or-summary>"],"primary_metric":{"name":"<metric>","value":<number>},"test_metric":{"name":"<metric>","value":<number>}}
 
    ## Results
 
    ```
+   - The `SENPAI-RESULT` line must be valid single-line JSON. Set `terminal=true` only when every advisor-required arm/run is finished or intentionally aborted and no pending result could change the conclusion. Set `pending_arms=true` for partial updates and do not submit for review yet.
    - All key metrics required by `$PROBLEM_DIR/program.md` and the PR baseline.
    - When a dataset has a literature-facing test target or reference, include
      that reference beside your reported test metric.
@@ -128,6 +130,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
 - Avoid `Monitor` for normal training progress. If you must monitor a run, trigger only on terminal events such as process exit, `Traceback`, OOM, NaN, or explicit completion; never monitor `Epoch`, validation metrics, best-checkpoint updates, or `tail -f` output.
 - Do not use `Monitor` for GitHub assignment polling. Assignment polling belongs to the entrypoint and the `senpai:poll-for-work` helper.
 - Use a background `until ...; do sleep N; done` loop only for a bounded local check.
+- Do not wait for your own background commands with broad `pgrep -f "<experiment name or args>"` patterns. The waiting shell command line contains that pattern too, so `pgrep -f` can match the waiter itself forever. Capture the PID when you launch a background command and use `wait "$pid"`, a task id, or a pidfile instead.
 
 ### Give new experiments the best possible chance of success
 
@@ -142,6 +145,10 @@ Note: Don't try to fix errors or failures that arise from our hard, fixed experi
 ### If you find bugs, you fix them
 
 You are at the front line of this codebase. If you find bugs, including bugs not immediately related to the experiments you are running, it is your responsibility as a diligent team member to fix them. Ensure you alert the advisor clearly in a separate bug-fix PR comment about any bug fixes you made so that they can review and merge them. Run the bug fixes before you start your experiments.
+
+### Always leave rich local metrics for every experiment
+
+Ensure that you log all relevant metrics and configs to local JSONL metrics files, especially when adding new metrics or configs particular to an experiment. We want to leave behind a rich committed record for future analysis.
 
 ### You can install new packages if necessary for an experiment
 

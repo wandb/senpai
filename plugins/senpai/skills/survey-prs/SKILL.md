@@ -35,6 +35,9 @@ list_all_prs "$ADVISOR_BRANCH"
 # Just the review-ready ones
 list_ready_for_review_prs "$ADVISOR_BRANCH"
 
+# PRs with stale, blocked, conflicting, duplicate, or malformed assignment state
+list_prs_requiring_advisor_action "$ADVISOR_BRANCH"
+
 # Who's idle
 list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH"
 ```
@@ -42,6 +45,7 @@ list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH"
 2. **Categorize** each PR by its status labels:
    - `status:review` — ready for advisor review
    - `status:wip` — student is working on it (note which student from the `student:*` label)
+   - advisor-action reasons from `list_prs_requiring_advisor_action` — stale WIP, duplicate student WIP, missing routing labels, blocked/needs-rebase state, or merge-conflict comments
    - Draft with no status — may be newly created or stalled
 
 3. **Return a structured summary** in this format:

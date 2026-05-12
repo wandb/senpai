@@ -10,7 +10,7 @@ Autonomous ML research loop powered by Claude Code agents coordinated through Gi
 
 ## How it works
 
-An **advisor** pod creates experiment PRs and assigns them to **student** GPU pods. Students implement, train, and report; the advisor merges winners and closes dead ends. GitHub labels route work, and students commit local JSONL metrics.
+An **advisor** pod creates experiment PRs and assigns them to **student** GPU pods. Students implement, train, and report; the advisor merges winners and closes dead ends. GitHub labels route work, and committed local JSONL files track metrics.
 
 `senpai` is **problem-agnostic**. The pod entrypoint clones the configured problem-package repo into `target/`, so agent commits and PRs land in that external repo, not here.
 
@@ -39,7 +39,7 @@ graph TD
         A -->|"GitHub PRs<br/>(draft → review → merge/close)"| Students
     end
     K8s --> GH["GitHub<br/>PRs = hypotheses<br/>Labels = routing"]
-    K8s --> LM["Local JSONL metrics<br/>Committed with PRs"]
+    K8s --> LM["Local JSONL metrics<br/>Committed to experiment PRs"]
 ```
 
 ### PR lifecycle
@@ -80,7 +80,7 @@ senpai/
 └── .claude/                       # Claude Code skills and agents
 ```
 
-**Important**: agent commits and PRs land in the problem-package repo, never in the runner repo.
+**Important**: agent commits and PRs land in the problem-package repo, never in `wandb/senpai`.
 
 ## Configuration
 
@@ -88,16 +88,16 @@ All project settings live in `senpai.yaml`:
 
 ```yaml
 problem_dir: target/
-repo_url: <runner-repo-url>
+repo_url: https://github.com/wandb/senpai.git
 repo_branch: main
 target_repo_url: https://github.com/morganmcg1/tandemfoil2.git
 target_repo_branch: main
 advisor_branch: schmidhuber
 gh_history_scope: branch
-image: <runner-image>
+human_issues: true
+image: ghcr.io/wandb/senpai:latest
 pvc_claim_name: new-pvc
 pvc_mount_path: /mnt/new-pvc
-experiment_metrics: local-jsonl
 timeout_minutes: 30.0
 max_epochs: 50
 n_students: 4
@@ -137,10 +137,15 @@ GitHub token requirements: use a PAT with `repo` and `read:org`; it must clone `
 
 `--gh_history_scope branch` is the default: pods clone only the advisor branch while keeping that branch's history. Use `--gh_history_scope repo` to clone the full target repo, or `--gh_history_scope fresh` for a shallow single-branch clone. Use `--extra_instructions` for any agent-facing guidance about what history to use or ignore.
 
-### Experiment Metrics
+### Research Modes
 
-This branch is configured for local-only experiment metrics. Students should
-commit JSONL metric files and reference those paths in PR result comments.
+- **Isolated ablation:** use a unique `--tag`, unique `--advisor_branch`, `--gh_history_scope fresh`, `--student_prefix`, and `--nohuman_issues`. Agents see only the routed branch/PR stream unless explicitly told otherwise.
+- **Normal branch memory:** use `--gh_history_scope branch` with human issues enabled. Agents keep continuity on the active advisor branch while routine PR/issue polling stays scoped to the target repo.
+- **Deliberate exploration:** use `--gh_history_scope repo` or targeted `--extra_instructions` that ask the advisor/researcher-agent to inspect other branches, PRs, issues, metric artifacts, or repos. Senpai helpers stay scoped to `GH_REPO`, but explicit `gh --repo owner/repo ...` reads are available when credentials allow.
+
+### Metrics for Charlie runs
+
+Charlie is the no-W&B ablation arm. Pods do not receive a W&B API key, do not install Weave/Hivemind logging, and instruct students to use local JSONL metrics committed to their PR branches.
 
 ## Running
 

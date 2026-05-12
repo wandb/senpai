@@ -8,6 +8,17 @@
   url           = {https://arxiv.org/abs/2602.04940}
 }
 
+@misc{luo2025transolverplusplus,
+  title         = {Transolver++: An Accurate Neural Solver for PDEs on Million-Scale Geometries},
+  author        = {Luo, Huakun and Wu, Haixu and Zhou, Hang and Xing, Lanxiang and Di, Yichen and Wang, Jianmin and Long, Mingsheng},
+  year          = {2025},
+  eprint        = {2502.02414},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  doi           = {10.48550/arXiv.2502.02414},
+  url           = {https://arxiv.org/abs/2502.02414}
+}
+
 @misc{wang2024cfdmlsurvey,
   title         = {Recent Advances on Machine Learning for Computational Fluid Dynamics: A Survey},
   author        = {Wang, Haixin and others},
@@ -142,7 +153,7 @@
 @misc{miyai2026jraiscientist,
   title         = {Jr. AI Scientist and Its Risk Report: Autonomous Scientific Exploration from a Baseline Paper},
   author        = {Miyai, Atsuyuki and Toyooka, Mashiro and Otonari, Takashi and Zhao, Zaiying and Aizawa, Kiyoharu},
-  year          = {2026},
+  year          = {2025},
   eprint        = {2511.04583},
   archivePrefix = {arXiv},
   primaryClass  = {cs.AI},
@@ -209,14 +220,16 @@
   note   = {Accessed 2026-04-24}
 }
 
-@misc{bonnet2022airfrans,
+@inproceedings{bonnet2022airfrans,
   title         = {AirfRANS: High Fidelity Computational Fluid Dynamics Dataset for Approximating Reynolds-Averaged Navier--Stokes Solutions},
-  author        = {Bonnet, Francois and others},
+  author        = {Bonnet, Florent and Mazari, Jocelyn and Cinnella, Paola and Gallinari, Patrick},
+  booktitle     = {Advances in Neural Information Processing Systems},
+  volume        = {35},
   year          = {2022},
   eprint        = {2212.07564},
   archivePrefix = {arXiv},
   primaryClass  = {physics.flu-dyn},
-  url           = {https://arxiv.org/abs/2212.07564}
+  url           = {https://papers.nips.cc/paper_files/paper/2022/hash/94ab7b23a345f93333eac8748a66c763-Abstract-Datasets_and_Benchmarks.html}
 }
 
 @inproceedings{wu2024transolver,
@@ -228,10 +241,15 @@
 }
 
 @article{li2024geoanf,
-  title   = {GeoANF: Geometry-Aware Neural Fields for Airfoil Flow Field Prediction},
-  author  = {Li, Zenong and others},
+  title   = {Learning Airfoil Flow Field Representation via Geometric Attention Neural Field},
+  author  = {Xiao, Li and Zhang, Mingjie and Chang, Xinghua},
   journal = {Applied Sciences},
-  year    = {2024}
+  volume  = {14},
+  number  = {22},
+  pages   = {10685},
+  year    = {2024},
+  doi     = {10.3390/app142210685},
+  url     = {https://www.mdpi.com/2076-3417/14/22/10685}
 }
 
 @inproceedings{qi2025spidersolver,
@@ -250,17 +268,15 @@
   url       = {https://openreview.net/forum?id=4Z0P4Nbosn}
 }
 
-@misc{mcguire2026tandemfoilsetbalanced,
+@misc{anonymous2026tandemfoilsetbalanced,
   title        = {{TandemFoilSet-Balanced}: Balanced Split Design and CFD Surrogate Benchmark Package},
-  author       = {McGuire, Morgan and Capelle, Thomas},
+  author       = {Anonymous},
   year         = {2026},
-  howpublished = {GitHub repository},
-  url          = {https://github.com/morganmcg1/TandemFoilSet-Balanced},
-  note         = {Accessed 2026-04-24}
+  note         = {Anonymous supplementary artifact}
 }
 
 @misc{ashton2024drivaerml,
-  title         = {{DrivAerML}: A High-Fidelity Computational Fluid Dynamics Dataset for Machine Learning and Reduced-Order Modeling},
+  title         = {{DrivAerML}: High-Fidelity Computational Fluid Dynamics Dataset for Road-Car External Aerodynamics},
   author        = {Ashton, Neil and others},
   year          = {2024},
   eprint        = {2408.11969},
@@ -270,9 +286,65 @@
 }
 
 @article{alkin2025abupt,
-  title   = {AB-UPT: Scaling Industrial Geometries and Partial Differential Equations Using Auto-Regressive Boundary Unified Pre-trained Transformers},
-  author  = {Alkin, Benedikt and others},
+  title   = {{AB-UPT}: Scaling Neural {CFD} Surrogates for High-Fidelity Automotive Aerodynamics Simulations via Anchored-Branched Universal Physics Transformers},
+  author  = {Alkin, Benedikt and Bleeker, Maurits and Kurle, Richard and Kronlachner, Tobias and Sonnleitner, Reinhard and Dorfer, Matthias and Brandstetter, Johannes},
   journal = {Transactions on Machine Learning Research},
   year    = {2025},
-  url     = {https://openreview.net/forum?id=dcN0LBDRZ8}
+  url     = {https://openreview.net/forum?id=nwQ8nitlTZ}
+}
+
+@article{yang2026simple,
+  title   = {Simple yet Effective: Low-Rank Spatial Attention for Neural Operators},
+  author  = {Yang, Zherui and Xin, Haiyang and Du, Tao and Liu, Ligang},
+  journal = {arXiv preprint arXiv:2604.03582},
+  year    = {2026},
+  doi     = {10.48550/arXiv.2604.03582},
+  url     = {https://arxiv.org/abs/2604.03582}
+}
+
+@inproceedings{li2021learnable,
+  title     = {Learnable Fourier Features for Multi-Dimensional Spatial Positional Encoding},
+  author    = {Li, Yang and Si, Si and Li, Gang and Hsieh, Cho-Jui and Bengio, Samy},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2021},
+  url       = {https://arxiv.org/abs/2106.02795}
+}
+
+@inproceedings{schenck2025learningropes,
+  title     = {Learning the {R}o{PE}s: Better 2{D} and 3{D} Position Encodings with {STRING}},
+  author    = {Schenck, Connor and Reid, Isaac and Jacob, Mithun George and Bewley, Alex and Ainslie, Joshua and Rendleman, David and Jain, Deepali and Sharma, Mohit and Dubey, Kumar Avinava and Wahid, Ayzaan and Singh, Sumeet and Wagner, Rene and Ding, Tianli and Fu, Chuyuan and Byravan, Arunkumar and Varley, Jake and Gritsenko, Alexey A. and Minderer, Matthias and Kalashnikov, Dmitry and Tompson, Jonathan and Sindhwani, Vikas and Choromanski, Krzysztof Marcin},
+  booktitle = {Proceedings of the 42nd International Conference on Machine Learning},
+  pages     = {53295--53315},
+  year      = {2025},
+  volume    = {267},
+  series    = {Proceedings of Machine Learning Research},
+  publisher = {PMLR},
+  url       = {https://proceedings.mlr.press/v267/schenck25a.html}
+}
+
+@inproceedings{chen2023symbolic,
+  title     = {Symbolic Discovery of Optimization Algorithms},
+  author    = {Chen, Xiangning and Liang, Chen and Huang, Da and Real, Esteban and Wang, Kaiyuan and Liu, Yao and Pham, Hieu and Dong, Xuanyi and Luong, Thang and Hsieh, Cho-Jui and Lu, Yifeng and Le, Quoc V.},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2023},
+  url       = {https://arxiv.org/abs/2302.06675}
+}
+
+@inproceedings{chen2018gradnorm,
+  title     = {{G}rad{N}orm: Gradient Normalization for Adaptive Loss Balancing in Deep Multitask Networks},
+  author    = {Chen, Zhao and Badrinarayanan, Vijay and Lee, Chen-Yu and Rabinovich, Andrew},
+  booktitle = {Proceedings of the 35th International Conference on Machine Learning},
+  pages     = {794--803},
+  year      = {2018},
+  volume    = {80},
+  series    = {Proceedings of Machine Learning Research},
+  publisher = {PMLR},
+  url       = {https://proceedings.mlr.press/v80/chen18a.html}
+}
+
+@misc{anonymous2026kagent,
+  title        = {\texttt{kagent}: A Lightweight Multi-Agent Experiment Harness},
+  author       = {Anonymous},
+  year         = {2026},
+  note         = {Anonymous supplementary artifact}
 }

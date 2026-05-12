@@ -26,7 +26,15 @@ You've run the experiment, posted a results comment on the experiment PR — now
 
 ## Before you call this
 
-Make sure you've already posted a results comment on the experiment PR with metrics, the committed JSONL metrics path, any local metric summary path, analysis, and suggested follow-ups.
+Make sure you've already posted a results comment on the experiment PR with metrics, committed local metrics paths, analysis, and suggested follow-ups.
+
+The comment must include a valid one-line terminal result marker before the Results section:
+
+```markdown
+SENPAI-RESULT: {"terminal":true,"status":"complete","pending_arms":false,"metric_artifacts":["<path-to-jsonl-or-summary>"],"primary_metric":{"name":"<metric>","value":<number>},"test_metric":{"name":"<metric>","value":<number>}}
+```
+
+Use `terminal=true` only when every advisor-required arm/run is finished or intentionally aborted. If any local run can still change the conclusion, leave the PR as `status:wip`.
 
 ## Steps
 
@@ -34,8 +42,7 @@ Make sure you've already posted a results comment on the experiment PR with metr
 
 ```bash
 git add "$1/train.py"
-# Also add committed metric JSONL files and any other files you modified
-# (pyproject.toml if you added packages, etc.).
+# Also add any other files you modified (pyproject.toml if you added packages, etc.)
 git commit -m "<concise description of what you changed>"
 ```
 
@@ -51,5 +58,7 @@ git push origin "$(git branch --show-current)"
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 mark_ready_for_review $0
 ```
+
+`mark_ready_for_review` refuses the handoff if the terminal `SENPAI-RESULT` marker is missing, invalid JSON, or still reports pending arms/runs. Read the error, fix the PR comment, and retry.
 
 That's it. The advisor will pick it up in their next review cycle.
