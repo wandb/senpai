@@ -1,0 +1,30 @@
+.env
+.env.*
+!.env.example
+
+# Python / notebook runtime
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Notebook-generated workshop outputs
+artifacts/*
+!artifacts/README.md
+
+# Node / Slidev
+node_modules/
+.vite/
+.slidev/
+dist/
+
+# Slidev exports and review outputs
+*.pdf
+*.pptx
+*.png
+autoresearch-workshop-pages*/
+pdf-inspection/
+review/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

@@ -1,0 +1,31 @@
+{
+  "trace_id": "trace-workshop-ema-review",
+  "root_call": {
+    "name": "advisor_review_pr",
+    "inputs": {
+      "pr_number": 2417,
+      "metric_contract": "test_primary/surface_pressure_rel_l2_pct"
+    },
+    "output": {
+      "decision": "do_not_merge",
+      "reason": "test metric regressed against baseline"
+    }
+  },
+  "calls": [
+    {
+      "name": "pr_all_comments",
+      "type": "tool",
+      "output_summary": "Found terminal SENPAI-RESULT with W&B run driv-ema-042."
+    },
+    {
+      "name": "wandb.Api().run",
+      "type": "tool",
+      "output_summary": "Run finished. Validation surface pressure 4.42, test surface pressure 6.31."
+    },
+    {
+      "name": "advisor_decision",
+      "type": "llm",
+      "output_summary": "Recommend do not merge validation-only improvement."
+    }
+  ]
+}

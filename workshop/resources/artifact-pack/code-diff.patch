@@ -1,0 +1,27 @@
+diff --git a/train.py b/train.py
+index 1111111..2222222 100644
+--- a/train.py
++++ b/train.py
+@@ -42,6 +42,9 @@ def parse_args():
+     parser.add_argument("--epochs", type=int, default=80)
+     parser.add_argument("--wandb_name", type=str, required=True)
++    parser.add_argument("--ema-decay", type=float, default=0.0)
++    parser.add_argument("--ema-warmup-fraction", type=float, default=0.0)
++    parser.add_argument("--restore-best-checkpoint", action="store_true")
+     return parser.parse_args()
+ 
+@@ -171,6 +174,9 @@ def train(args):
+             loss.backward()
+             optimizer.step()
++            if ema is not None and global_step >= ema_start_step:
++                ema.update(model.parameters())
+ 
+         val_metrics = evaluate(model, val_loader)
+@@ -184,6 +190,9 @@ def train(args):
+             best_metric = val_metrics["surface_pressure_rel_l2_pct"]
+             best_checkpoint = copy.deepcopy(model.state_dict())
+ 
++    if args.restore_best_checkpoint and best_checkpoint is not None:
++        model.load_state_dict(best_checkpoint)
++
+     test_metrics = evaluate(model, test_loader)

@@ -1,0 +1,58 @@
+---
+kind: Secret
+metadata:
+  name: senpai-launch-secrets-workshop
+  labels:
+    app: senpai
+    research-tag: workshop
+data:
+  github-token: <REDACTED>
+  anthropic-api-key: <REDACTED>
+  exa-api-key: <REDACTED>
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: senpai-config-advisor-workshop
+  labels:
+    app: senpai
+    role: advisor
+    research-tag: workshop
+data:
+  TARGET_REPO_URL: "https://github.com/example/cfd-target.git"
+  TARGET_REPO_BRANCH: "main"
+  GH_REPO: "example/cfd-target"
+  RESEARCH_TAG: "workshop"
+  STUDENT_NAMES: "ws-frieren,ws-fern"
+  WANDB_ENTITY: "wandb-applied-ai-team"
+  WANDB_PROJECT: "senpai-v1"
+  ADVISOR_BRANCH: "workshop-r1"
+  GH_HISTORY_SCOPE: "branch"
+  PROBLEM_DIR: "target/"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: senpai-workshop-ws-fern
+  labels:
+    app: senpai
+    role: student
+    student: ws-fern
+    research-tag: workshop
+spec:
+  template:
+    spec:
+      containers:
+        - name: student
+          image: ghcr.io/wandb/senpai:latest
+          resources:
+            requests:
+              cpu: "15"
+              memory: "120Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "15"
+              memory: "120Gi"
+              nvidia.com/gpu: "1"

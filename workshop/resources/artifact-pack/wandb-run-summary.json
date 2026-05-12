@@ -1,0 +1,25 @@
+{
+  "entity": "wandb-applied-ai-team",
+  "project": "senpai-v1",
+  "run_id": "driv-ema-042",
+  "name": "ws-fern/drivaerml-ema-warmup",
+  "group": "workshop-drivaerml-ema",
+  "state": "finished",
+  "config": {
+    "split": "public_400_34_50",
+    "model": "grouped-transolver",
+    "ema_decay": 0.999,
+    "ema_warmup_fraction": 0.1,
+    "restore_best_checkpoint": true
+  },
+  "summary": {
+    "full_val_primary/surface_pressure_rel_l2_pct": 4.42,
+    "test_primary/surface_pressure_rel_l2_pct": 6.31,
+    "test_primary/volume_pressure_rel_l2_pct": 12.8,
+    "test_primary/wall_shear_rel_l2_pct": 9.4
+  },
+  "baseline": {
+    "test_primary/surface_pressure_rel_l2_pct": 6.24,
+    "full_val_primary/surface_pressure_rel_l2_pct": 4.62
+  }
+}
