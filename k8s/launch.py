@@ -176,6 +176,7 @@ def render_advisor(template: str, tag: str, student_list: list[str], secret_name
         "ADVISOR_DEPLOYMENT_NAME": advisor_deployment_name,
         "ADVISOR_CONFIGMAP_NAME": advisor_configmap_name,
         "RESEARCH_TAG": tag,
+        "IMAGE": args.image,
         "PVC_CLAIM_NAME": args.pvc_claim_name,
         "PVC_MOUNT_PATH": args.pvc_mount_path,
         "LAUNCH_SECRET_NAME": secret_name,
