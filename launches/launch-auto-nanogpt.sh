@@ -36,7 +36,7 @@ else
 fi
 
 for rep in 1 2 3 4 5; do
-  tag="auto-nanogpt-r${rep}"
+  tag="auto-nanogpt-1gpu-r${rep}"
   "${launch_cmd[@]}" k8s/launch.py \
     --tag "${tag}" \
     --advisor \
@@ -45,8 +45,8 @@ for rep in 1 2 3 4 5; do
     --advisor_branch "${tag}" \
     --gh_history_scope fresh \
     --n_students 8 \
-    --student_prefix "r${rep}" \
-    --gpus_per_student 8 \
+    --student_prefix "g1r${rep}" \
+    --gpus_per_student 1 \
     --timeout_minutes "${timeout_minutes}" \
     --max_epochs "${max_epochs}" \
     --wandb_entity "${wandb_entity}" \
