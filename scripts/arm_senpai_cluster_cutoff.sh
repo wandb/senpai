@@ -262,7 +262,7 @@ import sys
 data = json.load(sys.stdin)
 for item in data.get("items", []):
     meta = item.get("metadata", {})
-    print(f"{meta.get('name', '')}\t{meta.get('labels', {}).get('research-tag', '')}")
+    print("{}\t{}".format(meta.get("name", ""), meta.get("labels", {}).get("research-tag", "")))
 ' > "${dest}/pod_list.tsv"
 
   pod_count="$(wc -l < "${dest}/pod_list.tsv" | tr -d ' ')"
