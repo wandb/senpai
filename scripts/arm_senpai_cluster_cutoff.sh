@@ -135,7 +135,7 @@ utc_from_epoch() {
   python - "$1" <<'PY'
 import datetime as dt
 import sys
-print(dt.datetime.fromtimestamp(int(sys.argv[1]), tz=dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"))
+print(dt.datetime.fromtimestamp(int(sys.argv[1]), tz=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
 PY
 }
 
