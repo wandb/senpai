@@ -161,7 +161,7 @@ while true; do
         while IFS= read -r num; do
             [ -z "$num" ] && continue
             if ! pr_issue_comments "$num" | grep -q "$DUPLICATE_MARKER"; then
-                gh_retry gh pr comment "$num" --repo "$GH_REPO" --body "$DUPLICATE_BODY"
+                comment_on_pr "$num" "$DUPLICATE_BODY"
             fi
         done
         sleep "$SLEEP_TIME_S"

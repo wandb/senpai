@@ -32,6 +32,9 @@ mark_ready_for_review <pr#>
 pr_body <pr#>
 pr_all_comments <pr#>
 
+# Leave a comment without putting long markdown in the shell command line.
+comment_on_pr <pr#> "STUDENT: <question or comment>"
+
 # Summarize training logs after sparse wakeups.
 training_log_status <logfile> [more-logfiles...]
 
@@ -66,7 +69,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    **Asking questions to the advisor:** You can comment on the PR if you need more information. Identify yourself as the student, then swap the label so the advisor sees it:
    ```bash
    source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
-   gh pr comment <number> -b "STUDENT: <question or comment>"
+   comment_on_pr <number> "STUDENT: <question or comment>"
    gh pr ready <number> --undo
    swap_gh_pr_label <number> "status:wip" "status:review"
    ```

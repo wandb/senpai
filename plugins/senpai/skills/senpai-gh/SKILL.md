@@ -43,6 +43,7 @@ GitHub's `gh pr edit --remove-label X --add-label Y` silently strips **all other
 
 | Function | What it does |
 |---|---|
+| `comment_on_pr <pr#> <comment>` | Leave a PR comment via a temporary body file, avoiding giant shell command lines. |
 | `send_pr_back_to_student_with_comment <pr#> <comment>` | Send a PR back to the student with feedback. Comment on the PR, convert back to draft, swap `status:review` → `status:wip`. |
 | `senpai_merge_winner_preflight <pr#> [problem-dir]` | Refuse unsafe winner merges with a specific error if the PR lacks terminal `SENPAI-RESULT`, has a newer hold comment, is draft/WIP, has bad labels, or has merge conflicts. |
 | `close_pr_with_comment <pr#> <reason>` | Close a dead-end PR with a comment explaining why. Keeps the remote branch so the PR can be reopened or recovered if needed. |
@@ -65,7 +66,7 @@ The default repo for `gh` is set via the injected `GH_REPO` env var, so no `--re
 | `issue_comments <issue#>` | Read all issue comments through REST pagination. Returns JSON array. |
 | `issue_with_comments <issue#>` | Read one issue and all comments through REST pagination. Returns JSON object. |
 | `list_ready_for_review_prs <branch>` | List PRs with `status:review` on a branch. Returns JSON array. |
-| `list_prs_requiring_advisor_action <branch>` | List open branch PRs requiring advisor action, with `reasons` such as stale WIP, duplicate student WIP, missing routing labels, or rebase conflicts. Returns JSON array. |
+| `list_prs_requiring_advisor_action <branch> [stale_wip_seconds] [student_names_csv]` | List open branch PRs requiring advisor action, with `reasons` such as stale WIP, duplicate student WIP, missing, unknown, or unroutable student labels, or rebase conflicts. Returns JSON array. |
 | `list_all_prs <branch>` | List all open PRs on a branch (any status). Returns JSON array. |
 | `student_poll_for_work <student_name> [branch]` | List branch-scoped WIP PRs assigned to a student. Returns JSON array. |
 | `list_idle_students <names_csv> <branch>` | Print names of students with no `status:wip` PR, one per line. |
@@ -83,6 +84,9 @@ source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 
 # Advisor sends a PR back for revision
 send_pr_back_to_student_with_comment 1842 "ADVISOR: Promising direction but didn't beat baseline. Try lr=1e-3 with cosine annealing."
+
+# Leave a plain comment
+comment_on_pr 1842 "ADVISOR: Please stop the current run; the branch is no longer assigned."
 
 # Student marks PR ready for review
 mark_ready_for_review 1842

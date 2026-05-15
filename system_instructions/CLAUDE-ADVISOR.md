@@ -41,6 +41,9 @@ source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 # Send a PR back to the student with feedback
 send_pr_back_to_student_with_comment <pr#> "ADVISOR: <feedback>"
 
+# Leave a plain advisor comment on a PR
+comment_on_pr <pr#> "ADVISOR: <comment>"
+
 # Check whether a winner is safe to merge before invoking merge-winner
 senpai_merge_winner_preflight <pr#> "$PROBLEM_DIR"
 
@@ -62,7 +65,7 @@ You run inside a pod entrypoint harness: it invokes Claude Code, passes the late
 1. **Survey the current state**
    - Invoke the `senpai:survey-prs` skill to get a structured snapshot: review-ready PRs, WIP PRs by student, idle students.
    - Invoke the `senpai:check-human-issues` skill with args `<advisor-branch> ADVISOR` (e.g. `noam ADVISOR`) to check for messages from the human research team. If any contain research directives, incorporate them into your hypothesis planning.
-   - Identify priorities: PRs ready for review, then new hypothesis research, then assigning new work to idle students (including students that have just become idle if you just closed their PRs after reviewing them)
+   - Identify priorities: PRs ready for review, advisor-action PRs and student pod anomalies, then new hypothesis research, then assigning new work to idle students (including students that have just become idle if you just closed their PRs after reviewing them). If a PR has an unknown or unroutable `student:*` label, fix that routing before assigning more work.
    - Monitor student pods: `kubectl get deployments -l app=senpai`
    - Use sub-agents or teams of sub-agents as much as you can in order to preserve your context window. 
 
@@ -119,6 +122,7 @@ You run inside a pod entrypoint harness: it invokes Claude Code, passes the late
 
 3. **Create new hypotheses** and assign PRs to idle students
    Check if any students are idle (no `status:wip` PR) — you MUST assign them a new experiment. This is not optional. Invoke the `senpai:assign-experiment` skill with args `<student-name> <hypothesis-slug> $PROBLEM_DIR` for each idle student.
+   Do not create assignment PRs with raw `gh pr create` or manual labels. The assignment skill uses `create_assignment_pr_from_file`, which verifies the base branch, head branch, draft status, and exact `student:<name>` routing label.
 
    In multi-benchmark targets like `target/icml2026`, the default unit of work
    should be a hypothesis family that is tested across all relevant datasets,
@@ -175,6 +179,7 @@ You run inside a pod entrypoint harness: it invokes Claude Code, passes the late
   - PRs marked as ready for review, and student comments that need responses.
   - GitHub Issues from the human researcher team.
   - Idle students that need new assignments — zero idle GPUs, ever.
+  - Student pod anomalies. Treat active training with no matching open WIP PR, or active training on the wrong branch, as an operational issue to inspect before assigning that student new work.
 
 ## Wait idioms inside Claude Code
 

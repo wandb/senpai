@@ -25,14 +25,44 @@ SENPAI_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ---------------------------------------------------------------------------
 # Retry helper: up to 6 attempts with 15s backoff, then fail loudly.
 # ---------------------------------------------------------------------------
+senpai_run_with_timeout() {
+    local timeout_seconds="${SENPAI_GH_TIMEOUT_SECONDS:-120}"
+    if command -v timeout >/dev/null 2>&1; then
+        local kill_after="${SENPAI_GH_TIMEOUT_KILL_AFTER_SECONDS:-30}"
+        timeout -k "$kill_after" "$timeout_seconds" "$@"
+    else
+        "$@"
+    fi
+}
+
 gh_retry() {
-    local attempt
+    local attempt status
     for attempt in 1 2 3 4 5 6; do
-        "$@" && return 0
-        echo "gh_retry: attempt $attempt failed, retrying in 15s..." >&2
+        senpai_run_with_timeout "$@" && return 0
+        status=$?
+        if [ "$attempt" -eq 6 ]; then
+            echo "gh_retry: attempt $attempt failed with status $status; giving up" >&2
+            return "$status"
+        fi
+        echo "gh_retry: attempt $attempt failed with status $status, retrying in 15s..." >&2
         sleep 15
     done
     return 1
+}
+
+comment_on_pr() {
+    local num="$1" body="$2" tmp status
+    if [ -z "$num" ]; then
+        echo "comment_on_pr: usage: <pr-number> <body>" >&2
+        return 2
+    fi
+
+    tmp=$(mktemp "${TMPDIR:-/tmp}/senpai-gh-comment.XXXXXX") || return
+    printf '%s' "$body" > "$tmp"
+    gh_retry gh pr comment "$num" --repo "$GH_REPO" --body-file "$tmp"
+    status=$?
+    rm -f "$tmp"
+    return "$status"
 }
 
 poll_or_empty() {
@@ -135,7 +165,7 @@ swap_gh_pr_label() {
     # DELETE the old label — retry transient failures, tolerate 404 (already gone).
     local attempt err
     for attempt in 1 2 3 4 5 6; do
-        err=$(gh api "repos/${GH_REPO}/issues/${num}/labels/${remove}" \
+        err=$(senpai_run_with_timeout gh api "repos/${GH_REPO}/issues/${num}/labels/${remove}" \
             --method DELETE --silent 2>&1) && break
         echo "$err" | grep -q "404" && break
         echo "swap_gh_pr_label: DELETE attempt $attempt failed, retrying in 15s..." >&2
@@ -156,7 +186,7 @@ swap_gh_pr_label() {
 #   send_pr_back_to_student_with_comment <number> <comment_body>
 send_pr_back_to_student_with_comment() {
     local num="$1" body="$2"
-    gh_retry gh pr comment "$num" --repo "$GH_REPO" --body "$body"
+    comment_on_pr "$num" "$body"
     gh_retry gh pr ready "$num" --repo "$GH_REPO" --undo
     swap_gh_pr_label "$num" "status:review" "status:wip"
 }
@@ -197,7 +227,7 @@ senpai_merge_winner_preflight() {
 close_pr_with_comment() {
     local num="$1" reason="$2"
 
-    gh_retry gh pr comment "$num" --repo "$GH_REPO" --body "ADVISOR: Closing PR #${num} because ${reason}."
+    comment_on_pr "$num" "ADVISOR: Closing PR #${num} because ${reason}."
     gh_retry gh pr close "$num" --repo "$GH_REPO"
 }
 
@@ -328,7 +358,10 @@ items = json.loads(sys.stdin.read())
 parts = []
 for item in items:
     reasons = ",".join(item.get("reasons", []))
-    parts.append("#{}[{}]".format(item["number"], reasons))
+    detail = ""
+    if item.get("unknownStudentLabels"):
+        detail = " unknown={}".format("|".join(item["unknownStudentLabels"]))
+    parts.append("#{}[{}{}]".format(item["number"], reasons, detail))
 print(",".join(parts))
 '
 }
@@ -380,6 +413,235 @@ gh_api_paginated_array() {
     local path="$1" jq_expr="$2" raw
     raw=$(gh_retry gh api --paginate "$path" --jq "$jq_expr") || return
     printf '%s\n' "$raw" | json_merge_arrays_from_stream
+}
+
+github_urlencode() {
+    python3 - "$1" <<'PY'
+from urllib.parse import quote
+import sys
+
+print(quote(sys.argv[1], safe=""))
+PY
+}
+
+rest_pull_details_from_numbers() {
+    python3 -c '
+import json
+import subprocess
+import sys
+
+repo = sys.argv[1]
+items = json.load(sys.stdin)
+out = []
+
+
+def gh_label(label):
+    return {
+        "id": label.get("node_id") or str(label.get("id", "")),
+        "name": label.get("name", ""),
+        "description": label.get("description"),
+        "color": label.get("color", ""),
+    }
+
+
+def mergeable_value(pr):
+    value = pr.get("mergeable")
+    if value is True:
+        return "MERGEABLE"
+    if value is False:
+        return "CONFLICTING"
+    return "UNKNOWN"
+
+
+def merge_state_status(pr):
+    return (pr.get("mergeable_state") or "unknown").upper()
+
+
+for item in items:
+    num = item["number"]
+    res = subprocess.run(
+        ["gh", "api", f"repos/{repo}/pulls/{num}"],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        sys.stderr.write(res.stderr)
+        sys.exit(res.returncode)
+    pr = json.loads(res.stdout)
+    out.append({
+        "number": pr["number"],
+        "title": pr["title"],
+        "state": pr["state"].upper(),
+        "labels": [gh_label(label) for label in pr.get("labels", [])],
+        "headRefName": pr["head"]["ref"],
+        "baseRefName": pr["base"]["ref"],
+        "updatedAt": pr["updated_at"],
+        "isDraft": pr.get("draft", False),
+        "body": pr.get("body") or "",
+        "mergeStateStatus": merge_state_status(pr),
+        "mergeable": mergeable_value(pr),
+    })
+
+print(json.dumps(out))
+' "$GH_REPO"
+}
+
+rest_labeled_pull_details() {
+    local labels="$1" labels_q issues
+    labels_q=$(github_urlencode "$labels")
+    issues=$(gh_api_paginated_array "repos/${GH_REPO}/issues?state=open&labels=${labels_q}&per_page=100" \
+        '[.[] | select(has("pull_request")) | {number}]') || return
+    printf '%s' "$issues" | rest_pull_details_from_numbers
+}
+
+rest_base_pull_details() {
+    local branch="$1" branch_q pulls
+    branch_q=$(github_urlencode "$branch")
+    pulls=$(gh_api_paginated_array "repos/${GH_REPO}/pulls?state=open&base=${branch_q}&per_page=100" \
+        '[.[] | {number}]') || return
+    printf '%s' "$pulls" | rest_pull_details_from_numbers
+}
+
+student_pr_looks_live() {
+    local student="$1" head_ref="$2" tag="${RESEARCH_TAG:-}"
+    local pod
+    [ -n "$student" ] && [ -n "$head_ref" ] && [ -n "$tag" ] || return 1
+    command -v kubectl >/dev/null 2>&1 || return 1
+
+    pod=$(
+        kubectl get pods -l "app=senpai,research-tag=${tag},student=${student}" \
+            -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null |
+            head -1
+    ) || return 1
+    [ -n "$pod" ] || return 1
+
+    kubectl exec "$pod" -- sh -lc '
+        branch=$(git -C /workspace/senpai/target branch --show-current 2>/dev/null || true)
+        [ "$branch" = "$1" ] || exit 1
+
+        # A stale GitHub timestamp is not actionable if the pod is still doing
+        # useful work on this exact PR branch. Count either active training,
+        # active GPU use, or Claude Code editing an uncommitted checkout.
+        pytrain=$(ps -eo comm=,args= | awk '\''$1 ~ /^python/ && /train[.]py/ {n++} END{print n+0}'\'')
+        gpu=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | awk '\''NF{n++} END{print n+0}'\'')
+        claude=$(ps -eo comm=,args= | awk '\''$1 ~ /^claude$/ || /[ /]claude( |$)/ {n++} END{print n+0}'\'')
+        dirty=$(git -C /workspace/senpai/target status --porcelain 2>/dev/null | wc -l | tr -d " ")
+
+        [ "$pytrain" -gt 0 ] || [ "$gpu" -gt 0 ] || { [ "$claude" -gt 0 ] && [ "${dirty:-0}" -gt 0 ]; }
+    ' sh "$head_ref" >/dev/null 2>&1
+}
+
+suppress_live_stale_wips() {
+    local actions="$1" live_numbers="" num student head_ref
+    while IFS=$'\t' read -r num student head_ref; do
+        [ -n "$num" ] || continue
+        if student_pr_looks_live "$student" "$head_ref"; then
+            live_numbers+="${num}"$'\n'
+        fi
+    done < <(printf '%s' "$actions" | python3 -c '
+import json
+import sys
+
+for pr in json.load(sys.stdin):
+    if "stale_wip" not in pr.get("reasons", []):
+        continue
+    students = [
+        label.get("name", "").removeprefix("student:")
+        for label in pr.get("labels", [])
+        if label.get("name", "").startswith("student:")
+    ]
+    if len(students) == 1:
+        print("{}\t{}\t{}".format(pr["number"], students[0], pr.get("headRefName", "")))
+')
+
+    printf '%s\0%s' "$actions" "$live_numbers" | python3 -c '
+import json
+import sys
+
+raw_actions, raw_live = sys.stdin.buffer.read().split(b"\0", 1)
+live = {int(line) for line in raw_live.decode().splitlines() if line.strip()}
+filtered = []
+for pr in json.loads(raw_actions):
+    if pr["number"] in live:
+        # Only remove the stale timestamp reason. Other advisor-action reasons
+        # such as blocked, duplicate assignment, or rebase trouble remain live.
+        pr["reasons"] = [reason for reason in pr.get("reasons", []) if reason != "stale_wip"]
+    if pr.get("reasons"):
+        filtered.append(pr)
+print(json.dumps(filtered))
+'
+}
+
+# List active student pods whose training process does not match an open WIP PR.
+# Returns a JSON array of human-readable warnings for the advisor prompt.
+#   list_student_pod_anomalies <student_names_csv> <branch>
+list_student_pod_anomalies() {
+    local students_csv="$1" branch="$2" tag="${RESEARCH_TAG:-}"
+    local all_prs open_heads anomalies="" student pod snapshot current_branch pytrain gpu expected_heads
+    # This helper runs inside advisor pods. Local/dev shells without Kubernetes
+    # context should stay quiet rather than making every advisor poll noisy.
+    [ -n "$tag" ] && command -v kubectl >/dev/null 2>&1 || { echo "[]"; return 0; }
+
+    all_prs=$(rest_labeled_pull_details "${branch},status:wip") || return
+    # Map each open WIP assignment to the branch the student's pod should be on.
+    open_heads=$(printf '%s' "$all_prs" | python3 -c '
+import json
+import sys
+
+for pr in json.load(sys.stdin):
+    head = pr.get("headRefName", "")
+    for label in pr.get("labels", []):
+        name = label.get("name", "")
+        if name.startswith("student:"):
+            student = name.split(":", 1)[1]
+            print(f"{student}\t{head}")
+')
+
+    IFS=',' read -r -a students <<< "$students_csv"
+    for student in "${students[@]}"; do
+        student="${student//[[:space:]]/}"
+        [ -n "$student" ] || continue
+
+        pod=$(
+            kubectl get pods -l "app=senpai,research-tag=${tag},student=${student}" \
+                -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null |
+                head -1
+        ) || continue
+        [ -n "$pod" ] || continue
+
+        snapshot=$(kubectl exec "$pod" -- sh -lc '
+            branch=$(git -C /workspace/senpai/target branch --show-current 2>/dev/null || true)
+            # Only active training/GPU use is a zombie risk. Claude editing a
+            # checkout is handled by stale-WIP suppression above, not here.
+            pytrain=$(ps -eo comm=,args= | awk '\''$1 ~ /^python/ && /train[.]py/ {n++} END{print n+0}'\'')
+            gpu=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | awk '\''NF{n++} END{print n+0}'\'')
+            printf "%s\t%s\t%s\n" "$branch" "$pytrain" "$gpu"
+        ' 2>/dev/null) || continue
+
+        current_branch=${snapshot%%$'\t'*}
+        snapshot=${snapshot#*$'\t'}
+        pytrain=${snapshot%%$'\t'*}
+        gpu=${snapshot#*$'\t'}
+        if [ "${pytrain:-0}" -eq 0 ] && [ "${gpu:-0}" -eq 0 ]; then
+            continue
+        fi
+
+        expected_heads=$(printf '%s' "$open_heads" | awk -F '\t' -v wanted="$student" '$1 == wanted {heads = heads sep $2; sep = " or "} END {print heads}')
+        if [ -z "$expected_heads" ]; then
+            anomalies+="${student}: active training on branch ${current_branch:-unknown} but this student has no open status:wip PR on ${branch}; possible zombie run after PR closure; inspect or stop the pod before assigning new work; pytrain=${pytrain:-0}; gpu=${gpu:-0}"$'\n'
+            continue
+        fi
+        if ! printf '%s' "$open_heads" | awk -F '\t' -v wanted="$student" -v current="$current_branch" '$1 == wanted && $2 == current {found=1} END {exit !found}'; then
+            anomalies+="${student}: active training on branch ${current_branch:-unknown} but open status:wip assignment expects ${expected_heads}; possible stale checkout or wrong pod assignment; reconcile or stop the pod before assigning new work; pytrain=${pytrain:-0}; gpu=${gpu:-0}"$'\n'
+        fi
+    done
+
+    printf '%s' "$anomalies" | python3 -c '
+import json
+import sys
+
+print(json.dumps([line for line in sys.stdin.read().splitlines() if line]))
+'
 }
 
 # ---------------------------------------------------------------------------
@@ -497,11 +759,6 @@ PY
 # Queries
 # ---------------------------------------------------------------------------
 
-# GitHub CLI list commands default to 30 items, which silently truncates busy
-# research branches. Use an explicit high cap so advisor triage sees the full
-# queue when dozens of PRs are in flight.
-GH_LIST_LIMIT="${GH_LIST_LIMIT:-999}"
-
 # List human-created GitHub Issues addressed to a role (+ team issues).
 # Returns a JSON array, deduplicated by issue number.
 # Optional second arg: ISO timestamp — only return issues updated after it.
@@ -514,12 +771,12 @@ check_gh_issues() {
         printf '[]\n'
         return
     fi
-    role_issues=$(gh_retry gh issue list --repo "$GH_REPO" --label "human" --label "$role" --state open \
-        --limit "$GH_LIST_LIMIT" \
-        --json number,title,updatedAt)
-    team_issues=$(gh_retry gh issue list --repo "$GH_REPO" --label "human" --label "team" --state open \
-        --limit "$GH_LIST_LIMIT" \
-        --json number,title,updatedAt)
+    role_issues=$(gh_api_paginated_array \
+        "repos/${GH_REPO}/issues?state=open&labels=$(github_urlencode "human,${role}")&per_page=100" \
+        '[.[] | select(has("pull_request") | not) | {number,title,updatedAt:.updated_at}]')
+    team_issues=$(gh_api_paginated_array \
+        "repos/${GH_REPO}/issues?state=open&labels=$(github_urlencode "human,team")&per_page=100" \
+        '[.[] | select(has("pull_request") | not) | {number,title,updatedAt:.updated_at}]')
     printf '[%s,%s]' "$role_issues" "$team_issues" | python3 -c "
 import json, sys
 a, b = json.loads(sys.stdin.read())
@@ -542,9 +799,21 @@ print(json.dumps(merged))
 #   list_ready_for_review_prs <branch> [since]
 list_ready_for_review_prs() {
     local branch="$1"
-    gh_retry gh pr list --repo "$GH_REPO" --label "$branch" --label "status:review" \
-        --limit "$GH_LIST_LIMIT" \
-        --json number,title,headRefName,labels,updatedAt
+    rest_labeled_pull_details "${branch},status:review" | python3 -c '
+import json
+import sys
+
+print(json.dumps([
+    {
+        "number": pr["number"],
+        "title": pr["title"],
+        "headRefName": pr["headRefName"],
+        "labels": pr["labels"],
+        "updatedAt": pr["updatedAt"],
+    }
+    for pr in json.load(sys.stdin)
+]))
+'
 }
 
 # List all open PRs on a branch (any status).
@@ -552,21 +821,33 @@ list_ready_for_review_prs() {
 #   list_all_prs <branch>
 list_all_prs() {
     local branch="$1"
-    gh_retry gh pr list --repo "$GH_REPO" --label "$branch" \
-        --limit "$GH_LIST_LIMIT" \
-        --json number,title,state,labels,headRefName,updatedAt,isDraft
+    rest_labeled_pull_details "$branch" | python3 -c '
+import json
+import sys
+
+print(json.dumps([
+    {
+        "number": pr["number"],
+        "title": pr["title"],
+        "state": pr["state"],
+        "labels": pr["labels"],
+        "headRefName": pr["headRefName"],
+        "updatedAt": pr["updatedAt"],
+        "isDraft": pr["isDraft"],
+    }
+    for pr in json.load(sys.stdin)
+]))
+'
 }
 
 # List open PRs requiring advisor action, even when they have not been updated
 # since the last heartbeat.
 # Returns a JSON array with a `reasons` list on each PR.
-#   list_prs_requiring_advisor_action <branch> [stale_wip_seconds]
+#   list_prs_requiring_advisor_action <branch> [stale_wip_seconds] [student_names_csv]
 list_prs_requiring_advisor_action() {
-    local branch="$1" stale_seconds="${2:-${SENPAI_STALE_WIP_SECONDS:-7200}}"
-    local prs comments_by_pr num comments row
-    prs=$(gh_retry gh pr list --repo "$GH_REPO" --base "$branch" --state open \
-        --limit "$GH_LIST_LIMIT" \
-        --json number,title,baseRefName,headRefName,labels,updatedAt,isDraft,mergeStateStatus,mergeable)
+    local branch="$1" stale_seconds="${2:-${SENPAI_STALE_WIP_SECONDS:-7200}}" students_csv="${3:-${STUDENT_NAMES:-}}"
+    local prs comments_by_pr num comments row actions
+    prs=$(rest_base_pull_details "$branch")
     comments_by_pr=""
     while IFS= read -r num; do
         [ -z "$num" ] && continue
@@ -581,7 +862,7 @@ print(json.dumps({"number": int(num), "comments": json.loads(comments)}))
         comments_by_pr+="${row}"$'\n'
     done < <(printf '%s' "$prs" | python3 -c 'import json,sys; print("\n".join(str(pr["number"]) for pr in json.loads(sys.stdin.read())))')
 
-    printf '%s\0%s' "$prs" "$comments_by_pr" | python3 -c '
+    actions=$(printf '%s\0%s' "$prs" "$comments_by_pr" | python3 -c '
 import json
 import re
 import sys
@@ -590,6 +871,7 @@ from datetime import datetime, timezone
 
 branch = sys.argv[1]
 stale_seconds = int(sys.argv[2])
+known_students = {s.strip() for s in sys.argv[3].split(",") if s.strip()}
 now = datetime.now(timezone.utc)
 raw_prs, raw_comments = sys.stdin.buffer.read().split(b"\0", 1)
 prs = json.loads(raw_prs)
@@ -610,9 +892,11 @@ metadata = {}
 for pr in prs:
     labels = label_names(pr)
     students = sorted(label.removeprefix("student:") for label in labels if label.startswith("student:"))
-    metadata[pr["number"]] = (labels, students)
+    unknown_students = [student for student in students if known_students and student not in known_students]
+    routed_students = [student for student in students if not known_students or student in known_students]
+    metadata[pr["number"]] = (labels, students, routed_students, unknown_students)
     if "status:wip" in labels:
-        for student in students:
+        for student in routed_students:
             student_wips[student].append(pr["number"])
 
 duplicate_wips = {
@@ -625,12 +909,16 @@ duplicate_wips = {
 conflict_re = re.compile(r"merge conflict|rebase conflict|cannot automatically merge|can.t automatically merge|conflicts? with", re.I)
 prs_requiring_advisor_action = []
 for pr in prs:
-    labels, students = metadata[pr["number"]]
+    labels, students, routed_students, unknown_students = metadata[pr["number"]]
     reasons = []
     if branch not in labels:
         reasons.append("missing_branch_label")
     if not students:
         reasons.append("missing_student_label")
+    if unknown_students:
+        reasons.append("unknown_student_label")
+    if students and not routed_students:
+        reasons.append("unroutable_student_label")
     if pr["number"] in duplicate_wips:
         reasons.append("duplicate_student_wip")
     if "status:wip" in labels:
@@ -651,10 +939,13 @@ for pr in prs:
     if reasons:
         item = dict(pr)
         item["reasons"] = sorted(set(reasons), key=reasons.index)
+        if unknown_students:
+            item["unknownStudentLabels"] = [f"student:{student}" for student in unknown_students]
         prs_requiring_advisor_action.append(item)
 
 print(json.dumps(prs_requiring_advisor_action))
-' "$branch" "$stale_seconds"
+' "$branch" "$stale_seconds" "$students_csv")
+    suppress_live_stale_wips "$actions"
 }
 
 # List WIP PRs assigned to a specific student on the current advisor branch.
@@ -666,9 +957,21 @@ student_poll_for_work() {
         echo "student_poll_for_work: missing advisor branch" >&2
         return 2
     fi
-    gh_retry gh pr list --repo "$GH_REPO" --label "$branch" --label "student:${name}" --label "status:wip" \
-        --limit "$GH_LIST_LIMIT" \
-        --json number,title,headRefName,updatedAt,body
+    rest_labeled_pull_details "${branch},student:${name},status:wip" | python3 -c '
+import json
+import sys
+
+print(json.dumps([
+    {
+        "number": pr["number"],
+        "title": pr["title"],
+        "headRefName": pr["headRefName"],
+        "updatedAt": pr["updatedAt"],
+        "body": pr["body"],
+    }
+    for pr in json.load(sys.stdin)
+]))
+'
 }
 
 # Compute which students are idle (have no status:wip PR).
@@ -678,9 +981,7 @@ student_poll_for_work() {
 list_idle_students() {
     local students_csv="$1" branch="$2"
     local all_prs
-    all_prs=$(gh_retry gh pr list --repo "$GH_REPO" --label "$branch" --label "status:wip" \
-        --limit "$GH_LIST_LIMIT" \
-        --json labels)
+    all_prs=$(rest_labeled_pull_details "${branch},status:wip")
     printf '%s' "$all_prs" | python3 -c "
 import json, sys
 students = [s.strip() for s in sys.argv[1].split(',') if s.strip()]

@@ -11,17 +11,21 @@ run_senpai_claude() {
     local max_turns=$1 user_prompt=$2
     shift 2
     export CLAUDE_PLUGIN_ROOT="$SENPAI_PLUGIN"
+    local claude_cmd=(claude "$@" -p -
+        --model "claude-opus-4-7[1m]"
+        --effort "max"
+        --max-turns "$max_turns"
+        --output-format stream-json --verbose
+        --plugin-dir "$SENPAI_PLUGIN"
+        --dangerously-skip-permissions)
+    if [ -n "${SENPAI_CLAUDE_TIMEOUT_SECONDS:-}" ] && command -v timeout >/dev/null 2>&1; then
+        local kill_after="${SENPAI_CLAUDE_TIMEOUT_KILL_AFTER_SECONDS:-30}"
+        claude_cmd=(timeout -k "$kill_after" "$SENPAI_CLAUDE_TIMEOUT_SECONDS" "${claude_cmd[@]}")
+    fi
 
     # Pipe prompt via stdin instead of -p to keep prompt text out of the process
     # cmdline. Agents use `pkill -f "train.py"` to kill training runs, and -p
     # embeds the prompt (which mentions train.py) in the cmdline, causing the
     # agent to accidentally kill its own Claude Code process.
-    printf '%s' "$user_prompt" | claude "$@" -p - \
-        --model "claude-opus-4-7[1m]" \
-        --effort "max" \
-        --max-turns "$max_turns" \
-        --output-format stream-json --verbose \
-        --plugin-dir "$SENPAI_PLUGIN" \
-        --dangerously-skip-permissions \
-        >> "$LOGFILE" 2>&1
+    printf '%s' "$user_prompt" | "${claude_cmd[@]}" >> "$LOGFILE" 2>&1
 }

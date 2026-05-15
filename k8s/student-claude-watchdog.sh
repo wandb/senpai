@@ -116,7 +116,7 @@ EOF
     printf '%s\n' "$start_numbers" | tr ',' '\n' | sed 's/^#//' |
     while IFS= read -r num; do
         [ -n "$num" ] || continue
-        gh_retry gh pr comment "$num" --repo "$GH_REPO" --body "$body" || true
+        comment_on_pr "$num" "$body" || true
     done
 }
 
