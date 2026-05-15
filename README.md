@@ -149,7 +149,7 @@ GitHub token requirements: use a PAT with `repo` and `read:org`; it must clone `
 
 ### Metrics for Charlie runs
 
-Charlie is the no-W&B experiment-metrics ablation arm. Students use local JSONL metrics committed to their PR branches. Developer telemetry may still run through Weave/Hivemind, but it is not a source of experiment metrics and is not part of the advisor/student research contract.
+Charlie is the local-only experiment-metrics ablation arm. Students use local JSONL metrics committed to their PR branches. Developer telemetry may still run through Weave/Hivemind, but it is not a source of experiment metrics and is not part of the advisor/student research contract.
 
 ## Running
 

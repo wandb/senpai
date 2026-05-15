@@ -55,8 +55,8 @@ class Args:
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL (senpai runner)
     repo_branch: str = "main"  # git branch to clone (senpai runner)
     image: str = "ghcr.io/wandb/senpai:latest"  # container image for students
-    wandb_entity: str = "wandb-applied-ai-team"  # developer telemetry entity; not used for Charlie experiment metrics
-    wandb_project: str = "senpai-v1"  # developer telemetry project; not used for Charlie experiment metrics
+    wandb_entity: str = "wandb-applied-ai-team"  # developer telemetry entity; not used for Charlie metrics
+    wandb_project: str = "senpai-v1"  # developer telemetry project; not used for Charlie metrics
     human_issues: bool = True  # allow human GitHub issue triage; disable for isolated launches
     advisor_branch: str = "schmidhuber"  # branch the advisor works on inside the problem-package repo (students PR into it; created from target_repo_branch if missing)
     gh_history_scope: str = "branch"  # branch=normal track memory, fresh=clean ablation, repo=whole-repo memory
@@ -87,8 +87,8 @@ def build_extra_instructions(args: Args, tag: str, student_list: list[str]) -> s
 - Do not inspect, compare, summarize, cherry-pick, borrow from, or base decisions on any PR or branch outside `{args.advisor_branch}` and the assigned student PR branches for this launch.
 - Do not use unrelated experiment runs or historical results unless the human explicitly names them during this launch.
 - Students branch from `{args.advisor_branch}`. Do not rebase or retarget work onto unrelated branches.
-- This is the Charlie no-W&B experiment-metrics arm. Do not add, import, configure, query, or log experiment metrics to W&B/wandb. Use local JSONL metrics and local artifacts only.
-- If any stale target prompt or code comment mentions W&B/wandb experiment logging or `--wandb_name`, treat it as stale guidance and use the local JSONL contract instead.
+- This is the Charlie local-metrics arm. Do not add, import, configure, query, or log experiment metrics to any remote experiment-tracking service. Use local JSONL metrics and local artifacts only.
+- If any stale target prompt or code comment mentions remote experiment dashboards, remote metric logging, or legacy metric flags, treat it as stale guidance and use the local JSONL contract instead.
 - Treat `SENPAI_TIMEOUT_MINUTES` and `SENPAI_MAX_EPOCHS` as hard per-training-run bounds. Do not override them or continue a run past them.
 """
     user_extra = load_extra_instructions(args.extra_instructions)
