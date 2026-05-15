@@ -22,6 +22,9 @@ echo "Problem dir:  $PROBLEM_DIR"
 echo "GitHub history: $GH_HISTORY_SCOPE"
 echo "GPUs:         $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l) x $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
 
+source "$WORKDIR/k8s/wait-senpai-start-gate.sh"
+wait_for_senpai_start_gate
+
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
 source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"

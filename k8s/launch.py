@@ -66,6 +66,7 @@ class Args:
     extra_instructions: str = ""  # extra prompt text for the advisor: a .md file path or a literal string
     timeout_minutes: float = 30.0  # training run wall-clock limit (SENPAI_TIMEOUT_MINUTES)
     max_epochs: int = 50  # maximum training epochs (SENPAI_MAX_EPOCHS)
+    start_gate_path: str = ""  # optional shared file path that must exist before advisor/student loops begin
     dry_run: bool = False  # render manifests only: do not apply them or validate credentials
     preflight_only: bool = False  # validate credentials/access only: do not render or apply manifests
 
@@ -127,6 +128,7 @@ def render_student(template: str, student_name: str, tag: str, secret_name: str,
             "EXTRA_INSTRUCTIONS_B64": encoded_extra_instructions(args, tag, [student_name]),
             "PROBLEM_DIR": args.problem_dir,
             "PVC_MOUNT_PATH": args.pvc_mount_path,
+            "SENPAI_START_GATE_PATH": args.start_gate_path,
         },
     )
     deployment = render_template(template, {
@@ -166,6 +168,7 @@ def render_advisor(template: str, tag: str, student_list: list[str], secret_name
         "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
         "PROBLEM_DIR": args.problem_dir,
         "PVC_MOUNT_PATH": args.pvc_mount_path,
+        "SENPAI_START_GATE_PATH": args.start_gate_path,
     }
     data["EXTRA_INSTRUCTIONS_B64"] = encoded_extra_instructions(args, tag, student_list)
     configmap = render_configmap(

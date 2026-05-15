@@ -23,6 +23,9 @@ echo "Tag:          $RESEARCH_TAG"
 echo "Students:     $STUDENT_NAMES"
 echo "GitHub history: $GH_HISTORY_SCOPE"
 
+source "$WORKDIR/k8s/wait-senpai-start-gate.sh"
+wait_for_senpai_start_gate
+
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
 source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"

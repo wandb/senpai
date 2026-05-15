@@ -26,6 +26,7 @@ PVC_MOUNT_PATH="/mnt/new-pvc"
 PVC_LOG_ROOT="/mnt/new-pvc/senpai-conversation-logs"
 IMAGE="ghcr.io/wandb/senpai:latest"
 MAX_PARALLEL_COPIES="16"
+START_GATE_PATH=""
 START_LOCAL_PULL="true"
 DRY_RUN="false"
 
@@ -46,6 +47,7 @@ Options:
   --pvc-log-root PATH         PVC output root (default: /mnt/new-pvc/senpai-conversation-logs)
   --image IMAGE               Image containing bash, python, tar, and kubectl (default: ghcr.io/wandb/senpai:latest)
   --max-parallel-copies N     Concurrent pod log tar streams during harvest (default: 16)
+  --start-gate-path PATH      Write this file after all pods are Ready, releasing gated pods
   --no-local-pull             Do not start the best-effort local PVC mirror process
   --dry-run                   Print manifests and helper script without applying
 USAGE
@@ -64,6 +66,7 @@ while [ "$#" -gt 0 ]; do
     --pvc-log-root) PVC_LOG_ROOT="$2"; shift 2 ;;
     --image) IMAGE="$2"; shift 2 ;;
     --max-parallel-copies) MAX_PARALLEL_COPIES="$2"; shift 2 ;;
+    --start-gate-path) START_GATE_PATH="$2"; shift 2 ;;
     --no-local-pull) START_LOCAL_PULL="false"; shift ;;
     --dry-run) DRY_RUN="true"; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -119,6 +122,7 @@ BUDGET_SECONDS="${BUDGET_SECONDS:?}"
 HARVEST_LEAD_SECONDS="${HARVEST_LEAD_SECONDS:?}"
 PVC_LOG_ROOT="${PVC_LOG_ROOT:?}"
 MAX_PARALLEL_COPIES="${MAX_PARALLEL_COPIES:?}"
+START_GATE_PATH="${START_GATE_PATH:-}"
 NAMESPACE="${NAMESPACE:-default}"
 SELECTOR="research-tag in (${TAGS_CSV})"
 
@@ -181,8 +185,25 @@ write_state() {
     printf 'EXPECTED_PODS=%q\n' "$EXPECTED_PODS"
     printf 'EXPECTED_DEPLOYMENTS=%q\n' "$EXPECTED_DEPLOYMENTS"
     printf 'SELECTOR=%q\n' "$SELECTOR"
+    printf 'START_GATE_PATH=%q\n' "$START_GATE_PATH"
   } > "$tmp"
   mv "$tmp" "$STATE_FILE"
+}
+
+open_start_gate() {
+  local tmp
+  [ -n "$START_GATE_PATH" ] || return 0
+  mkdir -p "$(dirname "$START_GATE_PATH")"
+  tmp="${START_GATE_PATH}.tmp"
+  {
+    printf 'RUN_SLUG=%q\n' "$RUN_SLUG"
+    printf 'TAGS_CSV=%q\n' "$TAGS_CSV"
+    printf 'OPENED_AT_UTC=%q\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'KILL_AT_UTC=%q\n' "${KILL_AT_UTC:-}"
+    printf 'SELECTOR=%q\n' "$SELECTOR"
+  } > "$tmp"
+  mv "$tmp" "$START_GATE_PATH"
+  log "Opened start gate: ${START_GATE_PATH}"
 }
 
 wait_for_ready_gate() {
@@ -191,6 +212,7 @@ wait_for_ready_gate() {
     # shellcheck source=/dev/null
     source "$STATE_FILE"
     log "Loaded existing cutoff state: LAST_READY_UTC=${LAST_READY_UTC}, KILL_AT_UTC=${KILL_AT_UTC}"
+    open_start_gate
     return 0
   fi
 
@@ -204,6 +226,7 @@ wait_for_ready_gate() {
       # shellcheck source=/dev/null
       source "$STATE_FILE"
       log "Ready gate passed: LAST_READY_UTC=${LAST_READY_UTC}, KILL_AT_UTC=${KILL_AT_UTC}"
+      open_start_gate
       return 0
     fi
     sleep 60
@@ -417,6 +440,8 @@ spec:
           value: "${PVC_LOG_ROOT}"
         - name: MAX_PARALLEL_COPIES
           value: "${MAX_PARALLEL_COPIES}"
+        - name: START_GATE_PATH
+          value: "${START_GATE_PATH}"
         - name: NAMESPACE
           value: "${NAMESPACE}"
         volumeMounts:
