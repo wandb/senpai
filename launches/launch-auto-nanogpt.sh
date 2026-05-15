@@ -4,7 +4,7 @@ set -euo pipefail
 target_repo_url="https://github.com/morganmcg1/modded-nanogpt-senpai.git"
 target_repo_branch="senpai-launch-20260515"
 extra_instructions="launches/auto-nanogpt-extra-instructions.md"
-wandb_entity="morganmcg1"
+wandb_entity="wandb-applied-ai-team"
 wandb_project="modded-nanogpt-senpai"
 timeout_minutes="30240"
 max_epochs="100000"
