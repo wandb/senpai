@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-target_repo_url="https://github.com/morganmcg1/auto-nanogpt-senpai.git"
+target_repo_url="https://github.com/morganmcg1/modded-nanogpt-senpai.git"
 target_repo_branch="senpai-launch-20260515"
 extra_instructions="launches/auto-nanogpt-extra-instructions.md"
-wandb_project="senpai-auto-nanogpt"
+wandb_entity="morganmcg1"
+wandb_project="modded-nanogpt-senpai"
 timeout_minutes="30240"
 max_epochs="100000"
 
@@ -48,6 +49,7 @@ for rep in 1 2 3 4 5; do
     --gpus_per_student 8 \
     --timeout_minutes "${timeout_minutes}" \
     --max_epochs "${max_epochs}" \
+    --wandb_entity "${wandb_entity}" \
     --wandb_project "${wandb_project}" \
     --extra_instructions "${extra_instructions}" \
     "$@"
