@@ -147,6 +147,25 @@ GitHub token requirements: use a PAT with `repo` and `read:org`; it must clone `
 - **Normal branch memory:** use `--gh_history_scope branch` with human issues enabled. Agents keep continuity on the active advisor branch while routine PR/issue polling stays scoped to the target repo.
 - **Deliberate exploration:** use `--gh_history_scope repo` or targeted `--extra_instructions` that ask the advisor/researcher-agent to inspect other branches, PRs, issues, metric artifacts, or repos. Senpai helpers stay scoped to `GH_REPO`, but explicit `gh --repo owner/repo ...` reads are available when credentials allow.
 
+### Ablations
+
+The ICML appendix Charlie/Willow logging ablation uses long-lived runner
+branches in `wandb/senpai` plus matching mirror branches in the
+[`morganmcg1/TandemFoilSet-Balanced`](https://github.com/morganmcg1/TandemFoilSet-Balanced)
+problem-package repo. Keep these pairs matched; do not launch a Charlie runner
+against a Willow target branch, or vice versa.
+
+| Arm | Runner branch (`wandb/senpai`) | Target mirror branch (`TandemFoilSet-Balanced`) | Meaning |
+|---|---|---|---|
+| Willow | `icml-appendix-willow` | `icml-appendix-willow` | Control arm: normal Senpai with W&B experiment logging available to advisor/student workflows. The target mirror should stay functionally aligned with the target repo's `main`. |
+| Charlie | `icml-appendix-charlie` | `icml-appendix-charlie` | Treatment arm: removes W&B experiment logging from advisor/student workflows and from the target trainer. The target trainer writes committed local metrics such as `models/<experiment>/metrics.jsonl` and `metrics.yaml` instead. Developer telemetry such as Weave/Hivemind may still run from the runner, but it is not an experiment-metrics source and should not be used as a research signal. |
+
+Before rerunning this ablation, sync current operational fixes into both runner
+branches. Then verify the target mirrors: Willow should match target `main`;
+Charlie should keep the same model, data, optimizer, scheduler, validation,
+test, and timeout behavior as Willow, changing only the experiment-metrics
+logging surface and the prompts/docs that describe it.
+
 ### Metrics for Charlie runs
 
 Charlie is the local-only experiment-metrics ablation arm. Students use local JSONL metrics committed to their PR branches. Developer telemetry may still run through Weave/Hivemind, but it is not a source of experiment metrics and is not part of the advisor/student research contract.
