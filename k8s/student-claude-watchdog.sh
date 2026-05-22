@@ -17,6 +17,10 @@ STUDENT_CLAUDE_STALE_LOG_S="${STUDENT_CLAUDE_STALE_LOG_S:-1200}"
 STUDENT_CLAUDE_KILL_GRACE_S="${STUDENT_CLAUDE_KILL_GRACE_S:-15}"
 STUDENT_ASSIGNMENT_DRIFT_GRACE_S="${STUDENT_ASSIGNMENT_DRIFT_GRACE_S:-1800}"
 
+student_grouped_pod() {
+    [ "${SENPAI_GROUPED_STUDENT_POD:-}" = "1" ]
+}
+
 student_file_mtime_s() {
     stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"
 }
@@ -33,16 +37,24 @@ print(",".join(f"#{number}" for number in numbers))
 }
 
 student_has_active_training() {
+    # A grouped pod shares one process table across multiple logical students.
+    # Do not let one student's watchdog treat a peer's train.py as its own.
+    student_grouped_pod && return 1
     ps -eo pid,ppid,comm,args |
         awk '$3 ~ /^(python[0-9.]*|torchrun)$/ && $0 ~ /train[.]py/ { found = 1 } END { exit !found }'
 }
 
 student_training_pids() {
+    student_grouped_pod && return 0
     ps -eo pid,ppid,comm,args |
         awk '$3 ~ /^(python[0-9.]*|torchrun|pt_elastic)$/ && $0 ~ /train[.]py/ { print $1 }'
 }
 
 student_training_snapshot() {
+    if student_grouped_pod; then
+        echo "(suppressed in grouped student pod to avoid reporting peer processes)"
+        return 0
+    fi
     ps -eo pid,ppid,etimes,pcpu,pmem,comm,args |
         awk '$6 ~ /^(python[0-9.]*|torchrun|pt_elastic)$/ && $0 ~ /train[.]py/ { print }' |
         head -20
@@ -74,6 +86,10 @@ student_stop_claude_tree() {
 
 student_stop_training_trees() {
     local pids pid
+    if student_grouped_pod; then
+        echo "=== Claude watchdog: grouped pod; not killing global train.py processes ==="
+        return 0
+    fi
     pids=$(student_training_pids | sort -nr)
     [ -n "$pids" ] || return 0
 

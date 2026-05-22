@@ -585,10 +585,9 @@ rest_base_pull_details() {
     printf '%s' "$pulls" | rest_pull_details_from_numbers
 }
 
-student_pr_looks_live() {
-    local student="$1" head_ref="$2" tag="${RESEARCH_TAG:-}"
-    local pod
-    [ -n "$student" ] && [ -n "$head_ref" ] && [ -n "$tag" ] || return 1
+student_pod_and_target_path() {
+    local student="$1" tag="${RESEARCH_TAG:-}" pod
+    [ -n "$student" ] && [ -n "$tag" ] || return 1
     command -v kubectl >/dev/null 2>&1 || return 1
 
     pod=$(
@@ -596,22 +595,73 @@ student_pr_looks_live() {
             -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null |
             head -1
     ) || return 1
-    [ -n "$pod" ] || return 1
+    if [ -n "$pod" ]; then
+        printf '%s\t%s\n' "$pod" "/workspace/senpai/target"
+        return 0
+    fi
+
+    kubectl get pods -l "app=senpai,role=student,research-tag=${tag}" -o json 2>/dev/null |
+        STUDENT_TO_FIND="$student" python3 -c '
+import json
+import os
+import sys
+
+student = os.environ["STUDENT_TO_FIND"]
+data = json.load(sys.stdin)
+for item in data.get("items", []):
+    if item.get("status", {}).get("phase") != "Running":
+        continue
+    metadata = item.get("metadata", {})
+    annotations = metadata.get("annotations", {})
+    names = [
+        name.strip()
+        for name in annotations.get("senpai/student-names", "").split(",")
+        if name.strip()
+    ]
+    if student in names:
+        print("{}\t/workspace/senpai-{}/target".format(metadata.get("name", ""), student))
+        sys.exit(0)
+sys.exit(1)
+'
+}
+
+student_pr_looks_live() {
+    local student="$1" head_ref="$2" tag="${RESEARCH_TAG:-}"
+    local pod_info pod target_path grouped
+    [ -n "$student" ] && [ -n "$head_ref" ] && [ -n "$tag" ] || return 1
+    command -v kubectl >/dev/null 2>&1 || return 1
+
+    pod_info=$(student_pod_and_target_path "$student") || return 1
+    pod=${pod_info%%$'\t'*}
+    target_path=${pod_info#*$'\t'}
+    [ -n "$pod" ] && [ -n "$target_path" ] || return 1
+    grouped=0
+    case "$target_path" in
+        /workspace/senpai-*/target) grouped=1 ;;
+    esac
 
     kubectl exec "$pod" -- sh -lc '
-        branch=$(git -C /workspace/senpai/target branch --show-current 2>/dev/null || true)
-        [ "$branch" = "$1" ] || exit 1
+        target_path="$1"
+        expected_branch="$2"
+        grouped="$3"
+        branch=$(git -C "$target_path" branch --show-current 2>/dev/null || true)
+        [ "$branch" = "$expected_branch" ] || exit 1
 
         # A stale GitHub timestamp is not actionable if the pod is still doing
         # useful work on this exact PR branch. Count either active training,
         # active GPU use, or Claude Code editing an uncommitted checkout.
-        pytrain=$(ps -eo comm=,args= | awk '\''$1 ~ /^python/ && /train[.]py/ {n++} END{print n+0}'\'')
-        gpu=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | awk '\''NF{n++} END{print n+0}'\'')
+        if [ "$grouped" = "1" ]; then
+            pytrain=0
+            gpu=0
+        else
+            pytrain=$(ps -eo comm=,args= | awk '\''$1 ~ /^python/ && /train[.]py/ {n++} END{print n+0}'\'')
+            gpu=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | awk '\''NF{n++} END{print n+0}'\'')
+        fi
         claude=$(ps -eo comm=,args= | awk '\''$1 ~ /^claude$/ || /[ /]claude( |$)/ {n++} END{print n+0}'\'')
-        dirty=$(git -C /workspace/senpai/target status --porcelain 2>/dev/null | wc -l | tr -d " ")
+        dirty=$(git -C "$target_path" status --porcelain 2>/dev/null | wc -l | tr -d " ")
 
         [ "$pytrain" -gt 0 ] || [ "$gpu" -gt 0 ] || { [ "$claude" -gt 0 ] && [ "${dirty:-0}" -gt 0 ]; }
-    ' sh "$head_ref" >/dev/null 2>&1
+    ' sh "$target_path" "$head_ref" "$grouped" >/dev/null 2>&1
 }
 
 suppress_live_stale_wips() {
@@ -660,7 +710,7 @@ print(json.dumps(filtered))
 #   list_student_pod_anomalies <student_names_csv> <branch>
 list_student_pod_anomalies() {
     local students_csv="$1" branch="$2" tag="${RESEARCH_TAG:-}"
-    local all_prs open_heads anomalies="" student pod snapshot current_branch pytrain gpu expected_heads
+    local all_prs open_heads anomalies="" student pod snapshot current_branch pytrain gpu expected_heads pod_info target_path grouped
     # This helper runs inside advisor pods. Local/dev shells without Kubernetes
     # context should stay quiet rather than making every advisor poll noisy.
     [ -n "$tag" ] && command -v kubectl >/dev/null 2>&1 || { echo "[]"; return 0; }
@@ -685,21 +735,30 @@ for pr in json.load(sys.stdin):
         student="${student//[[:space:]]/}"
         [ -n "$student" ] || continue
 
-        pod=$(
-            kubectl get pods -l "app=senpai,research-tag=${tag},student=${student}" \
-                -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null |
-                head -1
-        ) || continue
-        [ -n "$pod" ] || continue
+        pod_info=$(student_pod_and_target_path "$student") || continue
+        pod=${pod_info%%$'\t'*}
+        target_path=${pod_info#*$'\t'}
+        [ -n "$pod" ] && [ -n "$target_path" ] || continue
+        grouped=0
+        case "$target_path" in
+            /workspace/senpai-*/target) grouped=1 ;;
+        esac
 
         snapshot=$(kubectl exec "$pod" -- sh -lc '
-            branch=$(git -C /workspace/senpai/target branch --show-current 2>/dev/null || true)
+            target_path="$1"
+            grouped="$2"
+            branch=$(git -C "$target_path" branch --show-current 2>/dev/null || true)
             # Only active training/GPU use is a zombie risk. Claude editing a
             # checkout is handled by stale-WIP suppression above, not here.
-            pytrain=$(ps -eo comm=,args= | awk '\''$1 ~ /^python/ && /train[.]py/ {n++} END{print n+0}'\'')
-            gpu=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | awk '\''NF{n++} END{print n+0}'\'')
+            if [ "$grouped" = "1" ]; then
+                pytrain=0
+                gpu=0
+            else
+                pytrain=$(ps -eo comm=,args= | awk '\''$1 ~ /^python/ && /train[.]py/ {n++} END{print n+0}'\'')
+                gpu=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | awk '\''NF{n++} END{print n+0}'\'')
+            fi
             printf "%s\t%s\t%s\n" "$branch" "$pytrain" "$gpu"
-        ' 2>/dev/null) || continue
+        ' sh "$target_path" "$grouped" 2>/dev/null) || continue
 
         current_branch=${snapshot%%$'\t'*}
         snapshot=${snapshot#*$'\t'}

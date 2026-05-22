@@ -2,20 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-PackageName: senpai
 #
-# A student is a long-running worker that polls for PR assignments.
-# Replace {{STUDENT_NAME}} and {{RESEARCH_TAG}} before applying, or use launch.py.
+# A grouped student deployment runs multiple logical student loops in one GPU
+# pod. Each logical student gets an isolated runner and target checkout under
+# /workspace/senpai-<student>.
 
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{STUDENT_DEPLOYMENT_NAME}}
+  name: {{STUDENT_GROUP_DEPLOYMENT_NAME}}
   labels:
     app: senpai
     role: student
-    student: {{STUDENT_NAME}}
+    student-group: {{STUDENT_GROUP_NAME}}
     research-tag: {{RESEARCH_TAG}}
   annotations:
-    senpai/student-names: "{{STUDENT_NAME}}"
+    senpai/student-names: "{{STUDENT_NAMES_CSV}}"
 spec:
   replicas: 1
   strategy:
@@ -23,33 +24,33 @@ spec:
   selector:
     matchLabels:
       app: senpai
-      student: {{STUDENT_NAME}}
+      student-group: {{STUDENT_GROUP_NAME}}
       research-tag: {{RESEARCH_TAG}}
   template:
     metadata:
       labels:
         app: senpai
         role: student
-        student: {{STUDENT_NAME}}
+        student-group: {{STUDENT_GROUP_NAME}}
         research-tag: {{RESEARCH_TAG}}
       annotations:
-        senpai/student-names: "{{STUDENT_NAME}}"
+        senpai/student-names: "{{STUDENT_NAMES_CSV}}"
     spec:
       containers:
-      - name: student
+      - name: student-group
         image: {{IMAGE}}
         command: ["/bin/bash", "-c"]
         args:
         - |
           set -e
           repo_auth_url="$(printf '%s' "$REPO_URL" | sed "s#https://github.com/#https://${GITHUB_TOKEN}@github.com/#")"
-          git clone --branch "$REPO_BRANCH" --single-branch --depth 1 --no-tags "$repo_auth_url" /workspace/senpai
-          cd /workspace/senpai
-          git remote set-url origin "$REPO_URL"
-          bash k8s/entrypoint-student.sh
+          git clone --branch "$REPO_BRANCH" --single-branch --depth 1 --no-tags "$repo_auth_url" /workspace/senpai-group
+          git -C /workspace/senpai-group remote set-url origin "$REPO_URL"
+          cd /workspace/senpai-group
+          bash k8s/entrypoint-student-group.sh
         envFrom:
         - configMapRef:
-            name: {{STUDENT_CONFIGMAP_NAME}}
+            name: {{STUDENT_GROUP_CONFIGMAP_NAME}}
         env:
         - name: WANDB_API_KEY
           valueFrom:
@@ -73,12 +74,12 @@ spec:
               key: exa-api-key
         resources:
           requests:
-            cpu: "{{STUDENT_CPU}}"
-            memory: "{{STUDENT_MEMORY}}"
+            cpu: "{{STUDENT_GROUP_CPU}}"
+            memory: "{{STUDENT_GROUP_MEMORY}}"
             nvidia.com/gpu: "{{GPUS_PER_STUDENT}}"
           limits:
-            cpu: "{{STUDENT_CPU}}"
-            memory: "{{STUDENT_MEMORY}}"
+            cpu: "{{STUDENT_GROUP_CPU}}"
+            memory: "{{STUDENT_GROUP_MEMORY}}"
             nvidia.com/gpu: "{{GPUS_PER_STUDENT}}"
         volumeMounts:
         - name: dshm

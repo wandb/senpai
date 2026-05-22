@@ -7,7 +7,7 @@
 set -e
 set -o pipefail
 
-WORKDIR="/workspace/senpai"
+WORKDIR="${WORKDIR:-/workspace/senpai}"
 GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 TARGET_REPO_BRANCH="${TARGET_REPO_BRANCH:-}"
 export SENPAI_ROLE="student"

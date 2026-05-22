@@ -78,11 +78,22 @@ def existing_student_names(tag: str) -> list[str]:
             "-l",
             f"app=senpai,role=student,research-tag={tag}",
             "-o",
-            'jsonpath={range .items[*]}{.metadata.labels.student}{"\\n"}{end}',
+            "json",
         ],
         capture_output=True, text=True, check=True,
     )
-    return [line for line in result.stdout.splitlines() if line]
+    names: list[str] = []
+    for item in json.loads(result.stdout or "{}").get("items", []):
+        metadata = item.get("metadata", {})
+        labels = metadata.get("labels", {})
+        annotations = metadata.get("annotations", {})
+        label_student = labels.get("student", "")
+        if label_student:
+            names.append(label_student)
+            continue
+        annotated_students = annotations.get("senpai/student-names", "")
+        names.extend(name.strip() for name in annotated_students.split(",") if name.strip())
+    return list(dict.fromkeys(names))
 
 
 def render_template(template: str, replacements: dict[str, str]) -> str:
