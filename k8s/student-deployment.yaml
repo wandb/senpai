@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-PackageName: senpai
 #
-# A student is a long-running worker that polls for PR assignments.
-# Replace {{STUDENT_NAME}} and {{RESEARCH_TAG}} before applying, or use launch.py.
+# Student deployments are long-running workers that poll for PR assignments.
+# launch.py renders either one logical student or a grouped student supervisor
+# from this template.
 
 apiVersion: apps/v1
 kind: Deployment
@@ -12,10 +13,10 @@ metadata:
   labels:
     app: senpai
     role: student
-    student: {{STUDENT_NAME}}
+{{STUDENT_METADATA_ID_LABEL}}
     research-tag: {{RESEARCH_TAG}}
   annotations:
-    senpai/student-names: "{{STUDENT_NAME}}"
+    senpai/student-names: "{{STUDENT_NAMES_CSV}}"
 spec:
   replicas: 1
   strategy:
@@ -23,30 +24,30 @@ spec:
   selector:
     matchLabels:
       app: senpai
-      student: {{STUDENT_NAME}}
+{{STUDENT_SELECTOR_ID_LABEL}}
       research-tag: {{RESEARCH_TAG}}
   template:
     metadata:
       labels:
         app: senpai
         role: student
-        student: {{STUDENT_NAME}}
+{{STUDENT_TEMPLATE_ID_LABEL}}
         research-tag: {{RESEARCH_TAG}}
       annotations:
-        senpai/student-names: "{{STUDENT_NAME}}"
+        senpai/student-names: "{{STUDENT_NAMES_CSV}}"
     spec:
       containers:
-      - name: student
+      - name: {{STUDENT_CONTAINER_NAME}}
         image: {{IMAGE}}
         command: ["/bin/bash", "-c"]
         args:
         - |
           set -e
           repo_auth_url="$(printf '%s' "$REPO_URL" | sed "s#https://github.com/#https://${GITHUB_TOKEN}@github.com/#")"
-          git clone --branch "$REPO_BRANCH" --single-branch --depth 1 --no-tags "$repo_auth_url" /workspace/senpai
-          cd /workspace/senpai
-          git remote set-url origin "$REPO_URL"
-          bash k8s/entrypoint-student.sh
+          git clone --branch "$REPO_BRANCH" --single-branch --depth 1 --no-tags "$repo_auth_url" {{STUDENT_RUNNER_WORKDIR}}
+          git -C {{STUDENT_RUNNER_WORKDIR}} remote set-url origin "$REPO_URL"
+          cd {{STUDENT_RUNNER_WORKDIR}}
+          bash {{STUDENT_ENTRYPOINT}}
         envFrom:
         - configMapRef:
             name: {{STUDENT_CONFIGMAP_NAME}}

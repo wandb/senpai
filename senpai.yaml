@@ -51,6 +51,7 @@ student_assignment_drift_grace_s: 1800
 # students
 n_students: 4
 student_prefix: ""
+# In packed mode, this is the GPU request for the shared student pod.
 gpus_per_student: 8
 students_per_gpu_pod: 1
 cpu_per_gpu: 15

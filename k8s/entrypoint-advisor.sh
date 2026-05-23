@@ -147,7 +147,7 @@ if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
 fi
 
 # Add "$KEY_INFO" (reminder of student names etc) to PROMPT
-KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Tag: '"$RESEARCH_TAG"' | Target repo: '"$GH_REPO"' | Target base branch: '"${TARGET_REPO_BRANCH:-<default>}"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
+KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | GPU request: '"$GPUS_PER_STUDENT"' | Tag: '"$RESEARCH_TAG"' | Target repo: '"$GH_REPO"' | Target base branch: '"${TARGET_REPO_BRANCH:-<default>}"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 # Heartbeat prompt for polling

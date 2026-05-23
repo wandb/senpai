@@ -134,6 +134,8 @@ pack multiple logical students into each pod while still requesting
 `gpus_per_student` GPUs for that pod. This is useful for single-GPU targets
 where the advisor coordinates heavy runs and students can still prepare
 launchers, inspect logs, run smoke checks, or take turns on the shared GPU.
+In packed mode, `gpus_per_student` is the shared pod GPU request, not a
+per-logical-student allocation.
 
 ### Responsiveness knobs
 

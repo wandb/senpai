@@ -35,7 +35,6 @@ from launch_helpers import (
 )
 
 STUDENT_TEMPLATE = Path(__file__).parent / "student-deployment.yaml"
-STUDENT_GROUP_TEMPLATE = Path(__file__).parent / "student-group-deployment.yaml"
 ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-deployment.yaml"
 SENPAI_CONFIG = Path(__file__).parent.parent / "senpai.yaml"
 DOTENV_PATH = Path(__file__).parent.parent / ".env"
@@ -51,7 +50,7 @@ class Args:
     names: str = ""  # comma-separated student names (e.g. "frieren,fern")
     n_students: int = 4  # number of students to launch (ignored if --names is provided)
     student_prefix: str = ""  # make assignment labels unique across parallel launches using the same base names
-    gpus_per_student: int = 8  # GPUs requested by each student pod
+    gpus_per_student: int = 8  # GPUs requested by each singleton student pod or packed student group
     students_per_gpu_pod: int = 1  # logical student loops to pack into each GPU pod
     cpu_per_gpu: int = 15  # CPU requested per student GPU
     memory_gi_per_gpu: int = 120  # memory Gi requested per student GPU
@@ -177,11 +176,47 @@ def student_common_config_data(args: Args, tag: str) -> dict[str, str]:
     }
 
 
+def render_student_deployment(
+    template: str,
+    *,
+    deployment_name: str,
+    configmap_name: str,
+    id_label_key: str,
+    id_label_value: str,
+    student_names_csv: str,
+    container_name: str,
+    runner_workdir: str,
+    entrypoint: str,
+    tag: str,
+    secret_name: str,
+    args: Args,
+) -> str:
+    student_cpu = args.cpu_per_gpu * args.gpus_per_student
+    student_memory_gi = args.memory_gi_per_gpu * args.gpus_per_student
+    return render_template(template, {
+        "STUDENT_DEPLOYMENT_NAME": deployment_name,
+        "STUDENT_CONFIGMAP_NAME": configmap_name,
+        "STUDENT_METADATA_ID_LABEL": f"    {id_label_key}: {id_label_value}",
+        "STUDENT_SELECTOR_ID_LABEL": f"      {id_label_key}: {id_label_value}",
+        "STUDENT_TEMPLATE_ID_LABEL": f"        {id_label_key}: {id_label_value}",
+        "STUDENT_NAMES_CSV": student_names_csv,
+        "STUDENT_CONTAINER_NAME": container_name,
+        "STUDENT_RUNNER_WORKDIR": runner_workdir,
+        "STUDENT_ENTRYPOINT": entrypoint,
+        "RESEARCH_TAG": tag,
+        "IMAGE": args.image,
+        "PVC_CLAIM_NAME": args.pvc_claim_name,
+        "PVC_MOUNT_PATH": args.pvc_mount_path,
+        "LAUNCH_SECRET_NAME": secret_name,
+        "STUDENT_CPU": str(student_cpu),
+        "STUDENT_MEMORY": f"{student_memory_gi}Gi",
+        "GPUS_PER_STUDENT": str(args.gpus_per_student),
+    })
+
+
 def render_student(template: str, student_name: str, tag: str, secret_name: str, args: Args) -> str:
     student_configmap_name = f"senpai-config-student-{tag}-{student_name}"
     student_deployment_name = f"senpai-{tag}-{student_name}"
-    student_cpu = args.cpu_per_gpu * args.gpus_per_student
-    student_memory_gi = args.memory_gi_per_gpu * args.gpus_per_student
     data = student_common_config_data(args, tag)
     data.update({
         "STUDENT_NAME": student_name,
@@ -192,20 +227,20 @@ def render_student(template: str, student_name: str, tag: str, secret_name: str,
         labels={"app": "senpai", "role": "student", "research-tag": tag},
         data=data,
     )
-    deployment = render_template(template, {
-        "STUDENT_DEPLOYMENT_NAME": student_deployment_name,
-        "STUDENT_CONFIGMAP_NAME": student_configmap_name,
-        "STUDENT_NAME": student_name,
-        "RESEARCH_TAG": tag,
-        "IMAGE": args.image,
-        "ADVISOR_BRANCH": args.advisor_branch,
-        "PVC_CLAIM_NAME": args.pvc_claim_name,
-        "PVC_MOUNT_PATH": args.pvc_mount_path,
-        "LAUNCH_SECRET_NAME": secret_name,
-        "STUDENT_CPU": str(student_cpu),
-        "STUDENT_MEMORY": f"{student_memory_gi}Gi",
-        "GPUS_PER_STUDENT": str(args.gpus_per_student),
-    })
+    deployment = render_student_deployment(
+        template,
+        deployment_name=student_deployment_name,
+        configmap_name=student_configmap_name,
+        id_label_key="student",
+        id_label_value=student_name,
+        student_names_csv=student_name,
+        container_name="student",
+        runner_workdir="/workspace/senpai",
+        entrypoint="k8s/entrypoint-student.sh",
+        tag=tag,
+        secret_name=secret_name,
+        args=args,
+    )
     return configmap + "\n---\n" + deployment
 
 
@@ -214,8 +249,6 @@ def render_student_group(template: str, student_names: list[str], group_index: i
     student_names_csv = ",".join(student_names)
     configmap_name = f"senpai-config-student-{tag}-{group_name}"
     deployment_name = f"senpai-{tag}-{group_name}"
-    student_cpu = args.cpu_per_gpu * args.gpus_per_student
-    student_memory_gi = args.memory_gi_per_gpu * args.gpus_per_student
     extra_by_student = {
         student: encoded_extra_instructions(args, tag, [student])
         for student in student_names
@@ -232,20 +265,20 @@ def render_student_group(template: str, student_names: list[str], group_index: i
         labels={"app": "senpai", "role": "student", "research-tag": tag},
         data=data,
     )
-    deployment = render_template(template, {
-        "STUDENT_GROUP_DEPLOYMENT_NAME": deployment_name,
-        "STUDENT_GROUP_CONFIGMAP_NAME": configmap_name,
-        "STUDENT_GROUP_NAME": group_name,
-        "STUDENT_NAMES_CSV": student_names_csv,
-        "RESEARCH_TAG": tag,
-        "IMAGE": args.image,
-        "PVC_CLAIM_NAME": args.pvc_claim_name,
-        "PVC_MOUNT_PATH": args.pvc_mount_path,
-        "LAUNCH_SECRET_NAME": secret_name,
-        "STUDENT_GROUP_CPU": str(student_cpu),
-        "STUDENT_GROUP_MEMORY": f"{student_memory_gi}Gi",
-        "GPUS_PER_STUDENT": str(args.gpus_per_student),
-    })
+    deployment = render_student_deployment(
+        template,
+        deployment_name=deployment_name,
+        configmap_name=configmap_name,
+        id_label_key="student-group",
+        id_label_value=group_name,
+        student_names_csv=student_names_csv,
+        container_name="student-group",
+        runner_workdir="/workspace/senpai-group",
+        entrypoint="k8s/entrypoint-student-group.sh",
+        tag=tag,
+        secret_name=secret_name,
+        args=args,
+    )
     return configmap + "\n---\n" + deployment
 
 
@@ -342,7 +375,6 @@ def main():
         ensure_target_repo_labels(args.target_repo_url, github_token, routing_labels(args.advisor_branch, student_list))
 
     student_template = STUDENT_TEMPLATE.read_text()
-    student_group_template = STUDENT_GROUP_TEMPLATE.read_text()
     advisor_template = ADVISOR_TEMPLATE.read_text()
     secret_name = f"senpai-launch-secrets-{args.tag}"
 
@@ -376,7 +408,7 @@ def main():
                 kubectl_apply(manifest, f"student {name}")
     else:
         for group_index, names in enumerate(student_chunks(student_list, args.students_per_gpu_pod)):
-            manifest = render_student_group(student_group_template, names, group_index, args.tag, secret_name, args)
+            manifest = render_student_group(student_template, names, group_index, args.tag, secret_name, args)
             group_name = f"group-{group_index + 1}"
             if args.dry_run:
                 print(f"--- Student group: {group_name} ({', '.join(names)}) ---")
