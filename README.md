@@ -6,7 +6,7 @@ SPDX-PackageName: senpai
 
 # senpai
 
-Autonomous ML research loop powered by Claude Code agents coordinated through GitHub PRs. Point it at a problem, deploy advisor + student agents on k8s, and let them iterate.
+Autonomous ML research loop powered by Claude Code Agent SDK agents coordinated through GitHub PRs. Point it at a problem, deploy advisor + student agents on k8s, and let them iterate.
 
 ## How it works
 
@@ -31,7 +31,7 @@ An **advisor** pod creates experiment PRs and assigns them to **student** GPU po
 ```mermaid
 graph TD
     subgraph K8s["Kubernetes Cluster"]
-        A["Advisor Pod<br/>(Claude Code, no GPU)<br/>Creates hypothesis PRs<br/>Reviews results, merges/closes"]
+        A["Advisor Pod<br/>(Claude Code SDK, no GPU)<br/>Creates hypothesis PRs<br/>Reviews results, merges/closes"]
         subgraph Students["Student Deployments (one per GPU node)"]
             S1["frieren<br/>8x GPU"]
             S2["fern<br/>8x GPU"]
@@ -74,6 +74,7 @@ senpai/
 │   └── CLAUDE-STUDENT.md
 ├── k8s/                           # Kubernetes deployment (problem-agnostic)
 │   ├── launch.py                  #   Deploy advisor + student pods
+│   ├── run_senpai_claude_sdk.py   #   Claude Agent SDK bridge
 │   ├── advisor-deployment.yaml
 │   ├── student-deployment.yaml
 │   ├── entrypoint-advisor.sh
@@ -117,6 +118,12 @@ preflight_only: false
 ### Image rebuilds
 
 The published runner image is `ghcr.io/wandb/senpai:latest`. It is built by `.github/workflows/build.yaml` on pushes to `main` or `docker` when `Dockerfile`, `pyproject.toml`, `uv.lock`, or the workflow changes. It can also be rebuilt manually from the GitHub Actions `workflow_dispatch` button.
+
+### Claude Agent SDK runtime
+
+Advisor and student loops invoke Claude through `k8s/run_senpai_claude_sdk.py`, a Python Agent SDK bridge. The outer shell loops still own GitHub polling, assignment checkout, idle skipping, and watchdog termination; the SDK bridge owns the model session itself.
+
+The bridge uses the Claude Code preset, model `claude-opus-4-7`, max effort, bypass permissions inside the pod sandbox, checked-in project settings, the local `plugins/senpai` plugin, all discovered skills, strict Exa MCP config from `.mcp.json`, and SDK hook telemetry for prompts and tool use.
 
 ### Launch credentials
 

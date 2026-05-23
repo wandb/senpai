@@ -4,9 +4,10 @@ Deploys a test pod, verifies the weave plugin works, checks that a
 claude session produces a trace in Weave, then tears down the pod.
 
 Usage:
-    uv run pytest tests/test_docker_image.py -v -s
+    uv run --extra dev pytest tests/test_docker_image.py -v -s
 """
 
+import shlex
 import subprocess
 import time
 import uuid
@@ -109,6 +110,7 @@ def test_python_deps_and_icml_target_import(test_pod):
     """The image has the Python deps needed by the new ICML target."""
     cmd = (
         "python - <<'PY'\n"
+        "import claude_agent_sdk\n"
         "import numpy\n"
         "import torch\n"
         "import torch_geometric\n"
@@ -127,16 +129,21 @@ def test_weave_plugin_ready(test_pod):
 
 
 def test_claude_creates_trace(test_pod):
-    """Running claude with a unique prompt produces a matching Weave trace."""
+    """Running the SDK bridge with a unique prompt produces a matching Weave trace."""
     marker = f"senpai-test-{uuid.uuid4().hex[:8]}"
     prompt = f"Reply with exactly this string and nothing else: {marker}"
+    quoted_prompt = shlex.quote(prompt)
 
     out = kubectl_check(
         "exec", test_pod, "--",
-        "bash", "-c", f'CLAUDE_CODE_ALLOW_ROOT=1 claude -p "{prompt}"',
+        "bash", "-c",
+        "cd /workspaces/senpai && "
+        f"printf %s {quoted_prompt} | "
+        "python3 k8s/run_senpai_claude_sdk.py --max-turns 1 --plugin-dir plugins/senpai",
         timeout=CLAUDE_TIMEOUT,
     )
     assert marker in out, f"Expected {marker!r} in output, got: {out!r}"
+    assert "senpai_hook" in out, f"Expected SDK hook telemetry in output, got: {out!r}"
 
     # Give the daemon a moment to flush the trace
     time.sleep(10)
