@@ -107,6 +107,7 @@ max_epochs: 50
 poll_interval_s: 600
 poll_jitter_s: 120
 stale_wip_seconds: 7200
+advisor_idle_student_action_s: 0
 advisor_claude_watchdog_interval_s: 60
 advisor_claude_min_runtime_s: 600
 advisor_claude_stale_log_s: 1200
@@ -151,8 +152,11 @@ already running.
 
 For short, interactive experiments, lower `poll_interval_s` and
 `poll_jitter_s` so idle students and review-ready PRs are picked up quickly.
+Set `advisor_idle_student_action_s` to a small deadline, such as 120-240, when
+idle students should force a quick advisor restart if no assignment PR appears.
 For long training runs, keep those defaults or use larger values to reduce
-GitHub/API churn. Lower `*_claude_watchdog_interval_s` and
+GitHub/API churn. Lower `*_claude_watchdog_interval_s`,
+`*_claude_min_runtime_s`, `*_claude_stale_log_s`, and
 `student_assignment_drift_grace_s` only when you want the outer loop to reclaim
 stale or reassigned work aggressively.
 
@@ -163,6 +167,7 @@ python k8s/launch.py \
   --poll_interval_s 30 \
   --poll_jitter_s 5 \
   --stale_wip_seconds 600 \
+  --advisor_idle_student_action_s 180 \
   --student_claude_watchdog_interval_s 30 \
   --student_claude_watchdog_jitter_s 5 \
   --student_assignment_drift_grace_s 120

@@ -71,6 +71,7 @@ class Args:
     poll_interval_s: int = 600  # default advisor/student outer-loop sleep between GitHub polls
     poll_jitter_s: int = 120  # max random jitter added to outer-loop sleeps
     stale_wip_seconds: int = 7200  # advisor-action threshold for stale WIP PRs
+    advisor_idle_student_action_s: int = 0  # optional deadline for opening assignments when students start idle
     advisor_claude_watchdog_interval_s: int = 60  # how often advisor watchdog checks active Claude
     advisor_claude_min_runtime_s: int = 600  # minimum advisor runtime before stale-log intervention
     advisor_claude_stale_log_s: int = 1200  # advisor stale-log intervention threshold
@@ -97,6 +98,7 @@ def validate_timing_args(args: Args) -> None:
     non_negative = [
         "poll_jitter_s",
         "stale_wip_seconds",
+        "advisor_idle_student_action_s",
         "student_claude_watchdog_jitter_s",
         "student_assignment_drift_grace_s",
     ]
@@ -303,6 +305,7 @@ def render_advisor(template: str, tag: str, student_list: list[str], secret_name
         "SENPAI_POLL_INTERVAL_S": str(args.poll_interval_s),
         "SENPAI_POLL_JITTER_S": str(args.poll_jitter_s),
         "SENPAI_STALE_WIP_SECONDS": str(args.stale_wip_seconds),
+        "ADVISOR_IDLE_STUDENT_ACTION_S": str(args.advisor_idle_student_action_s),
         "ADVISOR_CLAUDE_WATCHDOG_INTERVAL_S": str(args.advisor_claude_watchdog_interval_s),
         "ADVISOR_CLAUDE_MIN_RUNTIME_S": str(args.advisor_claude_min_runtime_s),
         "ADVISOR_CLAUDE_STALE_LOG_S": str(args.advisor_claude_stale_log_s),

@@ -17,6 +17,14 @@ ADVISOR_CLAUDE_STALE_LOG_S="${ADVISOR_CLAUDE_STALE_LOG_S:-1200}"
 ADVISOR_CLAUDE_KILL_GRACE_S="${ADVISOR_CLAUDE_KILL_GRACE_S:-15}"
 ADVISOR_CLAUDE_SELF_PGREP_STALE_S="${ADVISOR_CLAUDE_SELF_PGREP_STALE_S:-300}"
 ADVISOR_CLAUDE_SELF_PGREP_PATTERNS="${ADVISOR_CLAUDE_SELF_PGREP_PATTERNS:-wandb_sparse_val.py}"
+ADVISOR_IDLE_STUDENT_ACTION_S="${ADVISOR_IDLE_STUDENT_ACTION_S:-0}"
+
+advisor_uint_or_zero() {
+    case "${1:-}" in
+        ''|*[!0-9]*) printf '0\n' ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
 
 # Read log mtimes portably so stale-output checks work on Linux and macOS.
 advisor_file_mtime_s() {
@@ -113,11 +121,28 @@ advisor_self_pgrep_wait_pids() {
     done | sort -nu
 }
 
+advisor_started_with_only_idle_students() {
+    [ "$(advisor_uint_or_zero "$ADVISOR_IDLE_STUDENT_ACTION_S")" -gt 0 ] || return 1
+    [ "$(advisor_uint_or_zero "${ADVISOR_INVOCATION_IDLE_COUNT:-0}")" -gt 0 ] || return 1
+    [ "$(advisor_uint_or_zero "${ADVISOR_INVOCATION_REVIEW_COUNT:-0}")" -eq 0 ] || return 1
+    [ "$(advisor_uint_or_zero "${ADVISOR_INVOCATION_ADVISOR_ACTION_COUNT:-0}")" -eq 0 ] || return 1
+    [ "$(advisor_uint_or_zero "${ADVISOR_INVOCATION_ISSUE_COUNT:-0}")" -eq 0 ] || return 1
+    [ "$(advisor_uint_or_zero "${ADVISOR_INVOCATION_POD_ANOMALY_COUNT:-0}")" -eq 0 ] || return 1
+}
+
+advisor_current_idle_students() {
+    local idle_json
+
+    idle_json=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH") || return 1
+    printf '%s' "$idle_json" | json_join
+}
+
 # Run Claude under supervision and return 124 when the outer loop should re-poll.
 run_advisor_claude_with_watchdog() {
     run_senpai_claude "$@" &
     local claude_pid=$!
     local start_ts now_ts runtime log_mtime log_age reason rc self_pgrep_wait_pids
+    local idle_action_s current_idle_students
     local watchdog_fired=0
     start_ts=$(date +%s)
 
@@ -137,6 +162,19 @@ run_advisor_claude_with_watchdog() {
                 watchdog_fired=1
             else
                 echo "=== Advisor Claude watchdog: saw self-matching pgrep wait; waiting ${runtime}/${ADVISOR_CLAUDE_SELF_PGREP_STALE_S}s before intervention ==="
+            fi
+        fi
+
+        if advisor_started_with_only_idle_students; then
+            idle_action_s=$(advisor_uint_or_zero "$ADVISOR_IDLE_STUDENT_ACTION_S")
+            if [ "$runtime" -ge "$idle_action_s" ]; then
+                current_idle_students=$(advisor_current_idle_students 2>/dev/null || true)
+                if [ -n "$current_idle_students" ]; then
+                    advisor_log_watchdog_trigger "=== Advisor Claude watchdog: stopping advisor invocation after ${runtime}s because students are still idle: ${current_idle_students} ==="
+                    advisor_stop_process_trees "$claude_pid"
+                    watchdog_fired=1
+                    break
+                fi
             fi
         fi
 
