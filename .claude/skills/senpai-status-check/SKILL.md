@@ -114,16 +114,39 @@ PY
 
 # Fleet overview and real training process sweep
 kubectl --context pai-2 get pods -l app=senpai -o wide
-for podref in $(kubectl --context pai-2 get pods -l app=senpai,role=student -o name | sort); do
-  pod=${podref#pod/}
-  student=${pod#senpai-}; student=${student%-*}; student=${student%-*}
-  out=$(kubectl --context pai-2 exec "$pod" -- sh -lc "ps -eo pid,etime,comm,args | awk '\$3 ~ /python/ && /train.py/ {print; exit}'" 2>/dev/null || true)
+kubectl --context pai-2 get pods -l app=senpai,role=student -o json > /tmp/student_pods.json
+uv run python - <<'PY' </tmp/student_pods.json >/tmp/student_runtime.tsv
+import json, sys
+for item in json.load(sys.stdin).get("items", []):
+    meta = item.get("metadata", {})
+    labels = meta.get("labels", {})
+    annotations = meta.get("annotations", {})
+    pod = meta.get("name", "")
+    names = [n.strip() for n in annotations.get("senpai/student-names", "").split(",") if n.strip()]
+    if not names and labels.get("student"):
+        names = [labels["student"]]
+    grouped = "student" not in labels
+    for student in names:
+        runner = f"/workspace/senpai-{student}" if grouped else "/workspace/senpai"
+        target = f"{runner}/target"
+        home = f"/workspace/home-{student}" if grouped else "/root"
+        print(f"{student}\t{pod}\t{target}\t{home}\t{runner}")
+PY
+while IFS="$(printf '\t')" read -r student pod target home runner; do
+  out=$(kubectl --context pai-2 exec "$pod" -- sh -lc '
+    target="${1%/}"
+    runner="${2%/}"
+    . "$runner/k8s/senpai-processes.sh"
+    pid=$(senpai_training_pids_for_target "$target" target | head -1)
+    [ -n "$pid" ] || exit 0
+    ps -p "$pid" -o pid=,etime=,comm=,args= 2>/dev/null
+  ' sh "$target" "$runner" 2>/dev/null || true)
   if [ -n "$out" ]; then
     printf "%-10s PYTRAIN %s\n" "$student" "$(printf "%s" "$out" | sed 's/^[[:space:]]*//; s/[[:space:]][[:space:]]*/ /g' | cut -c1-180)"
   else
     printf "%-10s NO_PYTRAIN\n" "$student"
   fi
-done
+done </tmp/student_runtime.tsv
 
 # Advisor state and raw log locations
 gh api 'repos/wandb/senpai/contents/research/CURRENT_RESEARCH_STATE.md?ref=radford' \
@@ -132,12 +155,11 @@ kubectl --context pai-2 exec deploy/senpai-advisor -- sh -lc \
   "find /root/.claude -type f -name '*.jsonl' -printf '%T@ %p %s\n' | sort -nr | head -10"
 
 # Student raw log locations and latest tails
-for podref in $(kubectl --context pai-2 get pods -l app=senpai,role=student -o name | sort); do
-  pod=${podref#pod/}
-  echo "### $pod"
+while IFS="$(printf '\t')" read -r student pod target home runner; do
+  echo "### $student ($pod)"
   kubectl --context pai-2 exec "$pod" -- sh -lc \
-    "latest=\$(find /root/.claude -type f -name '*.jsonl' -printf '%T@ %p\n' | sort -nr | awk 'NR==1{sub(/^[^ ]+ /,\"\"); print}'); [ -n \"\$latest\" ] && tail -40 \"\$latest\""
-done
+    "latest=\$(find \"\$1/.claude\" -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1{sub(/^[^ ]+ /,\"\"); print}'); [ -n \"\$latest\" ] && tail -40 \"\$latest\"" sh "$home"
+done </tmp/student_runtime.tsv
 ```
 
 ## W&B metric scan pattern

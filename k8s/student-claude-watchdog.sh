@@ -17,6 +17,24 @@ STUDENT_CLAUDE_STALE_LOG_S="${STUDENT_CLAUDE_STALE_LOG_S:-1200}"
 STUDENT_CLAUDE_KILL_GRACE_S="${STUDENT_CLAUDE_KILL_GRACE_S:-15}"
 STUDENT_ASSIGNMENT_DRIFT_GRACE_S="${STUDENT_ASSIGNMENT_DRIFT_GRACE_S:-1800}"
 
+. "${SENPAI_PROCESS_HELPERS:-${WORKDIR:-/workspace/senpai}/k8s/senpai-processes.sh}"
+
+student_grouped_pod() {
+    [ "${SENPAI_GROUPED_STUDENT_POD:-}" = "1" ]
+}
+
+student_target_workdir() {
+    (cd "$TARGET_WORKDIR" && pwd -P) 2>/dev/null || printf '%s\n' "${TARGET_WORKDIR%/}"
+}
+
+student_process_scope() {
+    if student_grouped_pod; then
+        printf 'target\n'
+    else
+        printf 'global\n'
+    fi
+}
+
 student_file_mtime_s() {
     stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"
 }
@@ -33,19 +51,20 @@ print(",".join(f"#{number}" for number in numbers))
 }
 
 student_has_active_training() {
-    ps -eo pid,ppid,comm,args |
-        awk '$3 ~ /^(python[0-9.]*|torchrun)$/ && $0 ~ /train[.]py/ { found = 1 } END { exit !found }'
+    local claude_pid="${1:-}"
+    [ -n "$(student_training_pids "$claude_pid" | head -1)" ]
 }
 
 student_training_pids() {
-    ps -eo pid,ppid,comm,args |
-        awk '$3 ~ /^(python[0-9.]*|torchrun|pt_elastic)$/ && $0 ~ /train[.]py/ { print $1 }'
+    local claude_pid="${1:-}"
+    senpai_training_pids_for_target "$(student_target_workdir)" "$(student_process_scope)" "$claude_pid"
 }
 
 student_training_snapshot() {
-    ps -eo pid,ppid,etimes,pcpu,pmem,comm,args |
-        awk '$6 ~ /^(python[0-9.]*|torchrun|pt_elastic)$/ && $0 ~ /train[.]py/ { print }' |
-        head -20
+    local claude_pid="${1:-}" pids
+    pids="$(student_training_pids "$claude_pid" | head -20 | tr '\n' ',')"
+    [ -n "$pids" ] || return 0
+    ps -p "${pids%,}" -o pid,ppid,etimes,pcpu,pmem,comm,args 2>/dev/null || true
 }
 
 student_log_watchdog_trigger() {
@@ -73,8 +92,8 @@ student_stop_claude_tree() {
 }
 
 student_stop_training_trees() {
-    local pids pid
-    pids=$(student_training_pids | sort -nr)
+    local claude_pid="${1:-}" pids pid
+    pids=$(student_training_pids "$claude_pid" | sort -nr)
     [ -n "$pids" ] || return 0
 
     echo "=== Claude watchdog: stopping active train.py processes ==="
@@ -92,10 +111,10 @@ student_stop_training_trees() {
 }
 
 student_comment_watchdog_stop() {
-    local reason="$1" start_numbers="$2" current_numbers="$3" snapshot body num
+    local reason="$1" start_numbers="$2" current_numbers="$3" claude_pid="${4:-}" snapshot body num
     [ -n "$start_numbers" ] || return 0
 
-    snapshot=$(student_training_snapshot || true)
+    snapshot=$(student_training_snapshot "$claude_pid" || true)
     [ -n "$snapshot" ] || snapshot="(no active train.py process found at comment time)"
     body=$(cat <<EOF
 STUDENT-WATCHDOG: stopping this student invocation on $(hostname).
@@ -145,7 +164,7 @@ run_student_claude_with_watchdog() {
 
         reason=""
         active_training=0
-        student_has_active_training && active_training=1
+        student_has_active_training "$claude_pid" && active_training=1
 
         if [ -n "$start_numbers" ]; then
             poll_status=0
@@ -198,9 +217,9 @@ run_student_claude_with_watchdog() {
         if [ -n "$reason" ]; then
             student_log_watchdog_trigger "=== Claude watchdog: stopping stale student invocation (${reason}) ==="
             if [ "$active_training" -eq 1 ]; then
-                student_comment_watchdog_stop "$reason" "$start_numbers" "${current_numbers:-}" || true
+                student_comment_watchdog_stop "$reason" "$start_numbers" "${current_numbers:-}" "$claude_pid" || true
             fi
-            student_stop_training_trees
+            student_stop_training_trees "$claude_pid"
             student_stop_claude_tree "$claude_pid"
             watchdog_fired=1
             break

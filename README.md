@@ -118,12 +118,24 @@ student_assignment_drift_grace_s: 1800
 n_students: 4
 student_prefix: ""
 gpus_per_student: 8
+students_per_gpu_pod: 1
 cpu_per_gpu: 15
 memory_gi_per_gpu: 120
 preflight_only: false
 ```
 
 `launch.py` reads this via `simple_parsing` — every field can be overridden on the CLI.
+
+### Student pod packing
+
+By default, `students_per_gpu_pod: 1` preserves the normal deployment topology:
+one logical student loop per GPU pod. Set `students_per_gpu_pod` above 1 to
+pack multiple logical students into each pod while still requesting
+`gpus_per_student` GPUs for that pod. This is useful for single-GPU targets
+where the advisor coordinates heavy runs and students can still prepare
+launchers, inspect logs, run smoke checks, or take turns on the shared GPU.
+In packed mode, `gpus_per_student` is the shared pod GPU request, not a
+per-logical-student allocation.
 
 ### Responsiveness knobs
 

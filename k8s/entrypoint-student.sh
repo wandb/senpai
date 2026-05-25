@@ -7,13 +7,17 @@
 set -e
 set -o pipefail
 
-WORKDIR="/workspace/senpai"
+WORKDIR="${WORKDIR:-/workspace/senpai}"
 GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 TARGET_REPO_BRANCH="${TARGET_REPO_BRANCH:-}"
 export SENPAI_ROLE="student"
 export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
 GIT_CREDENTIAL_FILE="$WORKDIR/.git-credentials"
 SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
+
+if [ -x /usr/bin/nvidia-smi ]; then
+    export PATH="/usr/bin:$PATH"
+fi
 
 echo "=== Senpai Student: $STUDENT_NAME ==="
 echo "Runner repo:  $REPO_URL (branch: $REPO_BRANCH)"
@@ -62,6 +66,9 @@ fi
 # --- Install checked-in Claude Code config into user scope ---
 mkdir -p "$HOME/.claude"
 cp -a "$WORKDIR/.claude/." "$HOME/.claude/"
+if ! python3 -m json.tool "$HOME/.claude.json" >/dev/null 2>&1; then
+    printf '{}\n' > "$HOME/.claude.json"
+fi
 
 echo "=== Claude config installed ==="
 ls "$HOME/.claude/skills/wandb-primary/SKILL.md" "$HOME/.claude/agents/researcher-agent.md"
@@ -91,7 +98,7 @@ if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
     PROMPT="${PROMPT}"$'\n\n# Finally, some additional instructions\n\n'"$(printf '%s' "$EXTRA_INSTRUCTIONS_B64" | base64 -d)"
 fi
 
-KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | GPUs per Student: '"$GPUS_PER_STUDENT"' | Target repo: '"$GH_REPO"' | Target base branch: '"${TARGET_REPO_BRANCH:-<default>}"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
+KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | GPU request: '"$GPUS_PER_STUDENT"' | Target repo: '"$GH_REPO"' | Target base branch: '"${TARGET_REPO_BRANCH:-<default>}"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 HEARTBEAT_PROMPT="Continue your student loop using the assigned PRs and GitHub issues listed in the Student research state below. The entrypoint owns assignment polling; do not start persistent GitHub polling monitors. For active training, use sparse wakeups plus training_log_status; do not stream per-epoch logs into Monitor."

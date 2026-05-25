@@ -3,9 +3,9 @@
 #
 # The job waits inside Kubernetes until all expected Senpai pods are Ready,
 # records that timestamp on the PVC, sleeps for the requested budget, harvests
-# Claude Code conversation logs from /root/.claude, writes them to the PVC, then
-# deletes the tagged Senpai deployments/configmaps/secrets. This keeps the hard
-# cutoff independent of the operator laptop staying awake.
+# Claude Code conversation logs from singleton and grouped student homes, writes
+# them to the PVC, then deletes the tagged Senpai deployments/configmaps/secrets.
+# This keeps the hard cutoff independent of the operator laptop staying awake.
 
 set -euo pipefail
 
@@ -250,17 +250,23 @@ sleep_until() {
 }
 
 copy_one_pod() {
-  local pod="$1" tag="$2" dest="$3" pod_dir
+  local pod="$1" tag="$2" student_names="$3" dest="$4" pod_dir
   pod_dir="${dest}/pods/$(safe_name "$tag")/$(safe_name "$pod")"
   mkdir -p "$pod_dir"
-  printf '%s\t%s\n' "$pod" "$tag" > "${pod_dir}/pod.tsv"
+  printf '%s\t%s\t%s\n' "$pod" "$tag" "$student_names" > "${pod_dir}/pod.tsv"
   log "Harvesting Claude Code logs from ${pod} (${tag})"
   if kubectl -n "$NAMESPACE" exec "$pod" -- sh -lc '
-      cd /root || exit 0
+      cd / || exit 0
       set --
-      [ -d .claude/projects ] && set -- "$@" .claude/projects
-      [ -d .claude/todos ] && set -- "$@" .claude/todos
-      [ -f .claude.json ] && set -- "$@" .claude.json
+      [ -d root/.claude/projects ] && set -- "$@" root/.claude/projects
+      [ -d root/.claude/todos ] && set -- "$@" root/.claude/todos
+      [ -f root/.claude.json ] && set -- "$@" root/.claude.json
+      for home in workspace/home-*; do
+        [ -d "$home" ] || continue
+        [ -d "$home/.claude/projects" ] && set -- "$@" "$home/.claude/projects"
+        [ -d "$home/.claude/todos" ] && set -- "$@" "$home/.claude/todos"
+        [ -f "$home/.claude.json" ] && set -- "$@" "$home/.claude.json"
+      done
       [ "$#" -gt 0 ] || exit 0
       tar -czf - "$@"
     ' > "${pod_dir}/claude-code-logs.tgz" 2> "${pod_dir}/harvest.err"; then
@@ -285,7 +291,13 @@ import sys
 data = json.load(sys.stdin)
 for item in data.get("items", []):
     meta = item.get("metadata", {})
-    print("{}\t{}".format(meta.get("name", ""), meta.get("labels", {}).get("research-tag", "")))
+    labels = meta.get("labels", {})
+    annotations = meta.get("annotations", {})
+    print("{}\t{}\t{}".format(
+        meta.get("name", ""),
+        labels.get("research-tag", ""),
+        annotations.get("senpai/student-names", labels.get("student", "")),
+    ))
 ' > "${dest}/pod_list.tsv"
 
   pod_count="$(wc -l < "${dest}/pod_list.tsv" | tr -d ' ')"
@@ -296,14 +308,14 @@ for item in data.get("items", []):
   fi
 
   copy_failed=0
-  while IFS="$(printf '\t')" read -r pod tag; do
+  while IFS="$(printf '\t')" read -r pod tag student_names; do
     [ -n "$pod" ] || continue
     while true; do
       job_count="$(jobs -pr | wc -l | tr -d ' ')"
       [ "$job_count" -lt "$MAX_PARALLEL_COPIES" ] && break
       sleep 1
     done
-    copy_one_pod "$pod" "$tag" "$dest" &
+    copy_one_pod "$pod" "$tag" "$student_names" "$dest" &
   done < "${dest}/pod_list.tsv"
 
   for job in $(jobs -pr); do
