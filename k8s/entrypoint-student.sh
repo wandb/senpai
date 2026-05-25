@@ -62,6 +62,9 @@ fi
 # --- Install checked-in Claude Code config into user scope ---
 mkdir -p "$HOME/.claude"
 cp -a "$WORKDIR/.claude/." "$HOME/.claude/"
+if ! python3 -m json.tool "$HOME/.claude.json" >/dev/null 2>&1; then
+    printf '{}\n' > "$HOME/.claude.json"
+fi
 
 echo "=== Claude config installed ==="
 ls "$HOME/.claude/skills/wandb-primary/SKILL.md" "$HOME/.claude/agents/researcher-agent.md"
