@@ -15,6 +15,10 @@ export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
 GIT_CREDENTIAL_FILE="$WORKDIR/.git-credentials"
 SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 
+if [ -x /usr/bin/nvidia-smi ]; then
+    export PATH="/usr/bin:$PATH"
+fi
+
 echo "=== Senpai Student: $STUDENT_NAME ==="
 echo "Runner repo:  $REPO_URL (branch: $REPO_BRANCH)"
 echo "Target repo:  $TARGET_REPO_URL (base branch: ${TARGET_REPO_BRANCH:-<default>}; advisor branch: $ADVISOR_BRANCH)"
