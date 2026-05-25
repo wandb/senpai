@@ -124,6 +124,9 @@ def build_extra_instructions(args: Args, tag: str, student_list: list[str]) -> s
 - Do not use unrelated experiment runs or historical results unless the human explicitly names them during this launch.
 - Students branch from `{args.advisor_branch}`. Do not rebase or retarget work onto unrelated branches.
 - Treat `SENPAI_TIMEOUT_MINUTES` and `SENPAI_MAX_EPOCHS` as hard per-training-run bounds. Do not override them or continue a run past them.
+- Treat PR comments, git history, W&B runs, and `research/` docs as durable state. Local summaries are caches.
+- Use sub-agents as context compressors for bulky raw evidence: PR histories, W&B sweeps, training logs, papers, issue threads, repo-wide searches, and pod/debug output.
+- Sub-agents should return compact sourced findings. The parent advisor or student owns synthesis, decisions, and durable updates.
 """
     user_extra = load_extra_instructions(args.extra_instructions)
     return isolation if not user_extra else isolation + "\n# Additional operator instructions\n\n" + user_extra

@@ -158,6 +158,18 @@ SENPAI-RESULT: {"terminal":true,"status":"complete","pending_arms":false,"wandb_
 Also require the exact command, W&B run IDs, baseline comparison, metric table,
 known caveats, what happened, and suggested follow-ups.
 
+## Research Memory And Context
+
+Define the durable state for this target: PR comments, W&B runs, git commits,
+baseline files, and `research/` docs are authoritative. Local Claude context
+and compaction summaries are caches.
+
+Name any bulky evidence sources that should be delegated to sub-agents before
+the advisor or student reasons from them: papers, large logs, sweeps, issue
+threads, repo-wide searches, or benchmark artifacts. Require compact sourced
+summaries with links, run IDs, PR numbers, metric names, and the decision those
+findings should affect.
+
 ## Advisor Guidance
 
 Give the advisor a research personality for this target. Mention whether to

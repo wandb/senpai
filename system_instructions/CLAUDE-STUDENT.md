@@ -76,7 +76,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
 
 3. **Implement the hypothesis**
    - Read the PR's hypothesis and instructions carefully.
-   - Kick off the researcher-agent to review the hypothesis and instructions and generate a plan for the experiment, the goal is to become a subject matter expert on the hypothesis.
+   - Kick off the researcher-agent to review the hypothesis and instructions and generate a plan for the experiment; the goal is to become a subject matter expert on the hypothesis. Ask for a compact plan and evidence summary, not raw paper, PR, log, or repo dumps. If the plan changes the implementation materially, preserve the relevant reasoning in a PR comment.
    - Follow the instructions in the PR body - note you have liberty to modify the instructions to make them more specific and actionable if you think it will help the experiment based on the researcher-agent's findings.
    - Ensure that the advisor-provided baseline command is correct and up to date, check `/research/BASELINE.md` if you need to see the current best metrics. Ask the advisor for clarification if needed via a comment on the PR.
    - Only modify files allowed by `$PROBLEM_DIR/program.md`, the assigned PR, and any target task contract. If those policies conflict, ask the advisor before editing.
@@ -90,7 +90,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    - **Run limits**: `SENPAI_MAX_EPOCHS` and `SENPAI_TIMEOUT_MINUTES` are hard upper bounds, not targets. Choose epochs/steps that fit the evidence: tiny debug runs when useful, medium screening runs, and longer confirmation runs only for stable promising ideas. Ensure training runs do not exceed these limits.
    - Use `--wandb_group` only when the PR instructions say to (the advisor sets this for multi-iteration ideas).
    - Only run multiple variations if the PR instructions explicitly ask for it (e.g. "try surface weight 5, 10, 20"). Otherwise, run the single experiment described.
-   - For active training, prefer `ScheduleWakeup` every 10-30 minutes plus `training_log_status <logfile>` or W&B queries. Do not stream per-epoch training logs into `Monitor`.
+   - For active training, prefer `ScheduleWakeup` every 10-30 minutes plus `training_log_status <logfile>` or W&B queries. Do not stream per-epoch training logs into `Monitor`. For long logs, sweeps, broad repo checks, or crash archaeology, delegate the raw scan and keep only compact findings in your main context.
    - **After each run finishes**, check for new advisor comments before continuing:
      ```bash
      pr_all_comments <number>
@@ -116,6 +116,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    - W&B run ID
    - **What happened** — honest analysis: did it work? why or why not?
    - **Suggested follow-ups** — what would you try next based on what you learned?
+   - **Research memory update** — what belief changed, what remains uncertain, and what evidence the advisor should carry forward.
 
    If there are results from follow-up experiments, add them as a new results comment using the same format.
 

@@ -151,7 +151,7 @@ KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | GPUs per Stu
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 # Heartbeat prompt for polling
-HEARTBEAT_PROMPT="Continue your advisor loop. Attached is the current research state. Review any completed experiment PRs, assign work to all idle students, and check for human gh issues and comments."
+HEARTBEAT_PROMPT="Continue your advisor loop. Attached is the current research state. Review any completed experiment PRs, assign work to all idle students, and check for human gh issues and comments. Protect the advisor context: use sub-agents for bulky PR, W&B, log, issue, literature, or repo scans; bring back compact sourced summaries; and write durable research state to PR comments or research docs."
 
 # --- Last-check timestamp state for filtering GitHub issues ---
 LAST_CHECK_FILE="$LOGDIR/.last_check_ts"

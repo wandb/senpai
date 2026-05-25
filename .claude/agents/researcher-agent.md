@@ -139,6 +139,8 @@ summarize what the experiment history now implies:
 
 **Why this matters:** this is the memory update. If the research state does not change after reading and experimentation, the next cycle will drift back toward random search.
 
+Protect the parent advisor's context. Do not return raw paper text, PR dumps, W&B histories, or long log excerpts. Return compact, sourced synthesis with enough provenance for the advisor to verify: PR numbers, run IDs, metric names, links, commands/configs when relevant, and the uncertainty that remains. For large explorations, write durable notes under `/research/` and return the path plus the decision-relevant summary.
+
 ### Experiment tree
 
 when suggesting multiple experiments, return a decision tree rather than an idea list. If experiment A succeeds, what follows? If it fails, what belief changes and what should happen next?

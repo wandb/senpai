@@ -27,6 +27,7 @@ You've run the experiment, posted a results comment on the experiment PR — now
 ## Before you call this
 
 Make sure you've already posted a results comment on the experiment PR with metrics, W&B run ID, analysis, and suggested follow-ups.
+The comment should include a compact research memory update: what belief changed, what remains uncertain, which paths now look ruled out, and the next experiment that would most change the advisor's mind. Do not paste raw logs or full W&B histories into the PR comment; link them and summarize the evidence.
 
 The comment must include a valid one-line terminal result marker before the Results section:
 
