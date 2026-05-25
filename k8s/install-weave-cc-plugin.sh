@@ -18,6 +18,11 @@
 # already-token-authenticated HTTPS form set up in the deployment entrypoint.
 git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "git@github.com:"
 
+mkdir -p "$HOME/.weave_claude_plugin"
+if ! python3 -m json.tool "$HOME/.weave_claude_plugin/settings.json" >/dev/null 2>&1; then
+    rm -f "$HOME/.weave_claude_plugin/settings.json"
+fi
+
 WEAVE_PROJECT="${WANDB_ENTITY}/${WANDB_PROJECT}" \
     weave-claude-plugin install --non-interactive
 
