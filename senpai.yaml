@@ -39,7 +39,6 @@ max_epochs: 50
 poll_interval_s: 600
 poll_jitter_s: 120
 stale_wip_seconds: 7200
-advisor_idle_student_action_s: 0
 advisor_claude_watchdog_interval_s: 60
 advisor_claude_min_runtime_s: 600
 advisor_claude_stale_log_s: 1200

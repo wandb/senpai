@@ -216,12 +216,6 @@ while true; do
     # --- Log triage state and select prompt ---
     echo "=== Log: $LOGFILE ==="
     echo "$TRIAGE_INFO" > "$LOGFILE"
-    export ADVISOR_INVOCATION_REVIEW_COUNT="$REVIEW_COUNT"
-    export ADVISOR_INVOCATION_ADVISOR_ACTION_COUNT="$ADVISOR_ACTION_COUNT"
-    export ADVISOR_INVOCATION_ISSUE_COUNT="$ISSUE_COUNT"
-    export ADVISOR_INVOCATION_IDLE_COUNT="$IDLE_COUNT"
-    export ADVISOR_INVOCATION_IDLE_STUDENTS="$(printf '%s' "$IDLE_JSON" | json_join)"
-    export ADVISOR_INVOCATION_POD_ANOMALY_COUNT="$POD_ANOMALY_COUNT"
 
     START_TS=$(date +%s)
     EXIT_CODE=0
