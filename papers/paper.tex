@@ -292,6 +292,20 @@ To contrast SENPAI's Advisor-mediated loop, we compared the performance of a \te
 \paragraph{Interpretation.}
 In a direct 12-hour head-to-head, \texttt{kagent} behaved like a public Kaggle sprint: agents trained short variants, watched the leaderboard and shared hosted-logger configs, and quickly reused recipes that worked for peers. This fast peer diffusion, including copied hyperparameters and occasional prediction ensembles, likely gave it an exploitation-speed edge over SENPAI's slower PR-mediated review loop. While this was successful in a 12-hour experiment setting, the inability to steer these agents and the less rigorous polling and monitoring infrastructure are likely to lead to drift and context rot as each Claude Code agent's context window fills. However a later external validation potentially contradicts this. A model checkpoint from a 30-hour autonomous \texttt{kagent} run, with a 30 minute per-experiment budget, was submitted to the GRaM ICLR 2026 competition and subsequently ranked 4th of 22 entries on the official held-out leaderboard, with relative-$L_2$ error $0.0553 \pm 0.0168$.
 
+\subsection{Modded-NanoGPT Track 3}
+
+\paragraph{Result.}
+To demonstrate SENPAI's applicability beyond CFD research, we also ran SENPAI on Keller Jordan's modded-NanoGPT Track 3 optimization benchmark \citep{jordan2026moddednanogpttrack3}. Track 3 fixes the dataset, batch size, and architecture, and scores methods by the fewest optimizer steps needed to reach 3.28 validation loss on FineWeb \citep{penedo2024fineweb,karpathy2024llmcgpt2}. Valid submissions must use non-cherry-picked runs, include reproducible logs, avoid validation-loss-based per-run early stopping, and satisfy the benchmark precision rule $(3.28-\mu)\sqrt{n}\ge 0.004$ at a shared stopping point.
+
+We ran five SENPAI trials to measure result consistency and understand the distribution of autonomous search outcomes, rather than to select a single lucky run. The core SENPAI system prompts were kept unchanged from the CFD experiments; only the usual repository-specific task prompts were adapted to the modded-NanoGPT codebase and benchmark rules. We additionally instructed the system not to inspect or reuse Prime Intellect's autonomous nanoGPT speedrun result \citep{primeintellect2026autonanogpt}, since it was itself an autoresearch artifact and we wanted to avoid biasing SENPAI's search trajectory.
+
+Across the five trials, SENPAI ran 9,591 tracked experiments using 9,772 training GPU-hours on NVIDIA RTX PRO 6000 Blackwell 96GB GPUs, or 1,954 GPU-hours per trial on average. Using NVIDIA's published dense BF16/FP16 tensor throughput for RTX PRO 6000 Blackwell and H200 GPUs \citep{nvidia2025rtxpro6000blackwell,nvidia2026h200}, this corresponds to a rough peak-compute upper bound of 17.7 zettaFLOP. Prime Intellect reports roughly 10k runs and 14k H200 GPU-hours for its autonomous nanoGPT speedrun, approximately 49.9 zettaFLOP at dense H200 BF16/FP16 peak. SENPAI therefore used about 36\% of the comparable theoretical peak training compute. These are hardware-peak estimates, not measured realized training FLOPs.
+
+SENPAI produced a candidate Track 3 state-of-the-art result at 2925 steps, pending official ratification. The result is recorded in PR~\#\texttt{<BEST\_RESULT\_PR>}. The two non-cherry-picked confirmation runs reached fixed-step EMA validation losses of 3.27490 and 3.27625 at step 2925, for mean 3.27558 and validation-rule margin $(3.28-3.27558)\sqrt{2}=0.00626$. Both runs later finished with terminal EMA validation losses of 3.26218 and 3.26352. Internally, both first crossed the 3.28 target at step 2875, but we report the 2925-step fixed point as the conservative claim until external validation is complete.
+
+\paragraph{Recipe.}
+\texttt{[WINNING\_RECIPE\_PLACEHOLDER]}
+
 \section{Discussion}
 
 \subsection{Observable State as a Control Surface}
