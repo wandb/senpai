@@ -42,6 +42,7 @@ def args(**overrides):
         "start_gate_path": "",
         "local_run_root": "~/.senpai/runs",
         "local_runner_source": "",
+        "local_container_image": "",
         "local_student_gpu_ids": "",
         "local_skip_install": True,
         "local_disable_hivemind": True,
@@ -81,6 +82,27 @@ class LaunchSpecTests(unittest.TestCase):
 
             self.assertIn("--- Local student-fern ---", output.getvalue())
             self.assertIn("GITHUB_TOKEN='<redacted>'", output.getvalue())
+            self.assertFalse((Path(tmp) / "aws-r1").exists())
+
+    def test_local_container_dry_run_uses_docker_image_and_mounts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_args = args(
+                local_run_root=tmp,
+                local_container_image="vllm/vllm-openai",
+                local_student_gpu_ids="fern:0",
+            )
+            spec = build_student_spec(run_args, "aws-r1", "fern", {"GITHUB_TOKEN": "secret"})
+            output = io.StringIO()
+
+            with redirect_stdout(output):
+                launch_local(run_args, [spec])
+
+            text = output.getvalue()
+            self.assertIn("Container image: vllm/vllm-openai", text)
+            self.assertIn("docker run", text)
+            self.assertIn("--gpus device=0", text)
+            self.assertIn("vllm/vllm-openai", text)
+            self.assertIn("SENPAI_BACKEND='<redacted>'", text)
             self.assertFalse((Path(tmp) / "aws-r1").exists())
 
 

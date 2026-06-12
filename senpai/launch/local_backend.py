@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-PackageName: senpai
 
-"""Local process backend for running Senpai roles on one machine."""
+"""Local backend for running Senpai roles on one machine."""
 
 from __future__ import annotations
 
@@ -13,6 +13,9 @@ import subprocess
 from pathlib import Path
 
 from .specs import RoleSpec
+
+CONTAINER_WORKDIR = "/workspace/senpai"
+CONTAINER_RUN_ROOT = "/senpai-run"
 
 
 def role_command(spec: RoleSpec) -> list[str]:
@@ -37,9 +40,24 @@ def _env_file_text(values: dict[str, str], *, redact: bool = False) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _docker_env_file_text(values: dict[str, str]) -> str:
+    lines = []
+    for key in sorted(values):
+        value = values[key]
+        value = value.replace("\n", "\\n")
+        lines.append(f"{key}={value}")
+    return "\n".join(lines) + "\n"
+
+
 def _write_env_file(path: Path, values: dict[str, str], *, mode: int = 0o644) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_env_file_text(values), encoding="utf-8")
+    path.chmod(mode)
+
+
+def _write_docker_env_file(path: Path, values: dict[str, str], *, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_docker_env_file_text(values), encoding="utf-8")
     path.chmod(mode)
 
 
@@ -54,52 +72,122 @@ def _prepare_runner_workdir(source: Path, workdir: Path) -> None:
     subprocess.run(["git", "clone", str(source), str(workdir)], check=True)
 
 
-def _role_env(args, run_root: Path, spec: RoleSpec, workdir: Path, log_dir: Path) -> dict[str, str]:
-    env = os.environ.copy()
-    env.update(spec.env)
-    env.update({key: value for key, value in spec.secrets.items() if value})
-    env.update(
+def _role_values(
+    args,
+    run_root: Path,
+    spec: RoleSpec,
+    workdir: Path,
+    log_dir: Path,
+    *,
+    containerized: bool = False,
+) -> dict[str, str]:
+    values = dict(spec.env)
+    values.update({key: value for key, value in spec.secrets.items() if value})
+    workdir_value = CONTAINER_WORKDIR if containerized else str(workdir)
+    run_root_value = CONTAINER_RUN_ROOT if containerized else str(run_root)
+    backend = "local-container" if containerized else "local"
+    values.update(
         {
-            "SENPAI_BACKEND": "local",
-            "SENPAI_WORKDIR": str(workdir),
-            "SENPAI_LOGDIR": str(log_dir / spec.key / "iterations"),
-            "SENPAI_GIT_CREDENTIAL_FILE": str(run_root / "secrets" / f"{spec.key}.git-credentials"),
-            "HOME": str(run_root / "home" / spec.key),
+            "SENPAI_BACKEND": backend,
+            "SENPAI_WORKDIR": workdir_value,
+            "SENPAI_LOGDIR": f"{run_root_value}/logs/{spec.key}/iterations",
+            "SENPAI_GIT_CREDENTIAL_FILE": f"{run_root_value}/secrets/{spec.key}.git-credentials",
+            "HOME": f"{run_root_value}/home/{spec.key}",
         }
     )
     if args.local_skip_install:
-        env["SENPAI_SKIP_INSTALL"] = "1"
+        values["SENPAI_SKIP_INSTALL"] = "1"
     if args.local_disable_hivemind:
-        env["SENPAI_DISABLE_HIVEMIND"] = "1"
+        values["SENPAI_DISABLE_HIVEMIND"] = "1"
     if spec.role == "advisor":
-        env["CUDA_VISIBLE_DEVICES"] = ""
+        values["CUDA_VISIBLE_DEVICES"] = ""
     elif args.local_student_gpu_ids:
         gpu_by_student = dict(
             item.split(":", 1)
             for item in args.local_student_gpu_ids.split(",")
             if ":" in item
         )
-        env["CUDA_VISIBLE_DEVICES"] = gpu_by_student.get(spec.name, "")
+        values["CUDA_VISIBLE_DEVICES"] = gpu_by_student.get(spec.name, "")
     elif args.gpus_per_student == 0:
-        env["CUDA_VISIBLE_DEVICES"] = ""
+        values["CUDA_VISIBLE_DEVICES"] = ""
+    return values
+
+
+def _role_env(args, run_root: Path, spec: RoleSpec, workdir: Path, log_dir: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(_role_values(args, run_root, spec, workdir, log_dir))
     return env
+
+
+def _container_name(tag: str, key: str) -> str:
+    safe = "".join(char if char.isalnum() or char in "_.-" else "-" for char in f"senpai-{tag}-{key}")
+    return safe[:128]
+
+
+def _docker_gpu_args(values: dict[str, str]) -> list[str]:
+    devices = values.get("CUDA_VISIBLE_DEVICES", "")
+    if not devices:
+        return []
+    return ["--gpus", f"device={devices}"]
+
+
+def _docker_command(
+    args,
+    run_root: Path,
+    spec: RoleSpec,
+    workdir: Path,
+    env_file: Path,
+    secret_file: Path,
+    values: dict[str, str],
+) -> list[str]:
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        _container_name(args.tag, spec.key),
+        "--workdir",
+        CONTAINER_WORKDIR,
+        "--env-file",
+        str(env_file),
+        "--env-file",
+        str(secret_file),
+        "--volume",
+        f"{workdir}:{CONTAINER_WORKDIR}",
+        "--volume",
+        f"{run_root}:{CONTAINER_RUN_ROOT}",
+    ]
+    command.extend(_docker_gpu_args(values))
+    command.append(args.local_container_image)
+    command.extend(role_command(spec))
+    return command
 
 
 def launch_local(args, role_specs: list[RoleSpec]) -> None:
     run_root = local_run_root(args)
     source = local_runner_source(args)
+    container_image = getattr(args, "local_container_image", "")
     print(f"Local Senpai run: {run_root}")
     print(f"Runner source: {source}")
+    if container_image:
+        print(f"Container image: {container_image}")
 
     if args.dry_run:
         for spec in role_specs:
             workdir = run_root / "workdirs" / spec.key
+            values = _role_values(args, run_root, spec, workdir, run_root / "logs", containerized=bool(container_image))
             print(f"\n--- Local {spec.key} ---")
             print(f"workdir: {workdir}")
             print(f"log:     {run_root / 'logs' / f'{spec.key}.log'}")
             print(f"pid:     {run_root / 'pids' / f'{spec.key}.pid'}")
-            print("command:", " ".join(role_command(spec)))
-            print(_env_file_text({**spec.env, **spec.secrets}, redact=True), end="")
+            if container_image:
+                env_file = run_root / "env" / f"{spec.key}.docker.env"
+                secret_file = run_root / "secrets" / f"{spec.key}.docker.env"
+                docker_command = _docker_command(args, run_root, spec, workdir, env_file, secret_file, values)
+                print("command:", " ".join(shlex.quote(part) for part in docker_command))
+            else:
+                print("command:", " ".join(role_command(spec)))
+            print(_env_file_text(values, redact=True), end="")
         return
 
     run_root.mkdir(parents=True, exist_ok=True)
@@ -118,15 +206,29 @@ def launch_local(args, role_specs: list[RoleSpec]) -> None:
         _prepare_runner_workdir(source, workdir)
         _write_env_file(run_root / "env" / f"{spec.key}.env", spec.env)
         _write_env_file(run_root / "secrets" / f"{spec.key}.env", spec.secrets, mode=0o600)
-        role_env = _role_env(args, run_root, spec, workdir, run_root / "logs")
-        Path(role_env["HOME"]).mkdir(parents=True, exist_ok=True)
-        Path(role_env["SENPAI_LOGDIR"]).mkdir(parents=True, exist_ok=True)
+        values = _role_values(args, run_root, spec, workdir, run_root / "logs", containerized=bool(container_image))
+        Path(run_root / "home" / spec.key).mkdir(parents=True, exist_ok=True)
+        Path(run_root / "logs" / spec.key / "iterations").mkdir(parents=True, exist_ok=True)
+        if container_image:
+            env_file = run_root / "env" / f"{spec.key}.docker.env"
+            secret_file = run_root / "secrets" / f"{spec.key}.docker.env"
+            _write_docker_env_file(env_file, {key: values[key] for key in values if key not in spec.secrets})
+            _write_docker_env_file(
+                secret_file,
+                {key: value for key, value in spec.secrets.items() if value},
+                mode=0o600,
+            )
+            command = _docker_command(args, run_root, spec, workdir, env_file, secret_file, values)
+            env = os.environ.copy()
+        else:
+            command = role_command(spec)
+            env = _role_env(args, run_root, spec, workdir, run_root / "logs")
 
         log = log_file.open("ab")
         process = subprocess.Popen(
-            role_command(spec),
+            command,
             cwd=workdir,
-            env=role_env,
+            env=env,
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,

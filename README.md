@@ -295,6 +295,26 @@ python k8s/launch.py --backend local --tag <tag> --advisor --names fern \
   --gpus_per_student 1 --local_student_gpu_ids fern:0
 ```
 
+To mirror a container runtime on a single node, pass `--local_container_image`.
+The image must contain the Senpai runner tooling required by the entrypoints
+(`bash`, `git`, `uv`, `gh`, Claude/Codex tooling, and the target runtime). The
+backend mounts each role checkout at `/workspace/senpai`, mounts run state at
+`/senpai-run`, and starts the same advisor/student entrypoint scripts through
+`docker run`.
+
+```bash
+python k8s/launch.py --backend local --tag <tag> --advisor --names fern \
+  --gpus_per_student 1 \
+  --local_student_gpu_ids fern:0 \
+  --local_container_image ghcr.io/wandb/senpai:latest
+```
+
+For challenge targets where the official benchmark image matters, build a
+runner image from that benchmark base rather than baking challenge-specific
+defaults into Senpai. For example, the Gemma Challenge benchmark currently uses
+`vllm/vllm-openai` for the HF Job, so an AWS parity runner should be derived
+from `vllm/vllm-openai` and then install the Senpai agent tooling.
+
 For benchmark targets where official compute is external (for example a
 submission that launches HF Jobs), `--gpus_per_student 0` is intentional: the
 student edits code, launches the external job, polls results, and reports back

@@ -90,6 +90,7 @@ class Args:
     start_gate_path: str = ""  # optional shared file path that must exist before advisor/student loops begin
     local_run_root: str = "~/.senpai/runs"  # root directory for local backend run state
     local_runner_source: str = ""  # runner checkout to clone for local roles; default is current directory
+    local_container_image: str = ""  # local backend: run roles through docker with this image; empty = host processes
     local_student_gpu_ids: str = ""  # comma-separated local GPU map, e.g. "fern:0,tanjiro:1"
     local_skip_install: bool = False  # local backend: skip uv install in role entrypoints
     local_disable_hivemind: bool = False  # local backend: do not start the Hivemind sidecar loop
