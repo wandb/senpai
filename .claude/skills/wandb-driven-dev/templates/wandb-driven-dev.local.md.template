@@ -1,0 +1,72 @@
+---
+# wandb-driven-dev project config
+#
+# Copy this file to `.claude/wandb-driven-dev.local.md` in your repo and fill
+# in the values. The `wandb-driven-dev` skill's first-run interview can also
+# generate this for you (`/wandb-driven-dev setup`).
+
+# "entity/project" path on wandb.ai — where every run from this project lands.
+wandb_project: ""
+
+launcher:
+  # Exact project-specific command Codex will copy-paste to start or submit a
+  # training run. This is your repo's launcher, not W&B Launch.
+  # Examples:
+  #   uv run python scripts/train.py
+  #   uv run python k8s/launch.py
+  #   sbatch slurm/train.sh
+  command: ""
+
+  # How does the launcher get the code onto the compute?
+  #   working_tree — runs uncommitted edits as-is from your worktree (local).
+  #   clone        — submitter clones origin/HEAD; needs a clean tree + pushed commit.
+  #   shared_fs    — compute mounts your working tree (e.g. NFS).
+  #   image        — code is baked into a container image, built/pushed before submit.
+  reproduction: working_tree
+
+training:
+  script: ""        # underlying training entrypoint for --help validation, e.g. scripts/train.py
+  config_dir: ""    # dir containing training configs, e.g. configs/
+
+gpus:
+  smoke: 1          # GPU count for short smoke runs (50–200 steps)
+  full: 1           # GPU count for full experiments
+
+metrics:
+  # Wandb keys driving pass/fail. The first one is treated as the headline
+  # metric for sorting result tables.
+  decision: []
+  # Keys watched for divergence / NaN during smoke and review.
+  health: []
+
+curves:
+  # W&B's built-in history x-axis. Keep this default unless the project has a
+  # better semantic step key for specific metrics.
+  default_step_key: _step
+  # Exact metric keys and namespace wildcards are supported.
+  # Examples:
+  #   train/*: train/global_step
+  #   val/*: train/global_step
+  #   stage_4e/*: stage_4e/epoch
+  metric_step_keys: {}
+  # Extra keys for setup_project.py discovery to consider.
+  candidate_step_keys: [_step]
+
+# Project-level W&B metadata discovered during setup.
+# This stores keys and decisions only, never run summaries or metric values.
+wandb_metadata: {}
+---
+
+# Project notes
+
+This section is free-form. Anything you'd want Claude to know about this
+project that doesn't fit the structured schema above. Examples:
+
+- Dataset quirks (e.g. the train split has duplicates that bias accuracy by ~2%).
+- Known-good baseline run IDs to pin against.
+- Naming conventions you already follow (e.g. tags scheme, group conventions).
+- Launcher gotchas (e.g. "always pass `--num_gpus 8` for the full run, the
+  config default is 1").
+- Things that have burned you before.
+
+The agents read this body verbatim as context, so write in plain prose.
