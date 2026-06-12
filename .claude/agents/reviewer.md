@@ -2,7 +2,7 @@
 name: reviewer
 description: "Use this agent in Phase 5 of the wandb-driven-dev workflow to review a completed experiment and draft the ## Result block. The agent reads plan.md, the staged result (if the watcher produced one), pulls fresh wandb summaries, validates that the only config difference between baseline and variant is the named dimension, and proposes a verdict (pass/fail/inconclusive) with key numbers and merge recommendation. Returns the proposed ## Result markdown — DOES NOT auto-write it. The main thread shows it to the user for approval before splicing into plan.md. Examples: <example>context: User typed 'review experiment 20260429-loss-scheme'.\nassistant: 'Delegating to the reviewer agent to draft the verdict.'</example> <example>context: wandb-driven-dev skill Phase 5 invoked after a watcher run.\nassistant: 'Spawning reviewer agent with the slug and worktree path.'</example>"
 tools: Read, Edit, Bash, Glob, Grep
-model: opus
+model: claude-opus-4-8
 color: purple
 ---
 

@@ -4,7 +4,7 @@ description: "Enforce a systematic, reproducible approach to empirical questions
 user-invocable: true
 argument-hint: "[setup | reconfigure | review experiment <slug> | <empty>]"
 allowed-tools: Read, Write, Edit, Bash, Grep, Glob, Agent
-model: opus
+model: claude-opus-4-8
 ---
 
 # Experiment-Driven Development
