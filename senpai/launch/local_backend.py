@@ -18,6 +18,71 @@ CONTAINER_WORKDIR = "/workspace/senpai"
 CONTAINER_RUN_ROOT = "/senpai-run"
 
 
+def _student_gpu_map(raw: str) -> dict[str, list[str]]:
+    gpu_map: dict[str, list[str]] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"invalid --local_student_gpu_ids entry {item!r}; expected name:gpu")
+        name, devices = item.split(":", 1)
+        name = name.strip()
+        device_list = [device.strip() for device in devices.replace("|", "+").split("+") if device.strip()]
+        if not name or not device_list:
+            raise ValueError(f"invalid --local_student_gpu_ids entry {item!r}; expected name:gpu")
+        gpu_map[name] = device_list
+    return gpu_map
+
+
+def _validate_local_gpu_assignments(args, role_specs: list[RoleSpec]) -> None:
+    students = [spec.name for spec in role_specs if spec.role == "student"]
+    gpu_map = _student_gpu_map(args.local_student_gpu_ids)
+    if not students:
+        return
+    if args.gpus_per_student == 0:
+        if gpu_map:
+            raise RuntimeError("--local_student_gpu_ids requires --gpus_per_student greater than 0")
+        return
+    if not gpu_map:
+        raise RuntimeError(
+            "local GPU launches require --local_student_gpu_ids when "
+            "--gpus_per_student is greater than 0"
+        )
+
+    missing = [name for name in students if name not in gpu_map]
+    if missing:
+        raise RuntimeError(
+            "missing GPU assignments for local students: "
+            f"{', '.join(missing)}; pass --local_student_gpu_ids name:gpu"
+        )
+
+    extra = [name for name in gpu_map if name not in students]
+    if extra:
+        raise RuntimeError(f"unknown local GPU assignment students: {', '.join(extra)}")
+
+    wrong_count = {
+        name: devices
+        for name, devices in gpu_map.items()
+        if len(devices) != args.gpus_per_student
+    }
+    if wrong_count:
+        details = ", ".join(f"{name}:{'+'.join(devices)}" for name, devices in wrong_count.items())
+        raise RuntimeError(
+            f"--gpus_per_student={args.gpus_per_student} but assignments have a different count: {details}"
+        )
+
+    owners: dict[str, str] = {}
+    duplicates = []
+    for name, devices in gpu_map.items():
+        for device in devices:
+            if device in owners:
+                duplicates.append(f"{device} assigned to {owners[device]} and {name}")
+            owners[device] = name
+    if duplicates:
+        raise RuntimeError("local GPU assignments must be exclusive: " + "; ".join(duplicates))
+
+
 def role_command(spec: RoleSpec) -> list[str]:
     script = "k8s/entrypoint-advisor.sh" if spec.role == "advisor" else "k8s/entrypoint-student.sh"
     return ["bash", script]
@@ -101,15 +166,11 @@ def _role_values(
         values["SENPAI_DISABLE_HIVEMIND"] = "1"
     if spec.role == "advisor":
         values["CUDA_VISIBLE_DEVICES"] = ""
-    elif args.local_student_gpu_ids:
-        gpu_by_student = dict(
-            item.split(":", 1)
-            for item in args.local_student_gpu_ids.split(",")
-            if ":" in item
-        )
-        values["CUDA_VISIBLE_DEVICES"] = gpu_by_student.get(spec.name, "")
     elif args.gpus_per_student == 0:
         values["CUDA_VISIBLE_DEVICES"] = ""
+    elif args.local_student_gpu_ids:
+        gpu_by_student = _student_gpu_map(args.local_student_gpu_ids)
+        values["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_by_student.get(spec.name, []))
     return values
 
 
@@ -164,6 +225,7 @@ def _docker_command(
 
 
 def launch_local(args, role_specs: list[RoleSpec]) -> None:
+    _validate_local_gpu_assignments(args, role_specs)
     run_root = local_run_root(args)
     source = local_runner_source(args)
     container_image = getattr(args, "local_container_image", "")

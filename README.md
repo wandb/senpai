@@ -259,6 +259,11 @@ backend. It reuses the same advisor/student GitHub PR protocol, but starts each
 role as a supervised local process under `~/.senpai/runs/<tag>/` instead of
 creating Kubernetes Deployments.
 
+For GPU-backed local research, give every active student an explicit and
+exclusive GPU assignment. A one-GPU A10G node can run one GPU-backed student at
+a time; use a larger multi-GPU instance before launching multiple GPU-backed
+students concurrently.
+
 ```bash
 python k8s/launch.py \
   --backend local \
@@ -268,7 +273,8 @@ python k8s/launch.py \
   --target_repo_branch main \
   --advisor_branch <advisor-branch> \
   --names fern \
-  --gpus_per_student 0 \
+  --gpus_per_student 1 \
+  --local_student_gpu_ids fern:0 \
   --poll_interval_s 30 \
   --poll_jitter_s 5 \
   --local_disable_hivemind \
@@ -287,8 +293,9 @@ Remove `--dry_run` to start the processes. Runtime state lands in:
 └── workdirs/  # one runner checkout per role
 ```
 
-Map a local GPU to a student only when the target actually needs local GPU
-work:
+The launcher fails fast if `--gpus_per_student` is greater than zero and any
+student is missing from `--local_student_gpu_ids`, or if two students are mapped
+to the same GPU.
 
 ```bash
 python k8s/launch.py --backend local --tag <tag> --advisor --names fern \
@@ -296,10 +303,16 @@ python k8s/launch.py --backend local --tag <tag> --advisor --names fern \
 ```
 
 To mirror a container runtime on a single node, pass `--local_container_image`.
-The image must contain the Senpai runner tooling required by the entrypoints
-(`bash`, `git`, `uv`, `gh`, Claude/Codex tooling, and the target runtime). The
-backend mounts each role checkout at `/workspace/senpai`, mounts run state at
-`/senpai-run`, and starts the same advisor/student entrypoint scripts through
+There are two image concerns:
+
+- The Senpai runner image must contain the agent/runtime tooling required by
+  the entrypoints (`bash`, `git`, `uv`, `gh`, Claude/Codex tooling, and the
+  target runtime).
+- The benchmark or submission image should match the official challenge
+  environment when parity matters.
+
+The backend mounts each role checkout at `/workspace/senpai`, mounts run state
+at `/senpai-run`, and starts the same advisor/student entrypoint scripts through
 `docker run`.
 
 ```bash
@@ -316,9 +329,9 @@ defaults into Senpai. For example, the Gemma Challenge benchmark currently uses
 from `vllm/vllm-openai` and then install the Senpai agent tooling.
 
 For benchmark targets where official compute is external (for example a
-submission that launches HF Jobs), `--gpus_per_student 0` is intentional: the
-student edits code, launches the external job, polls results, and reports back
-without reserving the local A10G.
+submission that only launches HF Jobs), `--gpus_per_student 0` can be used for
+CPU-only orchestration. Do not use that mode for local GPU profiling or
+benchmark smoke tests; those students should get explicit GPU assignments.
 
 ## Adding a new problem
 

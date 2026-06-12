@@ -90,6 +90,7 @@ class LaunchSpecTests(unittest.TestCase):
             run_args = args(
                 local_run_root=tmp,
                 local_container_image="vllm/vllm-openai",
+                gpus_per_student=1,
                 local_student_gpu_ids="fern:0",
             )
             spec = build_student_spec(run_args, "aws-r1", "fern", {"GITHUB_TOKEN": "secret"})
@@ -105,6 +106,37 @@ class LaunchSpecTests(unittest.TestCase):
             self.assertIn("vllm/vllm-openai", text)
             self.assertIn("SENPAI_BACKEND='<redacted>'", text)
             self.assertFalse((Path(tmp) / "aws-r1").exists())
+
+    def test_local_gpu_students_require_explicit_map(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_args = args(local_run_root=tmp, gpus_per_student=1)
+            spec = build_student_spec(run_args, "aws-r1", "fern", {})
+
+            with self.assertRaisesRegex(RuntimeError, "local_student_gpu_ids"):
+                launch_local(run_args, [spec])
+
+    def test_local_gpu_map_requires_gpu_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_args = args(local_run_root=tmp, local_student_gpu_ids="fern:0")
+            spec = build_student_spec(run_args, "aws-r1", "fern", {})
+
+            with self.assertRaisesRegex(RuntimeError, "gpus_per_student"):
+                launch_local(run_args, [spec])
+
+    def test_local_gpu_assignments_must_be_exclusive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_args = args(
+                local_run_root=tmp,
+                gpus_per_student=1,
+                local_student_gpu_ids="fern:0,tanjiro:0",
+            )
+            specs = [
+                build_student_spec(run_args, "aws-r1", "fern", {}),
+                build_student_spec(run_args, "aws-r1", "tanjiro", {}),
+            ]
+
+            with self.assertRaisesRegex(RuntimeError, "exclusive"):
+                launch_local(run_args, specs)
 
 
 if __name__ == "__main__":
