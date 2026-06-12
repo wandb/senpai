@@ -187,12 +187,13 @@ def main():
     if target_repo_slug(args.target_repo_url) == target_repo_slug(args.repo_url):
         sys.exit("ERROR: --target_repo_url must be a different repo from --repo_url")
 
-    github_token = anthropic_api_key = exa_api_key = wandb_api_key = ""
+    github_token = anthropic_api_key = exa_api_key = wandb_api_key = hf_token = ""
     if not args.dry_run or args.preflight_only:
         github_token = resolve_github_token(DOTENV_PATH)
         anthropic_api_key = resolve_anthropic_api_key(DOTENV_PATH)
         exa_api_key = resolve_exa_api_key(DOTENV_PATH)
         wandb_api_key = resolve_optional_secret(DOTENV_PATH, "WANDB_API_KEY")
+        hf_token = resolve_optional_secret(DOTENV_PATH, "HF_TOKEN")
         preflight_check_target_repo_access(args.target_repo_url, github_token)
         args.target_repo_branch = preflight_check_target_repo_branch(
             args.target_repo_url,
@@ -227,6 +228,7 @@ def main():
         "ANTHROPIC_API_KEY": anthropic_api_key,
         "EXA_API_KEY": exa_api_key,
         "WANDB_API_KEY": wandb_api_key,
+        "HF_TOKEN": hf_token,
     }
 
     if args.backend == "local":

@@ -74,7 +74,7 @@ class LaunchSpecTests(unittest.TestCase):
     def test_local_dry_run_does_not_create_run_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_args = args(local_run_root=tmp)
-            spec = build_student_spec(run_args, "aws-r1", "fern", {"GITHUB_TOKEN": "secret"})
+            spec = build_student_spec(run_args, "aws-r1", "fern", {"GITHUB_TOKEN": "secret", "HF_TOKEN": "hf-secret"})
             output = io.StringIO()
 
             with redirect_stdout(output):
@@ -82,6 +82,7 @@ class LaunchSpecTests(unittest.TestCase):
 
             self.assertIn("--- Local student-fern ---", output.getvalue())
             self.assertIn("GITHUB_TOKEN='<redacted>'", output.getvalue())
+            self.assertIn("HF_TOKEN='<redacted>'", output.getvalue())
             self.assertFalse((Path(tmp) / "aws-r1").exists())
 
     def test_local_container_dry_run_uses_docker_image_and_mounts(self):
