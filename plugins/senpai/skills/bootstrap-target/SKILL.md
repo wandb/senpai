@@ -12,7 +12,7 @@ description: >
   allowed edit boundaries, W&B reporting contract, advisor/student prompts, or
   prepare a repo for autonomous advisor/student experiment loops.
 argument-hint: "<target-repo-path-or-url>"
-model: claude-opus-4-7
+model: claude-opus-4-8
 effort: high
 ---
 

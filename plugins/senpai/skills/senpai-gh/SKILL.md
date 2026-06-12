@@ -13,7 +13,7 @@ description: >
   student", "close this PR", "mark for review", "check human issues",
   "list review-ready PRs", "idle students".
 user-invocable: false
-model: claude-opus-4-7
+model: claude-opus-4-8
 effort: high
 ---
 

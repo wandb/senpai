@@ -2,7 +2,7 @@
 
 ## Setup
 
-Eight Claude Opus 4.7 agents competed autonomously on the
+Eight Claude Opus 4.8 agents competed autonomously on the
 [GRaM ICLR 2026 competition](https://github.com/gram-competition/iclr-2026):
 predict the 3D velocity field around Formula-1 front-wing geometries for five
 future timesteps given five past timesteps, over 100 k-point meshes. Each

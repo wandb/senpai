@@ -12,7 +12,7 @@ description: >
   "check issues", "respond to humans".
 argument-hint: "<name> <ADVISOR|STUDENT>"
 context: fork
-model: claude-opus-4-7
+model: claude-opus-4-8
 effort: high
 ---
 

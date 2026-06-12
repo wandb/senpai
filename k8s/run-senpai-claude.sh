@@ -12,7 +12,7 @@ run_senpai_claude() {
     shift 2
     export CLAUDE_PLUGIN_ROOT="$SENPAI_PLUGIN"
     local claude_cmd=(claude "$@" -p -
-        --model "claude-opus-4-7[1m]"
+        --model "claude-opus-4-8[1m]"
         --effort "max"
         --max-turns "$max_turns"
         --output-format stream-json --verbose
