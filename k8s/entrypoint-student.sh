@@ -7,12 +7,12 @@
 set -e
 set -o pipefail
 
-WORKDIR="/workspace/senpai"
+WORKDIR="${SENPAI_WORKDIR:-/workspace/senpai}"
 GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 TARGET_REPO_BRANCH="${TARGET_REPO_BRANCH:-}"
 export SENPAI_ROLE="student"
 export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
-GIT_CREDENTIAL_FILE="$WORKDIR/.git-credentials"
+GIT_CREDENTIAL_FILE="${SENPAI_GIT_CREDENTIAL_FILE:-$WORKDIR/.git-credentials}"
 SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 
 echo "=== Senpai Student: $STUDENT_NAME ==="
@@ -45,7 +45,13 @@ clone_target_repo() {
 [ -d "$PROBLEM_DIR/.git" ] || clone_target_repo
 git config --global --unset-all credential.helper 2>/dev/null || true
 
-uv pip install --system -e .
+if [ "${SENPAI_SKIP_INSTALL:-0}" != "1" ]; then
+    if [ -n "${VIRTUAL_ENV:-}" ]; then
+        uv pip install -e .
+    else
+        uv pip install --system -e .
+    fi
+fi
 
 # --- Git identity for commits (inside the problem-package repo) ---
 cd "$WORKDIR/$PROBLEM_DIR"
@@ -68,7 +74,9 @@ ls "$HOME/.claude/skills/wandb-primary/SKILL.md" "$HOME/.claude/agents/researche
 
 # --- Start Hivemind (streams CC session logs to hivemind.wandb.tools) ---
 source "$WORKDIR/k8s/start-hivemind.sh"
-start_hivemind
+if [ "${SENPAI_DISABLE_HIVEMIND:-0}" != "1" ]; then
+    start_hivemind
+fi
 
 # --- Load CC run command helper function ---
 source "$WORKDIR/k8s/run-senpai-claude.sh"
@@ -99,7 +107,7 @@ HEARTBEAT_PROMPT="Continue your student loop using the assigned PRs and GitHub i
 # --- Launch Claude Code Loop ---
 export IS_SANDBOX=1
 
-LOGDIR="$WORKDIR/student_logs"
+LOGDIR="${SENPAI_LOGDIR:-$WORKDIR/student_logs}"
 mkdir -p "$LOGDIR"
 SLEEP_TIME_S="${SENPAI_STUDENT_POLL_INTERVAL_S:-${SENPAI_POLL_INTERVAL_S:-600}}"
 POLL_JITTER_S="${SENPAI_STUDENT_POLL_JITTER_S:-${SENPAI_POLL_JITTER_S:-120}}"

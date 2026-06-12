@@ -228,6 +228,14 @@ def resolve_required_secret(dotenv_path: Path, env_name: str, label: str) -> str
     sys.exit(f"ERROR: no {label}. Set ${env_name} in your shell or add {env_name}=<key> to .env.")
 
 
+def resolve_optional_secret(dotenv_path: Path, env_name: str) -> str:
+    """Resolve an optional secret from the shell env, then .env."""
+    value = os.environ.get(env_name, "").strip()
+    if not value:
+        value = _dotenv_values(dotenv_path).get(env_name, "").strip()
+    return value
+
+
 def resolve_github_token(dotenv_path: Path) -> str:
     """Resolve the GitHub token: $GITHUB_TOKEN → .env → `gh auth token` → hard error."""
     tok = os.environ.get("GITHUB_TOKEN", "").strip()

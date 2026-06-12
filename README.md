@@ -252,6 +252,54 @@ python k8s/launch.py --tag <tag-b> --advisor --student_prefix b
 kubectl delete deployments,configmaps,secrets -l research-tag=<research-tag>
 ```
 
+### Local / single-node launch
+
+For a single AWS GPU node or a CPU-only orchestration box, use the local
+backend. It reuses the same advisor/student GitHub PR protocol, but starts each
+role as a supervised local process under `~/.senpai/runs/<tag>/` instead of
+creating Kubernetes Deployments.
+
+```bash
+python k8s/launch.py \
+  --backend local \
+  --tag <research-tag> \
+  --advisor \
+  --target_repo_url https://github.com/<org>/<problem-repo>.git \
+  --target_repo_branch main \
+  --advisor_branch <advisor-branch> \
+  --names fern \
+  --gpus_per_student 0 \
+  --poll_interval_s 30 \
+  --poll_jitter_s 5 \
+  --local_disable_hivemind \
+  --dry_run
+```
+
+Remove `--dry_run` to start the processes. Runtime state lands in:
+
+```text
+~/.senpai/runs/<research-tag>/
+├── env/       # non-secret role env files
+├── home/      # per-role HOME directories
+├── logs/      # process logs and Claude iteration logs
+├── pids/      # role pid files
+├── secrets/   # chmod 600 secret env and git credential files
+└── workdirs/  # one runner checkout per role
+```
+
+Map a local GPU to a student only when the target actually needs local GPU
+work:
+
+```bash
+python k8s/launch.py --backend local --tag <tag> --advisor --names fern \
+  --gpus_per_student 1 --local_student_gpu_ids fern:0
+```
+
+For benchmark targets where official compute is external (for example a
+submission that launches HF Jobs), `--gpus_per_student 0` is intentional: the
+student edits code, launches the external job, polls results, and reports back
+without reserving the local A10G.
+
 ## Adding a new problem
 
 Use the `senpai:bootstrap-target <target-repo-path-or-url>` skill to onboard any ML or research target repository.
