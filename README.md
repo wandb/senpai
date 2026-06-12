@@ -97,7 +97,7 @@ target_repo_branch: main
 advisor_branch: schmidhuber
 gh_history_scope: branch
 human_issues: true
-image: ghcr.io/wandb/senpai:latest
+image: ghcr.io/wandb/senpai:gemma-vllm
 pvc_claim_name: new-pvc
 pvc_mount_path: /mnt/new-pvc
 wandb_entity: wandb-applied-ai-team
@@ -158,7 +158,19 @@ python k8s/launch.py \
 
 ### Image rebuilds
 
-The published runner image is `ghcr.io/wandb/senpai:latest`. It is built by `.github/workflows/build.yaml` on pushes to `main` or `docker` when `Dockerfile`, `pyproject.toml`, or the workflow changes. It can also be rebuilt manually from the GitHub Actions `workflow_dispatch` button.
+The generic runner image is `ghcr.io/wandb/senpai:latest`. The Gemma challenge
+runner image is `ghcr.io/wandb/senpai:gemma-vllm`, built from the official
+benchmark base `vllm/vllm-openai` plus the Senpai agent tooling. The generic
+image is built by `.github/workflows/build.yaml`; the Gemma tag is the default
+image on this AWS-compatible branch and can be built with the helper script
+below.
+
+Build the Gemma runner locally or on the AWS node:
+
+```bash
+scripts/build_gemma_runner_image.sh
+PUSH=true scripts/build_gemma_runner_image.sh
+```
 
 ### Launch credentials
 
@@ -319,14 +331,21 @@ at `/senpai-run`, and starts the same advisor/student entrypoint scripts through
 python k8s/launch.py --backend local --tag <tag> --advisor --names fern \
   --gpus_per_student 1 \
   --local_student_gpu_ids fern:0 \
-  --local_container_image ghcr.io/wandb/senpai:latest
+  --local_container_image ghcr.io/wandb/senpai:gemma-vllm
 ```
 
-For challenge targets where the official benchmark image matters, build a
-runner image from that benchmark base rather than baking challenge-specific
-defaults into Senpai. For example, the Gemma Challenge benchmark currently uses
-`vllm/vllm-openai` for the HF Job, so an AWS parity runner should be derived
-from `vllm/vllm-openai` and then install the Senpai agent tooling.
+For challenge targets where the official benchmark image matters, use a runner
+image derived from that benchmark base rather than the raw benchmark image. For
+example, the Gemma Challenge benchmark currently uses `vllm/vllm-openai` for
+the HF Job; `ghcr.io/wandb/senpai:gemma-vllm` is the corresponding Senpai
+runner image derived from that base with agent tooling installed.
+
+Challenge submissions do not select their own outer HF Job image through
+`manifest.json`. The official harness mounts the submission, installs
+`manifest.json` dependencies into `/tmp/server-venv`, starts `serve.py`, and
+runs the benchmark inside the harness-selected job image. Ship extra runtime
+needs as manifest dependencies, local wheels, patched packages, kernels, or
+model artifacts in the submission prefix.
 
 For benchmark targets where official compute is external (for example a
 submission that only launches HF Jobs), `--gpus_per_student 0` can be used for

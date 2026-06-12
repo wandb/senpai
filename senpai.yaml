@@ -17,7 +17,8 @@ repo_branch: main
 target_repo_branch: ""
 
 # docker image
-image: ghcr.io/wandb/senpai:latest
+# Gemma challenge runner: HF benchmark base image plus Senpai agent tooling.
+image: ghcr.io/wandb/senpai:gemma-vllm
 
 # dataset PVC mount
 pvc_claim_name: new-pvc

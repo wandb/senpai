@@ -1,8 +1,11 @@
-FROM ghcr.io/coreweave/ml-containers/torch-extras:c0f5966-base-cuda13.2.0-ubuntu22.04-torch2.11.0-vision0.26.0-audio2.11.0-abi1
+ARG BASE_IMAGE=ghcr.io/coreweave/ml-containers/torch-extras:c0f5966-base-cuda13.2.0-ubuntu22.04-torch2.11.0-vision0.26.0-audio2.11.0-abi1
+FROM ${BASE_IMAGE}
 
 # Install Node.js 22 + yq
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y nodejs netcat-openbsd gettext-base && rm -rf /var/lib/apt/lists/* && \
+RUN apt-get update && \
+    apt-get install -y ca-certificates curl gettext-base git gnupg netcat-openbsd openssh-client && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y nodejs && rm -rf /var/lib/apt/lists/* && \
     curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq && \
     chmod +x /usr/local/bin/yq
 
@@ -47,5 +50,10 @@ EOF
 
 # Add local bin to PATH
 ENV PATH="/root/.local/bin:${PATH}"
+
+# Runner commands should execute directly even when a base image defines a
+# model-server entrypoint.
+ENTRYPOINT []
+CMD ["/bin/bash"]
 
 WORKDIR /workspaces

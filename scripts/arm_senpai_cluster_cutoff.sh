@@ -24,7 +24,7 @@ HARVEST_LEAD_SECONDS="900"
 PVC_CLAIM_NAME="new-pvc"
 PVC_MOUNT_PATH="/mnt/new-pvc"
 PVC_LOG_ROOT="/mnt/new-pvc/senpai-conversation-logs"
-IMAGE="ghcr.io/wandb/senpai:latest"
+IMAGE="ghcr.io/wandb/senpai:gemma-vllm"
 MAX_PARALLEL_COPIES="16"
 START_GATE_PATH=""
 START_LOCAL_PULL="true"
@@ -45,7 +45,7 @@ Options:
   --pvc-claim NAME            PVC claim mounted into cutoff job (default: new-pvc)
   --pvc-mount-path PATH       Mount path inside cutoff job (default: /mnt/new-pvc)
   --pvc-log-root PATH         PVC output root (default: /mnt/new-pvc/senpai-conversation-logs)
-  --image IMAGE               Image containing bash, python, tar, and kubectl (default: ghcr.io/wandb/senpai:latest)
+  --image IMAGE               Image containing bash, python, tar, and kubectl (default: ghcr.io/wandb/senpai:gemma-vllm)
   --max-parallel-copies N     Concurrent pod log tar streams during harvest (default: 16)
   --start-gate-path PATH      Write this file after all pods are Ready, releasing gated pods
   --no-local-pull             Do not start the best-effort local PVC mirror process
