@@ -71,10 +71,9 @@ if [ "$GH_HISTORY_SCOPE" != "repo" ]; then
 fi
 
 # A restarted student may resume from an assignment branch left in the mounted
-# workdir. Build the role prompt from the current advisor branch so instruction
-# updates take effect before the student checks out assigned work in the loop.
-git fetch origin "$ADVISOR_BRANCH"
-git checkout -B "$ADVISOR_BRANCH" "origin/$ADVISOR_BRANCH"
+# workdir, possibly with uncommitted experiment files. Refresh the advisor ref
+# and render role instructions from that ref without touching the worktree.
+git fetch origin "$ADVISOR_BRANCH:refs/remotes/origin/$ADVISOR_BRANCH"
 
 # --- Install checked-in Claude Code config into user scope ---
 mkdir -p "$HOME/.claude"
@@ -103,7 +102,7 @@ source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 # regardless of the agent's cwd.
 
 # --- Build prompts (CC auto-discovers CLAUDE.md for role instructions) ---
-TASK_INSTRUCTIONS="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
+TASK_INSTRUCTIONS="$(git show "origin/$ADVISOR_BRANCH:instructions/prompt-student.md" | envsubst | sed '/^<!--$/,/^-->$/d')"
 PROMPT="${TASK_INSTRUCTIONS}"
 
 if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
