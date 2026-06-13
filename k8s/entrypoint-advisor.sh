@@ -23,6 +23,10 @@ echo "Tag:          $RESEARCH_TAG"
 echo "Students:     $STUDENT_NAMES"
 echo "GitHub history: $GH_HISTORY_SCOPE"
 
+# Trust the mounted runner checkout before sourcing helper scripts. Docker bind
+# mounts often have host UID ownership that Git treats as suspicious.
+git config --global --add safe.directory "$WORKDIR" || true
+
 source "$WORKDIR/k8s/wait-senpai-start-gate.sh"
 wait_for_senpai_start_gate
 
@@ -78,6 +82,7 @@ if [ ! -d "$PROBLEM_DIR/.git" ] && ! clone_target_repo; then
     cd "$WORKDIR"
 fi
 git config --global --unset-all credential.helper 2>/dev/null || true
+git config --global --add safe.directory "$TARGET_WORKDIR" || true
 
 if [ "${SENPAI_SKIP_INSTALL:-0}" != "1" ]; then
     if [ -n "${VIRTUAL_ENV:-}" ]; then

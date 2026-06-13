@@ -9,10 +9,12 @@ set -euo pipefail
 
 IMAGE="${IMAGE:-ghcr.io/wandb/senpai:gemma-vllm}"
 BASE_IMAGE="${BASE_IMAGE:-vllm/vllm-openai}"
+DOCKERFILE="${DOCKERFILE:-Dockerfile.gemma-vllm}"
 PUSH="${PUSH:-false}"
 
 docker build \
   --pull \
+  -f "${DOCKERFILE}" \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
   -t "${IMAGE}" \
   .

@@ -398,12 +398,9 @@ def preflight_check_target_repo_access(target_repo_url: str, token: str) -> None
             )
 
     perms = gh_api(f"/repos/{slug}").get("permissions", {})
-    if seen_scopes and not ({"read:org", "admin:org"} & seen_scopes):
-        sys.exit(
-            "ERROR: github token is missing read:org scope.\n"
-            "  Fix: create a PAT with repo + read:org and put it in .env as GITHUB_TOKEN."
-        )
     if perms.get("push"):
+        if seen_scopes and not ({"read:org", "admin:org"} & seen_scopes):
+            print("  Note — token does not advertise read:org; continuing because repo push access is verified")
         print(f"  OK — token has push access to {slug}")
         return
 
