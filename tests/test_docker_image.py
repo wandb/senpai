@@ -17,7 +17,7 @@ import weave
 from weave.trace.weave_client import CallsFilter
 
 ENTITY = "wandb-applied-ai-team"
-PROJECT = "senpai-v1"
+PROJECT = "gemma-challenge-senpai"
 POD_NAME = "senpai-image-test"
 IMAGE = "ghcr.io/wandb/senpai:gemma-vllm"
 REPO_URL = "https://github.com/wandb/senpai.git"

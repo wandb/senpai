@@ -26,7 +26,7 @@ pvc_mount_path: /mnt/new-pvc
 
 # W&B
 wandb_entity: wandb-applied-ai-team
-wandb_project: senpai-v1
+wandb_project: gemma-challenge-senpai
 
 # advisor — the integration branch inside the problem-package repo that advisor PRs merge into
 advisor_branch: schmidhuber

@@ -24,7 +24,7 @@ An **advisor** pod creates experiment PRs and assigns them to **student** GPU po
 
 ![val/loss over time](animated_chart.gif)
 
-[W&B Dashboard](https://wandb.ai/wandb-applied-ai-team/senpai-v1)
+[W&B Dashboard](https://wandb.ai/wandb-applied-ai-team/gemma-challenge-senpai)
 
 ## Architecture
 
@@ -101,7 +101,7 @@ image: ghcr.io/wandb/senpai:gemma-vllm
 pvc_claim_name: new-pvc
 pvc_mount_path: /mnt/new-pvc
 wandb_entity: wandb-applied-ai-team
-wandb_project: senpai-v1
+wandb_project: gemma-challenge-senpai
 timeout_minutes: 30.0
 max_epochs: 50
 poll_interval_s: 600

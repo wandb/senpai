@@ -66,7 +66,7 @@ class Args:
     repo_branch: str = "main"  # git branch to clone (senpai runner)
     image: str = "ghcr.io/wandb/senpai:gemma-vllm"  # container image for students
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
-    wandb_project: str = "senpai-v1"  # W&B project name
+    wandb_project: str = "gemma-challenge-senpai"  # W&B project name
     human_issues: bool = True  # allow human GitHub issue triage; disable for isolated launches
     advisor_branch: str = "schmidhuber"  # branch the advisor works on inside the problem-package repo (students PR into it; created from target_repo_branch if missing)
     gh_history_scope: str = "branch"  # branch=normal track memory, fresh=clean ablation, repo=whole-repo memory
