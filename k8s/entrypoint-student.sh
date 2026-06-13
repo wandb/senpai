@@ -22,6 +22,10 @@ echo "Problem dir:  $PROBLEM_DIR"
 echo "GitHub history: $GH_HISTORY_SCOPE"
 echo "GPUs:         $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l) x $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
 
+# Trust the mounted runner checkout before sourcing helper scripts. Docker bind
+# mounts often have host UID ownership that Git treats as suspicious.
+git config --global --add safe.directory "$WORKDIR" || true
+
 source "$WORKDIR/k8s/wait-senpai-start-gate.sh"
 wait_for_senpai_start_gate
 
@@ -44,6 +48,7 @@ clone_target_repo() {
 # agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
 [ -d "$PROBLEM_DIR/.git" ] || clone_target_repo
 git config --global --unset-all credential.helper 2>/dev/null || true
+git config --global --add safe.directory "$TARGET_WORKDIR" || true
 
 if [ "${SENPAI_SKIP_INSTALL:-0}" != "1" ]; then
     if [ -n "${VIRTUAL_ENV:-}" ]; then
