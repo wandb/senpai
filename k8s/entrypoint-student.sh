@@ -70,6 +70,12 @@ if [ "$GH_HISTORY_SCOPE" != "repo" ]; then
     git config remote.origin.tagOpt --no-tags
 fi
 
+# A restarted student may resume from an assignment branch left in the mounted
+# workdir. Build the role prompt from the current advisor branch so instruction
+# updates take effect before the student checks out assigned work in the loop.
+git fetch origin "$ADVISOR_BRANCH"
+git checkout -B "$ADVISOR_BRANCH" "origin/$ADVISOR_BRANCH"
+
 # --- Install checked-in Claude Code config into user scope ---
 mkdir -p "$HOME/.claude"
 cp -a "$WORKDIR/.claude/." "$HOME/.claude/"

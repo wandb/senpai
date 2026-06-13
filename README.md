@@ -159,8 +159,11 @@ python k8s/launch.py \
 ### Image rebuilds
 
 The generic runner image is `ghcr.io/wandb/senpai:latest`. The Gemma challenge
-runner image is `ghcr.io/wandb/senpai:gemma-vllm`, built from the official
-benchmark base `vllm/vllm-openai` plus the Senpai agent tooling. The generic
+runner image is `ghcr.io/wandb/senpai:gemma-vllm`, built with
+`Dockerfile.gemma-vllm` from the official benchmark base `vllm/vllm-openai` plus
+the Senpai agent tooling. The Gemma image deliberately avoids installing the
+generic Senpai Python dependency set into the base image, so it does not upgrade
+the vLLM image's Torch/CUDA stack underneath the competition runtime. The generic
 image is built by `.github/workflows/build.yaml`; the Gemma tag is the default
 image on this AWS-compatible branch and can be built with the helper script
 below.

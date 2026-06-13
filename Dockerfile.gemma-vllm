@@ -1,0 +1,46 @@
+ARG BASE_IMAGE=vllm/vllm-openai
+FROM ${BASE_IMAGE}
+
+# Keep the official vLLM runtime intact. This image adds only the tooling Senpai
+# agents need to operate inside the same base image used by the HF benchmark.
+RUN apt-get update && \
+    apt-get install -y ca-certificates curl gettext-base git gnupg netcat-openbsd openssh-client && \
+    curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
+    apt-get install -y nodejs && rm -rf /var/lib/apt/lists/* && \
+    curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq && \
+    chmod +x /usr/local/bin/yq
+
+RUN curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+      -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
+
+RUN pip install --no-cache-dir --upgrade uv
+RUN ln -sf "$(command -v python3)" /usr/local/bin/python
+
+RUN curl -fsSL https://claude.ai/install.sh | bash || true && \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null && \
+    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli-stable.list > /dev/null && \
+    apt-get update && apt-get install -y gh && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g weave-claude-plugin@latest && \
+    (sed -i "s/const INACTIVITY_TIMEOUT_MS = 10 \* 60 \* 1_000;/const INACTIVITY_TIMEOUT_MS = 12 * 60 * 60 * 1_000;/" \
+      "$(npm root -g)/weave-claude-plugin/dist/daemon.js" || true)
+
+RUN mkdir -p /root/.weave_claude_plugin/logs && \
+    cat > /root/.weave_claude_plugin/settings.json <<'EOF'
+{
+  "log_file": "/root/.weave_claude_plugin/logs/daemon.log",
+  "weave_project": null,
+  "wandb_api_key": null,
+  "debug": false,
+  "version": "0.1.0",
+  "daemon_socket": "/root/.weave_claude_plugin/daemon.sock"
+}
+EOF
+
+ENV PATH="/root/.local/bin:${PATH}"
+
+ENTRYPOINT []
+CMD ["/bin/bash"]
+
+WORKDIR /workspaces
