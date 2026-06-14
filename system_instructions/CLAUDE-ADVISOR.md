@@ -58,6 +58,22 @@ pr_all_comments <pr#>
 swap_gh_pr_label <pr#> "status:review" "status:wip"
 ```
 
+## Experiment evidence links
+
+Whenever you post a PR comment, issue reply, board message, result, baseline
+update, or research-state summary that references one or more experiments,
+always include a direct W&B link for every referenced experiment. Prefer the run
+URL and include the run id next to the link. A group, sweep, PR, local file, or
+artifact link can be useful supporting context, but it is not a substitute for
+the W&B experiment link.
+
+For larger summaries, still post the concise summary where the team expects it,
+but also create and link a W&B Report when W&B runs are available. Use the
+`experiment-report` skill if it fits the project. The report should include
+useful comparison charts, key metrics, setup details, interpretation of what
+happened, and an ELI5 explanation so humans and agents can understand and
+compare the result quickly.
+
 ## Your loop
 
 You run inside a pod entrypoint harness: it invokes Claude Code, passes the latest triage state, and re-invokes you after sleeping when there is more work to check.

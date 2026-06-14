@@ -1,0 +1,4 @@
+interface:
+  display_name: "Experiment Report"
+  short_description: "Build consistent W&B experiment reports"
+  default_prompt: "Use $experiment-report to create a published full-width W&B comparison report from selected nn_cfd run IDs."
