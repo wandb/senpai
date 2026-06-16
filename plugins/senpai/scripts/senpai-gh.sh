@@ -586,33 +586,237 @@ rest_base_pull_details() {
     printf '%s' "$pulls" | rest_pull_details_from_numbers
 }
 
-student_pr_looks_live() {
-    local student="$1" head_ref="$2" tag="${RESEARCH_TAG:-}"
-    local pod
-    [ -n "$student" ] && [ -n "$head_ref" ] && [ -n "$tag" ] || return 1
-    command -v kubectl >/dev/null 2>&1 || return 1
+senpai_student_key() {
+    printf 'student-%s\n' "$1"
+}
+
+senpai_run_root() {
+    local logdir="${SENPAI_LOGDIR:-}" root
+    if [ -n "${SENPAI_RUN_ROOT:-}" ]; then
+        printf '%s\n' "$SENPAI_RUN_ROOT"
+        return
+    fi
+    if [ -n "$logdir" ]; then
+        root=$(dirname "$(dirname "$(dirname "${logdir%/}")")")
+        printf '%s\n' "$root"
+        return
+    fi
+    [ -d /senpai-run ] && printf '/senpai-run\n'
+}
+
+senpai_container_name() {
+    local tag="$1" key="$2"
+    printf 'senpai-%s-%s' "$tag" "$key" | tr -c '[:alnum:]_.-' '-' | cut -c1-128
+}
+
+senpai_count_processes() {
+    ps -eo comm=,args= | awk -v train_re="$SENPAI_TRAIN_SCRIPT_RE" '
+        $1 ~ /^(python[0-9.]*|torchrun|pt_elastic)$/ && $0 ~ train_re { train++ }
+        $1 ~ /^claude$/ || /[ /]claude( |$)/ { claude++ }
+        END { printf "%d\t%d", claude + 0, train + 0 }
+    '
+}
+
+senpai_count_gpu_processes() {
+    { nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null || true; } |
+        awk 'NF { n++ } END { print n + 0 }'
+}
+
+senpai_worker_activity_command() {
+    cat <<'EOF'
+        ps -eo comm=,args= | awk -v train_re="$1" '
+            $1 ~ /^(python[0-9.]*|torchrun|pt_elastic)$/ && $0 ~ train_re { train++ }
+            $1 ~ /^claude$/ || /[ /]claude( |$)/ { claude++ }
+            END { printf "%d\t%d\t", claude + 0, train + 0 }
+        '
+        nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null |
+            awk 'NF { n++ } END { print n + 0 }'
+EOF
+}
+
+senpai_heartbeat_fields() {
+    local line="$1" at="" epoch="" now age="missing"
+    if [ -n "$line" ]; then
+        at=$(printf '%s\n' "$line" | sed -n 's/^.*(\(.*\)).*$/\1/p')
+        if [ -n "$at" ]; then
+            epoch=$(python3 - "$at" <<'PY' 2>/dev/null || true
+from datetime import datetime, timezone
+import sys
+
+value = sys.argv[1]
+formats = [
+    ("%a %b %d %H:%M:%S UTC %Y", True),
+    ("%a %b %d %H:%M:%S %Z %Y", True),
+    ("%Y-%m-%dT%H:%M:%SZ", True),
+]
+for fmt, force_utc in formats:
+    try:
+        dt = datetime.strptime(value, fmt)
+        if force_utc or dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        print(int(dt.timestamp()))
+        break
+    except ValueError:
+        pass
+PY
+)
+            if [ -n "$epoch" ]; then
+                now=$(date -u +%s)
+                age=$((now - epoch))
+            else
+                age="unknown"
+            fi
+        fi
+    fi
+    printf '%s\t%s\n' "$age" "$at"
+}
+
+senpai_log_heartbeat_fields() {
+    local log_file="$1" line=""
+    [ -f "$log_file" ] && line=$(grep -E "Student Heartbeat" "$log_file" 2>/dev/null | tail -1 || true)
+    senpai_heartbeat_fields "$line"
+}
+
+senpai_k8s_student_snapshot() {
+    local student="$1" tag="${RESEARCH_TAG:-}" pod activity branch dirty heartbeat
+    [ -n "$tag" ] && command -v kubectl >/dev/null 2>&1 || return 1
 
     pod=$(
         kubectl get pods -l "app=senpai,research-tag=${tag},student=${student}" \
             -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null |
             head -1
     ) || return 1
-    [ -n "$pod" ] || return 1
+    if [ -z "$pod" ]; then
+        printf '%s\tkubernetes\tpod:<missing>\tno\tunknown\tunknown\tunknown\tunknown\tunknown\tunknown\tmissing\t\n' "$student"
+        return 0
+    fi
 
-    kubectl exec "$pod" -- sh -lc '
-        branch=$(git -C /workspace/senpai/target branch --show-current 2>/dev/null || true)
-        [ "$branch" = "$1" ] || exit 1
+    branch=$(kubectl exec "$pod" -- sh -lc 'git -C /workspace/senpai/target branch --show-current 2>/dev/null || true' 2>/dev/null || true)
+    dirty=$(kubectl exec "$pod" -- sh -lc 'git -C /workspace/senpai/target status --porcelain 2>/dev/null | wc -l | tr -d " "' 2>/dev/null || true)
+    activity=$(kubectl exec "$pod" -- sh -lc "$(senpai_worker_activity_command)" sh "$SENPAI_TRAIN_SCRIPT_RE" 2>/dev/null || printf 'unknown\tunknown\tunknown')
+    heartbeat=$(kubectl logs "$pod" --tail=300 2>/dev/null | grep -E "Student Heartbeat" | tail -1 || true)
+    heartbeat=$(senpai_heartbeat_fields "$heartbeat")
+    printf '%s\tkubernetes\tpod:%s\tyes\tunknown\t%s\t%s\t%s\t%s\n' \
+        "$student" "$pod" "${branch:-unknown}" "${dirty:-unknown}" "$activity" "$heartbeat"
+}
 
-        # A stale GitHub timestamp is not actionable if the pod is still doing
-        # useful work on this exact PR branch. Count either active training,
-        # active GPU use, or Claude Code editing an uncommitted checkout.
-        pytrain=$(ps -eo comm=,args= | awk -v train_re="$2" '\''$1 ~ /^(python[0-9.]*|torchrun|pt_elastic)$/ && $0 ~ train_re {n++} END{print n+0}'\'')
-        gpu=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | awk '\''NF{n++} END{print n+0}'\'')
-        claude=$(ps -eo comm=,args= | awk '\''$1 ~ /^claude$/ || /[ /]claude( |$)/ {n++} END{print n+0}'\'')
-        dirty=$(git -C /workspace/senpai/target status --porcelain 2>/dev/null | wc -l | tr -d " ")
+senpai_local_student_snapshot() {
+    local student="$1" backend="${SENPAI_BACKEND:-local}" root key target pid_file log_file pid pid_alive
+    local locator present branch dirty activity claude train gpu heartbeat container
 
-        [ "$pytrain" -gt 0 ] || [ "$gpu" -gt 0 ] || { [ "$claude" -gt 0 ] && [ "${dirty:-0}" -gt 0 ]; }
-    ' sh "$head_ref" "$SENPAI_TRAIN_SCRIPT_RE" >/dev/null 2>&1
+    root=$(senpai_run_root)
+    [ -n "$root" ] || return 1
+
+    key=$(senpai_student_key "$student")
+    target="$root/workdirs/$key/target"
+    pid_file="$root/pids/$key.pid"
+    log_file="$root/logs/$key.log"
+    pid=""
+    pid_alive="missing"
+    if [ -f "$pid_file" ]; then
+        pid=$(cat "$pid_file" 2>/dev/null || true)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            pid_alive="yes"
+        elif [ "$backend" = "local-container" ]; then
+            pid_alive="unknown"
+        else
+            pid_alive="no"
+        fi
+    fi
+
+    locator="pid:${pid:-missing}"
+    present="unknown"
+    branch=""
+    dirty=""
+    claude="unknown"
+    train="unknown"
+    gpu="unknown"
+
+    if [ "$backend" = "local-container" ]; then
+        container=$(senpai_container_name "${RESEARCH_TAG:-}" "$key")
+        locator="container:$container"
+        if command -v docker >/dev/null 2>&1; then
+            if docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null | grep -qx true; then
+                present="yes"
+                branch=$(docker exec "$container" sh -lc 'git -C /workspace/senpai/target branch --show-current 2>/dev/null || true' 2>/dev/null || true)
+                dirty=$(docker exec "$container" sh -lc 'git -C /workspace/senpai/target status --porcelain 2>/dev/null | wc -l | tr -d " "' 2>/dev/null || true)
+                activity=$(docker exec "$container" sh -lc "$(senpai_worker_activity_command)" sh "$SENPAI_TRAIN_SCRIPT_RE" 2>/dev/null || printf 'unknown\tunknown\tunknown')
+                claude=${activity%%$'\t'*}
+                activity=${activity#*$'\t'}
+                train=${activity%%$'\t'*}
+                gpu=${activity#*$'\t'}
+            else
+                present="no"
+            fi
+        elif [ -f "$pid_file" ] || [ -f "$log_file" ]; then
+            present="unknown"
+        else
+            present="no"
+        fi
+    else
+        [ "$pid_alive" = "yes" ] && present="yes" || present="no"
+        activity=$(senpai_count_processes)
+        claude=${activity%%$'\t'*}
+        train=${activity#*$'\t'}
+        gpu=$(senpai_count_gpu_processes)
+    fi
+
+    [ -n "$branch" ] || branch=$(git -C "$target" branch --show-current 2>/dev/null || true)
+    [ -n "$dirty" ] || dirty=$(git -C "$target" status --porcelain 2>/dev/null | wc -l | tr -d " " || true)
+    heartbeat=$(senpai_log_heartbeat_fields "$log_file")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$student" "$backend" "$locator" "$present" "$pid_alive" \
+        "${branch:-unknown}" "${dirty:-unknown}" "$claude" "$train" "$gpu" "$heartbeat"
+}
+
+student_worker_snapshot() {
+    local student="$1" backend="${SENPAI_BACKEND:-}"
+    case "$backend" in
+        local|local-container)
+            senpai_local_student_snapshot "$student"
+            return
+            ;;
+    esac
+    if senpai_k8s_student_snapshot "$student"; then
+        return
+    fi
+    senpai_local_student_snapshot "$student"
+}
+
+senpai_positive_count() {
+    case "${1:-}" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$1" -gt 0 ]
+}
+
+senpai_recent_heartbeat() {
+    local age="$1" stale="${SENPAI_WORKER_HEARTBEAT_STALE_S:-${SENPAI_STALE_WIP_SECONDS:-7200}}"
+    case "$age" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$age" -le "$stale" ]
+}
+
+student_pr_looks_live() {
+    local student="$1" head_ref="$2" snapshot
+    local snap_student backend locator present pid_alive branch dirty claude train gpu heartbeat_age heartbeat_at
+    [ -n "$student" ] && [ -n "$head_ref" ] || return 1
+
+    snapshot=$(student_worker_snapshot "$student") || return 1
+    IFS=$'\t' read -r snap_student backend locator present pid_alive branch dirty claude train gpu heartbeat_age heartbeat_at <<< "$snapshot"
+    [ "$branch" = "$head_ref" ] || return 1
+
+    # A stale GitHub timestamp is not actionable if the worker is still doing
+    # useful work on this exact PR branch. Prefer direct process/GPU evidence,
+    # but accept a recent heartbeat for Docker-backed runs where the advisor
+    # container cannot inspect sibling container processes.
+    senpai_positive_count "$train" && return 0
+    senpai_positive_count "$gpu" && return 0
+    if senpai_positive_count "$claude" && senpai_positive_count "$dirty"; then
+        return 0
+    fi
+    [ "$present" != "no" ] && [ "$pid_alive" != "no" ] && senpai_recent_heartbeat "$heartbeat_age"
 }
 
 suppress_live_stale_wips() {
@@ -656,15 +860,13 @@ print(json.dumps(filtered))
 '
 }
 
-# List active student pods whose training process does not match an open WIP PR.
+# List active student workers whose training process does not match an open WIP PR.
 # Returns a JSON array of human-readable warnings for the advisor prompt.
 #   list_student_pod_anomalies <student_names_csv> <branch>
 list_student_pod_anomalies() {
-    local students_csv="$1" branch="$2" tag="${RESEARCH_TAG:-}"
-    local all_prs open_heads anomalies="" student pod snapshot current_branch pytrain gpu expected_heads
-    # This helper runs inside advisor pods. Local/dev shells without Kubernetes
-    # context should stay quiet rather than making every advisor poll noisy.
-    [ -n "$tag" ] && command -v kubectl >/dev/null 2>&1 || { echo "[]"; return 0; }
+    local students_csv="$1" branch="$2"
+    local all_prs open_heads anomalies="" student snapshot expected_heads details stale
+    local snap_student backend locator present pid_alive current_branch dirty claude pytrain gpu heartbeat_age heartbeat_at
 
     all_prs=$(rest_labeled_pull_details "${branch},status:wip") || return
     # Map each open WIP assignment to the branch the student's pod should be on.
@@ -686,37 +888,26 @@ for pr in json.load(sys.stdin):
         student="${student//[[:space:]]/}"
         [ -n "$student" ] || continue
 
-        pod=$(
-            kubectl get pods -l "app=senpai,research-tag=${tag},student=${student}" \
-                -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null |
-                head -1
-        ) || continue
-        [ -n "$pod" ] || continue
-
-        snapshot=$(kubectl exec "$pod" -- sh -lc '
-            branch=$(git -C /workspace/senpai/target branch --show-current 2>/dev/null || true)
-            # Only active training/GPU use is a zombie risk. Claude editing a
-            # checkout is handled by stale-WIP suppression above, not here.
-            pytrain=$(ps -eo comm=,args= | awk -v train_re="$1" '\''$1 ~ /^(python[0-9.]*|torchrun|pt_elastic)$/ && $0 ~ train_re {n++} END{print n+0}'\'')
-            gpu=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | awk '\''NF{n++} END{print n+0}'\'')
-            printf "%s\t%s\t%s\n" "$branch" "$pytrain" "$gpu"
-        ' sh "$SENPAI_TRAIN_SCRIPT_RE" 2>/dev/null) || continue
-
-        current_branch=${snapshot%%$'\t'*}
-        snapshot=${snapshot#*$'\t'}
-        pytrain=${snapshot%%$'\t'*}
-        gpu=${snapshot#*$'\t'}
-        if [ "${pytrain:-0}" -eq 0 ] && [ "${gpu:-0}" -eq 0 ]; then
-            continue
-        fi
-
+        snapshot=$(student_worker_snapshot "$student") || continue
+        IFS=$'\t' read -r snap_student backend locator present pid_alive current_branch dirty claude pytrain gpu heartbeat_age heartbeat_at <<< "$snapshot"
         expected_heads=$(printf '%s' "$open_heads" | awk -F '\t' -v wanted="$student" '$1 == wanted {heads = heads sep $2; sep = " or "} END {print heads}')
-        if [ -z "$expected_heads" ]; then
-            anomalies+="${student}: active training on branch ${current_branch:-unknown} but this student has no open status:wip PR on ${branch}; possible zombie run after PR closure; inspect or stop the pod before assigning new work; pytrain=${pytrain:-0}; gpu=${gpu:-0}"$'\n'
+        details="backend=${backend:-unknown}; worker=${locator:-unknown}; present=${present:-unknown}; pid_alive=${pid_alive:-unknown}; branch=${current_branch:-unknown}; expected=${expected_heads:-none}; dirty=${dirty:-unknown}; claude=${claude:-unknown}; train=${pytrain:-unknown}; gpu=${gpu:-unknown}; heartbeat_age_s=${heartbeat_age:-unknown}; heartbeat_at=${heartbeat_at:-unknown}"
+
+        stale=0
+        if [ "${heartbeat_age:-missing}" = "missing" ] || ! senpai_recent_heartbeat "$heartbeat_age"; then
+            stale=1
+        fi
+        if [ "$present" = "no" ] || [ "$pid_alive" = "no" ] || { [ "$stale" -eq 1 ] && [ "$present" != "yes" ]; }; then
+            anomalies+="${student}: worker unhealthy; ${details}"$'\n'
             continue
         fi
-        if ! printf '%s' "$open_heads" | awk -F '\t' -v wanted="$student" -v current="$current_branch" '$1 == wanted && $2 == current {found=1} END {exit !found}'; then
-            anomalies+="${student}: active training on branch ${current_branch:-unknown} but open status:wip assignment expects ${expected_heads}; possible stale checkout or wrong pod assignment; reconcile or stop the pod before assigning new work; pytrain=${pytrain:-0}; gpu=${gpu:-0}"$'\n'
+
+        if [ -n "$expected_heads" ] && ! printf '%s' "$open_heads" | awk -F '\t' -v wanted="$student" -v current="$current_branch" '$1 == wanted && $2 == current {found=1} END {exit !found}'; then
+            anomalies+="${student}: worker is on branch ${current_branch:-unknown} but open status:wip assignment expects ${expected_heads}; ${details}"$'\n'
+            continue
+        fi
+        if [ -z "$expected_heads" ] && { senpai_positive_count "$pytrain" || senpai_positive_count "$gpu"; }; then
+            anomalies+="${student}: active training/GPU use on branch ${current_branch:-unknown} but this student has no open status:wip PR on ${branch}; possible zombie run after PR closure; ${details}"$'\n'
         fi
     done
 

@@ -154,6 +154,7 @@ def _role_values(
     values.update(
         {
             "SENPAI_BACKEND": backend,
+            "SENPAI_RUN_ROOT": run_root_value,
             "SENPAI_WORKDIR": workdir_value,
             "SENPAI_LOGDIR": f"{run_root_value}/logs/{spec.key}/iterations",
             "SENPAI_GIT_CREDENTIAL_FILE": f"{run_root_value}/secrets/{spec.key}.git-credentials",
