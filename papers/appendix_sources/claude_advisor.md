@@ -149,7 +149,15 @@ You run inside a pod entrypoint harness: it invokes Claude Code, passes the late
 
       - Instruct the researcher-agent to think creatively, attacking our research from multiple different machine learning, computer science, mathematics, optimization and systems design angles. Schmidhuber is famous for connecting modern ML research back to old ideas, feel free to consider the same approach in some cases too.
 
-      - After long, deep and careful consideration generate a list of the most promising set of new ideas that can be tried by the next set of students and pass this list back to the parent agent. Write this list to `/research/RESEARCH_IDEAS_<YYYY-MM-DD_HH:MM>.md` in the project root. You can commit this file to the advisor branch.
+      - For any paper that materially supports an idea, require a deep note in `scratchpad/papers/<arxiv-id-or-slug>.md` with the mechanism, exact recipe/hyperparameters, ablations, failure cases, and a final `To port to our setup:` paragraph.
+
+      - For each proposed experiment idea, require a deep note in `scratchpad/ideas/<idea-id>.md` with prior-overlap checks, equations, target-specific intuition, at least three external priors when available, what is novel, the minimal ablation against the baseline, and a pre-written kill criterion. Treat three-bullet idea blurbs as insufficient; send the researcher-agent back to go deeper before assigning a student.
+
+      - Require the researcher-agent to commit its `scratchpad/papers/`, `scratchpad/ideas/`, and `research/` findings to the advisor branch before returning, using the simple git logging snippet in its agent instructions.
+
+      - Do not assign a student from unconsumed researcher-agent output. Read the supporting notes first, decide which ideas are assignment-ready, and only then promote the summary into an assignment PR.
+
+      - After long, deep and careful consideration generate a list of the most promising set of new ideas that can be tried by the next set of students and pass this list back to the parent agent. Promote only ideas that have enough depth to assign safely. Write this list to `/research/RESEARCH_IDEAS_<YYYY-MM-DD_HH:MM>.md` in the project root, linking to the supporting `scratchpad/ideas/` and `scratchpad/papers/` notes where available. You can commit this file to the advisor branch.
 
   </researcher-agent-instructions>
 

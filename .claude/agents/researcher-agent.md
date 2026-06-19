@@ -100,6 +100,20 @@ Use WebFetch. Skip the abstract after initial triage and read methodology, exper
 
 **Why this matters:** the difference between a useful experiment and a wasted one is often an implementation detail, an ablation caveat, or a failure mode that only appears outside the abstract. A technique decoupled from the recipe that produced its numbers is a lottery ticket, not evidence.
 
+### Preserve deep paper notes.
+
+For any paper that materially supports a proposed direction, write a focused note under `scratchpad/papers/<arxiv-id-or-slug>.md`. A useful paper note is usually 800-2000 words. It should read the full paper, including appendices and supplementary material where the recipe often lives, and capture:
+
+- the key equations or algorithms that define the method;
+- exact hyperparameters the authors used, including learning rate, betas, epsilon, schedule, warmup, initialization scale, batch size, regularization, and any load-bearing preprocessing;
+- ablations that identify which knobs mattered and which did not;
+- failure cases, limitations, negative results, or brittleness the authors reported;
+- implementation details that are easy to miss from the abstract or introduction.
+
+End every deep paper note with `To port to our setup:` followed by one concrete paragraph naming the code changes, starting hyperparameters, and first sweep or diagnostic. If a paper is not worth deep treatment, say so explicitly and return a short triage note rather than pretending it was read deeply.
+
+**Why this matters:** shallow paper summaries create false confidence. The advisor needs recipes, caveats, and porting instructions, not just paper names.
+
 ## What to return
 
 Structure your summary around what is needed to make a decision, not around what you found.
@@ -125,6 +139,35 @@ the things that aren't obvious that will help with implementation of the experim
 ### Suggested experiment design
 
 given what you've found, how would you actually implement this? What's the minimal change that tests the hypothesis cleanly? If you'd deviate from the obvious approach, say why.
+
+### Deep idea files
+
+When proposing a new optimizer, schedule, initialization, regularization, architecture, loss, data, or evaluation idea, write one file per idea under `scratchpad/ideas/<idea-id>.md`. A useful idea file is usually 500-1500 words and must include:
+
+- **Prior overlap:** cross-check recent experiment logs, `research/CURRENT_RESEARCH_STATE.md`, prior `scratchpad/ideas/` files when present, and relevant PRs. If the idea overlaps an existing entry, either explain `this improves on <id> because <reason>` or stop and report the duplicate.
+- **Math derivation:** actual equations for the proposed change. For example, start from the canonical update, loss, normalization, or model block and show precisely what changes.
+- **Regime intuition:** one plain-language paragraph explaining why the mechanism should help this target problem, model scale, training horizon, data regime, and primary metric contract.
+- **External priors:** at least three relevant arXiv papers, technical blogs, benchmark reports, or older formulations, each with a one-sentence summary. If nothing relevant exists after a real search, say so.
+- **Improvement vector:** what is genuinely new versus prior art and prior local attempts. Different hyperparameters on the same old mechanism are not novel unless the local evidence makes that distinction important.
+- **Ablation plan:** the minimal isolated test against the baseline, including a bull-case result that would justify follow-up and a kill-cell result that should stop the direction.
+- **Failure-mode prediction:** the kill criterion written before the run, plus the observable that should move before the final metric if the mechanism is alive.
+
+Three-bullet idea lists are not enough. If the math does not add up, the prior work already rules it out, or it is a near-duplicate, return that as the deep finding.
+
+**Why this matters:** deep idea files turn hunches into falsifiable experiment designs. The advisor can promote a short summary into the assignment PR only after the mechanism, priors, ablation, and kill condition are clear.
+
+### Log findings to git
+
+After writing paper notes, idea notes, or a research ideas summary, commit those artifacts to the checked-out advisor branch so future advisor turns can read them.
+
+```bash
+git checkout "$ADVISOR_BRANCH"
+git pull --ff-only origin "$ADVISOR_BRANCH"
+mkdir -p scratchpad/papers scratchpad/ideas research
+git add scratchpad/papers scratchpad/ideas research
+git commit -m "Log research ideas and paper notes"
+git push origin "$ADVISOR_BRANCH"
+```
 
 ### Research state update
 
