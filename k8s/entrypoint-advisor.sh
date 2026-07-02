@@ -125,6 +125,7 @@ start_hivemind
 # --- Load CC run command helper function ---
 source "$WORKDIR/k8s/run-senpai-claude.sh"
 source "$WORKDIR/k8s/advisor-claude-watchdog.sh"
+source "$WORKDIR/k8s/senpai-console-inbox.sh"
 
 # --- Register Weave CC plugin (tools already baked into Docker image) ---
 export PATH="$HOME/.claude/bin:$PATH"
@@ -210,6 +211,14 @@ while true; do
     [ "$POD_ANOMALY_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **Student pod anomalies ($POD_ANOMALY_COUNT):** investigate these before assigning new work: $(printf '%s' "$POD_ANOMALY_JSON" | json_join)"
     echo "$TRIAGE_INFO"
 
+    # --- Console -> agent inbox (near-live steer): drain pending directives ---
+    INBOX_DIRECTIVES="$(senpai_drain_inbox)"
+    INBOX_COUNT=0
+    if [ -n "$INBOX_DIRECTIVES" ]; then
+        INBOX_COUNT=1
+        TRIAGE_INFO="${TRIAGE_INFO}"$'\n\n'"${INBOX_DIRECTIVES}"
+    fi
+
     # --- Log triage state and select prompt ---
     echo "=== Log: $LOGFILE ==="
     echo "$TRIAGE_INFO" > "$LOGFILE"
@@ -223,7 +232,7 @@ while true; do
         run_advisor_claude_with_watchdog $MAX_TURNS "${FULL_PROMPT}"$'\n\n'"${TRIAGE_INFO}" || EXIT_CODE=$?
     else
         # --- Programmatic skip: skip rest of CC loop if nothing actionable ---
-        if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ADVISOR_ACTION_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$IDLE_COUNT" -eq 0 ] && [ "$POD_ANOMALY_COUNT" -eq 0 ]; then
+        if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ADVISOR_ACTION_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$IDLE_COUNT" -eq 0 ] && [ "$POD_ANOMALY_COUNT" -eq 0 ] && [ "$INBOX_COUNT" -eq 0 ]; then
             echo "=== Iteration $ITERATION: Nothing actionable, sleeping $SLEEP_TIME_S seconds + up to ${POLL_JITTER_S}s jitter ==="
             senpai_sleep_with_jitter "$SLEEP_TIME_S" "$POLL_JITTER_S"
             continue

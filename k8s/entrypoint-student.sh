@@ -73,6 +73,7 @@ start_hivemind
 # --- Load CC run command helper function ---
 source "$WORKDIR/k8s/run-senpai-claude.sh"
 source "$WORKDIR/k8s/student-claude-watchdog.sh"
+source "$WORKDIR/k8s/senpai-console-inbox.sh"
 
 # --- Register Weave Claude Code Plugin (tools already baked into Docker image) ---
 export PATH="$HOME/.claude/bin:$PATH"
@@ -177,6 +178,10 @@ while true; do
         senpai_sleep_with_jitter "$SLEEP_TIME_S" "$POLL_JITTER_S"
         continue
     fi
+
+    # --- Console -> agent inbox (near-live steer): drain only when we will run ---
+    INBOX_DIRECTIVES="$(senpai_drain_inbox)"
+    [ -n "$INBOX_DIRECTIVES" ] && TRIAGE_INFO="${TRIAGE_INFO}"$'\n\n'"${INBOX_DIRECTIVES}"
 
     START_TS=$(date +%s)
     EXIT_CODE=0

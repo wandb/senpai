@@ -78,6 +78,8 @@ class Args:
     student_claude_stale_log_s: int = 1200  # student stale-log intervention threshold
     student_assignment_drift_grace_s: int = 1800  # grace before stopping active work after assignment changes
     start_gate_path: str = ""  # optional shared file path that must exist before advisor/student loops begin
+    event_dir: str = ""  # SENPAI Console live-event mirror dir (Phase 2); empty = disabled
+    console_inbox_dir: str = ""  # SENPAI Console -> agent inbox dir for near-live steer (Phase 2); empty = disabled
     dry_run: bool = False  # render manifests only: do not apply them or validate credentials
     preflight_only: bool = False  # validate credentials/access only: do not render or apply manifests
 
@@ -169,6 +171,8 @@ def render_student(template: str, student_name: str, tag: str, secret_name: str,
             "PROBLEM_DIR": args.problem_dir,
             "PVC_MOUNT_PATH": args.pvc_mount_path,
             "SENPAI_START_GATE_PATH": args.start_gate_path,
+            "SENPAI_EVENT_DIR": args.event_dir,
+            "SENPAI_CONSOLE_INBOX_DIR": args.console_inbox_dir,
         },
     )
     deployment = render_template(template, {
@@ -215,6 +219,8 @@ def render_advisor(template: str, tag: str, student_list: list[str], secret_name
         "PROBLEM_DIR": args.problem_dir,
         "PVC_MOUNT_PATH": args.pvc_mount_path,
         "SENPAI_START_GATE_PATH": args.start_gate_path,
+        "SENPAI_EVENT_DIR": args.event_dir,
+        "SENPAI_CONSOLE_INBOX_DIR": args.console_inbox_dir,
     }
     data["EXTRA_INSTRUCTIONS_B64"] = encoded_extra_instructions(args, tag, student_list)
     configmap = render_configmap(

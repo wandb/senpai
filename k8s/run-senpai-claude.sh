@@ -27,5 +27,15 @@ run_senpai_claude() {
     # cmdline. Agents use `pkill -f "train.py"` to kill training runs, and -p
     # embeds the prompt (which mentions train.py) in the cmdline, causing the
     # agent to accidentally kill its own Claude Code process.
-    printf '%s' "$user_prompt" | "${claude_cmd[@]}" >> "$LOGFILE" 2>&1
+    #
+    # SENPAI Console (Phase 2, live event ingestion): when $SENPAI_EVENT_DIR is set,
+    # also mirror the stream-json to a stable per-iteration event file the console
+    # tails, instead of scraping the iteration logs. Inert when unset.
+    if [ -n "${SENPAI_EVENT_DIR:-}" ]; then
+        mkdir -p "$SENPAI_EVENT_DIR"
+        local event_file="$SENPAI_EVENT_DIR/event-$(date +%Y%m%d_%H%M%S)_$$.jsonl"
+        printf '%s' "$user_prompt" | "${claude_cmd[@]}" 2>&1 | tee -a "$event_file" >> "$LOGFILE"
+    else
+        printf '%s' "$user_prompt" | "${claude_cmd[@]}" >> "$LOGFILE" 2>&1
+    fi
 }
