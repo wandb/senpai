@@ -108,7 +108,10 @@ Load these only when they help the current task:
 
    `prompt-advisor.md` should brief the research lead on target identity,
    branch discipline, first survey actions, metric focus, hypothesis design, and
-   portfolio strategy.
+   portfolio strategy. It should also include any target-specific context
+   preservation rules: what evidence belongs in PRs, W&B, or `research/` docs,
+   and which bulky target artifacts should be delegated to sub-agents for
+   compact summaries.
 
    `prompt-student.md` should brief the implementer on target identity,
    resource expectations, edit boundaries, exact run command patterns, research

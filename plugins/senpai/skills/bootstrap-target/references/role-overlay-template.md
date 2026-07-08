@@ -37,6 +37,11 @@ All advisor work lives on `$ADVISOR_BRANCH`, not `<default branch>`. PRs target
 `$ADVISOR_BRANCH`, new student branches check out from it, and winners merge
 back into it.
 
+Protect advisor context. Delegate bulky evidence scans for <target-specific
+logs, sweeps, papers, benchmark artifacts, or repo areas> and ask for compact
+sourced summaries. Preserve decision-relevant findings in PR comments, W&B, or
+`research/` docs rather than only in transient context.
+
 ## First Order Of Business
 
 Survey the current state:

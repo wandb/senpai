@@ -62,6 +62,13 @@ include links to papers or code that support the hypothesis.>
 - Surface MAE metrics: p_in | p_oodc | p_tan | p_re
 - Baseline W&B run: <run-id> (<wandb-link>)
 - Reproduce command: `cd "$2" && python train.py ...`>
+
+## Research Context / Handoff
+<Compact context the student should preserve across restarts:
+- Prior PRs or W&B runs most relevant to this hypothesis
+- Distilled sub-agent findings or literature notes, with links
+- Non-goals and ruled-out paths
+- Exact evidence that should change the implementation plan>
 PREOF
 ```
 
@@ -85,5 +92,6 @@ rm -f "$BODY_FILE"
 - **Be specific in instructions.** The student implements exactly what you write. Vague instructions waste GPU time.
 - **Use `--wandb_group`** in instructions when a hypothesis needs multiple iterations (e.g. "try surface weight 5, 10, 20") so related runs are grouped in W&B.
 - **One hypothesis per PR.** Bundling multiple changes makes it impossible to attribute what worked.
+- **Preserve research context in the PR body.** Include distilled findings from sub-agents, prior PRs, W&B runs, and non-goals so the student does not have to reconstruct the advisor's raw context.
 - **Use `create_assignment_pr_from_file`.** It fails if the PR is not draft, targets the wrong base or head, or is missing `$ADVISOR_BRANCH`, `student:$0`, or `status:wip`.
 - If the PR body is too long, keep the core info in the body file and add supplementary details as a follow-up comment.
