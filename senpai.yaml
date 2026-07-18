@@ -1,5 +1,8 @@
 # senpai project configuration
-# All fields can be overridden via CLI: python k8s/launch.py --tag <tag> [--field value]
+# All fields can be overridden via CLI: uv run python launch.py --tag <tag> [--field value]
+
+# compute backend: kubernetes or docker
+backend: kubernetes
 
 # active problem directory
 # The entrypoint clones target_repo_url into this path at pod startup, so the
@@ -11,13 +14,18 @@ repo_url: https://github.com/wandb/senpai.git
 repo_branch: main
 
 # problem-package repo is REQUIRED and must be passed on the CLI
-#   python k8s/launch.py --tag <tag> --target_repo_url https://github.com/<org>/<repo>.git
+#   uv run python launch.py --tag <tag> --target_repo_url https://github.com/<org>/<repo>.git
 # The launcher creates advisor_branch from target_repo_branch when needed, then
 # the entrypoint clones it into $PROBLEM_DIR.
 target_repo_branch: ""
 
 # docker image
 image: ghcr.io/wandb/senpai:latest
+
+# Docker backend (for example, a single AWS GPU host)
+docker_run_root: ~/.senpai/runs
+docker_dataset_path: ""
+docker_gpu_ids: ""
 
 # dataset PVC mount
 pvc_claim_name: new-pvc

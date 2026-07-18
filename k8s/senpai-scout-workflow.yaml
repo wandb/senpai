@@ -1,3 +1,6 @@
+# Apply this template with `python scripts/apply_scout_workflow.py`; the script
+# fills this block from the same root .env used by launch.py and sends it to
+# kubectl over stdin.
 apiVersion: agentic.coreweave.com/v1alpha1
 kind: Workflow
 metadata:
@@ -12,10 +15,10 @@ spec:
     env:
       SEMANTIC_SCHOLAR_ENDPOINT: "https://api.semanticscholar.org"
     secrets:
-      GITHUB_TOKEN: "REPLACE_ME_ghp_xxx"
-      SLACK_WEBHOOK_URL: "REPLACE_ME_https://hooks.slack.com/services/..."
-      WANDB_API_KEY: "REPLACE_ME_wandb_xxx"
-      KUBECONFIG_B64: "REPLACE_ME_base64_of_pai2_kubeconfig"
+      GITHUB_TOKEN: ""
+      SLACK_WEBHOOK_URL: ""
+      WANDB_API_KEY: ""
+      KUBECONFIG_B64: ""
       SEMANTIC_SCHOLAR_API_KEY: ""
   parameters:
     - name: research_tag

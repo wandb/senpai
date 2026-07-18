@@ -4,14 +4,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-PackageName: senpai
 
-"""Launch senpai advisor and student agents as K8s resources."""
+"""Launch Senpai advisor and student agents."""
 
-import base64
+# ruff: noqa: E402 -- direct script execution needs the repository root on sys.path.
+
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import simple_parsing as sp
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from launch_helpers import (
     ensure_advisor_branch,
@@ -23,15 +28,15 @@ from launch_helpers import (
     preflight_check_exa_api_key,
     preflight_check_target_repo_branch,
     preflight_check_target_repo_access,
+    preflight_check_wandb_api_key,
     render_configmap,
     render_launch_secret,
     render_template,
-    resolve_anthropic_api_key,
-    resolve_exa_api_key,
-    resolve_github_token,
     routing_labels,
-    target_repo_slug,
 )
+from senpai.launch.credentials import load_secrets, secret_names, workload_secrets
+from senpai.launch.docker_backend import launch_docker
+from senpai.launch.specs import build_advisor_spec, build_student_spec, target_repo_slug
 
 STUDENT_TEMPLATE = Path(__file__).parent / "student-deployment.yaml"
 ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-deployment.yaml"
@@ -41,9 +46,11 @@ DOTENV_PATH = Path(__file__).parent.parent / ".env"
 
 @dataclass
 class Args:
-    """Launch senpai advisor and/or student agents on Kubernetes."""
+    """Launch senpai advisor and/or student agents."""
+
     tag: str  # research tag (e.g. mar13)
     target_repo_url: str  # problem-package repo (entrypoint clones this into $PROBLEM_DIR; agent commits/PRs land here) — REQUIRED, no default
+    backend: str = "kubernetes"  # compute backend: kubernetes or docker
     target_repo_branch: str = ""  # target repo branch used as the base when creating advisor_branch; empty = target repo default branch
     problem_dir: str = "target/"  # active problem directory — entrypoint clones target_repo_url here (from senpai.yaml)
     names: str = ""  # comma-separated student names (e.g. "frieren,fern")
@@ -78,6 +85,9 @@ class Args:
     student_claude_stale_log_s: int = 1200  # student stale-log intervention threshold
     student_assignment_drift_grace_s: int = 1800  # grace before stopping active work after assignment changes
     start_gate_path: str = ""  # optional shared file path that must exist before advisor/student loops begin
+    docker_run_root: str = "~/.senpai/runs"  # generated non-secret Compose files
+    docker_dataset_path: str = ""  # optional host dataset path mounted at pvc_mount_path
+    docker_gpu_ids: str = ""  # comma-separated GPU IDs; default assigns 0..N across students
     dry_run: bool = False  # render manifests only: do not apply them or validate credentials
     preflight_only: bool = False  # validate credentials/access only: do not render or apply manifests
 
@@ -106,34 +116,8 @@ def validate_timing_args(args: Args) -> None:
             sys.exit(f"ERROR: --{name} must be non-negative")
 
 
-def load_extra_instructions(extra_instructions: str) -> str:
-    if not extra_instructions:
-        return ""
-    p = Path(extra_instructions)
-    return p.read_text() if p.exists() else extra_instructions
-
-
-def build_extra_instructions(args: Args, tag: str, student_list: list[str]) -> str:
-    students = ", ".join(student_list)
-    target_base = args.target_repo_branch or "<default>"
-    isolation = f"""# Launch isolation and run-limit rules
-
-- This launch is scoped to research tag `{tag}`, advisor branch `{args.advisor_branch}`, and target base branch `{target_base}`.
-- Only inspect, modify, or reason from `{args.advisor_branch}` plus PR branches assigned to these students in this launch: {students}.
-- Do not inspect, compare, summarize, cherry-pick, borrow from, or base decisions on any PR or branch outside `{args.advisor_branch}` and the assigned student PR branches for this launch.
-- Do not use unrelated experiment runs or historical results unless the human explicitly names them during this launch.
-- Students branch from `{args.advisor_branch}`. Do not rebase or retarget work onto unrelated branches.
-- Treat `SENPAI_TIMEOUT_MINUTES` and `SENPAI_MAX_EPOCHS` as hard per-training-run bounds. Do not override them or continue a run past them.
-"""
-    user_extra = load_extra_instructions(args.extra_instructions)
-    return isolation if not user_extra else isolation + "\n# Additional operator instructions\n\n" + user_extra
-
-
-def encoded_extra_instructions(args: Args, tag: str, student_list: list[str]) -> str:
-    return base64.b64encode(build_extra_instructions(args, tag, student_list).encode()).decode()
-
-
 def render_student(template: str, student_name: str, tag: str, secret_name: str, args: Args) -> str:
+    spec = build_student_spec(args, tag, student_name, secrets={})
     student_configmap_name = f"senpai-config-student-{tag}-{student_name}"
     student_deployment_name = f"senpai-{tag}-{student_name}"
     student_cpu = args.cpu_per_gpu * args.gpus_per_student
@@ -141,35 +125,7 @@ def render_student(template: str, student_name: str, tag: str, secret_name: str,
     configmap = render_configmap(
         name=student_configmap_name,
         labels={"app": "senpai", "role": "student", "research-tag": tag},
-        data={
-            "REPO_URL": args.repo_url,
-            "REPO_BRANCH": args.repo_branch,
-            "TARGET_REPO_URL": args.target_repo_url,
-            "TARGET_REPO_BRANCH": args.target_repo_branch,
-            "GH_REPO": target_repo_slug(args.target_repo_url),
-            "STUDENT_NAME": student_name,
-            "RESEARCH_TAG": tag,
-            "GPUS_PER_STUDENT": str(args.gpus_per_student),
-            "WANDB_ENTITY": args.wandb_entity,
-            "WANDB_PROJECT": args.wandb_project,
-            "WANDB_MODE": "online",
-            "ADVISOR_BRANCH": args.advisor_branch,
-            "GH_HISTORY_SCOPE": args.gh_history_scope,
-            "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
-            "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
-            "SENPAI_MAX_EPOCHS": str(args.max_epochs),
-            "SENPAI_POLL_INTERVAL_S": str(args.poll_interval_s),
-            "SENPAI_POLL_JITTER_S": str(args.poll_jitter_s),
-            "STUDENT_CLAUDE_WATCHDOG_INTERVAL_S": str(args.student_claude_watchdog_interval_s),
-            "STUDENT_CLAUDE_WATCHDOG_JITTER_S": str(args.student_claude_watchdog_jitter_s),
-            "STUDENT_CLAUDE_MIN_RUNTIME_S": str(args.student_claude_min_runtime_s),
-            "STUDENT_CLAUDE_STALE_LOG_S": str(args.student_claude_stale_log_s),
-            "STUDENT_ASSIGNMENT_DRIFT_GRACE_S": str(args.student_assignment_drift_grace_s),
-            "EXTRA_INSTRUCTIONS_B64": encoded_extra_instructions(args, tag, [student_name]),
-            "PROBLEM_DIR": args.problem_dir,
-            "PVC_MOUNT_PATH": args.pvc_mount_path,
-            "SENPAI_START_GATE_PATH": args.start_gate_path,
-        },
+        data=spec.env,
     )
     deployment = render_template(template, {
         "STUDENT_DEPLOYMENT_NAME": student_deployment_name,
@@ -189,38 +145,13 @@ def render_student(template: str, student_name: str, tag: str, secret_name: str,
 
 
 def render_advisor(template: str, tag: str, student_list: list[str], secret_name: str, args: Args) -> str:
+    spec = build_advisor_spec(args, tag, student_list, secrets={})
     advisor_configmap_name = f"senpai-config-advisor-{tag}"
     advisor_deployment_name = f"senpai-advisor-{tag}"
-    data = {
-        "REPO_URL": args.repo_url,
-        "REPO_BRANCH": args.repo_branch,
-        "TARGET_REPO_URL": args.target_repo_url,
-        "TARGET_REPO_BRANCH": args.target_repo_branch,
-        "GH_REPO": target_repo_slug(args.target_repo_url),
-        "RESEARCH_TAG": tag,
-        "STUDENT_NAMES": ",".join(student_list),
-        "GPUS_PER_STUDENT": str(args.gpus_per_student),
-        "WANDB_ENTITY": args.wandb_entity,
-        "WANDB_PROJECT": args.wandb_project,
-        "WANDB_MODE": "online",
-        "ADVISOR_BRANCH": args.advisor_branch,
-        "GH_HISTORY_SCOPE": args.gh_history_scope,
-        "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
-        "SENPAI_POLL_INTERVAL_S": str(args.poll_interval_s),
-        "SENPAI_POLL_JITTER_S": str(args.poll_jitter_s),
-        "SENPAI_STALE_WIP_SECONDS": str(args.stale_wip_seconds),
-        "ADVISOR_CLAUDE_WATCHDOG_INTERVAL_S": str(args.advisor_claude_watchdog_interval_s),
-        "ADVISOR_CLAUDE_MIN_RUNTIME_S": str(args.advisor_claude_min_runtime_s),
-        "ADVISOR_CLAUDE_STALE_LOG_S": str(args.advisor_claude_stale_log_s),
-        "PROBLEM_DIR": args.problem_dir,
-        "PVC_MOUNT_PATH": args.pvc_mount_path,
-        "SENPAI_START_GATE_PATH": args.start_gate_path,
-    }
-    data["EXTRA_INSTRUCTIONS_B64"] = encoded_extra_instructions(args, tag, student_list)
     configmap = render_configmap(
         name=advisor_configmap_name,
         labels={"app": "senpai", "role": "advisor", "research-tag": tag},
-        data=data,
+        data=spec.env,
     )
     deployment = render_template(template, {
         "ADVISOR_DEPLOYMENT_NAME": advisor_deployment_name,
@@ -236,30 +167,40 @@ def render_advisor(template: str, tag: str, student_list: list[str], secret_name
 
 def main():
     args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
-    if min(args.gpus_per_student, args.cpu_per_gpu, args.memory_gi_per_gpu) < 1:
-        sys.exit("ERROR: --gpus_per_student, --cpu_per_gpu, and --memory_gi_per_gpu must all be at least 1")
+    if args.backend not in {"kubernetes", "docker"}:
+        sys.exit("ERROR: --backend must be one of: kubernetes, docker")
+    if min(args.cpu_per_gpu, args.memory_gi_per_gpu) < 1:
+        sys.exit("ERROR: --cpu_per_gpu and --memory_gi_per_gpu must both be at least 1")
+    if args.gpus_per_student < 0:
+        sys.exit("ERROR: --gpus_per_student must be non-negative")
+    if args.backend == "kubernetes" and args.gpus_per_student < 1:
+        sys.exit("ERROR: Kubernetes launches require --gpus_per_student at least 1")
     validate_timing_args(args)
     if args.gh_history_scope not in {"branch", "repo", "fresh"}:
         sys.exit("ERROR: --gh_history_scope must be one of: branch, repo, fresh")
     if target_repo_slug(args.target_repo_url) == target_repo_slug(args.repo_url):
         sys.exit("ERROR: --target_repo_url must be a different repo from --repo_url")
 
-    github_token = anthropic_api_key = exa_api_key = ""
+    secrets = {}
     if not args.dry_run or args.preflight_only:
-        github_token = resolve_github_token(DOTENV_PATH)
-        anthropic_api_key = resolve_anthropic_api_key(DOTENV_PATH)
-        exa_api_key = resolve_exa_api_key(DOTENV_PATH)
+        secrets = workload_secrets(load_secrets(DOTENV_PATH))
+        github_token = secrets["GITHUB_TOKEN"]
         preflight_check_target_repo_access(args.target_repo_url, github_token)
         args.target_repo_branch = preflight_check_target_repo_branch(
             args.target_repo_url,
             github_token,
             args.target_repo_branch,
         )
-        preflight_check_anthropic_api_key(anthropic_api_key)
-        preflight_check_exa_api_key(exa_api_key)
+        preflight_check_anthropic_api_key(secrets["ANTHROPIC_API_KEY"])
+        preflight_check_exa_api_key(secrets["EXA_API_KEY"])
+        preflight_check_wandb_api_key(secrets["WANDB_API_KEY"])
         if args.preflight_only:
             print("Preflight OK — credentials and target repo access verified.")
             return
+    else:
+        secrets = workload_secrets(
+            {name: "<REDACTED>" for name in secret_names(DOTENV_PATH)}
+        )
 
     # Resolve student list
     if args.names:
@@ -278,6 +219,13 @@ def main():
         )
         ensure_target_repo_labels(args.target_repo_url, github_token, routing_labels(args.advisor_branch, student_list))
 
+    if args.backend == "docker":
+        role_specs = [build_student_spec(args, args.tag, name, secrets) for name in student_list]
+        if args.advisor:
+            role_specs.append(build_advisor_spec(args, args.tag, student_list, secrets))
+        launch_docker(args, role_specs)
+        return
+
     student_template = STUDENT_TEMPLATE.read_text()
     advisor_template = ADVISOR_TEMPLATE.read_text()
     secret_name = f"senpai-launch-secrets-{args.tag}"
@@ -285,18 +233,11 @@ def main():
     # --- Apply per-launch token secret first (pods reference it on startup) ---
     if args.dry_run:
         print(f"--- Secret: {secret_name} ---")
-        print(
-            render_launch_secret(
-                args.tag,
-                "<REDACTED_GITHUB_TOKEN>",
-                "<REDACTED_ANTHROPIC_API_KEY>",
-                "<REDACTED_EXA_API_KEY>",
-            )
-        )
+        print(render_launch_secret(args.tag, secrets))
         print()
     else:
         kubectl_apply(
-            render_launch_secret(args.tag, github_token, anthropic_api_key, exa_api_key),
+            render_launch_secret(args.tag, secrets),
             f"secret {secret_name}",
         )
 
@@ -328,13 +269,13 @@ def main():
         print(f"\nLaunched {len(student_list)} students: {', '.join(student_list)}")
         if args.advisor:
             print("Launched advisor pod")
-        print(f"\nMonitor:")
+        print("\nMonitor:")
         print(f"  kubectl get deployments -l research-tag={args.tag}")
         if args.advisor:
             print(f"  kubectl get deployment senpai-advisor-{args.tag}")
         if student_list:
             print(f"  kubectl logs -f deployment/senpai-{args.tag}-{student_list[0]}")
-        print(f"\nStop:")
+        print("\nStop:")
         print(f"  kubectl delete deployments,configmaps,secrets -l research-tag={args.tag}")
 
 

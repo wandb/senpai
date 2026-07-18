@@ -39,7 +39,7 @@ plots/
 # models
 models/
 
-# K8s secrets (keep the .template, ignore actual secrets)
+# Legacy K8s secret file (new launches use the gitignored root .env)
 k8s/secrets.yaml
 
 # Experiment logs

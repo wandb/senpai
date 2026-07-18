@@ -6,13 +6,29 @@ SPDX-PackageName: senpai
 
 # senpai
 
-Autonomous ML research loop powered by Claude Code agents coordinated through GitHub PRs. Point it at a problem, deploy advisor + student agents on k8s, and let them iterate.
+Autonomous ML research loop powered by Claude Code agents coordinated through GitHub PRs. Point it at a problem, launch advisor + student agents on Kubernetes or Docker, and let them iterate.
 
 ## How it works
 
-An **advisor** pod creates experiment PRs and assigns them to **student** GPU pods. Students implement, train, and report; the advisor merges winners and closes dead ends. GitHub labels route work, and W&B tracks metrics.
+An **advisor** creates experiment PRs and assigns them to **student** GPU workers. Students implement, train, and report; the advisor merges winners and closes dead ends. GitHub labels route work, and W&B tracks metrics.
 
-`senpai` is **problem-agnostic**. The pod entrypoint clones the configured problem-package repo into `target/`, so agent commits and PRs land in that external repo, not here.
+`senpai` is **problem-agnostic**. Each worker clones the configured problem-package repo into `target/`, so agent commits and PRs land in that external repo, not here.
+
+### Quick start
+
+```bash
+uv sync
+cp example.env .env
+# Fill in the four required credentials in .env, then:
+uv run python launch.py \
+  --tag first-run \
+  --target_repo_url https://github.com/<org>/<problem-repo>.git \
+  --advisor
+```
+
+The command uses Kubernetes by default. Add `--backend docker` for a local or
+AWS Docker host. Run either form with `--dry_run` first to inspect the generated
+resources without reading credentials or changing infrastructure.
 
 ### Problem packages
 
@@ -35,9 +51,9 @@ An **advisor** pod creates experiment PRs and assigns them to **student** GPU po
 
 ```mermaid
 graph TD
-    subgraph K8s["Kubernetes Cluster"]
-        A["Advisor Pod<br/>(Claude Code, no GPU)<br/>Creates hypothesis PRs<br/>Reviews results, merges/closes"]
-        subgraph Students["Student Deployments (one per GPU node)"]
+    subgraph Compute["Kubernetes or Docker"]
+        A["Advisor<br/>(Claude Code, no GPU)<br/>Creates hypothesis PRs<br/>Reviews results, merges/closes"]
+        subgraph Students["Student workers"]
             S1["frieren<br/>8x GPU"]
             S2["fern<br/>8x GPU"]
             S3["tanjiro<br/>8x GPU"]
@@ -45,8 +61,8 @@ graph TD
         end
         A -->|"GitHub PRs<br/>(draft → review → merge/close)"| Students
     end
-    K8s --> GH["GitHub<br/>PRs = hypotheses<br/>Labels = routing"]
-    K8s --> WB["Weights & Biases<br/>Metrics, runs, groups"]
+    Compute --> GH["GitHub<br/>PRs = hypotheses<br/>Labels = routing"]
+    Compute --> WB["Weights & Biases<br/>Metrics, runs, groups"]
 ```
 
 ### PR lifecycle
@@ -66,7 +82,10 @@ graph TD
 
 ```
 senpai/
+├── launch.py                       # One launcher for Kubernetes and Docker
 ├── senpai.yaml                    # Project config: problem-package repo/branch + launch defaults
+├── example.env                    # Credential template; copy to gitignored .env
+├── senpai/launch/                 # Shared role, credential, and backend logic
 ├── target/                        # Problem package clone (empty by default)
 │   ├── train.py                   #   Training script + model
 │   ├── program.md                 #   Research context, metrics, constraints
@@ -77,8 +96,8 @@ senpai/
 ├── system_instructions/           # System-level Claude Code instructions (run the role)
 │   ├── CLAUDE-ADVISOR.md
 │   └── CLAUDE-STUDENT.md
-├── k8s/                           # Kubernetes deployment (problem-agnostic)
-│   ├── launch.py                  #   Deploy advisor + student pods
+├── k8s/                           # Kubernetes manifests and worker entrypoints
+│   ├── launch.py                  #   Backwards-compatible launcher path
 │   ├── advisor-deployment.yaml
 │   ├── student-deployment.yaml
 │   ├── entrypoint-advisor.sh
@@ -94,6 +113,7 @@ senpai/
 All project settings live in `senpai.yaml`:
 
 ```yaml
+backend: kubernetes
 problem_dir: target/
 repo_url: https://github.com/wandb/senpai.git
 repo_branch: main
@@ -103,6 +123,9 @@ advisor_branch: schmidhuber
 gh_history_scope: branch
 human_issues: true
 image: ghcr.io/wandb/senpai:latest
+docker_run_root: ~/.senpai/runs
+docker_dataset_path: ""
+docker_gpu_ids: ""
 pvc_claim_name: new-pvc
 pvc_mount_path: /mnt/new-pvc
 wandb_entity: wandb-applied-ai-team
@@ -150,7 +173,7 @@ GitHub/API churn. Lower `*_claude_watchdog_interval_s` and
 stale or reassigned work aggressively.
 
 ```bash
-python k8s/launch.py \
+uv run python launch.py \
   --tag inferencebench-a-r1 \
   --advisor \
   --poll_interval_s 30 \
@@ -167,22 +190,46 @@ The published runner image is `ghcr.io/wandb/senpai:latest`. It is built by `.gi
 
 ### Launch credentials
 
-`launch.py` resolves and preflights these for real launches and `--preflight_only`, then writes them to a per-tag Secret named `senpai-launch-secrets-<tag>`:
-
-| Env var | Pod env | Resolution |
-|---|---|---|
-| `GITHUB_TOKEN` | `GITHUB_TOKEN` | shell env -> `.env` -> `gh auth token` |
-| `ANTHROPIC_API_KEY` | `ANTHROPIC_API_KEY` | shell env -> `.env` |
-| `EXA_API_KEY` | `EXA_API_KEY` | shell env -> `.env` |
-
-Use `example.env` for local setup:
+All workload credentials live in one gitignored file at the repository root:
 
 ```bash
 cp example.env .env
-# edit .env and set GITHUB_TOKEN, ANTHROPIC_API_KEY, and EXA_API_KEY
+# edit .env, then launch normally
 ```
 
-Notes: `--dry_run` renders redacted manifests without resolving or preflighting credentials. Real launches pass the Secret manifest to `kubectl apply` via stdin, but Kubernetes Secrets are still readable to anyone with namespace Secret read access. Delete launch resources when done: `kubectl delete deployments,configmaps,secrets -l research-tag=<tag>`.
+Four keys are required and preflighted before any resources start:
+
+| Key | Used for |
+|---|---|
+| `GITHUB_TOKEN` | Clone, push, and open PRs in the target repository |
+| `ANTHROPIC_API_KEY` | Claude Code |
+| `EXA_API_KEY` | Research search tools |
+| `WANDB_API_KEY` | W&B experiment tracking and Weave traces |
+
+Add any other provider credential to `.env`; every non-empty workload key is
+passed to advisor and student workers without a launcher code change. Known
+scout-only keys (`SLACK_WEBHOOK_URL`, `KUBECONFIG_B64`, and
+`SEMANTIC_SCHOLAR_API_KEY`) are routed only to that workflow. Keep ordinary
+settings in `senpai.yaml`, not `.env`, so workers receive only credentials they
+need.
+
+The launcher reads credentials only from `.env`, automatically restricts the
+file to mode `0600`, and never writes a generated plaintext credential file:
+
+| Backend | What the launcher does |
+|---|---|
+| Kubernetes | Applies one launch-scoped `Secret` over stdin and injects its keys with `envFrom` |
+| Docker | Passes values only to the Compose client, which mounts them as files under `/run/secrets` |
+
+`--dry_run` never prints secret values. Kubernetes Secrets still require
+cluster-side encryption at rest and least-privilege namespace RBAC. Docker
+workers convert mounted secret files to process environment variables only
+inside the container because the underlying tools expect those names; the
+values do not appear in the saved Compose file or `docker inspect` environment.
+
+The optional CoreWeave scout workflow uses the same source: add its commented
+keys from `example.env`, then run
+`uv run python scripts/apply_scout_workflow.py`.
 
 GitHub token requirements: use a PAT with `repo` and `read:org`; it must clone `target_repo_url` and push/open PRs there.
 
@@ -217,20 +264,6 @@ Charlie should keep the same model, data, optimizer, scheduler, validation,
 test, and timeout behavior as Willow, changing only the experiment-metrics
 logging surface and the prompts/docs that describe it.
 
-### Shared cluster secret (`senpai-secrets`)
-
-Every pod also reads `WANDB_API_KEY` from the shared `senpai-secrets` Secret:
-
-```bash
-# Create
-kubectl create secret generic senpai-secrets --from-literal=wandb-api-key="$WANDB_API_KEY"
-
-# Rotate
-kubectl patch secret senpai-secrets --type=merge -p "{\"stringData\":{\"wandb-api-key\":\"$WANDB_API_KEY\"}}"
-```
-
-`launch.py` does not preflight W&B; missing keys crash-loop pods.
-
 ## Running
 
 ```bash
@@ -241,21 +274,48 @@ git clone -b kagent_royal_rumble https://github.com/morganmcg1/tandemfoil2.git t
 cd target/ && python train.py --help
 cd target/ && python train.py --wandb_name "<name>/<description>"
 
-# Deploy to k8s (reads defaults from senpai.yaml, only --tag is required)
-python k8s/launch.py --tag <research-tag> --advisor
+# Deploy to Kubernetes (reads defaults from senpai.yaml)
+uv run python launch.py --tag <research-tag> --target_repo_url https://github.com/<org>/<problem-repo>.git --advisor
 
-python k8s/launch.py --tag <research-tag> --advisor --n_students 7 --pvc_mount_path "/mnt/pai-amf1-cfd"
-python k8s/launch.py --tag <research-tag> --n_students 7 --dry_run
-python k8s/launch.py --tag <research-tag> --advisor --extra_instructions "Only consider optimizer changes."
-python k8s/launch.py --tag <research-tag> --advisor --target_repo_branch icml-appendix-charlie --advisor_branch icml-appendix-charlie-rerun-r1 --gh_history_scope fresh --extra_instructions no-history.md
+uv run python launch.py --tag <research-tag> --advisor --n_students 7 --pvc_mount_path "/mnt/pai-amf1-cfd"
+uv run python launch.py --tag <research-tag> --n_students 7 --dry_run
+uv run python launch.py --tag <research-tag> --advisor --extra_instructions "Only consider optimizer changes."
+uv run python launch.py --tag <research-tag> --advisor --target_repo_branch icml-appendix-charlie --advisor_branch icml-appendix-charlie-rerun-r1 --gh_history_scope fresh --extra_instructions no-history.md
 
 # Parallel launches: use unique tags, plus --student_prefix when runs share student names
-python k8s/launch.py --tag <tag-a> --advisor --student_prefix a
-python k8s/launch.py --tag <tag-b> --advisor --student_prefix b
+uv run python launch.py --tag <tag-a> --advisor --student_prefix a
+uv run python launch.py --tag <tag-b> --advisor --student_prefix b
 
 # Stop a launch
 kubectl delete deployments,configmaps,secrets -l research-tag=<research-tag>
 ```
+
+### Docker on a single host
+
+Use the same command and `.env` file on any host with Docker Compose, including
+an AWS GPU instance. Each advisor or student runs as a Compose service using
+the same image and entrypoint as Kubernetes. GPU workers require the NVIDIA
+Container Toolkit; CPU-only launches need only Docker Engine with Compose v2.
+
+```bash
+# One student on GPU 0 plus the advisor
+uv run python launch.py \
+  --backend docker \
+  --tag <research-tag> \
+  --target_repo_url https://github.com/<org>/<problem-repo>.git \
+  --advisor \
+  --names fern \
+  --gpus_per_student 1 \
+  --docker_gpu_ids 0 \
+  --docker_dataset_path /path/to/dataset
+```
+
+Omit `--docker_gpu_ids` to assign GPU IDs sequentially across students. Use
+`--gpus_per_student 0` for CPU-only orchestration. The launcher saves only the
+non-secret Compose definition under `~/.senpai/runs/<tag>/compose.yaml` and
+prints the exact `logs` and `down` commands after launch. Re-run the same
+command after rotating `.env`; `--force-recreate` gives every container the new
+secret values.
 
 ## Adding a new problem
 
@@ -278,7 +338,7 @@ plus `instructions/` files that make the target work well with Senpai.
    git add senpai.yaml && git commit -m "Point senpai at my_problem"
    ```
    Or pass on the CLI: `--target_repo_url ... --target_repo_branch ... --advisor_branch ...`.
-3. Deploy as usual — `python k8s/launch.py --tag <tag> --advisor`. Agent commits/PRs will land in `myorg/my_problem`, not senpai.
+3. Deploy as usual — `uv run python launch.py --tag <tag> --advisor`. Agent commits/PRs will land in `myorg/my_problem`, not senpai.
 
 ## References
 

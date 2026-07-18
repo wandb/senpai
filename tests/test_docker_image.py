@@ -16,6 +16,9 @@ import pytest
 import weave
 from weave.trace.weave_client import CallsFilter
 
+from k8s.launch_helpers import render_launch_secret
+from senpai.launch.credentials import load_secrets
+
 ENTITY = "wandb-applied-ai-team"
 PROJECT = "senpai-v1"
 POD_NAME = "senpai-image-test"
@@ -23,6 +26,7 @@ IMAGE = "ghcr.io/wandb/senpai:latest"
 REPO_URL = "https://github.com/wandb/senpai.git"
 REPO_BRANCH = "main"
 POD_TEMPLATE = Path(__file__).parent / "test-pod.yaml"
+DOTENV_PATH = Path(__file__).parent.parent / ".env"
 STARTUP_TIMEOUT = 120  # seconds to wait for pod + plugin install
 CLAUDE_TIMEOUT = 60
 TAG = "test"
@@ -63,8 +67,8 @@ def _build_configmap() -> str:
         "apiVersion: v1", "kind: ConfigMap", "metadata:",
         "  name: senpai-config-test",
         "  labels:",
-        f"    app: senpai",
-        f"    role: test",
+        "    app: senpai",
+        "    role: test",
         f"    research-tag: {TAG}",
         "data:",
         f'  REPO_URL: "{REPO_URL}"',
@@ -84,10 +88,18 @@ def _render_pod_template() -> str:
 @pytest.fixture(scope="module")
 def test_pod():
     """Create configmap + test pod, wait for it, yield, then clean up."""
-    kubectl("delete", "pod,configmap", "-l", f"research-tag={TAG}", "--ignore-not-found", timeout=120)
+    kubectl(
+        "delete",
+        "pod,configmap,secret",
+        "-l",
+        f"research-tag={TAG}",
+        "--ignore-not-found",
+        timeout=120,
+    )
     time.sleep(2)
 
-    # Apply configmap then pod
+    # Apply the same .env-backed launch Secret used by real launches, then the pod.
+    kubectl_check("apply", "-f", "-", input=render_launch_secret(TAG, load_secrets(DOTENV_PATH)))
     kubectl_check("apply", "-f", "-", input=_build_configmap())
     kubectl_check("apply", "-f", "-", input=_render_pod_template())
     wait_for_pod(POD_NAME)
@@ -95,7 +107,14 @@ def test_pod():
     time.sleep(30)
     yield POD_NAME
 
-    kubectl("delete", "pod,configmap", "-l", f"research-tag={TAG}", "--ignore-not-found", timeout=120)
+    kubectl(
+        "delete",
+        "pod,configmap,secret",
+        "-l",
+        f"research-tag={TAG}",
+        "--ignore-not-found",
+        timeout=120,
+    )
 
 
 def test_tools_installed(test_pod):

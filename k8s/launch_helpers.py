@@ -10,13 +10,13 @@ future scripts (teardown, status, etc.) and unit-tested in isolation.
 
 import base64
 import json
-import os
 import subprocess
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
+
+from senpai.launch.specs import target_repo_slug
 
 STUDENT_NAMES = [
     "frieren", "fern", "tanjiro", "nezuko", "alphonse", "edward",
@@ -62,10 +62,7 @@ def routing_labels(advisor_branch: str, student_names: list[str]) -> dict[str, t
         advisor_branch: (LABEL_COLOR_ADVISOR_BRANCH, f"Advisor branch: {advisor_branch}"),
         "status:wip": (LABEL_COLOR_STATUS_WIP, "Work in progress"),
         "status:review": (LABEL_COLOR_STATUS_REVIEW, "Ready for advisor review"),
-        **{
-            f"student:{name}": (LABEL_COLOR_STUDENT, f"Assigned to student {name}")
-            for name in student_names
-        },
+        **{f"student:{name}": (LABEL_COLOR_STUDENT, f"Assigned to student {name}") for name in student_names},
     }
 
 
@@ -102,11 +99,6 @@ def render_configmap(name: str, labels: dict[str, str], data: dict[str, str]) ->
     for k, v in data.items():
         lines.append(f"  {k}: \"{v}\"")
     return "\n".join(lines)
-
-
-def target_repo_slug(url: str) -> str:
-    """Extract owner/repo slug from a GitHub URL (for `gh --repo`)."""
-    return url.split("github.com", 1)[-1].lstrip(":/").removesuffix(".git")
 
 
 def _github_api(
@@ -196,94 +188,13 @@ def ensure_advisor_branch(
     print(f"  created {advisor_branch} from {base_branch} at {base_sha[:7]}")
 
 
-LAUNCH_CREDENTIAL_ENV_NAMES = ("GITHUB_TOKEN", "ANTHROPIC_API_KEY", "EXA_API_KEY")
-
-
-def _dotenv_values(path: Path) -> dict[str, str]:
-    """Read KEY=VAL lines from path."""
-    values = {}
-    if not path.exists():
-        return values
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        v = v.strip().strip('"').strip("'")
-        values[k.strip()] = v
-    return values
-
-
-def _subprocess_env_without_launch_credentials() -> dict[str, str]:
-    return {k: v for k, v in os.environ.items() if k not in LAUNCH_CREDENTIAL_ENV_NAMES}
-
-
-def resolve_required_secret(dotenv_path: Path, env_name: str, label: str) -> str:
-    """Resolve a required secret from the shell env, then .env."""
-    value = os.environ.get(env_name, "").strip()
-    if not value:
-        value = _dotenv_values(dotenv_path).get(env_name, "").strip()
-    if value:
-        return value
-    sys.exit(f"ERROR: no {label}. Set ${env_name} in your shell or add {env_name}=<key> to .env.")
-
-
-def resolve_github_token(dotenv_path: Path) -> str:
-    """Resolve the GitHub token: $GITHUB_TOKEN → .env → `gh auth token` → hard error."""
-    tok = os.environ.get("GITHUB_TOKEN", "").strip()
-    if not tok:
-        tok = _dotenv_values(dotenv_path).get("GITHUB_TOKEN", "").strip()
-    if tok:
-        return tok
-    try:
-        res = subprocess.run(
-            ["gh", "auth", "token"],
-            capture_output=True,
-            text=True,
-            env=_subprocess_env_without_launch_credentials(),
-        )
-        if res.returncode == 0 and res.stdout.strip():
-            return res.stdout.strip()
-    except FileNotFoundError:
-        pass
-    sys.exit("ERROR: no github token. Set $GITHUB_TOKEN in your shell, add it to .env "
-             "at the senpai repo root, or run `gh auth login`.")
-
-
-def resolve_anthropic_api_key(dotenv_path: Path) -> str:
-    """Resolve the Anthropic API key: $ANTHROPIC_API_KEY → .env → hard error."""
-    return resolve_required_secret(dotenv_path, "ANTHROPIC_API_KEY", "Anthropic API key")
-
-
-def resolve_exa_api_key(dotenv_path: Path) -> str:
-    """Resolve the Exa API key: $EXA_API_KEY → .env → hard error."""
-    return resolve_required_secret(dotenv_path, "EXA_API_KEY", "Exa API key")
-
-
-def render_launch_secret(
-    tag: str,
-    github_token: str,
-    anthropic_api_key: str,
-    exa_api_key: str,
-) -> str:
+def render_launch_secret(tag: str, secrets: dict[str, str]) -> str:
     """Per-launch k8s Secret holding API credentials used by advisor/student pods."""
-    github_enc = base64.b64encode(github_token.encode()).decode()
-    anthropic_enc = base64.b64encode(anthropic_api_key.encode()).decode()
-    exa_enc = base64.b64encode(exa_api_key.encode()).decode()
-    return (
-        "apiVersion: v1\n"
-        "kind: Secret\n"
-        "metadata:\n"
-        f"  name: senpai-launch-secrets-{tag}\n"
-        "  labels:\n"
-        "    app: senpai\n"
-        f"    research-tag: {tag}\n"
-        "type: Opaque\n"
-        "data:\n"
-        f"  github-token: {github_enc}\n"
-        f"  anthropic-api-key: {anthropic_enc}\n"
-        f"  exa-api-key: {exa_enc}\n"
-    )
+    manifest = f"apiVersion: v1\nkind: Secret\nmetadata:\n  name: senpai-launch-secrets-{tag}\n  labels:\n    app: senpai\n    research-tag: {tag}\ntype: Opaque\ndata:\n"
+    for name, value in sorted(secrets.items()):
+        encoded = base64.b64encode(value.encode()).decode()
+        manifest += f"  {name}: {encoded}\n"
+    return manifest
 
 
 def _api_error_summary(error: urllib.error.HTTPError, *secrets: str) -> str:
@@ -308,16 +219,17 @@ def _api_error_summary(error: urllib.error.HTTPError, *secrets: str) -> str:
     return (summary or "<empty response>")[:1000]
 
 
-def _preflight_http(name: str, req: urllib.request.Request, secret: str, timeout: int) -> None:
+def _preflight_http(name: str, req: urllib.request.Request, secret: str, timeout: int) -> dict:
     print(f"Preflight: checking {name}", flush=True)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            json.loads(resp.read())
+            payload = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         sys.exit(f"ERROR: {name} failed: HTTP {e.code}: {_api_error_summary(e, secret)}")
     except urllib.error.URLError as e:
         sys.exit(f"ERROR: {name} failed: {e.reason}")
     print(f"  OK — {name} authenticated")
+    return payload
 
 
 def preflight_check_anthropic_api_key(api_key: str) -> None:
@@ -353,6 +265,22 @@ def preflight_check_exa_api_key(api_key: str) -> None:
     _preflight_http("Exa API key", req, api_key, timeout=15)
 
 
+def preflight_check_wandb_api_key(api_key: str) -> None:
+    """Verify the supplied W&B API key can authenticate."""
+    import wandb
+
+    print("Preflight: checking W&B API key", flush=True)
+    try:
+        wandb.Api(
+            overrides={"base_url": "https://api.wandb.ai"},
+            timeout=10,
+            api_key=api_key,
+        )
+    except wandb.errors.AuthenticationError as error:
+        sys.exit(f"ERROR: W&B API key failed: {error}")
+    print("  OK — W&B API key authenticated")
+
+
 def _oauth_scopes(header_value: str | None) -> set[str]:
     return {scope.strip() for scope in (header_value or "").split(",") if scope.strip()}
 
@@ -378,32 +306,18 @@ def preflight_check_target_repo_access(target_repo_url: str, token: str) -> None
         except urllib.error.HTTPError as e:
             hint = ""
             if e.code == 401:
-                hint = (
-                    "\n  Your token is invalid or expired. Grab a fresh one with:\n"
-                    "    gh auth token\n"
-                    "  then paste it into .env at the senpai repo root as GITHUB_TOKEN=<token>\n"
-                    "  (or `export GITHUB_TOKEN=$(gh auth token)` for this shell)."
-                )
-            sys.exit(
-                f"ERROR: GitHub API {e.code} for {path}: "
-                f"{_api_error_summary(e, token)}{hint}"
-            )
+                hint = "\n  Your token is invalid or expired. Replace GITHUB_TOKEN in .env at the senpai repo root."
+            sys.exit(f"ERROR: GitHub API {e.code} for {path}: {_api_error_summary(e, token)}{hint}")
 
     perms = gh_api(f"/repos/{slug}").get("permissions", {})
     if seen_scopes and not ({"read:org", "admin:org"} & seen_scopes):
-        sys.exit(
-            "ERROR: github token is missing read:org scope.\n"
-            "  Fix: create a PAT with repo + read:org and put it in .env as GITHUB_TOKEN."
-        )
+        sys.exit("ERROR: github token is missing read:org scope.\n  Fix: create a PAT with repo + read:org and put it in .env as GITHUB_TOKEN.")
     if perms.get("push"):
         print(f"  OK — token has push access to {slug}")
         return
 
     user = gh_api("/user").get("login", "<unknown>")
-    sys.exit(f"ERROR: github token (user '{user}') cannot push to {slug}\n"
-             f"  permissions: {perms}\n"
-             f"  Fix: supply a token with write on {slug} via $GITHUB_TOKEN / .env / gh auth, "
-             f"or grant '{user}' collaborator write on {slug}.")
+    sys.exit(f"ERROR: github token (user '{user}') cannot push to {slug}\n  permissions: {perms}\n  Fix: put a token with write on {slug} in .env, or grant '{user}' collaborator write on {slug}.")
 
 
 def ensure_target_repo_labels(target_repo_url: str, token: str, labels: dict[str, tuple[str, str]]) -> None:
@@ -456,6 +370,5 @@ def kubectl_apply(manifest: str, name: str) -> None:
         capture_output=True,
     )
     if result.returncode != 0:
-        print(f"  ERROR: {result.stderr.strip()}", file=sys.stderr)
-    else:
-        print(f"  {result.stdout.strip()}")
+        sys.exit(f"ERROR: could not apply {name}: {result.stderr.strip()}")
+    print(f"  {result.stdout.strip()}")
