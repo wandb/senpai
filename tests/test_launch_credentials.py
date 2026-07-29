@@ -116,6 +116,23 @@ def test_wandb_entity_is_omitted_until_explicitly_resolved():
     assert build_student_env(args, args.tag, "fern")["WANDB_ENTITY"] == "research-team"
 
 
+def test_launcher_only_encodes_user_supplied_instructions():
+    args = Args(
+        tag="paper-r1",
+        target_repo_url="https://github.com/wandb/target.git",
+    )
+
+    env = build_student_env(args, args.tag, "fern")
+    assert env["EXTRA_INSTRUCTIONS_B64"] == ""
+
+    args.extra_instructions = "Only consider optimizer changes."
+    env = build_student_env(args, args.tag, "fern")
+    assert (
+        base64.b64decode(env["EXTRA_INSTRUCTIONS_B64"]).decode()
+        == args.extra_instructions
+    )
+
+
 def test_wandb_preflight_uses_the_api_key_default_entity():
     with patch("senpai.launch.preflight.wandb.Api") as api:
         api.return_value.default_entity = "default-user"

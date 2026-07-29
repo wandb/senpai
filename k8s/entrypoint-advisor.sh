@@ -143,7 +143,7 @@ EXTRA_LAUNCH_INSTRUCTIONS=""
 # Append extra instructions from launch.py if provided
 if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
     EXTRA_LAUNCH_INSTRUCTIONS="$(printf '%s' "$EXTRA_INSTRUCTIONS_B64" | base64 -d)"
-    PROMPT="${PROMPT}"$'\n\n# Finally, some additional instructions\n\n'"${EXTRA_LAUNCH_INSTRUCTIONS}"
+    PROMPT="${PROMPT}"$'\n\n'"${EXTRA_LAUNCH_INSTRUCTIONS}"
 fi
 
 # Add "$KEY_INFO" (reminder of student names etc) to PROMPT
@@ -235,7 +235,7 @@ while true; do
 
         CONTINUE_PROMPT="${HEARTBEAT_PROMPT}"
         if [ -n "$EXTRA_LAUNCH_INSTRUCTIONS" ]; then
-            CONTINUE_PROMPT="${CONTINUE_PROMPT}"$'\n\n# Launch isolation and run-limit reminder\n\n'"${EXTRA_LAUNCH_INSTRUCTIONS}"
+            CONTINUE_PROMPT="${CONTINUE_PROMPT}"$'\n\n'"${EXTRA_LAUNCH_INSTRUCTIONS}"
         fi
         CONTINUE_PROMPT="${CONTINUE_PROMPT}"$'\n\n'"${TRIAGE_INFO}"
         run_advisor_claude_with_watchdog 1000 "$CONTINUE_PROMPT" -c || EXIT_CODE=$?

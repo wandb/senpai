@@ -83,37 +83,12 @@ def target_repo_slug(url: str) -> str:
     return url.split("github.com", 1)[-1].lstrip(":/").removesuffix(".git")
 
 
-def load_extra_instructions(extra_instructions: str) -> str:
+def encode_extra_instructions(extra_instructions: str) -> str:
     if not extra_instructions:
         return ""
     path = Path(extra_instructions)
-    return path.read_text() if path.exists() else extra_instructions
-
-
-def build_extra_instructions(args, tag: str, student_list: list[str]) -> str:
-    students = ", ".join(student_list)
-    target_base = args.target_repo_branch or "<default>"
-    isolation = f"""# Launch isolation and run-limit rules
-
-- This launch is scoped to research tag `{tag}`, advisor branch `{args.advisor_branch}`, and target base branch `{target_base}`.
-- Only inspect, modify, or reason from `{args.advisor_branch}` plus PR branches assigned to these students in this launch: {students}.
-- Do not inspect, compare, summarize, cherry-pick, borrow from, or base decisions on any PR or branch outside `{args.advisor_branch}` and the assigned student PR branches for this launch.
-- Do not use unrelated experiment runs or historical results unless the human explicitly names them during this launch.
-- Students branch from `{args.advisor_branch}`. Do not rebase or retarget work onto unrelated branches.
-- Treat `SENPAI_TIMEOUT_MINUTES` and `SENPAI_MAX_EPOCHS` as hard per-training-run bounds. Do not override them or continue a run past them.
-"""
-    user_extra = load_extra_instructions(args.extra_instructions)
-    return (
-        isolation
-        if not user_extra
-        else isolation + "\n# Additional operator instructions\n\n" + user_extra
-    )
-
-
-def encoded_extra_instructions(args, tag: str, student_list: list[str]) -> str:
-    return base64.b64encode(
-        build_extra_instructions(args, tag, student_list).encode()
-    ).decode()
+    instructions = path.read_text() if path.is_file() else extra_instructions
+    return base64.b64encode(instructions.encode()).decode()
 
 
 def build_student_env(args, tag: str, student_name: str) -> dict[str, str]:
@@ -143,7 +118,7 @@ def build_student_env(args, tag: str, student_name: str) -> dict[str, str]:
         "STUDENT_CLAUDE_MIN_RUNTIME_S": str(args.student_claude_min_runtime_s),
         "STUDENT_CLAUDE_STALE_LOG_S": str(args.student_claude_stale_log_s),
         "STUDENT_ASSIGNMENT_DRIFT_GRACE_S": str(args.student_assignment_drift_grace_s),
-        "EXTRA_INSTRUCTIONS_B64": encoded_extra_instructions(args, tag, [student_name]),
+        "EXTRA_INSTRUCTIONS_B64": encode_extra_instructions(args.extra_instructions),
         "PROBLEM_DIR": args.problem_dir,
         "PVC_MOUNT_PATH": args.pvc_mount_path,
         "SENPAI_START_GATE_PATH": args.start_gate_path,
@@ -177,7 +152,7 @@ def build_advisor_env(args, tag: str, student_list: list[str]) -> dict[str, str]
         "PROBLEM_DIR": args.problem_dir,
         "PVC_MOUNT_PATH": args.pvc_mount_path,
         "SENPAI_START_GATE_PATH": args.start_gate_path,
-        "EXTRA_INSTRUCTIONS_B64": encoded_extra_instructions(args, tag, student_list),
+        "EXTRA_INSTRUCTIONS_B64": encode_extra_instructions(args.extra_instructions),
     }
 
 
