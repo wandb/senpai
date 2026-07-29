@@ -26,20 +26,23 @@ def _args(tmp_path, **overrides):
     return SimpleNamespace(**values)
 
 
-def _roles():
-    secrets = {
+def _secrets():
+    return {
         "GITHUB_TOKEN": "github-secret",
         "WANDB_API_KEY": "wandb-secret",
     }
+
+
+def _roles():
     return [
-        RoleSpec("student", "fern", {"STUDENT_NAME": "fern"}, secrets),
-        RoleSpec("student", "frieren", {"STUDENT_NAME": "frieren"}, secrets),
-        RoleSpec("advisor", "advisor", {"STUDENT_NAMES": "fern,frieren"}, secrets),
+        RoleSpec("student", "fern", {"STUDENT_NAME": "fern"}),
+        RoleSpec("student", "frieren", {"STUDENT_NAME": "frieren"}),
+        RoleSpec("advisor", "advisor", {"STUDENT_NAMES": "fern,frieren"}),
     ]
 
 
 def test_compose_uses_native_secrets_without_serializing_values(tmp_path):
-    rendered = render_compose(_args(tmp_path), _roles())
+    rendered = render_compose(_args(tmp_path), _roles(), _secrets())
     compose = yaml.safe_load(rendered)
 
     assert "github-secret" not in rendered
@@ -68,7 +71,7 @@ def test_docker_launch_passes_secrets_only_to_compose_process(tmp_path):
     args = _args(tmp_path)
 
     with patch("senpai.launch.docker_backend.subprocess.run") as run:
-        launch_docker(args, _roles())
+        launch_docker(args, _roles(), _secrets())
 
     command = run.call_args.args[0]
     child_env = run.call_args.kwargs["env"]

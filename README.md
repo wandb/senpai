@@ -210,8 +210,9 @@ Add any other provider credential to `.env`; every non-empty workload key is
 passed to advisor and student workers without a launcher code change. Known
 scout-only keys (`SLACK_WEBHOOK_URL`, `KUBECONFIG_B64`, and
 `SEMANTIC_SCHOLAR_API_KEY`) are routed only to that workflow. Keep ordinary
-settings in `senpai.yaml`, not `.env`, so workers receive only credentials they
-need.
+settings in `senpai.yaml` or launch arguments, not `.env`. The launcher fails
+before creating resources if a `.env` name would override a Senpai runtime
+setting such as `WANDB_PROJECT` or `REPO_URL`.
 
 The launcher reads credentials only from `.env`, automatically restricts the
 file to mode `0600`, and never writes a generated plaintext credential file:
@@ -226,6 +227,13 @@ cluster-side encryption at rest and least-privilege namespace RBAC. Docker
 workers convert mounted secret files to process environment variables only
 inside the container because the underlying tools expect those names; the
 values do not appear in the saved Compose file or `docker inspect` environment.
+
+Re-running a Kubernetes tag updates its Secret but deliberately does not
+restart existing pods, because doing so could interrupt long-running training.
+The launcher warns when the tag already has deployments and prints the
+`kubectl rollout restart` command to run when it is safe. Existing pods keep
+their current credentials until they restart; any pod that restarts later loads
+the updated values.
 
 The optional CoreWeave scout workflow uses the same source: add its commented
 keys from `example.env`, then run

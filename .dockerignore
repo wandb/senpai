@@ -3,5 +3,4 @@
 # SPDX-PackageName: senpai
 
 # Local credentials must never enter a Docker build context.
-.env
-.env.*
+.env*

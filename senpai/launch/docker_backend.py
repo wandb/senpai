@@ -55,8 +55,8 @@ def _gpu_assignments(args, role_specs: list[RoleSpec]) -> dict[str, list[str]]:
     return assignments
 
 
-def render_compose(args, role_specs: list[RoleSpec]) -> str:
-    secret_names = sorted({name for spec in role_specs for name in spec.secrets})
+def render_compose(args, role_specs: list[RoleSpec], secrets: dict[str, str]) -> str:
+    secret_names = sorted(secrets)
     gpu_ids = _gpu_assignments(args, role_specs)
     services = {}
     for spec in role_specs:
@@ -100,8 +100,8 @@ def render_compose(args, role_specs: list[RoleSpec]) -> str:
     return yaml.safe_dump(compose, sort_keys=False)
 
 
-def launch_docker(args, role_specs: list[RoleSpec]) -> None:
-    compose = render_compose(args, role_specs)
+def launch_docker(args, role_specs: list[RoleSpec], secrets: dict[str, str]) -> None:
+    compose = render_compose(args, role_specs, secrets)
     if args.dry_run:
         print(compose, end="")
         return
@@ -113,8 +113,7 @@ def launch_docker(args, role_specs: list[RoleSpec]) -> None:
     compose_path.chmod(0o600)
 
     secret_env = os.environ.copy()
-    for spec in role_specs:
-        secret_env.update(spec.secrets)
+    secret_env.update(secrets)
 
     project = _safe_name(f"senpai-{args.tag}")
     subprocess.run(

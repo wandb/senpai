@@ -17,7 +17,7 @@ import weave
 from weave.trace.weave_client import CallsFilter
 
 from k8s.launch_helpers import render_launch_secret
-from senpai.launch.credentials import load_secrets
+from senpai.launch.credentials import load_workload_secrets
 
 ENTITY = "wandb-applied-ai-team"
 PROJECT = "senpai-v1"
@@ -99,7 +99,12 @@ def test_pod():
     time.sleep(2)
 
     # Apply the same .env-backed launch Secret used by real launches, then the pod.
-    kubectl_check("apply", "-f", "-", input=render_launch_secret(TAG, load_secrets(DOTENV_PATH)))
+    kubectl_check(
+        "apply",
+        "-f",
+        "-",
+        input=render_launch_secret(TAG, load_workload_secrets(DOTENV_PATH)),
+    )
     kubectl_check("apply", "-f", "-", input=_build_configmap())
     kubectl_check("apply", "-f", "-", input=_render_pod_template())
     wait_for_pod(POD_NAME)

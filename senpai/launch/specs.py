@@ -16,7 +16,6 @@ class RoleSpec:
     role: str
     name: str
     env: dict[str, str]
-    secrets: dict[str, str]
 
     @property
     def key(self) -> str:
@@ -126,17 +125,25 @@ def build_advisor_env(args, tag: str, student_list: list[str]) -> dict[str, str]
     }
 
 
-def build_student_spec(
-    args, tag: str, student_name: str, secrets: dict[str, str]
-) -> RoleSpec:
-    return RoleSpec(
-        "student", student_name, build_student_env(args, tag, student_name), secrets
-    )
+def build_student_spec(args, tag: str, student_name: str) -> RoleSpec:
+    return RoleSpec("student", student_name, build_student_env(args, tag, student_name))
 
 
-def build_advisor_spec(
-    args, tag: str, student_list: list[str], secrets: dict[str, str]
-) -> RoleSpec:
-    return RoleSpec(
-        "advisor", "advisor", build_advisor_env(args, tag, student_list), secrets
-    )
+def build_advisor_spec(args, tag: str, student_list: list[str]) -> RoleSpec:
+    return RoleSpec("advisor", "advisor", build_advisor_env(args, tag, student_list))
+
+
+def validate_secret_config_separation(
+    role_specs: list[RoleSpec], secrets: dict[str, str]
+) -> None:
+    """Reject .env keys owned by senpai.yaml or the launcher."""
+    runtime_names = {"SENPAI_ROLE"}
+    for spec in role_specs:
+        runtime_names.update(spec.env)
+    overlap = sorted(runtime_names.intersection(secrets))
+    if overlap:
+        raise SystemExit(
+            "ERROR: .env overlaps Senpai runtime settings: "
+            f"{', '.join(overlap)}. Keep only credentials in .env; "
+            "set these values in senpai.yaml or launch arguments."
+        )

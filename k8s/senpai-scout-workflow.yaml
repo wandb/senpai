@@ -14,12 +14,7 @@ spec:
     timeout: 45m
     env:
       SEMANTIC_SCHOLAR_ENDPOINT: "https://api.semanticscholar.org"
-    secrets:
-      GITHUB_TOKEN: ""
-      SLACK_WEBHOOK_URL: ""
-      WANDB_API_KEY: ""
-      KUBECONFIG_B64: ""
-      SEMANTIC_SCHOLAR_API_KEY: ""
+    secrets: {}
   parameters:
     - name: research_tag
       type: string

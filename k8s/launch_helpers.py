@@ -66,20 +66,32 @@ def routing_labels(advisor_branch: str, student_names: list[str]) -> dict[str, t
     }
 
 
-def existing_student_names(tag: str) -> list[str]:
+def _kubectl_get_lines(*args: str) -> list[str]:
     result = subprocess.run(
-        [
-            "kubectl",
-            "get",
-            "deployments",
-            "-l",
-            f"app=senpai,role=student,research-tag={tag}",
-            "-o",
-            'jsonpath={range .items[*]}{.metadata.labels.student}{"\\n"}{end}',
-        ],
+        ["kubectl", "get", *args],
         capture_output=True, text=True, check=True,
     )
     return [line for line in result.stdout.splitlines() if line]
+
+
+def existing_student_names(tag: str) -> list[str]:
+    return _kubectl_get_lines(
+        "deployments",
+        "-l",
+        f"app=senpai,role=student,research-tag={tag}",
+        "-o",
+        'jsonpath={range .items[*]}{.metadata.labels.student}{"\\n"}{end}',
+    )
+
+
+def existing_deployment_names(tag: str) -> list[str]:
+    return _kubectl_get_lines(
+        "deployments",
+        "-l",
+        f"app=senpai,research-tag={tag}",
+        "-o",
+        "name",
+    )
 
 
 def render_template(template: str, replacements: dict[str, str]) -> str:
