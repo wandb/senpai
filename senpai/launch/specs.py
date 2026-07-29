@@ -10,6 +10,27 @@ import base64
 from dataclasses import dataclass
 from pathlib import Path
 
+STUDENT_NAMES = (
+    "frieren", "fern", "tanjiro", "nezuko", "alphonse", "edward",
+    "thorfinn", "askeladd", "violet", "gilbert", "senku", "kohaku",
+    "emma", "norman", "chihiro", "haku", "shoya", "shouko",
+    "mitsuha", "taki", "shinji", "rei", "kaneda", "tetsuo",
+    "naruto", "sasuke", "sakura", "kakashi", "hinata", "itachi",
+    "roy", "winry", "eren", "mikasa", "armin", "levi",
+    "historia", "ymir", "zenitsu", "inosuke", "giyu", "shinobu",
+    "chrome", "gen", "ray", "asuka", "kaworu", "luffy",
+    "zoro", "nami", "sanji", "robin", "chopper", "usopp",
+    "franky", "brook", "yuji", "megumi", "nobara", "gojo",
+    "sukuna", "spike", "jet", "faye", "vash", "wolfwood",
+    "guts", "casca", "griffith", "einar", "canute", "stark",
+    "himmel", "mugen", "jin",
+)
+
+LABEL_COLOR_ADVISOR_BRANCH = "0075ca"
+LABEL_COLOR_STATUS_WIP = "fbca04"
+LABEL_COLOR_STATUS_REVIEW = "0e8a16"
+LABEL_COLOR_STUDENT = "f9d0c4"
+
 
 @dataclass(frozen=True)
 class RoleSpec:
@@ -20,6 +41,41 @@ class RoleSpec:
     @property
     def key(self) -> str:
         return "advisor" if self.role == "advisor" else f"student-{self.name}"
+
+
+def expand_student_names(
+    n: int, names: tuple[str, ...] = STUDENT_NAMES
+) -> list[str]:
+    """Return names, adding numeric suffixes after the base list is exhausted."""
+    return [
+        (
+            names[index % len(names)]
+            if index < len(names)
+            else f"{names[index % len(names)]}{index // len(names) + 1}"
+        )
+        for index in range(n)
+    ]
+
+
+def routing_labels(
+    advisor_branch: str, student_names: list[str]
+) -> dict[str, tuple[str, str]]:
+    """Labels required for advisor/student PR routing."""
+    return {
+        advisor_branch: (
+            LABEL_COLOR_ADVISOR_BRANCH,
+            f"Advisor branch: {advisor_branch}",
+        ),
+        "status:wip": (LABEL_COLOR_STATUS_WIP, "Work in progress"),
+        "status:review": (LABEL_COLOR_STATUS_REVIEW, "Ready for advisor review"),
+        **{
+            f"student:{name}": (
+                LABEL_COLOR_STUDENT,
+                f"Assigned to student {name}",
+            )
+            for name in student_names
+        },
+    }
 
 
 def target_repo_slug(url: str) -> str:

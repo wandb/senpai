@@ -2,115 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-PackageName: senpai
 
-"""Pure helpers shared by launch.py.
+"""Credential and target-repository checks performed before launch."""
 
-Keep this file free of CLI/argparse coupling so helpers can be reused by
-future scripts (teardown, status, etc.) and unit-tested in isolation.
-"""
-
-import base64
 import json
-import subprocess
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from senpai.launch.specs import target_repo_slug
-
-STUDENT_NAMES = [
-    "frieren", "fern", "tanjiro", "nezuko", "alphonse", "edward",
-    "thorfinn", "askeladd", "violet", "gilbert", "senku", "kohaku",
-    "emma", "norman", "chihiro", "haku", "shoya", "shouko",
-    "mitsuha", "taki", "shinji", "rei", "kaneda", "tetsuo",
-    "naruto", "sasuke", "sakura", "kakashi", "hinata", "itachi",
-    "roy", "winry", "eren", "mikasa", "armin", "levi",
-    "historia", "ymir", "zenitsu", "inosuke", "giyu", "shinobu",
-    "chrome", "gen", "ray", "asuka", "kaworu", "luffy",
-    "zoro", "nami", "sanji", "robin", "chopper", "usopp",
-    "franky", "brook", "yuji", "megumi", "nobara", "gojo",
-    "sukuna", "spike", "jet", "faye", "vash", "wolfwood",
-    "guts", "casca", "griffith", "einar", "canute", "stark",
-    "himmel", "mugen", "jin",
-]
-
-LABEL_COLOR_ADVISOR_BRANCH = "0075ca"
-LABEL_COLOR_STATUS_WIP = "fbca04"
-LABEL_COLOR_STATUS_REVIEW = "0e8a16"
-LABEL_COLOR_STUDENT = "f9d0c4"
-
-
-def expand_student_names(n: int, names: list[str] = STUDENT_NAMES) -> list[str]:
-    """Return n student names, cycling through `names` with a numeric suffix
-    once the list is exhausted.
-
-    First pass uses bare names; each subsequent pass appends an incrementing
-    suffix (e.g. for `n=3*len(names)`: frieren, ..., jin, frieren2, ..., jin2,
-    frieren3, ..., jin3).
-    """
-    out = []
-    for i in range(n):
-        base = names[i % len(names)]
-        round_num = i // len(names)
-        out.append(base if round_num == 0 else f"{base}{round_num + 1}")
-    return out
-
-
-def routing_labels(advisor_branch: str, student_names: list[str]) -> dict[str, tuple[str, str]]:
-    """Labels required for advisor/student PR routing."""
-    return {
-        advisor_branch: (LABEL_COLOR_ADVISOR_BRANCH, f"Advisor branch: {advisor_branch}"),
-        "status:wip": (LABEL_COLOR_STATUS_WIP, "Work in progress"),
-        "status:review": (LABEL_COLOR_STATUS_REVIEW, "Ready for advisor review"),
-        **{f"student:{name}": (LABEL_COLOR_STUDENT, f"Assigned to student {name}") for name in student_names},
-    }
-
-
-def _kubectl_get_lines(*args: str) -> list[str]:
-    result = subprocess.run(
-        ["kubectl", "get", *args],
-        capture_output=True, text=True, check=True,
-    )
-    return [line for line in result.stdout.splitlines() if line]
-
-
-def existing_student_names(tag: str) -> list[str]:
-    return _kubectl_get_lines(
-        "deployments",
-        "-l",
-        f"app=senpai,role=student,research-tag={tag}",
-        "-o",
-        'jsonpath={range .items[*]}{.metadata.labels.student}{"\\n"}{end}',
-    )
-
-
-def existing_deployment_names(tag: str) -> list[str]:
-    return _kubectl_get_lines(
-        "deployments",
-        "-l",
-        f"app=senpai,research-tag={tag}",
-        "-o",
-        "name",
-    )
-
-
-def render_template(template: str, replacements: dict[str, str]) -> str:
-    """Replace {{PLACEHOLDER}} tokens in a K8s manifest template."""
-    out = template
-    for key, value in replacements.items():
-        out = out.replace(f"{{{{{key}}}}}", value)
-    return out
-
-
-def render_configmap(name: str, labels: dict[str, str], data: dict[str, str]) -> str:
-    """Generate a ConfigMap YAML document."""
-    lines = ["apiVersion: v1", "kind: ConfigMap", "metadata:", f"  name: {name}", "  labels:"]
-    for k, v in labels.items():
-        lines.append(f"    {k}: {v}")
-    lines.append("data:")
-    for k, v in data.items():
-        lines.append(f"  {k}: \"{v}\"")
-    return "\n".join(lines)
+from .specs import target_repo_slug
 
 
 def _github_api(
@@ -198,15 +98,6 @@ def ensure_advisor_branch(
     }).encode()
     _github_api(f"/repos/{slug}/git/refs", token, method="POST", data=payload)
     print(f"  created {advisor_branch} from {base_branch} at {base_sha[:7]}")
-
-
-def render_launch_secret(tag: str, secrets: dict[str, str]) -> str:
-    """Per-launch k8s Secret holding API credentials used by advisor/student pods."""
-    manifest = f"apiVersion: v1\nkind: Secret\nmetadata:\n  name: senpai-launch-secrets-{tag}\n  labels:\n    app: senpai\n    research-tag: {tag}\ntype: Opaque\ndata:\n"
-    for name, value in sorted(secrets.items()):
-        encoded = base64.b64encode(value.encode()).decode()
-        manifest += f"  {name}: {encoded}\n"
-    return manifest
 
 
 def _api_error_summary(error: urllib.error.HTTPError, *secrets: str) -> str:
@@ -370,17 +261,3 @@ def ensure_target_repo_labels(target_repo_url: str, token: str, labels: dict[str
 
             print(f"GitHub label check failed for {name!r}", file=sys.stderr)
             raise
-
-
-def kubectl_apply(manifest: str, name: str) -> None:
-    """Apply a manifest via kubectl."""
-    print(f"Launching: {name}")
-    result = subprocess.run(
-        ["kubectl", "apply", "-f", "-"],
-        input=manifest,
-        text=True,
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        sys.exit(f"ERROR: could not apply {name}: {result.stderr.strip()}")
-    print(f"  {result.stdout.strip()}")

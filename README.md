@@ -97,7 +97,6 @@ senpai/
 │   ├── CLAUDE-ADVISOR.md
 │   └── CLAUDE-STUDENT.md
 ├── k8s/                           # Kubernetes manifests and worker entrypoints
-│   ├── launch.py                  #   Backwards-compatible launcher path
 │   ├── advisor-deployment.yaml
 │   ├── student-deployment.yaml
 │   ├── entrypoint-advisor.sh

@@ -16,8 +16,8 @@ import pytest
 import weave
 from weave.trace.weave_client import CallsFilter
 
-from k8s.launch_helpers import render_launch_secret
 from senpai.launch.credentials import load_workload_secrets
+from senpai.launch.kubernetes_backend import render_launch_secret
 
 ENTITY = "wandb-applied-ai-team"
 PROJECT = "senpai-v1"

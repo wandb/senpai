@@ -10,25 +10,23 @@ from pathlib import Path
 
 import simple_parsing as sp
 
-from k8s.launch_helpers import (
+from .credentials import load_workload_secrets, workload_secret_names
+from .docker_backend import launch_docker
+from .kubernetes_backend import existing_student_names, launch_kubernetes
+from .preflight import (
     ensure_advisor_branch,
     ensure_target_repo_labels,
-    existing_student_names,
-    expand_student_names,
     preflight_check_anthropic_api_key,
     preflight_check_exa_api_key,
     preflight_check_target_repo_access,
     preflight_check_target_repo_branch,
     preflight_check_wandb_api_key,
-    routing_labels,
 )
-
-from .credentials import load_workload_secrets, workload_secret_names
-from .docker_backend import launch_docker
-from .kubernetes_backend import launch_kubernetes
 from .specs import (
     build_advisor_spec,
     build_student_spec,
+    expand_student_names,
+    routing_labels,
     target_repo_slug,
     validate_secret_config_separation,
 )

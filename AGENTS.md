@@ -52,7 +52,6 @@ to README.md or SPEC.md as appropriate.
 
 - `k8s/advisor-deployment.yaml` / `k8s/student-deployment.yaml` — pod specs
 - `k8s/entrypoint-advisor.sh` / `k8s/entrypoint-student.sh` — startup scripts
-- `k8s/launch.py` — helper to template and apply deployments
 
 ## system_instructions/
 

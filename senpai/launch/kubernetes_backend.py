@@ -4,21 +4,100 @@
 
 """Kubernetes backend for launch-scoped configuration and credentials."""
 
+import base64
+import subprocess
+import sys
 from pathlib import Path
-
-from k8s.launch_helpers import (
-    existing_deployment_names,
-    kubectl_apply,
-    render_configmap,
-    render_launch_secret,
-    render_template,
-)
 
 from .specs import RoleSpec
 
 ROOT = Path(__file__).resolve().parents[2]
 STUDENT_TEMPLATE = ROOT / "k8s" / "student-deployment.yaml"
 ADVISOR_TEMPLATE = ROOT / "k8s" / "advisor-deployment.yaml"
+
+
+def _kubectl_get_lines(*args: str) -> list[str]:
+    result = subprocess.run(
+        ["kubectl", "get", *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def existing_student_names(tag: str) -> list[str]:
+    return _kubectl_get_lines(
+        "deployments",
+        "-l",
+        f"app=senpai,role=student,research-tag={tag}",
+        "-o",
+        'jsonpath={range .items[*]}{.metadata.labels.student}{"\\n"}{end}',
+    )
+
+
+def existing_deployment_names(tag: str) -> list[str]:
+    return _kubectl_get_lines(
+        "deployments",
+        "-l",
+        f"app=senpai,research-tag={tag}",
+        "-o",
+        "name",
+    )
+
+
+def render_template(template: str, replacements: dict[str, str]) -> str:
+    for key, value in replacements.items():
+        template = template.replace(f"{{{{{key}}}}}", value)
+    return template
+
+
+def render_configmap(
+    name: str, labels: dict[str, str], data: dict[str, str]
+) -> str:
+    lines = [
+        "apiVersion: v1",
+        "kind: ConfigMap",
+        "metadata:",
+        f"  name: {name}",
+        "  labels:",
+    ]
+    lines.extend(f"    {key}: {value}" for key, value in labels.items())
+    lines.append("data:")
+    lines.extend(f'  {key}: "{value}"' for key, value in data.items())
+    return "\n".join(lines)
+
+
+def render_launch_secret(tag: str, secrets: dict[str, str]) -> str:
+    manifest = (
+        "apiVersion: v1\n"
+        "kind: Secret\n"
+        "metadata:\n"
+        f"  name: senpai-launch-secrets-{tag}\n"
+        "  labels:\n"
+        "    app: senpai\n"
+        f"    research-tag: {tag}\n"
+        "type: Opaque\n"
+        "data:\n"
+    )
+    for name, value in sorted(secrets.items()):
+        encoded = base64.b64encode(value.encode()).decode()
+        manifest += f"  {name}: {encoded}\n"
+    return manifest
+
+
+def kubectl_apply(manifest: str, name: str) -> None:
+    print(f"Launching: {name}")
+    result = subprocess.run(
+        ["kubectl", "apply", "-f", "-"],
+        input=manifest,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        sys.exit(f"ERROR: could not apply {name}: {result.stderr.strip()}")
+    print(f"  {result.stdout.strip()}")
 
 
 def render_student(args, spec: RoleSpec, secret_name: str) -> str:

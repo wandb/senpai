@@ -8,7 +8,6 @@ import stat
 import pytest
 import yaml
 
-from k8s.launch_helpers import render_launch_secret
 from scripts.apply_scout_workflow import render_workflow
 from senpai.launch.credentials import (
     SCOUT_SECRET_NAMES,
@@ -17,6 +16,7 @@ from senpai.launch.credentials import (
     load_workload_secrets,
     workload_secret_names,
 )
+from senpai.launch.kubernetes_backend import render_launch_secret
 from senpai.launch.specs import RoleSpec, validate_secret_config_separation
 
 
