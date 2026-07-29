@@ -207,8 +207,8 @@ Four keys are required and preflighted before any resources start:
 
 Add any other provider credential to `.env`; every non-empty workload key is
 passed to advisor and student workers without a launcher code change. Known
-scout-only keys (`SLACK_WEBHOOK_URL`, `KUBECONFIG_B64`, and
-`SEMANTIC_SCHOLAR_API_KEY`) are routed only to that workflow. Keep ordinary
+scout-only keys (`KUBECONFIG_B64` and `SEMANTIC_SCHOLAR_API_KEY`) are routed
+only to that workflow. Keep ordinary
 settings in `senpai.yaml` or launch arguments, not `.env`. The launcher fails
 before creating resources if a `.env` name would override a Senpai runtime
 setting such as `WANDB_PROJECT` or `REPO_URL`.

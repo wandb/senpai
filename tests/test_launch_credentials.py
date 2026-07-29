@@ -67,7 +67,6 @@ def test_scout_only_secrets_are_not_sent_to_workers(tmp_path):
     path.write_text(
         _dotenv(
             CUSTOM_SERVICE_TOKEN="custom-secret",
-            SLACK_WEBHOOK_URL="slack-secret",
             KUBECONFIG_B64="cluster-secret",
             SEMANTIC_SCHOLAR_API_KEY="search-secret",
         )
@@ -87,7 +86,6 @@ def test_scout_receives_only_its_declared_secrets(tmp_path):
     path = tmp_path / ".env"
     path.write_text(
         _dotenv(
-            SLACK_WEBHOOK_URL="slack-secret",
             KUBECONFIG_B64="cluster-secret",
             SEMANTIC_SCHOLAR_API_KEY="search-secret",
             CUSTOM_SERVICE_TOKEN="workload-only",
@@ -165,7 +163,6 @@ def test_kubernetes_secret_preserves_env_names_and_values():
 def test_scout_workflow_is_filled_from_the_same_secret_mapping():
     secrets = {
         "GITHUB_TOKEN": "github-secret",
-        "SLACK_WEBHOOK_URL": "https://hooks.example/secret",
         "WANDB_API_KEY": "wandb-secret",
         "KUBECONFIG_B64": "kube-secret",
     }
