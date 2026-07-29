@@ -32,7 +32,8 @@ pvc_claim_name: new-pvc
 pvc_mount_path: /mnt/new-pvc
 
 # W&B
-wandb_entity: wandb-applied-ai-team
+# Optional; null uses the default entity for WANDB_API_KEY.
+wandb_entity: null
 wandb_project: senpai-v1
 
 # advisor — the integration branch inside the problem-package repo that advisor PRs merge into

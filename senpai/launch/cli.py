@@ -54,7 +54,7 @@ class Args:
     repo_url: str = "https://github.com/wandb/senpai.git"  # runner repo
     repo_branch: str = "main"  # runner branch
     image: str = "ghcr.io/wandb/senpai:latest"  # worker container image
-    wandb_entity: str = "wandb-applied-ai-team"  # W&B team or username
+    wandb_entity: str | None = None  # W&B team; defaults to the API key's entity
     wandb_project: str = "senpai-v1"  # W&B project
     human_issues: bool = True  # allow human GitHub issue triage
     advisor_branch: str = "schmidhuber"  # target integration branch
@@ -142,7 +142,10 @@ def _preflight(args: Args, secrets: dict[str, str]) -> str:
     )
     preflight_check_anthropic_api_key(secrets["ANTHROPIC_API_KEY"])
     preflight_check_exa_api_key(secrets["EXA_API_KEY"])
-    preflight_check_wandb_api_key(secrets["WANDB_API_KEY"])
+    args.wandb_entity = preflight_check_wandb_api_key(
+        secrets["WANDB_API_KEY"],
+        args.wandb_entity,
+    )
     return github_token
 
 

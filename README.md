@@ -127,7 +127,7 @@ docker_dataset_path: ""
 docker_gpu_ids: ""
 pvc_claim_name: new-pvc
 pvc_mount_path: /mnt/new-pvc
-wandb_entity: wandb-applied-ai-team
+wandb_entity: null  # optional; uses the API key's default entity
 wandb_project: senpai-v1
 timeout_minutes: 30.0
 max_epochs: 50

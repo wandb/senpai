@@ -4,11 +4,13 @@
 
 import base64
 import stat
+from unittest.mock import patch
 
 import pytest
 import yaml
 
 from scripts.apply_scout_workflow import render_workflow
+from senpai.launch.cli import Args
 from senpai.launch.credentials import (
     SCOUT_SECRET_NAMES,
     WORKLOAD_REQUIRED_SECRET_NAMES,
@@ -17,7 +19,12 @@ from senpai.launch.credentials import (
     workload_secret_names,
 )
 from senpai.launch.kubernetes_backend import render_launch_secret
-from senpai.launch.specs import RoleSpec, validate_secret_config_separation
+from senpai.launch.preflight import preflight_check_wandb_api_key
+from senpai.launch.specs import (
+    RoleSpec,
+    build_student_env,
+    validate_secret_config_separation,
+)
 
 
 def _dotenv(**overrides: str) -> str:
@@ -97,6 +104,27 @@ def test_scout_receives_only_its_declared_secrets(tmp_path):
 
 def test_dry_run_secret_names_work_without_dotenv(tmp_path):
     assert workload_secret_names(tmp_path / ".env") == WORKLOAD_REQUIRED_SECRET_NAMES
+
+
+def test_wandb_entity_is_omitted_until_explicitly_resolved():
+    args = Args(
+        tag="paper-r1",
+        target_repo_url="https://github.com/wandb/target.git",
+    )
+
+    assert "WANDB_ENTITY" not in build_student_env(args, args.tag, "fern")
+
+    args.wandb_entity = "research-team"
+    assert build_student_env(args, args.tag, "fern")["WANDB_ENTITY"] == "research-team"
+
+
+def test_wandb_preflight_uses_the_api_key_default_entity():
+    with patch("senpai.launch.preflight.wandb.Api") as api:
+        api.return_value.default_entity = "default-user"
+
+        entity = preflight_check_wandb_api_key("wandb-secret", None)
+
+    assert entity == "default-user"
 
 
 def test_dotenv_cannot_override_runtime_settings():

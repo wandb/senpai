@@ -170,18 +170,29 @@ def preflight_check_exa_api_key(api_key: str) -> None:
     _preflight_http("Exa API key", req, api_key, timeout=15)
 
 
-def preflight_check_wandb_api_key(api_key: str) -> None:
-    """Verify the supplied W&B API key can authenticate."""
+def preflight_check_wandb_api_key(
+    api_key: str,
+    entity: str | None,
+) -> str:
+    """Verify the W&B key and resolve its configured or default entity."""
     print("Preflight: checking W&B API key", flush=True)
     try:
-        wandb.Api(
+        api = wandb.Api(
             overrides={"base_url": "https://api.wandb.ai"},
             timeout=10,
             api_key=api_key,
         )
+        default_entity = api.default_entity
     except wandb.errors.AuthenticationError as error:
         sys.exit(f"ERROR: W&B API key failed: {error}")
-    print("  OK — W&B API key authenticated")
+    resolved_entity = entity or default_entity
+    if not resolved_entity:
+        sys.exit(
+            "ERROR: W&B API key has no default entity. "
+            "Set wandb_entity in senpai.yaml or pass --wandb_entity."
+        )
+    print(f"  OK — W&B API key authenticated as {resolved_entity}")
+    return resolved_entity
 
 
 def _oauth_scopes(header_value: str | None) -> set[str]:
