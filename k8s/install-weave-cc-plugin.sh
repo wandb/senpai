@@ -10,8 +10,8 @@
 # This call creates ~/.weave_claude_plugin/settings.json, registers the
 # plugin with the Claude Code CLI, and persists weave_project for the daemon.
 #
-# WANDB_API_KEY is already in the pod env (from senpai-secrets) and is picked
-# up automatically by `--non-interactive`.
+# WANDB_API_KEY is already available from the launch backend's secret and is
+# picked up automatically by `--non-interactive`.
 
 # The installer invokes `git clone git@github.com:...` internally. Fresh pods
 # have no known_hosts entry for github.com, so rewrite SSH URLs to the

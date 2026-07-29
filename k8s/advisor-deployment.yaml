@@ -43,27 +43,8 @@ spec:
         envFrom:
         - configMapRef:
             name: {{ADVISOR_CONFIGMAP_NAME}}
-        env:
-        - name: WANDB_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: senpai-secrets
-              key: wandb-api-key
-        - name: GITHUB_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: {{LAUNCH_SECRET_NAME}}
-              key: github-token
-        - name: ANTHROPIC_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: {{LAUNCH_SECRET_NAME}}
-              key: anthropic-api-key
-        - name: EXA_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: {{LAUNCH_SECRET_NAME}}
-              key: exa-api-key
+        - secretRef:
+            name: {{LAUNCH_SECRET_NAME}}
         resources:
           requests:
             cpu: "4"

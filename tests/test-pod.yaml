@@ -20,22 +20,8 @@ spec:
     envFrom:
     - configMapRef:
         name: senpai-config-test
-    env:
-    - name: WANDB_API_KEY
-      valueFrom:
-        secretKeyRef:
-          name: senpai-secrets
-          key: wandb-api-key
-    - name: ANTHROPIC_API_KEY
-      valueFrom:
-        secretKeyRef:
-          name: senpai-secrets
-          key: anthropic-api-key
-    - name: GITHUB_TOKEN
-      valueFrom:
-        secretKeyRef:
-          name: senpai-secrets
-          key: github-token
+    - secretRef:
+        name: senpai-launch-secrets-test
     resources:
       requests:
         cpu: "2"
