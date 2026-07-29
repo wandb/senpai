@@ -10,6 +10,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import wandb
+
 from .specs import target_repo_slug
 
 
@@ -170,8 +172,6 @@ def preflight_check_exa_api_key(api_key: str) -> None:
 
 def preflight_check_wandb_api_key(api_key: str) -> None:
     """Verify the supplied W&B API key can authenticate."""
-    import wandb
-
     print("Preflight: checking W&B API key", flush=True)
     try:
         wandb.Api(
