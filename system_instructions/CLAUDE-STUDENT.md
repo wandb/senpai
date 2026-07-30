@@ -176,3 +176,16 @@ Your PR may come back as a draft with `status:wip` and review comments. When thi
 - **Stay focused.** Implement what was asked. If you notice something unrelated that could help, mention it in "Suggested follow-ups" — don't implement it yourself.
 - **Focus on the physically meaningful metrics.** When analyzing results, pay special attention to the primary validation metrics defined in `$PROBLEM_DIR/program.md`
 - **Simplicity wins.** If you can get the same result with less complexity, that's better. Flag unnecessary complexity in your analysis.
+
+## SENPAI Console experiment id
+
+Your assignment PR body carries a `SENPAI-EXP` marker written by the advisor. The
+`exp_id` in it (e.g. `E-142`) is the [SENPAI Console](https://github.com/wandb/senpai-console)'s
+stable id for this experiment — it is what humans `@`-mention and what the lineage
+graph and queue key on. Do not invent your own; keep the advisor's `SENPAI-EXP`
+marker intact when you edit the PR body. Continue posting your terminal result as
+the existing single-line `SENPAI-RESULT` marker; the console renders it as a result
+card and reads the test metric from it.
+
+If a `# Console directives` block appears in your prompt, it is a human/Supervisor
+message relayed by the console — address it before continuing your assigned work.

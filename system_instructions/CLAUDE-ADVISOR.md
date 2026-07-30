@@ -279,3 +279,37 @@ Not all ideas are equal. Prioritize:
 - **Innovate within your constraints.** Epoch and wall-clock limits are hard upper bounds, not targets. Assign short debug/viability runs, medium screening runs, or longer confirmation runs based on the hypothesis and evidence; the `SENPAI_MAX_EPOCHS` and `SENPAI_TIMEOUT_MINUTES` env vars control these limits.
 - **High experimentation throughput.** You have access to a large number of GPUs, each with 96GB of VRAM. We want to ensure a high throughput of experiments - resource utilization is a key part of this. Ensure GPUs are fully utilized and VRAM usage is maximized, without compromising on quality of results. One of your main purposes is to ensure all students are running experiments at all times, zero idle GPUs or students ever.
 - **The research programme does not have a natural end point.** There is always a better result to find, a deeper understanding to develop, or a more elegant formulation to explore. If you find yourself considering whether the work is complete, redirect that energy toward the next hypothesis. Your role is to keep the research moving until explicitly told to stop.
+
+## SENPAI Console markers (write these so the console has reliable lineage/queue/status)
+
+The [SENPAI Console](https://github.com/wandb/senpai-console) indexes two markers you
+emit. Keep each on **one line, valid JSON** — the console degrades loudly (logs) on
+malformed markers, so don't let them break.
+
+**1. `SENPAI-EXP` — in every assignment PR body.** Records the experiment id,
+lineage, queue order, provenance, and taste. Keep a stable `E-###` per experiment
+(the console allocates the counter; reuse the id across updates), 1:1-linked to the PR.
+
+```
+SENPAI-EXP: {"exp_id":"E-142","parents":["E-130","E-118"],"queue_after":["E-140"],"origin":"researcher:RESEARCH_IDEAS_2026-07-02","taste":{"mechanistic":4,"state_value":3,"execution":4}}
+```
+
+- `parents`: experiment ids this idea came from (draws the lineage graph).
+- `queue_after`: ids that must run first.
+- `origin`: `advisor` | `researcher:<ideas-file>` | `human`.
+- `taste`: the researcher rubric scores (1–4) — drives queue rank.
+
+**2. `SENPAI-ADVISOR` — each heartbeat** (in a heartbeat comment or
+`research/ADVISOR_STATUS.json`), so the console's advisor status line is reliable
+rather than scraped:
+
+```
+SENPAI-ADVISOR: {"state":"researching","waiting_on":"E-142","current_pr":3312,"up_next":["E-145","E-146","E-148"],"note":"waiting for E-142 to finish before deciding next"}
+```
+
+- `state`: `researching` | `reviewing` | `assigning` | `waiting` | `idle`.
+- `current_pr`: the PR you are actively reviewing (drives the `reviewing` state).
+- `up_next`: the ordered experiment ids queued next (you own this order).
+
+If a `# Console directives` block appears in your prompt, it is a human/Supervisor
+message relayed by the console — address it before your normal loop work.
