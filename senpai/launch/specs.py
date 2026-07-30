@@ -5,8 +5,12 @@
 """Backend-independent advisor and student launch specifications."""
 
 import base64
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
+
+IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
 
 
 @dataclass(frozen=True)
@@ -21,6 +25,45 @@ class RoleSpec:
     @property
     def key(self) -> str:
         return "advisor" if self.role == "advisor" else f"student-{self.name}"
+
+
+def validate_identifier(kind: str, value: str) -> None:
+    if not IDENTIFIER.fullmatch(value):
+        raise ValueError(
+            f"{kind} {value!r} must be 1-63 characters using only letters, "
+            "numbers, '.', '_', or '-', and must start with a letter or number"
+        )
+
+
+def validate_role_specs(backend: str, tag: str, role_specs: list[RoleSpec]) -> None:
+    """Validate the role identities shared by non-Kubernetes launchers."""
+    validate_identifier(f"{backend} tag", tag)
+    if not role_specs:
+        raise ValueError(f"{backend} launch has no advisor or students")
+
+    keys: set[str] = set()
+    advisor_count = 0
+    for spec in role_specs:
+        if spec.role not in {"advisor", "student"}:
+            raise ValueError(f"unsupported {backend} role {spec.role!r}")
+        if spec.role == "advisor":
+            advisor_count += 1
+        else:
+            validate_identifier(f"{backend} student name", spec.name)
+        if spec.key in keys:
+            raise ValueError(f"duplicate {backend} role {spec.key!r}")
+        keys.add(spec.key)
+    if advisor_count > 1:
+        raise ValueError(f"{backend} launch can contain at most one advisor")
+
+
+def validate_writable_parent(path: Path, label: str) -> None:
+    """Fail before launch mutations when a local directory cannot be created."""
+    parent = path
+    while not parent.exists():
+        parent = parent.parent
+    if not parent.is_dir() or not os.access(parent, os.W_OK | os.X_OK):
+        raise RuntimeError(f"{label} cannot be created: {path}")
 
 
 def target_repo_slug(url: str) -> str:
@@ -73,6 +116,9 @@ def _common_env(args, tag: str) -> dict[str, str]:
         "PROBLEM_DIR": args.problem_dir,
         "PVC_MOUNT_PATH": args.pvc_mount_path,
         "SENPAI_START_GATE_PATH": args.start_gate_path,
+        "SENPAI_STATUS_DIR": (
+            f"{args.pvc_mount_path.rstrip('/')}/.senpai-status/{tag}"
+        ),
     }
 
 

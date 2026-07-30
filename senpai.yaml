@@ -1,7 +1,7 @@
 # senpai project configuration
 # All fields can be overridden via CLI: python k8s/launch.py --tag <tag> [--field value]
 
-# compute backend (kubernetes or docker)
+# compute backend (kubernetes, docker, or aws)
 backend: kubernetes
 
 # active problem directory
@@ -35,10 +35,22 @@ pvc_mount_path: /mnt/new-pvc
 
 # standalone Docker host
 docker_run_root: ~/.senpai/runs
-docker_runner_source: ""
 docker_student_gpu_ids: ""
 docker_data_dir: ""
 docker_shm_size: 32g
+docker_ready_timeout_s: 600
+
+# AWS provisions one GPU host, then reuses the Docker backend on it.
+aws_region: ""
+aws_profile: ""
+aws_instance_type: ""
+aws_ami_id: ""
+aws_subnet_id: ""
+aws_volume_gib: 100
+aws_state_root: ~/.senpai/aws
+aws_ssh_cidr: ""
+aws_ready_timeout_s: 900
+aws_ttl_hours: 24.0
 
 # W&B
 wandb_entity: wandb-applied-ai-team
@@ -71,9 +83,10 @@ stale_wip_seconds: 7200
 human_issues: true
 
 # students
-n_students: 4
+# -1 selects backend defaults: Kubernetes 4x8, Docker/AWS 1x1.
+n_students: -1
 student_prefix: ""
-gpus_per_student: 1
+gpus_per_student: -1
 cpu_per_gpu: 15
 memory_gi_per_gpu: 120
 preflight_only: false
