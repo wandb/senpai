@@ -69,7 +69,7 @@ The default repo for `gh` is set via the injected `GH_REPO` env var, so no `--re
 | `list_prs_requiring_advisor_action <branch> [stale_wip_seconds] [student_names_csv]` | List open branch PRs requiring advisor action, with `reasons` such as stale WIP, duplicate student WIP, missing, unknown, or unroutable student labels, or rebase conflicts. Returns JSON array. |
 | `list_all_prs <branch>` | List all open PRs on a branch (any status). Returns JSON array. |
 | `student_poll_for_work <student_name> [branch]` | List branch-scoped WIP PRs assigned to a student. Returns JSON array. |
-| `list_idle_students <names_csv> <branch>` | Print names of students with no `status:wip` PR, one per line. |
+| `list_idle_students <names_csv> <branch>` | Return JSON names of students with no `status:wip` PR whose worker pod is running and ready when Kubernetes liveness is available. |
 | `pr_body <pr#>` | Read one PR body through REST. Returns JSON. |
 | `pr_issue_comments <pr#>` | Read all PR conversation comments through REST pagination. Returns JSON array. |
 | `pr_reviews <pr#>` | Read all PR review submissions through REST pagination. Returns JSON array. |

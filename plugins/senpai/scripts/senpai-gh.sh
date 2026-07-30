@@ -991,6 +991,7 @@ duplicate_wips = {
 }
 
 conflict_re = re.compile(r"merge conflict|rebase conflict|cannot automatically merge|can.t automatically merge|conflicts? with", re.I)
+checkout_failure_re = re.compile(r"STUDENT-(?:CHECKOUT|ADVISOR-REFRESH)-FAILED", re.I)
 prs_requiring_advisor_action = []
 for pr in prs:
     labels, students, routed_students, unknown_students = metadata[pr["number"]]
@@ -1018,6 +1019,8 @@ for pr in prs:
     comment_text = "\n".join(comment.get("body", "") for comment in comments_by_pr.get(pr["number"], []))
     if conflict_re.search(comment_text):
         reasons.append("merge_conflict_comment")
+    if checkout_failure_re.search(comment_text):
+        reasons.append("student_checkout_failed")
     if pr.get("isDraft") and "status:review" in labels:
         reasons.append("draft_but_claimed_mergeable")
     if reasons:
@@ -1059,16 +1062,44 @@ print(json.dumps([
 }
 
 # Compute which students are idle (have no status:wip PR).
+# In cluster mode, a student is idle only when the GitHub assignment state says
+# it has no WIP PR and Kubernetes says its worker pod is running and ready.
+# Local/dev shells without Kubernetes keep the historical assignment-only check.
 # Expects a comma-separated student list and the advisor branch.
 # Returns a JSON array of idle student names.
 #   list_idle_students <student_names_csv> <branch>
+student_worker_liveness_available() {
+    [ -n "${RESEARCH_TAG:-}" ] && command -v kubectl >/dev/null 2>&1
+}
+
+student_worker_is_available() {
+    local student="$1" tag="${RESEARCH_TAG:-}" pod
+    student_worker_liveness_available || return 0
+    [ -n "$student" ] && [ -n "$tag" ] || return 1
+
+    pod=$(
+        kubectl get pods -l "app=senpai,research-tag=${tag},student=${student}" \
+            -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\n"}{end}' 2>/dev/null |
+            awk '$2 == "True" {print $1; exit}'
+    ) || return 1
+    [ -n "$pod" ]
+}
+
 list_idle_students() {
     local students_csv="$1" branch="$2"
-    local all_prs
+    local all_prs available_students="" student
+    local -a students
     all_prs=$(rest_labeled_pull_details "${branch},status:wip")
+    IFS=',' read -r -a students <<< "$students_csv"
+    for student in "${students[@]}"; do
+        student="${student//[[:space:]]/}"
+        [ -n "$student" ] || continue
+        student_worker_is_available "$student" || continue
+        available_students+="${student}"$'\n'
+    done
     printf '%s' "$all_prs" | python3 -c "
 import json, sys
-students = [s.strip() for s in sys.argv[1].split(',') if s.strip()]
+students = [s.strip() for s in sys.argv[1].splitlines() if s.strip()]
 prs = json.loads(sys.stdin.read())
 busy = set()
 for pr in prs:
@@ -1077,5 +1108,5 @@ for pr in prs:
         if name.startswith('student:'):
             busy.add(name.split(':', 1)[1])
 print(json.dumps([s for s in students if s not in busy]))
-" "$students_csv"
+" "$available_students"
 }

@@ -105,6 +105,76 @@ SLEEP_TIME_S="${SENPAI_STUDENT_POLL_INTERVAL_S:-${SENPAI_POLL_INTERVAL_S:-600}}"
 POLL_JITTER_S="${SENPAI_STUDENT_POLL_JITTER_S:-${SENPAI_POLL_JITTER_S:-120}}"
 MAX_TURNS=100000
 
+quarantine_dirty_target_worktree() {
+    local context="$1" status ts message
+    status=$(git status --porcelain --untracked-files=all)
+    [ -z "$status" ] && return 0
+
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    message="senpai-${STUDENT_NAME}-${ts}: ${context}"
+    echo "WARN: dirty target worktree before ${context}; preserving changes in git stash: ${message}"
+    git status --short
+    git stash push --include-untracked -m "$message"
+}
+
+mark_advisor_refresh_failure() {
+    local reason="$1" marker="STUDENT-ADVISOR-REFRESH-FAILED" body assigned_json
+    body="${marker}: student:${STUDENT_NAME} could not refresh advisor branch ${ADVISOR_BRANCH} in ${PROBLEM_DIR}. ${reason}. Dirty or untracked local work was preserved in a timestamped git stash if present; the pod will retry after the poll sleep."
+    echo "ERROR: ${body}" >&2
+
+    assigned_json=$(student_poll_for_work "$STUDENT_NAME" 2>/dev/null || printf '[]')
+    printf '%s' "$assigned_json" | python3 -c 'import json,sys; print("\n".join(str(pr["number"]) for pr in json.load(sys.stdin)))' |
+    while IFS= read -r pr_number; do
+        [ -n "$pr_number" ] || continue
+        if ! pr_issue_comments "$pr_number" 2>/dev/null | grep -Fq "${marker}: student:${STUDENT_NAME}"; then
+            comment_on_pr "$pr_number" "$body" || true
+        fi
+    done
+}
+
+safe_checkout_advisor_branch() {
+    cd "$WORKDIR/$PROBLEM_DIR"
+    if ! quarantine_dirty_target_worktree "refresh advisor branch ${ADVISOR_BRANCH}"; then
+        mark_advisor_refresh_failure "Failed to preserve the existing worktree before refreshing ${ADVISOR_BRANCH}"
+        return 1
+    fi
+
+    if ! git checkout "$ADVISOR_BRANCH"; then
+        mark_advisor_refresh_failure "git checkout ${ADVISOR_BRANCH} failed"
+        return 1
+    fi
+    if ! git pull --ff-only origin "$ADVISOR_BRANCH"; then
+        mark_advisor_refresh_failure "git pull --ff-only origin ${ADVISOR_BRANCH} failed"
+        return 1
+    fi
+}
+
+mark_assignment_checkout_failure() {
+    local pr_number="$1" head_ref="$2" reason="$3" marker="STUDENT-CHECKOUT-FAILED" body
+    body="${marker}: student:${STUDENT_NAME} could not prepare branch ${head_ref} in ${PROBLEM_DIR}. ${reason}. Dirty or untracked local work was preserved in a timestamped git stash if present; the pod will retry after the poll sleep."
+    echo "ERROR: ${body}" >&2
+    if ! pr_issue_comments "$pr_number" 2>/dev/null | grep -Fq "${marker}: student:${STUDENT_NAME}"; then
+        comment_on_pr "$pr_number" "$body" || true
+    fi
+}
+
+safe_checkout_assignment() {
+    local pr_number="$1" head_ref="$2"
+    quarantine_dirty_target_worktree "checkout assignment #${pr_number} ${head_ref}" || {
+        mark_assignment_checkout_failure "$pr_number" "$head_ref" "Failed to preserve the existing worktree before checkout"
+        return 1
+    }
+
+    if ! git fetch origin "$head_ref"; then
+        mark_assignment_checkout_failure "$pr_number" "$head_ref" "git fetch origin ${head_ref} failed"
+        return 1
+    fi
+    if ! git checkout -B "$head_ref" FETCH_HEAD; then
+        mark_assignment_checkout_failure "$pr_number" "$head_ref" "git checkout -B ${head_ref} FETCH_HEAD failed"
+        return 1
+    fi
+}
+
 ITERATION=0
 while true; do
     ITERATION=$((ITERATION + 1))
@@ -112,9 +182,10 @@ while true; do
     echo "=== Student Heartbeat iteration $ITERATION ($(date)) ==="
 
     # Return to latest advisor branch so student starts from the current baseline
-    cd "$WORKDIR/$PROBLEM_DIR"
-    git checkout "$ADVISOR_BRANCH" 2>/dev/null || true
-    git pull --ff-only origin "$ADVISOR_BRANCH" 2>/dev/null || true
+    if ! safe_checkout_advisor_branch; then
+        senpai_sleep_with_jitter "$SLEEP_TIME_S" "$POLL_JITTER_S"
+        continue
+    fi
 
     # Overwrite CLAUDE.md with the student role instructions — git checkout/pull clobbers it with the developer copy.
     # Whitelist vars so envsubst substitutes pod env vars but leaves Claude Code runtime vars
@@ -135,8 +206,11 @@ while true; do
 
     if [ "$ASSIGNED_COUNT" -eq 1 ]; then
         ASSIGNED_HEAD=$(printf '%s' "$ASSIGNED_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["headRefName"])')
-        git fetch origin "$ASSIGNED_HEAD"
-        git checkout -B "$ASSIGNED_HEAD" FETCH_HEAD
+        ASSIGNED_PR=$(printf '%s' "$ASSIGNED_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["number"])')
+        if ! safe_checkout_assignment "$ASSIGNED_PR" "$ASSIGNED_HEAD"; then
+            senpai_sleep_with_jitter "$SLEEP_TIME_S" "$POLL_JITTER_S"
+            continue
+        fi
     fi
 
     # --- Build triage info ---
