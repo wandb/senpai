@@ -1,6 +1,9 @@
 # senpai project configuration
 # All fields can be overridden via CLI: python k8s/launch.py --tag <tag> [--field value]
 
+# compute backend (kubernetes or docker)
+backend: kubernetes
+
 # active problem directory
 # The entrypoint clones target_repo_url into this path at pod startup, so the
 # problem-package repo's root ends up at ./target/ in the pod workspace.
@@ -29,6 +32,13 @@ namespace: default
 # dataset PVC mount
 pvc_claim_name: new-pvc
 pvc_mount_path: /mnt/new-pvc
+
+# standalone Docker host
+docker_run_root: ~/.senpai/runs
+docker_runner_source: ""
+docker_student_gpu_ids: ""
+docker_data_dir: ""
+docker_shm_size: 32g
 
 # W&B
 wandb_entity: wandb-applied-ai-team
