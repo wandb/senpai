@@ -696,8 +696,13 @@ usermod -aG docker ubuntu
 """
 
 
-def _ssh_base(run_dir: Path, state: dict) -> list[str]:
-    return [
+def _ssh_base(
+    run_dir: Path,
+    state: dict,
+    *,
+    compression: bool = False,
+) -> list[str]:
+    command = [
         "ssh",
         "-i",
         str(run_dir / "id_ed25519"),
@@ -713,6 +718,9 @@ def _ssh_base(run_dir: Path, state: dict) -> list[str]:
         f"UserKnownHostsFile={run_dir / 'known_hosts'}",
         f"ubuntu@{state['public_ip']}",
     ]
+    if compression:
+        command.insert(1, "-C")
+    return command
 
 
 def _ssh(
@@ -724,11 +732,12 @@ def _ssh(
     input_file=None,
     timeout: float | None = None,
     check: bool = True,
+    compression: bool = False,
     redactions: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
     try:
         result = subprocess.run(
-            [*_ssh_base(run_dir, state), command],
+            [*_ssh_base(run_dir, state, compression=compression), command],
             input=input_bytes,
             stdin=input_file,
             capture_output=True,
@@ -1144,6 +1153,7 @@ def _stream_directory(
                 "bash -o pipefail -c " + shlex.quote(script),
                 input_file=archive.stdout,
                 timeout=timeout_s,
+                compression=True,
             )
         finally:
             archive.stdout.close()

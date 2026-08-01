@@ -680,6 +680,7 @@ class AwsTransportTests(unittest.TestCase):
             def receive(_run_dir, _state, command, *, input_file, **_kwargs):
                 self.assertTrue(input_file.read())
                 self.assertIn("find /home/ubuntu/senpai-data", command)
+                self.assertTrue(_kwargs["compression"])
                 return subprocess.CompletedProcess(
                     ["ssh"],
                     0,
@@ -708,6 +709,30 @@ class AwsTransportTests(unittest.TestCase):
                 popen.call_args.kwargs["env"]["COPYFILE_DISABLE"],
                 "1",
             )
+
+    def test_ssh_compression_uses_openssh_transport_compression(self):
+        completed = subprocess.CompletedProcess(
+            ["ssh"],
+            0,
+            stdout=b"",
+            stderr=b"",
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "senpai.launch.aws_backend.subprocess.run",
+                return_value=completed,
+            ) as run,
+        ):
+            _ssh(
+                Path(tmp),
+                {"public_ip": "203.0.113.10"},
+                "cat >/dev/null",
+                input_bytes=b"payload",
+                compression=True,
+            )
+
+        self.assertEqual(run.call_args.args[0][0:2], ["ssh", "-C"])
 
     def test_remote_disk_headroom_is_checked_before_upload(self):
         available = 90 * aws_backend.GIB
