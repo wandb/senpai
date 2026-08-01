@@ -8,9 +8,19 @@ import base64
 import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
+CONTAINER_STATE_ROOT = "/var/lib/senpai"
+CONTAINER_GATE_ROOT = "/senpai-launch"
+CONTAINER_WORKDIR = "/workspace/senpai"
+CONTAINER_USER_ID = 10001
+CONTAINER_IMAGE_GROUP_ID = 10001
+CONTAINER_RESERVED_PATHS = (
+    CONTAINER_STATE_ROOT,
+    CONTAINER_GATE_ROOT,
+    CONTAINER_WORKDIR,
+)
 
 
 @dataclass(frozen=True)
@@ -66,14 +76,50 @@ def validate_writable_parent(path: Path, label: str) -> None:
         raise RuntimeError(f"{label} cannot be created: {path}")
 
 
+def validate_pvc_mount_path(value: str, reserved_paths: tuple[str, ...]) -> None:
+    """Require a stable absolute mount target outside backend-owned paths."""
+    mount_path = PurePosixPath(value)
+    reserved = tuple(PurePosixPath(path) for path in reserved_paths)
+    if (
+        not mount_path.is_absolute()
+        or ".." in mount_path.parts
+        or any(
+            mount_path == path
+            or mount_path in path.parents
+            or path in mount_path.parents
+            for path in reserved
+        )
+    ):
+        choices = ", ".join(reserved_paths)
+        raise ValueError(
+            f"pvc_mount_path must be an absolute path outside {choices}"
+        )
+
+
 def target_repo_slug(url: str) -> str:
     """Extract an owner/repo slug from an HTTPS or SSH GitHub URL."""
     return url.split("github.com", 1)[-1].lstrip(":/").removesuffix(".git")
 
 
-def _extra_instructions(args, tag: str, student_names: list[str]) -> str:
+def build_extra_instructions(args, tag: str, student_names: list[str]) -> str:
+    """Render backend-neutral, authoritative context for both agent roles."""
     students = ", ".join(student_names)
     target_base = args.target_repo_branch or "<default>"
+    runtime = f"""# Authoritative launch context
+
+These values were resolved by the Senpai launcher and describe the actual runtime.
+They override conflicting compute or run-limit claims in the target repository's
+`program.md` and role prompts.
+
+- Compute backend: `{args.backend}`.
+- Visible GPUs per student: `{args.gpus_per_student}`.
+- Hard limits for each training run: `{args.timeout_minutes:g}` minutes wall-clock
+  and `{args.max_epochs}` epochs.
+- Use tools and operational commands that work with `{args.backend}`. Do not follow
+  target-repository instructions written for another backend.
+- Do not assume additional GPUs or bypass, extend, or continue past the hard
+  training limits.
+"""
     isolation = f"""# Launch isolation and run-limit rules
 
 - This launch is scoped to research tag `{tag}`, advisor branch `{args.advisor_branch}`, and target base branch `{target_base}`.
@@ -83,23 +129,24 @@ def _extra_instructions(args, tag: str, student_names: list[str]) -> str:
 - Students branch from `{args.advisor_branch}`. Do not rebase or retarget work onto unrelated branches.
 - Treat `SENPAI_TIMEOUT_MINUTES` and `SENPAI_MAX_EPOCHS` as hard per-training-run bounds. Do not override them or continue a run past them.
 """
+    context = runtime + "\n" + isolation
     if not args.extra_instructions:
-        return isolation
+        return context
     path = Path(args.extra_instructions)
     user_extra = path.read_text() if path.exists() else args.extra_instructions
-    return isolation + "\n# Additional operator instructions\n\n" + user_extra
+    return context + "\n# Additional operator instructions\n\n" + user_extra
 
 
 def _encoded_extra_instructions(args, tag: str, student_names: list[str]) -> str:
     return base64.b64encode(
-        _extra_instructions(args, tag, student_names).encode()
+        build_extra_instructions(args, tag, student_names).encode()
     ).decode()
 
 
 def _common_env(args, tag: str) -> dict[str, str]:
     return {
         "REPO_URL": args.repo_url,
-        "REPO_BRANCH": args.repo_branch,
+        "REPO_REVISION": args.repo_revision,
         "TARGET_REPO_URL": args.target_repo_url,
         "TARGET_REPO_BRANCH": args.target_repo_branch,
         "GH_REPO": target_repo_slug(args.target_repo_url),
@@ -116,32 +163,42 @@ def _common_env(args, tag: str) -> dict[str, str]:
         "PROBLEM_DIR": args.problem_dir,
         "PVC_MOUNT_PATH": args.pvc_mount_path,
         "SENPAI_START_GATE_PATH": args.start_gate_path,
-        "SENPAI_STATUS_DIR": (
-            f"{args.pvc_mount_path.rstrip('/')}/.senpai-status/{tag}"
-        ),
+    }
+
+
+def role_model_config(args, role: str) -> dict[str, str]:
+    """Return the OpenHands model profiles shared by every launch backend."""
+    model = args.advisor_model if role == "advisor" else args.student_model
+    reasoning_effort = (
+        args.advisor_reasoning_effort
+        if role == "advisor"
+        else args.student_reasoning_effort
+    )
+    return {
+        "SENPAI_OPENHANDS_MODEL": model,
+        "SENPAI_OPENHANDS_REASONING_EFFORT": reasoning_effort,
+        "SENPAI_OPENHANDS_SMART_MODEL": args.smart_model,
+        "SENPAI_OPENHANDS_SMART_REASONING_EFFORT": args.smart_reasoning_effort,
+        "SENPAI_OPENHANDS_FAST_MODEL": args.fast_model,
+        "SENPAI_OPENHANDS_FAST_REASONING_EFFORT": args.fast_reasoning_effort,
+        "SENPAI_OPENHANDS_FRONTIER_MODEL": args.frontier_model,
+        "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": args.frontier_reasoning_effort,
     }
 
 
 def build_student_spec(
-    args, tag: str, student_name: str, secrets: dict[str, str]
+    args,
+    tag: str,
+    student_name: str,
+    secrets: dict[str, str],
 ) -> RoleSpec:
     env = _common_env(args, tag)
+    env.update(role_model_config(args, "student"))
     env.update(
         {
             "STUDENT_NAME": student_name,
             "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
             "SENPAI_MAX_EPOCHS": str(args.max_epochs),
-            "STUDENT_CLAUDE_WATCHDOG_INTERVAL_S": str(
-                args.student_claude_watchdog_interval_s
-            ),
-            "STUDENT_CLAUDE_WATCHDOG_JITTER_S": str(
-                args.student_claude_watchdog_jitter_s
-            ),
-            "STUDENT_CLAUDE_MIN_RUNTIME_S": str(args.student_claude_min_runtime_s),
-            "STUDENT_CLAUDE_STALE_LOG_S": str(args.student_claude_stale_log_s),
-            "STUDENT_ASSIGNMENT_DRIFT_GRACE_S": str(
-                args.student_assignment_drift_grace_s
-            ),
             "EXTRA_INSTRUCTIONS_B64": _encoded_extra_instructions(
                 args, tag, [student_name]
             ),
@@ -157,15 +214,11 @@ def build_advisor_spec(
     secrets: dict[str, str],
 ) -> RoleSpec:
     env = _common_env(args, tag)
+    env.update(role_model_config(args, "advisor"))
     env.update(
         {
             "STUDENT_NAMES": ",".join(student_names),
             "SENPAI_STALE_WIP_SECONDS": str(args.stale_wip_seconds),
-            "ADVISOR_CLAUDE_WATCHDOG_INTERVAL_S": str(
-                args.advisor_claude_watchdog_interval_s
-            ),
-            "ADVISOR_CLAUDE_MIN_RUNTIME_S": str(args.advisor_claude_min_runtime_s),
-            "ADVISOR_CLAUDE_STALE_LOG_S": str(args.advisor_claude_stale_log_s),
             "EXTRA_INSTRUCTIONS_B64": _encoded_extra_instructions(
                 args, tag, student_names
             ),

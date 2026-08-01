@@ -119,6 +119,7 @@ def test_dry_run_binds_each_role_image_to_the_derived_source_revision():
 
 def test_launch_rejects_role_images_from_different_source_revisions():
     result = run_launch(
+        "--advisor",
         "--advisor_image",
         ADVISOR_IMAGE,
         "--student_image",
@@ -135,6 +136,7 @@ def test_launch_rejects_a_mutable_image_for_either_role(role):
     images[role] = f"ghcr.io/wandb/senpai-{role}:latest"
 
     result = run_launch(
+        "--advisor",
         "--advisor_image",
         images["advisor"],
         "--student_image",
@@ -143,6 +145,44 @@ def test_launch_rejects_a_mutable_image_for_either_role(role):
 
     assert result.returncode != 0
     assert f"--{role}_image must be an immutable digest" in result.stderr
+
+
+def test_student_only_launch_validates_only_the_student_image():
+    args = launch_args(advisor=False, advisor_image="")
+
+    launch.resolve_runner_revision(args, has_students=True)
+
+    assert args.repo_revision == REVISION
+
+
+def test_advisor_only_launch_validates_only_the_advisor_image():
+    args = launch_args(names="", n_students=0, student_image="")
+
+    launch.resolve_runner_revision(args, has_students=False)
+
+    assert args.repo_revision == REVISION
+
+
+def test_launch_help_keeps_descriptions_with_their_options():
+    result = run_launch("--help")
+    help_text = " ".join(result.stdout.split())
+
+    assert result.returncode == 0, result.stderr
+    for option_help in (
+        "--repo_url str git repo URL (senpai runner)",
+        "--repo_revision str exact runner commit",
+        "--advisor_image str immutable advisor image; required with --advisor",
+        "--student_image str immutable student image; required when students are launched",
+        "--human_issues, --nohuman_issues bool allow human GitHub issue triage",
+        "--advisor, --noadvisor bool also deploy the advisor pod",
+        "--extra_instructions str extra prompt text for the advisor",
+        "--timeout_minutes float training run wall-clock limit",
+        "--max_epochs int maximum training epochs",
+        "--poll_interval_s int default advisor/student outer-loop sleep",
+        "--dry_run, --nodry_run bool render manifests only",
+        "--preflight_only, --nopreflight_only bool validate credentials/access only",
+    ):
+        assert option_help in help_text
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
@@ -209,8 +249,15 @@ def test_launch_secret_contains_each_credential_and_both_roles_reference_it():
             for item in container["env"]
         }
         assert references == {
-            key: "senpai-launch-secrets-test-track" for key in expected_values
+            key: "senpai-launch-secrets-test-track"
+            for key in (*expected_values, "hf-token")
         }
+        hf_reference = next(
+            item["valueFrom"]["secretKeyRef"]
+            for item in container["env"]
+            if item["name"] == "HF_TOKEN"
+        )
+        assert hf_reference["optional"] is True
 
 
 def test_role_model_configuration_preserves_the_configured_efforts():
@@ -340,6 +387,7 @@ def test_roles_mount_only_the_provider_used_by_their_models(
         provider_env,
         "EXA_API_KEY",
         "WANDB_API_KEY",
+        "HF_TOKEN",
     }
 
 
@@ -361,7 +409,13 @@ def test_role_mounts_include_its_main_model_and_shared_profiles_only():
         ][0]["env"]
         mounted[role] = {item["name"] for item in environment}
 
-    common = {"GITHUB_TOKEN", "ANTHROPIC_API_KEY", "EXA_API_KEY", "WANDB_API_KEY"}
+    common = {
+        "GITHUB_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "EXA_API_KEY",
+        "WANDB_API_KEY",
+        "HF_TOKEN",
+    }
     assert mounted["advisor"] == common
     assert mounted["student"] == common | {"OPENAI_API_KEY"}
 

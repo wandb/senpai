@@ -3,11 +3,12 @@ import base64
 import pytest
 import yaml
 
-from launch_test_support import launch, launch_args, render_role
+from launch_test_support import launch_args, render_role
+from senpai.launch.specs import build_extra_instructions
 
 
 def test_default_fleet_is_four_students_with_one_gpu_each():
-    args = launch.Args(
+    args = launch_args(
         tag="defaults",
         target_repo_url="https://github.com/example/problem.git",
     )
@@ -27,12 +28,8 @@ def test_launch_context_records_resolved_runtime_facts(backend):
         max_epochs=7,
     )
 
-    context = launch.build_extra_instructions(
-        args,
-        args.tag,
-        ["fern", "frieren"],
-        backend=backend,
-    )
+    args.backend = backend
+    context = build_extra_instructions(args, args.tag, ["fern", "frieren"])
 
     assert "resolved by the Senpai launcher" in context
     assert "override conflicting compute or run-limit claims" in context
