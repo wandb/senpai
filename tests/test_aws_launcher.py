@@ -1038,6 +1038,7 @@ class AwsLaunchFlowTests(unittest.TestCase):
                 data_dir=str(root / "data"),
             )
             callback = unittest.mock.Mock()
+            output = io.StringIO()
 
             def provision(_args, _plan, _run_dir, state):
                 state.update(
@@ -1047,8 +1048,12 @@ class AwsLaunchFlowTests(unittest.TestCase):
                     }
                 )
 
+            def cleanup(*_):
+                self.assertIn("AWS launch failed:\nimage is invalid", output.getvalue())
+                return []
+
             with (
-                redirect_stdout(io.StringIO()),
+                redirect_stdout(output),
                 patch(
                     "senpai.launch.aws_backend._provision",
                     side_effect=provision,
@@ -1062,7 +1067,7 @@ class AwsLaunchFlowTests(unittest.TestCase):
                 patch("senpai.launch.aws_backend._start_roles") as start,
                 patch(
                     "senpai.launch.aws_backend._cleanup",
-                    return_value=[],
+                    side_effect=cleanup,
                 ) as cleanup,
                 self.assertRaisesRegex(RuntimeError, "image is invalid"),
             ):
@@ -1524,6 +1529,113 @@ class AwsCleanupTests(unittest.TestCase):
                     ("ec2", "delete-key-pair", "--key-name"),
                 ],
             )
+
+    def test_cleanup_continues_after_a_termination_waiter_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            state = {
+                "region": "us-east-1",
+                "profile": "research",
+                "instance_id": "i-123",
+                "security_group_id": "sg-123",
+            }
+            waiter_calls = 0
+
+            def aws_raw(_context, _service, operation, *arguments):
+                nonlocal waiter_calls
+                if operation == "wait":
+                    waiter_calls += 1
+                    if waiter_calls == 1:
+                        raise AwsCommandError(
+                            "`aws ec2 wait` failed: Waiter InstanceTerminated "
+                            "failed: Max attempts exceeded"
+                        )
+                return ""
+
+            with patch(
+                "senpai.launch.aws_backend._aws_raw",
+                side_effect=aws_raw,
+            ) as aws:
+                errors = _cleanup(run_dir, state)
+
+            self.assertEqual(errors, [])
+            self.assertFalse(run_dir.exists())
+            operations = [call.args[2] for call in aws.call_args_list]
+            self.assertEqual(
+                operations,
+                [
+                    "terminate-instances",
+                    "wait",
+                    "wait",
+                    "delete-security-group",
+                ],
+            )
+
+    def test_cleanup_bounds_termination_wait_and_preserves_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            state = {
+                "region": "us-east-1",
+                "profile": "research",
+                "instance_id": "i-123",
+                "security_group_id": "sg-123",
+            }
+
+            def aws_raw(_context, _service, operation, *arguments):
+                if operation == "wait":
+                    raise AwsCommandError(
+                        "`aws ec2 wait` failed: Waiter InstanceTerminated "
+                        "failed: Max attempts exceeded"
+                    )
+                return ""
+
+            with patch(
+                "senpai.launch.aws_backend._aws_raw",
+                side_effect=aws_raw,
+            ) as aws:
+                errors = _cleanup(run_dir, state)
+
+            self.assertEqual(len(errors), 1)
+            self.assertIn("Max attempts exceeded", errors[0])
+            operations = [call.args[2] for call in aws.call_args_list]
+            self.assertEqual(
+                operations,
+                ["terminate-instances", "wait", "wait"],
+            )
+            saved = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(saved["phase"], "cleanup-failed")
+            self.assertEqual(saved["cleanup_errors"], errors)
+
+    def test_cleanup_does_not_retry_non_timeout_waiter_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            state = {
+                "region": "us-east-1",
+                "profile": "research",
+                "instance_id": "i-123",
+            }
+
+            def aws_raw(_context, _service, operation, *arguments):
+                if operation == "wait":
+                    raise AwsCommandError(
+                        "`aws ec2 wait` failed: UnauthorizedOperation"
+                    )
+                return ""
+
+            with patch(
+                "senpai.launch.aws_backend._aws_raw",
+                side_effect=aws_raw,
+            ) as aws:
+                errors = _cleanup(run_dir, state)
+
+            self.assertEqual(len(errors), 1)
+            self.assertIn("UnauthorizedOperation", errors[0])
+            operations = [call.args[2] for call in aws.call_args_list]
+            self.assertEqual(operations, ["terminate-instances", "wait"])
+            self.assertTrue((run_dir / "state.json").is_file())
 
 
 if __name__ == "__main__":
