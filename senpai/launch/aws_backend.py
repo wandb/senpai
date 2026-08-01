@@ -59,6 +59,7 @@ CAPACITY_ERROR_CODES = (
     "InsufficientFreeAddressesInSubnet",
     "UnfulfillableCapacity",
 )
+AWS_TERMINATION_WAITER_ATTEMPTS = 2  # Two 10-minute AWS waiter windows.
 
 
 @dataclass(frozen=True)
@@ -1345,6 +1346,32 @@ def _missing_resource(error: AwsCommandError) -> bool:
     )
 
 
+def _wait_for_instances_terminated(
+    context: AwsContext,
+    instance_ids: list[str],
+) -> None:
+    for attempt in range(AWS_TERMINATION_WAITER_ATTEMPTS):
+        try:
+            _aws_raw(
+                context,
+                "ec2",
+                "wait",
+                "instance-terminated",
+                "--instance-ids",
+                *instance_ids,
+            )
+            return
+        except AwsCommandError as error:
+            timed_out = "Max attempts exceeded" in str(error)
+            if not timed_out or attempt == AWS_TERMINATION_WAITER_ATTEMPTS - 1:
+                raise
+            print(
+                "AWS instance termination is still in progress; "
+                "continuing to wait.",
+                flush=True,
+            )
+
+
 def _instances_for_client_token(
     context: AwsContext, client_token: str
 ) -> list[str]:
@@ -1473,14 +1500,7 @@ def _cleanup(
                 "--instance-ids",
                 *instance_ids,
             )
-            _aws_raw(
-                context,
-                "ec2",
-                "wait",
-                "instance-terminated",
-                "--instance-ids",
-                *instance_ids,
-            )
+            _wait_for_instances_terminated(context, instance_ids)
         except AwsCommandError as error:
             if not _missing_resource(error):
                 errors.append(str(error))
@@ -1651,7 +1671,9 @@ def launch_aws(
         _save_state(run_dir, state)
         _start_roles(args, role_specs, run_dir, state)
     except BaseException as error:
-        print("AWS launch failed; terminating the temporary host.", flush=True)
+        if detail := str(error).strip():
+            print(f"AWS launch failed:\n{detail}", flush=True)
+        print("Terminating the temporary host.", flush=True)
         cleanup_errors = _cleanup(run_dir, state)
         if cleanup_errors and isinstance(error, Exception):
             terminate = _lifecycle_command(

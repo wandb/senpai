@@ -32,6 +32,7 @@ from .specs import (
 RUN_LABEL = "com.wandb.senpai.run"
 ROLE_LABEL = "com.wandb.senpai.role"
 DEFAULT_DOCKER_RUN_ROOT = "~/.senpai/runs"
+DOCKER_PULL_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -572,12 +573,67 @@ print(
     return indices
 
 
+def _pull_image(image: str) -> None:
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", image],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if inspect.returncode == 0:
+        return
+
+    inspect_detail = "\n".join(
+        output
+        for output in (inspect.stderr.strip(), inspect.stdout.strip())
+        if output
+    ) or "<no error detail>"
+    if not any(
+        missing in inspect_detail for missing in ("No such image", "No such object")
+    ):
+        raise RuntimeError(
+            f"Docker cannot inspect cached image {image!r}: {inspect_detail}"
+        )
+
+    for attempt in range(1, DOCKER_PULL_ATTEMPTS + 1):
+        result = subprocess.run(
+            ["docker", "pull", image],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+
+        detail = "\n".join(
+            output
+            for output in (result.stderr.strip(), result.stdout.strip())
+            if output
+        ) or "<no error detail>"
+        connection_reset = "connection reset by peer" in detail.lower()
+        if not connection_reset:
+            raise RuntimeError(f"Docker cannot pull {image!r}: {detail}")
+        if attempt < DOCKER_PULL_ATTEMPTS:
+            print(
+                f"Docker registry connection reset while pulling {image!r}; "
+                f"retrying ({attempt + 1}/{DOCKER_PULL_ATTEMPTS}).",
+                flush=True,
+            )
+            continue
+        raise RuntimeError(
+            f"Docker cannot pull {image!r} after {DOCKER_PULL_ATTEMPTS} "
+            f"connection-reset attempts: {detail}"
+        )
+
+
 def _check_image(image: str, revision: str) -> None:
+    _pull_image(image)
     result = subprocess.run(
         [
             "docker",
             "run",
             "--rm",
+            "--pull=never",
             "--entrypoint",
             "/bin/bash",
             image,

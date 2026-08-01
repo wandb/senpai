@@ -18,6 +18,7 @@ from senpai.launch.docker_backend import (
     _docker_gpu_indices,
     _env_file_text,
     _path_beneath,
+    _pull_image,
     _prepare_runner_workdir,
     _role_values,
     _wait_until_ready,
@@ -87,6 +88,14 @@ def args(**overrides):
 
 def student(run_args, name="fern"):
     return build_student_spec(run_args, run_args.tag, name, {})
+
+
+def missing_image():
+    return SimpleNamespace(
+        returncode=1,
+        stdout="",
+        stderr="Error response from daemon: No such image: test",
+    )
 
 
 class LaunchSpecTests(unittest.TestCase):
@@ -344,11 +353,21 @@ class DockerPreflightTests(unittest.TestCase):
             _check_image("ghcr.io/wandb/senpai-advisor:test", "b" * 40)
 
         self.assertEqual(
-            run.call_args.args[0],
+            run.call_args_list[0].args[0],
+            [
+                "docker",
+                "image",
+                "inspect",
+                "ghcr.io/wandb/senpai-advisor:test",
+            ],
+        )
+        self.assertEqual(
+            run.call_args_list[1].args[0],
             [
                 "docker",
                 "run",
                 "--rm",
+                "--pull=never",
                 "--entrypoint",
                 "/bin/bash",
                 "ghcr.io/wandb/senpai-advisor:test",
@@ -358,6 +377,141 @@ class DockerPreflightTests(unittest.TestCase):
                 "b" * 40,
             ],
         )
+
+    def test_cached_image_skips_the_registry_pull(self):
+        cached = SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+        with patch(
+            "senpai.launch.docker_backend.subprocess.run",
+            return_value=cached,
+        ) as run:
+            _pull_image("ghcr.io/wandb/senpai-student:test")
+
+        self.assertEqual(
+            run.call_args.args[0],
+            ["docker", "image", "inspect", "ghcr.io/wandb/senpai-student:test"],
+        )
+        run.assert_called_once()
+
+    def test_image_pull_retries_a_registry_connection_reset(self):
+        reset = SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr=(
+                "docker: failed to copy: read tcp "
+                "192.168.42.0:56036->185.199.109.154:443: "
+                "read: connection reset by peer"
+            ),
+        )
+        completed = SimpleNamespace(returncode=0, stdout="pulled", stderr="")
+        output = io.StringIO()
+
+        with (
+            patch(
+                "senpai.launch.docker_backend.subprocess.run",
+                side_effect=[missing_image(), reset, completed],
+            ) as run,
+            redirect_stdout(output),
+        ):
+            _pull_image("ghcr.io/wandb/senpai-student:test")
+
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                [
+                    "docker",
+                    "image",
+                    "inspect",
+                    "ghcr.io/wandb/senpai-student:test",
+                ],
+                ["docker", "pull", "ghcr.io/wandb/senpai-student:test"],
+                ["docker", "pull", "ghcr.io/wandb/senpai-student:test"],
+            ],
+        )
+        self.assertIn("retrying (2/3)", output.getvalue())
+
+    def test_image_pull_connection_reset_retries_are_bounded(self):
+        reset = SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="read: connection reset by peer",
+        )
+
+        with (
+            patch(
+                "senpai.launch.docker_backend.subprocess.run",
+                side_effect=[missing_image(), reset, reset, reset],
+            ) as run,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "after 3 connection-reset attempts.*connection reset by peer",
+            ),
+        ):
+            _pull_image("ghcr.io/wandb/senpai-student:test")
+
+        self.assertEqual(run.call_count, 4)
+
+    def test_image_pull_does_not_retry_a_deterministic_failure(self):
+        rejected = SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="manifest unknown",
+        )
+
+        with (
+            patch(
+                "senpai.launch.docker_backend.subprocess.run",
+                side_effect=[missing_image(), rejected],
+            ) as run,
+            self.assertRaisesRegex(RuntimeError, "manifest unknown"),
+        ):
+            _pull_image("ghcr.io/wandb/senpai-student:missing")
+
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                [
+                    "docker",
+                    "image",
+                    "inspect",
+                    "ghcr.io/wandb/senpai-student:missing",
+                ],
+                ["docker", "pull", "ghcr.io/wandb/senpai-student:missing"],
+            ],
+        )
+
+    def test_image_inspect_failure_is_not_misclassified_as_a_cache_miss(self):
+        unavailable = SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="Cannot connect to the Docker daemon",
+        )
+
+        with (
+            patch(
+                "senpai.launch.docker_backend.subprocess.run",
+                return_value=unavailable,
+            ) as run,
+            self.assertRaisesRegex(RuntimeError, "cannot inspect.*Cannot connect"),
+        ):
+            _pull_image("ghcr.io/wandb/senpai-student:test")
+
+        run.assert_called_once()
+
+    def test_image_probe_still_rejects_a_wrong_source_revision_after_pull(self):
+        pulled = SimpleNamespace(returncode=0, stdout="pulled", stderr="")
+        wrong_revision = SimpleNamespace(returncode=1, stdout="", stderr="")
+
+        with (
+            patch(
+                "senpai.launch.docker_backend.subprocess.run",
+                side_effect=[missing_image(), pulled, wrong_revision],
+            ) as run,
+            self.assertRaisesRegex(RuntimeError, "at source revision"),
+        ):
+            _check_image("ghcr.io/wandb/senpai-advisor:test", "b" * 40)
+
+        self.assertEqual(run.call_count, 3)
 
     def test_preflight_checks_both_role_images(self):
         with tempfile.TemporaryDirectory() as tmp:
