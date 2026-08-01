@@ -5,25 +5,33 @@
 """Run Senpai roles as Docker containers on one host."""
 
 import json
+import os
+import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from .specs import (
+    CONTAINER_GATE_ROOT,
+    CONTAINER_IMAGE_GROUP_ID,
+    CONTAINER_RESERVED_PATHS,
+    CONTAINER_STATE_ROOT,
+    CONTAINER_USER_ID,
+    CONTAINER_WORKDIR,
     RoleSpec,
     validate_identifier,
+    validate_pvc_mount_path,
     validate_role_specs,
     validate_writable_parent,
 )
 
-CONTAINER_RUN_ROOT = "/senpai-run"
-CONTAINER_STATUS_ROOT = "/senpai-status"
-CONTAINER_WORKDIR = "/workspace/senpai"
 RUN_LABEL = "com.wandb.senpai.run"
 ROLE_LABEL = "com.wandb.senpai.role"
+DEFAULT_DOCKER_RUN_ROOT = "~/.senpai/runs"
 
 
 @dataclass(frozen=True)
@@ -38,7 +46,6 @@ class DockerRolePlan:
     env_file: Path
     ready_file: Path
     cid_file: Path
-    status_dir: Path | None
     devices: tuple[str, ...]
     command: tuple[str, ...]
 
@@ -48,7 +55,7 @@ class DockerLaunchPlan:
     """A validated Docker launch with all host paths resolved."""
 
     run_root: Path
-    status_root: Path
+    gate_root: Path
     roles: tuple[DockerRolePlan, ...]
 
 
@@ -210,7 +217,25 @@ def _container_name(tag: str, role_key: str) -> str:
 def _docker_gpu_args(devices: tuple[str, ...]) -> list[str]:
     if not devices:
         return []
-    return ["--gpus", f"device={','.join(devices)}"]
+    value = f"device={','.join(devices)}"
+    if len(devices) > 1:
+        value = f'"{value}"'
+    return ["--gpus", value]
+
+
+def _role_image(args, spec: RoleSpec) -> str:
+    return args.advisor_image if spec.role == "advisor" else args.student_image
+
+
+def _supplemental_group_args(paths: list[Path]) -> list[str]:
+    """Add each mounted path's group, using its nearest existing parent in plans."""
+    group_ids: dict[int, None] = {}
+    for path in paths:
+        existing = path
+        while not existing.exists():
+            existing = existing.parent
+        group_ids[existing.stat().st_gid] = None
+    return [value for gid in group_ids for value in ("--group-add", str(gid))]
 
 
 def _role_values(spec: RoleSpec) -> dict[str, str]:
@@ -220,17 +245,10 @@ def _role_values(spec: RoleSpec) -> dict[str, str]:
     }
     values.update(
         {
-            "HOME": f"{CONTAINER_RUN_ROOT}/home",
+            "HOME": f"{CONTAINER_STATE_ROOT}/home",
             "SENPAI_BACKEND": "docker",
-            "SENPAI_GIT_CREDENTIAL_FILE": (
-                f"{CONTAINER_RUN_ROOT}/secrets/git-credentials"
-            ),
-            "SENPAI_LAUNCH_GATE_PATH": f"{CONTAINER_STATUS_ROOT}/.launch",
-            "SENPAI_LOGDIR": f"{CONTAINER_RUN_ROOT}/logs/iterations",
-            "SENPAI_READY_FILE": f"{CONTAINER_RUN_ROOT}/ready",
-            "SENPAI_RUN_ROOT": CONTAINER_RUN_ROOT,
-            "SENPAI_STATUS_DIR": CONTAINER_STATUS_ROOT,
-            "SENPAI_WORKDIR": CONTAINER_WORKDIR,
+            "SENPAI_LAUNCH_GATE_PATH": f"{CONTAINER_GATE_ROOT}/.launch",
+            "SENPAI_UMASK": "0002",
         }
     )
     return values
@@ -250,13 +268,26 @@ def _docker_command(
     args,
     spec: RoleSpec,
     state_root: Path,
-    status_root: Path,
-    status_dir: Path | None,
+    gate_root: Path,
     workdir: Path,
     env_file: Path,
     cid_file: Path,
     devices: tuple[str, ...],
 ) -> list[str]:
+    data_dir = Path(args.data_dir).expanduser().resolve() if args.data_dir else None
+    mount_sources = [workdir, state_root, gate_root]
+    if data_dir is not None:
+        mount_sources.append(data_dir)
+    data_identity = (
+        [
+            "--user",
+            f"{CONTAINER_USER_ID}:{data_dir.stat().st_gid}",
+            "--group-add",
+            str(CONTAINER_IMAGE_GROUP_ID),
+        ]
+        if data_dir is not None
+        else []
+    )
     command = [
         "docker",
         "run",
@@ -264,6 +295,10 @@ def _docker_command(
         "--init",
         "--restart",
         "unless-stopped",
+        "--stop-timeout",
+        "90",
+        *data_identity,
+        *_supplemental_group_args(mount_sources),
         "--name",
         _container_name(args.tag, spec.key),
         "--cidfile",
@@ -279,19 +314,11 @@ def _docker_command(
         "--volume",
         f"{workdir}:{CONTAINER_WORKDIR}",
         "--volume",
-        f"{state_root}:{CONTAINER_RUN_ROOT}",
+        f"{state_root}:{CONTAINER_STATE_ROOT}",
         "--volume",
-        f"{status_root}:{CONTAINER_STATUS_ROOT}:ro",
+        f"{gate_root}:{CONTAINER_GATE_ROOT}:ro",
     ]
-    if status_dir is not None:
-        command.extend(
-            [
-                "--volume",
-                f"{status_dir}:{CONTAINER_STATUS_ROOT}/{spec.name}",
-            ]
-        )
-    if args.docker_data_dir:
-        data_dir = Path(args.docker_data_dir).expanduser().resolve()
+    if data_dir is not None:
         command.extend(
             [
                 "--volume",
@@ -299,6 +326,15 @@ def _docker_command(
             ]
         )
     if spec.role == "student":
+        if args.gpus_per_student > 0:
+            command.extend(
+                [
+                    "--cpus",
+                    str(args.cpu_per_gpu * args.gpus_per_student),
+                    "--memory",
+                    f"{args.memory_gi_per_gpu * args.gpus_per_student}g",
+                ]
+            )
         command.extend(["--shm-size", args.docker_shm_size])
         command.extend(_docker_gpu_args(devices))
     script = (
@@ -306,7 +342,7 @@ def _docker_command(
         if spec.role == "advisor"
         else "k8s/entrypoint-student.sh"
     )
-    command.extend([args.image, "bash", script])
+    command.extend([_role_image(args, spec), "bash", script])
     return command
 
 
@@ -326,35 +362,26 @@ def plan_docker(
     _check_run_root_available(run_root)
     run_base = run_root.parent
     validate_writable_parent(run_base, "Docker run root")
-    status_root = _path_beneath(run_root, "status")
-    if args.docker_data_dir:
-        data_dir = Path(args.docker_data_dir).expanduser().resolve()
+    gate_root = _path_beneath(run_root, "gate")
+    if args.data_dir:
+        data_dir = Path(args.data_dir).expanduser().resolve()
         if not data_dir.is_dir():
             raise ValueError(f"Docker data directory does not exist: {data_dir}")
+        if data_dir in {Path(data_dir.anchor), Path.home().resolve()}:
+            raise ValueError("Docker data directory must not be / or the home directory")
         if data_dir.is_relative_to(run_base) or run_base.is_relative_to(data_dir):
             raise ValueError(
                 f"Docker data directory overlaps private run state: {data_dir}"
             )
-        mount_path = PurePosixPath(args.pvc_mount_path)
-        reserved = tuple(
-            PurePosixPath(path)
-            for path in (CONTAINER_RUN_ROOT, CONTAINER_STATUS_ROOT, CONTAINER_WORKDIR)
+        validate_pvc_mount_path(
+            args.pvc_mount_path,
+            CONTAINER_RESERVED_PATHS,
         )
-        if (
-            not mount_path.is_absolute()
-            or ".." in mount_path.parts
-            or any(
-                mount_path == path
-                or mount_path in path.parents
-                or path in mount_path.parents
-                for path in reserved
-            )
-        ):
-            raise ValueError(
-                "Docker pvc_mount_path must be an absolute path outside "
-                f"{CONTAINER_RUN_ROOT}, {CONTAINER_STATUS_ROOT}, and "
-                f"{CONTAINER_WORKDIR}"
-            )
+    elif args.start_gate_path:
+        raise ValueError(
+            "Docker --start_gate_path requires --data_dir so the gate "
+            "is visible inside every role"
+        )
 
     assignments = _gpu_assignments(args, role_specs, available_gpu_ids)
     roles = []
@@ -363,20 +390,19 @@ def plan_docker(
         state_root = _path_beneath(role_root, "state")
         workdir = _path_beneath(role_root, "workdir")
         env_file = _path_beneath(role_root, "role.env")
-        ready_file = _path_beneath(state_root, "ready")
-        cid_file = _path_beneath(role_root, "container.cid")
-        status_dir = (
-            _path_beneath(status_root, spec.name)
-            if spec.role == "student"
-            else None
+        ready_parts = (
+            (args.tag, "advisor", "openhands_state", "controller-lease.json")
+            if spec.role == "advisor"
+            else ("openhands_state", "controller-lease.json")
         )
+        ready_file = _path_beneath(state_root, *ready_parts)
+        cid_file = _path_beneath(role_root, "container.cid")
         devices = tuple(assignments.get(spec.name, ()))
         command = _docker_command(
             args,
             spec,
             state_root,
-            status_root,
-            status_dir,
+            gate_root,
             workdir,
             env_file,
             cid_file,
@@ -392,32 +418,41 @@ def plan_docker(
                 env_file=env_file,
                 ready_file=ready_file,
                 cid_file=cid_file,
-                status_dir=status_dir,
                 devices=devices,
                 command=tuple(command),
             )
         )
-    return DockerLaunchPlan(run_root, status_root, tuple(roles))
+    return DockerLaunchPlan(run_root, gate_root, tuple(roles))
 
 
-def _prepare_runner_workdir(repo_url: str, workdir: Path, branch: str) -> None:
+def _prepare_runner_workdir(repo_url: str, workdir: Path, revision: str) -> None:
     workdir.parent.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
         [
             "git",
             "clone",
-            "--branch",
-            branch,
-            "--single-branch",
+            "--no-checkout",
             repo_url,
             str(workdir),
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode:
         raise RuntimeError(
-            f"Could not clone runner branch {branch!r} from {repo_url}: "
+            f"Could not clone runner source from {repo_url}: "
+            f"{result.stderr.strip()}"
+        )
+    result = subprocess.run(
+        ["git", "-C", str(workdir), "checkout", "--detach", revision],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(
+            f"Could not check out runner revision {revision!r} from {repo_url}: "
             f"{result.stderr.strip()}"
         )
 
@@ -425,29 +460,69 @@ def _prepare_runner_workdir(repo_url: str, workdir: Path, branch: str) -> None:
 def _check_docker() -> None:
     if not shutil.which("docker"):
         raise RuntimeError("Docker is not installed or is not on PATH")
-    result = subprocess.run(["docker", "info"], capture_output=True, text=True)
+    result = subprocess.run(
+        ["docker", "info"], capture_output=True, text=True, check=False
+    )
     if result.returncode:
         raise RuntimeError(f"Docker daemon is unavailable: {result.stderr.strip()}")
 
 
-def _check_runner_source(repo_url: str, branch: str) -> None:
-    result = subprocess.run(
-        [
-            "git",
-            "ls-remote",
-            "--exit-code",
-            "--heads",
-            repo_url,
-            f"refs/heads/{branch}",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode:
-        raise RuntimeError(
-            f"Runner branch {branch!r} is not available from {repo_url}: "
-            f"{result.stderr.strip()}"
+def _check_runner_source(repo_url: str, revision: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="senpai-source-check-") as tmp:
+        checkout = Path(tmp) / "runner"
+        clone = subprocess.run(
+            [
+                "git",
+                "clone",
+                "--filter=blob:none",
+                "--no-checkout",
+                repo_url,
+                str(checkout),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
         )
+        if clone.returncode:
+            raise RuntimeError(
+                f"Runner revision {revision!r} cannot be checked out from "
+                f"{repo_url}: {clone.stderr.strip()}"
+            )
+
+        reference = (
+            revision
+            if re.fullmatch(r"[0-9a-f]{40}", revision)
+            else f"refs/remotes/origin/{revision}"
+        )
+        for action, command in (
+            (
+                "resolve",
+                [
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "cat-file",
+                    "-e",
+                    f"{reference}^{{commit}}",
+                ],
+            ),
+            (
+                "check out",
+                ["git", "-C", str(checkout), "checkout", "--detach", reference],
+            ),
+        ):
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode:
+                detail = result.stderr.strip() or result.stdout.strip()
+                raise RuntimeError(
+                    f"Runner revision {revision!r} cannot be checked out from "
+                    f"{repo_url}: could not {action} it: {detail}"
+                )
 
 
 def _docker_gpu_indices(image: str) -> list[str]:
@@ -482,6 +557,7 @@ print(
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode:
         raise RuntimeError(
@@ -496,7 +572,7 @@ print(
     return indices
 
 
-def _check_image(image: str) -> None:
+def _check_image(image: str, revision: str) -> None:
     result = subprocess.run(
         [
             "docker",
@@ -506,15 +582,58 @@ def _check_image(image: str) -> None:
             "/bin/bash",
             image,
             "-c",
-            "true",
+            'test "$SENPAI_IMAGE_REVISION" = "$1"',
+            "senpai-image-check",
+            revision,
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode:
         raise RuntimeError(
-            f"Docker cannot run the Senpai image {image!r}: "
+            f"Docker cannot run {image!r} at source revision {revision}: "
             + (result.stderr.strip() or result.stdout.strip())
+        )
+
+
+def _check_data_mount(role: str, image: str, data_dir: Path, mount_path: str) -> None:
+    group_id = data_dir.stat().st_gid
+    access_check = r"""
+test -r "$1" && test -x "$1" && test -w "$1" &&
+test -z "$(find "$1" -type d \( ! -readable -o ! -executable \) -print -quit)" &&
+test -z "$(find "$1" -type f ! -readable -print -quit)"
+"""
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--user",
+            f"{CONTAINER_USER_ID}:{group_id}",
+            "--group-add",
+            str(CONTAINER_IMAGE_GROUP_ID),
+            "--volume",
+            f"{data_dir}:{mount_path}:rw",
+            "--entrypoint",
+            "/bin/bash",
+            image,
+            "-c",
+            access_check,
+            "senpai-data-check",
+            mount_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            f"Docker {role} image {image!r} cannot read, traverse, and write "
+            f"data directory {data_dir} as its runtime user with host group GID "
+            f"{group_id}: {detail}. Grant that group directory r/w/x access "
+            "through group ownership or an ACL; Senpai did not modify user data."
         )
 
 
@@ -524,6 +643,7 @@ def _check_container_names_available(names: list[str]) -> None:
             ["docker", "container", "inspect", name],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            check=False,
         )
         if result.returncode == 0:
             raise RuntimeError(
@@ -535,34 +655,67 @@ def _check_container_names_available(names: list[str]) -> None:
 def preflight_docker(args, role_specs: list[RoleSpec]) -> DockerLaunchPlan:
     """Validate a real Docker launch without changing host or GitHub state."""
     preview = plan_docker(args, role_specs)
-    _check_runner_source(args.repo_url, args.repo_branch)
+    _check_runner_source(args.repo_url, args.repo_revision)
     _check_docker()
     _check_container_names_available(
         [role.container_name for role in preview.roles]
     )
+    has_advisor = any(role.spec.role == "advisor" for role in preview.roles)
+    has_students = any(role.spec.role == "student" for role in preview.roles)
     needs_gpus = any(role.devices for role in preview.roles)
-    check = "image and GPU access" if needs_gpus else "image"
+    check = "images and GPU access" if needs_gpus else "images"
     print(
-        f"Checking Docker {check} with {args.image!r}; "
-        "the first pull can take several minutes.",
+        f"Checking Docker {check}; the first pull can take several minutes.",
         flush=True,
     )
+    if has_advisor:
+        _check_image(args.advisor_image, args.repo_revision)
+    if has_students:
+        _check_image(args.student_image, args.repo_revision)
+    if args.data_dir:
+        data_dir = Path(args.data_dir).expanduser().resolve()
+        if has_advisor:
+            _check_data_mount(
+                "advisor",
+                args.advisor_image,
+                data_dir,
+                args.pvc_mount_path,
+            )
+        if has_students:
+            _check_data_mount(
+                "student",
+                args.student_image,
+                data_dir,
+                args.pvc_mount_path,
+            )
     if needs_gpus:
-        gpu_ids = _docker_gpu_indices(args.image)
+        gpu_ids = _docker_gpu_indices(args.student_image)
     else:
-        _check_image(args.image)
         gpu_ids = None
     return plan_docker(args, role_specs, gpu_ids)
+
+
+def _share_with_container_group(path: Path) -> None:
+    """Keep host ownership while granting the container's supplemental group access."""
+    for root, directories, files in os.walk(path):
+        root_path = Path(root)
+        root_path.chmod(root_path.stat().st_mode | 0o2070)
+        for name in directories:
+            directory = root_path / name
+            if not directory.is_symlink():
+                directory.chmod(directory.stat().st_mode | 0o2070)
+        for name in files:
+            file = root_path / name
+            if not file.is_symlink():
+                file.chmod(file.stat().st_mode | 0o060)
 
 
 def _create_role_files(args, role: DockerRolePlan) -> None:
     role.state_root.mkdir(parents=True)
     (role.state_root / "home").mkdir()
-    (role.state_root / "logs" / "iterations").mkdir(parents=True)
-    (role.state_root / "secrets").mkdir()
-    if role.status_dir is not None:
-        role.status_dir.mkdir(parents=True)
-    _prepare_runner_workdir(args.repo_url, role.workdir, args.repo_branch)
+    _prepare_runner_workdir(args.repo_url, role.workdir, args.repo_revision)
+    _share_with_container_group(role.state_root)
+    _share_with_container_group(role.workdir)
     role.env_file.write_text(
         _env_file_text(_role_values(role.spec)),
         encoding="utf-8",
@@ -570,15 +723,50 @@ def _create_role_files(args, role: DockerRolePlan) -> None:
     role.env_file.chmod(0o600)
 
 
-def _container_state(name: str) -> dict:
+def _container_details(name: str) -> dict:
     result = subprocess.run(
-        ["docker", "container", "inspect", "--format", "{{json .State}}", name],
+        ["docker", "container", "inspect", "--format", "{{json .}}", name],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode:
         raise RuntimeError(f"Docker container {name!r} disappeared during startup")
     return json.loads(result.stdout)
+
+
+def _container_exists(name: str) -> bool:
+    result = subprocess.run(
+        ["docker", "container", "inspect", name],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return True
+    detail = result.stderr.strip() or result.stdout.strip()
+    if "No such container" in detail or "No such object" in detail:
+        return False
+    raise RuntimeError(
+        f"Could not determine whether Docker container {name!r} exists: "
+        f"{detail or '<no error detail>'}. Run state was preserved."
+    )
+
+
+def _container_state(name: str) -> dict:
+    return _container_details(name)["State"]
+
+
+def _lease_is_waiting_at_gate(path: Path) -> bool:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return (
+            int(value["pid"]) > 0
+            and value["phase"] == "start-gate"
+            and float(value["deadline"]) > 0
+        )
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def _wait_until_ready(plan: DockerLaunchPlan, timeout_s: float) -> None:
@@ -599,7 +787,7 @@ def _wait_until_ready(plan: DockerLaunchPlan, timeout_s: float) -> None:
                     f"Docker container {name!r} failed before becoming ready "
                     f"(status={status}, exit={state.get('ExitCode')})"
                 )
-            if not role.ready_file.is_file():
+            if not _lease_is_waiting_at_gate(role.ready_file):
                 pending.append(name)
         if not pending:
             return
@@ -619,6 +807,7 @@ def _container_logs(container_ids: list[str]) -> str:
             ["docker", "logs", "--tail", "80", container_id],
             capture_output=True,
             text=True,
+            check=False,
         )
         logs = (result.stdout + result.stderr).strip()
         if result.returncode == 0 and logs:
@@ -633,6 +822,7 @@ def _remove_containers(container_ids: list[str]) -> list[str]:
             ["docker", "rm", "--force", container_id],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode:
             failures.append(
@@ -654,10 +844,102 @@ def _created_container_ids(
     return list(dict.fromkeys(container_id for container_id in ids if container_id))
 
 
+def _write_manifest(args, plan: DockerLaunchPlan) -> None:
+    path = plan.run_root / "manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "tag": args.tag,
+                "roles": [
+                    {
+                        "key": role.spec.key,
+                        "container": role.container_name,
+                    }
+                    for role in plan.roles
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+
+def _load_manifest(tag: str, run_root: str) -> tuple[Path, dict]:
+    validate_identifier("Docker tag", tag)
+    base = Path(run_root).expanduser().resolve()
+    path = (base / tag).resolve()
+    if not path.is_relative_to(base) or path == base:
+        raise ValueError(f"Docker run path escapes configured root: {path}")
+    manifest_path = path / "manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"No Docker Senpai run {tag!r} found at {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("tag") != tag:
+        raise RuntimeError(f"Docker run manifest tag does not match {tag!r}")
+    return path, manifest
+
+
+def status_docker(tag: str, run_root: str = "~/.senpai/runs") -> None:
+    """Print container and OpenHands supervisor health for one Docker run."""
+    _, manifest = _load_manifest(tag, run_root)
+    for role in manifest["roles"]:
+        details = _container_details(role["container"])
+        state = details["State"]
+        health = state.get("Health", {}).get("Status", "none")
+        print(
+            f"{role['key']}: container={role['container']} "
+            f"state={state['Status']} health={health} "
+            f"restarts={details['RestartCount']}"
+        )
+
+
+def logs_docker(
+    tag: str,
+    run_root: str = "~/.senpai/runs",
+    *,
+    role_key: str = "",
+    follow: bool = False,
+    tail: int = 200,
+) -> None:
+    """Print bounded logs for one role, optionally following the stream."""
+    if tail < 1:
+        raise ValueError("Docker log tail must be at least 1")
+    _, manifest = _load_manifest(tag, run_root)
+    roles = manifest["roles"]
+    role = next(
+        (value for value in roles if value["key"] == role_key),
+        roles[0] if not role_key and roles else None,
+    )
+    if role is None:
+        choices = ", ".join(value["key"] for value in roles)
+        raise ValueError(f"Unknown Docker role {role_key!r}; choose one of: {choices}")
+    command = ["docker", "logs", "--tail", str(tail)]
+    if follow:
+        command.append("--follow")
+    command.append(role["container"])
+    subprocess.run(command, check=True)
+
+
+def terminate_docker(tag: str, run_root: str = "~/.senpai/runs") -> None:
+    """Gracefully stop one recorded run, remove its containers and credentials."""
+    path, manifest = _load_manifest(tag, run_root)
+    names = [role["container"] for role in manifest["roles"]]
+    existing = [name for name in names if _container_exists(name)]
+    if existing:
+        subprocess.run(["docker", "stop", "--time", "90", *existing], check=True)
+        subprocess.run(["docker", "rm", *existing], check=True)
+    shutil.rmtree(path)
+    print(f"Stopped Docker Senpai run {tag!r} and removed its private run state.")
+
+
 def _print_plan(args, plan: DockerLaunchPlan) -> None:
     print(f"Docker Senpai run: {plan.run_root}")
-    print(f"Runner source: {args.repo_url} ({args.repo_branch})")
-    print(f"Image: {args.image}")
+    print(f"Runner source: {args.repo_url} ({args.repo_revision})")
+    print(f"Advisor image: {args.advisor_image}")
+    print(f"Student image: {args.student_image}")
     for role in plan.roles:
         print(f"\n--- Docker {role.spec.key} ---")
         print(f"workdir: {role.workdir}")
@@ -666,10 +948,34 @@ def _print_plan(args, plan: DockerLaunchPlan) -> None:
         print(f"command: {shlex.join(role.command)}")
 
 
+def _runtime_command(args, role: DockerRolePlan, gate_root: Path) -> list[str]:
+    return _docker_command(
+        args,
+        role.spec,
+        role.state_root,
+        gate_root,
+        role.workdir,
+        role.env_file,
+        role.cid_file,
+        role.devices,
+    )
+
+
+def _lifecycle_command(args, action: str, *options: str) -> str:
+    command = ["python3", "k8s/docker.py", action, args.tag, *options]
+    run_root = Path(args.docker_run_root).expanduser().resolve()
+    default_root = Path(DEFAULT_DOCKER_RUN_ROOT).expanduser().resolve()
+    if run_root != default_root:
+        command.extend(["--run-root", str(run_root)])
+    return shlex.join(command)
+
+
 def launch_docker(
     args,
     role_specs: list[RoleSpec],
     plan: DockerLaunchPlan | None = None,
+    *,
+    show_lifecycle: bool = True,
 ) -> None:
     """Launch all roles together and open their shared gate once ready."""
     if args.dry_run:
@@ -680,7 +986,9 @@ def launch_docker(
     _check_run_root_available(plan.run_root)
     plan.run_root.mkdir(parents=True)
     plan.run_root.chmod(0o700)
-    plan.status_root.mkdir()
+    plan.gate_root.mkdir()
+    _share_with_container_group(plan.gate_root)
+    _write_manifest(args, plan)
     attempted_roles: list[DockerRolePlan] = []
     started_ids: list[str] = []
     try:
@@ -689,10 +997,11 @@ def launch_docker(
         for role in plan.roles:
             attempted_roles.append(role)
             result = subprocess.run(
-                role.command,
+                _runtime_command(args, role, plan.gate_root),
                 cwd=role.workdir,
                 capture_output=True,
                 text=True,
+                check=False,
             )
             if result.returncode:
                 raise RuntimeError(
@@ -707,7 +1016,9 @@ def launch_docker(
             )
 
         _wait_until_ready(plan, args.docker_ready_timeout_s)
-        (plan.status_root / ".launch").touch(exist_ok=False)
+        launch_gate = plan.gate_root / ".launch"
+        launch_gate.touch(exist_ok=False)
+        launch_gate.chmod(0o640)
     except BaseException as error:
         created_ids = _created_container_ids(started_ids, attempted_roles)
         logs = ""
@@ -735,11 +1046,12 @@ def launch_docker(
             )
         raise
 
-    names = [role.container_name for role in plan.roles]
     print("\nAll roles are ready; launch gate opened.")
+    if not show_lifecycle:
+        return
     print("\nStatus:")
-    print(f"  docker ps --all --filter label={RUN_LABEL}={args.tag}")
+    print(f"  {_lifecycle_command(args, 'status')}")
     print("\nLogs:")
-    print(f"  docker logs --follow {names[0]}")
-    print("\nStop and remove:")
-    print(f"  docker rm --force {' '.join(names)}")
+    print(f"  {_lifecycle_command(args, 'logs', '--follow')}")
+    print("\nStop and remove private run state:")
+    print(f"  {_lifecycle_command(args, 'terminate')}")

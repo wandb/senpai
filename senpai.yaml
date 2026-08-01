@@ -33,10 +33,11 @@ namespace: default
 pvc_claim_name: new-pvc
 pvc_mount_path: /mnt/new-pvc
 
-# standalone Docker host
+# Docker/AWS data root and standalone Docker host
 docker_run_root: ~/.senpai/runs
 docker_student_gpu_ids: ""
-docker_data_dir: ""
+# Mounted directly by Docker or streamed once to AWS at pvc_mount_path.
+data_dir: ""
 docker_shm_size: 32g
 docker_ready_timeout_s: 600
 
@@ -46,10 +47,11 @@ aws_profile: ""
 aws_instance_type: ""
 aws_ami_id: ""
 aws_subnet_id: ""
-aws_volume_gib: 100
+aws_volume_gib: 250
 aws_state_root: ~/.senpai/aws
 aws_ssh_cidr: ""
 aws_ready_timeout_s: 900
+aws_data_timeout_s: 7200
 aws_ttl_hours: 24.0
 
 # W&B

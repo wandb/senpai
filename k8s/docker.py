@@ -4,9 +4,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-PackageName: senpai
 
-"""Inspect, read logs from, or terminate an AWS Senpai run."""
+"""Inspect, follow, or terminate a standalone Docker Senpai run."""
 
 import argparse
+import subprocess
 import sys
 from pathlib import Path
 
@@ -14,7 +15,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from senpai.launch.aws_backend import logs_aws, status_aws, terminate_aws  # noqa: E402
+from senpai.launch.docker_backend import (  # noqa: E402
+    logs_docker,
+    status_docker,
+    terminate_docker,
+)
 
 
 def main() -> None:
@@ -23,27 +28,27 @@ def main() -> None:
     for name in ("status", "logs", "terminate"):
         command = actions.add_parser(name)
         command.add_argument("tag")
-        command.add_argument("--state-root", default="~/.senpai/aws")
-        command.add_argument("--profile", default="")
+        command.add_argument("--run-root", default="~/.senpai/runs")
         if name == "logs":
             command.add_argument("--role", default="")
             command.add_argument("--tail", type=int, default=200)
+            command.add_argument("--follow", action="store_true")
     args = parser.parse_args()
 
     try:
         if args.action == "status":
-            status_aws(args.tag, args.state_root, profile=args.profile)
+            status_docker(args.tag, args.run_root)
         elif args.action == "logs":
-            logs_aws(
+            logs_docker(
                 args.tag,
-                args.state_root,
-                profile=args.profile,
+                args.run_root,
                 role_key=args.role,
+                follow=args.follow,
                 tail=args.tail,
             )
         else:
-            terminate_aws(args.tag, args.state_root, profile=args.profile)
-    except (ValueError, RuntimeError) as error:
+            terminate_docker(args.tag, args.run_root)
+    except (ValueError, RuntimeError, subprocess.CalledProcessError) as error:
         sys.exit(f"ERROR: {error}")
 
 
