@@ -75,9 +75,9 @@ class Args:
     target_repo_branch: str = ""  # target repo branch used as the base when creating advisor_branch; empty = target repo default branch
     problem_dir: str = "target/"  # active problem directory — entrypoint clones target_repo_url here (from senpai.yaml)
     names: str = ""  # comma-separated student names (e.g. "frieren,fern")
-    n_students: int = -1  # number of students; -1 chooses 4 on Kubernetes or 1 on Docker/AWS
+    n_students: int = 4  # students to launch on every backend; ignored when --names is set
     student_prefix: str = ""  # make assignment labels unique across parallel launches using the same base names
-    gpus_per_student: int = -1  # GPUs per student; -1 chooses 8 on Kubernetes or 1 on Docker/AWS
+    gpus_per_student: int = 1  # GPUs allocated to each student on every backend
     cpu_per_gpu: int = 15  # CPU requested per student GPU
     memory_gi_per_gpu: int = 120  # memory Gi requested per student GPU
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL (senpai runner)
@@ -123,7 +123,8 @@ class Args:
     aws_instance_type: str = ""  # EC2 GPU type; empty chooses the smallest supported type for this launch
     aws_ami_id: str = ""  # x86_64 GPU AMI; empty uses the latest AWS Deep Learning Base AMI
     aws_subnet_id: str = ""  # public subnet; empty selects one that offers the instance type
-    aws_volume_gib: int = 250  # encrypted gp3 root volume GiB, raised to the AMI minimum
+    aws_volume_gib: int = 250  # bootstrap gp3 GiB; must fit the AMI and image-pull peak
+    aws_runtime_reserve_gib: int = 80  # total free host disk retained after data upload
     aws_state_root: str = "~/.senpai/aws"  # local lifecycle state and ephemeral SSH keys
     aws_ssh_cidr: str = ""  # SSH source IPv4 /32; empty discovers the launcher's public IP
     aws_ready_timeout_s: int = 900  # wait for EC2, cloud-init, Docker, and GPU readiness
@@ -349,14 +350,6 @@ def render_advisor(
     return configmap + "\n---\n" + deployment
 
 
-def resolve_backend_defaults(args: Args) -> None:
-    """Preserve Kubernetes capacity while keeping single-host launches small."""
-    if args.n_students == -1:
-        args.n_students = 4 if args.backend == "kubernetes" else 1
-    if args.gpus_per_student == -1:
-        args.gpus_per_student = 8 if args.backend == "kubernetes" else 1
-
-
 def resolve_student_names(args: Args) -> list[str]:
     names = (
         [name.strip() for name in args.names.split(",") if name.strip()]
@@ -402,7 +395,6 @@ def main():
     args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
     if args.backend not in {"kubernetes", "docker", "aws"}:
         sys.exit("ERROR: --backend must be one of: kubernetes, docker, aws")
-    resolve_backend_defaults(args)
     if min(args.cpu_per_gpu, args.memory_gi_per_gpu) < 1:
         sys.exit("ERROR: --cpu_per_gpu and --memory_gi_per_gpu must be at least 1")
     if args.n_students < 0:

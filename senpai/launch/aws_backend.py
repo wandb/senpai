@@ -44,8 +44,12 @@ REMOTE_RUN_ROOT = "/home/ubuntu/.senpai/runs"
 DEFAULT_STATE_ROOT = "~/.senpai/aws"
 GIB = 1024**3
 GP3_MAX_GIB = 16_384
-AWS_VOLUME_HEADROOM_GIB = 160
-AWS_POST_UPLOAD_HEADROOM_GIB = 80
+DOS_PARTITION_MAX_GIB = 2_048
+REMOTE_FILESYSTEM_BLOCK_BYTES = 4096
+AWS_DATA_INODE_MARGIN_PERCENT = 10
+AWS_DATA_INODE_MIN_MARGIN = 1024
+AWS_VOLUME_GROWTH_MARGIN_PERCENT = 10
+AWS_VOLUME_GROWTH_MIN_MARGIN_GIB = 1
 AWS_HOST_VCPU_HEADROOM = 4
 AWS_HOST_MEMORY_HEADROOM_GIB = 16
 AUTO_INSTANCE_TYPES = (
@@ -98,6 +102,15 @@ class AwsSubnet:
     subnet_id: str
     vpc_id: str
     availability_zone: str
+
+
+@dataclass(frozen=True)
+class AwsRootLayout:
+    source: str
+    filesystem: str
+    disk: str
+    partition: int | None
+    partition_table: str | None
 
 
 @dataclass(frozen=True)
@@ -352,6 +365,8 @@ def _validate_aws_inputs(
         raise ValueError("--aws_volume_gib must be at least 1")
     if args.aws_volume_gib > GP3_MAX_GIB:
         raise ValueError(f"--aws_volume_gib cannot exceed {GP3_MAX_GIB:,} GiB")
+    if args.aws_runtime_reserve_gib < 0:
+        raise ValueError("--aws_runtime_reserve_gib must be non-negative")
     if args.aws_ttl_hours <= 0:
         raise ValueError("--aws_ttl_hours must be greater than 0")
     if args.aws_ready_timeout_s < 1:
@@ -369,13 +384,12 @@ def _validate_aws_inputs(
         data_files=data_files,
         data_bytes=data_bytes,
     )
-    required_volume_gib = (
-        math.ceil(data_bytes / GIB) + AWS_VOLUME_HEADROOM_GIB if data_bytes else 0
-    )
-    if required_volume_gib > GP3_MAX_GIB:
+    minimum_payload_gib = math.ceil(data_bytes / GIB) + args.aws_runtime_reserve_gib
+    if minimum_payload_gib > GP3_MAX_GIB:
         raise ValueError(
-            f"AWS data needs a {required_volume_gib:,} GiB root volume including "
-            f"headroom, beyond the gp3 limit of {GP3_MAX_GIB:,} GiB"
+            f"AWS data plus the runtime reserve needs at least "
+            f"{minimum_payload_gib:,} GiB, beyond the gp3 limit of "
+            f"{GP3_MAX_GIB:,} GiB"
         )
     if not args.aws_instance_type:
         _automatic_instance_type(requirements)
@@ -641,12 +655,7 @@ def preflight_aws(args, role_specs: list[RoleSpec]) -> AwsLaunchPlan:
         args.aws_ami_id,
     )
     subnets = _select_subnets(context, instance_type, args.aws_subnet_id)
-    data_volume_gib = (
-        math.ceil(requirements.data_bytes / GIB) + AWS_VOLUME_HEADROOM_GIB
-        if requirements.data_bytes
-        else 0
-    )
-    volume_gib = max(args.aws_volume_gib, minimum_volume_gib, data_volume_gib)
+    volume_gib = max(args.aws_volume_gib, minimum_volume_gib)
     if volume_gib > GP3_MAX_GIB:
         raise RuntimeError(
             f"AWS root volume resolves to {volume_gib:,} GiB, beyond the gp3 "
@@ -866,6 +875,10 @@ def _data_summary(source: Path) -> tuple[int, int]:
     if not count:
         raise ValueError(f"AWS data directory contains no files: {source}")
     return count, size
+
+
+def _data_directory_count(source: Path) -> int:
+    return sum(len(directories) for _, directories, _ in os.walk(source))
 
 
 def _remote_payload(
@@ -1126,9 +1139,10 @@ def _stream_directory(
     source: Path,
     destination: str,
     timeout_s: float,
+    expected: tuple[int, int] | None = None,
 ) -> None:
     """Stream one local directory to the fresh host without a second local copy."""
-    expected = _data_summary(source)
+    expected = expected or _data_summary(source)
     destination_arg = shlex.quote(destination)
     script = (
         "set -e; "
@@ -1275,12 +1289,7 @@ def _preflight_roles(
         print(output)
 
 
-def _check_remote_data_capacity(
-    args,
-    run_dir: Path,
-    state: dict,
-    data_bytes: int,
-) -> None:
+def _remote_free_bytes(args, run_dir: Path, state: dict) -> int:
     result = _ssh(
         run_dir,
         state,
@@ -1291,20 +1300,425 @@ def _check_remote_data_capacity(
         available = int(result.stdout.strip())
     except ValueError as error:
         raise RuntimeError("AWS host returned invalid free-disk information") from error
-    required = data_bytes + AWS_POST_UPLOAD_HEADROOM_GIB * GIB
-    if available < required:
+    return available
+
+
+def _remote_free_inodes(args, run_dir: Path, state: dict) -> int:
+    result = _ssh(
+        run_dir,
+        state,
+        "df --output=iavail /home/ubuntu | tail -1",
+        timeout=args.aws_ready_timeout_s,
+    )
+    try:
+        return int(result.stdout.strip())
+    except ValueError as error:
+        raise RuntimeError("AWS host returned invalid free-inode information") from error
+
+
+def _validate_shared_root_storage(args, run_dir: Path, state: dict) -> None:
+    result = _ssh(
+        run_dir,
+        state,
+        (
+            "set -eu; "
+            "root=$(readlink -f \"$(findmnt -n -o SOURCE /)\"); "
+            "home=$(readlink -f \"$(findmnt -n -o SOURCE -T /home/ubuntu)\"); "
+            "docker=$(readlink -f \"$(findmnt -n -o SOURCE -T /var/lib/docker)\"); "
+            "printf '%s\\t%s\\t%s\\n' \"$root\" \"$home\" \"$docker\""
+        ),
+        timeout=args.aws_ready_timeout_s,
+    )
+    sources = result.stdout.decode(errors="replace").strip().split("\t")
+    if len(sources) != 3:
+        raise RuntimeError("AWS host returned invalid storage mount information")
+    if len(set(sources)) != 1:
         raise RuntimeError(
-            f"AWS host has {available / GIB:.1f} GiB free after pulling images, "
-            f"but the dataset plus runtime headroom needs {required / GIB:.1f} "
-            "GiB. Increase --aws_volume_gib."
+            "AWS requires /, /home/ubuntu, and /var/lib/docker to share one "
+            f"root device; found {sources[0]!r}, {sources[1]!r}, and "
+            f"{sources[2]!r}"
         )
 
 
-def _upload_data(args, run_dir: Path, state: dict, data_bytes: int) -> None:
-    if not args.data_dir:
+def _root_volume(context: AwsContext, state: dict) -> tuple[str, int]:
+    instance_id = _recorded_instance_id(state)
+    instance = _instance_details(context, instance_id)
+    root_device = instance.get("RootDeviceName", "")
+    mapping = next(
+        (
+            item
+            for item in instance.get("BlockDeviceMappings", [])
+            if item.get("DeviceName") == root_device
+            and item.get("Ebs", {}).get("VolumeId")
+        ),
+        None,
+    )
+    if mapping is None:
+        raise RuntimeError(
+            f"AWS instance {instance_id} has no recorded EBS root volume; "
+            "refusing to resize an unknown device"
+        )
+    volume_id = mapping["Ebs"]["VolumeId"]
+    payload = _aws_json(
+        context,
+        "ec2",
+        "describe-volumes",
+        "--volume-ids",
+        volume_id,
+    )
+    volumes = payload.get("Volumes", [])
+    if len(volumes) != 1:
+        raise RuntimeError(f"AWS root volume {volume_id} could not be resolved")
+    return volume_id, int(volumes[0]["Size"])
+
+
+def _root_layout(args, run_dir: Path, state: dict) -> AwsRootLayout:
+    command = r"""set -eu
+source=$(readlink -f "$(findmnt -n -o SOURCE /)")
+home_source=$(readlink -f "$(findmnt -n -o SOURCE -T /home/ubuntu)")
+docker_source=$(readlink -f "$(findmnt -n -o SOURCE -T /var/lib/docker)")
+filesystem=$(findmnt -n -o FSTYPE /)
+device_type=$(lsblk -dn -o TYPE "$source" | tr -d ' ')
+name=$(lsblk -dn -o NAME "$source" | tr -d ' ')
+parent=$(lsblk -dn -o PKNAME "$source" | tr -d ' ')
+partition=-
+partition_table=-
+last_partition=-
+test ! -r "/sys/class/block/$name/partition" || \
+  partition=$(cat "/sys/class/block/$name/partition")
+test -n "$parent" || parent=-
+if test "$parent" != -; then
+  partition_table=$(lsblk -dn -o PTTYPE "/dev/$parent" | tr -d ' ')
+  test -n "$partition_table" || partition_table=-
+  last_partition=$(
+    for candidate in /sys/class/block/"$parent"/*/partition; do
+      test -r "$candidate" || continue
+      directory=${candidate%/partition}
+      start=$(cat "$directory/start")
+      size=$(cat "$directory/size")
+      number=$(cat "$candidate")
+      printf '%s\t%s\n' "$((start + size))" "$number"
+    done | sort -n | tail -1 | cut -f2
+  )
+  test -n "$last_partition" || last_partition=-
+fi
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$source" "$home_source" "$docker_source" "$filesystem" \
+  "$device_type" "$parent" "$partition" "$partition_table" "$last_partition"
+"""
+    result = _ssh(
+        run_dir,
+        state,
+        command,
+        timeout=args.aws_ready_timeout_s,
+    )
+    fields = result.stdout.decode(errors="replace").strip().split("\t")
+    if len(fields) != 9:
+        raise RuntimeError("AWS host returned an invalid root filesystem layout")
+    (
+        source,
+        home_source,
+        docker_source,
+        filesystem,
+        device_type,
+        parent,
+        partition,
+        partition_table,
+        last_partition,
+    ) = fields
+    if home_source != source or docker_source != source:
+        raise RuntimeError(
+            "AWS can grow storage automatically only when /, /home/ubuntu, "
+            f"and /var/lib/docker share one root device; found {source!r}, "
+            f"{home_source!r}, and {docker_source!r}"
+        )
+    if filesystem not in {"ext4", "xfs"}:
+        raise RuntimeError(
+            f"AWS root filesystem {filesystem!r} is unsupported; use the "
+            "supported DLAMI with an ext4 or XFS root filesystem"
+        )
+    if device_type == "disk":
+        layout = AwsRootLayout(source, filesystem, source, None, None)
+    elif (
+        device_type == "part"
+        and parent != "-"
+        and partition.isdecimal()
+        and partition_table in {"gpt", "dos"}
+        and last_partition == partition
+    ):
+        layout = AwsRootLayout(
+            source,
+            filesystem,
+            f"/dev/{parent}",
+            int(partition),
+            partition_table,
+        )
+    else:
+        raise RuntimeError(
+            f"AWS root device layout for {source!r} is unsupported: type "
+            f"{device_type!r}, partition table {partition_table!r}, root "
+            f"partition {partition!r}, final partition {last_partition!r}. "
+            "LVM, device-mapper, unknown partition tables, and non-final root "
+            "partitions must set a sufficiently large --aws_volume_gib before "
+            "launch"
+        )
+
+    tools = ["resize2fs" if filesystem == "ext4" else "xfs_growfs"]
+    if layout.partition is not None:
+        tools.append("growpart")
+    checks = [
+        f"command -v {tool} >/dev/null || "
+        f"{{ echo 'AWS root resize requires {tool}' >&2; exit 1; }}"
+        for tool in tools
+    ]
+    _ssh(
+        run_dir,
+        state,
+        "set -eu; " + "; ".join(checks),
+        timeout=args.aws_ready_timeout_s,
+    )
+    return layout
+
+
+def _wait_for_volume_resize(
+    context: AwsContext,
+    volume_id: str,
+    target_gib: int,
+    timeout_s: float,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        payload = _aws_json(
+            context,
+            "ec2",
+            "describe-volumes-modifications",
+            "--volume-ids",
+            volume_id,
+        )
+        modifications = payload.get("VolumesModifications", [])
+        if modifications:
+            modification = modifications[0]
+            status = modification.get("ModificationState", "")
+            if status == "failed":
+                detail = modification.get("StatusMessage", "no error detail")
+                raise RuntimeError(f"AWS root volume resize failed: {detail}")
+            if status in {"optimizing", "completed"} and int(
+                modification.get("TargetSize", 0)
+            ) >= target_gib:
+                return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"AWS root volume {volume_id} did not reach {target_gib} GiB "
+                f"within {timeout_s:g}s"
+            )
+        time.sleep(min(5, remaining))
+
+
+def _wait_for_guest_disk_size(
+    args,
+    run_dir: Path,
+    state: dict,
+    disk: str,
+    target_gib: int,
+) -> None:
+    deadline = time.monotonic() + args.aws_ready_timeout_s
+    target_bytes = target_gib * GIB
+    while True:
+        result = _ssh(
+            run_dir,
+            state,
+            f"lsblk -bdno SIZE {shlex.quote(disk)}",
+            timeout=min(30, args.aws_ready_timeout_s),
+        )
+        try:
+            actual_bytes = int(result.stdout.strip())
+        except ValueError as error:
+            raise RuntimeError(
+                "AWS host returned an invalid root block-device size"
+            ) from error
+        if actual_bytes >= target_bytes:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"AWS guest root disk {disk} did not expose {target_gib} GiB "
+                f"within {args.aws_ready_timeout_s:g}s"
+            )
+        time.sleep(min(5, remaining))
+
+
+def _grow_root_filesystem(
+    args,
+    run_dir: Path,
+    state: dict,
+    layout: AwsRootLayout,
+) -> None:
+    commands = ["set -eu"]
+    if layout.partition is not None:
+        commands.append(
+            f"sudo growpart {shlex.quote(layout.disk)} {layout.partition}"
+        )
+    if layout.filesystem == "ext4":
+        commands.append(f"sudo resize2fs {shlex.quote(layout.source)}")
+    else:
+        commands.append("sudo xfs_growfs /")
+    _ssh(
+        run_dir,
+        state,
+        "; ".join(commands),
+        timeout=args.aws_ready_timeout_s,
+    )
+
+
+def _grow_root_volume(
+    args,
+    context: AwsContext,
+    run_dir: Path,
+    state: dict,
+    shortage_bytes: int,
+) -> None:
+    volume_id, current_gib = _root_volume(context, state)
+    shortage_gib = math.ceil(shortage_bytes / GIB)
+    margin_gib = max(
+        AWS_VOLUME_GROWTH_MIN_MARGIN_GIB,
+        math.ceil(shortage_gib * AWS_VOLUME_GROWTH_MARGIN_PERCENT / 100),
+    )
+    target_gib = current_gib + shortage_gib + margin_gib
+    if target_gib > GP3_MAX_GIB:
+        raise RuntimeError(
+            f"AWS root volume needs {target_gib:,} GiB, beyond the gp3 limit "
+            f"of {GP3_MAX_GIB:,} GiB"
+        )
+    layout = _root_layout(args, run_dir, state)
+    if layout.partition_table == "dos" and target_gib > DOS_PARTITION_MAX_GIB:
+        raise RuntimeError(
+            f"AWS root volume needs {target_gib:,} GiB, but its DOS/MBR "
+            f"partition table supports at most {DOS_PARTITION_MAX_GIB:,} GiB; "
+            "use a GPT-based DLAMI or a smaller dataset"
+        )
+    previous_phase = state.get("phase", "sizing-storage")
+    state.update(
+        {
+            "phase": "resizing-volume",
+            "root_volume_id": volume_id,
+            "volume_resize_started": True,
+            "volume_resize_target_gib": target_gib,
+        }
+    )
+    _save_state(run_dir, state)
+    print(
+        f"Growing AWS root volume from {current_gib} to {target_gib} GiB "
+        "for the dataset and runtime reserve.",
+        flush=True,
+    )
+    _aws_raw(
+        context,
+        "ec2",
+        "modify-volume",
+        "--volume-id",
+        volume_id,
+        "--size",
+        str(target_gib),
+    )
+    state["volume_resize_requested"] = True
+    _save_state(run_dir, state)
+    _wait_for_volume_resize(
+        context,
+        volume_id,
+        target_gib,
+        args.aws_ready_timeout_s,
+    )
+    _wait_for_guest_disk_size(args, run_dir, state, layout.disk, target_gib)
+    _grow_root_filesystem(args, run_dir, state, layout)
+    state.update(
+        {
+            "phase": previous_phase,
+            "volume_gib": target_gib,
+            "volume_resize_completed": True,
+        }
+    )
+    _save_state(run_dir, state)
+
+
+def _ensure_remote_capacity(
+    args,
+    context: AwsContext,
+    run_dir: Path,
+    state: dict,
+    data_entries: int,
+    data_bytes: int,
+) -> None:
+    _validate_shared_root_storage(args, run_dir, state)
+    data_allocation_bytes = (
+        data_bytes + data_entries * REMOTE_FILESYSTEM_BLOCK_BYTES
+    )
+    required = data_allocation_bytes + args.aws_runtime_reserve_gib * GIB
+    available = _remote_free_bytes(args, run_dir, state)
+    if available < required:
+        _grow_root_volume(
+            args,
+            context,
+            run_dir,
+            state,
+            required - available,
+        )
+        available = _remote_free_bytes(args, run_dir, state)
+        if available < required:
+            raise RuntimeError(
+                f"AWS host has {available / GIB:.1f} GiB free after growing the "
+                f"root filesystem, but the dataset plus runtime reserve needs "
+                f"{required / GIB:.1f} GiB"
+            )
+    if data_entries:
+        inode_margin = max(
+            AWS_DATA_INODE_MIN_MARGIN,
+            math.ceil(data_entries * AWS_DATA_INODE_MARGIN_PERCENT / 100),
+        )
+        required_inodes = data_entries + inode_margin
+        available_inodes = _remote_free_inodes(args, run_dir, state)
+        if available_inodes < required_inodes:
+            raise RuntimeError(
+                f"AWS host has {available_inodes:,} free inodes, but the dataset "
+                f"needs {required_inodes:,} including allocation margin. Increase "
+                "--aws_volume_gib so the initial filesystem has more inodes."
+            )
+
+
+def _prepare_remote_storage(
+    args,
+    context: AwsContext,
+    run_dir: Path,
+    state: dict,
+) -> None:
+    data_dir = Path(args.data_dir).expanduser().resolve() if args.data_dir else None
+    data_files, data_bytes = _data_summary(data_dir) if data_dir else (0, 0)
+    data_directories = _data_directory_count(data_dir) if data_dir else 0
+    data_entries = data_files + data_directories + (1 if data_dir else 0)
+    state.update(
+        {
+            "data_files": data_files,
+            "data_directories": data_directories,
+            "data_bytes": data_bytes,
+            "data_allocation_bytes": (
+                data_bytes + data_entries * REMOTE_FILESYSTEM_BLOCK_BYTES
+            ),
+            "runtime_reserve_gib": args.aws_runtime_reserve_gib,
+        }
+    )
+    _save_state(run_dir, state)
+    _ensure_remote_capacity(
+        args,
+        context,
+        run_dir,
+        state,
+        data_entries,
+        data_bytes,
+    )
+    if data_dir is None:
         return
-    _check_remote_data_capacity(args, run_dir, state, data_bytes)
-    data_dir = Path(args.data_dir).expanduser().resolve()
+    state["phase"] = "uploading-data"
+    _save_state(run_dir, state)
     print(f"Uploading dataset from {data_dir} to the AWS host.", flush=True)
     _stream_directory(
         run_dir,
@@ -1312,8 +1726,17 @@ def _upload_data(args, run_dir: Path, state: dict, data_bytes: int) -> None:
         data_dir,
         REMOTE_DATA,
         args.aws_data_timeout_s,
+        (data_files, data_bytes),
     )
     print("Dataset upload complete.", flush=True)
+    available = _remote_free_bytes(args, run_dir, state)
+    required = args.aws_runtime_reserve_gib * GIB
+    if available < required:
+        raise RuntimeError(
+            f"AWS host has {available / GIB:.1f} GiB free after dataset upload, "
+            f"below the {args.aws_runtime_reserve_gib} GiB total-host runtime "
+            "reserve"
+        )
 
 
 def _start_roles(
@@ -1601,6 +2024,10 @@ def launch_aws(
             f"encrypted at least {args.aws_volume_gib} GiB root volume; "
             f"SSH restricted to {args.aws_ssh_cidr or '<current public IP>/32'}"
         )
+        print(
+            f"Disk reserve: {args.aws_runtime_reserve_gib} GiB free for all "
+            "roles after any dataset upload."
+        )
         print(f"Roles ({roles}) reuse the Docker launcher; credentials redacted.")
         print(f"Safety TTL: {args.aws_ttl_hours:g} hours")
         return
@@ -1623,7 +2050,9 @@ def launch_aws(
         "tag": args.tag,
         "vpc_id": plan.vpc_id,
         "roles": [spec.key for spec in role_specs],
+        "root_device": plan.root_device,
         "volume_gib": plan.volume_gib,
+        "runtime_reserve_gib": args.aws_runtime_reserve_gib,
         "data_files": getattr(plan, "data_files", 0),
         "data_bytes": getattr(plan, "data_bytes", 0),
     }
@@ -1639,19 +2068,25 @@ def launch_aws(
         print("AWS host is ready; validating Senpai images and CUDA.", flush=True)
         state["phase"] = "validating-images"
         _save_state(run_dir, state)
-        _preflight_roles(
-            args,
-            role_specs,
-            run_dir,
-            state,
-            include_data=False,
-        )
-        state["phase"] = "uploading-data"
+        try:
+            _preflight_roles(
+                args,
+                role_specs,
+                run_dir,
+                state,
+                include_data=False,
+            )
+        except RuntimeError as error:
+            if "no space left on device" not in str(error).lower():
+                raise
+            raise RuntimeError(
+                f"AWS image pull exhausted the {state['volume_gib']} GiB "
+                "initial root volume. Increase --aws_volume_gib; it must fit "
+                "the AMI and the compressed/unpacked image-pull peak."
+            ) from error
+        state["phase"] = "sizing-storage"
         _save_state(run_dir, state)
-        data_bytes = getattr(plan, "data_bytes", 0)
-        if args.data_dir and not data_bytes:
-            _, data_bytes = _data_summary(Path(args.data_dir).expanduser().resolve())
-        _upload_data(args, run_dir, state, data_bytes)
+        _prepare_remote_storage(args, plan.context, run_dir, state)
         if args.data_dir:
             state["phase"] = "validating-data"
             _save_state(run_dir, state)

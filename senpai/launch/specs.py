@@ -10,6 +10,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from senpai_agent.launch_context import render_launch_context
+
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
 CONTAINER_STATE_ROOT = "/var/lib/senpai"
 CONTAINER_GATE_ROOT = "/senpai-launch"
@@ -103,38 +105,17 @@ def target_repo_slug(url: str) -> str:
 
 def build_extra_instructions(args, tag: str, student_names: list[str]) -> str:
     """Render backend-neutral, authoritative context for both agent roles."""
-    students = ", ".join(student_names)
-    target_base = args.target_repo_branch or "<default>"
-    runtime = f"""# Authoritative launch context
-
-These values were resolved by the Senpai launcher and describe the actual runtime.
-They override conflicting compute or run-limit claims in the target repository's
-`program.md` and role prompts.
-
-- Compute backend: `{args.backend}`.
-- Visible GPUs per student: `{args.gpus_per_student}`.
-- Hard limits for each training run: `{args.timeout_minutes:g}` minutes wall-clock
-  and `{args.max_epochs}` epochs.
-- Use tools and operational commands that work with `{args.backend}`. Do not follow
-  target-repository instructions written for another backend.
-- Do not assume additional GPUs or bypass, extend, or continue past the hard
-  training limits.
-"""
-    isolation = f"""# Launch isolation and run-limit rules
-
-- This launch is scoped to research tag `{tag}`, advisor branch `{args.advisor_branch}`, and target base branch `{target_base}`.
-- Only inspect, modify, or reason from `{args.advisor_branch}` plus PR branches assigned to these students in this launch: {students}.
-- Do not inspect, compare, summarize, cherry-pick, borrow from, or base decisions on any PR or branch outside `{args.advisor_branch}` and the assigned student PR branches for this launch.
-- Do not use unrelated experiment runs or historical results unless the human explicitly names them during this launch.
-- Students branch from `{args.advisor_branch}`. Do not rebase or retarget work onto unrelated branches.
-- Treat `SENPAI_TIMEOUT_MINUTES` and `SENPAI_MAX_EPOCHS` as hard per-training-run bounds. Do not override them or continue a run past them.
-"""
-    context = runtime + "\n" + isolation
-    if not args.extra_instructions:
-        return context
-    path = Path(args.extra_instructions)
-    user_extra = path.read_text() if path.exists() else args.extra_instructions
-    return context + "\n# Additional operator instructions\n\n" + user_extra
+    return render_launch_context(
+        backend=args.backend,
+        gpus_per_student=args.gpus_per_student,
+        timeout_minutes=args.timeout_minutes,
+        max_epochs=args.max_epochs,
+        tag=tag,
+        advisor_branch=args.advisor_branch,
+        target_base=args.target_repo_branch,
+        students=student_names,
+        extra_instructions=args.extra_instructions,
+    )
 
 
 def _encoded_extra_instructions(args, tag: str, student_names: list[str]) -> str:
