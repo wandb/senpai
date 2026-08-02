@@ -8,10 +8,7 @@ from senpai.launch.specs import build_extra_instructions
 
 
 def test_default_fleet_is_four_students_with_one_gpu_each():
-    args = launch_args(
-        tag="defaults",
-        target_repo_url="https://github.com/example/problem.git",
-    )
+    args = launch_args()
 
     assert args.n_students == 4
     assert args.gpus_per_student == 1

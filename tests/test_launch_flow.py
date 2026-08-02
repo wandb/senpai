@@ -7,24 +7,15 @@ REVISION = "a" * 40
 
 
 class BackendDefaultTests(unittest.TestCase):
-    def test_defaults_preserve_kubernetes_shape(self):
-        args = launch.Args("tag", "https://github.com/example/target.git")
-
-        launch.resolve_backend_defaults(args)
-
-        self.assertEqual((args.n_students, args.gpus_per_student), (4, 8))
-
-    def test_defaults_make_single_host_launch_small(self):
-        for backend in ("docker", "aws"):
+    def test_fleet_defaults_are_shared_across_backends(self):
+        for backend in ("kubernetes", "docker", "aws"):
             args = launch.Args(
                 "tag",
                 "https://github.com/example/target.git",
                 backend=backend,
             )
 
-            launch.resolve_backend_defaults(args)
-
-            self.assertEqual((args.n_students, args.gpus_per_student), (1, 1))
+            self.assertEqual((args.n_students, args.gpus_per_student), (4, 1))
 
 
 class LaunchOrderingTests(unittest.TestCase):

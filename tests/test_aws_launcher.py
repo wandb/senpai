@@ -16,15 +16,18 @@ from senpai.launch.aws_backend import (
     AwsInstanceShape,
     AwsLaunchPlan,
     AwsRequirements,
+    AwsRootLayout,
     AwsSubnet,
     _automatic_instance_type,
     _aws_command,
     _aws_raw,
     _check_account,
-    _check_remote_data_capacity,
     _check_source_revision,
     _cleanup,
+    _ensure_remote_capacity,
+    _grow_root_volume,
     _prepare_host,
+    _prepare_remote_storage,
     _provision,
     _remote_payload,
     _resolve_region,
@@ -53,6 +56,7 @@ def args(**overrides):
         "aws_ami_id": "",
         "aws_subnet_id": "",
         "aws_volume_gib": 100,
+        "aws_runtime_reserve_gib": 80,
         "aws_state_root": "~/.senpai/aws",
         "aws_ssh_cidr": "",
         "aws_ready_timeout_s": 900,
@@ -202,7 +206,7 @@ class AwsPlanningTests(unittest.TestCase):
                     [student()],
                 )
 
-    def test_dataset_size_adds_volume_headroom(self):
+    def test_dataset_size_does_not_change_the_initial_volume_floor(self):
         requirements = AwsRequirements(
             gpus=1,
             vcpus=15,
@@ -246,10 +250,50 @@ class AwsPlanningTests(unittest.TestCase):
         ):
             plan = preflight_aws(args(aws_volume_gib=100), [student()])
 
-        self.assertEqual(plan.volume_gib, 202)
+        self.assertEqual(plan.volume_gib, 100)
         self.assertEqual(plan.data_files, 3502)
         self.assertEqual(plan.data_bytes, requirements.data_bytes)
-        self.assertIn("volume=202 GiB", output.getvalue())
+        self.assertIn("volume=100 GiB", output.getvalue())
+
+    def test_payload_beyond_gp3_limit_fails_before_aws_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data"
+            data_dir.mkdir()
+            with (
+                patch(
+                    "senpai.launch.aws_backend._data_summary",
+                    return_value=(
+                        1,
+                        (aws_backend.GP3_MAX_GIB - 79) * aws_backend.GIB,
+                    ),
+                ),
+                patch(
+                    "senpai.launch.aws_backend._resolve_region",
+                    side_effect=AssertionError("AWS should not be reached"),
+                ),
+                self.assertRaisesRegex(ValueError, "beyond the gp3 limit"),
+            ):
+                aws_backend._validate_aws_inputs(
+                    args(
+                        aws_state_root=str(root / "state"),
+                        data_dir=str(data_dir),
+                        aws_runtime_reserve_gib=80,
+                    ),
+                    [student()],
+                )
+
+    def test_runtime_reserve_must_be_non_negative(self):
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(
+            ValueError, "aws_runtime_reserve_gib"
+        ):
+            aws_backend._validate_aws_inputs(
+                args(
+                    aws_state_root=str(Path(tmp) / "state"),
+                    aws_runtime_reserve_gib=-1,
+                ),
+                [student()],
+            )
 
     def test_ssh_access_is_restricted_to_one_ipv4_address(self):
         response = unittest.mock.MagicMock()
@@ -734,35 +778,587 @@ class AwsTransportTests(unittest.TestCase):
 
         self.assertEqual(run.call_args.args[0][0:2], ["ssh", "-C"])
 
-    def test_remote_disk_headroom_is_checked_before_upload(self):
-        available = 90 * aws_backend.GIB
-        dataset = 11 * aws_backend.GIB
-        result = subprocess.CompletedProcess(
+    def test_capacity_does_not_resize_when_runtime_reserve_already_fits(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "senpai.launch.aws_backend._remote_free_bytes",
+                return_value=80 * aws_backend.GIB,
+            ),
+            patch("senpai.launch.aws_backend._validate_shared_root_storage"),
+            patch("senpai.launch.aws_backend._grow_root_volume") as grow,
+        ):
+            _ensure_remote_capacity(
+                args(),
+                AwsContext("us-east-1", "research"),
+                Path(tmp),
+                {"instance_id": "i-123"},
+                0,
+                0,
+            )
+
+        grow.assert_not_called()
+
+    def test_capacity_rounds_growth_up_and_persists_target_before_modify(self):
+        required = 200 * aws_backend.GIB
+        available = required - 100 * aws_backend.GIB - 1
+        layout = AwsRootLayout(
+            "/dev/nvme0n1p1", "ext4", "/dev/nvme0n1", 1, "gpt"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            state = {"instance_id": "i-123", "phase": "sizing-storage"}
+
+            def modify(*arguments):
+                saved = json.loads((run_dir / "state.json").read_text())
+                self.assertTrue(saved["volume_resize_started"])
+                self.assertEqual(saved["volume_resize_target_gib"], 212)
+                self.assertNotIn("volume_resize_requested", saved)
+                self.assertEqual(
+                    arguments[1:],
+                    (
+                        "ec2",
+                        "modify-volume",
+                        "--volume-id",
+                        "vol-root",
+                        "--size",
+                        "212",
+                    ),
+                )
+                return ""
+
+            with (
+                patch(
+                    "senpai.launch.aws_backend._remote_free_bytes",
+                    side_effect=[available, required],
+                ) as free,
+                patch("senpai.launch.aws_backend._validate_shared_root_storage"),
+                patch(
+                    "senpai.launch.aws_backend._root_volume",
+                    return_value=("vol-root", 100),
+                ),
+                patch(
+                    "senpai.launch.aws_backend._root_layout",
+                    return_value=layout,
+                ),
+                patch("senpai.launch.aws_backend._aws_raw", side_effect=modify),
+                patch("senpai.launch.aws_backend._wait_for_volume_resize") as wait,
+                patch("senpai.launch.aws_backend._wait_for_guest_disk_size") as guest,
+                patch("senpai.launch.aws_backend._grow_root_filesystem") as filesystem,
+            ):
+                _ensure_remote_capacity(
+                    args(),
+                    AwsContext("us-east-1", "research"),
+                    run_dir,
+                    state,
+                    0,
+                    120 * aws_backend.GIB,
+                )
+
+            self.assertEqual(free.call_count, 2)
+            wait.assert_called_once_with(
+                AwsContext("us-east-1", "research"),
+                "vol-root",
+                212,
+                900,
+            )
+            guest.assert_called_once_with(
+                args(), run_dir, state, "/dev/nvme0n1", 212
+            )
+            filesystem.assert_called_once_with(args(), run_dir, state, layout)
+            self.assertEqual(state["volume_gib"], 212)
+            self.assertTrue(state["volume_resize_completed"])
+            self.assertEqual(state["phase"], "sizing-storage")
+
+    def test_growth_rejects_gp3_limit_before_aws_mutation(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "senpai.launch.aws_backend._root_volume",
+                return_value=("vol-root", aws_backend.GP3_MAX_GIB),
+            ),
+            patch("senpai.launch.aws_backend._root_layout") as layout,
+            patch("senpai.launch.aws_backend._aws_raw") as aws,
+            self.assertRaisesRegex(RuntimeError, "beyond the gp3 limit"),
+        ):
+            _grow_root_volume(
+                args(),
+                AwsContext("us-east-1", "research"),
+                Path(tmp),
+                {"instance_id": "i-123"},
+                1,
+            )
+
+        layout.assert_not_called()
+        aws.assert_not_called()
+
+    def test_capacity_recheck_rejects_short_growth(self):
+        required = 80 * aws_backend.GIB
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "senpai.launch.aws_backend._remote_free_bytes",
+                side_effect=[required - 1, required - 1],
+            ),
+            patch("senpai.launch.aws_backend._validate_shared_root_storage"),
+            patch("senpai.launch.aws_backend._grow_root_volume") as grow,
+            self.assertRaisesRegex(RuntimeError, "after growing the root filesystem"),
+        ):
+            _ensure_remote_capacity(
+                args(),
+                AwsContext("us-east-1", "research"),
+                Path(tmp),
+                {"instance_id": "i-123"},
+                0,
+                0,
+            )
+
+        grow.assert_called_once()
+
+    def test_capacity_accounts_for_remote_block_allocation_per_file(self):
+        reserve = 80 * aws_backend.GIB
+        allocated = aws_backend.REMOTE_FILESYSTEM_BLOCK_BYTES
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "senpai.launch.aws_backend._remote_free_bytes",
+                side_effect=[reserve, reserve + allocated],
+            ),
+            patch("senpai.launch.aws_backend._validate_shared_root_storage"),
+            patch(
+                "senpai.launch.aws_backend._remote_free_inodes",
+                return_value=10_000,
+            ),
+            patch("senpai.launch.aws_backend._grow_root_volume") as grow,
+        ):
+            _ensure_remote_capacity(
+                args(),
+                AwsContext("us-east-1", "research"),
+                Path(tmp),
+                {"instance_id": "i-123"},
+                1,
+                0,
+            )
+
+        grow.assert_called_once_with(
+            args(),
+            AwsContext("us-east-1", "research"),
+            Path(tmp),
+            {"instance_id": "i-123"},
+            allocated,
+        )
+
+    def test_capacity_rejects_inode_exhaustion_before_upload(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "senpai.launch.aws_backend._remote_free_bytes",
+                return_value=80 * aws_backend.GIB + 4096,
+            ),
+            patch("senpai.launch.aws_backend._validate_shared_root_storage"),
+            patch(
+                "senpai.launch.aws_backend._remote_free_inodes",
+                return_value=1024,
+            ),
+            patch("senpai.launch.aws_backend._grow_root_volume") as grow,
+            self.assertRaisesRegex(RuntimeError, "free inodes.*Increase"),
+        ):
+            _ensure_remote_capacity(
+                args(),
+                AwsContext("us-east-1", "research"),
+                Path(tmp),
+                {"instance_id": "i-123"},
+                1,
+                0,
+            )
+
+        grow.assert_not_called()
+
+    def test_free_inode_query_uses_compatible_gnu_df_flags(self):
+        completed = subprocess.CompletedProcess(
             ["ssh"],
             0,
-            stdout=f"{available}\n".encode(),
+            stdout=b"123456\n",
             stderr=b"",
         )
         with (
             tempfile.TemporaryDirectory() as tmp,
-            patch("senpai.launch.aws_backend._ssh", return_value=result) as ssh,
-            self.assertRaisesRegex(
-                RuntimeError,
-                r"90\.0 GiB free.*91\.0 GiB.*Increase --aws_volume_gib",
-            ),
+            patch("senpai.launch.aws_backend._ssh", return_value=completed) as ssh,
         ):
-            _check_remote_data_capacity(
-                args(aws_ready_timeout_s=321),
+            available = aws_backend._remote_free_inodes(
+                args(),
                 Path(tmp),
-                {"public_ip": "203.0.113.10"},
-                dataset,
+                {"instance_id": "i-123"},
             )
 
+        self.assertEqual(available, 123456)
         self.assertEqual(
             ssh.call_args.args[2],
-            "df -B1 --output=avail /home/ubuntu | tail -1",
+            "df --output=iavail /home/ubuntu | tail -1",
         )
-        self.assertEqual(ssh.call_args.kwargs["timeout"], 321)
+
+    def test_root_volume_is_resolved_from_the_live_instance_mapping(self):
+        context = AwsContext("us-east-1", "research")
+        instance = {
+            "RootDeviceName": "/dev/sda1",
+            "BlockDeviceMappings": [
+                {
+                    "DeviceName": "/dev/sda1",
+                    "Ebs": {"VolumeId": "vol-root"},
+                }
+            ],
+        }
+        with (
+            patch(
+                "senpai.launch.aws_backend._instance_details",
+                return_value=instance,
+            ),
+            patch(
+                "senpai.launch.aws_backend._aws_json",
+                return_value={"Volumes": [{"VolumeId": "vol-root", "Size": 250}]},
+            ) as aws,
+        ):
+            resolved = aws_backend._root_volume(
+                context,
+                {"instance_id": "i-123"},
+            )
+
+        self.assertEqual(resolved, ("vol-root", 250))
+        aws.assert_called_once_with(
+            context,
+            "ec2",
+            "describe-volumes",
+            "--volume-ids",
+            "vol-root",
+        )
+
+    def test_storage_mounts_are_validated_even_when_no_resize_is_needed(self):
+        output = subprocess.CompletedProcess(
+            ["ssh"],
+            0,
+            stdout=b"/dev/root\t/dev/root\t/dev/root\n",
+            stderr=b"",
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("senpai.launch.aws_backend._ssh", return_value=output),
+            patch(
+                "senpai.launch.aws_backend._remote_free_bytes",
+                return_value=80 * aws_backend.GIB,
+            ),
+            patch("senpai.launch.aws_backend._grow_root_volume") as grow,
+        ):
+            _ensure_remote_capacity(
+                args(),
+                AwsContext("us-east-1", "research"),
+                Path(tmp),
+                {"instance_id": "i-123"},
+                0,
+                0,
+            )
+
+        grow.assert_not_called()
+
+    def test_storage_mounts_reject_a_separate_docker_device(self):
+        output = subprocess.CompletedProcess(
+            ["ssh"],
+            0,
+            stdout=b"/dev/root\t/dev/root\t/dev/docker\n",
+            stderr=b"",
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("senpai.launch.aws_backend._ssh", return_value=output),
+            patch("senpai.launch.aws_backend._remote_free_bytes") as free,
+            self.assertRaisesRegex(RuntimeError, "share one root device"),
+        ):
+            _ensure_remote_capacity(
+                args(),
+                AwsContext("us-east-1", "research"),
+                Path(tmp),
+                {"instance_id": "i-123"},
+                0,
+                0,
+            )
+
+        free.assert_not_called()
+
+    def test_root_layout_accepts_ext4_partition_and_xfs_disk(self):
+        cases = (
+            (
+                b"/dev/nvme0n1p1\t/dev/nvme0n1p1\t/dev/nvme0n1p1\t"
+                b"ext4\tpart\tnvme0n1\t1\tgpt\t1\n",
+                AwsRootLayout(
+                    "/dev/nvme0n1p1", "ext4", "/dev/nvme0n1", 1, "gpt"
+                ),
+                "growpart",
+            ),
+            (
+                b"/dev/nvme0n1\t/dev/nvme0n1\t/dev/nvme0n1\t"
+                b"xfs\tdisk\t-\t-\t-\t-\n",
+                AwsRootLayout(
+                    "/dev/nvme0n1", "xfs", "/dev/nvme0n1", None, None
+                ),
+                "xfs_growfs",
+            ),
+        )
+        for output, expected, tool in cases:
+            with (
+                self.subTest(filesystem=expected.filesystem),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                completed = subprocess.CompletedProcess(
+                    ["ssh"], 0, stdout=output, stderr=b""
+                )
+                checked = subprocess.CompletedProcess(
+                    ["ssh"], 0, stdout=b"", stderr=b""
+                )
+                with patch(
+                    "senpai.launch.aws_backend._ssh",
+                    side_effect=[completed, checked],
+                ) as ssh:
+                    layout = aws_backend._root_layout(
+                        args(), Path(tmp), {"instance_id": "i-123"}
+                    )
+
+                self.assertEqual(layout, expected)
+                self.assertIn(tool, ssh.call_args_list[1].args[2])
+                discovery = ssh.call_args_list[0].args[2]
+                self.assertIn('start=$(cat "$directory/start")', discovery)
+                self.assertIn('size=$(cat "$directory/size")', discovery)
+
+    def test_root_layout_rejects_separate_home_or_docker_filesystem(self):
+        output = subprocess.CompletedProcess(
+            ["ssh"],
+            0,
+            stdout=(
+                b"/dev/nvme0n1p1\t/dev/nvme0n1p1\t/dev/nvme1n1\t"
+                b"ext4\tpart\tnvme0n1\t1\tgpt\t1\n"
+            ),
+            stderr=b"",
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("senpai.launch.aws_backend._ssh", return_value=output),
+            self.assertRaisesRegex(RuntimeError, "share one root device"),
+        ):
+            aws_backend._root_layout(
+                args(), Path(tmp), {"instance_id": "i-123"}
+            )
+
+    def test_root_layout_rejects_non_final_partition(self):
+        output = subprocess.CompletedProcess(
+            ["ssh"],
+            0,
+            stdout=(
+                b"/dev/nvme0n1p1\t/dev/nvme0n1p1\t/dev/nvme0n1p1\t"
+                b"ext4\tpart\tnvme0n1\t1\tgpt\t2\n"
+            ),
+            stderr=b"",
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("senpai.launch.aws_backend._ssh", return_value=output),
+            self.assertRaisesRegex(RuntimeError, "non-final root partitions"),
+        ):
+            aws_backend._root_layout(
+                args(), Path(tmp), {"instance_id": "i-123"}
+            )
+
+    def test_dos_partition_cannot_grow_beyond_two_tib(self):
+        layout = AwsRootLayout(
+            "/dev/nvme0n1p1", "ext4", "/dev/nvme0n1", 1, "dos"
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "senpai.launch.aws_backend._root_volume",
+                return_value=("vol-root", aws_backend.DOS_PARTITION_MAX_GIB - 1),
+            ),
+            patch(
+                "senpai.launch.aws_backend._root_layout",
+                return_value=layout,
+            ),
+            patch("senpai.launch.aws_backend._aws_raw") as aws,
+            self.assertRaisesRegex(RuntimeError, "DOS/MBR"),
+        ):
+            _grow_root_volume(
+                args(),
+                AwsContext("us-east-1", "research"),
+                Path(tmp),
+                {"instance_id": "i-123"},
+                aws_backend.GIB,
+            )
+
+        aws.assert_not_called()
+
+    def test_guest_disk_size_is_polled_before_filesystem_growth(self):
+        sizes = [100 * aws_backend.GIB, 103 * aws_backend.GIB]
+
+        def completed(size):
+            return subprocess.CompletedProcess(
+                ["ssh"], 0, stdout=f"{size}\n".encode(), stderr=b""
+            )
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "senpai.launch.aws_backend._ssh",
+                side_effect=[completed(size) for size in sizes],
+            ) as ssh,
+            patch("senpai.launch.aws_backend.time.sleep") as sleep,
+        ):
+            aws_backend._wait_for_guest_disk_size(
+                args(),
+                Path(tmp),
+                {"instance_id": "i-123"},
+                "/dev/nvme0n1",
+                103,
+            )
+
+        self.assertEqual(ssh.call_count, 2)
+        self.assertIn("lsblk -bdno SIZE /dev/nvme0n1", ssh.call_args.args[2])
+        sleep.assert_called_once()
+
+    def test_filesystem_growth_uses_the_validated_layout(self):
+        cases = (
+            (
+                AwsRootLayout(
+                    "/dev/nvme0n1p1", "ext4", "/dev/nvme0n1", 1, "gpt"
+                ),
+                "sudo growpart /dev/nvme0n1 1; sudo resize2fs /dev/nvme0n1p1",
+            ),
+            (
+                AwsRootLayout(
+                    "/dev/nvme0n1", "xfs", "/dev/nvme0n1", None, None
+                ),
+                "sudo xfs_growfs /",
+            ),
+        )
+        for layout, expected in cases:
+            with (
+                self.subTest(filesystem=layout.filesystem),
+                tempfile.TemporaryDirectory() as tmp,
+                patch("senpai.launch.aws_backend._ssh") as ssh,
+            ):
+                aws_backend._grow_root_filesystem(
+                    args(),
+                    Path(tmp),
+                    {"instance_id": "i-123"},
+                    layout,
+                )
+
+            self.assertIn(expected, ssh.call_args.args[2])
+
+    def test_unsupported_root_layout_fails_before_modify_volume(self):
+        output = subprocess.CompletedProcess(
+            ["ssh"],
+            0,
+            stdout=(
+                b"/dev/mapper/root\t/dev/mapper/root\t/dev/mapper/root\t"
+                b"ext4\tlvm\t-\t-\t-\t-\n"
+            ),
+            stderr=b"",
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "senpai.launch.aws_backend._root_volume",
+                return_value=("vol-root", 100),
+            ),
+            patch("senpai.launch.aws_backend._ssh", return_value=output),
+            patch("senpai.launch.aws_backend._aws_raw") as aws,
+            self.assertRaisesRegex(RuntimeError, "LVM, device-mapper"),
+        ):
+            _grow_root_volume(
+                args(),
+                AwsContext("us-east-1", "research"),
+                Path(tmp),
+                {"instance_id": "i-123"},
+                aws_backend.GIB,
+            )
+
+        aws.assert_not_called()
+
+    def test_no_data_still_reserves_runtime_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            state = {"instance_id": "i-123", "phase": "sizing-storage"}
+            with (
+                patch("senpai.launch.aws_backend._ensure_remote_capacity") as ensure,
+                patch("senpai.launch.aws_backend._stream_directory") as stream,
+            ):
+                _prepare_remote_storage(
+                    args(data_dir=""),
+                    AwsContext("us-east-1", "research"),
+                    run_dir,
+                    state,
+                )
+
+            ensure.assert_called_once_with(
+                args(data_dir=""),
+                AwsContext("us-east-1", "research"),
+                run_dir,
+                state,
+                0,
+                0,
+            )
+            stream.assert_not_called()
+            self.assertEqual(state["runtime_reserve_gib"], 80)
+
+    def test_storage_recomputes_data_and_rechecks_reserve_after_upload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            data_dir = run_dir / "data"
+            data_dir.mkdir()
+            (data_dir / "sample.bin").write_bytes(b"sample")
+            (data_dir / "empty-directory").mkdir()
+            state = {"instance_id": "i-123", "phase": "sizing-storage"}
+            launch_args = args(data_dir=str(data_dir))
+            with (
+                patch("senpai.launch.aws_backend._ensure_remote_capacity") as ensure,
+                patch("senpai.launch.aws_backend._stream_directory") as stream,
+                patch(
+                    "senpai.launch.aws_backend._remote_free_bytes",
+                    return_value=79 * aws_backend.GIB,
+                ),
+                self.assertRaisesRegex(RuntimeError, "after dataset upload"),
+            ):
+                _prepare_remote_storage(
+                    launch_args,
+                    AwsContext("us-east-1", "research"),
+                    run_dir,
+                    state,
+                )
+
+            ensure.assert_called_once_with(
+                launch_args,
+                AwsContext("us-east-1", "research"),
+                run_dir,
+                state,
+                3,
+                6,
+            )
+            self.assertEqual(state["data_directories"], 1)
+            self.assertEqual(
+                state["data_allocation_bytes"],
+                6 + 3 * aws_backend.REMOTE_FILESYSTEM_BLOCK_BYTES,
+            )
+            stream.assert_called_once_with(
+                run_dir,
+                state,
+                data_dir.resolve(),
+                aws_backend.REMOTE_DATA,
+                7200,
+                (1, 6),
+            )
+            saved = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(saved["data_files"], 1)
+            self.assertEqual(saved["data_bytes"], 6)
+            self.assertEqual(
+                saved["data_allocation_bytes"],
+                6 + 3 * aws_backend.REMOTE_FILESYSTEM_BLOCK_BYTES,
+            )
 
     def test_source_bootstrap_rejects_an_existing_destination_and_is_atomic(self):
         completed = subprocess.CompletedProcess(
@@ -1002,7 +1598,7 @@ class AwsLaunchFlowTests(unittest.TestCase):
                     side_effect=preflight,
                 ),
                 patch(
-                    "senpai.launch.aws_backend._upload_data",
+                    "senpai.launch.aws_backend._prepare_remote_storage",
                     side_effect=upload,
                 ),
                 patch(
@@ -1063,7 +1659,7 @@ class AwsLaunchFlowTests(unittest.TestCase):
                     "senpai.launch.aws_backend._preflight_roles",
                     side_effect=RuntimeError("image is invalid"),
                 ),
-                patch("senpai.launch.aws_backend._upload_data") as upload,
+                patch("senpai.launch.aws_backend._prepare_remote_storage") as upload,
                 patch("senpai.launch.aws_backend._start_roles") as start,
                 patch(
                     "senpai.launch.aws_backend._cleanup",
@@ -1082,6 +1678,41 @@ class AwsLaunchFlowTests(unittest.TestCase):
             callback.assert_not_called()
             start.assert_not_called()
             cleanup.assert_called_once()
+
+    def test_image_pull_disk_exhaustion_explains_bootstrap_volume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launch_args = args(aws_state_root=str(root / "state"))
+
+            def provision(_args, _plan, _run_dir, state):
+                state.update(
+                    {
+                        "instance_id": "i-123",
+                        "public_ip": "203.0.113.10",
+                    }
+                )
+
+            with (
+                redirect_stdout(io.StringIO()),
+                patch(
+                    "senpai.launch.aws_backend._provision",
+                    side_effect=provision,
+                ),
+                patch("senpai.launch.aws_backend._prepare_host"),
+                patch(
+                    "senpai.launch.aws_backend._preflight_roles",
+                    side_effect=RuntimeError("no space left on device"),
+                ),
+                patch("senpai.launch.aws_backend._prepare_remote_storage") as storage,
+                patch("senpai.launch.aws_backend._cleanup", return_value=[]),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    r"Increase --aws_volume_gib.*compressed/unpacked image-pull peak",
+                ),
+            ):
+                launch_aws(launch_args, [student()], aws_plan(volume_gib=100))
+
+            storage.assert_not_called()
 
 
 class AwsLifecycleTests(unittest.TestCase):
@@ -1227,6 +1858,7 @@ class AwsCleanupTests(unittest.TestCase):
                 ssh_cidr="203.0.113.9/32",
                 subnet_id="subnet-123",
                 vpc_id="vpc-123",
+                root_device="/dev/sda1",
                 volume_gib=250,
             )
 
@@ -1247,7 +1879,7 @@ class AwsCleanupTests(unittest.TestCase):
                 ),
                 patch("senpai.launch.aws_backend._prepare_host"),
                 patch("senpai.launch.aws_backend._preflight_roles"),
-                patch("senpai.launch.aws_backend._upload_data"),
+                patch("senpai.launch.aws_backend._prepare_remote_storage"),
                 patch("senpai.launch.aws_backend._start_roles"),
             ):
                 launch_aws(launch_args, [student()], plan)

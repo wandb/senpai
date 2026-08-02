@@ -47,7 +47,10 @@ aws_profile: ""
 aws_instance_type: ""
 aws_ami_id: ""
 aws_subnet_id: ""
+# Bootstrap floor; must fit the AMI and image-pull peak. Data can grow it afterward.
 aws_volume_gib: 250
+# Total free host disk retained for all role worktrees, checkpoints, caches, and logs.
+aws_runtime_reserve_gib: 80
 aws_state_root: ~/.senpai/aws
 aws_ssh_cidr: ""
 aws_ready_timeout_s: 900
@@ -85,10 +88,10 @@ stale_wip_seconds: 7200
 human_issues: true
 
 # students
-# -1 selects backend defaults: Kubernetes 4x8, Docker/AWS 1x1.
-n_students: -1
+# Shared fleet defaults for Kubernetes, Docker, and AWS.
+n_students: 4
 student_prefix: ""
-gpus_per_student: -1
+gpus_per_student: 1
 cpu_per_gpu: 15
 memory_gi_per_gpu: 120
 preflight_only: false
