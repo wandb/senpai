@@ -60,6 +60,7 @@ def validate_role_specs(backend: str, tag: str, role_specs: list[RoleSpec]) -> N
             raise ValueError(f"unsupported {backend} role {spec.role!r}")
         if spec.role == "advisor":
             advisor_count += 1
+            validate_identifier(f"{backend} advisor name", spec.name)
         else:
             validate_identifier(f"{backend} student name", spec.name)
         if spec.key in keys:
@@ -198,6 +199,7 @@ def build_advisor_spec(
     env.update(role_model_config(args, "advisor"))
     env.update(
         {
+            "ADVISOR_NAME": args.advisor_name,
             "STUDENT_NAMES": ",".join(student_names),
             "SENPAI_STALE_WIP_SECONDS": str(args.stale_wip_seconds),
             "EXTRA_INSTRUCTIONS_B64": _encoded_extra_instructions(
@@ -205,4 +207,4 @@ def build_advisor_spec(
             ),
         }
     )
-    return RoleSpec("advisor", "advisor", env, secrets)
+    return RoleSpec("advisor", args.advisor_name, env, secrets)

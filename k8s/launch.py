@@ -62,6 +62,9 @@ from senpai.launch.specs import (  # noqa: E402
     build_student_spec,
     target_repo_slug,
 )
+from senpai_agent.model_compatibility import (  # noqa: E402
+    supports_reasoning_effort,
+)
 
 STUDENT_TEMPLATE = Path(__file__).parent / "student-deployment.yaml"
 ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-deployment.yaml"
@@ -105,6 +108,7 @@ class Args:
     human_issues: bool = (
         True  # allow human GitHub issue triage; disable for isolated launches
     )
+    advisor_name: str = "advisor"  # neutral advisor identity used in Git, prompts, and traces
     advisor_branch: str = "schmidhuber"  # branch the advisor works on inside the problem-package repo (students PR into it; created from target_repo_branch if missing)
     gh_history_scope: str = "branch"  # branch=normal track memory, fresh=clean ablation, repo=whole-repo memory
     pvc_claim_name: str = "new-pvc"  # PVC name mounted into pods
@@ -201,11 +205,6 @@ def deployed_model_providers(args: Args, *, has_students: bool = True) -> set[st
     return providers
 
 
-def _supports_openai_pro(model: str) -> bool:
-    normalized = model.lower()
-    return normalized == "openai/gpt-5.6" or normalized.startswith("openai/gpt-5.6-")
-
-
 def validate_model_config(args: Args, *, has_students: bool = True) -> None:
     profiles = {
         "smart": (args.smart_model, args.smart_reasoning_effort),
@@ -235,9 +234,14 @@ def validate_model_config(args: Args, *, has_students: bool = True) -> None:
                     f"unsupported for {model}"
                 )
             continue
-        if effort == "max" and not _supports_openai_pro(model):
+        if not supports_reasoning_effort(model, effort):
+            requirement = (
+                "an openai/gpt-5.6* model"
+                if effort == "ultra"
+                else "an openai/gpt-5.6* or supported Anthropic model"
+            )
             sys.exit(
-                f"ERROR: --{name}_reasoning_effort={effort} is unsupported for {model}"
+                f"ERROR: --{name}_reasoning_effort={effort} requires {requirement}"
             )
 
 

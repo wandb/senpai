@@ -65,6 +65,7 @@ def args(**overrides):
         "frontier_model": "openai/gpt-5.6-sol",
         "frontier_reasoning_effort": "max",
         "human_issues": True,
+        "advisor_name": "advisor",
         "advisor_branch": "research",
         "gh_history_scope": "branch",
         "pvc_mount_path": "/mnt/datasets",
@@ -112,9 +113,16 @@ class LaunchSpecTests(unittest.TestCase):
         self.assertEqual(spec.secrets["GITHUB_TOKEN"], "secret")
 
     def test_advisor_spec_lists_students(self):
-        spec = build_advisor_spec(args(), "aws-r1", ["fern", "tanjiro"], {})
+        spec = build_advisor_spec(
+            args(advisor_name="aurora"),
+            "aws-r1",
+            ["fern", "tanjiro"],
+            {},
+        )
 
         self.assertEqual(spec.key, "advisor")
+        self.assertEqual(spec.name, "aurora")
+        self.assertEqual(spec.env["ADVISOR_NAME"], "aurora")
         self.assertEqual(spec.env["STUDENT_NAMES"], "fern,tanjiro")
         self.assertEqual(spec.env["SENPAI_STALE_WIP_SECONDS"], "600")
 
@@ -140,6 +148,17 @@ class DockerPlanTests(unittest.TestCase):
             spec = build_student_spec(run_args, run_args.tag, "../../peer", {})
 
             with self.assertRaisesRegex(ValueError, "Docker student name"):
+                plan_docker(run_args, [spec])
+
+    def test_unsafe_advisor_name_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_args = args(
+                advisor_name="../../peer",
+                docker_run_root=str(Path(tmp) / "runs"),
+            )
+            spec = build_advisor_spec(run_args, run_args.tag, [], {})
+
+            with self.assertRaisesRegex(ValueError, "Docker advisor name"):
                 plan_docker(run_args, [spec])
 
     def test_existing_run_root_is_never_reused(self):

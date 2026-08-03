@@ -46,8 +46,13 @@ from senpai_agent.weave_monitoring import (
     register_trace_secret,
     weave_conversation_url,
 )
+from senpai_agent.model_compatibility import (
+    register_litellm_model_compatibility,
+    supports_reasoning_effort,
+)
 
 WEAVE_PROJECT = initialize_weave_monitoring()
+register_litellm_model_compatibility()
 
 from openhands.sdk import LLM, Agent, AgentContext, LocalConversation, Tool
 from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
@@ -207,9 +212,6 @@ def parse_runner_args(argv: Sequence[str] | None = None) -> RunnerArgs:
 
 def openhands_reasoning_effort(reasoning_effort: str, model: str) -> str:
     provider, _, model_name = model.lower().partition("/")
-    supports_openai_pro = provider == "openai" and (
-        model_name == "gpt-5.6" or model_name.startswith("gpt-5.6-")
-    )
     if reasoning_effort not in REASONING_EFFORTS:
         choices = ", ".join(REASONING_EFFORTS)
         raise ValueError(
@@ -223,11 +225,16 @@ def openhands_reasoning_effort(reasoning_effort: str, model: str) -> str:
                 f"model {model!r}; use 'high' or 'max'"
             )
         return reasoning_effort
-    if reasoning_effort == "max" and not supports_openai_pro:
+    if not supports_reasoning_effort(model, reasoning_effort):
+        requirement = (
+            "an openai/gpt-5.6 model"
+            if reasoning_effort == "ultra"
+            else "an openai/gpt-5.6 or supported Anthropic model"
+        )
         raise ValueError(
             f"reasoning effort {reasoning_effort!r} is unsupported for model "
             f"{model!r}; "
-            "use an openai/gpt-5.6 model or select a lower effort"
+            f"use {requirement} or select a lower effort"
         )
     return reasoning_effort
 

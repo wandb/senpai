@@ -20,6 +20,10 @@ from senpai_agent.openhands_runner import (
     parse_runner_args,
     prompt_cache_configuration,
 )
+from senpai_agent.model_compatibility import (
+    CLAUDE_OPUS_5_MODEL_INFO,
+    register_litellm_model_compatibility,
+)
 from openhands_support import REPO_ROOT, runtime_config
 
 
@@ -88,6 +92,8 @@ def test_openhands_fork_main_is_consistent_across_install_paths():
         ("xhigh", "anthropic/claude-opus-4-8", "xhigh"),
         ("high", "wandb/zai-org/GLM-5.2", "high"),
         ("max", "wandb/zai-org/GLM-5.2", "max"),
+        ("xhigh", "anthropic/claude-opus-5", "xhigh"),
+        ("max", "anthropic/claude-fable-5", "max"),
     ],
 )
 def test_supported_reasoning_effort_is_preserved(
@@ -104,7 +110,7 @@ def test_supported_reasoning_effort_is_preserved(
 @pytest.mark.parametrize(
     ("effort", "model"),
     [
-        ("max", "anthropic/claude-opus-4-8"),
+        ("max", "anthropic/claude-haiku-4-5"),
         ("max", "openai/gpt-5.4"),
         ("max", "openai/gpt-5.60"),
         ("medium", "wandb/zai-org/GLM-5.2"),
@@ -118,6 +124,33 @@ def test_unsupported_reasoning_effort_fails_instead_of_being_rewritten(
 ):
     with pytest.raises(ValueError, match="unsupported reasoning effort|unsupported for"):
         openhands_reasoning_effort(effort, model)
+
+
+def test_ultra_is_preserved_as_a_cli_reasoning_effort():
+    args = parse_runner_args(["--max-turns", "1", "--reasoning-effort", "ultra"])
+
+    assert args.reasoning_effort == "ultra"
+
+
+def test_opus_5_litellm_metadata_is_available_without_the_remote_catalog(
+    monkeypatch,
+):
+    import litellm
+
+    model_cost = dict(litellm.model_cost)
+    model_cost.pop("claude-opus-5", None)
+    monkeypatch.setattr(litellm, "model_cost", model_cost)
+    register_litellm_model_compatibility()
+
+    assert model_cost["claude-opus-5"] == CLAUDE_OPUS_5_MODEL_INFO
+    assert model_cost["claude-opus-5"]["supports_adaptive_thinking"] is True
+    assert model_cost["claude-opus-5"]["supports_xhigh_reasoning_effort"] is True
+    llm = LLM(
+        model="anthropic/claude-opus-5",
+        api_key=SecretStr("test-key"),
+        reasoning_effort="xhigh",
+    )
+    assert llm.reasoning_effort == "xhigh"
 
 
 @pytest.mark.parametrize(

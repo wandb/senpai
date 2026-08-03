@@ -44,6 +44,9 @@ def weave_agent_name(env: Mapping[str, str]) -> str:
     student_name = env.get("STUDENT_NAME")
     if role == "student" and student_name:
         return f"student-{student_name}"
+    advisor_name = env.get("ADVISOR_NAME")
+    if role == "advisor" and advisor_name and advisor_name != "advisor":
+        return f"advisor-{advisor_name}"
     return role
 
 

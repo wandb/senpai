@@ -158,6 +158,27 @@ def test_first_turn_supports_repository_nested_program_without_role_overlay(
     assert "program.md can be found in senpai/program.md" in prompt
 
 
+def test_advisor_runtime_identity_includes_its_configured_name(tmp_path: Path):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    (workspace / "program.md").write_text("Improve the benchmark.")
+
+    prompt = _full_prompt(
+        "advisor",
+        {
+            "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
+            "GH_REPO": "acme/widgets",
+            "ADVISOR_NAME": "aurora",
+            "ADVISOR_BRANCH": "research",
+            "WANDB_ENTITY": "acme",
+            "WANDB_PROJECT": "cfd",
+            "STUDENT_NAMES": "fern,tanjiro",
+        },
+    )
+
+    assert "Advisor: aurora. Students: fern,tanjiro." in prompt
+
+
 def test_empty_mailbox_does_not_start_a_model_turn():
     turns = Turns()
 

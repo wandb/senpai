@@ -372,6 +372,23 @@ def test_launch_rejects_unsupported_reasoning_effort(overrides, message):
         launch.validate_model_config(launch_args(**overrides))
 
 
+def test_launch_accepts_documented_anthropic_extended_efforts():
+    launch.validate_model_config(
+        launch_args(
+            advisor_model="anthropic/claude-opus-5",
+            advisor_reasoning_effort="xhigh",
+            student_model="anthropic/claude-opus-5",
+            student_reasoning_effort="xhigh",
+            smart_model="anthropic/claude-opus-5",
+            smart_reasoning_effort="xhigh",
+            fast_model="anthropic/claude-sonnet-5",
+            fast_reasoning_effort="high",
+            frontier_model="anthropic/claude-fable-5",
+            frontier_reasoning_effort="max",
+        )
+    )
+
+
 @pytest.mark.parametrize(
     ("model", "provider_env", "secret_key"),
     [
