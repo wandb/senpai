@@ -535,6 +535,8 @@ class NativeEntrypointTests(unittest.TestCase):
         self.assertIn('command -v nvidia-smi', student_text)
         self.assertIn('"$(uname -s)" = "Darwin"', student_text)
         self.assertIn("Accelerator:  Apple Silicon", student_text)
+        self.assertIn('git config user.name "senpai-$ADVISOR_NAME"', advisor)
+        self.assertIn('git config user.email "senpai-$ADVISOR_NAME@senpai"', advisor)
 
     def test_payload_cli_names_match_the_aws_fleet_protocol(self):
         text = (Path(__file__).resolve().parents[1] / "k8s" / "native.py").read_text()

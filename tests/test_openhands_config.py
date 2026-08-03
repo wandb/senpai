@@ -314,6 +314,44 @@ def test_invalid_model_profile_effort_fails_configuration(
         resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
+def test_requested_anthropic_profiles_resolve_with_documented_efforts(
+    tmp_path: Path,
+):
+    env = runtime_env(tmp_path)
+    env.update(
+        {
+            "ANTHROPIC_API_KEY": "anthropic-key",
+            "SENPAI_OPENHANDS_MODEL": "anthropic/claude-opus-5",
+            "SENPAI_OPENHANDS_REASONING_EFFORT": "xhigh",
+            "SENPAI_OPENHANDS_SMART_MODEL": "anthropic/claude-opus-5",
+            "SENPAI_OPENHANDS_SMART_REASONING_EFFORT": "xhigh",
+            "SENPAI_OPENHANDS_FAST_MODEL": "anthropic/claude-sonnet-5",
+            "SENPAI_OPENHANDS_FAST_REASONING_EFFORT": "high",
+            "SENPAI_OPENHANDS_FRONTIER_MODEL": "anthropic/claude-fable-5",
+            "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": "max",
+        }
+    )
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert (config.model, config.reasoning_effort) == (
+        "anthropic/claude-opus-5",
+        "xhigh",
+    )
+    assert (config.smart_model, config.smart_reasoning_effort) == (
+        "anthropic/claude-opus-5",
+        "xhigh",
+    )
+    assert (config.fast_model, config.fast_reasoning_effort) == (
+        "anthropic/claude-sonnet-5",
+        "high",
+    )
+    assert (config.frontier_model, config.frontier_reasoning_effort) == (
+        "anthropic/claude-fable-5",
+        "max",
+    )
+
+
 def test_explicit_api_key_env_preserves_custom_provider_support(tmp_path: Path):
     env = runtime_env(tmp_path)
     env.update(

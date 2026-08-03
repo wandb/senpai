@@ -598,7 +598,10 @@ def _full_prompt(role: Literal["advisor", "student"], env: Mapping[str, str]) ->
         f"W&B: {env['WANDB_ENTITY']}/{env['WANDB_PROJECT']}."
     )
     if role == "advisor":
-        identity += f" Students: {env.get('STUDENT_NAMES', '')}."
+        identity += (
+            f" Advisor: {env.get('ADVISOR_NAME', 'advisor')}."
+            f" Students: {env.get('STUDENT_NAMES', '')}."
+        )
     else:
         identity += f" Student: {env['STUDENT_NAME']}."
     return f"{prompt}\n\n# Runtime identity\n\n{identity}"
