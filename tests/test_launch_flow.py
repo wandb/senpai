@@ -25,16 +25,28 @@ class LaunchOrderingTests(unittest.TestCase):
             "https://github.com/example/target.git",
             backend="docker",
             names="fern",
+            advisor=True,
             gpus_per_student=1,
             advisor_image=f"ghcr.io/wandb/senpai-advisor:sha-{REVISION}",
             student_image=f"ghcr.io/wandb/senpai-student:sha-{REVISION}",
+            student_model="openai/gpt-5.6-sol",
+            student_reasoning_effort="high",
+            frontier_model="anthropic/claude-opus-4-8",
+            frontier_reasoning_effort="xhigh",
         )
         events = []
+        captured_specs = {}
+
+        def preflight_docker(_args, role_specs):
+            captured_specs.update({spec.key: spec for spec in role_specs})
+            events.append("compute")
+            return "plan"
 
         with (
             patch.object(launch.sp, "parse", return_value=args),
             patch.object(launch, "resolve_github_token", return_value="github"),
             patch.object(launch, "resolve_anthropic_api_key", return_value="anthropic"),
+            patch.object(launch, "resolve_openai_api_key", return_value="openai"),
             patch.object(launch, "resolve_exa_api_key", return_value="exa"),
             patch.object(launch, "resolve_wandb_api_key", return_value="wandb"),
             patch.object(launch, "resolve_optional_secret", return_value=""),
@@ -46,12 +58,13 @@ class LaunchOrderingTests(unittest.TestCase):
             ),
             patch.object(launch, "preflight_check_student_name_availability"),
             patch.object(launch, "preflight_check_anthropic_api_key"),
+            patch.object(launch, "preflight_check_openai_api_key"),
             patch.object(launch, "preflight_check_exa_api_key"),
             patch.object(launch, "preflight_check_wandb_api_key"),
             patch.object(
                 launch,
                 "preflight_docker",
-                side_effect=lambda *_: events.append("compute") or "plan",
+                side_effect=preflight_docker,
             ),
             patch.object(
                 launch,
@@ -75,6 +88,35 @@ class LaunchOrderingTests(unittest.TestCase):
             events,
             ["compute", "branch", "labels", ("launch", "plan")],
         )
+        self.assertEqual(
+            {
+                key
+                for key in captured_specs["advisor"].secrets
+                if key.endswith("_API_KEY")
+            },
+            {"ANTHROPIC_API_KEY", "EXA_API_KEY", "WANDB_API_KEY"},
+        )
+        self.assertEqual(
+            {
+                key
+                for key in captured_specs["student-fern"].secrets
+                if key.endswith("_API_KEY")
+            },
+            {
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "EXA_API_KEY",
+                "WANDB_API_KEY",
+            },
+        )
+        self.assertEqual(
+            captured_specs["student-fern"].env["SENPAI_OPENHANDS_MODEL"],
+            "openai/gpt-5.6-sol",
+        )
+        self.assertEqual(
+            captured_specs["advisor"].env["SENPAI_OPENHANDS_FRONTIER_MODEL"],
+            "anthropic/claude-opus-4-8",
+        )
 
     def test_aws_mutates_github_only_after_remote_preflight(self):
         args = launch.Args(
@@ -96,6 +138,7 @@ class LaunchOrderingTests(unittest.TestCase):
             patch.object(launch.sp, "parse", return_value=args),
             patch.object(launch, "resolve_github_token", return_value="github"),
             patch.object(launch, "resolve_anthropic_api_key", return_value="anthropic"),
+            patch.object(launch, "resolve_openai_api_key", return_value="openai"),
             patch.object(launch, "resolve_exa_api_key", return_value="exa"),
             patch.object(launch, "resolve_wandb_api_key", return_value="wandb"),
             patch.object(launch, "resolve_optional_secret", return_value=""),
@@ -107,6 +150,7 @@ class LaunchOrderingTests(unittest.TestCase):
             ),
             patch.object(launch, "preflight_check_student_name_availability"),
             patch.object(launch, "preflight_check_anthropic_api_key"),
+            patch.object(launch, "preflight_check_openai_api_key"),
             patch.object(launch, "preflight_check_exa_api_key"),
             patch.object(launch, "preflight_check_wandb_api_key"),
             patch.object(
@@ -151,6 +195,7 @@ class LaunchOrderingTests(unittest.TestCase):
             patch.object(launch.sp, "parse", return_value=args),
             patch.object(launch, "resolve_github_token", return_value="github"),
             patch.object(launch, "resolve_anthropic_api_key", return_value="anthropic"),
+            patch.object(launch, "resolve_openai_api_key", return_value="openai"),
             patch.object(launch, "resolve_exa_api_key", return_value="exa"),
             patch.object(launch, "resolve_wandb_api_key", return_value="wandb"),
             patch.object(launch, "resolve_optional_secret", return_value=""),
@@ -162,6 +207,7 @@ class LaunchOrderingTests(unittest.TestCase):
             ),
             patch.object(launch, "preflight_check_student_name_availability"),
             patch.object(launch, "preflight_check_anthropic_api_key"),
+            patch.object(launch, "preflight_check_openai_api_key"),
             patch.object(launch, "preflight_check_exa_api_key"),
             patch.object(launch, "preflight_check_wandb_api_key"),
             patch.object(launch, "preflight_aws", return_value="plan"),
@@ -195,6 +241,7 @@ class LaunchOrderingTests(unittest.TestCase):
             patch.object(launch.sp, "parse", return_value=args),
             patch.object(launch, "resolve_github_token", return_value="github"),
             patch.object(launch, "resolve_anthropic_api_key", return_value="anthropic"),
+            patch.object(launch, "resolve_openai_api_key", return_value="openai"),
             patch.object(launch, "resolve_exa_api_key", return_value="exa"),
             patch.object(launch, "resolve_wandb_api_key", return_value="wandb"),
             patch.object(launch, "resolve_optional_secret", return_value=""),
@@ -206,6 +253,7 @@ class LaunchOrderingTests(unittest.TestCase):
             ),
             patch.object(launch, "preflight_check_student_name_availability"),
             patch.object(launch, "preflight_check_anthropic_api_key"),
+            patch.object(launch, "preflight_check_openai_api_key"),
             patch.object(launch, "preflight_check_exa_api_key"),
             patch.object(launch, "preflight_check_wandb_api_key"),
             patch.object(launch, "preflight_docker", return_value="plan"),

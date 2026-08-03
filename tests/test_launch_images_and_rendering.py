@@ -260,6 +260,24 @@ def test_launch_secret_contains_each_credential_and_both_roles_reference_it():
         assert hf_reference["optional"] is True
 
 
+def test_launch_secret_includes_hugging_face_token_only_when_configured():
+    with_token = yaml.safe_load(
+        launch_helpers.render_launch_secret(
+            "track",
+            "github",
+            "exa",
+            "wandb",
+            hf_token="hugging-face",
+        )
+    )["data"]
+    without_token = yaml.safe_load(
+        launch_helpers.render_launch_secret("track", "github", "exa", "wandb")
+    )["data"]
+
+    assert base64.b64decode(with_token["hf-token"]).decode() == "hugging-face"
+    assert "hf-token" not in without_token
+
+
 def test_role_model_configuration_preserves_the_configured_efforts():
     args = launch_args(
         advisor_model="openai/gpt-5.6-sol",

@@ -24,7 +24,10 @@ cluster.
 
 - Python 3.13, [uv](https://docs.astral.sh/uv/), and Git. Kubernetes launches
   also need `kubectl`.
-- A Kubernetes context and existing namespace with outbound access to GitHub, Anthropic, Exa, and W&B. Your identity must be able to get, list, create, update, patch, and delete Deployments, ConfigMaps, and Secrets there.
+- A Kubernetes context and existing namespace with outbound access to GitHub,
+  Exa, W&B, and each configured model provider. Your identity must be able to
+  get, list, create, update, patch, and delete Deployments, ConfigMaps, and
+  Secrets there.
 - An existing PVC with enough space for the dataset and advisor state, plus concurrent mounts from every scheduled node—normally `ReadWriteMany`, unless your storage driver explicitly supports another multi-node topology. The launcher mounts this claim but does not create it.
 - NVIDIA GPU nodes, the Kubernetes NVIDIA device plugin, and a host driver compatible with CUDA 13 and the shipped student image.
 - A target GitHub repository that Senpai can clone and modify.
@@ -50,8 +53,9 @@ uv sync --locked --extra dev
 cp example.env .env
 ```
 
-Fill in the values in the gitignored `.env` file. Model-provider keys are
-required when any configured model uses that provider:
+Fill in the required values in the gitignored `.env` file. Model-provider keys
+are required when any configured model uses that provider; `HF_TOKEN` is
+optional:
 
 ```dotenv
 GITHUB_TOKEN=
@@ -59,6 +63,7 @@ ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
 EXA_API_KEY=
 WANDB_API_KEY=
+HF_TOKEN=
 ```
 
 | Credential | Required access |
@@ -68,6 +73,7 @@ WANDB_API_KEY=
 | `OPENAI_API_KEY` | Required when an `openai/...` model is configured. Every default profile uses GPT-5.6. |
 | `EXA_API_KEY` | General-web and research-publication search. |
 | `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. |
+| `HF_TOKEN` | Optional access to private or gated Hugging Face models and datasets. It is omitted from launch secrets when unset. |
 
 `k8s/launch.py` reads shell environment variables first and then the
 repository-root `.env`; only the GitHub token also falls back to `gh auth
