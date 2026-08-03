@@ -156,7 +156,12 @@ class LaunchOrderingTests(unittest.TestCase):
                 for key in captured_specs["advisor"].secrets
                 if key.endswith("_API_KEY")
             },
-            {"ANTHROPIC_API_KEY", "EXA_API_KEY", "WANDB_API_KEY"},
+            {
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "EXA_API_KEY",
+                "WANDB_API_KEY",
+            },
         )
         self.assertEqual(
             {
