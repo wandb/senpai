@@ -184,6 +184,10 @@ class NativeLaunchTests(unittest.TestCase):
             self.assertEqual(role.log_root.stat().st_mode & 0o777, 0o700)
             self.assertEqual(role.workdir.stat().st_mode & 0o777, 0o700)
             self.assertEqual(plan.launch_gate.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                descriptor["environment"]["BROWSER_USE_DISABLE_EXTENSIONS"],
+                "1",
+            )
             self.assertEqual(descriptor["environment"]["HOME"], str(role.home))
             self.assertEqual(
                 descriptor["environment"]["SENPAI_WORKDIR"], str(role.workdir)

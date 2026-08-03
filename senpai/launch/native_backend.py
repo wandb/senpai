@@ -340,6 +340,7 @@ def _role_environment(plan: NativeLaunchPlan, role: NativeRolePlan) -> dict[str,
         pythonpath += os.pathsep + inherited
     return {
         **role.spec.env,
+        "BROWSER_USE_DISABLE_EXTENSIONS": "1",
         "HOME": str(role.home),
         "LANG": os.environ.get("LANG", "en_US.UTF-8"),
         "PATH": _native_path(),
