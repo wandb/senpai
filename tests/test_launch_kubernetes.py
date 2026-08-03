@@ -229,6 +229,39 @@ def test_students_only_launch_ignores_the_inactive_advisor_provider(
     assert resolved == ["anthropic"]
 
 
+def test_advisor_only_launch_ignores_the_inactive_student_provider(monkeypatch):
+    args = launch_args(
+        names="",
+        n_students=0,
+        advisor=True,
+        student_image="",
+        advisor_model="anthropic/claude-opus-4-8",
+        student_model="openai/gpt-5.6-sol",
+        student_reasoning_effort="max",
+        smart_model="anthropic/claude-opus-4-8",
+        fast_model="anthropic/claude-haiku-4-5",
+        frontier_model="anthropic/claude-opus-4-8",
+        frontier_reasoning_effort="xhigh",
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(launch, "existing_student_names", lambda *_args, **_kwargs: [])
+    resolved = []
+
+    for provider in ("anthropic", "openai"):
+        monkeypatch.setattr(
+            launch,
+            f"resolve_{provider}_api_key",
+            lambda _path, provider=provider: resolved.append(provider)
+            or f"{provider}-key",
+        )
+    monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+
+    launch.main()
+
+    assert resolved == ["anthropic"]
+
+
 def test_launch_uses_one_scope_for_apply_discovery_and_handoff_commands(
     monkeypatch,
     capsys,
