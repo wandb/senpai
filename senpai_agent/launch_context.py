@@ -26,6 +26,15 @@ def _render(path: Path, values: dict[str, str]) -> str:
     return template.strip()
 
 
+def _read_extra_instructions(value: str) -> str:
+    path = Path(value)
+    try:
+        is_file = path.is_file()
+    except OSError:
+        is_file = False
+    return read_agent_markdown(path) if is_file else strip_spdx_header(value)
+
+
 def render_launch_context(
     *,
     backend: str,
@@ -61,11 +70,6 @@ def render_launch_context(
         ),
     ]
     if extra_instructions:
-        path = Path(extra_instructions)
-        text = (
-            read_agent_markdown(path)
-            if path.exists()
-            else strip_spdx_header(extra_instructions)
-        )
+        text = _read_extra_instructions(extra_instructions)
         sections.append(_render(OPERATOR_TEMPLATE, {"EXTRA_INSTRUCTIONS": text}))
     return "\n\n".join(sections)

@@ -66,3 +66,18 @@ def test_each_role_receives_authoritative_launch_context(role):
         "# Additional operator instructions\n\n"
         "Prefer small, measurable experiments."
     )
+
+
+def test_long_multiline_operator_instructions_are_literal_text():
+    instructions = (
+        "program.md can be found in senpai/program.md\n\n"
+        "Campaign authority:\n"
+        + "- Every role may submit a distinct validated candidate.\n" * 20
+    )
+    args = launch_args(extra_instructions=instructions)
+
+    context = build_extra_instructions(args, args.tag, ["fern"])
+
+    assert context.endswith(
+        "# Additional operator instructions\n\n" + instructions.rstrip()
+    )
