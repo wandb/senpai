@@ -699,6 +699,7 @@ def _remote_setup_script(args) -> bytes:
     return f"""#!/bin/bash
 set -euo pipefail
 export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+sudo /usr/bin/sntp -sS -t 10 169.254.169.123
 if [ ! -d /Applications/Xcode.app ]; then
   sudo ditto -x -k /tmp/senpai-Xcode.zip /Applications
 fi

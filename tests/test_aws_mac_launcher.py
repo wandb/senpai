@@ -241,6 +241,19 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
         self.assertIn("MLXFAST_BENCHMARK_REF='eigenlabs/mlxfast-challenge'", script)
         self.assertIn("mlxfast version", script)
 
+    def test_remote_setup_synchronizes_clock_before_apple_download(self):
+        script = _remote_setup_script(
+            SimpleNamespace(
+                repo_url="https://github.com/wandb/senpai.git",
+                repo_revision=REVISION,
+            )
+        ).decode()
+
+        time_sync = "sudo /usr/bin/sntp -sS -t 10 169.254.169.123"
+        metal_download = "xcodebuild -downloadComponent MetalToolchain"
+        self.assertIn(time_sync, script)
+        self.assertLess(script.index(time_sync), script.index(metal_download))
+
     def test_each_prepared_node_receives_the_local_mlxfast_bundle(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
