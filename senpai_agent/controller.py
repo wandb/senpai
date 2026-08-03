@@ -648,17 +648,23 @@ def _full_prompt(role: Literal["advisor", "student"], env: Mapping[str, str]) ->
     workspace = Path(env["SENPAI_OPENHANDS_WORKSPACE"]).resolve()
     instructions = workspace / "instructions" / f"prompt-{role}.md"
     program = workspace / "program.md"
+    if not program.is_file() and (workspace / "senpai" / "program.md").is_file():
+        program = workspace / "senpai" / "program.md"
     template_env = {
         key: env[key] for key in _PROMPT_TEMPLATE_VARIABLES if key in env
     }
-    role_prompt = Template(read_agent_markdown(instructions)).safe_substitute(
-        template_env
+    role_prompt = (
+        Template(read_agent_markdown(instructions))
+        .safe_substitute(template_env)
+        .strip()
+        if instructions.is_file()
+        else "Follow the repository AGENTS.md, the assigned GitHub work, and the Senpai role charter."
     )
     prompt = (
         "# Research programme\n\n"
         f"{read_agent_markdown(program).strip()}\n\n"
         f"# {role.title()} task\n\n"
-        f"{role_prompt.strip()}"
+        f"{role_prompt}"
     )
     encoded_extra = env.get("EXTRA_INSTRUCTIONS_B64")
     if encoded_extra:

@@ -1,7 +1,7 @@
 # senpai project configuration
 # All fields can be overridden via CLI: python k8s/launch.py --tag <tag> [--field value]
 
-# compute backend (kubernetes, docker, or aws)
+# compute backend (kubernetes, docker, aws, or aws-mac)
 backend: kubernetes
 
 # active problem directory
@@ -53,9 +53,23 @@ aws_volume_gib: 250
 aws_runtime_reserve_gib: 80
 aws_state_root: ~/.senpai/aws
 aws_ssh_cidr: ""
-aws_ready_timeout_s: 900
+aws_ready_timeout_s: 1800
 aws_data_timeout_s: 7200
 aws_ttl_hours: 24.0
+
+# AWS Mac reuses allocated Dedicated Hosts and runs roles natively on macOS.
+native_run_root: ~/.senpai/native
+native_ready_timeout_s: 600
+aws_mac_host_ids: ""
+# Comma-separated AZ=subnet-id entries covering every selected host.
+aws_mac_subnet_ids: ""
+aws_mac_security_group_id: ""
+# A full local Xcode copied to fresh base AMIs before native role startup.
+aws_mac_xcode_app: /Applications/Xcode.app
+aws_mac_xcode_archive: ""
+aws_mac_mlxfast_bundle: ~/.local/share/mlxfast/mlxfast.js
+# When enabled, every active role receives MLXFAST_API_TOKEN for official dispatch.
+aws_mac_official_submit: false
 
 # W&B
 wandb_entity: wandb-applied-ai-team
