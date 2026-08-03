@@ -15,11 +15,15 @@ Senpai is problem-agnostic. It runs against a separate target repository, and ev
 
 ## Quick start
 
-Kubernetes is currently the turnkey deployment path. The GitHub-based coordination protocol is infrastructure-independent, but Docker and direct-host operation still require manual bootstrap; see [Other deployment environments](#other-deployment-environments).
+Kubernetes, local Docker, and AWS use the same launcher, role configuration,
+training limits, GitHub workflow, and W&B record. This quick start shows
+Kubernetes; see [Docker](#docker) or [AWS](#aws) for a GPU host without a
+cluster.
 
 ### 1. Prerequisites
 
-- Python 3.13, [uv](https://docs.astral.sh/uv/), Git, and `kubectl`.
+- Python 3.13, [uv](https://docs.astral.sh/uv/), and Git. Kubernetes launches
+  also need `kubectl`.
 - A Kubernetes context and existing namespace with outbound access to GitHub, Anthropic, Exa, and W&B. Your identity must be able to get, list, create, update, patch, and delete Deployments, ConfigMaps, and Secrets there.
 - An existing PVC with enough space for the dataset and advisor state, plus concurrent mounts from every scheduled node—normally `ReadWriteMany`, unless your storage driver explicitly supports another multi-node topology. The launcher mounts this claim but does not create it.
 - NVIDIA GPU nodes, the Kubernetes NVIDIA device plugin, and a host driver compatible with CUDA 13 and the shipped student image.
@@ -65,9 +69,16 @@ WANDB_API_KEY=
 | `EXA_API_KEY` | General-web and research-publication search. |
 | `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. |
 
-`k8s/launch.py` reads shell environment variables first and then the repository-root `.env`; only the GitHub token also falls back to `gh auth token`. Direct Docker or host execution must export or pass credentials explicitly.
+`k8s/launch.py` reads shell environment variables first and then the
+repository-root `.env`; only the GitHub token also falls back to `gh auth
+token`.
 
-The launcher places credentials in a per-launch Kubernetes Secret. During bootstrap, the GitHub write token is removed from the process environment and handed to the controller through a one-use channel; it is not exposed to the model or subagents.
+Kubernetes stores runtime credentials in a per-launch Secret. Docker stores
+them in private local run state; AWS sends them over SSH into the same private
+run state on EC2. Termination removes that state. During role bootstrap, the
+GitHub write token is removed from the process environment and handed to the
+controller through a one-use channel; it is not exposed to the model or
+subagents.
 
 ### 4. Prepare the target repository
 
@@ -120,7 +131,7 @@ frontier_reasoning_effort: ultra
 pvc_claim_name: your-existing-pvc
 pvc_mount_path: /mnt/data
 
-n_students: 1
+n_students: 4
 gpus_per_student: 1
 cpu_per_gpu: 8
 memory_gi_per_gpu: 64
@@ -136,40 +147,42 @@ uses `WANDB_API_KEY` for auth.
 
 The defaults in `senpai.yaml` describe W&B's deployment and should not be copied unchanged into another environment. Every setting can also be overridden on the command line. `--tag` and `--target_repo_url` are required unless your chosen config file supplies them.
 
-Deployments require matching advisor and student image digests, or `sha-<40-character-commit>` tags built from the same Senpai revision. Digest-pinned images also require the full matching `repo_revision`. The source commit must be fetchable from `repo_url`; PR image checks build but do not publish images.
+Deployments require one immutable image per active role, all built from the same
+Senpai revision. Full `sha-<40-character-commit>` tags identify it directly;
+digest-pinned role images require an explicit shared `repo_revision`.
+Kubernetes and Docker fetch that commit from `repo_url`. AWS transfers the exact
+clean local commit instead. PR image checks build but do not publish images.
 
 ### 6. Run preflight
 
 ```bash
-uv run python k8s/launch.py \
-  --config_path senpai.local.yaml \
-  --tag first-run \
-  --target_repo_url https://github.com/OWNER/TARGET.git \
-  --preflight_only
+revision=$(git rev-parse HEAD)
+launch_args=(
+  --config_path senpai.local.yaml
+  --tag first-run
+  --target_repo_url https://github.com/OWNER/TARGET.git
+  --advisor
+  --names frieren
+  --advisor_image "ghcr.io/wandb/senpai-advisor:sha-$revision"
+  --student_image "ghcr.io/wandb/senpai-student:sha-$revision"
+)
+
+uv run python k8s/launch.py "${launch_args[@]}" --preflight_only
 ```
 
-Preflight authenticates GitHub, Exa, W&B, and every model provider referenced by
-the configured model profiles. It also verifies GitHub Contents write access,
-resolves the target branch, and rejects student labels already carrying active
-assignments. It deliberately skips image validation and makes no cluster
-changes. A real launch additionally verifies immutable image syntax and that
-both role images identify the same source revision.
+Every preflight authenticates GitHub, Exa, W&B, and every model provider used by
+an active role or shared model profile. It verifies GitHub Contents write
+access, resolves the target branch, rejects active student-label collisions,
+and checks immutable image references against one expected runner revision.
+Backend-specific checks are described below. Preflight never changes GitHub or
+starts advisor or student roles.
 
 ### 7. Launch
 
-For a Senpai commit whose images have been published:
+Inspect the preflight result, then launch with the same arguments:
 
 ```bash
-revision=$(git rev-parse HEAD)
-
-uv run python k8s/launch.py \
-  --config_path senpai.local.yaml \
-  --tag first-run \
-  --target_repo_url https://github.com/OWNER/TARGET.git \
-  --advisor \
-  --names frieren \
-  --advisor_image "ghcr.io/wandb/senpai-advisor:sha-$revision" \
-  --student_image "ghcr.io/wandb/senpai-student:sha-$revision"
+uv run python k8s/launch.py "${launch_args[@]}"
 ```
 
 The launcher creates routing labels, one launch Secret, role ConfigMaps, and Deployments. It does not create the namespace, PVC, Service, or general cluster RBAC.
@@ -183,6 +196,160 @@ kubectl delete deployments,configmaps,secrets -l research-tag=first-run
 ```
 
 Use `--kube_context` and `--namespace` when the desired cluster is not your current default. Use `--dry_run` to render redacted manifests without checking credentials or writing to the cluster.
+
+## Docker
+
+Docker uses the same role specification and in-container `pvc_mount_path` as
+Kubernetes. It requires a Linux host with Docker Engine, Git, the NVIDIA
+Container Toolkit, a compatible NVIDIA driver, and enough GPUs for all
+students. Docker Desktop on macOS cannot run the GPU student image.
+
+```bash
+revision=$(git rev-parse HEAD)
+uv run python k8s/launch.py \
+  --config_path senpai.local.yaml \
+  --backend docker \
+  --tag first-docker-run \
+  --target_repo_url https://github.com/OWNER/TARGET.git \
+  --advisor \
+  --names fern \
+  --data_dir /srv/ml-data \
+  --advisor_image "ghcr.io/wandb/senpai-advisor:sha-$revision" \
+  --student_image "ghcr.io/wandb/senpai-student:sha-$revision"
+```
+
+This first run uses one student; omit `--names fern` to use the shared default
+of four. `data_dir` is mounted at `pvc_mount_path`, so target code and data paths
+do not change between Kubernetes and Docker. Preflight checks the local images,
+source revision, Docker, CUDA, GPU allocation, state directory, and
+container-name collisions before changing GitHub. Runtime state lives under
+`~/.senpai/runs/<tag>`.
+
+```bash
+uv run python k8s/docker.py status first-docker-run
+uv run python k8s/docker.py logs first-docker-run --role student-fern --follow
+uv run python k8s/docker.py terminate first-docker-run
+```
+
+## AWS
+
+AWS creates one temporary, public, on-demand EC2 GPU host and runs the Docker
+backend on it. All students share that host. The target repository, role
+settings, data path, and agent workflow remain identical to Kubernetes.
+
+### AWS setup
+
+Install AWS CLI v2 and OpenSSH. The selected AWS identity needs
+`sts:GetCallerIdentity`, `ssm:GetParameter`, EC2 `Describe*` access for instance
+types, images, networking, instances, security groups, volumes, and volume
+modifications, plus `CreateKeyPair`, `DeleteKeyPair`, `CreateSecurityGroup`,
+`AuthorizeSecurityGroupIngress`, `DeleteSecurityGroup`, `RunInstances`,
+`TerminateInstances`, `CreateTags`, and `ModifyVolume`. The region needs GPU
+quota and a public subnet with an internet-gateway route.
+
+For AWS SSO:
+
+```bash
+aws configure sso --profile senpai
+aws sso login --profile senpai
+aws sts get-caller-identity --profile senpai
+```
+
+If the session expires, run `aws sso login --profile senpai` again before a
+status, logs, or termination command. AWS credentials remain on the operator
+machine and are never copied to EC2. Runtime credentials still come from the
+gitignored `.env` described above; Senpai sends them over SSH into private
+remote Docker state. Local AWS state contains only lifecycle identifiers and
+the ephemeral SSH key.
+
+AWS currently needs anonymously pullable advisor and student images. Use
+matching `:sha-<40-character-commit>` tags, or digest-pinned images with an
+explicit matching `repo_revision`. Commit local changes before launching: AWS
+requires a clean checkout whose `HEAD` exactly matches that revision.
+
+### Preflight and launch
+
+This first run uses one student to control cost. Omit `--names fern` to use the
+shared default of four one-GPU students.
+
+```bash
+profile=senpai
+region=us-east-2
+tag=first-aws-run
+revision=$(git rev-parse HEAD)
+
+launch_args=(
+  --config_path senpai.local.yaml
+  --backend aws
+  --tag "$tag"
+  --target_repo_url https://github.com/OWNER/TARGET.git
+  --advisor
+  --names fern
+  --aws_profile "$profile"
+  --aws_region "$region"
+  --aws_ttl_hours 8
+  --data_dir /absolute/path/to/data-root
+  --advisor_image "ghcr.io/wandb/senpai-advisor:sha-$revision"
+  --student_image "ghcr.io/wandb/senpai-student:sha-$revision"
+)
+
+uv run python k8s/launch.py "${launch_args[@]}" --preflight_only
+```
+
+Verify the printed account, region, instance shape, AMI, subnet count, and
+volume before creating anything. Then launch with the same arguments:
+
+```bash
+uv run python k8s/launch.py "${launch_args[@]}"
+```
+
+AWS preflight is read-only. It checks the account, local source revision,
+credentials, AMI, actual GPU/vCPU/memory shape, SSH boundary, and eligible
+public subnets. Image pulls and CUDA validation require the temporary host, so
+EC2 billing has started, but they still happen before data upload or GitHub
+mutation.
+
+The contents of `data_dir` appear at `pvc_mount_path`. For code that reads
+`/mnt/data/datasets/...` with the configuration above, pass the directory whose
+child is `datasets/`. The directory must be non-empty and contain no symlinks.
+Senpai streams it over SSH and verifies its file count and bytes. The initial
+`aws_volume_gib` is a bootstrap floor for the AMI and image-pull peak; after
+image validation, Senpai measures free space and grows the root EBS volume for
+the actual dataset plus `aws_runtime_reserve_gib`.
+
+Usually only `aws_profile`, `aws_region`, `data_dir`, and `aws_ttl_hours` need
+attention. Leave the others empty unless your AWS environment has known
+resources:
+
+| Setting | When to set it |
+|---|---|
+| `aws_instance_type` | Pin an available x86_64 NVIDIA type. Senpai validates its real GPU, vCPU, and memory shape; otherwise it selects the first fitting type from its catalog. |
+| `aws_subnet_id` | Pin a known public subnet. Otherwise Senpai searches eligible subnets across AZs and retries recognized capacity failures. |
+| `aws_ami_id` | Pin the supported Ubuntu 22.04 NVIDIA Deep Learning Base AMI; otherwise Senpai resolves the current regional image. |
+| `aws_ssh_cidr` | Pin the operator's IPv4 `/32`; otherwise Senpai discovers the current public IP. |
+| `aws_volume_gib` | Increase the initial AMI/image-pull space when using unusually large images. |
+| `aws_runtime_reserve_gib` | Change the free space retained across all roles for worktrees, checkpoints, caches, and logs. |
+| `aws_ready_timeout_s`, `aws_data_timeout_s` | Increase host-start or dataset-upload deadlines on slower environments. |
+
+### Operate and clean up
+
+```bash
+uv run python k8s/aws.py status first-aws-run
+uv run python k8s/aws.py logs first-aws-run --role student-fern --tail 200
+uv run python k8s/aws.py logs first-aws-run --role advisor --tail 200
+uv run python k8s/aws.py terminate first-aws-run
+```
+
+Always run `terminate`. It attempts to gracefully stop the agents, terminates
+EC2, and removes the ephemeral key pair, security group, local SSH key, and
+lifecycle state. Launch failures attempt the same cleanup automatically.
+
+`aws_ttl_hours` is an emergency cost backstop measured from instance startup,
+not a replacement for cleanup. If it fires, run `terminate` afterward to remove
+the remaining key, security group, and local state. The current AWS backend
+intentionally owns one disposable public host; it does not yet support Spot,
+multiple nodes, existing-host reuse, private-subnet/SSM transport, private image
+registries, or IAM instance profiles.
 
 ## Experiment workflow
 
@@ -374,13 +541,10 @@ Advisor and student images are built from the same source revision. The advisor 
 
 For multi-day fleets, [`arm_senpai_cluster_cutoff.sh`](scripts/arm_senpai_cluster_cutoff.sh) creates a cluster-side hard cutoff that does not depend on an operator laptop remaining online. It can also hold a shared start gate until the expected fleet is ready or its readiness deadline expires.
 
-Pod startup and liveness probes read the supervisor lease. Restarting a Deployment resumes the durable advisor or student conversation when its state directory survives. Stop a container before copying or snapshotting a live advisor state directory.
-
-### Other deployment environments
-
-GitHub coordination works across Docker, cloud VMs, or local hosts without private networking. The current repository does not yet provide a Compose or direct-host launcher: the Kubernetes manifests perform the source clone, environment assembly, skill installation, token handoff, mounts, and entrypoint selection.
-
-To build another launcher, reproduce [entrypoint-advisor.sh](k8s/entrypoint-advisor.sh) or [entrypoint-student.sh](k8s/entrypoint-student.sh), persist `/var/lib/senpai/<tag>/advisor` for the advisor, and use the container healthcheck with a restart policy. Student execution requires Linux, an NVIDIA runtime, and compatible CUDA hardware; Docker Desktop on macOS cannot run the GPU student image.
+On Kubernetes, pod startup and liveness probes read the supervisor lease.
+Restarting a Deployment resumes the durable advisor or student conversation
+when its state directory survives. For any backend, stop a live role before
+copying or snapshotting its advisor state directory.
 
 ## Development and reference
 
