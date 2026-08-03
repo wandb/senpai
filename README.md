@@ -15,10 +15,10 @@ Senpai is problem-agnostic. It runs against a separate target repository, and ev
 
 ## Quick start
 
-Kubernetes, local Docker, and AWS use the same launcher, role configuration,
-training limits, GitHub workflow, and W&B record. This quick start shows
-Kubernetes; see [Docker](#docker) or [AWS](#aws) for a GPU host without a
-cluster.
+Kubernetes, local Docker, AWS GPU, and AWS Mac use the same launcher, role
+configuration, training limits, GitHub workflow, and W&B record. This quick
+start shows Kubernetes; see [Docker](#docker), [AWS](#aws), or
+[AWS Mac](#aws-mac) for a host without a cluster.
 
 ### 1. Prerequisites
 
@@ -88,7 +88,7 @@ subagents.
 
 ### 4. Prepare the target repository
 
-The target branch must contain:
+The target branch normally contains:
 
 ```text
 program.md
@@ -100,6 +100,11 @@ instructions/
 - `program.md` defines the research objective, baseline, metrics, benchmark rules, training limits, and allowed edit surface.
 - `prompt-advisor.md` adds target-specific experiment-selection and review guidance.
 - `prompt-student.md` adds target-specific implementation, training, and reporting guidance.
+
+Targets that keep their Senpai configuration in a subdirectory may use
+`senpai/program.md`. Role prompt overlays are optional in that layout; without
+them, both roles follow the repository instructions and their built-in Senpai
+role charter.
 
 Use the [bootstrap-target guide](plugins/senpai/skills/bootstrap-target/SKILL.md) to inspect a new target and create these files. Target `AGENTS.md`, compatible `CLAUDE.md`, and `.agents/skills/` are also loaded through OpenHands project context and progressive disclosure.
 
@@ -356,6 +361,68 @@ the remaining key, security group, and local state. The current AWS backend
 intentionally owns one disposable public host; it does not yet support Spot,
 multiple nodes, existing-host reuse, private-subnet/SSM transport, private image
 registries, or IAM instance profiles.
+
+## AWS Mac
+
+AWS Mac reuses an already allocated fleet of `mac-m4pro.metal` Dedicated Hosts
+and runs Senpai natively under per-user `launchd` services. It assigns exactly
+one student to each host and co-locates the optional advisor on the first host.
+The backend creates and terminates EC2 instances, but never releases the
+Dedicated Hosts.
+
+Use a clean checkout at the exact committed revision being launched. The base
+macOS AMI does not contain full Xcode, so provide either a local Xcode app or a
+prepared `ditto` zip. Each selected host also needs a public subnet in its own
+Availability Zone and an existing security group in the same VPC.
+
+```bash
+tag=first-aws-mac-run
+revision=$(git rev-parse HEAD)
+
+launch_args=(
+  --config_path senpai.local.yaml
+  --backend aws-mac
+  --tag "$tag"
+  --target_repo_url https://github.com/OWNER/TARGET.git
+  --advisor
+  --n_students 2
+  --gpus_per_student 1
+  --repo_revision "$revision"
+  --aws_region us-east-1
+  --aws_instance_type mac-m4pro.metal
+  --aws_mac_host_ids h-HOST1,h-HOST2
+  --aws_mac_subnet_ids us-east-1a=subnet-A,us-east-1b=subnet-B
+  --aws_mac_security_group_id sg-EXAMPLE
+  --aws_mac_xcode_archive /absolute/path/to/Xcode.zip
+  --aws_mac_mlxfast_bundle "$HOME/.local/share/mlxfast/mlxfast.js"
+  --aws_mac_official_submit
+)
+
+uv run python k8s/launch.py "${launch_args[@]}" --preflight_only
+uv run python k8s/launch.py "${launch_args[@]}"
+```
+
+Preflight is read-only: it validates the exact source revision, Apple Silicon
+AMI, host availability and capacity, subnet placement, security group, and
+Xcode source. Launch creates an ephemeral SSH key, temporarily permits the
+operator's IPv4 `/32`, validates one native canary, prepares the remaining Macs
+in parallel, and holds every role at a fleet-wide start gate before opening it.
+With `--aws_mac_official_submit`, the launcher also requires
+`MLXFAST_API_TOKEN` and gives every active role official dispatch capability.
+Coordinate submissions so students send distinct, validated candidates rather
+than duplicate jobs.
+
+```bash
+uv run python k8s/aws_mac.py status first-aws-mac-run
+uv run python k8s/aws_mac.py logs first-aws-mac-run --role advisor
+uv run python k8s/aws_mac.py logs first-aws-mac-run --role student-fern
+uv run python k8s/aws_mac.py terminate first-aws-mac-run
+```
+
+Termination unloads the native services, removes their private state,
+terminates only the instances recorded for the run, deletes the ephemeral key,
+and revokes the temporary SSH rule. It preserves all pre-existing Dedicated
+Hosts and networking resources.
 
 ## Experiment workflow
 

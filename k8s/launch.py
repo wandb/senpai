@@ -8,6 +8,7 @@
 
 import posixpath
 import shlex
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,10 @@ from k8s.launch_helpers import (  # noqa: E402
     source_revision_for_image,
 )
 from senpai.launch.aws_backend import launch_aws, preflight_aws  # noqa: E402
+from senpai.launch.aws_mac_backend import (  # noqa: E402
+    launch_aws_mac,
+    preflight_aws_mac,
+)
 from senpai.launch.docker_backend import (  # noqa: E402
     launch_docker,
     preflight_docker,
@@ -70,7 +75,7 @@ class Args:
 
     tag: str  # research tag (e.g. mar13)
     target_repo_url: str  # problem-package repo (entrypoint clones this into $PROBLEM_DIR; agent commits/PRs land here) — REQUIRED, no default
-    backend: str = "kubernetes"  # compute backend: kubernetes, docker, or aws
+    backend: str = "kubernetes"  # compute backend: kubernetes, docker, aws, or aws-mac
     target_repo_branch: str = ""  # target repo branch used as the base when creating advisor_branch; empty = target repo default branch
     problem_dir: str = "target/"  # active problem directory — entrypoint clones target_repo_url here (from senpai.yaml)
     names: str = ""  # comma-separated student names (e.g. "frieren,fern")
@@ -126,9 +131,18 @@ class Args:
     aws_runtime_reserve_gib: int = 80  # total free host disk retained after data upload
     aws_state_root: str = "~/.senpai/aws"  # local lifecycle state and ephemeral SSH keys
     aws_ssh_cidr: str = ""  # SSH source IPv4 /32; empty discovers the launcher's public IP
-    aws_ready_timeout_s: int = 900  # wait for EC2, cloud-init, Docker, and GPU readiness
+    aws_ready_timeout_s: int = 1800  # wait for EC2, cloud-init, Docker, and GPU readiness
     aws_data_timeout_s: int = 7200  # maximum time to stream data_dir to the host
     aws_ttl_hours: float = 24.0  # instance self-termination cost backstop
+    native_run_root: str = "~/.senpai/native"  # native macOS role state and logs
+    native_ready_timeout_s: int = 600  # wait for native supervisor leases
+    aws_mac_host_ids: str = ""  # existing Dedicated Host IDs, one per student
+    aws_mac_subnet_ids: str = ""  # AZ=subnet-id map for the selected hosts
+    aws_mac_security_group_id: str = ""  # existing SSH security group
+    aws_mac_xcode_app: str = "/Applications/Xcode.app"  # full local Xcode copied to fresh Macs
+    aws_mac_xcode_archive: str = ""  # optional prepared Xcode zip; avoids re-archiving
+    aws_mac_mlxfast_bundle: str = "~/.local/share/mlxfast/mlxfast.js"  # local CLI bundle installed on every Mac
+    aws_mac_official_submit: bool = False  # give every active role the MLXFast submission token
     dry_run: bool = False  # render manifests only: do not apply them or validate credentials
     preflight_only: bool = False  # validate credentials/access only: do not render or apply manifests
 
@@ -390,10 +404,28 @@ def resolve_runner_revision(args: Args, *, has_students: bool) -> None:
     args.repo_revision = revisions[0]
 
 
+def resolve_checkout_revision(args: Args) -> None:
+    """Bind a native launch to the exact local Senpai commit."""
+    head = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if args.repo_revision and args.repo_revision != head:
+        sys.exit(
+            f"ERROR: --repo_revision is {args.repo_revision}, but this checkout "
+            f"is {head}"
+        )
+    args.repo_revision = head
+
+
 def main():
     args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
-    if args.backend not in {"kubernetes", "docker", "aws"}:
-        sys.exit("ERROR: --backend must be one of: kubernetes, docker, aws")
+    if args.backend not in {"kubernetes", "docker", "aws", "aws-mac"}:
+        sys.exit(
+            "ERROR: --backend must be one of: kubernetes, docker, aws, aws-mac"
+        )
     if min(args.cpu_per_gpu, args.memory_gi_per_gpu) < 1:
         sys.exit("ERROR: --cpu_per_gpu and --memory_gi_per_gpu must be at least 1")
     if args.n_students < 0:
@@ -402,8 +434,10 @@ def main():
         sys.exit("ERROR: --gpus_per_student must be non-negative")
     if args.backend == "kubernetes" and args.gpus_per_student < 1:
         sys.exit("ERROR: Kubernetes launches require --gpus_per_student at least 1")
-    if args.backend in {"docker", "aws"} and args.docker_ready_timeout_s < 1:
+    if args.backend in {"docker", "aws", "aws-mac"} and args.docker_ready_timeout_s < 1:
         sys.exit("ERROR: --docker_ready_timeout_s must be at least 1")
+    if args.backend == "aws-mac" and args.native_ready_timeout_s < 1:
+        sys.exit("ERROR: --native_ready_timeout_s must be at least 1")
     validate_timing_args(args)
     if args.gh_history_scope not in {"branch", "repo", "fresh"}:
         sys.exit("ERROR: --gh_history_scope must be one of: branch, repo, fresh")
@@ -411,7 +445,10 @@ def main():
         sys.exit("ERROR: --target_repo_url must be a different repo from --repo_url")
 
     student_list = resolve_student_names(args)
-    resolve_runner_revision(args, has_students=bool(student_list))
+    if args.backend == "aws-mac":
+        resolve_checkout_revision(args)
+    else:
+        resolve_runner_revision(args, has_students=bool(student_list))
     validate_model_config(args, has_students=bool(student_list))
 
     model_providers = deployed_model_providers(
@@ -420,6 +457,7 @@ def main():
     )
     github_token = exa_api_key = wandb_api_key = hf_token = ""
     provider_api_keys: dict[str, str] = {}
+    mlxfast_api_token = ""
     if not args.dry_run or args.preflight_only:
         github_token = resolve_github_token(DOTENV_PATH)
         if "anthropic" in model_providers:
@@ -429,6 +467,16 @@ def main():
         exa_api_key = resolve_exa_api_key(DOTENV_PATH)
         wandb_api_key = resolve_wandb_api_key(DOTENV_PATH)
         hf_token = resolve_optional_secret(DOTENV_PATH, "HF_TOKEN")
+        if args.backend == "aws-mac" and args.aws_mac_official_submit:
+            mlxfast_api_token = resolve_optional_secret(
+                DOTENV_PATH,
+                "MLXFAST_API_TOKEN",
+            )
+            if not mlxfast_api_token:
+                sys.exit(
+                    "ERROR: --aws_mac_official_submit requires "
+                    "MLXFAST_API_TOKEN"
+                )
         preflight_check_target_repo_access(args.target_repo_url, github_token)
         args.target_repo_branch = preflight_check_target_repo_branch(
             args.target_repo_url,
@@ -462,13 +510,16 @@ def main():
     }
 
     def role_secrets(role: str) -> dict[str, str]:
-        return {
+        secrets = {
             **common_secrets,
             **{
                 MODEL_PROVIDERS[provider][0]: provider_api_keys.get(provider, "")
                 for provider in configured_model_providers(args, role)
             },
         }
+        if mlxfast_api_token:
+            secrets["MLXFAST_API_TOKEN"] = mlxfast_api_token
+        return secrets
 
     role_specs = [
         build_student_spec(
@@ -489,13 +540,15 @@ def main():
             )
         )
 
-    docker_plan = aws_plan = None
+    docker_plan = aws_plan = aws_mac_plan = None
     if not args.dry_run or args.preflight_only:
         try:
             if args.backend == "docker":
                 docker_plan = preflight_docker(args, role_specs)
             elif args.backend == "aws":
                 aws_plan = preflight_aws(args, role_specs)
+            elif args.backend == "aws-mac":
+                aws_mac_plan = preflight_aws_mac(args, role_specs)
         except (ValueError, RuntimeError) as error:
             sys.exit(f"ERROR: {error}")
 
@@ -509,6 +562,10 @@ def main():
             "aws": (
                 "credentials, repository, source provenance, and the AWS launch "
                 "target are ready"
+            ),
+            "aws-mac": (
+                "credentials, repository, source provenance, and all existing "
+                "EC2 Mac hosts are ready"
             ),
         }
         detail = details[args.backend]
@@ -536,6 +593,18 @@ def main():
                 args,
                 role_specs,
                 aws_plan,
+                before_start=prepare_github,
+            )
+        except (ValueError, RuntimeError) as error:
+            sys.exit(f"ERROR: {error}")
+        return
+
+    if args.backend == "aws-mac":
+        try:
+            launch_aws_mac(
+                args,
+                role_specs,
+                aws_mac_plan,
                 before_start=prepare_github,
             )
         except (ValueError, RuntimeError) as error:

@@ -117,6 +117,33 @@ def test_first_turn_combines_programme_role_template_and_runtime_identity(
     assert "SPDX-" not in prompt
 
 
+def test_first_turn_supports_repository_nested_program_without_role_overlay(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "target"
+    (workspace / "senpai").mkdir(parents=True)
+    (workspace / "senpai" / "program.md").write_text("Optimize MLX inference.")
+
+    prompt = _full_prompt(
+        "student",
+        {
+            "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
+            "GH_REPO": "acme/mlxfast",
+            "ADVISOR_BRANCH": "research",
+            "WANDB_ENTITY": "acme",
+            "WANDB_PROJECT": "mlxfast",
+            "STUDENT_NAME": "fern",
+            "EXTRA_INSTRUCTIONS_B64": b64encode(
+                b"program.md can be found in senpai/program.md"
+            ).decode(),
+        },
+    )
+
+    assert "# Research programme\n\nOptimize MLX inference." in prompt
+    assert "Follow the repository AGENTS.md" in prompt
+    assert "program.md can be found in senpai/program.md" in prompt
+
+
 def test_empty_mailbox_does_not_start_a_model_turn():
     turns = Turns()
 
