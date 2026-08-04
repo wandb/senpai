@@ -43,6 +43,7 @@ REMOTE_SOURCE = f"{REMOTE_HOME}/senpai-source"
 REMOTE_VENV = f"{REMOTE_HOME}/.senpai/venv"
 REMOTE_BROWSER_ROOT = f"{REMOTE_HOME}/.senpai/ms-playwright"
 REMOTE_RUN_ROOT = f"{REMOTE_HOME}/.senpai/native"
+REMOTE_SETUP_SCRIPT = "/tmp/senpai-setup.sh"
 REMOTE_METAL_TOOLCHAIN_ARCHIVE = "/tmp/senpai-MetalToolchain.zip"
 DEFAULT_MLXFAST_BUNDLE = "~/.local/share/mlxfast/mlxfast.js"
 MAC_ROOT_IOPS = 10_000
@@ -828,9 +829,25 @@ def _prepare_node(args, run_dir: Path, node: dict, archive: Path) -> None:
     _ssh(
         run_dir,
         node,
-        "/bin/bash -s",
+        f"umask 077; cat > {REMOTE_SETUP_SCRIPT}; "
+        f"chmod 0700 {REMOTE_SETUP_SCRIPT}",
         input_bytes=_remote_setup_script(args),
         timeout=args.aws_data_timeout_s,
+    )
+    _ssh(
+        run_dir,
+        node,
+        "set -eu; "
+        f"trap 'rm -f {REMOTE_SETUP_SCRIPT}' EXIT; "
+        f"/bin/bash {REMOTE_SETUP_SCRIPT} </dev/null",
+        timeout=args.aws_data_timeout_s,
+    )
+    _ssh(
+        run_dir,
+        node,
+        f"{REMOTE_VENV}/bin/python -c "
+        "'import openhands.sdk, weave_openhands'",
+        timeout=60,
     )
     print(f"AWS Mac {node['instance_id']} runtime is ready.", flush=True)
 
