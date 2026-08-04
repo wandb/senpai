@@ -283,6 +283,18 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
         ).decode()
 
         self.assertIn("/usr/local/bin/chromium", script)
+        self.assertIn(
+            "printf '%s\\n' '#!/bin/sh' 'exec \"'\"$chromium_path\"'\" \"$@\"'",
+            script,
+        )
+        self.assertIn("/usr/local/bin/chromium --version", script)
+        self.assertNotIn(
+            'ln -sf "$chromium_path" /usr/local/bin/chromium',
+            script,
+        )
+        remove_wrapper = script.index("sudo rm -f /usr/local/bin/chromium")
+        write_wrapper = script.index("sudo tee /usr/local/bin/chromium")
+        self.assertLess(remove_wrapper, write_wrapper)
         self.assertIn("senpai-browser-smoke-test.py", script)
         self.assertIn('HOME="$role_home"', script)
         self.assertIn("brew install uv gh gettext cmake jq", script)
