@@ -238,6 +238,19 @@ class AwsMacInputTests(unittest.TestCase):
 
 
 class AwsMacInfrastructureValidationTests(unittest.TestCase):
+    def test_ssh_disconnects_stdin_when_no_payload_is_sent(self):
+        node = {"instance_id": "i-test", "public_ip": "198.51.100.1"}
+        completed = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+
+        with patch.object(
+            aws_mac_backend.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            aws_mac_backend._ssh(Path("/tmp/state"), node, "true")
+
+        self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
     def test_launchd_canary_reconnects_before_removing_the_system_service(self):
         node = {"instance_id": "i-canary", "public_ip": "198.51.100.1"}
         calls = []
@@ -375,7 +388,7 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
         calls = ssh.call_args_list
         commands = [call.args[2] for call in calls]
         upload = commands.index(
-            "umask 077; cat > /tmp/senpai-setup.sh; "
+            "set -eu; umask 077; cat > /tmp/senpai-setup.sh; "
             "chmod 0700 /tmp/senpai-setup.sh"
         )
         execute = next(

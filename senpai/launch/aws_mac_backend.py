@@ -660,9 +660,14 @@ def _ssh(
     timeout: float | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess:
+    stdin = (
+        input_file
+        if input_file is not None
+        else None if input_bytes is not None else subprocess.DEVNULL
+    )
     result = subprocess.run(
         [*_ssh_base(run_dir, node), command],
-        stdin=input_file,
+        stdin=stdin,
         input=input_bytes,
         capture_output=True,
         timeout=timeout,
@@ -829,7 +834,7 @@ def _prepare_node(args, run_dir: Path, node: dict, archive: Path) -> None:
     _ssh(
         run_dir,
         node,
-        f"umask 077; cat > {REMOTE_SETUP_SCRIPT}; "
+        f"set -eu; umask 077; cat > {REMOTE_SETUP_SCRIPT}; "
         f"chmod 0700 {REMOTE_SETUP_SCRIPT}",
         input_bytes=_remote_setup_script(args),
         timeout=args.aws_data_timeout_s,
