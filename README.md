@@ -420,6 +420,8 @@ source, and Metal toolchain archive. Launch creates an ephemeral SSH key,
 temporarily permits the operator's IPv4 `/32`, validates one native canary,
 prepares the remaining Macs in parallel, and holds every role at a fleet-wide
 start gate before opening it.
+Host preparation installs tmux and Chromium and smoke-tests both with a fresh
+role-like `HOME`, matching the private-home environment used by native roles.
 With `--aws_mac_official_submit`, the launcher also requires
 `MLXFAST_API_TOKEN` and gives every active role official dispatch capability.
 Coordinate submissions so students send distinct, validated candidates rather

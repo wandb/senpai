@@ -274,7 +274,7 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
         self.assertIn("state = running", calls[1][0])
         self.assertIn("launchctl bootout system/", calls[2][0])
 
-    def test_remote_setup_exposes_and_smoke_tests_chromium_for_private_homes(self):
+    def test_remote_setup_smoke_tests_native_tools_for_private_homes(self):
         script = _remote_setup_script(
             SimpleNamespace(
                 repo_url="https://github.com/wandb/senpai.git",
@@ -301,6 +301,19 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
         self.assertIn("command -v jq", script)
         self.assertIn("jq -n -e 'true'", script)
         self.assertIn("brew install uv gh gettext cmake jq bun", script)
+        self.assertIn("brew install uv gh gettext cmake jq bun tmux", script)
+        self.assertIn('HOME="$role_home" tmux -V', script)
+        self.assertIn(
+            'tmux -L "$tmux_socket" -f /dev/null new-session -d -s smoke',
+            script,
+        )
+        self.assertIn('tmux -L "$tmux_socket" has-session -t smoke', script)
+        self.assertIn('tmux -L "$tmux_socket" kill-server', script)
+        self.assertIn("trap cleanup_role_runtime EXIT", script)
+        tmux_smoke = script.index('HOME="$role_home" tmux -V')
+        browser_smoke = script.index("senpai-browser-smoke-test.py")
+        self.assertLess(tmux_smoke, browser_smoke)
+        self.assertIn("trap - EXIT", script)
         self.assertIn("/usr/local/libexec/mlxfast.js", script)
         self.assertIn("/usr/local/bin/mlxfast", script)
         self.assertIn("MLXFAST_API_URL='https://api.mlx.fast'", script)
