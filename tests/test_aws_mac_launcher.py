@@ -342,6 +342,65 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
             1,
         )
 
+    def test_prepared_node_executes_setup_from_a_file_then_reconnects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "Xcode.zip"
+            archive.write_bytes(b"xcode")
+            metal = root / "MetalToolchain.zip"
+            with ZipFile(metal, "w") as contents:
+                contents.writestr(
+                    "MetalToolchain-17F109.exportedBundle/Restore/component.dmg",
+                    b"metal",
+                )
+            bundle = root / "mlxfast.js"
+            bundle.write_bytes(b"#!/usr/bin/env bun\n")
+            run_args = args(
+                root / "state",
+                aws_mac_metal_toolchain_archive=str(metal),
+                aws_mac_mlxfast_bundle=str(bundle),
+            )
+            node = {
+                "student": "fern",
+                "instance_id": "i-fern",
+                "public_ip": "198.51.100.1",
+            }
+
+            with (
+                patch.object(aws_mac_backend, "_wait_ssh"),
+                patch.object(aws_mac_backend, "_ssh") as ssh,
+            ):
+                aws_mac_backend._prepare_node(run_args, root, node, archive)
+
+        calls = ssh.call_args_list
+        commands = [call.args[2] for call in calls]
+        upload = commands.index(
+            "umask 077; cat > /tmp/senpai-setup.sh; "
+            "chmod 0700 /tmp/senpai-setup.sh"
+        )
+        execute = next(
+            index
+            for index, command in enumerate(commands)
+            if "/bin/bash /tmp/senpai-setup.sh </dev/null" in command
+        )
+        reconnect = next(
+            index
+            for index, command in enumerate(commands)
+            if command.startswith(
+                "/Users/ec2-user/.senpai/venv/bin/python -c"
+            )
+        )
+
+        self.assertEqual(
+            calls[upload].kwargs["input_bytes"],
+            _remote_setup_script(run_args),
+        )
+        self.assertIn("trap 'rm -f /tmp/senpai-setup.sh' EXIT", commands[execute])
+        self.assertIn("import openhands.sdk, weave_openhands", commands[reconnect])
+        self.assertLess(upload, execute)
+        self.assertLess(execute, reconnect)
+        self.assertNotIn("/bin/bash -s", commands)
+
     def test_instance_launch_is_pinned_to_the_mapped_dedicated_host(self):
         host = mac_host("h-a1", "fern")
         plan = AwsMacPlan(
