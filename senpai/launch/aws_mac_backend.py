@@ -784,7 +784,10 @@ PLAYWRIGHT_BROWSERS_PATH={REMOTE_BROWSER_ROOT} uvx --from playwright==1.55.0 pla
 chromium_path=$(find {REMOTE_BROWSER_ROOT} -type f -path '*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium' -print -quit)
 test -x "$chromium_path"
 sudo mkdir -p /usr/local/bin
-sudo ln -sf "$chromium_path" /usr/local/bin/chromium
+sudo rm -f /usr/local/bin/chromium
+printf '%s\\n' '#!/bin/sh' 'exec "'"$chromium_path"'" "$@"' | sudo tee /usr/local/bin/chromium >/dev/null
+sudo chmod 0755 /usr/local/bin/chromium
+/usr/local/bin/chromium --version
 role_home=$(mktemp -d)
 HOME="$role_home" {REMOTE_VENV}/bin/python {REMOTE_SOURCE}/scripts/senpai-browser-smoke-test.py
 rm -rf "$role_home"
