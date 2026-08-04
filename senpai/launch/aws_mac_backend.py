@@ -755,7 +755,7 @@ if ! command -v brew >/dev/null; then
   NONINTERACTIVE=1 /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"
 fi
 eval \"$(/opt/homebrew/bin/brew shellenv)\"
-brew install uv gh gettext cmake jq bun
+brew install uv gh gettext cmake jq bun tmux
 command -v jq >/dev/null
 jq -n -e 'true' >/dev/null
 sudo mkdir -p /usr/local/libexec /usr/local/bin
@@ -789,8 +789,19 @@ printf '%s\\n' '#!/bin/sh' 'exec "'"$chromium_path"'" "$@"' | sudo tee /usr/loca
 sudo chmod 0755 /usr/local/bin/chromium
 /usr/local/bin/chromium --version
 role_home=$(mktemp -d)
+tmux_socket="senpai-smoke-$$"
+cleanup_role_runtime() {{
+  HOME="$role_home" tmux -L "$tmux_socket" kill-server >/dev/null 2>&1 || true
+  rm -rf "$role_home"
+}}
+trap cleanup_role_runtime EXIT
+HOME="$role_home" tmux -V
+HOME="$role_home" tmux -L "$tmux_socket" -f /dev/null new-session -d -s smoke /bin/sleep 30
+HOME="$role_home" tmux -L "$tmux_socket" has-session -t smoke
+HOME="$role_home" tmux -L "$tmux_socket" kill-server
 HOME="$role_home" {REMOTE_VENV}/bin/python {REMOTE_SOURCE}/scripts/senpai-browser-smoke-test.py
 rm -rf "$role_home"
+trap - EXIT
 {REMOTE_VENV}/bin/python -c 'import openhands.sdk, weave_openhands'
 xcrun -sdk macosx metal --version
 """.encode()
