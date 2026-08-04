@@ -10,6 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from zipfile import ZipFile
 
 from k8s import aws_mac as aws_mac_cli
 from senpai.launch import aws_mac_backend
@@ -19,6 +20,7 @@ from senpai.launch.aws_mac_backend import (
     _cleanup,
     _csv,
     _launchd_canary,
+    _metal_toolchain_archive,
     _native_payload,
     _resolve_ami,
     _resolve_hosts,
@@ -195,6 +197,45 @@ class AwsMacInputTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "one host per student"):
             distribute_roles([student("fern")], hosts)
 
+    def test_metal_toolchain_archive_is_required_and_has_one_exported_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(ValueError, "is required"):
+                _metal_toolchain_archive(SimpleNamespace())
+
+            invalid = root / "invalid.zip"
+            invalid.write_bytes(b"not a zip")
+            with self.assertRaisesRegex(RuntimeError, "not a zip file"):
+                _metal_toolchain_archive(
+                    SimpleNamespace(
+                        aws_mac_metal_toolchain_archive=str(invalid),
+                    )
+                )
+
+            wrong_shape = root / "wrong-shape.zip"
+            with ZipFile(wrong_shape, "w") as archive:
+                archive.writestr("README.txt", b"no exported bundle")
+            with self.assertRaisesRegex(RuntimeError, "exactly one"):
+                _metal_toolchain_archive(
+                    SimpleNamespace(
+                        aws_mac_metal_toolchain_archive=str(wrong_shape),
+                    )
+                )
+
+            artifact = root / "MetalToolchain.zip"
+            with ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "MetalToolchain-17F109.exportedBundle/Restore/component.dmg",
+                    b"metal",
+                )
+
+            resolved = _metal_toolchain_archive(
+                SimpleNamespace(
+                    aws_mac_metal_toolchain_archive=str(artifact),
+                )
+            )
+            self.assertEqual(resolved, artifact.resolve())
+
 
 class AwsMacInfrastructureValidationTests(unittest.TestCase):
     def test_launchd_canary_reconnects_before_removing_the_system_service(self):
@@ -241,7 +282,7 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
         self.assertIn("MLXFAST_BENCHMARK_REF='eigenlabs/mlxfast-challenge'", script)
         self.assertIn("mlxfast version", script)
 
-    def test_remote_setup_synchronizes_clock_before_apple_download(self):
+    def test_remote_setup_imports_the_supplied_metal_toolchain(self):
         script = _remote_setup_script(
             SimpleNamespace(
                 repo_url="https://github.com/wandb/senpai.git",
@@ -250,19 +291,33 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
         ).decode()
 
         time_sync = "sudo /usr/bin/sntp -sS -t 10 169.254.169.123"
-        metal_download = "xcodebuild -downloadComponent MetalToolchain"
+        metal_import = "xcodebuild -importComponent metalToolchain -importPath"
         self.assertIn(time_sync, script)
-        self.assertLess(script.index(time_sync), script.index(metal_download))
+        self.assertIn("ditto -x -k /tmp/senpai-MetalToolchain.zip", script)
+        self.assertIn(metal_import, script)
+        self.assertNotIn("-downloadComponent", script)
+        self.assertLess(script.index(time_sync), script.index(metal_import))
+        self.assertLess(
+            script.index(metal_import),
+            script.index("xcrun -sdk macosx metal --version"),
+        )
 
-    def test_each_prepared_node_receives_the_local_mlxfast_bundle(self):
+    def test_each_prepared_node_receives_each_local_artifact_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             archive = root / "Xcode.zip"
             archive.write_bytes(b"xcode")
+            metal = root / "MetalToolchain.zip"
+            with ZipFile(metal, "w") as contents:
+                contents.writestr(
+                    "MetalToolchain-17F109.exportedBundle/Restore/component.dmg",
+                    b"metal",
+                )
             bundle = root / "mlxfast.js"
             bundle.write_bytes(b"#!/usr/bin/env bun\n")
             run_args = args(
                 root / "state",
+                aws_mac_metal_toolchain_archive=str(metal),
                 aws_mac_mlxfast_bundle=str(bundle),
             )
             node = {
@@ -278,7 +333,14 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
                 aws_mac_backend._prepare_node(run_args, root, node, archive)
 
         commands = [call.args[2] for call in ssh.call_args_list]
-        self.assertIn("umask 077; cat > /tmp/senpai-mlxfast.js", commands)
+        self.assertEqual(
+            commands.count("umask 077; cat > /tmp/senpai-MetalToolchain.zip"),
+            1,
+        )
+        self.assertEqual(
+            commands.count("umask 077; cat > /tmp/senpai-mlxfast.js"),
+            1,
+        )
 
     def test_instance_launch_is_pinned_to_the_mapped_dedicated_host(self):
         host = mac_host("h-a1", "fern")

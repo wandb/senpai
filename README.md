@@ -371,9 +371,20 @@ The backend creates and terminates EC2 instances, but never releases the
 Dedicated Hosts.
 
 Use a clean checkout at the exact committed revision being launched. The base
-macOS AMI does not contain full Xcode, so provide either a local Xcode app or a
-prepared `ditto` zip. Each selected host also needs a public subnet in its own
-Availability Zone and an existing security group in the same VPC.
+macOS AMI does not contain full Xcode or the Metal toolchain. Provide either a
+local Xcode app or a prepared `ditto` zip, plus a zip containing exactly one
+Metal `*.exportedBundle`. Launch imports that local artifact instead of relying
+on Apple's component catalog. Each selected host also needs a public subnet in
+its own Availability Zone and an existing security group in the same VPC.
+
+Package the directory produced by Xcode's component export without changing
+its bundle layout:
+
+```bash
+ditto -c -k --sequesterRsrc --keepParent \
+  /path/to/MetalToolchain-17F109.exportedBundle \
+  /path/to/MetalToolchain.zip
+```
 
 ```bash
 tag=first-aws-mac-run
@@ -394,6 +405,7 @@ launch_args=(
   --aws_mac_subnet_ids us-east-1a=subnet-A,us-east-1b=subnet-B
   --aws_mac_security_group_id sg-EXAMPLE
   --aws_mac_xcode_archive /absolute/path/to/Xcode.zip
+  --aws_mac_metal_toolchain_archive /absolute/path/to/MetalToolchain.zip
   --aws_mac_mlxfast_bundle "$HOME/.local/share/mlxfast/mlxfast.js"
   --aws_mac_official_submit
 )
@@ -403,10 +415,11 @@ uv run python k8s/launch.py "${launch_args[@]}"
 ```
 
 Preflight is read-only: it validates the exact source revision, Apple Silicon
-AMI, host availability and capacity, subnet placement, security group, and
-Xcode source. Launch creates an ephemeral SSH key, temporarily permits the
-operator's IPv4 `/32`, validates one native canary, prepares the remaining Macs
-in parallel, and holds every role at a fleet-wide start gate before opening it.
+AMI, host availability and capacity, subnet placement, security group, Xcode
+source, and Metal toolchain archive. Launch creates an ephemeral SSH key,
+temporarily permits the operator's IPv4 `/32`, validates one native canary,
+prepares the remaining Macs in parallel, and holds every role at a fleet-wide
+start gate before opening it.
 With `--aws_mac_official_submit`, the launcher also requires
 `MLXFAST_API_TOKEN` and gives every active role official dispatch capability.
 Coordinate submissions so students send distinct, validated candidates rather

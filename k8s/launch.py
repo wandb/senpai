@@ -145,6 +145,7 @@ class Args:
     aws_mac_security_group_id: str = ""  # existing SSH security group
     aws_mac_xcode_app: str = "/Applications/Xcode.app"  # full local Xcode copied to fresh Macs
     aws_mac_xcode_archive: str = ""  # optional prepared Xcode zip; avoids re-archiving
+    aws_mac_metal_toolchain_archive: str = ""  # exported Metal toolchain bundle zip
     aws_mac_mlxfast_bundle: str = "~/.local/share/mlxfast/mlxfast.js"  # local CLI bundle installed on every Mac
     aws_mac_official_submit: bool = False  # give every active role the MLXFast submission token
     dry_run: bool = False  # render manifests only: do not apply them or validate credentials
