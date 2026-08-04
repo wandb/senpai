@@ -67,6 +67,8 @@ aws_mac_security_group_id: ""
 # A full local Xcode copied to fresh base AMIs before native role startup.
 aws_mac_xcode_app: /Applications/Xcode.app
 aws_mac_xcode_archive: ""
+# Required zip containing one exported Metal toolchain bundle.
+aws_mac_metal_toolchain_archive: ""
 aws_mac_mlxfast_bundle: ~/.local/share/mlxfast/mlxfast.js
 # When enabled, every active role receives MLXFAST_API_TOKEN for official dispatch.
 aws_mac_official_submit: false

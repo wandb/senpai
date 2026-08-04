@@ -18,7 +18,8 @@ import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from zipfile import BadZipFile, ZipFile
 
 from .aws_backend import (
     AwsCommandError,
@@ -42,6 +43,7 @@ REMOTE_SOURCE = f"{REMOTE_HOME}/senpai-source"
 REMOTE_VENV = f"{REMOTE_HOME}/.senpai/venv"
 REMOTE_BROWSER_ROOT = f"{REMOTE_HOME}/.senpai/ms-playwright"
 REMOTE_RUN_ROOT = f"{REMOTE_HOME}/.senpai/native"
+REMOTE_METAL_TOOLCHAIN_ARCHIVE = "/tmp/senpai-MetalToolchain.zip"
 DEFAULT_MLXFAST_BUNDLE = "~/.local/share/mlxfast/mlxfast.js"
 MAC_ROOT_IOPS = 10_000
 MAC_ROOT_THROUGHPUT = 400
@@ -101,6 +103,35 @@ def _student_specs(role_specs: list[RoleSpec]) -> list[RoleSpec]:
 
 def _advisor_spec(role_specs: list[RoleSpec]) -> RoleSpec | None:
     return next((spec for spec in role_specs if spec.role == "advisor"), None)
+
+
+def _metal_toolchain_archive(args) -> Path:
+    configured = getattr(args, "aws_mac_metal_toolchain_archive", "")
+    if not configured:
+        raise ValueError("--aws_mac_metal_toolchain_archive is required")
+    archive = Path(configured).expanduser().resolve()
+    if not archive.is_file():
+        raise RuntimeError(
+            f"Prepared Metal toolchain archive was not found at {archive}"
+        )
+    try:
+        with ZipFile(archive) as contents:
+            bundle_roots = {
+                parts[0]
+                for name in contents.namelist()
+                if (parts := PurePosixPath(name).parts)
+                and parts[0].endswith(".exportedBundle")
+            }
+    except BadZipFile as error:
+        raise RuntimeError(
+            f"Prepared Metal toolchain archive is not a zip file: {archive}"
+        ) from error
+    if len(bundle_roots) != 1:
+        raise RuntimeError(
+            "Prepared Metal toolchain archive must contain exactly one "
+            "top-level .exportedBundle"
+        )
+    return archive
 
 
 def distribute_roles(
@@ -319,6 +350,7 @@ def preflight_aws_mac(args, role_specs: list[RoleSpec]) -> AwsMacPlan:
         xcode = Path(args.aws_mac_xcode_app).expanduser().resolve()
         if not (xcode / "Contents" / "Developer").is_dir():
             raise RuntimeError(f"Full local Xcode was not found at {xcode}")
+    _metal_toolchain_archive(args)
     mlxfast_bundle = Path(
         getattr(args, "aws_mac_mlxfast_bundle", DEFAULT_MLXFAST_BUNDLE)
     ).expanduser().resolve()
@@ -706,8 +738,13 @@ fi
 sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 sudo xcodebuild -license accept
 sudo xcodebuild -runFirstLaunch
-xcodebuild -downloadComponent MetalToolchain
-rm -f /tmp/senpai-Xcode.zip
+metal_root=$(mktemp -d /tmp/senpai-metal-toolchain.XXXXXX)
+ditto -x -k {REMOTE_METAL_TOOLCHAIN_ARCHIVE} "$metal_root"
+set -- "$metal_root"/*.exportedBundle
+test "$#" -eq 1
+test -d "$1"
+xcodebuild -importComponent metalToolchain -importPath "$1"
+rm -rf "$metal_root" {REMOTE_METAL_TOOLCHAIN_ARCHIVE} /tmp/senpai-Xcode.zip
 if ! command -v brew >/dev/null; then
   NONINTERACTIVE=1 /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"
 fi
@@ -746,7 +783,7 @@ role_home=$(mktemp -d)
 HOME="$role_home" {REMOTE_VENV}/bin/python {REMOTE_SOURCE}/scripts/senpai-browser-smoke-test.py
 rm -rf "$role_home"
 {REMOTE_VENV}/bin/python -c 'import openhands.sdk, weave_openhands'
-xcrun -sdk macosx metal -v
+xcrun -sdk macosx metal --version
 """.encode()
 
 
@@ -765,6 +802,15 @@ def _prepare_node(args, run_dir: Path, node: dict, archive: Path) -> None:
             run_dir,
             node,
             "umask 077; cat > /tmp/senpai-Xcode.zip",
+            input_file=source,
+            timeout=args.aws_data_timeout_s,
+        )
+    metal_toolchain_archive = _metal_toolchain_archive(args)
+    with metal_toolchain_archive.open("rb") as source:
+        _ssh(
+            run_dir,
+            node,
+            f"umask 077; cat > {REMOTE_METAL_TOOLCHAIN_ARCHIVE}",
             input_file=source,
             timeout=args.aws_data_timeout_s,
         )
