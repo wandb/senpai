@@ -357,6 +357,7 @@ def _role_environment(plan: NativeLaunchPlan, role: NativeRolePlan) -> dict[str,
         "SENPAI_TMPDIR": str(role.tmp_root),
         "SENPAI_UMASK": "0077",
         "SENPAI_WORKDIR": str(role.workdir),
+        "TMUX_TMPDIR": str(role.tmp_root),
         "TMPDIR": str(role.tmp_root),
     }
 

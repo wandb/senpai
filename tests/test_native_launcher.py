@@ -39,10 +39,10 @@ def args(root: Path, **overrides):
     return SimpleNamespace(**values)
 
 
-def student(secret: str = "service-secret") -> RoleSpec:
+def student(secret: str = "service-secret", *, name: str = "fern") -> RoleSpec:
     return RoleSpec(
         role="student",
-        name="fern",
+        name=name,
         env={
             "PROBLEM_DIR": "target",
             "REPO_REVISION": "a" * 40,
@@ -78,6 +78,20 @@ class NativePlanTests(unittest.TestCase):
         self.assertEqual(role.log_root.name, "logs")
         self.assertEqual(role.state_root.name, "state")
         self.assertTrue(role.lease.is_relative_to(role.state_root))
+
+    def test_roles_get_distinct_tmux_socket_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = plan_native(
+                args(Path(tmp) / "runs"),
+                [student(), student(name="tanjiro")],
+            )
+
+        socket_roots = {
+            native_backend._role_environment(plan, role)["TMUX_TMPDIR"]
+            for role in plan.roles
+        }
+        self.assertEqual(socket_roots, {str(role.tmp_root) for role in plan.roles})
+        self.assertEqual(len(socket_roots), 2)
 
     def test_preflight_requires_apple_silicon_before_host_mutation(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(
@@ -194,6 +208,9 @@ class NativeLaunchTests(unittest.TestCase):
             )
             self.assertEqual(
                 descriptor["environment"]["SENPAI_LOGDIR"], str(role.state_root)
+            )
+            self.assertEqual(
+                descriptor["environment"]["TMUX_TMPDIR"], str(role.tmp_root)
             )
             command_path = descriptor["environment"]["PATH"].split(os.pathsep)
             self.assertIn("/opt/homebrew/bin", command_path)
