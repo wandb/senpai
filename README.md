@@ -423,8 +423,11 @@ prepares the remaining Macs in parallel, and holds every role at a fleet-wide
 start gate before opening it.
 Host preparation installs tmux and Chromium and smoke-tests both with a fresh
 role-like `HOME`, matching the private-home environment used by native roles.
-Each native role also has a private tmux socket root, so co-located roles and
-their recursive subagents cannot attach to another role's tmux server.
+Each native role also has a private, shortened tmux socket root under
+`~/.senpai/t`. This keeps macOS Unix-socket paths within the platform limit
+while giving co-located roles and their recursive subagents separate tmux
+namespaces. All native roles still run under the configured Unix user; this is
+namespace isolation, not a hostile-process security boundary.
 With `--aws_mac_official_submit`, the launcher also requires
 `MLXFAST_API_TOKEN` and gives every active role official dispatch capability.
 Coordinate submissions so students send distinct, validated candidates rather

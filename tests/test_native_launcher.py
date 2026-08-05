@@ -61,7 +61,24 @@ def create_runner_checkout(_source: Path, workdir: Path, _revision: str) -> None
     (workdir / "k8s" / "native.py").write_text("# native runner\n")
 
 
-class NativePlanTests(unittest.TestCase):
+class NativeTmuxTestCase(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.tmux_tmp = tempfile.TemporaryDirectory(
+            prefix="senpai-tmux-test-",
+            dir="/tmp",
+        )
+        self.tmux_root_patch = patch.object(
+            native_backend,
+            "DEFAULT_NATIVE_TMUX_ROOT",
+            str(Path(self.tmux_tmp.name) / "t"),
+        )
+        self.tmux_root_patch.start()
+        self.addCleanup(self.tmux_root_patch.stop)
+        self.addCleanup(self.tmux_tmp.cleanup)
+
+
+class NativePlanTests(NativeTmuxTestCase):
     def test_plan_gives_every_role_private_roots_and_a_launchd_label(self):
         with tempfile.TemporaryDirectory() as tmp:
             plan = plan_native(args(Path(tmp) / "runs"), [student()])
@@ -90,8 +107,52 @@ class NativePlanTests(unittest.TestCase):
             native_backend._role_environment(plan, role)["TMUX_TMPDIR"]
             for role in plan.roles
         }
-        self.assertEqual(socket_roots, {str(role.tmp_root) for role in plan.roles})
+        self.assertEqual(socket_roots, {str(role.tmux_root) for role in plan.roles})
         self.assertEqual(len(socket_roots), 2)
+        self.assertTrue(
+            socket_roots.isdisjoint(str(role.tmp_root) for role in plan.roles)
+        )
+
+    def test_tmux_socket_root_stays_below_the_macos_path_limit(self):
+        with patch.object(
+            native_backend,
+            "DEFAULT_NATIVE_TMUX_ROOT",
+            "/Users/ec2-user/.senpai/t",
+        ):
+            for campaign in ("maple", "cedar"):
+                run_root = Path(
+                    f"/Users/ec2-user/.senpai/native/mlxfast-{campaign}-20260804"
+                )
+                for student_name in ("frieren", "tanjiro"):
+                    role_key = f"student-{campaign}-{student_name}"
+                    legacy_socket = (
+                        run_root / "roles" / role_key / "tmp" / "tmux-501" / "openhands"
+                    )
+                    socket = (
+                        native_backend._tmux_root(run_root, role_key)
+                        / f"tmux-{os.getuid()}"
+                        / "openhands"
+                    )
+                    with self.subTest(role=role_key):
+                        self.assertGreaterEqual(
+                            len(os.fsencode(legacy_socket)),
+                            native_backend.DARWIN_UNIX_SOCKET_PATH_MAX,
+                        )
+                        self.assertLess(
+                            len(os.fsencode(socket)),
+                            native_backend.DARWIN_UNIX_SOCKET_PATH_MAX,
+                        )
+
+    def test_tmux_socket_root_rejects_an_overlong_base(self):
+        with (
+            patch.object(
+                native_backend,
+                "DEFAULT_NATIVE_TMUX_ROOT",
+                "/private/tmp/" + ("x" * 100),
+            ),
+            self.assertRaisesRegex(ValueError, "too long for the macOS tmux socket"),
+        ):
+            native_backend._tmux_root(Path("/private/tmp/run"), "advisor")
 
     def test_preflight_requires_apple_silicon_before_host_mutation(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(
@@ -168,7 +229,7 @@ class NativePlanTests(unittest.TestCase):
         )
 
 
-class NativeLaunchTests(unittest.TestCase):
+class NativeLaunchTests(NativeTmuxTestCase):
     def test_launch_writes_private_state_and_secret_free_persistent_plist(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_args = args(Path(tmp) / "runs")
@@ -186,6 +247,7 @@ class NativeLaunchTests(unittest.TestCase):
 
             role = plan.roles[0]
             descriptor = json.loads(role.descriptor.read_text())
+            manifest = json.loads((plan.run_root / "manifest.json").read_text())
             plist = plistlib.loads(role.plist.read_bytes())
 
             self.assertEqual(role.descriptor.stat().st_mode & 0o777, 0o600)
@@ -196,6 +258,7 @@ class NativeLaunchTests(unittest.TestCase):
             self.assertEqual(role.home.stat().st_mode & 0o777, 0o700)
             self.assertEqual(role.state_root.stat().st_mode & 0o777, 0o700)
             self.assertEqual(role.log_root.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(role.tmux_root.stat().st_mode & 0o777, 0o700)
             self.assertEqual(role.workdir.stat().st_mode & 0o777, 0o700)
             self.assertEqual(plan.launch_gate.stat().st_mode & 0o777, 0o600)
             self.assertEqual(
@@ -210,8 +273,9 @@ class NativeLaunchTests(unittest.TestCase):
                 descriptor["environment"]["SENPAI_LOGDIR"], str(role.state_root)
             )
             self.assertEqual(
-                descriptor["environment"]["TMUX_TMPDIR"], str(role.tmp_root)
+                descriptor["environment"]["TMUX_TMPDIR"], str(role.tmux_root)
             )
+            self.assertEqual(manifest["roles"][0]["tmux_root"], str(role.tmux_root))
             command_path = descriptor["environment"]["PATH"].split(os.pathsep)
             self.assertIn("/opt/homebrew/bin", command_path)
             self.assertIn("/opt/homebrew/opt/gettext/bin", command_path)
@@ -288,6 +352,28 @@ class NativeLaunchTests(unittest.TestCase):
                 launch_native(run_args, [spec], plan, show_lifecycle=False)
 
             uninstall.assert_called_once_with(plan, plan.roles[0])
+            self.assertFalse(plan.run_root.exists())
+            self.assertFalse(plan.roles[0].tmux_root.exists())
+
+    def test_launch_preserves_a_preexisting_tmux_socket_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_args = args(Path(tmp) / "runs")
+            spec = student()
+            plan = plan_native(run_args, [spec])
+            role = plan.roles[0]
+            role.tmux_root.mkdir(parents=True)
+            marker = role.tmux_root / "stale-server"
+            marker.write_text("preserve")
+            with (
+                patch(
+                    "senpai.launch.native_backend._prepare_runner_workdir",
+                    side_effect=create_runner_checkout,
+                ),
+                self.assertRaisesRegex(RuntimeError, "tmux socket root already exists"),
+            ):
+                launch_native(run_args, [spec], plan, show_lifecycle=False)
+
+            self.assertEqual(marker.read_text(), "preserve")
             self.assertFalse(plan.run_root.exists())
 
     def test_distributed_launch_waits_for_leases_without_opening_gate(self):
@@ -407,9 +493,13 @@ class NativeLaunchTests(unittest.TestCase):
             )
 
 
-class NativeLifecycleTests(unittest.TestCase):
-    @staticmethod
-    def write_manifest(root: Path) -> tuple[Path, dict]:
+class NativeLifecycleTests(NativeTmuxTestCase):
+    def write_manifest(
+        self,
+        root: Path,
+        *,
+        include_tmux: bool = False,
+    ) -> tuple[Path, dict]:
         run_path = root / "mlxfast-r1"
         logs = run_path / "logs"
         logs.mkdir(parents=True)
@@ -434,6 +524,10 @@ class NativeLifecycleTests(unittest.TestCase):
                 }
             ],
         }
+        if include_tmux:
+            tmux_root = native_backend._tmux_root(run_path, "student-fern")
+            tmux_root.mkdir(parents=True)
+            manifest["roles"][0]["tmux_root"] = str(tmux_root)
         (run_path / "manifest.json").write_text(json.dumps(manifest))
         return run_path, manifest
 
@@ -480,6 +574,63 @@ class NativeLifecycleTests(unittest.TestCase):
 
             uninstall.assert_called_once_with("system", manifest["roles"][0])
             self.assertFalse(run_path.exists())
+
+    def test_terminate_removes_the_recorded_tmux_root_after_bootout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runs"
+            run_path, manifest = self.write_manifest(root, include_tmux=True)
+            tmux_root = Path(manifest["roles"][0]["tmux_root"])
+
+            def uninstall(_domain, _role):
+                self.assertTrue(tmux_root.exists())
+
+            with patch(
+                "senpai.launch.native_backend._uninstall_recorded_role",
+                side_effect=uninstall,
+            ):
+                terminate_native("mlxfast-r1", str(root))
+
+            self.assertFalse(tmux_root.exists())
+            self.assertFalse(run_path.exists())
+
+    def test_terminate_rejects_an_unexpected_tmux_root_and_preserves_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runs"
+            run_path, manifest = self.write_manifest(root)
+            unexpected = Path(tmp) / "do-not-delete"
+            unexpected.mkdir()
+            manifest["roles"][0]["tmux_root"] = str(unexpected)
+            (run_path / "manifest.json").write_text(json.dumps(manifest))
+
+            with (
+                patch("senpai.launch.native_backend._uninstall_recorded_role"),
+                self.assertRaisesRegex(RuntimeError, "unexpected tmux root"),
+            ):
+                terminate_native("mlxfast-r1", str(root))
+
+            self.assertTrue(unexpected.exists())
+            self.assertTrue(run_path.exists())
+
+    def test_terminate_does_not_delete_another_runs_valid_tmux_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runs"
+            run_path, manifest = self.write_manifest(root)
+            sibling = native_backend._tmux_root(
+                root / "another-run",
+                "student-fern",
+            )
+            sibling.mkdir(parents=True)
+            manifest["roles"][0]["tmux_root"] = str(sibling)
+            (run_path / "manifest.json").write_text(json.dumps(manifest))
+
+            with (
+                patch("senpai.launch.native_backend._uninstall_recorded_role"),
+                self.assertRaisesRegex(RuntimeError, "unexpected tmux root"),
+            ):
+                terminate_native("mlxfast-r1", str(root))
+
+            self.assertTrue(sibling.exists())
+            self.assertTrue(run_path.exists())
 
     def test_uninstall_boots_out_then_removes_the_root_launchdaemon(self):
         completed = SimpleNamespace(returncode=0, stdout="", stderr="")
