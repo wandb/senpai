@@ -295,6 +295,18 @@ class AwsPlanningTests(unittest.TestCase):
                 [student()],
             )
 
+    def test_gpu_aws_still_requires_a_positive_ttl(self):
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(
+            ValueError, "greater than 0"
+        ):
+            aws_backend._validate_aws_inputs(
+                args(
+                    aws_state_root=str(Path(tmp) / "state"),
+                    aws_ttl_hours=0,
+                ),
+                [student()],
+            )
+
     def test_ssh_access_is_restricted_to_one_ipv4_address(self):
         response = unittest.mock.MagicMock()
         response.__enter__.return_value.read.return_value = b"203.0.113.9\n"

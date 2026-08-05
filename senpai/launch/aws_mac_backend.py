@@ -327,8 +327,8 @@ def preflight_aws_mac(args, role_specs: list[RoleSpec]) -> AwsMacPlan:
         raise ValueError("AWS Mac owns its distributed launch gates")
     if args.aws_volume_gib < 200:
         raise ValueError("AWS Mac root volumes must be at least 200 GiB")
-    if args.aws_ttl_hours <= 0:
-        raise ValueError("--aws_ttl_hours must be positive")
+    if args.aws_ttl_hours < 0:
+        raise ValueError("--aws_ttl_hours must be non-negative for AWS Mac")
 
     run_dir = _state_dir(args.aws_state_root, args.tag)
     if run_dir.exists() or run_dir.is_symlink():
@@ -458,6 +458,8 @@ def _revoke_ssh(context: AwsContext, state: dict) -> None:
 
 
 def _user_data(ttl_hours: float) -> str:
+    if ttl_hours == 0:
+        return ""
     minutes = max(1, round(ttl_hours * 60))
     return f"""#!/bin/bash
 set -eu
@@ -473,6 +475,8 @@ def _run_instance(
     client_token: str,
 ) -> dict:
     name = f"{args.tag}-{host.student}"
+    user_data = _user_data(args.aws_ttl_hours)
+    shutdown_behavior = "terminate" if user_data else "stop"
     network = json.dumps(
         [
             {
@@ -532,9 +536,8 @@ def _run_instance(
         "--metadata-options",
         "HttpTokens=required,HttpEndpoint=enabled",
         "--instance-initiated-shutdown-behavior",
-        "terminate",
-        "--user-data",
-        _user_data(args.aws_ttl_hours),
+        shutdown_behavior,
+        *(("--user-data", user_data) if user_data else ()),
         "--tag-specifications",
         tags,
         "--client-token",
@@ -1312,9 +1315,11 @@ def launch_aws_mac(
                 state["ssh_authorize_started"] = False
                 state["ssh_authorized"] = False
                 _save_state(run_dir, state)
-            raise
-        state["ssh_authorized"] = True
-        _save_state(run_dir, state)
+            else:
+                raise
+        else:
+            state["ssh_authorized"] = True
+            _save_state(run_dir, state)
 
         group_by_host = {host.host_id: specs for host, specs in groups}
         canary_host, *remaining_hosts = plan.hosts

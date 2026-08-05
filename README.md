@@ -408,6 +408,7 @@ launch_args=(
   --aws_mac_metal_toolchain_archive /absolute/path/to/MetalToolchain.zip
   --aws_mac_mlxfast_bundle "$HOME/.local/share/mlxfast/mlxfast.js"
   --aws_mac_official_submit
+  --aws_ttl_hours 0
 )
 
 uv run python k8s/launch.py "${launch_args[@]}" --preflight_only
@@ -426,6 +427,13 @@ With `--aws_mac_official_submit`, the launcher also requires
 `MLXFAST_API_TOKEN` and gives every active role official dispatch capability.
 Coordinate submissions so students send distinct, validated candidates rather
 than duplicate jobs.
+
+AWS Mac alone accepts `--aws_ttl_hours 0` to omit the scheduled instance
+shutdown and make guest-initiated shutdowns stop rather than terminate the
+instance; a positive value retains the automatic termination backstop. Zero
+does not change explicit termination or release the Dedicated Hosts, so monitor
+the fleet and run `terminate` manually. The GPU AWS backend continues to
+require a positive TTL.
 
 ```bash
 uv run python k8s/aws_mac.py status first-aws-mac-run

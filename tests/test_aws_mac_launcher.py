@@ -27,11 +27,13 @@ from senpai.launch.aws_mac_backend import (
     _remote_setup_script,
     _run_instance,
     _subnet_map,
+    _user_data,
     _validate_network,
     _wait_instance,
     distribute_roles,
     launch_aws_mac,
     logs_aws_mac,
+    preflight_aws_mac,
     status_aws_mac,
 )
 from senpai.launch.aws_backend import AwsCommandError, AwsContext
@@ -196,6 +198,21 @@ class AwsMacInputTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "one host per student"):
             distribute_roles([student("fern")], hosts)
+
+    def test_ttl_zero_disables_shutdown_and_negative_values_are_rejected(self):
+        self.assertEqual(_user_data(0), "")
+        self.assertIn("/sbin/shutdown -h +150", _user_data(2.5))
+
+        run_args = args(
+            Path("/tmp/state"),
+            aws_ttl_hours=-1,
+            gpus_per_student=1,
+            data_dir="",
+            start_gate_path="",
+            aws_volume_gib=250,
+        )
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            preflight_aws_mac(run_args, [student("fern")])
 
     def test_metal_toolchain_archive_is_required_and_has_one_exported_bundle(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -476,6 +493,40 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
         self.assertEqual(node["instance_id"], "i-fern")
         self.assertEqual(node["host_id"], "h-a1")
         self.assertEqual(node["client_token"], "token-fern")
+        user_data = command[command.index("--user-data") + 1]
+        self.assertIn("/sbin/shutdown -h +1440", user_data)
+
+    def test_zero_ttl_omits_scheduled_shutdown_from_instance_launch(self):
+        host = mac_host("h-a1", "fern")
+        plan = AwsMacPlan(
+            context=AwsContext("us-east-1", "sandbox"),
+            account_id="770934259321",
+            ami_id="ami-mac",
+            root_device="/dev/sda1",
+            volume_gib=250,
+            security_group_id="sg-a1",
+            ssh_cidr="203.0.113.7/32",
+            hosts=(host,),
+        )
+        with patch.object(
+            aws_mac_backend,
+            "_aws_json",
+            return_value={"Instances": [{"InstanceId": "i-fern"}]},
+        ) as aws_json:
+            _run_instance(
+                args(Path("/tmp/state"), aws_ttl_hours=0),
+                plan,
+                host,
+                "senpai-key",
+                "token-fern",
+            )
+
+        command = aws_json.call_args.args
+        self.assertNotIn("--user-data", command)
+        self.assertEqual(
+            command[command.index("--instance-initiated-shutdown-behavior") + 1],
+            "stop",
+        )
 
     def test_instance_readiness_polling_uses_health_status_without_stock_waiters(self):
         instance = {
@@ -791,7 +842,13 @@ class AwsMacLaunchTests(unittest.TestCase):
                 ),
                 patch.object(aws_mac_backend, "_key_name", return_value="senpai-key"),
                 patch.object(aws_mac_backend, "_write_private_key", side_effect=write_key),
-                patch.object(aws_mac_backend, "_authorize_ssh"),
+                patch.object(
+                    aws_mac_backend,
+                    "_authorize_ssh",
+                    side_effect=AwsCommandError(
+                        "An error occurred (InvalidPermission.Duplicate)"
+                    ),
+                ),
                 patch.object(aws_mac_backend, "_run_instance", side_effect=run_instance),
                 patch.object(
                     aws_mac_backend,
@@ -862,6 +919,7 @@ class AwsMacLaunchTests(unittest.TestCase):
                 (root / "state" / "mlxfast-r1" / "state.json").read_text()
             )
             self.assertEqual(state["phase"], "running")
+            self.assertFalse(state["ssh_authorized"])
             self.assertEqual(len({node["client_token"] for node in state["nodes"]}), 2)
 
     def test_rollback_cleanup_terminates_instances_but_never_releases_hosts(self):
