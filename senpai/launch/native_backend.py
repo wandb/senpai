@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import grp
+import hashlib
 import json
 import os
 import platform
@@ -32,6 +33,7 @@ from .specs import (
 )
 
 DEFAULT_NATIVE_RUN_ROOT = "~/.senpai/native"
+DEFAULT_NATIVE_TMUX_ROOT = "~/.senpai/t"
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHD_PREFIX = "com.wandb.senpai"
 LAUNCHD_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]+")
@@ -45,6 +47,7 @@ MISSING_SERVICE_MARKERS = (
     "service is not loaded",
     "no such process",
 )
+DARWIN_UNIX_SOCKET_PATH_MAX = 104
 MACOS_COMMAND_PATHS = (
     "/opt/homebrew/bin",
     "/opt/homebrew/opt/gettext/bin",
@@ -68,6 +71,7 @@ class NativeRolePlan:
     log_root: Path
     state_root: Path
     tmp_root: Path
+    tmux_root: Path
     descriptor: Path
     plist: Path
     launchd_plist: Path
@@ -130,6 +134,25 @@ def _check_run_root_available(run_root: Path) -> None:
         raise RuntimeError(f"Native run already exists at {run_root}; use a new --tag")
 
 
+def _native_tmux_base() -> Path:
+    return Path(DEFAULT_NATIVE_TMUX_ROOT).expanduser().resolve()
+
+
+def _tmux_root(run_root: Path, role_key: str) -> Path:
+    """Return a stable, short socket root for one role."""
+    run_root = Path(run_root).expanduser().resolve()
+    identity = os.fsencode(run_root) + b"\0" + role_key.encode()
+    digest = hashlib.sha256(identity).hexdigest()[:16]
+    base = _native_tmux_base()
+    root = _path_beneath(base, digest)
+    socket = root / f"tmux-{os.getuid()}" / "openhands"
+    if len(os.fsencode(socket)) >= DARWIN_UNIX_SOCKET_PATH_MAX:
+        raise ValueError(
+            "Native home is too long for the macOS tmux socket path"
+        )
+    return root
+
+
 def plan_native(args, role_specs: list[RoleSpec]) -> NativeLaunchPlan:
     """Resolve a native launch without writing files or starting services."""
     validate_role_specs("Native", args.tag, role_specs)
@@ -142,6 +165,7 @@ def plan_native(args, role_specs: list[RoleSpec]) -> NativeLaunchPlan:
         raise ValueError("native_run_root must be outside the Senpai source checkout")
     _check_run_root_available(run_root)
     validate_writable_parent(run_root.parent, "Native run root")
+    validate_writable_parent(_native_tmux_base(), "Native tmux root")
     launch_gate = _path_beneath(run_root, "launch-gate")
     user_name = pwd.getpwuid(os.getuid()).pw_name
     group_name = grp.getgrgid(os.getgid()).gr_name
@@ -159,6 +183,7 @@ def plan_native(args, role_specs: list[RoleSpec]) -> NativeLaunchPlan:
                 log_root=_path_beneath(role_root, "logs"),
                 state_root=state_root,
                 tmp_root=_path_beneath(role_root, "tmp"),
+                tmux_root=_tmux_root(run_root, spec.key),
                 descriptor=_path_beneath(role_root, "role.json"),
                 plist=_path_beneath(role_root, "service.plist"),
                 launchd_plist=_launchd_plist_path(
@@ -171,6 +196,8 @@ def plan_native(args, role_specs: list[RoleSpec]) -> NativeLaunchPlan:
                 ),
             )
         )
+    if len({role.tmux_root for role in roles}) != len(roles):
+        raise RuntimeError("Native role tmux socket roots collided")
     return NativeLaunchPlan(
         tag=args.tag,
         run_root=run_root,
@@ -294,6 +321,16 @@ def preflight_native(args, role_specs: list[RoleSpec]) -> NativeLaunchPlan:
         raise RuntimeError(
             "Native LaunchDaemon plists already exist: " + ", ".join(installed)
         )
+    occupied_tmux_roots = [
+        str(role.tmux_root)
+        for role in plan.roles
+        if role.tmux_root.exists() or role.tmux_root.is_symlink()
+    ]
+    if occupied_tmux_roots:
+        raise RuntimeError(
+            "Native tmux socket roots already exist: "
+            + ", ".join(occupied_tmux_roots)
+        )
     return plan
 
 
@@ -357,7 +394,7 @@ def _role_environment(plan: NativeLaunchPlan, role: NativeRolePlan) -> dict[str,
         "SENPAI_TMPDIR": str(role.tmp_root),
         "SENPAI_UMASK": "0077",
         "SENPAI_WORKDIR": str(role.workdir),
-        "TMUX_TMPDIR": str(role.tmp_root),
+        "TMUX_TMPDIR": str(role.tmux_root),
         "TMPDIR": str(role.tmp_root),
     }
 
@@ -418,6 +455,16 @@ def _create_role_files(args, plan: NativeLaunchPlan, role: NativeRolePlan) -> No
     role.plist.chmod(0o600)
 
 
+def _create_tmux_root(role: NativeRolePlan) -> None:
+    _private_directory(role.tmux_root.parent)
+    try:
+        role.tmux_root.mkdir(mode=0o700)
+    except FileExistsError as error:
+        raise RuntimeError(
+            f"Native tmux socket root already exists: {role.tmux_root}"
+        ) from error
+
+
 def _write_manifest(plan: NativeLaunchPlan) -> None:
     _write_private_json(
         plan.run_root / "manifest.json",
@@ -432,6 +479,7 @@ def _write_manifest(plan: NativeLaunchPlan) -> None:
                     "plist": str(role.launchd_plist),
                     "stderr": str(role.stderr_log),
                     "stdout": str(role.stdout_log),
+                    "tmux_root": str(role.tmux_root),
                 }
                 for role in plan.roles
             ],
@@ -506,6 +554,22 @@ def _uninstall_recorded_role(domain: str, role: dict) -> None:
             f"{recorded}"
         )
     _uninstall_service(domain, label, expected)
+
+
+def _remove_tmux_root(path: str | Path, expected: Path) -> None:
+    base = _native_tmux_base()
+    recorded = Path(path)
+    root = recorded.resolve()
+    if (
+        recorded.is_symlink()
+        or recorded.parent.resolve() != base
+        or root.parent != base
+        or not re.fullmatch(r"[0-9a-f]{16}", root.name)
+        or root != expected.resolve()
+    ):
+        raise RuntimeError(f"Native manifest has unexpected tmux root: {path}")
+    if root.exists():
+        shutil.rmtree(root)
 
 
 def _lease_is_waiting_at_gate(path: Path) -> bool:
@@ -604,9 +668,12 @@ def launch_native(
     _check_run_root_available(plan.run_root)
     _private_directory(plan.run_root)
     attempted: list[NativeRolePlan] = []
+    created: list[NativeRolePlan] = []
     try:
         for role in plan.roles:
             _create_role_files(args, plan, role)
+            _create_tmux_root(role)
+            created.append(role)
         _write_manifest(plan)
         for role in plan.roles:
             attempted.append(role)
@@ -628,10 +695,16 @@ def launch_native(
                 cleanup_errors.append(str(cleanup_error))
         logs = _role_failure_logs(list(plan.roles))
         if not cleanup_errors:
-            try:
-                shutil.rmtree(plan.run_root)
-            except OSError as cleanup_error:
-                cleanup_errors.append(str(cleanup_error))
+            for role in created:
+                try:
+                    _remove_tmux_root(role.tmux_root, role.tmux_root)
+                except (OSError, RuntimeError) as cleanup_error:
+                    cleanup_errors.append(str(cleanup_error))
+            if not cleanup_errors:
+                try:
+                    shutil.rmtree(plan.run_root)
+                except OSError as cleanup_error:
+                    cleanup_errors.append(str(cleanup_error))
         if isinstance(error, Exception):
             detail = f"\n{logs}" if logs else ""
             if cleanup_errors:
@@ -730,7 +803,12 @@ def terminate_native(tag: str, run_root: str = DEFAULT_NATIVE_RUN_ROOT) -> None:
     for role in reversed(manifest["roles"]):
         try:
             _uninstall_recorded_role(manifest["domain"], role)
-        except RuntimeError as error:
+            if tmux_root := role.get("tmux_root"):
+                _remove_tmux_root(
+                    tmux_root,
+                    _tmux_root(path, role["key"]),
+                )
+        except (OSError, RuntimeError) as error:
             errors.append(str(error))
     if errors:
         raise RuntimeError(
