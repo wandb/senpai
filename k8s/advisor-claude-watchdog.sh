@@ -17,6 +17,7 @@ ADVISOR_CLAUDE_STALE_LOG_S="${ADVISOR_CLAUDE_STALE_LOG_S:-1200}"
 ADVISOR_CLAUDE_KILL_GRACE_S="${ADVISOR_CLAUDE_KILL_GRACE_S:-15}"
 ADVISOR_CLAUDE_SELF_PGREP_STALE_S="${ADVISOR_CLAUDE_SELF_PGREP_STALE_S:-300}"
 ADVISOR_CLAUDE_SELF_PGREP_PATTERNS="${ADVISOR_CLAUDE_SELF_PGREP_PATTERNS:-wandb_sparse_val.py}"
+ADVISOR_CLAUDE_TASK_OUTPUT_WAIT_STALE_S="${ADVISOR_CLAUDE_TASK_OUTPUT_WAIT_STALE_S:-300}"
 
 # Read log mtimes portably so stale-output checks work on Linux and macOS.
 advisor_file_mtime_s() {
@@ -113,11 +114,87 @@ advisor_self_pgrep_wait_pids() {
     done | sort -nu
 }
 
+# Utility-only descendants, such as sleep/grep/cat, do not mean real work is
+# still running below a Claude task-output waiter.
+advisor_real_descendant_process_exists() {
+    local root_pid="$1" pid comm
+
+    for pid in $(advisor_descendant_pids "$root_pid"); do
+        comm=$(ps -o comm= -p "$pid" 2>/dev/null | awk '{print $1}' || true)
+        [ -n "$comm" ] || continue
+        case "$comm" in
+            awk|basename|cat|cut|dirname|grep|head|pgrep|ps|sed|sleep|sort|stat|tail|tee|test|tr|wc)
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+advisor_is_task_output_wait_line() {
+    local line="$1"
+
+    case "$line" in
+        *"/tmp/claude-"*"/tasks/"*".output"*) ;;
+        *) return 1 ;;
+    esac
+
+    case "$line" in
+        *"until "*"grep -q "*"sleep "*"done"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+advisor_extract_task_output_path() {
+    local line="$1"
+
+    printf '%s\n' "$line" |
+        awk '
+            {
+                for (i = 1; i <= NF; i++) {
+                    token = $i
+                    sub(/[;)]*$/, "", token)
+                    if (token ~ /^\/tmp\/claude-[^[:space:]]*\/tasks\/[^[:space:]]*[.]output$/) {
+                        print token
+                        exit
+                    }
+                }
+            }
+        '
+}
+
+# Find Claude tool-output waiters whose output file stopped changing and whose
+# real worker process is gone. This catches stale TaskOutput waits without
+# binding the watchdog to one specific command or one specific error string.
+advisor_stale_task_output_wait_pids() {
+    local root_pid="$1" now_ts="$2"
+    local pid line output_path output_mtime output_age
+
+    for pid in $(advisor_tree_pids "$root_pid"); do
+        line=$(ps -o comm= -o args= -p "$pid" 2>/dev/null || true)
+        [ -n "$line" ] || continue
+        advisor_is_task_output_wait_line "$line" || continue
+
+        output_path=$(advisor_extract_task_output_path "$line")
+        [ -n "$output_path" ] && [ -f "$output_path" ] || continue
+
+        output_mtime=$(advisor_file_mtime_s "$output_path" 2>/dev/null || printf '%s' "$now_ts")
+        output_age=$((now_ts - output_mtime))
+        [ "$output_age" -ge "$ADVISOR_CLAUDE_TASK_OUTPUT_WAIT_STALE_S" ] || continue
+
+        advisor_real_descendant_process_exists "$pid" && continue
+        printf '%s\n' "$pid"
+    done | sort -nu
+}
+
 # Run Claude under supervision and return 124 when the outer loop should re-poll.
 run_advisor_claude_with_watchdog() {
     run_senpai_claude "$@" &
     local claude_pid=$!
-    local start_ts now_ts runtime log_mtime log_age reason rc self_pgrep_wait_pids
+    local start_ts now_ts runtime log_mtime log_age reason rc self_pgrep_wait_pids task_output_wait_pids
     local watchdog_fired=0
     start_ts=$(date +%s)
 
@@ -138,6 +215,13 @@ run_advisor_claude_with_watchdog() {
             else
                 echo "=== Advisor Claude watchdog: saw self-matching pgrep wait; waiting ${runtime}/${ADVISOR_CLAUDE_SELF_PGREP_STALE_S}s before intervention ==="
             fi
+        fi
+
+        task_output_wait_pids=$(advisor_stale_task_output_wait_pids "$claude_pid" "$now_ts")
+        if [ -n "$task_output_wait_pids" ]; then
+            advisor_log_watchdog_trigger "=== Advisor Claude watchdog: stopping stale task-output wait children after ${runtime}s: $(printf '%s' "$task_output_wait_pids" | tr '\n' ' ')==="
+            advisor_stop_process_trees "$task_output_wait_pids"
+            watchdog_fired=1
         fi
 
         [ "$runtime" -lt "$ADVISOR_CLAUDE_MIN_RUNTIME_S" ] && continue
