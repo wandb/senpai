@@ -236,13 +236,9 @@ def validate_model_config(args: Args, *, has_students: bool = True) -> None:
                 )
             continue
         if not supports_reasoning_effort(model, effort):
-            requirement = (
-                "an openai/gpt-5.6* model"
-                if effort == "ultra"
-                else "an openai/gpt-5.6* or supported Anthropic model"
-            )
             sys.exit(
-                f"ERROR: --{name}_reasoning_effort={effort} requires {requirement}"
+                f"ERROR: --{name}_reasoning_effort={effort} is unsupported for "
+                f"{model}"
             )
 
 
@@ -471,6 +467,8 @@ def main():
             provider_api_keys["openai"] = resolve_openai_api_key(DOTENV_PATH)
         exa_api_key = resolve_exa_api_key(DOTENV_PATH)
         wandb_api_key = resolve_wandb_api_key(DOTENV_PATH)
+        if "wandb" in model_providers:
+            provider_api_keys["wandb"] = wandb_api_key
         hf_token = resolve_optional_secret(DOTENV_PATH, "HF_TOKEN")
         if args.backend == "aws-mac" and args.aws_mac_official_submit:
             mlxfast_api_token = resolve_optional_secret(

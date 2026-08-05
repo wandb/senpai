@@ -151,10 +151,11 @@ timeout_minutes: 30
 max_epochs: 50
 ```
 
-OpenHands uses LiteLLM, so LLM provider names are required as prefixes. 
-
-If using W&B Inference use `wandb/` provider as the provider. For example `wandb/zai-org/GLM-5.2`, senpai
-uses `WANDB_API_KEY` for auth.
+W&B Inference uses LiteLLM's native `wandb/` provider. For example, set every
+model profile to `wandb/zai-org/GLM-5.2` with reasoning effort `max`. Senpai
+uses `WANDB_API_KEY`, routes requests through the W&B chat endpoint, explicitly
+enables GLM thinking, and sends
+`OpenAI-Project: <wandb_entity>/<wandb_project>` on every request.
 
 The defaults in `senpai.yaml` describe W&B's deployment and should not be copied unchanged into another environment. Every setting can also be overridden on the command line. `--tag` and `--target_repo_url` are required unless your chosen config file supplies them.
 
