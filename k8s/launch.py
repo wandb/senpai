@@ -137,7 +137,7 @@ class Args:
     aws_ssh_cidr: str = ""  # SSH source IPv4 /32; empty discovers the launcher's public IP
     aws_ready_timeout_s: int = 1800  # wait for EC2, cloud-init, Docker, and GPU readiness
     aws_data_timeout_s: int = 7200  # maximum time to stream data_dir to the host
-    aws_ttl_hours: float = 24.0  # instance self-termination cost backstop
+    aws_ttl_hours: float = 24.0  # self-termination backstop; 0 disables it only on AWS Mac
     native_run_root: str = "~/.senpai/native"  # native macOS role state and logs
     native_ready_timeout_s: int = 600  # wait for native supervisor leases
     aws_mac_host_ids: str = ""  # existing Dedicated Host IDs, one per student

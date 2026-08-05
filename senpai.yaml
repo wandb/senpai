@@ -55,6 +55,7 @@ aws_state_root: ~/.senpai/aws
 aws_ssh_cidr: ""
 aws_ready_timeout_s: 1800
 aws_data_timeout_s: 7200
+# AWS Mac accepts 0 to disable scheduled shutdown; GPU AWS requires a positive TTL.
 aws_ttl_hours: 24.0
 
 # AWS Mac reuses allocated Dedicated Hosts and runs roles natively on macOS.
