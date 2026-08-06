@@ -5,8 +5,10 @@ from io import StringIO
 from types import SimpleNamespace
 
 import pytest
+from openhands.sdk import Agent, LLM
 from openhands.sdk.conversation import ConversationExecutionStatus
 from openhands.sdk.llm import Message, TextContent
+from pydantic import SecretStr
 
 import senpai_agent.openhands_runner as runner
 from senpai_agent.openhands_runner import (
@@ -233,6 +235,58 @@ def test_student_requests_persistent_storage_for_monitor_wake(
     }
     assert delegation[0].role == "student"
     assert delegation[-1] is None
+
+
+def test_named_agent_compaction_uses_its_own_provider(tmp_path, monkeypatch):
+    captured = {}
+    named_llm = LLM(
+        model="wandb/zai-org/GLM-5.2",
+        api_key=SecretStr("test-key"),
+        reasoning_effort="max",
+        **runner.model_runtime_configuration(
+            "wandb/zai-org/GLM-5.2",
+            "max",
+            wandb_entity="research-team",
+            wandb_project="mlxfast",
+        ),
+    )
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            captured["condenser"] = kwargs["agent"].condenser
+            self.state = SimpleNamespace(
+                execution_status=ConversationExecutionStatus.FINISHED
+            )
+
+        def send_message(self, _prompt):
+            pass
+
+        async def arun(self):
+            pass
+
+        def close(self):
+            pass
+
+    isolate_agent_discovery(monkeypatch, runner)
+    monkeypatch.setattr(runner, "find_named_agent", lambda *_: object())
+    monkeypatch.setattr(
+        runner,
+        "agent_definition_to_factory",
+        lambda *_args, **_kwargs: lambda _parent_llm: Agent(
+            llm=named_llm,
+            tools=[],
+        ),
+    )
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+
+    config = runtime_config(
+        tmp_path,
+        agent_name="explore",
+        local_condenser_max_events=180,
+    )
+    assert run_openhands("named task", config) == 0
+    assert captured["condenser"].max_size == 180
 
 
 def test_github_tokens_never_reach_the_agent_environment(

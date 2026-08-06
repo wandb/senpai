@@ -138,6 +138,7 @@ fast_model: openai/gpt-5.6-luna
 fast_reasoning_effort: high
 frontier_model: openai/gpt-5.6-sol
 frontier_reasoning_effort: max
+local_condenser_max_events: 80
 
 pvc_claim_name: your-existing-pvc
 pvc_mount_path: /mnt/data
@@ -156,6 +157,10 @@ model profile to `wandb/zai-org/GLM-5.2` with reasoning effort `max`. Senpai
 uses `WANDB_API_KEY`, routes requests through the W&B chat endpoint, explicitly
 enables GLM thinking, and sends
 `OpenAI-Project: <wandb_entity>/<wandb_project>` on every request.
+Providers without native token-aware compaction use
+`local_condenser_max_events` as an event-count fallback. Tool-heavy model turns
+can produce several events, so tune this against the observed event stream,
+not as a literal turn count.
 
 The defaults in `senpai.yaml` describe W&B's deployment and should not be copied unchanged into another environment. Every setting can also be overridden on the command line. `--tag` and `--target_repo_url` are required unless your chosen config file supplies them.
 

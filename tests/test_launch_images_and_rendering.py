@@ -35,6 +35,7 @@ def test_default_config_exposes_every_model_profile_and_effort():
         "fast_reasoning_effort": "high",
         "frontier_model": "openai/gpt-5.6-sol",
         "frontier_reasoning_effort": "max",
+        "local_condenser_max_events": 80,
     }.items() <= config.items()
 
 
@@ -128,6 +129,21 @@ def test_launch_rejects_role_images_from_different_source_revisions():
 
     assert result.returncode != 0
     assert "same source revision" in result.stderr
+
+
+def test_launch_rejects_an_unsafe_local_condenser_event_cap():
+    result = run_launch(
+        "--advisor",
+        "--advisor_image",
+        ADVISOR_IMAGE,
+        "--student_image",
+        STUDENT_IMAGE,
+        "--local_condenser_max_events",
+        "11",
+    )
+
+    assert result.returncode != 0
+    assert "--local_condenser_max_events must be at least 12" in result.stderr
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
@@ -290,6 +306,7 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         fast_reasoning_effort="none",
         frontier_model="openai/gpt-5.6-sol",
         frontier_reasoning_effort="max",
+        local_condenser_max_events=180,
     )
 
     advisor_config, _deployment, _secret = render_role("advisor", args)
@@ -308,6 +325,7 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         assert config["SENPAI_OPENHANDS_FAST_REASONING_EFFORT"] == "none"
         assert config["SENPAI_OPENHANDS_FRONTIER_MODEL"] == args.frontier_model
         assert config["SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT"] == "max"
+        assert config["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"] == "180"
 
 
 def test_openai_ultra_launch_value_is_rejected():

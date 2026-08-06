@@ -165,6 +165,9 @@ def role_model_config(args, role: str) -> dict[str, str]:
         "SENPAI_OPENHANDS_FAST_REASONING_EFFORT": args.fast_reasoning_effort,
         "SENPAI_OPENHANDS_FRONTIER_MODEL": args.frontier_model,
         "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": args.frontier_reasoning_effort,
+        "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS": str(
+            args.local_condenser_max_events
+        ),
     }
 
 

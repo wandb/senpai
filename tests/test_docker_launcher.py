@@ -64,6 +64,7 @@ def args(**overrides):
         "fast_reasoning_effort": "low",
         "frontier_model": "openai/gpt-5.6-sol",
         "frontier_reasoning_effort": "max",
+        "local_condenser_max_events": 80,
         "human_issues": True,
         "advisor_name": "advisor",
         "advisor_branch": "research",
