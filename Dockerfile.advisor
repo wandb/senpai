@@ -1,6 +1,7 @@
 FROM python:3.13-slim-bookworm
 
 ARG PLAYWRIGHT_VERSION=1.55.0
+ARG KUBECTL_VERSION=v1.33.4
 ARG SENPAI_SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.revision="${SENPAI_SOURCE_REVISION}"
 
@@ -28,6 +29,21 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       > /etc/apt/sources.list.d/github-cli-stable.list && \
     apt-get update && apt-get install -y gh && \
     rm -rf /var/lib/apt/lists/*
+
+# The operational-supervisor deployment uses kubectl only through Senpai's
+# campaign-scoped typed backend. Pin and verify the client shipped in the image.
+RUN architecture="$(dpkg --print-architecture)" && \
+    case "$architecture" in \
+      amd64|arm64) ;; \
+      *) echo "unsupported kubectl architecture: $architecture" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSLo /tmp/kubectl \
+      "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${architecture}/kubectl" && \
+    curl -fsSLo /tmp/kubectl.sha256 \
+      "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${architecture}/kubectl.sha256" && \
+    printf '%s  %s\n' "$(cat /tmp/kubectl.sha256)" /tmp/kubectl | sha256sum --check && \
+    install -m 0755 /tmp/kubectl /usr/local/bin/kubectl && \
+    rm -f /tmp/kubectl /tmp/kubectl.sha256
 
 RUN python -m pip install --no-cache-dir "uv==0.10.9" && \
     uv venv --python /usr/local/bin/python /opt/senpai-venv

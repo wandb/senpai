@@ -2,7 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from senpai_agent.training import TrainingState, TrainingSupervisor
+from senpai_agent.training import (
+    TrainingResult,
+    TrainingState,
+    TrainingSupervisor,
+    training_result_path,
+)
 from training_test_support import (
     assert_process_stopped,
     make_supervisor,
@@ -33,6 +38,44 @@ def test_finished_training_persists_its_result_and_log(tmp_path: Path):
     assert terminal.wandb_run_ids == ("run-123",)
     assert Path(terminal.log_path).read_text().strip().endswith("/runs/run-123")
     assert reopened == terminal
+
+
+def test_restart_repairs_a_result_file_from_the_authoritative_inventory(
+    tmp_path: Path,
+):
+    workspace, supervisor = make_supervisor(tmp_path)
+    terminal = TrainingResult(
+        training_id="4aebf5ce-87ba-4189-ae99-fad922cdcc61",
+        state=TrainingState.FINISHED,
+        exit_code=0,
+        elapsed_seconds=60,
+        log_path=str(tmp_path / "state" / "finished.log"),
+        wandb_run_ids=("run-finished",),
+    )
+    supervisor._write_result(terminal)
+    stale = terminal.model_copy(
+        update={
+            "state": TrainingState.RUNNING,
+            "pid": 999_999_999,
+            "process_group_id": 999_999_999,
+            "process_start_time": 1.0,
+            "exit_code": None,
+        }
+    )
+    result_path = tmp_path / "state" / f"{terminal.training_id}.json"
+    result_path.write_text(stale.model_dump_json())
+
+    reopened = TrainingSupervisor(
+        workspace=workspace,
+        state_dir=tmp_path / "state",
+    )
+
+    assert reopened.get_training_status(terminal.training_id) == terminal
+
+
+def test_training_result_cannot_overwrite_the_inventory(tmp_path: Path):
+    with pytest.raises(ValueError, match="local result"):
+        training_result_path(tmp_path, "inventory")
 
 
 def test_training_passes_shell_metacharacters_as_a_literal_argument(tmp_path: Path):

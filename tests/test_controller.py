@@ -401,9 +401,10 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
     assert (
         controller_module.controller_main(
             ["advisor"],
-            {
-                "SENPAI_ROLE": "advisor",
-                "ADVISOR_BRANCH": "main",
+                {
+                    "SENPAI_ROLE": "advisor",
+                    "RESEARCH_TAG": "test-track",
+                    "ADVISOR_BRANCH": "main",
                 "SENPAI_POLL_INTERVAL_S": "30",
             },
         )

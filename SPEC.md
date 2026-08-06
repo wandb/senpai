@@ -38,6 +38,9 @@ dependencies.
 10. Secrets are passed at narrow executor boundaries and redacted before
     monitored content is attached.
 11. Hivemind is disabled, not redesigned, in this change.
+12. The campaign operational supervisor is separate from advisor/student
+    research prompts, scopes every observation and write to the immutable
+    launch inventory, and never turns missing evidence into a healthy zero.
 
 ## Control loop and remote protocol
 
@@ -69,6 +72,73 @@ supervisor provides the same recovery on a plain host.
 
 The core controller imports no Kubernetes API and needs no Service, port, DNS
 record, ServiceAccount, RBAC, cross-node token, or tailnet.
+
+### Campaign operational supervisor
+
+Kubernetes launches optionally add one independent operational-supervisor
+Deployment. It is not the per-role crash supervisor above and it does not join
+advisor/student research conversations. Every 15 minutes it deterministically
+collects a timestamped campaign snapshot, retains the latest three snapshots,
+and starts one fresh bounded in-memory OpenHands conversation over those
+snapshots. Only the snapshot state and mutation audit persist locally.
+
+Every managed role Deployment records its exact Senpai source revision. An
+incremental supervisor launch is rejected unless the existing exact-tag advisor
+and every student not replaced in the same launch use that revision and advisor
+branch, and the advisor's configured student inventory is unchanged. This
+prevents a supervisor from starting against an absent, incompatible, or
+differently scoped role-control protocol.
+
+The snapshot scope is fixed at launch:
+
+- GitHub returns only open PRs whose current base ref exactly equals the
+  configured advisor branch. Each PR includes age and paginated counts for
+  issue comments, submitted reviews, and inline comments.
+- W&B resolves only exact run IDs discovered in the configured students'
+  role-local training state. Experiment code may freely choose its own W&B
+  group without breaking campaign ownership.
+- Kubernetes selects exactly one running pod for each configured role using
+  the research-tag, role, and student labels. Role-local inspection returns the
+  controller lease, current conversation UUID, completed turns, running
+  training count, bounded utilization, reset status, and recent structured
+  error markers. Raw log and training-error text never leaves the role.
+
+Each failed evidence source remains `unknown` with a typed evidence gap. In
+particular, a failed W&B query is not reported as zero running jobs. Repeated
+`SENPAI_TURN_DEFERRED` log markers survive in the bounded three-snapshot trend.
+
+The supervisor receives one typed operations tool, not a general cluster or
+role terminal. It may inspect, enqueue a deduplicated role event, queue a
+context reset, or restart the controller process. Targets can name only the
+configured advisor or students; callers cannot
+supply hosts, pods, namespaces, working directories, environments, or
+credentials. Mutations have durable idempotency keys, per-incident cooldowns,
+and metadata-only audit records. The enforced cooldown identity is derived from
+the typed anomaly category, mutation kind, and exact role target; changing a
+free-form incident label cannot bypass it. Role inspection is always fresh and
+is never replayed from the mutation ledger. Each fresh supervisor turn receives
+the 12 most recent mutation targets, categories, timestamps, and outcomes.
+
+A context reset is an owner-consumed request. The external supervisor records
+the expected conversation UUID, controller identity, raw-event prefix digest
+and count, and pending-event keys. Only that role's controller may claim it at
+a quiescent turn boundary. The controller calls
+`run_openhands(..., reset_context=True)`, records completion before ordinary
+event acknowledgement, and keeps the same UUID, workspace, complete append-only
+event trace, and pending events. External code never instantiates a second
+`LocalConversation` over live state or deletes individual events.
+
+A controller restart is refused while a student training process or delegated
+agent is running, or when either activity inventory cannot be proven. It
+signals only the verified controller PID; the role's existing crash supervisor
+performs the restart. The operational supervisor has no AWS, node, pod-delete,
+Deployment-patch, experiment-cancel, branch, or PR-mutation authority.
+
+Every six hours, the next wake runs a second fresh review against the currently
+deployed `system_instructions/ADVISOR.md`. It may inject one concise reminder
+into the existing advisor conversation only for clear sustained strategic
+drift. This periodic review does not modify the advisor prompt and does not
+micromanage ordinary scientific judgment.
 
 GitHub state is level-triggered:
 
@@ -113,11 +183,13 @@ Generic child results use a local SQLite WAL event store because parent and
 child run on the same advisor or student instance. That is not an inter-node
 protocol.
 
-The only SQLite databases are `advisor-events.sqlite3`, for unacknowledged
-advisor watcher/child events; `student-events.sqlite3`, for unacknowledged
-student feedback/child events; and `training/monitors.sqlite3`, for student
-monitor policy, samples, and deduplicated actionable signals. OpenHands
-conversation history is a separate file-backed per-UUID event log.
+Role SQLite databases are `advisor-events.sqlite3`, for unacknowledged advisor
+watcher/child/supervisor events; `student-events.sqlite3`, for unacknowledged
+student feedback/child/supervisor events; `context-resets.sqlite3`, for the
+owner-consumed reset queue; and `training/monitors.sqlite3`, for student monitor
+policy, samples, and deduplicated actionable signals. The operational
+supervisor separately stores `operations.sqlite3` for metadata-only action
+audit. OpenHands conversation history remains a file-backed per-UUID event log.
 
 ## State and conversations
 
@@ -128,6 +200,7 @@ Advisor state:
 ├── advisor-conversation-id
 ├── controller-lease.json
 ├── advisor-events.sqlite3
+├── context-resets.sqlite3
 ├── conversation-state.json
 ├── github/
 └── conversations managed by OpenHands
@@ -144,6 +217,7 @@ Student state:
 ├── github-feedback.json
 ├── student-conversations.json
 ├── student-events.sqlite3
+├── context-resets.sqlite3
 ├── conversation-state.json
 ├── training/
 │   ├── <training-id>.json
@@ -203,6 +277,10 @@ The model receives:
 4. A compact skill catalog whose bodies are loaded only when invoked.
 5. User turns containing `program.md`, target role instructions, current state,
    and current UTC time.
+
+The operational supervisor instead uses the minimal
+`system_instructions/OPERATIONAL_SUPERVISOR_HARNESS.md`; it does not inherit
+target-workspace, research, or subagent instructions.
 
 Harness and role remain separate source documents because they have different
 owners, but are merged into one system suffix so the agent knows both the
@@ -571,8 +649,8 @@ Observability and queried with `get_agent_spans()`, not the legacy Calls API;
 
 Three images are built from the same exact source commit:
 
-- advisor: Python/OpenHands, GitHub CLI, and Chromium; no PyTorch, CUDA, or
-  Kubernetes tooling;
+- advisor: Python/OpenHands, GitHub CLI, Chromium, and pinned `kubectl`; no
+  PyTorch or CUDA. Only the separate supervisor pod receives campaign RBAC;
 - student: the CUDA/PyTorch stack plus the same OpenHands and Chromium runtime;
 - cutoff: a minimal shell/Python runtime with one checksum-verified, pinned
   `kubectl`.
@@ -593,9 +671,16 @@ Launch preflight verifies:
 Exa is a progressive skill/script integration, not an always-connected MCP
 server.
 
-The Kubernetes launcher creates one Secret, ConfigMaps, and Deployments. It
-creates no Service or RBAC. Docker and local hosts need no shared network for
-Senpai communication.
+The Kubernetes launcher creates one Secret, ConfigMaps, role Deployments, and,
+when enabled, one dedicated supervisor ServiceAccount, namespace-scoped Role,
+RoleBinding, and Deployment. Kubernetes RBAC cannot constrain pod list/log/exec
+by label, so the typed backend enforces exact campaign selectors inside that
+namespace. Deploy campaigns into separate namespaces when hard authorization
+isolation between campaigns is required. The Role has no AWS, node,
+pod-deletion, or Deployment-mutation verbs. The launcher creates no Service or
+general cluster RBAC. Docker and local hosts need no shared network for
+advisor/student communication; another deployment backend may implement the
+same typed supervisor operation protocol.
 
 Hivemind startup remains commented with a clear note. The Python controller
 waits for the optional cluster start gate while continuously refreshing a

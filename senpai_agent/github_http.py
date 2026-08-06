@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from urllib import request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -95,6 +96,41 @@ class GitHubReader:
                 raise GitHubReadError("GitHub returned an invalid paginated list")
             objects.extend(page)
         return objects
+
+    def objects_bounded(
+        self,
+        path: str,
+        *,
+        limit: int,
+        stop: Callable[[dict[str, object]], bool] | None = None,
+    ) -> tuple[list[dict[str, object]], bool]:
+        """Read a sorted list only until its useful window or hard bound ends.
+
+        The boolean is true when the remote sequence ended or ``stop`` ended the
+        requested window. It is false when ``limit`` truncated matching data.
+        """
+
+        if limit <= 0:
+            raise ValueError("GitHub object limit must be positive")
+        objects: list[dict[str, object]] = []
+        url: str | None = self._url(path)
+        visited: set[str] = set()
+        while url is not None:
+            if url in visited:
+                raise GitHubReadError("GitHub pagination contains a cycle")
+            visited.add(url)
+            page, url = self._request(url)
+            if not isinstance(page, list) or any(
+                not isinstance(item, dict) for item in page
+            ):
+                raise GitHubReadError("GitHub returned an invalid paginated list")
+            for item in page:
+                if stop is not None and stop(item):
+                    return objects, True
+                if len(objects) == limit:
+                    return objects, False
+                objects.append(item)
+        return objects, True
 
     def actor(self) -> str:
         """Return and cache the authenticated GitHub login."""

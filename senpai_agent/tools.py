@@ -1281,6 +1281,8 @@ def register_senpai_tools() -> None:
     global _TOOLS_REGISTERED
     if _TOOLS_REGISTERED:
         return
+    from senpai_agent.operational_tools import SupervisorOperationTool
+
     register_tool("senpai_training", TrainingToolSet)
     register_tool("get_prs", GetPRsTool)
     register_tool("github_transition", GitHubTransitionTool)
@@ -1290,4 +1292,5 @@ def register_senpai_tools() -> None:
     register_tool("cancel_agents", CancelAgentsTool)
     register_tool("delegate_agent", DelegateAgentTool)
     register_tool("senpai_terminal", SenpaiTerminalTool)
+    register_tool("senpai_operations", SupervisorOperationTool)
     _TOOLS_REGISTERED = True

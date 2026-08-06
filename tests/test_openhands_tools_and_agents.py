@@ -121,6 +121,27 @@ def test_main_tools_replace_unsafe_defaults_with_role_scoped_boundaries(
         }
 
 
+def test_supervisor_receives_only_the_campaign_operations_tool(tmp_path, monkeypatch):
+    monkeypatch.setenv("STUDENT_NAMES", "fern,frieren")
+    monkeypatch.setenv("SENPAI_KUBECTL_NAMESPACE", "research")
+    monkeypatch.setenv("RESEARCH_TAG", "maple")
+    monkeypatch.setenv("ADVISOR_BRANCH", "maple-advisor")
+    config = runtime_config(tmp_path, role="supervisor")
+
+    tools = build_main_tools(config)
+
+    assert [tool.name for tool in tools] == ["senpai_operations"]
+    assert tools[0].params == {
+        "state_dir": str(config.state_dir),
+        "namespace": "research",
+        "research_tag": "maple",
+        "repo": "acme/widgets",
+        "advisor_branch": "maple-advisor",
+        "students": ("fern", "frieren"),
+        "mutation_cooldown_seconds": 1800.0,
+    }
+
+
 def test_native_senpai_plugin_loads_its_runtime_skills():
     assert resolve_plugin_dir(str(PLUGIN_DIR)) == PLUGIN_DIR
 

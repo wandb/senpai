@@ -7,6 +7,7 @@
 """Launch senpai advisor and student agents as K8s resources."""
 
 import base64
+import json
 import posixpath
 import shlex
 import sys
@@ -24,6 +25,8 @@ from senpai_agent.launch_context import render_launch_context
 from launch_helpers import (
     ensure_advisor_branch,
     ensure_target_repo_labels,
+    existing_advisor_deployments,
+    existing_role_metadata,
     existing_student_names,
     expand_student_names,
     is_immutable_image_reference,
@@ -53,6 +56,7 @@ from launch_helpers import (
 
 STUDENT_TEMPLATE = Path(__file__).parent / "student-deployment.yaml"
 ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-deployment.yaml"
+SUPERVISOR_TEMPLATE = Path(__file__).parent / "operational-supervisor-deployment.yaml"
 SENPAI_CONFIG = Path(__file__).parent.parent / "senpai.yaml"
 DOTENV_PATH = Path(__file__).parent.parent / ".env"
 
@@ -103,6 +107,7 @@ class Args:
         "/mnt/new-pvc"  # mount path for the dataset PVC inside the containers
     )
     advisor: bool = False  # also deploy the advisor pod (default: students only)
+    operational_supervisor: bool = False  # deploy one independent operational supervisor for this campaign
     extra_instructions: str = (
         ""  # extra prompt text for the advisor: a .md file path or a literal string
     )
@@ -115,6 +120,9 @@ class Args:
     )
     poll_jitter_s: int = 120  # max random jitter added to outer-loop sleeps
     stale_wip_seconds: int = 7200  # advisor-action threshold for stale WIP PRs
+    supervisor_interval_s: int = 900  # operational supervisor wake cadence
+    supervisor_research_interval_s: int = 21600  # research-philosophy review cadence
+    supervisor_action_cooldown_s: int = 1800  # duplicate intervention cooldown
     start_gate_path: str = ""  # optional shared file path that must exist before advisor/student loops begin
     dry_run: bool = (
         False  # render manifests only: do not apply them or validate credentials
@@ -172,7 +180,7 @@ def configured_model_providers(args: Args, role: str | None = None) -> set[str]:
 
 def deployed_model_providers(args: Args) -> set[str]:
     providers = configured_model_providers(args, "student")
-    if args.advisor:
+    if args.advisor or args.operational_supervisor:
         providers |= configured_model_providers(args, "advisor")
     return providers
 
@@ -184,7 +192,7 @@ def validate_model_config(args: Args) -> None:
         "fast": (args.fast_model, args.fast_reasoning_effort),
         "frontier": (args.frontier_model, args.frontier_reasoning_effort),
     }
-    if args.advisor:
+    if args.advisor or args.operational_supervisor:
         profiles["advisor"] = (
             args.advisor_model,
             args.advisor_reasoning_effort,
@@ -212,7 +220,7 @@ def validate_model_config(args: Args) -> None:
             )
 
 
-def role_model_config(args: Args, role: str) -> dict[str, str]:
+def primary_model_config(args: Args, role: str) -> dict[str, str]:
     model = args.advisor_model if role == "advisor" else args.student_model
     reasoning_effort = (
         args.advisor_reasoning_effort
@@ -222,6 +230,12 @@ def role_model_config(args: Args, role: str) -> dict[str, str]:
     return {
         "SENPAI_OPENHANDS_MODEL": model,
         "SENPAI_OPENHANDS_REASONING_EFFORT": reasoning_effort,
+    }
+
+
+def role_model_config(args: Args, role: str) -> dict[str, str]:
+    return {
+        **primary_model_config(args, role),
         "SENPAI_OPENHANDS_SMART_MODEL": args.smart_model,
         "SENPAI_OPENHANDS_SMART_REASONING_EFFORT": args.smart_reasoning_effort,
         "SENPAI_OPENHANDS_FAST_MODEL": args.fast_model,
@@ -232,9 +246,12 @@ def role_model_config(args: Args, role: str) -> dict[str, str]:
 
 
 def model_provider_env(args: Args, role: str, secret_name: str) -> str:
+    return provider_env(configured_model_providers(args, role), secret_name)
+
+
+def provider_env(providers: set[str], secret_name: str) -> str:
     lines = []
-    providers = sorted(configured_model_providers(args, role) - {"wandb"})
-    for index, provider in enumerate(providers):
+    for index, provider in enumerate(sorted(providers - {"wandb"})):
         env_name, secret_key = MODEL_PROVIDERS[provider]
         lines.extend(
             (
@@ -253,7 +270,12 @@ def validate_timing_args(args: Args) -> None:
         sys.exit("ERROR: --timeout_minutes must be positive")
     if args.max_epochs < 1:
         sys.exit("ERROR: --max_epochs must be at least 1")
-    positive = ["poll_interval_s"]
+    positive = [
+        "poll_interval_s",
+        "supervisor_interval_s",
+        "supervisor_research_interval_s",
+        "supervisor_action_cooldown_s",
+    ]
     non_negative = [
         "poll_jitter_s",
         "stale_wip_seconds",
@@ -345,6 +367,9 @@ def render_student(
             "WANDB_ENTITY": args.wandb_entity,
             "WANDB_PROJECT": args.wandb_project,
             "WANDB_MODE": "online",
+            "SENPAI_WANDB_SCOPE": tag,
+            "WANDB_JOB_TYPE": student_name,
+            "WANDB_TAGS": f"senpai,senpai:{tag},senpai-student:{student_name}",
             "ADVISOR_BRANCH": args.advisor_branch,
             "GH_HISTORY_SCOPE": args.gh_history_scope,
             "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
@@ -370,8 +395,10 @@ def render_student(
             "STUDENT_CONFIGMAP_NAME": student_configmap_name,
             "STUDENT_NAME": student_name,
             "RESEARCH_TAG": tag,
+            "REPO_REVISION": args.repo_revision,
             "STUDENT_IMAGE": args.student_image,
             "ADVISOR_BRANCH": args.advisor_branch,
+            "ADVISOR_BRANCH_JSON": json.dumps(args.advisor_branch),
             "PVC_CLAIM_NAME": args.pvc_claim_name,
             "PVC_MOUNT_PATH": args.pvc_mount_path,
             "LAUNCH_SECRET_NAME": secret_name,
@@ -435,12 +462,74 @@ def render_advisor(
             "ADVISOR_DEPLOYMENT_NAME": advisor_deployment_name,
             "ADVISOR_CONFIGMAP_NAME": advisor_configmap_name,
             "RESEARCH_TAG": tag,
+            "REPO_REVISION": args.repo_revision,
             "ADVISOR_IMAGE": args.advisor_image,
+            "ADVISOR_BRANCH": args.advisor_branch,
+            "ADVISOR_BRANCH_JSON": json.dumps(args.advisor_branch),
+            "STUDENT_NAMES": ",".join(student_list),
             "PVC_CLAIM_NAME": args.pvc_claim_name,
             "PVC_MOUNT_PATH": args.pvc_mount_path,
             "LAUNCH_SECRET_NAME": secret_name,
             "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
             "MODEL_PROVIDER_ENV": model_provider_env(args, "advisor", secret_name),
+        },
+    )
+    return configmap + "\n---\n" + deployment
+
+
+def render_operational_supervisor(
+    template: str,
+    tag: str,
+    student_list: list[str],
+    secret_name: str,
+    launch_secret: str,
+    args: Args,
+) -> str:
+    configmap_name = f"senpai-config-supervisor-{tag}"
+    deployment_name = f"senpai-supervisor-{tag}"
+    service_account_name = f"senpai-supervisor-{tag}"
+    configmap = render_configmap(
+        name=configmap_name,
+        labels={"app": "senpai", "role": "supervisor", "research-tag": tag},
+        data={
+            **primary_model_config(args, "advisor"),
+            "REPO_URL": args.repo_url,
+            "REPO_REVISION": args.repo_revision,
+            "GH_REPO": target_repo_slug(args.target_repo_url),
+            "RESEARCH_TAG": tag,
+            "STUDENT_NAMES": ",".join(student_list),
+            "WANDB_ENTITY": args.wandb_entity,
+            "WANDB_PROJECT": args.wandb_project,
+            "SENPAI_WANDB_SCOPE": tag,
+            "ADVISOR_BRANCH": args.advisor_branch,
+            "SENPAI_SUPERVISOR_INTERVAL_SECONDS": str(args.supervisor_interval_s),
+            "SENPAI_SUPERVISOR_RESEARCH_INTERVAL_SECONDS": str(
+                args.supervisor_research_interval_s
+            ),
+            "SENPAI_SUPERVISOR_ACTION_COOLDOWN_SECONDS": str(
+                args.supervisor_action_cooldown_s
+            ),
+            "SENPAI_KUBECTL_NAMESPACE": args.namespace,
+        },
+    )
+    deployment = render_template(
+        template,
+        {
+            "SUPERVISOR_DEPLOYMENT_NAME": deployment_name,
+            "SUPERVISOR_CONFIGMAP_NAME": configmap_name,
+            "SUPERVISOR_SERVICE_ACCOUNT_NAME": service_account_name,
+            "RESEARCH_TAG": tag,
+            "REPO_REVISION": args.repo_revision,
+            "ADVISOR_IMAGE": args.advisor_image,
+            "ADVISOR_BRANCH": args.advisor_branch,
+            "ADVISOR_BRANCH_JSON": json.dumps(args.advisor_branch),
+            "PVC_CLAIM_NAME": args.pvc_claim_name,
+            "LAUNCH_SECRET_NAME": secret_name,
+            "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
+            "MODEL_PROVIDER_ENV": provider_env(
+                {model_provider(args.advisor_model)},
+                secret_name,
+            ),
         },
     )
     return configmap + "\n---\n" + deployment
@@ -531,7 +620,88 @@ def main():
             print("Preflight OK — credentials and target repo access verified.")
             return
 
+    existing_supervised_students: list[str] | None = None
     if not args.dry_run:
+        if args.operational_supervisor:
+            advisors = existing_advisor_deployments(
+                args.tag,
+                kube_context=args.kube_context,
+                namespace=args.namespace,
+            )
+            expected_advisor = f"senpai-advisor-{args.tag}"
+            if args.advisor and set(advisors) - {expected_advisor}:
+                sys.exit(
+                    "ERROR: existing exact-tag advisor Deployments would remain "
+                    "alongside the managed advisor; remove or retag them first"
+                )
+            if not args.advisor and len(advisors) != 1:
+                sys.exit(
+                    "ERROR: --operational_supervisor without --advisor requires "
+                    f"exactly one existing advisor Deployment for tag {args.tag!r}; "
+                    f"found {len(advisors)}"
+                )
+            if not args.advisor:
+                advisor_metadata = existing_role_metadata(
+                    args.tag,
+                    "advisor",
+                    kube_context=args.kube_context,
+                    namespace=args.namespace,
+                )
+                advisor_record = advisor_metadata.get(advisors[0], {})
+                if set(advisor_metadata) != set(advisors) or any(
+                    (
+                        advisor_record.get("senpai.wandb.com/source-revision")
+                        != args.repo_revision,
+                        advisor_record.get("senpai.wandb.com/advisor-branch")
+                        != args.advisor_branch,
+                    )
+                ):
+                    sys.exit(
+                        "ERROR: the existing advisor Deployment does not match the "
+                        "requested Senpai source revision and advisor branch"
+                    )
+            student_metadata = existing_role_metadata(
+                args.tag,
+                "student",
+                kube_context=args.kube_context,
+                namespace=args.namespace,
+            )
+            incompatible_students = {
+                student
+                for student, record in student_metadata.items()
+                if student not in student_list
+                and (
+                    record.get("senpai.wandb.com/source-revision")
+                    != args.repo_revision
+                    or record.get("senpai.wandb.com/advisor-branch")
+                    != args.advisor_branch
+                )
+            }
+            if incompatible_students:
+                names = ", ".join(sorted(incompatible_students))
+                sys.exit(
+                    "ERROR: existing student Deployments not replaced by this "
+                    "launch do not match the requested Senpai source revision "
+                    "and advisor branch: "
+                    f"{names}"
+                )
+            existing_supervised_students = list(student_metadata)
+            if not args.advisor:
+                configured_students = {
+                    name
+                    for name in advisor_record.get(
+                        "senpai.wandb.com/student-names",
+                        "",
+                    ).split(",")
+                    if name
+                }
+                launched_students = {*existing_supervised_students, *student_list}
+                if configured_students != launched_students:
+                    sys.exit(
+                        "ERROR: incremental supervisor launch would change the "
+                        "existing advisor's student inventory; relaunch with "
+                        "--advisor"
+                    )
         ensure_advisor_branch(
             args.target_repo_url,
             github_token,
@@ -546,6 +716,7 @@ def main():
 
     student_template = STUDENT_TEMPLATE.read_text()
     advisor_template = ADVISOR_TEMPLATE.read_text()
+    supervisor_template = SUPERVISOR_TEMPLATE.read_text()
     secret_name = f"senpai-launch-secrets-{args.tag}"
     if args.dry_run:
         provider_api_keys = {
@@ -597,15 +768,19 @@ def main():
             )
 
     advisor_student_list = student_list
-    if args.advisor and not args.dry_run:
+    if (args.advisor or args.operational_supervisor) and not args.dry_run:
+        existing_students = (
+            existing_supervised_students
+            if existing_supervised_students is not None
+            else existing_student_names(
+                args.tag,
+                kube_context=args.kube_context,
+                namespace=args.namespace,
+            )
+        )
         advisor_student_list = list(
             dict.fromkeys(
-                existing_student_names(
-                    args.tag,
-                    kube_context=args.kube_context,
-                    namespace=args.namespace,
-                )
-                + student_list
+                existing_students + student_list
             )
         )
 
@@ -631,10 +806,33 @@ def main():
                 namespace=args.namespace,
             )
 
+    if args.operational_supervisor:
+        manifest = render_operational_supervisor(
+            supervisor_template,
+            args.tag,
+            advisor_student_list,
+            secret_name,
+            launch_secret,
+            args,
+        )
+        if args.dry_run:
+            print("--- Operational supervisor ---")
+            print(manifest)
+            print()
+        else:
+            kubectl_apply(
+                manifest,
+                "operational supervisor",
+                kube_context=args.kube_context,
+                namespace=args.namespace,
+            )
+
     if not args.dry_run:
         print(f"\nLaunched {len(student_list)} students: {', '.join(student_list)}")
         if args.advisor:
             print("Launched advisor pod")
+        if args.operational_supervisor:
+            print("Launched operational supervisor pod")
         kubectl = shlex.join(
             kubectl_command(
                 kube_context=args.kube_context,
@@ -652,7 +850,8 @@ def main():
             )
         print("\nStop:")
         print(
-            f"  {kubectl} delete deployments,configmaps,secrets "
+            f"  {kubectl} delete deployments,configmaps,secrets,"
+            "serviceaccounts,roles,rolebindings "
             f"-l research-tag={args.tag}"
         )
 

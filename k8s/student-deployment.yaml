@@ -9,6 +9,9 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{STUDENT_DEPLOYMENT_NAME}}
+  annotations:
+    senpai.wandb.com/source-revision: "{{REPO_REVISION}}"
+    senpai.wandb.com/advisor-branch: {{ADVISOR_BRANCH_JSON}}
   labels:
     app: senpai
     role: student

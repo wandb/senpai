@@ -60,6 +60,13 @@ poll_jitter_s: 120
 stale_wip_seconds: 7200
 human_issues: true
 
+# optional independent campaign supervisor; operational reviews every 15
+# minutes, with a separate ADVISOR.md-based research review every 6 hours
+operational_supervisor: false
+supervisor_interval_s: 900
+supervisor_research_interval_s: 21600
+supervisor_action_cooldown_s: 1800
+
 # students
 n_students: 4
 student_prefix: ""

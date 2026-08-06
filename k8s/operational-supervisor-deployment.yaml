@@ -1,21 +1,61 @@
 # SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-PackageName: senpai
-#
-# The advisor: a lightweight deployment (no GPU) that runs OpenHands
-# to manage research hypotheses via GitHub PRs.
 
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{SUPERVISOR_SERVICE_ACCOUNT_NAME}}
+  labels:
+    app: senpai
+    role: supervisor
+    research-tag: {{RESEARCH_TAG}}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{SUPERVISOR_SERVICE_ACCOUNT_NAME}}
+  labels:
+    app: senpai
+    role: supervisor
+    research-tag: {{RESEARCH_TAG}}
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{SUPERVISOR_SERVICE_ACCOUNT_NAME}}
+  labels:
+    app: senpai
+    role: supervisor
+    research-tag: {{RESEARCH_TAG}}
+subjects:
+- kind: ServiceAccount
+  name: {{SUPERVISOR_SERVICE_ACCOUNT_NAME}}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{SUPERVISOR_SERVICE_ACCOUNT_NAME}}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ADVISOR_DEPLOYMENT_NAME}}
+  name: {{SUPERVISOR_DEPLOYMENT_NAME}}
   annotations:
     senpai.wandb.com/source-revision: "{{REPO_REVISION}}"
     senpai.wandb.com/advisor-branch: {{ADVISOR_BRANCH_JSON}}
-    senpai.wandb.com/student-names: "{{STUDENT_NAMES}}"
   labels:
     app: senpai
-    role: advisor
+    role: supervisor
     research-tag: {{RESEARCH_TAG}}
 spec:
   replicas: 1
@@ -24,7 +64,7 @@ spec:
   selector:
     matchLabels:
       app: senpai
-      role: advisor
+      role: supervisor
       research-tag: {{RESEARCH_TAG}}
   template:
     metadata:
@@ -32,9 +72,10 @@ spec:
         senpai.wandb.com/content-hash: "{{POD_CONFIG_HASH}}"
       labels:
         app: senpai
-        role: advisor
+        role: supervisor
         research-tag: {{RESEARCH_TAG}}
     spec:
+      serviceAccountName: {{SUPERVISOR_SERVICE_ACCOUNT_NAME}}
       terminationGracePeriodSeconds: 90
       securityContext:
         runAsNonRoot: true
@@ -45,7 +86,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-      - name: advisor
+      - name: supervisor
         image: {{ADVISOR_IMAGE}}
         securityContext:
           allowPrivilegeEscalation: false
@@ -78,10 +119,10 @@ spec:
           export SENPAI_GITHUB_TOKEN_FILE="$token_handoff"
           unset GITHUB_TOKEN GH_TOKEN
           rm -f "$askpass"
-          exec bash k8s/entrypoint-advisor.sh
+          exec bash k8s/entrypoint-operational-supervisor.sh
         envFrom:
         - configMapRef:
-            name: {{ADVISOR_CONFIGMAP_NAME}}
+            name: {{SUPERVISOR_CONFIGMAP_NAME}}
         env:
         - name: WANDB_API_KEY
           valueFrom:
@@ -94,24 +135,19 @@ spec:
               name: {{LAUNCH_SECRET_NAME}}
               key: github-token
         {{MODEL_PROVIDER_ENV}}
-        - name: EXA_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: {{LAUNCH_SECRET_NAME}}
-              key: exa-api-key
         resources:
           requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
             cpu: "4"
             memory: "8Gi"
-          limits:
-            cpu: "8"
-            memory: "16Gi"
         startupProbe:
           exec:
             command:
             - /bin/sh
             - -c
-            - python -m senpai_agent.supervisor health "/var/lib/senpai/$RESEARCH_TAG/advisor/openhands_state/controller-lease.json"
+            - python -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 60
@@ -120,20 +156,15 @@ spec:
             command:
             - /bin/sh
             - -c
-            - python -m senpai_agent.supervisor health "/var/lib/senpai/$RESEARCH_TAG/advisor/openhands_state/controller-lease.json"
+            - python -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
           periodSeconds: 30
           timeoutSeconds: 5
           failureThreshold: 5
           terminationGracePeriodSeconds: 75
         volumeMounts:
-        - name: dataset
-          mountPath: {{PVC_MOUNT_PATH}}
         - name: state
           mountPath: /var/lib/senpai
       volumes:
-      - name: dataset
-        persistentVolumeClaim:
-          claimName: {{PVC_CLAIM_NAME}}
       - name: state
         persistentVolumeClaim:
           claimName: {{PVC_CLAIM_NAME}}

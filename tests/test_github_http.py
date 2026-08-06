@@ -52,6 +52,56 @@ def test_reader_follows_pagination_with_typed_auth(monkeypatch):
     assert reader.objects("/items?per_page=1") == [{"id": 1}, {"id": 2}]
 
 
+def test_bounded_reader_stops_before_fetching_an_irrelevant_page(monkeypatch):
+    calls = []
+
+    def urlopen(github_request, timeout):
+        calls.append(github_request.full_url)
+        return Response(
+            [{"id": 1}, {"id": 2}],
+            link='<https://api.github.test/items?page=2>; rel="next"',
+        )
+
+    monkeypatch.setattr(github_http.request, "urlopen", urlopen)
+    reader = GitHubReader(
+        SecretStr("github-secret"),
+        api_url="https://api.github.test",
+    )
+
+    objects, complete = reader.objects_bounded(
+        "/items?page=1",
+        limit=100,
+        stop=lambda item: item["id"] == 2,
+    )
+
+    assert objects == [{"id": 1}]
+    assert complete is True
+    assert calls == ["https://api.github.test/items?page=1"]
+
+
+def test_bounded_reader_reports_a_hard_limit_without_following_next(monkeypatch):
+    calls = []
+
+    def urlopen(github_request, timeout):
+        calls.append(github_request.full_url)
+        return Response(
+            [{"id": 1}, {"id": 2}],
+            link='<https://api.github.test/items?page=2>; rel="next"',
+        )
+
+    monkeypatch.setattr(github_http.request, "urlopen", urlopen)
+    reader = GitHubReader(
+        SecretStr("github-secret"),
+        api_url="https://api.github.test",
+    )
+
+    objects, complete = reader.objects_bounded("/items?page=1", limit=1)
+
+    assert objects == [{"id": 1}]
+    assert complete is False
+    assert calls == ["https://api.github.test/items?page=1"]
+
+
 def test_reader_rejects_foreign_pagination_origin(monkeypatch):
     monkeypatch.setattr(
         github_http.request,

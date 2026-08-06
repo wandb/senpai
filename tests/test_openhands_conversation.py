@@ -131,6 +131,67 @@ def test_context_reset_preserves_history_and_starts_a_fresh_active_branch(
     assert calls[1] == ("navigate", None)
 
 
+def test_context_reset_delivers_recovery_prompt_when_audit_persistence_fails(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    calls = []
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                active_branch=lambda: [],
+                events=["preserved raw event"],
+                execution_status=ConversationExecutionStatus.FINISHED,
+            )
+
+        def navigate_to(self, event_id):
+            calls.append(("navigate", event_id))
+
+        def send_message(self, prompt):
+            calls.append(("send", prompt))
+
+        async def arun(self):
+            calls.append(("run", None))
+
+        def close(self):
+            calls.append(("close", None))
+
+    def fail_audit():
+        calls.append(("audit", None))
+        raise OSError("durable queue temporarily unavailable")
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(
+        runner.ConversationState,
+        "get_unmatched_actions",
+        lambda _events: [],
+    )
+    isolate_agent_discovery(monkeypatch, runner)
+    config = runtime_config(tmp_path)
+
+    assert run_openhands(
+        "fresh recovery prompt",
+        config,
+        reset_context=True,
+        context_reset_applied=fail_audit,
+    ) == 0
+
+    assert [name for name, _ in calls] == [
+        "navigate",
+        "send",
+        "audit",
+        "run",
+        "close",
+    ]
+    assert ("send", "fresh recovery prompt") in calls
+    stderr = capsys.readouterr().err
+    assert "SENPAI_CONTEXT_RESET_AUDIT_ERROR" in stderr
+    assert "durable queue temporarily unavailable" not in stderr
+
+
 def test_child_requests_ephemeral_storage_and_emits_its_terminal_report(
     tmp_path,
     monkeypatch,
@@ -233,6 +294,47 @@ def test_student_requests_persistent_storage_for_monitor_wake(
     }
     assert delegation[0].role == "student"
     assert delegation[-1] is None
+
+
+def test_operational_supervisor_discards_each_fresh_local_conversation(
+    tmp_path,
+    monkeypatch,
+):
+    captured = {}
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            captured["delete_on_close"] = kwargs["delete_on_close"]
+            captured["persistence_dir"] = kwargs["persistence_dir"]
+            captured["secrets"] = kwargs["secrets"]
+            self.state = SimpleNamespace(
+                execution_status=ConversationExecutionStatus.FINISHED
+            )
+
+        def send_message(self, _prompt):
+            pass
+
+        async def arun(self):
+            pass
+
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(runner, "build_main_tools", lambda _config: [])
+    isolate_agent_discovery(monkeypatch, runner)
+
+    assert run_openhands(
+        "operational review",
+        runtime_config(tmp_path, role="supervisor"),
+    ) == 0
+    assert captured == {
+        "delete_on_close": True,
+        "persistence_dir": None,
+        "secrets": {},
+        "closed": True,
+    }
 
 
 def test_github_tokens_never_reach_the_agent_environment(

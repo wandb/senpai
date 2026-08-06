@@ -26,6 +26,7 @@ from senpai_agent.advisor import (
 from senpai_agent.github_mailbox import ActiveGitHubWatcher, GitHubMailbox
 from senpai_agent.mailbox import (
     CompositeMailbox,
+    ContextResetMailbox,
     ControllerEvent,
     LocalAdvisorMailbox,
     LocalStudentMailbox,
@@ -133,13 +134,47 @@ class OpenHandsTurnRunner:
             self.config,
             conversation_id=conversation_id,
         )
+        reset_request = _claim_context_reset(config.state_dir, conversation_id)
         turn_deadline = time.monotonic() + config.timeout_seconds
 
-        def run_turn() -> int:
+        def run_turn(
+            reset_delivered_event_keys: frozenset[str] = frozenset(),
+        ) -> int:
+            current_prompt = prompt
+            reset_callback = None
+            if reset_request is not None:
+                current_prompt = _context_recovery_prompt(
+                    self.full_prompt,
+                    f"{reset_request.recovery_prompt}\n\n{prompt}",
+                )
+
+                def reset_callback() -> None:
+                    if reset_delivered_event_keys:
+                        with AdvisorEventStore(local_event_db_path(config)) as store:
+                            for event_key in reset_delivered_event_keys:
+                                store.acknowledge(event_key)
+                    _complete_context_reset(
+                        config.state_dir,
+                        reset_request,
+                        delivered_event_keys=tuple(
+                            sorted(
+                                reset_delivered_event_keys.intersection(
+                                    reset_request.expected_pending_event_keys
+                                )
+                            )
+                        ),
+                    )
             try:
-                return run_openhands(prompt, config)
+                if reset_callback is not None:
+                    return run_openhands(
+                        current_prompt,
+                        config,
+                        reset_context=True,
+                        context_reset_applied=reset_callback,
+                    )
+                return run_openhands(current_prompt, config)
             except Exception as error:
-                if not _is_context_history_failure(error):
+                if reset_request is not None or not _is_context_history_failure(error):
                     raise
                 print(
                     "SENPAI_CONTEXT_RECOVERY "
@@ -193,9 +228,10 @@ class OpenHandsTurnRunner:
         # A late watcher event may still be pending locally when the next
         # controller prompt carries that same GitHub event. The prompt is the
         # delivery path for this turn, so keep the event pump from repeating it.
-        with AdvisorEventStore(store_path) as store:
-            for event_key in event_keys:
-                store.acknowledge(event_key)
+        if reset_request is None:
+            with AdvisorEventStore(store_path) as store:
+                for event_key in event_keys:
+                    store.acknowledge(event_key)
         with ActiveGitHubWatcher(
             self.github_mailbox,
             store_path,
@@ -203,12 +239,111 @@ class OpenHandsTurnRunner:
             poll_interval_seconds=self.active_poll_interval_seconds,
             map_event=map_event,
         ) as watcher:
-            exit_code = run_turn()
+            exit_code = run_turn(
+                event_keys if reset_request is not None else frozenset()
+            )
         with AdvisorEventStore(store_path) as store:
             delivered = store.acknowledged(tuple(watcher.observed_keys))
         return TurnResult(
             exit_code=exit_code,
             delivered_event_keys=frozenset(delivered),
+        )
+
+
+def _claim_context_reset(state_dir: Path, conversation_id: UUID):
+    from senpai_agent.operations import ContextResetRequestStore, RoleTarget
+    from senpai_agent.role_control import (
+        _active_delegation_count,
+        _control_token,
+        _pending_event_keys,
+        _raw_history_checkpoint,
+        _read_lease,
+    )
+
+    queue_path = state_dir / "context-resets.sqlite3"
+    if not queue_path.is_file():
+        return None
+    role = os.environ.get("SENPAI_ROLE")
+    research_tag = os.environ.get("RESEARCH_TAG")
+    if role not in {"advisor", "student"} or not research_tag:
+        return None
+    target = RoleTarget(
+        research_tag=research_tag,
+        role=role,
+        student=os.environ.get("STUDENT_NAME") if role == "student" else None,
+    )
+    with ContextResetRequestStore(queue_path) as store:
+        request = store.claim_next(target, conversation_id=conversation_id)
+        if request is None:
+            return None
+        count, digest = _raw_history_checkpoint(state_dir, conversation_id)
+        pending = _pending_event_keys(state_dir, target, conversation_id)
+        token = _control_token(
+            _read_lease(state_dir / "controller-lease.json"),
+            conversation_id,
+            digest,
+            request.expected_pending_event_keys,
+            _active_delegation_count(state_dir),
+        )
+        if count != request.expected_raw_history_event_count:
+            store.reject(request.request_id, "raw-history-count-changed")
+            return None
+        if digest != request.expected_raw_history_digest:
+            store.reject(request.request_id, "raw-history-prefix-changed")
+            return None
+        if not set(request.expected_pending_event_keys).issubset(pending):
+            store.reject(request.request_id, "pending-events-lost")
+            return None
+        if token != request.expected_control_token:
+            store.reject(request.request_id, "controller-identity-changed")
+            return None
+        return request
+
+
+def _complete_context_reset(
+    state_dir: Path,
+    request: object,
+    *,
+    delivered_event_keys: tuple[str, ...] = (),
+) -> None:
+    from senpai_agent.operations import (
+        ContextResetCompletion,
+        ContextResetRequest,
+        ContextResetRequestStore,
+    )
+    from senpai_agent.role_control import (
+        _pending_event_keys,
+        _raw_history_checkpoint,
+    )
+
+    reset = ContextResetRequest.model_validate(request)
+    total_count, _ = _raw_history_checkpoint(
+        state_dir,
+        reset.expected_conversation_id,
+    )
+    _, prefix_digest = _raw_history_checkpoint(
+        state_dir,
+        reset.expected_conversation_id,
+        event_count=reset.expected_raw_history_event_count,
+    )
+    if total_count is None or prefix_digest is None:
+        raise RuntimeError("context reset history checkpoint is unreadable")
+    pending = _pending_event_keys(
+        state_dir,
+        reset.target,
+        reset.expected_conversation_id,
+    )
+    with ContextResetRequestStore(state_dir / "context-resets.sqlite3") as store:
+        store.complete(
+            ContextResetCompletion(
+                request_id=reset.request_id,
+                target=reset.target,
+                conversation_id=reset.expected_conversation_id,
+                raw_history_event_count_after=total_count,
+                raw_history_digest=prefix_digest,
+                pending_event_keys=pending,
+                delivered_event_keys=delivered_event_keys,
+            )
         )
 
 
@@ -347,6 +482,7 @@ class Controller:
                         self._publish_progress(
                             "openhands-turn",
                             self.turn_timeout_seconds,
+                            conversation_id=conversation_id,
                         )
                         result = self.turns.run(
                             prompt,
@@ -478,12 +614,16 @@ class Controller:
         timeout_seconds: float | None = None,
         *,
         completed_turn: bool = False,
+        conversation_id: UUID | None = None,
     ) -> None:
         if self.progress is not None:
             self.progress.update(
                 phase,
                 timeout_seconds or self.operation_timeout_seconds,
                 completed_turn=completed_turn,
+                conversation_id=(
+                    str(conversation_id) if conversation_id is not None else None
+                ),
             )
 
     def _sleep(self, phase: str, seconds: float) -> None:
@@ -624,6 +764,7 @@ def controller_main(
         resolve_config,
         scrub_model_credentials,
     )
+    from senpai_agent.operations import RoleTarget
     from senpai_agent.tools import (
         close_training_runtimes,
         training_runtime,
@@ -675,11 +816,24 @@ def controller_main(
     reconcile = None
 
     if role == "advisor":
+        role_target = RoleTarget(
+            research_tag=env["RESEARCH_TAG"],
+            role="advisor",
+        )
         mailbox = CompositeMailbox(
             github_mailbox,
             LocalAdvisorMailbox(runner_config.state_dir / "advisor-events.sqlite3"),
+            ContextResetMailbox(
+                runner_config.state_dir / "context-resets.sqlite3",
+                role_target,
+            ),
         )
     else:
+        role_target = RoleTarget(
+            research_tag=env["RESEARCH_TAG"],
+            role="student",
+            student=env["STUDENT_NAME"],
+        )
         training, monitor_store = training_runtime(
             runner_config.workspace,
             runner_config.state_dir / "training",
@@ -692,6 +846,10 @@ def controller_main(
         mailbox = CompositeMailbox(
             github_mailbox,
             LocalStudentMailbox(runner_config.state_dir / "student-events.sqlite3"),
+            ContextResetMailbox(
+                runner_config.state_dir / "context-resets.sqlite3",
+                role_target,
+            ),
             MonitorMailbox(
                 TrainingMonitorEngine(monitor_store, training, metrics),
                 monitor_store,

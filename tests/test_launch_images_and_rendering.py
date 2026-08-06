@@ -109,7 +109,10 @@ def test_dry_run_binds_each_role_image_to_the_derived_source_revision():
     assert {
         role: deployment["spec"]["template"]["spec"]["containers"][0]["image"]
         for role, deployment in deployments.items()
-    } == {"advisor": ADVISOR_IMAGE, "student": STUDENT_IMAGE}
+        } == {
+            "advisor": ADVISOR_IMAGE,
+            "student": STUDENT_IMAGE,
+        }
     assert {
         document["data"]["REPO_REVISION"]
         for document in documents

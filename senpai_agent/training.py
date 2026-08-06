@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 import signal
@@ -6,11 +7,13 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 import psutil
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from senpai_agent.processes import signal_process_group, terminate_process_group
 
@@ -24,6 +27,10 @@ _WANDB_COMPLETE_RUN_URL_BYTES = re.compile(
 _LOG_READ_BYTES = 64 * 1024
 _WANDB_SCAN_OVERLAP_BYTES = 4096
 _ERROR_TAIL_BYTES = 8192
+TRAINING_INVENTORY_FILENAME = "inventory.json"
+_RECENT_TRAINING_LIMIT = 64
+_RECENT_WANDB_RUN_LIMIT = 200
+_RECENT_ERROR_LIMIT = 20
 
 
 class TrainingState(StrEnum):
@@ -57,6 +64,131 @@ class TrainingResult(BaseModel):
     error_tail: str = ""
 
 
+class TrainingInventoryEntry(BaseModel):
+    """One current or recently terminal result in the bounded inventory."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    result: TrainingResult
+    updated_at: AwareDatetime
+
+
+class TrainingInventoryError(BaseModel):
+    """Sanitized error evidence retained independently of result history."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    training_id: str
+    state: TrainingState
+    observed_at: AwareDatetime
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{16}$")
+
+
+class TrainingInventory(BaseModel):
+    """Bounded observation index; full per-training results remain on disk."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: Literal[1] = 1
+    active: tuple[TrainingInventoryEntry, ...] = ()
+    recent_terminal: tuple[TrainingInventoryEntry, ...] = Field(
+        default=(),
+        max_length=_RECENT_TRAINING_LIMIT,
+    )
+    recent_wandb_run_ids: tuple[str, ...] = Field(
+        default=(),
+        max_length=_RECENT_WANDB_RUN_LIMIT,
+    )
+    wandb_run_inventory_overflow: bool = False
+    recent_errors: tuple[TrainingInventoryError, ...] = Field(
+        default=(),
+        max_length=_RECENT_ERROR_LIMIT,
+    )
+
+
+def training_inventory_path(state_dir: Path) -> Path:
+    directory = state_dir.resolve()
+    path = (directory / TRAINING_INVENTORY_FILENAME).resolve()
+    if path.parent != directory:
+        raise ValueError("training inventory must remain inside its state directory")
+    return path
+
+
+def training_result_path(state_dir: Path, training_id: str) -> Path:
+    directory = state_dir.resolve()
+    path = (directory / f"{training_id}.json").resolve()
+    if (
+        not training_id
+        or path.parent != directory
+        or path.name == TRAINING_INVENTORY_FILENAME
+    ):
+        raise ValueError("training id does not name a local result")
+    return path
+
+
+def read_training_inventory(state_dir: Path) -> TrainingInventory:
+    return TrainingInventory.model_validate_json(
+        training_inventory_path(state_dir).read_text(encoding="utf-8")
+    )
+
+
+def _inventory_with_result(
+    inventory: TrainingInventory,
+    result: TrainingResult,
+    observed_at: datetime,
+) -> TrainingInventory:
+    entry = TrainingInventoryEntry(result=result, updated_at=observed_at)
+    active = {
+        item.result.training_id: item
+        for item in inventory.active
+        if item.result.training_id != result.training_id
+    }
+    terminal = [
+        item
+        for item in inventory.recent_terminal
+        if item.result.training_id != result.training_id
+    ]
+    if result.state is TrainingState.RUNNING:
+        active[result.training_id] = entry
+    else:
+        terminal.append(entry)
+
+    run_ids = dict.fromkeys(inventory.recent_wandb_run_ids)
+    overflow = inventory.wandb_run_inventory_overflow
+    for run_id in result.wandb_run_ids:
+        if run_id in run_ids:
+            continue
+        run_ids[run_id] = None
+        if len(run_ids) > _RECENT_WANDB_RUN_LIMIT:
+            run_ids.pop(next(iter(run_ids)))
+            overflow = True
+
+    errors = [
+        item
+        for item in inventory.recent_errors
+        if item.training_id != result.training_id
+    ]
+    if result.error_tail:
+        errors.append(
+            TrainingInventoryError(
+                training_id=result.training_id,
+                state=result.state,
+                observed_at=observed_at,
+                fingerprint=hashlib.sha256(
+                    result.error_tail.encode(errors="ignore")
+                ).hexdigest()[:16],
+            )
+        )
+
+    return TrainingInventory(
+        active=tuple(active.values()),
+        recent_terminal=tuple(terminal[-_RECENT_TRAINING_LIMIT:]),
+        recent_wandb_run_ids=tuple(run_ids),
+        wandb_run_inventory_overflow=overflow,
+        recent_errors=tuple(errors[-_RECENT_ERROR_LIMIT:]),
+    )
+
+
 @dataclass
 class _ActiveTraining:
     process: subprocess.Popen[bytes]
@@ -85,32 +217,73 @@ class TrainingSupervisor:
             raise ValueError("max_timeout_seconds must be positive")
         self.max_timeout_seconds = max_timeout_seconds
         self._lock = threading.Lock()
+        self._inventory_lock = threading.Lock()
         self._active: dict[str, _ActiveTraining] = {}
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_inventory()
         self._cancel_orphaned_runs()
 
     def _cancel_orphaned_runs(self) -> None:
-        for path in self.state_dir.glob("*.json"):
-            result = TrainingResult.model_validate_json(path.read_text())
-            if result.state is TrainingState.RUNNING:
-                process_was_terminated = self._terminate_recovered_process(result)
-                recovered = result.model_copy(
-                    update={
-                        "state": TrainingState.CANCELLED,
-                        "error_tail": (
-                            "Training state was recovered after its "
-                            "supervisor restarted."
-                            if process_was_terminated
-                            else (
-                                "Training state was recovered after its "
-                                "supervisor restarted; its persisted process "
-                                "identity was no longer live, so no signal "
-                                "was sent."
-                            )
-                        ),
-                    }
+        inventory = read_training_inventory(self.state_dir)
+        for entry in inventory.active:
+            result = entry.result
+            process_was_terminated = self._terminate_recovered_process(result)
+            recovered = result.model_copy(
+                update={
+                    "state": TrainingState.CANCELLED,
+                    "error_tail": (
+                        "Training state was recovered after its supervisor restarted."
+                        if process_was_terminated
+                        else (
+                            "Training state was recovered after its supervisor "
+                            "restarted; its persisted process identity was no longer "
+                            "live, so no signal was sent."
+                        )
+                    ),
+                }
+            )
+            self._write_result(recovered)
+
+    def _ensure_inventory(self) -> None:
+        path = training_inventory_path(self.state_dir)
+        if path.is_file():
+            inventory = read_training_inventory(self.state_dir)
+            self._repair_indexed_results(inventory)
+            return
+
+        inventory = TrainingInventory()
+        paths = sorted(
+            (
+                candidate
+                for candidate in self.state_dir.glob("*.json")
+                if candidate.name != TRAINING_INVENTORY_FILENAME
+            ),
+            key=lambda candidate: (candidate.stat().st_mtime, candidate.name),
+        )
+        for candidate in paths:
+            result = TrainingResult.model_validate_json(
+                candidate.read_text(encoding="utf-8")
+            )
+            if candidate.stem != result.training_id:
+                raise ValueError("training result path does not match its id")
+            inventory = _inventory_with_result(
+                inventory,
+                result,
+                datetime.fromtimestamp(candidate.stat().st_mtime, UTC),
+            )
+        self._write_inventory(inventory)
+
+    def _repair_indexed_results(self, inventory: TrainingInventory) -> None:
+        for entry in (*inventory.active, *inventory.recent_terminal):
+            path = training_result_path(self.state_dir, entry.result.training_id)
+            try:
+                persisted = TrainingResult.model_validate_json(
+                    path.read_text(encoding="utf-8")
                 )
-                self._write_result(recovered)
+            except (OSError, ValueError):
+                persisted = None
+            if persisted != entry.result:
+                self._write_result_file(entry.result)
 
     def run_training(self, spec: TrainingSpec) -> TrainingResult:
         if isinstance(spec.argv, str) or not spec.argv:
@@ -366,19 +539,7 @@ class TrainingSupervisor:
 
     @staticmethod
     def _process_identity_matches(result: TrainingResult) -> bool:
-        assert result.pid is not None
-        assert result.process_group_id is not None
-        assert result.process_start_time is not None
-        try:
-            process = psutil.Process(result.pid)
-            return (
-                process.is_running()
-                and process.status() != psutil.STATUS_ZOMBIE
-                and os.getpgid(result.pid) == result.process_group_id
-                and process.create_time() == result.process_start_time
-            )
-        except (ProcessLookupError, psutil.NoSuchProcess):
-            return False
+        return training_process_is_live(result)
 
     def close(self) -> None:
         with self._lock:
@@ -401,7 +562,45 @@ class TrainingSupervisor:
             thread.join()
 
     def _write_result(self, result: TrainingResult) -> None:
-        path = self.state_dir / f"{result.training_id}.json"
+        with self._inventory_lock:
+            training_result_path(self.state_dir, result.training_id)
+            inventory = _inventory_with_result(
+                read_training_inventory(self.state_dir),
+                result,
+                datetime.now(UTC),
+            )
+            self._write_inventory(inventory)
+            self._write_result_file(result)
+
+    def _write_inventory(self, inventory: TrainingInventory) -> None:
+        path = training_inventory_path(self.state_dir)
         temporary = path.with_suffix(".tmp")
-        temporary.write_text(result.model_dump_json(indent=2))
+        temporary.write_text(inventory.model_dump_json(indent=2), encoding="utf-8")
         temporary.replace(path)
+
+    def _write_result_file(self, result: TrainingResult) -> None:
+        path = training_result_path(self.state_dir, result.training_id)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+        temporary.replace(path)
+
+
+def training_process_is_live(result: TrainingResult) -> bool:
+    """Verify a persisted RUNNING result still names the same live process."""
+
+    if (
+        result.pid is None
+        or result.process_group_id is None
+        or result.process_start_time is None
+    ):
+        return False
+    try:
+        process = psutil.Process(result.pid)
+        return (
+            process.is_running()
+            and process.status() != psutil.STATUS_ZOMBIE
+            and os.getpgid(result.pid) == result.process_group_id
+            and process.create_time() == result.process_start_time
+        )
+    except (ProcessLookupError, psutil.NoSuchProcess):
+        return False

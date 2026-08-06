@@ -209,6 +209,55 @@ def test_wandb_gateway_configuration_is_explicit_and_uses_max_glm_reasoning(
     assert config.frontier_reasoning_effort == "max"
 
 
+@pytest.mark.parametrize(
+    ("model", "effort", "key_env", "key"),
+    [
+        (
+            "anthropic/claude-opus-4-8",
+            "xhigh",
+            "ANTHROPIC_API_KEY",
+            "anthropic-key",
+        ),
+        ("wandb/zai-org/GLM-5.2", "max", "WANDB_API_KEY", "wandb-key"),
+    ],
+)
+def test_supervisor_uses_only_its_primary_model_profile(
+    tmp_path: Path,
+    model: str,
+    effort: str,
+    key_env: str,
+    key: str,
+):
+    env = runtime_env(tmp_path, role="supervisor")
+    env.update(
+        {
+            key_env: key,
+            "WANDB_ENTITY": "research-team",
+            "WANDB_PROJECT": "mlxfast",
+            "SENPAI_OPENHANDS_MODEL": model,
+            "SENPAI_OPENHANDS_REASONING_EFFORT": effort,
+        }
+    )
+    for unused in {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "WANDB_API_KEY"} - {
+        key_env
+    }:
+        env.pop(unused, None)
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert config.model == config.smart_model == config.fast_model
+    assert config.model == config.frontier_model == model
+    assert config.api_key_env == config.smart_api_key_env == key_env
+    assert config.api_key_env == config.fast_api_key_env == config.frontier_api_key_env
+    assert config.api_key.get_secret_value() == key
+    assert config.smart_api_key.get_secret_value() == key
+    assert config.fast_api_key.get_secret_value() == key
+    assert config.frontier_api_key.get_secret_value() == key
+    assert config.reasoning_effort == config.smart_reasoning_effort == effort
+    assert config.reasoning_effort == config.fast_reasoning_effort
+    assert config.reasoning_effort == config.frontier_reasoning_effort
+
+
 def test_fast_model_uses_luna_for_an_openai_main_profile(tmp_path: Path):
     env = runtime_env(tmp_path)
     env.update(
@@ -446,6 +495,18 @@ def test_advisor_config_reuses_its_durable_conversation_id(tmp_path: Path):
     second = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
     assert first.conversation_id == second.conversation_id
+
+
+def test_operational_supervisor_uses_a_fresh_conversation_per_resolved_turn(
+    tmp_path: Path,
+):
+    env = runtime_env(tmp_path, role="supervisor")
+
+    first = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+    second = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert first.role == "supervisor"
+    assert first.conversation_id != second.conversation_id
 
 
 @pytest.mark.parametrize("state_location", [None, "inside-workspace"])

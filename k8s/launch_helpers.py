@@ -196,6 +196,77 @@ def existing_student_names(
     return [line for line in result.stdout.splitlines() if line]
 
 
+def existing_advisor_deployments(
+    tag: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> list[str]:
+    """Return exact-tag advisor Deployments for incremental launches."""
+
+    result = subprocess.run(
+        kubectl_command(
+            "get",
+            "deployments",
+            "-l",
+            f"app=senpai,role=advisor,research-tag={tag}",
+            "-o",
+            'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def existing_role_metadata(
+    tag: str,
+    role: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> dict[str, dict[str, str]]:
+    """Return exact-tag role identities and their managed launch annotations."""
+
+    if role not in {"advisor", "student"}:
+        raise ValueError("role must be advisor or student")
+    result = subprocess.run(
+        kubectl_command(
+            "get",
+            "deployments",
+            "-l",
+            f"app=senpai,role={role},research-tag={tag}",
+            "-o",
+            "json",
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    records: dict[str, dict[str, str]] = {}
+    for item in json.loads(result.stdout).get("items", []):
+        metadata = item.get("metadata", {})
+        identity = (
+            metadata.get("labels", {}).get("student")
+            if role == "student"
+            else metadata.get("name")
+        )
+        if not identity or identity in records:
+            raise RuntimeError(f"invalid or duplicate {role} Deployment identity")
+        annotations = metadata.get("annotations", {})
+        records[str(identity)] = {
+            key: str(value)
+            for key, value in annotations.items()
+            if key.startswith("senpai.wandb.com/")
+        }
+    return records
+
+
 def render_template(template: str, replacements: dict[str, str]) -> str:
     """Replace {{PLACEHOLDER}} tokens in a K8s manifest template."""
     out = template

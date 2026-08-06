@@ -127,6 +127,11 @@ memory_gi_per_gpu: 64
 
 timeout_minutes: 30
 max_epochs: 50
+
+operational_supervisor: true
+supervisor_interval_s: 900
+supervisor_research_interval_s: 21600
+supervisor_action_cooldown_s: 1800
 ```
 
 W&B Inference uses LiteLLM's native `wandb/` provider. For example, set every
@@ -173,14 +178,20 @@ uv run python k8s/launch.py \
   --student_image "ghcr.io/wandb/senpai-student:sha-$revision"
 ```
 
-The launcher creates routing labels, one launch Secret, role ConfigMaps, and Deployments. It does not create the namespace, PVC, Service, or general cluster RBAC.
+The launcher creates routing labels, one launch Secret, role ConfigMaps and
+Deployments, plus a dedicated ServiceAccount and namespace-scoped
+Role/RoleBinding for the operational supervisor. The typed backend enforces the
+campaign inventory within that namespace. Use a separate namespace per campaign
+when the Kubernetes authorization boundary itself must isolate campaigns. The
+launcher does not create the namespace, PVC, Service, or general cluster RBAC.
 
 Inspect and stop the launch:
 
 ```bash
 kubectl get deployments,pods -l research-tag=first-run
 kubectl logs -f deployment/senpai-first-run-frieren
-kubectl delete deployments,configmaps,secrets -l research-tag=first-run
+kubectl delete deployments,configmaps,secrets,serviceaccounts,roles,rolebindings \
+  -l research-tag=first-run
 ```
 
 Use `--kube_context` and `--namespace` when the desired cluster is not your current default. Use `--dry_run` to render redacted manifests without checking credentials or writing to the cluster.
@@ -319,14 +330,71 @@ flowchart LR
     WB["W&B<br/>runs and metrics"]
     A["Advisor<br/>controller + OpenHands"]
     S["Students<br/>controller + OpenHands + GPU"]
+    O["Operational supervisor<br/>fresh 15-minute review"]
 
     A <--> GH
     S <--> GH
     A --> WB
     S --> WB
+    O --> GH
+    O --> WB
+    O -. "scoped inspect / repair" .-> A
+    O -. "scoped inspect / repair" .-> S
 ```
 
-There is no Senpai RPC service or cross-node database. GitHub PR labels, typed comments, reviews, and human-tagged Issues are the only advisor/student communication protocol; W&B is the shared experiment store. Role-local SQLite stores local event queues and deduplication plus training-monitor policies; it is never shared across nodes.
+There is no Senpai RPC service or cross-node database. GitHub PR labels, typed
+comments, reviews, and human-tagged Issues remain the only advisor/student
+research protocol; W&B is the shared experiment store. Role-local SQLite
+stores local event queues, deduplication, training-monitor policies, and queued
+context resets; it is never shared across nodes. The separate operational
+supervisor uses Kubernetes pod inspection/exec as a management transport, not
+as a research communication channel.
+
+The opt-in operational supervisor wakes every 15 minutes with a fresh model
+conversation and a timestamped snapshot. It retains only the last three
+snapshots in its explicit working context, so it can detect stagnation without
+growing one long-lived history. Each fresh OpenHands conversation is in-memory;
+the three snapshots and mutation audit are the only local durable supervisor
+state. Enable it while launching the advisor, or add it incrementally only when
+the exact-tag advisor and every unreplaced student Deployment carry the same
+pinned Senpai source revision and advisor branch, with an unchanged student
+inventory. The launcher rejects mixed, unversioned, or differently scoped role
+protocols. Each snapshot contains:
+
+- open PRs whose base is exactly this launch's advisor branch, including age,
+  workflow labels, and issue/review/inline-comment counts;
+- running W&B runs resolved from exact run IDs discovered by this launch's
+  student training supervisors, independent of experiment grouping; and
+- each exact role pod's controller lease, completed turns, running training
+  count, bounded machine utilization, reset status, and recent structured
+  error markers. Raw log and training-error text never leaves the role.
+
+Missing GitHub, W&B, pod, log, or process evidence is represented as unknown,
+never as a false zero. Repeated `SENPAI_TURN_DEFERRED` markers are intentionally
+visible in the three-snapshot trend. Because log windows overlap and persisted
+training errors can recur unchanged, the supervisor counts only distinct
+timestamp/fingerprint pairs rather than treating the same marker in two wakes
+as two failures.
+
+The supervisor has one typed operation tool. It may inspect a configured role,
+send one deduplicated nudge to its existing conversation, queue a same-UUID
+model-context reset, or restart only a quiescent controller. Every mutation is
+campaign-scoped, audited, idempotent, and cooldown-limited. Cooldown identity
+comes from the typed anomaly category, action, and exact role target rather
+than the model's free-form incident label. Inspections always execute fresh,
+and every fresh supervisor turn sees a bounded audit of the 12 most recent
+mutation outcomes. A controller restart is refused while a student experiment
+or delegated agent is active, or when either activity inventory is unknown. A
+context reset is consumed only by the owning controller at a safe turn
+boundary: it starts a clean active branch while preserving the raw OpenHands
+trace, conversation UUID, workspace, and pending events. It never deletes or
+rewrites event files.
+
+Every six hours, the next wake runs a second fresh research review against the
+current `system_instructions/ADVISOR.md`. It intervenes only for clear strategic
+drift, such as a sustained narrow sweep loop, by injecting a concise reminder
+into the existing advisor conversation. This does not change the advisor or
+student research prompts and does not continuously direct experiments.
 
 Each role runs a small Python supervisor around the deterministic controller:
 
@@ -357,7 +425,7 @@ The controller owns cadence, durable events, conversation selection, GitHub tran
 
 The command policy blocks raw GitHub mutations, direct training, `git push`, polling loops, and log streams. Typed transitions enforce repository, branch, assignment, revision, head-SHA, label, and replay preconditions. This policy keeps routine operations deterministic while leaving high-entropy research work to the agent.
 
-When `WANDB_ENTITY` and `WANDB_PROJECT` are configured, [`weave-openhands`](https://github.com/morganmcg1/weave-openhands) traces advisor, student, and child conversations. Each `OPENHANDS_RUN` record includes a direct Weave Agent Observability URL.
+When `WANDB_ENTITY` and `WANDB_PROJECT` are configured, [`weave-openhands`](https://github.com/morganmcg1/weave-openhands) traces advisor, student, supervisor, and child conversations. Each `OPENHANDS_RUN` record includes a direct Weave Agent Observability URL.
 
 ## Operations
 
@@ -370,8 +438,16 @@ Useful launch controls:
 - `--gh_history_scope branch` keeps normal advisor-branch memory, `fresh` creates a shallow ablation checkout, and `repo` exposes full repository history.
 - `--extra_instructions` accepts a Markdown file or literal operator guidance.
 - `human_issues: false` disables GitHub Issue polling for isolated launches.
+- `--operational_supervisor` enables the independent campaign supervisor;
+  `--supervisor_interval_s`, `--supervisor_research_interval_s`, and
+  `--supervisor_action_cooldown_s` configure its durable cadences.
 
-Advisor and student images are built from the same source revision. The advisor image excludes CUDA and PyTorch; the student image contains the CUDA/PyTorch runtime; the cutoff image contains only the minimal job runtime and pinned `kubectl`. Advisor and student builds install Chromium and execute an OpenHands browser smoke test.
+Advisor and student images are built from the same source revision. The advisor
+image excludes CUDA and PyTorch and includes checksum-verified `kubectl` for
+the separate supervisor deployment; advisor pods receive no supervisor RBAC.
+The student image contains the CUDA/PyTorch runtime; the cutoff image contains
+only the minimal job runtime and pinned `kubectl`. Advisor and student builds
+install Chromium and execute an OpenHands browser smoke test.
 
 For multi-day fleets, [`arm_senpai_cluster_cutoff.sh`](scripts/arm_senpai_cluster_cutoff.sh) creates a cluster-side hard cutoff that does not depend on an operator laptop remaining online. It can also hold a shared start gate until the expected fleet is ready or its readiness deadline expires.
 
@@ -396,6 +472,7 @@ Deep references:
 - [SPEC.md](SPEC.md): canonical runtime, persistence, safety, and acceptance contract.
 - [OpenHands plugin](plugins/senpai/README.md): skills and lifecycle hooks.
 - [Harness instructions](system_instructions/SENPAI-HARNESS.md): shared agent/tool contract.
+- [Operational-supervisor harness](system_instructions/OPERATIONAL_SUPERVISOR_HARNESS.md): isolated control-plane contract.
 - [Advisor instructions](system_instructions/ADVISOR.md) and [student instructions](system_instructions/STUDENT.md): role workflows.
 - [OpenHands fork modifications](https://github.com/morganmcg1/software-agent-sdk/blob/main/FORK_MODS.md): provider continuation, compaction, reasoning, and cache changes.
 - [Contributing](CONTRIBUTING.md): development and CLA requirements.

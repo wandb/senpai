@@ -71,6 +71,69 @@ def test_student_discovery_uses_the_requested_cluster_scope(monkeypatch):
     assert "app=senpai,role=student,research-tag=track-a" in captured["argv"]
 
 
+def test_advisor_discovery_uses_the_exact_campaign_scope(monkeypatch):
+    captured = {}
+
+    def run(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="senpai-advisor-track-a\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+
+    names = launch_helpers.existing_advisor_deployments(
+        "track-a",
+        kube_context="gpu-cluster",
+        namespace="research",
+    )
+
+    assert names == ["senpai-advisor-track-a"]
+    assert "app=senpai,role=advisor,research-tag=track-a" in captured["argv"]
+
+
+def test_role_revision_discovery_is_exact_and_reports_missing_annotations(
+    monkeypatch,
+):
+    captured = {}
+
+    def run(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout=(
+                '{"items":['
+                '{"metadata":{"name":"senpai-track-a-fern",'
+                '"labels":{"student":"fern"},'
+                '"annotations":{"senpai.wandb.com/source-revision":"abc"}}},'
+                '{"metadata":{"name":"senpai-track-a-frieren",'
+                '"labels":{"student":"frieren"}}}'
+                "]}"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+
+    metadata = launch_helpers.existing_role_metadata(
+        "track-a",
+        "student",
+        kube_context="gpu-cluster",
+        namespace="research",
+    )
+
+    assert metadata == {
+        "fern": {"senpai.wandb.com/source-revision": "abc"},
+        "frieren": {},
+    }
+    assert "app=senpai,role=student,research-tag=track-a" in captured["argv"]
+    assert captured["argv"][-2:] == ["-o", "json"]
+
+
 def test_kubectl_default_scope_omits_an_empty_context():
     assert launch_helpers.kubectl_command("apply", "-f", "-") == [
         "kubectl",
@@ -108,6 +171,207 @@ def bypass_external_preflight(monkeypatch):
         "preflight_check_target_repo_branch",
         lambda *_args: "main",
     )
+
+
+def test_incremental_supervisor_requires_one_existing_exact_tag_advisor(monkeypatch):
+    args = launch_args(advisor=False, operational_supervisor=True)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "existing_advisor_deployments",
+        lambda *_args, **_kwargs: [],
+    )
+    mutations = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **_kwargs: mutations.append("apply"),
+    )
+
+    with pytest.raises(SystemExit, match="exactly one existing advisor Deployment"):
+        launch.main()
+
+    assert mutations == []
+
+
+def test_incremental_supervisor_requires_the_same_advisor_source_revision(
+    monkeypatch,
+):
+    args = launch_args(advisor=False, operational_supervisor=True)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "existing_advisor_deployments",
+        lambda *_args, **_kwargs: ["senpai-advisor-test-track"],
+    )
+    monkeypatch.setattr(
+        launch,
+        "existing_role_metadata",
+        lambda _tag, role, **_kwargs: (
+            {
+                "senpai-advisor-test-track": {
+                    "senpai.wandb.com/source-revision": "b" * 40,
+                    "senpai.wandb.com/advisor-branch": args.advisor_branch,
+                    "senpai.wandb.com/student-names": "fern",
+                }
+            }
+            if role == "advisor"
+            else {}
+        ),
+    )
+    mutations = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **_kwargs: mutations.append("apply"),
+    )
+
+    with pytest.raises(SystemExit, match="does not match the requested Senpai"):
+        launch.main()
+
+    assert mutations == []
+
+
+def test_incremental_supervisor_cannot_change_the_advisor_student_inventory(
+    monkeypatch,
+):
+    args = launch_args(advisor=False, operational_supervisor=True)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "existing_advisor_deployments",
+        lambda *_args, **_kwargs: ["senpai-advisor-test-track"],
+    )
+
+    def metadata(_tag, role, **_kwargs):
+        if role == "advisor":
+            return {
+                "senpai-advisor-test-track": {
+                    "senpai.wandb.com/source-revision": args.repo_revision,
+                    "senpai.wandb.com/advisor-branch": args.advisor_branch,
+                    "senpai.wandb.com/student-names": "fern",
+                }
+            }
+        return {
+            "frieren": {
+                "senpai.wandb.com/source-revision": args.repo_revision,
+                "senpai.wandb.com/advisor-branch": args.advisor_branch,
+            }
+        }
+
+    monkeypatch.setattr(launch, "existing_role_metadata", metadata)
+    mutations = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **_kwargs: mutations.append("apply"),
+    )
+
+    with pytest.raises(SystemExit, match="would change.*student inventory"):
+        launch.main()
+
+    assert mutations == []
+
+
+def test_compatible_incremental_supervisor_launch_preserves_campaign_scope(
+    monkeypatch,
+):
+    args = launch_args(advisor=False, operational_supervisor=True)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "existing_advisor_deployments",
+        lambda *_args, **_kwargs: ["senpai-advisor-test-track"],
+    )
+
+    def metadata(_tag, role, **_kwargs):
+        if role == "advisor":
+            return {
+                "senpai-advisor-test-track": {
+                    "senpai.wandb.com/source-revision": args.repo_revision,
+                    "senpai.wandb.com/advisor-branch": args.advisor_branch,
+                    "senpai.wandb.com/student-names": "fern",
+                }
+            }
+        return {}
+
+    monkeypatch.setattr(launch, "existing_role_metadata", metadata)
+    mutations = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda _manifest, name, **_kwargs: mutations.append(name),
+    )
+
+    launch.main()
+
+    assert mutations == [
+        "secret senpai-launch-secrets-test-track",
+        "student fern",
+        "operational supervisor",
+    ]
+
+
+def test_supervisor_rejects_an_extra_exact_tag_advisor(monkeypatch):
+    args = launch_args(advisor=True, operational_supervisor=True)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "existing_advisor_deployments",
+        lambda *_args, **_kwargs: ["senpai-advisor-test-track", "stray-advisor"],
+    )
+    mutations = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **_kwargs: mutations.append("apply"),
+    )
+
+    with pytest.raises(SystemExit, match="remain alongside"):
+        launch.main()
+
+    assert mutations == []
+
+
+def test_supervisor_rejects_unreplaced_students_on_an_old_revision(monkeypatch):
+    args = launch_args(advisor=True, operational_supervisor=True)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "existing_advisor_deployments",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        launch,
+        "existing_role_metadata",
+        lambda _tag, role, **_kwargs: (
+            {
+                "legacy-student": {
+                    "senpai.wandb.com/source-revision": "b" * 40,
+                    "senpai.wandb.com/advisor-branch": args.advisor_branch,
+                }
+            }
+            if role == "student"
+            else {}
+        ),
+    )
+    mutations = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **_kwargs: mutations.append("apply"),
+    )
+
+    with pytest.raises(SystemExit, match="legacy-student"):
+        launch.main()
+
+    assert mutations == []
 
 
 def test_wandb_gateway_uses_the_wandb_key_for_openai_compatible_inference(

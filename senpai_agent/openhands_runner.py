@@ -13,7 +13,7 @@ import stat
 import sys
 import time
 import uuid
-from collections.abc import Iterator, Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -456,8 +456,8 @@ def resolve_config(
             "OpenHands state directory must be outside the target workspace"
         )
     role = env.get("SENPAI_ROLE", "")
-    if role not in {"advisor", "student"}:
-        raise RuntimeError("SENPAI_ROLE must be advisor or student")
+    if role not in {"advisor", "student", "supervisor"}:
+        raise RuntimeError("SENPAI_ROLE must be advisor, student, or supervisor")
     try:
         training_max_timeout_seconds = round(
             float(env.get("SENPAI_TIMEOUT_MINUTES", "30")) * 60
@@ -527,98 +527,107 @@ def resolve_config(
         )
     )
 
-    smart_default_model = (
-        env.get("SENPAI_OPENHANDS_MODEL") if args.child else model
-    ) or DEFAULT_MODEL
-    smart_model = (
-        env_value(
-            args.smart_model,
-            env,
-            "SENPAI_OPENHANDS_SMART_MODEL",
-            smart_default_model,
+    if role == "supervisor":
+        smart_model = fast_model = frontier_model = model
+        smart_reasoning_effort = fast_reasoning_effort = (
+            frontier_reasoning_effort
+        ) = reasoning_effort
+        smart_api_key_env = fast_api_key_env = frontier_api_key_env = api_key_env
+    else:
+        smart_default_model = (
+            env.get("SENPAI_OPENHANDS_MODEL") if args.child else model
+        ) or DEFAULT_MODEL
+        smart_model = (
+            env_value(
+                args.smart_model,
+                env,
+                "SENPAI_OPENHANDS_SMART_MODEL",
+                smart_default_model,
+            )
+            or smart_default_model
         )
-        or smart_default_model
-    )
-    smart_default_effort = (
-        env.get("SENPAI_OPENHANDS_REASONING_EFFORT") if args.child else reasoning_effort
-    ) or DEFAULT_REASONING_EFFORT
-    smart_reasoning_effort = (
-        env_value(
-            args.smart_reasoning_effort,
-            env,
-            "SENPAI_OPENHANDS_SMART_REASONING_EFFORT",
-            smart_default_effort,
+        smart_default_effort = (
+            env.get("SENPAI_OPENHANDS_REASONING_EFFORT")
+            if args.child
+            else reasoning_effort
+        ) or DEFAULT_REASONING_EFFORT
+        smart_reasoning_effort = (
+            env_value(
+                args.smart_reasoning_effort,
+                env,
+                "SENPAI_OPENHANDS_SMART_REASONING_EFFORT",
+                smart_default_effort,
+            )
+            or smart_default_effort
         )
-        or smart_default_effort
-    )
-    openhands_reasoning_effort(smart_reasoning_effort, smart_model)
+        openhands_reasoning_effort(smart_reasoning_effort, smart_model)
 
-    fast_default_model = (
-        DEFAULT_FAST_MODEL
-        if model_provider(smart_model) == model_provider(DEFAULT_FAST_MODEL)
-        else smart_model
-    )
-    fast_model = (
-        env_value(
-            args.fast_model,
-            env,
-            "SENPAI_OPENHANDS_FAST_MODEL",
-            fast_default_model,
+        fast_default_model = (
+            DEFAULT_FAST_MODEL
+            if model_provider(smart_model) == model_provider(DEFAULT_FAST_MODEL)
+            else smart_model
         )
-        or fast_default_model
-    )
-    fast_reasoning_effort = (
-        env_value(
-            args.fast_reasoning_effort,
-            env,
-            "SENPAI_OPENHANDS_FAST_REASONING_EFFORT",
-            DEFAULT_FAST_REASONING_EFFORT,
+        fast_model = (
+            env_value(
+                args.fast_model,
+                env,
+                "SENPAI_OPENHANDS_FAST_MODEL",
+                fast_default_model,
+            )
+            or fast_default_model
         )
-        or DEFAULT_FAST_REASONING_EFFORT
-    )
-    openhands_reasoning_effort(fast_reasoning_effort, fast_model)
+        fast_reasoning_effort = (
+            env_value(
+                args.fast_reasoning_effort,
+                env,
+                "SENPAI_OPENHANDS_FAST_REASONING_EFFORT",
+                DEFAULT_FAST_REASONING_EFFORT,
+            )
+            or DEFAULT_FAST_REASONING_EFFORT
+        )
+        openhands_reasoning_effort(fast_reasoning_effort, fast_model)
 
-    frontier_model = (
-        env_value(
-            args.frontier_model,
-            env,
-            "SENPAI_OPENHANDS_FRONTIER_MODEL",
-            DEFAULT_FRONTIER_MODEL,
+        frontier_model = (
+            env_value(
+                args.frontier_model,
+                env,
+                "SENPAI_OPENHANDS_FRONTIER_MODEL",
+                DEFAULT_FRONTIER_MODEL,
+            )
+            or DEFAULT_FRONTIER_MODEL
         )
-        or DEFAULT_FRONTIER_MODEL
-    )
-    frontier_reasoning_effort = (
-        env_value(
-            args.frontier_reasoning_effort,
-            env,
-            "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT",
-            DEFAULT_FRONTIER_REASONING_EFFORT,
+        frontier_reasoning_effort = (
+            env_value(
+                args.frontier_reasoning_effort,
+                env,
+                "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT",
+                DEFAULT_FRONTIER_REASONING_EFFORT,
+            )
+            or DEFAULT_FRONTIER_REASONING_EFFORT
         )
-        or DEFAULT_FRONTIER_REASONING_EFFORT
-    )
-    openhands_reasoning_effort(frontier_reasoning_effort, frontier_model)
+        openhands_reasoning_effort(frontier_reasoning_effort, frontier_model)
 
-    smart_api_key_env = profile_api_key_env(
-        smart_model,
-        env,
-        "SENPAI_OPENHANDS_SMART_API_KEY_ENV",
-        inherited_model=model,
-        inherited_api_key_env=api_key_env,
-    )
-    fast_api_key_env = profile_api_key_env(
-        fast_model,
-        env,
-        "SENPAI_OPENHANDS_FAST_API_KEY_ENV",
-        inherited_model=smart_model,
-        inherited_api_key_env=smart_api_key_env,
-    )
-    frontier_api_key_env = profile_api_key_env(
-        frontier_model,
-        env,
-        "SENPAI_OPENHANDS_FRONTIER_API_KEY_ENV",
-        inherited_model=model,
-        inherited_api_key_env=api_key_env,
-    )
+        smart_api_key_env = profile_api_key_env(
+            smart_model,
+            env,
+            "SENPAI_OPENHANDS_SMART_API_KEY_ENV",
+            inherited_model=model,
+            inherited_api_key_env=api_key_env,
+        )
+        fast_api_key_env = profile_api_key_env(
+            fast_model,
+            env,
+            "SENPAI_OPENHANDS_FAST_API_KEY_ENV",
+            inherited_model=smart_model,
+            inherited_api_key_env=smart_api_key_env,
+        )
+        frontier_api_key_env = profile_api_key_env(
+            frontier_model,
+            env,
+            "SENPAI_OPENHANDS_FRONTIER_API_KEY_ENV",
+            inherited_model=model,
+            inherited_api_key_env=api_key_env,
+        )
     api_key = resolve_api_key(env, api_key_env)
     smart_api_key = resolve_api_key(env, smart_api_key_env)
     fast_api_key = resolve_api_key(env, fast_api_key_env)
@@ -909,6 +918,34 @@ def scrub_model_credentials(
 def build_main_tools(config: RunnerConfig) -> list[Tool]:
     """Keep native reasoning tools while replacing unsafe control boundaries."""
 
+    if config.role == "supervisor":
+        register_senpai_tools()
+        students = tuple(
+            student.strip()
+            for student in os.environ.get("STUDENT_NAMES", "").split(",")
+            if student.strip()
+        )
+        if not students:
+            raise RuntimeError("supervisor requires an exact student inventory")
+        return [
+            Tool(
+                name="senpai_operations",
+                params={
+                    "state_dir": str(config.state_dir),
+                    "namespace": os.environ["SENPAI_KUBECTL_NAMESPACE"],
+                    "research_tag": os.environ["RESEARCH_TAG"],
+                    "repo": config.github_repo,
+                    "advisor_branch": os.environ["ADVISOR_BRANCH"],
+                    "students": students,
+                    "mutation_cooldown_seconds": float(
+                        os.environ.get(
+                            "SENPAI_SUPERVISOR_ACTION_COOLDOWN_SECONDS",
+                            "1800",
+                        )
+                    ),
+                },
+            )
+        ]
     if config.github_token is None:
         raise RuntimeError("main agents require GitHub credentials")
     register_senpai_tools()
@@ -1130,6 +1167,7 @@ def run_openhands(
     config: RunnerConfig,
     *,
     reset_context: bool = False,
+    context_reset_applied: Callable[[], None] | None = None,
 ) -> int:
     started_at = time.time()
     run_deadline = min(
@@ -1144,10 +1182,18 @@ def run_openhands(
     role_instructions = read_role_instructions(config.role_file)
     register_default_tools(enable_browser=config.enable_browser)
     register_senpai_tools()
-    file_agents = sanitized_agent_definitions(config.workspace)
+    file_agents = (
+        []
+        if config.role == "supervisor"
+        else sanitized_agent_definitions(config.workspace)
+    )
     register_agent_definitions(file_agents, config.workspace)
     available_agents = [definition.name for definition in file_agents]
-    project_skills = sanitized_project_skills(config.workspace)
+    project_skills = (
+        []
+        if config.role == "supervisor"
+        else sanitized_project_skills(config.workspace)
+    )
     os.environ["SENPAI_CONVERSATION_ID"] = config.conversation_id.hex
 
     print(
@@ -1201,7 +1247,11 @@ def run_openhands(
             config.github_token,
             trusted_actor=config.github_trusted_actor,
         )
-    configure_delegation(delegation_config(config, deadline_epoch=run_deadline))
+    configure_delegation(
+        None
+        if config.role == "supervisor"
+        else delegation_config(config, deadline_epoch=run_deadline)
+    )
     scrub_github_credentials(os.environ)
     conversation = None
     cleanup_error: BaseException | None = None
@@ -1271,14 +1321,18 @@ def run_openhands(
             agent=agent,
             workspace=config.workspace,
             plugins=[PluginSource(source=str(config.plugin_dir))],
-            persistence_dir=config.state_dir,
+            persistence_dir=(
+                None if config.role == "supervisor" else config.state_dir
+            ),
             conversation_id=config.conversation_id,
             callbacks=[] if config.child else [print_event],
             max_iteration_per_run=config.max_turns,
             visualizer=None,
-            secrets=dict(config.command_secrets),
+            secrets=(
+                {} if config.role == "supervisor" else dict(config.command_secrets)
+            ),
             tags={"runtime": "senpai-openhands"},
-            delete_on_close=config.child,
+            delete_on_close=(config.child or config.role == "supervisor"),
             prompt_cache_key=conversation_prompt_cache_key(config),
         )
         reject_recovered_actions(conversation)
@@ -1295,11 +1349,22 @@ def run_openhands(
         try:
             # send_message performs OpenHands' lazy tool initialization.
             conversation.send_message(prompt)
+            if reset_context and context_reset_applied is not None:
+                try:
+                    context_reset_applied()
+                except Exception as error:  # audit failure must not strand recovery
+                    print(
+                        "SENPAI_CONTEXT_RESET_AUDIT_ERROR "
+                        f"conversation_id={config.conversation_id} "
+                        f"error={type(error).__name__}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
         finally:
             clear_github_credentials()
             configure_delegation(None)
         with graceful_interrupts(conversation):
-            if not config.child:
+            if not config.child and config.role != "supervisor":
                 with (
                     AdvisorEventStore(local_event_db_path(config)) as event_store,
                     AdvisorEventPump(

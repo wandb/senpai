@@ -56,6 +56,7 @@ class WorkerLease:
     phase: str
     deadline: float
     completed_turns: int = 0
+    conversation_id: str | None = None
 
     @classmethod
     def read(cls, path: Path) -> WorkerLease:
@@ -65,6 +66,11 @@ class WorkerLease:
             phase=str(value["phase"]),
             deadline=float(value["deadline"]),
             completed_turns=int(value.get("completed_turns", 0)),
+            conversation_id=(
+                str(value["conversation_id"])
+                if value.get("conversation_id") is not None
+                else None
+            ),
         )
         if lease.pid <= 0 or not lease.phase or lease.completed_turns < 0:
             raise ValueError("invalid controller lease")
@@ -77,6 +83,7 @@ class ProgressLease:
     def __init__(self, path: Path):
         self.path = path.resolve()
         self.completed_turns = 0
+        self.conversation_id: str | None = None
 
     def update(
         self,
@@ -84,11 +91,14 @@ class ProgressLease:
         timeout_seconds: float,
         *,
         completed_turn: bool = False,
+        conversation_id: str | None = None,
     ) -> None:
         if not phase or timeout_seconds <= 0:
             raise ValueError("progress phase and timeout must be positive")
         if completed_turn:
             self.completed_turns += 1
+        if conversation_id is not None:
+            self.conversation_id = conversation_id
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(
@@ -98,6 +108,7 @@ class ProgressLease:
                     "phase": phase,
                     "deadline": time.monotonic() + timeout_seconds,
                     "completed_turns": self.completed_turns,
+                    "conversation_id": self.conversation_id,
                 },
                 sort_keys=True,
             ),
