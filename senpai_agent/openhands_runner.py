@@ -55,6 +55,7 @@ register_litellm_model_compatibility()
 
 from openhands.sdk import LLM, Agent, AgentContext, LocalConversation, Tool
 from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
+from openhands.sdk.context.condenser import CondenserBase, LLMSummarizingCondenser
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
 from openhands.sdk.event import ActionEvent, MessageEvent
 from openhands.sdk.llm import TextContent
@@ -110,6 +111,8 @@ COMMAND_SECRET_ENV_NAMES = (
     "EXA_API_KEY",
 )
 EVENT_TEXT_LIMIT = 20000
+DEFAULT_LOCAL_CONDENSER_MAX_EVENTS = 80
+MIN_LOCAL_CONDENSER_MAX_EVENTS = 12
 
 
 @dataclass(frozen=True)
@@ -193,6 +196,7 @@ class RunnerConfig:
     timeout_seconds: float = 3600
     llm_timeout_seconds: int = 900
     llm_num_retries: int = 1
+    local_condenser_max_events: int = DEFAULT_LOCAL_CONDENSER_MAX_EVENTS
     child: bool = False
     delegation_root_state_dir: Path | None = None
     delegation_tree_id: str | None = None
@@ -486,8 +490,22 @@ def resolve_config(
         llm_num_retries = int(env.get("SENPAI_LLM_NUM_RETRIES", "1"))
     except ValueError as error:
         raise RuntimeError("Senpai LLM timeout settings must be numeric") from error
+    try:
+        local_condenser_max_events = int(
+            env.get(
+                "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS",
+                str(DEFAULT_LOCAL_CONDENSER_MAX_EVENTS),
+            )
+        )
+    except ValueError as error:
+        raise RuntimeError("local condenser max events must be an integer") from error
     if llm_timeout_seconds <= 0 or llm_num_retries <= 0:
         raise RuntimeError("Senpai LLM timeout and attempts must be positive")
+    if local_condenser_max_events < MIN_LOCAL_CONDENSER_MAX_EVENTS:
+        raise RuntimeError(
+            "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS must be at least "
+            f"{MIN_LOCAL_CONDENSER_MAX_EVENTS}"
+        )
     wandb_entity = env.get("WANDB_ENTITY", "").strip() or None
     wandb_project = env.get("WANDB_PROJECT", "").strip() or None
     delegation_root_value = env.get("SENPAI_DELEGATION_ROOT_STATE_DIR")
@@ -706,6 +724,7 @@ def resolve_config(
         timeout_seconds=timeout_seconds,
         llm_timeout_seconds=llm_timeout_seconds,
         llm_num_retries=llm_num_retries,
+        local_condenser_max_events=local_condenser_max_events,
         child=args.child,
         delegation_root_state_dir=delegation_root_state_dir,
         delegation_tree_id=delegation_tree_id,
@@ -896,6 +915,25 @@ def anthropic_compaction_configuration(model: str) -> dict[str, int]:
     return {"anthropic_compact_threshold": 100_000}
 
 
+def configured_local_condenser(
+    llm: LLM,
+    max_events: int,
+    condenser: CondenserBase | None = None,
+) -> CondenserBase | None:
+    """Size the local fallback without overriding provider-native compaction."""
+
+    if llm.responses_use_previous_response_id or llm.uses_anthropic_compaction():
+        return None
+    selected = condenser
+    if selected is None:
+        selected = get_default_condenser(
+            llm.model_copy(update={"usage_id": "senpai-condenser"})
+        )
+    if not isinstance(selected, LLMSummarizingCondenser):
+        return selected
+    return selected.model_copy(update={"max_size": max_events})
+
+
 def local_event_db_path(config: RunnerConfig) -> Path:
     return config.state_dir / f"{config.role}-events.sqlite3"
 
@@ -987,6 +1025,7 @@ def delegation_config(
         enable_browser=config.enable_browser,
         command_secrets=config.command_secrets,
         role=config.role,
+        local_condenser_max_events=config.local_condenser_max_events,
         root_state_dir=config.delegation_root_state_dir,
         tree_id=config.delegation_tree_id,
         depth=config.delegation_depth,
@@ -1183,6 +1222,7 @@ def run_openhands(
                 "reasoning_mode": (
                     "pro" if config.reasoning_effort == "ultra" else "standard"
                 ),
+                "local_condenser_max_events": config.local_condenser_max_events,
                 "agent": config.agent_name,
                 "enable_browser": config.enable_browser,
                 "role_file": str(config.role_file) if config.role_file else None,
@@ -1246,21 +1286,19 @@ def run_openhands(
                 project_skills,
             )
             agent = with_tool_concurrency(agent, MAX_PARALLEL_AGENTS)
-            if (
-                llm.responses_use_previous_response_id
-                or llm.uses_anthropic_compaction()
-            ):
-                agent = agent.model_copy(update={"condenser": None})
+            agent = agent.model_copy(
+                update={
+                    "condenser": configured_local_condenser(
+                        agent.llm,
+                        config.local_condenser_max_events,
+                        agent.condenser,
+                    )
+                }
+            )
         else:
-            condenser = (
-                None
-                if (
-                    llm.responses_use_previous_response_id
-                    or llm.uses_anthropic_compaction()
-                )
-                else get_default_condenser(
-                    llm.model_copy(update={"usage_id": "senpai-condenser"})
-                )
+            condenser = configured_local_condenser(
+                llm,
+                config.local_condenser_max_events,
             )
             agent = Agent(
                 llm=llm,

@@ -79,6 +79,7 @@ def delegation_config(tmp_path: Path, **updates) -> DelegationConfig:
         "enable_browser": True,
         "command_secrets": {"EXA_API_KEY": "exa-secret"},
         "role": "advisor",
+        "local_condenser_max_events": 180,
     }
     values.update(updates)
     return DelegationConfig(**values)
@@ -206,6 +207,7 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
     assert fast.environment["SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT"] == (
         config.frontier_reasoning_effort
     )
+    assert fast.environment["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"] == "180"
 
 
 def test_child_environment_replaces_ambient_model_credentials(

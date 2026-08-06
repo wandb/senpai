@@ -11,6 +11,7 @@ from pydantic import SecretStr
 from senpai_agent.openhands_runner import (
     EVENT_TEXT_LIMIT,
     anthropic_compaction_configuration,
+    configured_local_condenser,
     conversation_prompt_cache_key,
     event_summary,
     model_runtime_configuration,
@@ -205,6 +206,40 @@ def test_openai_response_configuration_is_accepted_by_the_pinned_sdk():
     assert llm.responses_use_previous_response_id is True
     assert llm.responses_compact_threshold == 200_000
     assert openai_responses_configuration("anthropic/claude-opus-4-8") == {}
+
+
+def test_local_condenser_cap_applies_only_without_provider_native_compaction():
+    wandb = LLM(
+        model="wandb/zai-org/GLM-5.2",
+        api_key=SecretStr("test-key"),
+        reasoning_effort="max",
+        **model_runtime_configuration(
+            "wandb/zai-org/GLM-5.2",
+            "max",
+            wandb_entity="research-team",
+            wandb_project="mlxfast",
+        ),
+    )
+    openai = LLM(
+        model="openai/gpt-5.6-sol",
+        api_key=SecretStr("test-key"),
+        reasoning_effort="max",
+        **model_runtime_configuration("openai/gpt-5.6-sol", "max"),
+    )
+    anthropic = LLM(
+        model="anthropic/claude-opus-4-8",
+        api_key=SecretStr("test-key"),
+        reasoning_effort="xhigh",
+        **model_runtime_configuration("anthropic/claude-opus-4-8", "xhigh"),
+    )
+
+    existing = configured_local_condenser(wandb, 80)
+    resized = configured_local_condenser(wandb, 180, existing)
+
+    assert existing.max_size == 80
+    assert resized.max_size == 180
+    assert configured_local_condenser(openai, 180) is None
+    assert configured_local_condenser(anthropic, 180) is None
 
 
 def test_ultra_uses_openai_max_effort_in_pro_mode():

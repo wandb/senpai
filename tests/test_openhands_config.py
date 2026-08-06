@@ -145,6 +145,29 @@ def test_runtime_stall_bounds_are_validated(tmp_path, updates, message):
         resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
+def test_local_condenser_event_cap_is_explicit_and_configurable(tmp_path):
+    default = resolve_config(
+        parse_runner_args(["--max-turns", "1"]),
+        runtime_env(tmp_path),
+    )
+    env = runtime_env(tmp_path)
+    env["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"] = "180"
+
+    configured = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert default.local_condenser_max_events == 80
+    assert configured.local_condenser_max_events == 180
+
+
+@pytest.mark.parametrize("value", ["eleven", "11"])
+def test_local_condenser_event_cap_rejects_invalid_values(tmp_path, value):
+    env = runtime_env(tmp_path)
+    env["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"] = value
+
+    with pytest.raises(RuntimeError, match="condenser|integers|at least 12"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+
 def test_default_model_profiles_are_explicit_and_provider_credentials_are_inferred(
     tmp_path: Path,
 ):
