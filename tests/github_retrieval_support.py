@@ -1,6 +1,6 @@
 from urllib.parse import parse_qs, urlsplit
 
-from senpai_agent import github
+from senpai_agent.github import pull_requests
 
 REPO = "acme/widgets"
 
@@ -95,4 +95,4 @@ class FakeGitHubReader:
 
 
 def install_fake_github(monkeypatch, fake: FakeGitHubReader) -> None:
-    monkeypatch.setattr(github, "GitHubReader", fake.factory)
+    monkeypatch.setattr(pull_requests, "GitHubReader", fake.factory)

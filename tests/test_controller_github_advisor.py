@@ -1,8 +1,18 @@
 import pytest
 from pydantic import SecretStr
 
-from senpai_agent.github_mailbox import GitHubMailbox
-from senpai_agent.models import AssignmentRecord, render_assignment_marker
+from senpai_agent.github.mailbox import GitHubMailbox
+from senpai_agent.models import (
+    AssignmentKey,
+    AssignmentRecord,
+    ExperimentResult,
+    ResearchBaseAcceptanceRecord,
+    ResultStatus,
+    experiment_result_digest,
+    render_assignment_marker,
+    render_research_base_acceptance_marker,
+    render_result_comment,
+)
 
 
 def pull(
@@ -11,9 +21,10 @@ def pull(
     number=17,
     body="",
     head_sha=None,
+    comments_url=None,
     updated_at="2099-07-29T18:00:00Z",
 ):
-    return {
+    value = {
         "number": number,
         "title": "Try bounded change",
         "html_url": f"https://github.test/acme/widgets/pull/{number}",
@@ -25,6 +36,9 @@ def pull(
         },
         "labels": [{"name": label} for label in labels],
     }
+    if comments_url is not None:
+        value["comments_url"] = comments_url
+    return value
 
 
 def mailbox(monkeypatch, pulls, *, students=()):
@@ -40,16 +54,16 @@ def mailbox(monkeypatch, pulls, *, students=()):
     return value
 
 
-def assignment(*, base_sha="b" * 40):
+def assignment(*, base_sha="b" * 40, base_ref="research", number=17):
     return AssignmentRecord(
         repo="acme/widgets",
-        assignment_id="assignment-17",
+        assignment_id=f"assignment-{number}",
         revision_id="revision-2",
         student="student-1",
-        base_ref="research",
+        base_ref=base_ref,
         base_sha=base_sha,
-        head_ref="student/candidate-17",
-        head_sha="7" * 40,
+        head_ref=f"student/candidate-{number}",
+        head_sha=str(number % 10) * 40,
     )
 
 
@@ -133,7 +147,7 @@ def test_duplicate_assignments_report_every_pr_for_the_student(monkeypatch):
     assert duplicate.payload["pull_requests"] == [17, 18]
 
 
-def test_baseline_advance_uses_the_fresh_live_branch_head_on_each_poll(
+def test_research_base_change_uses_the_fresh_live_branch_head_on_each_poll(
     monkeypatch,
 ):
     assigned_sha = "b" * 40
@@ -158,15 +172,18 @@ def test_baseline_advance_uses_the_fresh_live_branch_head_on_each_poll(
     monkeypatch.setattr(advisor._github, "get", get_ref)
 
     first = next(
-        event for event in advisor.poll() if event.kind == "baseline_advanced"
+        event for event in advisor.poll() if event.kind == "research_base_changed"
     )
     current_sha[0] = "d" * 40
     second = next(
-        event for event in advisor.poll() if event.kind == "baseline_advanced"
+        event for event in advisor.poll() if event.kind == "research_base_changed"
     )
 
-    assert first.dedupe_key == f"baseline_advanced:17:{assigned_sha}:{'c' * 40}"
-    assert first.payload["assigned_base_sha"] == assigned_sha
+    assert first.dedupe_key == (
+        f"research_base_changed:17:assignment-17:revision-2:"
+        f"{'7' * 40}:{assigned_sha}:{'c' * 40}"
+    )
+    assert first.payload["required_base_sha"] == assigned_sha
     assert first.payload["current_base_sha"] == "c" * 40
     assert first.payload["compare_url"] == (
         f"https://github.test/acme/widgets/compare/{assigned_sha}...{'c' * 40}"
@@ -178,7 +195,283 @@ def test_baseline_advance_uses_the_fresh_live_branch_head_on_each_poll(
     ]
 
 
-def test_current_assignment_baseline_does_not_emit_a_false_advance(monkeypatch):
+def terminal_result(*, summary="The candidate remains valid."):
+    return ExperimentResult(
+        assignment=AssignmentKey(
+            repo="acme/widgets",
+            pr_number=17,
+            assignment_id="assignment-17",
+            revision_id="revision-2",
+            expected_head_sha="7" * 40,
+            student="student-1",
+        ),
+        status=ResultStatus.SUCCEEDED,
+        hypothesis="The candidate improves the primary metric.",
+        summary=summary,
+        runs=(),
+        commit_sha="7" * 40,
+    )
+
+
+def result_comment(*, result=None, author="senpai-bot"):
+    current = terminal_result() if result is None else result
+    return {
+        "body": render_result_comment(current),
+        "user": {"login": author},
+    }
+
+
+def acceptance_comment(
+    *,
+    result=None,
+    accepted_base_sha="c" * 40,
+    author="senpai-bot",
+):
+    current = terminal_result() if result is None else result
+    marker = render_research_base_acceptance_marker(
+        ResearchBaseAcceptanceRecord(
+            repo="acme/widgets",
+            pr_number=17,
+            assignment_id="assignment-17",
+            revision_id="revision-2",
+            result_head_sha="7" * 40,
+            result_digest=experiment_result_digest(current),
+            evaluated_base_sha="b" * 40,
+            base_ref="research",
+            accepted_base_sha=accepted_base_sha,
+        )
+    )
+    return {
+        "body": f"{marker}\n\nThe result remains valid.",
+        "user": {"login": author},
+    }
+
+
+def test_exact_trusted_acceptance_suppresses_review_restart_redelivery(monkeypatch):
+    advisor = mailbox(
+        monkeypatch,
+        [
+            pull(
+                labels=("research", "student:student-1", "status:review"),
+                body=render_assignment_marker(assignment()),
+                head_sha="7" * 40,
+                comments_url=(
+                    "https://api.github.test/repos/acme/widgets/"
+                    "issues/17/comments"
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        advisor._github,
+        "get",
+        lambda _path: {"object": {"sha": "c" * 40}},
+    )
+    monkeypatch.setattr(advisor._github, "actor", lambda: "senpai-bot")
+    monkeypatch.setattr(
+        advisor._github,
+        "objects",
+        lambda _url: [result_comment(), acceptance_comment()],
+    )
+
+    assert "research_base_changed" not in {
+        event.kind for event in advisor.poll()
+    }
+
+
+@pytest.mark.parametrize(
+    "extra",
+    ["duplicate-acceptance", "duplicate-result", "malformed-result"],
+)
+def test_acceptance_suppression_tolerates_idempotent_or_malformed_noise(
+    monkeypatch,
+    extra,
+):
+    advisor = mailbox(
+        monkeypatch,
+        [
+            pull(
+                labels=("research", "student:student-1", "status:review"),
+                body=render_assignment_marker(assignment()),
+                head_sha="7" * 40,
+                comments_url=(
+                    "https://api.github.test/repos/acme/widgets/"
+                    "issues/17/comments"
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        advisor._github,
+        "get",
+        lambda _path: {"object": {"sha": "c" * 40}},
+    )
+    monkeypatch.setattr(advisor._github, "actor", lambda: "senpai-bot")
+    acceptance = acceptance_comment()
+    if extra == "duplicate-acceptance":
+        noise = acceptance_comment()
+    elif extra == "duplicate-result":
+        noise = result_comment()
+    else:
+        noise = {
+            "body": '<!-- senpai-result:v2 {"assignment_id":"assignment-17"} -->',
+            "user": {"login": "senpai-bot"},
+        }
+    monkeypatch.setattr(
+        advisor._github,
+        "objects",
+        lambda _url: [result_comment(), acceptance, noise],
+    )
+
+    assert "research_base_changed" not in {
+        event.kind for event in advisor.poll()
+    }
+
+
+@pytest.mark.parametrize(
+    "comment",
+    [
+        acceptance_comment(author="untrusted-user"),
+        acceptance_comment(accepted_base_sha="d" * 40),
+    ],
+    ids=("untrusted", "stale"),
+)
+def test_untrusted_or_stale_acceptance_does_not_suppress_change(
+    monkeypatch,
+    comment,
+):
+    advisor = mailbox(
+        monkeypatch,
+        [
+            pull(
+                labels=("research", "student:student-1", "status:review"),
+                body=render_assignment_marker(assignment()),
+                head_sha="7" * 40,
+                comments_url=(
+                    "https://api.github.test/repos/acme/widgets/"
+                    "issues/17/comments"
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        advisor._github,
+        "get",
+        lambda _path: {"object": {"sha": "c" * 40}},
+    )
+    monkeypatch.setattr(advisor._github, "actor", lambda: "senpai-bot")
+    monkeypatch.setattr(
+        advisor._github,
+        "objects",
+        lambda _url: [result_comment(), comment],
+    )
+
+    assert "research_base_changed" in {event.kind for event in advisor.poll()}
+
+
+def test_acceptance_for_different_result_at_same_head_does_not_suppress_change(
+    monkeypatch,
+):
+    accepted = terminal_result(summary="Result A remains valid.")
+    current = terminal_result(summary="Result B supersedes it.")
+    advisor = mailbox(
+        monkeypatch,
+        [
+            pull(
+                labels=("research", "student:student-1", "status:review"),
+                body=render_assignment_marker(assignment()),
+                head_sha="7" * 40,
+                comments_url=(
+                    "https://api.github.test/repos/acme/widgets/"
+                    "issues/17/comments"
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        advisor._github,
+        "get",
+        lambda _path: {"object": {"sha": "c" * 40}},
+    )
+    monkeypatch.setattr(advisor._github, "actor", lambda: "senpai-bot")
+    monkeypatch.setattr(
+        advisor._github,
+        "objects",
+        lambda _url: [
+            result_comment(result=current),
+            acceptance_comment(result=accepted),
+        ],
+    )
+
+    assert "research_base_changed" in {event.kind for event in advisor.poll()}
+
+
+def test_malformed_trusted_acceptance_does_not_suppress_change(monkeypatch):
+    advisor = mailbox(
+        monkeypatch,
+        [
+            pull(
+                labels=("research", "student:student-1", "status:review"),
+                body=render_assignment_marker(assignment()),
+                head_sha="7" * 40,
+                comments_url=(
+                    "https://api.github.test/repos/acme/widgets/"
+                    "issues/17/comments"
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        advisor._github,
+        "get",
+        lambda _path: {"object": {"sha": "c" * 40}},
+    )
+    monkeypatch.setattr(advisor._github, "actor", lambda: "senpai-bot")
+    monkeypatch.setattr(
+        advisor._github,
+        "objects",
+        lambda _url: [
+            result_comment(),
+            {
+                "body": "<!-- senpai-research-base-acceptance:v1 malformed -->",
+                "user": {"login": "senpai-bot"},
+            },
+        ],
+    )
+
+    assert "research_base_changed" in {event.kind for event in advisor.poll()}
+
+
+def test_wip_base_change_does_not_query_acceptance_comments(monkeypatch):
+    advisor = mailbox(
+        monkeypatch,
+        [
+            pull(
+                labels=("research", "student:student-1", "status:wip"),
+                body=render_assignment_marker(assignment()),
+                head_sha="7" * 40,
+                comments_url=(
+                    "https://api.github.test/repos/acme/widgets/"
+                    "issues/17/comments"
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        advisor._github,
+        "get",
+        lambda _path: {"object": {"sha": "c" * 40}},
+    )
+    monkeypatch.setattr(
+        advisor._github,
+        "objects",
+        lambda _url: pytest.fail("WIP base polling queried comments"),
+    )
+
+    assert "research_base_changed" in {event.kind for event in advisor.poll()}
+
+
+def test_current_assignment_base_does_not_emit_a_false_change(monkeypatch):
     current_sha = "b" * 40
     advisor = mailbox(
         monkeypatch,
@@ -197,10 +490,57 @@ def test_current_assignment_baseline_does_not_emit_a_false_advance(monkeypatch):
         lambda _path: {"object": {"sha": current_sha}},
     )
 
-    assert "baseline_advanced" not in {event.kind for event in advisor.poll()}
+    assert "research_base_changed" not in {
+        event.kind for event in advisor.poll()
+    }
 
 
-def test_baseline_ref_failure_does_not_suppress_other_advisor_events(
+def test_each_assignment_watches_its_own_research_base_ref(monkeypatch):
+    advisor = mailbox(
+        monkeypatch,
+        [
+            pull(
+                number=17,
+                labels=("research-a", "student:student-1", "status:wip"),
+                body=render_assignment_marker(
+                    assignment(base_ref="research-a", number=17)
+                ),
+            ),
+            pull(
+                number=18,
+                labels=("research-b", "student:student-2", "status:wip"),
+                body=render_assignment_marker(
+                    assignment(base_ref="research-b", number=18)
+                ),
+            ),
+        ],
+    )
+    reads = []
+
+    def get_ref(path):
+        reads.append(path)
+        sha = "c" * 40 if path.endswith("research-a") else "d" * 40
+        return {"object": {"sha": sha}}
+
+    monkeypatch.setattr(advisor._github, "get", get_ref)
+
+    changed = [
+        event
+        for event in advisor.poll()
+        if event.kind == "research_base_changed"
+    ]
+
+    assert {event.payload["base_ref"] for event in changed} == {
+        "research-a",
+        "research-b",
+    }
+    assert reads == [
+        "/repos/acme/widgets/git/ref/heads/research-a",
+        "/repos/acme/widgets/git/ref/heads/research-b",
+    ]
+
+
+def test_research_base_ref_failure_does_not_suppress_other_advisor_events(
     monkeypatch,
     capsys,
 ):
@@ -224,4 +564,4 @@ def test_baseline_ref_failure_does_not_suppress_other_advisor_events(
     events = advisor.poll()
 
     assert {event.kind for event in events} == {"review_ready", "idle_student"}
-    assert "SENPAI_BASELINE_WATCH_ERROR TypeError" in capsys.readouterr().err
+    assert "SENPAI_RESEARCH_BASE_WATCH_ERROR" in capsys.readouterr().err

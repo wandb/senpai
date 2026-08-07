@@ -76,7 +76,7 @@ def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
     runtime_root = tmp_path / "runtime"
     home.mkdir()
     runtime_root.mkdir()
-    source_skill = PLUGIN_DIR / "skills" / "merge-winner" / "SKILL.md"
+    source_skill = PLUGIN_DIR / "skills" / "review-experiment" / "SKILL.md"
     source_agent = ROOT / ".agents" / "agents" / "bash-runner.md"
     originals = {
         source_skill: source_skill.read_text(encoding="utf-8"),
@@ -104,7 +104,7 @@ def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
     plugin = Plugin.load(runtime_plugin)
     agents = discover_agents(home, include_project=True, include_user=False)
 
-    assert "merge-winner" in {skill.name for skill in plugin.skills}
+    assert "review-experiment" in {skill.name for skill in plugin.skills}
     assert "bash-runner" in {agent.name for agent in agents}
     assert all(
         strip_spdx_header(text) == text

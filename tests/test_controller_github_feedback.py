@@ -4,7 +4,7 @@ from uuid import UUID
 from pydantic import SecretStr
 
 from senpai_agent.controller import Controller, TurnResult
-from senpai_agent.github_mailbox import GitHubMailbox
+from senpai_agent.github.mailbox import GitHubMailbox
 from senpai_agent.models import (
     AssignmentFeedbackRecord,
     AssignmentRecord,

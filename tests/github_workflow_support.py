@@ -5,7 +5,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import SecretStr
 
-from senpai_agent.github_workflow import (
+from senpai_agent.github.workflow import (
     GitHubTransportError,
     GitHubWorkflow,
     HttpResponse,
@@ -91,11 +91,16 @@ def comment(
     body: str,
     *,
     author: str = "senpai-bot",
+    author_type: str | None = None,
+    association: str = "MEMBER",
 ) -> dict[str, object]:
+    if author_type is None:
+        author_type = "Bot" if author.casefold() == "senpai-bot" else "User"
     return {
         "id": comment_id,
         "body": body,
-        "user": {"login": author},
+        "user": {"login": author, "type": author_type},
+        "author_association": association,
         "html_url": f"https://github.com/{REPO}/pull/7#issuecomment-{comment_id}",
     }
 
@@ -106,6 +111,8 @@ def human_issue(
     state: str = "open",
     labels: set[str] | None = None,
     author: str = "human-researcher",
+    author_type: str = "User",
+    association: str = "MEMBER",
     pull_request_url: str | None = None,
 ) -> dict[str, object]:
     issue: dict[str, object] = {
@@ -118,7 +125,8 @@ def human_issue(
             {"name": label}
             for label in sorted(labels if labels is not None else {"human", "team"})
         ],
-        "user": {"login": author},
+        "user": {"login": author, "type": author_type},
+        "author_association": association,
     }
     if pull_request_url is not None:
         issue["pull_request"] = {"url": pull_request_url}

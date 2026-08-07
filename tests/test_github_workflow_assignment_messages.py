@@ -2,10 +2,11 @@ from typing import cast
 
 import pytest
 
-from senpai_agent.github_workflow import (
+from senpai_agent.github.workflow import (
     PullHeadMismatchError,
     ReconciliationError,
     StaleAssignmentRevisionError,
+    StaleResearchBaseError,
     WorkflowPreconditionError,
 )
 from senpai_agent.models import (
@@ -17,6 +18,7 @@ from senpai_agent.models import (
 )
 from github_workflow_support import (
     ASSIGNMENT_ID,
+    BASE_SHA,
     HEAD_SHA,
     REPO,
     FakeGitHub,
@@ -42,13 +44,18 @@ def request_revision(
     client,
     *,
     assignment_id: str = ASSIGNMENT_ID,
+    current_revision_id: str = "revision-1",
+    new_revision_id: str = "revision-2",
+    required_base_sha: str = BASE_SHA,
     comment: str = "Run the requested ablation.",
 ):
     return client.request_revision(
         7,
         assignment_id=assignment_id,
+        current_revision_id=current_revision_id,
+        new_revision_id=new_revision_id,
         expected_head_sha=HEAD_SHA,
-        revision_id="revision-2",
+        required_base_sha=required_base_sha,
         comment=comment,
     )
 
@@ -69,12 +76,39 @@ def test_request_revision_converges_marker_assignment_state_and_replays():
     assert parse_assignment_markers(cast(str, fake.pr["body"]))[0].revision_id == (
         "revision-2"
     )
+    assert parse_assignment_markers(cast(str, fake.pr["body"]))[0].base_sha == BASE_SHA
     assert fake.comments == [
         comment(1, f"{marker}\n\nADVISOR: Run the requested ablation.")
     ]
     assert fake.pr["draft"] is True
     assert fake.pr["labels"] == {"student:one", "status:wip"}
     assert fake.mutations == mutations_after_first
+
+
+def test_request_revision_retargets_the_exact_live_research_base():
+    current_base_sha = "c" * 40
+    fake = FakeGitHub(
+        pull_request(labels={"student:one", "status:review"}, draft=False),
+        branch_heads={"schmidhuber": current_base_sha},
+    )
+
+    request_revision(workflow(fake), required_base_sha=current_base_sha)
+
+    assignment = parse_assignment_markers(cast(str, fake.pr["body"]))[0]
+    assert assignment.revision_id == "revision-2"
+    assert assignment.base_sha == current_base_sha
+
+
+def test_request_revision_rejects_a_stale_required_research_base_before_writing():
+    fake = FakeGitHub(
+        pull_request(labels={"student:one", "status:review"}, draft=False),
+        branch_heads={"schmidhuber": "c" * 40},
+    )
+
+    with pytest.raises(StaleResearchBaseError, match="does not match live"):
+        request_revision(workflow(fake), required_base_sha="d" * 40)
+
+    assert fake.mutations == []
 
 
 def test_request_revision_updates_a_trusted_marker_on_the_final_comment_page():

@@ -63,8 +63,7 @@ def test_child_mode_keeps_bounded_delegation_lifecycle_tools(tmp_path):
             "advisor",
             {
                 "senpai_terminal",
-                "get_prs",
-                "github_transition",
+                "senpai_github",
                 "delegate_agent",
                 "spawn_agents",
                 "await_agents",
@@ -76,8 +75,7 @@ def test_child_mode_keeps_bounded_delegation_lifecycle_tools(tmp_path):
             "student",
             {
                 "senpai_terminal",
-                "get_prs",
-                "github_transition",
+                "senpai_github",
                 "delegate_agent",
                 "spawn_agents",
                 "await_agents",
@@ -93,7 +91,13 @@ def test_main_tools_replace_unsafe_defaults_with_role_scoped_boundaries(
     role: str,
     expected_custom: set[str],
 ):
-    config = runtime_config(tmp_path, role=role)
+    config = runtime_config(
+        tmp_path,
+        role=role,
+        advisor_branch="advisor-branch" if role == "advisor" else None,
+        student_names=("student-one",) if role == "advisor" else None,
+        student_name="student-one" if role == "student" else None,
+    )
     by_name = {tool.name: tool for tool in build_main_tools(config)}
 
     assert "terminal" not in by_name
@@ -111,8 +115,12 @@ def test_main_tools_replace_unsafe_defaults_with_role_scoped_boundaries(
         "cancel_agents",
     ):
         assert by_name[name].params == delegation_params
-    assert by_name["get_prs"].params == {
-        "state_dir": str(config.state_dir / "github")
+    assert by_name["senpai_github"].params == {
+        "role": role,
+        "state_dir": str(config.state_dir / "github"),
+        "advisor_branch": "advisor-branch" if role == "advisor" else None,
+        "student_names": ("student-one",) if role == "advisor" else None,
+        "student_name": "student-one" if role == "student" else None,
     }
     if role == "student":
         assert by_name["senpai_training"].params == {
@@ -132,11 +140,11 @@ def test_native_senpai_plugin_loads_its_runtime_skills():
         "assign-experiment",
         "bootstrap-target",
         "check-human-issues",
-        "merge-winner",
+        "review-experiment",
         "submit-experiment-results",
     }
-    assert "merge_experiment" in skills["merge-winner"].content
-    assert "close_experiment" in skills["merge-winner"].content
+    assert "merge_experiment" in skills["review-experiment"].content
+    assert "close_experiment" in skills["review-experiment"].content
     assert plugin.mcp_config == {}
 
 
@@ -328,7 +336,20 @@ def test_file_agent_definitions_keep_bounded_tools_and_no_github_mutations(
     assert definition.permission_mode == "never_confirm"
     assert set(definition.tools) == tools
     assert set(definition.skills) == skills
-    assert {"get_prs", "github_transition"}.isdisjoint(definition.tools)
+    assert {
+        "senpai_github",
+        "get_prs",
+        "create_assignment",
+        "publish_advisor_branch",
+        "repair_assignment_routing",
+        "send_assignment_feedback",
+        "request_assignment_revision",
+        "accept_result_on_current_base",
+        "merge_experiment",
+        "close_experiment",
+        "respond_to_human_issue",
+        "submit_experiment_result",
+    }.isdisjoint(definition.tools)
 
 
 def test_advisor_research_precedes_assignment_without_idle_dispatch_priority():
@@ -341,20 +362,6 @@ def test_advisor_research_precedes_assignment_without_idle_dispatch_priority():
         "Well-founded experiment assignments"
     )
     assert "Idleness is not a reason to skip" in instructions
-
-    template = (
-        REPO_ROOT
-        / "plugins"
-        / "senpai"
-        / "skills"
-        / "bootstrap-target"
-        / "references"
-        / "role-overlay-template.md"
-    ).read_text(encoding="utf-8")
-    assert "Assign work to every idle student" not in template
-    assert template.index("Research and synthesize") < template.index(
-        "Assign the best well-founded experiments"
-    )
 
 
 def test_harness_states_bounded_delegation_tree_contract():

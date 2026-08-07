@@ -9,9 +9,48 @@ import senpai_agent.git_workflow as git_workflow
 from senpai_agent.git_workflow import (
     GitWorkflowPreconditionError,
     push_assignment_branch,
+    require_commit_contains_base,
 )
 
 from git_workflow_support import commit_file, detached_commit, git, repository
+
+
+def test_result_commit_must_contain_its_assigned_research_base(tmp_path: Path):
+    workspace, _remote, base_sha = repository(tmp_path)
+    result_sha = commit_file(
+        workspace,
+        "model.py",
+        "baseline = 2\n",
+        "candidate",
+    )
+
+    require_commit_contains_base(
+        workspace,
+        commit_sha=result_sha,
+        base_sha=base_sha,
+    )
+
+
+def test_result_commit_rejects_an_unrelated_research_base(tmp_path: Path):
+    workspace, _remote, _base_sha = repository(tmp_path)
+    result_sha = commit_file(
+        workspace,
+        "model.py",
+        "baseline = 2\n",
+        "candidate",
+    )
+    tree = git(workspace, "rev-parse", f"{result_sha}^{{tree}}")
+    unrelated_base = git(workspace, "commit-tree", tree, "-m", "unrelated base")
+
+    with pytest.raises(
+        GitWorkflowPreconditionError,
+        match="does not contain assigned research base",
+    ):
+        require_commit_contains_base(
+            workspace,
+            commit_sha=result_sha,
+            base_sha=unrelated_base,
+        )
 
 
 def test_push_is_lease_guarded_verified_and_idempotent(tmp_path: Path):

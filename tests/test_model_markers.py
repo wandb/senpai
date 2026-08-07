@@ -8,12 +8,16 @@ import pytest
 
 from model_test_support import HEAD_SHA, assignment, result
 from senpai_agent.models import (
+    ResearchBaseAcceptanceRecord,
     ResultMarkerError,
     ResultStatus,
     WandbRunRef,
+    experiment_result_digest,
     parse_assignment_markers,
+    parse_research_base_acceptance_markers,
     parse_result_markers,
     render_assignment_marker,
+    render_research_base_acceptance_marker,
     render_result_comment,
     render_result_marker,
 )
@@ -46,6 +50,51 @@ def test_assignment_parser_ignores_marker_examples_in_prose():
     marker = render_assignment_marker(assignment())
 
     assert parse_assignment_markers(f"example: {marker}\n> {marker}") == ()
+
+
+def test_research_base_acceptance_marker_round_trips_as_one_line():
+    acceptance = ResearchBaseAcceptanceRecord(
+        repo="acme/widgets",
+        pr_number=17,
+        assignment_id="assignment-17",
+        revision_id="revision-2",
+        result_head_sha="a" * 40,
+        result_digest=experiment_result_digest(result()),
+        evaluated_base_sha="b" * 40,
+        base_ref="research",
+        accepted_base_sha="c" * 40,
+    )
+
+    marker = render_research_base_acceptance_marker(acceptance)
+
+    assert "\n" not in marker
+    assert marker.startswith("<!-- senpai-research-base-acceptance:v1 {")
+    assert parse_research_base_acceptance_markers(marker) == (acceptance,)
+
+
+def test_result_digest_is_canonical_and_binds_every_result_field():
+    original = result()
+
+    assert experiment_result_digest(original) == experiment_result_digest(
+        original.model_copy(deep=True)
+    )
+    assert experiment_result_digest(original) != experiment_result_digest(
+        result(summary="A different terminal conclusion.")
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "<!-- senpai-research-base-acceptance:v2 {} -->",
+        "<!-- senpai-research-base-acceptance:v1 not-json -->",
+        "<!-- senpai-research-base-acceptance:v1 {} --> trailing",
+        "<!-- senpai-research-base-acceptance:v1 {} -->",
+    ],
+)
+def test_research_base_acceptance_parser_rejects_invalid_markers(line: str):
+    with pytest.raises(ValueError, match="research-base acceptance marker"):
+        parse_research_base_acceptance_markers(line)
 
 
 def test_result_marker_is_canonical_and_round_trips():

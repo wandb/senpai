@@ -1,14 +1,17 @@
+from urllib.parse import urlsplit
+
 import pytest
 
-from senpai_agent.github_workflow import (
+from senpai_agent.github.workflow import (
     ReconciliationError,
     StaleAssignmentRevisionError,
-    StaleBaselineError,
+    StaleResearchBaseError,
     WorkflowPreconditionError,
 )
 from senpai_agent.models import render_assignment_marker, render_result_comment
 from github_workflow_support import (
     ASSIGNMENT_ID,
+    BASE_SHA,
     HEAD_SHA,
     REPO,
     AmbiguousMutationGitHub,
@@ -35,13 +38,32 @@ def merge_experiment(
     client,
     *,
     expected_head_sha: str = HEAD_SHA,
-    accepted_base_sha: str | None = None,
+    revision_id: str = "revision-1",
+    expected_current_base_sha: str = BASE_SHA,
 ):
     return client.merge_experiment(
         7,
         expected_head_sha=expected_head_sha,
         assignment_id=ASSIGNMENT_ID,
-        accepted_base_sha=accepted_base_sha,
+        current_revision_id=revision_id,
+        expected_current_base_sha=expected_current_base_sha,
+    )
+
+
+def accept_result(
+    client,
+    *,
+    expected_current_base_sha: str,
+    revision_id: str = "revision-1",
+    reason: str = "The result remains valid against the current research base.",
+):
+    return client.accept_result_on_current_base(
+        7,
+        assignment_id=ASSIGNMENT_ID,
+        current_revision_id=revision_id,
+        expected_head_sha=HEAD_SHA,
+        expected_current_base_sha=expected_current_base_sha,
+        reason=reason,
     )
 
 
@@ -92,15 +114,7 @@ def test_merge_recovers_when_the_success_response_is_lost():
     assert fake.pr["merged"] is True
 
 
-@pytest.mark.parametrize(
-    ("accepted_base_sha", "message"),
-    [(None, "advanced"), ("d" * 40, "does not match")],
-    ids=("unacknowledged", "wrong-acknowledgement"),
-)
-def test_merge_rejects_baseline_drift_without_exact_live_acceptance(
-    accepted_base_sha,
-    message,
-):
+def test_merge_rejects_changed_research_base_without_durable_acceptance():
     current_base_sha = "c" * 40
     fake = FakeGitHub(
         mergeable_pull(),
@@ -108,16 +122,32 @@ def test_merge_rejects_baseline_drift_without_exact_live_acceptance(
         branch_heads={"schmidhuber": current_base_sha},
     )
 
-    with pytest.raises(StaleBaselineError, match=message):
+    with pytest.raises(StaleResearchBaseError, match="no durable acceptance"):
         merge_experiment(
             workflow(fake),
-            accepted_base_sha=accepted_base_sha,
+            expected_current_base_sha=current_base_sha,
         )
 
     assert fake.mutations == []
 
 
-def test_merge_accepts_baseline_drift_only_at_the_exact_live_sha():
+def test_merge_rejects_a_stale_expected_current_research_base():
+    fake = FakeGitHub(
+        mergeable_pull(),
+        comments=[result_comment()],
+        branch_heads={"schmidhuber": "c" * 40},
+    )
+
+    with pytest.raises(StaleResearchBaseError, match="but live base is"):
+        merge_experiment(
+            workflow(fake),
+            expected_current_base_sha="d" * 40,
+        )
+
+    assert fake.mutations == []
+
+
+def test_accept_result_is_durable_idempotent_and_bound_to_the_live_base():
     current_base_sha = "c" * 40
     fake = FakeGitHub(
         mergeable_pull(),
@@ -125,13 +155,294 @@ def test_merge_accepts_baseline_drift_only_at_the_exact_live_sha():
         branch_heads={"schmidhuber": current_base_sha},
     )
 
-    result = merge_experiment(
+    client = workflow(fake)
+
+    first = accept_result(client, expected_current_base_sha=current_base_sha)
+    mutations_after_first = list(fake.mutations)
+    second = accept_result(client, expected_current_base_sha=current_base_sha)
+
+    assert first.changed is True
+    assert first.state == "research_base_accepted"
+    assert second.changed is False
+    assert "<!-- senpai-research-base-acceptance:v1 " in str(
+        fake.comments[-1]["body"]
+    )
+    assert fake.mutations == mutations_after_first
+
+
+def test_accept_result_treats_identical_duplicate_results_as_one():
+    current_base_sha = "c" * 40
+    result = result_comment()
+    fake = FakeGitHub(
+        mergeable_pull(),
+        comments=[result, comment(2, str(result["body"]))],
+        branch_heads={"schmidhuber": current_base_sha},
+    )
+
+    accepted = accept_result(
         workflow(fake),
-        accepted_base_sha=current_base_sha,
+        expected_current_base_sha=current_base_sha,
+    )
+
+    assert accepted.state == "research_base_accepted"
+
+
+def test_accept_result_rejects_stale_revision_and_base_before_writing():
+    current_base_sha = "c" * 40
+    fake = FakeGitHub(
+        mergeable_pull(),
+        comments=[result_comment()],
+        branch_heads={"schmidhuber": current_base_sha},
+    )
+    client = workflow(fake)
+
+    with pytest.raises(StaleAssignmentRevisionError, match="revision"):
+        accept_result(
+            client,
+            revision_id="revision-0",
+            expected_current_base_sha=current_base_sha,
+        )
+    with pytest.raises(StaleResearchBaseError, match="but live base is"):
+        accept_result(
+            client,
+            expected_current_base_sha="d" * 40,
+        )
+
+    assert fake.mutations == []
+
+
+def test_acceptance_becomes_harmless_when_base_moves_during_reconciliation():
+    class MovingBaseGitHub(FakeGitHub):
+        def request(self, method, url, *, headers, json_body=None):
+            response = super().request(
+                method,
+                url,
+                headers=headers,
+                json_body=json_body,
+            )
+            if method == "POST" and url.endswith("/issues/7/comments"):
+                self.branch_heads["schmidhuber"] = "d" * 40
+            return response
+
+    fake = MovingBaseGitHub(
+        mergeable_pull(),
+        comments=[result_comment()],
+        branch_heads={"schmidhuber": "c" * 40},
+    )
+
+    with pytest.raises(StaleResearchBaseError, match="but live base is"):
+        accept_result(
+            workflow(fake),
+            expected_current_base_sha="c" * 40,
+        )
+
+    assert "<!-- senpai-research-base-acceptance:v1 " in str(
+        fake.comments[-1]["body"]
+    )
+    assert fake.pr["merged"] is False
+
+
+def test_merge_consumes_exact_durable_research_base_acceptance():
+    current_base_sha = "c" * 40
+    fake = FakeGitHub(
+        mergeable_pull(),
+        comments=[result_comment()],
+        branch_heads={"schmidhuber": current_base_sha},
+    )
+    client = workflow(fake)
+
+    accept_result(client, expected_current_base_sha=current_base_sha)
+    result = merge_experiment(
+        client,
+        expected_current_base_sha=current_base_sha,
     )
 
     assert result.state == "experiment_merged"
     assert fake.pr["merged"] is True
+
+
+def test_merge_treats_identical_duplicate_results_as_one():
+    result = result_comment()
+    fake = FakeGitHub(
+        mergeable_pull(),
+        comments=[result, comment(2, str(result["body"]))],
+    )
+
+    merged = merge_experiment(workflow(fake))
+
+    assert merged.state == "experiment_merged"
+    assert fake.pr["merged"] is True
+
+
+def test_trusted_result_actor_login_is_case_insensitive():
+    fake = FakeGitHub(
+        mergeable_pull(),
+        comments=[
+            comment(
+                1,
+                render_result_comment(experiment_result()),
+                author="SENPAI-BOT",
+            )
+        ],
+    )
+
+    merged = merge_experiment(workflow(fake))
+
+    assert merged.state == "experiment_merged"
+
+
+def test_acceptance_for_result_a_does_not_authorize_result_b_at_same_head():
+    current_base_sha = "c" * 40
+    fake = FakeGitHub(
+        mergeable_pull(),
+        comments=[result_comment()],
+        branch_heads={"schmidhuber": current_base_sha},
+    )
+    client = workflow(fake)
+    accept_result(client, expected_current_base_sha=current_base_sha)
+    result_b = experiment_result().model_copy(
+        update={"summary": "A different result at the same commit."}
+    )
+    fake.comments[0]["body"] = render_result_comment(result_b)
+
+    with pytest.raises(StaleResearchBaseError, match="no durable acceptance"):
+        merge_experiment(client, expected_current_base_sha=current_base_sha)
+
+    assert fake.pr["merged"] is False
+
+
+def test_merge_ignores_malformed_acceptance_marker_when_exact_one_exists():
+    current_base_sha = "c" * 40
+    fake = FakeGitHub(
+        mergeable_pull(),
+        comments=[result_comment()],
+        branch_heads={"schmidhuber": current_base_sha},
+    )
+    client = workflow(fake)
+    accept_result(client, expected_current_base_sha=current_base_sha)
+    fake.comments.append(
+        comment(99, "<!-- senpai-research-base-acceptance:v1 malformed -->")
+    )
+
+    merged = merge_experiment(client, expected_current_base_sha=current_base_sha)
+
+    assert merged.state == "experiment_merged"
+    assert fake.pr["merged"] is True
+
+
+def test_merge_treats_duplicate_exact_acceptances_as_idempotent():
+    current_base_sha = "c" * 40
+    fake = FakeGitHub(
+        mergeable_pull(),
+        comments=[result_comment()],
+        branch_heads={"schmidhuber": current_base_sha},
+    )
+    client = workflow(fake)
+    accept_result(client, expected_current_base_sha=current_base_sha)
+    fake.comments.append(comment(99, str(fake.comments[-1]["body"])))
+
+    merged = merge_experiment(client, expected_current_base_sha=current_base_sha)
+
+    assert merged.state == "experiment_merged"
+    assert fake.pr["merged"] is True
+
+
+def test_merge_ignores_an_acceptance_marker_from_an_untrusted_author():
+    current_base_sha = "c" * 40
+    fake = FakeGitHub(
+        mergeable_pull(),
+        comments=[result_comment()],
+        branch_heads={"schmidhuber": current_base_sha},
+    )
+    client = workflow(fake)
+    accept_result(client, expected_current_base_sha=current_base_sha)
+    fake.comments[-1]["user"] = {"login": "untrusted-user", "type": "User"}
+
+    with pytest.raises(StaleResearchBaseError, match="no durable acceptance"):
+        merge_experiment(client, expected_current_base_sha=current_base_sha)
+
+    assert fake.pr["merged"] is False
+
+
+def test_merge_rechecks_the_research_base_immediately_before_mutation():
+    class MovingBaseGitHub(FakeGitHub):
+        base_reads = 0
+
+        def request(self, method, url, *, headers, json_body=None):
+            if method == "GET" and "/git/ref/heads/" in url:
+                self.base_reads += 1
+                if self.base_reads == 2:
+                    self.branch_heads["schmidhuber"] = "c" * 40
+            return super().request(
+                method,
+                url,
+                headers=headers,
+                json_body=json_body,
+            )
+
+    fake = MovingBaseGitHub(
+        mergeable_pull(),
+        comments=[result_comment()],
+    )
+
+    with pytest.raises(StaleResearchBaseError, match="but live base is"):
+        merge_experiment(workflow(fake))
+
+    assert fake.pr["merged"] is False
+    assert fake.mutations == []
+
+
+@pytest.mark.parametrize(
+    ("change_phase", "expected_merged", "message"),
+    [
+        ("before", False, "immediately before merge"),
+        ("after", True, "immediately after merge"),
+    ],
+)
+def test_merge_detects_terminal_result_change_at_the_mutation_boundary(
+    change_phase,
+    expected_merged,
+    message,
+):
+    changed = experiment_result().model_copy(
+        update={"summary": "Evidence changed during merge."}
+    )
+
+    class ChangingResultGitHub(FakeGitHub):
+        base_reads = 0
+
+        def request(self, method, url, *, headers, json_body=None):
+            path = urlsplit(url).path
+            if method == "GET" and "/git/ref/heads/" in path:
+                self.base_reads += 1
+            response = super().request(
+                method,
+                url,
+                headers=headers,
+                json_body=json_body,
+            )
+            if (
+                change_phase == "before"
+                and method == "GET"
+                and "/git/ref/heads/" in path
+                and self.base_reads == 2
+            ) or (
+                change_phase == "after"
+                and method == "PUT"
+                and path == f"/repos/{REPO}/pulls/7/merge"
+            ):
+                self.comments[0]["body"] = render_result_comment(changed)
+            return response
+
+    fake = ChangingResultGitHub(
+        mergeable_pull(),
+        comments=[result_comment()],
+    )
+
+    with pytest.raises(ReconciliationError, match=message):
+        merge_experiment(workflow(fake))
+
+    assert fake.pr["merged"] is expected_merged
 
 
 @pytest.mark.parametrize(
@@ -220,24 +531,37 @@ def test_merge_does_not_treat_assignment_prose_as_terminal_evidence():
     assert fake.mutations == []
 
 
-@pytest.mark.parametrize(
-    ("comments", "match"),
-    [
-        (
-            [comment(1, '<!-- senpai-result:v2 {"assignment_id":"assignment-7"} -->')],
-            "result marker",
-        ),
-        (
-            [result_comment(), comment(2, render_result_comment(experiment_result()))],
-            "multiple",
-        ),
-    ],
-    ids=("malformed", "duplicate"),
-)
-def test_merge_fails_closed_on_invalid_trusted_result_markers(comments, match):
-    fake = FakeGitHub(mergeable_pull(), comments=comments)
+def test_malformed_result_does_not_poison_unique_valid_result():
+    fake = FakeGitHub(
+        mergeable_pull(),
+        comments=[
+            result_comment(),
+            comment(
+                2,
+                '<!-- senpai-result:v2 {"assignment_id":"assignment-7"} -->',
+            ),
+        ],
+    )
 
-    with pytest.raises(ReconciliationError, match=match):
+    merged = merge_experiment(workflow(fake))
+
+    assert merged.state == "experiment_merged"
+    assert fake.pr["merged"] is True
+
+
+def test_merge_fails_closed_on_conflicting_distinct_valid_results():
+    conflicting = experiment_result().model_copy(
+        update={"summary": "A conflicting terminal conclusion."}
+    )
+    fake = FakeGitHub(
+        mergeable_pull(),
+        comments=[
+            result_comment(),
+            comment(2, render_result_comment(conflicting)),
+        ],
+    )
+
+    with pytest.raises(ReconciliationError, match="multiple"):
         merge_experiment(workflow(fake))
 
     assert fake.mutations == []

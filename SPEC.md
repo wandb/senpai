@@ -9,7 +9,7 @@ OpenHands owns research judgment, code changes, evidence interpretation, and
 bounded delegation. Python owns operations that should not depend on an LLM
 composing fragile tool calls:
 
-- GitHub polling, workflow transitions, and verification;
+- GitHub polling, workflow operations, and verification;
 - assignment branch publication;
 - training process supervision and W&B metric monitoring;
 - conversation selection and durable local events;
@@ -76,9 +76,10 @@ GitHub state is level-triggered:
 - trusted human comments and reviews on one assigned open `status:wip` or
   `status:review` PR wake its exact student assignment conversation;
 - `status:review` is a durable advisor wake;
-- when the live advisor branch moves beyond an active assignment's recorded
-  base SHA, `baseline_advanced` gives the advisor both exact SHAs and a compare
-  URL without cancelling the student;
+- when the configured research base changes from an active assignment's
+  recorded base SHA, `research_base_changed` gives the advisor
+  `required_base_sha`, `current_base_sha`, and a compare URL without cancelling
+  the student;
 - `status:blocked`, `status:needs-rebase`, missing or duplicate student labels,
   stale WIP, and duplicate assignments are advisor-action events; and
 - an open Issue labeled `human` plus `team`, the advisor branch, or one student
@@ -86,7 +87,7 @@ GitHub state is level-triggered:
 
 Human Issue events use the exact latest human-authored body/comment ID as their
 dedupe key and `human_message_id`. An agent reply updates the Issue but does not
-create a new wake for its own comment. `respond_to_issue` verifies the exact
+create a new wake for its own comment. `respond_to_human_issue` verifies the exact
 human message before writing an idempotent response.
 Launches with human-Issue handling disabled skip that GitHub query entirely.
 
@@ -94,7 +95,7 @@ Assigned-PR issue comments, submitted reviews, and inline comments each use
 their immutable GitHub ID as a level-triggered event key. Senpai accepts GitHub
 users associated as repository owners, members, or collaborators. A comment by
 the authenticated actor containing a Senpai protocol marker is automation, not
-human feedback, except for the explicit `senpai-assignment-feedback` transition.
+human feedback, except for the explicit `senpai-assignment-feedback` operation.
 Every accepted event carries its first-seen assignment and revision identity,
 so monitor and feedback events resume one student UUID.
 Successful turns atomically acknowledge immutable feedback keys in a small JSON
@@ -285,52 +286,103 @@ compact manifest and path. Raising the inline limit above five warns about
 context pollution. There is no duplicate JSON artifact and no hidden
 summarizing subagent.
 
-### `github_transition`
+### GitHub workflow tools
 
-One discriminated tool owns:
+GitHub mutations are separate, operation-specific tools without a union wrapper.
+There is no operation discriminator or model-supplied repository. The runtime
+binds repository, role, credentials, workspace, and configured branches outside
+the model-facing schema. It also canonicalizes every Senpai-authored comment to
+an `ADVISOR:` or `STUDENT:` prefix from that trusted role; models supply plain
+comment text and cannot impersonate the other role through a payload.
 
-- `create_assignment`;
-- `push_branch`;
-- `reconcile_labels`;
-- `request_revision`;
-- `send_assignment_feedback`;
-- `respond_to_issue`;
-- `submit_result`;
-- `close_experiment`; and
-- `merge_experiment`.
+Advisor operations that act on an assignment share this object:
 
-Student publication happens only inside `submit_result`, which validates
-repository, PR, assignment, revision, student, current remote head, and
-proposed result head before it can push. Assignment identity is required for
-feedback, revision, label, close, and merge transitions. Marker comments are
-trusted only when authored by the authenticated token actor.
+```json
+{
+  "pr_number": 123,
+  "assignment_id": "assignment-id",
+  "revision_id": "current-revision-id",
+  "expected_pr_head_sha": "CURRENT_PR_HEAD_SHA"
+}
+```
+
+| Tool | Role | Input beyond the shared `assignment` object |
+|---|---|---|
+| `create_assignment` | advisor | `assignment_id`, `revision_id`, `student`, `expected_base_sha`, `head_branch`, `title`, `body`; the base is the configured advisor branch |
+| `publish_advisor_branch` | advisor | `remote_branch_sha_before_push`, `local_commit_sha` |
+| `repair_assignment_routing` | advisor | `working_state` (`wip` or `review`) and a `blockers` list containing only `blocked`, `hold`, or `needs-rebase` |
+| `send_assignment_feedback` | advisor | `feedback_id`, `comment` |
+| `request_assignment_revision` | advisor | `new_revision_id`, `required_base_sha`, `comment` |
+| `accept_result_on_current_base` | advisor | `expected_current_base_sha`, `reason` |
+| `merge_experiment` | advisor | `expected_current_base_sha`, `merge_method` |
+| `close_experiment` | advisor | `reason` |
+| `respond_to_human_issue` | advisor or student | `issue_number`, `human_message_id`, `response` |
+| `submit_experiment_result` | student | `branch`, `remote_branch_sha_before_push`, `result` |
+
+Student publication happens only inside `submit_experiment_result`, which
+derives the PR and proposed local head from the structured result, then validates
+repository, assignment, revision, student, and current remote head before it can
+push. Marker comments are trusted only when authored by the authenticated token
+actor.
 
 Assignment creation checks the remote base SHA, creates an isolated empty
 assignment commit with `git commit-tree`, publishes with force-with-lease,
 refuses a second active assignment for the student, creates or reconciles one
 draft PR, embeds a typed assignment marker, and verifies routing state.
 
-Advisor feedback carries exact assignment, revision, and head preconditions. It
-creates one immutable feedback ID without changing the assignment marker,
+Advisor feedback carries exact assignment, revision, and PR-head preconditions.
+It creates one immutable feedback ID without changing the assignment marker,
 draft state, or routing labels, so a nudge reaches the current conversation
 without creating a new revision UUID. Exact replay converges; changed guidance
 uses a new ID and therefore a new durable GitHub comment event.
 
+Routing repair declares the desired working state and blocker set; the tool
+computes and verifies the corresponding labels. It cannot restore `review`
+without the exact authenticated terminal result for that assignment revision
+and head. Revision requests bind the new revision to an exact required
+research-base SHA rather than leaving that base implicit.
+
 Student submission requires a clean assignment branch, lease-pushes the local
 commit, upserts the typed result, marks the PR ready, reconciles
 `status:review`, and verifies all postconditions. The label itself is the
-cross-node notification.
+cross-node notification. A schema-valid result is immutable for its assignment
+revision and head: canonical-identical duplicates are one idempotent result,
+while different evidence must use a new commit or revision. Distinct valid
+results at the same identity fail closed.
+
+Research-base movement is a general property of concurrent research, not a
+target-specific benchmark rule. A changed base does not cancel an in-flight
+assignment. When deciding a terminal result whose required base differs from
+the live base, the advisor must either request a new revision on that live SHA
+or call `accept_result_on_current_base`. Acceptance records a durable reason
+bound to the exact assignment, revision, result head, canonical structured
+result, and live base SHA. It becomes stale when any of those identities or the
+result payload changes.
 
 Immediately before a first merge mutation, `merge_experiment` reads the live
-Git ref for the assignment's base branch. If it no longer equals the base SHA
-recorded in the assignment marker, the transition refuses the merge unless the
-advisor deliberately supplies `accepted_base_sha` equal to that exact live
-SHA. This keeps the rerun decision scientific while making stale-baseline
-acceptance explicit and race-checked. Replay of an already verified merge
-returns before this ref lookup.
+Git ref for the assignment's base branch and compares it with
+`expected_current_base_sha`. The merge proceeds only when the result's required
+base equals that live SHA or an exact matching acceptance exists. Replay of an
+already verified merge returns before this ref lookup.
+
+All assignment mutations issued by one workflow instance, plus that worker's
+advisor-branch publication and the student's complete preflight/push/result
+transaction, share one runtime lock. This closes races among sibling tool calls
+in the same process. Separate advisor and student workers still rely on exact
+GitHub identities, branch leases, immutable result evidence, and post-mutation
+verification; a stale result that loses a revision race restores the current
+revision to WIP before failing. GitHub's merge endpoint can precondition the PR
+head but not the base SHA, so deployments with external writers need strict
+up-to-date branch protection or a merge queue for an atomic cross-process base
+guarantee.
 
 Definitive HTTP failures fail clearly. An ambiguous transport failure after a
 mutation is resolved by reading and verifying desired state before any retry.
+
+This tool split is a breaking schema change. The removed multi-operation action
+has no alias, adapter, or event-log migration. A deployment upgraded across this
+boundary must start with fresh OpenHands conversation state; historical GitHub
+and W&B records remain durable outside that state.
 
 ### Subagent lifecycle
 

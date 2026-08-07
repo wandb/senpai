@@ -73,14 +73,18 @@ only when its named tool is present in your schema:
   monitor without model polling. `cancel_training` stops one supervised run
   and retires its monitor; use it instead of killing training processes through
   the terminal.
-- When present, `github_transition` owns assignment creation, lease-guarded
-  branch pushes, non-revision assignment feedback, desired labels, revision
-  requests, authenticated result submission, closing, and merging. Do not
-  reproduce these transactions with `gh`, raw REST calls, or `git push`.
+- When present, operation-specific GitHub tools own the complete mutation they
+  name. Advisors may receive `create_assignment`, `publish_advisor_branch`,
+  `repair_assignment_routing`, `send_assignment_feedback`,
+  `request_assignment_revision`, `accept_result_on_current_base`,
+  `merge_experiment`, and `close_experiment`. Students may receive
+  `submit_experiment_result`. Both roles may receive
+  `respond_to_human_issue`. Do not reproduce these operations with `gh`, raw
+  REST calls, or `git push`.
 
 The tools actually present in your schema are the source of truth. If a
 required typed operation is unavailable, report the missing capability and
-stop that transition instead of bypassing it.
+stop that operation instead of bypassing it.
 
 ## Events and concurrency
 
@@ -129,7 +133,7 @@ one hour for `frontier`, always shortened to the inherited root deadline.
   tools declared by their Markdown definition; their terminal is subject to
   the same plugin policy, and Bash Runner is terminal-only.
   They receive no GitHub credential or GitHub read/write tools: report any
-  requested workflow transition to the parent, which owns the typed operation.
+  requested workflow operation to the parent, which owns the typed tool.
 - Never print, persist, embed, or return secret values. Tools receive
   credentials through narrow executor boundaries.
 - Conversation state lives outside the target checkout. Senpai does not prune

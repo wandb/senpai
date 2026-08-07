@@ -22,14 +22,17 @@ Check GitHub Issues tagged `human` for messages from the research team, and resp
 
 ## Arguments
 
-- **$0** — Your name/label for gh issue filtering (e.g. `noam`, `fern`)
+- **$0** — The configured advisor branch for `ADVISOR`, or student name for
+  `STUDENT`
 - **$1** — Either `ADVISOR` or `STUDENT`
-
-The comment prefix is: if role is `ADVISOR` → `ADVISOR:`, if role is `STUDENT` → `STUDENT $0:`.
 
 ## How it works
 
-Human researchers communicate with agents through GitHub Issues. Issues are tagged with `human` plus either your name or `team` (for broadcast messages). Your job is to check them, respond to new ones, and skip ones you've already handled.
+Human researchers communicate with agents through GitHub Issues. Issues are
+tagged with `human` plus `team` for a broadcast, the configured advisor branch
+for an advisor, or `student:<student-name>` for a student. Your job is to check
+messages routed to your exact role, respond to new ones, and skip ones you've
+already handled.
 
 ## Steps
 
@@ -43,25 +46,21 @@ Human researchers communicate with agents through GitHub Issues. Issues are tagg
    - Record the exact numeric `id` of the issue body or human comment you are
      answering. Never substitute the issue number for a comment ID.
 
-3. **Respond** through `github_transition` with
-   `operation="respond_to_issue"`, the issue number, the exact
-   `human_message_id`, and your role-prefixed response. This verified,
+3. **Respond** through `respond_to_human_issue` with the issue number, the exact
+   `human_message_id`, and the response text without a role prefix. This verified,
    idempotent operation refuses closed issues, pull requests, missing `human`
-   labels, stale message IDs, and messages authored by the agent identity.
+   labels, stale message IDs, messages authored by the agent identity, and
+   issues not addressed to this configured advisor branch or student.
 
 ```json
 {
-  "transition": {
-    "operation": "respond_to_issue",
-    "issue_number": 123,
-    "human_message_id": 987654,
-    "response": "ADVISOR: <your response>"
-  }
+  "issue_number": 123,
+  "human_message_id": 987654,
+  "response": "<your response>"
 }
 ```
 
-For a student, use `"response": "STUDENT $0: <your response>"`. Never mutate
-the issue through `gh` or `curl`.
+Never mutate the issue through `gh` or `curl`.
 
 4. **Never close human issues.** Only the human does that.
 

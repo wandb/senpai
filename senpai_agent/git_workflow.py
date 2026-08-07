@@ -35,6 +35,27 @@ def require_clean_training_worktree(workspace: Path) -> None:
         )
 
 
+def require_commit_contains_base(
+    workspace: Path,
+    *,
+    commit_sha: str,
+    base_sha: str,
+) -> None:
+    """Require an exact result commit to contain its assigned research base."""
+
+    workspace = Path(workspace).resolve()
+    if not commit_sha.strip() or not base_sha.strip():
+        raise ValueError("commit_sha and base_sha must not be empty")
+    commit = _git(workspace, "rev-parse", f"{commit_sha}^{{commit}}")
+    base = _git(workspace, "rev-parse", f"{base_sha}^{{commit}}")
+    try:
+        _git(workspace, "merge-base", "--is-ancestor", base, commit)
+    except GitWorkflowPreconditionError as error:
+        raise GitWorkflowPreconditionError(
+            f"result commit {commit} does not contain assigned research base {base}"
+        ) from error
+
+
 def push_assignment_branch(
     workspace: Path,
     *,

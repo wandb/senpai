@@ -79,11 +79,11 @@ from simple_parsing import ArgumentParser, field
 from simple_parsing.helpers import flag
 
 from senpai_agent.agent_markdown import read_agent_markdown, strip_spdx_header
-from senpai_agent.tools import (
+from senpai_agent.github.tools import (
     clear_github_credentials,
     configure_github_credentials,
-    register_senpai_tools,
 )
+from senpai_agent.tools import register_senpai_tools
 
 DEFAULT_MODEL = "openai/gpt-5.6-sol"
 DEFAULT_FAST_MODEL = "openai/gpt-5.6-luna"
@@ -198,6 +198,9 @@ class RunnerConfig:
     harness_file: Path
     role_file: Path
     plugin_dir: Path
+    advisor_branch: str | None = None
+    student_names: tuple[str, ...] | None = None
+    student_name: str | None = None
     wandb_entity: str | None = None
     wandb_project: str | None = None
     training_max_timeout_seconds: int = 1800
@@ -760,6 +763,13 @@ def resolve_config(
         plugin_dir=resolve_plugin_dir(
             env_value(args.plugin_dir, env, "SENPAI_PLUGIN"),
         ),
+        advisor_branch=env.get("ADVISOR_BRANCH") or None,
+        student_names=tuple(
+            name.strip()
+            for name in env.get("STUDENT_NAMES", "").split(",")
+            if name.strip()
+        ),
+        student_name=env.get("STUDENT_NAME") or None,
         wandb_entity=wandb_entity,
         wandb_project=wandb_project,
         training_max_timeout_seconds=training_max_timeout_seconds,
@@ -1074,10 +1084,15 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
         (
             Tool(name="senpai_terminal", params={"role": config.role}),
             Tool(
-                name="get_prs",
-                params={"state_dir": str(config.state_dir / "github")},
+                name="senpai_github",
+                params={
+                    "role": config.role,
+                    "state_dir": str(config.state_dir / "github"),
+                    "advisor_branch": config.advisor_branch,
+                    "student_names": config.student_names,
+                    "student_name": config.student_name,
+                },
             ),
-            Tool(name="github_transition", params={"role": config.role}),
         )
     )
     delegation_params = {"event_db_path": str(local_event_db_path(config))}

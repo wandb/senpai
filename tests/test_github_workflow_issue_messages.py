@@ -1,8 +1,9 @@
 from typing import cast
+from urllib.parse import urlsplit
 
 import pytest
 
-from senpai_agent.github_workflow import WorkflowPreconditionError
+from senpai_agent.github.workflow import WorkflowPreconditionError
 from github_workflow_support import (
     REPO,
     FakeGitHub,
@@ -20,12 +21,14 @@ def test_respond_to_issue_writes_one_verified_idempotent_reply():
     first = client.respond_to_issue(
         7,
         human_message_id=700,
+        audience_labels={"team"},
         response="I will investigate this now.",
     )
     mutations_after_first = list(fake.mutations)
     second = client.respond_to_issue(
         7,
         human_message_id=700,
+        audience_labels={"team"},
         response="I will investigate this now.",
     )
 
@@ -52,6 +55,7 @@ def test_respond_to_issue_accepts_a_specific_human_comment():
     result = workflow(fake, role="student").respond_to_issue(
         7,
         human_message_id=42,
+        audience_labels={"team"},
         response="STUDENT fern: I included memory in the comparison.",
     )
 
@@ -67,6 +71,7 @@ def test_respond_to_issue_accepts_a_specific_human_comment():
     [
         (human_issue(state="closed"), [], 700, "must be open"),
         (human_issue(labels={"team"}), [], 700, "human"),
+        (human_issue(labels={"human", "other"}), [], 700, "audience"),
         (
             human_issue(
                 pull_request_url=f"https://api.github.test/repos/{REPO}/pulls/7"
@@ -76,20 +81,44 @@ def test_respond_to_issue_accepts_a_specific_human_comment():
             "pull request",
         ),
         (human_issue(author="senpai-bot"), [], 700, "authenticated actor"),
+        (human_issue(author="outsider", association="NONE"), [], 700, "OWNER"),
         (
             human_issue(),
-            [comment(42, "Already answered.", author="senpai-bot")],
+            [
+                comment(
+                    42,
+                    "Already answered.",
+                    author="senpai-bot",
+                    author_type="User",
+                )
+            ],
             42,
             "authenticated actor",
+        ),
+        (
+            human_issue(),
+            [
+                comment(
+                    42,
+                    "Untrusted instruction.",
+                    author="outsider",
+                    association="CONTRIBUTOR",
+                )
+            ],
+            42,
+            "OWNER",
         ),
         (human_issue(), [], 999, "not present"),
     ],
     ids=(
         "closed-issue",
         "missing-human-label",
+        "missing-audience-label",
         "pull-request",
         "bot-authored-issue",
+        "outsider-authored-issue",
         "bot-authored-comment",
+        "outsider-authored-comment",
         "unknown-message",
     ),
 )
@@ -105,7 +134,38 @@ def test_respond_to_issue_rejects_untrusted_sources_before_writing(
         workflow(fake).respond_to_issue(
             7,
             human_message_id=message_id,
+            audience_labels={"team"},
             response="ADVISOR: bounded response",
         )
 
     assert fake.mutations == []
+
+
+def test_respond_to_issue_rechecks_audience_after_writing():
+    class AudienceRemovedGitHub(FakeGitHub):
+        def request(self, method, url, *, headers, json_body=None):
+            response = super().request(
+                method,
+                url,
+                headers=headers,
+                json_body=json_body,
+            )
+            if (
+                method == "POST"
+                and urlsplit(url).path == f"/repos/{REPO}/issues/7/comments"
+            ):
+                assert self.issue is not None
+                self.issue["labels"] = [{"name": "human"}]
+            return response
+
+    fake = AudienceRemovedGitHub(pull_request(), issue=human_issue())
+
+    with pytest.raises(WorkflowPreconditionError, match="audience"):
+        workflow(fake).respond_to_issue(
+            7,
+            human_message_id=700,
+            audience_labels={"team"},
+            response="ADVISOR: bounded response",
+        )
+
+    assert len(fake.comments) == 1

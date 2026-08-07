@@ -3,17 +3,20 @@ from threading import Event
 
 import pytest
 
-from senpai_agent.github_workflow import (
+from senpai_agent.github.workflow import (
     MutationResult,
     ReconciliationError,
     WorkflowPreconditionError,
 )
-from senpai_agent.models import render_assignment_marker
+from senpai_agent.models import render_assignment_marker, render_result_comment
 from github_workflow_support import (
     ASSIGNMENT_ID,
+    BASE_SHA,
     HEAD_SHA,
     FakeGitHub,
     assignment_record,
+    comment,
+    experiment_result,
     pull_request,
     workflow,
 )
@@ -140,8 +143,10 @@ def test_create_and_revision_transitions_cannot_overlap(monkeypatch):
         return client.request_revision(
             7,
             assignment_id=ASSIGNMENT_ID,
+            current_revision_id="revision-1",
+            new_revision_id="revision-2",
             expected_head_sha=HEAD_SHA,
-            revision_id="revision-2",
+            required_base_sha=BASE_SHA,
             comment="Run the requested ablation.",
         )
 
@@ -164,72 +169,202 @@ def test_create_and_revision_transitions_cannot_overlap(monkeypatch):
     assert revision_entered.is_set()
 
 
-def test_reconcile_labels_sets_the_exact_union_and_replays_without_writes():
-    fake = FakeGitHub(pull_request(labels={"student:one", "status:wip", "keep"}))
+def test_submit_and_revision_transitions_cannot_overlap(monkeypatch):
+    client = workflow(FakeGitHub(pull_request()))
+    submit_entered = Event()
+    release_submit = Event()
+    revision_started = Event()
+    revision_entered = Event()
+    result = MutationResult(False, "https://github.test/pr/7", "test")
+
+    def hold_submit(*_args, **_kwargs):
+        submit_entered.set()
+        assert release_submit.wait(1)
+        return result
+
+    def observe_revision(*_args, **_kwargs):
+        revision_entered.set()
+        return result
+
+    monkeypatch.setattr(type(client), "_submit_result", hold_submit)
+    monkeypatch.setattr(type(client), "_request_revision", observe_revision)
+
+    def request_revision():
+        revision_started.set()
+        return client.request_revision(
+            7,
+            assignment_id=ASSIGNMENT_ID,
+            current_revision_id="revision-1",
+            new_revision_id="revision-2",
+            expected_head_sha=HEAD_SHA,
+            required_base_sha=BASE_SHA,
+            comment="Run the requested ablation.",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        submit = executor.submit(
+            client.submit_result,
+            7,
+            expected_head_sha=HEAD_SHA,
+            result=experiment_result(),
+        )
+        assert submit_entered.wait(1)
+        revise = executor.submit(request_revision)
+        assert revision_started.wait(1)
+        overlapped = revision_entered.wait(0.1)
+        release_submit.set()
+        assert submit.result(timeout=1) is result
+        assert revise.result(timeout=1) is result
+
+    assert not overlapped
+    assert revision_entered.is_set()
+
+
+def test_repair_routing_sets_exact_protocol_labels_and_preserves_unrelated_labels():
+    fake = FakeGitHub(
+        pull_request(
+            labels={"student:one", "status:wip", "status:hold", "keep"},
+            draft=True,
+        ),
+        comments=[comment(1, render_result_comment(experiment_result()))],
+    )
     client = workflow(fake)
 
-    first = client.reconcile_labels(
+    first = client.repair_assignment_routing(
         7,
         assignment_id=ASSIGNMENT_ID,
-        add={"status:review"},
-        remove={"status:wip"},
+        current_revision_id="revision-1",
         expected_head_sha=HEAD_SHA,
+        working_state="review",
+        blockers={"blocked"},
     )
     mutations_after_first = list(fake.mutations)
-    second = client.reconcile_labels(
+    second = client.repair_assignment_routing(
         7,
         assignment_id=ASSIGNMENT_ID,
-        add={"status:review"},
-        remove={"status:wip"},
+        current_revision_id="revision-1",
         expected_head_sha=HEAD_SHA,
+        working_state="review",
+        blockers={"blocked"},
     )
 
     assert first.changed is True
     assert second.changed is False
-    assert fake.pr["labels"] == {"student:one", "status:review", "keep"}
+    assert fake.pr["labels"] == {
+        "keep",
+        "schmidhuber",
+        "student:student-one",
+        "status:blocked",
+        "status:review",
+    }
+    assert fake.pr["draft"] is False
     assert fake.mutations == mutations_after_first
 
 
-def test_reconcile_labels_rejects_a_stale_head_before_writing():
+def test_repair_routing_restores_wip_draft_state_without_label_changes():
+    fake = FakeGitHub(
+        pull_request(
+            labels={
+                "schmidhuber",
+                "student:student-one",
+                "status:wip",
+            },
+            draft=False,
+        )
+    )
+
+    result = workflow(fake).repair_assignment_routing(
+        7,
+        assignment_id=ASSIGNMENT_ID,
+        current_revision_id="revision-1",
+        expected_head_sha=HEAD_SHA,
+        working_state="wip",
+        blockers=set(),
+    )
+
+    assert result.changed is True
+    assert fake.pr["draft"] is True
+
+
+def test_repair_routing_rejects_a_stale_head_before_writing():
     fake = FakeGitHub(pull_request())
 
     with pytest.raises(WorkflowPreconditionError, match="head SHA"):
-        workflow(fake).reconcile_labels(
+        workflow(fake).repair_assignment_routing(
             7,
             assignment_id=ASSIGNMENT_ID,
-            add={"status:review"},
-            remove={"status:wip"},
+            current_revision_id="revision-1",
             expected_head_sha="b" * 40,
+            working_state="review",
+            blockers=set(),
         )
 
     assert fake.mutations == []
 
 
-def test_reconcile_labels_fails_if_github_does_not_apply_the_write():
-    fake = FakeGitHub(pull_request(), ignore_label_put=True)
+def test_repair_routing_rejects_a_stale_revision_before_writing():
+    fake = FakeGitHub(pull_request())
 
-    with pytest.raises(ReconciliationError, match="label set"):
-        workflow(fake).reconcile_labels(
+    with pytest.raises(WorkflowPreconditionError, match="revision"):
+        workflow(fake).repair_assignment_routing(
             7,
             assignment_id=ASSIGNMENT_ID,
-            add={"status:review"},
-            remove={"status:wip"},
+            current_revision_id="revision-0",
             expected_head_sha=HEAD_SHA,
+            working_state="review",
+            blockers=set(),
+        )
+
+    assert fake.mutations == []
+
+
+def test_repair_routing_fails_if_github_does_not_apply_the_write():
+    fake = FakeGitHub(
+        pull_request(),
+        comments=[comment(1, render_result_comment(experiment_result()))],
+        ignore_label_put=True,
+    )
+
+    with pytest.raises(ReconciliationError, match="label set"):
+        workflow(fake).repair_assignment_routing(
+            7,
+            assignment_id=ASSIGNMENT_ID,
+            current_revision_id="revision-1",
+            expected_head_sha=HEAD_SHA,
+            working_state="review",
+            blockers=set(),
         )
 
     assert len(fake.mutations) == 1
 
 
-def test_reconcile_labels_rejects_a_foreign_assignment_before_writing():
+def test_repair_routing_rejects_review_without_exact_terminal_result():
+    fake = FakeGitHub(pull_request())
+
+    with pytest.raises(WorkflowPreconditionError, match="terminal result"):
+        workflow(fake).repair_assignment_routing(
+            7,
+            assignment_id=ASSIGNMENT_ID,
+            current_revision_id="revision-1",
+            expected_head_sha=HEAD_SHA,
+            working_state="review",
+            blockers=set(),
+        )
+
+    assert fake.mutations == []
+
+
+def test_repair_routing_rejects_a_foreign_assignment_before_writing():
     fake = FakeGitHub(pull_request())
 
     with pytest.raises(WorkflowPreconditionError, match="assignment"):
-        workflow(fake).reconcile_labels(
+        workflow(fake).repair_assignment_routing(
             7,
             assignment_id="other-assignment",
-            add={"status:review"},
-            remove={"status:wip"},
+            current_revision_id="revision-1",
             expected_head_sha=HEAD_SHA,
+            working_state="review",
+            blockers=set(),
         )
 
     assert fake.mutations == []

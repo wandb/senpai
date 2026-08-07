@@ -72,13 +72,13 @@ def review_event(number=17):
     )
 
 
-def baseline_event(current_sha="def"):
+def research_base_event(current_sha="def"):
     return ControllerEvent(
-        kind="baseline_advanced",
-        dedupe_key=f"baseline_advanced:17:abc:{current_sha}",
+        kind="research_base_changed",
+        dedupe_key=f"research_base_changed:17:abc:{current_sha}",
         payload={
             "number": 17,
-            "assigned_base_sha": "abc",
+            "required_base_sha": "abc",
             "current_base_sha": current_sha,
         },
     )
@@ -338,10 +338,10 @@ def test_fast_poll_defaults_to_ten_minute_level_trigger_reminders(monkeypatch):
     ]
 
 
-def test_unchanged_baseline_advance_does_not_repeat_on_reminder_cadence(
+def test_unchanged_research_base_change_does_not_repeat_on_reminder_cadence(
     monkeypatch,
 ):
-    event = baseline_event()
+    event = research_base_event()
     clock = [0.0]
     monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
 
@@ -368,9 +368,9 @@ def test_unchanged_baseline_advance_does_not_repeat_on_reminder_cadence(
     ]
 
 
-def test_changed_baseline_sha_wakes_immediately():
-    first = baseline_event("def")
-    changed = baseline_event("fed")
+def test_changed_research_base_sha_wakes_immediately():
+    first = research_base_event("def")
+    changed = research_base_event("fed")
     turns = Turns()
 
     controller(Mailbox([(first,), (changed,), ()]), turns).run(max_cycles=1)
@@ -381,8 +381,8 @@ def test_changed_baseline_sha_wakes_immediately():
     ]
 
 
-def test_baseline_advance_wakes_again_after_disappearing():
-    event = baseline_event()
+def test_research_base_change_wakes_again_after_disappearing():
+    event = research_base_event()
     turns = Turns()
 
     controller(
