@@ -345,6 +345,8 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
         self.assertIn("llm.has_chat_template_tokenizer()", script)
         self.assertIn("HF_HUB_OFFLINE=1", script)
         self.assertIn("tokenizer.apply_chat_template", script)
+        self.assertIn('tokens.get("input_ids")', script)
+        self.assertIn("token_count > 0", script)
         self.assertIn('"name": "echo"', script)
 
     def test_remote_setup_skips_glm_tokenizer_for_other_model_profiles(self):
