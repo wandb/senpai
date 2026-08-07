@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from openhands.sdk import Agent, LLM, LocalConversation
+from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.llm import Message, TextContent
 from pydantic import SecretStr
 
@@ -19,6 +20,7 @@ from senpai_agent.openhands_runner import (
     openhands_reasoning_effort,
     parse_runner_args,
     prompt_cache_configuration,
+    require_exact_tokenizer,
 )
 from senpai_agent.model_compatibility import (
     CLAUDE_OPUS_5_MODEL_INFO,
@@ -27,11 +29,12 @@ from senpai_agent.model_compatibility import (
 from openhands_support import REPO_ROOT, runtime_config
 
 
-def test_openhands_fork_main_is_consistent_across_install_paths():
+def test_openhands_fork_pin_is_consistent_across_install_paths():
     package_names = {"openhands-sdk", "openhands-tools"}
     fork_url = "git+https://github.com/morganmcg1/software-agent-sdk.git"
+    revision = "33608f0b8242ca0e1f6251efc8f535e249cd6101"
     expected_requirements = {
-        f"{name} @ {fork_url}@main#subdirectory={name}"
+        f"{name} @ {fork_url}@{revision}#subdirectory={name}"
         for name in package_names
     }
 
@@ -76,12 +79,12 @@ def test_openhands_fork_main_is_consistent_across_install_paths():
         assert source.path == "/morganmcg1/software-agent-sdk.git"
         assert parse_qs(source.query) == {
             "subdirectory": [name],
-            "rev": ["main"],
+            "rev": [revision],
         }
         assert re.fullmatch(r"[0-9a-f]{40}", source.fragment)
         resolved_revisions.add(source.fragment)
 
-    assert len(resolved_revisions) == 1
+    assert resolved_revisions == {revision}
 
 
 @pytest.mark.parametrize(
@@ -209,16 +212,21 @@ def test_openai_response_configuration_is_accepted_by_the_pinned_sdk():
 
 
 def test_local_condenser_cap_applies_only_without_provider_native_compaction():
+    wandb_configuration = model_runtime_configuration(
+        "wandb/zai-org/GLM-5.2",
+        "max",
+        wandb_entity="research-team",
+        wandb_project="mlxfast",
+    )
     wandb = LLM(
         model="wandb/zai-org/GLM-5.2",
         api_key=SecretStr("test-key"),
         reasoning_effort="max",
-        **model_runtime_configuration(
-            "wandb/zai-org/GLM-5.2",
-            "max",
-            wandb_entity="research-team",
-            wandb_project="mlxfast",
-        ),
+        **{
+            key: value
+            for key, value in wandb_configuration.items()
+            if key != "custom_tokenizer"
+        },
     )
     openai = LLM(
         model="openai/gpt-5.6-sol",
@@ -233,13 +241,71 @@ def test_local_condenser_cap_applies_only_without_provider_native_compaction():
         **model_runtime_configuration("anthropic/claude-opus-4-8", "xhigh"),
     )
 
-    existing = configured_local_condenser(wandb, 80)
-    resized = configured_local_condenser(wandb, 180, existing)
+    existing = configured_local_condenser(wandb, 0)
+    resized = configured_local_condenser(
+        wandb,
+        700,
+        existing,
+        max_tokens=190_000,
+        target_events=50,
+    )
 
-    assert existing.max_size == 80
-    assert resized.max_size == 180
+    assert (existing.max_size, existing.max_tokens, existing.target_size) == (
+        600,
+        180_000,
+        40,
+    )
+    assert (resized.max_size, resized.max_tokens, resized.target_size) == (
+        700,
+        190_000,
+        50,
+    )
     assert configured_local_condenser(openai, 180) is None
     assert configured_local_condenser(anthropic, 180) is None
+
+
+def test_local_condenser_preserves_legacy_positional_condenser_argument():
+    llm = LLM(
+        model="wandb/other-model",
+        api_key=SecretStr("test-key"),
+        base_url="https://api.inference.wandb.ai/v1",
+        api_mode="chat",
+    )
+    existing = LLMSummarizingCondenser(llm=llm, max_size=100, keep_first=2)
+
+    defaulted = configured_local_condenser(llm, 0, existing)
+    configured = configured_local_condenser(llm, 180, existing)
+
+    assert defaulted.max_size == 80
+    assert defaulted.max_tokens is None
+    assert defaulted.target_size is None
+    assert configured.max_size == 180
+    assert configured.max_tokens is None
+    assert configured.target_size is None
+
+
+@pytest.mark.parametrize("target_events", [3, 95])
+def test_local_condenser_rejects_targets_that_cannot_make_progress(target_events):
+    llm = LLM(
+        model="wandb/other-model",
+        api_key=SecretStr("test-key"),
+        base_url="https://api.inference.wandb.ai/v1",
+        api_mode="chat",
+    )
+    existing = LLMSummarizingCondenser(
+        llm=llm,
+        max_size=100,
+        keep_first=2,
+        minimum_progress=0.1,
+    )
+
+    with pytest.raises(ValueError, match="progress|keep_first"):
+        configured_local_condenser(
+            llm,
+            100,
+            existing,
+            target_events=target_events,
+        )
 
 
 def test_ultra_uses_openai_max_effort_in_pro_mode():
@@ -305,7 +371,11 @@ def test_wandb_gateway_uses_chat_thinking_and_project_routing():
         model="wandb/zai-org/GLM-5.2",
         api_key=SecretStr("test-key"),
         reasoning_effort="max",
-        **configuration,
+        **{
+            key: value
+            for key, value in configuration.items()
+            if key != "custom_tokenizer"
+        },
     )
     _messages, _tools, _mocked, call_kwargs, _telemetry = (
         llm._prepare_completion_params(
@@ -326,6 +396,7 @@ def test_wandb_gateway_uses_chat_thinking_and_project_routing():
         },
         "max_input_tokens": 262_144,
         "max_output_tokens": 16_384,
+        "custom_tokenizer": "zai-org/GLM-5.2",
         "litellm_extra_body": {
             "chat_template_kwargs": {
                 "enable_thinking": True,
@@ -346,6 +417,48 @@ def test_wandb_gateway_uses_chat_thinking_and_project_routing():
     assert "reasoning_effort" not in call_kwargs
     assert llm._provider_info.name == "wandb"
     assert llm._provider_info.api_base == "https://api.inference.wandb.ai/v1"
+
+
+def test_glm_exact_tokenizer_readiness_is_checked_without_network(monkeypatch):
+    import transformers
+
+    class ExactTokenizer:
+        def apply_chat_template(self, *_args, **_kwargs):
+            return [1]
+
+    loaded = []
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        lambda identifier: loaded.append(identifier) or ExactTokenizer(),
+    )
+    configuration = model_runtime_configuration(
+        "wandb/zai-org/GLM-5.2",
+        "max",
+        wandb_entity="research-team",
+        wandb_project="mlxfast",
+    )
+
+    llm = LLM(
+        model="wandb/zai-org/GLM-5.2",
+        api_key=SecretStr("test-key"),
+        reasoning_effort="max",
+        **configuration,
+    )
+
+    require_exact_tokenizer(llm)
+    assert llm.has_chat_template_tokenizer()
+    assert loaded == ["zai-org/GLM-5.2"]
+
+
+def test_glm_fails_clearly_without_an_exact_chat_template_tokenizer():
+    llm = SimpleNamespace(
+        model="wandb/zai-org/glm-5.2",
+        has_chat_template_tokenizer=lambda: False,
+    )
+
+    with pytest.raises(RuntimeError, match="exact.*chat-template tokenizer"):
+        require_exact_tokenizer(llm)
 
 
 @pytest.mark.parametrize(

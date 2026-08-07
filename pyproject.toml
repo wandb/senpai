@@ -14,6 +14,7 @@ dependencies = [
     "torch_geometric",
     "einops",
     "timm",
+    "transformers==5.12.0",
     "rich",
     "python-dotenv",
     "simple-parsing",
@@ -22,8 +23,8 @@ dependencies = [
     "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@c1e9cda697e10ee92e5629b19c7d81cac8bcf54b",
     "tqdm",
     "matplotlib",
-    "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@main#subdirectory=openhands-sdk",
-    "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@main#subdirectory=openhands-tools",
+    "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@33608f0b8242ca0e1f6251efc8f535e249cd6101#subdirectory=openhands-sdk",
+    "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@33608f0b8242ca0e1f6251efc8f535e249cd6101#subdirectory=openhands-tools",
     "psutil",
     # v2.16.2 is tagged upstream but has not been published to PyPI.
     "exa-py @ https://github.com/exa-labs/exa-py/archive/71f315b4be07d474df128c8fafc70cc7d0e47b56.tar.gz",

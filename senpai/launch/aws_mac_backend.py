@@ -21,6 +21,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from zipfile import BadZipFile, ZipFile
 
+from senpai_agent.model_compatibility import (
+    WANDB_GLM_52_MODEL,
+    WANDB_GLM_52_TOKENIZER,
+)
+
 from .aws_backend import (
     AwsCommandError,
     AwsContext,
@@ -42,6 +47,7 @@ REMOTE_HOME = "/Users/ec2-user"
 REMOTE_SOURCE = f"{REMOTE_HOME}/senpai-source"
 REMOTE_VENV = f"{REMOTE_HOME}/.senpai/venv"
 REMOTE_BROWSER_ROOT = f"{REMOTE_HOME}/.senpai/ms-playwright"
+REMOTE_HF_HOME = f"{REMOTE_HOME}/.senpai/huggingface"
 REMOTE_RUN_ROOT = f"{REMOTE_HOME}/.senpai/native"
 REMOTE_SETUP_SCRIPT = "/tmp/senpai-setup.sh"
 REMOTE_METAL_TOOLCHAIN_ARCHIVE = "/tmp/senpai-MetalToolchain.zip"
@@ -734,9 +740,25 @@ def _xcode_archive(args, run_dir: Path) -> tuple[Path, bool]:
     return archive, True
 
 
+def _uses_glm(args) -> bool:
+    models = (
+        getattr(args, f"{profile}_model", "")
+        for profile in ("advisor", "student", "smart", "fast", "frontier")
+    )
+    return any(model.lower() == WANDB_GLM_52_MODEL for model in models)
+
+
 def _remote_setup_script(args) -> bytes:
     repo_url = shlex.quote(args.repo_url)
     revision = shlex.quote(args.repo_revision)
+    tokenizer_setup = ""
+    if _uses_glm(args):
+        tokenizer_setup = f"""mkdir -p {REMOTE_HF_HOME}
+chmod 0700 {REMOTE_HF_HOME}
+HF_HOME={REMOTE_HF_HOME} {REMOTE_VENV}/bin/python -c 'from transformers import AutoTokenizer; tokenizer = AutoTokenizer.from_pretrained("{WANDB_GLM_52_TOKENIZER}"); assert tokenizer.chat_template'
+HF_HOME={REMOTE_HF_HOME} HF_HUB_OFFLINE=1 {REMOTE_VENV}/bin/python -c 'from transformers import AutoTokenizer; tokenizer = AutoTokenizer.from_pretrained("{WANDB_GLM_52_TOKENIZER}", local_files_only=True); tokens = tokenizer.apply_chat_template([{{"role": "user", "content": "smoke"}}], tools=[{{"type": "function", "function": {{"name": "echo", "description": "echo text", "parameters": {{"type": "object", "properties": {{"text": {{"type": "string"}}}}, "required": ["text"]}}}}}}], tokenize=True, add_generation_prompt=True, enable_thinking=True, reasoning_effort="max"); assert tokens and all(isinstance(token, int) for token in tokens)'
+HF_HOME={REMOTE_HF_HOME} HF_HUB_OFFLINE=1 {REMOTE_VENV}/bin/python -c 'from openhands.sdk import LLM; from pydantic import SecretStr; llm = LLM(model="{WANDB_GLM_52_MODEL}", api_key=SecretStr("smoke"), api_mode="chat", base_url="https://api.inference.wandb.ai/v1", custom_tokenizer="{WANDB_GLM_52_TOKENIZER}"); assert llm.has_chat_template_tokenizer()'
+"""
     return f"""#!/bin/bash
 set -euo pipefail
 export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
@@ -783,7 +805,7 @@ uv export --locked --python 3.13 --no-dev --no-emit-project --format requirement
 uv pip install --python {REMOTE_VENV}/bin/python -r /tmp/senpai-requirements.txt
 uv pip install --python {REMOTE_VENV}/bin/python --no-deps -e .
 rm -f /tmp/senpai-requirements.txt
-PLAYWRIGHT_BROWSERS_PATH={REMOTE_BROWSER_ROOT} uvx --from playwright==1.55.0 playwright install chromium --no-shell
+{tokenizer_setup}PLAYWRIGHT_BROWSERS_PATH={REMOTE_BROWSER_ROOT} uvx --from playwright==1.55.0 playwright install chromium --no-shell
 chromium_path=$(find {REMOTE_BROWSER_ROOT} -type f -path '*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium' -print -quit)
 test -x "$chromium_path"
 sudo mkdir -p /usr/local/bin
@@ -875,6 +897,7 @@ def _prepare_node(args, run_dir: Path, node: dict, archive: Path) -> None:
 
 
 def _native_payload(args, specs: tuple[RoleSpec, ...]) -> bytes:
+    shared_hf_environment = {"HF_HOME": REMOTE_HF_HOME} if _uses_glm(args) else {}
     values = {
         "args": {
             "tag": args.tag,
@@ -882,7 +905,13 @@ def _native_payload(args, specs: tuple[RoleSpec, ...]) -> bytes:
             "repo_revision": args.repo_revision,
             "native_ready_timeout_s": args.native_ready_timeout_s,
         },
-        "roles": [asdict(spec) for spec in specs],
+        "roles": [
+            {
+                **asdict(spec),
+                "env": {**spec.env, **shared_hf_environment},
+            }
+            for spec in specs
+        ],
     }
     return (json.dumps(values) + "\n").encode()
 

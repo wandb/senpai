@@ -138,7 +138,9 @@ fast_model: openai/gpt-5.6-luna
 fast_reasoning_effort: high
 frontier_model: openai/gpt-5.6-sol
 frontier_reasoning_effort: ultra
-local_condenser_max_events: 80
+local_condenser_max_events: 0
+local_condenser_max_tokens: 0
+local_condenser_target_events: 0
 
 pvc_claim_name: your-existing-pvc
 pvc_mount_path: /mnt/data
@@ -157,10 +159,25 @@ model profile to `wandb/zai-org/GLM-5.2` with reasoning effort `max`. Senpai
 uses `WANDB_API_KEY`, routes requests through the W&B chat endpoint, explicitly
 enables GLM thinking, and sends
 `OpenAI-Project: <wandb_entity>/<wandb_project>` on every request.
-Providers without native token-aware compaction use
-`local_condenser_max_events` as an event-count fallback. Tool-heavy model turns
-can produce several events, so tune this against the observed event stream,
-not as a literal turn count.
+Providers without native compaction use Senpai's local summarizing condenser.
+Zero selects model-specific defaults for each of its three limits. Unknown
+local models retain the existing 80-event fallback with token and target limits
+disabled. W&B GLM-5.2 instead uses its exact `zai-org/GLM-5.2` chat-template
+tokenizer, condenses at 180,000 input tokens, targets about 40 retained events,
+and keeps 600 events as an emergency fuse. The 82,144-token margin below W&B's
+262,144-token context window leaves room for a large tool result and the next
+model response. OpenAI Responses and Anthropic keep their native compaction and
+ignore all three local limits.
+
+Set positive values to override any dimension with
+`local_condenser_max_events`, `local_condenser_max_tokens`, and
+`local_condenser_target_events`; the target must leave room for the preserved
+prefix and meaningful progress. The corresponding environment variables are
+`SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS`,
+`SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS`, and
+`SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS`. AWS Mac preparation downloads
+the GLM tokenizer once into `/Users/ec2-user/.senpai/huggingface`, verifies it
+offline, and shares that cache with the roles' private home directories.
 
 The defaults in `senpai.yaml` describe W&B's deployment and should not be copied unchanged into another environment. Every setting can also be overridden on the command line. `--tag` and `--target_repo_url` are required unless your chosen config file supplies them.
 

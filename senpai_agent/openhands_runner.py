@@ -46,6 +46,8 @@ from senpai_agent.weave_monitoring import (
     weave_conversation_url,
 )
 from senpai_agent.model_compatibility import (
+    WANDB_GLM_52_MODEL,
+    WANDB_GLM_52_TOKENIZER,
     register_litellm_model_compatibility,
     supports_reasoning_effort,
 )
@@ -111,8 +113,14 @@ COMMAND_SECRET_ENV_NAMES = (
     "EXA_API_KEY",
 )
 EVENT_TEXT_LIMIT = 20000
-DEFAULT_LOCAL_CONDENSER_MAX_EVENTS = 80
+DEFAULT_LOCAL_CONDENSER_MAX_EVENTS = 0
+GENERIC_LOCAL_CONDENSER_MAX_EVENTS = 80
 MIN_LOCAL_CONDENSER_MAX_EVENTS = 12
+DEFAULT_LOCAL_CONDENSER_MAX_TOKENS = 0
+DEFAULT_LOCAL_CONDENSER_TARGET_EVENTS = 0
+WANDB_GLM_52_MAX_EVENTS = 600
+WANDB_GLM_52_MAX_TOKENS = 180_000
+WANDB_GLM_52_TARGET_EVENTS = 40
 
 
 @dataclass(frozen=True)
@@ -197,6 +205,8 @@ class RunnerConfig:
     llm_timeout_seconds: int = 900
     llm_num_retries: int = 1
     local_condenser_max_events: int = DEFAULT_LOCAL_CONDENSER_MAX_EVENTS
+    local_condenser_max_tokens: int = DEFAULT_LOCAL_CONDENSER_MAX_TOKENS
+    local_condenser_target_events: int = DEFAULT_LOCAL_CONDENSER_TARGET_EVENTS
     child: bool = False
     delegation_root_state_dir: Path | None = None
     delegation_tree_id: str | None = None
@@ -497,14 +507,46 @@ def resolve_config(
                 str(DEFAULT_LOCAL_CONDENSER_MAX_EVENTS),
             )
         )
+        local_condenser_max_tokens = int(
+            env.get(
+                "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS",
+                str(DEFAULT_LOCAL_CONDENSER_MAX_TOKENS),
+            )
+        )
+        local_condenser_target_events = int(
+            env.get(
+                "SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS",
+                str(DEFAULT_LOCAL_CONDENSER_TARGET_EVENTS),
+            )
+        )
     except ValueError as error:
-        raise RuntimeError("local condenser max events must be an integer") from error
+        raise RuntimeError("local condenser limits must be integers") from error
     if llm_timeout_seconds <= 0 or llm_num_retries <= 0:
         raise RuntimeError("Senpai LLM timeout and attempts must be positive")
-    if local_condenser_max_events < MIN_LOCAL_CONDENSER_MAX_EVENTS:
+    if (
+        local_condenser_max_events
+        and local_condenser_max_events < MIN_LOCAL_CONDENSER_MAX_EVENTS
+    ):
         raise RuntimeError(
-            "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS must be at least "
+            "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS must be 0 or at least "
             f"{MIN_LOCAL_CONDENSER_MAX_EVENTS}"
+        )
+    if local_condenser_max_tokens < 0:
+        raise RuntimeError(
+            "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS must be non-negative"
+        )
+    if local_condenser_target_events < 0:
+        raise RuntimeError(
+            "SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS must be non-negative"
+        )
+    if (
+        local_condenser_max_events
+        and local_condenser_target_events
+        and local_condenser_target_events >= local_condenser_max_events
+    ):
+        raise RuntimeError(
+            "SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS must be less than "
+            "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"
         )
     wandb_entity = env.get("WANDB_ENTITY", "").strip() or None
     wandb_project = env.get("WANDB_PROJECT", "").strip() or None
@@ -725,6 +767,8 @@ def resolve_config(
         llm_timeout_seconds=llm_timeout_seconds,
         llm_num_retries=llm_num_retries,
         local_condenser_max_events=local_condenser_max_events,
+        local_condenser_max_tokens=local_condenser_max_tokens,
+        local_condenser_target_events=local_condenser_target_events,
         child=args.child,
         delegation_root_state_dir=delegation_root_state_dir,
         delegation_tree_id=delegation_tree_id,
@@ -884,6 +928,7 @@ def model_runtime_configuration(
             "max_output_tokens": 16_384,
         }
         if model.lower() == "wandb/zai-org/glm-5.2":
+            configuration["custom_tokenizer"] = WANDB_GLM_52_TOKENIZER
             configuration["litellm_extra_body"] = {
                 "chat_template_kwargs": {
                     "enable_thinking": True,
@@ -919,8 +964,11 @@ def configured_local_condenser(
     llm: LLM,
     max_events: int,
     condenser: CondenserBase | None = None,
+    *,
+    max_tokens: int = DEFAULT_LOCAL_CONDENSER_MAX_TOKENS,
+    target_events: int = DEFAULT_LOCAL_CONDENSER_TARGET_EVENTS,
 ) -> CondenserBase | None:
-    """Size the local fallback without overriding provider-native compaction."""
+    """Configure the local fallback without overriding provider compaction."""
 
     if llm.responses_use_previous_response_id or llm.uses_anthropic_compaction():
         return None
@@ -931,7 +979,64 @@ def configured_local_condenser(
         )
     if not isinstance(selected, LLMSummarizingCondenser):
         return selected
-    return selected.model_copy(update={"max_size": max_events})
+    max_events, max_tokens, target_events = local_condenser_limits(
+        llm.model,
+        max_events,
+        max_tokens,
+        target_events,
+    )
+    max_tokens = max_tokens or selected.max_tokens
+    target_events = target_events or selected.target_size
+    retained_events = target_events or max_events // 2
+    if retained_events > int(max_events * (1 - selected.minimum_progress)):
+        raise ValueError(
+            "local condenser target events must leave the configured minimum progress"
+        )
+    if retained_events <= selected.keep_first + 1:
+        raise ValueError(
+            "local condenser target events must leave room after keep_first"
+        )
+    return selected.model_copy(
+        update={
+            "max_size": max_events,
+            "max_tokens": max_tokens or None,
+            "target_size": target_events or None,
+        }
+    )
+
+
+def local_condenser_limits(
+    model: str,
+    max_events: int,
+    max_tokens: int,
+    target_events: int,
+) -> tuple[int, int | None, int | None]:
+    """Resolve zero-valued knobs against the actual model profile."""
+
+    if model.lower() == WANDB_GLM_52_MODEL:
+        return (
+            max_events or WANDB_GLM_52_MAX_EVENTS,
+            max_tokens or WANDB_GLM_52_MAX_TOKENS,
+            target_events or WANDB_GLM_52_TARGET_EVENTS,
+        )
+    return (
+        max_events or GENERIC_LOCAL_CONDENSER_MAX_EVENTS,
+        max_tokens or None,
+        target_events or None,
+    )
+
+
+def require_exact_tokenizer(llm: LLM) -> None:
+    """Fail before a GLM turn if exact chat-template accounting is unavailable."""
+
+    if (
+        llm.model.lower() == WANDB_GLM_52_MODEL
+        and not llm.has_chat_template_tokenizer()
+    ):
+        raise RuntimeError(
+            f"{WANDB_GLM_52_MODEL} requires the exact "
+            f"{WANDB_GLM_52_TOKENIZER} chat-template tokenizer"
+        )
 
 
 def local_event_db_path(config: RunnerConfig) -> Path:
@@ -1026,6 +1131,8 @@ def delegation_config(
         command_secrets=config.command_secrets,
         role=config.role,
         local_condenser_max_events=config.local_condenser_max_events,
+        local_condenser_max_tokens=config.local_condenser_max_tokens,
+        local_condenser_target_events=config.local_condenser_target_events,
         root_state_dir=config.delegation_root_state_dir,
         tree_id=config.delegation_tree_id,
         depth=config.delegation_depth,
@@ -1195,6 +1302,16 @@ def run_openhands(
     available_agents = [definition.name for definition in file_agents]
     project_skills = sanitized_project_skills(config.workspace)
     os.environ["SENPAI_CONVERSATION_ID"] = config.conversation_id.hex
+    local_condenser = (
+        (None, None, None)
+        if model_provider(config.model) in {"openai", "anthropic"}
+        else local_condenser_limits(
+            config.model,
+            config.local_condenser_max_events,
+            config.local_condenser_max_tokens,
+            config.local_condenser_target_events,
+        )
+    )
 
     print(
         "OPENHANDS_RUN "
@@ -1222,7 +1339,9 @@ def run_openhands(
                 "reasoning_mode": (
                     "pro" if config.reasoning_effort == "ultra" else "standard"
                 ),
-                "local_condenser_max_events": config.local_condenser_max_events,
+                "local_condenser_max_events": local_condenser[0],
+                "local_condenser_max_tokens": local_condenser[1],
+                "local_condenser_target_events": local_condenser[2],
                 "agent": config.agent_name,
                 "enable_browser": config.enable_browser,
                 "role_file": str(config.role_file) if config.role_file else None,
@@ -1269,6 +1388,7 @@ def run_openhands(
                 wandb_project=config.wandb_project,
             ),
         )
+        require_exact_tokenizer(llm)
         if config.agent_name:
             definition = find_named_agent(config.agent_name, file_agents)
             agent = agent_definition_to_factory(
@@ -1279,6 +1399,7 @@ def run_openhands(
                 agent.llm.reasoning_effort,
                 agent.llm.model,
             )
+            require_exact_tokenizer(agent.llm)
             agent = with_role_and_project_context(
                 agent,
                 harness_instructions,
@@ -1292,6 +1413,8 @@ def run_openhands(
                         agent.llm,
                         config.local_condenser_max_events,
                         agent.condenser,
+                        max_tokens=config.local_condenser_max_tokens,
+                        target_events=config.local_condenser_target_events,
                     )
                 }
             )
@@ -1299,6 +1422,8 @@ def run_openhands(
             condenser = configured_local_condenser(
                 llm,
                 config.local_condenser_max_events,
+                max_tokens=config.local_condenser_max_tokens,
+                target_events=config.local_condenser_target_events,
             )
             agent = Agent(
                 llm=llm,

@@ -89,8 +89,10 @@ fast_model: openai/gpt-5.6-luna
 fast_reasoning_effort: high
 frontier_model: openai/gpt-5.6-sol
 frontier_reasoning_effort: ultra
-# Fallback context condenser for providers without native token-aware compaction.
-local_condenser_max_events: 80
+# Local context fallback. Zero selects model-specific defaults.
+local_condenser_max_events: 0
+local_condenser_max_tokens: 0
+local_condenser_target_events: 0
 
 # advisor — the integration branch inside the problem-package repo that advisor PRs merge into
 advisor_branch: schmidhuber

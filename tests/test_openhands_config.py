@@ -145,18 +145,24 @@ def test_runtime_stall_bounds_are_validated(tmp_path, updates, message):
         resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
-def test_local_condenser_event_cap_is_explicit_and_configurable(tmp_path):
+def test_local_condenser_limits_are_explicit_and_configurable(tmp_path):
     default = resolve_config(
         parse_runner_args(["--max-turns", "1"]),
         runtime_env(tmp_path),
     )
     env = runtime_env(tmp_path)
     env["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"] = "180"
+    env["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS"] = "190000"
+    env["SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS"] = "40"
 
     configured = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
-    assert default.local_condenser_max_events == 80
+    assert default.local_condenser_max_events == 0
+    assert default.local_condenser_max_tokens == 0
+    assert default.local_condenser_target_events == 0
     assert configured.local_condenser_max_events == 180
+    assert configured.local_condenser_max_tokens == 190_000
+    assert configured.local_condenser_target_events == 40
 
 
 @pytest.mark.parametrize("value", ["eleven", "11"])
@@ -165,6 +171,21 @@ def test_local_condenser_event_cap_rejects_invalid_values(tmp_path, value):
     env["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"] = value
 
     with pytest.raises(RuntimeError, match="condenser|integers|at least 12"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS", "-1"),
+        ("SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS", "-1"),
+    ],
+)
+def test_local_condenser_limits_reject_negative_values(tmp_path, name, value):
+    env = runtime_env(tmp_path)
+    env[name] = value
+
+    with pytest.raises(RuntimeError, match="non-negative"):
         resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
