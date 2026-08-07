@@ -8,6 +8,7 @@ from typing import Any
 
 OPENAI_EXTENDED_EFFORT_PREFIX = "openai/gpt-5.6"
 WANDB_GLM_52_MODEL = "wandb/zai-org/glm-5.2"
+WANDB_GLM_52_TOKENIZER = "zai-org/GLM-5.2"
 ANTHROPIC_MAX_EFFORT_MODELS = frozenset(
     {
         "anthropic/claude-fable-5",

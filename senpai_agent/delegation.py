@@ -144,7 +144,9 @@ class DelegationConfig:
     enable_browser: bool
     command_secrets: Mapping[str, str]
     role: str
-    local_condenser_max_events: int = 80
+    local_condenser_max_events: int = 0
+    local_condenser_max_tokens: int = 0
+    local_condenser_target_events: int = 0
     root_state_dir: Path | None = None
     tree_id: str | None = None
     depth: int = 0
@@ -360,6 +362,12 @@ class OpenHandsChildProcess:
                 ),
                 "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS": str(
                     self._config.local_condenser_max_events
+                ),
+                "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS": str(
+                    self._config.local_condenser_max_tokens
+                ),
+                "SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS": str(
+                    self._config.local_condenser_target_events
                 ),
                 "SENPAI_PARENT_CONVERSATION_HISTORY_DIR": str(
                     self._config.state_dir

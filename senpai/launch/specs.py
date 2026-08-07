@@ -168,6 +168,12 @@ def role_model_config(args, role: str) -> dict[str, str]:
         "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS": str(
             args.local_condenser_max_events
         ),
+        "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS": str(
+            args.local_condenser_max_tokens
+        ),
+        "SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS": str(
+            args.local_condenser_target_events
+        ),
     }
 
 

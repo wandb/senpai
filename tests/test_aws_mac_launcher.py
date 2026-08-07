@@ -296,6 +296,7 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
             SimpleNamespace(
                 repo_url="https://github.com/wandb/senpai.git",
                 repo_revision=REVISION,
+                advisor_model="wandb/zai-org/GLM-5.2",
             )
         ).decode()
 
@@ -336,6 +337,28 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
         self.assertIn("MLXFAST_API_URL='https://api.mlx.fast'", script)
         self.assertIn("MLXFAST_BENCHMARK_REF='eigenlabs/mlxfast-challenge'", script)
         self.assertIn("mlxfast version", script)
+        self.assertIn("HF_HOME=/Users/ec2-user/.senpai/huggingface", script)
+        self.assertIn(
+            'AutoTokenizer.from_pretrained("zai-org/GLM-5.2")',
+            script,
+        )
+        self.assertIn("llm.has_chat_template_tokenizer()", script)
+        self.assertIn("HF_HUB_OFFLINE=1", script)
+        self.assertIn("tokenizer.apply_chat_template", script)
+        self.assertIn('"name": "echo"', script)
+
+    def test_remote_setup_skips_glm_tokenizer_for_other_model_profiles(self):
+        script = _remote_setup_script(
+            SimpleNamespace(
+                repo_url="https://github.com/wandb/senpai.git",
+                repo_revision=REVISION,
+                advisor_model="openai/gpt-5.6-sol",
+                student_model="anthropic/claude-opus-5",
+            )
+        ).decode()
+
+        self.assertNotIn("AutoTokenizer.from_pretrained", script)
+        self.assertNotIn("llm.has_chat_template_tokenizer()", script)
 
     def test_remote_setup_imports_the_supplied_metal_toolchain(self):
         script = _remote_setup_script(
@@ -644,9 +667,25 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
             payload["args"]["native_ready_timeout_s"],
             run_args.native_ready_timeout_s,
         )
+        self.assertNotIn("HF_HOME", payload["roles"][0]["env"])
+        self.assertNotIn("HF_HUB_OFFLINE", payload["roles"][0]["env"])
         serialized = json.dumps(payload)
         self.assertNotIn("AWS_ACCESS_KEY_ID", serialized)
         self.assertNotIn("AWS_SECRET_ACCESS_KEY", serialized)
+
+    def test_glm_native_payload_does_not_disable_huggingface_network(self):
+        run_args = args(
+            Path("/tmp/state"),
+            student_model="wandb/zai-org/GLM-5.2",
+        )
+
+        payload = json.loads(_native_payload(run_args, (student("fern"),)))
+
+        self.assertEqual(
+            payload["roles"][0]["env"]["HF_HOME"],
+            "/Users/ec2-user/.senpai/huggingface",
+        )
+        self.assertNotIn("HF_HUB_OFFLINE", payload["roles"][0]["env"])
 
 
 class AwsMacLaunchTests(unittest.TestCase):

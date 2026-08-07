@@ -105,8 +105,9 @@ class Args:
     fast_reasoning_effort: str = "high"
     frontier_model: str = "openai/gpt-5.6-sol"
     frontier_reasoning_effort: str = "max"
-    # Event-count fallback for providers without native compaction.
-    local_condenser_max_events: int = 80
+    local_condenser_max_events: int = 0  # event fuse; 0 selects the model default
+    local_condenser_max_tokens: int = 0  # token trigger; 0 selects the model default
+    local_condenser_target_events: int = 0  # retained events; 0 selects model default
     human_issues: bool = (
         True  # allow human GitHub issue triage; disable for isolated launches
     )
@@ -441,8 +442,27 @@ def main():
         sys.exit("ERROR: --docker_ready_timeout_s must be at least 1")
     if args.backend == "aws-mac" and args.native_ready_timeout_s < 1:
         sys.exit("ERROR: --native_ready_timeout_s must be at least 1")
-    if args.local_condenser_max_events < 12:
-        sys.exit("ERROR: --local_condenser_max_events must be at least 12")
+    if (
+        args.local_condenser_max_events
+        and args.local_condenser_max_events < 12
+    ):
+        sys.exit(
+            "ERROR: --local_condenser_max_events must be 0 or at least 12"
+        )
+    if min(
+        args.local_condenser_max_tokens,
+        args.local_condenser_target_events,
+    ) < 0:
+        sys.exit("ERROR: local condenser token and target limits cannot be negative")
+    if (
+        args.local_condenser_max_events
+        and args.local_condenser_target_events
+        and args.local_condenser_target_events >= args.local_condenser_max_events
+    ):
+        sys.exit(
+            "ERROR: --local_condenser_target_events must be less than "
+            "--local_condenser_max_events"
+        )
     validate_timing_args(args)
     if args.gh_history_scope not in {"branch", "repo", "fresh"}:
         sys.exit("ERROR: --gh_history_scope must be one of: branch, repo, fresh")
