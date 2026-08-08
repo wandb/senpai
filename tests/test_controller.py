@@ -14,7 +14,7 @@ from senpai_agent.controller import (
     _full_prompt,
 )
 from senpai_agent.mailbox import ControllerEvent
-from senpai_agent.state import ConversationStateLedger
+from senpai_agent.state import ConversationStateLedger, WorkspaceDivergenceLedger
 from senpai_agent.supervisor import ProgressLease, WorkerLease
 from senpai_agent.workspace import WorkspaceDivergence
 from test_agent_markdown import HTML_HEADER
@@ -578,6 +578,205 @@ def test_preserved_workspace_divergence_is_delivered_to_the_existing_turn():
         {event.dedupe_key, conflict.event.dedupe_key}
     )
     assert "do not reset or discard local work" in turns.calls[0][0]
+
+
+def student_assignment_event():
+    return ControllerEvent(
+        kind="student_assignment",
+        dedupe_key="student_assignment:assignment-17:revision-2:base:head",
+        payload={
+            "assignment_id": "assignment-17",
+            "revision_id": "revision-2",
+        },
+    )
+
+
+def test_identical_workspace_divergence_does_not_rewake_on_reminders(
+    monkeypatch,
+):
+    event = student_assignment_event()
+    conflict = WorkspaceDivergence(
+        head_ref="student/candidate",
+        expected_head="a" * 40,
+        local_head="b" * 40,
+    )
+    clock = [0.0]
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+
+    class PersistentMailbox(Mailbox):
+        def poll(self):
+            self.calls += 1
+            return (event,)
+
+    turns = Turns()
+    controller_module.Controller(
+        role="student",
+        mailbox=PersistentMailbox([]),
+        turns=turns,
+        conversation_id=CONVERSATION_ID,
+        full_prompt="programme",
+        reconcile=lambda _events: (_ for _ in ()).throw(conflict),
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        poll_interval_seconds=1,
+        jitter_seconds=0,
+        event_reminder_seconds=1,
+    ).run(max_cycles=3)
+
+    assert len(turns.calls) == 1
+
+
+def test_workspace_divergence_suppression_survives_a_controller_restart(tmp_path):
+    event = student_assignment_event()
+    conflict = WorkspaceDivergence(
+        head_ref="student/candidate",
+        expected_head="a" * 40,
+        local_head="b" * 40,
+    )
+    ledger = WorkspaceDivergenceLedger(tmp_path / "workspace-divergence.json")
+    first_turns = Turns()
+    second_turns = Turns()
+
+    for turns in (first_turns, second_turns):
+        controller(
+            Mailbox([(event,), ()]),
+            turns,
+            role="student",
+            reconcile=lambda _events: (_ for _ in ()).throw(conflict),
+            workspace_divergence_state=ledger,
+        ).run(max_cycles=1)
+
+    assert len(first_turns.calls) == 1
+    assert second_turns.calls == []
+
+
+def test_unacknowledged_workspace_divergence_is_not_suppressed_after_restart(
+    tmp_path,
+):
+    event = student_assignment_event()
+    conflict = WorkspaceDivergence(
+        head_ref="student/candidate",
+        expected_head="a" * 40,
+        local_head="b" * 40,
+    )
+    ledger = WorkspaceDivergenceLedger(tmp_path / "workspace-divergence.json")
+
+    class FailingAcknowledgementMailbox(Mailbox):
+        def acknowledge(self, _dedupe_keys):
+            raise RuntimeError("mailbox acknowledgement failed")
+
+    with pytest.raises(RuntimeError, match="mailbox acknowledgement failed"):
+        controller(
+            FailingAcknowledgementMailbox([(event,)]),
+            Turns(),
+            role="student",
+            reconcile=lambda _events: (_ for _ in ()).throw(conflict),
+            workspace_divergence_state=ledger,
+        ).run(max_cycles=1)
+
+    assert ledger.current(CONVERSATION_ID) is None
+
+    restarted_turns = Turns()
+    controller(
+        Mailbox([(event,), ()]),
+        restarted_turns,
+        role="student",
+        reconcile=lambda _events: (_ for _ in ()).throw(conflict),
+        workspace_divergence_state=ledger,
+    ).run(max_cycles=1)
+
+    assert len(restarted_turns.calls) == 1
+
+
+def test_new_feedback_passes_through_an_unchanged_workspace_divergence():
+    assignment = student_assignment_event()
+    feedback = ControllerEvent(
+        kind="student_pr_feedback",
+        dedupe_key="student_pr_feedback:issue_comment:17:101",
+        payload={"message": "Use the accepted base."},
+    )
+    conflict = WorkspaceDivergence(
+        head_ref="student/candidate",
+        expected_head="a" * 40,
+        local_head="b" * 40,
+    )
+    turns = Turns()
+
+    controller(
+        Mailbox([(assignment,), (assignment, feedback), ()]),
+        turns,
+        role="student",
+        reconcile=lambda _events: (_ for _ in ()).throw(conflict),
+    ).run(max_cycles=1)
+
+    assert [call[2] for call in turns.calls] == [
+        frozenset({assignment.dedupe_key, conflict.event.dedupe_key}),
+        frozenset({feedback.dedupe_key, conflict.event.dedupe_key}),
+    ]
+
+
+def test_changed_workspace_divergence_wakes_again(monkeypatch):
+    event = student_assignment_event()
+    conflicts = iter(
+        [
+            WorkspaceDivergence(
+                head_ref="student/candidate",
+                expected_head="a" * 40,
+                local_head="b" * 40,
+            ),
+            WorkspaceDivergence(
+                head_ref="student/candidate",
+                expected_head="a" * 40,
+                local_head="c" * 40,
+            ),
+        ]
+    )
+    last = [None]
+    clock = [0.0]
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+
+    def reconcile(_events):
+        last[0] = next(conflicts, last[0])
+        raise last[0]
+
+    class PersistentMailbox(Mailbox):
+        def poll(self):
+            self.calls += 1
+            return (event,)
+
+    turns = Turns()
+    controller_module.Controller(
+        role="student",
+        mailbox=PersistentMailbox([]),
+        turns=turns,
+        conversation_id=CONVERSATION_ID,
+        full_prompt="programme",
+        reconcile=reconcile,
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        poll_interval_seconds=1,
+        jitter_seconds=0,
+        event_reminder_seconds=1,
+    ).run(max_cycles=2)
+
+    assert len(turns.calls) == 2
+
+
+def test_failed_workspace_divergence_turn_is_retried():
+    event = student_assignment_event()
+    conflict = WorkspaceDivergence(
+        head_ref="student/candidate",
+        expected_head="a" * 40,
+        local_head="b" * 40,
+    )
+    turns = Turns([TurnResult(exit_code=19), TurnResult(exit_code=0)])
+
+    controller(
+        Mailbox([(event,), (event,), ()]),
+        turns,
+        role="student",
+        reconcile=lambda _events: (_ for _ in ()).throw(conflict),
+    ).run(max_cycles=2)
+
+    assert len(turns.calls) == 2
 
 
 def test_successful_turn_acknowledges_and_suppresses_mid_turn_feedback():

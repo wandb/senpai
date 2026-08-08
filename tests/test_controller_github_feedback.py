@@ -1,6 +1,7 @@
 from pathlib import Path
 from uuid import UUID
 
+import pytest
 from pydantic import SecretStr
 
 from senpai_agent.controller import Controller, TurnResult
@@ -83,6 +84,7 @@ def student_mailbox(
         "updated_at": "2026-07-29T18:00:00Z",
         "body": render_assignment_marker(assignment),
         "head": {"ref": "student/candidate", "sha": "a" * 40},
+        "base": {"ref": "research", "sha": "b" * 40},
         "labels": [
             {"name": "research"},
             {"name": "student:student-1"},
@@ -148,6 +150,49 @@ def test_student_assignment_carries_the_marker_revision_identity(monkeypatch):
     assert event.kind == "student_assignment"
     assert event.payload["assignment_id"] == "assignment-17"
     assert event.payload["revision_id"] == "revision-2"
+    assert event.payload["base_ref"] == "research"
+    assert event.payload["base_sha"] == "b" * 40
+    assert event.payload["head_ref"] == "student/candidate"
+    assert event.payload["head_sha"] == "a" * 40
+    assert event.dedupe_key.endswith(f":{'b' * 40}:{'a' * 40}")
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        AssignmentRecord(
+            repo="other/widgets",
+            assignment_id="assignment-17",
+            revision_id="revision-2",
+            student="student-1",
+            base_ref="research",
+            base_sha="b" * 40,
+            head_ref="student/candidate",
+            head_sha="a" * 40,
+        ),
+        AssignmentRecord(
+            repo="acme/widgets",
+            assignment_id="assignment-17",
+            revision_id="revision-2",
+            student="student-1",
+            base_ref="research",
+            base_sha="not-a-sha",
+            head_ref="student/candidate",
+            head_sha="a" * 40,
+        ),
+    ],
+    ids=["foreign-repo", "invalid-base-sha"],
+)
+def test_student_rejects_assignment_markers_that_cannot_drive_safe_fetches(
+    monkeypatch,
+    assignment,
+):
+    mailbox = student_mailbox(monkeypatch, feedback_responses())
+    mailbox._pulls()[0]["body"] = render_assignment_marker(assignment)
+
+    event = mailbox.poll()[0]
+
+    assert event.kind == "malformed_assignment"
 
 
 def test_trusted_feedback_from_each_github_surface_is_ordered_and_routable(
@@ -213,6 +258,13 @@ def test_trusted_feedback_from_each_github_surface_is_ordered_and_routable(
         (event.payload["assignment_id"], event.payload["revision_id"])
         for event in events
     } == {("assignment-17", "revision-2")}
+    assert {
+        (
+            event.payload["base_sha"],
+            event.payload["head_sha"],
+        )
+        for event in events
+    } == {("b" * 40, "a" * 40)}
     assert events[1].payload["state"] == "CHANGES_REQUESTED"
     assert events[2].payload["path"] == "train.py"
     assert events[2].payload["line"] == 42

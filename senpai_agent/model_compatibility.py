@@ -67,6 +67,14 @@ def is_openai_extended_effort_model(model: str) -> bool:
     )
 
 
+def canonical_reasoning_effort(model: str, effort: str) -> str:
+    """Normalize Senpai's retired OpenAI-only profile spelling."""
+
+    if effort == "ultra" and is_openai_extended_effort_model(model):
+        return "max"
+    return effort
+
+
 def supports_reasoning_effort(model: str, effort: str) -> bool:
     if model.lower() == WANDB_GLM_52_MODEL:
         return effort in {"high", "max"}

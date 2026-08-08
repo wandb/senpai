@@ -34,7 +34,7 @@ def test_default_config_exposes_every_model_profile_and_effort():
         "fast_model": "openai/gpt-5.6-luna",
         "fast_reasoning_effort": "high",
         "frontier_model": "openai/gpt-5.6-sol",
-        "frontier_reasoning_effort": "ultra",
+        "frontier_reasoning_effort": "max",
         "local_condenser_max_events": 0,
         "local_condenser_max_tokens": 0,
         "local_condenser_target_events": 0,
@@ -332,6 +332,21 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         assert config["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"] == "180"
         assert config["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS"] == "180000"
         assert config["SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS"] == "40"
+
+
+def test_legacy_openai_ultra_launch_value_is_rendered_as_max():
+    args = launch_args(
+        frontier_model="openai/gpt-5.6-sol",
+        frontier_reasoning_effort="ultra",
+    )
+
+    launch.validate_model_config(args)
+    configmap, _deployment, _secret = render_role("student", args)
+
+    assert (
+        yaml.safe_load(configmap)["data"]["SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT"]
+        == "max"
+    )
 
 
 def test_wandb_gateway_is_rendered_for_every_role():

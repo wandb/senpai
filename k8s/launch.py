@@ -63,6 +63,7 @@ from senpai.launch.specs import (  # noqa: E402
     target_repo_slug,
 )
 from senpai_agent.model_compatibility import (  # noqa: E402
+    canonical_reasoning_effort,
     supports_reasoning_effort,
 )
 
@@ -104,7 +105,7 @@ class Args:
     fast_model: str = "openai/gpt-5.6-luna"
     fast_reasoning_effort: str = "high"
     frontier_model: str = "openai/gpt-5.6-sol"
-    frontier_reasoning_effort: str = "ultra"
+    frontier_reasoning_effort: str = "max"
     local_condenser_max_events: int = 0  # event fuse; 0 selects the model default
     local_condenser_max_tokens: int = 0  # token trigger; 0 selects the model default
     local_condenser_target_events: int = 0  # retained events; 0 selects model default
@@ -164,7 +165,6 @@ REASONING_EFFORTS = {
     "high",
     "xhigh",
     "max",
-    "ultra",
     "none",
 }
 
@@ -226,12 +226,17 @@ def validate_model_config(args: Args, *, has_students: bool = True) -> None:
         )
     for name, (model, effort) in profiles.items():
         model_provider(model)
-        if effort not in REASONING_EFFORTS:
+        canonical_effort = canonical_reasoning_effort(model, effort)
+        if effort == "ultra" and canonical_effort == "ultra":
+            sys.exit(
+                f"ERROR: --{name}_reasoning_effort={effort} is unsupported for {model}"
+            )
+        if canonical_effort not in REASONING_EFFORTS:
             choices = ", ".join(sorted(REASONING_EFFORTS))
             sys.exit(f"ERROR: --{name}_reasoning_effort must be one of: {choices}")
         normalized_model = model.lower()
         if normalized_model == "wandb/zai-org/glm-5.2":
-            if effort not in {"high", "max"}:
+            if canonical_effort not in {"high", "max"}:
                 sys.exit(
                     f"ERROR: --{name}_reasoning_effort={effort} is "
                     f"unsupported for {model}"
@@ -239,8 +244,7 @@ def validate_model_config(args: Args, *, has_students: bool = True) -> None:
             continue
         if not supports_reasoning_effort(model, effort):
             sys.exit(
-                f"ERROR: --{name}_reasoning_effort={effort} is unsupported for "
-                f"{model}"
+                f"ERROR: --{name}_reasoning_effort={effort} is unsupported for {model}"
             )
 
 

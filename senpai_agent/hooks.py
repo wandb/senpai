@@ -66,6 +66,7 @@ _GIT_TERMINAL_COMMANDS = {
     "mv",
     "name-rev",
     "notes",
+    "patch-id",
     "range-diff",
     "rebase",
     "reflog",
@@ -480,8 +481,9 @@ def _git_policy(arguments: list[str]) -> PolicyDecision:
         return PolicyDecision(True)
     return PolicyDecision(
         False,
-        "Only explicit local or read-only Git commands may use the terminal; "
-        "use the typed Senpai tool for branch publication.",
+        f"Terminal use of `git {command}` is not allowed; use explicit local or "
+        "read-only Git commands, and use the typed Senpai tool for branch "
+        "publication.",
     )
 
 

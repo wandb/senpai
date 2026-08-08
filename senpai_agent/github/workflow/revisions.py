@@ -108,11 +108,11 @@ class RevisionMixin:
             )
         )
         rendered_comment = marker_body(marker, comment)
-        marker_changed, _ = self._upsert_marker_comment(
-            number,
-            marker=marker,
-            body=rendered_comment,
-        )
+        marker_comments = self._marker_comments(number, marker)
+        if len(marker_comments) > 1:
+            raise ReconciliationError(
+                f"GitHub contains multiple comments for marker {marker!r}"
+            )
         revised_assignment = assignment.model_copy(
             update={
                 "revision_id": new_revision_id,
@@ -132,6 +132,11 @@ class RevisionMixin:
         require_open(current)
         if parse_assignment_markers(current.body) != (revised_assignment,):
             raise ReconciliationError("GitHub did not update the assignment revision")
+        marker_changed, _ = self._upsert_marker_comment(
+            number,
+            marker=marker,
+            body=rendered_comment,
+        )
         draft_changed = self._set_draft(current, draft=True)
         labels_changed, desired_labels = self._set_labels(
             number,

@@ -256,7 +256,7 @@ def _git(
         text=True,
         input=input_text,
         capture_output=True,
-        env=_git_process_env(token),
+        env=git_process_env(token),
         check=False,
     )
     if completed.returncode != 0:
@@ -274,7 +274,10 @@ def _validate_token(token: SecretStr | None) -> None:
         raise ValueError("token must not be empty")
 
 
-def _git_process_env(token: SecretStr | None) -> dict[str, str]:
+def git_process_env(token: SecretStr | None) -> dict[str, str]:
+    """Build a scrubbed Git environment with optional in-memory GitHub auth."""
+
+    _validate_token(token)
     env = dict(os.environ)
     scrub_github_credentials(env)
     if token is None:

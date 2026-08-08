@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import re
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from senpai_agent.mailbox import ControllerEvent
-from senpai_agent.models import parse_assignment_markers
+from senpai_agent.models import AssignmentRecord, parse_assignment_markers
 
 from .feedback import student_pr_feedback_events
 from .issues import human_issue_events
@@ -14,6 +15,42 @@ from .values import label_names, object_value, pull_payload
 
 if TYPE_CHECKING:
     from .core import GitHubMailbox
+
+
+_GIT_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
+
+
+def _validate_assignment_route(
+    pull: Mapping[str, object],
+    assignment: AssignmentRecord,
+    *,
+    repo: str,
+    student: str,
+) -> None:
+    head = pull.get("head")
+    base = pull.get("base")
+    if not isinstance(head, dict) or not isinstance(base, dict):
+        raise ValueError("assigned PR has invalid head or base metadata")
+    expected = {
+        "repo": (assignment.repo, repo),
+        "student": (assignment.student, student),
+        "head_ref": (assignment.head_ref, str(head.get("ref") or "")),
+        "base_ref": (assignment.base_ref, str(base.get("ref") or "")),
+    }
+    mismatches = [
+        name for name, (recorded, live) in expected.items() if recorded != live
+    ]
+    if mismatches:
+        raise ValueError(
+            "assignment marker does not match PR routing: " + ", ".join(mismatches)
+        )
+    for name, value in (
+        ("assignment head SHA", assignment.head_sha),
+        ("assignment base SHA", assignment.base_sha),
+        ("live head SHA", str(head.get("sha") or "")),
+    ):
+        if _GIT_OBJECT_ID.fullmatch(value) is None:
+            raise ValueError(f"{name} is not a full Git object ID")
 
 
 def student_events(
@@ -55,6 +92,13 @@ def student_events(
                 raise ValueError(
                     "assigned PR must contain exactly one Senpai assignment marker"
                 )
+            assignment = markers[0]
+            _validate_assignment_route(
+                pull,
+                assignment,
+                repo=mailbox.repo,
+                student=mailbox.student_name,
+            )
         except ValueError as error:
             number = int(pull["number"])
             head_sha = str(object_value(pull["head"])["sha"])
@@ -69,7 +113,6 @@ def student_events(
                 )
             )
         else:
-            assignment = markers[0]
             feedback = student_pr_feedback_events(mailbox, pull, assignment)
             prior_revision_pending = any(
                 event.payload["assignment_id"] != assignment.assignment_id
@@ -82,13 +125,17 @@ def student_events(
                         kind="student_assignment",
                         dedupe_key=(
                             f"student_assignment:{assignment.assignment_id}:"
-                            f"{assignment.revision_id}"
+                            f"{assignment.revision_id}:"
+                            f"{assignment.base_ref}:{assignment.head_ref}:"
+                            f"{assignment.base_sha}:"
+                            f"{object_value(pull['head'])['sha']!s}"
                         ),
                         payload={
                             **pull_payload(pull),
                             "assignment_id": assignment.assignment_id,
                             "revision_id": assignment.revision_id,
                             "base_ref": assignment.base_ref,
+                            "base_sha": assignment.base_sha,
                         },
                     )
                 )

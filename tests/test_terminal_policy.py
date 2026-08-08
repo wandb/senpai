@@ -45,6 +45,8 @@ def test_policy_denies_recognized_publication_and_github_mutations(command: str)
         "git config user.email 'Senpai Student'",
         "git config --get remote.origin.url",
         "git remote -v",
+        "git show HEAD | git patch-id --stable",
+        "git rebase research && git show HEAD | git patch-id --stable",
         "gh pr view 17 --json title",
         "gh api repos/wandb/senpai/pulls/17",
         "env GH_HOST=github.com gh repo view wandb/senpai",
@@ -70,6 +72,18 @@ def test_one_shot_git_alias_cannot_hide_a_push():
 )
 def test_unknown_git_subcommands_cannot_bypass_branch_publication(command: str):
     assert is_allowed(command) is False
+
+
+def test_compound_command_denial_names_the_rejected_git_subcommand():
+    decision = terminal_policy(
+        "git rebase research && git push origin experiment",
+        "student",
+        WORKSPACE,
+    )
+
+    assert decision.allowed is False
+    assert "git push" in decision.reason
+    assert "git rebase" not in decision.reason
 
 
 @pytest.mark.parametrize(

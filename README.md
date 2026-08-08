@@ -137,7 +137,7 @@ smart_reasoning_effort: xhigh
 fast_model: openai/gpt-5.6-luna
 fast_reasoning_effort: high
 frontier_model: openai/gpt-5.6-sol
-frontier_reasoning_effort: ultra
+frontier_reasoning_effort: max
 local_condenser_max_events: 0
 local_condenser_max_tokens: 0
 local_condenser_target_events: 0
@@ -505,6 +505,14 @@ The structured result records its terminal status, exact result commit, W&B run 
 
 Trusted collaborator comments, submitted reviews, and inline review comments are delivered automatically to the relevant student; feedback from untrusted authors and unrecognized bots is ignored. `get_prs` can still retrieve the complete discussion explicitly. If the configured research base changes while an experiment is running, Senpai emits `research_base_changed` with the assignment's `required_base_sha` and the live `current_base_sha` without cancelling the assignment. When reviewing its terminal result, the advisor either requests a revision on the current base or records why that exact result remains valid with `accept_result_on_current_base`; `merge_experiment` still verifies the live SHA immediately before merging.
 
+Before each assignment or PR-feedback turn, the student controller authenticates
+and hydrates the exact assignment head and recorded baseline into
+`refs/senpai/assignment/` without resetting the checkout. A revision can
+atomically record an explicitly accepted live baseline SHA. Divergent local
+history and dirty work are preserved and reported once; an unchanged assignment
+reminder does not repeatedly wake the model, while changed refs, local work, or
+new feedback still do.
+
 `get_prs` returns complete PR bodies and discussions. Up to five PRs are returned in context by default; larger selections become a Markdown artifact outside the target checkout so long histories do not pollute the main conversation.
 
 ## Long-running training and monitoring
@@ -538,8 +546,8 @@ child runs in a fresh OpenHands conversation and separate process group.
 | [Bash Runner](.agents/agents/bash-runner.md) | Tests, builds, linters, dependency commands, Git inspection, and noisy CLI work. It returns counts and actionable failures rather than raw logs. | `fast`. |
 
 The model tier is independent of the agent specialization. With the default
-`agent=general-purpose`, `model=frontier` launches GPT-5.6 Sol at the `ultra`
-profile, sent to the Responses API as `max` effort with `reasoning.mode: pro`
+`agent=general-purpose`, `model=frontier` launches GPT-5.6 Sol at `max`, sent
+to the Responses API with `reasoning.mode: pro`
 with the general-purpose terminal and code-editing toolset. Pair `frontier`
 with `agent=search` when the hard task is external or publication research.
 

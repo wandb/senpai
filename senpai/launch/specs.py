@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from senpai_agent.launch_context import render_launch_context
+from senpai_agent.model_compatibility import canonical_reasoning_effort
 
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
 CONTAINER_STATE_ROOT = "/var/lib/senpai"
@@ -158,13 +159,25 @@ def role_model_config(args, role: str) -> dict[str, str]:
     )
     return {
         "SENPAI_OPENHANDS_MODEL": model,
-        "SENPAI_OPENHANDS_REASONING_EFFORT": reasoning_effort,
+        "SENPAI_OPENHANDS_REASONING_EFFORT": canonical_reasoning_effort(
+            model,
+            reasoning_effort,
+        ),
         "SENPAI_OPENHANDS_SMART_MODEL": args.smart_model,
-        "SENPAI_OPENHANDS_SMART_REASONING_EFFORT": args.smart_reasoning_effort,
+        "SENPAI_OPENHANDS_SMART_REASONING_EFFORT": canonical_reasoning_effort(
+            args.smart_model,
+            args.smart_reasoning_effort,
+        ),
         "SENPAI_OPENHANDS_FAST_MODEL": args.fast_model,
-        "SENPAI_OPENHANDS_FAST_REASONING_EFFORT": args.fast_reasoning_effort,
+        "SENPAI_OPENHANDS_FAST_REASONING_EFFORT": canonical_reasoning_effort(
+            args.fast_model,
+            args.fast_reasoning_effort,
+        ),
         "SENPAI_OPENHANDS_FRONTIER_MODEL": args.frontier_model,
-        "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": args.frontier_reasoning_effort,
+        "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": canonical_reasoning_effort(
+            args.frontier_model,
+            args.frontier_reasoning_effort,
+        ),
         "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS": str(
             args.local_condenser_max_events
         ),

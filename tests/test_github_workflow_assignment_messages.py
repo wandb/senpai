@@ -200,6 +200,60 @@ def test_request_revision_rejects_another_wip_for_the_student(monkeypatch):
     assert fake.mutations == []
 
 
+def test_request_revision_replays_after_the_recorded_base_advances():
+    required_base_sha = "c" * 40
+    fake = FakeGitHub(
+        pull_request(labels={"student:one", "status:review"}, draft=False),
+        branch_heads={"schmidhuber": required_base_sha},
+    )
+    client = workflow(fake)
+
+    first = request_revision(client, required_base_sha=required_base_sha)
+    mutations_after_first = list(fake.mutations)
+    fake.branch_heads["schmidhuber"] = "d" * 40
+    second = request_revision(client, required_base_sha=required_base_sha)
+
+    assignment = parse_assignment_markers(cast(str, fake.pr["body"]))[0]
+    assert assignment.base_sha == required_base_sha
+    assert first.changed is True
+    assert second.changed is False
+    assert fake.mutations == mutations_after_first
+
+
+def test_request_revision_recovers_after_the_assignment_marker_was_recorded(
+    monkeypatch,
+):
+    required_base_sha = "c" * 40
+    fake = FakeGitHub(
+        pull_request(labels={"student:one", "status:review"}, draft=False),
+        branch_heads={"schmidhuber": required_base_sha},
+    )
+    client = workflow(fake)
+    upsert = type(client)._upsert_marker_comment
+
+    def interrupt_after_assignment(_self, *_args, **_kwargs):
+        raise RuntimeError("controller interrupted")
+
+    monkeypatch.setattr(
+        type(client),
+        "_upsert_marker_comment",
+        interrupt_after_assignment,
+    )
+    with pytest.raises(RuntimeError, match="controller interrupted"):
+        request_revision(client, required_base_sha=required_base_sha)
+
+    recorded = parse_assignment_markers(cast(str, fake.pr["body"]))[0]
+    assert recorded.revision_id == "revision-2"
+    assert recorded.base_sha == required_base_sha
+
+    fake.branch_heads["schmidhuber"] = "d" * 40
+    monkeypatch.setattr(type(client), "_upsert_marker_comment", upsert)
+
+    recovered = request_revision(client, required_base_sha=required_base_sha)
+
+    assert recovered.state == "revision_requested"
+
+
 def feedback_marker() -> str:
     return render_assignment_feedback_marker(
         AssignmentFeedbackRecord(

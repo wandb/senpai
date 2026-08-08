@@ -119,7 +119,7 @@ def config(tmp_path: Path, **updates) -> DelegationConfig:
         "fast_api_key_env": "OPENAI_API_KEY",
         "fast_api_key": "secret",
         "frontier_model": "openai/gpt-5.6-sol",
-        "frontier_reasoning_effort": "ultra",
+        "frontier_reasoning_effort": "max",
         "frontier_api_key_env": "OPENAI_API_KEY",
         "frontier_api_key": "secret",
         "github_repo": "acme/widgets",

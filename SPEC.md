@@ -250,8 +250,8 @@ explicit on every request.
 Senpai sets `reasoning_context="all_turns"` and `reasoning_summary="auto"` so
 supported models can reuse server-side private reasoning and return the most
 detailed available summary. The default main effort is `xhigh`; GPT-5.6 also
-accepts `max` and the `ultra` profile, which uses API `max` effort with
-Responses `reasoning.mode: pro`. Automatic OpenAI compaction starts at
+accepts `max`, which uses API `max` effort with Responses
+`reasoning.mode: pro`. Automatic OpenAI compaction starts at
 200,000 rendered tokens. The OpenHands condenser is disabled for that provider
 chain, but its complete local event log remains durable and is used to recover
 the latest response ID after restart.
@@ -455,7 +455,7 @@ This makes chains such as Explore -> Explore impossible without constraining a
 later research phase to the first batch's lifetime budget.
 
 The tree inherits one absolute root-turn deadline. Each task also has a tier
-runtime cap: 300 seconds for `fast`, 600 for `smart`, and 1,500 for `frontier`.
+runtime cap: 600 seconds for `fast`, 1,800 for `smart`, and 3,600 for `frontier`.
 The effective deadline is the earlier of that cap and the inherited root
 deadline. Reaching it interrupts the complete process group and records a
 terminal timeout; no descendant survives the tree deadline.
@@ -464,15 +464,16 @@ Each tier selects one explicit model-and-effort profile. `model=fast` defaults
 to `openai/gpt-5.6-luna` at `high` for mechanical search, command execution,
 and extraction. `model=smart` defaults to `openai/gpt-5.6-sol` at `xhigh` for
 ordinary review, literature research, synthesis, and failure diagnosis.
-`model=frontier` defaults to `openai/gpt-5.6-sol` at the `ultra` profile
-(`max` effort with Responses `reasoning.mode: pro`) for the hardest
+`model=frontier` defaults to `openai/gpt-5.6-sol` at `max` with Responses
+`reasoning.mode: pro` for the hardest
 quality-first work. The provider prefix determines the required credential
 (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`); model-facing calls never select
 credential names.
 
-Reasoning effort is validated against the selected model and passed through
-unchanged. Invalid combinations fail clearly rather than being clamped or
-translated. The built-in file agents inherit the selected profile's effort.
+Reasoning effort is validated against the selected model. Provider-specific
+request configuration maps GPT-5.6 `max` to Responses Pro mode; invalid
+combinations fail clearly. The built-in file agents inherit the selected
+profile's effort.
 
 `explore` searches code, data, PR artifacts, and durable history and returns
 concise conclusions with paths and line numbers. `search` requires exactly one
