@@ -104,6 +104,16 @@ COMMAND_SECRET_ENV_NAMES = (
     "WANDB_API_KEY",
     "EXA_API_KEY",
 )
+_RETIRED_PERSISTED_TOOL_DEFINITION_KINDS = frozenset(
+    {
+        "DelegateAgentTool",
+        "RunTrainingTool",
+        "GetTrainingStatusTool",
+        "CancelTrainingTool",
+        "MonitorTrainingTool",
+    }
+)
+_DISABLED_PERSISTED_TOOL_NAMES = frozenset({"delegate_agent", "think"})
 EVENT_TEXT_LIMIT = 20000
 DEFAULT_LOCAL_CONDENSER_MAX_EVENTS = 0
 GENERIC_LOCAL_CONDENSER_MAX_EVENTS = 80
@@ -1195,47 +1205,7 @@ def without_legacy_think(agent: Agent) -> Agent:
     )
 
 
-def migrate_persisted_disabled_tools(
-    state_dir: Path,
-    conversation_id: uuid.UUID,
-) -> bool:
-    """Atomically remove only Think declarations from one saved agent spec."""
-
-    path = Path(state_dir) / conversation_id.hex / "base_state.json"
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return False
-    except (json.JSONDecodeError, OSError) as error:
-        raise RuntimeError(
-            f"cannot migrate persisted agent state at {path}: {error}"
-        ) from error
-    if not isinstance(payload, dict) or not isinstance(payload.get("agent"), dict):
-        raise TypeError(f"persisted agent state at {path} has an unknown shape")
-    saved_agent = payload["agent"]
-    tools = saved_agent.get("tools")
-    defaults = saved_agent.get("include_default_tools")
-    if not isinstance(tools, list) or not all(
-        isinstance(tool, dict) and isinstance(tool.get("name"), str) for tool in tools
-    ):
-        raise RuntimeError(f"persisted agent tools at {path} have an unknown shape")
-    if defaults is not None and (
-        not isinstance(defaults, list)
-        or not all(isinstance(name, str) for name in defaults)
-    ):
-        raise RuntimeError(f"persisted default tools at {path} have an unknown shape")
-
-    migrated_tools = [tool for tool in tools if tool["name"] != "think"]
-    migrated_defaults = [
-        name
-        for name in (defaults if defaults is not None else ["FinishTool", "ThinkTool"])
-        if name != "ThinkTool"
-    ]
-    if migrated_tools == tools and migrated_defaults == defaults:
-        return False
-    saved_agent["tools"] = migrated_tools
-    saved_agent["include_default_tools"] = migrated_defaults
-
+def _write_json_atomically(path: Path, payload: object) -> None:
     mode = stat.S_IMODE(path.stat().st_mode)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -1256,7 +1226,95 @@ def migrate_persisted_disabled_tools(
             os.close(directory)
     finally:
         temporary.unlink(missing_ok=True)
-    return True
+
+
+def migrate_persisted_retired_tool_definitions(
+    state_dir: Path,
+    conversation_id: uuid.UUID,
+) -> int:
+    """Remove only retired tool snapshots that the SDK can no longer decode."""
+
+    events_dir = Path(state_dir) / conversation_id.hex / "events"
+    removed = 0
+    for path in sorted(events_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as error:
+            raise RuntimeError(
+                f"cannot migrate persisted conversation event at {path}: {error}"
+            ) from error
+        if not isinstance(payload, dict) or payload.get("kind") != "SystemPromptEvent":
+            continue
+        tools = payload.get("tools")
+        if not isinstance(tools, list):
+            continue
+        migrated_tools = [
+            tool
+            for tool in tools
+            if not (
+                isinstance(tool, dict)
+                and tool.get("kind") in _RETIRED_PERSISTED_TOOL_DEFINITION_KINDS
+            )
+        ]
+        removed_from_event = len(tools) - len(migrated_tools)
+        if not removed_from_event:
+            continue
+        payload["tools"] = migrated_tools
+        _write_json_atomically(path, payload)
+        removed += removed_from_event
+    return removed
+
+
+def migrate_persisted_disabled_tools(
+    state_dir: Path,
+    conversation_id: uuid.UUID,
+) -> frozenset[str]:
+    """Atomically remove disabled tools from one saved agent specification."""
+
+    path = Path(state_dir) / conversation_id.hex / "base_state.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return frozenset()
+    except (json.JSONDecodeError, OSError) as error:
+        raise RuntimeError(
+            f"cannot migrate persisted agent state at {path}: {error}"
+        ) from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("agent"), dict):
+        raise TypeError(f"persisted agent state at {path} has an unknown shape")
+    saved_agent = payload["agent"]
+    tools = saved_agent.get("tools")
+    defaults = saved_agent.get("include_default_tools")
+    if not isinstance(tools, list) or not all(
+        isinstance(tool, dict) and isinstance(tool.get("name"), str) for tool in tools
+    ):
+        raise RuntimeError(f"persisted agent tools at {path} have an unknown shape")
+    if defaults is not None and (
+        not isinstance(defaults, list)
+        or not all(isinstance(name, str) for name in defaults)
+    ):
+        raise RuntimeError(f"persisted default tools at {path} have an unknown shape")
+
+    removed = {
+        tool["name"] for tool in tools if tool["name"] in _DISABLED_PERSISTED_TOOL_NAMES
+    }
+    migrated_tools = [
+        tool for tool in tools if tool["name"] not in _DISABLED_PERSISTED_TOOL_NAMES
+    ]
+    if defaults is None or "ThinkTool" in defaults:
+        removed.add("think")
+    migrated_defaults = [
+        name
+        for name in (defaults if defaults is not None else ["FinishTool", "ThinkTool"])
+        if name != "ThinkTool"
+    ]
+    if migrated_tools == tools and migrated_defaults == defaults:
+        return frozenset()
+    saved_agent["tools"] = migrated_tools
+    saved_agent["include_default_tools"] = migrated_defaults
+
+    _write_json_atomically(path, payload)
+    return frozenset(removed)
 
 
 def delegation_config(
@@ -1604,12 +1662,26 @@ def run_openhands(
                 tool_concurrency_limit=MAX_PARALLEL_AGENTS,
             )
         agent = without_legacy_think(agent)
-        if migrate_persisted_disabled_tools(
+        retired_tool_definitions = migrate_persisted_retired_tool_definitions(
             config.state_dir,
             config.conversation_id,
-        ):
+        )
+        if retired_tool_definitions:
             print(
-                "OPENHANDS_STATE_MIGRATION removed_tool=think "
+                "OPENHANDS_STATE_MIGRATION "
+                f"removed_retired_tool_definitions={retired_tool_definitions} "
+                f"conversation_id={config.conversation_id}",
+                file=sys.stderr,
+                flush=True,
+            )
+        disabled_tools = migrate_persisted_disabled_tools(
+            config.state_dir,
+            config.conversation_id,
+        )
+        if disabled_tools:
+            print(
+                "OPENHANDS_STATE_MIGRATION "
+                f"removed_tools={','.join(sorted(disabled_tools))} "
                 f"conversation_id={config.conversation_id}",
                 file=sys.stderr,
                 flush=True,
