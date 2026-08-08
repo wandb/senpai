@@ -10,6 +10,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from senpai_agent.training import training_result_paths
+
 
 @dataclass(frozen=True, slots=True)
 class PolicyDecision:
@@ -587,7 +589,7 @@ def _stop_policy(
     if state_dir is not None:
         running = {
             path.stem
-            for path in (state_dir / "training").glob("*.json")
+            for path in training_result_paths(state_dir / "training")
             if json.loads(path.read_text()).get("state") == "running"
         }
         monitored = {

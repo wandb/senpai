@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -57,6 +58,18 @@ class TrainingResult(BaseModel):
     error_tail: str = ""
 
 
+def training_result_paths(state_dir: Path) -> Iterator[Path]:
+    """Yield only process records owned by the training supervisor."""
+
+    for path in state_dir.glob("*.json"):
+        try:
+            training_id = uuid.UUID(path.stem)
+        except ValueError:
+            continue
+        if path.name == f"{training_id}.json":
+            yield path
+
+
 @dataclass
 class _ActiveTraining:
     process: subprocess.Popen[bytes]
@@ -90,7 +103,7 @@ class TrainingSupervisor:
         self._cancel_orphaned_runs()
 
     def _cancel_orphaned_runs(self) -> None:
-        for path in self.state_dir.glob("*.json"):
+        for path in training_result_paths(self.state_dir):
             result = TrainingResult.model_validate_json(path.read_text())
             if result.state is TrainingState.RUNNING:
                 process_was_terminated = self._terminate_recovered_process(result)

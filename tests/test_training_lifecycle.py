@@ -35,6 +35,33 @@ def test_finished_training_persists_its_result_and_log(tmp_path: Path):
     assert reopened == terminal
 
 
+def test_recovery_ignores_non_training_json_sidecars(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    state_dir = tmp_path / "state"
+    workspace.mkdir()
+    state_dir.mkdir()
+    sidecar = state_dir / "b81440b1-b803-471e-9fe0-6dcabd756b83.score.json"
+    contents = '{"metrics": {}, "passed": true, "score": 1.0}'
+    sidecar.write_text(contents)
+
+    supervisor = TrainingSupervisor(workspace=workspace, state_dir=state_dir)
+
+    assert sidecar.read_text() == contents
+    supervisor.close()
+
+
+def test_recovery_rejects_a_corrupt_training_result(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    state_dir = tmp_path / "state"
+    workspace.mkdir()
+    state_dir.mkdir()
+    result = state_dir / "b81440b1-b803-471e-9fe0-6dcabd756b83.json"
+    result.write_text('{"state": "running"}')
+
+    with pytest.raises(ValueError):
+        TrainingSupervisor(workspace=workspace, state_dir=state_dir)
+
+
 def test_training_passes_shell_metacharacters_as_a_literal_argument(tmp_path: Path):
     workspace, supervisor = make_supervisor(tmp_path)
     literal = "result; $(echo not-a-shell)"

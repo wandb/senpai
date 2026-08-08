@@ -151,6 +151,8 @@ def test_restart_stops_a_verified_orphaned_process_group(tmp_path: Path):
         log_path=str(state_dir / "orphan.log"),
     )
     (state_dir / f"{orphan.training_id}.json").write_text(orphan.model_dump_json())
+    sidecar = state_dir / f"{orphan.training_id}.score.json"
+    sidecar.write_text('{"metrics": {}, "passed": true, "score": 1.0}')
 
     try:
         supervisor = TrainingSupervisor(
@@ -162,6 +164,7 @@ def test_restart_stops_a_verified_orphaned_process_group(tmp_path: Path):
         recovered = supervisor.get_training_status(orphan.training_id)
         assert recovered.state is TrainingState.CANCELLED
         assert "supervisor restarted" in recovered.error_tail
+        assert sidecar.exists()
         assert process.wait(timeout=3) is not None
         assert_process_stopped(int(child_pid_path.read_text()))
     finally:
