@@ -386,7 +386,7 @@ def test_all_model_profiles_accept_independent_cli_model_and_effort_settings(
             "unsupported",
         ),
         (
-            {"SENPAI_OPENHANDS_FRONTIER_MODEL": "anthropic/claude-opus-4-8"},
+            {"SENPAI_OPENHANDS_FRONTIER_MODEL": "anthropic/claude-haiku-4-5"},
             "unsupported for",
         ),
     ],

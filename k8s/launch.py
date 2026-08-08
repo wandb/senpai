@@ -109,9 +109,7 @@ class Args:
     local_condenser_max_events: int = 0  # event fuse; 0 selects the model default
     local_condenser_max_tokens: int = 0  # token trigger; 0 selects the model default
     local_condenser_target_events: int = 0  # retained events; 0 selects model default
-    human_issues: bool = (
-        True  # allow human GitHub issue triage; disable for isolated launches
-    )
+    human_issues: bool = True  # allow human GitHub issue triage; disable for isolated launches
     advisor_name: str = "advisor"  # neutral advisor identity used in Git, prompts, and traces
     advisor_branch: str = "schmidhuber"  # branch the advisor works on inside the problem-package repo (students PR into it; created from target_repo_branch if missing)
     gh_history_scope: str = "branch"  # branch=normal track memory, fresh=clean ablation, repo=whole-repo memory
