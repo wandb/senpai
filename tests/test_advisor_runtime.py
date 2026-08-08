@@ -17,7 +17,7 @@ from senpai_agent.advisor import (
     advisor_main,
     deliver_pending_events,
 )
-from senpai_agent.delegation import DelegateAgentAction, DelegateAgentObservation
+from senpai_agent.delegation import AgentStatusAction, AgentStatusObservation
 
 
 class ConversationStateStub:
@@ -47,33 +47,29 @@ class ConversationStateStub:
         self._lock.release()
 
 
-def pending_delegate_action() -> ActionEvent:
-    action = DelegateAgentAction(task="Inspect the timeout")
+def pending_tool_action() -> ActionEvent:
+    action = AgentStatusAction()
     return ActionEvent(
         thought=[],
         action=action,
-        tool_name="delegate_agent",
-        tool_call_id="delegate-call",
+        tool_name="agent_status",
+        tool_call_id="status-call",
         tool_call=MessageToolCall(
-            id="delegate-call",
-            name="delegate_agent",
+            id="status-call",
+            name="agent_status",
             arguments=json.dumps(action.model_dump(mode="json")),
             origin="completion",
         ),
-        llm_response_id="delegate-response",
+        llm_response_id="status-response",
     )
 
 
-def completed_delegate_action(action: ActionEvent) -> ObservationEvent:
+def completed_tool_action(action: ActionEvent) -> ObservationEvent:
     return ObservationEvent(
-        tool_name="delegate_agent",
+        tool_name="agent_status",
         tool_call_id=action.tool_call_id,
         action_id=action.id,
-        observation=DelegateAgentObservation(
-            task_id="task-1",
-            status="finished",
-            result="done",
-        ),
+        observation=AgentStatusObservation(tasks=[]),
     )
 
 
@@ -174,7 +170,7 @@ def test_event_pump_keeps_events_queued_while_a_tool_action_is_unmatched(
 
     class Conversation:
         def __init__(self):
-            self.state = ConversationStateStub([pending_delegate_action()])
+            self.state = ConversationStateStub([pending_tool_action()])
             self.messages: list[str] = []
 
         def send_message(self, message: str) -> None:
@@ -199,7 +195,7 @@ def test_event_pump_delivers_queued_event_after_the_tool_boundary_is_safe(
         dedupe_key="agent_result:task-1",
         payload={"task_id": "task-1"},
     )
-    action = pending_delegate_action()
+    action = pending_tool_action()
 
     class Conversation:
         def __init__(self):
@@ -219,7 +215,7 @@ def test_event_pump_delivers_queued_event_after_the_tool_boundary_is_safe(
             assert conversation.messages == []
             assert store.pending() == [event]
 
-            conversation.state.append(completed_delegate_action(action))
+            conversation.state.append(completed_tool_action(action))
             assert conversation.received.wait(1)
 
         assert conversation.messages == [event.to_user_message()]

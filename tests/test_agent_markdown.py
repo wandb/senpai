@@ -106,6 +106,7 @@ def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
 
     assert "review-experiment" in {skill.name for skill in plugin.skills}
     assert "bash-runner" in {agent.name for agent in agents}
+    assert not (home / ".agents/skills/senpai-tool-telemetry").exists()
     assert all(
         strip_spdx_header(text) == text
         for root in (runtime_plugin, home / ".agents")

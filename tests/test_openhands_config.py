@@ -94,6 +94,21 @@ def test_project_instructions_and_file_agents_are_sanitized_without_mutation(
     assert "# SPDX-" in definition.read_text(encoding="utf-8")
 
 
+def test_developer_only_project_skills_are_not_exposed_to_senpai(tmp_path: Path):
+    workspace = tmp_path / "target"
+    skill_dir = workspace / ".agents" / "skills" / "telemetry"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: telemetry\ndescription: Developer diagnostics.\n---\n",
+        encoding="utf-8",
+    )
+    (skill_dir / ".senpai-developer-only").touch()
+
+    assert "telemetry" not in {
+        skill.name for skill in sanitized_project_skills(workspace)
+    }
+
+
 def test_resolved_config_separates_runtime_credentials_from_command_secrets(
     tmp_path: Path,
 ):

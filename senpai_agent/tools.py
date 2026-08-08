@@ -11,24 +11,26 @@ from typing import TYPE_CHECKING, Literal, Self
 from openhands.sdk.llm import TextContent
 from openhands.sdk.tool import (
     Action,
+    DeclaredResources,
     Observation,
     ToolAnnotations,
     ToolDefinition,
     ToolExecutor,
     register_tool,
 )
+from openhands.tools.browser_use import BrowserToolSet
 from openhands.tools.terminal import (
     TerminalAction,
     TerminalObservation,
     TerminalTool,
 )
+from openhands.tools.task_tracker import TaskTrackerTool
 from pydantic import Field, model_validator
 
 from senpai_agent.delegation import (
     AgentStatusTool,
     AwaitAgentsTool,
     CancelAgentsTool,
-    DelegateAgentTool,
     SpawnAgentsTool,
 )
 from senpai_agent.git_workflow import require_clean_training_worktree
@@ -42,13 +44,117 @@ from senpai_agent.training import (
 )
 
 if TYPE_CHECKING:
-    from openhands.sdk.conversation import LocalConversation
+    from openhands.sdk.conversation import ConversationState, LocalConversation
 
 
 _TRAINING_RUNTIMES: dict[
     Path,
     tuple[TrainingSupervisor, MonitorStore],
 ] = {}
+_BROWSER_ENABLED_STATE_KEY = "senpai.browser_enabled"
+
+
+class LoadBrowserAction(Action):
+    """Enable the browser tool family for this conversation."""
+
+
+class LoadBrowserObservation(Observation):
+    tools: tuple[str, ...]
+
+    @property
+    def to_llm_content(self) -> Sequence[TextContent]:
+        return [
+            TextContent(
+                text=(
+                    "Browser tools are now available: "
+                    + ", ".join(self.tools)
+                    + "."
+                )
+            )
+        ]
+
+
+class _LoadBrowserExecutor(
+    ToolExecutor[LoadBrowserAction, LoadBrowserObservation]
+):
+    def __call__(
+        self,
+        action: LoadBrowserAction,  # noqa: ARG002
+        conversation: LocalConversation | None = None,
+    ) -> LoadBrowserObservation:
+        if conversation is None:
+            raise ValueError("load_browser requires its parent conversation")
+        if conversation.state.agent_state.get(_BROWSER_ENABLED_STATE_KEY):
+            names = tuple(
+                name
+                for name in conversation.agent.tools_map
+                if name.startswith("browser_")
+            )
+            return LoadBrowserObservation(tools=names)
+
+        browser_tools = BrowserToolSet.create(conversation.state)
+        conversation.agent.add_runtime_tools(browser_tools)
+        conversation.state.agent_state = {
+            **conversation.state.agent_state,
+            _BROWSER_ENABLED_STATE_KEY: True,
+        }
+        return LoadBrowserObservation(tools=tuple(tool.name for tool in browser_tools))
+
+
+class LoadBrowserTool(ToolDefinition[LoadBrowserAction, LoadBrowserObservation]):
+    name = "load_browser"
+
+    def declared_resources(self, action: Action) -> DeclaredResources:  # noqa: ARG002
+        return DeclaredResources(keys=("browser-tools",), declared=True)
+
+    @classmethod
+    def create(
+        cls,
+        conv_state: ConversationState,
+    ) -> Sequence[ToolDefinition]:
+        if conv_state.agent_state.get(_BROWSER_ENABLED_STATE_KEY):
+            return BrowserToolSet.create(conv_state)
+        return [
+            cls(
+                description=(
+                    "Load the full browser tool family for this conversation. "
+                    "Use it when interactive web navigation or page inspection is "
+                    "needed; the browser operations become available on the next step."
+                ),
+                action_type=LoadBrowserAction,
+                observation_type=LoadBrowserObservation,
+                annotations=ToolAnnotations(
+                    title="Load browser tools",
+                    readOnlyHint=False,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=True,
+                ),
+                executor=_LoadBrowserExecutor(),
+            )
+        ]
+
+
+_TASK_TRACKER_DESCRIPTION = """Maintain an optional persisted task list for complex work.
+
+Use it when a task has several meaningful steps or concurrent workstreams and a
+compact todo/in-progress/done record will prevent omissions. Multiple items may
+be in progress when the work is genuinely parallel. Skip it for short, atomic,
+or purely informational work. View the current list before replacing it, keep
+entries concise, and mark work done only when its required evidence is complete."""
+
+
+class SenpaiTaskTrackerTool(TaskTrackerTool):
+    """OpenHands task persistence with a concise, concurrency-safe description."""
+
+    name = "task_tracker"
+
+    @classmethod
+    def create(cls, conv_state: ConversationState) -> Sequence[ToolDefinition]:
+        return [
+            tool.model_copy(update={"description": _TASK_TRACKER_DESCRIPTION})
+            for tool in super().create(conv_state)
+        ]
 
 
 def training_runtime(
@@ -589,6 +695,8 @@ def register_senpai_tools() -> None:
     register_tool("await_agents", AwaitAgentsTool)
     register_tool("agent_status", AgentStatusTool)
     register_tool("cancel_agents", CancelAgentsTool)
-    register_tool("delegate_agent", DelegateAgentTool)
+    register_tool("browser_tool_set", LoadBrowserTool)
+    register_tool("load_browser", LoadBrowserTool)
+    register_tool("task_tracker", SenpaiTaskTrackerTool)
     register_tool("senpai_terminal", SenpaiTerminalTool)
     _TOOLS_REGISTERED = True

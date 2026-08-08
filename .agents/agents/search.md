@@ -1,8 +1,8 @@
 ---
 name: search
 description: |
-  Use for external research in one explicit mode: general-web for current
-  documentation and public web sources, or research-publications for scholarly
+  Use for external research through the explicit search_general_web task form
+  for current public sources, or search_research_publications for scholarly
   literature through Exa and primary papers.
 
   <example>Find the current API behavior in official documentation.</example>

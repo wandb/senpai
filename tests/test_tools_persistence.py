@@ -2,7 +2,7 @@ import json
 
 import pytest
 from openhands.sdk.conversation.event_store import EventLog
-from openhands.sdk.event import ActionEvent, Event, ObservationEvent, SystemPromptEvent
+from openhands.sdk.event import ActionEvent, Event, ObservationEvent
 from openhands.sdk.io import InMemoryFileStore
 from openhands.sdk.llm import MessageToolCall
 
@@ -11,11 +11,6 @@ from senpai_agent.models import (
     ExperimentResult,
     MetricComparison,
     ResultStatus,
-)
-from senpai_agent.delegation import (
-    DelegateAgentAction,
-    DelegateAgentObservation,
-    DelegateAgentTool,
 )
 from senpai_agent.github.tools import SubmitExperimentResultAction
 from senpai_agent.tools import (
@@ -81,54 +76,6 @@ def test_legacy_monitor_actions_restore_without_the_removed_status_filter():
     assert isinstance(restored.action, MonitorTrainingAction)
     assert restored.action.training_id == "training-17"
     assert "notify_on_status" not in restored.action.model_dump()
-
-
-def test_legacy_delegate_agent_events_and_tool_definition_still_restore():
-    action = DelegateAgentAction(
-        task="Inspect the prior benchmark",
-        agent="explore",
-        model="fast",
-        background=True,
-        include_context=True,
-    )
-    restored_action = round_trip(
-        ActionEvent(
-            thought=[],
-            action=action,
-            tool_name="delegate_agent",
-            tool_call_id="legacy-delegate",
-            tool_call=MessageToolCall(
-                id="legacy-delegate",
-                name="delegate_agent",
-                arguments=json.dumps(action.model_dump(mode="json")),
-                origin="completion",
-            ),
-            llm_response_id="legacy-response",
-        )
-    )
-    restored_observation = round_trip(
-        ObservationEvent(
-            tool_name="delegate_agent",
-            tool_call_id="legacy-delegate",
-            action_id=restored_action.id,
-            observation=DelegateAgentObservation(
-                task_id="legacy-task",
-                status="dispatched",
-            ),
-        )
-    )
-    restored_system = round_trip(
-        SystemPromptEvent(
-            system_prompt={"text": "Legacy system prompt"},
-            tools=DelegateAgentTool.create()[0:1],
-        )
-    )
-
-    assert isinstance(restored_action.action, DelegateAgentAction)
-    assert restored_action.action.background is True
-    assert isinstance(restored_observation.observation, DelegateAgentObservation)
-    assert restored_observation.observation.status == "dispatched"
-    assert isinstance(restored_system.tools[0], DelegateAgentTool)
 
 
 def test_running_training_observation_survives_event_log_restore():

@@ -1,7 +1,8 @@
+import json
+import sqlite3
 import threading
 import time
 import uuid
-import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,8 +23,8 @@ from senpai_agent.delegation import (
     DelegationConfig,
     DelegationRegistry,
     DelegationRequest,
-    DelegateAgentAction,
-    DelegateAgentTool,
+    LeafAgentTask,
+    LeafSpawnAgentsAction,
     MODEL_TIER_TIMEOUT_SECONDS,
     SpawnAgentsAction,
     SpawnAgentsTool,
@@ -38,6 +39,134 @@ def test_model_tier_runtime_limits():
         "smart": 1800,
         "frontier": 3600,
     }
+
+
+def test_explicit_search_task_forms_resolve_to_internal_search_modes():
+    web = AgentTask(task="Find current documentation", agent="search_general_web")
+    papers = LeafAgentTask(
+        task="Find primary papers",
+        agent="search_research_publications",
+    )
+
+    assert web.resolved_agent() == ("search", "general-web")
+    assert papers.resolved_agent() == ("search", "research-publications")
+    assert "search_mode" not in web.model_dump()
+
+
+def test_persisted_search_task_restores_without_exposing_the_old_schema():
+    restored = AgentTask.model_validate(
+        {
+            "task": "Find primary papers",
+            "agent": "search",
+            "search_mode": "research-publications",
+        }
+    )
+
+    assert restored.agent == "search_research_publications"
+    task_schema = AgentTask.model_json_schema()["properties"]
+    assert "search_mode" not in task_schema
+    assert "search" not in task_schema["agent"]["enum"]
+
+
+@pytest.mark.parametrize(
+    ("current", "legacy"),
+    [
+        (
+            AgentTask(key="inspect", task="Inspect the code", agent="explore"),
+            {
+                "key": "inspect",
+                "task": "Inspect the code",
+                "agent": "explore",
+                "model": "smart",
+                "include_context": False,
+                "search_mode": None,
+            },
+        ),
+        (
+            AgentTask(
+                key="papers",
+                task="Find primary papers",
+                agent="search_research_publications",
+            ),
+            {
+                "key": "papers",
+                "task": "Find primary papers",
+                "agent": "search",
+                "model": "smart",
+                "include_context": False,
+                "search_mode": "research-publications",
+            },
+        ),
+    ],
+)
+def test_pre_upgrade_registry_specs_replay_semantically(
+    tmp_path: Path,
+    current: AgentTask,
+    legacy: dict,
+):
+    registry = DelegationRegistry(tmp_path / "tasks.sqlite3")
+    operation_key = "conversation:stable-batch"
+    reserve = {
+        "operation_key": operation_key,
+        "tree_id": "tree",
+        "parent_conversation_id": "conversation",
+        "parent_task_id": None,
+        "depth": 1,
+        "deadlines": [time.time() + 60],
+    }
+    original, created = registry.reserve(specs=[current], **reserve)
+    with sqlite3.connect(registry.path) as database:
+        database.execute(
+            "UPDATE operations SET specs_json = ? WHERE operation_key = ?",
+            (
+                json.dumps([legacy], sort_keys=True, separators=(",", ":")),
+                operation_key,
+            ),
+        )
+
+    replayed, replay_created = registry.reserve(specs=[current], **reserve)
+
+    assert created is True
+    assert replay_created is False
+    assert replayed[0]["task_id"] == original[0]["task_id"]
+    with pytest.raises(ValueError, match="different task specifications"):
+        registry.reserve(
+            specs=[current.model_copy(update={"task": "Do something else"})],
+            **reserve,
+        )
+    with sqlite3.connect(registry.path) as database:
+        database.execute(
+            "UPDATE operations SET specs_json = ? WHERE operation_key = ?",
+            (
+                json.dumps(
+                    [{**legacy, "unexpected": "must not disappear"}],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                operation_key,
+            ),
+        )
+    with pytest.raises(RuntimeError, match="unknown fields: unexpected"):
+        registry.reserve(specs=[current], **reserve)
+
+
+def test_depth_one_generalist_schema_cannot_request_generalist_child(tmp_path):
+    configure_delegation(config(tmp_path, depth=0))
+    root = SpawnAgentsTool.create(child_runner_factory=lambda _: None)[0]
+    assert root.action_type is SpawnAgentsAction
+
+    configure_delegation(
+        config(tmp_path, depth=1, agent_name="general-purpose")
+    )
+    nested = SpawnAgentsTool.create(child_runner_factory=lambda _: None)[0]
+    assert nested.action_type is LeafSpawnAgentsAction
+    with pytest.raises(ValueError, match="literal_error"):
+        LeafSpawnAgentsAction.model_validate(
+            {
+                "batch_key": "invalid-generalist-chain",
+                "tasks": [{"task": "Recurse", "agent": "general-purpose"}],
+            }
+        )
 
 
 class EventSink:
@@ -149,39 +278,6 @@ def tools(tmp_path: Path, factory, sink=None, **config_updates):
     return spawn, await_tool, status, cancel
 
 
-def test_deprecated_delegate_agent_never_constructs_or_launches_a_runner(
-    tmp_path,
-    monkeypatch,
-):
-    def forbidden_factory():
-        raise AssertionError("legacy delegate_agent reached the runner factory")
-
-    monkeypatch.setattr(
-        "senpai_agent.delegation.configured_child_runner_factory",
-        forbidden_factory,
-    )
-    tool = DelegateAgentTool.create(
-        event_db_path=tmp_path / "events.sqlite3"
-    )[0]
-
-    observation = tool(
-        DelegateAgentAction(
-            task="Launch an Explore child",
-            agent="explore",
-            model="fast",
-            background=True,
-        ),
-        parent_conversation(),
-    )
-
-    assert observation.status == "finished"
-    assert observation.task_id == "deprecated"
-    assert "cannot launch" in (observation.result or "")
-    assert "spawn_agents" in (observation.result or "")
-    assert "await_agents" in (observation.result or "")
-    assert not (tmp_path / "events.sqlite3").exists()
-
-
 def test_spawn_is_nonblocking_and_await_first_collects_the_first_result(tmp_path):
     releases = [threading.Event(), threading.Event()]
     children = []
@@ -229,6 +325,43 @@ def test_spawn_is_nonblocking_and_await_first_collects_the_first_result(tmp_path
     releases[0].set()
 
 
+def test_search_task_form_is_resolved_in_registry_and_child_request(tmp_path):
+    release = threading.Event()
+    release.set()
+    requests = []
+
+    def factory(request):
+        requests.append(request)
+        return FakeChild(release)
+
+    spawn, *_ = tools(tmp_path, factory)
+    parent = parent_conversation()
+    spawned = spawn(
+        SpawnAgentsAction(
+            batch_key="publication-search",
+            tasks=[
+                AgentTask(
+                    task="Find primary sources",
+                    agent="search_research_publications",
+                )
+            ],
+        ),
+        parent,
+    )
+    row = DelegationRegistry(
+        tmp_path / "state" / "delegation" / "tasks.sqlite3"
+    ).rows([spawned.tasks[0].task_id])[0]
+
+    assert (requests[0].agent, requests[0].search_mode) == (
+        "search",
+        "research-publications",
+    )
+    assert (row["agent"], row["search_mode"]) == (
+        "search",
+        "research-publications",
+    )
+
+
 def test_await_quorum_and_timeout_leave_unfinished_tasks_running(tmp_path):
     releases = [threading.Event() for _ in range(3)]
     children = []
@@ -272,7 +405,82 @@ def test_await_quorum_and_timeout_leave_unfinished_tasks_running(tmp_path):
     assert timed_out.satisfied is False
     assert timed_out.timed_out is True
     assert timed_out.tasks[0].status == "running"
+    assert timed_out.waited_seconds >= 0.05
+    assert "keep running" in timed_out.guidance
     releases[2].set()
+
+
+def test_await_change_returns_on_the_next_task_transition(tmp_path):
+    release = threading.Event()
+    spawn, await_tool, _status, _cancel = tools(
+        tmp_path,
+        lambda _request: FakeChild(release),
+    )
+    parent = parent_conversation()
+    task = spawn(
+        SpawnAgentsAction(
+            batch_key="next-state-change",
+            tasks=[AgentTask(task="Finish after the signal", agent="explore")],
+        ),
+        parent,
+    ).tasks[0]
+
+    threading.Timer(0.05, release.set).start()
+    changed = await_tool(
+        AwaitAgentsAction(
+            task_ids=[task.task_id],
+            join="change",
+            timeout_seconds=2,
+        ),
+        parent,
+    )
+
+    assert changed.satisfied is True
+    assert changed.timed_out is False
+    assert changed.changed_task_ids == [task.task_id]
+    assert changed.tasks[0].status == "finished"
+
+
+def test_timed_out_await_collects_results_it_already_returned(tmp_path):
+    releases = [threading.Event(), threading.Event()]
+    children = []
+
+    def factory(_request):
+        child = FakeChild(releases[len(children)])
+        children.append(child)
+        return child
+
+    spawn, await_tool, status, _cancel = tools(tmp_path, factory)
+    parent = parent_conversation()
+    spawned = spawn(
+        SpawnAgentsAction(
+            batch_key="partial-timeout",
+            tasks=[AgentTask(task="First"), AgentTask(task="Second")],
+        ),
+        parent,
+    )
+    releases[0].set()
+    while status(
+        AgentStatusAction(task_ids=[spawned.tasks[0].task_id]), parent
+    ).tasks[0].status == "running":
+        time.sleep(0.01)
+
+    result = await_tool(
+        AwaitAgentsAction(
+            task_ids=[task.task_id for task in spawned.tasks],
+            join="all",
+            timeout_seconds=0.05,
+        ),
+        parent,
+    )
+    uncollected = DelegationRegistry(
+        tmp_path / "state" / "delegation" / "tasks.sqlite3"
+    ).uncollected_for_parent(str(parent.id))
+
+    assert result.timed_out is True
+    assert [task.status for task in result.tasks].count("finished") == 1
+    assert [row["task_id"] for row in uncollected] == [spawned.tasks[1].task_id]
+    releases[1].set()
 
 
 def test_replayed_batch_reuses_task_ids_and_changed_specs_fail(tmp_path):

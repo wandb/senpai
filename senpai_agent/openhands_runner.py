@@ -27,6 +27,7 @@ from senpai_agent.advisor import (
     compose_system_instructions,
 )
 from senpai_agent.delegation import (
+    MAX_DELEGATION_DEPTH,
     MAX_PARALLEL_AGENTS,
     DelegationConfig,
     cancel_pending_descendants,
@@ -425,6 +426,12 @@ def sanitized_project_skills(workspace: Path) -> list[Skill]:
     return [
         skill.model_copy(update={"content": strip_spdx_header(skill.content)})
         for skill in load_project_skills(workspace)
+        if not (
+            skill.source
+            and (
+                workspace / Path(skill.source).parent / ".senpai-developer-only"
+            ).is_file()
+        )
     ]
 
 
@@ -448,6 +455,24 @@ def sanitized_agent_definitions(workspace: Path) -> list[AgentDefinition]:
             ),
         )
     ]
+
+
+def depth_aware_child_definition(
+    definition: AgentDefinition,
+    *,
+    child: bool,
+    depth: int,
+) -> AgentDefinition:
+    """Expose recursive spawn only to the one child role that can use it."""
+
+    if not child or (
+        definition.name == "general-purpose"
+        and 0 < depth < MAX_DELEGATION_DEPTH
+    ):
+        return definition
+    return definition.model_copy(
+        update={"tools": [tool for tool in definition.tools if tool != "spawn_agents"]}
+    )
 
 
 def register_agent_definitions(
@@ -1098,7 +1123,7 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
     tools = [
         tool
         for tool in get_default_tools(
-            enable_browser=config.enable_browser,
+            enable_browser=False,
             enable_sub_agents=False,
         )
         if tool.name != "terminal"
@@ -1118,9 +1143,11 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
             ),
         )
     )
+    if config.enable_browser:
+        # Keep the persisted spec name stable while its resolver exposes only
+        # the lightweight load_browser definition until the model opts in.
+        tools.append(Tool(name="browser_tool_set"))
     delegation_params = {"event_db_path": str(local_event_db_path(config))}
-    if not config.child:
-        tools.append(Tool(name="delegate_agent", params=delegation_params))
     tools.extend(
         Tool(name=name, params=delegation_params)
         for name in (
@@ -1333,7 +1360,7 @@ def run_openhands(
     scrub_model_credentials(os.environ, config)
     harness_instructions = read_role_instructions(config.harness_file)
     role_instructions = read_role_instructions(config.role_file)
-    register_default_tools(enable_browser=config.enable_browser)
+    register_default_tools(enable_browser=False)
     register_senpai_tools()
     file_agents = sanitized_agent_definitions(config.workspace)
     register_agent_definitions(file_agents, config.workspace)
@@ -1433,7 +1460,11 @@ def run_openhands(
         )
         require_exact_tokenizer(llm)
         if config.agent_name:
-            definition = find_named_agent(config.agent_name, file_agents)
+            definition = depth_aware_child_definition(
+                find_named_agent(config.agent_name, file_agents),
+                child=config.child,
+                depth=config.delegation_depth,
+            )
             agent = agent_definition_to_factory(
                 definition,
                 work_dir=config.workspace,

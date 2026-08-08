@@ -532,24 +532,34 @@ After launch, the student can finish its turn. The deterministic controller poll
 
 Worker and container restarts preserve completed OpenHands events. Recovered live training is terminated safely rather than being adopted under an unverifiable process identity; the original student conversation receives the persisted terminal outcome.
 
+Interactive browser operations are progressively disclosed. A fresh root
+conversation initially sees only `load_browser`; invoking it adds the fourteen
+OpenHands browser operations and records the choice in conversation state so a
+resumed conversation restores them. `--no-browser` exposes neither the loader
+nor the browser family.
+
 ## Subagents
 
 `spawn_agents` launches a batch and immediately returns stable task IDs;
-`await_agents` collects them with an `all`, `first`, or `quorum` join. Every
-child runs in a fresh OpenHands conversation and separate process group.
+`await_agents` collects them with an `all`, `first`, `quorum`, or any-state
+`change` join; `change` also surfaces an already-terminal result immediately. A
+timed-out wait returns current state and suggests non-blocking next steps; it
+does not cancel the children. Every child runs in a fresh OpenHands conversation
+and separate process group.
 
 | Agent | Best for | Recommended tier |
 |---|---|---|
 | [General Purpose](.agents/agents/general-purpose.md) | Bounded work combining terminal investigation, code editing, task tracking, tests, and one controlled level of leaf delegation. | `smart` for ordinary implementation or review; `frontier` for the hardest generalist work. |
 | [Explore](.agents/agents/explore.md) | Read-only search across code, data, experiment artifacts, papers, or durable conversation history. It returns conclusions with paths and line numbers rather than dumping source. | `fast` for mechanical exploration; `smart` when relationships are subtle. |
-| [Search](.agents/agents/search.md) | External research through Exa in `general-web` or `research-publications` mode, with primary-source links. | `smart`. |
+| [Search](.agents/agents/search.md) | External research through Exa via the explicit `search_general_web` or `search_research_publications` task form, with primary-source links. | `smart`. |
 | [Bash Runner](.agents/agents/bash-runner.md) | Tests, builds, linters, dependency commands, Git inspection, and noisy CLI work. It returns counts and actionable failures rather than raw logs. | `fast`. |
 
 The model tier is independent of the agent specialization. With the default
 `agent=general-purpose`, `model=frontier` launches GPT-5.6 Sol at `max`, sent
 to the Responses API with `reasoning.mode: pro`
 with the general-purpose terminal and code-editing toolset. Pair `frontier`
-with `agent=search` when the hard task is external or publication research.
+with `search_general_web` or `search_research_publications` when the hard task
+is external research.
 
 A root spawn batch and its descendants form one delegation tree, which may
 create at most eight children total. A role runs at most eight active tasks
@@ -568,9 +578,6 @@ up to eight direct tasks that are active or have an uncollected terminal result.
 `cancel_agents` records terminal cancellation. Atomic records keyed by the
 required batch key and each optional task key (or stable list index) make replay
 return the original task IDs instead of spawning duplicates.
-The deprecated `delegate_agent` name remains visible on root advisor and
-student agents only so persisted conversations can resume; it never launches
-work and directs callers to `spawn_agents` and `await_agents`.
 `include_context=false` sends only the system prompt and task; the child can
 still search the supplied parent-history directory. `include_context=true`
 also copies the model-visible parent history. The root advisor or student may

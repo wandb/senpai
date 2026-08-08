@@ -392,19 +392,20 @@ spawn_agents(
   tasks: [{
     key: str | null = null,
     task: str,
-    agent: general-purpose | explore | search | bash-runner = general-purpose,
+    agent: general-purpose | explore | search_general_web |
+           search_research_publications | bash-runner = general-purpose,
     model: fast | smart | frontier = smart,
     include_context: bool = false,
-    search_mode: general-web | research-publications | null = null,
   }],
 ) -> {tasks: [{task_id, key, status, agent, model, result?, error?}]}
 
 await_agents(
   task_ids: [str],
-  join: all | first | quorum = all,
+  join: all | first | quorum | change = all,
   quorum: int | null = null,
   timeout_seconds: float,
-) -> {join, satisfied, timed_out, tasks: [{task_id, key, status, agent, model, result?, error?}]}
+) -> {join, satisfied, timed_out, changed_task_ids, waited_seconds, guidance,
+      tasks: [{task_id, key, status, agent, model, result?, error?}]}
 
 agent_status(
   task_ids: [str] | null = null,
@@ -427,10 +428,14 @@ it never launches duplicate children. Reusing a batch key with a different
 task specification fails clearly.
 
 `await_agents` is the only blocking delegation operation. `all` waits for every
-selected task to reach a terminal state, `first` waits for any one, and
-`quorum` waits for the requested number. Its timeout is required and capped at
-300 seconds; expiry returns `satisfied=false` plus the current records without
-cancelling unfinished work. `agent_status` is a non-blocking snapshot. With no
+selected task to reach a terminal state, `first` waits for any one, `quorum`
+waits for the requested number, and `change` returns when any selected task
+changes state or immediately when one is already terminal. Its timeout is
+required and capped at 300 seconds; expiry returns
+`satisfied=false`, current records, elapsed time, and next-step guidance without
+cancelling unfinished work. Any terminal results included in that response are
+marked collected so a later event does not repeat them. `agent_status` is a
+non-blocking snapshot. With no
 task IDs, it returns up to eight direct tasks that are active or have an
 uncollected terminal result; explicit task IDs can retrieve older history.
 `cancel_agents` terminates selected pending or running process groups and
