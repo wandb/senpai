@@ -9,6 +9,14 @@ from typing import Any
 OPENAI_EXTENDED_EFFORT_PREFIX = "openai/gpt-5.6"
 WANDB_GLM_52_MODEL = "wandb/zai-org/glm-5.2"
 WANDB_GLM_52_TOKENIZER = "zai-org/GLM-5.2"
+REASONING_EFFORTS = (
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "none",
+)
 ANTHROPIC_MAX_EFFORT_MODELS = frozenset(
     {
         "anthropic/claude-fable-5",
@@ -67,19 +75,11 @@ def is_openai_extended_effort_model(model: str) -> bool:
     )
 
 
-def canonical_reasoning_effort(model: str, effort: str) -> str:
-    """Normalize Senpai's retired OpenAI-only profile spelling."""
-
-    if effort == "ultra" and is_openai_extended_effort_model(model):
-        return "max"
-    return effort
-
-
 def supports_reasoning_effort(model: str, effort: str) -> bool:
+    if effort not in REASONING_EFFORTS:
+        return False
     if model.lower() == WANDB_GLM_52_MODEL:
         return effort in {"high", "max"}
-    if effort == "ultra":
-        return is_openai_extended_effort_model(model)
     if effort == "max":
         return is_openai_extended_effort_model(
             model

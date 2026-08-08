@@ -63,7 +63,7 @@ from senpai.launch.specs import (  # noqa: E402
     target_repo_slug,
 )
 from senpai_agent.model_compatibility import (  # noqa: E402
-    canonical_reasoning_effort,
+    REASONING_EFFORTS,
     supports_reasoning_effort,
 )
 
@@ -159,16 +159,6 @@ MODEL_PROVIDERS = {
     "openai": ("OPENAI_API_KEY", "openai-api-key"),
     "wandb": ("WANDB_API_KEY", "wandb-api-key"),
 }
-REASONING_EFFORTS = {
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-    "none",
-}
-
-
 def model_provider(model: str) -> str:
     provider, separator, model_name = model.partition("/")
     if not separator or not model_name or provider not in MODEL_PROVIDERS:
@@ -226,17 +216,12 @@ def validate_model_config(args: Args, *, has_students: bool = True) -> None:
         )
     for name, (model, effort) in profiles.items():
         model_provider(model)
-        canonical_effort = canonical_reasoning_effort(model, effort)
-        if effort == "ultra" and canonical_effort == "ultra":
-            sys.exit(
-                f"ERROR: --{name}_reasoning_effort={effort} is unsupported for {model}"
-            )
-        if canonical_effort not in REASONING_EFFORTS:
+        if effort not in REASONING_EFFORTS:
             choices = ", ".join(sorted(REASONING_EFFORTS))
             sys.exit(f"ERROR: --{name}_reasoning_effort must be one of: {choices}")
         normalized_model = model.lower()
         if normalized_model == "wandb/zai-org/glm-5.2":
-            if canonical_effort not in {"high", "max"}:
+            if effort not in {"high", "max"}:
                 sys.exit(
                     f"ERROR: --{name}_reasoning_effort={effort} is "
                     f"unsupported for {model}"

@@ -119,6 +119,7 @@ def test_supported_reasoning_effort_is_preserved(
         ("max", "openai/gpt-5.60"),
         ("medium", "wandb/zai-org/GLM-5.2"),
         ("extreme", "openai/gpt-5.6-sol"),
+        ("ultra", "openai/gpt-5.6-sol"),
     ],
 )
 def test_unsupported_reasoning_effort_fails_instead_of_being_rewritten(
@@ -129,10 +130,9 @@ def test_unsupported_reasoning_effort_fails_instead_of_being_rewritten(
         openhands_reasoning_effort(effort, model)
 
 
-def test_ultra_is_preserved_as_a_cli_reasoning_effort():
-    args = parse_runner_args(["--max-turns", "1", "--reasoning-effort", "ultra"])
-
-    assert args.reasoning_effort == "ultra"
+def test_ultra_is_rejected_as_a_cli_reasoning_effort():
+    with pytest.raises(SystemExit):
+        parse_runner_args(["--max-turns", "1", "--reasoning-effort", "ultra"])
 
 
 def test_opus_5_litellm_metadata_is_available_without_the_remote_catalog(
@@ -365,7 +365,6 @@ def test_openai_max_uses_pro_mode_on_the_wire():
     [
         ("xhigh", "max", "max", True),
         ("max", "xhigh", "xhigh", False),
-        ("xhigh", "ultra", "max", True),
     ],
 )
 def test_file_agent_reasoning_override_replaces_the_parent_request_profile(
@@ -392,6 +391,21 @@ def test_file_agent_reasoning_override_replaces_the_parent_request_profile(
         "mode": "explicit",
         "ttl": "30m",
     }
+
+
+def test_file_agent_reasoning_override_rejects_ultra():
+    model = "openai/gpt-5.6-sol"
+    parent = LLM(
+        model=model,
+        api_key=SecretStr("test-key"),
+        reasoning_effort="xhigh",
+        **model_runtime_configuration(model, "xhigh"),
+    )
+
+    with pytest.raises(ValueError, match="unsupported reasoning effort"):
+        apply_reasoning_profile(
+            parent.model_copy(update={"reasoning_effort": "ultra"})
+        )
 
 
 def test_wandb_gateway_uses_chat_thinking_and_project_routing():

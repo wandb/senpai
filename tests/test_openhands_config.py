@@ -219,43 +219,12 @@ def test_default_model_profiles_are_explicit_and_provider_credentials_are_inferr
     ) == ("openai/gpt-5.6-sol", "OPENAI_API_KEY", "max")
 
 
-def test_legacy_ultra_environment_values_normalize_to_max(tmp_path: Path):
+def test_ultra_environment_value_is_rejected(tmp_path: Path):
     env = runtime_env(tmp_path)
-    env.update(
-        {
-            "SENPAI_OPENHANDS_REASONING_EFFORT": "ultra",
-            "SENPAI_OPENHANDS_SMART_REASONING_EFFORT": "ultra",
-            "SENPAI_OPENHANDS_FAST_MODEL": "openai/gpt-5.6-luna",
-            "SENPAI_OPENHANDS_FAST_REASONING_EFFORT": "ultra",
-            "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": "ultra",
-        }
-    )
+    env["SENPAI_OPENHANDS_REASONING_EFFORT"] = "ultra"
 
-    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
-
-    assert {
-        config.reasoning_effort,
-        config.smart_reasoning_effort,
-        config.fast_reasoning_effort,
-        config.frontier_reasoning_effort,
-    } == {"max"}
-
-
-def test_legacy_ultra_cli_value_normalizes_to_max(tmp_path: Path):
-    args = parse_runner_args(
-        [
-            "--max-turns",
-            "1",
-            "--model",
-            "openai/gpt-5.6-sol",
-            "--reasoning-effort",
-            "ultra",
-        ]
-    )
-
-    config = resolve_config(args, runtime_env(tmp_path))
-
-    assert config.reasoning_effort == "max"
+    with pytest.raises(ValueError, match="unsupported reasoning effort"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
 def test_wandb_gateway_configuration_is_explicit_and_uses_max_glm_reasoning(
@@ -377,7 +346,7 @@ def test_all_model_profiles_accept_independent_cli_model_and_effort_settings(
                 "SENPAI_OPENHANDS_MODEL": "anthropic/claude-opus-4-8",
                 "SENPAI_OPENHANDS_REASONING_EFFORT": "ultra",
             },
-            "unsupported for",
+            "unsupported",
         ),
         (
             {"SENPAI_OPENHANDS_FRONTIER_MODEL": "anthropic/claude-haiku-4-5"},

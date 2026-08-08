@@ -334,19 +334,14 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         assert config["SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS"] == "40"
 
 
-def test_legacy_openai_ultra_launch_value_is_rendered_as_max():
+def test_openai_ultra_launch_value_is_rejected():
     args = launch_args(
         frontier_model="openai/gpt-5.6-sol",
         frontier_reasoning_effort="ultra",
     )
 
-    launch.validate_model_config(args)
-    configmap, _deployment, _secret = render_role("student", args)
-
-    assert (
-        yaml.safe_load(configmap)["data"]["SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT"]
-        == "max"
-    )
+    with pytest.raises(SystemExit, match="must be one of"):
+        launch.validate_model_config(args)
 
 
 def test_wandb_gateway_is_rendered_for_every_role():
@@ -385,7 +380,7 @@ def test_wandb_gateway_is_rendered_for_every_role():
                 "advisor_model": "anthropic/claude-opus-4-8",
                 "advisor_reasoning_effort": "ultra",
             },
-            "unsupported for",
+            "must be one of",
         ),
         (
             {

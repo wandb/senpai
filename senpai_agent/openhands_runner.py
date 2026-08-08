@@ -46,9 +46,9 @@ from senpai_agent.weave_monitoring import (
     weave_conversation_url,
 )
 from senpai_agent.model_compatibility import (
+    REASONING_EFFORTS,
     WANDB_GLM_52_MODEL,
     WANDB_GLM_52_TOKENIZER,
-    canonical_reasoning_effort,
     register_litellm_model_compatibility,
     supports_reasoning_effort,
 )
@@ -93,16 +93,6 @@ DEFAULT_REASONING_EFFORT = "xhigh"
 DEFAULT_FAST_REASONING_EFFORT = "high"
 DEFAULT_FRONTIER_REASONING_EFFORT = "max"
 WANDB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
-REASONING_EFFORTS = (
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-    "none",
-)
-# Input-only compatibility for live configs; RunnerConfig stores max.
-_REASONING_EFFORT_INPUTS = (*REASONING_EFFORTS, "ultra")
 SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore", "search")
 SENPAI_AGENT_DIR = Path(__file__).resolve().parents[1] / ".agents" / "agents"
 PROVIDER_API_KEY_ENVS = {
@@ -133,25 +123,25 @@ class RunnerArgs:
     reasoning_effort: str | None = field(
         default=None,
         alias="--reasoning-effort",
-        choices=_REASONING_EFFORT_INPUTS,
+        choices=REASONING_EFFORTS,
     )
     smart_model: str | None = field(default=None, alias="--smart-model")
     smart_reasoning_effort: str | None = field(
         default=None,
         alias="--smart-reasoning-effort",
-        choices=_REASONING_EFFORT_INPUTS,
+        choices=REASONING_EFFORTS,
     )
     fast_model: str | None = field(default=None, alias="--fast-model")
     fast_reasoning_effort: str | None = field(
         default=None,
         alias="--fast-reasoning-effort",
-        choices=_REASONING_EFFORT_INPUTS,
+        choices=REASONING_EFFORTS,
     )
     frontier_model: str | None = field(default=None, alias="--frontier-model")
     frontier_reasoning_effort: str | None = field(
         default=None,
         alias="--frontier-reasoning-effort",
-        choices=_REASONING_EFFORT_INPUTS,
+        choices=REASONING_EFFORTS,
     )
     workspace: str | None = field(default=None, alias="--workspace")
     state_dir: str | None = field(default=None, alias="--state-dir")
@@ -227,8 +217,8 @@ def parse_runner_args(argv: Sequence[str] | None = None) -> RunnerArgs:
 
 
 def openhands_reasoning_effort(reasoning_effort: str, model: str) -> str:
-    if reasoning_effort not in _REASONING_EFFORT_INPUTS:
-        choices = ", ".join(_REASONING_EFFORT_INPUTS)
+    if reasoning_effort not in REASONING_EFFORTS:
+        choices = ", ".join(REASONING_EFFORTS)
         raise ValueError(
             f"unsupported reasoning effort {reasoning_effort!r}; "
             f"choose one of: {choices}"
@@ -238,7 +228,7 @@ def openhands_reasoning_effort(reasoning_effort: str, model: str) -> str:
             f"reasoning effort {reasoning_effort!r} is unsupported for model "
             f"{model!r}; select a supported effort"
         )
-    return canonical_reasoning_effort(model, reasoning_effort)
+    return reasoning_effort
 
 
 def _uses_openai_pro_mode(model: str, reasoning_effort: str | None) -> bool:
@@ -264,7 +254,7 @@ def _openai_pro_reasoning(
 
 
 def apply_reasoning_profile(llm: LLM) -> LLM:
-    """Canonicalize effort and replace only Senpai's reasoning request body."""
+    """Validate effort and replace only Senpai's reasoning request body."""
 
     reasoning_effort = openhands_reasoning_effort(
         llm.reasoning_effort,
