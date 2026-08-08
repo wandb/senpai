@@ -47,6 +47,7 @@ from senpai_agent.weave_monitoring import (
     weave_conversation_url,
 )
 from senpai_agent.model_compatibility import (
+    REASONING_EFFORTS,
     WANDB_GLM_52_MODEL,
     WANDB_GLM_52_TOKENIZER,
     register_litellm_model_compatibility,
@@ -93,14 +94,6 @@ DEFAULT_REASONING_EFFORT = "xhigh"
 DEFAULT_FAST_REASONING_EFFORT = "high"
 DEFAULT_FRONTIER_REASONING_EFFORT = "max"
 WANDB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
-REASONING_EFFORTS = (
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-    "none",
-)
 SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore", "search")
 SENPAI_AGENT_DIR = Path(__file__).resolve().parents[1] / ".agents" / "agents"
 PROVIDER_API_KEY_ENVS = {
@@ -225,30 +218,16 @@ def parse_runner_args(argv: Sequence[str] | None = None) -> RunnerArgs:
 
 
 def openhands_reasoning_effort(reasoning_effort: str, model: str) -> str:
-    provider, _, model_name = model.lower().partition("/")
     if reasoning_effort not in REASONING_EFFORTS:
         choices = ", ".join(REASONING_EFFORTS)
         raise ValueError(
             f"unsupported reasoning effort {reasoning_effort!r}; "
             f"choose one of: {choices}"
         )
-    if provider == "wandb" and model_name == "zai-org/glm-5.2":
-        if reasoning_effort not in {"high", "max"}:
-            raise ValueError(
-                f"reasoning effort {reasoning_effort!r} is unsupported for "
-                f"model {model!r}; use 'high' or 'max'"
-            )
-        return reasoning_effort
     if not supports_reasoning_effort(model, reasoning_effort):
-        requirement = (
-            "an openai/gpt-5.6 model"
-            if reasoning_effort == "ultra"
-            else "an openai/gpt-5.6 or supported Anthropic model"
-        )
         raise ValueError(
             f"reasoning effort {reasoning_effort!r} is unsupported for model "
-            f"{model!r}; "
-            f"use {requirement} or select a lower effort"
+            f"{model!r}; select a supported effort"
         )
     return reasoning_effort
 

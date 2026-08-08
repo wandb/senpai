@@ -63,6 +63,7 @@ from senpai.launch.specs import (  # noqa: E402
     target_repo_slug,
 )
 from senpai_agent.model_compatibility import (  # noqa: E402
+    REASONING_EFFORTS,
     supports_reasoning_effort,
 )
 
@@ -160,16 +161,6 @@ MODEL_PROVIDERS = {
     "openai": ("OPENAI_API_KEY", "openai-api-key"),
     "wandb": ("WANDB_API_KEY", "wandb-api-key"),
 }
-REASONING_EFFORTS = {
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-    "none",
-}
-
-
 def model_provider(model: str) -> str:
     provider, separator, model_name = model.partition("/")
     if not separator or not model_name or provider not in MODEL_PROVIDERS:
