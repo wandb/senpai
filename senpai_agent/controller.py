@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import signal
@@ -17,12 +18,12 @@ from string import Template
 from typing import Literal, Protocol
 from uuid import UUID
 
-from senpai_agent.agent_markdown import read_agent_markdown, strip_spdx_header
 from senpai_agent.advisor import (
     AdvisorEvent,
     AdvisorEventStore,
     compose_system_instructions,
 )
+from senpai_agent.agent_markdown import read_agent_markdown, strip_spdx_header
 from senpai_agent.github.mailbox import ActiveGitHubWatcher, GitHubMailbox
 from senpai_agent.mailbox import (
     CompositeMailbox,
@@ -44,8 +45,11 @@ from senpai_agent.state import (
     WorkspaceDivergenceLedger,
 )
 from senpai_agent.supervisor import LEASE_ENV, ProgressLease
-from senpai_agent.workspace import StudentWorkspaceReconciler, WorkspaceDivergence
-
+from senpai_agent.workspace import (
+    StudentWorkspaceReconciler,
+    WorkspaceDivergence,
+    WorkspaceJobRunning,
+)
 
 _EDGE_TRIGGERED_EVENT_KINDS = frozenset({"research_base_changed"})
 _PROMPT_TEMPLATE_VARIABLES = frozenset(
@@ -98,9 +102,7 @@ def _is_context_history_failure(error: Exception) -> bool:
     )
 
     cause = (
-        error.original_exception
-        if isinstance(error, ConversationRunError)
-        else error
+        error.original_exception if isinstance(error, ConversationRunError) else error
     )
     return isinstance(
         cause,
@@ -167,9 +169,7 @@ class OpenHandsTurnRunner:
                 )
                 remaining = turn_deadline - time.monotonic()
                 if remaining <= 0:
-                    timeout = TimeoutError(
-                        "no turn time remains for context recovery"
-                    )
+                    timeout = TimeoutError("no turn time remains for context recovery")
                     raise ConversationRecoveryExhausted(
                         conversation_id,
                         timeout,
@@ -282,8 +282,15 @@ class Controller:
         sleep: Callable[[float], None] = time.sleep,
         poll_interval_seconds: float = 600,
         jitter_seconds: float = 120,
+        next_monitor_poll_seconds: Callable[[], float | None] | None = None,
     ):
-        if min(poll_interval_seconds, jitter_seconds) < 0:
+        if (
+            not all(
+                math.isfinite(value)
+                for value in (poll_interval_seconds, jitter_seconds)
+            )
+            or min(poll_interval_seconds, jitter_seconds) < 0
+        ):
             raise ValueError("poll and jitter intervals must not be negative")
         if start_gate_poll_seconds <= 0:
             raise ValueError("start-gate polling interval must be positive")
@@ -312,6 +319,7 @@ class Controller:
         self.sleep = sleep
         self.poll_interval_seconds = poll_interval_seconds
         self.jitter_seconds = jitter_seconds
+        self.next_monitor_poll_seconds = next_monitor_poll_seconds
         self.event_reminder_seconds = (
             max(poll_interval_seconds, 600)
             if event_reminder_seconds is None
@@ -344,6 +352,36 @@ class Controller:
                             self._publish_progress("reconcile")
                             try:
                                 self.reconcile(batch_events)
+                            except WorkspaceJobRunning as busy:
+                                retry_delay = 30.0
+                                retry_at = time.monotonic() + retry_delay
+                                checkout_kinds = {
+                                    "student_assignment",
+                                    "student_pr_feedback",
+                                }
+                                deferred_events = tuple(
+                                    event
+                                    for event in batch_events
+                                    if event.kind in checkout_kinds
+                                )
+                                batch_events = tuple(
+                                    event
+                                    for event in batch_events
+                                    if event.kind not in checkout_kinds
+                                )
+                                for event in deferred_events:
+                                    self._visible.pop(event.dedupe_key, None)
+                                    self._deferred_until[event.dedupe_key] = retry_at
+                                print(
+                                    "SENPAI_WORKSPACE_JOB_DEFERRED "
+                                    f"conversation_id={conversation_id} "
+                                    f"retry_after_seconds={retry_delay:g} "
+                                    f"jobs={','.join(busy.job_ids)}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                                if not batch_events:
+                                    continue
                             except WorkspaceDivergence as conflict:
                                 workspace_divergence = conflict
                                 print(
@@ -424,7 +462,7 @@ class Controller:
                             flush=True,
                         )
                         continue
-                    except Exception as error:  # noqa: BLE001
+                    except Exception as error:
                         turn_failures += 1
                         for event in batch_events:
                             self._visible.pop(event.dedupe_key, None)
@@ -446,9 +484,7 @@ class Controller:
                             *(event.dedupe_key for event in batch_events),
                             *sorted(result.delivered_event_keys),
                         )
-                        self.mailbox.acknowledge(
-                            tuple(dict.fromkeys(acknowledged))
-                        )
+                        self.mailbox.acknowledge(tuple(dict.fromkeys(acknowledged)))
                         if workspace_divergence is not None:
                             self._record_workspace_divergence(
                                 conversation_id,
@@ -506,10 +542,8 @@ class Controller:
                 return
             if turn_failed:
                 continue
-            self._sleep(
-                "sleep",
-                self.poll_interval_seconds + random.uniform(0, self.jitter_seconds),
-            )
+            phase, delay = self._idle_delay()
+            self._sleep(phase, delay)
 
     def _event_batches(
         self,
@@ -547,6 +581,33 @@ class Controller:
             max(seconds + self.operation_timeout_seconds, 1),
         )
         self.sleep(seconds)
+
+    def _idle_delay(self) -> tuple[str, float]:
+        heartbeat = max(
+            1.0,
+            self.poll_interval_seconds + random.uniform(0, self.jitter_seconds),
+        )
+        if self.next_monitor_poll_seconds is None:
+            return "sleep", heartbeat
+        try:
+            monitor_delay = self.next_monitor_poll_seconds()
+        except Exception as error:  # noqa: BLE001
+            print(
+                f"SENPAI_MONITOR_SCHEDULE_ERROR {type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return "monitor-backoff", min(heartbeat, 5.0)
+        if monitor_delay is None:
+            return "sleep", heartbeat
+        if not math.isfinite(monitor_delay) or monitor_delay < 0:
+            print(
+                f"SENPAI_MONITOR_SCHEDULE_INVALID delay={monitor_delay!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return "monitor-backoff", min(heartbeat, 5.0)
+        return "monitor-sleep", max(1.0, min(heartbeat, monitor_delay))
 
     def _has_started(self, conversation_id: UUID) -> bool:
         return conversation_id in self._started or (
@@ -770,29 +831,35 @@ def controller_main(
     mailbox: Mailbox = github_mailbox
     conversation_selector = None
     reconcile = None
+    job_supervisor, monitor_store = training_runtime(
+        runner_config.workspace,
+        runner_config.state_dir / "training",
+        max_timeout_seconds=runner_config.training_max_timeout_seconds,
+    )
+    monitor_mailbox = MonitorMailbox(
+        TrainingMonitorEngine(
+            monitor_store,
+            job_supervisor,
+            WandbMetricSource(
+                env["WANDB_ENTITY"],
+                env["WANDB_PROJECT"],
+                api_key=runner_config.command_secrets.get("WANDB_API_KEY"),
+            ),
+        ),
+        monitor_store,
+    )
 
     if role == "advisor":
         mailbox = CompositeMailbox(
             github_mailbox,
             LocalAdvisorMailbox(runner_config.state_dir / "advisor-events.sqlite3"),
+            monitor_mailbox,
         )
     else:
-        training, monitor_store = training_runtime(
-            runner_config.workspace,
-            runner_config.state_dir / "training",
-            max_timeout_seconds=runner_config.training_max_timeout_seconds,
-        )
-        metrics = WandbMetricSource(
-            env["WANDB_ENTITY"],
-            env["WANDB_PROJECT"],
-        )
         mailbox = CompositeMailbox(
             github_mailbox,
             LocalStudentMailbox(runner_config.state_dir / "student-events.sqlite3"),
-            MonitorMailbox(
-                TrainingMonitorEngine(monitor_store, training, metrics),
-                monitor_store,
-            ),
+            monitor_mailbox,
         )
         registry = AssignmentConversationRegistry(
             runner_config.state_dir / "student-conversations.json"
@@ -802,6 +869,7 @@ def controller_main(
             runner_config.workspace,
             repo=runner_config.github_repo,
             token=runner_config.github_token,
+            active_mutable_job_ids=job_supervisor.active_mutable_job_ids,
         )
 
     full_prompt = _full_prompt(role, env)
@@ -810,8 +878,7 @@ def controller_main(
         read_role_instructions(runner_config.role_file),
     )
     continuation_context = (
-        f"{system_context.strip()}\n\n"
-        f"# Current research brief\n\n{full_prompt}"
+        f"{system_context.strip()}\n\n# Current research brief\n\n{full_prompt}"
     )
     turns = OpenHandsTurnRunner(
         runner_config,
@@ -876,6 +943,7 @@ def controller_main(
             "POLL_JITTER_S",
             120,
         ),
+        next_monitor_poll_seconds=monitor_store.seconds_until_next_poll,
     )
 
     def interrupt(_signum: int, _frame: object) -> None:

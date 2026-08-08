@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,7 +18,6 @@ from senpai_agent.monitor import (
     evaluate_monitor,
 )
 from senpai_agent.training import TrainingState
-
 
 NOW = datetime(2026, 7, 30, tzinfo=UTC)
 
@@ -46,14 +46,12 @@ SIGNAL = MonitorSignal(
 )
 
 
-def test_registration_and_stop_hook_marker_survive_reopen(tmp_path: Path):
+def test_registration_survives_reopen_in_the_authoritative_database(tmp_path: Path):
     monitor = spec()
     database = tmp_path / "monitors.sqlite3"
 
     with MonitorStore(database) as store:
         assert store.register(monitor) is True
-        marker = store.marker_dir / "train-1.json"
-        assert TrainingMonitorSpec.model_validate_json(marker.read_text()) == monitor
 
     with MonitorStore(database) as reopened:
         assert reopened.active() == [monitor]
@@ -77,6 +75,27 @@ def test_same_policy_reregistration_preserves_derived_state(tmp_path: Path):
         assert store.spec("train-1") == monitor
         assert store.previous_sample("train-1") == sample
         assert store.pending_signals() == [SIGNAL]
+
+
+def test_next_poll_delay_tracks_the_earliest_active_monitor(tmp_path: Path):
+    first = spec(training_id="first", poll_interval_seconds=60)
+    second = spec(training_id="second", poll_interval_seconds=180)
+
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        assert store.seconds_until_next_poll(NOW) is None
+        store.register(first)
+        store.register(second)
+        assert store.seconds_until_next_poll(NOW) == 0
+
+        store.record_poll(first, MonitorEvaluation(), None, now=NOW)
+        store.record_poll(second, MonitorEvaluation(), None, now=NOW)
+        assert store.seconds_until_next_poll(NOW + timedelta(seconds=30)) == 30
+
+        store.complete(first.training_id)
+        assert store.seconds_until_next_poll(NOW + timedelta(seconds=30)) == 150
+
+        store.complete(second.training_id)
+        assert store.seconds_until_next_poll(NOW) is None
 
 
 def test_changed_policy_reactivates_monitor_and_clears_old_state(tmp_path: Path):
@@ -105,8 +124,6 @@ def test_changed_policy_reactivates_monitor_and_clears_old_state(tmp_path: Path)
         assert store.pending_signals() == []
         assert store.emitted("train-1") == frozenset()
         assert store.due(NOW + timedelta(minutes=5)) == [changed]
-        marker = store.marker_dir / "train-1.json"
-        assert TrainingMonitorSpec.model_validate_json(marker.read_text()) == changed
 
 
 def test_signal_is_durable_deduplicated_and_acknowledged(tmp_path: Path):
@@ -130,9 +147,7 @@ def test_signal_is_durable_deduplicated_and_acknowledged(tmp_path: Path):
 
 
 def test_first_sample_remains_the_change_gate_baseline(tmp_path: Path):
-    monitor = spec(
-        gates=(MetricGate(operator="improved_by", threshold=0.1),)
-    )
+    monitor = spec(gates=(MetricGate(operator="improved_by", threshold=0.1),))
     first = MetricSample(value=0.8, observed_at=NOW)
     later = MetricSample(value=0.75, observed_at=NOW + timedelta(minutes=1))
 
@@ -205,3 +220,81 @@ def test_legacy_schema_promotes_previous_sample_to_change_baseline(
         )
 
         assert [item.kind for item in evaluation.signals] == ["metric_gate"]
+
+
+def test_malformed_monitor_is_quarantined_without_blocking_healthy_rows(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+):
+    broken = spec(training_id="broken")
+    healthy = spec(training_id="healthy")
+
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(broken)
+        store.register(healthy)
+        with store.connection:
+            store.connection.execute(
+                "UPDATE monitors SET spec_json = ? WHERE training_id = ?",
+                ("not-json", broken.training_id),
+            )
+
+        assert store.due(NOW) == [healthy]
+        assert store.active() == [healthy]
+        assert store.seconds_until_next_poll(NOW) == 0
+
+    assert "SENPAI_MONITOR_QUARANTINED job_id=broken" in capsys.readouterr().err
+
+
+def test_nonfinite_schedule_is_quarantined_without_a_zero_sleep_loop(
+    tmp_path: Path,
+):
+    broken = spec(training_id="broken")
+    healthy = spec(training_id="healthy")
+
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(broken)
+        store.register(healthy)
+        store.record_poll(healthy, MonitorEvaluation(), None, now=NOW)
+        with store.connection:
+            store.connection.execute(
+                "UPDATE monitors SET next_poll_at = ? WHERE training_id = ?",
+                ("nan", broken.training_id),
+            )
+
+        assert store.seconds_until_next_poll(NOW) == 60
+        assert store.active() == [healthy]
+
+
+def test_store_operations_are_serialized_across_monitor_and_tool_threads(
+    tmp_path: Path,
+):
+    monitor = spec()
+    errors = []
+
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(monitor)
+
+        def exercise_store(offset: int):
+            try:
+                for step in range(30):
+                    sample = MetricSample(
+                        value=float(offset + step),
+                        observed_at=NOW + timedelta(seconds=step),
+                    )
+                    store.record_poll(monitor, MonitorEvaluation(), sample, now=NOW)
+                    store.spec(monitor.training_id)
+                    store.previous_sample(monitor.training_id)
+                    store.emitted(monitor.training_id)
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=exercise_store, args=(index,)) for index in range(4)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert store.active() == [monitor]

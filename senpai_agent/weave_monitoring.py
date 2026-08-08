@@ -10,7 +10,10 @@ from uuid import UUID
 from weave_openhands import finish as weave_finish
 from weave_openhands import init as weave_init
 
-from senpai_agent.secrets import GITHUB_TOKEN_ENV_NAMES
+from senpai_agent.secrets import (
+    GITHUB_TOKEN_ENV_NAMES,
+    is_secret_environment_variable,
+)
 
 _initialized = False
 _project_name: str | None = None
@@ -24,9 +27,7 @@ TRACE_SECRET_ENV_NAMES = (
 
 
 def _is_secret_env(name: str) -> bool:
-    return name in TRACE_SECRET_ENV_NAMES or name.endswith(
-        ("_API_KEY", "_TOKEN", "_PASSWORD", "_SECRET", "_CREDENTIAL")
-    )
+    return name in TRACE_SECRET_ENV_NAMES or is_secret_environment_variable(name)
 
 
 def weave_project_name(env: Mapping[str, str]) -> str | None:
