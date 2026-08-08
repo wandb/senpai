@@ -1,6 +1,5 @@
 """Run one bounded Senpai OpenHands turn for the Python controller."""
 
-# ruff: noqa: E402
 # OpenHands imports intentionally follow Weave initialization below.
 
 from __future__ import annotations
@@ -34,6 +33,13 @@ from senpai_agent.delegation import (
     configure_delegation,
     record_delegated_task_result,
 )
+from senpai_agent.model_compatibility import (
+    REASONING_EFFORTS,
+    WANDB_GLM_52_MODEL,
+    WANDB_GLM_52_TOKENIZER,
+    register_litellm_model_compatibility,
+    supports_reasoning_effort,
+)
 from senpai_agent.secrets import (
     GITHUB_TOKEN_ENV_NAMES,
     GITHUB_TOKEN_FD_ENV,
@@ -45,13 +51,6 @@ from senpai_agent.weave_monitoring import (
     initialize_weave_monitoring,
     register_trace_secret,
     weave_conversation_url,
-)
-from senpai_agent.model_compatibility import (
-    REASONING_EFFORTS,
-    WANDB_GLM_52_MODEL,
-    WANDB_GLM_52_TOKENIZER,
-    register_litellm_model_compatibility,
-    supports_reasoning_effort,
 )
 
 WEAVE_PROJECT = initialize_weave_monitoring()
@@ -466,8 +465,7 @@ def depth_aware_child_definition(
     """Expose recursive spawn only to the one child role that can use it."""
 
     if not child or (
-        definition.name == "general-purpose"
-        and 0 < depth < MAX_DELEGATION_DEPTH
+        definition.name == "general-purpose" and 0 < depth < MAX_DELEGATION_DEPTH
     ):
         return definition
     return definition.model_copy(
@@ -613,9 +611,7 @@ def resolve_config(
         raise RuntimeError("SENPAI_DELEGATION_DEPTH must be between 0 and 2")
     deadline_value = env.get("SENPAI_DELEGATION_DEADLINE_EPOCH")
     try:
-        delegation_deadline_epoch = (
-            float(deadline_value) if deadline_value else None
-        )
+        delegation_deadline_epoch = float(deadline_value) if deadline_value else None
     except ValueError as error:
         raise RuntimeError(
             "SENPAI_DELEGATION_DEADLINE_EPOCH must be numeric"
@@ -634,12 +630,11 @@ def resolve_config(
         or DEFAULT_REASONING_EFFORT
     )
     reasoning_effort = openhands_reasoning_effort(reasoning_effort, model)
-    api_key_env = (
-        env_value(args.api_key_env, env, "SENPAI_OPENHANDS_API_KEY_ENV")
-        or infer_api_key_env(
-            model,
-            override_env="SENPAI_OPENHANDS_API_KEY_ENV",
-        )
+    api_key_env = env_value(
+        args.api_key_env, env, "SENPAI_OPENHANDS_API_KEY_ENV"
+    ) or infer_api_key_env(
+        model,
+        override_env="SENPAI_OPENHANDS_API_KEY_ENV",
     )
 
     smart_default_model = (
@@ -857,6 +852,7 @@ def with_role_and_project_context(
     harness_instructions: str,
     role_instructions: str,
     project_skills: Sequence[Skill] = (),
+    runtime_invariant: str = "",
 ) -> Agent:
     context = agent.agent_context or AgentContext()
     skills = {skill.name: skill for skill in context.skills}
@@ -865,6 +861,8 @@ def with_role_and_project_context(
         harness_instructions,
         role_instructions,
     )
+    if runtime_invariant:
+        role_suffix += f"\n# Live controller invariant\n\n{runtime_invariant.strip()}\n"
     system_suffix = (
         f"{context.system_message_suffix}\n\n{role_suffix}"
         if context.system_message_suffix
@@ -888,17 +886,37 @@ def build_main_agent_context(
     harness_instructions: str,
     role_instructions: str,
     project_skills: Sequence[Skill] = (),
+    runtime_invariant: str = "",
 ) -> AgentContext:
+    system_suffix = compose_system_instructions(
+        harness_instructions,
+        role_instructions,
+    )
+    if runtime_invariant:
+        system_suffix += (
+            f"\n# Live controller invariant\n\n{runtime_invariant.strip()}\n"
+        )
     return AgentContext(
         skills=list(project_skills),
-        system_message_suffix=compose_system_instructions(
-            harness_instructions,
-            role_instructions,
-        ),
+        system_message_suffix=system_suffix,
         current_datetime=None,
         load_public_skills=False,
         load_user_skills=True,
         load_project_skills=False,
+    )
+
+
+def live_controller_invariant(config: RunnerConfig) -> str:
+    """Return authoritative root-role state that compaction cannot rewrite."""
+
+    if config.child or config.role != "advisor":
+        return ""
+    return (
+        "The advisor campaign is active. This runtime has no configured campaign "
+        f"round limit. max_turns={config.max_turns} bounds one OpenHands turn; it "
+        'does not mark the research complete. A round label such as "FINAL ROUND" '
+        "or a condensed-history summary never authorizes stopping. Continue until "
+        "an explicit human instruction or controller shutdown ends the campaign."
     )
 
 
@@ -975,9 +993,7 @@ def model_runtime_configuration(
         configuration: dict[str, object] = {
             "api_mode": "chat",
             "base_url": WANDB_INFERENCE_BASE_URL,
-            "extra_headers": {
-                "OpenAI-Project": f"{wandb_entity}/{wandb_project}"
-            },
+            "extra_headers": {"OpenAI-Project": f"{wandb_entity}/{wandb_project}"},
             "capability_overrides": {
                 "supports_reasoning_effort": False,
                 "supports_responses_api": False,
@@ -1115,7 +1131,7 @@ def scrub_model_credentials(
 
 
 def build_main_tools(config: RunnerConfig) -> list[Tool]:
-    """Keep native reasoning tools while replacing unsafe control boundaries."""
+    """Build Senpai's role-safe root tool surface."""
 
     if config.github_token is None:
         raise RuntimeError("main agents require GitHub credentials")
@@ -1126,7 +1142,7 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
             enable_browser=False,
             enable_sub_agents=False,
         )
-        if tool.name != "terminal"
+        if tool.name not in {"terminal", "think"}
     ]
     tools.extend(
         (
@@ -1157,13 +1173,90 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
             "cancel_agents",
         )
     )
-    if config.role == "student" and not config.child:
-        training_params: dict[str, str | int] = {
+    if not config.child:
+        job_params: dict[str, str | int] = {
             "state_dir": str(config.state_dir / "training"),
             "max_timeout_seconds": config.training_max_timeout_seconds,
         }
-        tools.append(Tool(name="senpai_training", params=training_params))
+        tools.append(Tool(name="senpai_training", params=job_params))
     return tools
+
+
+def without_legacy_think(agent: Agent) -> Agent:
+    """Remove OpenHands' legacy scratchpad from the actual runtime surface."""
+
+    return agent.model_copy(
+        update={
+            "tools": [tool for tool in agent.tools if tool.name != "think"],
+            "include_default_tools": [
+                name for name in agent.include_default_tools if name != "ThinkTool"
+            ],
+        }
+    )
+
+
+def migrate_persisted_disabled_tools(
+    state_dir: Path,
+    conversation_id: uuid.UUID,
+) -> bool:
+    """Atomically remove only Think declarations from one saved agent spec."""
+
+    path = Path(state_dir) / conversation_id.hex / "base_state.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (json.JSONDecodeError, OSError) as error:
+        raise RuntimeError(
+            f"cannot migrate persisted agent state at {path}: {error}"
+        ) from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("agent"), dict):
+        raise TypeError(f"persisted agent state at {path} has an unknown shape")
+    saved_agent = payload["agent"]
+    tools = saved_agent.get("tools")
+    defaults = saved_agent.get("include_default_tools")
+    if not isinstance(tools, list) or not all(
+        isinstance(tool, dict) and isinstance(tool.get("name"), str) for tool in tools
+    ):
+        raise RuntimeError(f"persisted agent tools at {path} have an unknown shape")
+    if defaults is not None and (
+        not isinstance(defaults, list)
+        or not all(isinstance(name, str) for name in defaults)
+    ):
+        raise RuntimeError(f"persisted default tools at {path} have an unknown shape")
+
+    migrated_tools = [tool for tool in tools if tool["name"] != "think"]
+    migrated_defaults = [
+        name
+        for name in (defaults if defaults is not None else ["FinishTool", "ThinkTool"])
+        if name != "ThinkTool"
+    ]
+    if migrated_tools == tools and migrated_defaults == defaults:
+        return False
+    saved_agent["tools"] = migrated_tools
+    saved_agent["include_default_tools"] = migrated_defaults
+
+    mode = stat.S_IMODE(path.stat().st_mode)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            mode,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(payload, output, separators=(",", ":"))
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
 
 
 def delegation_config(
@@ -1469,15 +1562,14 @@ def run_openhands(
                 definition,
                 work_dir=config.workspace,
             )(llm)
-            agent = agent.model_copy(
-                update={"llm": apply_reasoning_profile(agent.llm)}
-            )
+            agent = agent.model_copy(update={"llm": apply_reasoning_profile(agent.llm)})
             require_exact_tokenizer(agent.llm)
             agent = with_role_and_project_context(
                 agent,
                 harness_instructions,
                 role_instructions,
                 project_skills,
+                live_controller_invariant(config),
             )
             agent = with_tool_concurrency(agent, MAX_PARALLEL_AGENTS)
             agent = agent.model_copy(
@@ -1505,10 +1597,22 @@ def run_openhands(
                     harness_instructions,
                     role_instructions,
                     project_skills,
+                    live_controller_invariant(config),
                 ),
                 system_prompt_kwargs={"cli_mode": True},
                 condenser=condenser,
                 tool_concurrency_limit=MAX_PARALLEL_AGENTS,
+            )
+        agent = without_legacy_think(agent)
+        if migrate_persisted_disabled_tools(
+            config.state_dir,
+            config.conversation_id,
+        ):
+            print(
+                "OPENHANDS_STATE_MIGRATION removed_tool=think "
+                f"conversation_id={config.conversation_id}",
+                file=sys.stderr,
+                flush=True,
             )
         conversation = LocalConversation(
             agent=agent,
@@ -1639,7 +1743,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config = resolve_config(args)
             os.environ.pop(config.api_key_env, None)
             return run_openhands(prompt, config)
-        except BaseException as error:  # noqa: BLE001
+        except BaseException as error:
             if task_id := os.environ.get("SENPAI_DELEGATION_TASK_ID"):
                 record_delegated_task_result(
                     task_id,

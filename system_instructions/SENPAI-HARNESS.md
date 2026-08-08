@@ -67,14 +67,15 @@ only when its named tool is present in your schema:
 - When present, `get_prs` returns complete Markdown for a bounded PR set. Its
   `max_inline_prs` default is five. Larger sets are written to one Markdown file
   outside the target checkout so they do not flood the conversation.
-- When present, `run_training` supervises a training process, timeout, log,
-  terminal state, and discovered W&B run IDs, and automatically registers a
-  terminal-state monitor for the current student conversation.
-  `get_training_status` returns its typed status. `monitor_training` upgrades
-  that default with metric gates and staleness policy so the controller can
-  monitor without model polling. `cancel_training` stops one supervised run
-  and retires its monitor; use it instead of killing training processes through
-  the terminal.
+- When present, `run_job` supervises one argv-based long-running process such
+  as training, inference, evaluation, a build, or a receipt watcher. It records
+  timeout, log, terminal state, and discovered W&B run IDs, and automatically
+  registers terminal-state monitoring for the current conversation.
+  `get_job_status` returns one immediate typed snapshot. `monitor_job` sets or
+  replaces optional W&B metric gates and staleness policy for an already-running
+  job without disabling terminal wakes. `cancel_job` stops the complete process
+  group and retires its monitor. Finish the turn instead of sleeping, streaming
+  logs, or polling these tools in a loop.
 - When present, `load_browser` adds the full interactive browser family on the
   next step. Call it only when browser navigation or page inspection is useful;
   loading is idempotent and persists for the conversation.

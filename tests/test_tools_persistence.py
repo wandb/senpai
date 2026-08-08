@@ -6,15 +6,18 @@ from openhands.sdk.event import ActionEvent, Event, ObservationEvent
 from openhands.sdk.io import InMemoryFileStore
 from openhands.sdk.llm import MessageToolCall
 
+from senpai_agent.github.tools import SubmitExperimentResultAction
 from senpai_agent.models import (
     AssignmentKey,
     ExperimentResult,
     MetricComparison,
     ResultStatus,
 )
-from senpai_agent.github.tools import SubmitExperimentResultAction
 from senpai_agent.tools import (
+    JobResultObservation,
+    JobSpec,
     MonitorTrainingAction,
+    RunJobAction,
     TrainingResultObservation,
 )
 from senpai_agent.training import TrainingState
@@ -98,6 +101,51 @@ def test_running_training_observation_survives_event_log_restore():
     assert isinstance(restored.observation, TrainingResultObservation)
     assert restored.observation.state is TrainingState.RUNNING
     assert restored.observation.exit_code is None
+
+
+def test_job_actions_and_observations_survive_event_log_restore():
+    action = RunJobAction(
+        spec=JobSpec(
+            argv=("python", "evaluate.py"),
+            cwd="/workspace",
+            timeout_seconds=600,
+        )
+    )
+    restored_action = round_trip(
+        ActionEvent(
+            thought=[],
+            action=action,
+            tool_name="run_job",
+            tool_call_id="job-action",
+            tool_call=MessageToolCall(
+                id="job-action",
+                name="run_job",
+                arguments=json.dumps(action.model_dump(mode="json")),
+                origin="completion",
+            ),
+            llm_response_id="job-response",
+        )
+    )
+    restored_observation = round_trip(
+        ObservationEvent(
+            tool_name="run_job",
+            tool_call_id="job-observation",
+            action_id="job-action",
+            observation=JobResultObservation(
+                job_id="job-17",
+                state=TrainingState.RUNNING,
+                elapsed_seconds=12.5,
+                log_path="/state/job-17.log",
+            ),
+        )
+    )
+
+    assert isinstance(restored_action, ActionEvent)
+    assert isinstance(restored_action.action, RunJobAction)
+    assert restored_action.action.spec.argv == ("python", "evaluate.py")
+    assert isinstance(restored_observation, ObservationEvent)
+    assert isinstance(restored_observation.observation, JobResultObservation)
+    assert restored_observation.observation.job_id == "job-17"
 
 
 @pytest.mark.parametrize(

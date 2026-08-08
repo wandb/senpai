@@ -169,6 +169,12 @@ and keeps 600 events as an emergency fuse. The 82,144-token margin below W&B's
 model response. OpenAI Responses and Anthropic keep their native compaction and
 ignore all three local limits.
 
+Every advisor root turn also receives a live controller invariant in its
+non-condensed system context: the campaign is active, no campaign round limit
+is configured, and round labels or compaction summaries cannot declare the
+research finished. `max_turns` is identified explicitly as a per-turn safety
+bound, not a research-completion counter.
+
 Set positive values to override any dimension with
 `local_condenser_max_events`, `local_condenser_max_tokens`, and
 `local_condenser_target_events`; the target must leave room for the preserved
@@ -484,7 +490,7 @@ flowchart LR
     H["Advisor records hypothesis, baseline, and acceptance rule"]
     P["Typed draft PR<br/>student:name + status:wip"]
     I["Student implements and commits"]
-    T["Supervised training<br/>W&B metrics"]
+    T["Supervised jobs<br/>optional W&B metrics"]
     R["Structured result<br/>status:review"]
     D["Advisor merges, closes, requests a revision, or sends feedback"]
 
@@ -515,28 +521,54 @@ new feedback still do.
 
 `get_prs` returns complete PR bodies and discussions. Up to five PRs are returned in context by default; larger selections become a Markdown artifact outside the target checkout so long histories do not pollute the main conversation.
 
-## Long-running training and monitoring
+## Long-running jobs and monitoring
 
-Students do not start GPU work, stream logs, sleep, or poll through the terminal. Four typed tools make training a durable controller operation:
+Advisor and student root conversations receive four typed tools for durable,
+non-blocking process supervision. Students use them for GPU work; advisors can
+use them for repository-side watchers or other bounded long-running commands.
 
 | Tool | Contract |
 |---|---|
-| `run_training` | Accepts structured `argv`, `cwd`, and a hard timeout. It requires a clean assignment worktree, starts a supervised process group without blocking, persists its identity, full log, and bounded error tail, discovers W&B run IDs, and automatically registers terminal-state monitoring for the current conversation. |
-| `get_training_status` | Performs one bounded read of the latest persisted state, exit code, elapsed time, W&B run IDs, and error tail. |
-| `monitor_training` | Adds a W&B metric, minimize/maximize direction, `lte`, `gte`, `improved_by`, or `regressed_by` gates, a poll interval, and stale-update detection. It cannot disable terminal wakes. |
-| `cancel_training` | Stops the complete process group through the supervised TERM/KILL path, waits for a durable terminal state, and retires its monitor. |
+| `run_job` | Accepts structured `argv`, `cwd`, a hard timeout, a `read_only` or `mutable` workspace-access declaration, and an optional W&B credential grant. It starts a supervised process group without blocking, persists its identity, full log, and bounded error tail, discovers W&B run IDs, and automatically registers terminal-state monitoring for the current conversation. Suitable work includes training, inference, evaluation, builds, and receipt watchers. |
+| `get_job_status` | Performs one bounded read of the latest persisted state, exit code, elapsed time, W&B run IDs, and error tail. |
+| `monitor_job` | Sets or replaces optional W&B policy for an already-running job: metric, minimize/maximize direction, `lte`, `gte`, `improved_by`, or `regressed_by` gates, poll interval, and stale-update detection. It cannot disable terminal wakes. |
+| `cancel_job` | Stops the complete process group through the supervised TERM/KILL path, waits for a durable terminal state, and retires its monitor. |
 
-After launch, the student can finish its turn. The deterministic controller polls process state and at most one selected W&B metric without consuming model tokens. A threshold crossing, regression, stale metric, terminal state, or monitor error creates one compact durable event and resumes the same student conversation. One broken monitor cannot block other training, GitHub feedback, or child-agent results.
+After launch, the role can finish its turn. The deterministic controller polls
+process state and at most one selected W&B metric without consuming model
+tokens. A threshold crossing, regression, stale metric, terminal state, or
+monitor error creates one compact durable event and resumes the same
+conversation. Due monitors are processed in bounded batches with a time budget;
+a slow or broken monitor can delay its batch only within those bounds and cannot
+prevent later jobs, GitHub feedback, or child-agent results from being
+processed. Monitor policy and ownership have one durable SQLite source of truth.
+While any monitor is active, the controller sleeps only until its earliest due
+poll rather than the ordinary advisor/student heartbeat.
+
+`workspace_access="mutable"` is the default for builds, training, evaluation,
+or any command that can write in the checkout. A student must have a clean
+worktree before launching such a job, and controller-driven branch changes wait
+until it finishes. `read_only` is reserved for passive watchers and does not take
+that lease. A job receives no ambient credentials; request `WANDB_API_KEY` in
+`secret_env` only when it actually communicates with W&B.
 
 `improved_by` and `regressed_by` compare with the monitor policy's first observed sample; they do not silently reuse the assignment's documented baseline.
 
-Worker and container restarts preserve completed OpenHands events. Recovered live training is terminated safely rather than being adopted under an unverifiable process identity; the original student conversation receives the persisted terminal outcome.
+Worker and container restarts preserve completed OpenHands events. A recovered
+live job is terminated safely rather than adopted under an unverifiable process
+identity; its original conversation receives the persisted terminal outcome.
 
 Interactive browser operations are progressively disclosed. A fresh root
 conversation initially sees only `load_browser`; invoking it adds the fourteen
 OpenHands browser operations and records the choice in conversation state so a
 resumed conversation restores them. `--no-browser` exposes neither the loader
 nor the browser family.
+
+`task_tracker` is optional persisted working memory for multi-step work, parallel
+workstreams, delegated agents, and long-running jobs; several items may be
+`in_progress` when the work is genuinely concurrent. The legacy `think`
+scratchpad tool is not exposed to any Senpai root or child—the selected models'
+native reasoning remains enabled.
 
 ## Subagents
 
@@ -584,7 +616,7 @@ also copies the model-visible parent history. The root advisor or student may
 leave useful tasks running and receives their terminal results as durable
 events; nested children may not detach descendants.
 
-Children share the parent workspace, so their process and conversation are isolated but their filesystem is not. They receive only their declared tools and never receive GitHub credentials, GitHub workflow tools, or training tools.
+Children share the parent workspace, so their process and conversation are isolated but their filesystem is not. They receive only their declared tools and never receive GitHub credentials, GitHub workflow tools, or job tools.
 
 ## Task guides
 

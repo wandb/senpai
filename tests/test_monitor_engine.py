@@ -15,7 +15,6 @@ from senpai_agent.monitor import (
 )
 from senpai_agent.training import TrainingResult, TrainingState
 
-
 NOW = datetime(2026, 7, 30, tzinfo=UTC)
 
 
@@ -180,6 +179,8 @@ def test_terminal_failure_wins_over_metric_and_sample_failures(
 
 
 def test_wandb_source_returns_latest_value_and_timestamp(monkeypatch):
+    api_options = []
+
     class Run:
         def history(self, *, keys, **_options):
             if keys != ["accuracy", "_timestamp"]:
@@ -197,12 +198,83 @@ def test_wandb_source_returns_latest_value_and_timestamp(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "wandb",
-        SimpleNamespace(Api=lambda **_options: SimpleNamespace(run=run)),
+        SimpleNamespace(
+            Api=lambda **options: (
+                api_options.append(options) or SimpleNamespace(run=run)
+            )
+        ),
     )
 
-    sample = WandbMetricSource("entity", "project").latest("run-1", "accuracy")
+    sample = WandbMetricSource(
+        "entity",
+        "project",
+        api_key="wandb-secret",
+    ).latest("run-1", "accuracy")
 
     assert sample == MetricSample(
         value=0.7,
         observed_at=datetime.fromtimestamp(200, UTC),
     )
+    assert api_options == [{"api_key": "wandb-secret", "timeout": 20}]
+
+
+def test_monitor_cycle_cap_is_fair_across_due_jobs(tmp_path: Path):
+    monitors = [monitor(f"train-{index}") for index in range(6)]
+    checked = []
+
+    class Training:
+        def get_training_status(self, training_id):
+            checked.append(training_id)
+            return result(tmp_path, training_id, TrainingState.FINISHED)
+
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        for item in monitors:
+            store.register(item)
+        engine = TrainingMonitorEngine(
+            store,
+            Training(),
+            SimpleNamespace(),
+            max_polls_per_cycle=2,
+        )
+
+        engine.poll(NOW)
+        engine.poll(NOW)
+        engine.poll(NOW)
+
+    assert checked == [item.training_id for item in monitors]
+
+
+def test_monitor_cycle_stops_between_polls_when_budget_is_spent(tmp_path: Path):
+    monitors = [monitor(f"train-{index}", metric="loss") for index in range(4)]
+    clock = [0.0]
+    checked = []
+
+    class Training:
+        def get_training_status(self, training_id):
+            checked.append(training_id)
+            return result(tmp_path, training_id)
+
+    class Metrics:
+        def latest(self, _run_id, _metric):
+            clock[0] += 2
+            return MetricSample(value=0.2, observed_at=NOW)
+
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        for item in monitors:
+            store.register(item)
+        engine = TrainingMonitorEngine(
+            store,
+            Training(),
+            Metrics(),
+            max_polls_per_cycle=4,
+            poll_budget_seconds=3,
+            monotonic=lambda: clock[0],
+        )
+
+        engine.poll(NOW)
+
+        assert checked == ["train-0", "train-1"]
+        assert [item.training_id for item in store.due(NOW)] == [
+            "train-2",
+            "train-3",
+        ]
