@@ -500,7 +500,7 @@ flowchart LR
 
 1. The advisor creates a falsifiable assignment with the exact required research-base SHA, baseline metrics, expected mechanism, implementation scope, and stopping rules.
 2. `create_assignment` creates the student branch and draft PR, embeds a typed assignment record, and applies the routing labels.
-3. The assigned student receives one OpenHands conversation for that assignment revision. New PR comments and reviews are injected into that conversation, including while a turn is active.
+3. The assigned student receives one OpenHands conversation for that assignment revision. New PR comments and reviews are queued durably even while a turn is active, then delivered in the next bounded turn.
 4. The student commits the exact implementation, launches supervised training, and records every referenced run in W&B.
 5. The student calls `submit_experiment_result`; the tool validates and publishes the branch before changing the PR to `status:review`.
 6. The advisor compares the evidence, then uses the corresponding operation-specific tool to merge a reproducible winner, close a useful negative result, request a new revision, or send non-revision feedback.
@@ -645,7 +645,7 @@ OpenHands receives these as progressively disclosed skills; their bodies are loa
 
 The repository also contains two reusable optimization case studies:
 
-- [LLM inference optimization](LLM-INFERENCE-OPTIMIZATION-SENPAI-GUIDE.md)
+- [LLM inference optimization](literature_and_guidance/LLM-INFERENCE-OPTIMIZATION-SENPAI-GUIDE.md)
 - [LLM training optimization](LLM-TRAINING-OPTIMIZATION-GUIDE.md)
 
 ## Architecture and durability
@@ -663,7 +663,7 @@ flowchart LR
     S --> WB
 ```
 
-There is no Senpai RPC service or cross-node database. GitHub PR labels, typed comments, reviews, and human-tagged Issues are the only advisor/student communication protocol; W&B is the shared experiment store. Role-local SQLite stores local event queues and deduplication plus training-monitor policies; it is never shared across nodes.
+There is no Senpai RPC service or cross-node database. GitHub PR labels, typed comments, reviews, and human-tagged Issues are the only advisor/student communication protocol; W&B is the shared experiment store. Role-local SQLite stores the ordered delivery inbox and its receipts plus training-monitor policies; it is never shared across nodes.
 
 Each role runs a small Python supervisor around the deterministic controller:
 
@@ -686,7 +686,8 @@ The controller owns cadence, durable events, conversation selection, verified Gi
 - A student uses one UUID per assignment revision; feedback, monitor events, and child-task results resume that exact conversation.
 - Still-actionable GitHub state is re-delivered on the configured reminder cadence, which defaults to at least ten minutes even when GitHub is polled more frequently. Immediate post-turn polls deliver changed state but not timed reminders, so a successful research-only turn cannot enter a no-sleep reminder loop. `research_base_changed` is keyed by assignment, revision, PR head, and the exact required/current base pair; each identity or base movement requires a new decision. Merge repeats the live-base check immediately before its mutation, while external base writers still require strict up-to-date branch protection or a merge queue for an atomic guarantee.
 - Each model request gets one bounded 15-minute attempt. Foreground terminal calls return control within ten minutes for explicit continuation, the whole turn retains its one-hour hard lease, and two consecutive failed turns exit to the supervisor for a clean worker restart. Restart backoff grows across failed workers to a five-minute ceiling; only a successfully acknowledged turn resets that streak, not process uptime or idle sleep.
-- Events injected into an active conversation are acknowledged only after that turn exits cleanly. A typed context-window or malformed-history failure gets one fresh model-visible branch under the same conversation UUID and original turn deadline; the raw trace and workspace remain intact. If that clean recovery also fails, the work stays unacknowledged and is retried after at least ten minutes rather than entering a restart loop.
+- Every controller prompt, GitHub event, monitor signal, and child result follows one durable `pending -> delivered -> processed` inbox. A provider failure resumes the already-delivered turn without resending it, and a crash after inference performs mailbox acknowledgement without another model call. New events wait behind an unresolved turn in the same conversation; normal drains are FIFO and bounded to 16 events or 64 KiB, while ready conversations take fair turns.
+- A typed context-window or malformed-history failure gets one fresh model-visible branch under the same conversation UUID and original turn deadline; the raw trace and workspace remain intact. The reset and its canonical recovery copy are durable across crashes. If that clean recovery also fails, the work stays unacknowledged and is retried after at least ten minutes rather than entering a restart loop.
 - On restart, an incomplete persisted tool action is rejected rather than replayed implicitly. A checked-out assignment branch that was deliberately rebased or extended locally is preserved and surfaced to its existing student conversation for explicit reconciliation.
 - The complete OpenHands event log remains locally searchable. Senpai does not prune conversation directories; operators own retention.
 - Student state may be ephemeral because the branch, PR, typed result, W&B runs, and Weave trace are the durable handoff.

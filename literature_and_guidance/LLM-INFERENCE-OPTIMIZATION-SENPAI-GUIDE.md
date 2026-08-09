@@ -152,6 +152,19 @@ For a new model, establish this before optimizing:
 If the local harness cannot reproduce the baseline, do not trust local
 optimization deltas.
 
+### Prove Hardware And Kernel Reachability
+
+Record the exact base commit, hardware, and kernel variant for every result. A
+measurement supports only the path that ran; a local fallback does not validate
+a target-only kernel.
+
+Before accepting a result, prove that:
+
+- the changed control reaches the timed path,
+- the intended kernel dispatched,
+- the required workload was preserved,
+- the compiler and runtime used the intended implementation.
+
 ### Treat Quality As A System, Not One Number
 
 Perplexity is necessary when the contract requires it, but it is not sufficient.
@@ -541,6 +554,15 @@ Try:
 - launch-overhead reduction,
 - host-loop removal.
 
+Cost a kernel change before building it:
+
+- bytes moved,
+- dispatches removed and whether they serialized or overlapped,
+- work replicated per threadgroup,
+- barriers or synchronization added,
+- register pressure and occupancy,
+- materialization or graph construction removed.
+
 Every kernel optimization needs a numerical-equivalence gate. If the gate is
 "same selected token" rather than bit-exact equality, state that explicitly and
 test the margin where token choices can flip.
@@ -687,6 +709,9 @@ Use this schema:
 ```text
 Hypothesis:
   The specific cost or quality issue this experiment addresses.
+
+Base and hardware:
+  Exact commit, architecture, and kernel family exercised.
 
 Target cost:
   The measured budget line, in milliseconds, bytes, or percentage of decode time.

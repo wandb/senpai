@@ -33,17 +33,18 @@ from senpai_agent.delegation import (
     configure_delegation,
     record_delegated_task_result,
 )
-from senpai_agent.delivery import (
-    MessageDelivery,
-    PendingDeliveryLedger,
-    send_message_once,
-)
 from senpai_agent.model_compatibility import (
     REASONING_EFFORTS,
     WANDB_GLM_52_MODEL,
     WANDB_GLM_52_TOKENIZER,
     register_litellm_model_compatibility,
     supports_reasoning_effort,
+)
+from senpai_agent.inbox import (
+    DeliveryState,
+    PersistentInbox,
+    deliver_turn_messages,
+    turn_has_finished_response,
 )
 from senpai_agent.secrets import (
     GITHUB_TOKEN_ENV_NAMES,
@@ -1505,10 +1506,11 @@ def run_openhands(
     config: RunnerConfig,
     *,
     reset_context: bool = False,
-    prompt_delivery_id: str | None = None,
-    message_deliveries: Sequence[MessageDelivery] = (),
-    delivery_state: PendingDeliveryLedger | None = None,
+    inbox: PersistentInbox | None = None,
+    inbox_turn_id: str | None = None,
 ) -> int:
+    if (inbox is None) != (inbox_turn_id is None):
+        raise ValueError("inbox and inbox_turn_id must be provided together")
     started_at = time.time()
     run_deadline = min(
         started_at + config.timeout_seconds,
@@ -1601,6 +1603,7 @@ def run_openhands(
     scrub_github_credentials(os.environ)
     conversation = None
     cleanup_error: BaseException | None = None
+    active_inbox_turn_id = inbox_turn_id
     try:
         llm = LLM(
             model=config.model,
@@ -1710,7 +1713,32 @@ def run_openhands(
             prompt_cache_key=conversation_prompt_cache_key(config),
         )
         reject_recovered_actions(conversation)
-        if reset_context:
+        if inbox is not None and active_inbox_turn_id is not None:
+            if reset_context:
+                recovery = inbox.reset_turn(active_inbox_turn_id, prompt)
+                active_inbox_turn_id = recovery.turn_id
+            active_turn = inbox.turn(active_inbox_turn_id)
+            if active_turn.context_reset_required:
+                active_branch = tuple(conversation.state.active_branch())
+                active_senders = {
+                    getattr(event, "sender", None) for event in active_branch
+                }
+                recovery_started = any(
+                    message.sender in active_senders
+                    for message in active_turn.messages
+                )
+                if active_branch and not recovery_started:
+                    preserved_events = len(conversation.state.events)
+                    conversation.navigate_to(None)
+                    print(
+                        "OPENHANDS_CONTEXT_RESET "
+                        f"conversation_id={config.conversation_id} "
+                        f"preserved_events={preserved_events}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                inbox.record_context_reset(active_inbox_turn_id)
+        elif reset_context:
             preserved_events = len(conversation.state.events)
             conversation.navigate_to(None)
             print(
@@ -1720,40 +1748,59 @@ def run_openhands(
                 file=sys.stderr,
                 flush=True,
             )
+        inference_required = True
         try:
             # send_message performs OpenHands' lazy tool initialization.
-            if prompt_delivery_id is None:
+            if inbox is None or active_inbox_turn_id is None:
                 conversation.send_message(prompt)
             else:
-                send_message_once(
-                    conversation,
-                    MessageDelivery(prompt_delivery_id, prompt),
-                )
-            for delivery in message_deliveries:
-                send_message_once(conversation, delivery)
+                turn = inbox.turn(active_inbox_turn_id)
+                if turn.state is DeliveryState.PROCESSED:
+                    inference_required = False
+                else:
+                    turn = deliver_turn_messages(
+                        conversation,
+                        inbox,
+                        active_inbox_turn_id,
+                    )
+                    if (
+                        conversation.state.execution_status
+                        == ConversationExecutionStatus.FINISHED
+                        and turn_has_finished_response(conversation, turn)
+                    ):
+                        inbox.record_processed(active_inbox_turn_id)
+                        inference_required = False
         finally:
             clear_github_credentials()
             configure_delegation(None)
-        with graceful_interrupts(conversation):
-            if not config.child:
-                with (
-                    AdvisorEventStore(local_event_db_path(config)) as event_store,
-                    AdvisorEventPump(
-                        event_store,
-                        conversation,
-                        parent_conversation_id=(
-                            str(config.conversation_id)
-                            if config.role == "student"
-                            else None
+        if inference_required:
+            with graceful_interrupts(conversation):
+                if not config.child:
+                    with (
+                        AdvisorEventStore(local_event_db_path(config)) as event_store,
+                        AdvisorEventPump(
+                            event_store,
+                            conversation,
+                            parent_conversation_id=(
+                                str(config.conversation_id)
+                                if config.role == "student"
+                                else None
+                            ),
+                            inbox=inbox,
+                            conversation_id=config.conversation_id,
                         ),
-                        delivery_state=delivery_state,
-                        conversation_id=config.conversation_id,
-                    ),
-                ):
+                    ):
+                        run_conversation(conversation, run_deadline - time.time())
+                else:
                     run_conversation(conversation, run_deadline - time.time())
-            else:
-                run_conversation(conversation, run_deadline - time.time())
         status = conversation.state.execution_status
+        if (
+            inference_required
+            and inbox is not None
+            and active_inbox_turn_id is not None
+            and status == ConversationExecutionStatus.FINISHED
+        ):
+            inbox.record_processed(active_inbox_turn_id)
         child_result = (
             final_agent_result(conversation)
             if config.child and status == ConversationExecutionStatus.FINISHED

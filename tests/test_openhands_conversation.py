@@ -11,6 +11,9 @@ from openhands.sdk.event import SystemPromptEvent
 from openhands.sdk.llm import Message, TextContent
 from openhands.sdk.tool import FinishTool
 from openhands.sdk.workspace import LocalWorkspace
+
+import senpai_agent.openhands_runner as runner
+from senpai_agent.inbox import DeliveryState, PersistentInbox
 from openhands_support import (
     PLUGIN_DIR,
     isolate_agent_discovery,
@@ -19,7 +22,6 @@ from openhands_support import (
 from pydantic import SecretStr
 
 import senpai_agent.openhands_runner as runner
-from senpai_agent.delivery import MessageDelivery
 from senpai_agent.openhands_runner import (
     graceful_interrupts,
     main,
@@ -188,55 +190,6 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     assert captured["llm_timeout"] == 900
     assert captured["llm_num_retries"] == 1
     assert captured["closed"] is True
-
-
-def test_run_does_not_reappend_failed_turn_messages_and_keeps_new_delivery(
-    tmp_path,
-    monkeypatch,
-):
-    history = []
-
-    class FakeConversation:
-        def __init__(self, **kwargs):
-            self.id = kwargs["conversation_id"]
-            self.state = SimpleNamespace(
-                active_branch=lambda: list(history),
-                execution_status=ConversationExecutionStatus.FINISHED,
-            )
-
-        def send_message(self, prompt, sender=None):
-            history.append(SimpleNamespace(prompt=prompt, sender=sender))
-
-        async def arun(self):
-            pass
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
-    isolate_agent_discovery(monkeypatch, runner)
-    config = runtime_config(tmp_path)
-    first = MessageDelivery("event-attempt-1", "first event")
-    second = MessageDelivery("event-attempt-2", "second event")
-
-    assert run_openhands(
-        "controller context",
-        config,
-        prompt_delivery_id="controller-attempt",
-        message_deliveries=(first,),
-    ) == 0
-    assert run_openhands(
-        "controller context changed only by retry time",
-        config,
-        prompt_delivery_id="controller-attempt",
-        message_deliveries=(first, second),
-    ) == 0
-
-    assert [event.prompt for event in history] == [
-        "controller context",
-        "first event",
-        "second event",
-    ]
 
 
 def test_disabled_tool_migration_preserves_history_and_job_factory_resume(tmp_path):
@@ -455,6 +408,330 @@ def test_context_reset_preserves_history_and_starts_a_fresh_active_branch(
         "close",
     ]
     assert calls[1] == ("navigate", None)
+
+
+def test_provider_timeout_resumes_inference_without_resending_the_turn(
+    tmp_path,
+    monkeypatch,
+):
+    """
+    Requirement: a timed-out provider turn resumes with arun on its existing branch.
+    Interface: run_openhands, the persistent inbox, and model-visible messages.
+    """
+    history = []
+    sent = []
+    arun_calls = []
+    statuses = [
+        ConversationExecutionStatus.PAUSED,
+        ConversationExecutionStatus.FINISHED,
+    ]
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                active_branch=lambda: list(history),
+                events=history,
+                execution_status=ConversationExecutionStatus.IDLE,
+            )
+
+        def send_message(self, message, sender=None):
+            sent.append((message, sender))
+            history.append(SimpleNamespace(message=message, sender=sender))
+
+        async def arun(self):
+            arun_calls.append(1)
+            self.state.execution_status = statuses.pop(0)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(
+        runner.ConversationState,
+        "get_unmatched_actions",
+        lambda _events: [],
+    )
+    isolate_agent_discovery(monkeypatch, runner)
+    config = runtime_config(tmp_path)
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(config.conversation_id, "event:1", "first event")
+    turn = inbox.next_turn(config.conversation_id, "controller prompt")
+    assert turn is not None
+
+    assert run_openhands(
+        "unused retry prompt",
+        config,
+        inbox=inbox,
+        inbox_turn_id=turn.turn_id,
+    ) == 1
+    assert run_openhands(
+        "another unused retry prompt",
+        config,
+        inbox=PersistentInbox(inbox.path),
+        inbox_turn_id=turn.turn_id,
+    ) == 0
+
+    assert [message for message, _sender in sent] == [
+        "controller prompt",
+        "first event",
+    ]
+    assert len(arun_calls) == 2
+    assert PersistentInbox(inbox.path).turn(turn.turn_id).state is (
+        DeliveryState.PROCESSED
+    )
+
+
+def test_processed_turn_recovers_without_append_or_inference(tmp_path, monkeypatch):
+    """
+    Requirement: a processed turn is acknowledgement-only after restart.
+    Interface: run_openhands against a reopened persistent inbox.
+    """
+    calls = []
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                active_branch=lambda: [],
+                events=[],
+                execution_status=ConversationExecutionStatus.FINISHED,
+            )
+
+        def send_message(self, *_args, **_kwargs):
+            calls.append("send")
+
+        async def arun(self):
+            calls.append("arun")
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(
+        runner.ConversationState,
+        "get_unmatched_actions",
+        lambda _events: [],
+    )
+    isolate_agent_discovery(monkeypatch, runner)
+    config = runtime_config(tmp_path)
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(config.conversation_id, "event:1", "first event")
+    turn = inbox.next_turn(config.conversation_id, "controller prompt")
+    assert turn is not None
+    for message in turn.messages:
+        inbox.record_delivered(message.delivery_id, message.body)
+    inbox.record_processed(turn.turn_id)
+
+    assert run_openhands(
+        "unused",
+        config,
+        inbox=PersistentInbox(inbox.path),
+        inbox_turn_id=turn.turn_id,
+    ) == 0
+    assert calls == ["close"]
+
+
+def test_finished_branch_repairs_processing_receipt_without_inference(
+    tmp_path,
+    monkeypatch,
+):
+    """
+    Requirement: a crash after inference is recovered from durable conversation state.
+    Interface: active branch, persistent inbox, send count, and arun count.
+    """
+    calls = []
+    config = runtime_config(tmp_path)
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(config.conversation_id, "event:1", "first event")
+    turn = inbox.next_turn(config.conversation_id, "controller prompt")
+    assert turn is not None
+    for message in turn.messages:
+        inbox.record_delivered(message.delivery_id, message.body)
+    branch = [
+        SimpleNamespace(message=message.body, sender=message.sender)
+        for message in turn.messages
+    ]
+    branch.append(SimpleNamespace(message="completed answer", sender="agent"))
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                active_branch=lambda: list(branch),
+                events=branch,
+                execution_status=ConversationExecutionStatus.FINISHED,
+            )
+
+        def send_message(self, *_args, **_kwargs):
+            calls.append("send")
+
+        async def arun(self):
+            calls.append("arun")
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(
+        runner.ConversationState,
+        "get_unmatched_actions",
+        lambda _events: [],
+    )
+    isolate_agent_discovery(monkeypatch, runner)
+
+    assert run_openhands(
+        "unused",
+        config,
+        inbox=PersistentInbox(inbox.path),
+        inbox_turn_id=turn.turn_id,
+    ) == 0
+    assert calls == ["close"]
+    assert PersistentInbox(inbox.path).turn(turn.turn_id).state is (
+        DeliveryState.PROCESSED
+    )
+
+
+def test_context_reset_preserves_old_branch_and_requeues_once(tmp_path, monkeypatch):
+    """
+    Requirement: reset keeps the old trace and creates one canonical recovery copy.
+    Interface: OpenHands branch navigation, sends, arun calls, and persistent inbox.
+    """
+    config = runtime_config(tmp_path)
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(config.conversation_id, "event:1", "first event")
+    old_turn = inbox.next_turn(config.conversation_id, "old controller prompt")
+    assert old_turn is not None
+    old_branch = [
+        SimpleNamespace(message=message.body, sender=message.sender)
+        for message in old_turn.messages
+    ]
+    for message in old_turn.messages:
+        inbox.record_delivered(message.delivery_id, message.body)
+
+    active = list(old_branch)
+    archived = list(old_branch)
+    calls = []
+    statuses = [
+        ConversationExecutionStatus.PAUSED,
+        ConversationExecutionStatus.FINISHED,
+    ]
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                active_branch=lambda: list(active),
+                events=archived,
+                execution_status=ConversationExecutionStatus.ERROR,
+            )
+
+        def navigate_to(self, event_id):
+            calls.append(("navigate", event_id))
+            active.clear()
+
+        def send_message(self, message, sender=None):
+            calls.append(("send", message))
+            event = SimpleNamespace(message=message, sender=sender)
+            active.append(event)
+            archived.append(event)
+
+        async def arun(self):
+            calls.append(("arun", None))
+            self.state.execution_status = statuses.pop(0)
+
+        def close(self):
+            calls.append(("close", None))
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(
+        runner.ConversationState,
+        "get_unmatched_actions",
+        lambda _events: [],
+    )
+    isolate_agent_discovery(monkeypatch, runner)
+
+    for _attempt in range(2):
+        run_openhands(
+            "fresh recovery prompt",
+            config,
+            reset_context=True,
+            inbox=PersistentInbox(inbox.path),
+            inbox_turn_id=old_turn.turn_id,
+        )
+
+    assert archived[: len(old_branch)] == old_branch
+    assert [name for name, _value in calls].count("navigate") == 1
+    assert [name for name, _value in calls].count("send") == 2
+    assert [name for name, _value in calls].count("arun") == 2
+    assert len(active) == 2
+
+
+def test_restart_after_recovery_commit_resets_before_delivering(tmp_path, monkeypatch):
+    """A crash after reset persistence cannot deliver onto the polluted branch."""
+    config = runtime_config(tmp_path)
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(config.conversation_id, "event:1", "canonical event")
+    old = inbox.next_turn(config.conversation_id, "old prompt")
+    assert old is not None
+    old_branch = [
+        SimpleNamespace(message=message.body, sender=message.sender)
+        for message in old.messages
+    ]
+    for message in old.messages:
+        inbox.record_delivered(message.delivery_id, message.body)
+    recovery = inbox.reset_turn(old.turn_id, "recovery prompt")
+
+    active = list(old_branch)
+    archived = list(old_branch)
+    calls = []
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                active_branch=lambda: list(active),
+                events=archived,
+                execution_status=ConversationExecutionStatus.ERROR,
+            )
+
+        def navigate_to(self, event_id):
+            calls.append(("navigate", event_id))
+            active.clear()
+
+        def send_message(self, message, sender=None):
+            calls.append(("send", message))
+            event = SimpleNamespace(message=message, sender=sender)
+            active.append(event)
+            archived.append(event)
+
+        async def arun(self):
+            calls.append(("arun", None))
+            self.state.execution_status = ConversationExecutionStatus.FINISHED
+
+        def close(self):
+            calls.append(("close", None))
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(
+        runner.ConversationState,
+        "get_unmatched_actions",
+        lambda _events: [],
+    )
+    isolate_agent_discovery(monkeypatch, runner)
+
+    assert run_openhands(
+        "unused normal-restart prompt",
+        config,
+        inbox=PersistentInbox(inbox.path),
+        inbox_turn_id=recovery.turn_id,
+    ) == 0
+
+    assert [name for name, _value in calls[:3]] == ["navigate", "send", "send"]
+    assert [event.message for event in active] == [
+        "recovery prompt",
+        "canonical event",
+    ]
 
 
 def test_child_requests_ephemeral_storage_and_emits_its_terminal_report(

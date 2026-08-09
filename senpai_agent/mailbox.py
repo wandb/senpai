@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import sys
-import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,9 +19,14 @@ class ControllerEvent:
     payload: dict[str, object]
 
     def to_prompt(self) -> str:
+        payload = {
+            key: value
+            for key, value in self.payload.items()
+            if key != "parent_conversation_id"
+        }
         return (
             f"## {self.kind}\n\n"
-            f"{json.dumps(self.payload, sort_keys=True, separators=(',', ':'))}"
+            f"{json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
         )
 
 
@@ -60,7 +64,7 @@ class CompositeMailbox:
 
 
 class LocalAdvisorMailbox:
-    """Wake an idle advisor so its event pump can drain local child results."""
+    """Deliver durable local child results directly to the advisor inbox."""
 
     def __init__(self, store_path: Path):
         self.store_path = store_path
@@ -68,30 +72,23 @@ class LocalAdvisorMailbox:
     def poll(self) -> tuple[ControllerEvent, ...]:
         with AdvisorEventStore(self.store_path) as store:
             pending = store.pending()
-        if not pending:
-            return ()
-        identity = "|".join(event.dedupe_key for event in pending)
-        return (
+        return tuple(
             ControllerEvent(
-                kind="local_events_pending",
-                dedupe_key=f"local_events:{uuid.uuid5(uuid.NAMESPACE_URL, identity)}",
-                payload={
-                    "count": len(pending),
-                    "kinds": sorted({event.kind for event in pending}),
-                    "delivery": (
-                        "The OpenHands event pump will inject these events at "
-                        "the next safe conversation boundary."
-                    ),
-                },
-            ),
+                kind=event.kind,
+                dedupe_key=event.dedupe_key,
+                payload=event.payload,
+            )
+            for event in pending
         )
 
-    def acknowledge(self, _dedupe_keys: Sequence[str]) -> None:
-        return
+    def acknowledge(self, dedupe_keys: Sequence[str]) -> None:
+        with AdvisorEventStore(self.store_path) as store:
+            for key in dedupe_keys:
+                store.acknowledge(key)
 
 
 class LocalStudentMailbox:
-    """Wake the student conversation that dispatched a finished child."""
+    """Deliver local child results directly to their parent conversations."""
 
     def __init__(self, store_path: Path):
         self.store_path = store_path
@@ -99,32 +96,19 @@ class LocalStudentMailbox:
     def poll(self) -> tuple[ControllerEvent, ...]:
         with AdvisorEventStore(self.store_path) as store:
             pending = store.pending()
-        if not pending:
-            return ()
-        parent_id = pending[0].payload.get("parent_conversation_id")
-        if not isinstance(parent_id, str):
-            raise RuntimeError("student child event has no parent conversation")
-        matching = [
-            event
-            for event in pending
-            if event.payload.get("parent_conversation_id") == parent_id
-        ]
-        identity = "|".join(event.dedupe_key for event in matching)
-        return (
+        for event in pending:
+            if not isinstance(event.payload.get("parent_conversation_id"), str):
+                raise RuntimeError("student child event has no parent conversation")
+        return tuple(
             ControllerEvent(
-                kind="local_events_pending",
-                dedupe_key=f"local_events:{uuid.uuid5(uuid.NAMESPACE_URL, identity)}",
-                payload={
-                    "conversation_id": parent_id,
-                    "count": len(matching),
-                    "kinds": sorted({event.kind for event in matching}),
-                    "delivery": (
-                        "The OpenHands event pump will inject these events at "
-                        "the next safe conversation boundary."
-                    ),
-                },
-            ),
+                kind=event.kind,
+                dedupe_key=event.dedupe_key,
+                payload=event.payload,
+            )
+            for event in pending
         )
 
-    def acknowledge(self, _dedupe_keys: Sequence[str]) -> None:
-        return
+    def acknowledge(self, dedupe_keys: Sequence[str]) -> None:
+        with AdvisorEventStore(self.store_path) as store:
+            for key in dedupe_keys:
+                store.acknowledge(key)

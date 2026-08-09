@@ -2,6 +2,7 @@ import re
 import tomllib
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
+from uuid import UUID
 
 import pytest
 from openhands.sdk import Agent, LLM, LocalConversation
@@ -27,6 +28,7 @@ from senpai_agent.model_compatibility import (
     CLAUDE_OPUS_5_MODEL_INFO,
     register_litellm_model_compatibility,
 )
+from senpai_agent.inbox import DeliveryState, PersistentInbox, deliver_turn_messages
 from openhands_support import REPO_ROOT, runtime_config
 
 
@@ -613,6 +615,45 @@ def test_local_conversation_exposes_the_configured_prompt_cache_key(tmp_path):
         )
     finally:
         conversation.close()
+
+
+def test_local_conversation_persists_delivery_sender_and_payload(tmp_path):
+    conversation_id = UUID("00000000-0000-0000-0000-000000000117")
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(conversation_id, "event:1", "durable event")
+    turn = inbox.next_turn(conversation_id, "durable prompt")
+    assert turn is not None
+
+    def conversation():
+        return LocalConversation(
+            agent=Agent(
+                llm=LLM(
+                    model="openai/gpt-5.6",
+                    api_key=SecretStr("test-key"),
+                ),
+                tools=[],
+            ),
+            workspace=tmp_path,
+            persistence_dir=tmp_path / "openhands-state",
+            conversation_id=conversation_id,
+            visualizer=None,
+        )
+
+    first = conversation()
+    try:
+        for message in turn.messages:
+            first.send_message(message.body, sender=message.sender)
+    finally:
+        first.close()
+
+    reopened = conversation()
+    try:
+        event_count = len(reopened.state.events)
+        recovered = deliver_turn_messages(reopened, inbox, turn.turn_id)
+        assert len(reopened.state.events) == event_count
+        assert recovered.state is DeliveryState.DELIVERED
+    finally:
+        reopened.close()
 
 
 def test_event_summary_bounds_fields_and_keeps_the_latest_text():

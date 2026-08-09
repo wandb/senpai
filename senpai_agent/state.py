@@ -185,8 +185,11 @@ class StudentConversationSelector:
         )
 
     def _conversation_for(self, event: ControllerEvent) -> UUID:
-        if event.kind in {"local_events_pending", "job_monitor", "training_monitor"}:
+        if event.kind in {"job_monitor", "training_monitor"}:
             return UUID(str(event.payload["conversation_id"]))
+        parent_id = event.payload.get("parent_conversation_id")
+        if isinstance(parent_id, str):
+            return UUID(parent_id)
         if event.kind in {"student_assignment", "student_pr_feedback"}:
             return self.registry.for_assignment(
                 str(event.payload["assignment_id"]),

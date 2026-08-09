@@ -19,7 +19,8 @@ from senpai_agent.advisor import (
     deliver_pending_events,
 )
 from senpai_agent.delegation import AgentStatusAction, AgentStatusObservation
-from senpai_agent.delivery import PendingDeliveryLedger
+from senpai_agent.inbox import PersistentInbox
+from senpai_agent.mailbox import ControllerEvent
 
 
 class ConversationStateStub:
@@ -95,6 +96,8 @@ def test_event_store_deduplicates_and_survives_reopen(tmp_path: Path):
         assert store.enqueue(event) is True
         assert store.pending_count() == 1
         assert store.enqueue(event) is False
+        with pytest.raises(RuntimeError, match="reused with a different payload"):
+            store.enqueue(event.model_copy(update={"payload": {"pr": 999}}))
 
     with AdvisorEventStore(database) as reopened:
         pending = reopened.pending()
@@ -259,14 +262,19 @@ def test_event_pump_injects_new_events_while_conversation_is_running(
         assert store.pending() == []
 
 
-def test_failed_turn_does_not_reappend_delivered_child_result_on_the_next_pump(
+def test_event_pump_queues_into_the_controller_inbox_without_mid_turn_injection(
     tmp_path: Path,
 ):
+    """
+    Requirement: controller and event-pump messages use one durable inbox.
+    Interface: AdvisorEventPump, PersistentInbox, and the active conversation.
+    """
     event = AdvisorEvent(
         kind="agent_result",
         dedupe_key="agent_result:task-1",
         payload={"task_id": "task-1"},
     )
+    conversation_id = "00000000-0000-0000-0000-000000000017"
 
     class Conversation:
         def __init__(self):
@@ -281,41 +289,39 @@ def test_failed_turn_does_not_reappend_delivered_child_result_on_the_next_pump(
 
     with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
         store.enqueue(event)
-        failed_conversation = Conversation()
-        delivery_path = tmp_path / "pending-deliveries.json"
-
-        with pytest.raises(RuntimeError, match="context failed"):
-            with AdvisorEventPump(
-                store,
-                failed_conversation,
-                poll_interval=0.01,
-                delivery_state=PendingDeliveryLedger(delivery_path),
-                conversation_id="advisor",
-            ):
-                assert failed_conversation.received.wait(1)
-                time.sleep(0.03)
-                assert failed_conversation.messages == [event.to_user_message()]
-                raise RuntimeError("context failed")
-
-        assert store.pending() == [event]
-
-        failed_conversation.state.inspected.clear()
+        conversation = Conversation()
+        inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+        inbox.enqueue(conversation_id, "controller:event", "controller event")
+        active = inbox.next_turn(conversation_id, "controller prompt")
+        assert active is not None
+        for message in active.messages:
+            inbox.record_delivered(message.delivery_id, message.body)
         with AdvisorEventPump(
             store,
-            failed_conversation,
+            conversation,
             poll_interval=0.01,
-            delivery_state=PendingDeliveryLedger(delivery_path),
-            conversation_id="advisor",
+            inbox=inbox,
+            conversation_id=conversation_id,
         ):
-            assert failed_conversation.state.inspected.wait(1)
-            assert failed_conversation.messages == [event.to_user_message()]
-            assert store.pending() == [event]
-            failed_conversation.state.execution_status = (
-                ConversationExecutionStatus.FINISHED
-            )
+            deadline = time.monotonic() + 1
+            while store.pending() and time.monotonic() < deadline:
+                time.sleep(0.01)
 
-        assert failed_conversation.messages == [event.to_user_message()]
+        assert conversation.messages == []
         assert store.pending() == []
+        retry = inbox.next_turn(conversation_id, "retry prompt")
+        assert retry is not None and retry.turn_id == active.turn_id
+        assert [message.body for message in retry.events] == ["controller event"]
+        assert inbox.pending_count(conversation_id) == 1
+
+        inbox.record_processed(active.turn_id)
+        inbox.acknowledge(active.turn_id)
+        next_turn = inbox.next_turn(conversation_id, "next prompt")
+        assert next_turn is not None
+        assert [message.body for message in next_turn.events] == [
+            event.to_inbox_message()
+        ]
+        assert next_turn.acknowledgement_keys == (event.dedupe_key,)
 
 
 def test_non_finished_turn_leaves_delivered_child_result_pending(
@@ -482,3 +488,20 @@ def test_advisor_cli_reports_the_pending_event_count(
         == 0
     )
     assert capsys.readouterr().out.strip() == "1"
+
+
+def test_inbox_rendering_excludes_transport_only_parent_conversation_id():
+    """Watcher and controller paths must render one payload for one event key."""
+    payload = {"assignment_id": "a-17", "revision_id": "r-2"}
+    controller_event = ControllerEvent(
+        kind="student_pr_feedback",
+        dedupe_key="feedback:17",
+        payload=payload,
+    )
+    watcher_event = AdvisorEvent(
+        kind=controller_event.kind,
+        dedupe_key=controller_event.dedupe_key,
+        payload={**payload, "parent_conversation_id": "conversation-17"},
+    )
+
+    assert watcher_event.to_inbox_message() == controller_event.to_prompt()

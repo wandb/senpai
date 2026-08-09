@@ -128,8 +128,8 @@ class Turns:
         conversation_id,
         event_keys,
         visible_event_keys=frozenset(),
-        prompt_delivery_id=None,
-        message_deliveries=(),
+        inbox,
+        inbox_turn_id,
     ):
         self.calls.append(
             (
@@ -137,11 +137,15 @@ class Turns:
                 conversation_id,
                 event_keys,
                 visible_event_keys,
-                prompt_delivery_id,
-                tuple(message_deliveries),
             )
         )
-        return TurnResult(exit_code=next(self.exit_codes, 0))
+        result = TurnResult(exit_code=next(self.exit_codes, 0))
+        if result.exit_code == 0:
+            turn = inbox.turn(inbox_turn_id)
+            for message in turn.messages:
+                inbox.record_delivered(message.delivery_id, message.body)
+            inbox.record_processed(inbox_turn_id)
+        return result
 
 
 def run_student_controller(tmp_path: Path, mailbox, turns):
