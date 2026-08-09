@@ -129,7 +129,7 @@ class OpenHandsTurnRunner:
         *,
         full_prompt: str,
         github_mailbox: GitHubMailbox | None = None,
-        active_poll_interval_seconds: float = 30,
+        active_poll_interval_seconds: float = 120,
     ):
         self.config = config
         self.full_prompt = full_prompt.strip()
@@ -885,7 +885,7 @@ def controller_main(
         full_prompt=full_prompt,
         github_mailbox=github_mailbox,
         active_poll_interval_seconds=float(
-            env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "30")
+            env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "120")
         ),
     )
     controller = Controller(

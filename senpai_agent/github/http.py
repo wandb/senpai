@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from urllib import request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -12,6 +13,10 @@ from pydantic import SecretStr
 
 class GitHubReadError(RuntimeError):
     """A GitHub read failed or returned an invalid response."""
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class GitHubReader:
@@ -59,7 +64,8 @@ class GitHubReader:
                 )
         except HTTPError as error:
             raise GitHubReadError(
-                f"GitHub GET {self._safe_path(url)} returned HTTP {error.code}"
+                f"GitHub GET {self._safe_path(url)} returned HTTP {error.code}",
+                retry_after_seconds=_retry_after_seconds(error),
             ) from error
         except (URLError, TimeoutError) as error:
             raise GitHubReadError(
@@ -134,3 +140,22 @@ def next_link(value: str | None) -> str | None:
             if target.startswith("<") and target.endswith(">"):
                 return target[1:-1]
     return None
+
+
+def _retry_after_seconds(error: HTTPError) -> float | None:
+    """Return GitHub's requested retry delay without retaining response headers."""
+
+    retry_after = error.headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            pass
+
+    reset = error.headers.get("X-RateLimit-Reset")
+    if reset is None or error.headers.get("X-RateLimit-Remaining") != "0":
+        return None
+    try:
+        return max(0.0, float(reset) - time.time()) + 1.0
+    except ValueError:
+        return None

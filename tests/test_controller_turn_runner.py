@@ -343,6 +343,35 @@ def test_active_watcher_retries_after_a_transient_github_read_error(
     assert "SENPAI_GITHUB_WATCHER_POLL_ERROR" in capsys.readouterr().err
 
 
+def test_active_watcher_honors_github_retry_delay(tmp_path: Path):
+    event = advisor_event()
+
+    class RateLimitedMailbox:
+        def __init__(self):
+            self.calls: list[float] = []
+
+        def poll(self):
+            self.calls.append(time.monotonic())
+            if len(self.calls) == 1:
+                raise GitHubReadError("rate limited", retry_after_seconds=0.03)
+            return (event,)
+
+    mailbox = RateLimitedMailbox()
+    store_path = tmp_path / "advisor-events.sqlite3"
+    with ActiveGitHubWatcher(
+        mailbox,
+        store_path,
+        known_keys=frozenset(),
+        poll_interval_seconds=0.001,
+    ):
+        deadline = time.monotonic() + 1
+        while len(mailbox.calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+    assert len(mailbox.calls) >= 2
+    assert mailbox.calls[1] - mailbox.calls[0] >= 0.025
+
+
 def test_context_exhaustion_retries_once_on_a_fresh_branch_with_the_same_id(
     tmp_path: Path,
     monkeypatch,
