@@ -341,6 +341,91 @@ def test_legacy_pr3472_delivery_is_adopted_without_replay(
     assert json.loads(legacy_path.read_text(encoding="utf-8")) == legacy_value
 
 
+def test_adopted_legacy_prompt_is_stable_when_migration_reenters(tmp_path: Path):
+    """Retrying a migrated turn must verify the same nearest historical prompt."""
+    event_key = "job:finished"
+    event_id = str(UUID(int=118))
+    legacy_path = tmp_path / "pending-message-deliveries.json"
+    legacy_path.write_text(
+        json.dumps({str(CONVERSATION_ID): {event_key: event_id}}),
+        encoding="utf-8",
+    )
+    inbox_path = tmp_path / "inbox.sqlite3"
+    inbox = PersistentInbox(
+        inbox_path,
+        legacy_path=legacy_path,
+    )
+    inbox.enqueue(CONVERSATION_ID, event_key, "new compact event")
+    turn = inbox.next_turn(
+        CONVERSATION_ID,
+        "new controller prompt",
+        legacy_prompt_identity="initial:new-controller-prompt",
+    )
+    assert turn is not None
+
+    current_prompt_id = "historical-current-prompt"
+    branch = [
+        SimpleNamespace(
+            message="older controller prompt",
+            sender=delivery_sender("older-controller-prompt"),
+        ),
+        SimpleNamespace(
+            message="current controller prompt",
+            sender=delivery_sender(current_prompt_id),
+        ),
+        SimpleNamespace(
+            message="historical event body",
+            sender=delivery_sender(event_id),
+        ),
+        SimpleNamespace(message="completed answer", sender="agent"),
+    ]
+    conversation = Conversation(branch)
+
+    first = inbox.prepare_legacy_turn(turn.turn_id, branch)
+    assert first.state is DeliveryState.DELIVERED
+    assert all(
+        message.state is DeliveryState.DELIVERED for message in first.messages
+    )
+    inbox.close()
+    reopened = PersistentInbox(inbox_path, legacy_path=legacy_path)
+    second = deliver_turn_messages(conversation, reopened, turn.turn_id)
+
+    assert conversation.sent == []
+    assert first.prompt.delivery_id == second.prompt.delivery_id == (
+        "legacy-prompt:"
+        + delivery_sender(current_prompt_id).removeprefix("senpai-delivery:")
+    )
+    assert second.prompt.body == "current controller prompt"
+    assert second.state is DeliveryState.DELIVERED
+    assert turn_has_finished_response(conversation, second)
+
+    tampered = Conversation(
+        [
+            branch[0],
+            SimpleNamespace(
+                message="tampered current controller prompt",
+                sender=delivery_sender(current_prompt_id),
+            ),
+            *branch[2:],
+        ]
+    )
+    with pytest.raises(RuntimeError, match="payload mismatch"):
+        deliver_turn_messages(tampered, reopened, turn.turn_id)
+
+    tampered_event = Conversation(
+        [
+            *branch[:2],
+            SimpleNamespace(
+                message="tampered historical event body",
+                sender=delivery_sender(event_id),
+            ),
+            branch[3],
+        ]
+    )
+    with pytest.raises(RuntimeError, match="payload mismatch"):
+        deliver_turn_messages(tampered_event, reopened, turn.turn_id)
+
+
 def test_unappended_legacy_backlog_obeys_normal_count_and_byte_limits(
     tmp_path: Path,
 ):

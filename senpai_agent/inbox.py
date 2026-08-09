@@ -499,11 +499,20 @@ class PersistentInbox:
                 for message in turn.events
                 if message.sender in positions
             ]
-            prompt_index = self._legacy_prompt_index(
-                turn,
-                branch_senders,
-                frozenset(legacy_by_sender),
-                selected_positions,
+            persisted_prompt_positions = positions.get(turn.prompt.sender, [])
+            if len(persisted_prompt_positions) > 1:
+                raise RuntimeError(
+                    f"duplicate sender {turn.prompt.sender!r} on active branch"
+                )
+            prompt_index = (
+                persisted_prompt_positions[0]
+                if persisted_prompt_positions
+                else self._legacy_prompt_index(
+                    turn,
+                    branch_senders,
+                    frozenset(legacy_by_sender),
+                    selected_positions,
+                )
             )
             if prompt_index is None:
                 return turn
@@ -571,6 +580,7 @@ class PersistentInbox:
                     "UPDATE inbox_messages SET position = ? WHERE delivery_id = ?",
                     (position, row["delivery_id"]),
                 )
+            self._refresh_turn_state(database, turn_id)
             return self._turn(database, turn_id)
 
     def turn(self, turn_id: str) -> InboxTurn:
@@ -888,12 +898,30 @@ class PersistentInbox:
             raise RuntimeError(
                 f"native delivery {current_delivery_id} cannot adopt legacy payload"
             )
-        if DeliveryState(row["state"]) is not DeliveryState.PENDING:
+        already_adopted = (
+            row["event_key"] is None
+            and bool(row["legacy"])
+        )
+        if (
+            DeliveryState(row["state"]) is not DeliveryState.PENDING
+            or already_adopted
+        ):
             _verify_body(row, body)
+            if delivery_id is not None and row["delivery_id"] != delivery_id:
+                raise RuntimeError(
+                    f"delivery {current_delivery_id} identity mismatch"
+                )
             if sender is not None and row["sender"] != sender:
                 raise RuntimeError(
                     f"delivery {current_delivery_id} sender mismatch"
                 )
+            if DeliveryState(row["state"]) is DeliveryState.PENDING:
+                database.execute(
+                    "UPDATE inbox_messages SET state = 'delivered' WHERE delivery_id = ?",
+                    (current_delivery_id,),
+                )
+                if row["turn_id"] is not None:
+                    self._refresh_turn_state(database, row["turn_id"])
             return
         adopted_id = delivery_id or str(row["delivery_id"])
         adopted_sender = sender or str(row["sender"])
@@ -904,7 +932,8 @@ class PersistentInbox:
                 body_sha256 = ?,
                 delivery_id = ?,
                 sender = ?,
-                legacy = 1
+                legacy = 1,
+                state = 'delivered'
             WHERE delivery_id = ?
             """,
             (
@@ -915,6 +944,8 @@ class PersistentInbox:
                 current_delivery_id,
             ),
         )
+        if row["turn_id"] is not None:
+            self._refresh_turn_state(database, row["turn_id"])
 
     def _is_legacy_message(
         self,
