@@ -12,6 +12,21 @@ from typing import Protocol, Self
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
 from pydantic import BaseModel, ConfigDict, Field
 
+from senpai_agent.delivery import (
+    MessageDelivery,
+    PendingDeliveryLedger,
+    send_message_once,
+)
+
+_TERMINAL_DELIVERY_STATUSES = frozenset(
+    {
+        ConversationExecutionStatus.FINISHED,
+        ConversationExecutionStatus.ERROR,
+        ConversationExecutionStatus.STUCK,
+        ConversationExecutionStatus.DELETING,
+    }
+)
+
 
 class AdvisorEvent(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -108,6 +123,17 @@ class AdvisorEventStore:
             ).fetchall()
         return {str(row[0]) for row in rows}
 
+    def acknowledged_keys(self) -> set[str]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT dedupe_key
+                FROM advisor_events
+                WHERE acknowledged = 1
+                """
+            ).fetchall()
+        return {str(row[0]) for row in rows}
+
     def close(self) -> None:
         with self._lock:
             self._connection.close()
@@ -149,7 +175,9 @@ def advisor_conversation_id(
 
 
 class MessageConversation(Protocol):
-    def send_message(self, message: str) -> None: ...
+    state: object
+
+    def send_message(self, message: str, sender: str | None = None) -> None: ...
 
 
 def _deliver_pending_events(
@@ -159,6 +187,7 @@ def _deliver_pending_events(
     record_delivery: Callable[[str], None],
     already_delivered: Set[str] = frozenset(),
     parent_conversation_id: str | None = None,
+    delivery_id: Callable[[str], str] | None = None,
 ) -> int:
     delivered = 0
     pending = store.pending()
@@ -172,9 +201,19 @@ def _deliver_pending_events(
     for event in pending:
         if event.dedupe_key in already_delivered:
             continue
-        conversation.send_message(event.to_user_message())
+        appended = True
+        if delivery_id is None:
+            conversation.send_message(event.to_user_message())
+        else:
+            appended = send_message_once(
+                conversation,
+                MessageDelivery(
+                    delivery_id(event.dedupe_key),
+                    event.to_user_message(),
+                ),
+            )
         record_delivery(event.dedupe_key)
-        delivered += 1
+        delivered += int(appended)
     return delivered
 
 
@@ -200,11 +239,17 @@ class AdvisorEventPump:
         *,
         poll_interval: float = 0.5,
         parent_conversation_id: str | None = None,
+        delivery_state: PendingDeliveryLedger | None = None,
+        conversation_id: str | uuid.UUID | None = None,
     ):
         self._store = store
         self._conversation = conversation
         self._poll_interval = poll_interval
         self._parent_conversation_id = parent_conversation_id
+        self._delivery_state = delivery_state
+        self._conversation_id = str(
+            conversation_id or getattr(conversation, "id", "local")
+        )
         self._delivered_event_keys: set[str] = set()
         self._stop = threading.Event()
         self._error: BaseException | None = None
@@ -233,8 +278,11 @@ class AdvisorEventPump:
                 record_delivery=self._delivered_event_keys.add,
                 already_delivered=self._delivered_event_keys,
                 parent_conversation_id=self._parent_conversation_id,
+                delivery_id=self._delivery_id,
             )
         with state:
+            if state.execution_status in _TERMINAL_DELIVERY_STATUSES:
+                return 0
             if ConversationState.get_unmatched_actions(state.active_branch()):
                 return 0
             return _deliver_pending_events(
@@ -243,7 +291,16 @@ class AdvisorEventPump:
                 record_delivery=self._delivered_event_keys.add,
                 already_delivered=self._delivered_event_keys,
                 parent_conversation_id=self._parent_conversation_id,
+                delivery_id=self._delivery_id,
             )
+
+    def _delivery_id(self, event_key: str) -> str:
+        if self._delivery_state is None:
+            return f"advisor-event:{event_key}"
+        return self._delivery_state.claim(
+            self._conversation_id,
+            (event_key,),
+        )[event_key]
 
     def __enter__(self) -> Self:
         self._thread.start()
@@ -257,7 +314,6 @@ class AdvisorEventPump:
     ) -> None:
         self._stop.set()
         self._thread.join()
-        # Failed turns may abandon their active branch; replay those events instead.
         if exc_type is None and self._error is None:
             state = getattr(self._conversation, "state", None)
             if (

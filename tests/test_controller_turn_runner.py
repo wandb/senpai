@@ -82,7 +82,7 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
 
     def run_openhands(_prompt, config):
         class Conversation:
-            def send_message(self, message):
+            def send_message(self, message, sender=None):
                 messages.append(message)
 
         with AdvisorEventStore(
@@ -187,7 +187,7 @@ def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
 
     def run_openhands(_prompt, config):
         class Conversation:
-            def send_message(self, message):
+            def send_message(self, message, sender=None):
                 messages.append(message)
 
         with AdvisorEventStore(store_path) as store, AdvisorEventPump(
@@ -231,7 +231,7 @@ def test_full_visible_set_suppresses_events_handled_in_an_earlier_turn(
 
     def run_openhands(_prompt, _config):
         class Conversation:
-            def send_message(self, message):
+            def send_message(self, message, sender=None):
                 messages.append(message)
 
         with AdvisorEventStore(store_path) as store, AdvisorEventPump(

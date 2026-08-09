@@ -3,6 +3,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from openhands.sdk.conversation import ConversationExecutionStatus
@@ -18,13 +19,14 @@ from senpai_agent.advisor import (
     deliver_pending_events,
 )
 from senpai_agent.delegation import AgentStatusAction, AgentStatusObservation
+from senpai_agent.delivery import PendingDeliveryLedger
 
 
 class ConversationStateStub:
     def __init__(
         self,
         events=(),
-        execution_status=ConversationExecutionStatus.FINISHED,
+        execution_status=ConversationExecutionStatus.RUNNING,
     ):
         self.events = list(events)
         self.execution_status = execution_status
@@ -142,7 +144,7 @@ def test_deliver_pending_events_acknowledges_only_messages_sent(tmp_path: Path):
             self.state = ConversationStateStub()
             self.messages: list[str] = []
 
-        def send_message(self, message: str) -> None:
+        def send_message(self, message: str, sender: str | None = None) -> None:
             if self.messages:
                 raise RuntimeError("conversation unavailable")
             self.messages.append(message)
@@ -173,8 +175,9 @@ def test_event_pump_keeps_events_queued_while_a_tool_action_is_unmatched(
             self.state = ConversationStateStub([pending_tool_action()])
             self.messages: list[str] = []
 
-        def send_message(self, message: str) -> None:
+        def send_message(self, message: str, sender: str | None = None) -> None:
             self.messages.append(message)
+            self.state.append(SimpleNamespace(sender=sender))
 
     with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
         store.enqueue(event)
@@ -203,8 +206,9 @@ def test_event_pump_delivers_queued_event_after_the_tool_boundary_is_safe(
             self.messages: list[str] = []
             self.received = threading.Event()
 
-        def send_message(self, message: str) -> None:
+        def send_message(self, message: str, sender: str | None = None) -> None:
             self.messages.append(message)
+            self.state.append(SimpleNamespace(sender=sender))
             self.received.set()
 
     with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
@@ -217,6 +221,7 @@ def test_event_pump_delivers_queued_event_after_the_tool_boundary_is_safe(
 
             conversation.state.append(completed_tool_action(action))
             assert conversation.received.wait(1)
+            conversation.state.execution_status = ConversationExecutionStatus.FINISHED
 
         assert conversation.messages == [event.to_user_message()]
         assert store.pending() == []
@@ -236,8 +241,9 @@ def test_event_pump_injects_new_events_while_conversation_is_running(
             self.state = ConversationStateStub()
             self.messages: list[str] = []
 
-        def send_message(self, message: str) -> None:
+        def send_message(self, message: str, sender: str | None = None) -> None:
             self.messages.append(message)
+            self.state.append(SimpleNamespace(sender=sender))
 
     with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
         conversation = Conversation()
@@ -247,12 +253,13 @@ def test_event_pump_injects_new_events_while_conversation_is_running(
             while not conversation.messages and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert store.pending() == [event]
+            conversation.state.execution_status = ConversationExecutionStatus.FINISHED
 
         assert conversation.messages == [event.to_user_message()]
         assert store.pending() == []
 
 
-def test_failed_turn_replays_delivered_child_result_on_the_next_pump(
+def test_failed_turn_does_not_reappend_delivered_child_result_on_the_next_pump(
     tmp_path: Path,
 ):
     event = AdvisorEvent(
@@ -267,19 +274,23 @@ def test_failed_turn_replays_delivered_child_result_on_the_next_pump(
             self.messages: list[str] = []
             self.received = threading.Event()
 
-        def send_message(self, message: str) -> None:
+        def send_message(self, message: str, sender: str | None = None) -> None:
             self.messages.append(message)
+            self.state.append(SimpleNamespace(sender=sender))
             self.received.set()
 
     with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
         store.enqueue(event)
         failed_conversation = Conversation()
+        delivery_path = tmp_path / "pending-deliveries.json"
 
         with pytest.raises(RuntimeError, match="context failed"):
             with AdvisorEventPump(
                 store,
                 failed_conversation,
                 poll_interval=0.01,
+                delivery_state=PendingDeliveryLedger(delivery_path),
+                conversation_id="advisor",
             ):
                 assert failed_conversation.received.wait(1)
                 time.sleep(0.03)
@@ -288,15 +299,22 @@ def test_failed_turn_replays_delivered_child_result_on_the_next_pump(
 
         assert store.pending() == [event]
 
-        recovered_conversation = Conversation()
+        failed_conversation.state.inspected.clear()
         with AdvisorEventPump(
             store,
-            recovered_conversation,
+            failed_conversation,
             poll_interval=0.01,
+            delivery_state=PendingDeliveryLedger(delivery_path),
+            conversation_id="advisor",
         ):
-            assert recovered_conversation.received.wait(1)
+            assert failed_conversation.state.inspected.wait(1)
+            assert failed_conversation.messages == [event.to_user_message()]
+            assert store.pending() == [event]
+            failed_conversation.state.execution_status = (
+                ConversationExecutionStatus.FINISHED
+            )
 
-        assert recovered_conversation.messages == [event.to_user_message()]
+        assert failed_conversation.messages == [event.to_user_message()]
         assert store.pending() == []
 
 
@@ -317,8 +335,9 @@ def test_non_finished_turn_leaves_delivered_child_result_pending(
             self.messages: list[str] = []
             self.received = threading.Event()
 
-        def send_message(self, message: str) -> None:
+        def send_message(self, message: str, sender: str | None = None) -> None:
             self.messages.append(message)
+            self.state.append(SimpleNamespace(sender=sender))
             self.received.set()
 
     with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
@@ -353,8 +372,9 @@ def test_event_pump_routes_child_results_to_their_parent_conversation(
             self.state = ConversationStateStub()
             self.messages: list[str] = []
 
-        def send_message(self, message: str) -> None:
+        def send_message(self, message: str, sender: str | None = None) -> None:
             self.messages.append(message)
+            self.state.append(SimpleNamespace(sender=sender))
 
     with AdvisorEventStore(tmp_path / "student-events.sqlite3") as store:
         store.enqueue(first)
@@ -369,9 +389,40 @@ def test_event_pump_routes_child_results_to_their_parent_conversation(
             deadline = time.monotonic() + 1
             while not conversation.messages and time.monotonic() < deadline:
                 time.sleep(0.01)
+            conversation.state.execution_status = ConversationExecutionStatus.FINISHED
 
         assert conversation.messages == [first.to_user_message()]
         assert store.pending() == [second]
+
+
+def test_event_pump_leaves_late_event_pending_after_conversation_finishes(
+    tmp_path: Path,
+):
+    event = AdvisorEvent(
+        kind="submission_slot_free",
+        dedupe_key="submission_slot_free:cedar",
+        payload={"campaign": "cedar"},
+    )
+
+    class Conversation:
+        def __init__(self):
+            self.state = ConversationStateStub(
+                execution_status=ConversationExecutionStatus.FINISHED
+            )
+            self.messages: list[str] = []
+
+        def send_message(self, message: str, sender: str | None = None) -> None:
+            self.messages.append(message)
+
+    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+        store.enqueue(event)
+        conversation = Conversation()
+
+        with AdvisorEventPump(store, conversation, poll_interval=0.01):
+            time.sleep(0.03)
+
+        assert conversation.messages == []
+        assert store.pending() == [event]
 
 
 def test_event_pump_surfaces_delivery_failure_and_leaves_event_pending(
@@ -387,7 +438,11 @@ def test_event_pump_surfaces_delivery_failure_and_leaves_event_pending(
         def __init__(self):
             self.state = ConversationStateStub()
 
-        def send_message(self, _message: str) -> None:
+        def send_message(
+            self,
+            _message: str,
+            sender: str | None = None,
+        ) -> None:
             raise RuntimeError("conversation rejected event")
 
     with AdvisorEventStore(tmp_path / "events.sqlite3") as store:

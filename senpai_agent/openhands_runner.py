@@ -33,6 +33,11 @@ from senpai_agent.delegation import (
     configure_delegation,
     record_delegated_task_result,
 )
+from senpai_agent.delivery import (
+    MessageDelivery,
+    PendingDeliveryLedger,
+    send_message_once,
+)
 from senpai_agent.model_compatibility import (
     REASONING_EFFORTS,
     WANDB_GLM_52_MODEL,
@@ -1500,6 +1505,9 @@ def run_openhands(
     config: RunnerConfig,
     *,
     reset_context: bool = False,
+    prompt_delivery_id: str | None = None,
+    message_deliveries: Sequence[MessageDelivery] = (),
+    delivery_state: PendingDeliveryLedger | None = None,
 ) -> int:
     started_at = time.time()
     run_deadline = min(
@@ -1714,7 +1722,15 @@ def run_openhands(
             )
         try:
             # send_message performs OpenHands' lazy tool initialization.
-            conversation.send_message(prompt)
+            if prompt_delivery_id is None:
+                conversation.send_message(prompt)
+            else:
+                send_message_once(
+                    conversation,
+                    MessageDelivery(prompt_delivery_id, prompt),
+                )
+            for delivery in message_deliveries:
+                send_message_once(conversation, delivery)
         finally:
             clear_github_credentials()
             configure_delegation(None)
@@ -1730,6 +1746,8 @@ def run_openhands(
                             if config.role == "student"
                             else None
                         ),
+                        delivery_state=delivery_state,
+                        conversation_id=config.conversation_id,
                     ),
                 ):
                     run_conversation(conversation, run_deadline - time.time())

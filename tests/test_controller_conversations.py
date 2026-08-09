@@ -35,9 +35,18 @@ class Turns:
         conversation_id,
         event_keys,
         visible_event_keys=frozenset(),
+        prompt_delivery_id=None,
+        message_deliveries=(),
     ):
         self.calls.append(
-            (prompt, conversation_id, event_keys, visible_event_keys)
+            (
+                prompt,
+                conversation_id,
+                event_keys,
+                visible_event_keys,
+                prompt_delivery_id,
+                tuple(message_deliveries),
+            )
         )
         return TurnResult(exit_code=next(self.exit_codes, 0))
 
@@ -157,10 +166,12 @@ def test_controller_partitions_and_acknowledges_events_by_conversation(
     run_student_controller(tmp_path, mailbox, turns)
 
     assert [call[1] for call in turns.calls] == [first, second]
-    assert "first only" in turns.calls[0][0]
-    assert "second only" not in turns.calls[0][0]
-    assert "second only" in turns.calls[1][0]
-    assert "first only" not in turns.calls[1][0]
+    first_messages = "\n".join(item.message for item in turns.calls[0][5])
+    second_messages = "\n".join(item.message for item in turns.calls[1][5])
+    assert "first only" in first_messages
+    assert "second only" not in first_messages
+    assert "second only" in second_messages
+    assert "first only" not in second_messages
     assert mailbox.acknowledged == [
         (first_event.dedupe_key,),
         (second_event.dedupe_key,),

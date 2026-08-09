@@ -14,6 +14,7 @@ from senpai_agent.controller import (
     TurnResult,
     _full_prompt,
 )
+from senpai_agent.delivery import PendingDeliveryLedger
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.state import ConversationStateLedger, WorkspaceDivergenceLedger
 from senpai_agent.supervisor import ProgressLease, WorkerLease
@@ -48,9 +49,18 @@ class Turns:
         conversation_id,
         event_keys,
         visible_event_keys=frozenset(),
+        prompt_delivery_id=None,
+        message_deliveries=(),
     ):
         self.calls.append(
-            (prompt, conversation_id, event_keys, visible_event_keys)
+            (
+                prompt,
+                conversation_id,
+                event_keys,
+                visible_event_keys,
+                prompt_delivery_id,
+                tuple(message_deliveries),
+            )
         )
         outcome = self.outcomes.pop(0) if self.outcomes else TurnResult(exit_code=0)
         if isinstance(outcome, Exception):
@@ -78,6 +88,10 @@ def review_event(number=17):
         dedupe_key=f"review_ready:{number}:abc",
         payload={"number": number},
     )
+
+
+def delivered_text(call) -> str:
+    return "\n\n".join(delivery.message for delivery in call[5])
 
 
 def research_base_event(current_sha="def"):
@@ -342,6 +356,64 @@ def test_failed_turn_retries_the_same_unacknowledged_event_with_full_brief(failu
     assert mailbox.acknowledged == [(event.dedupe_key,)]
 
 
+def test_failed_turn_reuses_delivery_attempt_and_adds_only_new_events(
+    tmp_path: Path,
+):
+    first = review_event(17)
+    second = review_event(18)
+    mailbox = Mailbox([(first,), (first, second), ()])
+    turns = Turns([TurnResult(exit_code=19), TurnResult(exit_code=0)])
+    ledger_path = tmp_path / "pending-deliveries.json"
+
+    controller(
+        mailbox,
+        turns,
+        delivery_state=PendingDeliveryLedger(ledger_path),
+    ).run(max_cycles=2)
+
+    first_attempt = turns.calls[0][5][0].delivery_id
+    assert turns.calls[1][5][0].delivery_id == first_attempt
+    assert turns.calls[1][5][1].delivery_id != first_attempt
+    assert turns.calls[0][4] == turns.calls[1][4]
+    assert first.to_prompt() not in turns.calls[0][0]
+    assert mailbox.acknowledged == [(first.dedupe_key, second.dedupe_key)]
+
+    next_attempt = PendingDeliveryLedger(ledger_path).claim(
+        CONVERSATION_ID,
+        (first.dedupe_key,),
+    )[first.dedupe_key]
+    assert next_attempt != first_attempt
+
+
+def test_mailbox_ack_failure_keeps_delivery_attempt_for_restart(tmp_path: Path):
+    event = review_event()
+    ledger_path = tmp_path / "pending-deliveries.json"
+    first_turns = Turns()
+
+    class FailingAckMailbox(Mailbox):
+        def acknowledge(self, dedupe_keys):
+            raise RuntimeError("mailbox acknowledgement failed")
+
+    with pytest.raises(RuntimeError, match="mailbox acknowledgement failed"):
+        controller(
+            FailingAckMailbox([(event,)]),
+            first_turns,
+            delivery_state=PendingDeliveryLedger(ledger_path),
+        ).run(max_cycles=1)
+
+    retried_turns = Turns()
+    controller(
+        Mailbox([(event,), ()]),
+        retried_turns,
+        delivery_state=PendingDeliveryLedger(ledger_path),
+    ).run(max_cycles=1)
+
+    assert (
+        retried_turns.calls[0][5][0].delivery_id
+        == first_turns.calls[0][5][0].delivery_id
+    )
+
+
 def test_level_trigger_is_quiet_while_visible_and_wakes_after_reappearing():
     event = review_event()
     mailbox = Mailbox([(event,), (event,), (), (event,), ()])
@@ -417,12 +489,16 @@ def test_older_visible_event_does_not_lose_its_reminder_to_another_turn(
             conversation_id,
             event_keys,
             visible_event_keys=frozenset(),
+            prompt_delivery_id=None,
+            message_deliveries=(),
         ):
             result = super().run(
                 prompt,
                 conversation_id=conversation_id,
                 event_keys=event_keys,
                 visible_event_keys=visible_event_keys,
+                prompt_delivery_id=prompt_delivery_id,
+                message_deliveries=message_deliveries,
             )
             if (
                 event_keys == frozenset({newer.dedupe_key})
@@ -726,7 +802,7 @@ def test_preserved_workspace_divergence_is_delivered_to_the_existing_turn():
     ).run(max_cycles=1)
 
     assert turns.calls[0][2] == frozenset({event.dedupe_key, conflict.event.dedupe_key})
-    assert "do not reset or discard local work" in turns.calls[0][0]
+    assert "do not reset or discard local work" in delivered_text(turns.calls[0])
 
 
 def student_assignment_event():
@@ -1094,7 +1170,7 @@ def test_workspace_lease_defers_only_checkout_events_in_a_mixed_batch():
 
     assert len(turns.calls) == 1
     assert turns.calls[0][2] == frozenset({monitor.dedupe_key})
-    assert "metric regressed" in turns.calls[0][0]
+    assert "metric regressed" in delivered_text(turns.calls[0])
     assert mailbox.acknowledged == [(monitor.dedupe_key,)]
 
 

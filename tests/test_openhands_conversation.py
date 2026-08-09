@@ -19,6 +19,7 @@ from openhands_support import (
 from pydantic import SecretStr
 
 import senpai_agent.openhands_runner as runner
+from senpai_agent.delivery import MessageDelivery
 from senpai_agent.openhands_runner import (
     graceful_interrupts,
     main,
@@ -187,6 +188,55 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     assert captured["llm_timeout"] == 900
     assert captured["llm_num_retries"] == 1
     assert captured["closed"] is True
+
+
+def test_run_does_not_reappend_failed_turn_messages_and_keeps_new_delivery(
+    tmp_path,
+    monkeypatch,
+):
+    history = []
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                active_branch=lambda: list(history),
+                execution_status=ConversationExecutionStatus.FINISHED,
+            )
+
+        def send_message(self, prompt, sender=None):
+            history.append(SimpleNamespace(prompt=prompt, sender=sender))
+
+        async def arun(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    isolate_agent_discovery(monkeypatch, runner)
+    config = runtime_config(tmp_path)
+    first = MessageDelivery("event-attempt-1", "first event")
+    second = MessageDelivery("event-attempt-2", "second event")
+
+    assert run_openhands(
+        "controller context",
+        config,
+        prompt_delivery_id="controller-attempt",
+        message_deliveries=(first,),
+    ) == 0
+    assert run_openhands(
+        "controller context changed only by retry time",
+        config,
+        prompt_delivery_id="controller-attempt",
+        message_deliveries=(first, second),
+    ) == 0
+
+    assert [event.prompt for event in history] == [
+        "controller context",
+        "first event",
+        "second event",
+    ]
 
 
 def test_disabled_tool_migration_preserves_history_and_job_factory_resume(tmp_path):

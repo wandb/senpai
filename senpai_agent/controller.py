@@ -13,6 +13,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
+from hashlib import sha256
 from pathlib import Path
 from string import Template
 from typing import Literal, Protocol
@@ -24,6 +25,7 @@ from senpai_agent.advisor import (
     compose_system_instructions,
 )
 from senpai_agent.agent_markdown import read_agent_markdown, strip_spdx_header
+from senpai_agent.delivery import MessageDelivery, PendingDeliveryLedger
 from senpai_agent.github.mailbox import ActiveGitHubWatcher, GitHubMailbox
 from senpai_agent.mailbox import (
     CompositeMailbox,
@@ -91,6 +93,8 @@ class TurnRunner(Protocol):
         conversation_id: UUID,
         event_keys: frozenset[str],
         visible_event_keys: frozenset[str] = frozenset(),
+        prompt_delivery_id: str | None = None,
+        message_deliveries: Sequence[MessageDelivery] = (),
     ) -> TurnResult: ...
 
 
@@ -130,6 +134,7 @@ class OpenHandsTurnRunner:
         full_prompt: str,
         github_mailbox: GitHubMailbox | None = None,
         active_poll_interval_seconds: float = 120,
+        delivery_state: PendingDeliveryLedger | None = None,
     ):
         self.config = config
         self.full_prompt = full_prompt.strip()
@@ -137,6 +142,7 @@ class OpenHandsTurnRunner:
             raise ValueError("full prompt must not be empty")
         self.github_mailbox = github_mailbox
         self.active_poll_interval_seconds = active_poll_interval_seconds
+        self.delivery_state = delivery_state
 
     def run(
         self,
@@ -145,6 +151,8 @@ class OpenHandsTurnRunner:
         conversation_id: UUID,
         event_keys: frozenset[str],
         visible_event_keys: frozenset[str] = frozenset(),
+        prompt_delivery_id: str | None = None,
+        message_deliveries: Sequence[MessageDelivery] = (),
     ) -> TurnResult:
         from senpai_agent.openhands_runner import local_event_db_path, run_openhands
 
@@ -154,9 +162,26 @@ class OpenHandsTurnRunner:
         )
         turn_deadline = time.monotonic() + config.timeout_seconds
 
+        def invoke_openhands(
+            turn_prompt: str,
+            turn_config: object,
+            *,
+            reset_context: bool = False,
+        ) -> int:
+            options: dict[str, object] = {}
+            if reset_context:
+                options["reset_context"] = True
+            if prompt_delivery_id is not None:
+                options["prompt_delivery_id"] = prompt_delivery_id
+            if message_deliveries:
+                options["message_deliveries"] = message_deliveries
+            if self.delivery_state is not None:
+                options["delivery_state"] = self.delivery_state
+            return run_openhands(turn_prompt, turn_config, **options)
+
         def run_turn() -> int:
             try:
-                return run_openhands(prompt, config)
+                return invoke_openhands(prompt, config)
             except Exception as error:
                 if not _is_context_history_failure(error):
                     raise
@@ -179,7 +204,7 @@ class OpenHandsTurnRunner:
                     timeout_seconds=remaining,
                 )
                 try:
-                    return run_openhands(
+                    return invoke_openhands(
                         _context_recovery_prompt(self.full_prompt, prompt),
                         recovery_config,
                         reset_context=True,
@@ -211,6 +236,7 @@ class OpenHandsTurnRunner:
         # controller prompt carries that same GitHub event. The prompt is the
         # delivery path for this turn, so keep the event pump from repeating it.
         with AdvisorEventStore(store_path) as store:
+            acknowledged_before = store.acknowledged_keys()
             for event_key in event_keys:
                 store.acknowledge(event_key)
         with ActiveGitHubWatcher(
@@ -219,10 +245,12 @@ class OpenHandsTurnRunner:
             known_keys=visible_event_keys | event_keys,
             poll_interval_seconds=self.active_poll_interval_seconds,
             map_event=map_event,
-        ) as watcher:
+        ):
             exit_code = run_turn()
         with AdvisorEventStore(store_path) as store:
-            delivered = store.acknowledged(tuple(watcher.enqueued_keys))
+            delivered = (
+                store.acknowledged_keys() - acknowledged_before - event_keys
+            )
         return TurnResult(
             exit_code=exit_code,
             delivered_event_keys=frozenset(delivered),
@@ -266,6 +294,7 @@ class Controller:
         full_prompt: str,
         system_context: str = "",
         conversation_state: ConversationStateLedger | None = None,
+        delivery_state: PendingDeliveryLedger | None = None,
         workspace_divergence_state: WorkspaceDivergenceLedger | None = None,
         conversation_for_events: (
             Callable[[Sequence[ControllerEvent]], Sequence[ConversationBatch]] | None
@@ -315,6 +344,7 @@ class Controller:
         self.full_prompt = full_prompt.strip()
         self.system_context = system_context.strip()
         self.conversation_state = conversation_state
+        self.delivery_state = delivery_state or PendingDeliveryLedger()
         self.workspace_divergence_state = workspace_divergence_state
         self.sleep = sleep
         self.poll_interval_seconds = poll_interval_seconds
@@ -435,6 +465,17 @@ class Controller:
                         batch_event_keys = frozenset(
                             event.dedupe_key for event in batch_events
                         )
+                        delivery_attempts = self.delivery_state.claim(
+                            conversation_id,
+                            batch_event_keys,
+                        )
+                        message_deliveries = tuple(
+                            MessageDelivery(
+                                delivery_attempts[event.dedupe_key],
+                                event.to_prompt(),
+                            )
+                            for event in batch_events
+                        )
                         result = self.turns.run(
                             prompt,
                             conversation_id=conversation_id,
@@ -442,6 +483,12 @@ class Controller:
                             visible_event_keys=(
                                 frozenset(self._visible) | batch_event_keys
                             ),
+                            prompt_delivery_id=self._prompt_delivery_id(
+                                continuing=continuing,
+                                refresh_system_context=refresh_system_context,
+                                delivery_attempts=delivery_attempts.values(),
+                            ),
+                            message_deliveries=message_deliveries,
                         )
                     except ConversationRecoveryExhausted as error:
                         retry_delay = max(self.poll_interval_seconds, 600)
@@ -484,7 +531,12 @@ class Controller:
                             *(event.dedupe_key for event in batch_events),
                             *sorted(result.delivered_event_keys),
                         )
-                        self.mailbox.acknowledge(tuple(dict.fromkeys(acknowledged)))
+                        acknowledged = tuple(dict.fromkeys(acknowledged))
+                        self.mailbox.acknowledge(acknowledged)
+                        self.delivery_state.complete(
+                            conversation_id,
+                            acknowledged,
+                        )
                         if workspace_divergence is not None:
                             self._record_workspace_divergence(
                                 conversation_id,
@@ -678,22 +730,21 @@ class Controller:
 
     def _prompt(
         self,
-        events: Sequence[ControllerEvent],
+        _events: Sequence[ControllerEvent],
         *,
         continuing: bool,
         refresh_system_context: bool = False,
     ) -> str:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        event_prompt = "\n\n".join(event.to_prompt() for event in events)
         if not continuing:
             return (
                 f"{self.full_prompt}\n\nCurrent time (UTC): {now}\n\n"
-                f"# Current GitHub state\n\n{event_prompt}"
+                "# Current GitHub state\n\n"
+                "Actionable events follow as separately tracked messages."
             )
         prompt = (
             f"Continue the {self.role} loop. Current time (UTC): {now}. "
-            "GitHub now contains the following actionable state:\n\n"
-            f"{event_prompt}"
+            "Actionable GitHub events follow as separately tracked messages."
         )
         if refresh_system_context:
             prompt += (
@@ -703,6 +754,21 @@ class Controller:
                 f"{self.system_context}"
             )
         return prompt
+
+    def _prompt_delivery_id(
+        self,
+        *,
+        continuing: bool,
+        refresh_system_context: bool,
+        delivery_attempts: Sequence[str],
+    ) -> str:
+        if not continuing:
+            identity = f"initial:{self.full_prompt}"
+        elif refresh_system_context:
+            identity = f"system-context:{self.system_context}"
+        else:
+            identity = "turn:" + "|".join(sorted(delivery_attempts))
+        return f"controller-prompt:{sha256(identity.encode()).hexdigest()}"
 
 
 def _full_prompt(role: Literal["advisor", "student"], env: Mapping[str, str]) -> str:
@@ -880,10 +946,14 @@ def controller_main(
     continuation_context = (
         f"{system_context.strip()}\n\n# Current research brief\n\n{full_prompt}"
     )
+    delivery_state = PendingDeliveryLedger(
+        runner_config.state_dir / "pending-message-deliveries.json"
+    )
     turns = OpenHandsTurnRunner(
         runner_config,
         full_prompt=full_prompt,
         github_mailbox=github_mailbox,
+        delivery_state=delivery_state,
         active_poll_interval_seconds=float(
             env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "120")
         ),
@@ -897,6 +967,7 @@ def controller_main(
         conversation_state=ConversationStateLedger(
             runner_config.state_dir / "conversation-state.json"
         ),
+        delivery_state=delivery_state,
         workspace_divergence_state=(
             WorkspaceDivergenceLedger(
                 runner_config.state_dir / "workspace-divergence.json"
