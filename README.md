@@ -15,12 +15,19 @@ Senpai is problem-agnostic. It runs against a separate target repository, and ev
 
 ## Quick start
 
-Kubernetes is currently the turnkey deployment path. The GitHub-based coordination protocol is infrastructure-independent, but Docker and direct-host operation still require manual bootstrap; see [Other deployment environments](#other-deployment-environments).
+Kubernetes, local Docker, AWS GPU, and AWS Mac use the same launcher, role
+configuration, training limits, GitHub workflow, and W&B record. This quick
+start shows Kubernetes; see [Docker](#docker), [AWS](#aws), or
+[AWS Mac](#aws-mac) for a host without a cluster.
 
 ### 1. Prerequisites
 
-- Python 3.13, [uv](https://docs.astral.sh/uv/), Git, and `kubectl`.
-- A Kubernetes context and existing namespace with outbound access to GitHub, Anthropic, Exa, and W&B. Your identity must be able to get, list, create, update, patch, and delete Deployments, ConfigMaps, and Secrets there.
+- Python 3.13, [uv](https://docs.astral.sh/uv/), and Git. Kubernetes launches
+  also need `kubectl`.
+- A Kubernetes context and existing namespace with outbound access to GitHub,
+  Exa, W&B, and each configured model provider. Your identity must be able to
+  get, list, create, update, patch, and delete Deployments, ConfigMaps, and
+  Secrets there.
 - An existing PVC with enough space for the dataset, plus concurrent mounts from every scheduled node—normally `ReadWriteMany`, unless your storage driver explicitly supports another multi-node topology. The launcher mounts this claim but does not create it; role state stays on each pod's node-local `emptyDir` volume.
 - NVIDIA GPU nodes, the Kubernetes NVIDIA device plugin, and a host driver compatible with CUDA 13 and the shipped student image.
 - A target GitHub repository that Senpai can clone and modify.
@@ -46,8 +53,9 @@ uv sync --locked --extra dev
 cp example.env .env
 ```
 
-Fill in the values in the gitignored `.env` file. Model-provider keys are
-required when any configured model uses that provider:
+Fill in the required values in the gitignored `.env` file. Model-provider keys
+are required when any configured model uses that provider; `HF_TOKEN` is
+optional:
 
 ```dotenv
 GITHUB_TOKEN=
@@ -55,6 +63,7 @@ ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
 EXA_API_KEY=
 WANDB_API_KEY=
+HF_TOKEN=
 ```
 
 | Credential | Required access |
@@ -64,14 +73,22 @@ WANDB_API_KEY=
 | `OPENAI_API_KEY` | Required when an `openai/...` model is configured. Every default profile uses GPT-5.6. |
 | `EXA_API_KEY` | General-web and research-publication search. |
 | `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. |
+| `HF_TOKEN` | Optional access to private or gated Hugging Face models and datasets. It is omitted from launch secrets when unset. |
 
-`k8s/launch.py` reads shell environment variables first and then the repository-root `.env`; only the GitHub token also falls back to `gh auth token`. Direct Docker or host execution must export or pass credentials explicitly.
+`k8s/launch.py` reads shell environment variables first and then the
+repository-root `.env`; only the GitHub token also falls back to `gh auth
+token`.
 
-The launcher places credentials in a per-launch Kubernetes Secret. During bootstrap, the GitHub write token is removed from the process environment and handed to the controller through a one-use channel; it is not exposed to the model or subagents.
+Kubernetes stores runtime credentials in a per-launch Secret. Docker stores
+them in private local run state; AWS sends them over SSH into the same private
+run state on EC2. Termination removes that state. During role bootstrap, the
+GitHub write token is removed from the process environment and handed to the
+controller through a one-use channel; it is not exposed to the model or
+subagents.
 
 ### 4. Prepare the target repository
 
-The target branch must contain:
+The target branch normally contains:
 
 ```text
 program.md
@@ -83,6 +100,11 @@ instructions/
 - `program.md` defines the research objective, baseline, metrics, benchmark rules, training limits, and allowed edit surface.
 - `prompt-advisor.md` adds target-specific experiment-selection and review guidance.
 - `prompt-student.md` adds target-specific implementation, training, and reporting guidance.
+
+Targets that keep their Senpai configuration in a subdirectory may use
+`senpai/program.md`. Role prompt overlays are optional in that layout; without
+them, both roles follow the repository instructions and their built-in Senpai
+role charter.
 
 Use the [bootstrap-target guide](plugins/senpai/skills/bootstrap-target/SKILL.md) to inspect a new target and create these files. Target `AGENTS.md`, compatible `CLAUDE.md`, and `.agents/skills/` are also loaded through OpenHands project context and progressive disclosure.
 
@@ -116,11 +138,14 @@ fast_model: openai/gpt-5.6-luna
 fast_reasoning_effort: high
 frontier_model: openai/gpt-5.6-sol
 frontier_reasoning_effort: max
+local_condenser_max_events: 0
+local_condenser_max_tokens: 0
+local_condenser_target_events: 0
 
 pvc_claim_name: your-existing-pvc
 pvc_mount_path: /mnt/data
 
-n_students: 1
+n_students: 4
 gpus_per_student: 1
 cpu_per_gpu: 8
 memory_gi_per_gpu: 64
@@ -134,47 +159,75 @@ supervisor_research_interval_s: 21600
 supervisor_action_cooldown_s: 1800
 ```
 
-OpenHands uses LiteLLM, so LLM provider names are required as prefixes. 
+W&B Inference uses LiteLLM's native `wandb/` provider. For example, set every
+model profile to `wandb/zai-org/GLM-5.2` with reasoning effort `max`. Senpai
+uses `WANDB_API_KEY`, routes requests through the W&B chat endpoint, explicitly
+enables GLM thinking, and sends
+`OpenAI-Project: <wandb_entity>/<wandb_project>` on every request.
+Providers without native compaction use Senpai's local summarizing condenser.
+Zero selects model-specific defaults for each of its three limits. Unknown
+local models retain the existing 80-event fallback with token and target limits
+disabled. W&B GLM-5.2 instead uses its exact `zai-org/GLM-5.2` chat-template
+tokenizer, condenses at 180,000 input tokens, targets about 40 retained events,
+and keeps 600 events as an emergency fuse. The 82,144-token margin below W&B's
+262,144-token context window leaves room for a large tool result and the next
+model response. OpenAI Responses and Anthropic keep their native compaction and
+ignore all three local limits.
 
-If using W&B Inference use `wandb/` provider as the provider. For example `wandb/zai-org/GLM-5.2`, senpai
-uses `WANDB_API_KEY` for auth.
+Every advisor root turn also receives a live controller invariant in its
+non-condensed system context: the campaign is active, no campaign round limit
+is configured, and round labels or compaction summaries cannot declare the
+research finished. `max_turns` is identified explicitly as a per-turn safety
+bound, not a research-completion counter.
+
+Set positive values to override any dimension with
+`local_condenser_max_events`, `local_condenser_max_tokens`, and
+`local_condenser_target_events`; the target must leave room for the preserved
+prefix and meaningful progress. The corresponding environment variables are
+`SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS`,
+`SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS`, and
+`SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS`. AWS Mac preparation downloads
+the GLM tokenizer once into `/Users/ec2-user/.senpai/huggingface`, verifies it
+offline, and shares that cache with the roles' private home directories.
 
 The defaults in `senpai.yaml` describe W&B's deployment and should not be copied unchanged into another environment. Every setting can also be overridden on the command line. `--tag` and `--target_repo_url` are required unless your chosen config file supplies them.
 
-Deployments require matching advisor and student image digests, or `sha-<40-character-commit>` tags built from the same Senpai revision. Digest-pinned images also require the full matching `repo_revision`. The source commit must be fetchable from `repo_url`; PR image checks build but do not publish images.
+Deployments require one immutable image per active role, all built from the same
+Senpai revision. Full `sha-<40-character-commit>` tags identify it directly;
+digest-pinned role images require an explicit shared `repo_revision`.
+Kubernetes and Docker fetch that commit from `repo_url`. AWS transfers the exact
+clean local commit instead. PR image checks build but do not publish images.
 
 ### 6. Run preflight
 
 ```bash
-uv run python k8s/launch.py \
-  --config_path senpai.local.yaml \
-  --tag first-run \
-  --target_repo_url https://github.com/OWNER/TARGET.git \
-  --preflight_only
+revision=$(git rev-parse HEAD)
+launch_args=(
+  --config_path senpai.local.yaml
+  --tag first-run
+  --target_repo_url https://github.com/OWNER/TARGET.git
+  --advisor
+  --names frieren
+  --advisor_image "ghcr.io/wandb/senpai-advisor:sha-$revision"
+  --student_image "ghcr.io/wandb/senpai-student:sha-$revision"
+)
+
+uv run python k8s/launch.py "${launch_args[@]}" --preflight_only
 ```
 
-Preflight authenticates GitHub, Exa, W&B, and every model provider referenced by
-the configured model profiles. It also verifies GitHub Contents write access,
-resolves the target branch, and rejects student labels already carrying active
-assignments. It deliberately skips image validation and makes no cluster
-changes. A real launch additionally verifies immutable image syntax and that
-both role images identify the same source revision.
+Every preflight authenticates GitHub, Exa, W&B, and every model provider used by
+an active role or shared model profile. It verifies GitHub Contents write
+access, resolves the target branch, rejects active student-label collisions,
+and checks immutable image references against one expected runner revision.
+Backend-specific checks are described below. Preflight never changes GitHub or
+starts advisor or student roles.
 
 ### 7. Launch
 
-For a Senpai commit whose images have been published:
+Inspect the preflight result, then launch with the same arguments:
 
 ```bash
-revision=$(git rev-parse HEAD)
-
-uv run python k8s/launch.py \
-  --config_path senpai.local.yaml \
-  --tag first-run \
-  --target_repo_url https://github.com/OWNER/TARGET.git \
-  --advisor \
-  --names frieren \
-  --advisor_image "ghcr.io/wandb/senpai-advisor:sha-$revision" \
-  --student_image "ghcr.io/wandb/senpai-student:sha-$revision"
+uv run python k8s/launch.py "${launch_args[@]}"
 ```
 
 The launcher creates routing labels, one launch Secret, role ConfigMaps and
@@ -195,6 +248,250 @@ kubectl delete deployments,configmaps,secrets,serviceaccounts,roles,rolebindings
 
 Use `--kube_context` and `--namespace` when the desired cluster is not your current default. Use `--dry_run` to render redacted manifests without checking credentials or writing to the cluster.
 
+## Docker
+
+Docker uses the same role specification and in-container `pvc_mount_path` as
+Kubernetes. It requires a Linux host with Docker Engine, Git, the NVIDIA
+Container Toolkit, a compatible NVIDIA driver, and enough GPUs for all
+students. Docker Desktop on macOS cannot run the GPU student image.
+
+```bash
+revision=$(git rev-parse HEAD)
+uv run python k8s/launch.py \
+  --config_path senpai.local.yaml \
+  --backend docker \
+  --tag first-docker-run \
+  --target_repo_url https://github.com/OWNER/TARGET.git \
+  --advisor \
+  --names fern \
+  --data_dir /srv/ml-data \
+  --advisor_image "ghcr.io/wandb/senpai-advisor:sha-$revision" \
+  --student_image "ghcr.io/wandb/senpai-student:sha-$revision"
+```
+
+This first run uses one student; omit `--names fern` to use the shared default
+of four. `data_dir` is mounted at `pvc_mount_path`, so target code and data paths
+do not change between Kubernetes and Docker. Preflight checks the local images,
+source revision, Docker, CUDA, GPU allocation, state directory, and
+container-name collisions before changing GitHub. Runtime state lives under
+`~/.senpai/runs/<tag>`.
+
+```bash
+uv run python k8s/docker.py status first-docker-run
+uv run python k8s/docker.py logs first-docker-run --role student-fern --follow
+uv run python k8s/docker.py terminate first-docker-run
+```
+
+## AWS
+
+AWS creates one temporary, public, on-demand EC2 GPU host and runs the Docker
+backend on it. All students share that host. The target repository, role
+settings, data path, and agent workflow remain identical to Kubernetes.
+
+### AWS setup
+
+Install AWS CLI v2 and OpenSSH. The selected AWS identity needs
+`sts:GetCallerIdentity`, `ssm:GetParameter`, EC2 `Describe*` access for instance
+types, images, networking, instances, security groups, volumes, and volume
+modifications, plus `CreateKeyPair`, `DeleteKeyPair`, `CreateSecurityGroup`,
+`AuthorizeSecurityGroupIngress`, `DeleteSecurityGroup`, `RunInstances`,
+`TerminateInstances`, `CreateTags`, and `ModifyVolume`. The region needs GPU
+quota and a public subnet with an internet-gateway route.
+
+For AWS SSO:
+
+```bash
+aws configure sso --profile senpai
+aws sso login --profile senpai
+aws sts get-caller-identity --profile senpai
+```
+
+If the session expires, run `aws sso login --profile senpai` again before a
+status, logs, or termination command. AWS credentials remain on the operator
+machine and are never copied to EC2. Runtime credentials still come from the
+gitignored `.env` described above; Senpai sends them over SSH into private
+remote Docker state. Local AWS state contains only lifecycle identifiers and
+the ephemeral SSH key.
+
+AWS currently needs anonymously pullable advisor and student images. Use
+matching `:sha-<40-character-commit>` tags, or digest-pinned images with an
+explicit matching `repo_revision`. Commit local changes before launching: AWS
+requires a clean checkout whose `HEAD` exactly matches that revision.
+
+### Preflight and launch
+
+This first run uses one student to control cost. Omit `--names fern` to use the
+shared default of four one-GPU students.
+
+```bash
+profile=senpai
+region=us-east-2
+tag=first-aws-run
+revision=$(git rev-parse HEAD)
+
+launch_args=(
+  --config_path senpai.local.yaml
+  --backend aws
+  --tag "$tag"
+  --target_repo_url https://github.com/OWNER/TARGET.git
+  --advisor
+  --names fern
+  --aws_profile "$profile"
+  --aws_region "$region"
+  --aws_ttl_hours 8
+  --data_dir /absolute/path/to/data-root
+  --advisor_image "ghcr.io/wandb/senpai-advisor:sha-$revision"
+  --student_image "ghcr.io/wandb/senpai-student:sha-$revision"
+)
+
+uv run python k8s/launch.py "${launch_args[@]}" --preflight_only
+```
+
+Verify the printed account, region, instance shape, AMI, subnet count, and
+volume before creating anything. Then launch with the same arguments:
+
+```bash
+uv run python k8s/launch.py "${launch_args[@]}"
+```
+
+AWS preflight is read-only. It checks the account, local source revision,
+credentials, AMI, actual GPU/vCPU/memory shape, SSH boundary, and eligible
+public subnets. Image pulls and CUDA validation require the temporary host, so
+EC2 billing has started, but they still happen before data upload or GitHub
+mutation.
+
+The contents of `data_dir` appear at `pvc_mount_path`. For code that reads
+`/mnt/data/datasets/...` with the configuration above, pass the directory whose
+child is `datasets/`. The directory must be non-empty and contain no symlinks.
+Senpai streams it over SSH and verifies its file count and bytes. The initial
+`aws_volume_gib` is a bootstrap floor for the AMI and image-pull peak; after
+image validation, Senpai measures free space and grows the root EBS volume for
+the actual dataset plus `aws_runtime_reserve_gib`.
+
+Usually only `aws_profile`, `aws_region`, `data_dir`, and `aws_ttl_hours` need
+attention. Leave the others empty unless your AWS environment has known
+resources:
+
+| Setting | When to set it |
+|---|---|
+| `aws_instance_type` | Pin an available x86_64 NVIDIA type. Senpai validates its real GPU, vCPU, and memory shape; otherwise it selects the first fitting type from its catalog. |
+| `aws_subnet_id` | Pin a known public subnet. Otherwise Senpai searches eligible subnets across AZs and retries recognized capacity failures. |
+| `aws_ami_id` | Pin the supported Ubuntu 22.04 NVIDIA Deep Learning Base AMI; otherwise Senpai resolves the current regional image. |
+| `aws_ssh_cidr` | Pin the operator's IPv4 `/32`; otherwise Senpai discovers the current public IP. |
+| `aws_volume_gib` | Increase the initial AMI/image-pull space when using unusually large images. |
+| `aws_runtime_reserve_gib` | Change the free space retained across all roles for worktrees, checkpoints, caches, and logs. |
+| `aws_ready_timeout_s`, `aws_data_timeout_s` | Increase host-start or dataset-upload deadlines on slower environments. |
+
+### Operate and clean up
+
+```bash
+uv run python k8s/aws.py status first-aws-run
+uv run python k8s/aws.py logs first-aws-run --role student-fern --tail 200
+uv run python k8s/aws.py logs first-aws-run --role advisor --tail 200
+uv run python k8s/aws.py terminate first-aws-run
+```
+
+Always run `terminate`. It attempts to gracefully stop the agents, terminates
+EC2, and removes the ephemeral key pair, security group, local SSH key, and
+lifecycle state. Launch failures attempt the same cleanup automatically.
+
+`aws_ttl_hours` is an emergency cost backstop measured from instance startup,
+not a replacement for cleanup. If it fires, run `terminate` afterward to remove
+the remaining key, security group, and local state. The current AWS backend
+intentionally owns one disposable public host; it does not yet support Spot,
+multiple nodes, existing-host reuse, private-subnet/SSM transport, private image
+registries, or IAM instance profiles.
+
+## AWS Mac
+
+AWS Mac reuses an already allocated fleet of `mac-m4pro.metal` Dedicated Hosts
+and runs Senpai natively under per-user `launchd` services. It assigns exactly
+one student to each host and co-locates the optional advisor on the first host.
+The backend creates and terminates EC2 instances, but never releases the
+Dedicated Hosts.
+
+Use a clean checkout at the exact committed revision being launched. The base
+macOS AMI does not contain full Xcode or the Metal toolchain. Provide either a
+local Xcode app or a prepared `ditto` zip, plus a zip containing exactly one
+Metal `*.exportedBundle`. Launch imports that local artifact instead of relying
+on Apple's component catalog. Each selected host also needs a public subnet in
+its own Availability Zone and an existing security group in the same VPC.
+
+Package the directory produced by Xcode's component export without changing
+its bundle layout:
+
+```bash
+ditto -c -k --sequesterRsrc --keepParent \
+  /path/to/MetalToolchain-17F109.exportedBundle \
+  /path/to/MetalToolchain.zip
+```
+
+```bash
+tag=first-aws-mac-run
+revision=$(git rev-parse HEAD)
+
+launch_args=(
+  --config_path senpai.local.yaml
+  --backend aws-mac
+  --tag "$tag"
+  --target_repo_url https://github.com/OWNER/TARGET.git
+  --advisor
+  --n_students 2
+  --gpus_per_student 1
+  --repo_revision "$revision"
+  --aws_region us-east-1
+  --aws_instance_type mac-m4pro.metal
+  --aws_mac_host_ids h-HOST1,h-HOST2
+  --aws_mac_subnet_ids us-east-1a=subnet-A,us-east-1b=subnet-B
+  --aws_mac_security_group_id sg-EXAMPLE
+  --aws_mac_xcode_archive /absolute/path/to/Xcode.zip
+  --aws_mac_metal_toolchain_archive /absolute/path/to/MetalToolchain.zip
+  --aws_mac_mlxfast_bundle "$HOME/.local/share/mlxfast/mlxfast.js"
+  --aws_mac_official_submit
+  --aws_ttl_hours 0
+)
+
+uv run python k8s/launch.py "${launch_args[@]}" --preflight_only
+uv run python k8s/launch.py "${launch_args[@]}"
+```
+
+Preflight is read-only: it validates the exact source revision, Apple Silicon
+AMI, host availability and capacity, subnet placement, security group, Xcode
+source, and Metal toolchain archive. Launch creates an ephemeral SSH key,
+temporarily permits the operator's IPv4 `/32`, validates one native canary,
+prepares the remaining Macs in parallel, and holds every role at a fleet-wide
+start gate before opening it.
+Host preparation installs tmux and Chromium and smoke-tests both with a fresh
+role-like `HOME`, matching the private-home environment used by native roles.
+Each native role also has a private, shortened tmux socket root under
+`~/.senpai/t`. This keeps macOS Unix-socket paths within the platform limit
+while giving co-located roles and their recursive subagents separate tmux
+namespaces. All native roles still run under the configured Unix user; this is
+namespace isolation, not a hostile-process security boundary.
+With `--aws_mac_official_submit`, the launcher also requires
+`MLXFAST_API_TOKEN` and gives every active role official dispatch capability.
+Coordinate submissions so students send distinct, validated candidates rather
+than duplicate jobs.
+
+AWS Mac alone accepts `--aws_ttl_hours 0` to omit the scheduled instance
+shutdown and make guest-initiated shutdowns stop rather than terminate the
+instance; a positive value retains the automatic termination backstop. Zero
+does not change explicit termination or release the Dedicated Hosts, so monitor
+the fleet and run `terminate` manually. The GPU AWS backend continues to
+require a positive TTL.
+
+```bash
+uv run python k8s/aws_mac.py status first-aws-mac-run
+uv run python k8s/aws_mac.py logs first-aws-mac-run --role advisor
+uv run python k8s/aws_mac.py logs first-aws-mac-run --role student-fern
+uv run python k8s/aws_mac.py terminate first-aws-mac-run
+```
+
+Termination unloads the native services, removes their private state,
+terminates only the instances recorded for the run, deletes the ephemeral key,
+and revokes the temporary SSH rule. It preserves all pre-existing Dedicated
+Hosts and networking resources.
+
 ## Experiment workflow
 
 GitHub is both the coordination layer and the durable scientific notebook. W&B is the metric and artifact record.
@@ -204,7 +501,7 @@ flowchart LR
     H["Advisor records hypothesis, baseline, and acceptance rule"]
     P["Typed draft PR<br/>student:name + status:wip"]
     I["Student implements and commits"]
-    T["Supervised training<br/>W&B metrics"]
+    T["Supervised jobs<br/>optional W&B metrics"]
     R["Structured result<br/>status:review"]
     D["Advisor merges, closes, requests a revision, or sends feedback"]
 
@@ -235,28 +532,54 @@ new feedback still do.
 
 `get_prs` returns complete PR bodies and discussions. Up to five PRs are returned in context by default; larger selections become a Markdown artifact outside the target checkout so long histories do not pollute the main conversation.
 
-## Long-running training and monitoring
+## Long-running jobs and monitoring
 
-Students do not start GPU work, stream logs, sleep, or poll through the terminal. Four typed tools make training a durable controller operation:
+Advisor and student root conversations receive four typed tools for durable,
+non-blocking process supervision. Students use them for GPU work; advisors can
+use them for repository-side watchers or other bounded long-running commands.
 
 | Tool | Contract |
 |---|---|
-| `run_training` | Accepts structured `argv`, `cwd`, and a hard timeout. It requires a clean assignment worktree, starts a supervised process group without blocking, persists its identity, full log, and bounded error tail, discovers W&B run IDs, and automatically registers terminal-state monitoring for the current conversation. |
-| `get_training_status` | Performs one bounded read of the latest persisted state, exit code, elapsed time, W&B run IDs, and error tail. |
-| `monitor_training` | Adds a W&B metric, minimize/maximize direction, `lte`, `gte`, `improved_by`, or `regressed_by` gates, a poll interval, and stale-update detection. It cannot disable terminal wakes. |
-| `cancel_training` | Stops the complete process group through the supervised TERM/KILL path, waits for a durable terminal state, and retires its monitor. |
+| `run_job` | Accepts structured `argv`, `cwd`, a hard timeout, a `read_only` or `mutable` workspace-access declaration, and an optional W&B credential grant. It starts a supervised process group without blocking, persists its identity, full log, and bounded error tail, discovers W&B run IDs, and automatically registers terminal-state monitoring for the current conversation. Suitable work includes training, inference, evaluation, builds, and receipt watchers. |
+| `get_job_status` | Performs one bounded read of the latest persisted state, exit code, elapsed time, W&B run IDs, and error tail. |
+| `monitor_job` | Sets or replaces optional W&B policy for an already-running job: metric, minimize/maximize direction, `lte`, `gte`, `improved_by`, or `regressed_by` gates, poll interval, and stale-update detection. It cannot disable terminal wakes. |
+| `cancel_job` | Stops the complete process group through the supervised TERM/KILL path, waits for a durable terminal state, and retires its monitor. |
 
-After launch, the student can finish its turn. The deterministic controller polls process state and at most one selected W&B metric without consuming model tokens. A threshold crossing, regression, stale metric, terminal state, or monitor error creates one compact durable event and resumes the same student conversation. One broken monitor cannot block other training, GitHub feedback, or child-agent results.
+After launch, the role can finish its turn. The deterministic controller polls
+process state and at most one selected W&B metric without consuming model
+tokens. A threshold crossing, regression, stale metric, terminal state, or
+monitor error creates one compact durable event and resumes the same
+conversation. Due monitors are processed in bounded batches with a time budget;
+a slow or broken monitor can delay its batch only within those bounds and cannot
+prevent later jobs, GitHub feedback, or child-agent results from being
+processed. Monitor policy and ownership have one durable SQLite source of truth.
+While any monitor is active, the controller sleeps only until its earliest due
+poll rather than the ordinary advisor/student heartbeat.
+
+`workspace_access="mutable"` is the default for builds, training, evaluation,
+or any command that can write in the checkout. A student must have a clean
+worktree before launching such a job, and controller-driven branch changes wait
+until it finishes. `read_only` is reserved for passive watchers and does not take
+that lease. A job receives no ambient credentials; request `WANDB_API_KEY` in
+`secret_env` only when it actually communicates with W&B.
 
 `improved_by` and `regressed_by` compare with the monitor policy's first observed sample; they do not silently reuse the assignment's documented baseline.
 
-Worker and container restarts preserve completed OpenHands events. Recovered live training is terminated safely rather than being adopted under an unverifiable process identity; the original student conversation receives the persisted terminal outcome.
+Worker and container restarts preserve completed OpenHands events. A recovered
+live job is terminated safely rather than adopted under an unverifiable process
+identity; its original conversation receives the persisted terminal outcome.
 
 Interactive browser operations are progressively disclosed. A fresh root
 conversation initially sees only `load_browser`; invoking it adds the fourteen
 OpenHands browser operations and records the choice in conversation state so a
 resumed conversation restores them. `--no-browser` exposes neither the loader
 nor the browser family.
+
+`task_tracker` is optional persisted working memory for multi-step work, parallel
+workstreams, delegated agents, and long-running jobs; several items may be
+`in_progress` when the work is genuinely concurrent. The legacy `think`
+scratchpad tool is not exposed to any Senpai root or child—the selected models'
+native reasoning remains enabled.
 
 ## Subagents
 
@@ -298,16 +621,13 @@ up to eight direct tasks that are active or have an uncollected terminal result.
 `cancel_agents` records terminal cancellation. Atomic records keyed by the
 required batch key and each optional task key (or stable list index) make replay
 return the original task IDs instead of spawning duplicates.
-The deprecated `delegate_agent` name remains visible on root advisor and
-student agents only so persisted conversations can resume; it never launches
-work and directs callers to `spawn_agents` and `await_agents`.
 `include_context=false` sends only the system prompt and task; the child can
 still search the supplied parent-history directory. `include_context=true`
 also copies the model-visible parent history. The root advisor or student may
 leave useful tasks running and receives their terminal results as durable
 events; nested children may not detach descendants.
 
-Children share the parent workspace, so their process and conversation are isolated but their filesystem is not. They receive only their declared tools and never receive GitHub credentials, GitHub workflow tools, or training tools.
+Children share the parent workspace, so their process and conversation are isolated but their filesystem is not. They receive only their declared tools and never receive GitHub credentials, GitHub workflow tools, or job tools.
 
 ## Task guides
 
@@ -468,13 +788,10 @@ install Chromium and execute an OpenHands browser smoke test.
 
 For multi-day fleets, [`arm_senpai_cluster_cutoff.sh`](scripts/arm_senpai_cluster_cutoff.sh) creates a cluster-side hard cutoff that does not depend on an operator laptop remaining online. It can also hold a shared start gate until the expected fleet is ready or its readiness deadline expires.
 
-Pod startup and liveness probes read the supervisor lease. Container restarts resume the advisor or student conversation from the pod-local state volume; replacing or rescheduling the pod starts fresh state. Stop a container before copying or snapshotting a live advisor state directory.
-
-### Other deployment environments
-
-GitHub coordination works across Docker, cloud VMs, or local hosts without private networking. The current repository does not yet provide a Compose or direct-host launcher: the Kubernetes manifests perform the source clone, environment assembly, skill installation, token handoff, mounts, and entrypoint selection.
-
-To build another launcher, reproduce [entrypoint-advisor.sh](k8s/entrypoint-advisor.sh) or [entrypoint-student.sh](k8s/entrypoint-student.sh), persist `/var/lib/senpai/<tag>/advisor` for the advisor, and use the container healthcheck with a restart policy. Student execution requires Linux, an NVIDIA runtime, and compatible CUDA hardware; Docker Desktop on macOS cannot run the GPU student image.
+On Kubernetes, pod startup and liveness probes read the supervisor lease.
+Restarting a Deployment resumes the durable advisor or student conversation
+when its state directory survives. For any backend, stop a live role before
+copying or snapshotting its advisor state directory.
 
 ## Development and reference
 

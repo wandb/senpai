@@ -123,8 +123,8 @@ def test_assignment_feedback_and_monitor_wake_share_the_assignment_uuid(
             },
         ),
         ControllerEvent(
-            kind="training_monitor",
-            dedupe_key="training_monitor:run-1:finished",
+            kind="job_monitor",
+            dedupe_key="job_monitor:run-1:finished",
             payload={"conversation_id": str(conversation_id)},
         ),
     )

@@ -3,10 +3,11 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -48,6 +49,7 @@ class TrainingSpec(BaseModel):
     argv: tuple[str, ...] = Field(min_length=1)
     cwd: Path
     timeout_seconds: int = Field(gt=0)
+    workspace_access: Literal["read_only", "mutable"] = "mutable"
 
 
 class TrainingResult(BaseModel):
@@ -63,6 +65,7 @@ class TrainingResult(BaseModel):
     log_path: str
     wandb_run_ids: tuple[str, ...] = ()
     error_tail: str = ""
+    workspace_access: Literal["read_only", "mutable"] = "mutable"
 
 
 class TrainingInventoryEntry(BaseModel):
@@ -210,6 +213,8 @@ class _ActiveTraining:
     started: float
     timeout_seconds: int
     log_path: Path
+    redacted_values: tuple[bytes, ...] = ()
+    workspace_access: Literal["read_only", "mutable"] = "mutable"
     cancelled: bool = False
     thread: threading.Thread | None = None
 
@@ -294,7 +299,13 @@ class TrainingSupervisor:
             if persisted != entry.result:
                 self._write_result_file(entry.result)
 
-    def run_training(self, spec: TrainingSpec) -> TrainingResult:
+    def run_training(
+        self,
+        spec: TrainingSpec,
+        *,
+        env: Mapping[str, str] | None = None,
+        redacted_values: Sequence[str] = (),
+    ) -> TrainingResult:
         if isinstance(spec.argv, str) or not spec.argv:
             raise ValueError("argv must be a non-empty sequence, not a shell string")
         if (
@@ -313,47 +324,108 @@ class TrainingSupervisor:
         training_id = str(uuid.uuid4())
         log_path = self.state_dir / f"{training_id}.log"
         started = time.monotonic()
-        with log_path.open("wb") as log:
-            process = subprocess.Popen(
-                list(spec.argv),
-                cwd=cwd,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                shell=False,
-                start_new_session=True,
-            )
-        process_start_time = psutil.Process(process.pid).create_time()
-        process_group_id = process.pid
-
-        result = TrainingResult(
-            training_id=training_id,
-            state=TrainingState.RUNNING,
-            pid=process.pid,
-            process_group_id=process_group_id,
-            process_start_time=process_start_time,
-            exit_code=None,
-            elapsed_seconds=0,
-            log_path=str(log_path),
-        )
-        self._write_result(result)
-        active = _ActiveTraining(
-            process=process,
-            process_group_id=process_group_id,
-            process_start_time=process_start_time,
-            started=started,
-            timeout_seconds=spec.timeout_seconds,
-            log_path=log_path,
-        )
-        thread = threading.Thread(
-            target=self._monitor,
-            args=(training_id,),
-            name=f"senpai-training-{training_id}",
-        )
-        active.thread = thread
+        process: subprocess.Popen[bytes] | None = None
+        result_written = False
+        active_registered = False
         with self._lock:
-            self._active[training_id] = active
-            thread.start()
+            if spec.workspace_access == "mutable":
+                active_mutable = self._active_mutable_job_ids_locked()
+                if active_mutable:
+                    raise RuntimeError(
+                        "a mutable workspace job is already running: "
+                        + ", ".join(active_mutable)
+                    )
+            try:
+                log_descriptor = os.open(
+                    log_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                with os.fdopen(log_descriptor, "wb") as log:
+                    process = subprocess.Popen(
+                        list(spec.argv),
+                        cwd=cwd,
+                        env=dict(env) if env is not None else None,
+                        stdin=subprocess.DEVNULL,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        shell=False,
+                        start_new_session=True,
+                    )
+                process_start_time = psutil.Process(process.pid).create_time()
+                process_group_id = process.pid
+                result = TrainingResult(
+                    training_id=training_id,
+                    state=TrainingState.RUNNING,
+                    pid=process.pid,
+                    process_group_id=process_group_id,
+                    process_start_time=process_start_time,
+                    exit_code=None,
+                    elapsed_seconds=0,
+                    log_path=str(log_path),
+                    workspace_access=spec.workspace_access,
+                )
+                self._write_result(result)
+                result_written = True
+                active = _ActiveTraining(
+                    process=process,
+                    process_group_id=process_group_id,
+                    process_start_time=process_start_time,
+                    started=started,
+                    timeout_seconds=spec.timeout_seconds,
+                    log_path=log_path,
+                    redacted_values=tuple(
+                        value.encode() for value in redacted_values if value
+                    ),
+                    workspace_access=spec.workspace_access,
+                )
+                thread = threading.Thread(
+                    target=self._monitor,
+                    args=(training_id,),
+                    name=f"senpai-training-{training_id}",
+                )
+                active.thread = thread
+                self._active[training_id] = active
+                active_registered = True
+                thread.start()
+            except BaseException as error:
+                if active_registered:
+                    self._active.pop(training_id, None)
+                if process is not None and process.poll() is None:
+                    self._terminate_process_group(
+                        process,
+                        process.pid,
+                        grace_seconds=self.terminate_grace_seconds,
+                    )
+                if result_written:
+                    self._write_result(
+                        result.model_copy(
+                            update={
+                                "state": TrainingState.CANCELLED,
+                                "exit_code": process.returncode if process else None,
+                                "elapsed_seconds": time.monotonic() - started,
+                                "error_tail": (
+                                    "Job launch rolled back after "
+                                    f"{type(error).__name__}."
+                                ),
+                            }
+                        )
+                    )
+                raise
         return result
+
+    def active_mutable_job_ids(self) -> tuple[str, ...]:
+        """Return durable workspace leases held by mutable running jobs."""
+
+        with self._lock:
+            return self._active_mutable_job_ids_locked()
+
+    def _active_mutable_job_ids_locked(self) -> tuple[str, ...]:
+        return tuple(
+            training_id
+            for training_id, active in self._active.items()
+            if active.workspace_access == "mutable"
+        )
 
     def get_training_status(self, training_id: str) -> TrainingResult:
         path = self.state_dir / f"{uuid.UUID(training_id)}.json"
@@ -387,10 +459,74 @@ class TrainingSupervisor:
     def _monitor(self, training_id: str) -> None:
         with self._lock:
             active = self._active[training_id]
+        try:
+            self._monitor_process(training_id, active)
+        except BaseException as error:  # noqa: BLE001
+            try:
+                if active.process.poll() is None:
+                    self._terminate_process_group(
+                        active.process,
+                        active.process_group_id,
+                    )
+            except BaseException as terminate_error:  # noqa: BLE001
+                try:
+                    signal_process_group(active.process_group_id, signal.SIGKILL)
+                except BaseException as kill_error:  # noqa: BLE001
+                    print(
+                        "SENPAI_JOB_CLEANUP_ERROR "
+                        f"job_id={training_id} "
+                        f"terminate_error={type(terminate_error).__name__} "
+                        f"kill_error={type(kill_error).__name__}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            try:
+                self._write_result(
+                    TrainingResult(
+                        training_id=training_id,
+                        state=TrainingState.FAILED,
+                        pid=active.process.pid,
+                        process_group_id=active.process_group_id,
+                        process_start_time=active.process_start_time,
+                        exit_code=active.process.poll(),
+                        elapsed_seconds=time.monotonic() - active.started,
+                        log_path=str(active.log_path),
+                        error_tail=(
+                            "Job supervisor failed internally "
+                            f"({type(error).__name__})."
+                        ),
+                        workspace_access=active.workspace_access,
+                    )
+                )
+            except BaseException as persistence_error:  # noqa: BLE001
+                print(
+                    "SENPAI_JOB_STATE_WRITE_ERROR "
+                    f"job_id={training_id} "
+                    f"error={type(persistence_error).__name__}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        finally:
+            with self._lock:
+                self._active.pop(training_id, None)
+
+    def _monitor_process(
+        self,
+        training_id: str,
+        active: _ActiveTraining,
+    ) -> None:
         run_ids: dict[str, None] = {}
         published_run_ids: tuple[str, ...] = ()
         error_tail = b""
         scan_overlap = b""
+        tail_bytes = (
+            _ERROR_TAIL_BYTES
+            + max(
+                (len(value) for value in active.redacted_values),
+                default=1,
+            )
+            - 1
+        )
         deadline = active.started + active.timeout_seconds
         terminate_at = max(
             active.started,
@@ -410,6 +546,7 @@ class TrainingSupervisor:
                     error_tail,
                     scan_overlap,
                     run_ids,
+                    tail_bytes=tail_bytes,
                 )
                 discovered_run_ids = tuple(run_ids)
                 if discovered_run_ids != published_run_ids:
@@ -424,6 +561,7 @@ class TrainingSupervisor:
                             elapsed_seconds=time.monotonic() - active.started,
                             log_path=str(active.log_path),
                             wandb_run_ids=discovered_run_ids,
+                            workspace_access=active.workspace_access,
                         )
                     )
                     published_run_ids = discovered_run_ids
@@ -468,6 +606,7 @@ class TrainingSupervisor:
                 error_tail,
                 scan_overlap,
                 run_ids,
+                tail_bytes=tail_bytes,
             )
             while log.peek(1):
                 error_tail, scan_overlap = self._consume_log(
@@ -475,6 +614,7 @@ class TrainingSupervisor:
                     error_tail,
                     scan_overlap,
                     run_ids,
+                    tail_bytes=tail_bytes,
                 )
             for match in _WANDB_RUN_URL_BYTES.findall(scan_overlap):
                 run_ids.setdefault(match.decode(), None)
@@ -490,14 +630,15 @@ class TrainingSupervisor:
             log_path=str(active.log_path),
             wandb_run_ids=tuple(run_ids),
             error_tail=(
-                error_tail.decode(errors="ignore")
+                _redact_bytes(error_tail, active.redacted_values)[
+                    -_ERROR_TAIL_BYTES:
+                ].decode(errors="ignore")
                 if state is not TrainingState.FINISHED
                 else ""
             ),
+            workspace_access=active.workspace_access,
         )
         self._write_result(result)
-        with self._lock:
-            self._active.pop(training_id, None)
 
     @staticmethod
     def _consume_log(
@@ -505,6 +646,8 @@ class TrainingSupervisor:
         error_tail: bytes,
         scan_overlap: bytes,
         run_ids: dict[str, None],
+        *,
+        tail_bytes: int = _ERROR_TAIL_BYTES,
     ) -> tuple[bytes, bytes]:
         chunk = log.read(_LOG_READ_BYTES)
         if not chunk:
@@ -513,7 +656,7 @@ class TrainingSupervisor:
         for match in _WANDB_COMPLETE_RUN_URL_BYTES.findall(scan):
             run_ids.setdefault(match.decode(), None)
         scan_overlap = scan[-_WANDB_SCAN_OVERLAP_BYTES:]
-        error_tail = (error_tail + chunk)[-_ERROR_TAIL_BYTES:]
+        error_tail = (error_tail + chunk)[-tail_bytes:]
         return error_tail, scan_overlap
 
     def _terminate_process_group(
@@ -527,9 +670,7 @@ class TrainingSupervisor:
             process,
             process_group_id=process_group_id,
             grace_seconds=(
-                self.terminate_grace_seconds
-                if grace_seconds is None
-                else grace_seconds
+                self.terminate_grace_seconds if grace_seconds is None else grace_seconds
             ),
             wait_full_grace=True,
         )
@@ -613,3 +754,9 @@ def training_process_is_live(result: TrainingResult) -> bool:
         )
     except (ProcessLookupError, psutil.NoSuchProcess):
         return False
+
+def _redact_bytes(content: bytes, values: Sequence[bytes]) -> bytes:
+    for value in values:
+        if value:
+            content = content.replace(value, b"<secret-hidden>")
+    return content

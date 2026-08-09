@@ -5,21 +5,125 @@ from io import StringIO
 from types import SimpleNamespace
 
 import pytest
-from openhands.sdk.conversation import ConversationExecutionStatus
+from openhands.sdk import LLM, Agent, Tool
+from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
+from openhands.sdk.event import SystemPromptEvent
 from openhands.sdk.llm import Message, TextContent
-
-import senpai_agent.openhands_runner as runner
-from senpai_agent.openhands_runner import (
-    graceful_interrupts,
-    main,
-    reject_recovered_actions,
-    run_openhands,
-)
+from openhands.sdk.tool import FinishTool
+from openhands.sdk.workspace import LocalWorkspace
 from openhands_support import (
     PLUGIN_DIR,
     isolate_agent_discovery,
     runtime_config,
 )
+from pydantic import SecretStr
+
+import senpai_agent.openhands_runner as runner
+from senpai_agent.openhands_runner import (
+    graceful_interrupts,
+    main,
+    migrate_persisted_disabled_tools,
+    migrate_persisted_retired_tool_definitions,
+    reject_recovered_actions,
+    run_openhands,
+    without_legacy_think,
+)
+
+_RETIRED_TOOL_TYPES = (
+    (
+        "DelegateAgentTool",
+        "delegate_agent",
+        "DelegateAgentAction",
+        "DelegateAgentObservation",
+    ),
+    (
+        "RunTrainingTool",
+        "run_training",
+        "RunTrainingAction",
+        "TrainingResultObservation",
+    ),
+    (
+        "GetTrainingStatusTool",
+        "get_training_status",
+        "GetTrainingStatusAction",
+        "TrainingResultObservation",
+    ),
+    (
+        "CancelTrainingTool",
+        "cancel_training",
+        "CancelTrainingAction",
+        "TrainingResultObservation",
+    ),
+    (
+        "MonitorTrainingTool",
+        "monitor_training",
+        "MonitorTrainingAction",
+        "MonitorTrainingObservation",
+    ),
+)
+
+
+def _persisted_conversation_with_retired_tool_snapshots(tmp_path):
+    conversation_id = runner.uuid.uuid4()
+    persistence_root = tmp_path / "state"
+    persistence_dir = persistence_root / conversation_id.hex
+    workspace = LocalWorkspace(working_dir=tmp_path / "workspace")
+    llm = LLM(model="openai/gpt-4o-mini", api_key=SecretStr("test-key"))
+    persisted_agent = Agent(llm=llm, tools=[Tool(name="delegate_agent")])
+    agent = without_legacy_think(Agent(llm=llm, tools=[]))
+    state = ConversationState.create(
+        id=conversation_id,
+        agent=persisted_agent,
+        workspace=workspace,
+        persistence_dir=str(persistence_dir),
+    )
+    system_event = state.append_event(
+        SystemPromptEvent(
+            system_prompt=TextContent(text="preserve the historical system prompt"),
+            tools=[FinishTool.create()[0]],
+        )
+    )
+    message_event = state.append_event(
+        runner.MessageEvent(
+            source="user",
+            llm_message=Message(
+                role="user",
+                content=[TextContent(text="preserve this historical message")],
+            ),
+        )
+    )
+    system_path = next(
+        path
+        for path in (persistence_dir / "events").glob("*.json")
+        if json.loads(path.read_text(encoding="utf-8"))["kind"] == "SystemPromptEvent"
+    )
+    payload = json.loads(system_path.read_text(encoding="utf-8"))
+    payload["tools"] = [
+        {
+            "description": f"Historical {title} description.",
+            "action_type": action,
+            "observation_type": observation,
+            "annotations": None,
+            "kind": kind,
+            "title": title,
+        }
+        for kind, title, action, observation in _RETIRED_TOOL_TYPES
+    ] + payload["tools"]
+    system_path.write_text(json.dumps(payload), encoding="utf-8")
+    message_path = next(
+        path
+        for path in (persistence_dir / "events").glob("*.json")
+        if path != system_path
+    )
+    return SimpleNamespace(
+        conversation_id=conversation_id,
+        persistence_root=persistence_root,
+        workspace=workspace,
+        agent=agent,
+        event_ids=[system_event.id, message_event.id],
+        system_path=system_path,
+        message_path=message_path,
+    )
 
 
 def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
@@ -64,6 +168,8 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     assert captured["role"] == (
         "# Senpai harness\n\nharness instructions\n\n"
         "# Senpai role\n\nadvisor role\n"
+        "\n# Live controller invariant\n\n"
+        f"{runner.live_controller_invariant(config)}\n"
     )
     assert captured["plugin"] == str(PLUGIN_DIR)
     assert captured["secrets"] == {"WANDB_API_KEY": "wandb-key"}
@@ -72,6 +178,167 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     assert captured["llm_timeout"] == 900
     assert captured["llm_num_retries"] == 1
     assert captured["closed"] is True
+
+
+def test_disabled_tool_migration_preserves_history_and_job_factory_resume(tmp_path):
+    conversation_id = runner.uuid.uuid4()
+    persistence_root = tmp_path / "state"
+    persistence_dir = persistence_root / conversation_id.hex
+    workspace = LocalWorkspace(working_dir=tmp_path / "workspace")
+    llm = LLM(model="openai/gpt-4o-mini", api_key=SecretStr("test-key"))
+    job_tool = Tool(
+        name="senpai_training",
+        params={"state_dir": str(tmp_path / "jobs")},
+    )
+    old_agent = Agent(
+        llm=llm,
+        tools=[job_tool, Tool(name="delegate_agent"), Tool(name="think")],
+    )
+    state = ConversationState.create(
+        id=conversation_id,
+        agent=old_agent,
+        workspace=workspace,
+        persistence_dir=str(persistence_dir),
+    )
+    message = state.append_event(
+        runner.MessageEvent(
+            source="user",
+            llm_message=Message(
+                role="user",
+                content=[TextContent(text="preserve this research history")],
+            ),
+        )
+    )
+    event_files = tuple(
+        (p, p.read_bytes()) for p in (persistence_dir / "events").iterdir()
+    )
+    before = json.loads((persistence_dir / "base_state.json").read_text())
+
+    assert migrate_persisted_disabled_tools(persistence_root, conversation_id) == {
+        "delegate_agent",
+        "think",
+    }
+    assert not migrate_persisted_disabled_tools(persistence_root, conversation_id)
+
+    persisted = json.loads((persistence_dir / "base_state.json").read_text())
+    assert [tool["name"] for tool in persisted["agent"]["tools"]] == ["senpai_training"]
+    assert persisted["agent"]["tools"][0] == job_tool.model_dump(mode="json")
+    assert "ThinkTool" not in persisted["agent"]["include_default_tools"]
+    assert {key: value for key, value in persisted.items() if key != "agent"} == {
+        key: value for key, value in before.items() if key != "agent"
+    }
+    assert {
+        key: value
+        for key, value in persisted["agent"].items()
+        if key not in {"tools", "include_default_tools"}
+    } == {
+        key: value
+        for key, value in before["agent"].items()
+        if key not in {"tools", "include_default_tools"}
+    }
+    assert all(path.read_bytes() == content for path, content in event_files)
+
+    current_agent = without_legacy_think(Agent(llm=llm, tools=[job_tool]))
+    conversation = runner.LocalConversation(
+        agent=current_agent,
+        workspace=workspace,
+        persistence_dir=persistence_root,
+        conversation_id=conversation_id,
+        visualizer=None,
+    )
+    try:
+        assert [event.id for event in conversation.state.events] == [message.id]
+        assert [tool.name for tool in conversation.state.agent.tools] == [
+            "senpai_training"
+        ]
+        assert conversation.state.agent.include_default_tools == ["FinishTool"]
+    finally:
+        conversation.close()
+
+
+def test_retired_tool_snapshots_are_removed_before_history_deserialization(tmp_path):
+    persisted = _persisted_conversation_with_retired_tool_snapshots(tmp_path)
+    original_system = json.loads(persisted.system_path.read_text(encoding="utf-8"))
+    original_message = persisted.message_path.read_bytes()
+
+    assert migrate_persisted_retired_tool_definitions(
+        persisted.persistence_root, persisted.conversation_id
+    ) == len(_RETIRED_TOOL_TYPES)
+    assert migrate_persisted_disabled_tools(
+        persisted.persistence_root, persisted.conversation_id
+    ) == {"delegate_agent", "think"}
+    assert (
+        migrate_persisted_retired_tool_definitions(
+            persisted.persistence_root, persisted.conversation_id
+        )
+        == 0
+    )
+
+    migrated_system = json.loads(persisted.system_path.read_text(encoding="utf-8"))
+    expected_system = original_system
+    expected_system["tools"] = [
+        tool
+        for tool in expected_system["tools"]
+        if tool["kind"] not in {item[0] for item in _RETIRED_TOOL_TYPES}
+    ]
+    assert migrated_system == expected_system
+    assert persisted.message_path.read_bytes() == original_message
+
+    conversation = runner.LocalConversation(
+        agent=persisted.agent,
+        workspace=persisted.workspace,
+        persistence_dir=persisted.persistence_root,
+        conversation_id=persisted.conversation_id,
+        visualizer=None,
+    )
+    try:
+        assert [event.id for event in conversation.state.events] == persisted.event_ids
+        assert conversation.state.events[0].system_prompt.text == (
+            "preserve the historical system prompt"
+        )
+        assert conversation.state.events[1].llm_message.content[0].text == (
+            "preserve this historical message"
+        )
+    finally:
+        conversation.close()
+
+
+def test_retired_tool_snapshot_migration_is_narrow_and_atomic(tmp_path, monkeypatch):
+    persisted = _persisted_conversation_with_retired_tool_snapshots(tmp_path)
+    payload = json.loads(persisted.system_path.read_text(encoding="utf-8"))
+    payload["tools"] = [
+        {
+            **payload["tools"][0],
+            "kind": "UnknownRetiredTool",
+            "meta": {"historical": "must remain visible"},
+        },
+        payload["tools"][1],
+    ]
+    persisted.system_path.write_text(json.dumps(payload), encoding="utf-8")
+    original = persisted.system_path.read_bytes()
+
+    def fail_replace(_source, _destination):
+        raise OSError("simulated atomic replacement failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runner.os, "replace", fail_replace)
+        with pytest.raises(OSError, match="simulated atomic replacement failure"):
+            migrate_persisted_retired_tool_definitions(
+                persisted.persistence_root, persisted.conversation_id
+            )
+    assert persisted.system_path.read_bytes() == original
+    assert not tuple(
+        persisted.system_path.parent.glob(f".{persisted.system_path.name}.*.tmp")
+    )
+
+    assert (
+        migrate_persisted_retired_tool_definitions(
+            persisted.persistence_root, persisted.conversation_id
+        )
+        == 1
+    )
+    migrated = json.loads(persisted.system_path.read_text(encoding="utf-8"))
+    assert migrated["tools"] == [payload["tools"][0]]
 
 
 def test_context_reset_preserves_history_and_starts_a_fresh_active_branch(
@@ -267,9 +534,7 @@ def test_student_requests_persistent_storage_for_monitor_wake(
         def __init__(self, **kwargs):
             self.id = kwargs["conversation_id"]
             captured["delete_on_close"] = kwargs["delete_on_close"]
-            captured["tool_concurrency_limit"] = kwargs[
-                "agent"
-            ].tool_concurrency_limit
+            captured["tool_concurrency_limit"] = kwargs["agent"].tool_concurrency_limit
             self.state = SimpleNamespace(
                 execution_status=ConversationExecutionStatus.FINISHED
             )
@@ -335,6 +600,60 @@ def test_operational_supervisor_discards_each_fresh_local_conversation(
         "secrets": {},
         "closed": True,
     }
+
+
+def test_named_agent_compaction_uses_its_own_provider(tmp_path, monkeypatch):
+    captured = {}
+    named_llm = LLM(
+        model="wandb/zai-org/GLM-5.2",
+        api_key=SecretStr("test-key"),
+        reasoning_effort="max",
+        **runner.model_runtime_configuration(
+            "wandb/zai-org/GLM-5.2",
+            "max",
+            wandb_entity="research-team",
+            wandb_project="mlxfast",
+        ),
+    )
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            captured["condenser"] = kwargs["agent"].condenser
+            self.state = SimpleNamespace(
+                execution_status=ConversationExecutionStatus.FINISHED
+            )
+
+        def send_message(self, _prompt):
+            pass
+
+        async def arun(self):
+            pass
+
+        def close(self):
+            pass
+
+    isolate_agent_discovery(monkeypatch, runner)
+    monkeypatch.setattr(runner, "find_named_agent", lambda *_: object())
+    monkeypatch.setattr(
+        runner,
+        "agent_definition_to_factory",
+        lambda *_args, **_kwargs: (
+            lambda _parent_llm: Agent(
+                llm=named_llm,
+                tools=[],
+            )
+        ),
+    )
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+
+    config = runtime_config(
+        tmp_path,
+        agent_name="explore",
+        local_condenser_max_events=180,
+    )
+    assert run_openhands("named task", config) == 0
+    assert captured["condenser"].max_size == 180
 
 
 def test_github_tokens_never_reach_the_agent_environment(
@@ -425,7 +744,9 @@ def test_conversation_and_credentials_are_cleaned_up_after_failures(
 
     monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
     isolate_agent_discovery(monkeypatch, runner)
-    monkeypatch.setattr(runner, "clear_github_credentials", lambda: cleared.append(True))
+    monkeypatch.setattr(
+        runner, "clear_github_credentials", lambda: cleared.append(True)
+    )
     monkeypatch.setattr(runner, "configure_delegation", delegation.append)
 
     with pytest.raises(RuntimeError, match="failed"):
@@ -466,10 +787,10 @@ def test_turn_deadline_requests_conversation_interrupt(tmp_path, monkeypatch):
     isolate_agent_discovery(monkeypatch, runner)
 
     assert (
-            run_openhands(
-                "task",
-                runtime_config(tmp_path, timeout_seconds=0.2),
-            )
+        run_openhands(
+            "task",
+            runtime_config(tmp_path, timeout_seconds=0.2),
+        )
         == 1
     )
     assert interrupted.is_set()
@@ -489,10 +810,9 @@ def test_signal_interrupts_the_conversation_and_restores_handlers(monkeypatch):
     conversation = SimpleNamespace(interrupt=lambda: calls.append("interrupt"))
     monkeypatch.setattr(runner.signal, "signal", fake_signal)
 
-    with pytest.raises(SystemExit) as raised:
-        with graceful_interrupts(conversation):
-            installed[signal.SIGTERM](signal.SIGTERM, None)
-            calls.append("handler-returned")
+    with pytest.raises(SystemExit) as raised, graceful_interrupts(conversation):
+        installed[signal.SIGTERM](signal.SIGTERM, None)
+        calls.append("handler-returned")
 
     assert raised.value.code == 128 + signal.SIGTERM
     assert "interrupt" in calls

@@ -85,5 +85,13 @@ def test_monitor_mailbox_routes_and_acknowledges_each_signal_independently(
             first.dedupe_key: str(first_id),
             second.dedupe_key: str(second_id),
         }
+        assert {event.kind for event in events} == {"job_monitor"}
+        assert {event.payload["job_id"] for event in events} == {
+            "training-first",
+            "training-second",
+        }
+        assert {event.payload["signal"]["kind"] for event in events} == {"job_status"}
+        assert all("training_id" not in event.payload["signal"] for event in events)
+        assert all("metric" not in event.payload["signal"] for event in events)
         mailbox.acknowledge((first.dedupe_key,))
         assert [event.dedupe_key for event in mailbox.poll()] == [second.dedupe_key]

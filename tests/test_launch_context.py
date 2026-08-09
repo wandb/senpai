@@ -3,14 +3,12 @@ import base64
 import pytest
 import yaml
 
-from launch_test_support import launch, launch_args, render_role
+from launch_test_support import launch_args, render_role
+from senpai.launch.specs import build_extra_instructions
 
 
 def test_default_fleet_is_four_students_with_one_gpu_each():
-    args = launch.Args(
-        tag="defaults",
-        target_repo_url="https://github.com/example/problem.git",
-    )
+    args = launch_args()
 
     assert args.n_students == 4
     assert args.gpus_per_student == 1
@@ -27,12 +25,8 @@ def test_launch_context_records_resolved_runtime_facts(backend):
         max_epochs=7,
     )
 
-    context = launch.build_extra_instructions(
-        args,
-        args.tag,
-        ["fern", "frieren"],
-        backend=backend,
-    )
+    args.backend = backend
+    context = build_extra_instructions(args, args.tag, ["fern", "frieren"])
 
     assert "resolved by the Senpai launcher" in context
     assert "override conflicting compute or run-limit claims" in context
@@ -71,4 +65,19 @@ def test_each_role_receives_authoritative_launch_context(role):
     assert context.endswith(
         "# Additional operator instructions\n\n"
         "Prefer small, measurable experiments."
+    )
+
+
+def test_long_multiline_operator_instructions_are_literal_text():
+    instructions = (
+        "program.md can be found in senpai/program.md\n\n"
+        "Campaign authority:\n"
+        + "- Every role may submit a distinct validated candidate.\n" * 20
+    )
+    args = launch_args(extra_instructions=instructions)
+
+    context = build_extra_instructions(args, args.tag, ["fern"])
+
+    assert context.endswith(
+        "# Additional operator instructions\n\n" + instructions.rstrip()
     )

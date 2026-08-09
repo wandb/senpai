@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from senpai_agent.hooks import terminal_policy
+from senpai_agent.hooks import supervised_job_policy, terminal_policy
 
 WORKSPACE = Path("/workspace")
 
@@ -108,7 +108,7 @@ def test_policy_denies_recognized_training_launches(command: str):
         "python train.py --help",
         "timeout 120 python train.py --help 2>&1 | grep epochs",
         "tail -n 50 training.log",
-        "for id in run-a run-b; do grep -n \"$id\" results.log; done",
+        'for id in run-a run-b; do grep -n "$id" results.log; done',
     ],
 )
 def test_policy_allows_bounded_training_inspection(command: str):
@@ -139,6 +139,50 @@ def test_help_flags_do_not_hide_training_arguments(command: str):
 )
 def test_policy_denies_foreground_polling(command: str):
     assert is_allowed(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python evaluate.py &",
+        "nohup python evaluate.py >/tmp/eval.log 2>&1 &",
+        "if true; then ./benchmark.sh & fi",
+    ],
+)
+def test_policy_denies_unsupervised_background_processes(command: str):
+    assert is_allowed(command) is False
+
+
+def test_background_syntax_in_literals_and_arithmetic_remains_allowed():
+    assert is_allowed("printf '%s' '&'") is True
+    assert is_allowed("echo $((flags & 1))") is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("git", "push", "origin", "experiment"),
+        ("gh", "pr", "merge", "17"),
+        ("bash", "-lc", "curl -XPOST https://api.github.com/repos/acme/x"),
+        ("sh", "-c", "eval 'git push origin experiment'"),
+    ],
+)
+def test_supervised_job_policy_retains_git_and_github_guards(argv):
+    assert supervised_job_policy(argv, "student", WORKSPACE).allowed is False
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("python", "train.py", "--epochs", "10"),
+        ("bash", "-lc", "python train.py >out 2>&1"),
+        ("python", "-c", 'print("git push origin experiment")'),
+        ("python", "script.py", ""),
+        ("sleep", "300"),
+    ],
+)
+def test_supervised_job_policy_allows_bounded_long_processes(argv):
+    assert supervised_job_policy(argv, "student", WORKSPACE).allowed is True
 
 
 def test_quoted_file_heredoc_treats_restricted_words_as_literal_data():
@@ -182,7 +226,7 @@ def test_commands_around_literal_heredocs_remain_subject_to_policy(command: str)
 def test_eval_cannot_hide_a_push_inside_a_nested_heredoc():
     command = (
         'eval "$(cat "$(echo x >/tmp/y; echo -)" <<\'EOF\'\n'
-        "git push origin experiment\nEOF\n)\""
+        'git push origin experiment\nEOF\n)"'
     )
 
     assert is_allowed(command) is False

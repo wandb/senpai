@@ -8,17 +8,21 @@ set -e
 set -o pipefail
 umask "${SENPAI_UMASK:-0022}"
 LOGDIR="/var/lib/senpai/$RESEARCH_TAG/advisor"
+LOGDIR="${SENPAI_LOGDIR:-$LOGDIR}"
 rm -f "$LOGDIR/openhands_state/controller-lease.json"
 date +%s > "${SENPAI_BOOTSTRAP_STARTED_PATH:-/var/lib/senpai/.bootstrap-started}"
 
 WORKDIR="/workspace/senpai"
+WORKDIR="${SENPAI_WORKDIR:-$WORKDIR}"
 GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 TARGET_REPO_BRANCH="${TARGET_REPO_BRANCH:-}"
 export SENPAI_ROLE="advisor"
+export ADVISOR_NAME="${ADVISOR_NAME:-advisor}"
 export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
 SOURCE_SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 export SENPAI_PLUGIN="$SOURCE_SENPAI_PLUGIN"
 GIT_ASKPASS_FILE="/tmp/senpai-git-askpass"
+GIT_ASKPASS_FILE="${SENPAI_GIT_ASKPASS_FILE:-$GIT_ASKPASS_FILE}"
 mkdir -p "$LOGDIR"
 if [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
     export GITHUB_TOKEN="$(<"$SENPAI_GITHUB_TOKEN_FILE")"
@@ -35,6 +39,7 @@ echo "Runner repo:  $REPO_URL (revision: $REPO_REVISION)"
 echo "Target repo:  $TARGET_REPO_URL (base branch: ${TARGET_REPO_BRANCH:-<default>}; advisor branch: $ADVISOR_BRANCH)"
 echo "Problem dir:  $PROBLEM_DIR"
 echo "Tag:          $RESEARCH_TAG"
+echo "Advisor:      $ADVISOR_NAME"
 echo "Students:     $STUDENT_NAMES"
 echo "GitHub history: $GH_HISTORY_SCOPE"
 
@@ -92,10 +97,12 @@ if [ ! -d "$PROBLEM_DIR/.git" ] && ! clone_target_repo; then
 fi
 git config --global --unset-all credential.helper 2>/dev/null || true
 
-uv pip install --python "$SENPAI_PYTHON" --no-deps -e .
+if [ "${SENPAI_SKIP_EDITABLE_INSTALL:-0}" != "1" ]; then
+    uv pip install --python "$SENPAI_PYTHON" --no-deps -e .
+fi
 
 source "$SOURCE_SENPAI_PLUGIN/scripts/agent-context.sh"
-AGENT_CONTEXT_ROOT="$(mktemp -d /tmp/senpai-agent-context.XXXXXX)"
+AGENT_CONTEXT_ROOT="$(mktemp -d "${SENPAI_TMPDIR:-${TMPDIR:-/tmp}}/senpai-agent-context.XXXXXX")"
 export SENPAI_PLUGIN="$(
     install_senpai_agent_context \
         "$WORKDIR" "$SOURCE_SENPAI_PLUGIN" "$AGENT_CONTEXT_ROOT"
@@ -103,8 +110,8 @@ export SENPAI_PLUGIN="$(
 
 # --- Git identity (inside the problem-package repo) ---
 cd "$WORKDIR/$PROBLEM_DIR"
-git config user.name "senpai-advisor"
-git config user.email "senpai-advisor@senpai"
+git config user.name "senpai-$ADVISOR_NAME"
+git config user.email "senpai-$ADVISOR_NAME@senpai"
 gh repo set-default "$GH_REPO"
 install_senpai_target_git_guard "$TARGET_WORKDIR"
 
