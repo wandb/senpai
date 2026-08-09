@@ -105,6 +105,27 @@ def test_stable_sender_verifies_payload_after_crash_between_append_and_receipt(
         deliver_turn_messages(tampered, PersistentInbox(inbox.path), turn.turn_id)
 
 
+def test_event_identity_cannot_hide_a_changed_payload(tmp_path: Path):
+    """
+    Requirement: one event identity always denotes one canonical payload.
+    Interface: repeated enqueue calls against the persistent inbox.
+    """
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+
+    with pytest.raises(RuntimeError, match="reused with a different payload"):
+        inbox.enqueue(CONVERSATION_ID, "event:1", "changed event")
+
+    turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
+    assert turn is not None
+    deliver_turn_messages(Conversation(), inbox, turn.turn_id)
+    inbox.record_processed(turn.turn_id)
+    inbox.acknowledge(turn.turn_id)
+
+    with pytest.raises(RuntimeError, match="reused with a different payload"):
+        inbox.enqueue(CONVERSATION_ID, "event:1", "changed after acknowledgement")
+
+
 def test_crash_before_append_reuses_turn_and_appends_each_message_once(tmp_path: Path):
     """
     Requirement: a crash before append retries the same durable delivery normally.
@@ -339,6 +360,42 @@ def test_legacy_pr3472_delivery_is_adopted_without_replay(
     assert reminder is not None
     assert reminder.events[0].delivery_id != legacy_event_id
     assert json.loads(legacy_path.read_text(encoding="utf-8")) == legacy_value
+
+
+def test_reset_preserves_legacy_provenance_for_a_later_compact_reminder(
+    tmp_path: Path,
+):
+    event_key = "idle_student:Fern"
+    compact_body = "compact event"
+    legacy_id = str(UUID(int=119))
+    legacy_path = tmp_path / "pending-message-deliveries.json"
+    legacy_path.write_text(
+        json.dumps({str(CONVERSATION_ID): {event_key: legacy_id}}),
+        encoding="utf-8",
+    )
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3", legacy_path=legacy_path)
+    inbox.enqueue(CONVERSATION_ID, event_key, compact_body)
+    original = inbox.next_turn(CONVERSATION_ID, "new prompt")
+    assert original is not None
+    branch = [
+        SimpleNamespace(
+            message="old prompt",
+            sender=delivery_sender(original.legacy_prompt_delivery_id),
+        ),
+        SimpleNamespace(
+            message="verbose legacy event",
+            sender=delivery_sender(legacy_id),
+        ),
+    ]
+    deliver_turn_messages(Conversation(branch), inbox, original.turn_id)
+
+    recovery = inbox.reset_turn(original.turn_id, "recovery prompt")
+    inbox.record_context_reset(recovery.turn_id)
+    deliver_turn_messages(Conversation(), inbox, recovery.turn_id)
+    inbox.record_processed(recovery.turn_id)
+    inbox.acknowledge(recovery.turn_id)
+
+    assert inbox.enqueue(CONVERSATION_ID, event_key, compact_body) is True
 
 
 def test_adopted_legacy_prompt_is_stable_when_migration_reenters(tmp_path: Path):

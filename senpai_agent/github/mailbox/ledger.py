@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from .values import FEEDBACK_KEY_PREFIX, FeedbackBinding
@@ -33,11 +34,7 @@ def acknowledge_feedback(
         binding = ledger[key]
         if binding.acknowledged:
             continue
-        ledger[key] = FeedbackBinding(
-            assignment_id=binding.assignment_id,
-            revision_id=binding.revision_id,
-            acknowledged=True,
-        )
+        ledger[key] = replace(binding, acknowledged=True)
         changed = True
     if changed:
         write_feedback_ledger(mailbox, ledger)
@@ -64,6 +61,18 @@ def read_feedback_ledger(
             or not isinstance(item.get("assignment_id"), str)
             or not isinstance(item.get("revision_id"), str)
             or not isinstance(item.get("acknowledged"), bool)
+            or (
+                item.get("source_key") is not None
+                and not isinstance(item.get("source_key"), str)
+            )
+            or (
+                item.get("content_digest") is not None
+                and not isinstance(item.get("content_digest"), str)
+            )
+            or (
+                item.get("payload") is not None
+                and not isinstance(item.get("payload"), dict)
+            )
         ):
             raise RuntimeError(
                 f"invalid student PR feedback ledger: {mailbox.feedback_path}"
@@ -72,6 +81,9 @@ def read_feedback_ledger(
             assignment_id=item["assignment_id"],
             revision_id=item["revision_id"],
             acknowledged=item["acknowledged"],
+            source_key=item.get("source_key"),
+            content_digest=item.get("content_digest"),
+            payload=item.get("payload"),
         )
     return ledger
 
@@ -94,6 +106,15 @@ def write_feedback_ledger(
                     "assignment_id": binding.assignment_id,
                     "revision_id": binding.revision_id,
                     "acknowledged": binding.acknowledged,
+                    **(
+                        {
+                            "source_key": binding.source_key,
+                            "content_digest": binding.content_digest,
+                            "payload": binding.payload,
+                        }
+                        if binding.source_key is not None
+                        else {}
+                    ),
                 }
                 for key, binding in sorted(ledger.items())
             },

@@ -13,6 +13,8 @@ from .values import (
     github_datetime,
     label_names,
     object_value,
+    payload_digest,
+    versioned_event,
 )
 
 if TYPE_CHECKING:
@@ -67,22 +69,26 @@ def human_issue_events(
             ),
         )
         number = int(issue["number"])
+        full_message = str(latest["body"])
+        payload = {
+            "number": number,
+            "title": str(issue["title"]),
+            "url": str(issue["html_url"]),
+            "human_message_id": int(latest["id"]),
+            "author": str(latest["author"]),
+            "message": bounded_text(
+                full_message,
+                limit=12_000,
+            ),
+            "created_at": str(latest["created_at"]),
+        }
         events.append(
-            ControllerEvent(
-                kind="human_issue",
-                dedupe_key=f"human_issue:{number}:{latest['id']}",
-                payload={
-                    "number": number,
-                    "title": str(issue["title"]),
-                    "url": str(issue["html_url"]),
-                    "human_message_id": int(latest["id"]),
-                    "author": str(latest["author"]),
-                    "message": bounded_text(
-                        str(latest["body"]),
-                        limit=12_000,
-                    ),
-                    "created_at": str(latest["created_at"]),
-                },
+            versioned_event(
+                "human_issue",
+                number,
+                latest["id"],
+                payload_digest({"message": full_message}),
+                payload=payload,
             )
         )
     return events

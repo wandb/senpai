@@ -138,6 +138,9 @@ class PersistentInbox:
             CREATE INDEX IF NOT EXISTS inbox_pending_by_conversation
             ON inbox_messages(conversation_id, state, turn_id, sequence);
 
+            CREATE INDEX IF NOT EXISTS inbox_event_identity
+            ON inbox_messages(conversation_id, event_key);
+
             CREATE INDEX IF NOT EXISTS inbox_turns_by_conversation
             ON inbox_turns(conversation_id, acknowledged, superseded_by, created_at);
 
@@ -201,9 +204,25 @@ class PersistentInbox:
             raise ValueError("event body must not be empty")
         conversation = str(conversation_id)
         with self._transaction() as database:
+            payload_conflict = database.execute(
+                """
+                SELECT 1
+                FROM inbox_messages
+                WHERE conversation_id = ?
+                  AND event_key = ?
+                  AND legacy = 0
+                  AND body != ?
+                LIMIT 1
+                """,
+                (conversation, event_key, body),
+            ).fetchone()
+            if payload_conflict is not None:
+                raise RuntimeError(
+                    f"event {event_key!r} was reused with a different payload"
+                )
             existing = database.execute(
                 """
-                SELECT message.sequence, message.body, message.requires_ack
+                SELECT message.sequence, message.requires_ack
                 FROM inbox_messages AS message
                 LEFT JOIN inbox_turns AS turn ON turn.turn_id = message.turn_id
                 WHERE message.conversation_id = ?
@@ -221,10 +240,6 @@ class PersistentInbox:
                 (conversation, event_key),
             ).fetchone()
             if existing is not None:
-                if existing["body"] != body:
-                    raise RuntimeError(
-                        f"event {event_key!r} was reused with a different payload"
-                    )
                 if requires_ack and not existing["requires_ack"]:
                     database.execute(
                         "UPDATE inbox_messages SET requires_ack = 1 WHERE sequence = ?",
@@ -741,9 +756,10 @@ class PersistentInbox:
                         sender,
                         state,
                         requires_ack,
+                        legacy,
                         turn_id,
                         position
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
                     """,
                     (
                         original.conversation_id,
@@ -753,6 +769,7 @@ class PersistentInbox:
                         delivery_id,
                         _sender(delivery_id),
                         int(message.requires_ack),
+                        int(self._is_legacy_message(database, message.delivery_id)),
                         recovery_id,
                         position,
                     ),

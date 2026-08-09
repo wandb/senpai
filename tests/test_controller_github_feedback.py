@@ -6,6 +6,8 @@ from pydantic import SecretStr
 
 from senpai_agent.controller import Controller, TurnResult
 from senpai_agent.github.mailbox import GitHubMailbox
+from senpai_agent.inbox import PersistentInbox
+from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.models import (
     AssignmentFeedbackRecord,
     AssignmentRecord,
@@ -26,6 +28,7 @@ def feedback(
     association="OWNER",
     user_type="User",
     created_at="2026-07-29T18:01:00Z",
+    updated_at=None,
     **extra,
 ):
     return {
@@ -33,6 +36,7 @@ def feedback(
         "html_url": f"https://github.test/comment/{feedback_id}",
         "body": body,
         "created_at": created_at,
+        "updated_at": updated_at or created_at,
         "author_association": association,
         "user": {"login": author, "type": user_type},
         **extra,
@@ -176,7 +180,80 @@ def test_student_assignment_carries_the_marker_revision_identity(monkeypatch):
     assert event.payload["base_sha"] == "b" * 40
     assert event.payload["head_ref"] == "student/candidate"
     assert event.payload["head_sha"] == "a" * 40
-    assert event.dedupe_key.endswith(f":{'b' * 40}:{'a' * 40}")
+    assert event.dedupe_key.startswith("student_assignment:v2:17:")
+    assert len(event.dedupe_key.rsplit(":", 1)[1]) == 64
+
+
+def test_repolling_one_assignment_after_mutable_pr_metadata_changes_is_idempotent(
+    monkeypatch,
+    tmp_path,
+):
+    mailbox = student_mailbox(monkeypatch, feedback_responses())
+    first = mailbox.poll()[0]
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+
+    assert inbox.enqueue(UUID(int=17), first.dedupe_key, first.to_prompt()) is True
+
+    pull = mailbox._pulls()[0]
+    pull["title"] = "Clarify the bounded change"
+    pull["updated_at"] = "2026-07-29T18:05:00Z"
+    pull["labels"].append({"name": "operator-note"})
+    repeated = mailbox.poll()[0]
+
+    assert repeated.dedupe_key == first.dedupe_key
+    assert repeated.to_prompt() == first.to_prompt()
+    assert (
+        inbox.enqueue(UUID(int=17), repeated.dedupe_key, repeated.to_prompt())
+        is False
+    )
+
+
+@pytest.mark.parametrize("blocker", ("blocked", "hold", "needs-rebase"))
+def test_actionable_assignment_blockers_create_a_new_event_version(
+    monkeypatch,
+    blocker,
+):
+    mailbox = student_mailbox(monkeypatch, feedback_responses())
+    first = mailbox.poll()[0]
+
+    mailbox._pulls()[0]["labels"].append({"name": f"status:{blocker}"})
+    changed = mailbox.poll()[0]
+
+    assert changed.dedupe_key != first.dedupe_key
+    assert changed.payload["blockers"] == [blocker]
+
+
+def test_v2_assignment_queues_behind_an_unresolved_v1_delivery(
+    monkeypatch,
+    tmp_path,
+):
+    mailbox = student_mailbox(monkeypatch, feedback_responses())
+    current = mailbox.poll()[0]
+    key_parts = current.dedupe_key.split(":")
+    legacy_key = "student_assignment:" + ":".join(key_parts[3:-1])
+    legacy_payload = {
+        **{key: value for key, value in current.payload.items() if key != "blockers"},
+        "title": "Try bounded change",
+        "labels": ["research", "status:wip", "student:student-1"],
+        "updated_at": "2026-07-29T18:00:00Z",
+    }
+    legacy = ControllerEvent(
+        kind="student_assignment",
+        dedupe_key=legacy_key,
+        payload=legacy_payload,
+    )
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(UUID(int=17), legacy.dedupe_key, legacy.to_prompt())
+    active = inbox.next_turn(UUID(int=17), "legacy prompt")
+    assert active is not None
+
+    assert inbox.enqueue(UUID(int=17), current.dedupe_key, current.to_prompt()) is True
+    resumed = inbox.next_turn(UUID(int=17), "new prompt")
+
+    assert resumed is not None
+    assert resumed.turn_id == active.turn_id
+    assert resumed.events[0].event_key == legacy.dedupe_key
+    assert inbox.pending_count(UUID(int=17)) == 1
 
 
 @pytest.mark.parametrize(
@@ -271,10 +348,10 @@ def test_trusted_feedback_from_each_github_surface_is_ordered_and_routable(
         if event.kind == "student_pr_feedback"
     ]
 
-    assert [event.dedupe_key for event in events] == [
-        "student_pr_feedback:issue_comment:17:101",
-        "student_pr_feedback:review:17:201",
-        "student_pr_feedback:inline_comment:17:301",
+    assert [":".join(event.dedupe_key.split(":")[:5]) for event in events] == [
+        "student_pr_feedback:v2:issue_comment:17:101",
+        "student_pr_feedback:v2:review:17:201",
+        "student_pr_feedback:v2:inline_comment:17:301",
     ]
     assert {
         (event.payload["assignment_id"], event.payload["revision_id"])
@@ -290,6 +367,66 @@ def test_trusted_feedback_from_each_github_surface_is_ordered_and_routable(
     assert events[1].payload["state"] == "CHANGES_REQUESTED"
     assert events[2].payload["path"] == "train.py"
     assert events[2].payload["line"] == 42
+
+
+def test_editing_unacknowledged_feedback_creates_a_new_event_version(monkeypatch):
+    comment = feedback(101, "Try the narrow change.")
+    mailbox = student_mailbox(
+        monkeypatch,
+        feedback_responses(issue_comments=[comment]),
+    )
+    first = next(
+        event for event in mailbox.poll() if event.kind == "student_pr_feedback"
+    )
+
+    comment["body"] = "Try the narrow change with a paired baseline."
+    comment["updated_at"] = "2026-07-29T18:02:00Z"
+    edited = next(
+        event for event in mailbox.poll() if event.kind == "student_pr_feedback"
+    )
+
+    assert edited.dedupe_key != first.dedupe_key
+    assert edited.payload["feedback_id"] == first.payload["feedback_id"]
+
+    comment["body"] = "Try the narrow change."
+    comment["updated_at"] = "2026-07-29T18:03:00Z"
+    reverted = next(
+        event for event in mailbox.poll() if event.kind == "student_pr_feedback"
+    )
+    assert reverted.dedupe_key != first.dedupe_key
+    assert reverted.dedupe_key != edited.dedupe_key
+    assert reverted.to_prompt() == first.to_prompt()
+
+
+def test_reverting_feedback_after_an_acknowledged_version_emits_a_correction(
+    monkeypatch,
+    tmp_path,
+):
+    comment = feedback(101, "Use direction A.")
+    mailbox = student_mailbox(
+        monkeypatch,
+        feedback_responses(issue_comments=[comment]),
+        feedback_path=tmp_path / "feedback.json",
+    )
+    first = next(
+        event for event in mailbox.poll() if event.kind == "student_pr_feedback"
+    )
+    run_student_controller(tmp_path, mailbox, Turns())
+
+    comment["body"] = "Use direction B."
+    comment["updated_at"] = "2026-07-29T18:02:00Z"
+    edited = next(
+        event for event in mailbox.poll() if event.kind == "student_pr_feedback"
+    )
+
+    comment["body"] = "Use direction A."
+    comment["updated_at"] = "2026-07-29T18:03:00Z"
+    reverted = next(
+        event for event in mailbox.poll() if event.kind == "student_pr_feedback"
+    )
+
+    assert reverted.dedupe_key not in {first.dedupe_key, edited.dedupe_key}
+    assert reverted.payload["message"] == "Use direction A."
 
 
 def test_review_ready_pull_routes_feedback_to_its_assignment_conversation(monkeypatch):
@@ -448,6 +585,9 @@ def test_feedback_stays_pending_and_bound_until_a_student_turn_succeeds(
         responses,
         feedback_path=ledger,
     )
+    original = next(
+        event for event in failed.poll() if event.kind == "student_pr_feedback"
+    )
     run_student_controller(tmp_path, failed, Turns((1,)))
 
     revised = student_mailbox(
@@ -456,9 +596,12 @@ def test_feedback_stays_pending_and_bound_until_a_student_turn_succeeds(
         revision_id="revision-3",
         feedback_path=ledger,
     )
+    revised._pulls()[0]["head"]["sha"] = "c" * 40
     pending = revised.poll()
     assert [event.kind for event in pending] == ["student_pr_feedback"]
     assert pending[0].payload["revision_id"] == "revision-2"
+    assert pending[0].dedupe_key == original.dedupe_key
+    assert pending[0].to_prompt() == original.to_prompt()
 
     turns = Turns()
     run_student_controller(tmp_path, revised, turns)
@@ -501,7 +644,7 @@ def test_controller_drains_feedback_batches_oldest_first_after_success(
 
     feedback_batches = [
         sorted(
-            int(key.rsplit(":", 1)[1])
+            int(key.split(":")[4])
             for key in event_keys
             if key.startswith("student_pr_feedback:")
         )

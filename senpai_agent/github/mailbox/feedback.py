@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from senpai_agent.mailbox import ControllerEvent
@@ -11,15 +12,24 @@ from senpai_agent.models import AssignmentRecord
 from .ledger import read_feedback_ledger, write_feedback_ledger
 from .values import (
     FEEDBACK_EXCERPT_BYTES,
+    FEEDBACK_KEY_PREFIX,
     FeedbackBinding,
     feedback_excerpt,
     github_datetime,
     object_value,
+    payload_digest,
     trusted_feedback,
 )
 
 if TYPE_CHECKING:
     from .core import GitHubMailbox
+
+
+@dataclass(frozen=True, slots=True)
+class _FeedbackCandidate:
+    source_key: str
+    content_digest: str
+    payload: dict[str, object]
 
 
 def student_pr_feedback_events(
@@ -49,7 +59,7 @@ def student_pr_feedback_events(
         for item in feedback_by_surface.get("review", ())
         if item.get("submitted_at") is not None
     }
-    events: list[ControllerEvent] = []
+    candidates: list[_FeedbackCandidate] = []
     for surface, _url in sources:
         for item in feedback_by_surface[surface]:
             if surface == "review" and item.get("submitted_at") is None:
@@ -112,51 +122,117 @@ def student_pr_feedback_events(
                 line = item.get("line") or item.get("original_line")
                 if line is not None:
                     payload["line"] = int(line)
-            events.append(
-                ControllerEvent(
-                    kind="student_pr_feedback",
-                    dedupe_key=(
+            content = {
+                "feedback_type": surface,
+                "feedback_id": feedback_id,
+                "author": payload["author"],
+                "author_association": payload["author_association"],
+                "message": str(item.get("body") or ""),
+                "created_at": created_at,
+                "updated_at": str(
+                    item.get("updated_at")
+                    or item.get("submitted_at")
+                    or item.get("created_at")
+                    or ""
+                ),
+            }
+            content.update(
+                {
+                    key: payload[key]
+                    for key in ("state", "path", "line")
+                    if key in payload
+                }
+            )
+            candidates.append(
+                _FeedbackCandidate(
+                    source_key=(
                         f"student_pr_feedback:{surface}:{number}:{feedback_id}"
                     ),
+                    content_digest=payload_digest(content),
                     payload=payload,
                 )
             )
-    events.sort(
-        key=lambda event: (
-            github_datetime(str(event.payload["created_at"])),
-            str(event.payload["feedback_type"]),
-            int(event.payload["feedback_id"]),
+    candidates.sort(
+        key=lambda candidate: (
+            github_datetime(str(candidate.payload["created_at"])),
+            str(candidate.payload["feedback_type"]),
+            int(candidate.payload["feedback_id"]),
         )
     )
-    return _pending_feedback(mailbox, events, assignment)
+    return _pending_feedback(mailbox, candidates, assignment)
 
 
 def _pending_feedback(
     mailbox: GitHubMailbox,
-    events: Iterable[ControllerEvent],
+    candidates: Iterable[_FeedbackCandidate],
     assignment: AssignmentRecord,
 ) -> list[ControllerEvent]:
     ledger = read_feedback_ledger(mailbox)
     ledger_changed = False
     bound_events: list[ControllerEvent] = []
-    for event in events:
-        binding = ledger.get(event.dedupe_key)
+    for candidate in candidates:
+        event_key = (
+            f"student_pr_feedback:v2:{candidate.source_key.removeprefix(FEEDBACK_KEY_PREFIX)}:"
+            f"{candidate.content_digest}"
+        )
+        binding = ledger.get(event_key)
         if binding is None:
-            binding = FeedbackBinding(
-                assignment_id=str(event.payload["assignment_id"]),
-                revision_id=str(event.payload["revision_id"]),
+            prior = [
+                value
+                for key, value in ledger.items()
+                if key == candidate.source_key
+                or value.source_key == candidate.source_key
+            ]
+            identities = {
+                (value.assignment_id, value.revision_id) for value in prior
+            }
+            if len(identities) > 1:
+                raise RuntimeError(
+                    f"feedback source {candidate.source_key!r} has conflicting bindings"
+                )
+            if identities:
+                assignment_id, revision_id = next(iter(identities))
+            else:
+                assignment_id = str(candidate.payload["assignment_id"])
+                revision_id = str(candidate.payload["revision_id"])
+            payload = {
+                **candidate.payload,
+                "assignment_id": assignment_id,
+                "revision_id": revision_id,
+            }
+            versioned_prior = any(
+                value.source_key == candidate.source_key for value in prior
             )
-            ledger[event.dedupe_key] = binding
+            acknowledged = (
+                bool(prior)
+                and not versioned_prior
+                and all(value.acknowledged for value in prior)
+            )
+            binding = FeedbackBinding(
+                assignment_id=assignment_id,
+                revision_id=revision_id,
+                acknowledged=acknowledged,
+                source_key=candidate.source_key,
+                content_digest=candidate.content_digest,
+                payload=payload,
+            )
+            ledger[event_key] = binding
             ledger_changed = True
+        if (
+            binding.source_key != candidate.source_key
+            or binding.content_digest != candidate.content_digest
+            or binding.payload is None
+            or binding.payload.get("assignment_id") != binding.assignment_id
+            or binding.payload.get("revision_id") != binding.revision_id
+        ):
+            raise RuntimeError(
+                f"feedback event {event_key!r} has incomplete durable content"
+            )
         bound_events.append(
             ControllerEvent(
-                kind=event.kind,
-                dedupe_key=event.dedupe_key,
-                payload={
-                    **event.payload,
-                    "assignment_id": binding.assignment_id,
-                    "revision_id": binding.revision_id,
-                },
+                kind="student_pr_feedback",
+                dedupe_key=event_key,
+                payload=binding.payload,
             )
         )
     if ledger_changed:

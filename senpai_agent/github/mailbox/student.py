@@ -11,7 +11,7 @@ from senpai_agent.models import AssignmentRecord, parse_assignment_markers
 
 from .feedback import student_pr_feedback_events
 from .issues import human_issue_events
-from .values import label_names, object_value, pull_payload
+from .values import label_names, object_value, pull_reference, versioned_event
 
 if TYPE_CHECKING:
     from .core import GitHubMailbox
@@ -116,14 +116,13 @@ def student_events(
         except ValueError as error:
             number = int(pull["number"])
             head_sha = str(object_value(pull["head"])["sha"])
+            payload = {
+                **pull_reference(pull),
+                "error": f"Assigned PR #{number}: {error}",
+            }
             events.append(
-                ControllerEvent(
-                    kind="malformed_assignment",
-                    dedupe_key=f"malformed_assignment:{number}:{head_sha}",
-                    payload={
-                        **pull_payload(pull),
-                        "error": f"Assigned PR #{number}: {error}",
-                    },
+                versioned_event(
+                    "malformed_assignment", number, head_sha, payload=payload
                 )
             )
             continue
@@ -139,23 +138,37 @@ def student_events(
             and not duplicate_wip
             and not prior_revision_pending
         ):
+            number = int(pull["number"])
+            head_sha = str(object_value(pull["head"])["sha"])
+            blockers = sorted(
+                label.removeprefix("status:")
+                for label in label_names(pull)
+                if label
+                in {
+                    "status:blocked",
+                    "status:hold",
+                    "status:needs-rebase",
+                }
+            )
+            payload = {
+                **pull_reference(pull),
+                "assignment_id": assignment.assignment_id,
+                "revision_id": assignment.revision_id,
+                "base_ref": assignment.base_ref,
+                "base_sha": assignment.base_sha,
+                "blockers": blockers,
+            }
             events.append(
-                ControllerEvent(
-                    kind="student_assignment",
-                    dedupe_key=(
-                        f"student_assignment:{assignment.assignment_id}:"
-                        f"{assignment.revision_id}:"
-                        f"{assignment.base_ref}:{assignment.head_ref}:"
-                        f"{assignment.base_sha}:"
-                        f"{object_value(pull['head'])['sha']!s}"
-                    ),
-                    payload={
-                        **pull_payload(pull),
-                        "assignment_id": assignment.assignment_id,
-                        "revision_id": assignment.revision_id,
-                        "base_ref": assignment.base_ref,
-                        "base_sha": assignment.base_sha,
-                    },
+                versioned_event(
+                    "student_assignment",
+                    number,
+                    assignment.assignment_id,
+                    assignment.revision_id,
+                    assignment.base_ref,
+                    assignment.head_ref,
+                    assignment.base_sha,
+                    head_sha,
+                    payload=payload,
                 )
             )
         events.extend(feedback)
