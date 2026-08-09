@@ -8,6 +8,9 @@ set -e
 set -o pipefail
 umask "${SENPAI_UMASK:-0077}"
 
+source /workspace/senpai/k8s/handoff-operational-supervisor-secrets.sh
+handoff_operational_supervisor_secrets
+
 WORKDIR="/workspace/senpai"
 STATE_DIR="/var/lib/senpai/$RESEARCH_TAG/operational-supervisor"
 mkdir -p "$STATE_DIR"

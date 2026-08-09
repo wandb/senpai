@@ -107,17 +107,22 @@ Each failed evidence source remains `unknown` with a typed evidence gap. In
 particular, a failed W&B query is not reported as zero running jobs. Repeated
 `SENPAI_TURN_DEFERRED` log markers survive in the bounded three-snapshot trend.
 
-The supervisor receives one typed operations tool, not a general cluster or
-role terminal. It may inspect, enqueue a deduplicated role event, queue a
-context reset, or restart the controller process. Targets can name only the
-configured advisor or students; callers cannot
-supply hosts, pods, namespaces, working directories, environments, or
-credentials. Mutations have durable idempotency keys, per-incident cooldowns,
-and metadata-only audit records. The enforced cooldown identity is derived from
-the typed anomaly category, mutation kind, and exact role target; changing a
-free-form incident label cannot bypass it. Role inspection is always fresh and
-is never replayed from the mutation ledger. Each fresh supervisor turn receives
-the 12 most recent mutation targets, categories, timestamps, and outcomes.
+The supervisor receives OpenHands' native terminal and one typed operations
+tool. Unlike advisor/student terminals, the native terminal is not wrapped by
+Senpai's command policy. It can run arbitrary commands permitted by the
+container's Unix identity and ServiceAccount. The exact runtime and instruction
+checkout is populated by an init container and mounted read-only into the model
+container, and user-skill loading is disabled. The typed tool remains the
+preferred surface for inspecting a role, enqueueing a deduplicated role event,
+queueing a context reset, or restarting the controller because targets can name
+only the configured advisor or students; callers cannot supply hosts, pods,
+namespaces, working directories, environments, or credentials. Typed mutations
+have durable idempotency keys, per-incident cooldowns, and metadata-only audit
+records. The enforced cooldown identity is derived from the anomaly category,
+mutation kind, and exact role target; changing a free-form incident label
+cannot bypass it. Role inspection is always fresh and is never replayed from
+the mutation ledger. Each fresh supervisor turn receives the 12 most recent
+mutation targets, categories, timestamps, and outcomes.
 
 A context reset is an owner-consumed request. The external supervisor records
 the expected conversation UUID, controller identity, raw-event prefix digest
@@ -128,11 +133,12 @@ event acknowledgement, and keeps the same UUID, workspace, complete append-only
 event trace, and pending events. External code never instantiates a second
 `LocalConversation` over live state or deletes individual events.
 
-A controller restart is refused while a student training process or delegated
-agent is running, or when either activity inventory cannot be proven. It
-signals only the verified controller PID; the role's existing crash supervisor
-performs the restart. The operational supervisor has no AWS, node, pod-delete,
-Deployment-patch, experiment-cancel, branch, or PR-mutation authority.
+A controller restart is refused while an advisor or student supervised job or
+delegated agent is running, or when either activity inventory cannot be proven.
+It signals only the verified controller PID; the role's existing crash
+supervisor performs the restart. Kubernetes RBAC grants no AWS, node,
+pod-delete, or Deployment-patch verbs. The terminal receives no GitHub token,
+so authenticated branch and PR mutations remain with advisor/student tools.
 
 Every six hours, the next wake runs a second fresh review against the currently
 deployed `system_instructions/ADVISOR.md`. It may inject one concise reminder
@@ -692,9 +698,13 @@ boundaries. Hooks give early model-visible feedback. `senpai_terminal` also
 evaluates the same pure policy in-process and fails closed if policy evaluation
 fails.
 
-Denied patterns include raw GitHub mutations, raw `git push`, direct training
-launches, sleeps, polling loops, `watch`, and `tail -f`, including nested shell
-and `env` wrappers.
+The operational supervisor does not load this research-role plugin. Its native
+terminal therefore has no Senpai command filter or 600-second Senpai wrapper.
+OpenHands' native 30-second no-output continuation behavior, the overall turn
+deadline, and infrastructure permissions still apply.
+For advisor, student, and child conversations, denied patterns include raw
+GitHub mutations, raw `git push`, direct training launches, sleeps, polling
+loops, `watch`, and `tail -f`, including nested shell and `env` wrappers.
 
 Every OpenHands turn has a controller-configured hard deadline. The deadline
 interrupts the conversation, produces a non-success result, and leaves durable
@@ -763,13 +773,43 @@ server.
 The Kubernetes launcher creates one Secret, ConfigMaps, role Deployments, and,
 when enabled, one dedicated supervisor ServiceAccount, namespace-scoped Role,
 RoleBinding, and Deployment. Kubernetes RBAC cannot constrain pod list/log/exec
-by label, so the typed backend enforces exact campaign selectors inside that
-namespace. Deploy campaigns into separate namespaces when hard authorization
-isolation between campaigns is required. The Role has no AWS, node,
+by label. The typed tool enforces exact campaign selectors, but the native
+terminal can use those verbs anywhere in its namespace. A campaign that enables
+the supervisor therefore requires a dedicated namespace for hard campaign
+isolation. The Role has no AWS, node,
 pod-deletion, or Deployment-mutation verbs. The launcher creates no Service or
 general cluster RBAC. Docker and local hosts need no shared network for
 advisor/student communication; another deployment backend may implement the
 same typed supervisor operation protocol.
+
+The Kubernetes container launcher transfers GitHub, W&B, and model credentials
+through a mode-checked, one-use directory, removes them from the environment,
+and execs Python. Python consumes and unlinks the directory before OpenHands is
+imported. Weave receives W&B authentication only during its synchronous
+initialization and the ambient environment is restored immediately afterward.
+The native terminal therefore receives no credentials through inheritance or
+the Python process's Linux initial environment.
+
+Docker, AWS GPU, and AWS Mac operational-supervisor transports are deliberately
+not implemented in this revision. Docker should use a narrow host-side broker
+bound to the exact planned container IDs rather than mounting the Docker socket
+into the model container. AWS GPU can reuse that broker on its single EC2 host
+without granting AWS lifecycle credentials. AWS Mac should run the supervisor
+beside the advisor on host zero and reach exact student LaunchDaemons through
+campaign-scoped forced-command SSH identities. It must never receive instance
+stop/termination or Dedicated Host release authority; upgrades preserve the
+allocated Macs, and it must not reuse #3472's broad bootstrap SSH key. The
+supervisor retains an unrestricted native terminal locally. Cross-container and
+cross-host access uses one fixed `senpai role-control` transport client that can
+carry an arbitrary command to an exact configured role. Its broker scopes
+reachable campaign runtimes rather than filtering Git or shell syntax,
+authenticates through a private per-launch Unix socket or forced SSH command,
+loads an immutable role-to-runtime map from the launch plan, rejects unrecorded
+containers, hosts, and labels, bounds output and execution time, cleans up
+orphaned children, and audits every request and outcome. All transports reuse
+the same snapshot, ledger, prompt, and role-control protocol and must pass
+scope, replay, restart-safety, and no-host-release tests before their launcher
+backend accepts the supervisor flag.
 
 Hivemind startup remains commented with a clear note. The Python controller
 waits for the optional cluster start gate while continuously refreshing a

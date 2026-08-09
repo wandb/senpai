@@ -119,12 +119,22 @@ def initialize_weave_monitoring(
         return None
 
     redactor = secret_redactor(env)
-    weave_init(
-        project_name,
-        agent_name=weave_agent_name(env),
-        capture_content=True,
-        content_transform=redactor,
-    )
+    wandb_key = env.get("WANDB_API_KEY")
+    previous_wandb_key = os.environ.get("WANDB_API_KEY")
+    if wandb_key is not None:
+        os.environ["WANDB_API_KEY"] = wandb_key
+    try:
+        weave_init(
+            project_name,
+            agent_name=weave_agent_name(env),
+            capture_content=True,
+            content_transform=redactor,
+        )
+    finally:
+        if previous_wandb_key is None:
+            os.environ.pop("WANDB_API_KEY", None)
+        else:
+            os.environ["WANDB_API_KEY"] = previous_wandb_key
     _content_redactor = redactor
     _initialized = True
     _project_name = project_name

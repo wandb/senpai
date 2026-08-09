@@ -570,9 +570,23 @@ def test_operational_supervisor_discards_each_fresh_local_conversation(
     class FakeConversation:
         def __init__(self, **kwargs):
             self.id = kwargs["conversation_id"]
+            captured["tools"] = [tool.name for tool in kwargs["agent"].tools]
+            captured["load_user_skills"] = (
+                kwargs["agent"].agent_context.load_user_skills
+            )
             captured["delete_on_close"] = kwargs["delete_on_close"]
             captured["persistence_dir"] = kwargs["persistence_dir"]
+            captured["plugins"] = kwargs["plugins"]
             captured["secrets"] = kwargs["secrets"]
+            captured["ambient_secrets"] = {
+                name: runner.os.environ.get(name)
+                for name in (
+                    "GITHUB_TOKEN",
+                    "GH_TOKEN",
+                    "WANDB_API_KEY",
+                    "EXA_API_KEY",
+                )
+            }
             self.state = SimpleNamespace(
                 execution_status=ConversationExecutionStatus.FINISHED
             )
@@ -587,17 +601,50 @@ def test_operational_supervisor_discards_each_fresh_local_conversation(
             captured["closed"] = True
 
     monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
-    monkeypatch.setattr(runner, "build_main_tools", lambda _config: [])
-    isolate_agent_discovery(monkeypatch, runner)
+    monkeypatch.setattr(
+        runner,
+        "sanitized_agent_definitions",
+        lambda _path: pytest.fail("supervisor discovered project agents"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "sanitized_project_skills",
+        lambda _path: pytest.fail("supervisor discovered project skills"),
+    )
+    monkeypatch.setenv("STUDENT_NAMES", "fern,frieren")
+    monkeypatch.setenv("SENPAI_KUBECTL_NAMESPACE", "maple")
+    monkeypatch.setenv("RESEARCH_TAG", "maple")
+    monkeypatch.setenv("ADVISOR_BRANCH", "maple-advisor")
+    monkeypatch.setenv("GITHUB_TOKEN", "ambient-github")
+    monkeypatch.setenv("GH_TOKEN", "ambient-gh")
+    monkeypatch.setenv("WANDB_API_KEY", "ambient-wandb")
+    monkeypatch.setenv("EXA_API_KEY", "ambient-exa")
 
     assert run_openhands(
         "operational review",
-        runtime_config(tmp_path, role="supervisor"),
+        runtime_config(
+            tmp_path,
+            role="supervisor",
+            enable_browser=True,
+            command_secrets={
+                "WANDB_API_KEY": "ambient-wandb",
+                "EXA_API_KEY": "ambient-exa",
+            },
+        ),
     ) == 0
     assert captured == {
+        "tools": ["terminal", "senpai_operations"],
+        "load_user_skills": False,
         "delete_on_close": True,
         "persistence_dir": None,
+        "plugins": [],
         "secrets": {},
+        "ambient_secrets": {
+            "GITHUB_TOKEN": None,
+            "GH_TOKEN": None,
+            "WANDB_API_KEY": None,
+            "EXA_API_KEY": None,
+        },
         "closed": True,
     }
 

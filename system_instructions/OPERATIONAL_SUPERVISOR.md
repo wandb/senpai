@@ -27,13 +27,14 @@ count only distinct marker occurrences by timestamp and fingerprint. The same
 marker repeated unchanged across snapshots is one occurrence, not evidence of
 repeated failure.
 
-You may use the campaign operations tool to inspect a role, send one bounded
-message to its existing conversation, request a same-conversation context
-reset, or restart its controller. These are real write actions. Use the least
-disruptive action that clears the observed obstruction. Context reset preserves
-the raw event trace and workspace while removing noisy history from the active
-model branch. Never delete a cloud host, pod, Deployment, branch, PR, worktree,
-experiment result, or raw conversation trace.
+Use the campaign operations tool to inspect a role, send one bounded message
+to its existing conversation, request a same-conversation context reset, or
+restart its controller. These state-bound operations are safer than ad hoc
+process manipulation and leave a durable audit. Use the native terminal for
+diagnosis and operational repairs outside that typed surface. Context reset
+preserves the raw event trace and workspace while removing noisy history from
+the active model branch. Prefer reversible repairs and do not release cloud
+hosts or destroy research evidence.
 
 Do not repeatedly send the same intervention. The tool enforces durable
 deduplication and cooldowns. Reuse a concise incident key for the same observed

@@ -154,6 +154,8 @@ timeout_minutes: 30
 max_epochs: 50
 
 operational_supervisor: true
+namespace: senpai-first-run
+supervisor_dedicated_namespace: true
 supervisor_interval_s: 900
 supervisor_research_interval_s: 21600
 supervisor_action_cooldown_s: 1800
@@ -232,9 +234,10 @@ uv run python k8s/launch.py "${launch_args[@]}"
 
 The launcher creates routing labels, one launch Secret, role ConfigMaps and
 Deployments, plus a dedicated ServiceAccount and namespace-scoped
-Role/RoleBinding for the operational supervisor. The typed backend enforces the
-campaign inventory within that namespace. Use a separate namespace per campaign
-when the Kubernetes authorization boundary itself must isolate campaigns. The
+Role/RoleBinding for the operational supervisor. Its typed operation tool
+enforces the campaign inventory, while its native terminal inherits
+namespace-wide pod list/log/exec verbs that Kubernetes cannot label-scope. Use
+a dedicated namespace for every campaign that enables the supervisor. The
 launcher does not create the namespace, PVC, Service, or general cluster RBAC.
 
 Inspect and stop the launch:
@@ -713,25 +716,78 @@ training errors can recur unchanged, the supervisor counts only distinct
 timestamp/fingerprint pairs rather than treating the same marker in two wakes
 as two failures.
 
-The supervisor has one typed operation tool. It may inspect a configured role,
-send one deduplicated nudge to its existing conversation, queue a same-UUID
-model-context reset, or restart only a quiescent controller. Every mutation is
-campaign-scoped, audited, idempotent, and cooldown-limited. Cooldown identity
+The supervisor has OpenHands' native terminal plus one typed operation tool.
+The terminal is not wrapped by Senpai's advisor/student command policy, so it
+can run arbitrary shell, Git, `gh`, and `kubectl` commands within the
+container's Unix permissions and ServiceAccount RBAC. Its pinned runtime and
+instruction checkout is mounted read-only, and persistent user-skill loading is
+disabled, so a wake cannot modify the pinned checkout or instructions in place.
+The terminal intentionally receives no GitHub token; authenticated repository
+writes remain with the existing credential-hiding advisor/student workflow. The
+typed tool may inspect a configured role, send one deduplicated nudge to its
+existing conversation,
+queue a same-UUID model-context reset, or restart only a quiescent controller.
+Every typed mutation is campaign-scoped, audited, idempotent, and
+cooldown-limited. Cooldown identity
 comes from the typed anomaly category, action, and exact role target rather
 than the model's free-form incident label. Inspections always execute fresh,
 and every fresh supervisor turn sees a bounded audit of the 12 most recent
-mutation outcomes. A controller restart is refused while a student experiment
-or delegated agent is active, or when either activity inventory is unknown. A
-context reset is consumed only by the owning controller at a safe turn
+mutation outcomes. A controller restart is refused while an advisor or student
+job or delegated agent is active, or when either activity inventory is unknown.
+A context reset is consumed only by the owning controller at a safe turn
 boundary: it starts a clean active branch while preserving the raw OpenHands
 trace, conversation UUID, workspace, and pending events. It never deletes or
 rewrites event files.
+
+The container launcher moves its GitHub, W&B, and model credentials through a
+private one-use directory, unsets them, and then execs Python. Python consumes
+and deletes that directory before importing OpenHands. The native terminal
+therefore inherits no credential values, and Linux cannot recover them from the
+Python process's initial environment.
 
 Every six hours, the next wake runs a second fresh research review against the
 current `system_instructions/ADVISOR.md`. It intervenes only for clear strategic
 drift, such as a sustained narrow sweep loop, by injecting a concise reminder
 into the existing advisor conversation. This does not change the advisor or
 student research prompts and does not continuously direct experiments.
+
+#### Planned Docker and AWS transports
+
+This PR does not yet launch the operational supervisor on #3472's Docker, AWS,
+or AWS Mac backends. The backend-neutral snapshot, ledger, prompt, and role
+control protocol will be reused; only discovery and transport should vary:
+
+- Docker will start a separate supervisor container and a narrow host-side
+  broker bound to the exact container IDs in that campaign's launch plan. The
+  broker will provide inspect/log/exec/restart without mounting the Docker
+  socket into the model container, which would otherwise grant host-root
+  authority.
+- AWS GPU will use that same Docker transport on its single provisioned EC2
+  host. The supervisor will receive no AWS lifecycle credentials; instance
+  termination remains an explicit launcher/operator action.
+- AWS Mac will run the supervisor beside the advisor on the first Mac and use
+  campaign-scoped, forced-command SSH identities to reach the exact student
+  LaunchDaemons. It may repair or restart role processes, but will receive no
+  EC2 Dedicated Host release, instance-stop, or termination authority. A
+  supervisor upgrade must preserve the running instances and host allocation;
+  the forced-command identity must not reuse #3472's broad bootstrap SSH key.
+
+The supervisor will retain its unrestricted native terminal locally. Access to
+another campaign container or host will go through one fixed
+`senpai role-control` transport client. That client may carry an arbitrary
+command to an exact configured role; the broker scopes which campaign runtime
+can be reached rather than filtering Git or shell syntax. It will authenticate
+the campaign through a private per-launch Unix socket or forced SSH command,
+load an immutable role-to-runtime map from the launch plan, reject unrecorded
+containers/hosts/labels, bound output and execution time, terminate orphaned
+child processes, and append every request and outcome to the supervisor audit.
+Raw Docker sockets and AWS lifecycle credentials remain outside the model
+container.
+
+Each transport should expose the same typed state-bound operations and native
+local terminal, persist the same three snapshots, and be covered by replay,
+scope, restart-safety, and no-host-release acceptance tests before the launcher
+accepts `--operational_supervisor` for that backend.
 
 Each role runs a small Python supervisor around the deterministic controller:
 
@@ -760,7 +816,12 @@ The controller owns cadence, durable events, conversation selection, verified Gi
 - Student state may be ephemeral because the branch, PR, typed result, W&B runs, and Weave trace are the durable handoff.
 - Project `AGENTS.md`, compatible `CLAUDE.md`, and skills are loaded progressively instead of being inlined into every prompt.
 
-The command policy blocks raw GitHub mutations, direct training, `git push`, polling loops, and log streams. Operation-specific typed tools enforce repository, branch, assignment, revision, head-SHA, label, and replay preconditions. This policy keeps routine operations deterministic while leaving high-entropy research work to the agent.
+For advisor, student, and file-defined child conversations, the command policy
+blocks raw GitHub mutations, direct training, `git push`, polling loops, and log
+streams. Operation-specific typed tools enforce repository, branch, assignment,
+revision, head-SHA, label, and replay preconditions. The independent operational
+supervisor deliberately does not load that plugin and therefore receives an
+unfiltered native terminal.
 
 When `WANDB_ENTITY` and `WANDB_PROJECT` are configured, [`weave-openhands`](https://github.com/morganmcg1/weave-openhands) traces advisor, student, supervisor, and child conversations. Each `OPENHANDS_RUN` record includes a direct Weave Agent Observability URL.
 
@@ -776,8 +837,12 @@ Useful launch controls:
 - `--extra_instructions` accepts a Markdown file or literal operator guidance.
 - `human_issues: false` disables GitHub Issue polling for isolated launches.
 - `--operational_supervisor` enables the independent campaign supervisor;
+  it also requires a non-default campaign-only `--namespace` and the explicit
+  `--supervisor_dedicated_namespace` acknowledgement because raw pod exec is
+  namespace-wide;
   `--supervisor_interval_s`, `--supervisor_research_interval_s`, and
-  `--supervisor_action_cooldown_s` configure its durable cadences.
+  `--supervisor_action_cooldown_s` configure its durable cadences. Supervisor
+  launch is currently Kubernetes-only.
 
 Advisor and student images are built from the same source revision. The advisor
 image excludes CUDA and PyTorch and includes checksum-verified `kubectl` for

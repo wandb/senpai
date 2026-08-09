@@ -170,7 +170,7 @@ def observe_role(
         pending_event_keys,
         active_delegation_count,
     )
-    restart_token = _restart_control_token(token, lease)
+    restart_token = _restart_control_token(token, lease, running_count)
     return RoleRuntimeState(
         target=target,
         observation=RoleObservation(
@@ -310,7 +310,7 @@ def restart_controller(
     if state.running_training_count is None:
         raise RuntimeError("training activity is unknown; refusing controller restart")
     if state.running_training_count:
-        raise RuntimeError("a student experiment is running; refusing controller restart")
+        raise RuntimeError("a supervised job is running; refusing controller restart")
     if state.active_delegation_count != observation.active_delegation_count:
         raise RuntimeError(
             "delegation activity observation is inconsistent; refusing controller restart"
@@ -324,6 +324,11 @@ def restart_controller(
     lease = _read_lease(role_state_dir(env) / "controller-lease.json")
     if lease is None or not _controller_alive(lease, state.target.role):
         raise RuntimeError("the observed controller is no longer live")
+    final_running_count, *_ = _training_state(role_state_dir(env), state.target.role)
+    if final_running_count is None:
+        raise RuntimeError("training activity is unknown; refusing controller restart")
+    if final_running_count:
+        raise RuntimeError("a supervised job started before controller restart")
     final_control_token = _control_token(
         lease,
         observation.conversation_id,
@@ -331,7 +336,10 @@ def restart_controller(
         observation.pending_event_keys,
         observation.active_delegation_count,
     )
-    if _restart_control_token(final_control_token, lease) != restart_control_token:
+    if (
+        _restart_control_token(final_control_token, lease, final_running_count)
+        != restart_control_token
+    ):
         raise RuntimeError("the controller left its quiescent restart boundary")
     os.kill(lease.pid, signal.SIGTERM)
     return RestartReceipt(
@@ -601,8 +609,8 @@ def _training_state(
     tuple[str, ...],
     bool | None,
 ]:
-    if role == "advisor":
-        return 0, (), (), (), True
+    if role not in {"advisor", "student"}:
+        raise ValueError(f"unsupported role: {role}")
     directory = state_dir / "training"
     if not directory.exists():
         return 0, (), (), (), True
@@ -721,11 +729,13 @@ def _control_token(
 def _restart_control_token(
     control_token: str,
     lease: WorkerLease | None,
+    running_training_count: int | None = 0,
 ) -> str:
     value = {
         "control": control_token,
         "phase": lease.phase if lease is not None else None,
         "completed_turns": lease.completed_turns if lease is not None else None,
+        "running_training_count": running_training_count,
     }
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()

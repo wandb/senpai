@@ -17,6 +17,21 @@ class BackendDefaultTests(unittest.TestCase):
 
             self.assertEqual((args.n_students, args.gpus_per_student), (4, 1))
 
+    def test_operational_supervisor_rejects_unimplemented_backends(self):
+        for backend in ("docker", "aws", "aws-mac"):
+            args = launch.Args(
+                "tag",
+                "https://github.com/example/target.git",
+                backend=backend,
+                operational_supervisor=True,
+            )
+            with (
+                self.subTest(backend=backend),
+                patch.object(launch.sp, "parse", return_value=args),
+                self.assertRaisesRegex(SystemExit, "requires --backend kubernetes"),
+            ):
+                launch.main()
+
 
 class LaunchOrderingTests(unittest.TestCase):
     def test_aws_mac_official_submit_token_reaches_every_role(self):

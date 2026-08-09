@@ -510,6 +510,42 @@ def test_running_wandb_inventory_reports_cap_truncation(
     assert complete is inventory_complete
 
 
+def test_advisor_job_inventory_is_not_reported_as_idle(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    supervisor = TrainingSupervisor(
+        workspace=workspace,
+        state_dir=state_dir / "training",
+    )
+    supervisor._write_result(
+        TrainingResult(
+            training_id="advisor-job",
+            state=TrainingState.RUNNING,
+            pid=123,
+            process_group_id=123,
+            process_start_time=1.0,
+            exit_code=None,
+            elapsed_seconds=60,
+            log_path="/private/advisor-job.log",
+            wandb_run_ids=("advisor-run",),
+        )
+    )
+    monkeypatch.setattr(
+        "senpai_agent.role_control.training_process_is_live",
+        lambda _result: True,
+    )
+
+    running, _, running_ids, _, complete = _training_state(state_dir, "advisor")
+
+    assert running == 1
+    assert running_ids == ("advisor-run",)
+    assert complete is True
+
+
 @pytest.mark.parametrize(
     ("run_count", "inventory_complete"),
     ((200, True), (201, False)),
@@ -651,8 +687,61 @@ def test_controller_restart_refuses_to_interrupt_a_running_experiment(
         lambda _token, _env: runtime_state(target, running=1),
     )
 
-    with pytest.raises(RuntimeError, match="experiment is running"):
+    with pytest.raises(RuntimeError, match="supervised job is running"):
         restart_controller(CONVERSATION_ID, "token-1", env)
+
+
+def test_controller_restart_refuses_an_advisor_with_a_running_job(
+    tmp_path: Path,
+    monkeypatch,
+):
+    env = {**student_env(tmp_path), "SENPAI_ROLE": "advisor"}
+    target = RoleTarget(research_tag="maple", role="advisor")
+    monkeypatch.setattr(
+        "senpai_agent.role_control._require_restart_control_token",
+        lambda _token, _env: runtime_state(target, running=1),
+    )
+
+    with pytest.raises(RuntimeError, match="supervised job is running"):
+        restart_controller(CONVERSATION_ID, "token-1", env)
+
+
+def test_controller_restart_rechecks_jobs_immediately_before_signal(
+    tmp_path: Path,
+    monkeypatch,
+):
+    env = student_env(tmp_path)
+    target = RoleTarget(research_tag="maple", role="student", student="fern")
+    state = runtime_state(target)
+    lease = WorkerLease(
+        pid=123,
+        phase="sleep",
+        deadline=100,
+        completed_turns=state.completed_turns or 0,
+    )
+    monkeypatch.setattr(
+        "senpai_agent.role_control._require_restart_control_token",
+        lambda _token, _env: state,
+    )
+    monkeypatch.setattr("senpai_agent.role_control._read_lease", lambda _path: lease)
+    monkeypatch.setattr(
+        "senpai_agent.role_control._controller_alive",
+        lambda _lease, _role: True,
+    )
+    monkeypatch.setattr(
+        "senpai_agent.role_control._training_state",
+        lambda _state_dir, _role: (1, (), (), (), True),
+    )
+    killed = []
+    monkeypatch.setattr(
+        "senpai_agent.role_control.os.kill",
+        lambda *args: killed.append(args),
+    )
+
+    with pytest.raises(RuntimeError, match="started before controller restart"):
+        restart_controller(CONVERSATION_ID, "token-1", env)
+
+    assert killed == []
 
 
 def test_controller_restart_rejects_a_missing_conversation_uuid(tmp_path: Path):

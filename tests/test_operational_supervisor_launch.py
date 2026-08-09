@@ -36,6 +36,7 @@ def test_supervisor_is_opt_in_with_fifteen_minute_and_six_hour_defaults():
     config = yaml.safe_load(launch.SENPAI_CONFIG.read_text())
 
     assert config["operational_supervisor"] is False
+    assert config["supervisor_dedicated_namespace"] is False
     assert config["supervisor_interval_s"] == 15 * 60
     assert config["supervisor_research_interval_s"] == 6 * 60 * 60
 
@@ -47,7 +48,9 @@ def test_supervisor_has_a_control_plane_specific_harness():
     ).read_text()
 
     assert "OPERATIONAL_SUPERVISOR_HARNESS.md" in entrypoint
-    assert "typed `senpai_operations` tool" in harness
+    assert "native `terminal`" in harness
+    assert "arbitrary shell, Git, `gh`, and `kubectl`" in harness
+    assert "GitHub credentials are not" in harness
     assert "target checkout" in harness
     assert "program.md" not in harness
     assert "spawn_agents" not in harness
@@ -75,7 +78,7 @@ def test_student_runs_receive_explicit_campaign_and_student_scope():
     assert "senpai-student:fern" in config["WANDB_TAGS"]
 
 
-def test_supervisor_is_separate_and_rbac_is_campaign_tooling_only():
+def test_supervisor_is_separate_with_namespace_scoped_pod_rbac():
     documents, _secret = rendered_supervisor()
     by_kind = {document["kind"]: document for document in documents}
     deployment = by_kind["Deployment"]
@@ -98,6 +101,33 @@ def test_supervisor_is_separate_and_rbac_is_campaign_tooling_only():
         {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
         {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["create"]},
     ]
+
+
+def test_supervisor_runtime_and_instructions_are_mounted_read_only():
+    documents, _secret = rendered_supervisor()
+    deployment = next(doc for doc in documents if doc["kind"] == "Deployment")
+    pod = deployment["spec"]["template"]["spec"]
+    initializer = pod["initContainers"][0]
+    supervisor = pod["containers"][0]
+
+    assert initializer["name"] == "source"
+    assert initializer["volumeMounts"] == [
+        {"name": "runtime", "mountPath": "/workspace/senpai"}
+    ]
+    assert {mount["name"]: mount for mount in supervisor["volumeMounts"]}[
+        "runtime"
+    ] == {
+        "name": "runtime",
+        "mountPath": "/workspace/senpai",
+        "readOnly": True,
+    }
+    assert {volume["name"]: volume for volume in pod["volumes"]}["runtime"] == {
+        "name": "runtime",
+        "emptyDir": {},
+    }
+    init_script = initializer["args"][0]
+    assert "remote get-url origin" in init_script
+    assert "remote set-url origin" in init_script
 
 
 def test_supervisor_config_carries_exact_campaign_inventory_and_cadence():
@@ -133,6 +163,28 @@ def test_supervisor_mounts_only_github_wandb_and_model_credentials():
 
     assert names == {"GITHUB_TOKEN", "WANDB_API_KEY", "OPENAI_API_KEY"}
     assert "EXA_API_KEY" not in names
+
+
+def test_supervisor_hands_off_and_unsets_credentials_before_python():
+    handoff_script = (
+        ROOT / "k8s" / "handoff-operational-supervisor-secrets.sh"
+    ).read_text()
+    entrypoint = (ROOT / "k8s" / "entrypoint-operational-supervisor.sh").read_text()
+
+    assert "mktemp -d /tmp/senpai-supervisor-secrets.XXXXXX" in handoff_script
+    for name in (
+        "GITHUB_TOKEN",
+        "WANDB_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ):
+        assert name in handoff_script
+    handoff = handoff_script.index("export SENPAI_SUPERVISOR_SECRET_DIR")
+    scrub = handoff_script.index("unset GITHUB_TOKEN")
+    assert handoff < scrub
+    assert entrypoint.index("handoff_operational_supervisor_secrets") < (
+        entrypoint.index("exec python -m senpai_agent.operational_supervisor run")
+    )
 
 
 def test_supervisor_mounts_only_its_primary_model_provider():

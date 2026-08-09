@@ -1,4 +1,5 @@
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,8 @@ from openhands.sdk.plugin import Plugin
 from openhands.sdk.subagent import AgentDefinition, agent_definition_to_factory
 from openhands.sdk.tool import resolve_tool
 from openhands.tools.preset.default import register_default_tools
+from openhands.tools.terminal import TerminalAction
+from openhands.tools.terminal.impl import TerminalExecutor
 from openhands_support import AGENT_DIR, PLUGIN_DIR, REPO_ROOT, runtime_config
 from pydantic import SecretStr
 
@@ -180,7 +183,10 @@ def test_main_tools_replace_unsafe_defaults_with_role_scoped_boundaries(
     }
 
 
-def test_supervisor_receives_only_the_campaign_operations_tool(tmp_path, monkeypatch):
+def test_supervisor_receives_native_terminal_and_campaign_operations(
+    tmp_path,
+    monkeypatch,
+):
     monkeypatch.setenv("STUDENT_NAMES", "fern,frieren")
     monkeypatch.setenv("SENPAI_KUBECTL_NAMESPACE", "research")
     monkeypatch.setenv("RESEARCH_TAG", "maple")
@@ -189,8 +195,9 @@ def test_supervisor_receives_only_the_campaign_operations_tool(tmp_path, monkeyp
 
     tools = build_main_tools(config)
 
-    assert [tool.name for tool in tools] == ["senpai_operations"]
-    assert tools[0].params == {
+    assert [tool.name for tool in tools] == ["terminal", "senpai_operations"]
+    assert tools[0].params == {}
+    assert tools[1].params == {
         "state_dir": str(config.state_dir),
         "namespace": "research",
         "research_tag": "maple",
@@ -199,6 +206,191 @@ def test_supervisor_receives_only_the_campaign_operations_tool(tmp_path, monkeyp
         "students": ("fern", "frieren"),
         "mutation_cooldown_seconds": 1800.0,
     }
+    assert "senpai_terminal" not in {tool.name for tool in tools}
+
+
+def test_supervisor_terminal_resolves_to_native_executor_and_allows_git_push(
+    tmp_path,
+    monkeypatch,
+):
+    remote = tmp_path / "remote.git"
+    workspace = tmp_path / "workspace"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "init", str(workspace)], check=True)
+    subprocess.run(
+        ["git", "-C", str(workspace), "config", "user.name", "Supervisor Test"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "config",
+            "user.email",
+            "supervisor@example.com",
+        ],
+        check=True,
+    )
+    (workspace / "README.md").write_text("supervisor terminal\n")
+    subprocess.run(["git", "-C", str(workspace), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(workspace), "commit", "-m", "initial"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(workspace), "remote", "add", "origin", str(remote)],
+        check=True,
+    )
+    monkeypatch.setenv("STUDENT_NAMES", "fern")
+    monkeypatch.setenv("SENPAI_KUBECTL_NAMESPACE", "maple")
+    monkeypatch.setenv("RESEARCH_TAG", "maple")
+    monkeypatch.setenv("ADVISOR_BRANCH", "maple-advisor")
+    monkeypatch.setattr(
+        "senpai_agent.hooks.terminal_policy",
+        lambda *_args, **_kwargs: pytest.fail("research terminal policy was called"),
+    )
+    register_default_tools(enable_browser=False)
+    state = SimpleNamespace(
+        workspace=SimpleNamespace(working_dir=str(workspace)),
+        env_observation_persistence_dir=None,
+    )
+    terminal = resolve_tool(
+        build_main_tools(runtime_config(tmp_path, role="supervisor"))[0],
+        state,
+    )[0]
+
+    assert isinstance(terminal.executor, TerminalExecutor)
+    try:
+        observation = terminal.executor(
+            TerminalAction(command="git push origin HEAD:main")
+        )
+    finally:
+        terminal.executor.close()
+
+    assert observation.metadata.exit_code == 0
+    assert subprocess.run(
+        ["git", "--git-dir", str(remote), "rev-parse", "refs/heads/main"],
+        check=False,
+    ).returncode == 0
+
+
+@pytest.mark.skipif(
+    not os.path.exists("/proc/self/environ"),
+    reason="Linux procfs is required for the initial-environment regression",
+)
+def test_supervisor_secrets_are_absent_from_native_terminal_ancestor_environments(
+    tmp_path,
+):
+    sentinels = {
+        "GITHUB_TOKEN": "proc-github-sentinel",
+        "GH_TOKEN": "proc-gh-sentinel",
+        "WANDB_API_KEY": "proc-wandb-sentinel",
+        "OPENAI_API_KEY": "proc-openai-sentinel",
+        "ANTHROPIC_API_KEY": "proc-anthropic-sentinel",
+    }
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    probe_path = tmp_path / "probe.py"
+    probe_path.write_text(
+        textwrap.dedent(
+            """
+            import os
+            import shlex
+            import sys
+            import textwrap
+            from pathlib import Path
+
+            from openhands.tools.terminal import TerminalAction
+            from openhands.tools.terminal.impl import TerminalExecutor
+            from senpai_agent.secrets import consume_supervisor_secret_directory
+
+            sentinels = (
+                b"proc-github-sentinel",
+                b"proc-gh-sentinel",
+                b"proc-wandb-sentinel",
+                b"proc-openai-sentinel",
+                b"proc-anthropic-sentinel",
+            )
+            private = consume_supervisor_secret_directory(os.environ, required=True)
+            assert private["GITHUB_TOKEN"] == "proc-github-sentinel"
+            assert private["WANDB_API_KEY"] == "proc-wandb-sentinel"
+            assert private["OPENAI_API_KEY"] == "proc-openai-sentinel"
+            assert private["ANTHROPIC_API_KEY"] == "proc-anthropic-sentinel"
+            if any(value in Path("/proc/self/environ").read_bytes() for value in sentinels):
+                raise SystemExit(17)
+
+            child_probe = textwrap.dedent('''
+            import os
+            from pathlib import Path
+
+            sentinels = (
+                b"proc-github-sentinel",
+                b"proc-gh-sentinel",
+                b"proc-wandb-sentinel",
+                b"proc-openai-sentinel",
+                b"proc-anthropic-sentinel",
+            )
+            pid = os.getppid()
+            leaked = False
+            while pid > 1:
+                try:
+                    environ = Path(f"/proc/{pid}/environ").read_bytes()
+                    leaked = leaked or any(value in environ for value in sentinels)
+                    status = Path(f"/proc/{pid}/status").read_text()
+                except (OSError, PermissionError):
+                    break
+                parent = next(
+                    line for line in status.splitlines() if line.startswith("PPid:")
+                )
+                pid = int(parent.split()[1])
+            raise SystemExit(19 if leaked else 0)
+            ''')
+            terminal = TerminalExecutor(
+                working_dir=os.environ["PROBE_WORKSPACE"],
+                terminal_type="subprocess",
+            )
+            try:
+                observation = terminal(
+                    TerminalAction(
+                        command=f"{shlex.quote(sys.executable)} -c {shlex.quote(child_probe)}"
+                    )
+                )
+            finally:
+                terminal.close()
+            raise SystemExit(observation.metadata.exit_code or 0)
+            """
+        )
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = {
+        "HOME": str(home),
+        "PATH": os.environ["PATH"],
+        "PYTHONPATH": str(REPO_ROOT),
+        "PROBE_WORKSPACE": str(workspace),
+        "OPENHANDS_SUPPRESS_BANNER": "1",
+        **sentinels,
+    }
+    helper = REPO_ROOT / "k8s" / "handoff-operational-supervisor-secrets.sh"
+    command = (
+        f"source {shlex.quote(str(helper))}; "
+        "handoff_operational_supervisor_secrets; "
+        f"exec {shlex.quote(sys.executable)} {shlex.quote(str(probe_path))}"
+    )
+
+    result = subprocess.run(
+        ["/bin/bash", "-c", command],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert all(value not in result.stdout for value in sentinels.values())
+    assert all(value not in result.stderr for value in sentinels.values())
 
 
 def test_native_senpai_plugin_loads_its_runtime_skills():

@@ -28,11 +28,17 @@ from senpai_agent.operational_supervisor import (
     collect_campaign_snapshot,
     compose_research_review_prompt,
     compose_supervisor_prompt,
+    operational_supervisor_main,
 )
 from senpai_agent.operations import OperationAuditRecord, RoleTarget
 
 
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+
+
+def test_operational_supervisor_run_requires_pre_exec_secret_handoff():
+    with pytest.raises(RuntimeError, match="SENPAI_SUPERVISOR_SECRET_DIR is required"):
+        operational_supervisor_main(["run"], env={})
 
 
 def mutation_audit_record(

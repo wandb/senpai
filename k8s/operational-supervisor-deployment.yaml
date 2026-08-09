@@ -85,8 +85,8 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
-      containers:
-      - name: supervisor
+      initContainers:
+      - name: source
         image: {{ADVISOR_IMAGE}}
         securityContext:
           allowPrivilegeEscalation: false
@@ -104,21 +104,44 @@ spec:
             '  *Password*) printf "%s\n" "$GITHUB_TOKEN" ;;' \
             'esac' > "$askpass"
           chmod 700 "$askpass"
-          mkdir -p /workspace
           git init /workspace/senpai
           GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
             git -C /workspace/senpai fetch --depth 1 "$REPO_URL" "$REPO_REVISION"
           git -C /workspace/senpai checkout --detach FETCH_HEAD
+          if git -C /workspace/senpai remote get-url origin >/dev/null 2>&1; then
+            git -C /workspace/senpai remote set-url origin "$REPO_URL"
+          else
+            git -C /workspace/senpai remote add origin "$REPO_URL"
+          fi
+          test "$(git -C /workspace/senpai rev-parse HEAD)" = "$REPO_REVISION"
+          test "$SENPAI_IMAGE_REVISION" = "$REPO_REVISION"
+          rm -f "$askpass"
+        envFrom:
+        - configMapRef:
+            name: {{SUPERVISOR_CONFIGMAP_NAME}}
+        env:
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{LAUNCH_SECRET_NAME}}
+              key: github-token
+        volumeMounts:
+        - name: runtime
+          mountPath: /workspace/senpai
+      containers:
+      - name: supervisor
+        image: {{ADVISOR_IMAGE}}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -e
           cd /workspace/senpai
-          git remote add origin "$REPO_URL"
           test "$(git rev-parse HEAD)" = "$REPO_REVISION"
           test "$SENPAI_IMAGE_REVISION" = "$REPO_REVISION"
-          token_handoff=/tmp/senpai-supervisor-github-token
-          umask 077
-          printf '%s' "$GITHUB_TOKEN" > "$token_handoff"
-          export SENPAI_GITHUB_TOKEN_FILE="$token_handoff"
-          unset GITHUB_TOKEN GH_TOKEN
-          rm -f "$askpass"
           exec bash k8s/entrypoint-operational-supervisor.sh
         envFrom:
         - configMapRef:
@@ -162,9 +185,14 @@ spec:
           failureThreshold: 5
           terminationGracePeriodSeconds: 75
         volumeMounts:
+        - name: runtime
+          mountPath: /workspace/senpai
+          readOnly: true
         - name: state
           mountPath: /var/lib/senpai
       volumes:
+      - name: runtime
+        emptyDir: {}
       - name: state
         persistentVolumeClaim:
           claimName: {{PVC_CLAIM_NAME}}

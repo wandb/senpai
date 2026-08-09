@@ -59,6 +59,16 @@ def test_main_agent_context_places_harness_and_role_before_project_skills():
     assert context.load_project_skills is False
 
 
+def test_supervisor_context_does_not_load_persistent_user_skills():
+    context = build_main_agent_context(
+        "harness",
+        "supervisor",
+        load_user_skills=False,
+    )
+
+    assert context.load_user_skills is False
+
+
 def test_live_advisor_invariant_is_part_of_non_condensed_system_context(tmp_path):
     advisor = runtime_config(tmp_path, role="advisor", max_turns=100000)
     invariant = live_controller_invariant(advisor)

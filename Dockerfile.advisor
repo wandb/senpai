@@ -30,8 +30,8 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y gh && \
     rm -rf /var/lib/apt/lists/*
 
-# The operational-supervisor deployment uses kubectl only through Senpai's
-# campaign-scoped typed backend. Pin and verify the client shipped in the image.
+# The operational-supervisor deployment uses kubectl through both its typed
+# campaign operations and native terminal. Pin and verify the shipped client.
 RUN architecture="$(dpkg --print-architecture)" && \
     case "$architecture" in \
       amd64|arm64) ;; \

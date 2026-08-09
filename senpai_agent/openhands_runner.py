@@ -41,6 +41,7 @@ from senpai_agent.model_compatibility import (
     supports_reasoning_effort,
 )
 from senpai_agent.secrets import (
+    GITHUB_CREDENTIAL_ENV_NAMES,
     GITHUB_TOKEN_ENV_NAMES,
     GITHUB_TOKEN_FD_ENV,
     GITHUB_TOKEN_FILE_ENV,
@@ -906,6 +907,8 @@ def build_main_agent_context(
     role_instructions: str,
     project_skills: Sequence[Skill] = (),
     runtime_invariant: str = "",
+    *,
+    load_user_skills: bool = True,
 ) -> AgentContext:
     system_suffix = compose_system_instructions(
         harness_instructions,
@@ -920,7 +923,7 @@ def build_main_agent_context(
         system_message_suffix=system_suffix,
         current_datetime=None,
         load_public_skills=False,
-        load_user_skills=True,
+        load_user_skills=load_user_skills,
         load_project_skills=False,
     )
 
@@ -1162,6 +1165,7 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
         if not students:
             raise RuntimeError("supervisor requires an exact student inventory")
         return [
+            Tool(name="terminal"),
             Tool(
                 name="senpai_operations",
                 params={
@@ -1547,6 +1551,9 @@ def run_openhands(
     if run_timeout <= 0:
         raise TimeoutError("the inherited OpenHands deadline has expired")
     scrub_model_credentials(os.environ, config)
+    if config.role == "supervisor":
+        for name in {*config.command_secrets, *GITHUB_CREDENTIAL_ENV_NAMES}:
+            os.environ.pop(name, None)
     harness_instructions = read_role_instructions(config.harness_file)
     role_instructions = read_role_instructions(config.role_file)
     register_default_tools(enable_browser=False)
@@ -1706,6 +1713,7 @@ def run_openhands(
                     role_instructions,
                     project_skills,
                     live_controller_invariant(config),
+                    load_user_skills=config.role != "supervisor",
                 ),
                 system_prompt_kwargs={"cli_mode": True},
                 condenser=condenser,
@@ -1739,7 +1747,11 @@ def run_openhands(
         conversation = LocalConversation(
             agent=agent,
             workspace=config.workspace,
-            plugins=[PluginSource(source=str(config.plugin_dir))],
+            plugins=(
+                []
+                if config.role == "supervisor"
+                else [PluginSource(source=str(config.plugin_dir))]
+            ),
             persistence_dir=(
                 None if config.role == "supervisor" else config.state_dir
             ),

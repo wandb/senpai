@@ -173,8 +173,34 @@ def bypass_external_preflight(monkeypatch):
     )
 
 
+def supervisor_launch_args(**overrides):
+    return launch_args(
+        namespace="senpai-test-track",
+        supervisor_dedicated_namespace=True,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"namespace": "default", "supervisor_dedicated_namespace": True},
+        {"namespace": "shared-research", "supervisor_dedicated_namespace": False},
+    ),
+)
+def test_supervisor_requires_explicit_campaign_dedicated_namespace(
+    monkeypatch,
+    overrides,
+):
+    args = launch_args(operational_supervisor=True, **overrides)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+
+    with pytest.raises(SystemExit, match="campaign-dedicated"):
+        launch.main()
+
+
 def test_incremental_supervisor_requires_one_existing_exact_tag_advisor(monkeypatch):
-    args = launch_args(advisor=False, operational_supervisor=True)
+    args = supervisor_launch_args(advisor=False, operational_supervisor=True)
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
     monkeypatch.setattr(
@@ -198,7 +224,7 @@ def test_incremental_supervisor_requires_one_existing_exact_tag_advisor(monkeypa
 def test_incremental_supervisor_requires_the_same_advisor_source_revision(
     monkeypatch,
 ):
-    args = launch_args(advisor=False, operational_supervisor=True)
+    args = supervisor_launch_args(advisor=False, operational_supervisor=True)
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
     monkeypatch.setattr(
@@ -237,7 +263,7 @@ def test_incremental_supervisor_requires_the_same_advisor_source_revision(
 def test_incremental_supervisor_cannot_change_the_advisor_student_inventory(
     monkeypatch,
 ):
-    args = launch_args(advisor=False, operational_supervisor=True)
+    args = supervisor_launch_args(advisor=False, operational_supervisor=True)
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
     monkeypatch.setattr(
@@ -279,7 +305,7 @@ def test_incremental_supervisor_cannot_change_the_advisor_student_inventory(
 def test_compatible_incremental_supervisor_launch_preserves_campaign_scope(
     monkeypatch,
 ):
-    args = launch_args(advisor=False, operational_supervisor=True)
+    args = supervisor_launch_args(advisor=False, operational_supervisor=True)
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
     monkeypatch.setattr(
@@ -317,7 +343,7 @@ def test_compatible_incremental_supervisor_launch_preserves_campaign_scope(
 
 
 def test_supervisor_rejects_an_extra_exact_tag_advisor(monkeypatch):
-    args = launch_args(advisor=True, operational_supervisor=True)
+    args = supervisor_launch_args(advisor=True, operational_supervisor=True)
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
     monkeypatch.setattr(
@@ -339,7 +365,7 @@ def test_supervisor_rejects_an_extra_exact_tag_advisor(monkeypatch):
 
 
 def test_supervisor_rejects_unreplaced_students_on_an_old_revision(monkeypatch):
-    args = launch_args(advisor=True, operational_supervisor=True)
+    args = supervisor_launch_args(advisor=True, operational_supervisor=True)
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
     monkeypatch.setattr(

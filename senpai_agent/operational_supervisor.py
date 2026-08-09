@@ -26,6 +26,10 @@ from senpai_agent.github.http import GitHubReader
 from senpai_agent.models import Contract
 from senpai_agent.operations import OperationAuditRecord, OperationLedger
 from senpai_agent.operations import ContextResetStatus
+from senpai_agent.secrets import (
+    SUPERVISOR_SECRET_DIR_ENV,
+    consume_supervisor_secret_directory,
+)
 
 
 OPERATIONAL_INTERVAL = timedelta(minutes=15)
@@ -1404,6 +1408,11 @@ def operational_supervisor_main(
 
         return 0 if lease_is_healthy(args.lease_path) else 1
 
+    env = consume_supervisor_secret_directory(env, required=True)
+    os.environ.pop(SUPERVISOR_SECRET_DIR_ENV, None)
+    from senpai_agent.weave_monitoring import initialize_weave_monitoring
+
+    initialize_weave_monitoring(env)
     from senpai_agent.agent_markdown import read_agent_markdown
     from senpai_agent.kubernetes_operations import KubectlCampaignBackend
     from senpai_agent.openhands_runner import (

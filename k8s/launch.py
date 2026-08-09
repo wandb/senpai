@@ -121,6 +121,7 @@ class Args:
     pvc_mount_path: str = "/mnt/new-pvc"  # mount path for the dataset PVC inside the containers
     advisor: bool = False  # also deploy the advisor pod (default: students only)
     operational_supervisor: bool = False  # deploy one independent operational supervisor for this campaign
+    supervisor_dedicated_namespace: bool = False  # acknowledge that the Kubernetes namespace contains only this campaign
     extra_instructions: str = ""  # extra prompt text for the advisor: a .md file path or a literal string
     timeout_minutes: float = 30.0  # training run wall-clock limit (SENPAI_TIMEOUT_MINUTES)
     max_epochs: int = 50  # maximum training epochs (SENPAI_MAX_EPOCHS)
@@ -416,6 +417,9 @@ def render_operational_supervisor(
         labels={"app": "senpai", "role": "supervisor", "research-tag": tag},
         data={
             **primary_model_config(args, "advisor"),
+            "SENPAI_OPENHANDS_API_KEY_ENV": MODEL_PROVIDERS[
+                model_provider(args.advisor_model)
+            ][0],
             "REPO_URL": args.repo_url,
             "REPO_REVISION": args.repo_revision,
             "GH_REPO": target_repo_slug(args.target_repo_url),
@@ -433,6 +437,7 @@ def render_operational_supervisor(
                 args.supervisor_action_cooldown_s
             ),
             "SENPAI_KUBECTL_NAMESPACE": args.namespace,
+            "SENPAI_SUPERVISOR_SECRET_HANDOFF": "1",
         },
     )
     deployment = render_template(
@@ -528,6 +533,14 @@ def main():
         sys.exit(
             "ERROR: --operational_supervisor currently requires "
             "--backend kubernetes"
+        )
+    if args.operational_supervisor and (
+        args.namespace == "default" or not args.supervisor_dedicated_namespace
+    ):
+        sys.exit(
+            "ERROR: --operational_supervisor requires a non-default, "
+            "campaign-dedicated --namespace and "
+            "--supervisor_dedicated_namespace"
         )
     if min(args.cpu_per_gpu, args.memory_gi_per_gpu) < 1:
         sys.exit("ERROR: --cpu_per_gpu and --memory_gi_per_gpu must be at least 1")
