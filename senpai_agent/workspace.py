@@ -169,7 +169,7 @@ class StudentWorkspaceReconciler:
             raise WorkspaceJobRunning(active_jobs)
 
         assignment = _Assignment.from_event(assignment_event)
-        self._hydrate(assignment)
+        fetched_head = self._hydrate(assignment)
         current_branch = self._git("branch", "--show-current") or None
         worktree_state = self._worktree_state()
         if current_branch != assignment.head_ref and worktree_state:
@@ -195,21 +195,29 @@ class StudentWorkspaceReconciler:
             == 0
         )
         if not branch_exists:
+            if fetched_head != assignment.head_sha:
+                raise WorkspaceDivergence(
+                    head_ref=assignment.head_ref,
+                    expected_head=fetched_head,
+                    local_head=self._git("rev-parse", "HEAD"),
+                    base_ref=assignment.base_ref,
+                    base_sha=assignment.base_sha,
+                    current_branch=current_branch,
+                    worktree_state=worktree_state,
+                )
             self._run("checkout", "-b", assignment.head_ref, _HEAD_REF)
             return
 
         local_head = self._git("rev-parse", local_ref)
-        ancestor = self._run(
-            "merge-base",
-            "--is-ancestor",
+        # A stale event may outlive successful student pushes. Resume only when
+        # the assigned, remote, and preserved local heads form one forward chain.
+        if not self._is_ancestor(
             assignment.head_sha,
-            local_head,
-            check=False,
-        ).returncode
-        if ancestor != 0:
+            fetched_head,
+        ) or not self._is_ancestor(fetched_head, local_head):
             raise WorkspaceDivergence(
                 head_ref=assignment.head_ref,
-                expected_head=assignment.head_sha,
+                expected_head=fetched_head,
                 local_head=local_head,
                 base_ref=assignment.base_ref,
                 base_sha=assignment.base_sha,
@@ -218,7 +226,7 @@ class StudentWorkspaceReconciler:
             )
         self._run("checkout", assignment.head_ref)
 
-    def _hydrate(self, assignment: _Assignment) -> None:
+    def _hydrate(self, assignment: _Assignment) -> str:
         self._git("check-ref-format", "--branch", assignment.head_ref)
         self._git("check-ref-format", "--branch", assignment.base_ref)
         self._fetch_refs(
@@ -226,11 +234,6 @@ class StudentWorkspaceReconciler:
             (f"refs/heads/{assignment.base_ref}", _BASE_TIP_REF),
         )
         fetched_head = self._git("rev-parse", _HEAD_REF)
-        if fetched_head != assignment.head_sha:
-            raise RuntimeError(
-                "assignment head moved: "
-                f"expected {assignment.head_sha}, fetched {fetched_head}"
-            )
 
         if not self._commit_exists(assignment.base_sha):
             try:
@@ -246,6 +249,19 @@ class StudentWorkspaceReconciler:
                     "is unavailable from the configured GitHub repository"
                 )
         self._run("update-ref", _BASE_REF, assignment.base_sha)
+        return fetched_head
+
+    def _is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        return (
+            self._run(
+                "merge-base",
+                "--is-ancestor",
+                ancestor,
+                descendant,
+                check=False,
+            ).returncode
+            == 0
+        )
 
     def _fetch_refs(self, *refs: tuple[str, str]) -> None:
         if self.token is None:
