@@ -161,7 +161,13 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
 
     monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
     isolate_agent_discovery(monkeypatch, runner)
-    config = runtime_config(tmp_path)
+    config = runtime_config(
+        tmp_path,
+        command_secrets={
+            "WANDB_API_KEY": "wandb-key",
+            "MLXFAST_API_TOKEN": "mlxfast-key",
+        },
+    )
 
     assert run_openhands("first task", config) == 0
     assert captured["prompt"] == "first task"
@@ -172,7 +178,10 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
         f"{runner.live_controller_invariant(config)}\n"
     )
     assert captured["plugin"] == str(PLUGIN_DIR)
-    assert captured["secrets"] == {"WANDB_API_KEY": "wandb-key"}
+    assert captured["secrets"] == {
+        "WANDB_API_KEY": "wandb-key",
+        "MLXFAST_API_TOKEN": "mlxfast-key",
+    }
     assert captured["conversation_id_env"] == config.conversation_id.hex
     assert captured["delete_on_close"] is False
     assert captured["llm_timeout"] == 900
