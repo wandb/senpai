@@ -9,7 +9,7 @@ from openhands.sdk import LLM, Agent, Tool
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
 from openhands.sdk.event import SystemPromptEvent
 from openhands.sdk.llm import Message, TextContent
-from openhands.sdk.tool import FinishTool
+from openhands.sdk.tool import FinishTool, resolve_tool
 from openhands.sdk.workspace import LocalWorkspace
 
 import senpai_agent.openhands_runner as runner
@@ -989,6 +989,69 @@ def test_conversation_and_credentials_are_cleaned_up_after_failures(
     assert closed == [True]
     assert cleared
     assert delegation[-1] is None
+
+
+def test_runtime_credentials_remain_configured_through_lazy_tool_initialization(
+    tmp_path,
+    monkeypatch,
+):
+    captured = {}
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class FakeConversation:
+        def __init__(self, agent, **kwargs):
+            self.agent = agent
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                execution_status=ConversationExecutionStatus.FINISHED,
+                workspace=SimpleNamespace(working_dir=workspace),
+            )
+
+        def send_message(self, _prompt):
+            pass
+
+        async def arun(self):
+            specs = {
+                tool.name: tool
+                for tool in self.agent.tools
+                if tool.name in {"senpai_github", "spawn_agents"}
+            }
+            captured["specs"] = specs
+            captured["state"] = self.state
+            captured["resolved"] = {
+                name: {tool.name for tool in resolve_tool(spec, self.state)}
+                for name, spec in specs.items()
+            }
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    isolate_agent_discovery(monkeypatch, runner)
+
+    config = runtime_config(
+        tmp_path,
+        workspace=workspace,
+        role="student",
+        student_name="Fern",
+    )
+    assert run_openhands("task", config) == 0
+    assert captured["resolved"] == {
+        "senpai_github": {
+            "get_prs",
+            "respond_to_human_issue",
+            "submit_experiment_result",
+        },
+        "spawn_agents": {"spawn_agents"},
+    }
+    with pytest.raises(
+        RuntimeError,
+        match="configure GitHub credentials before initializing workflows",
+    ):
+        resolve_tool(captured["specs"]["senpai_github"], captured["state"])
+    with pytest.raises(RuntimeError, match="subagent runtime is not configured"):
+        resolve_tool(captured["specs"]["spawn_agents"], captured["state"])
 
 
 def test_turn_deadline_requests_conversation_interrupt(tmp_path, monkeypatch):

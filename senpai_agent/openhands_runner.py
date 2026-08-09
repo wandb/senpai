@@ -1749,30 +1749,25 @@ def run_openhands(
                 flush=True,
             )
         inference_required = True
-        try:
-            # send_message performs OpenHands' lazy tool initialization.
-            if inbox is None or active_inbox_turn_id is None:
-                conversation.send_message(prompt)
+        if inbox is None or active_inbox_turn_id is None:
+            conversation.send_message(prompt)
+        else:
+            turn = inbox.turn(active_inbox_turn_id)
+            if turn.state is DeliveryState.PROCESSED:
+                inference_required = False
             else:
-                turn = inbox.turn(active_inbox_turn_id)
-                if turn.state is DeliveryState.PROCESSED:
+                turn = deliver_turn_messages(
+                    conversation,
+                    inbox,
+                    active_inbox_turn_id,
+                )
+                if (
+                    conversation.state.execution_status
+                    == ConversationExecutionStatus.FINISHED
+                    and turn_has_finished_response(conversation, turn)
+                ):
+                    inbox.record_processed(active_inbox_turn_id)
                     inference_required = False
-                else:
-                    turn = deliver_turn_messages(
-                        conversation,
-                        inbox,
-                        active_inbox_turn_id,
-                    )
-                    if (
-                        conversation.state.execution_status
-                        == ConversationExecutionStatus.FINISHED
-                        and turn_has_finished_response(conversation, turn)
-                    ):
-                        inbox.record_processed(active_inbox_turn_id)
-                        inference_required = False
-        finally:
-            clear_github_credentials()
-            configure_delegation(None)
         if inference_required:
             with graceful_interrupts(conversation):
                 if not config.child:
