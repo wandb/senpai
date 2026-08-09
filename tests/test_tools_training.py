@@ -385,9 +385,59 @@ def test_monitor_job_replaces_the_default_policy(tmp_path: Path):
         monitors.close()
 
 
-def test_get_job_status_is_scoped_to_the_owning_conversation(tmp_path: Path):
+@pytest.mark.parametrize(
+    "terminal_state",
+    [
+        TrainingState.FINISHED,
+        TrainingState.FAILED,
+        TrainingState.TIMED_OUT,
+        TrainingState.CANCELLED,
+    ],
+)
+def test_get_job_status_allows_a_resumed_role_to_collect_a_terminal_job(
+    tmp_path: Path,
+    terminal_state: TrainingState,
+):
     workspace = init_workspace(tmp_path)
-    training = StubTraining(workspace, finished_result(tmp_path))
+    result = finished_result(tmp_path).model_copy(update={"state": terminal_state})
+    training = StubTraining(workspace, result)
+    monitors = MonitorStore(tmp_path / "monitors.sqlite3")
+    conversation_id = uuid.uuid4()
+    RunJobTool.create(training, monitors)[0].executor(
+        RunJobAction(
+            spec=JobSpec(
+                argv=("python", "evaluate.py"),
+                cwd=workspace,
+                timeout_seconds=20,
+            )
+        ),
+        SimpleNamespace(id=conversation_id),
+    )
+
+    try:
+        status = GetJobStatusTool.create(training, monitors)[0].executor
+        with pytest.raises(ValueError, match="parent conversation"):
+            status(GetJobStatusAction(job_id="training-17"))
+
+        observation = status(
+            GetJobStatusAction(job_id="training-17"),
+            SimpleNamespace(id=uuid.uuid4()),
+        )
+
+        assert observation.job_id == "training-17"
+        assert observation.state is terminal_state
+    finally:
+        monitors.close()
+
+
+def test_get_job_status_keeps_a_running_job_scoped_to_its_conversation(
+    tmp_path: Path,
+):
+    workspace = init_workspace(tmp_path)
+    result = finished_result(tmp_path).model_copy(
+        update={"state": TrainingState.RUNNING, "exit_code": None}
+    )
+    training = StubTraining(workspace, result)
     monitors = MonitorStore(tmp_path / "monitors.sqlite3")
     conversation_id = uuid.uuid4()
     RunJobTool.create(training, monitors)[0].executor(
@@ -414,8 +464,7 @@ def test_get_job_status_is_scoped_to_the_owning_conversation(tmp_path: Path):
             SimpleNamespace(id=conversation_id),
         )
 
-        assert observation.job_id == "training-17"
-        assert observation.state is TrainingState.FINISHED
+        assert observation.state is TrainingState.RUNNING
     finally:
         monitors.close()
 

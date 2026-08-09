@@ -547,11 +547,20 @@ class _GetJobStatusExecutor(ToolExecutor[GetJobStatusAction, JobResultObservatio
         action: GetJobStatusAction,
         conversation: LocalConversation | None = None,
     ) -> JobResultObservation:
-        _require_owned_job(self.store, action.job_id, conversation, "get_job_status")
-        return _job_observation(
-            self.supervisor.get_training_status(action.job_id),
-            conversation,
-        )
+        if conversation is None:
+            raise ValueError("get_job_status requires its parent conversation")
+        result = self.supervisor.get_training_status(action.job_id)
+        # The training runtime is already isolated to one role and workspace.
+        # Once a job is terminal, no process remains for another resumed root
+        # conversation to observe or control.
+        if result.state is TrainingState.RUNNING:
+            _require_owned_job(
+                self.store,
+                action.job_id,
+                conversation,
+                "get_job_status",
+            )
+        return _job_observation(result, conversation)
 
 
 class _CancelJobExecutor(ToolExecutor[CancelJobAction, JobResultObservation]):
