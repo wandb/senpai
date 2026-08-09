@@ -155,12 +155,14 @@ def test_run_job_requires_a_conversation_before_starting(tmp_path: Path):
         monitors.close()
 
 
+@pytest.mark.parametrize("secret_name", ["WANDB_API_KEY", "MLXFAST_API_TOKEN"])
 def test_run_job_grants_only_requested_registry_secrets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    secret_name: str,
 ):
     workspace = init_workspace(tmp_path)
-    secret = "wandb-from-registry"
+    secret = f"{secret_name.lower()}-from-registry"
     failed = finished_result(tmp_path).model_copy(
         update={
             "state": TrainingState.FAILED,
@@ -171,12 +173,13 @@ def test_run_job_grants_only_requested_registry_secrets(
     training = StubTraining(workspace, failed)
     monitors = MonitorStore(tmp_path / "monitors.sqlite3")
     registry = SecretRegistry()
-    registry.update_secrets({"WANDB_API_KEY": secret})
+    registry.update_secrets({secret_name: secret})
     conversation = SimpleNamespace(
         id=uuid.uuid4(),
         state=SimpleNamespace(secret_registry=registry),
     )
     monkeypatch.setenv("WANDB_API_KEY", "ambient-wandb")
+    monkeypatch.setenv("MLXFAST_API_TOKEN", "ambient-mlxfast")
     monkeypatch.setenv("OPENAI_API_KEY", "model-secret")
     monkeypatch.setenv("EXA_API_KEY", "exa-secret")
     monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
@@ -191,16 +194,19 @@ def test_run_job_grants_only_requested_registry_secrets(
                     argv=("python", "evaluate.py"),
                     cwd=workspace,
                     timeout_seconds=20,
-                    secret_env=("WANDB_API_KEY",),
+                    secret_env=(secret_name,),
                 )
             ),
             conversation,
         )
 
         environment = training.environments[0]
-        assert environment["WANDB_API_KEY"] == secret
+        assert environment[secret_name] == secret
         assert training.redacted_values == [(secret,)]
         assert "PATH" in environment
+        assert ({"WANDB_API_KEY", "MLXFAST_API_TOKEN"} - {secret_name}).isdisjoint(
+            environment
+        )
         assert {
             "OPENAI_API_KEY",
             "EXA_API_KEY",
