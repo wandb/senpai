@@ -68,7 +68,7 @@ def delegation_config(tmp_path: Path, **updates) -> DelegationConfig:
         "fast_api_key_env": "ANTHROPIC_API_KEY",
         "fast_api_key": "anthropic-secret",
         "frontier_model": "openai/gpt-5.6",
-        "frontier_reasoning_effort": "ultra",
+        "frontier_reasoning_effort": "max",
         "frontier_api_key_env": "OPENAI_API_KEY",
         "frontier_api_key": "openai-secret",
         "github_repo": "acme/widgets",
@@ -168,9 +168,7 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
     assert "anthropic/claude-opus-4-8" in smart.command
     assert smart.command[smart.command.index("--reasoning-effort") + 1] == "xhigh"
     assert "openai/gpt-5.6" in frontier.command
-    assert frontier.command[frontier.command.index("--reasoning-effort") + 1] == (
-        "ultra"
-    )
+    assert frontier.command[frontier.command.index("--reasoning-effort") + 1] == "max"
     assert frontier.command[frontier.command.index("--api-key-env") + 1] == (
         "OPENAI_API_KEY"
     )

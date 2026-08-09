@@ -1,9 +1,6 @@
 ---
 name: exa-search
 description: Search the general web or scholarly publications through Exa. Use for current public information, official documentation, source code, release notes, papers, preprints, journals, or literature research.
-context: fork
-model: Codex-opus-4-8
-effort: high
 ---
 
 # Exa Search

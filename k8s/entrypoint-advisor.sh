@@ -7,6 +7,8 @@
 set -e
 set -o pipefail
 umask "${SENPAI_UMASK:-0022}"
+LOGDIR="/var/lib/senpai/$RESEARCH_TAG/advisor"
+rm -f "$LOGDIR/openhands_state/controller-lease.json"
 date +%s > "${SENPAI_BOOTSTRAP_STARTED_PATH:-/var/lib/senpai/.bootstrap-started}"
 
 WORKDIR="/workspace/senpai"
@@ -17,7 +19,6 @@ export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
 SOURCE_SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 export SENPAI_PLUGIN="$SOURCE_SENPAI_PLUGIN"
 GIT_ASKPASS_FILE="/tmp/senpai-git-askpass"
-LOGDIR="/var/lib/senpai/$RESEARCH_TAG/advisor"
 mkdir -p "$LOGDIR"
 if [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
     export GITHUB_TOKEN="$(<"$SENPAI_GITHUB_TOKEN_FILE")"

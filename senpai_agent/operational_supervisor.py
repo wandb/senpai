@@ -22,7 +22,7 @@ from urllib.parse import urlencode
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 
-from senpai_agent.github_http import GitHubReader
+from senpai_agent.github.http import GitHubReader
 from senpai_agent.models import Contract
 from senpai_agent.operations import OperationAuditRecord, OperationLedger
 from senpai_agent.operations import ContextResetStatus

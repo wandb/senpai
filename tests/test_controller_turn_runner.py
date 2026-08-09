@@ -26,6 +26,8 @@ from senpai_agent.mailbox import (
     ControllerEvent,
     LocalAdvisorMailbox,
 )
+from senpai_agent.github.http import GitHubReadError
+from senpai_agent.github.mailbox import ActiveGitHubWatcher
 from senpai_agent.state import AssignmentConversationRegistry
 from senpai_agent.operations import (
     ContextResetRequest,
@@ -64,6 +66,14 @@ def feedback_event(revision_id="revision-2"):
             "revision_id": revision_id,
             "message": f"Feedback for {revision_id}.",
         },
+    )
+
+
+def advisor_event(number=17):
+    return ControllerEvent(
+        kind="review_ready",
+        dedupe_key=f"review_ready:{number}:abc",
+        payload={"number": number},
     )
 
 
@@ -225,6 +235,131 @@ def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
     assert result.delivered_event_keys == frozenset()
     with AdvisorEventStore(store_path) as store:
         assert store.pending() == []
+
+
+def test_full_visible_set_suppresses_events_handled_in_an_earlier_turn(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    conversation_id = UUID("00000000-0000-0000-0000-000000000017")
+    handled = advisor_event(17)
+    current = advisor_event(18)
+    store_path = state_dir / "advisor-events.sqlite3"
+    messages = []
+
+    def run_openhands(_prompt, _config):
+        class Conversation:
+            def send_message(self, message):
+                messages.append(message)
+
+        with AdvisorEventStore(store_path) as store, AdvisorEventPump(
+            store,
+            Conversation(),
+            poll_interval=0.001,
+        ):
+            time.sleep(0.01)
+        return 0
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+
+    result = OpenHandsTurnRunner(
+        Config("advisor", state_dir, conversation_id),
+        full_prompt="advisor research brief",
+        github_mailbox=Mailbox((handled, current)),
+        active_poll_interval_seconds=0.001,
+    ).run(
+        current.to_prompt(),
+        conversation_id=conversation_id,
+        event_keys=frozenset({current.dedupe_key}),
+        visible_event_keys=frozenset(
+            {handled.dedupe_key, current.dedupe_key}
+        ),
+    )
+
+    assert messages == []
+    assert result.delivered_event_keys == frozenset()
+    with AdvisorEventStore(store_path) as store:
+        assert store.pending() == []
+
+
+def test_acknowledged_store_rows_are_not_reported_as_this_turn_deliveries(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    conversation_id = UUID("00000000-0000-0000-0000-000000000018")
+    handled = advisor_event()
+    store_path = state_dir / "advisor-events.sqlite3"
+    with AdvisorEventStore(store_path) as store:
+        store.enqueue(
+            AdvisorEvent(
+                kind=handled.kind,
+                dedupe_key=handled.dedupe_key,
+                payload=handled.payload,
+            )
+        )
+        store.acknowledge(handled.dedupe_key)
+
+    def run_openhands(_prompt, _config):
+        time.sleep(0.01)
+        return 0
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+
+    result = OpenHandsTurnRunner(
+        Config("advisor", state_dir, conversation_id),
+        full_prompt="advisor research brief",
+        github_mailbox=Mailbox((handled,)),
+        active_poll_interval_seconds=0.001,
+    ).run(
+        "current advisor turn",
+        conversation_id=conversation_id,
+        event_keys=frozenset(),
+    )
+
+    assert result.delivered_event_keys == frozenset()
+
+
+def test_active_watcher_retries_after_a_transient_github_read_error(
+    tmp_path: Path,
+    capsys,
+):
+    event = advisor_event()
+
+    class FlakyMailbox:
+        def __init__(self):
+            self.calls = 0
+
+        def poll(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise GitHubReadError("temporary outage")
+            return (event,)
+
+    mailbox = FlakyMailbox()
+    store_path = tmp_path / "advisor-events.sqlite3"
+    with ActiveGitHubWatcher(
+        mailbox,
+        store_path,
+        known_keys=frozenset(),
+        poll_interval_seconds=0.001,
+    ) as watcher:
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            with AdvisorEventStore(store_path) as store:
+                if store.pending_count():
+                    break
+            time.sleep(0.001)
+        assert watcher.thread.is_alive()
+
+    assert watcher.error is None
+    assert mailbox.calls >= 2
+    with AdvisorEventStore(store_path) as store:
+        assert [pending.dedupe_key for pending in store.pending()] == [
+            event.dedupe_key
+        ]
+    assert "SENPAI_GITHUB_WATCHER_POLL_ERROR" in capsys.readouterr().err
 
 
 def test_context_exhaustion_retries_once_on_a_fresh_branch_with_the_same_id(

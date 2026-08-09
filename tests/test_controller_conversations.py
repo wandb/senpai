@@ -28,8 +28,17 @@ class Turns:
         self.exit_codes = iter(exit_codes)
         self.calls = []
 
-    def run(self, prompt, *, conversation_id, event_keys):
-        self.calls.append((prompt, conversation_id, event_keys))
+    def run(
+        self,
+        prompt,
+        *,
+        conversation_id,
+        event_keys,
+        visible_event_keys=frozenset(),
+    ):
+        self.calls.append(
+            (prompt, conversation_id, event_keys, visible_event_keys)
+        )
         return TurnResult(exit_code=next(self.exit_codes, 0))
 
 

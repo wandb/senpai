@@ -14,7 +14,7 @@ from senpai_agent.controller import (
     _full_prompt,
 )
 from senpai_agent.mailbox import ControllerEvent
-from senpai_agent.state import ConversationStateLedger
+from senpai_agent.state import ConversationStateLedger, WorkspaceDivergenceLedger
 from senpai_agent.supervisor import ProgressLease, WorkerLease
 from senpai_agent.workspace import WorkspaceDivergence
 from test_agent_markdown import HTML_HEADER
@@ -42,8 +42,17 @@ class Turns:
         self.outcomes = list(outcomes)
         self.calls = []
 
-    def run(self, prompt, *, conversation_id, event_keys):
-        self.calls.append((prompt, conversation_id, event_keys))
+    def run(
+        self,
+        prompt,
+        *,
+        conversation_id,
+        event_keys,
+        visible_event_keys=frozenset(),
+    ):
+        self.calls.append(
+            (prompt, conversation_id, event_keys, visible_event_keys)
+        )
         outcome = self.outcomes.pop(0) if self.outcomes else TurnResult(exit_code=0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -72,13 +81,13 @@ def review_event(number=17):
     )
 
 
-def baseline_event(current_sha="def"):
+def research_base_event(current_sha="def"):
     return ControllerEvent(
-        kind="baseline_advanced",
-        dedupe_key=f"baseline_advanced:17:abc:{current_sha}",
+        kind="research_base_changed",
+        dedupe_key=f"research_base_changed:17:abc:{current_sha}",
         payload={
             "number": 17,
-            "assigned_base_sha": "abc",
+            "required_base_sha": "abc",
             "current_base_sha": current_sha,
         },
     )
@@ -92,7 +101,9 @@ def test_first_turn_combines_programme_role_template_and_runtime_identity(
     instructions.mkdir(parents=True)
     (workspace / "program.md").write_text(HTML_HEADER + "Minimize test error.")
     (instructions / "prompt-student.md").write_text(
-        HTML_HEADER + "Work as $STUDENT_NAME on $ADVISOR_BRANCH."
+        HTML_HEADER
+        + "Work as $STUDENT_NAME on $ADVISOR_BRANCH in $WANDB_PROJECT. "
+        + "Never expose $WANDB_API_KEY."
     )
 
     prompt = _full_prompt(
@@ -103,6 +114,7 @@ def test_first_turn_combines_programme_role_template_and_runtime_identity(
             "ADVISOR_BRANCH": "research",
             "WANDB_ENTITY": "acme",
             "WANDB_PROJECT": "cfd",
+            "WANDB_API_KEY": "live-secret",
             "STUDENT_NAME": "fern",
             "EXTRA_INSTRUCTIONS_B64": b64encode(
                 (HTML_HEADER + "Use typed tools.").encode()
@@ -111,7 +123,9 @@ def test_first_turn_combines_programme_role_template_and_runtime_identity(
     )
 
     assert "# Research programme\n\nMinimize test error." in prompt
-    assert "# Student task\n\nWork as fern on research." in prompt
+    assert "# Student task\n\nWork as fern on research in cfd." in prompt
+    assert "$WANDB_API_KEY" in prompt
+    assert "live-secret" not in prompt
     assert "# Additional launch instructions\n\nUse typed tools." in prompt
     assert "Role: student; repository: acme/widgets" in prompt
     assert "SPDX-" not in prompt
@@ -182,6 +196,11 @@ def test_post_turn_poll_at_reminder_boundary_only_delivers_new_state(
         frozenset({original.dedupe_key}),
         frozenset({changed.dedupe_key}),
         frozenset({original.dedupe_key}),
+    ]
+    assert [call[3] for call in turns.calls] == [
+        frozenset({original.dedupe_key}),
+        frozenset({original.dedupe_key, changed.dedupe_key}),
+        frozenset({original.dedupe_key, changed.dedupe_key}),
     ]
 
 
@@ -259,6 +278,67 @@ def test_still_actionable_event_is_redelivered_after_one_poll_interval(
     ]
 
 
+def test_older_visible_event_does_not_lose_its_reminder_to_another_turn(
+    monkeypatch,
+):
+    older = review_event(17)
+    newer = review_event(18)
+    clock = [0.0]
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+
+    class PersistentMailbox(Mailbox):
+        def poll(self):
+            self.calls += 1
+            return (older,) if self.calls <= 2 else (older, newer)
+
+    class WatcherAwareTurns(Turns):
+        def run(
+            self,
+            prompt,
+            *,
+            conversation_id,
+            event_keys,
+            visible_event_keys=frozenset(),
+        ):
+            result = super().run(
+                prompt,
+                conversation_id=conversation_id,
+                event_keys=event_keys,
+                visible_event_keys=visible_event_keys,
+            )
+            if (
+                event_keys == frozenset({newer.dedupe_key})
+                and older.dedupe_key not in visible_event_keys
+            ):
+                return TurnResult(
+                    exit_code=result.exit_code,
+                    delivered_event_keys=frozenset({older.dedupe_key}),
+                )
+            return result
+
+    turns = WatcherAwareTurns()
+    Controller(
+        role="advisor",
+        mailbox=PersistentMailbox([]),
+        turns=turns,
+        conversation_id=CONVERSATION_ID,
+        full_prompt="programme",
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        poll_interval_seconds=20,
+        jitter_seconds=0,
+        event_reminder_seconds=30,
+    ).run(max_cycles=3)
+
+    assert [call[2] for call in turns.calls] == [
+        frozenset({older.dedupe_key}),
+        frozenset({newer.dedupe_key}),
+        frozenset({older.dedupe_key}),
+    ]
+    assert turns.calls[1][3] == frozenset(
+        {older.dedupe_key, newer.dedupe_key}
+    )
+
+
 def test_fast_poll_defaults_to_ten_minute_level_trigger_reminders(monkeypatch):
     event = review_event()
     clock = [0.0]
@@ -290,10 +370,10 @@ def test_fast_poll_defaults_to_ten_minute_level_trigger_reminders(monkeypatch):
     ]
 
 
-def test_unchanged_baseline_advance_does_not_repeat_on_reminder_cadence(
+def test_unchanged_research_base_change_does_not_repeat_on_reminder_cadence(
     monkeypatch,
 ):
-    event = baseline_event()
+    event = research_base_event()
     clock = [0.0]
     monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
 
@@ -320,9 +400,9 @@ def test_unchanged_baseline_advance_does_not_repeat_on_reminder_cadence(
     ]
 
 
-def test_changed_baseline_sha_wakes_immediately():
-    first = baseline_event("def")
-    changed = baseline_event("fed")
+def test_changed_research_base_sha_wakes_immediately():
+    first = research_base_event("def")
+    changed = research_base_event("fed")
     turns = Turns()
 
     controller(Mailbox([(first,), (changed,), ()]), turns).run(max_cycles=1)
@@ -333,8 +413,8 @@ def test_changed_baseline_sha_wakes_immediately():
     ]
 
 
-def test_baseline_advance_wakes_again_after_disappearing():
-    event = baseline_event()
+def test_research_base_change_wakes_again_after_disappearing():
+    event = research_base_event()
     turns = Turns()
 
     controller(
@@ -531,6 +611,205 @@ def test_preserved_workspace_divergence_is_delivered_to_the_existing_turn():
         {event.dedupe_key, conflict.event.dedupe_key}
     )
     assert "do not reset or discard local work" in turns.calls[0][0]
+
+
+def student_assignment_event():
+    return ControllerEvent(
+        kind="student_assignment",
+        dedupe_key="student_assignment:assignment-17:revision-2:base:head",
+        payload={
+            "assignment_id": "assignment-17",
+            "revision_id": "revision-2",
+        },
+    )
+
+
+def test_identical_workspace_divergence_does_not_rewake_on_reminders(
+    monkeypatch,
+):
+    event = student_assignment_event()
+    conflict = WorkspaceDivergence(
+        head_ref="student/candidate",
+        expected_head="a" * 40,
+        local_head="b" * 40,
+    )
+    clock = [0.0]
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+
+    class PersistentMailbox(Mailbox):
+        def poll(self):
+            self.calls += 1
+            return (event,)
+
+    turns = Turns()
+    controller_module.Controller(
+        role="student",
+        mailbox=PersistentMailbox([]),
+        turns=turns,
+        conversation_id=CONVERSATION_ID,
+        full_prompt="programme",
+        reconcile=lambda _events: (_ for _ in ()).throw(conflict),
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        poll_interval_seconds=1,
+        jitter_seconds=0,
+        event_reminder_seconds=1,
+    ).run(max_cycles=3)
+
+    assert len(turns.calls) == 1
+
+
+def test_workspace_divergence_suppression_survives_a_controller_restart(tmp_path):
+    event = student_assignment_event()
+    conflict = WorkspaceDivergence(
+        head_ref="student/candidate",
+        expected_head="a" * 40,
+        local_head="b" * 40,
+    )
+    ledger = WorkspaceDivergenceLedger(tmp_path / "workspace-divergence.json")
+    first_turns = Turns()
+    second_turns = Turns()
+
+    for turns in (first_turns, second_turns):
+        controller(
+            Mailbox([(event,), ()]),
+            turns,
+            role="student",
+            reconcile=lambda _events: (_ for _ in ()).throw(conflict),
+            workspace_divergence_state=ledger,
+        ).run(max_cycles=1)
+
+    assert len(first_turns.calls) == 1
+    assert second_turns.calls == []
+
+
+def test_unacknowledged_workspace_divergence_is_not_suppressed_after_restart(
+    tmp_path,
+):
+    event = student_assignment_event()
+    conflict = WorkspaceDivergence(
+        head_ref="student/candidate",
+        expected_head="a" * 40,
+        local_head="b" * 40,
+    )
+    ledger = WorkspaceDivergenceLedger(tmp_path / "workspace-divergence.json")
+
+    class FailingAcknowledgementMailbox(Mailbox):
+        def acknowledge(self, _dedupe_keys):
+            raise RuntimeError("mailbox acknowledgement failed")
+
+    with pytest.raises(RuntimeError, match="mailbox acknowledgement failed"):
+        controller(
+            FailingAcknowledgementMailbox([(event,)]),
+            Turns(),
+            role="student",
+            reconcile=lambda _events: (_ for _ in ()).throw(conflict),
+            workspace_divergence_state=ledger,
+        ).run(max_cycles=1)
+
+    assert ledger.current(CONVERSATION_ID) is None
+
+    restarted_turns = Turns()
+    controller(
+        Mailbox([(event,), ()]),
+        restarted_turns,
+        role="student",
+        reconcile=lambda _events: (_ for _ in ()).throw(conflict),
+        workspace_divergence_state=ledger,
+    ).run(max_cycles=1)
+
+    assert len(restarted_turns.calls) == 1
+
+
+def test_new_feedback_passes_through_an_unchanged_workspace_divergence():
+    assignment = student_assignment_event()
+    feedback = ControllerEvent(
+        kind="student_pr_feedback",
+        dedupe_key="student_pr_feedback:issue_comment:17:101",
+        payload={"message": "Use the accepted base."},
+    )
+    conflict = WorkspaceDivergence(
+        head_ref="student/candidate",
+        expected_head="a" * 40,
+        local_head="b" * 40,
+    )
+    turns = Turns()
+
+    controller(
+        Mailbox([(assignment,), (assignment, feedback), ()]),
+        turns,
+        role="student",
+        reconcile=lambda _events: (_ for _ in ()).throw(conflict),
+    ).run(max_cycles=1)
+
+    assert [call[2] for call in turns.calls] == [
+        frozenset({assignment.dedupe_key, conflict.event.dedupe_key}),
+        frozenset({feedback.dedupe_key, conflict.event.dedupe_key}),
+    ]
+
+
+def test_changed_workspace_divergence_wakes_again(monkeypatch):
+    event = student_assignment_event()
+    conflicts = iter(
+        [
+            WorkspaceDivergence(
+                head_ref="student/candidate",
+                expected_head="a" * 40,
+                local_head="b" * 40,
+            ),
+            WorkspaceDivergence(
+                head_ref="student/candidate",
+                expected_head="a" * 40,
+                local_head="c" * 40,
+            ),
+        ]
+    )
+    last = [None]
+    clock = [0.0]
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+
+    def reconcile(_events):
+        last[0] = next(conflicts, last[0])
+        raise last[0]
+
+    class PersistentMailbox(Mailbox):
+        def poll(self):
+            self.calls += 1
+            return (event,)
+
+    turns = Turns()
+    controller_module.Controller(
+        role="student",
+        mailbox=PersistentMailbox([]),
+        turns=turns,
+        conversation_id=CONVERSATION_ID,
+        full_prompt="programme",
+        reconcile=reconcile,
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        poll_interval_seconds=1,
+        jitter_seconds=0,
+        event_reminder_seconds=1,
+    ).run(max_cycles=2)
+
+    assert len(turns.calls) == 2
+
+
+def test_failed_workspace_divergence_turn_is_retried():
+    event = student_assignment_event()
+    conflict = WorkspaceDivergence(
+        head_ref="student/candidate",
+        expected_head="a" * 40,
+        local_head="b" * 40,
+    )
+    turns = Turns([TurnResult(exit_code=19), TurnResult(exit_code=0)])
+
+    controller(
+        Mailbox([(event,), (event,), ()]),
+        turns,
+        role="student",
+        reconcile=lambda _events: (_ for _ in ()).throw(conflict),
+    ).run(max_cycles=2)
+
+    assert len(turns.calls) == 2
 
 
 def test_successful_turn_acknowledges_and_suppresses_mid_turn_feedback():

@@ -1,8 +1,11 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from typing import cast
+from urllib.parse import urlsplit
 
 import pytest
 
-from senpai_agent.github_workflow import WorkflowPreconditionError
+from senpai_agent.github.workflow import MutationResult, WorkflowPreconditionError
 from github_workflow_support import (
     REPO,
     FakeGitHub,
@@ -20,13 +23,17 @@ def test_respond_to_issue_writes_one_verified_idempotent_reply():
     first = client.respond_to_issue(
         7,
         human_message_id=700,
-        response="ADVISOR: I will investigate this now.",
+        audience_labels={"team"},
+        responder="advisor",
+        response="I will investigate this now.",
     )
     mutations_after_first = list(fake.mutations)
     second = client.respond_to_issue(
         7,
         human_message_id=700,
-        response="ADVISOR: I will investigate this now.",
+        audience_labels={"team"},
+        responder="advisor",
+        response="I will investigate this now.",
     )
 
     assert first.changed is True
@@ -35,7 +42,7 @@ def test_respond_to_issue_writes_one_verified_idempotent_reply():
     assert fake.comments == [
         comment(
             1,
-            "<!-- senpai-human-response:700 -->\n\n"
+            "<!-- senpai-human-response:advisor:700 -->\n\n"
             "ADVISOR: I will investigate this now.",
         )
     ]
@@ -49,15 +56,123 @@ def test_respond_to_issue_accepts_a_specific_human_comment():
         comments=[comment(42, "Please also compare memory use.", author="ada")],
     )
 
-    result = workflow(fake).respond_to_issue(
+    result = workflow(fake, role="student").respond_to_issue(
         7,
         human_message_id=42,
+        audience_labels={"team"},
+        responder="fern",
         response="STUDENT fern: I included memory in the comparison.",
     )
 
     assert result.changed is True
     assert len(fake.comments) == 2
-    assert "<!-- senpai-human-response:42 -->" in cast(str, fake.comments[-1]["body"])
+    assert cast(str, fake.comments[-1]["body"]).startswith(
+        "<!-- senpai-human-response:student:fern:42 -->"
+    )
+    assert cast(str, fake.comments[-1]["body"]).endswith(
+        "\n\nSTUDENT: I included memory in the comparison."
+    )
+
+
+def test_advisor_and_two_student_replies_to_one_human_message_coexist():
+    fake = FakeGitHub(pull_request(), issue=human_issue())
+    advisor = workflow(fake, role="advisor")
+    fern = workflow(fake, role="student")
+    sage = workflow(fake, role="student")
+
+    advisor.respond_to_issue(
+        7,
+        human_message_id=700,
+        audience_labels={"team"},
+        responder="advisor",
+        response="I will compare the candidate runs.",
+    )
+    fern.respond_to_issue(
+        7,
+        human_message_id=700,
+        audience_labels={"team"},
+        responder="fern",
+        response="I will inspect the training logs.",
+    )
+    sage.respond_to_issue(
+        7,
+        human_message_id=700,
+        audience_labels={"team"},
+        responder="sage",
+        response="I will compare memory use.",
+    )
+    mutations_after_replies = list(fake.mutations)
+
+    assert advisor.respond_to_issue(
+        7,
+        human_message_id=700,
+        audience_labels={"team"},
+        responder="advisor",
+        response="I will compare the candidate runs.",
+    ).changed is False
+    assert fern.respond_to_issue(
+        7,
+        human_message_id=700,
+        audience_labels={"team"},
+        responder="fern",
+        response="I will inspect the training logs.",
+    ).changed is False
+    assert sage.respond_to_issue(
+        7,
+        human_message_id=700,
+        audience_labels={"team"},
+        responder="sage",
+        response="I will compare memory use.",
+    ).changed is False
+    assert [cast(str, item["body"]).splitlines()[0] for item in fake.comments] == [
+        "<!-- senpai-human-response:advisor:700 -->",
+        "<!-- senpai-human-response:student:fern:700 -->",
+        "<!-- senpai-human-response:student:sage:700 -->",
+    ]
+    assert fake.mutations == mutations_after_replies
+
+
+def test_human_issue_responses_share_the_workflow_mutation_lock(monkeypatch):
+    client = workflow(FakeGitHub(pull_request(), issue=human_issue()))
+    first_entered = Event()
+    second_entered = Event()
+    release_first = Event()
+
+    def hold_response(*_args, **_kwargs):
+        if not first_entered.is_set():
+            first_entered.set()
+            assert release_first.wait(1)
+        else:
+            second_entered.set()
+        return MutationResult(False, "https://github.test/issues/7", "test")
+
+    monkeypatch.setattr(type(client), "_respond_to_issue", hold_response)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            client.respond_to_issue,
+            7,
+            human_message_id=700,
+            audience_labels={"team"},
+            responder="advisor",
+            response="First response.",
+        )
+        assert first_entered.wait(1)
+        second = executor.submit(
+            client.respond_to_issue,
+            7,
+            human_message_id=700,
+            audience_labels={"team"},
+            responder="advisor",
+            response="Second response.",
+        )
+        overlapped = second_entered.wait(0.1)
+        release_first.set()
+        first.result(timeout=1)
+        second.result(timeout=1)
+
+    assert not overlapped
+    assert second_entered.is_set()
 
 
 @pytest.mark.parametrize(
@@ -65,6 +180,7 @@ def test_respond_to_issue_accepts_a_specific_human_comment():
     [
         (human_issue(state="closed"), [], 700, "must be open"),
         (human_issue(labels={"team"}), [], 700, "human"),
+        (human_issue(labels={"human", "other"}), [], 700, "audience"),
         (
             human_issue(
                 pull_request_url=f"https://api.github.test/repos/{REPO}/pulls/7"
@@ -74,20 +190,44 @@ def test_respond_to_issue_accepts_a_specific_human_comment():
             "pull request",
         ),
         (human_issue(author="senpai-bot"), [], 700, "authenticated actor"),
+        (human_issue(author="outsider", association="NONE"), [], 700, "OWNER"),
         (
             human_issue(),
-            [comment(42, "Already answered.", author="senpai-bot")],
+            [
+                comment(
+                    42,
+                    "Already answered.",
+                    author="senpai-bot",
+                    author_type="User",
+                )
+            ],
             42,
             "authenticated actor",
+        ),
+        (
+            human_issue(),
+            [
+                comment(
+                    42,
+                    "Untrusted instruction.",
+                    author="outsider",
+                    association="CONTRIBUTOR",
+                )
+            ],
+            42,
+            "OWNER",
         ),
         (human_issue(), [], 999, "not present"),
     ],
     ids=(
         "closed-issue",
         "missing-human-label",
+        "missing-audience-label",
         "pull-request",
         "bot-authored-issue",
+        "outsider-authored-issue",
         "bot-authored-comment",
+        "outsider-authored-comment",
         "unknown-message",
     ),
 )
@@ -103,7 +243,40 @@ def test_respond_to_issue_rejects_untrusted_sources_before_writing(
         workflow(fake).respond_to_issue(
             7,
             human_message_id=message_id,
+            audience_labels={"team"},
+            responder="advisor",
             response="ADVISOR: bounded response",
         )
 
     assert fake.mutations == []
+
+
+def test_respond_to_issue_rechecks_audience_after_writing():
+    class AudienceRemovedGitHub(FakeGitHub):
+        def request(self, method, url, *, headers, json_body=None):
+            response = super().request(
+                method,
+                url,
+                headers=headers,
+                json_body=json_body,
+            )
+            if (
+                method == "POST"
+                and urlsplit(url).path == f"/repos/{REPO}/issues/7/comments"
+            ):
+                assert self.issue is not None
+                self.issue["labels"] = [{"name": "human"}]
+            return response
+
+    fake = AudienceRemovedGitHub(pull_request(), issue=human_issue())
+
+    with pytest.raises(WorkflowPreconditionError, match="audience"):
+        workflow(fake).respond_to_issue(
+            7,
+            human_message_id=700,
+            audience_labels={"team"},
+            responder="advisor",
+            response="ADVISOR: bounded response",
+        )
+
+    assert len(fake.comments) == 1

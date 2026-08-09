@@ -23,7 +23,7 @@ from senpai_agent.advisor import (
     AdvisorEventStore,
     compose_system_instructions,
 )
-from senpai_agent.github_mailbox import ActiveGitHubWatcher, GitHubMailbox
+from senpai_agent.github.mailbox import ActiveGitHubWatcher, GitHubMailbox
 from senpai_agent.mailbox import (
     CompositeMailbox,
     ContextResetMailbox,
@@ -42,12 +42,27 @@ from senpai_agent.state import (
     ConversationBatch,
     ConversationStateLedger,
     StudentConversationSelector,
+    WorkspaceDivergenceLedger,
 )
 from senpai_agent.supervisor import LEASE_ENV, ProgressLease
 from senpai_agent.workspace import StudentWorkspaceReconciler, WorkspaceDivergence
 
 
-_EDGE_TRIGGERED_EVENT_KINDS = frozenset({"baseline_advanced"})
+_EDGE_TRIGGERED_EVENT_KINDS = frozenset({"research_base_changed"})
+_PROMPT_TEMPLATE_VARIABLES = frozenset(
+    {
+        "ADVISOR_BRANCH",
+        "GH_REPO",
+        "GPUS_PER_STUDENT",
+        "PROBLEM_DIR",
+        "RESEARCH_TAG",
+        "STUDENT_NAME",
+        "STUDENT_NAMES",
+        "TARGET_REPO_URL",
+        "WANDB_ENTITY",
+        "WANDB_PROJECT",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +87,7 @@ class TurnRunner(Protocol):
         *,
         conversation_id: UUID,
         event_keys: frozenset[str],
+        visible_event_keys: frozenset[str] = frozenset(),
     ) -> TurnResult: ...
 
 
@@ -127,6 +143,7 @@ class OpenHandsTurnRunner:
         *,
         conversation_id: UUID,
         event_keys: frozenset[str],
+        visible_event_keys: frozenset[str] = frozenset(),
     ) -> TurnResult:
         from senpai_agent.openhands_runner import local_event_db_path, run_openhands
 
@@ -235,7 +252,7 @@ class OpenHandsTurnRunner:
         with ActiveGitHubWatcher(
             self.github_mailbox,
             store_path,
-            known_keys=event_keys,
+            known_keys=visible_event_keys | event_keys,
             poll_interval_seconds=self.active_poll_interval_seconds,
             map_event=map_event,
         ) as watcher:
@@ -243,7 +260,7 @@ class OpenHandsTurnRunner:
                 event_keys if reset_request is not None else frozenset()
             )
         with AdvisorEventStore(store_path) as store:
-            delivered = store.acknowledged(tuple(watcher.observed_keys))
+            delivered = store.acknowledged(tuple(watcher.enqueued_keys))
         return TurnResult(
             exit_code=exit_code,
             delivered_event_keys=frozenset(delivered),
@@ -384,6 +401,7 @@ class Controller:
         full_prompt: str,
         system_context: str = "",
         conversation_state: ConversationStateLedger | None = None,
+        workspace_divergence_state: WorkspaceDivergenceLedger | None = None,
         conversation_for_events: (
             Callable[[Sequence[ControllerEvent]], Sequence[ConversationBatch]] | None
         ) = None,
@@ -425,6 +443,7 @@ class Controller:
         self.full_prompt = full_prompt.strip()
         self.system_context = system_context.strip()
         self.conversation_state = conversation_state
+        self.workspace_divergence_state = workspace_divergence_state
         self.sleep = sleep
         self.poll_interval_seconds = poll_interval_seconds
         self.jitter_seconds = jitter_seconds
@@ -438,6 +457,7 @@ class Controller:
         self._started: set[UUID] = set()
         self._visible: dict[str, float] = {}
         self._deferred_until: dict[str, float] = {}
+        self._workspace_divergence: dict[UUID, str] = {}
 
     def run(self, *, max_cycles: int | None = None) -> None:
         self._wait_for_start_gates()
@@ -453,18 +473,44 @@ class Controller:
                 for batch in batches:
                     batch_events = batch.events
                     conversation_id = batch.conversation_id
+                    workspace_divergence: WorkspaceDivergence | None = None
                     try:
                         if self.reconcile is not None:
                             self._publish_progress("reconcile")
                             try:
                                 self.reconcile(batch_events)
                             except WorkspaceDivergence as conflict:
+                                workspace_divergence = conflict
                                 print(
                                     f"SENPAI_WORKSPACE_DIVERGENCE {conflict}",
                                     file=sys.stderr,
                                     flush=True,
                                 )
+                                if (
+                                    self._workspace_divergence_key(conversation_id)
+                                    == conflict.event.dedupe_key
+                                ):
+                                    batch_events = tuple(
+                                        event
+                                        for event in batch_events
+                                        if event.kind != "student_assignment"
+                                    )
+                                    if not batch_events:
+                                        print(
+                                            "SENPAI_WORKSPACE_DIVERGENCE_SUPPRESSED "
+                                            f"conversation_id={conversation_id} "
+                                            f"event_key={conflict.event.dedupe_key}",
+                                            file=sys.stderr,
+                                            flush=True,
+                                        )
+                                        continue
                                 batch_events = (*batch_events, conflict.event)
+                            else:
+                                if any(
+                                    event.kind == "student_assignment"
+                                    for event in batch_events
+                                ):
+                                    self._clear_workspace_divergence(conversation_id)
                         continuing = self._has_started(conversation_id)
                         refresh_system_context = (
                             continuing
@@ -484,11 +530,15 @@ class Controller:
                             self.turn_timeout_seconds,
                             conversation_id=conversation_id,
                         )
+                        batch_event_keys = frozenset(
+                            event.dedupe_key for event in batch_events
+                        )
                         result = self.turns.run(
                             prompt,
                             conversation_id=conversation_id,
-                            event_keys=frozenset(
-                                event.dedupe_key for event in batch_events
+                            event_keys=batch_event_keys,
+                            visible_event_keys=(
+                                frozenset(self._visible) | batch_event_keys
                             ),
                         )
                     except ConversationRecoveryExhausted as error:
@@ -535,6 +585,11 @@ class Controller:
                         self.mailbox.acknowledge(
                             tuple(dict.fromkeys(acknowledged))
                         )
+                        if workspace_divergence is not None:
+                            self._record_workspace_divergence(
+                                conversation_id,
+                                workspace_divergence.event.dedupe_key,
+                            )
                         self._publish_progress(
                             "turn-complete",
                             completed_turn=True,
@@ -647,6 +702,27 @@ class Controller:
                 self.system_context,
             )
 
+    def _workspace_divergence_key(self, conversation_id: UUID) -> str | None:
+        if self.workspace_divergence_state is not None:
+            return self.workspace_divergence_state.current(conversation_id)
+        return self._workspace_divergence.get(conversation_id)
+
+    def _record_workspace_divergence(
+        self,
+        conversation_id: UUID,
+        event_key: str,
+    ) -> None:
+        if self.workspace_divergence_state is not None:
+            self.workspace_divergence_state.record(conversation_id, event_key)
+        else:
+            self._workspace_divergence[conversation_id] = event_key
+
+    def _clear_workspace_divergence(self, conversation_id: UUID) -> None:
+        if self.workspace_divergence_state is not None:
+            self.workspace_divergence_state.clear(conversation_id)
+        else:
+            self._workspace_divergence.pop(conversation_id, None)
+
     def _new_events(
         self,
         events: Sequence[ControllerEvent],
@@ -712,11 +788,17 @@ def _full_prompt(role: Literal["advisor", "student"], env: Mapping[str, str]) ->
     workspace = Path(env["SENPAI_OPENHANDS_WORKSPACE"]).resolve()
     instructions = workspace / "instructions" / f"prompt-{role}.md"
     program = workspace / "program.md"
+    template_env = {
+        key: env[key] for key in _PROMPT_TEMPLATE_VARIABLES if key in env
+    }
+    role_prompt = Template(read_agent_markdown(instructions)).safe_substitute(
+        template_env
+    )
     prompt = (
         "# Research programme\n\n"
         f"{read_agent_markdown(program).strip()}\n\n"
         f"# {role.title()} task\n\n"
-        f"{Template(read_agent_markdown(instructions)).safe_substitute(env).strip()}"
+        f"{role_prompt.strip()}"
     )
     encoded_extra = env.get("EXTRA_INSTRUCTIONS_B64")
     if encoded_extra:
@@ -758,6 +840,7 @@ def controller_main(
     if progress is not None:
         progress.update("startup", 300)
 
+    from senpai_agent.delegation import reconcile_delegated_tasks
     from senpai_agent.openhands_runner import (
         parse_runner_args,
         read_role_instructions,
@@ -791,6 +874,11 @@ def controller_main(
     if runner_config.github_token is None:
         raise RuntimeError("controller worker requires GitHub credentials")
     scrub_model_credentials(os.environ, runner_config)
+    reconcile_delegated_tasks(
+        getattr(runner_config, "delegation_root_state_dir", None)
+        or runner_config.state_dir,
+        runner_config.state_dir / f"{role}-events.sqlite3",
+    )
     github_mailbox = GitHubMailbox(
         repo=runner_config.github_repo,
         token=runner_config.github_token,
@@ -859,7 +947,11 @@ def controller_main(
             runner_config.state_dir / "student-conversations.json"
         )
         conversation_selector = StudentConversationSelector(registry)
-        reconcile = StudentWorkspaceReconciler(runner_config.workspace)
+        reconcile = StudentWorkspaceReconciler(
+            runner_config.workspace,
+            repo=runner_config.github_repo,
+            token=runner_config.github_token,
+        )
 
     full_prompt = _full_prompt(role, env)
     system_context = compose_system_instructions(
@@ -886,6 +978,13 @@ def controller_main(
         system_context=continuation_context,
         conversation_state=ConversationStateLedger(
             runner_config.state_dir / "conversation-state.json"
+        ),
+        workspace_divergence_state=(
+            WorkspaceDivergenceLedger(
+                runner_config.state_dir / "workspace-divergence.json"
+            )
+            if role == "student"
+            else None
         ),
         conversation_for_events=conversation_selector,
         reconcile=reconcile,

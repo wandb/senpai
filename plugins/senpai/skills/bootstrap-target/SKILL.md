@@ -36,7 +36,6 @@ agree on what counts as a valid result.
 Load these only when they help the current task:
 
 - `references/program-template.md` - annotated `program.md` section template.
-- `references/role-overlay-template.md` - richer advisor/student prompt shapes.
 - `references/interview-question-bank.md` - question sets for ambiguous targets.
 - `references/benchmark-integrity-patterns.md` - common benchmark no-nos and how
   to phrase them.
@@ -106,14 +105,17 @@ Load these only when they help the current task:
    are overlays: concise, target-specific steering that helps the advisor and
    student inhabit this particular research program.
 
-   `prompt-advisor.md` should brief the research lead on target identity,
-   branch discipline, first survey actions, metric focus, hypothesis design, and
-   portfolio strategy.
+   `prompt-advisor.md` should contain only target-specific experiment-selection
+   judgment: promising hypothesis families, metric tradeoffs, target-specific
+   mistakes, and context worth reading first.
 
-   `prompt-student.md` should brief the implementer on target identity,
-   resource expectations, edit boundaries, exact run command patterns, research
-   pass expectations, and result reporting. For richer examples, read
-   `references/role-overlay-template.md`.
+   `prompt-student.md` should contain only target-specific implementation
+   guidance: important files, protected invariants, exact run-command patterns,
+   and interpretation pitfalls.
+
+   Do not repeat runtime identity, branch or W&B setup, generic role workflow,
+   tool instructions, or reporting rules already supplied by the control plane
+   and `program.md`.
 
 6. **Validate the target package.**
    Check that referenced paths exist, command patterns are plausible, metric

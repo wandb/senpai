@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -5,7 +6,12 @@ import pytest
 from openhands.sdk.conversation import ConversationExecutionStatus
 
 from senpai_agent.git_workflow import PushResult
-from senpai_agent.github_workflow import (
+from senpai_agent.github.tools import (
+    GitHubToolRuntime,
+    SubmitExperimentResultAction,
+    SubmitExperimentResultTool,
+)
+from senpai_agent.github.workflow import (
     MutationResult,
     PullHeadMismatchError,
     StaleAssignmentRevisionError,
@@ -15,11 +21,6 @@ from senpai_agent.models import (
     AssignmentKey,
     ExperimentResult,
     ResultStatus,
-)
-from senpai_agent.tools import (
-    GitHubTransitionAction,
-    GitHubTransitionTool,
-    SubmitResultTransition,
 )
 
 
@@ -42,17 +43,11 @@ def experiment_result(head_sha: str = "c" * 40) -> ExperimentResult:
     )
 
 
-def submit_action() -> GitHubTransitionAction:
-    return GitHubTransitionAction(
-        transition=SubmitResultTransition(
-            operation="submit_result",
-            repo="acme/widgets",
-            pr_number=17,
-            branch="student-one/candidate",
-            expected_remote_sha="a" * 40,
-            expected_head_sha="c" * 40,
-            result=experiment_result(),
-        )
+def submit_action() -> SubmitExperimentResultAction:
+    return SubmitExperimentResultAction(
+        branch="student-one/candidate",
+        remote_branch_sha_before_push="a" * 40,
+        result=experiment_result(),
     )
 
 
@@ -60,9 +55,19 @@ class RecordingWorkflow:
     def __init__(self):
         self.repo = "acme/widgets"
         self.events: list[tuple[str, int, dict]] = []
+        self.lock_depth = 0
+
+    @contextmanager
+    def serialized_assignment_mutation(self):
+        self.lock_depth += 1
+        try:
+            yield
+        finally:
+            self.lock_depth -= 1
 
     def preflight_submit_result(self, number, **kwargs):
         self.events.append(("preflight", number, kwargs))
+        return SimpleNamespace(assignment=SimpleNamespace(base_sha="b" * 40))
 
     def submit_result(self, number, **kwargs):
         self.events.append(("submit", number, kwargs))
@@ -75,11 +80,16 @@ class RecordingWorkflow:
 
 
 def student_tool(workflow, workspace: Path):
-    return GitHubTransitionTool.create(
+    runtime = GitHubToolRuntime(
         workflow=workflow,
-        role="student",
         workspace=workspace,
-    )[0]
+        git_token=None,
+        role="student",
+        advisor_branch=None,
+        student_names=frozenset(),
+        student_name="student-one",
+    )
+    return SubmitExperimentResultTool.create(runtime)[0]
 
 
 def test_submit_result_preflights_before_any_git_mutation(
@@ -94,8 +104,12 @@ def test_submit_result_preflights_before_any_git_mutation(
     workflow = RejectingWorkflow()
     pushes = []
     monkeypatch.setattr(
-        "senpai_agent.tools.push_assignment_branch",
+        "senpai_agent.github.tools.runtime.git_workflow.push_assignment_branch",
         lambda *args, **kwargs: pushes.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.runtime.git_workflow.require_commit_contains_base",
+        lambda *args, **kwargs: None,
     )
 
     with pytest.raises(WorkflowPreconditionError, match="invalid assignment"):
@@ -103,6 +117,38 @@ def test_submit_result_preflights_before_any_git_mutation(
 
     assert [event[0] for event in workflow.events] == ["preflight"]
     assert pushes == []
+
+
+def test_submit_result_rejects_another_students_assignment_before_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    workflow = RecordingWorkflow()
+    action = submit_action()
+    action = action.model_copy(
+        update={
+            "result": action.result.model_copy(
+                update={
+                    "assignment": action.result.assignment.model_copy(
+                        update={"student": "student-two"}
+                    )
+                }
+            )
+        }
+    )
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.runtime.git_workflow.push_assignment_branch",
+        lambda *_args, **_kwargs: pytest.fail("git push reached"),
+    )
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.runtime.git_workflow.require_commit_contains_base",
+        lambda *_args, **_kwargs: pytest.fail("ancestry check reached"),
+    )
+
+    with pytest.raises(PermissionError, match="does not match this runtime"):
+        student_tool(workflow, tmp_path)(action)
+
+    assert workflow.events == []
 
 
 def test_stale_submission_finishes_the_obsolete_conversation_without_pushing(
@@ -119,8 +165,12 @@ def test_stale_submission_finishes_the_obsolete_conversation_without_pushing(
     workflow = StaleWorkflow()
     pushes = []
     monkeypatch.setattr(
-        "senpai_agent.tools.push_assignment_branch",
+        "senpai_agent.github.tools.runtime.git_workflow.push_assignment_branch",
         lambda *args, **kwargs: pushes.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.runtime.git_workflow.require_commit_contains_base",
+        lambda *args, **kwargs: None,
     )
     conversation = SimpleNamespace(
         state=SimpleNamespace(execution_status=ConversationExecutionStatus.RUNNING)
@@ -134,6 +184,39 @@ def test_stale_submission_finishes_the_obsolete_conversation_without_pushing(
     assert pushes == []
 
 
+def test_stale_submission_after_push_finishes_the_obsolete_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    class StaleWorkflow(RecordingWorkflow):
+        def submit_result(self, number, **kwargs):
+            self.events.append(("submit", number, kwargs))
+            raise StaleAssignmentRevisionError(
+                "revision='revision-2'; result revision='revision-1'. Refresh PR #17."
+            )
+
+    workflow = StaleWorkflow()
+    pushes = []
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.runtime.git_workflow.push_assignment_branch",
+        lambda *args, **kwargs: pushes.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.runtime.git_workflow.require_commit_contains_base",
+        lambda *args, **kwargs: None,
+    )
+    conversation = SimpleNamespace(
+        state=SimpleNamespace(execution_status=ConversationExecutionStatus.RUNNING)
+    )
+
+    with pytest.raises(ValueError, match="controller can resume"):
+        student_tool(workflow, tmp_path)(submit_action(), conversation)
+
+    assert conversation.state.execution_status is ConversationExecutionStatus.FINISHED
+    assert [event[0] for event in workflow.events] == ["preflight", "submit"]
+    assert len(pushes) == 1
+
+
 def test_submit_result_pushes_the_validated_local_head_before_github_mutation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -143,7 +226,7 @@ def test_submit_result_pushes_the_validated_local_head_before_github_mutation(
     class Workflow(RecordingWorkflow):
         def preflight_submit_result(self, number, **kwargs):
             order.append("preflight")
-            super().preflight_submit_result(number, **kwargs)
+            return super().preflight_submit_result(number, **kwargs)
 
         def submit_result(self, number, **kwargs):
             order.append("submit")
@@ -159,16 +242,71 @@ def test_submit_result_pushes_the_validated_local_head_before_github_mutation(
         )
 
     workflow = Workflow()
-    monkeypatch.setattr("senpai_agent.tools.push_assignment_branch", push)
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.runtime.git_workflow.push_assignment_branch",
+        push,
+    )
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.runtime.git_workflow.require_commit_contains_base",
+        lambda *_args, **_kwargs: order.append("ancestry"),
+    )
 
     observation = student_tool(workflow, tmp_path)(submit_action())
 
     assert observation.state == "result_submitted"
-    assert order == ["preflight", "push", "submit"]
+    assert order == ["preflight", "ancestry", "push", "submit"]
     _, _, preflight = workflow.events[0]
     assert preflight["current_head_sha"] == "a" * 40
     assert preflight["expected_result_head_sha"] == "c" * 40
     assert workflow.events[1][2]["expected_head_sha"] == "c" * 40
+
+
+def test_submit_result_holds_one_workflow_lock_across_the_full_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    phases = []
+
+    class Workflow(RecordingWorkflow):
+        def preflight_submit_result(self, number, **kwargs):
+            phases.append(("preflight", self.lock_depth))
+            return super().preflight_submit_result(number, **kwargs)
+
+        def submit_result(self, number, **kwargs):
+            phases.append(("submit", self.lock_depth))
+            return super().submit_result(number, **kwargs)
+
+    workflow = Workflow()
+
+    def ancestry(*_args, **_kwargs):
+        phases.append(("ancestry", workflow.lock_depth))
+
+    def push(_workspace, **kwargs):
+        phases.append(("push", workflow.lock_depth))
+        return PushResult(
+            changed=True,
+            branch=kwargs["branch"],
+            head_sha=kwargs["expected_local_sha"],
+        )
+
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.runtime.git_workflow.require_commit_contains_base",
+        ancestry,
+    )
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.runtime.git_workflow.push_assignment_branch",
+        push,
+    )
+
+    student_tool(workflow, tmp_path)(submit_action())
+
+    assert phases == [
+        ("preflight", 1),
+        ("ancestry", 1),
+        ("push", 1),
+        ("submit", 1),
+    ]
+    assert workflow.lock_depth == 0
 
 
 @pytest.mark.parametrize(
@@ -212,8 +350,15 @@ def test_submit_result_retries_only_bounded_post_push_head_mismatches(
             head_sha=kwargs["expected_local_sha"],
         )
 
-    monkeypatch.setattr("senpai_agent.tools.push_assignment_branch", push)
-    monkeypatch.setattr("senpai_agent.tools.time.sleep", sleeps.append)
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.runtime.git_workflow.push_assignment_branch",
+        push,
+    )
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.runtime.git_workflow.require_commit_contains_base",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr("senpai_agent.github.tools.runtime.time.sleep", sleeps.append)
     call = lambda: student_tool(workflow, tmp_path)(submit_action())
 
     if raises:

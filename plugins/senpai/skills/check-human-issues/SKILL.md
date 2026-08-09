@@ -6,14 +6,10 @@
 name: check-human-issues
 description: >
   Check and respond to GitHub Issues from the human researcher team.
-  Runs in a forked context (no access to main conversation). Use this skill whenever you need to: check for human
-  messages, respond to human issues, poll for team communications,
-  check GitHub issues. Also triggers for: "any human messages?",
-  "check issues", "respond to humans".
+  Use this skill whenever you need to handle a human_issue event, respond to
+  human issues, or check team communications. Also triggers for: "any human
+  messages?", "check issues", "respond to humans".
 argument-hint: "<name> <ADVISOR|STUDENT>"
-context: fork
-model: claude-opus-4-8
-effort: high
 ---
 
 # check-human-issues
@@ -22,14 +18,17 @@ Check GitHub Issues tagged `human` for messages from the research team, and resp
 
 ## Arguments
 
-- **$0** — Your name/label for gh issue filtering (e.g. `noam`, `fern`)
+- **$0** — The configured advisor branch for `ADVISOR`, or student name for
+  `STUDENT`
 - **$1** — Either `ADVISOR` or `STUDENT`
-
-The comment prefix is: if role is `ADVISOR` → `ADVISOR:`, if role is `STUDENT` → `STUDENT $0:`.
 
 ## How it works
 
-Human researchers communicate with agents through GitHub Issues. Issues are tagged with `human` plus either your name or `team` (for broadcast messages). Your job is to check them, respond to new ones, and skip ones you've already handled.
+Human researchers communicate with agents through GitHub Issues. Issues are
+tagged with `human` plus `team` for a broadcast, the configured advisor branch
+for an advisor, or `student:<student-name>` for a student. Your job is to check
+messages routed to your exact role, respond to new ones, and skip ones you've
+already handled.
 
 ## Steps
 
@@ -43,32 +42,30 @@ Human researchers communicate with agents through GitHub Issues. Issues are tagg
    - Record the exact numeric `id` of the issue body or human comment you are
      answering. Never substitute the issue number for a comment ID.
 
-3. **Respond** through `github_transition` with
-   `operation="respond_to_issue"`, the issue number, the exact
-   `human_message_id`, and your role-prefixed response. This verified,
+3. **Respond** through `respond_to_human_issue` with the issue number, the exact
+   `human_message_id`, and the response text without a role prefix. This verified,
    idempotent operation refuses closed issues, pull requests, missing `human`
-   labels, stale message IDs, and messages authored by the agent identity.
+   labels, stale message IDs, messages authored by the agent identity, and
+   issues not addressed to this configured advisor branch or student.
 
 ```json
 {
-  "transition": {
-    "operation": "respond_to_issue",
-    "issue_number": 123,
-    "human_message_id": 987654,
-    "response": "ADVISOR: <your response>"
-  }
+  "issue_number": 123,
+  "human_message_id": 987654,
+  "response": "<your response>"
 }
 ```
 
-For a student, use `"response": "STUDENT $0: <your response>"`. Never mutate
-the issue through `gh` or `curl`.
+Never mutate the issue through `gh` or `curl`.
 
 4. **Never close human issues.** Only the human does that.
 
 ## Return format
 
-When you're done, return a structured summary of the issues you checked and responded to:
+When you're done, record a structured summary of the issues you checked and
+responded to in the current conversation:
 
 ### New research directives from the human researcher team
 
-If there are research directives in the issues, include them in detail in your summary so the parent agent can incorporate them into planning.
+If there are research directives in the issues, include them in detail so they
+remain available for subsequent planning in this conversation.

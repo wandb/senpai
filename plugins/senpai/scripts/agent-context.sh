@@ -12,6 +12,10 @@ install_senpai_agent_context() {
 
     mkdir -p "$HOME/.agents/skills"
     cp -a "$workdir/.agents/." "$HOME/.agents/"
+    for marker in "$HOME"/.agents/skills/*/.senpai-developer-only; do
+        [ -e "$marker" ] || continue
+        rm -rf -- "${marker%/.senpai-developer-only}"
+    done
     cp -a "$source_plugin" "$runtime_plugin"
     "$SENPAI_PYTHON" -m senpai_agent.agent_markdown \
         "$HOME/.agents" "$runtime_plugin"

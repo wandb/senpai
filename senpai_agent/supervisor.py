@@ -171,6 +171,7 @@ class WorkerSupervisor:
                 )
             finally:
                 self._terminate_worker(process, descendants)
+                self._reap_orphaned_children(None)
             if stop.is_set():
                 return 0
 
@@ -221,6 +222,7 @@ class WorkerSupervisor:
         made_progress = False
         while not stop.is_set():
             self._remember_descendants(process, descendants)
+            self._reap_orphaned_children(process.pid)
             lease = self._read_lease()
             now = time.monotonic()
             if lease is not None and lease.pid == process.pid:
@@ -291,6 +293,24 @@ class WorkerSupervisor:
                 if process.create_time() == started_at:
                     process.send_signal(sig)
             except (OSError, psutil.Error):
+                continue
+
+    @staticmethod
+    def _reap_orphaned_children(worker_pid: int | None) -> None:
+        """Reap children adopted by the supervisor when it is container PID 1."""
+
+        if os.getpid() != 1:
+            return
+        try:
+            children = psutil.Process().children()
+        except (OSError, psutil.Error):
+            return
+        for child in children:
+            if child.pid == worker_pid:
+                continue
+            try:
+                os.waitpid(child.pid, os.WNOHANG)
+            except (ChildProcessError, ProcessLookupError):
                 continue
 
 

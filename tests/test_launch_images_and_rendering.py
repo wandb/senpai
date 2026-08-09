@@ -34,7 +34,7 @@ def test_default_config_exposes_every_model_profile_and_effort():
         "fast_model": "openai/gpt-5.6-luna",
         "fast_reasoning_effort": "high",
         "frontier_model": "openai/gpt-5.6-sol",
-        "frontier_reasoning_effort": "ultra",
+        "frontier_reasoning_effort": "max",
     }.items() <= config.items()
 
 
@@ -248,6 +248,16 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         assert config["SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT"] == "max"
 
 
+def test_openai_ultra_launch_value_is_rejected():
+    args = launch_args(
+        frontier_model="openai/gpt-5.6-sol",
+        frontier_reasoning_effort="ultra",
+    )
+
+    with pytest.raises(SystemExit, match="must be one of"):
+        launch.validate_model_config(args)
+
+
 def test_wandb_gateway_is_rendered_for_every_role():
     model = "wandb/zai-org/GLM-5.2"
     args = launch_args(
@@ -284,7 +294,7 @@ def test_wandb_gateway_is_rendered_for_every_role():
                 "advisor_model": "anthropic/claude-opus-4-8",
                 "advisor_reasoning_effort": "ultra",
             },
-            "unsupported for",
+            "must be one of",
         ),
         (
             {

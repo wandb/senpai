@@ -211,6 +211,7 @@ esac
             "EXPECTED_DEPLOYMENTS": "1",
             "READINESS_TIMEOUT_SECONDS": "1800",
             "BUDGET_SECONDS": "0",
+            "ARM_ID": "acceptance-arm",
             "PVC_LOG_ROOT": str(state_root),
             "START_GATE_PATH": str(gate),
             "NAMESPACE": "test-ns",
@@ -287,6 +288,7 @@ esac
             "EXPECTED_DEPLOYMENTS": "1",
             "READINESS_TIMEOUT_SECONDS": "0",
             "BUDGET_SECONDS": "0",
+            "ARM_ID": "never-ready-arm",
             "PVC_LOG_ROOT": str(state_root),
             "START_GATE_PATH": str(gate),
             "NAMESPACE": "test-ns",
@@ -298,3 +300,114 @@ esac
     assert "Readiness deadline reached; arming cutoff anyway" in result.stdout
     assert gate.is_file()
     assert delete_log.is_file()
+
+
+def test_rearming_a_used_slug_replaces_its_expired_cutoff_state(tmp_path):
+    generated, captured_script = render_cutoff(
+        tmp_path,
+        "--run-slug",
+        "reused",
+        "--tags-csv",
+        "track-a",
+        "--expected-pods",
+        "1",
+        "--expected-deployments",
+        "1",
+        "--budget-hours",
+        "0",
+    )
+    assert generated.returncode == 0, generated.stderr
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    runtime_kubectl = bin_dir / "kubectl"
+    runtime_kubectl.write_text(
+        """#!/bin/sh
+case "$*" in
+  *"get pods"*)
+    printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"ready":true}]}}]}'
+    ;;
+  *"get deployments"*) printf '%s\n' 'senpai-track-a' ;;
+  *"delete deployments,configmaps,secrets"*) exit 0 ;;
+  *) exit 2 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    runtime_kubectl.chmod(0o755)
+    state_root = tmp_path / "state"
+    run_dir = state_root / "reused"
+    run_dir.mkdir(parents=True)
+    state_file = run_dir / "cutoff_state.env"
+    state_file.write_text(
+        "RUN_SLUG=reused\n"
+        "TAGS_CSV=track-a\n"
+        "ARMED_AT_UTC=2026-01-01T00:00:00Z\n"
+        "ARM_REASON=all_ready\n"
+        "KILL_AT_EPOCH=1\n"
+        "KILL_AT_UTC=2026-01-01T00:00:01Z\n"
+        "EXPECTED_PODS=1\n"
+        "EXPECTED_DEPLOYMENTS=1\n"
+        "SELECTOR='research-tag in (track-a)'\n"
+        "START_GATE_PATH=''\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(captured_script)],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "RUN_SLUG": "reused",
+            "TAGS_CSV": "track-a",
+            "EXPECTED_PODS": "1",
+            "EXPECTED_DEPLOYMENTS": "1",
+            "READINESS_TIMEOUT_SECONDS": "0",
+            "BUDGET_SECONDS": "0",
+            "ARM_ID": "fresh-arm",
+            "PVC_LOG_ROOT": str(state_root),
+            "NAMESPACE": "test-ns",
+        },
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Discarding cutoff state from an earlier arm" in result.stdout
+    state = state_file.read_text(encoding="utf-8")
+    assert "PERSISTED_ARM_ID=fresh-arm" in state
+    assert "KILL_AT_EPOCH=1\n" not in state
+
+
+def test_operator_job_replacement_is_scoped_to_the_requested_namespace(tmp_path):
+    kubectl_log = tmp_path / "kubectl.log"
+    fake_kubectl = tmp_path / "kubectl"
+    fake_kubectl.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$KUBECTL_LOG"
+case "$*" in
+  *"create configmap"*) printf '%s\n' 'apiVersion: v1' 'kind: ConfigMap' ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    fake_kubectl.chmod(0o755)
+
+    result = run_cutoff(
+        "--run-slug",
+        "namespaced",
+        "--tags-csv",
+        "track-a",
+        env={
+            "KUBECTL": str(fake_kubectl),
+            "KUBECTL_LOG": str(kubectl_log),
+            "NAMESPACE": "review-ns",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        "--context pai-2 -n review-ns delete job senpai-cutoff-namespaced "
+        "--ignore-not-found=true"
+    ) in kubectl_log.read_text(encoding="utf-8").splitlines()

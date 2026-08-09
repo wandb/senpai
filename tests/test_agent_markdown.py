@@ -69,6 +69,17 @@ def test_sanitize_markdown_changes_runtime_copies_only(tmp_path: Path):
     assert source.read_text(encoding="utf-8").startswith("<!--\nSPDX-")
 
 
+def test_human_issue_skill_keeps_the_single_intent_response_contract():
+    content = (
+        PLUGIN_DIR / "skills" / "check-human-issues" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    assert "respond_to_human_issue" in content
+    assert "without a role prefix" in content
+    assert "github_transition" not in content
+    assert "STUDENT $0" not in content
+
+
 def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
     tmp_path: Path,
 ):
@@ -76,7 +87,7 @@ def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
     runtime_root = tmp_path / "runtime"
     home.mkdir()
     runtime_root.mkdir()
-    source_skill = PLUGIN_DIR / "skills" / "merge-winner" / "SKILL.md"
+    source_skill = PLUGIN_DIR / "skills" / "review-experiment" / "SKILL.md"
     source_agent = ROOT / ".agents" / "agents" / "bash-runner.md"
     originals = {
         source_skill: source_skill.read_text(encoding="utf-8"),
@@ -104,8 +115,9 @@ def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
     plugin = Plugin.load(runtime_plugin)
     agents = discover_agents(home, include_project=True, include_user=False)
 
-    assert "merge-winner" in {skill.name for skill in plugin.skills}
+    assert "review-experiment" in {skill.name for skill in plugin.skills}
     assert "bash-runner" in {agent.name for agent in agents}
+    assert not (home / ".agents/skills/senpai-tool-telemetry").exists()
     assert all(
         strip_spdx_header(text) == text
         for root in (runtime_plugin, home / ".agents")

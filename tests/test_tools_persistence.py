@@ -17,10 +17,9 @@ from senpai_agent.delegation import (
     DelegateAgentObservation,
     DelegateAgentTool,
 )
+from senpai_agent.github.tools import SubmitExperimentResultAction
 from senpai_agent.tools import (
-    GitHubTransitionAction,
     MonitorTrainingAction,
-    SubmitResultTransition,
     TrainingResultObservation,
 )
 from senpai_agent.training import TrainingState
@@ -170,25 +169,20 @@ def test_running_training_observation_survives_event_log_restore():
 )
 def test_submit_result_action_survives_event_log_restore(primary_metric):
     result = experiment_result(primary_metric)
-    action = GitHubTransitionAction(
-        transition=SubmitResultTransition(
-            operation="submit_result",
-            pr_number=17,
-            branch="candidate",
-            expected_remote_sha="a" * 40,
-            expected_head_sha=result.commit_sha,
-            result=result,
-        )
+    action = SubmitExperimentResultAction(
+        branch="candidate",
+        remote_branch_sha_before_push="a" * 40,
+        result=result,
     )
     restored = round_trip(
         ActionEvent(
             thought=[],
             action=action,
-            tool_name="github_transition",
+            tool_name="submit_experiment_result",
             tool_call_id="call-17",
             tool_call=MessageToolCall(
                 id="call-17",
-                name="github_transition",
+                name="submit_experiment_result",
                 arguments=json.dumps(action.model_dump(mode="json")),
                 origin="completion",
             ),
@@ -197,5 +191,5 @@ def test_submit_result_action_survives_event_log_restore(primary_metric):
     )
 
     assert isinstance(restored, ActionEvent)
-    assert isinstance(restored.action, GitHubTransitionAction)
-    assert restored.action.transition.result.primary_metric == primary_metric
+    assert isinstance(restored.action, SubmitExperimentResultAction)
+    assert restored.action.result.primary_metric == primary_metric

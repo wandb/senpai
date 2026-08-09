@@ -96,7 +96,7 @@ class Args:
     fast_model: str = "openai/gpt-5.6-luna"
     fast_reasoning_effort: str = "high"
     frontier_model: str = "openai/gpt-5.6-sol"
-    frontier_reasoning_effort: str = "ultra"
+    frontier_reasoning_effort: str = "max"
     human_issues: bool = (
         True  # allow human GitHub issue triage; disable for isolated launches
     )
@@ -143,7 +143,6 @@ REASONING_EFFORTS = {
     "high",
     "xhigh",
     "max",
-    "ultra",
     "none",
 }
 
@@ -185,6 +184,11 @@ def deployed_model_providers(args: Args) -> set[str]:
     return providers
 
 
+def _supports_openai_pro(model: str) -> bool:
+    normalized = model.lower()
+    return normalized == "openai/gpt-5.6" or normalized.startswith("openai/gpt-5.6-")
+
+
 def validate_model_config(args: Args) -> None:
     profiles = {
         "student": (args.student_model, args.student_reasoning_effort),
@@ -210,13 +214,9 @@ def validate_model_config(args: Args) -> None:
                     f"unsupported for {model}"
                 )
             continue
-        supports_extended_effort = normalized_model == "openai/gpt-5.6" or (
-            normalized_model.startswith("openai/gpt-5.6-")
-        )
-        if effort in {"max", "ultra"} and not supports_extended_effort:
+        if effort == "max" and not _supports_openai_pro(model):
             sys.exit(
-                f"ERROR: --{name}_reasoning_effort={effort} is unsupported for "
-                f"{model}"
+                f"ERROR: --{name}_reasoning_effort={effort} is unsupported for {model}"
             )
 
 

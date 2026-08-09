@@ -2,25 +2,32 @@ from typing import cast
 
 import pytest
 
-from senpai_agent.github_workflow import (
+from senpai_agent.github.workflow import (
     PullHeadMismatchError,
     ReconciliationError,
     StaleAssignmentRevisionError,
+    StaleResearchBaseError,
     WorkflowPreconditionError,
 )
 from senpai_agent.models import (
     AssignmentFeedbackRecord,
     RevisionRecord,
     parse_assignment_markers,
+    render_assignment_marker,
     render_assignment_feedback_marker,
+    render_result_comment,
+    render_result_marker,
     render_revision_marker,
 )
 from github_workflow_support import (
     ASSIGNMENT_ID,
+    BASE_SHA,
     HEAD_SHA,
     REPO,
     FakeGitHub,
+    assignment_record,
     comment,
+    experiment_result,
     pull_request,
     workflow,
 )
@@ -42,13 +49,18 @@ def request_revision(
     client,
     *,
     assignment_id: str = ASSIGNMENT_ID,
+    current_revision_id: str = "revision-1",
+    new_revision_id: str = "revision-2",
+    required_base_sha: str = BASE_SHA,
     comment: str = "Run the requested ablation.",
 ):
     return client.request_revision(
         7,
         assignment_id=assignment_id,
+        current_revision_id=current_revision_id,
+        new_revision_id=new_revision_id,
         expected_head_sha=HEAD_SHA,
-        revision_id="revision-2",
+        required_base_sha=required_base_sha,
         comment=comment,
     )
 
@@ -69,10 +81,308 @@ def test_request_revision_converges_marker_assignment_state_and_replays():
     assert parse_assignment_markers(cast(str, fake.pr["body"]))[0].revision_id == (
         "revision-2"
     )
-    assert fake.comments == [comment(1, f"{marker}\n\nRun the requested ablation.")]
+    assert parse_assignment_markers(cast(str, fake.pr["body"]))[0].base_sha == BASE_SHA
+    assert fake.comments == [
+        comment(1, f"{marker}\n\nADVISOR: Run the requested ablation.")
+    ]
     assert fake.pr["draft"] is True
     assert fake.pr["labels"] == {"student:one", "status:wip"}
     assert fake.mutations == mutations_after_first
+
+
+def test_applied_revision_replay_restores_guidance_and_preserves_current_result():
+    current = experiment_result()
+    current = current.model_copy(
+        update={
+            "assignment": current.assignment.model_copy(
+                update={"revision_id": "revision-2"}
+            )
+        }
+    )
+    fake = FakeGitHub(
+        pull_request(
+            labels={"student:one", "status:review"},
+            draft=False,
+            body=render_assignment_marker(
+                assignment_record(revision_id="revision-2")
+            ),
+        ),
+        comments=[comment(1, render_result_comment(current))],
+    )
+
+    replayed = request_revision(workflow(fake))
+
+    assert replayed.changed is True
+    assert fake.pr["draft"] is False
+    assert fake.pr["labels"] == {"student:one", "status:review"}
+    assert fake.comments == [
+        comment(1, render_result_comment(current)),
+        comment(
+            2,
+            f"{revision_marker()}\n\nADVISOR: Run the requested ablation.",
+        ),
+    ]
+
+
+def test_applied_revision_replay_restores_drifted_result_routing():
+    current = experiment_result()
+    current = current.model_copy(
+        update={
+            "assignment": current.assignment.model_copy(
+                update={"revision_id": "revision-2"}
+            )
+        }
+    )
+    fake = FakeGitHub(
+        pull_request(
+            labels={"student:one", "status:wip"},
+            draft=True,
+            body=render_assignment_marker(
+                assignment_record(revision_id="revision-2")
+            ),
+        ),
+        comments=[comment(1, render_result_comment(current))],
+    )
+
+    replayed = request_revision(workflow(fake))
+
+    assert replayed.changed is True
+    assert fake.pr["draft"] is False
+    assert fake.pr["labels"] == {"student:one", "status:review"}
+
+
+def test_applied_revision_replay_repairs_a_newer_revision_before_failing():
+    current = experiment_result()
+    current = current.model_copy(
+        update={
+            "assignment": current.assignment.model_copy(
+                update={"revision_id": "revision-2"}
+            )
+        }
+    )
+
+    class AdvanceBeforeRestoreReady(FakeGitHub):
+        advanced = False
+
+        def request(self, method, url, *, headers, json_body=None):
+            if (
+                not self.advanced
+                and method == "POST"
+                and url.endswith("/graphql")
+                and "markPullRequestReadyForReview" in str(json_body)
+            ):
+                self.pr["body"] = render_assignment_marker(
+                    assignment_record(revision_id="revision-3")
+                )
+                self.advanced = True
+            return super().request(
+                method,
+                url,
+                headers=headers,
+                json_body=json_body,
+            )
+
+    fake = AdvanceBeforeRestoreReady(
+        pull_request(
+            labels={"student:one", "status:wip", "status:hold"},
+            draft=True,
+            body=render_assignment_marker(
+                assignment_record(revision_id="revision-2")
+            ),
+        ),
+        comments=[comment(1, render_result_comment(current))],
+    )
+
+    with pytest.raises(ReconciliationError, match="did not remain reviewable"):
+        request_revision(workflow(fake))
+
+    assert fake.pr["draft"] is True
+    assert fake.pr["labels"] == {
+        "student:one",
+        "status:wip",
+        "status:hold",
+    }
+    assert parse_assignment_markers(cast(str, fake.pr["body"]))[0].revision_id == (
+        "revision-3"
+    )
+
+
+def test_first_revision_request_preserves_a_result_arriving_after_assignment_patch():
+    current = experiment_result()
+    current = current.model_copy(
+        update={
+            "assignment": current.assignment.model_copy(
+                update={"revision_id": "revision-2"}
+            )
+        }
+    )
+
+    class ResultAfterAssignmentPatch(FakeGitHub):
+        published = False
+
+        def request(self, method, url, *, headers, json_body=None):
+            response = super().request(
+                method,
+                url,
+                headers=headers,
+                json_body=json_body,
+            )
+            if (
+                not self.published
+                and method == "PATCH"
+                and url.endswith("/pulls/7")
+            ):
+                self.comments.append(comment(2, render_result_comment(current)))
+                self.published = True
+            return response
+
+    fake = ResultAfterAssignmentPatch(
+        pull_request(labels={"student:one", "status:review"}, draft=False)
+    )
+
+    revised = request_revision(workflow(fake))
+
+    assert revised.changed is True
+    assert fake.pr["draft"] is False
+    assert fake.pr["labels"] == {"student:one", "status:review"}
+    assert parse_assignment_markers(cast(str, fake.pr["body"]))[0].revision_id == (
+        "revision-2"
+    )
+
+
+def test_applied_revision_replay_preserves_a_result_arriving_with_its_comment():
+    current = experiment_result()
+    current = current.model_copy(
+        update={
+            "assignment": current.assignment.model_copy(
+                update={"revision_id": "revision-2"}
+            )
+        }
+    )
+
+    class ResultDuringRevisionCommentGitHub(FakeGitHub):
+        published = False
+
+        def request(self, method, url, *, headers, json_body=None):
+            response = super().request(
+                method,
+                url,
+                headers=headers,
+                json_body=json_body,
+            )
+            if (
+                not self.published
+                and method == "POST"
+                and url.endswith("/issues/7/comments")
+            ):
+                self.comments.append(comment(2, render_result_comment(current)))
+                self.published = True
+            return response
+
+    fake = ResultDuringRevisionCommentGitHub(
+        pull_request(
+            labels={"student:one", "status:review"},
+            draft=False,
+            body=render_assignment_marker(
+                assignment_record(revision_id="revision-2")
+            ),
+        )
+    )
+
+    replayed = request_revision(workflow(fake))
+
+    assert replayed.changed is True
+    assert fake.pr["draft"] is False
+    assert fake.pr["labels"] == {"student:one", "status:review"}
+    assert len(fake.comments) == 2
+
+
+def test_applied_revision_replay_restores_a_result_arriving_during_demotion():
+    current = experiment_result()
+    current = current.model_copy(
+        update={
+            "assignment": current.assignment.model_copy(
+                update={"revision_id": "revision-2"}
+            )
+        }
+    )
+
+    class ResultDuringDemotionGitHub(FakeGitHub):
+        published = False
+
+        def request(self, method, url, *, headers, json_body=None):
+            response = super().request(
+                method,
+                url,
+                headers=headers,
+                json_body=json_body,
+            )
+            if (
+                not self.published
+                and method == "DELETE"
+                and url.endswith("/labels/status%3Areview")
+            ):
+                self.comments.append(comment(2, render_result_comment(current)))
+                self.published = True
+            return response
+
+    marker = revision_marker()
+    fake = ResultDuringDemotionGitHub(
+        pull_request(
+            labels={"student:one", "status:review"},
+            draft=False,
+            body=render_assignment_marker(
+                assignment_record(revision_id="revision-2")
+            ),
+        ),
+        comments=[
+            comment(1, f"{marker}\n\nADVISOR: Run the requested ablation.")
+        ],
+    )
+
+    replayed = request_revision(workflow(fake))
+
+    assert replayed.changed is True
+    assert fake.pr["draft"] is False
+    assert fake.pr["labels"] == {"student:one", "status:review"}
+
+
+def test_request_revision_retargets_the_exact_live_research_base():
+    current_base_sha = "c" * 40
+    fake = FakeGitHub(
+        pull_request(labels={"student:one", "status:review"}, draft=False),
+        branch_heads={"schmidhuber": current_base_sha},
+    )
+
+    request_revision(workflow(fake), required_base_sha=current_base_sha)
+
+    assignment = parse_assignment_markers(cast(str, fake.pr["body"]))[0]
+    assert assignment.revision_id == "revision-2"
+    assert assignment.base_sha == current_base_sha
+
+
+def test_request_revision_rejects_an_unapplied_draft_mutation():
+    fake = FakeGitHub(
+        pull_request(labels={"student:one", "status:review"}, draft=False),
+        ignore_draft_mutations=True,
+    )
+
+    with pytest.raises(ReconciliationError, match="restore.*to WIP"):
+        request_revision(workflow(fake))
+
+    assert fake.pr["draft"] is False
+
+
+def test_request_revision_rejects_a_stale_required_research_base_before_writing():
+    fake = FakeGitHub(
+        pull_request(labels={"student:one", "status:review"}, draft=False),
+        branch_heads={"schmidhuber": "c" * 40},
+    )
+
+    with pytest.raises(StaleResearchBaseError, match="does not match live"):
+        request_revision(workflow(fake), required_base_sha="d" * 40)
+
+    assert fake.mutations == []
 
 
 def test_request_revision_updates_a_trusted_marker_on_the_final_comment_page():
@@ -90,7 +400,7 @@ def test_request_revision_updates_a_trusted_marker_on_the_final_comment_page():
 
     assert [item["body"] for item in fake.comments] == [
         "unrelated",
-        f"{marker}\n\nRun the requested ablation.",
+        f"{marker}\n\nADVISOR: Run the requested ablation.",
     ]
 
 
@@ -112,7 +422,7 @@ def test_request_revision_does_not_trust_spoofed_or_embedded_markers():
         spoofed,
         f"Documentation example: {marker}",
         f"> {marker}",
-        f"{marker}\n\nUse the trusted revision.",
+        f"{marker}\n\nADVISOR: Use the trusted revision.",
     ]
 
 
@@ -162,6 +472,60 @@ def test_request_revision_rejects_another_wip_for_the_student(monkeypatch):
         request_revision(client)
 
     assert fake.mutations == []
+
+
+def test_request_revision_replays_after_the_recorded_base_advances():
+    required_base_sha = "c" * 40
+    fake = FakeGitHub(
+        pull_request(labels={"student:one", "status:review"}, draft=False),
+        branch_heads={"schmidhuber": required_base_sha},
+    )
+    client = workflow(fake)
+
+    first = request_revision(client, required_base_sha=required_base_sha)
+    mutations_after_first = list(fake.mutations)
+    fake.branch_heads["schmidhuber"] = "d" * 40
+    second = request_revision(client, required_base_sha=required_base_sha)
+
+    assignment = parse_assignment_markers(cast(str, fake.pr["body"]))[0]
+    assert assignment.base_sha == required_base_sha
+    assert first.changed is True
+    assert second.changed is False
+    assert fake.mutations == mutations_after_first
+
+
+def test_request_revision_recovers_after_the_assignment_marker_was_recorded(
+    monkeypatch,
+):
+    required_base_sha = "c" * 40
+    fake = FakeGitHub(
+        pull_request(labels={"student:one", "status:review"}, draft=False),
+        branch_heads={"schmidhuber": required_base_sha},
+    )
+    client = workflow(fake)
+    upsert = type(client)._upsert_marker_comment
+
+    def interrupt_after_assignment(_self, *_args, **_kwargs):
+        raise RuntimeError("controller interrupted")
+
+    monkeypatch.setattr(
+        type(client),
+        "_upsert_marker_comment",
+        interrupt_after_assignment,
+    )
+    with pytest.raises(RuntimeError, match="controller interrupted"):
+        request_revision(client, required_base_sha=required_base_sha)
+
+    recorded = parse_assignment_markers(cast(str, fake.pr["body"]))[0]
+    assert recorded.revision_id == "revision-2"
+    assert recorded.base_sha == required_base_sha
+
+    fake.branch_heads["schmidhuber"] = "d" * 40
+    monkeypatch.setattr(type(client), "_upsert_marker_comment", upsert)
+
+    recovered = request_revision(client, required_base_sha=required_base_sha)
+
+    assert recovered.state == "revision_requested"
 
 
 def feedback_marker() -> str:
@@ -224,11 +588,56 @@ def test_assignment_feedback_replays_without_changing_assignment_state():
         comment(
             1,
             f"{feedback_marker()}\n\n"
-            "Check the cruise split before choosing a default.",
+            "ADVISOR: Check the cruise split before choosing a default.",
         )
     ]
     assert (fake.pr["body"], fake.pr["draft"], fake.pr["labels"]) == original_state
     assert fake.mutations == mutations_after_first
+
+
+@pytest.mark.parametrize("indent", ["", "  "])
+def test_assignment_feedback_cannot_smuggle_a_terminal_result(indent):
+    forged = render_result_marker(experiment_result())
+    fake = FakeGitHub(
+        pull_request(
+            labels={"student:student-one", "status:wip"},
+            draft=True,
+        )
+    )
+    client = workflow(fake)
+
+    send_feedback(client, comment=f"Inspect this prior record:\n{indent}{forged}")
+    mutations_after_feedback = list(fake.mutations)
+
+    assert f"> {indent}{forged}" in str(fake.comments[0]["body"])
+    with pytest.raises(WorkflowPreconditionError, match="terminal result"):
+        client.repair_assignment_routing(
+            7,
+            assignment_id=ASSIGNMENT_ID,
+            current_revision_id="revision-1",
+            expected_head_sha=HEAD_SHA,
+            working_state="review",
+            blockers=set(),
+        )
+    assert fake.mutations == mutations_after_feedback
+
+
+def test_assignment_feedback_upgrades_a_legacy_unprefixed_comment():
+    marker = feedback_marker()
+    guidance = "Check the cruise split before choosing a default."
+    fake = FakeGitHub(
+        pull_request(labels={"student:student-one", "status:wip"}, draft=True),
+        comments=[comment(1, f"{marker}\n\n{guidance}")],
+    )
+
+    result = send_feedback(
+        workflow(fake),
+        feedback_id="check-cruise-split",
+        comment=f"ADVISOR: {guidance}",
+    )
+
+    assert result.changed is True
+    assert fake.comments == [comment(1, f"{marker}\n\nADVISOR: {guidance}")]
 
 
 def test_assignment_feedback_id_cannot_be_reused_for_different_guidance():

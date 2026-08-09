@@ -12,7 +12,7 @@ from openhands.sdk.plugin import Plugin
 from senpai_agent.hooks import hook_main
 
 PLUGIN_DIR = Path(__file__).parents[1] / "plugins" / "senpai"
-TRAINING_ID = "training-1"
+TRAINING_ID = "b81440b1-b803-471e-9fe0-6dcabd756b83"
 
 
 def invoke_hook(
@@ -116,6 +116,37 @@ def test_student_stop_allows_durable_monitored_training(
 ):
     state_dir = tmp_path / "state"
     write_running_training(state_dir, monitored=True)
+    monkeypatch.setattr(
+        "senpai_agent.hooks.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=""),
+    )
+
+    exit_code, output = invoke_hook(
+        "stop",
+        {"working_dir": str(assignment_workspace)},
+        monkeypatch,
+        capsys,
+        {
+            "SENPAI_ROLE": "student",
+            "SENPAI_OPENHANDS_STATE_DIR": str(state_dir),
+        },
+    )
+
+    assert (exit_code, output["decision"]) == (0, "allow")
+
+
+def test_student_stop_ignores_non_training_json_sidecars(
+    assignment_workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    state_dir = tmp_path / "state"
+    training_dir = state_dir / "training"
+    training_dir.mkdir(parents=True)
+    (training_dir / f"{TRAINING_ID}.score.json").write_text(
+        '{"metrics": {}, "passed": true, "score": 1.0}'
+    )
     monkeypatch.setattr(
         "senpai_agent.hooks.subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(stdout=""),

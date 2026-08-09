@@ -127,6 +127,40 @@ class ConversationStateLedger:
         return value
 
 
+class WorkspaceDivergenceLedger:
+    """Persist the last handled workspace blocker for each conversation."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def current(self, conversation_id: UUID) -> str | None:
+        return self._read().get(str(conversation_id))
+
+    def record(self, conversation_id: UUID, event_key: str) -> None:
+        values = self._read()
+        key = str(conversation_id)
+        if values.get(key) == event_key:
+            return
+        values[key] = event_key
+        _replace_json(self.path, values)
+
+    def clear(self, conversation_id: UUID) -> None:
+        values = self._read()
+        if values.pop(str(conversation_id), None) is not None:
+            _replace_json(self.path, values)
+
+    def _read(self) -> dict[str, str]:
+        if not self.path.exists():
+            return {}
+        value = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or not all(
+            isinstance(key, str) and isinstance(item, str)
+            for key, item in value.items()
+        ):
+            raise RuntimeError(f"invalid workspace divergence ledger: {self.path}")
+        return value
+
+
 @dataclass(frozen=True, slots=True)
 class ConversationBatch:
     conversation_id: UUID

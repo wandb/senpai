@@ -27,6 +27,7 @@ from senpai_agent.advisor import (
     compose_system_instructions,
 )
 from senpai_agent.delegation import (
+    MAX_DELEGATION_DEPTH,
     MAX_PARALLEL_AGENTS,
     DelegationConfig,
     cancel_pending_descendants,
@@ -71,18 +72,18 @@ from simple_parsing import ArgumentParser, field
 from simple_parsing.helpers import flag
 
 from senpai_agent.agent_markdown import read_agent_markdown, strip_spdx_header
-from senpai_agent.tools import (
+from senpai_agent.github.tools import (
     clear_github_credentials,
     configure_github_credentials,
-    register_senpai_tools,
 )
+from senpai_agent.tools import register_senpai_tools
 
 DEFAULT_MODEL = "openai/gpt-5.6-sol"
 DEFAULT_FAST_MODEL = "openai/gpt-5.6-luna"
 DEFAULT_FRONTIER_MODEL = "openai/gpt-5.6-sol"
 DEFAULT_REASONING_EFFORT = "xhigh"
 DEFAULT_FAST_REASONING_EFFORT = "high"
-DEFAULT_FRONTIER_REASONING_EFFORT = "ultra"
+DEFAULT_FRONTIER_REASONING_EFFORT = "max"
 WANDB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
 REASONING_EFFORTS = (
     "low",
@@ -90,7 +91,6 @@ REASONING_EFFORTS = (
     "high",
     "xhigh",
     "max",
-    "ultra",
     "none",
 )
 SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore", "search")
@@ -182,6 +182,9 @@ class RunnerConfig:
     harness_file: Path
     role_file: Path
     plugin_dir: Path
+    advisor_branch: str | None = None
+    student_names: tuple[str, ...] | None = None
+    student_name: str | None = None
     wandb_entity: str | None = None
     wandb_project: str | None = None
     training_max_timeout_seconds: int = 1800
@@ -204,6 +207,9 @@ def parse_runner_args(argv: Sequence[str] | None = None) -> RunnerArgs:
 
 def openhands_reasoning_effort(reasoning_effort: str, model: str) -> str:
     provider, _, model_name = model.lower().partition("/")
+    supports_openai_pro = provider == "openai" and (
+        model_name == "gpt-5.6" or model_name.startswith("gpt-5.6-")
+    )
     if reasoning_effort not in REASONING_EFFORTS:
         choices = ", ".join(REASONING_EFFORTS)
         raise ValueError(
@@ -217,16 +223,55 @@ def openhands_reasoning_effort(reasoning_effort: str, model: str) -> str:
                 f"model {model!r}; use 'high' or 'max'"
             )
         return reasoning_effort
-    supports_extended_effort = provider == "openai" and (
-        model_name == "gpt-5.6" or model_name.startswith("gpt-5.6-")
-    )
-    if reasoning_effort in {"max", "ultra"} and not supports_extended_effort:
+    if reasoning_effort == "max" and not supports_openai_pro:
         raise ValueError(
             f"reasoning effort {reasoning_effort!r} is unsupported for model "
             f"{model!r}; "
             "use an openai/gpt-5.6 model or select a lower effort"
         )
-    return "max" if reasoning_effort == "ultra" else reasoning_effort
+    return reasoning_effort
+
+
+def _uses_openai_pro_mode(model: str, reasoning_effort: str | None) -> bool:
+    return (
+        reasoning_effort is not None
+        and model.split("/", 1)[0].lower() == "openai"
+        and openhands_reasoning_effort(reasoning_effort, model) == "max"
+    )
+
+
+def _openai_pro_reasoning(
+    model: str,
+    reasoning_effort: str | None,
+) -> dict[str, str] | None:
+    if not _uses_openai_pro_mode(model, reasoning_effort):
+        return None
+    return {
+        "effort": "max",
+        "mode": "pro",
+        "summary": "auto",
+        "context": "all_turns",
+    }
+
+
+def apply_reasoning_profile(llm: LLM) -> LLM:
+    """Validate effort and replace only Senpai's reasoning request body."""
+
+    reasoning_effort = openhands_reasoning_effort(
+        llm.reasoning_effort,
+        llm.model,
+    )
+    extra_body = dict(llm.litellm_extra_body or {})
+    if reasoning := _openai_pro_reasoning(llm.model, reasoning_effort):
+        extra_body["reasoning"] = reasoning
+    else:
+        extra_body.pop("reasoning", None)
+    return llm.model_copy(
+        update={
+            "reasoning_effort": reasoning_effort,
+            "litellm_extra_body": extra_body,
+        }
+    )
 
 
 def model_provider(model: str) -> str:
@@ -381,6 +426,12 @@ def sanitized_project_skills(workspace: Path) -> list[Skill]:
     return [
         skill.model_copy(update={"content": strip_spdx_header(skill.content)})
         for skill in load_project_skills(workspace)
+        if not (
+            skill.source
+            and (
+                workspace / Path(skill.source).parent / ".senpai-developer-only"
+            ).is_file()
+        )
     ]
 
 
@@ -404,6 +455,24 @@ def sanitized_agent_definitions(workspace: Path) -> list[AgentDefinition]:
             ),
         )
     ]
+
+
+def depth_aware_child_definition(
+    definition: AgentDefinition,
+    *,
+    child: bool,
+    depth: int,
+) -> AgentDefinition:
+    """Expose recursive spawn only to the one child role that can use it."""
+
+    if not child or (
+        definition.name == "general-purpose"
+        and 0 < depth < MAX_DELEGATION_DEPTH
+    ):
+        return definition
+    return definition.model_copy(
+        update={"tools": [tool for tool in definition.tools if tool != "spawn_agents"]}
+    )
 
 
 def register_agent_definitions(
@@ -518,7 +587,7 @@ def resolve_config(
         )
         or DEFAULT_REASONING_EFFORT
     )
-    openhands_reasoning_effort(reasoning_effort, model)
+    reasoning_effort = openhands_reasoning_effort(reasoning_effort, model)
     api_key_env = (
         env_value(args.api_key_env, env, "SENPAI_OPENHANDS_API_KEY_ENV")
         or infer_api_key_env(
@@ -560,7 +629,10 @@ def resolve_config(
             )
             or smart_default_effort
         )
-        openhands_reasoning_effort(smart_reasoning_effort, smart_model)
+        smart_reasoning_effort = openhands_reasoning_effort(
+            smart_reasoning_effort,
+            smart_model,
+        )
 
         fast_default_model = (
             DEFAULT_FAST_MODEL
@@ -585,7 +657,10 @@ def resolve_config(
             )
             or DEFAULT_FAST_REASONING_EFFORT
         )
-        openhands_reasoning_effort(fast_reasoning_effort, fast_model)
+        fast_reasoning_effort = openhands_reasoning_effort(
+            fast_reasoning_effort,
+            fast_model,
+        )
 
         frontier_model = (
             env_value(
@@ -605,7 +680,10 @@ def resolve_config(
             )
             or DEFAULT_FRONTIER_REASONING_EFFORT
         )
-        openhands_reasoning_effort(frontier_reasoning_effort, frontier_model)
+        frontier_reasoning_effort = openhands_reasoning_effort(
+            frontier_reasoning_effort,
+            frontier_model,
+        )
 
         smart_api_key_env = profile_api_key_env(
             smart_model,
@@ -702,6 +780,13 @@ def resolve_config(
         plugin_dir=resolve_plugin_dir(
             env_value(args.plugin_dir, env, "SENPAI_PLUGIN"),
         ),
+        advisor_branch=env.get("ADVISOR_BRANCH") or None,
+        student_names=tuple(
+            name.strip()
+            for name in env.get("STUDENT_NAMES", "").split(",")
+            if name.strip()
+        ),
+        student_name=env.get("STUDENT_NAME") or None,
         wandb_entity=wandb_entity,
         wandb_project=wandb_project,
         training_max_timeout_seconds=training_max_timeout_seconds,
@@ -827,15 +912,9 @@ def openai_responses_configuration(
         "responses_use_previous_response_id": True,
         "responses_compact_threshold": 200_000,
     }
-    if reasoning_effort == "ultra":
-        openhands_reasoning_effort(reasoning_effort, model)
+    if reasoning := _openai_pro_reasoning(model, reasoning_effort):
         configuration["litellm_extra_body"] = {
-            "reasoning": {
-                "effort": "max",
-                "mode": "pro",
-                "summary": "auto",
-                "context": "all_turns",
-            }
+            "reasoning": reasoning,
         }
     return configuration
 
@@ -952,7 +1031,7 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
     tools = [
         tool
         for tool in get_default_tools(
-            enable_browser=config.enable_browser,
+            enable_browser=False,
             enable_sub_agents=False,
         )
         if tool.name != "terminal"
@@ -961,12 +1040,21 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
         (
             Tool(name="senpai_terminal", params={"role": config.role}),
             Tool(
-                name="get_prs",
-                params={"state_dir": str(config.state_dir / "github")},
+                name="senpai_github",
+                params={
+                    "role": config.role,
+                    "state_dir": str(config.state_dir / "github"),
+                    "advisor_branch": config.advisor_branch,
+                    "student_names": config.student_names,
+                    "student_name": config.student_name,
+                },
             ),
-            Tool(name="github_transition", params={"role": config.role}),
         )
     )
+    if config.enable_browser:
+        # Keep the persisted spec name stable while its resolver exposes only
+        # the lightweight load_browser definition until the model opts in.
+        tools.append(Tool(name="browser_tool_set"))
     delegation_params = {"event_db_path": str(local_event_db_path(config))}
     if not config.child:
         tools.append(Tool(name="delegate_agent", params=delegation_params))
@@ -1180,7 +1268,7 @@ def run_openhands(
     scrub_model_credentials(os.environ, config)
     harness_instructions = read_role_instructions(config.harness_file)
     role_instructions = read_role_instructions(config.role_file)
-    register_default_tools(enable_browser=config.enable_browser)
+    register_default_tools(enable_browser=False)
     register_senpai_tools()
     file_agents = (
         []
@@ -1220,7 +1308,12 @@ def run_openhands(
                     config.reasoning_effort, config.model
                 ),
                 "reasoning_mode": (
-                    "pro" if config.reasoning_effort == "ultra" else "standard"
+                    "pro"
+                    if _uses_openai_pro_mode(
+                        config.model,
+                        config.reasoning_effort,
+                    )
+                    else "standard"
                 ),
                 "agent": config.agent_name,
                 "enable_browser": config.enable_browser,
@@ -1273,14 +1366,17 @@ def run_openhands(
             ),
         )
         if config.agent_name:
-            definition = find_named_agent(config.agent_name, file_agents)
+            definition = depth_aware_child_definition(
+                find_named_agent(config.agent_name, file_agents),
+                child=config.child,
+                depth=config.delegation_depth,
+            )
             agent = agent_definition_to_factory(
                 definition,
                 work_dir=config.workspace,
             )(llm)
-            openhands_reasoning_effort(
-                agent.llm.reasoning_effort,
-                agent.llm.model,
+            agent = agent.model_copy(
+                update={"llm": apply_reasoning_profile(agent.llm)}
             )
             agent = with_role_and_project_context(
                 agent,
@@ -1290,8 +1386,8 @@ def run_openhands(
             )
             agent = with_tool_concurrency(agent, MAX_PARALLEL_AGENTS)
             if (
-                llm.responses_use_previous_response_id
-                or llm.uses_anthropic_compaction()
+                agent.llm.responses_use_previous_response_id
+                or agent.llm.uses_anthropic_compaction()
             ):
                 agent = agent.model_copy(update={"condenser": None})
         else:

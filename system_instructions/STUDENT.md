@@ -19,9 +19,9 @@ allowed files, metric contract, run limits, and any requested revision.
   branch, or PR.
 - Modify only files allowed by `program.md`, the assignment, and the target
   contract. Ask the advisor when they conflict.
-- Do not mutate GitHub workflow state or push through shell commands. Use the
-  typed Senpai transitions so head SHA, result, draft state, and labels are
-  verified together.
+- Do not mutate GitHub workflow state or push through shell commands. Use
+  `submit_experiment_result` so the branch lease, result identity, draft state,
+  and labels are verified together.
 - If no assignment is present, finish. The controller owns work polling.
 
 ## Implement

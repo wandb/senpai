@@ -1,6 +1,7 @@
 import pytest
 
 from senpai_agent.github import get_prs
+from senpai_agent.github.http import GitHubReadError
 
 from github_retrieval_support import (
     REPO,
@@ -57,8 +58,16 @@ def test_get_prs_unifies_explicit_search_and_date_range_selectors(
     fake = FakeGitHubReader(
         {3: pull_request(3), 7: pull_request(7)},
         search_pages=[
-            {"items": [{"number": 7}]},
-            {"items": [{"number": 3}, {"number": 7}]},
+            {
+                "total_count": 2,
+                "incomplete_results": False,
+                "items": [{"number": 7}],
+            },
+            {
+                "total_count": 2,
+                "incomplete_results": False,
+                "items": [{"number": 3}, {"number": 7}],
+            },
         ],
     )
     install_fake_github(monkeypatch, fake)
@@ -77,6 +86,38 @@ def test_get_prs_unifies_explicit_search_and_date_range_selectors(
         "repo:acme/widgets is:pr label:status:review "
         "created:2026-06-01..2026-06-30"
     )
+
+
+@pytest.mark.parametrize(
+    ("search_page", "message"),
+    [
+        (
+            {"total_count": 1, "incomplete_results": True, "items": []},
+            "incomplete results",
+        ),
+        (
+            {"total_count": 1_001, "incomplete_results": False, "items": []},
+            "1,000-result limit",
+        ),
+    ],
+    ids=("incomplete", "result-cap"),
+)
+def test_get_prs_rejects_incomplete_or_capped_searches(
+    monkeypatch,
+    tmp_path,
+    search_page,
+    message,
+):
+    fake = FakeGitHubReader({}, search_pages=[search_page])
+    install_fake_github(monkeypatch, fake)
+
+    with pytest.raises(GitHubReadError, match=message):
+        get_prs(
+            REPO,
+            search="label:status:review",
+            artifact_dir=tmp_path / "artifacts",
+            target_workspace=tmp_path / "target",
+        )
 
 
 def test_get_prs_requires_a_bounded_selector(monkeypatch, tmp_path):

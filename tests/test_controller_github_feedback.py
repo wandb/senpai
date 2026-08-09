@@ -1,10 +1,11 @@
 from pathlib import Path
 from uuid import UUID
 
+import pytest
 from pydantic import SecretStr
 
 from senpai_agent.controller import Controller, TurnResult
-from senpai_agent.github_mailbox import GitHubMailbox
+from senpai_agent.github.mailbox import GitHubMailbox
 from senpai_agent.models import (
     AssignmentFeedbackRecord,
     AssignmentRecord,
@@ -83,6 +84,7 @@ def student_mailbox(
         "updated_at": "2026-07-29T18:00:00Z",
         "body": render_assignment_marker(assignment),
         "head": {"ref": "student/candidate", "sha": "a" * 40},
+        "base": {"ref": "research", "sha": "b" * 40},
         "labels": [
             {"name": "research"},
             {"name": "student:student-1"},
@@ -119,8 +121,17 @@ class Turns:
         self.exit_codes = iter(exit_codes)
         self.calls = []
 
-    def run(self, prompt, *, conversation_id, event_keys):
-        self.calls.append((prompt, conversation_id, event_keys))
+    def run(
+        self,
+        prompt,
+        *,
+        conversation_id,
+        event_keys,
+        visible_event_keys=frozenset(),
+    ):
+        self.calls.append(
+            (prompt, conversation_id, event_keys, visible_event_keys)
+        )
         return TurnResult(exit_code=next(self.exit_codes, 0))
 
 
@@ -148,6 +159,49 @@ def test_student_assignment_carries_the_marker_revision_identity(monkeypatch):
     assert event.kind == "student_assignment"
     assert event.payload["assignment_id"] == "assignment-17"
     assert event.payload["revision_id"] == "revision-2"
+    assert event.payload["base_ref"] == "research"
+    assert event.payload["base_sha"] == "b" * 40
+    assert event.payload["head_ref"] == "student/candidate"
+    assert event.payload["head_sha"] == "a" * 40
+    assert event.dedupe_key.endswith(f":{'b' * 40}:{'a' * 40}")
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        AssignmentRecord(
+            repo="other/widgets",
+            assignment_id="assignment-17",
+            revision_id="revision-2",
+            student="student-1",
+            base_ref="research",
+            base_sha="b" * 40,
+            head_ref="student/candidate",
+            head_sha="a" * 40,
+        ),
+        AssignmentRecord(
+            repo="acme/widgets",
+            assignment_id="assignment-17",
+            revision_id="revision-2",
+            student="student-1",
+            base_ref="research",
+            base_sha="not-a-sha",
+            head_ref="student/candidate",
+            head_sha="a" * 40,
+        ),
+    ],
+    ids=["foreign-repo", "invalid-base-sha"],
+)
+def test_student_rejects_assignment_markers_that_cannot_drive_safe_fetches(
+    monkeypatch,
+    assignment,
+):
+    mailbox = student_mailbox(monkeypatch, feedback_responses())
+    mailbox._pulls()[0]["body"] = render_assignment_marker(assignment)
+
+    event = mailbox.poll()[0]
+
+    assert event.kind == "malformed_assignment"
 
 
 def test_trusted_feedback_from_each_github_surface_is_ordered_and_routable(
@@ -213,12 +267,19 @@ def test_trusted_feedback_from_each_github_surface_is_ordered_and_routable(
         (event.payload["assignment_id"], event.payload["revision_id"])
         for event in events
     } == {("assignment-17", "revision-2")}
+    assert {
+        (
+            event.payload["base_sha"],
+            event.payload["head_sha"],
+        )
+        for event in events
+    } == {("b" * 40, "a" * 40)}
     assert events[1].payload["state"] == "CHANGES_REQUESTED"
     assert events[2].payload["path"] == "train.py"
     assert events[2].payload["line"] == 42
 
 
-def test_review_ready_pull_does_not_route_feedback_to_the_student(monkeypatch):
+def test_review_ready_pull_routes_feedback_to_its_assignment_conversation(monkeypatch):
     mailbox = student_mailbox(
         monkeypatch,
         feedback_responses(
@@ -227,7 +288,69 @@ def test_review_ready_pull_does_not_route_feedback_to_the_student(monkeypatch):
         status="status:review",
     )
 
-    assert mailbox.poll() == ()
+    events = mailbox.poll()
+
+    assert [event.kind for event in events] == ["student_pr_feedback"]
+    assert events[0].payload["assignment_id"] == "assignment-17"
+    assert events[0].payload["revision_id"] == "revision-2"
+
+
+def test_student_does_not_launch_a_doubly_labeled_assignment(monkeypatch):
+    mailbox = student_mailbox(monkeypatch, feedback_responses())
+    pull = mailbox._pulls()[0]
+    pull["labels"].append({"name": "student:student-2"})
+
+    events = mailbox.poll()
+
+    assert [event.kind for event in events] == ["malformed_assignment"]
+    assert "exactly one student label" in events[0].payload["error"]
+
+
+def test_student_does_not_launch_an_assignment_marked_for_another_student(
+    monkeypatch,
+):
+    mailbox = student_mailbox(monkeypatch, feedback_responses())
+    pull = mailbox._pulls()[0]
+    pull["body"] = render_assignment_marker(
+        AssignmentRecord(
+            repo="acme/widgets",
+            assignment_id="assignment-17",
+            revision_id="revision-2",
+            student="student-2",
+            base_ref="research",
+            base_sha="b" * 40,
+            head_ref="student/candidate",
+            head_sha="a" * 40,
+        )
+    )
+
+    events = mailbox.poll()
+
+    assert [event.kind for event in events] == ["malformed_assignment"]
+    assert "marker student does not match" in events[0].payload["error"]
+
+
+def test_inline_comment_without_a_review_id_does_not_poison_feedback_poll(
+    monkeypatch,
+):
+    mailbox = student_mailbox(
+        monkeypatch,
+        feedback_responses(
+            inline_comments=[
+                feedback(
+                    301,
+                    "Detached inline comment.",
+                    pull_request_review_id=None,
+                    path="train.py",
+                    line=42,
+                )
+            ]
+        ),
+    )
+
+    events = mailbox.poll()
+
+    assert [event.kind for event in events] == ["student_assignment"]
 
 
 def test_untrusted_people_bots_and_automation_comments_are_not_feedback(
@@ -328,7 +451,7 @@ def test_feedback_stays_pending_and_bound_until_a_student_turn_succeeds(
     run_student_controller(tmp_path, revised, turns)
     assert [
         next(iter(event_keys)).split(":", 1)[0]
-        for _, _, event_keys in turns.calls
+        for _, _, event_keys, _ in turns.calls
     ] == ["student_pr_feedback", "student_assignment"]
 
     restarted = student_mailbox(
@@ -369,7 +492,7 @@ def test_controller_drains_feedback_batches_oldest_first_after_success(
             for key in event_keys
             if key.startswith("student_pr_feedback:")
         )
-        for _, _, event_keys in turns.calls
+        for _, _, event_keys, _ in turns.calls
     ]
     assert feedback_batches == [[140, 141], [142, 143], [144]]
     assert not any(event.kind == "student_pr_feedback" for event in mailbox.poll())

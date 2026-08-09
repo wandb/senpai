@@ -3,9 +3,11 @@ import shutil
 import subprocess
 import sys
 import textwrap
+from types import SimpleNamespace
 
 import pytest
 from openhands.sdk import Agent, LLM, Tool
+from openhands.sdk.tool import resolve_tool
 from openhands.sdk.plugin import Plugin
 from openhands.sdk.subagent import AgentDefinition, agent_definition_to_factory
 from openhands.tools.preset.default import register_default_tools
@@ -13,12 +15,18 @@ from pydantic import SecretStr
 
 from senpai_agent.openhands_runner import (
     build_main_tools,
+    depth_aware_child_definition,
     delegation_config,
     find_named_agent,
     resolve_plugin_dir,
     sanitized_agent_definitions,
 )
-from senpai_agent.tools import register_senpai_tools
+from senpai_agent.tools import (
+    LoadBrowserAction,
+    LoadBrowserTool,
+    SenpaiTaskTrackerTool,
+    register_senpai_tools,
+)
 from openhands_support import AGENT_DIR, PLUGIN_DIR, REPO_ROOT, runtime_config
 
 
@@ -56,6 +64,65 @@ def test_child_mode_keeps_bounded_delegation_lifecycle_tools(tmp_path):
     assert delegation_config(config).depth == 0
 
 
+def test_browser_family_is_lazy_and_respects_disable_flag(tmp_path):
+    enabled_tools = build_main_tools(runtime_config(tmp_path, enable_browser=True))
+    enabled = {tool.name for tool in enabled_tools}
+    disabled = {tool.name for tool in build_main_tools(runtime_config(tmp_path, enable_browser=False))}
+    state = SimpleNamespace(agent_state={})
+    resolved = resolve_tool(
+        next(tool for tool in enabled_tools if tool.name == "browser_tool_set"),
+        state,
+    )
+
+    assert "browser_tool_set" in enabled
+    assert [tool.name for tool in resolved] == ["load_browser"]
+    assert "load_browser" not in disabled
+    assert "browser_tool_set" not in disabled
+
+
+def test_lazy_browser_keeps_the_persisted_tool_spec_compatible():
+    llm = LLM(
+        model="anthropic/claude-opus-4-8",
+        api_key=SecretStr("test-key"),
+    )
+    persisted = Agent(llm=llm, tools=[Tool(name="browser_tool_set")])
+    runtime = Agent(llm=llm, tools=[Tool(name="browser_tool_set")])
+
+    assert runtime.verify(persisted) is runtime
+
+
+def test_browser_loader_uses_runtime_tools_and_persists_activation(monkeypatch):
+    from openhands.tools.browser_use import BrowserToolSet
+
+    browser_tool = SimpleNamespace(name="browser_navigate")
+    monkeypatch.setattr(
+        BrowserToolSet,
+        "create",
+        classmethod(lambda cls, state: [browser_tool]),
+    )
+
+    class RuntimeAgent:
+        def __init__(self):
+            self.tools_map = {"load_browser": object()}
+            self.added = []
+
+        def add_runtime_tools(self, tools):
+            self.added.extend(tools)
+            self.tools_map.update({tool.name: tool for tool in tools})
+
+    state = SimpleNamespace(agent_state={})
+    agent = RuntimeAgent()
+    conversation = SimpleNamespace(state=state, agent=agent)
+    loader = LoadBrowserTool.create(state)[0]
+
+    observation = loader(LoadBrowserAction(), conversation)
+
+    assert observation.tools == ("browser_navigate",)
+    assert agent.added == [browser_tool]
+    assert state.agent_state == {"senpai.browser_enabled": True}
+    assert LoadBrowserTool.create(state) == [browser_tool]
+
+
 @pytest.mark.parametrize(
     ("role", "expected_custom"),
     [
@@ -63,8 +130,7 @@ def test_child_mode_keeps_bounded_delegation_lifecycle_tools(tmp_path):
             "advisor",
             {
                 "senpai_terminal",
-                "get_prs",
-                "github_transition",
+                "senpai_github",
                 "delegate_agent",
                 "spawn_agents",
                 "await_agents",
@@ -76,8 +142,7 @@ def test_child_mode_keeps_bounded_delegation_lifecycle_tools(tmp_path):
             "student",
             {
                 "senpai_terminal",
-                "get_prs",
-                "github_transition",
+                "senpai_github",
                 "delegate_agent",
                 "spawn_agents",
                 "await_agents",
@@ -93,7 +158,13 @@ def test_main_tools_replace_unsafe_defaults_with_role_scoped_boundaries(
     role: str,
     expected_custom: set[str],
 ):
-    config = runtime_config(tmp_path, role=role)
+    config = runtime_config(
+        tmp_path,
+        role=role,
+        advisor_branch="advisor-branch" if role == "advisor" else None,
+        student_names=("student-one",) if role == "advisor" else None,
+        student_name="student-one" if role == "student" else None,
+    )
     by_name = {tool.name: tool for tool in build_main_tools(config)}
 
     assert "terminal" not in by_name
@@ -111,8 +182,12 @@ def test_main_tools_replace_unsafe_defaults_with_role_scoped_boundaries(
         "cancel_agents",
     ):
         assert by_name[name].params == delegation_params
-    assert by_name["get_prs"].params == {
-        "state_dir": str(config.state_dir / "github")
+    assert by_name["senpai_github"].params == {
+        "role": role,
+        "state_dir": str(config.state_dir / "github"),
+        "advisor_branch": "advisor-branch" if role == "advisor" else None,
+        "student_names": ("student-one",) if role == "advisor" else None,
+        "student_name": "student-one" if role == "student" else None,
     }
     if role == "student":
         assert by_name["senpai_training"].params == {
@@ -153,11 +228,11 @@ def test_native_senpai_plugin_loads_its_runtime_skills():
         "assign-experiment",
         "bootstrap-target",
         "check-human-issues",
-        "merge-winner",
+        "review-experiment",
         "submit-experiment-results",
     }
-    assert "merge_experiment" in skills["merge-winner"].content
-    assert "close_experiment" in skills["merge-winner"].content
+    assert "merge_experiment" in skills["review-experiment"].content
+    assert "close_experiment" in skills["review-experiment"].content
     assert plugin.mcp_config == {}
 
 
@@ -191,6 +266,33 @@ def test_target_agents_cannot_shadow_senpai_delegation_agents(tmp_path):
         "cancel_agents",
     }
     assert "Shadowed instructions" not in definition.system_prompt
+
+
+def test_child_definition_exposes_spawn_only_to_depth_one_generalist():
+    general = AgentDefinition.load(AGENT_DIR / "general-purpose.md")
+    explore = AgentDefinition.load(AGENT_DIR / "explore.md")
+
+    assert "spawn_agents" in depth_aware_child_definition(
+        general, child=False, depth=2
+    ).tools
+    assert "spawn_agents" in depth_aware_child_definition(
+        general, child=True, depth=1
+    ).tools
+    assert "spawn_agents" not in depth_aware_child_definition(
+        general, child=True, depth=2
+    ).tools
+    assert "spawn_agents" not in depth_aware_child_definition(
+        explore, child=True, depth=1
+    ).tools
+
+
+def test_senpai_task_tracker_description_is_concise_and_parallel_safe(tmp_path):
+    state = type("State", (), {"persistence_dir": str(tmp_path)})()
+    tool = SenpaiTaskTrackerTool.create(state)[0]
+
+    assert "genuinely parallel" in tool.description
+    assert "Limit active work to ONE" not in tool.description
+    assert len(tool.description) < 700
 
 
 def test_markdown_agents_register_and_construct_with_the_native_loader(tmp_path):
@@ -349,7 +451,20 @@ def test_file_agent_definitions_keep_bounded_tools_and_no_github_mutations(
     assert definition.permission_mode == "never_confirm"
     assert set(definition.tools) == tools
     assert set(definition.skills) == skills
-    assert {"get_prs", "github_transition"}.isdisjoint(definition.tools)
+    assert {
+        "senpai_github",
+        "get_prs",
+        "create_assignment",
+        "publish_advisor_branch",
+        "repair_assignment_routing",
+        "send_assignment_feedback",
+        "request_assignment_revision",
+        "accept_result_on_current_base",
+        "merge_experiment",
+        "close_experiment",
+        "respond_to_human_issue",
+        "submit_experiment_result",
+    }.isdisjoint(definition.tools)
 
 
 def test_advisor_research_precedes_assignment_without_idle_dispatch_priority():
@@ -362,20 +477,6 @@ def test_advisor_research_precedes_assignment_without_idle_dispatch_priority():
         "Well-founded experiment assignments"
     )
     assert "Idleness is not a reason to skip" in instructions
-
-    template = (
-        REPO_ROOT
-        / "plugins"
-        / "senpai"
-        / "skills"
-        / "bootstrap-target"
-        / "references"
-        / "role-overlay-template.md"
-    ).read_text(encoding="utf-8")
-    assert "Assign work to every idle student" not in template
-    assert template.index("Research and synthesize") < template.index(
-        "Assign the best well-founded experiments"
-    )
 
 
 def test_harness_states_bounded_delegation_tree_contract():

@@ -94,6 +94,21 @@ def test_project_instructions_and_file_agents_are_sanitized_without_mutation(
     assert "# SPDX-" in definition.read_text(encoding="utf-8")
 
 
+def test_developer_only_project_skills_are_not_exposed_to_senpai(tmp_path: Path):
+    workspace = tmp_path / "target"
+    skill_dir = workspace / ".agents" / "skills" / "telemetry"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: telemetry\ndescription: Developer diagnostics.\n---\n",
+        encoding="utf-8",
+    )
+    (skill_dir / ".senpai-developer-only").touch()
+
+    assert "telemetry" not in {
+        skill.name for skill in sanitized_project_skills(workspace)
+    }
+
+
 def test_resolved_config_separates_runtime_credentials_from_command_secrets(
     tmp_path: Path,
 ):
@@ -172,7 +187,15 @@ def test_default_model_profiles_are_explicit_and_provider_credentials_are_inferr
         config.frontier_model,
         config.frontier_api_key_env,
         config.frontier_reasoning_effort,
-    ) == ("openai/gpt-5.6-sol", "OPENAI_API_KEY", "ultra")
+    ) == ("openai/gpt-5.6-sol", "OPENAI_API_KEY", "max")
+
+
+def test_ultra_environment_value_is_rejected(tmp_path: Path):
+    env = runtime_env(tmp_path)
+    env["SENPAI_OPENHANDS_REASONING_EFFORT"] = "ultra"
+
+    with pytest.raises(ValueError, match="unsupported reasoning effort"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
 def test_wandb_gateway_configuration_is_explicit_and_uses_max_glm_reasoning(
@@ -343,7 +366,7 @@ def test_all_model_profiles_accept_independent_cli_model_and_effort_settings(
                 "SENPAI_OPENHANDS_MODEL": "anthropic/claude-opus-4-8",
                 "SENPAI_OPENHANDS_REASONING_EFFORT": "ultra",
             },
-            "unsupported for",
+            "unsupported",
         ),
         (
             {"SENPAI_OPENHANDS_FRONTIER_MODEL": "anthropic/claude-opus-4-8"},

@@ -40,6 +40,19 @@ if TYPE_CHECKING:
 
 
 AgentKind = Literal["general-purpose", "explore", "search", "bash-runner"]
+TaskAgentKind = Literal[
+    "general-purpose",
+    "explore",
+    "search_general_web",
+    "search_research_publications",
+    "bash-runner",
+]
+LeafTaskAgentKind = Literal[
+    "explore",
+    "search_general_web",
+    "search_research_publications",
+    "bash-runner",
+]
 ModelTier = Literal["smart", "fast", "frontier"]
 SearchMode = Literal["general-web", "research-publications"]
 MAX_PARALLEL_AGENTS = 8
@@ -59,7 +72,7 @@ TaskStatus = Literal[
     "failed",
     "cancelled",
 ]
-JoinMode = Literal["all", "first", "quorum"]
+JoinMode = Literal["all", "first", "quorum", "change"]
 TERMINAL_TASK_STATUSES = frozenset({"finished", "failed", "cancelled"})
 
 
@@ -560,7 +573,16 @@ class DelegateAgentObservation(Observation):
         ]
 
 
-class AgentTask(BaseModel):
+def resolve_task_agent(agent: TaskAgentKind) -> tuple[AgentKind, SearchMode | None]:
+    if agent == "search_general_web":
+        return "search", "general-web"
+    if agent == "search_research_publications":
+        return "search", "research-publications"
+    return agent, None
+
+
+class AgentTaskBase(BaseModel):
+    agent: TaskAgentKind
     key: str | None = Field(
         default=None,
         min_length=1,
@@ -571,10 +593,6 @@ class AgentTask(BaseModel):
         min_length=1,
         description="Self-contained assignment and requested evidence-linked report.",
     )
-    agent: AgentKind = Field(
-        default="general-purpose",
-        description="Use a leaf specialization or general-purpose for mixed work.",
-    )
     model: ModelTier = Field(
         default="smart",
         description="Fast for mechanical work, smart for synthesis, frontier for the hardest work.",
@@ -583,16 +601,88 @@ class AgentTask(BaseModel):
         default=False,
         description="Copy the complete model-visible parent history into this child.",
     )
-    search_mode: SearchMode | None = Field(
-        default=None,
-        description="Required only for search: general-web or research-publications.",
+
+    def resolved_agent(self) -> tuple[AgentKind, SearchMode | None]:
+        return resolve_task_agent(self.agent)
+
+    @model_validator(mode="before")
+    @classmethod
+    def restore_persisted_search_task(cls, value: object) -> object:
+        if not isinstance(value, Mapping) or value.get("agent") != "search":
+            return value
+        modes = {
+            "general-web": "search_general_web",
+            "research-publications": "search_research_publications",
+        }
+        restored = dict(value)
+        restored["agent"] = modes.get(restored.pop("search_mode", None), "search")
+        return restored
+
+
+class AgentTask(AgentTaskBase):
+    agent: TaskAgentKind = Field(
+        default="general-purpose",
+        description=(
+            "Use general-purpose for mixed work, explore or bash-runner for local "
+            "leaf work, and an explicit search form for external research."
+        ),
     )
 
-    @model_validator(mode="after")
-    def validate_search_mode(self) -> Self:
-        if (self.agent == "search") != (self.search_mode is not None):
-            raise ValueError("search_mode is required only when agent=search")
-        return self
+
+class LeafAgentTask(AgentTaskBase):
+    agent: LeafTaskAgentKind = Field(
+        default="explore",
+        description=(
+            "Choose a leaf specialization: explore, bash-runner, "
+            "search_general_web, or search_research_publications."
+        ),
+    )
+
+
+_PERSISTED_TASK_SPEC_FIELDS = frozenset(AgentTask.model_fields) | {"search_mode"}
+
+
+def _task_specs_json(specs: Sequence[AgentTaskBase]) -> str:
+    return json.dumps(
+        [spec.model_dump(mode="json") for spec in specs],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _canonical_persisted_task_specs(encoded: str) -> str:
+    try:
+        payload = json.loads(encoded)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "persisted delegation task specifications are invalid"
+        ) from error
+    if not isinstance(payload, list):
+        raise RuntimeError("persisted delegation task specifications must be a list")
+
+    specs = []
+    for item in payload:
+        if not isinstance(item, Mapping):
+            raise RuntimeError(
+                "persisted delegation task specifications must be objects"
+            )
+        unknown = set(item) - _PERSISTED_TASK_SPEC_FIELDS
+        if unknown:
+            fields = ", ".join(sorted(unknown))
+            raise RuntimeError(
+                f"persisted delegation task specifications have unknown fields: {fields}"
+            )
+        if item.get("agent") != "search" and item.get("search_mode") is not None:
+            raise RuntimeError(
+                "persisted delegation task specifications have an invalid search mode"
+            )
+        try:
+            specs.append(AgentTask.model_validate(item))
+        except ValueError as error:
+            raise RuntimeError(
+                "persisted delegation task specifications are invalid"
+            ) from error
+    return _task_specs_json(specs)
 
 
 class AgentTaskState(BaseModel):
@@ -684,14 +774,10 @@ class DelegationRegistry:
         parent_conversation_id: str,
         parent_task_id: str | None,
         depth: int,
-        specs: Sequence[AgentTask],
+        specs: Sequence[AgentTaskBase],
         deadlines: Sequence[float],
     ) -> tuple[list[sqlite3.Row], bool]:
-        specs_json = json.dumps(
-            [spec.model_dump(mode="json") for spec in specs],
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        specs_json = _task_specs_json(specs)
         keys = [spec.key or str(index) for index, spec in enumerate(specs)]
         if len(keys) != len(set(keys)):
             raise ValueError("task keys must be unique within a spawn batch")
@@ -713,7 +799,10 @@ class DelegationRegistry:
                 (operation_key,),
             ).fetchone()
             if existing is not None:
-                if existing["specs_json"] != specs_json:
+                if (
+                    _canonical_persisted_task_specs(existing["specs_json"])
+                    != specs_json
+                ):
                     raise ValueError(
                         "batch_key was already used with different task specifications"
                     )
@@ -761,6 +850,7 @@ class DelegationRegistry:
             for task_id, key, spec, deadline in zip(
                 task_ids, keys, specs, deadlines, strict=True
             ):
+                agent, search_mode = spec.resolved_agent()
                 database.execute(
                     """
                     INSERT INTO tasks (
@@ -777,9 +867,9 @@ class DelegationRegistry:
                         parent_task_id,
                         spec.key,
                         spec.task,
-                        spec.agent,
+                        agent,
                         spec.model,
-                        spec.search_mode,
+                        search_mode,
                         depth,
                         deadline,
                         now,
@@ -1078,6 +1168,86 @@ def _task_event(row: sqlite3.Row) -> AdvisorEvent:
     )
 
 
+def _enqueue_task_event(
+    registry: DelegationRegistry,
+    event: AdvisorEvent,
+    event_sink: AdvisorEventSink | None,
+    event_db_path: Path | None,
+) -> None:
+    if event_sink is not None:
+        event_sink.enqueue(event)
+    elif event_db_path is not None:
+        with AdvisorEventStore(event_db_path) as sink:
+            sink.enqueue(event)
+            task_id = str(event.payload["task_id"])
+            if registry.rows([task_id])[0]["collected_at"] is not None:
+                sink.acknowledge(event.dedupe_key)
+
+
+def _signal_active_tasks(targets: Sequence[sqlite3.Row]) -> None:
+    for target in targets:
+        if target["status"] in TERMINAL_TASK_STATUSES:
+            continue
+        with _LOCAL_RUNNERS_LOCK:
+            runner = _LOCAL_RUNNERS.get(target["task_id"])
+        if runner is not None:
+            runner.interrupt()
+        elif target["pid"]:
+            _terminate_recovered_task(target)
+
+
+def _reconcile_active_tasks(
+    registry: DelegationRegistry,
+    rows: Sequence[sqlite3.Row],
+    event_sink: AdvisorEventSink | None,
+    event_db_path: Path | None,
+    *,
+    allow_starting_grace: bool = True,
+) -> None:
+    now = time.time()
+    for row in rows:
+        pid = row["pid"]
+        if row["deadline_epoch"] <= now:
+            error = "TimeoutError: inherited subagent deadline expired"
+        elif row["status"] == "queued" or pid is None:
+            if allow_starting_grace and now - row["updated_at"] <= 10:
+                continue
+            error = "InterruptedError: subagent startup did not complete"
+        elif _pid_matches_task(row):
+            continue
+        else:
+            error = "InterruptedError: prior subagent process is no longer running"
+
+        targets = registry.cancel_tree(
+            [row["task_id"]],
+            error=error,
+            root_status="failed",
+        )
+        _signal_active_tasks(targets)
+        if row["depth"] == 1:
+            failed = registry.rows([row["task_id"]])[0]
+            _enqueue_task_event(
+                registry,
+                _task_event(failed),
+                event_sink,
+                event_db_path,
+            )
+
+
+def reconcile_delegated_tasks(state_dir: Path, event_db_path: Path) -> None:
+    """Close orphaned background tasks before the controller polls for work."""
+
+    registry = DelegationRegistry(state_dir / "delegation" / "tasks.sqlite3")
+    with registry.lifecycle():
+        _reconcile_active_tasks(
+            registry,
+            registry.active_rows(),
+            None,
+            event_db_path,
+            allow_starting_grace=False,
+        )
+
+
 def record_delegated_task_result(
     task_id: str,
     *,
@@ -1146,8 +1316,10 @@ class _DelegationManager:
         self.child_runner_factory = child_runner_factory
         self.event_sink = event_sink
         self.event_db_path = event_db_path
+        with self.registry.lifecycle():
+            self._reconcile(self.registry.active_rows())
 
-    def _validate_spawn(self, tasks: Sequence[AgentTask]) -> None:
+    def _validate_spawn(self, tasks: Sequence[AgentTaskBase]) -> None:
         if not tasks or len(tasks) > MAX_SPAWN_BATCH:
             raise ValueError(f"spawn_agents requires 1 to {MAX_SPAWN_BATCH} tasks")
         if self.config.depth >= MAX_DELEGATION_DEPTH:
@@ -1159,7 +1331,7 @@ class _DelegationManager:
                 raise ValueError(
                     "explore, search, and bash-runner agents are delegation leaves"
                 )
-            if any(task.agent == "general-purpose" for task in tasks):
+            if any(task.resolved_agent()[0] == "general-purpose" for task in tasks):
                 raise ValueError("depth-2 helpers must be leaf agents")
 
     def spawn(
@@ -1211,13 +1383,14 @@ class _DelegationManager:
             context = (
                 _model_visible_context(conversation) if task.include_context else ()
             )
+            agent, search_mode = task.resolved_agent()
             request = DelegationRequest(
                 task_id=row["task_id"],
                 parent_conversation_id=parent_id,
                 parent_context=context,
-                agent=task.agent,
+                agent=agent,
                 model=task.model,
-                search_mode=task.search_mode,
+                search_mode=search_mode,
                 tree_id=tree_id,
                 depth=self.config.depth + 1,
                 deadline_epoch=row["deadline_epoch"],
@@ -1287,59 +1460,24 @@ class _DelegationManager:
             self._enqueue(_task_event(self.registry.rows([request.task_id])[0]))
 
     def _enqueue(self, event: AdvisorEvent) -> None:
-        if self.event_sink is not None:
-            self.event_sink.enqueue(event)
-        elif self.event_db_path is not None:
-            with AdvisorEventStore(self.event_db_path) as sink:
-                sink.enqueue(event)
-                task_id = str(event.payload["task_id"])
-                if self.registry.rows([task_id])[0]["collected_at"] is not None:
-                    sink.acknowledge(event.dedupe_key)
+        _enqueue_task_event(
+            self.registry,
+            event,
+            self.event_sink,
+            self.event_db_path,
+        )
 
     def _reconcile(self, rows: Sequence[sqlite3.Row]) -> None:
-        now = time.time()
-        for row in rows:
-            pid = row["pid"]
-            if row["deadline_epoch"] <= now:
-                self._reconcile_failure(
-                    row,
-                    "TimeoutError: inherited subagent deadline expired",
-                )
-                continue
-            if row["status"] == "queued" or pid is None:
-                if now - row["updated_at"] > 10:
-                    self._reconcile_failure(
-                        row,
-                        "InterruptedError: subagent startup did not complete",
-                    )
-                continue
-            if not _pid_matches_task(row):
-                self._reconcile_failure(
-                    row,
-                    "InterruptedError: prior subagent process is no longer running",
-                )
-
-    def _reconcile_failure(self, row: sqlite3.Row, error: str) -> None:
-        targets = self.registry.cancel_tree(
-            [row["task_id"]],
-            error=error,
-            root_status="failed",
+        _reconcile_active_tasks(
+            self.registry,
+            rows,
+            self.event_sink,
+            self.event_db_path,
         )
-        self._signal_active(targets)
-        if row["depth"] == 1:
-            self._enqueue(_task_event(self.registry.rows([row["task_id"]])[0]))
 
     @staticmethod
     def _signal_active(targets: Sequence[sqlite3.Row]) -> None:
-        for target in targets:
-            if target["status"] in TERMINAL_TASK_STATUSES:
-                continue
-            with _LOCAL_RUNNERS_LOCK:
-                runner = _LOCAL_RUNNERS.get(target["task_id"])
-            if runner is not None:
-                runner.interrupt()
-            elif target["pid"]:
-                _terminate_recovered_task(target)
+        _signal_active_tasks(targets)
 
     def states(
         self,
@@ -1349,11 +1487,38 @@ class _DelegationManager:
         with self.registry.lifecycle():
             return self._states_locked(task_ids, conversation)
 
+    def await_snapshot(
+        self,
+        task_ids: Sequence[str],
+        conversation: LocalConversation,
+    ) -> tuple[list[AgentTaskState], frozenset[str]]:
+        with self.registry.lifecycle():
+            rows = self._owned_rows_locked(task_ids, conversation)
+            return (
+                [_row_state(row) for row in rows],
+                frozenset(
+                    row["task_id"]
+                    for row in rows
+                    if row["status"] in TERMINAL_TASK_STATUSES
+                    and row["collected_at"] is None
+                ),
+            )
+
     def _states_locked(
         self,
         task_ids: Sequence[str] | None,
         conversation: LocalConversation,
     ) -> list[AgentTaskState]:
+        return [
+            _row_state(row)
+            for row in self._owned_rows_locked(task_ids, conversation)
+        ]
+
+    def _owned_rows_locked(
+        self,
+        task_ids: Sequence[str] | None,
+        conversation: LocalConversation,
+    ) -> list[sqlite3.Row]:
         rows = self.registry.rows(
             task_ids,
             parent_conversation_id=(str(conversation.id) if task_ids is None else None),
@@ -1361,12 +1526,7 @@ class _DelegationManager:
         if any(row["parent_conversation_id"] != str(conversation.id) for row in rows):
             raise ValueError("a caller may inspect only its own subagent tasks")
         self._reconcile(rows)
-        return [
-            _row_state(row)
-            for row in self.registry.rows(
-                [row["task_id"] for row in rows],
-            )
-        ]
+        return self.registry.rows([row["task_id"] for row in rows])
 
     def cancel(
         self,
@@ -1423,6 +1583,19 @@ class SpawnAgentsAction(Action):
     )
 
 
+class LeafSpawnAgentsAction(Action):
+    batch_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="Stable idempotency key; changed specs on replay are rejected.",
+    )
+    tasks: list[LeafAgentTask] = Field(
+        min_length=1,
+        max_length=MAX_SPAWN_BATCH,
+        description="One to eight leaf tasks started without waiting for results.",
+    )
+
+
 class SpawnAgentsObservation(Observation):
     tasks: list[AgentTaskState]
 
@@ -1439,7 +1612,10 @@ class AwaitAgentsAction(Action):
     )
     join: JoinMode = Field(
         default="all",
-        description="Return after all, the first, or a quorum become terminal.",
+        description=(
+            "Return after all, the first, or a quorum become terminal, or after "
+            "any selected task changes state or has an uncollected terminal result."
+        ),
     )
     quorum: int | None = Field(
         default=None,
@@ -1469,6 +1645,9 @@ class AwaitAgentsObservation(Observation):
     satisfied: bool
     timed_out: bool
     tasks: list[AgentTaskState]
+    changed_task_ids: list[str] = Field(default_factory=list)
+    waited_seconds: float = 0
+    guidance: str = ""
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
@@ -1558,32 +1737,65 @@ class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservatio
         if conversation is None:
             raise ValueError("await_agents requires its parent conversation")
         self._interrupted.clear()
+        started = time.monotonic()
         inherited = self.manager.config.deadline_epoch or float("inf")
         deadline = min(time.time() + action.timeout_seconds, inherited)
+        tasks, uncollected_terminal = self.manager.await_snapshot(
+            action.task_ids,
+            conversation,
+        )
+        initial_statuses = {task.task_id: task.status for task in tasks}
         while True:
-            tasks = self.manager.states(action.task_ids, conversation)
             terminal = sum(task.status in TERMINAL_TASK_STATUSES for task in tasks)
-            required = {
-                "all": len(tasks),
-                "first": 1,
-                "quorum": action.quorum or len(tasks),
-            }[action.join]
-            if terminal >= required:
+            changed = [
+                task.task_id
+                for task in tasks
+                if task.status != initial_statuses[task.task_id]
+            ]
+            if action.join == "change":
+                satisfied = bool(changed) or bool(uncollected_terminal)
+            else:
+                required = {
+                    "all": len(tasks),
+                    "first": 1,
+                    "quorum": action.quorum or len(tasks),
+                }[action.join]
+                satisfied = terminal >= required
+            if satisfied:
                 self._acknowledge(tasks)
                 return AwaitAgentsObservation(
                     join=action.join,
                     satisfied=True,
                     timed_out=False,
                     tasks=tasks,
+                    changed_task_ids=changed,
+                    waited_seconds=round(time.monotonic() - started, 3),
+                    guidance=(
+                        "Use the returned state now; unfinished sibling tasks keep "
+                        "running unless you cancel them explicitly."
+                    ),
                 )
             remaining = deadline - time.time()
             if remaining <= 0 or self._interrupted.wait(min(0.1, remaining)):
+                self._acknowledge(tasks)
                 return AwaitAgentsObservation(
                     join=action.join,
                     satisfied=False,
                     timed_out=True,
                     tasks=tasks,
+                    changed_task_ids=changed,
+                    waited_seconds=round(time.monotonic() - started, 3),
+                    guidance=(
+                        "The tasks keep running. Continue useful parent work, inspect "
+                        "later with agent_status, or use join='change' for the next "
+                        "bounded wait; repeating the same long all-results "
+                        "wait will block on the same unfinished tasks."
+                    ),
                 )
+            tasks, uncollected_terminal = self.manager.await_snapshot(
+                action.task_ids,
+                conversation,
+            )
 
     def _acknowledge(self, tasks: Sequence[AgentTaskState]) -> None:
         terminal = [
@@ -1709,10 +1921,16 @@ class SpawnAgentsTool(_DelegationTool[SpawnAgentsAction, SpawnAgentsObservation]
         event_db_path=None,
     ) -> Sequence[Self]:
         manager = cls._manager(child_runner_factory, event_sink, event_db_path)
+        action_type = (
+            LeafSpawnAgentsAction
+            if manager.config.depth == 1
+            and manager.config.agent_name == "general-purpose"
+            else SpawnAgentsAction
+        )
         return [
             cls(
                 description="Start one bounded batch of subagents and return task IDs immediately.",
-                action_type=SpawnAgentsAction,
+                action_type=action_type,
                 observation_type=SpawnAgentsObservation,
                 annotations=ToolAnnotations(
                     title="Spawn agents",
@@ -1734,7 +1952,12 @@ class AwaitAgentsTool(_DelegationTool[AwaitAgentsAction, AwaitAgentsObservation]
         manager = cls._manager(None, None, event_db_path)
         return [
             cls(
-                description="Wait for all, the first, or a quorum of spawned agents.",
+                description=(
+                    "Wait for all, the first, a quorum, or any state change among "
+                    "spawned agents. The change join also immediately surfaces an "
+                    "uncollected terminal result. A timeout returns live state and "
+                    "practical next-step feedback without cancelling work."
+                ),
                 action_type=AwaitAgentsAction,
                 observation_type=AwaitAgentsObservation,
                 annotations=ToolAnnotations(title="Await agents", readOnlyHint=False),

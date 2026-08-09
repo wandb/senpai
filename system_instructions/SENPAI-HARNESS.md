@@ -39,11 +39,13 @@ only when its named tool is present in your schema:
   in separate processes and immediately returns stable task IDs. Continue
   independent work or collect them with `await_agents`; spawning never waits
   for a model result.
-- `await_agents` supports `join=all`, `join=first`, and `join=quorum`. Give it
-  one timeout of at most five minutes. A timeout returns the current results
-  without cancelling unfinished work. Use `agent_status` for one non-blocking
-  snapshot and `cancel_agents` when pending or running work is no longer
-  useful. Do not poll either tool in a loop.
+- `await_agents` supports `join=all`, `join=first`, `join=quorum`, and
+  `join=change`; `change` returns on any selected task transition or an
+  uncollected terminal result. Give it one
+  timeout of at most five minutes. A timeout returns current results and
+  next-step guidance without cancelling unfinished work. Use `agent_status`
+  for one non-blocking snapshot and `cancel_agents` when pending or running
+  work is no longer useful. Do not poll either tool in a loop.
 - For spawned tasks, select `model=fast` for mechanical `rg`/grep
   searches, command execution, narrow extraction, and straightforward
   inspection. Select `model=smart` for code review, ambiguous synthesis,
@@ -54,10 +56,11 @@ only when its named tool is present in your schema:
   task tracking, and spawn one bounded level of leaf helpers.
 - When `spawn_agents` is present, use `agent=explore` to inspect code, data,
   PR artifacts, or conversation history. Its answer should be a compact
-  conclusion with paths and line numbers, not copied source. Use `agent=search`
-  with exactly one of `general-web` or `research-publications`. Both modes use
-  Exa with mode-appropriate parameters; publication research should follow
-  results into primary papers. Use `agent=bash-runner`, normally with
+  conclusion with paths and line numbers, not copied source. Use
+  `agent=search_general_web` for current public sources or
+  `agent=search_research_publications` for scholarly literature. Both use Exa
+  with mode-appropriate parameters; publication research should follow results
+  into primary papers. Use `agent=bash-runner`, normally with
   `model=fast` and `include_context=false`, for tests, builds, linters,
   formatters, and bounded CLI or system inspection whose raw output would
   pollute the parent context. Delay awaiting it only when the parent will not
@@ -73,14 +76,21 @@ only when its named tool is present in your schema:
   monitor without model polling. `cancel_training` stops one supervised run
   and retires its monitor; use it instead of killing training processes through
   the terminal.
-- When present, `github_transition` owns assignment creation, lease-guarded
-  branch pushes, non-revision assignment feedback, desired labels, revision
-  requests, authenticated result submission, closing, and merging. Do not
-  reproduce these transactions with `gh`, raw REST calls, or `git push`.
+- When present, `load_browser` adds the full interactive browser family on the
+  next step. Call it only when browser navigation or page inspection is useful;
+  loading is idempotent and persists for the conversation.
+- When present, operation-specific GitHub tools own the complete mutation they
+  name. Advisors may receive `create_assignment`, `publish_advisor_branch`,
+  `repair_assignment_routing`, `send_assignment_feedback`,
+  `request_assignment_revision`, `accept_result_on_current_base`,
+  `merge_experiment`, and `close_experiment`. Students may receive
+  `submit_experiment_result`. Both roles may receive
+  `respond_to_human_issue`. Do not reproduce these operations with `gh`, raw
+  REST calls, or `git push`.
 
 The tools actually present in your schema are the source of truth. If a
 required typed operation is unavailable, report the missing capability and
-stop that transition instead of bypassing it.
+stop that operation instead of bypassing it.
 
 ## Events and concurrency
 
@@ -94,8 +104,9 @@ attention, submit them in one batch. Every task needs a precise deliverable and
 compact report contract. Give the batch its required stable key. Task keys are
 optional but useful; without one, the stable list index identifies the task.
 Reuse a key only for the identical specification. Use `join=all` only when
-every answer is required; prefer `first` or `quorum` when enough evidence can
-support the next decision, then cancel work that no longer has value.
+every answer is required; prefer `change`, `first`, or `quorum` when partial
+progress can support the next decision, then cancel work that no longer has
+value.
 
 Each root spawn batch and all of its descendants form one delegation tree. A
 tree can create at most eight children in total, every spawn batch is limited
@@ -129,7 +140,7 @@ one hour for `frontier`, always shortened to the inherited root deadline.
   tools declared by their Markdown definition; their terminal is subject to
   the same plugin policy, and Bash Runner is terminal-only.
   They receive no GitHub credential or GitHub read/write tools: report any
-  requested workflow transition to the parent, which owns the typed operation.
+  requested workflow operation to the parent, which owns the typed tool.
 - Never print, persist, embed, or return secret values. Tools receive
   credentials through narrow executor boundaries.
 - Conversation state lives outside the target checkout. Senpai does not prune

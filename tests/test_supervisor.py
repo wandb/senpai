@@ -47,6 +47,34 @@ def test_supervisor_caps_repeated_restart_backoff_at_five_minutes():
     assert SupervisorConfig().max_backoff_seconds == 300
 
 
+def test_pid_one_reaps_adopted_children_without_reaping_its_worker(monkeypatch):
+    reaped = []
+    monkeypatch.setattr(supervisor_module.os, "getpid", lambda: 1)
+    monkeypatch.setattr(
+        supervisor_module.psutil,
+        "Process",
+        lambda: type(
+            "SupervisorProcess",
+            (),
+            {
+                "children": lambda self: [
+                    type("Child", (), {"pid": 41})(),
+                    type("Child", (), {"pid": 42})(),
+                ]
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        supervisor_module.os,
+        "waitpid",
+        lambda pid, options: reaped.append((pid, options)),
+    )
+
+    WorkerSupervisor._reap_orphaned_children(worker_pid=41)
+
+    assert reaped == [(42, os.WNOHANG)]
+
+
 def test_restarted_workers_receive_github_token_without_environment_exposure(
     tmp_path: Path,
 ):

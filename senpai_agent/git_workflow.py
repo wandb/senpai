@@ -35,6 +35,27 @@ def require_clean_training_worktree(workspace: Path) -> None:
         )
 
 
+def require_commit_contains_base(
+    workspace: Path,
+    *,
+    commit_sha: str,
+    base_sha: str,
+) -> None:
+    """Require an exact result commit to contain its assigned research base."""
+
+    workspace = Path(workspace).resolve()
+    if not commit_sha.strip() or not base_sha.strip():
+        raise ValueError("commit_sha and base_sha must not be empty")
+    commit = _git(workspace, "rev-parse", f"{commit_sha}^{{commit}}")
+    base = _git(workspace, "rev-parse", f"{base_sha}^{{commit}}")
+    try:
+        _git(workspace, "merge-base", "--is-ancestor", base, commit)
+    except GitWorkflowPreconditionError as error:
+        raise GitWorkflowPreconditionError(
+            f"result commit {commit} does not contain assigned research base {base}"
+        ) from error
+
+
 def push_assignment_branch(
     workspace: Path,
     *,
@@ -235,7 +256,7 @@ def _git(
         text=True,
         input=input_text,
         capture_output=True,
-        env=_git_process_env(token),
+        env=git_process_env(token),
         check=False,
     )
     if completed.returncode != 0:
@@ -253,7 +274,10 @@ def _validate_token(token: SecretStr | None) -> None:
         raise ValueError("token must not be empty")
 
 
-def _git_process_env(token: SecretStr | None) -> dict[str, str]:
+def git_process_env(token: SecretStr | None) -> dict[str, str]:
+    """Build a scrubbed Git environment with optional in-memory GitHub auth."""
+
+    _validate_token(token)
     env = dict(os.environ)
     scrub_github_credentials(env)
     if token is None:

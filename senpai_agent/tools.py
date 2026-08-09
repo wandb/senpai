@@ -4,30 +4,29 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
-import time
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from datetime import date
+import threading
+from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, Self
+from typing import TYPE_CHECKING, Literal, Self
 
-from openhands.sdk.conversation import ConversationExecutionStatus
 from openhands.sdk.llm import TextContent
 from openhands.sdk.tool import (
     Action,
+    DeclaredResources,
     Observation,
     ToolAnnotations,
     ToolDefinition,
     ToolExecutor,
     register_tool,
 )
+from openhands.tools.browser_use import BrowserToolSet
 from openhands.tools.terminal import (
     TerminalAction,
     TerminalObservation,
     TerminalTool,
 )
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from openhands.tools.task_tracker import TaskTrackerTool
+from pydantic import Field, model_validator
 
 from senpai_agent.delegation import (
     AgentStatusTool,
@@ -36,24 +35,8 @@ from senpai_agent.delegation import (
     DelegateAgentTool,
     SpawnAgentsTool,
 )
-from senpai_agent.git_workflow import (
-    create_assignment_branch,
-    push_assignment_branch,
-    require_clean_training_worktree,
-)
-from senpai_agent.github import PRRetrievalResult, get_prs
-from senpai_agent.github_workflow import (
-    GitHubWorkflow,
-    MutationResult,
-    PullHeadMismatchError,
-    StaleAssignmentRevisionError,
-)
-from senpai_agent.models import (
-    AssignmentRecord,
-    DispositionRecord,
-    ExperimentResult,
-    render_disposition_marker,
-)
+from senpai_agent.git_workflow import require_clean_training_worktree
+from senpai_agent.github.tools import GitHubWorkflowToolSet
 from senpai_agent.monitor import MetricGate, MonitorStore, TrainingMonitorSpec
 from senpai_agent.training import (
     TrainingResult,
@@ -63,51 +46,117 @@ from senpai_agent.training import (
 )
 
 if TYPE_CHECKING:
-    from openhands.sdk.conversation import LocalConversation
+    from openhands.sdk.conversation import ConversationState, LocalConversation
 
 
-@dataclass(frozen=True)
-class GitHubCredentials:
-    repo: str
-    token: SecretStr
-    trusted_actor: str | None = None
-
-
-_GITHUB_CREDENTIALS: GitHubCredentials | None = None
-_POST_PUSH_HEAD_RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0, 8.0)
 _TRAINING_RUNTIMES: dict[
     Path,
     tuple[TrainingSupervisor, MonitorStore],
 ] = {}
+_BROWSER_ENABLED_STATE_KEY = "senpai.browser_enabled"
 
 
-def configure_github_credentials(
-    repo: str,
-    token: SecretStr,
-    *,
-    trusted_actor: str | None = None,
-) -> None:
-    """Hold write auth outside model-facing tool specs and terminal secrets."""
-
-    global _GITHUB_CREDENTIALS
-    if len(repo.split("/")) != 2 or not all(repo.split("/")):
-        raise ValueError("repo must use owner/name form")
-    if not isinstance(token, SecretStr):
-        raise TypeError("token must be a SecretStr")
-    if not token.get_secret_value().strip():
-        raise ValueError("token must not be empty")
-    if trusted_actor is not None and not trusted_actor.strip():
-        raise ValueError("trusted actor must not be empty")
-    _GITHUB_CREDENTIALS = GitHubCredentials(
-        repo=repo,
-        token=token,
-        trusted_actor=trusted_actor,
-    )
+class LoadBrowserAction(Action):
+    """Enable the browser tool family for this conversation."""
 
 
-def clear_github_credentials() -> None:
-    global _GITHUB_CREDENTIALS
-    _GITHUB_CREDENTIALS = None
+class LoadBrowserObservation(Observation):
+    tools: tuple[str, ...]
+
+    @property
+    def to_llm_content(self) -> Sequence[TextContent]:
+        return [
+            TextContent(
+                text=(
+                    "Browser tools are now available: "
+                    + ", ".join(self.tools)
+                    + "."
+                )
+            )
+        ]
+
+
+class _LoadBrowserExecutor(
+    ToolExecutor[LoadBrowserAction, LoadBrowserObservation]
+):
+    def __call__(
+        self,
+        action: LoadBrowserAction,  # noqa: ARG002
+        conversation: LocalConversation | None = None,
+    ) -> LoadBrowserObservation:
+        if conversation is None:
+            raise ValueError("load_browser requires its parent conversation")
+        if conversation.state.agent_state.get(_BROWSER_ENABLED_STATE_KEY):
+            names = tuple(
+                name
+                for name in conversation.agent.tools_map
+                if name.startswith("browser_")
+            )
+            return LoadBrowserObservation(tools=names)
+
+        browser_tools = BrowserToolSet.create(conversation.state)
+        conversation.agent.add_runtime_tools(browser_tools)
+        conversation.state.agent_state = {
+            **conversation.state.agent_state,
+            _BROWSER_ENABLED_STATE_KEY: True,
+        }
+        return LoadBrowserObservation(tools=tuple(tool.name for tool in browser_tools))
+
+
+class LoadBrowserTool(ToolDefinition[LoadBrowserAction, LoadBrowserObservation]):
+    name = "load_browser"
+
+    def declared_resources(self, action: Action) -> DeclaredResources:  # noqa: ARG002
+        return DeclaredResources(keys=("browser-tools",), declared=True)
+
+    @classmethod
+    def create(
+        cls,
+        conv_state: ConversationState,
+    ) -> Sequence[ToolDefinition]:
+        if conv_state.agent_state.get(_BROWSER_ENABLED_STATE_KEY):
+            return BrowserToolSet.create(conv_state)
+        return [
+            cls(
+                description=(
+                    "Load the full browser tool family for this conversation. "
+                    "Use it when interactive web navigation or page inspection is "
+                    "needed; the browser operations become available on the next step."
+                ),
+                action_type=LoadBrowserAction,
+                observation_type=LoadBrowserObservation,
+                annotations=ToolAnnotations(
+                    title="Load browser tools",
+                    readOnlyHint=False,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=True,
+                ),
+                executor=_LoadBrowserExecutor(),
+            )
+        ]
+
+
+_TASK_TRACKER_DESCRIPTION = """Maintain an optional persisted task list for complex work.
+
+Use it when a task has several meaningful steps or concurrent workstreams and a
+compact todo/in-progress/done record will prevent omissions. Multiple items may
+be in progress when the work is genuinely parallel. Skip it for short, atomic,
+or purely informational work. View the current list before replacing it, keep
+entries concise, and mark work done only when its required evidence is complete."""
+
+
+class SenpaiTaskTrackerTool(TaskTrackerTool):
+    """OpenHands task persistence with a concise, concurrency-safe description."""
+
+    name = "task_tracker"
+
+    @classmethod
+    def create(cls, conv_state: ConversationState) -> Sequence[ToolDefinition]:
+        return [
+            tool.model_copy(update={"description": _TASK_TRACKER_DESCRIPTION})
+            for tool in super().create(conv_state)
+        ]
 
 
 def training_runtime(
@@ -257,6 +306,9 @@ class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObserva
     def __init__(self, training: TrainingSupervisor, monitor_store: MonitorStore):
         self.training = training
         self.monitor_store = monitor_store
+        self._lock = threading.Lock()
+        self._in_flight: set[str] = set()
+        self._interrupt_generation = 0
 
     def __call__(
         self,
@@ -266,20 +318,35 @@ class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObserva
         if conversation is None:
             raise ValueError("run_training requires its student conversation")
         require_clean_training_worktree(self.training.workspace)
+        with self._lock:
+            interrupt_generation = self._interrupt_generation
         result = self.training.run_training(action.spec)
-        self.monitor_store.register(
-            TrainingMonitorSpec(
-                training_id=result.training_id,
-                conversation_id=conversation.id,
+        with self._lock:
+            self._in_flight.add(result.training_id)
+            interrupted = interrupt_generation != self._interrupt_generation
+        try:
+            if interrupted:
+                self.training.cancel_training(result.training_id)
+            self.monitor_store.register(
+                TrainingMonitorSpec(
+                    training_id=result.training_id,
+                    conversation_id=conversation.id,
+                )
             )
-        )
-        return TrainingResultObservation.from_result(result)
+            return TrainingResultObservation.from_result(result)
+        finally:
+            with self._lock:
+                self._in_flight.discard(result.training_id)
 
     def close(self) -> None:
         return
 
     def interrupt(self) -> None:
-        self.training.close()
+        with self._lock:
+            self._interrupt_generation += 1
+            training_ids = tuple(self._in_flight)
+        for training_id in training_ids:
+            self.training.cancel_training(training_id)
 
 
 class _GetTrainingStatusExecutor(
@@ -518,645 +585,6 @@ class TrainingToolSet(ToolDefinition[RunTrainingAction, TrainingResultObservatio
         )
 
 
-class GetPRsAction(Action):
-    repo: str = Field(
-        min_length=3,
-        description="GitHub repository in owner/name form.",
-    )
-    numbers: tuple[int, ...] = Field(
-        default=(),
-        description="Explicit positive PR numbers to include.",
-    )
-    date_range: tuple[str | date, str | date] | None = Field(
-        default=None,
-        description="Optional inclusive PR creation-date range.",
-    )
-    search: str | None = Field(
-        default=None,
-        description="Optional GitHub issue-search terms or qualifiers.",
-    )
-    max_inline_prs: int = Field(
-        default=5,
-        ge=0,
-        description=(
-            "Maximum PRs returned inline. Do not set this >5 unless explicitly "
-            "necessary: more than 5 inline PRs risks severe agent context "
-            "pollution. Prefer the returned artifact path."
-        ),
-    )
-
-
-class PRManifestObservation(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    number: int
-    title: str
-    head_sha: str
-    url: str
-
-
-class GetPRsObservation(Observation):
-    manifest: tuple[PRManifestObservation, ...]
-    markdown: str | None = None
-    path: str | None = None
-
-    @classmethod
-    def from_result(cls, result: PRRetrievalResult) -> Self:
-        return cls(
-            manifest=tuple(
-                PRManifestObservation(
-                    number=entry.number,
-                    title=entry.title,
-                    head_sha=entry.head_sha,
-                    url=entry.url,
-                )
-                for entry in result.manifest
-            ),
-            markdown=result.markdown,
-            path=str(result.path) if result.path is not None else None,
-        )
-
-    @property
-    def to_llm_content(self) -> Sequence[TextContent]:
-        if self.markdown is not None:
-            return [TextContent(text=self.markdown)]
-
-        manifest = "\n".join(
-            (f"- #{entry.number} `{entry.head_sha}` {entry.title} ({entry.url})")
-            for entry in self.manifest
-        )
-        return [
-            TextContent(
-                text=(
-                    f"Full PR context is stored at: {self.path}\n"
-                    f"Compact manifest:\n{manifest}"
-                )
-            )
-        ]
-
-
-class _GetPRsExecutor(ToolExecutor[GetPRsAction, GetPRsObservation]):
-    def __init__(
-        self,
-        get_prs_fn: Callable[..., PRRetrievalResult],
-        *,
-        credentials: GitHubCredentials | None = None,
-        artifact_dir: Path,
-        target_workspace: Path,
-    ):
-        self.get_prs = get_prs_fn
-        self.credentials = credentials
-        self.artifact_dir = artifact_dir
-        self.target_workspace = target_workspace
-
-    def __call__(
-        self,
-        action: GetPRsAction,
-        conversation: LocalConversation | None = None,
-    ) -> GetPRsObservation:
-        if self.credentials is not None and action.repo != self.credentials.repo:
-            raise PermissionError(
-                "requested repository does not match configured GitHub credentials"
-            )
-        auth = {"token": self.credentials.token} if self.credentials is not None else {}
-        result = self.get_prs(
-            action.repo,
-            numbers=action.numbers,
-            date_range=action.date_range,
-            search=action.search,
-            max_inline_prs=action.max_inline_prs,
-            artifact_dir=self.artifact_dir,
-            target_workspace=self.target_workspace,
-            **auth,
-        )
-        return GetPRsObservation.from_result(result)
-
-
-class GetPRsTool(ToolDefinition[GetPRsAction, GetPRsObservation]):
-    name = "get_prs"
-
-    @classmethod
-    def create(
-        cls,
-        conv_state: object | None = None,
-        *,
-        get_prs_fn: Callable[..., PRRetrievalResult] = get_prs,
-        state_dir: str | Path | None = None,
-        workspace: str | Path | None = None,
-    ) -> Sequence[Self]:
-        credentials = _GITHUB_CREDENTIALS if get_prs_fn is get_prs else None
-        if get_prs_fn is get_prs and credentials is None:
-            raise RuntimeError(
-                "configure GitHub credentials before initializing get_prs"
-            )
-        if workspace is None:
-            if conv_state is None:
-                raise ValueError("get_prs requires its OpenHands workspace")
-            workspace = Path(conv_state.workspace.working_dir)
-        target_workspace = Path(workspace).resolve()
-        artifact_dir = (
-            Path(state_dir).resolve()
-            if state_dir is not None
-            else Path(tempfile.gettempdir()).resolve() / "senpai-pr-artifacts"
-        )
-        if artifact_dir == target_workspace or artifact_dir.is_relative_to(
-            target_workspace
-        ):
-            raise ValueError("get_prs state_dir must be outside the target workspace")
-        return [
-            cls(
-                description=(
-                    "Retrieve complete PR bodies, comments, reviews, and inline "
-                    "comments by number, date range, and/or search. Large results "
-                    "are returned as one external Markdown artifact."
-                ),
-                action_type=GetPRsAction,
-                observation_type=GetPRsObservation,
-                annotations=ToolAnnotations(
-                    title="Get pull requests",
-                    readOnlyHint=True,
-                    destructiveHint=False,
-                    idempotentHint=True,
-                    openWorldHint=True,
-                ),
-                executor=_GetPRsExecutor(
-                    get_prs_fn,
-                    credentials=credentials,
-                    artifact_dir=artifact_dir,
-                    target_workspace=target_workspace,
-                ),
-            )
-        ]
-
-
-class _Transition(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    repo: str | None = Field(
-        default=None,
-        min_length=3,
-        description=(
-            "Optional target repository in owner/name form. When supplied, it "
-            "must match the repository bound to this Senpai runtime."
-        ),
-    )
-
-
-class ReconcileLabelsTransition(_Transition):
-    operation: Literal["reconcile_labels"]
-    pr_number: int = Field(gt=0)
-    assignment_id: str = Field(min_length=1)
-    expected_head_sha: str = Field(min_length=1)
-    add: set[str] = Field(default_factory=set)
-    remove: set[str] = Field(default_factory=set)
-
-
-class RequestRevisionTransition(_Transition):
-    operation: Literal["request_revision"]
-    pr_number: int = Field(gt=0)
-    assignment_id: str = Field(min_length=1)
-    expected_head_sha: str = Field(min_length=1)
-    revision_id: str = Field(min_length=1)
-    comment: str = Field(min_length=1)
-
-
-class SendAssignmentFeedbackTransition(_Transition):
-    operation: Literal["send_assignment_feedback"]
-    pr_number: int = Field(gt=0)
-    assignment_id: str = Field(min_length=1)
-    revision_id: str = Field(
-        min_length=1,
-        description="Current assignment revision; this operation does not change it.",
-    )
-    expected_head_sha: str = Field(min_length=1)
-    feedback_id: str = Field(
-        min_length=1,
-        max_length=256,
-        description=(
-            "Stable ID for this distinct guidance item within the assignment "
-            "revision. Exact replay is a no-op; use a new ID for changed guidance."
-        ),
-    )
-    comment: str = Field(
-        min_length=1,
-        max_length=50_000,
-        description="Actionable guidance that does not require a new revision.",
-    )
-
-
-class RespondToIssueTransition(_Transition):
-    operation: Literal["respond_to_issue"]
-    issue_number: int = Field(gt=0)
-    human_message_id: int = Field(
-        gt=0,
-        description=(
-            "Exact numeric ID of the human-authored issue body or comment "
-            "being answered."
-        ),
-    )
-    response: str = Field(
-        min_length=1,
-        max_length=50_000,
-        description="Response including the role prefix required by the skill.",
-    )
-
-
-class SubmitResultTransition(_Transition):
-    operation: Literal["submit_result"]
-    pr_number: int = Field(gt=0)
-    branch: str = Field(min_length=1)
-    expected_remote_sha: str = Field(
-        min_length=1,
-        description=(
-            "Current remote branch SHA before the push. This is the "
-            "force-with-lease precondition, not the local result commit."
-        ),
-    )
-    expected_head_sha: str = Field(
-        min_length=1,
-        description=(
-            "Local commit to push. Must equal result.assignment.expected_head_sha "
-            "and result.commit_sha."
-        ),
-    )
-    result: ExperimentResult = Field(
-        description=(
-            "Result for expected_head_sha. result.assignment.expected_head_sha "
-            "and result.commit_sha must both equal expected_head_sha."
-        )
-    )
-
-
-class CloseExperimentTransition(_Transition):
-    operation: Literal["close_experiment"]
-    pr_number: int = Field(gt=0)
-    expected_head_sha: str = Field(min_length=1)
-    assignment_id: str = Field(min_length=1)
-    reason: str = Field(min_length=1)
-
-
-class MergeExperimentTransition(_Transition):
-    operation: Literal["merge_experiment"]
-    pr_number: int = Field(gt=0)
-    expected_head_sha: str = Field(min_length=1)
-    assignment_id: str = Field(min_length=1)
-    merge_method: Literal["merge", "squash", "rebase"] = "squash"
-    accepted_base_sha: str | None = Field(
-        default=None,
-        min_length=1,
-        description=(
-            "Exact current SHA of the assignment's base branch. Omit when it "
-            "still equals the assignment marker's base SHA. Set only after "
-            "reviewing a baseline_advanced event and deliberately accepting "
-            "the result against that newer baseline."
-        ),
-    )
-
-
-class PushBranchTransition(_Transition):
-    operation: Literal["push_branch"]
-    branch: str = Field(min_length=1)
-    expected_remote_sha: str = Field(min_length=1)
-    expected_head_sha: str = Field(
-        min_length=1,
-        description=(
-            "Expected local commit to publish. The transition fails if the "
-            "worktree HEAD differs."
-        ),
-    )
-
-
-class CreateAssignmentTransition(_Transition):
-    operation: Literal["create_assignment"]
-    assignment_id: str = Field(min_length=1)
-    revision_id: str = Field(min_length=1)
-    student: str = Field(min_length=1)
-    base_branch: str = Field(min_length=1)
-    expected_base_sha: str = Field(min_length=1)
-    head_branch: str = Field(min_length=1)
-    title: str = Field(min_length=1, max_length=256)
-    body: str = Field(min_length=1, max_length=50_000)
-
-
-GitHubTransition = Annotated[
-    CreateAssignmentTransition
-    | ReconcileLabelsTransition
-    | RequestRevisionTransition
-    | SendAssignmentFeedbackTransition
-    | RespondToIssueTransition
-    | SubmitResultTransition
-    | CloseExperimentTransition
-    | MergeExperimentTransition
-    | PushBranchTransition,
-    Field(discriminator="operation"),
-]
-
-
-class GitHubTransitionAction(Action):
-    transition: GitHubTransition = Field(
-        description=(
-            "One typed, preconditioned, idempotent GitHub workflow transition. "
-            "For submit_result, expected_remote_sha is the current remote branch "
-            "SHA before push and expected_head_sha is the local commit to push; "
-            "transition.expected_head_sha, result.assignment.expected_head_sha, "
-            "and result.commit_sha must be identical."
-        )
-    )
-
-
-class GitHubTransitionObservation(Observation):
-    changed: bool
-    resource_url: str
-    state: str
-    version: str | None = None
-
-    @property
-    def to_llm_content(self) -> Sequence[TextContent]:
-        return [
-            TextContent(
-                text=json.dumps(
-                    self.model_dump(mode="json"),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
-        ]
-
-
-class _GitHubTransitionExecutor(
-    ToolExecutor[GitHubTransitionAction, GitHubTransitionObservation]
-):
-    def __init__(
-        self,
-        workflow: GitHubWorkflow,
-        role: str,
-        workspace: Path,
-        git_token: SecretStr | None = None,
-        advisor_branch: str | None = None,
-    ):
-        self.workflow = workflow
-        self.role = role
-        self.workspace = workspace
-        self.git_token = git_token
-        self.advisor_branch = advisor_branch
-
-    def __call__(
-        self,
-        action: GitHubTransitionAction,
-        conversation: LocalConversation | None = None,
-    ) -> GitHubTransitionObservation:
-        transition = action.transition
-        if isinstance(
-            transition,
-            (
-                CreateAssignmentTransition,
-                PushBranchTransition,
-                ReconcileLabelsTransition,
-                RequestRevisionTransition,
-                SendAssignmentFeedbackTransition,
-                CloseExperimentTransition,
-                MergeExperimentTransition,
-            ),
-        ):
-            self._require_role("advisor")
-        elif isinstance(transition, SubmitResultTransition):
-            self._require_role("student")
-        self._require_repo_scope(transition.repo)
-
-        if isinstance(transition, CreateAssignmentTransition):
-            branch = create_assignment_branch(
-                self.workspace,
-                branch=transition.head_branch,
-                base_branch=transition.base_branch,
-                expected_base_sha=transition.expected_base_sha,
-                assignment_id=transition.assignment_id,
-                token=self.git_token,
-            )
-            result = self.workflow.create_assignment(
-                AssignmentRecord(
-                    repo=self.workflow.repo,
-                    assignment_id=transition.assignment_id,
-                    revision_id=transition.revision_id,
-                    student=transition.student,
-                    base_ref=transition.base_branch,
-                    base_sha=transition.expected_base_sha,
-                    head_ref=transition.head_branch,
-                    head_sha=branch.head_sha,
-                ),
-                title=transition.title,
-                body=transition.body,
-            )
-        elif isinstance(transition, PushBranchTransition):
-            if transition.branch != self.advisor_branch:
-                raise PermissionError(
-                    "push_branch is limited to the configured advisor branch "
-                    f"{self.advisor_branch!r}"
-                )
-            push_options = {
-                "branch": transition.branch,
-                "expected_remote_sha": transition.expected_remote_sha,
-                "expected_local_sha": transition.expected_head_sha,
-                "token": self.git_token,
-            }
-            pushed = push_assignment_branch(self.workspace, **push_options)
-            return GitHubTransitionObservation(
-                changed=pushed.changed,
-                resource_url=f"git:origin/{pushed.branch}",
-                state="branch_pushed",
-                version=pushed.head_sha,
-            )
-        elif isinstance(transition, SubmitResultTransition):
-            try:
-                self.workflow.preflight_submit_result(
-                    transition.pr_number,
-                    branch=transition.branch,
-                    current_head_sha=transition.expected_remote_sha,
-                    expected_result_head_sha=transition.expected_head_sha,
-                    result=transition.result,
-                )
-            except StaleAssignmentRevisionError as error:
-                if conversation is not None:
-                    conversation.state.execution_status = (
-                        ConversationExecutionStatus.FINISHED
-                    )
-                raise ValueError(
-                    f"{error} Ending this stale turn so the controller can resume "
-                    "the current assignment revision."
-                ) from error
-            pushed = push_assignment_branch(
-                self.workspace,
-                branch=transition.branch,
-                expected_remote_sha=transition.expected_remote_sha,
-                expected_local_sha=transition.expected_head_sha,
-                token=self.git_token,
-            )
-            result = self._submit_result_after_push(transition)
-        elif isinstance(transition, ReconcileLabelsTransition):
-            result = self.workflow.reconcile_labels(
-                transition.pr_number,
-                assignment_id=transition.assignment_id,
-                add=transition.add,
-                remove=transition.remove,
-                expected_head_sha=transition.expected_head_sha,
-            )
-        elif isinstance(transition, RequestRevisionTransition):
-            result = self.workflow.request_revision(
-                transition.pr_number,
-                assignment_id=transition.assignment_id,
-                expected_head_sha=transition.expected_head_sha,
-                revision_id=transition.revision_id,
-                comment=transition.comment,
-            )
-        elif isinstance(transition, SendAssignmentFeedbackTransition):
-            result = self.workflow.send_assignment_feedback(
-                transition.pr_number,
-                assignment_id=transition.assignment_id,
-                revision_id=transition.revision_id,
-                expected_head_sha=transition.expected_head_sha,
-                feedback_id=transition.feedback_id,
-                comment=transition.comment,
-            )
-        elif isinstance(transition, RespondToIssueTransition):
-            result = self.workflow.respond_to_issue(
-                transition.issue_number,
-                human_message_id=transition.human_message_id,
-                response=transition.response,
-            )
-        elif isinstance(transition, CloseExperimentTransition):
-            result = self.workflow.close_experiment(
-                transition.pr_number,
-                assignment_id=transition.assignment_id,
-                expected_head_sha=transition.expected_head_sha,
-                marker=render_disposition_marker(
-                    DispositionRecord(
-                        repo=self.workflow.repo,
-                        pr_number=transition.pr_number,
-                        assignment_id=transition.assignment_id,
-                        head_sha=transition.expected_head_sha,
-                    )
-                ),
-                reason=transition.reason,
-            )
-        elif isinstance(transition, MergeExperimentTransition):
-            result = self.workflow.merge_experiment(
-                transition.pr_number,
-                expected_head_sha=transition.expected_head_sha,
-                assignment_id=transition.assignment_id,
-                merge_method=transition.merge_method,
-                accepted_base_sha=transition.accepted_base_sha,
-            )
-        else:
-            raise TypeError(
-                f"unsupported GitHub transition: {type(transition).__name__}"
-            )
-        return GitHubTransitionObservation(
-            changed=result.changed,
-            resource_url=result.resource_url,
-            state=result.state,
-            version=result.version,
-        )
-
-    def _submit_result_after_push(
-        self,
-        transition: SubmitResultTransition,
-    ) -> MutationResult:
-        for delay in _POST_PUSH_HEAD_RETRY_DELAYS:
-            try:
-                return self.workflow.submit_result(
-                    transition.pr_number,
-                    expected_head_sha=transition.expected_head_sha,
-                    result=transition.result,
-                )
-            except PullHeadMismatchError:
-                time.sleep(delay)
-        return self.workflow.submit_result(
-            transition.pr_number,
-            expected_head_sha=transition.expected_head_sha,
-            result=transition.result,
-        )
-
-    def _require_role(self, expected: str) -> None:
-        if self.role != expected:
-            raise PermissionError(
-                f"{self.role} cannot perform this {expected}-owned transition"
-            )
-
-    def _require_repo_scope(self, repo: str | None) -> None:
-        if repo is None:
-            return
-        configured_repo = self.workflow.repo
-        if repo != configured_repo:
-            raise PermissionError(
-                "transition repository does not match the configured GitHub "
-                "repository"
-            )
-
-
-class GitHubTransitionTool(
-    ToolDefinition[GitHubTransitionAction, GitHubTransitionObservation]
-):
-    name = "github_transition"
-
-    @classmethod
-    def create(
-        cls,
-        conv_state: object | None = None,
-        workflow: GitHubWorkflow | None = None,
-        *,
-        role: str | None = None,
-        workspace: str | Path | None = None,
-        advisor_branch: str | None = None,
-    ) -> Sequence[Self]:
-        role = role or os.environ.get("SENPAI_ROLE")
-        if role not in {"advisor", "student"}:
-            raise ValueError("role must be advisor or student")
-        advisor_branch = advisor_branch or os.environ.get("ADVISOR_BRANCH")
-        git_token: SecretStr | None = None
-        if workflow is None:
-            credentials = _GITHUB_CREDENTIALS
-            if credentials is None:
-                raise RuntimeError(
-                    "configure GitHub credentials before initializing workflows"
-                )
-            workflow = GitHubWorkflow(
-                credentials.repo,
-                credentials.token,
-                trusted_actor=credentials.trusted_actor,
-            )
-            git_token = credentials.token
-        if workspace is None:
-            if conv_state is None:
-                raise ValueError("github_transition requires its OpenHands workspace")
-            workspace = Path(conv_state.workspace.working_dir)
-        return [
-            cls(
-                description=(
-                    "Apply one verified GitHub workflow transition. Operations are "
-                    "create_assignment, push_branch, reconcile_labels, "
-                    "request_revision, send_assignment_feedback, respond_to_issue, "
-                    "submit_result, close_experiment, and merge_experiment. Every "
-                    "mutation verifies its durable identity and converges on replay."
-                ),
-                action_type=GitHubTransitionAction,
-                observation_type=GitHubTransitionObservation,
-                annotations=ToolAnnotations(
-                    title="GitHub transition",
-                    readOnlyHint=False,
-                    destructiveHint=True,
-                    idempotentHint=True,
-                    openWorldHint=True,
-                ),
-                executor=_GitHubTransitionExecutor(
-                    workflow,
-                    role,
-                    Path(workspace),
-                    git_token,
-                    advisor_branch,
-                ),
-            )
-        ]
-
-
 class SenpaiTerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
     """Fail-closed policy wrapper around the native terminal executor."""
 
@@ -1284,13 +712,15 @@ def register_senpai_tools() -> None:
     from senpai_agent.operational_tools import SupervisorOperationTool
 
     register_tool("senpai_training", TrainingToolSet)
-    register_tool("get_prs", GetPRsTool)
-    register_tool("github_transition", GitHubTransitionTool)
+    register_tool("senpai_github", GitHubWorkflowToolSet)
     register_tool("spawn_agents", SpawnAgentsTool)
     register_tool("await_agents", AwaitAgentsTool)
     register_tool("agent_status", AgentStatusTool)
     register_tool("cancel_agents", CancelAgentsTool)
     register_tool("delegate_agent", DelegateAgentTool)
+    register_tool("browser_tool_set", LoadBrowserTool)
+    register_tool("load_browser", LoadBrowserTool)
+    register_tool("task_tracker", SenpaiTaskTrackerTool)
     register_tool("senpai_terminal", SenpaiTerminalTool)
     register_tool("senpai_operations", SupervisorOperationTool)
     _TOOLS_REGISTERED = True

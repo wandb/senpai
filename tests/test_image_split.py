@@ -161,7 +161,7 @@ def test_runtime_workflow_uses_the_lockfile_uv_and_exa_versions():
     assert "exa-py @ https://github.com/exa-labs/exa-py/archive/" in install
 
 
-def test_advisor_state_is_persistent_and_student_state_is_ephemeral():
+def test_role_state_is_pod_local_and_separate_from_the_dataset_pvc():
     advisor = load_kubernetes_template("advisor-deployment.yaml")
     student = load_kubernetes_template("student-deployment.yaml")
 
@@ -169,7 +169,10 @@ def test_advisor_state_is_persistent_and_student_state_is_ephemeral():
     advisor_mounts = named_items(advisor_container["volumeMounts"])
     advisor_volumes = named_items(advisor["spec"]["template"]["spec"]["volumes"])
     assert advisor_mounts["state"]["mountPath"] == "/var/lib/senpai"
-    assert advisor_volumes["state"]["persistentVolumeClaim"] == {"claimName": "fixture"}
+    assert advisor_volumes["state"]["emptyDir"] == {}
+    assert advisor_volumes["dataset"]["persistentVolumeClaim"] == {
+        "claimName": "fixture"
+    }
     assert "serve-events" not in advisor_container["args"][0]
 
     student_container = container_for(student)
@@ -215,6 +218,19 @@ def test_entrypoints_delegate_runtime_lifecycle_to_the_python_supervisor(
         in container["livenessProbe"]["exec"]["command"][2]
     )
     assert deployment["spec"]["strategy"] == {"type": "Recreate"}
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_roles_clear_a_stale_lease_before_bootstrap(role: str):
+    entrypoint = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text(
+        encoding="utf-8"
+    )
+    container = container_for(load_kubernetes_template(f"{role}-deployment.yaml"))
+    bootstrap = container["args"][0]
+    lease = "openhands_state/controller-lease.json"
+
+    assert entrypoint.index(lease) < entrypoint.index("SENPAI_BOOTSTRAP_STARTED_PATH")
+    assert bootstrap.index(lease) < bootstrap.index("git init /workspace/senpai")
 
 
 def test_bootstrap_git_credentials_are_not_exposed_in_process_arguments():

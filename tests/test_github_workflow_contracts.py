@@ -1,11 +1,12 @@
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 from typing import cast
 from urllib.error import URLError
 
 import pytest
 from pydantic import SecretStr
 
-from senpai_agent.github_workflow import (
+from senpai_agent.github.workflow import (
     GitHubAPIError,
     GitHubTransportError,
     GitHubWorkflow,
@@ -17,10 +18,30 @@ from github_workflow_support import (
     API_URL,
     HEAD_SHA,
     REPO,
+    AmbiguousMutationGitHub,
     FakeGitHub,
     pull_request,
     workflow,
 )
+
+
+def test_github_code_uses_one_small_module_tree():
+    agent_package = Path(__file__).parents[1] / "senpai_agent"
+    modules = [
+        *(agent_package / "github").rglob("*.py"),
+        agent_package / "git_workflow.py",
+    ]
+    oversized = {
+        str(path.relative_to(agent_package)): lines
+        for path in modules
+        if (lines := len(path.read_text().splitlines())) > 300
+    }
+    stray_github_paths = sorted(
+        path.name for path in agent_package.glob("github_*")
+    )
+
+    assert oversized == {}
+    assert stray_github_paths == []
 
 
 def test_pull_request_returns_an_immutable_typed_snapshot():
@@ -74,6 +95,7 @@ def test_api_errors_do_not_expose_the_token():
     client = GitHubWorkflow(
         REPO,
         SecretStr("never-show-this"),
+        role="advisor",
         transport=FailingTransport(),
         api_url=API_URL,
     )
@@ -93,6 +115,7 @@ def test_network_failure_raises_a_token_safe_transport_error(monkeypatch):
     client = GitHubWorkflow(
         REPO,
         SecretStr("never-show-this"),
+        role="advisor",
         api_url=API_URL,
     )
 
@@ -101,3 +124,64 @@ def test_network_failure_raises_a_token_safe_transport_error(monkeypatch):
 
     assert "never-show-this" not in str(raised.value)
     assert "never-show-this" not in repr(raised.value)
+
+
+def test_draft_mutation_recovers_an_ambiguous_response_after_application():
+    fake = AmbiguousMutationGitHub(
+        pull_request(draft=False),
+        fail_method="POST",
+        fail_path="/graphql",
+    )
+    client = workflow(fake)
+
+    changed = client._set_draft(client.pull_request(7), draft=True)
+
+    assert changed is True
+    assert fake.pr["draft"] is True
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"errors": [{"message": "denied"}]}, "returned errors"),
+        ({"data": {"convertPullRequestToDraft": {}}}, "invalid GraphQL"),
+        (
+            {
+                "data": {
+                    "convertPullRequestToDraft": {
+                        "pullRequest": {"id": "other", "isDraft": True}
+                    }
+                }
+            },
+            "wrong pull request",
+        ),
+        (
+            {
+                "data": {
+                    "convertPullRequestToDraft": {
+                        "pullRequest": {"id": "PR_node_7", "isDraft": False}
+                    }
+                }
+            },
+            "wrong draft state",
+        ),
+    ],
+    ids=("errors", "malformed", "wrong-pull", "wrong-state"),
+)
+def test_draft_mutation_rejects_invalid_graphql_results(payload, message):
+    class GraphQLResultGitHub(FakeGitHub):
+        def request(self, method, url, *, headers, json_body=None):
+            if method == "POST" and url.endswith("/graphql"):
+                return HttpResponse(200, payload)
+            return super().request(
+                method,
+                url,
+                headers=headers,
+                json_body=json_body,
+            )
+
+    fake = GraphQLResultGitHub(pull_request(draft=False))
+    client = workflow(fake)
+
+    with pytest.raises(ReconciliationError, match=message):
+        client._set_draft(client.pull_request(7), draft=True)

@@ -1,109 +1,202 @@
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from senpai_agent.git_workflow import PushResult
-from senpai_agent.github_workflow import MutationResult
-from senpai_agent.tools import (
-    CloseExperimentTransition,
-    CreateAssignmentTransition,
-    GitHubTransitionAction,
-    GitHubTransitionTool,
-    MergeExperimentTransition,
-    PushBranchTransition,
+from senpai_agent.github.tools import (
+    AcceptResultOnCurrentBaseAction,
+    AcceptResultOnCurrentBaseTool,
+    AssignmentVersion,
+    CloseExperimentAction,
+    CloseExperimentTool,
+    CreateAssignmentAction,
+    CreateAssignmentTool,
+    GitHubToolRuntime,
+    MergeExperimentAction,
+    MergeExperimentTool,
+    PublishAdvisorBranchAction,
+    PublishAdvisorBranchTool,
+    RepairAssignmentRoutingAction,
+    RepairAssignmentRoutingTool,
+    RequestAssignmentRevisionAction,
+    RequestAssignmentRevisionTool,
+    SendAssignmentFeedbackAction,
+    SendAssignmentFeedbackTool,
 )
+from senpai_agent.github.workflow import MutationResult
+from senpai_agent.models import DispositionRecord, render_disposition_marker
 
 
-class Workflow:
+class RecordingWorkflow:
+    repo = "acme/widgets"
+
     def __init__(self):
-        self.repo = "acme/widgets"
         self.calls = []
 
-    def create_assignment(self, assignment, **kwargs):
-        self.calls.append(("create_assignment", assignment, kwargs))
-        return MutationResult(
-            changed=True,
-            resource_url="https://github.test/pull/18",
-            state="assignment_created",
-            version=assignment.head_sha,
-        )
+    @contextmanager
+    def serialized_assignment_mutation(self):
+        self.calls.append(("lock_enter", None, {}))
+        try:
+            yield
+        finally:
+            self.calls.append(("lock_exit", None, {}))
 
-    def merge_experiment(self, number, **kwargs):
-        self.calls.append(("merge_experiment", number, kwargs))
-        return MutationResult(
-            changed=True,
-            resource_url=f"https://github.test/pull/{number}",
-            state="experiment_merged",
-            version="merge-sha",
-        )
+    def __getattr__(self, name):
+        def call(number, **kwargs):
+            self.calls.append((name, number, kwargs))
+            return MutationResult(
+                changed=True,
+                resource_url=f"https://github.test/pull/{number}",
+                state=name,
+                version=kwargs.get("expected_head_sha"),
+            )
 
-    def close_experiment(self, number, **kwargs):
-        self.calls.append(("close_experiment", number, kwargs))
-        return MutationResult(
-            changed=True,
-            resource_url=f"https://github.test/pull/{number}",
-            state="experiment_closed",
-            version=kwargs["expected_head_sha"],
-        )
+        return call
 
 
-def advisor_tool(workflow: Workflow, workspace: Path, **kwargs):
-    return GitHubTransitionTool.create(
+def runtime(workflow: RecordingWorkflow, workspace: Path) -> GitHubToolRuntime:
+    return GitHubToolRuntime(
         workflow=workflow,
-        role="advisor",
         workspace=workspace,
-        **kwargs,
-    )[0]
+        git_token=None,
+        role="advisor",
+        advisor_branch="advisor-branch",
+        student_names=frozenset({"student-one"}),
+        student_name=None,
+    )
 
 
-def test_advisor_push_is_limited_to_the_configured_branch(
+def assignment() -> AssignmentVersion:
+    return AssignmentVersion(
+        pr_number=17,
+        assignment_id="assignment-17",
+        revision_id="revision-1",
+        expected_pr_head_sha="a" * 40,
+    )
+
+
+def test_create_assignment_uses_the_created_branch_head_for_the_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    workflow = RecordingWorkflow()
+    branch_calls = []
+
+    def create_branch(workspace, **kwargs):
+        workflow.calls.append(("create_branch", None, {}))
+        branch_calls.append((workspace, kwargs))
+        return PushResult(
+            changed=True,
+            branch=kwargs["branch"],
+            head_sha="c" * 40,
+        )
+
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.advisor.git_workflow.create_assignment_branch",
+        create_branch,
+    )
+    tool = CreateAssignmentTool.create(runtime(workflow, tmp_path))[0]
+    action = CreateAssignmentAction(
+        assignment_id="assignment-18",
+        revision_id="revision-1",
+        student="student-one",
+        expected_base_sha="b" * 40,
+        head_branch="student-one/lower-lr",
+        title="Try a lower learning rate",
+        body="Run one bounded comparison.",
+    )
+
+    observation = tool(action)
+
+    assert observation.state == "create_assignment"
+    assert branch_calls[0][1] == {
+        "branch": "student-one/lower-lr",
+        "base_branch": "advisor-branch",
+        "expected_base_sha": "b" * 40,
+        "assignment_id": "assignment-18",
+        "token": None,
+    }
+    assert [call[0] for call in workflow.calls] == [
+        "lock_enter",
+        "create_branch",
+        "create_assignment",
+        "lock_exit",
+    ]
+    _, _, fields = workflow.calls[2]
+    created = workflow.calls[2][1]
+    assert created.repo == "acme/widgets"
+    assert created.head_sha == "c" * 40
+    assert fields == {
+        "title": "Try a lower learning rate",
+        "body": "Run one bounded comparison.",
+    }
+
+
+def test_create_assignment_rejects_students_outside_the_launch_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    workflow = RecordingWorkflow()
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.advisor.git_workflow.create_assignment_branch",
+        lambda *_args, **_kwargs: pytest.fail("git mutation reached"),
+    )
+    tool = CreateAssignmentTool.create(runtime(workflow, tmp_path))[0]
+    action = CreateAssignmentAction(
+        assignment_id="assignment-18",
+        revision_id="revision-1",
+        student="student-outside-launch",
+        expected_base_sha="b" * 40,
+        head_branch="student-outside-launch/lower-lr",
+        title="Try a lower learning rate",
+        body="Run one bounded comparison.",
+    )
+
+    with pytest.raises(PermissionError, match="outside this launch"):
+        tool(action)
+
+    assert workflow.calls == []
+
+
+def test_publish_advisor_branch_uses_configured_branch_and_distinct_shas(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
     pushes = []
 
+    workflow = RecordingWorkflow()
+
     def push(workspace, **kwargs):
+        workflow.calls.append(("push", None, {}))
         pushes.append((workspace, kwargs))
         return PushResult(
             changed=True,
             branch=kwargs["branch"],
-            head_sha="b" * 40,
+            head_sha=kwargs["expected_local_sha"],
         )
 
-    monkeypatch.setattr("senpai_agent.tools.push_assignment_branch", push)
-    tool = advisor_tool(Workflow(), tmp_path, advisor_branch="schmidhuber")
-
-    with pytest.raises(PermissionError, match="advisor branch"):
-        tool(
-            GitHubTransitionAction(
-                transition=PushBranchTransition(
-                    operation="push_branch",
-                    branch="main",
-                    expected_remote_sha="a" * 40,
-                    expected_head_sha="b" * 40,
-                )
-            )
-        )
-
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.advisor.git_workflow.push_assignment_branch",
+        push,
+    )
+    tool = PublishAdvisorBranchTool.create(
+        runtime(workflow, tmp_path)
+    )[0]
     observation = tool(
-        GitHubTransitionAction(
-            transition=PushBranchTransition(
-                operation="push_branch",
-                repo="acme/widgets",
-                branch="schmidhuber",
-                expected_remote_sha="a" * 40,
-                expected_head_sha="b" * 40,
-            )
+        PublishAdvisorBranchAction(
+            remote_branch_sha_before_push="a" * 40,
+            local_commit_sha="b" * 40,
         )
     )
 
     assert observation.state == "branch_pushed"
-    assert observation.version == "b" * 40
+    assert [call[0] for call in workflow.calls] == ["lock_enter", "push", "lock_exit"]
     assert pushes == [
         (
             tmp_path,
             {
-                "branch": "schmidhuber",
+                "branch": "advisor-branch",
                 "expected_remote_sha": "a" * 40,
                 "expected_local_sha": "b" * 40,
                 "token": None,
@@ -112,123 +205,107 @@ def test_advisor_push_is_limited_to_the_configured_branch(
     ]
 
 
-def test_transition_rejects_a_repository_outside_the_bound_runtime(tmp_path: Path):
-    tool = advisor_tool(Workflow(), tmp_path)
-
-    with pytest.raises(PermissionError, match="repository"):
-        tool(
-            GitHubTransitionAction(
-                transition=MergeExperimentTransition(
-                    operation="merge_experiment",
-                    repo="other/widgets",
-                    pr_number=17,
-                    assignment_id="assignment-17",
-                    expected_head_sha="a" * 40,
-                )
-            )
-        )
-
-
-def test_create_assignment_uses_the_created_branch_head_for_the_pr(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-):
-    workflow = Workflow()
-    branch_calls = []
-
-    def create_branch(workspace, **kwargs):
-        branch_calls.append((workspace, kwargs))
-        return PushResult(
-            changed=True,
-            branch=kwargs["branch"],
-            head_sha="c" * 40,
-        )
-
-    monkeypatch.setattr("senpai_agent.tools.create_assignment_branch", create_branch)
-    tool = advisor_tool(workflow, tmp_path)
-
-    observation = tool(
-        GitHubTransitionAction(
-            transition=CreateAssignmentTransition(
-                operation="create_assignment",
-                assignment_id="assignment-18",
-                revision_id="revision-1",
-                student="student-one",
-                base_branch="schmidhuber",
-                expected_base_sha="b" * 40,
-                head_branch="student-one/lower-lr",
-                title="Try a lower learning rate",
-                body="Run one bounded comparison.",
-            )
-        )
-    )
-
-    assert observation.state == "assignment_created"
-    assert branch_calls[0][1] == {
-        "branch": "student-one/lower-lr",
-        "base_branch": "schmidhuber",
-        "expected_base_sha": "b" * 40,
-        "assignment_id": "assignment-18",
-        "token": None,
-    }
-    _, assignment, pr_fields = workflow.calls[0]
-    assert assignment.head_sha == "c" * 40
-    assert assignment.repo == "acme/widgets"
-    assert pr_fields == {
-        "title": "Try a lower learning rate",
-        "body": "Run one bounded comparison.",
-    }
-
-
-def test_close_stamps_the_runtime_repository_without_repeated_input(tmp_path: Path):
-    workflow = Workflow()
-    tool = advisor_tool(workflow, tmp_path)
-
-    observation = tool(
-        GitHubTransitionAction(
-            transition=CloseExperimentTransition(
-                operation="close_experiment",
-                pr_number=17,
-                expected_head_sha="a" * 40,
-                assignment_id="assignment-17",
-                reason="The hypothesis was falsified.",
-            )
-        )
-    )
-
-    assert observation.state == "experiment_closed"
-    _, _, fields = workflow.calls[0]
-    assert '"repo":"acme/widgets"' in fields["marker"]
-
-
-def test_merge_forwards_explicit_acceptance_of_an_advanced_baseline(
-    tmp_path: Path,
-):
-    workflow = Workflow()
-    tool = advisor_tool(workflow, tmp_path)
-
-    observation = tool(
-        GitHubTransitionAction(
-            transition=MergeExperimentTransition(
-                operation="merge_experiment",
-                pr_number=17,
-                assignment_id="assignment-17",
-                expected_head_sha="a" * 40,
-                accepted_base_sha="b" * 40,
-            )
-        )
-    )
-
-    assert observation.state == "experiment_merged"
-    assert workflow.calls == [
+@pytest.mark.parametrize(
+    ("tool_type", "action", "method", "expected"),
+    [
         (
-            "merge_experiment",
-            17,
+            RepairAssignmentRoutingTool,
+            RepairAssignmentRoutingAction(
+                assignment=assignment(),
+                working_state="review",
+                blockers={"hold"},
+            ),
+            "repair_assignment_routing",
+            {"working_state": "review", "blockers": {"hold"}},
+        ),
+        (
+            SendAssignmentFeedbackTool,
+            SendAssignmentFeedbackAction(
+                assignment=assignment(),
+                feedback_id="inspect-seed",
+                comment="Inspect the failed seed.",
+            ),
+            "send_assignment_feedback",
+            {"feedback_id": "inspect-seed", "comment": "Inspect the failed seed."},
+        ),
+        (
+            RequestAssignmentRevisionTool,
+            RequestAssignmentRevisionAction(
+                assignment=assignment(),
+                new_revision_id="revision-2",
+                required_base_sha="b" * 40,
+                comment="Rerun on the current research base.",
+            ),
+            "request_revision",
             {
-                "expected_head_sha": "a" * 40,
-                "assignment_id": "assignment-17",
-                "merge_method": "squash",
-                "accepted_base_sha": "b" * 40,
+                "new_revision_id": "revision-2",
+                "required_base_sha": "b" * 40,
             },
-        )
-    ]
+        ),
+        (
+            AcceptResultOnCurrentBaseTool,
+            AcceptResultOnCurrentBaseAction(
+                assignment=assignment(),
+                expected_current_base_sha="b" * 40,
+                reason="The changed files do not intersect this mechanism.",
+            ),
+            "accept_result_on_current_base",
+            {"expected_current_base_sha": "b" * 40},
+        ),
+        (
+            MergeExperimentTool,
+            MergeExperimentAction(
+                assignment=assignment(),
+                expected_current_base_sha="b" * 40,
+            ),
+            "merge_experiment",
+            {"expected_current_base_sha": "b" * 40, "merge_method": "squash"},
+        ),
+        (
+            CloseExperimentTool,
+            CloseExperimentAction(
+                assignment=assignment(),
+                reason="The hypothesis was falsified.",
+            ),
+            "close_experiment",
+            {
+                "marker": render_disposition_marker(
+                    DispositionRecord(
+                        repo="acme/widgets",
+                        pr_number=17,
+                        assignment_id="assignment-17",
+                        head_sha="a" * 40,
+                    )
+                ),
+                "reason": "The hypothesis was falsified.",
+            },
+        ),
+    ],
+)
+def test_assignment_tools_forward_one_exact_assignment_version(
+    tmp_path: Path,
+    tool_type,
+    action,
+    method: str,
+    expected: dict,
+):
+    workflow = RecordingWorkflow()
+    observation = tool_type.create(runtime(workflow, tmp_path))[0](action)
+
+    assert observation.state == method
+    name, number, fields = workflow.calls[0]
+    assert name == method
+    assert number == 17
+    assert fields["assignment_id"] == "assignment-17"
+    assert fields["expected_head_sha"] == "a" * 40
+    revision_field = (
+        "revision_id"
+        if method == "send_assignment_feedback"
+        else "current_revision_id"
+    )
+    if method != "send_assignment_feedback":
+        assert fields[revision_field] == "revision-1"
+    else:
+        assert fields["revision_id"] == "revision-1"
+    for key, value in expected.items():
+        assert fields[key] == value

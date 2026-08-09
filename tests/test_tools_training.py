@@ -1,4 +1,5 @@
 import subprocess
+import threading
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -282,15 +283,57 @@ def test_cancel_training_keeps_monitor_when_cancellation_is_not_terminal(
         monitors.close()
 
 
-def test_interrupting_run_training_closes_its_runtime(tmp_path: Path):
-    training = StubTraining(tmp_path, finished_result(tmp_path))
-    monitors = MonitorStore(tmp_path / "monitors.sqlite3")
+def test_interrupting_run_training_cancels_only_the_in_flight_run(tmp_path: Path):
+    class BlockingMonitorStore(MonitorStore):
+        def __init__(self, path: Path):
+            super().__init__(path)
+            self.registering = threading.Event()
+            self.release = threading.Event()
+
+        def register(self, spec):
+            self.registering.set()
+            assert self.release.wait(2)
+            super().register(spec)
+
+    workspace = init_workspace(tmp_path)
+    training = StubTraining(workspace, finished_result(tmp_path))
+    monitors = BlockingMonitorStore(tmp_path / "monitors.sqlite3")
+    executor = RunTrainingTool.create(training, monitors)[0].executor
+    action = RunTrainingAction(
+        spec=TrainingSpec(
+            argv=("python", "train.py"),
+            cwd=workspace,
+            timeout_seconds=20,
+        )
+    )
+    conversation = SimpleNamespace(id=uuid.uuid4())
+    errors = []
+
+    def run() -> None:
+        try:
+            executor(action, conversation)
+        except BaseException as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    thread = threading.Thread(target=run)
 
     try:
-        RunTrainingTool.create(training, monitors)[0].executor.interrupt()
+        executor.interrupt()
+        assert training.cancelled == []
 
-        assert training.closed is True
+        thread.start()
+        assert monitors.registering.wait(2)
+        executor.interrupt()
+        monitors.release.set()
+        thread.join(2)
+
+        assert not thread.is_alive()
+        assert errors == []
+        assert training.cancelled == ["training-17"]
+        assert training.closed is False
     finally:
+        monitors.release.set()
+        thread.join(2)
         monitors.close()
 
 

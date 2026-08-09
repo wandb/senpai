@@ -120,6 +120,11 @@ CONFIGMAP_NAME="${JOB_NAME}-script"
 SA_NAME="senpai-cutoff"
 ROLE_NAME="senpai-cutoff"
 ROLEBINDING_NAME="senpai-cutoff"
+ARM_ID="$(python - <<'PY'
+import uuid
+print(uuid.uuid4())
+PY
+)"
 BUDGET_SECONDS="$(python - "$BUDGET_HOURS" <<'PY'
 import sys
 print(int(float(sys.argv[1]) * 3600))
@@ -152,6 +157,7 @@ EXPECTED_PODS="${EXPECTED_PODS:?}"
 EXPECTED_DEPLOYMENTS="${EXPECTED_DEPLOYMENTS:?}"
 READINESS_TIMEOUT_SECONDS="${READINESS_TIMEOUT_SECONDS:?}"
 BUDGET_SECONDS="${BUDGET_SECONDS:?}"
+REQUESTED_ARM_ID="${ARM_ID:?}"
 PVC_LOG_ROOT="${PVC_LOG_ROOT:?}"
 START_GATE_PATH="${START_GATE_PATH:-}"
 NAMESPACE="${NAMESPACE:-default}"
@@ -199,6 +205,7 @@ write_state() {
   kill_at_utc="$(utc_from_epoch "$kill_at")"
   tmp="${STATE_FILE}.tmp"
   {
+    printf 'PERSISTED_ARM_ID=%q\n' "$REQUESTED_ARM_ID"
     printf 'RUN_SLUG=%q\n' "$RUN_SLUG"
     printf 'TAGS_CSV=%q\n' "$TAGS_CSV"
     printf 'ARMED_AT_UTC=%q\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -230,13 +237,23 @@ open_start_gate() {
 }
 
 wait_for_ready_gate() {
-  local total ready deploys deadline now delay
+  local total ready deploys deadline now delay existing_arm_id
   if [ -f "$STATE_FILE" ]; then
-    # shellcheck source=/dev/null
-    source "$STATE_FILE"
-    log "Loaded existing cutoff state: KILL_AT_UTC=${KILL_AT_UTC}"
-    open_start_gate
-    return 0
+    existing_arm_id="$(
+      # shellcheck source=/dev/null
+      source "$STATE_FILE"
+      printf '%s' "${PERSISTED_ARM_ID:-}"
+    )"
+    if [ "$existing_arm_id" = "$REQUESTED_ARM_ID" ]; then
+      # shellcheck source=/dev/null
+      source "$STATE_FILE"
+      log "Loaded existing cutoff state: KILL_AT_UTC=${KILL_AT_UTC}"
+      open_start_gate
+      return 0
+    fi
+    log "Discarding cutoff state from an earlier arm of this run slug"
+    rm -f "$STATE_FILE"
+    [ -z "$START_GATE_PATH" ] || rm -f "$START_GATE_PATH"
   fi
 
   deadline=$(($(date -u '+%s') + READINESS_TIMEOUT_SECONDS))
@@ -390,6 +407,8 @@ spec:
           value: "${READINESS_TIMEOUT_SECONDS}"
         - name: BUDGET_SECONDS
           value: "${BUDGET_SECONDS}"
+        - name: ARM_ID
+          value: "${ARM_ID}"
         - name: PVC_LOG_ROOT
           value: "${PVC_LOG_ROOT}"
         - name: START_GATE_PATH
@@ -423,7 +442,7 @@ fi
 
 "$KUBECTL" --context "$CONTEXT" apply -f "$RBAC_MANIFEST"
 "$KUBECTL" --context "$CONTEXT" apply -f "${TMP_DIR}/configmap.yaml"
-"$KUBECTL" --context "$CONTEXT" delete job "$JOB_NAME" --ignore-not-found=true
+"$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" delete job "$JOB_NAME" --ignore-not-found=true
 "$KUBECTL" --context "$CONTEXT" apply -f "$JOB_MANIFEST"
 
 echo "Armed cluster cutoff job: ${JOB_NAME}"

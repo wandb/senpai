@@ -15,9 +15,8 @@ experiment comparison report. The canonical template is the W&B report
    baseline run ID or run name before creating the report.
 2. Identify the experiment run IDs. Prefer exact run IDs over names, groups, or
    regex searches.
-3. Query W&B summaries/configs with `wbagent` helpers or the W&B SDK. Use
-   bounded metric keys; do not scan broad histories unless the report needs a
-   curve-specific claim.
+3. Query W&B summaries and configs with the W&B SDK. Use bounded metric keys;
+   do not scan broad histories unless the report needs a curve-specific claim.
 4. Read `references/template.md` before making a report by hand. It records the
    report width, runset settings, panel positions, plot axis limits, media
    keys, and expected block order from the template.

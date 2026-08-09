@@ -5,8 +5,8 @@ from urllib.parse import urlsplit
 import pytest
 from pydantic import SecretStr
 
-from senpai_agent import github_http
-from senpai_agent.github_http import GitHubReader, GitHubReadError, next_link
+from senpai_agent.github import http as github_http
+from senpai_agent.github.http import GitHubReader, GitHubReadError, next_link
 
 
 class Response:

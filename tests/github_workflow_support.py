@@ -1,11 +1,11 @@
 """Stateful GitHub transport used by the workflow transition tests."""
 
-from typing import cast
+from typing import Literal, cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import SecretStr
 
-from senpai_agent.github_workflow import (
+from senpai_agent.github.workflow import (
     GitHubTransportError,
     GitHubWorkflow,
     HttpResponse,
@@ -91,11 +91,16 @@ def comment(
     body: str,
     *,
     author: str = "senpai-bot",
+    author_type: str | None = None,
+    association: str = "MEMBER",
 ) -> dict[str, object]:
+    if author_type is None:
+        author_type = "Bot" if author.casefold() == "senpai-bot" else "User"
     return {
         "id": comment_id,
         "body": body,
-        "user": {"login": author},
+        "user": {"login": author, "type": author_type},
+        "author_association": association,
         "html_url": f"https://github.com/{REPO}/pull/7#issuecomment-{comment_id}",
     }
 
@@ -106,6 +111,8 @@ def human_issue(
     state: str = "open",
     labels: set[str] | None = None,
     author: str = "human-researcher",
+    author_type: str = "User",
+    association: str = "MEMBER",
     pull_request_url: str | None = None,
 ) -> dict[str, object]:
     issue: dict[str, object] = {
@@ -118,7 +125,8 @@ def human_issue(
             {"name": label}
             for label in sorted(labels if labels is not None else {"human", "team"})
         ],
-        "user": {"login": author},
+        "user": {"login": author, "type": author_type},
+        "author_association": association,
     }
     if pull_request_url is not None:
         issue["pull_request"] = {"url": pull_request_url}
@@ -170,15 +178,19 @@ class FakeGitHub:
         comments: list[dict[str, object]] | None = None,
         issue: dict[str, object] | None = None,
         comment_page_size: int = 100,
-        ignore_label_put: bool = False,
+        ignore_label_mutations: bool = False,
+        ignore_draft_mutations: bool = False,
         branch_heads: dict[str, str] | None = None,
+        actor_login: str = "senpai-bot",
     ):
         self.pr = pr
         self.comments = list(comments or [])
         self.issue = issue
         self.comment_page_size = comment_page_size
-        self.ignore_label_put = ignore_label_put
+        self.ignore_label_mutations = ignore_label_mutations
+        self.ignore_draft_mutations = ignore_draft_mutations
         self.branch_heads = branch_heads or {str(pr["base_ref"]): BASE_SHA}
+        self.actor_login = actor_login
         self.requests: list[tuple[str, str, object | None, dict[str, str]]] = []
 
     @property
@@ -207,6 +219,9 @@ class FakeGitHub:
         issue_path = f"/repos/{REPO}/issues/7"
         comments_path = f"/repos/{REPO}/issues/7/comments"
         labels_path = f"/repos/{REPO}/issues/7/labels"
+
+        if method == "GET" and path == "/user":
+            return HttpResponse(200, {"login": self.actor_login})
 
         if method == "GET" and path == pull_path:
             return HttpResponse(200, self._pull_payload())
@@ -288,22 +303,37 @@ class FakeGitHub:
             existing["body"] = body
             return HttpResponse(200, existing)
 
-        if method == "PUT" and path == labels_path:
-            labels = set(cast(dict[str, list[str]], json_body)["labels"])
-            if not self.ignore_label_put:
-                self.pr["labels"] = labels
-            return HttpResponse(200, [{"name": label} for label in sorted(labels)])
+        if method == "POST" and path == labels_path:
+            labels = cast(set[str], self.pr["labels"])
+            if not self.ignore_label_mutations:
+                labels.update(cast(dict[str, list[str]], json_body)["labels"])
+            return HttpResponse(
+                200,
+                [{"name": label} for label in sorted(labels)],
+            )
+
+        label_prefix = f"{labels_path}/"
+        if method == "DELETE" and path.startswith(label_prefix):
+            labels = cast(set[str], self.pr["labels"])
+            if not self.ignore_label_mutations:
+                labels.discard(unquote(path.removeprefix(label_prefix)))
+            return HttpResponse(
+                200,
+                [{"name": label} for label in sorted(labels)],
+            )
 
         if method == "POST" and path == "/graphql":
             query = cast(str, cast(dict[str, object], json_body)["query"])
             if "convertPullRequestToDraft" in query:
-                self.pr["draft"] = True
+                requested_draft = True
                 field = "convertPullRequestToDraft"
             elif "markPullRequestReadyForReview" in query:
-                self.pr["draft"] = False
+                requested_draft = False
                 field = "markPullRequestReadyForReview"
             else:
                 raise AssertionError(f"Unexpected GraphQL mutation: {query}")
+            if not self.ignore_draft_mutations:
+                self.pr["draft"] = requested_draft
             return HttpResponse(
                 200,
                 {
@@ -311,7 +341,7 @@ class FakeGitHub:
                         field: {
                             "pullRequest": {
                                 "id": self.pr["node_id"],
-                                "isDraft": self.pr["draft"],
+                                "isDraft": requested_draft,
                             }
                         }
                     }
@@ -378,10 +408,15 @@ class AmbiguousMutationGitHub(FakeGitHub):
         return response
 
 
-def workflow(fake: FakeGitHub) -> GitHubWorkflow:
+def workflow(
+    fake: FakeGitHub,
+    *,
+    role: Literal["advisor", "student"] = "advisor",
+) -> GitHubWorkflow:
     return GitHubWorkflow(
         REPO,
         SecretStr("github-secret"),
+        role=role,
         transport=fake,
         api_url=API_URL,
         trusted_actor="senpai-bot",

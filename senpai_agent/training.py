@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -189,6 +190,18 @@ def _inventory_with_result(
     )
 
 
+def training_result_paths(state_dir: Path) -> Iterator[Path]:
+    """Yield only process records owned by the training supervisor."""
+
+    for path in state_dir.glob("*.json"):
+        try:
+            training_id = uuid.UUID(path.stem)
+        except ValueError:
+            continue
+        if path.name == f"{training_id}.json":
+            yield path
+
+
 @dataclass
 class _ActiveTraining:
     process: subprocess.Popen[bytes]
@@ -253,11 +266,7 @@ class TrainingSupervisor:
 
         inventory = TrainingInventory()
         paths = sorted(
-            (
-                candidate
-                for candidate in self.state_dir.glob("*.json")
-                if candidate.name != TRAINING_INVENTORY_FILENAME
-            ),
+            training_result_paths(self.state_dir),
             key=lambda candidate: (candidate.stat().st_mtime, candidate.name),
         )
         for candidate in paths:

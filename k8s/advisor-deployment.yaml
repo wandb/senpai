@@ -55,6 +55,7 @@ spec:
         args:
         - |
           set -e
+          rm -f "/var/lib/senpai/$RESEARCH_TAG/advisor/openhands_state/controller-lease.json"
           askpass=/tmp/senpai-git-askpass
           printf '%s\n' \
             '#!/bin/sh' \
@@ -135,5 +136,4 @@ spec:
         persistentVolumeClaim:
           claimName: {{PVC_CLAIM_NAME}}
       - name: state
-        persistentVolumeClaim:
-          claimName: {{PVC_CLAIM_NAME}}
+        emptyDir: {}

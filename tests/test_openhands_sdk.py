@@ -11,6 +11,7 @@ from pydantic import SecretStr
 from senpai_agent.openhands_runner import (
     EVENT_TEXT_LIMIT,
     anthropic_compaction_configuration,
+    apply_reasoning_profile,
     conversation_prompt_cache_key,
     event_summary,
     model_runtime_configuration,
@@ -82,7 +83,6 @@ def test_openhands_fork_main_is_consistent_across_install_paths():
 @pytest.mark.parametrize(
     ("effort", "model", "expected"),
     [
-        ("ultra", "openai/gpt-5.6-sol", "max"),
         ("max", "openai/gpt-5.6-sol", "max"),
         ("high", "openai/gpt-5.6", "high"),
         ("xhigh", "anthropic/claude-opus-4-8", "xhigh"),
@@ -109,6 +109,7 @@ def test_supported_reasoning_effort_is_preserved(
         ("max", "openai/gpt-5.60"),
         ("medium", "wandb/zai-org/GLM-5.2"),
         ("extreme", "openai/gpt-5.6-sol"),
+        ("ultra", "openai/gpt-5.6-sol"),
     ],
 )
 def test_unsupported_reasoning_effort_fails_instead_of_being_rewritten(
@@ -117,12 +118,6 @@ def test_unsupported_reasoning_effort_fails_instead_of_being_rewritten(
 ):
     with pytest.raises(ValueError, match="unsupported reasoning effort|unsupported for"):
         openhands_reasoning_effort(effort, model)
-
-
-def test_ultra_is_preserved_as_a_cli_reasoning_effort():
-    args = parse_runner_args(["--max-turns", "1", "--reasoning-effort", "ultra"])
-
-    assert args.reasoning_effort == "ultra"
 
 
 @pytest.mark.parametrize(
@@ -180,16 +175,16 @@ def test_openai_response_configuration_is_accepted_by_the_pinned_sdk():
     assert openai_responses_configuration("anthropic/claude-opus-4-8") == {}
 
 
-def test_ultra_uses_openai_max_effort_in_pro_mode():
+def test_openai_max_uses_pro_mode_on_the_wire():
     configuration = model_runtime_configuration(
         "openai/gpt-5.6-sol",
-        "ultra",
+        "max",
     )
     llm = LLM(
         model="openai/gpt-5.6-sol",
         api_key=SecretStr("test-key"),
         reasoning_effort=openhands_reasoning_effort(
-            "ultra",
+            "max",
             "openai/gpt-5.6-sol",
         ),
         **configuration,
@@ -229,6 +224,39 @@ def test_ultra_uses_openai_max_effort_in_pro_mode():
         "mode": "pro",
         "summary": "auto",
         "context": "all_turns",
+    }
+
+
+@pytest.mark.parametrize(
+    ("parent_effort", "override", "expected_effort", "expects_pro"),
+    [
+        ("xhigh", "max", "max", True),
+        ("max", "xhigh", "xhigh", False),
+    ],
+)
+def test_file_agent_reasoning_override_replaces_the_parent_request_profile(
+    parent_effort,
+    override,
+    expected_effort,
+    expects_pro,
+):
+    model = "openai/gpt-5.6-sol"
+    parent = LLM(
+        model=model,
+        api_key=SecretStr("test-key"),
+        reasoning_effort=parent_effort,
+        **model_runtime_configuration(model, parent_effort),
+    )
+
+    configured = apply_reasoning_profile(
+        parent.model_copy(update={"reasoning_effort": override})
+    )
+
+    assert configured.reasoning_effort == expected_effort
+    assert ("reasoning" in configured.litellm_extra_body) is expects_pro
+    assert configured.litellm_extra_body["prompt_cache_options"] == {
+        "mode": "explicit",
+        "ttl": "30m",
     }
 
 
@@ -289,11 +317,11 @@ def test_wandb_gateway_uses_chat_thinking_and_project_routing():
 @pytest.mark.parametrize(
     ("model", "effort"),
     [
-        ("openai/gpt-5.6-sol", "max"),
+        ("openai/gpt-5.6-sol", "xhigh"),
         ("anthropic/claude-fable-5", "max"),
     ],
 )
-def test_pro_mode_is_only_enabled_by_the_openai_ultra_profile(model, effort):
+def test_pro_mode_is_only_enabled_by_openai_max(model, effort):
     extra_body = model_runtime_configuration(model, effort).get(
         "litellm_extra_body",
         {},

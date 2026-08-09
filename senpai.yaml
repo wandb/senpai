@@ -44,7 +44,7 @@ smart_reasoning_effort: xhigh
 fast_model: openai/gpt-5.6-luna
 fast_reasoning_effort: high
 frontier_model: openai/gpt-5.6-sol
-frontier_reasoning_effort: ultra
+frontier_reasoning_effort: max
 
 # advisor — the integration branch inside the problem-package repo that advisor PRs merge into
 advisor_branch: schmidhuber

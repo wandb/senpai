@@ -10,6 +10,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from senpai_agent.training import training_result_paths
+
 
 @dataclass(frozen=True, slots=True)
 class PolicyDecision:
@@ -66,6 +68,7 @@ _GIT_TERMINAL_COMMANDS = {
     "mv",
     "name-rev",
     "notes",
+    "patch-id",
     "range-diff",
     "rebase",
     "reflog",
@@ -480,8 +483,9 @@ def _git_policy(arguments: list[str]) -> PolicyDecision:
         return PolicyDecision(True)
     return PolicyDecision(
         False,
-        "Only explicit local or read-only Git commands may use the terminal; "
-        "use the typed Senpai tool for branch publication.",
+        f"Terminal use of `git {command}` is not allowed; use explicit local or "
+        "read-only Git commands, and use the typed Senpai tool for branch "
+        "publication.",
     )
 
 
@@ -585,7 +589,7 @@ def _stop_policy(
     if state_dir is not None:
         running = {
             path.stem
-            for path in (state_dir / "training").glob("*.json")
+            for path in training_result_paths(state_dir / "training")
             if json.loads(path.read_text()).get("state") == "running"
         }
         monitored = {
