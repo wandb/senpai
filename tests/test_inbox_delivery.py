@@ -1,5 +1,6 @@
 import hashlib
 import json
+import sqlite3
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
@@ -360,6 +361,149 @@ def test_legacy_pr3472_delivery_is_adopted_without_replay(
     assert reminder is not None
     assert reminder.events[0].delivery_id != legacy_event_id
     assert json.loads(legacy_path.read_text(encoding="utf-8")) == legacy_value
+
+
+@pytest.mark.parametrize("prompt_already_delivered", (False, True))
+def test_visible_persisted_prompt_keeps_its_identity_during_legacy_adoption(
+    tmp_path: Path,
+    prompt_already_delivered: bool,
+):
+    event_key = "review_ready:17:abc"
+    legacy_event_id = str(UUID(int=119))
+    legacy_path = tmp_path / "pending-message-deliveries.json"
+    legacy_path.write_text(
+        json.dumps({str(CONVERSATION_ID): {event_key: legacy_event_id}}),
+        encoding="utf-8",
+    )
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3", legacy_path=legacy_path)
+    inbox.enqueue(CONVERSATION_ID, event_key, "compact event")
+    turn = inbox.next_turn(CONVERSATION_ID, "persisted prompt")
+    assert turn is not None
+    if prompt_already_delivered:
+        inbox.record_delivered(turn.prompt.delivery_id, turn.prompt.body)
+    conversation = Conversation(
+        [
+            SimpleNamespace(
+                message="older historical prompt",
+                sender=delivery_sender(turn.legacy_prompt_delivery_id),
+            ),
+            SimpleNamespace(message=turn.prompt.body, sender=turn.prompt.sender),
+            SimpleNamespace(
+                message="historical event body",
+                sender=delivery_sender(legacy_event_id),
+            ),
+        ]
+    )
+
+    recovered = deliver_turn_messages(conversation, inbox, turn.turn_id)
+    repeated = deliver_turn_messages(conversation, inbox, turn.turn_id)
+
+    assert conversation.sent == []
+    assert recovered.prompt.delivery_id == turn.prompt.delivery_id
+    assert recovered.prompt.sender == turn.prompt.sender
+    assert recovered.legacy_prompt_delivery_id == turn.prompt.delivery_id
+    assert repeated.prompt == recovered.prompt
+    assert recovered.state is DeliveryState.DELIVERED
+    with sqlite3.connect(inbox.path) as database:
+        legacy = database.execute(
+            "SELECT legacy FROM inbox_messages WHERE delivery_id = ?",
+            (turn.prompt.delivery_id,),
+        ).fetchone()
+    assert legacy == (0,)
+
+
+@pytest.mark.parametrize("prompt_already_delivered", (False, True))
+def test_visible_persisted_prompt_rejects_a_changed_body_without_mutation(
+    tmp_path: Path,
+    prompt_already_delivered: bool,
+):
+    legacy_event_id = str(UUID(int=120))
+    legacy_path = tmp_path / "pending-message-deliveries.json"
+    legacy_path.write_text(
+        json.dumps(
+            {str(CONVERSATION_ID): {"review_ready:17:abc": legacy_event_id}}
+        ),
+        encoding="utf-8",
+    )
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3", legacy_path=legacy_path)
+    inbox.enqueue(CONVERSATION_ID, "review_ready:17:abc", "compact event")
+    turn = inbox.next_turn(CONVERSATION_ID, "persisted prompt")
+    assert turn is not None
+    if prompt_already_delivered:
+        inbox.record_delivered(turn.prompt.delivery_id, turn.prompt.body)
+    expected = inbox.turn(turn.turn_id)
+    conversation = Conversation(
+        [
+            SimpleNamespace(message="changed prompt", sender=turn.prompt.sender),
+            SimpleNamespace(
+                message="historical event body",
+                sender=delivery_sender(legacy_event_id),
+            ),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="payload mismatch"):
+        deliver_turn_messages(conversation, inbox, turn.turn_id)
+
+    unchanged = inbox.turn(turn.turn_id)
+    assert unchanged.prompt == expected.prompt
+    assert unchanged.prompt.delivery_id == turn.prompt.delivery_id
+    assert unchanged.prompt.sender == turn.prompt.sender
+    assert unchanged.prompt.body == turn.prompt.body
+    assert unchanged.prompt.state is (
+        DeliveryState.DELIVERED
+        if prompt_already_delivered
+        else DeliveryState.PENDING
+    )
+    assert conversation.sent == []
+
+
+def test_restart_after_preparing_visible_persisted_prompt_keeps_one_copy(
+    tmp_path: Path,
+):
+    legacy_event_id = str(UUID(int=121))
+    legacy_path = tmp_path / "pending-message-deliveries.json"
+    legacy_path.write_text(
+        json.dumps(
+            {str(CONVERSATION_ID): {"review_ready:17:abc": legacy_event_id}}
+        ),
+        encoding="utf-8",
+    )
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3", legacy_path=legacy_path)
+    inbox.enqueue(CONVERSATION_ID, "review_ready:17:abc", "compact event")
+    turn = inbox.next_turn(CONVERSATION_ID, "persisted prompt")
+    assert turn is not None
+    conversation = Conversation(
+        [
+            SimpleNamespace(
+                message="older historical prompt",
+                sender=delivery_sender(turn.legacy_prompt_delivery_id),
+            ),
+            SimpleNamespace(message=turn.prompt.body, sender=turn.prompt.sender),
+            SimpleNamespace(
+                message="historical event body",
+                sender=delivery_sender(legacy_event_id),
+            ),
+        ]
+    )
+
+    prepared = inbox.prepare_legacy_turn(
+        turn.turn_id,
+        conversation.state.active_branch(),
+    )
+    recovered = deliver_turn_messages(
+        conversation,
+        PersistentInbox(inbox.path, legacy_path=legacy_path),
+        turn.turn_id,
+    )
+
+    assert prepared.prompt == recovered.prompt
+    assert recovered.prompt.delivery_id == turn.prompt.delivery_id
+    assert recovered.prompt.sender == turn.prompt.sender
+    assert recovered.prompt.body == turn.prompt.body
+    assert recovered.prompt.state is DeliveryState.DELIVERED
+    assert recovered.legacy_prompt_delivery_id == turn.prompt.delivery_id
+    assert conversation.sent == []
 
 
 def test_reset_preserves_legacy_provenance_for_a_later_compact_reminder(

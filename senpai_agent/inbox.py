@@ -535,19 +535,34 @@ class PersistentInbox:
             prompt_event = branch[prompt_index]
             prompt_sender = str(branch_senders[prompt_index])
             prompt = turn.prompt
-            prompt_id = turn.legacy_prompt_delivery_id
-            if prompt_id is None or _sender(prompt_id) != prompt_sender:
-                prompt_id = (
-                    "legacy-prompt:"
-                    f"{prompt_sender.removeprefix(_SENDER_PREFIX)}"
+            if persisted_prompt_positions:
+                prompt_row = self._message_row(database, prompt.delivery_id)
+                _verify_body(prompt_row, _event_body(prompt_event))
+                if DeliveryState(prompt_row["state"]) is DeliveryState.PENDING:
+                    database.execute(
+                        "UPDATE inbox_messages SET state = 'delivered' "
+                        "WHERE delivery_id = ?",
+                        (prompt.delivery_id,),
+                    )
+                database.execute(
+                    "UPDATE inbox_turns SET legacy_prompt_delivery_id = ? "
+                    "WHERE turn_id = ?",
+                    (prompt.delivery_id, turn_id),
                 )
-            self._adopt_legacy_message_row(
-                database,
-                prompt.delivery_id,
-                _event_body(prompt_event),
-                delivery_id=prompt_id,
-                sender=prompt_sender,
-            )
+            else:
+                prompt_id = turn.legacy_prompt_delivery_id
+                if prompt_id is None or _sender(prompt_id) != prompt_sender:
+                    prompt_id = (
+                        "legacy-prompt:"
+                        f"{prompt_sender.removeprefix(_SENDER_PREFIX)}"
+                    )
+                self._adopt_legacy_message_row(
+                    database,
+                    prompt.delivery_id,
+                    _event_body(prompt_event),
+                    delivery_id=prompt_id,
+                    sender=prompt_sender,
+                )
 
             next_prompt = next(
                 (
