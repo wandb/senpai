@@ -25,7 +25,12 @@ from senpai_agent.advisor import (
     compose_system_instructions,
 )
 from senpai_agent.github.mailbox import ActiveGitHubWatcher, GitHubMailbox
-from senpai_agent.inbox import DeliveryState, InboxTurn, PersistentInbox
+from senpai_agent.inbox import (
+    DeliveryState,
+    InboxTurn,
+    InboxTurnQuarantined,
+    PersistentInbox,
+)
 from senpai_agent.mailbox import (
     CompositeMailbox,
     ControllerEvent,
@@ -170,6 +175,10 @@ class OpenHandsTurnRunner:
             return {
                 "inbox": inbox,
                 "inbox_turn_id": inbox_turn_id,
+                "recovery_prompt": _context_recovery_prompt(
+                    self.full_prompt,
+                    prompt,
+                ),
             }
 
         def run_turn() -> int:
@@ -361,6 +370,14 @@ class Controller:
 
     def run(self, *, max_cycles: int | None = None) -> None:
         self._wait_for_start_gates()
+        for turn in self.inbox.quarantined_turns():
+            print(
+                "SENPAI_TURN_QUARANTINED "
+                f"conversation_id={turn.conversation_id} "
+                f"turn_id={turn.turn_id} reason={turn.quarantine_reason}",
+                file=sys.stderr,
+                flush=True,
+            )
         cycles = 0
         turn_failures: dict[UUID, int] = {}
         while max_cycles is None or cycles < max_cycles:
@@ -404,6 +421,17 @@ class Controller:
                         f"event_keys={','.join(turn.event_keys)} "
                         f"retry_after_seconds={retry_delay:g} "
                         f"error={error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                except InboxTurnQuarantined as error:
+                    turn_failures.pop(conversation_id, None)
+                    served_conversations.add(conversation_id)
+                    print(
+                        "SENPAI_TURN_QUARANTINED "
+                        f"conversation_id={conversation_id} "
+                        f"turn_id={error.turn_id} reason={error.reason}",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -607,9 +635,7 @@ class Controller:
         return None
 
     def _assert_processed(self, turn_id: str) -> None:
-        turn = self.inbox.turn(turn_id)
-        if turn.superseded_by is not None:
-            turn = self.inbox.turn(turn.superseded_by)
+        turn = self.inbox.latest_turn(turn_id)
         if turn.state is not DeliveryState.PROCESSED:
             raise RuntimeError(
                 "turn runner returned success without a processed inbox receipt: "

@@ -15,7 +15,11 @@ from senpai_agent.controller import (
     TurnResult,
     _full_prompt,
 )
-from senpai_agent.inbox import PersistentInbox, deliver_turn_messages
+from senpai_agent.inbox import (
+    InboxTurnQuarantined,
+    PersistentInbox,
+    deliver_turn_messages,
+)
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.state import ConversationStateLedger, WorkspaceDivergenceLedger
 from senpai_agent.supervisor import ProgressLease, WorkerLease
@@ -98,6 +102,43 @@ def review_event(number=17):
 def delivered_text(call) -> str:
     return "\n\n".join(call[4])
 
+
+class MultiGenerationRecoveryTurns:
+    def run(
+        self,
+        _prompt,
+        *,
+        conversation_id,
+        event_keys,
+        visible_event_keys,
+        inbox,
+        inbox_turn_id,
+    ):
+        first = inbox.reset_turn(inbox_turn_id, "first recovery")
+        second = inbox.reset_turn(first.turn_id, "second recovery")
+        assert first.turn_id != second.turn_id
+        deliver_turn_messages(SimpleNamespace(
+            events=[],
+            state=SimpleNamespace(active_branch=lambda: []),
+            send_message=lambda *_args, **_kwargs: None,
+        ), inbox, second.turn_id)
+        inbox.record_processed(second.turn_id)
+        return TurnResult(exit_code=0)
+
+
+class QuarantiningTurns:
+    def run(
+        self,
+        _prompt,
+        *,
+        conversation_id,
+        event_keys,
+        visible_event_keys,
+        inbox,
+        inbox_turn_id,
+    ):
+        inbox.quarantine(inbox_turn_id, "recovery budget exhausted")
+        raise InboxTurnQuarantined(inbox_turn_id, "recovery budget exhausted")
 
 def research_base_event(current_sha="def"):
     return ControllerEvent(
@@ -1140,6 +1181,39 @@ def test_feedback_polled_after_a_turn_is_processed_in_the_next_turn():
         (assignment.dedupe_key,),
         (feedback.dedupe_key,),
     ]
+
+
+def test_controller_follows_the_complete_recovery_chain_before_acknowledging():
+    """
+    Requirement: any bounded number of recovery generations completes one logical turn.
+    Interface: controller acknowledgement of the original mailbox event.
+    """
+    event = review_event()
+    mailbox = Mailbox(((event,), ()))
+
+    controller(mailbox, MultiGenerationRecoveryTurns()).run(max_cycles=1)
+
+    assert mailbox.acknowledged == [(event.dedupe_key,)]
+
+
+def test_controller_quarantines_an_exhausted_turn_without_restarting(capsys):
+    """
+    Requirement: exhausting recovery is a durable visible stop, not a restart loop.
+    Interface: controller lifetime, stderr, mailbox acknowledgement, and inbox readiness.
+    """
+    event = review_event()
+    mailbox = Mailbox(((event,), ()))
+    runtime = controller(
+        mailbox,
+        QuarantiningTurns(),
+        max_consecutive_turn_failures=1,
+    )
+
+    runtime.run(max_cycles=1)
+
+    assert mailbox.acknowledged == []
+    assert runtime.inbox.ready_conversation_ids() == ()
+    assert "SENPAI_TURN_QUARANTINED" in capsys.readouterr().err
 
 
 def test_start_gate_wait_publishes_a_live_lease_before_polling(tmp_path: Path):

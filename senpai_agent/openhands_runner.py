@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import signal
 import stat
@@ -42,8 +43,10 @@ from senpai_agent.model_compatibility import (
 )
 from senpai_agent.inbox import (
     DeliveryState,
+    InboxTurn,
     PersistentInbox,
     deliver_turn_messages,
+    events_after_turn_delivery,
     turn_has_finished_response,
 )
 from senpai_agent.secrets import (
@@ -66,7 +69,7 @@ from openhands.sdk import LLM, Agent, AgentContext, LocalConversation, Tool
 from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
 from openhands.sdk.context.condenser import CondenserBase, LLMSummarizingCondenser
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
-from openhands.sdk.event import ActionEvent, MessageEvent
+from openhands.sdk.event import ActionEvent, MessageEvent, ObservationEvent
 from openhands.sdk.llm import TextContent
 from openhands.sdk.plugin import PluginSource
 from openhands.sdk.skills import Skill, load_project_skills
@@ -130,6 +133,9 @@ DEFAULT_LOCAL_CONDENSER_TARGET_EVENTS = 0
 WANDB_GLM_52_MAX_EVENTS = 600
 WANDB_GLM_52_MAX_TOKENS = 180_000
 WANDB_GLM_52_TARGET_EVENTS = 40
+DEFAULT_INBOX_MAX_STALLED_ATTEMPTS = 3
+DEFAULT_INBOX_MAX_TURN_AGE_SECONDS = 3 * 60 * 60
+DEFAULT_INBOX_MAX_RECOVERY_GENERATIONS = 1
 
 
 @dataclass(frozen=True)
@@ -219,6 +225,9 @@ class RunnerConfig:
     local_condenser_max_events: int = DEFAULT_LOCAL_CONDENSER_MAX_EVENTS
     local_condenser_max_tokens: int = DEFAULT_LOCAL_CONDENSER_MAX_TOKENS
     local_condenser_target_events: int = DEFAULT_LOCAL_CONDENSER_TARGET_EVENTS
+    inbox_max_stalled_attempts: int = DEFAULT_INBOX_MAX_STALLED_ATTEMPTS
+    inbox_max_turn_age_seconds: float = DEFAULT_INBOX_MAX_TURN_AGE_SECONDS
+    inbox_max_recovery_generations: int = DEFAULT_INBOX_MAX_RECOVERY_GENERATIONS
     child: bool = False
     delegation_root_state_dir: Path | None = None
     delegation_tree_id: str | None = None
@@ -611,6 +620,37 @@ def resolve_config(
             "SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS must be less than "
             "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"
         )
+    try:
+        inbox_max_stalled_attempts = int(
+            env.get(
+                "SENPAI_INBOX_MAX_STALLED_ATTEMPTS",
+                str(DEFAULT_INBOX_MAX_STALLED_ATTEMPTS),
+            )
+        )
+        inbox_max_turn_age_seconds = float(
+            env.get(
+                "SENPAI_INBOX_MAX_TURN_AGE_SECONDS",
+                str(DEFAULT_INBOX_MAX_TURN_AGE_SECONDS),
+            )
+        )
+        inbox_max_recovery_generations = int(
+            env.get(
+                "SENPAI_INBOX_MAX_RECOVERY_GENERATIONS",
+                str(DEFAULT_INBOX_MAX_RECOVERY_GENERATIONS),
+            )
+        )
+    except ValueError as error:
+        raise RuntimeError("inbox recovery budget must be numeric") from error
+    if (
+        inbox_max_stalled_attempts <= 0
+        or not math.isfinite(inbox_max_turn_age_seconds)
+        or inbox_max_turn_age_seconds <= 0
+        or inbox_max_recovery_generations < 0
+    ):
+        raise RuntimeError(
+            "inbox recovery budget requires positive attempt/age limits and a "
+            "non-negative recovery-generation limit"
+        )
     wandb_entity = env.get("WANDB_ENTITY", "").strip() or None
     wandb_project = env.get("WANDB_PROJECT", "").strip() or None
     delegation_root_value = env.get("SENPAI_DELEGATION_ROOT_STATE_DIR")
@@ -845,6 +885,9 @@ def resolve_config(
         local_condenser_max_events=local_condenser_max_events,
         local_condenser_max_tokens=local_condenser_max_tokens,
         local_condenser_target_events=local_condenser_target_events,
+        inbox_max_stalled_attempts=inbox_max_stalled_attempts,
+        inbox_max_turn_age_seconds=inbox_max_turn_age_seconds,
+        inbox_max_recovery_generations=inbox_max_recovery_generations,
         child=args.child,
         delegation_root_state_dir=delegation_root_state_dir,
         delegation_tree_id=delegation_tree_id,
@@ -1501,6 +1544,46 @@ def final_agent_result(conversation: object) -> str:
     raise RuntimeError("child finished without a model-visible result")
 
 
+def _activate_inbox_turn(
+    conversation: object,
+    inbox: PersistentInbox,
+    turn_id: str,
+) -> InboxTurn:
+    """Reset a recovery branch when needed, then deliver its canonical messages."""
+
+    turn = inbox.turn(turn_id)
+    if turn.context_reset_required:
+        active_branch = tuple(conversation.state.active_branch())
+        active_senders = {getattr(event, "sender", None) for event in active_branch}
+        recovery_started = any(
+            message.sender in active_senders for message in turn.messages
+        )
+        if active_branch and not recovery_started:
+            preserved_events = len(conversation.state.events)
+            conversation.navigate_to(None)
+            print(
+                "OPENHANDS_CONTEXT_RESET "
+                f"conversation_id={turn.conversation_id} "
+                f"preserved_events={preserved_events}",
+                file=sys.stderr,
+                flush=True,
+            )
+        inbox.record_context_reset(turn_id)
+    return deliver_turn_messages(conversation, inbox, turn_id)
+
+
+def _latest_completed_tool_event_id(
+    conversation: object,
+    turn: InboxTurn,
+) -> str | None:
+    for event in reversed(events_after_turn_delivery(conversation, turn)):
+        if type(event) is ObservationEvent:
+            event_id = getattr(event, "id", None)
+            if isinstance(event_id, str) and event_id:
+                return event_id
+    return None
+
+
 def run_openhands(
     prompt: str,
     config: RunnerConfig,
@@ -1508,6 +1591,7 @@ def run_openhands(
     reset_context: bool = False,
     inbox: PersistentInbox | None = None,
     inbox_turn_id: str | None = None,
+    recovery_prompt: str | None = None,
 ) -> int:
     if (inbox is None) != (inbox_turn_id is None):
         raise ValueError("inbox and inbox_turn_id must be provided together")
@@ -1714,30 +1798,14 @@ def run_openhands(
         )
         reject_recovered_actions(conversation)
         if inbox is not None and active_inbox_turn_id is not None:
+            active_inbox_turn_id = inbox.latest_turn(active_inbox_turn_id).turn_id
             if reset_context:
-                recovery = inbox.reset_turn(active_inbox_turn_id, prompt)
-                active_inbox_turn_id = recovery.turn_id
-            active_turn = inbox.turn(active_inbox_turn_id)
-            if active_turn.context_reset_required:
-                active_branch = tuple(conversation.state.active_branch())
-                active_senders = {
-                    getattr(event, "sender", None) for event in active_branch
-                }
-                recovery_started = any(
-                    message.sender in active_senders
-                    for message in active_turn.messages
+                recovery = inbox.recover_turn(
+                    active_inbox_turn_id,
+                    recovery_prompt or prompt,
+                    max_generations=config.inbox_max_recovery_generations,
                 )
-                if active_branch and not recovery_started:
-                    preserved_events = len(conversation.state.events)
-                    conversation.navigate_to(None)
-                    print(
-                        "OPENHANDS_CONTEXT_RESET "
-                        f"conversation_id={config.conversation_id} "
-                        f"preserved_events={preserved_events}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                inbox.record_context_reset(active_inbox_turn_id)
+                active_inbox_turn_id = recovery.turn_id
         elif reset_context:
             preserved_events = len(conversation.state.events)
             conversation.navigate_to(None)
@@ -1752,23 +1820,56 @@ def run_openhands(
         if inbox is None or active_inbox_turn_id is None:
             conversation.send_message(prompt)
         else:
-            turn = inbox.turn(active_inbox_turn_id)
+            turn = _activate_inbox_turn(
+                conversation,
+                inbox,
+                active_inbox_turn_id,
+            )
             if turn.state is DeliveryState.PROCESSED:
                 inference_required = False
-            else:
-                turn = deliver_turn_messages(
-                    conversation,
-                    inbox,
-                    active_inbox_turn_id,
-                )
-                if (
-                    conversation.state.execution_status
-                    == ConversationExecutionStatus.FINISHED
-                    and turn_has_finished_response(conversation, turn)
-                ):
-                    inbox.record_processed(active_inbox_turn_id)
-                    inference_required = False
+            elif turn_has_finished_response(conversation, turn):
+                inbox.record_processed(active_inbox_turn_id)
+                inference_required = False
         if inference_required:
+            if inbox is not None and active_inbox_turn_id is not None:
+                turn = inbox.turn(active_inbox_turn_id)
+                inbox.record_progress(
+                    active_inbox_turn_id,
+                    _latest_completed_tool_event_id(conversation, turn),
+                )
+                if inbox.terminal_recovery_due(
+                    active_inbox_turn_id,
+                    max_attempts=config.inbox_max_stalled_attempts,
+                    max_age_seconds=config.inbox_max_turn_age_seconds,
+                ):
+                    stalled_turn_id = active_inbox_turn_id
+                    recovery = inbox.recover_turn(
+                        stalled_turn_id,
+                        recovery_prompt or prompt,
+                        max_generations=config.inbox_max_recovery_generations,
+                    )
+                    active_inbox_turn_id = recovery.turn_id
+                    print(
+                        "SENPAI_TERMINAL_TURN_RECOVERY "
+                        f"conversation_id={config.conversation_id} "
+                        f"stalled_turn_id={stalled_turn_id} "
+                        f"recovery_turn_id={active_inbox_turn_id}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    recovery_turn = _activate_inbox_turn(
+                        conversation,
+                        inbox,
+                        active_inbox_turn_id,
+                    )
+                    inbox.record_progress(
+                        active_inbox_turn_id,
+                        _latest_completed_tool_event_id(
+                            conversation,
+                            recovery_turn,
+                        ),
+                    )
+                inbox.record_inference_attempt(active_inbox_turn_id)
             with graceful_interrupts(conversation):
                 if not config.child:
                     with (
@@ -1863,7 +1964,14 @@ def run_openhands(
         ),
         flush=True,
     )
-    return 0 if status == ConversationExecutionStatus.FINISHED else 1
+    durable_turn_processed = (
+        inbox is not None
+        and active_inbox_turn_id is not None
+        and inbox.latest_turn(active_inbox_turn_id).state is DeliveryState.PROCESSED
+    )
+    return 0 if (
+        status == ConversationExecutionStatus.FINISHED or durable_turn_processed
+    ) else 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:

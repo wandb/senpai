@@ -6,6 +6,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from collections.abc import Sequence
 from contextlib import nullcontext
@@ -49,6 +50,8 @@ class InboxTurn:
     legacy_prompt_delivery_id: str | None = None
     context_reset_completed: bool = True
     acknowledged: bool = False
+    recovery_generation: int = 0
+    quarantine_reason: str | None = None
 
     @property
     def context_reset_required(self) -> bool:
@@ -77,6 +80,13 @@ class InboxTurn:
             for message in self.events
             if message.event_key is not None and message.requires_ack
         )
+
+
+class InboxTurnQuarantined(RuntimeError):
+    def __init__(self, turn_id: str, reason: str):
+        self.turn_id = turn_id
+        self.reason = reason
+        super().__init__(f"inbox turn {turn_id} quarantined: {reason}")
 
 
 class PersistentInbox:
@@ -112,6 +122,10 @@ class PersistentInbox:
                 legacy_prompt_delivery_id TEXT,
                 context_reset_completed INTEGER NOT NULL DEFAULT 1,
                 acknowledged INTEGER NOT NULL DEFAULT 0,
+                stalled_attempts INTEGER NOT NULL DEFAULT 0,
+                progress_event_id TEXT,
+                recovery_generation INTEGER NOT NULL DEFAULT 0,
+                quarantine_reason TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 processed_at TEXT,
                 acknowledged_at TEXT
@@ -174,6 +188,35 @@ class PersistentInbox:
                 SET context_reset_completed = 0
                 WHERE recovery_of IS NOT NULL AND state != 'processed'
                 """
+            )
+        if "stalled_attempts" not in turn_columns:
+            self._connection.execute(
+                """
+                ALTER TABLE inbox_turns
+                ADD COLUMN stalled_attempts INTEGER NOT NULL DEFAULT 0
+                """
+            )
+        if "progress_event_id" not in turn_columns:
+            self._connection.execute(
+                "ALTER TABLE inbox_turns ADD COLUMN progress_event_id TEXT"
+            )
+        if "recovery_generation" not in turn_columns:
+            self._connection.execute(
+                """
+                ALTER TABLE inbox_turns
+                ADD COLUMN recovery_generation INTEGER NOT NULL DEFAULT 0
+                """
+            )
+            self._connection.execute(
+                """
+                UPDATE inbox_turns
+                SET recovery_generation = 1
+                WHERE recovery_of IS NOT NULL
+                """
+            )
+        if "quarantine_reason" not in turn_columns:
+            self._connection.execute(
+                "ALTER TABLE inbox_turns ADD COLUMN quarantine_reason TEXT"
             )
         message_columns = {
             str(row[1])
@@ -318,6 +361,7 @@ class PersistentInbox:
                   AND acknowledged = 0
                   AND superseded_by IS NULL
                   AND state != 'processed'
+                  AND quarantine_reason IS NULL
                 ORDER BY rowid
                 LIMIT 1
                 """,
@@ -325,6 +369,21 @@ class PersistentInbox:
             ).fetchone()
             if active is not None:
                 return self._turn(database, active["turn_id"])
+
+            quarantined = database.execute(
+                """
+                SELECT 1
+                FROM inbox_turns
+                WHERE conversation_id = ?
+                  AND acknowledged = 0
+                  AND superseded_by IS NULL
+                  AND quarantine_reason IS NOT NULL
+                LIMIT 1
+                """,
+                (conversation,),
+            ).fetchone()
+            if quarantined is not None:
+                return None
 
             waiting_for_ack = database.execute(
                 """
@@ -627,6 +686,7 @@ class PersistentInbox:
                   AND acknowledged = 0
                   AND superseded_by IS NULL
                   AND state != 'processed'
+                  AND quarantine_reason IS NULL
                 ORDER BY rowid
                 LIMIT 1
                 """,
@@ -682,6 +742,152 @@ class PersistentInbox:
             )
             return self._turn(database, turn_id)
 
+    def record_inference_attempt(self, turn_id: str) -> InboxTurn:
+        """Persist one attempt immediately before model inference starts."""
+
+        with self._transaction() as database:
+            turn = self._turn(database, turn_id)
+            if turn.state is not DeliveryState.DELIVERED:
+                raise ValueError(
+                    "inference can start only after the complete turn is delivered"
+                )
+            database.execute(
+                """
+                UPDATE inbox_turns
+                SET stalled_attempts = stalled_attempts + 1
+                WHERE turn_id = ?
+                """,
+                (turn_id,),
+            )
+            return self._turn(database, turn_id)
+
+    def record_progress(self, turn_id: str, progress_event_id: str | None) -> InboxTurn:
+        """Renew the attempt budget after a new completed tool observation."""
+
+        if progress_event_id is not None and not progress_event_id:
+            raise ValueError("progress event ID must be non-empty")
+        with self._transaction() as database:
+            turn = self._turn(database, turn_id)
+            if turn.state is DeliveryState.PROCESSED:
+                return turn
+            row = database.execute(
+                "SELECT progress_event_id FROM inbox_turns WHERE turn_id = ?",
+                (turn_id,),
+            ).fetchone()
+            if (
+                progress_event_id is not None
+                and progress_event_id != row["progress_event_id"]
+            ):
+                database.execute(
+                    """
+                    UPDATE inbox_turns
+                    SET progress_event_id = ?, stalled_attempts = 0
+                    WHERE turn_id = ?
+                    """,
+                    (progress_event_id, turn_id),
+                )
+            return self._turn(database, turn_id)
+
+    def terminal_recovery_due(
+        self,
+        turn_id: str,
+        *,
+        max_attempts: int,
+        max_age_seconds: float,
+        now: float | None = None,
+    ) -> bool:
+        """Return whether one unresolved delivered turn has exhausted its budget."""
+
+        if max_attempts <= 0 or max_age_seconds <= 0:
+            raise ValueError("terminal recovery limits must be positive")
+        current_time = time.time() if now is None else now
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT
+                    state,
+                    superseded_by,
+                    stalled_attempts,
+                    quarantine_reason,
+                    unixepoch(created_at) AS created_epoch
+                FROM inbox_turns
+                WHERE turn_id = ?
+                """,
+                (turn_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown inbox turn {turn_id}")
+        if (
+            DeliveryState(row["state"]) is not DeliveryState.DELIVERED
+            or row["superseded_by"] is not None
+            or row["quarantine_reason"] is not None
+        ):
+            return False
+        age_seconds = max(0.0, current_time - float(row["created_epoch"]))
+        return (
+            int(row["stalled_attempts"]) >= max_attempts
+            or age_seconds >= max_age_seconds
+        )
+
+    def latest_turn(self, turn_id: str) -> InboxTurn:
+        with self._lock:
+            return self._latest_turn(self._connection, turn_id)
+
+    def recover_turn(
+        self,
+        turn_id: str,
+        prompt: str,
+        *,
+        max_generations: int,
+    ) -> InboxTurn:
+        if max_generations < 0:
+            raise ValueError("maximum recovery generations must be non-negative")
+        current = self.latest_turn(turn_id)
+        if current.recovery_generation >= max_generations:
+            reason = "recovery budget exhausted"
+            self.quarantine(current.turn_id, reason)
+            raise InboxTurnQuarantined(current.turn_id, reason)
+        return self.reset_turn(current.turn_id, prompt)
+
+    def quarantine(self, turn_id: str, reason: str) -> InboxTurn:
+        if not reason:
+            raise ValueError("quarantine reason must not be empty")
+        with self._transaction() as database:
+            turn = self._turn(database, turn_id)
+            if turn.state is DeliveryState.PROCESSED:
+                raise ValueError("cannot quarantine a processed turn")
+            row = database.execute(
+                "SELECT quarantine_reason FROM inbox_turns WHERE turn_id = ?",
+                (turn_id,),
+            ).fetchone()
+            existing = row["quarantine_reason"]
+            if existing is not None and existing != reason:
+                raise RuntimeError(
+                    f"inbox turn {turn_id} already quarantined for {existing}"
+                )
+            database.execute(
+                """
+                UPDATE inbox_turns
+                SET quarantine_reason = ?
+                WHERE turn_id = ?
+                """,
+                (reason, turn_id),
+            )
+            return self._turn(database, turn_id)
+
+    def quarantined_turns(self) -> tuple[InboxTurn, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT turn_id
+                FROM inbox_turns
+                WHERE quarantine_reason IS NOT NULL
+                  AND superseded_by IS NULL
+                ORDER BY rowid
+                """
+            ).fetchall()
+            return tuple(self._turn(self._connection, row[0]) for row in rows)
+
     def processed_turns(self) -> tuple[InboxTurn, ...]:
         with self._lock:
             rows = self._connection.execute(
@@ -716,9 +922,14 @@ class PersistentInbox:
         with self._transaction() as database:
             original = self._turn(database, turn_id)
             if original.superseded_by is not None:
-                return self._turn(database, original.superseded_by)
+                return self._latest_turn(database, turn_id)
             if original.state is DeliveryState.PROCESSED:
                 return original
+            if original.quarantine_reason is not None:
+                raise InboxTurnQuarantined(
+                    original.turn_id,
+                    original.quarantine_reason,
+                )
 
             recovery_id = str(uuid.uuid4())
             database.execute(
@@ -728,10 +939,16 @@ class PersistentInbox:
                     conversation_id,
                     state,
                     recovery_of,
-                    context_reset_completed
-                ) VALUES (?, ?, 'pending', ?, 0)
+                    context_reset_completed,
+                    recovery_generation
+                ) VALUES (?, ?, 'pending', ?, 0, ?)
                 """,
-                (recovery_id, original.conversation_id, turn_id),
+                (
+                    recovery_id,
+                    original.conversation_id,
+                    turn_id,
+                    original.recovery_generation + 1,
+                ),
             )
             prompt_id = str(uuid.uuid4())
             database.execute(
@@ -829,11 +1046,22 @@ class PersistentInbox:
                 """
                 SELECT conversation_id, MIN(sequence) AS first_sequence
                 FROM inbox_messages
-                WHERE turn_id IS NULL OR turn_id IN (
-                    SELECT turn_id
-                    FROM inbox_turns
-                    WHERE acknowledged = 0 AND superseded_by IS NULL
-                )
+                WHERE conversation_id NOT IN (
+                        SELECT conversation_id
+                        FROM inbox_turns
+                        WHERE acknowledged = 0
+                          AND superseded_by IS NULL
+                          AND quarantine_reason IS NOT NULL
+                    )
+                  AND (
+                      turn_id IS NULL OR turn_id IN (
+                          SELECT turn_id
+                          FROM inbox_turns
+                          WHERE acknowledged = 0
+                            AND superseded_by IS NULL
+                            AND quarantine_reason IS NULL
+                      )
+                  )
                 GROUP BY conversation_id
                 ORDER BY first_sequence
                 """
@@ -894,7 +1122,23 @@ class PersistentInbox:
             legacy_prompt_delivery_id=row["legacy_prompt_delivery_id"],
             context_reset_completed=bool(row["context_reset_completed"]),
             acknowledged=bool(row["acknowledged"]),
+            recovery_generation=int(row["recovery_generation"]),
+            quarantine_reason=row["quarantine_reason"],
         )
+
+    def _latest_turn(
+        self,
+        database: sqlite3.Connection,
+        turn_id: str,
+    ) -> InboxTurn:
+        turn = self._turn(database, turn_id)
+        seen = {turn.turn_id}
+        while turn.superseded_by is not None:
+            if turn.superseded_by in seen:
+                raise RuntimeError("inbox turn supersession cycle")
+            seen.add(turn.superseded_by)
+            turn = self._turn(database, turn.superseded_by)
+        return turn
 
     def _message_row(
         self,
@@ -1158,6 +1402,43 @@ def deliver_turn_messages(
 
 
 def turn_has_finished_response(conversation: object, turn: InboxTurn) -> bool:
+    terminal = False
+    finish_calls: set[str] = set()
+    for event in events_after_turn_delivery(conversation, turn):
+        kind = type(event).__name__
+        if _is_agent_message(event):
+            terminal = True
+            continue
+        if kind == "ActionEvent":
+            terminal = False
+            if getattr(event, "tool_name", None) == "finish":
+                finish_calls.update(_event_call_ids(event))
+            continue
+        if kind == "ObservationEvent":
+            terminal = bool(finish_calls.intersection(_event_call_ids(event)))
+            continue
+        if kind in {"AgentErrorEvent", "UserRejectObservation"}:
+            terminal = False
+            continue
+        if kind == "MessageEvent" and getattr(event, "source", None) != "agent":
+            terminal = False
+            continue
+        if (
+            kind == "SimpleNamespace"
+            and getattr(event, "source", None) in {"user", "environment"}
+            and (
+                hasattr(event, "message")
+                or hasattr(event, "llm_message")
+            )
+        ):
+            terminal = False
+    return terminal
+
+
+def events_after_turn_delivery(
+    conversation: object,
+    turn: InboxTurn,
+) -> tuple[object, ...]:
     branch = _active_branch(conversation)
     positions = {
         getattr(event, "sender", None): index for index, event in enumerate(branch)
@@ -1165,8 +1446,8 @@ def turn_has_finished_response(conversation: object, turn: InboxTurn) -> bool:
     try:
         last_delivery = max(positions[message.sender] for message in turn.messages)
     except KeyError:
-        return False
-    return any(_is_agent_event(event) for event in branch[last_delivery + 1 :])
+        return ()
+    return tuple(branch[last_delivery + 1 :])
 
 
 def _active_branch(conversation: object) -> Sequence[object]:
@@ -1192,12 +1473,25 @@ def _event_body(event: object) -> str:
     raise RuntimeError("delivery sender exists without a verifiable message payload")
 
 
-def _is_agent_event(event: object) -> bool:
-    if getattr(event, "source", None) == "agent":
-        return True
+def _is_agent_message(event: object) -> bool:
+    if type(event).__name__ == "MessageEvent":
+        return (
+            getattr(event, "source", None) == "agent"
+            and bool(getattr(event, "llm_response_id", None))
+            and getattr(getattr(event, "llm_message", None), "role", None)
+            == "assistant"
+        )
     if getattr(event, "sender", None) == "agent":
-        return True
-    return getattr(getattr(event, "llm_message", None), "role", None) == "assistant"
+        return isinstance(getattr(event, "message", None), str)
+    return False
+
+
+def _event_call_ids(event: object) -> set[str]:
+    return {
+        value
+        for attribute in ("tool_call_id", "action_id", "id")
+        if isinstance((value := getattr(event, attribute, None)), str) and value
+    }
 
 
 def _message(row: sqlite3.Row) -> InboxMessage:

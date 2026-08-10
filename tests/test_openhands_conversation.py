@@ -7,21 +7,25 @@ from types import SimpleNamespace
 import pytest
 from openhands.sdk import LLM, Agent, Tool
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
-from openhands.sdk.event import SystemPromptEvent
+from openhands.sdk.event import (
+    AgentErrorEvent,
+    ConversationStateUpdateEvent,
+    InterruptEvent,
+    MessageEvent,
+    ObservationEvent,
+    SystemPromptEvent,
+)
 from openhands.sdk.llm import Message, TextContent
 from openhands.sdk.tool import FinishTool, resolve_tool
 from openhands.sdk.workspace import LocalWorkspace
 
 import senpai_agent.openhands_runner as runner
-from senpai_agent.inbox import DeliveryState, PersistentInbox
-from openhands_support import (
-    PLUGIN_DIR,
-    isolate_agent_discovery,
-    runtime_config,
+from senpai_agent.controller import OpenHandsTurnRunner
+from senpai_agent.inbox import (
+    DeliveryState,
+    InboxTurnQuarantined,
+    PersistentInbox,
 )
-from pydantic import SecretStr
-
-import senpai_agent.openhands_runner as runner
 from senpai_agent.openhands_runner import (
     graceful_interrupts,
     main,
@@ -31,6 +35,12 @@ from senpai_agent.openhands_runner import (
     run_openhands,
     without_legacy_think,
 )
+from openhands_support import (
+    PLUGIN_DIR,
+    isolate_agent_discovery,
+    runtime_config,
+)
+from pydantic import SecretStr
 
 _RETIRED_TOOL_TYPES = (
     (
@@ -592,6 +602,383 @@ def test_finished_branch_repairs_processing_receipt_without_inference(
     )
 
 
+def test_terminal_budget_reconciles_a_finished_response_before_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    """
+    Requirement: a crash after inference never causes duplicate inference.
+    Interface: OpenHandsTurnRunner over the durable inbox and conversation branch.
+    """
+    calls = []
+    config = runtime_config(tmp_path)
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(config.conversation_id, "event:1", "first event")
+    turn = inbox.next_turn(config.conversation_id, "controller prompt")
+    assert turn is not None
+    for message in turn.messages:
+        inbox.record_delivered(message.delivery_id, message.body)
+    for _attempt in range(3):
+        inbox.record_inference_attempt(turn.turn_id)
+    branch = [
+        SimpleNamespace(message=message.body, sender=message.sender)
+        for message in turn.messages
+    ]
+    branch.append(SimpleNamespace(message="completed answer", sender="agent"))
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                active_branch=lambda: list(branch),
+                events=branch,
+                execution_status=ConversationExecutionStatus.FINISHED,
+            )
+
+        def send_message(self, *_args, **_kwargs):
+            calls.append("send")
+
+        def navigate_to(self, _event_id):
+            calls.append("navigate")
+
+        async def arun(self):
+            calls.append("arun")
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(
+        runner.ConversationState,
+        "get_unmatched_actions",
+        lambda _events: [],
+    )
+    isolate_agent_discovery(monkeypatch, runner)
+
+    result = OpenHandsTurnRunner(
+        config,
+        full_prompt="complete research brief",
+    ).run(
+        turn.prompt.body,
+        conversation_id=config.conversation_id,
+        event_keys=frozenset(turn.event_keys),
+        inbox=inbox,
+        inbox_turn_id=turn.turn_id,
+    )
+
+    assert result.exit_code == 0
+    assert calls == ["close"]
+    assert inbox.turn(turn.turn_id).state is DeliveryState.PROCESSED
+    assert inbox.turn(turn.turn_id).superseded_by is None
+
+
+def test_paused_persisted_final_response_reconciles_without_inference(
+    tmp_path,
+    monkeypatch,
+):
+    """
+    Requirement: cancellation after a final response never reruns inference.
+    Interface: durable response evidence with a restored PAUSED SDK status.
+    """
+    calls = []
+    config = runtime_config(tmp_path)
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(config.conversation_id, "event:1", "first event")
+    turn = inbox.next_turn(config.conversation_id, "controller prompt")
+    assert turn is not None
+    branch = [
+        SimpleNamespace(message=message.body, sender=message.sender)
+        for message in turn.messages
+    ]
+    for message in turn.messages:
+        inbox.record_delivered(message.delivery_id, message.body)
+    branch.append(
+        MessageEvent(
+            source="agent",
+            llm_message=Message(
+                role="assistant",
+                content=[TextContent(text="completed answer")],
+            ),
+            llm_response_id="response-1",
+        )
+    )
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                active_branch=lambda: list(branch),
+                events=branch,
+                execution_status=ConversationExecutionStatus.PAUSED,
+            )
+
+        async def arun(self):
+            calls.append("arun")
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(
+        runner.ConversationState,
+        "get_unmatched_actions",
+        lambda _events: [],
+    )
+    isolate_agent_discovery(monkeypatch, runner)
+
+    assert run_openhands(
+        turn.prompt.body,
+        config,
+        inbox=inbox,
+        inbox_turn_id=turn.turn_id,
+    ) == 0
+    assert calls == ["close"]
+    assert inbox.turn(turn.turn_id).state is DeliveryState.PROCESSED
+
+
+def test_stalled_recovery_is_bounded_and_quarantined_with_the_full_brief(
+    tmp_path,
+    monkeypatch,
+):
+    """
+    Requirement: failed clean recovery cannot become a silent restart loop.
+    Interface: repeated OpenHands turns, active model branch, and durable inbox.
+    """
+    active = []
+    archived = []
+    calls = []
+    config = runtime_config(
+        tmp_path,
+        inbox_max_stalled_attempts=1,
+        inbox_max_turn_age_seconds=10_000,
+        inbox_max_recovery_generations=1,
+    )
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(config.conversation_id, "event:1", "canonical event")
+    turn = inbox.next_turn(config.conversation_id, "ordinary continuation")
+    assert turn is not None
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                active_branch=lambda: list(active),
+                events=archived,
+                execution_status=ConversationExecutionStatus.PAUSED,
+            )
+
+        def navigate_to(self, event_id):
+            calls.append(("navigate", event_id))
+            active.clear()
+
+        def send_message(self, message, sender=None):
+            calls.append(("send", message))
+            event = SimpleNamespace(message=message, sender=sender)
+            active.append(event)
+            archived.append(event)
+
+        async def arun(self):
+            calls.append(("arun", None))
+            self.state.execution_status = ConversationExecutionStatus.PAUSED
+
+        def close(self):
+            calls.append(("close", None))
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(
+        runner.ConversationState,
+        "get_unmatched_actions",
+        lambda _events: [],
+    )
+    isolate_agent_discovery(monkeypatch, runner)
+    turns = OpenHandsTurnRunner(config, full_prompt="complete research brief")
+
+    first = turns.run(
+        turn.prompt.body,
+        conversation_id=config.conversation_id,
+        event_keys=frozenset(turn.event_keys),
+        inbox=inbox,
+        inbox_turn_id=turn.turn_id,
+    )
+    second = turns.run(
+        turn.prompt.body,
+        conversation_id=config.conversation_id,
+        event_keys=frozenset(turn.event_keys),
+        inbox=inbox,
+        inbox_turn_id=turn.turn_id,
+    )
+
+    assert first.exit_code == second.exit_code == 1
+    assert [name for name, _value in calls].count("navigate") == 1
+    assert "complete research brief" in active[0].message
+    assert "Conversation context recovery" in active[0].message
+    assert [event.message for event in active[1:]] == ["canonical event"]
+
+    with pytest.raises(InboxTurnQuarantined, match="recovery budget exhausted"):
+        turns.run(
+            turn.prompt.body,
+            conversation_id=config.conversation_id,
+            event_keys=frozenset(turn.event_keys),
+            inbox=inbox,
+            inbox_turn_id=turn.turn_id,
+        )
+
+    quarantined = PersistentInbox(inbox.path).quarantined_turns()
+    assert len(quarantined) == 1
+    assert quarantined[0].quarantine_reason == "recovery budget exhausted"
+    assert inbox.next_turn(config.conversation_id, "must remain blocked") is None
+
+
+def test_model_visible_progress_renews_the_stalled_attempt_budget(
+    tmp_path,
+    monkeypatch,
+):
+    """
+    Requirement: useful persisted activity is not mistaken for a stalled turn.
+    Interface: repeated OpenHands turns and active model branch navigation.
+    """
+    active = []
+    archived = []
+    navigations = []
+    config = runtime_config(
+        tmp_path,
+        inbox_max_stalled_attempts=1,
+        inbox_max_turn_age_seconds=10_000,
+        inbox_max_recovery_generations=1,
+    )
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(config.conversation_id, "event:1", "canonical event")
+    turn = inbox.next_turn(config.conversation_id, "ordinary continuation")
+    assert turn is not None
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                active_branch=lambda: list(active),
+                events=archived,
+                execution_status=ConversationExecutionStatus.PAUSED,
+            )
+
+        def navigate_to(self, event_id):
+            navigations.append(event_id)
+            active.clear()
+
+        def send_message(self, message, sender=None):
+            event = SimpleNamespace(message=message, sender=sender)
+            active.append(event)
+            archived.append(event)
+
+        async def arun(self):
+            event = ObservationEvent.model_construct(
+                id=f"tool-progress-{len(archived)}",
+                source="environment",
+            )
+            active.append(event)
+            archived.append(event)
+            self.state.execution_status = ConversationExecutionStatus.PAUSED
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(
+        runner.ConversationState,
+        "get_unmatched_actions",
+        lambda _events: [],
+    )
+    isolate_agent_discovery(monkeypatch, runner)
+    turns = OpenHandsTurnRunner(config, full_prompt="complete research brief")
+
+    for _attempt in range(2):
+        assert turns.run(
+            turn.prompt.body,
+            conversation_id=config.conversation_id,
+            event_keys=frozenset(turn.event_keys),
+            inbox=inbox,
+            inbox_turn_id=turn.turn_id,
+        ).exit_code == 1
+
+    assert navigations == []
+    assert inbox.turn(turn.turn_id).superseded_by is None
+
+
+def test_timeout_and_error_artifacts_do_not_renew_the_stalled_attempt_budget(
+    tmp_path,
+    monkeypatch,
+):
+    """
+    Requirement: failed retries cannot manufacture their own liveness progress.
+    Interface: persisted SDK timeout/error/state events across controller wakes.
+    """
+    active = []
+    archived = []
+    navigations = []
+    artifacts = [
+        InterruptEvent.model_construct(id="interrupt-1"),
+        AgentErrorEvent.model_construct(id="error-1"),
+        ConversationStateUpdateEvent.model_construct(id="state-1"),
+    ]
+    config = runtime_config(
+        tmp_path,
+        inbox_max_stalled_attempts=2,
+        inbox_max_turn_age_seconds=10_000,
+        inbox_max_recovery_generations=1,
+    )
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(config.conversation_id, "event:1", "canonical event")
+    turn = inbox.next_turn(config.conversation_id, "ordinary continuation")
+    assert turn is not None
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                active_branch=lambda: list(active),
+                events=archived,
+                execution_status=ConversationExecutionStatus.PAUSED,
+            )
+
+        def navigate_to(self, event_id):
+            navigations.append(event_id)
+            active.clear()
+
+        def send_message(self, message, sender=None):
+            event = SimpleNamespace(message=message, sender=sender)
+            active.append(event)
+            archived.append(event)
+
+        async def arun(self):
+            artifact = artifacts.pop(0)
+            active.append(artifact)
+            archived.append(artifact)
+            self.state.execution_status = ConversationExecutionStatus.PAUSED
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(
+        runner.ConversationState,
+        "get_unmatched_actions",
+        lambda _events: [],
+    )
+    isolate_agent_discovery(monkeypatch, runner)
+    turns = OpenHandsTurnRunner(config, full_prompt="complete research brief")
+
+    for _attempt in range(3):
+        assert turns.run(
+            turn.prompt.body,
+            conversation_id=config.conversation_id,
+            event_keys=frozenset(turn.event_keys),
+            inbox=inbox,
+            inbox_turn_id=turn.turn_id,
+        ).exit_code == 1
+
+    assert navigations == [None]
+    assert inbox.turn(turn.turn_id).superseded_by is not None
+
+
 def test_context_reset_preserves_old_branch_and_requeues_once(tmp_path, monkeypatch):
     """
     Requirement: reset keeps the old trace and creates one canonical recovery copy.
@@ -651,14 +1038,19 @@ def test_context_reset_preserves_old_branch_and_requeues_once(tmp_path, monkeypa
     )
     isolate_agent_discovery(monkeypatch, runner)
 
-    for _attempt in range(2):
-        run_openhands(
-            "fresh recovery prompt",
-            config,
-            reset_context=True,
-            inbox=PersistentInbox(inbox.path),
-            inbox_turn_id=old_turn.turn_id,
-        )
+    run_openhands(
+        "fresh recovery prompt",
+        config,
+        reset_context=True,
+        inbox=PersistentInbox(inbox.path),
+        inbox_turn_id=old_turn.turn_id,
+    )
+    run_openhands(
+        "unused retry prompt",
+        config,
+        inbox=PersistentInbox(inbox.path),
+        inbox_turn_id=old_turn.turn_id,
+    )
 
     assert archived[: len(old_branch)] == old_branch
     assert [name for name, _value in calls].count("navigate") == 1

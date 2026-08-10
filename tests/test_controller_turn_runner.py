@@ -1,6 +1,7 @@
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -18,6 +19,7 @@ from senpai_agent.controller import (
 )
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.github.mailbox import ActiveGitHubWatcher
+from senpai_agent.inbox import DeliveryState, PersistentInbox, deliver_turn_messages
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.state import AssignmentConversationRegistry
 
@@ -415,6 +417,73 @@ def test_context_exhaustion_retries_once_on_a_fresh_branch_with_the_same_id(
     assert "complete current research brief" in calls[1][0]
     assert "current actionable event" in calls[1][0]
     assert "raw trace and workspace are preserved" in calls[1][0]
+
+
+def test_terminal_turn_recovery_preserves_history_and_excludes_new_events(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """
+    Requirement: a terminally stalled turn gets one fresh canonical branch.
+    Interface: OpenHandsTurnRunner and the persistent inbox.
+    """
+    conversation_id = UUID("00000000-0000-0000-0000-000000000095")
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(conversation_id, "event:old", "old canonical event")
+    original = inbox.next_turn(conversation_id, "unchanged controller prompt")
+    assert original is not None
+
+    class Conversation:
+        def __init__(self):
+            self.events = []
+            self.state = SimpleNamespace(active_branch=lambda: list(self.events))
+
+        def send_message(self, message, sender=None):
+            self.events.append(SimpleNamespace(message=message, sender=sender))
+
+    # The model-visible append happened once on the preserved old branch.
+    conversation = Conversation()
+    deliver_turn_messages(conversation, inbox, original.turn_id)
+    for _attempt in range(3):
+        inbox.record_inference_attempt(original.turn_id)
+
+    inbox.enqueue(conversation_id, "event:new", "new event stays queued")
+    calls = []
+
+    def run_openhands(prompt, _config, **kwargs):
+        calls.append((prompt, kwargs))
+        recovery = inbox.recover_turn(
+            kwargs["inbox_turn_id"],
+            kwargs["recovery_prompt"],
+            max_generations=1,
+        )
+        assert recovery.recovery_of == original.turn_id
+        assert [event.event_key for event in recovery.events] == ["event:old"]
+        assert inbox.pending_count(conversation_id) == 1
+        for message in recovery.messages:
+            inbox.record_delivered(message.delivery_id, message.body)
+        inbox.record_processed(recovery.turn_id)
+        return 0
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+
+    result = OpenHandsTurnRunner(
+        Config("advisor", tmp_path / "state", conversation_id),
+        full_prompt="complete current research brief",
+    ).run(
+        original.prompt.body,
+        conversation_id=conversation_id,
+        event_keys=frozenset(original.event_keys),
+        inbox=inbox,
+        inbox_turn_id=original.turn_id,
+    )
+
+    assert result.exit_code == 0
+    assert len(calls) == 1
+    assert calls[0][0] == "unchanged controller prompt"
+    assert "complete current research brief" in calls[0][1]["recovery_prompt"]
+    recovery = inbox.turn(inbox.turn(original.turn_id).superseded_by)
+    assert recovery.state is DeliveryState.PROCESSED
 
 
 def test_context_recovery_attempt_is_not_retried(
