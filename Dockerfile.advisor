@@ -71,7 +71,7 @@ RUN cd /tmp/senpai && \
       --only-binary rpds-py \
       -r requirements.txt && \
     uv pip install --python "$SENPAI_PYTHON" --no-deps /tmp/senpai && \
-    "$SENPAI_PYTHON" -I -c 'import importlib.metadata, importlib.util, openhands.sdk, sys; import senpai_agent; assert sys.version_info[:2] == (3, 13); assert importlib.util.find_spec("torch") is None; assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"; assert "/opt/senpai-venv/" in senpai_agent.__file__' && \
+    "$SENPAI_PYTHON" -I -c 'import importlib.metadata, importlib.util, openhands.sdk, sys, wandb; import senpai_agent; assert sys.version_info[:2] == (3, 13); assert importlib.util.find_spec("torch") is None; assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"; assert "/opt/senpai-venv/" in senpai_agent.__file__' && \
     rm -rf /root/.cache/uv
 
 COPY scripts/senpai-browser-smoke-test.py /usr/local/bin/senpai-browser-smoke-test

@@ -462,7 +462,7 @@ class _HeartbeatPublisher:
     def __init__(self, socket_path: str | Path):
         self.socket_path = _health_socket_path(socket_path)
         self._lock = threading.Lock()
-        self._state = "idle"
+        self._state = "starting"
         self._updated_at = time.monotonic()
         self._operation_deadline: float | None = None
         self._stop = threading.Event()
@@ -1031,44 +1031,84 @@ def _execute_in_worker(
 def _serve_worker(
     connection: socket.socket,
     request: RepairExecutionRequest,
+    *,
+    result_fd: int | None = None,
 ) -> None:
     try:
-        result = _execute_in_worker(request, connection)
-        if _client_is_connected(connection):
-            connection.sendall(_encode_frame(result))
-    except BaseException as error:  # noqa: BLE001
         try:
-            connection.sendall(
-                _encode_frame(
-                    {
-                        "error_type": type(error).__name__,
-                        "error": str(error)[:4_096],
-                    }
-                )
+            frame = _encode_frame(_execute_in_worker(request, connection))
+        except BaseException as error:  # noqa: BLE001
+            frame = _encode_frame(
+                {
+                    "error_type": type(error).__name__,
+                    "error": str(error)[:4_096],
+                }
             )
-        except OSError:
-            pass
+        if result_fd is not None:
+            with os.fdopen(result_fd, "wb", closefd=True) as result_file:
+                result_file.write(frame)
+                result_file.flush()
+        elif _client_is_connected(connection):
+            connection.sendall(frame)
+    except OSError:
+        pass
     finally:
         connection.close()
+
+
+def _read_worker_result(result_fd: int) -> bytes:
+    os.lseek(result_fd, 0, os.SEEK_SET)
+    chunks = []
+    size = 0
+    while size <= EXECUTOR_FRAME_LIMIT_BYTES + 1:
+        chunk = os.read(
+            result_fd,
+            min(65_536, EXECUTOR_FRAME_LIMIT_BYTES + 2 - size),
+        )
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    frame = b"".join(chunks)
+    if (
+        not frame.endswith(b"\n")
+        or len(frame) > EXECUTOR_FRAME_LIMIT_BYTES + 1
+        or b"\n" in frame[:-1]
+    ):
+        raise RepairExecutorError("repair worker returned an invalid result frame")
+    return frame
+
+
+def _managed_result_fd() -> int:
+    if sys.platform != "linux":
+        raise RepairExecutorError("managed repair execution requires Linux")
+    return os.memfd_create("senpai-repair-result", os.MFD_CLOEXEC)
 
 
 def _spawn_worker(
     connection: socket.socket,
     request: RepairExecutionRequest,
+    *,
+    result_fd: int | None = None,
 ) -> subprocess.Popen[bytes]:
     """Exec a fresh interpreter so a threaded PID 1 never runs after fork."""
 
+    command = [
+        sys.executable,
+        "-I",
+        str(Path(__file__).resolve()),
+        "worker",
+        "--connection-fd",
+        str(connection.fileno()),
+    ]
+    inherited_fds = [connection.fileno()]
+    if result_fd is not None:
+        command.extend(("--result-fd", str(result_fd)))
+        inherited_fds.append(result_fd)
     worker = subprocess.Popen(
-        [
-            sys.executable,
-            "-I",
-            str(Path(__file__).resolve()),
-            "worker",
-            "--connection-fd",
-            str(connection.fileno()),
-        ],
+        command,
         stdin=subprocess.PIPE,
-        pass_fds=(connection.fileno(),),
+        pass_fds=tuple(inherited_fds),
     )
     assert worker.stdin is not None
     try:
@@ -1096,6 +1136,21 @@ class RepairExecutorServer:
             except ProcessLookupError:
                 pass
 
+    def _bind_listener(self) -> socket.socket:
+        self._remove_stale_socket()
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(_socket_address(self.socket_path))
+            filesystem_path = _filesystem_socket_path(self.socket_path)
+            if filesystem_path is not None:
+                os.chmod(filesystem_path, 0o600)
+            listener.listen(1)
+            listener.settimeout(0.2)
+            return listener
+        except BaseException:
+            listener.close()
+            raise
+
     def serve_forever(self) -> None:
         become_child_subreaper()
         _scavenge_stale_volatile_roots()
@@ -1108,16 +1163,12 @@ class RepairExecutorServer:
             signum: signal.signal(signum, self._request_stop)
             for signum in (signal.SIGTERM, signal.SIGINT)
         }
+        listener: socket.socket | None = None
         try:
             while not self._stop:
-                heartbeat.publish("idle")
-                self._remove_stale_socket()
-                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                listener.bind(_socket_address(self.socket_path))
-                if filesystem_path is not None:
-                    os.chmod(filesystem_path, 0o600)
-                listener.listen(1)
-                listener.settimeout(0.2)
+                if listener is None:
+                    listener = self._bind_listener()
+                    heartbeat.publish("idle")
                 try:
                     while not self._stop:
                         try:
@@ -1156,40 +1207,71 @@ class RepairExecutorServer:
                     except OSError:
                         pass
                     connection.close()
-                    listener.close()
-                    self._remove_stale_socket()
                     continue
 
                 # The command shares this container. Remove every listening FD
                 # and path before it starts so it cannot enqueue a nested,
                 # unaudited repair for later execution.
                 listener.close()
+                listener = None
                 self._remove_stale_socket()
                 operation_deadline = time.monotonic() + request.timeout_seconds
                 heartbeat.publish("active", operation_deadline)
-                worker = _spawn_worker(connection, request)
-                connection.close()
-                self._active_worker = worker.pid
-                while True:
-                    try:
-                        if worker.poll() is not None:
+                result_fd = _managed_result_fd()
+                try:
+                    worker = _spawn_worker(
+                        connection,
+                        request,
+                        result_fd=result_fd,
+                    )
+                    self._active_worker = worker.pid
+                    if self._stop:
+                        self._request_stop(signal.SIGTERM, None)
+                    while True:
+                        try:
+                            if worker.poll() is not None:
+                                break
+                            heartbeat.publish("active", operation_deadline)
+                            time.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+                        except InterruptedError:
+                            if self._stop:
+                                self._request_stop(signal.SIGTERM, None)
+                            continue
+                        except ChildProcessError:
                             break
-                        heartbeat.publish("active", operation_deadline)
-                        time.sleep(_HEARTBEAT_INTERVAL_SECONDS)
-                    except InterruptedError:
-                        if self._stop:
-                            self._request_stop(signal.SIGTERM, None)
-                        continue
-                    except ChildProcessError:
-                        break
-                self._active_worker = None
-                # The request worker is normally its own subreaper, but a
-                # crash can reparent detached command descendants to PID 1.
-                # Reconcile before the executor becomes reachable again.
-                clean_current_process_descendants()
-                _scavenge_stale_volatile_roots()
-                heartbeat.publish("idle")
+                    self._active_worker = None
+                    # The request worker is normally its own subreaper, but a
+                    # crash can reparent detached command descendants to PID 1.
+                    # Reconcile before the executor becomes reachable again.
+                    clean_current_process_descendants()
+                    _scavenge_stale_volatile_roots()
+                    try:
+                        result_frame = _read_worker_result(result_fd)
+                    except RepairExecutorError as error:
+                        result_frame = None
+                        print(
+                            "SENPAI_REPAIR_WORKER_RESULT_ERROR "
+                            f"{type(error).__name__}",
+                            file=sys.stderr,
+                        )
+
+                    # A successful response is a readiness barrier: only
+                    # release it after PID 1 has restored the listener.
+                    if not self._stop:
+                        listener = self._bind_listener()
+                        heartbeat.publish("idle")
+                    if result_frame is not None and _client_is_connected(connection):
+                        try:
+                            connection.sendall(result_frame)
+                        except OSError:
+                            pass
+                finally:
+                    self._active_worker = None
+                    os.close(result_fd)
+                    connection.close()
         finally:
+            if listener is not None:
+                listener.close()
             heartbeat.close()
             self._request_stop(signal.SIGTERM, None)
             self._remove_stale_socket()
@@ -1294,6 +1376,7 @@ def repair_executor_main(argv: Sequence[str] | None = None) -> int:
     health.add_argument("--socket", default=DEFAULT_EXECUTOR_SOCKET)
     worker = subparsers.add_parser("worker")
     worker.add_argument("--connection-fd", required=True, type=int)
+    worker.add_argument("--result-fd", type=int)
     args = parser.parse_args(argv)
 
     if args.operation == "serve":
@@ -1317,7 +1400,7 @@ def repair_executor_main(argv: Sequence[str] | None = None) -> int:
         if not payload.endswith(b"\n") or len(payload) > EXECUTOR_REQUEST_LIMIT_BYTES + 1:
             raise RepairExecutorError("repair executor frame exceeded its byte limit")
         request = RepairExecutionRequest.parse(payload[:-1])
-        _serve_worker(connection, request)
+        _serve_worker(connection, request, result_fd=args.result_fd)
         return 0
 
     request = RepairExecutionRequest(

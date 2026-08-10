@@ -180,7 +180,7 @@ def test_build_workflow_builds_all_images_from_the_exact_checked_out_commit():
     )
 
 
-def test_runtime_workflow_uses_the_lockfile_uv_and_exa_versions():
+def test_runtime_workflow_installs_the_locked_advisor_dependency_set():
     workflow = yaml.safe_load(
         (ROOT / ".github" / "workflows" / "test.yaml").read_text(encoding="utf-8")
     )
@@ -189,7 +189,19 @@ def test_runtime_workflow_uses_the_lockfile_uv_and_exa_versions():
     assert steps["Install uv and Python"]["with"]["version"] == "0.10.9"
     install = steps["Install runtime test dependencies"]["run"]
     assert "uv lock --check" in install
-    assert "exa-py @ https://github.com/exa-labs/exa-py/archive/" in install
+    assert "uv export --locked --python 3.13 --no-dev --no-emit-project" in install
+    for package in (
+        "torch",
+        "torchvision",
+        "torch-geometric",
+        "timm",
+        "einops",
+        "matplotlib",
+    ):
+        assert f"--prune {package}" in install
+    assert "> /tmp/senpai-runtime-requirements.txt" in install
+    assert "-r /tmp/senpai-runtime-requirements.txt" in install
+    assert '"weave>=' not in install
 
 
 def test_role_state_is_pod_local_and_separate_from_the_dataset_pvc():

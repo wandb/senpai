@@ -1,6 +1,7 @@
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +9,33 @@ import pytest
 import yaml
 
 from launch_test_support import launch, launch_args, launch_helpers
+
+
+def test_canary_can_import_network_policy_without_the_cli_parser():
+    code = """
+import builtins
+
+real_import = builtins.__import__
+
+def without_cli_parser(name, *args, **kwargs):
+    if name == "simple_parsing":
+        raise ModuleNotFoundError(name)
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = without_cli_parser
+from k8s.launch import render_supervisor_network_policy
+print(render_supervisor_network_policy("canary"))
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "name: senpai-supervisor-egress-canary" in completed.stdout
 
 
 @pytest.mark.parametrize(

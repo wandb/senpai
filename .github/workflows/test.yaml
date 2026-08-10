@@ -27,17 +27,24 @@ jobs:
         run: |
           uv lock --check
           uv venv --python 3.13
+          uv export --locked --python 3.13 --no-dev --no-emit-project \
+            --format requirements.txt \
+            --prune torch \
+            --prune torchvision \
+            --prune torch-geometric \
+            --prune timm \
+            --prune einops \
+            --prune matplotlib \
+            > /tmp/senpai-runtime-requirements.txt
           uv pip install --python .venv/bin/python \
+            --only-binary cryptography \
+            --only-binary jiter \
+            --only-binary litellm \
+            --only-binary pycparser \
+            --only-binary pydantic-core \
+            --only-binary rpds-py \
             pytest \
-            psutil \
-            python-dotenv \
-            simple-parsing \
-            "transformers==5.12.0" \
-            "exa-py @ https://github.com/exa-labs/exa-py/archive/71f315b4be07d474df128c8fafc70cc7d0e47b56.tar.gz" \
-            "weave>=0.53.1,<0.54" \
-            "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@c1e9cda697e10ee92e5629b19c7d81cac8bcf54b" \
-            "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@33608f0b8242ca0e1f6251efc8f535e249cd6101#subdirectory=openhands-sdk" \
-            "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@33608f0b8242ca0e1f6251efc8f535e249cd6101#subdirectory=openhands-tools"
+            -r /tmp/senpai-runtime-requirements.txt
 
       - name: Test the complete control plane (no cluster)
         run: .venv/bin/python -m pytest

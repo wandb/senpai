@@ -15,7 +15,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import simple_parsing as sp
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -95,6 +94,19 @@ _DNS_SUBDOMAIN = re.compile(
     r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?"
     r"(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*"
 )
+
+
+class _LazySimpleParsing:
+    """Keep render helpers importable without the CLI-only parser."""
+
+    @staticmethod
+    def parse(*args, **kwargs):
+        import simple_parsing
+
+        return simple_parsing.parse(*args, **kwargs)
+
+
+sp = _LazySimpleParsing()
 
 
 @dataclass

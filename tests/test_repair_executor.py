@@ -3,6 +3,7 @@ import multiprocessing
 import os
 import shlex
 import shutil
+import signal
 import socket
 import sys
 import threading
@@ -142,6 +143,25 @@ def test_repair_executor_health_rejects_a_wedged_heartbeat():
     )
 
 
+def test_repair_executor_health_rejects_startup_before_the_listener_is_ready(
+    tmp_path,
+):
+    socket_path = _test_socket(tmp_path, "starting-executor")
+    heartbeat = repair_executor._HeartbeatPublisher(socket_path)
+    heartbeat.start()
+    try:
+        with pytest.raises(
+            repair_executor.RepairExecutorError,
+            match="stale or invalid",
+        ):
+            check_repair_executor_health(
+                socket_path,
+                expected_pid=os.getpid(),
+            )
+    finally:
+        heartbeat.close()
+
+
 def test_repair_executor_health_accepts_an_in_deadline_long_command():
     now = time.monotonic()
 
@@ -208,6 +228,93 @@ def test_repair_executor_remains_healthy_during_a_long_command(tmp_path):
             server.join(timeout=3)
 
     assert result["exit_code"] == 0
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreapers")
+def test_repair_executor_accepts_immediate_sequential_requests(
+    tmp_path,
+    monkeypatch,
+):
+    socket_path = _test_socket(tmp_path, "sequential-executor")
+    reconcile_descendants = repair_executor.clean_current_process_descendants
+
+    def deliberately_slow_reconciliation() -> None:
+        reconcile_descendants()
+        time.sleep(0.1)
+
+    monkeypatch.setattr(
+        repair_executor,
+        "clean_current_process_descendants",
+        deliberately_slow_reconciliation,
+    )
+    server = multiprocessing.get_context("fork").Process(
+        target=_serve,
+        args=(str(socket_path),),
+    )
+    server.start()
+    deadline = time.monotonic() + 3
+    while not socket_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    client = RepairExecutorClient(socket_path)
+    try:
+        first = client.execute(RepairExecutionRequest("printf first", tmp_path, 5))
+        second = client.execute(RepairExecutionRequest("printf second", tmp_path, 5))
+    finally:
+        server.terminate()
+        server.join(timeout=3)
+        if server.is_alive():
+            server.kill()
+            server.join(timeout=3)
+
+    assert first["stdout"] == "first"
+    assert second["stdout"] == "second"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux signals")
+def test_shutdown_during_worker_spawn_stops_the_new_repair(
+    tmp_path,
+    monkeypatch,
+):
+    socket_path = _test_socket(tmp_path, "spawn-shutdown-executor")
+    marker = tmp_path / "repair-survived-shutdown"
+    spawn_worker = repair_executor._spawn_worker
+
+    def spawn_then_stop(*args, **kwargs):
+        worker = spawn_worker(*args, **kwargs)
+        os.kill(os.getpid(), signal.SIGTERM)
+        return worker
+
+    monkeypatch.setattr(repair_executor, "_spawn_worker", spawn_then_stop)
+    server = multiprocessing.get_context("fork").Process(
+        target=_serve,
+        args=(str(socket_path),),
+    )
+    server.start()
+    deadline = time.monotonic() + 3
+    while not socket_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    started_at = time.monotonic()
+    try:
+        try:
+            RepairExecutorClient(socket_path).execute(
+                RepairExecutionRequest(
+                    f"sleep 5; touch {shlex.quote(str(marker))}",
+                    tmp_path,
+                    8,
+                )
+            )
+        except repair_executor.RepairExecutorOutcomeUnknown:
+            pass
+    finally:
+        server.join(timeout=3)
+        if server.is_alive():
+            server.kill()
+            server.join(timeout=3)
+
+    assert time.monotonic() - started_at < 3
+    assert not marker.exists()
 
 
 def test_maximum_unicode_command_fits_the_executor_request_frame(tmp_path):

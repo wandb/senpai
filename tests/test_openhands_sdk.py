@@ -1,10 +1,12 @@
 import re
+import shlex
 import tomllib
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
 import pytest
+import yaml
 from openhands.sdk import Agent, LLM, LocalConversation
 from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.llm import Message, TextContent
@@ -51,21 +53,6 @@ def test_openhands_fork_pin_is_consistent_across_install_paths():
     }
     assert project_requirements == expected_requirements
 
-    workflow = (REPO_ROOT / ".github" / "workflows" / "test.yaml").read_text(
-        encoding="utf-8"
-    )
-    ci_requirements = {
-        match.group(1)
-        for line in workflow.splitlines()
-        if (
-            match := re.fullmatch(
-                r'\s*"(openhands-(?:sdk|tools) @ git\+[^"]+)"(?:\s+\\)?\s*',
-                line,
-            )
-        )
-    }
-    assert ci_requirements == expected_requirements
-
     lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
     locked_packages = {
         package["name"]: package
@@ -88,6 +75,39 @@ def test_openhands_fork_pin_is_consistent_across_install_paths():
         resolved_revisions.add(source.fragment)
 
     assert resolved_revisions == {revision}
+
+    workflow = yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "test.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    install_script = next(
+        step["run"]
+        for step in workflow["jobs"]["runtime"]["steps"]
+        if step.get("name") == "Install runtime test dependencies"
+    )
+    commands = [
+        shlex.split(line)
+        for line in re.sub(r"\\\n\s*", " ", install_script).splitlines()
+        if line.strip()
+    ]
+    export_command = next(
+        command for command in commands if command[:2] == ["uv", "export"]
+    )
+    assert {"--locked", "--no-dev", "--no-emit-project"} <= set(export_command)
+    excluded_packages = {
+        package
+        for option, package in zip(export_command, export_command[1:])
+        if option in {"--prune", "--no-emit-package"}
+    }
+    assert package_names.isdisjoint(excluded_packages)
+    exported_requirements = export_command[export_command.index(">") + 1]
+
+    install_command = next(
+        command for command in commands if command[:3] == ["uv", "pip", "install"]
+    )
+    requirements_option = install_command.index("-r")
+    assert install_command[requirements_option + 1] == exported_requirements
 
 
 @pytest.mark.parametrize(
