@@ -412,14 +412,6 @@ def supervisor_control(args: argparse.Namespace) -> int:
         namespace=args.namespace,
         environment=os.environ,
     )
-    state_marker = (
-        Path("/var/lib/senpai")
-        / args.tag
-        / "operational-supervisor"
-        / "canary-state-marker"
-    )
-    state_marker.parent.mkdir(parents=True, exist_ok=True)
-    state_marker.write_text("supervisor-state-preserved\n", encoding="utf-8")
     socket_path = Path(os.environ["SENPAI_SUPERVISOR_REPAIR_SOCKET"])
     with RepairBrokerServer(socket_path, inventory, backend):
         stop = False
