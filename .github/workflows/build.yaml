@@ -76,6 +76,13 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
+      - name: Run operational supervisor entrypoint smoke
+        if: github.event_name == 'pull_request' && matrix.role == 'advisor'
+        env:
+          ADVISOR_IMAGE: ghcr.io/${{ env.IMAGE_NAME }}:sha-${{ env.SOURCE_REVISION }}
+          SENPAI_SUPERVISOR_SMOKE_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: scripts/test-operational-supervisor-image-smoke.sh
+
       - name: Run student image production smoke
         if: github.event_name == 'pull_request' && matrix.role == 'student'
         env:

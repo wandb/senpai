@@ -343,6 +343,57 @@ def test_pull_request_loads_and_smokes_the_actual_student_production_image():
     )
 
 
+def test_pull_request_executes_the_real_supervisor_entrypoint_without_authority():
+    """The advisor image must execute its supervisor entrypoint before Kind."""
+
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "build.yaml").read_text()
+    )
+    step = next(
+        item
+        for item in workflow["jobs"]["build"]["steps"]
+        if item["name"] == "Run operational supervisor entrypoint smoke"
+    )
+    assert "github.event_name == 'pull_request'" in step["if"]
+    assert "matrix.role == 'advisor'" in step["if"]
+    assert step["env"]["ADVISOR_IMAGE"] == (
+        "ghcr.io/${{ env.IMAGE_NAME }}:sha-${{ env.SOURCE_REVISION }}"
+    )
+    assert step["run"] == "scripts/test-operational-supervisor-image-smoke.sh"
+    assert "secrets." not in yaml.safe_dump(step)
+
+    smoke = (
+        ROOT / "scripts" / "test-operational-supervisor-image-smoke.sh"
+    ).read_text()
+    stub = (
+        ROOT
+        / "tests"
+        / "kubernetes"
+        / "operational-supervisor-controller-stub.sh"
+    ).read_text()
+    dockerfile = (
+        ROOT
+        / "tests"
+        / "kubernetes"
+        / "operational-supervisor-entrypoint.Dockerfile"
+    ).read_text()
+    assert "--network none" in smoke
+    assert "--read-only" in smoke
+    assert "dst=/workspace/senpai,readonly" in smoke
+    assert "SENPAI_CI_DUMMY_GITHUB" in smoke
+    assert "SENPAI_CI_DUMMY_WANDB" in smoke
+    assert "SENPAI_CI_DUMMY_OPENAI" in smoke
+    assert "entrypoint-operational-supervisor.sh" in smoke
+    assert "SENPAI_SKIP_EDITABLE_INSTALL=1" in smoke
+    assert "COPY operational-supervisor-controller-stub.sh" in dockerfile
+    assert "senpai-run-controller" in dockerfile
+    assert "operational-supervisor-entrypoint-ok" in stub
+    assert "test ! -w /workspace/senpai" in stub
+    assert 'test -z "${GITHUB_TOKEN+x}"' in stub
+    assert "SENPAI_SUPERVISOR_SECRET_DIR/GITHUB_TOKEN" in stub
+    assert "SENPAI_TEST" not in smoke + stub + dockerfile
+
+
 def test_live_role_repairs_prove_the_target_mount_is_a_real_git_worktree():
     """
     Requirement: a directory merely named `.git` must not let the production

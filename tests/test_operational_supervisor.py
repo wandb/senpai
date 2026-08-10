@@ -660,6 +660,247 @@ def test_failed_research_review_attempt_waits_for_the_next_six_hour_window(
     assert store.due_state(attempted_at + timedelta(hours=6)).research_review_due
 
 
+def test_main_loop_survives_collection_failure_and_keeps_research_cadence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    """Three due wakes include a failed review and a recoverable collection gap."""
+
+    import wandb
+
+    import senpai_agent.kubernetes_operations as kubernetes_operations
+    import senpai_agent.openhands_runner as openhands_runner
+    import senpai_agent.operational_supervisor as supervisor_module
+    import senpai_agent.repair_broker as repair_broker
+    import senpai_agent.supervisor as process_supervisor
+    import senpai_agent.weave_monitoring as weave_monitoring
+
+    wake_times = (
+        NOW + timedelta(hours=6),
+        NOW + timedelta(hours=6, minutes=15),
+        NOW + timedelta(hours=6, minutes=30),
+    )
+
+    class LoopClock(datetime):
+        current = wake_times[0]
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current if tz is None else cls.current.astimezone(tz)
+
+    class LoopStore:
+        instance = None
+
+        def __init__(self, _path, *, operational_interval, research_review_interval):
+            assert operational_interval == timedelta(minutes=15)
+            assert research_review_interval == timedelta(hours=6)
+            self.started_at = NOW
+            self.snapshots = []
+            self.last_research_review_at = None
+            self.last_research_review_attempt_at = None
+            self.review_attempts = []
+            self.research_due = []
+            self.due_calls = 0
+            type(self).instance = self
+
+        def due_state(self):
+            LoopClock.current = wake_times[self.due_calls]
+            self.due_calls += 1
+            research_due = (
+                self.last_research_review_attempt_at is None
+                or LoopClock.current
+                >= self.last_research_review_attempt_at + timedelta(hours=6)
+            )
+            self.research_due.append(research_due)
+            return SupervisorDueState(
+                operational_due=True,
+                research_review_due=research_due,
+                next_operational_at=LoopClock.current,
+                next_research_review_at=LoopClock.current,
+            )
+
+        def append(self, item):
+            self.snapshots.append(item)
+            return SimpleNamespace(
+                snapshots=tuple(self.snapshots[-3:]),
+                last_research_review_at=self.last_research_review_at,
+                started_at=self.started_at,
+            )
+
+        def mark_research_review(self, timestamp, *, succeeded):
+            self.last_research_review_attempt_at = timestamp
+            if succeeded:
+                self.last_research_review_at = timestamp
+            self.review_attempts.append((timestamp, succeeded))
+
+    class LoopStop:
+        instance = None
+
+        def __init__(self):
+            self.stopped = False
+            self.waits = []
+            type(self).instance = self
+
+        def is_set(self):
+            return self.stopped
+
+        def set(self):
+            self.stopped = True
+
+        def wait(self, seconds):
+            self.waits.append(seconds)
+            return self.stopped
+
+    class FakeProgress:
+        instance = None
+
+        def __init__(self, _path):
+            self.updates = []
+            type(self).instance = self
+
+        def update(self, *args):
+            self.updates.append(args)
+
+    class FakeRepairBroker:
+        instance = None
+
+        def __init__(self, *_args, **_kwargs):
+            self.entered = False
+            self.closed = False
+            type(self).instance = self
+
+        def __enter__(self):
+            self.entered = True
+            return self
+
+        def recent_audit(self, *, limit):
+            assert limit == 12
+            return ()
+
+        def close(self):
+            self.closed = True
+
+    state_dir = tmp_path / "supervisor"
+    runner_state = tmp_path / "openhands"
+    state_dir.mkdir()
+    runner_state.mkdir()
+    env = {
+        "STUDENT_NAMES": "alice,bob",
+        "SENPAI_SUPERVISOR_INTERVAL_SECONDS": "900",
+        "SENPAI_SUPERVISOR_RESEARCH_INTERVAL_SECONDS": "21600",
+        "SENPAI_OPENHANDS_MAX_TURNS": "11",
+        "ADVISOR_BRANCH": "advisor/maple",
+        "RESEARCH_TAG": "maple-20260806",
+        "WANDB_ENTITY": "research-team",
+        "WANDB_PROJECT": "speed-study",
+        "WANDB_API_KEY": "dummy-wandb",
+        "SENPAI_KUBECTL_NAMESPACE": "senpai-maple",
+        "SENPAI_SUPERVISOR_STATE_DIR": str(state_dir),
+        "SENPAI_SUPERVISOR_REPAIR_SOCKET": str(tmp_path / "repair.sock"),
+    }
+    runner_config = SimpleNamespace(
+        role="supervisor",
+        github_token=object(),
+        github_repo="example/research",
+        state_dir=runner_state,
+        timeout_seconds=30,
+    )
+    finished = []
+    collection_calls = []
+    operational_wakes = []
+
+    def collect(*_args, **_kwargs):
+        collection_calls.append(LoopClock.current)
+        if len(collection_calls) == 2:
+            raise TimeoutError("transient collector outage")
+        return snapshot(LoopClock.current)
+
+    def run_turn(_prompt, _config, _progress, *, phase):
+        operational_wakes.append((LoopClock.current, phase))
+        if len(operational_wakes) == 2:
+            LoopStop.instance.set()
+        return 0
+
+    monkeypatch.setattr(supervisor_module, "datetime", LoopClock)
+    monkeypatch.setattr(supervisor_module.threading, "Event", LoopStop)
+    monkeypatch.setattr(supervisor_module, "SupervisorStateStore", LoopStore)
+    monkeypatch.setattr(supervisor_module, "collect_campaign_snapshot", collect)
+    monkeypatch.setattr(
+        supervisor_module,
+        "collect_research_review_evidence",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("transient research evidence failure")
+        ),
+    )
+    monkeypatch.setattr(supervisor_module, "_run_fresh_supervisor_turn", run_turn)
+    monkeypatch.setattr(
+        supervisor_module,
+        "_reconcile_terminal_after_control_restart",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "consume_supervisor_secret_directory",
+        lambda supplied, *, required: dict(supplied),
+    )
+    monkeypatch.setattr(
+        supervisor_module.signal,
+        "signal",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        supervisor_module.GitHubPRCollector,
+        "authenticated",
+        staticmethod(lambda _token: object()),
+    )
+    monkeypatch.setattr(supervisor_module, "WandbRunCollector", lambda _api: object())
+    monkeypatch.setattr(
+        kubernetes_operations,
+        "KubectlCampaignBackend",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(openhands_runner, "parse_runner_args", lambda _args: object())
+    monkeypatch.setattr(
+        openhands_runner,
+        "resolve_config",
+        lambda *_args, **_kwargs: runner_config,
+    )
+    monkeypatch.setattr(repair_broker, "RepairBrokerServer", FakeRepairBroker)
+    monkeypatch.setattr(process_supervisor, "ProgressLease", FakeProgress)
+    monkeypatch.setattr(wandb, "Api", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        weave_monitoring,
+        "initialize_weave_monitoring",
+        lambda _env: None,
+    )
+    monkeypatch.setattr(
+        weave_monitoring,
+        "finish_weave_monitoring",
+        lambda: finished.append(True),
+    )
+
+    assert operational_supervisor_main(["run"], env=env) == 0
+
+    store = LoopStore.instance
+    assert collection_calls == list(wake_times)
+    assert [phase for _at, phase in operational_wakes] == [
+        "operational-review",
+        "operational-review",
+    ]
+    assert store.research_due == [True, False, False]
+    assert store.review_attempts == [(wake_times[0], False)]
+    assert LoopStop.instance.waits == [60]
+    assert ("collection-backoff", 180) in FakeProgress.instance.updates
+    assert FakeRepairBroker.instance.entered is True
+    assert FakeRepairBroker.instance.closed is True
+    assert finished == [True]
+    stderr = capsys.readouterr().err
+    assert "SENPAI_RESEARCH_REVIEW_ERROR RuntimeError" in stderr
+    assert "SENPAI_RESEARCH_REVIEW_FAILED exit_code=1" in stderr
+    assert "SENPAI_OPERATIONAL_SNAPSHOT_ERROR TimeoutError" in stderr
+
+
 def test_research_review_attempt_cannot_precede_a_migrated_success_timestamp(
     tmp_path: Path,
 ):
