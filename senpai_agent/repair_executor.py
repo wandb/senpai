@@ -1082,7 +1082,13 @@ def _read_worker_result(result_fd: int) -> bytes:
 def _managed_result_fd() -> int:
     if sys.platform != "linux":
         raise RepairExecutorError("managed repair execution requires Linux")
-    return os.memfd_create("senpai-repair-result", os.MFD_CLOEXEC)
+    result_fd, result_path = tempfile.mkstemp(prefix="senpai-repair-result-")
+    try:
+        os.unlink(result_path)
+    except BaseException:
+        os.close(result_fd)
+        raise
+    return result_fd
 
 
 def _spawn_worker(

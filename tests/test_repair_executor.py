@@ -194,6 +194,21 @@ def test_repair_executor_health_rejects_an_expired_command():
     )
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux repair execution")
+def test_managed_result_fd_is_anonymous_and_round_trips(tmp_path, monkeypatch):
+    monkeypatch.setattr(repair_executor.tempfile, "tempdir", str(tmp_path))
+
+    result_fd = repair_executor._managed_result_fd()
+    try:
+        os.write(result_fd, b'{"exit_code":0}\n')
+
+        assert os.fstat(result_fd).st_nlink == 0
+        assert repair_executor._read_worker_result(result_fd) == b'{"exit_code":0}\n'
+        assert not list(tmp_path.iterdir())
+    finally:
+        os.close(result_fd)
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux process health")
 def test_repair_executor_remains_healthy_during_a_long_command(tmp_path):
     socket_path = _test_socket(tmp_path, "active-executor")
