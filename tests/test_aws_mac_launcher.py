@@ -959,6 +959,8 @@ class AwsMacLaunchTests(unittest.TestCase):
             state = json.loads(
                 (root / "state" / "mlxfast-r1" / "state.json").read_text()
             )
+            self.assertEqual(state["backend"], "aws-mac")
+            self.assertEqual(state["state_version"], 1)
             self.assertEqual(state["phase"], "running")
             self.assertFalse(state["ssh_authorized"])
             self.assertEqual(len({node["client_token"] for node in state["nodes"]}), 2)
@@ -1148,9 +1150,15 @@ class AwsMacLifecycleTests(unittest.TestCase):
             json.dumps(
                 {
                     "account_id": "770934259321",
+                    "backend": "aws-mac",
                     "phase": "running",
                     "profile": "sandbox",
                     "region": "us-east-1",
+                    "instance_type": "mac-m4pro.metal",
+                    "security_group_id": "sg-a1",
+                    "ssh_authorize_started": False,
+                    "ssh_authorized": False,
+                    "state_version": 1,
                     "tag": "mlxfast-r1",
                     "nodes": [
                         {
@@ -1169,6 +1177,137 @@ class AwsMacLifecycleTests(unittest.TestCase):
                 }
             )
         )
+
+    def assert_lifecycle_state_rejected(
+        self,
+        state: dict,
+        message: str,
+    ) -> None:
+        actions = {
+            "status": lambda state_root: status_aws_mac(
+                "mlxfast-r1", str(state_root)
+            ),
+            "logs": lambda state_root: logs_aws_mac(
+                "mlxfast-r1", str(state_root)
+            ),
+            "terminate": lambda state_root: aws_mac_backend.terminate_aws_mac(
+                "mlxfast-r1", str(state_root)
+            ),
+        }
+        for action_name, action in actions.items():
+            with self.subTest(action=action_name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    state_root = Path(tmp) / "aws"
+                    run_dir = state_root / "mlxfast-r1"
+                    run_dir.mkdir(parents=True)
+                    state_path = run_dir / "state.json"
+                    state_path.write_text(json.dumps(state))
+                    key_path = run_dir / "id_ed25519"
+                    key_path.write_text("private-key")
+
+                    with (
+                        patch.object(aws_mac_backend, "_check_account") as account,
+                        patch.object(aws_mac_backend, "_aws_json") as aws_json,
+                        patch.object(aws_mac_backend, "_aws_raw") as aws_raw,
+                        patch.object(aws_mac_backend, "_ssh") as ssh,
+                        self.assertRaisesRegex(RuntimeError, message),
+                    ):
+                        action(state_root)
+
+                    account.assert_not_called()
+                    aws_json.assert_not_called()
+                    aws_raw.assert_not_called()
+                    ssh.assert_not_called()
+                    self.assertEqual(json.loads(state_path.read_text()), state)
+                    self.assertEqual(key_path.read_text(), "private-key")
+
+    def test_lifecycle_rejects_standard_aws_state_before_aws_or_local_mutation(self):
+        self.assert_lifecycle_state_rejected(
+            {
+                "account_id": "770934259321",
+                "availability_zone": "us-east-1a",
+                "instance_id": "i-standard-aws",
+                "instance_type": "g6.12xlarge",
+                "key_name": "senpai-standard-key",
+                "key_owned": True,
+                "phase": "running",
+                "profile": "sandbox",
+                "region": "us-east-1",
+                "roles": ["student-fern"],
+                "security_group_id": "sg-a1",
+                "subnet_id": "subnet-a1",
+                "tag": "mlxfast-r1",
+                "vpc_id": "vpc-a1",
+            },
+            "not compatible with AWS Mac lifecycle",
+        )
+
+    def test_lifecycle_rejects_explicit_non_mac_backend(self):
+        self.assert_lifecycle_state_rejected(
+            {
+                "account_id": "770934259321",
+                "backend": "aws",
+                "instance_type": "mac-m4pro.metal",
+                "nodes": [],
+                "profile": "sandbox",
+                "region": "us-east-1",
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": False,
+                "ssh_authorized": False,
+                "state_version": 1,
+                "tag": "mlxfast-r1",
+            },
+            "backend",
+        )
+
+    def test_lifecycle_rejects_unsupported_mac_state_version(self):
+        self.assert_lifecycle_state_rejected(
+            {
+                "account_id": "770934259321",
+                "backend": "aws-mac",
+                "instance_type": "mac-m4pro.metal",
+                "nodes": [],
+                "profile": "sandbox",
+                "region": "us-east-1",
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": False,
+                "ssh_authorized": False,
+                "state_version": 2,
+                "tag": "mlxfast-r1",
+            },
+            "state version",
+        )
+
+    def test_terminate_accepts_unambiguous_legacy_mac_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "aws"
+            run_dir = state_root / "mlxfast-r1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "account_id": "770934259321",
+                        "instance_type": "mac-m4pro.metal",
+                        "key_name": "",
+                        "nodes": [],
+                        "phase": "creating",
+                        "profile": "sandbox",
+                        "region": "us-east-1",
+                        "security_group_id": "sg-a1",
+                        "ssh_authorize_started": False,
+                        "ssh_authorized": False,
+                        "tag": "mlxfast-r1",
+                    }
+                )
+            )
+
+            with (
+                patch.object(aws_mac_backend, "_check_account"),
+                redirect_stdout(io.StringIO()),
+            ):
+                aws_mac_backend.terminate_aws_mac("mlxfast-r1", str(state_root))
+
+            self.assertFalse(run_dir.exists())
 
     def test_status_and_logs_map_roles_to_their_recorded_hosts(self):
         completed = subprocess.CompletedProcess(

@@ -58,6 +58,8 @@ DEFAULT_AMI_PARAMETER = (
     "/aws/service/ec2-macos/tahoe/arm64_mac/latest/image_id"
 )
 MAC_ARCHITECTURE = "arm64_mac"
+AWS_MAC_STATE_BACKEND = "aws-mac"
+AWS_MAC_STATE_VERSION = 1
 HOST_ID = re.compile(r"h-[0-9a-f]+")
 SUBNET_ID = re.compile(r"subnet-[0-9a-f]+")
 SECURITY_GROUP_ID = re.compile(r"sg-[0-9a-f]+")
@@ -1034,6 +1036,60 @@ def _context_from_state(state: dict, profile: str = "") -> AwsContext:
     return AwsContext(state["region"], profile or state.get("profile", ""))
 
 
+def _is_legacy_mac_state(state: dict) -> bool:
+    """Recognize only the complete Mac-only shape emitted before versioning."""
+    security_group_id = state.get("security_group_id")
+    ssh_authorized = state.get("ssh_authorized")
+    return (
+        state.get("instance_type") == "mac-m4pro.metal"
+        and isinstance(state.get("nodes"), list)
+        and isinstance(security_group_id, str)
+        and SECURITY_GROUP_ID.fullmatch(security_group_id) is not None
+        and isinstance(state.get("ssh_authorize_started"), bool)
+        and "ssh_authorized" in state
+        and (ssh_authorized is None or isinstance(ssh_authorized, bool))
+        and not any(
+            field in state
+            for field in (
+                "instance_id",
+                "instance_ids",
+                "roles",
+                "security_group_name",
+                "subnet_id",
+                "vpc_id",
+            )
+        )
+    )
+
+
+def _load_lifecycle_state(tag: str, state_root: str) -> tuple[Path, dict]:
+    run_dir = _state_dir(state_root, tag)
+    state = json.loads((run_dir / "state.json").read_text())
+    if "backend" in state or "state_version" in state:
+        backend = state.get("backend")
+        if backend != AWS_MAC_STATE_BACKEND:
+            raise RuntimeError(
+                f"Recorded lifecycle state uses backend {backend!r}, not "
+                f"{AWS_MAC_STATE_BACKEND!r}"
+            )
+        version = state.get("state_version")
+        if isinstance(version, bool) or version != AWS_MAC_STATE_VERSION:
+            raise RuntimeError(
+                f"AWS Mac state version {version!r} is unsupported; expected "
+                f"{AWS_MAC_STATE_VERSION}"
+            )
+    elif not _is_legacy_mac_state(state):
+        raise RuntimeError(
+            "Recorded state is not compatible with AWS Mac lifecycle; use "
+            "k8s/aws.py for standard AWS runs"
+        )
+    if state.get("tag") != tag:
+        raise RuntimeError(
+            f"AWS Mac state records tag {state.get('tag')!r}, not {tag!r}"
+        )
+    return run_dir, state
+
+
 def _missing_cleanup_resource(error: AwsCommandError) -> bool:
     return _missing_resource(error) or "InvalidPermission.NotFound" in str(error)
 
@@ -1280,6 +1336,7 @@ def launch_aws_mac(
     state = {
         "account_id": plan.account_id,
         "ami_id": plan.ami_id,
+        "backend": AWS_MAC_STATE_BACKEND,
         "created_at": int(time.time()),
         "instance_type": args.aws_instance_type or "mac-m4pro.metal",
         "key_name": "",
@@ -1293,6 +1350,7 @@ def launch_aws_mac(
         "ssh_authorize_started": False,
         "ssh_authorized": None,
         "ssh_cidr": plan.ssh_cidr,
+        "state_version": AWS_MAC_STATE_VERSION,
         "tag": args.tag,
         "volume_gib": plan.volume_gib,
     }
@@ -1499,8 +1557,7 @@ def status_aws_mac(
     *,
     profile: str = "",
 ) -> None:
-    run_dir = _state_dir(state_root, tag)
-    state = json.loads((run_dir / "state.json").read_text())
+    run_dir, state = _load_lifecycle_state(tag, state_root)
     context = _context_from_state(state, profile)
     _check_account(context, state["account_id"])
     print(f"{tag}: launcher={state.get('phase', 'unknown')} region={state['region']}")
@@ -1553,8 +1610,7 @@ def logs_aws_mac(
 ) -> None:
     if tail < 1:
         raise ValueError("AWS Mac log tail must be at least 1")
-    run_dir = _state_dir(state_root, tag)
-    state = json.loads((run_dir / "state.json").read_text())
+    run_dir, state = _load_lifecycle_state(tag, state_root)
     context = _context_from_state(state, profile)
     _check_account(context, state["account_id"])
     node = _node_for_role(state, role_key)
@@ -1575,8 +1631,7 @@ def terminate_aws_mac(
     *,
     profile: str = "",
 ) -> None:
-    run_dir = _state_dir(state_root, tag)
-    state = json.loads((run_dir / "state.json").read_text())
+    run_dir, state = _load_lifecycle_state(tag, state_root)
     context = _context_from_state(state, profile)
     _check_account(context, state["account_id"])
     errors = _cleanup(run_dir, state, context)
