@@ -184,6 +184,11 @@ FIRST_SECRET=$(kubectl_canary get deployment -n "$NAMESPACE" \
   "senpai-supervisor-$TAG" -o jsonpath='{.spec.template.spec.containers[?(@.name=="supervisor-control")].env[0].valueFrom.secretKeyRef.name}')
 FIRST_CONFIG=$(kubectl_canary get deployment -n "$NAMESPACE" \
   "senpai-supervisor-$TAG" -o jsonpath='{.spec.template.spec.containers[?(@.name=="supervisor-control")].envFrom[0].configMapRef.name}')
+SUPERVISOR_STATE_SENTINEL="state-$SOURCE_REVISION-$CANARY_ID"
+SUPERVISOR_STATE_MARKER="/var/lib/senpai/$TAG/operational-supervisor/canary-state-marker"
+kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" -c supervisor-control -- \
+  /bin/sh -c 'printf "%s\n" "$1" > "$2"' -- \
+  "$SUPERVISOR_STATE_SENTINEL" "$SUPERVISOR_STATE_MARKER"
 
 # A failed supervisor-only release must be observable and exactly reversible.
 render broken-upgrade "$UPGRADE_MANIFEST"
@@ -212,7 +217,6 @@ kubectl_canary get configmap -n "$NAMESPACE" "$FIRST_CONFIG" "$SECOND_CONFIG" >/
   -l "app=senpai,role=advisor,research-tag=$TAG" \
   -o jsonpath='{.items[0].metadata.uid}')" == "$ADVISOR_UID" ]]
 kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" -c supervisor-control -- \
-  grep -qx supervisor-state-preserved \
-  "/var/lib/senpai/$TAG/operational-supervisor/canary-state-marker"
+  grep -qx "$SUPERVISOR_STATE_SENTINEL" "$SUPERVISOR_STATE_MARKER"
 
 echo "Kubernetes production canary passed: isolation, typed repair, owner restart, rollback, and durable state"

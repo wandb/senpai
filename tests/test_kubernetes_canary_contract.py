@@ -221,4 +221,5 @@ def test_pull_request_canary_has_no_live_secret_or_checkout_credential_path():
         in install_script
     )
     assert 'delete cluster --name "$CLUSTER"' in script
+    assert "SUPERVISOR_STATE_SENTINEL" in script
     assert "SENPAI_CI_DUMMY_" not in workflow_text
