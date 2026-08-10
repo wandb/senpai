@@ -20,16 +20,22 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Literal, Protocol
 from urllib.parse import urlencode
+from uuid import UUID
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 
 from senpai_agent.github.http import GitHubReader
 from senpai_agent.models import Contract
 from senpai_agent.operations import (
+    CampaignInventory,
     ContextResetStatus,
+    Nudge,
+    OperationBackend,
     OperationAuditRecord,
     OperationLedger,
+    OperationService,
     RestartStatus,
+    RoleTarget,
 )
 from senpai_agent.repair_broker import RepairAuditRecord
 from senpai_agent.secrets import (
@@ -39,6 +45,18 @@ from senpai_agent.secrets import (
 
 OPERATIONAL_INTERVAL = timedelta(minutes=15)
 RESEARCH_REVIEW_INTERVAL = timedelta(hours=6)
+RESEARCH_PRINCIPLES_NUDGE = (
+    "Scheduled research review flagged possible strategic drift. Re-read the "
+    "research principles and plateau protocol in your deployed ADVISOR.md. "
+    "Reassess whether the current programme is producing causal, "
+    "high-information progress; preserve valid ongoing work and adjust only "
+    "where those principles indicate drift."
+)
+ResearchAssessmentDecision = Literal[
+    "aligned",
+    "insufficient_evidence",
+    "strategic_drift",
+]
 _NonEmpty = Annotated[str, Field(min_length=1)]
 _BoundedText = Annotated[str, Field(max_length=2_000)]
 
@@ -1195,15 +1213,40 @@ def _trend_view(snapshot: CampaignSnapshot) -> dict[str, object]:
                 "open_for_seconds": pull.open_for_seconds,
                 "updated_at": pull.updated_at.isoformat(),
                 "discussion_count": pull.discussions.total,
+                **_pull_protocol_view(snapshot.scope, pull),
             }
             for pull in snapshot.github.pull_requests
         ],
         "running_wandb_count": snapshot.wandb.running_count,
         "retained_wandb_run_count": len(snapshot.wandb.runs),
+        "running_wandb_by_student": _running_wandb_by_student(snapshot),
         "runtimes": [
             _runtime_view(runtime)
             for runtime in snapshot.runtimes
         ],
+        "evidence_gaps": _evidence_gap_view(snapshot),
+    }
+
+
+def _research_trend_view(snapshot: CampaignSnapshot) -> dict[str, object]:
+    """Keep the raw-evidence review's retained context compact."""
+
+    return {
+        "observed_at": snapshot.observed_at.isoformat(),
+        "open_pr_count": snapshot.github.open_pr_count,
+        "pull_requests": [
+            {
+                "number": pull.number,
+                "draft": pull.draft,
+                "open_for_seconds": pull.open_for_seconds,
+                "updated_at": pull.updated_at.isoformat(),
+                "discussion_count": pull.discussions.total,
+            }
+            for pull in snapshot.github.pull_requests
+        ],
+        "running_wandb_count": snapshot.wandb.running_count,
+        "retained_wandb_run_count": len(snapshot.wandb.runs),
+        "runtimes": [_runtime_view(runtime) for runtime in snapshot.runtimes],
         "evidence_gaps": _evidence_gap_view(snapshot),
     }
 
@@ -1213,6 +1256,8 @@ def _operational_snapshot_view(snapshot: CampaignSnapshot) -> dict[str, object]:
         "observed_at": snapshot.observed_at.isoformat(),
         "scope": {
             "fingerprint": _scope_fingerprint(snapshot.scope),
+            "repo": snapshot.scope.repo,
+            "advisor_branch": snapshot.scope.advisor_branch,
             "launch_scope": snapshot.scope.launch_scope,
             "students": list(snapshot.scope.students),
         },
@@ -1226,6 +1271,7 @@ def _operational_snapshot_view(snapshot: CampaignSnapshot) -> dict[str, object]:
                     "updated_at": pull.updated_at.isoformat(),
                     "open_for_seconds": pull.open_for_seconds,
                     "discussions": pull.discussions.model_dump(mode="json"),
+                    **_pull_protocol_view(snapshot.scope, pull),
                 }
                 for pull in snapshot.github.pull_requests
             ],
@@ -1233,6 +1279,7 @@ def _operational_snapshot_view(snapshot: CampaignSnapshot) -> dict[str, object]:
         "wandb": {
             "running_count": snapshot.wandb.running_count,
             "retained_run_count": len(snapshot.wandb.runs),
+            "running_by_student": _running_wandb_by_student(snapshot),
         },
         "runtimes": [_runtime_view(runtime) for runtime in snapshot.runtimes],
         "evidence_gaps": _evidence_gap_view(snapshot),
@@ -1254,6 +1301,43 @@ _CONTROLLER_PHASES = frozenset(
         "turn-complete",
     }
 )
+
+_PR_PROTOCOL_STATUSES = frozenset(
+    {
+        "status:wip",
+        "status:review",
+        "status:blocked",
+        "status:needs-rebase",
+        "status:hold",
+    }
+)
+
+
+def _pull_protocol_view(
+    scope: CampaignScope,
+    pull: PullRequestObservation,
+) -> dict[str, object]:
+    configured_students = set(scope.students)
+    statuses = set(pull.workflow_status)
+    return {
+        "students": [
+            student for student in scope.students
+            if student in set(pull.students) and student in configured_students
+        ],
+        "protocol_status": sorted(statuses & _PR_PROTOCOL_STATUSES),
+        "unknown_protocol_status_count": len(statuses - _PR_PROTOCOL_STATUSES),
+    }
+
+
+def _running_wandb_by_student(
+    snapshot: CampaignSnapshot,
+) -> dict[str, int | None]:
+    if snapshot.wandb.running_count is None:
+        return {student: None for student in snapshot.scope.students}
+    return {
+        student: sum(run.student == student for run in snapshot.wandb.runs)
+        for student in snapshot.scope.students
+    }
 
 
 def _runtime_view(runtime: RoleRuntimeObservation) -> dict[str, object]:
@@ -1557,9 +1641,10 @@ def compose_research_review_prompt(
         "# Scheduled six-hour research review\n\n"
         "You are Senpai's separate campaign supervisor. Assess only clear, "
         "sustained strategic drift. Ordinary scientific choices remain the "
-        "advisor's responsibility. If intervention is warranted, inject one "
-        "concise reminder into the existing advisor conversation. If the "
-        "evidence is incomplete or equivocal, abstain.\n\n"
+        "advisor's responsibility. You cannot act on the campaign. Classify the "
+        "evidence only; trusted code decides whether to send a fixed reminder. "
+        "If the evidence is incomplete or equivocal, select insufficient_evidence."
+        "\n\n"
         "# Trusted current ADVISOR.md\n\n"
         f"{guidance}\n\n"
         "# Untrusted research evidence\n\n"
@@ -1570,16 +1655,16 @@ def compose_research_review_prompt(
     )
     suffix = (
         "\n\n# Required response\n\n"
-        "State whether there is concrete sustained drift, the evidence across the "
-        "review window, and any single intervention taken. Do not intervene merely "
-        "because an experiment failed or because a bounded sweep is scientifically "
-        "justified."
+        "Call submit_research_assessment exactly once with aligned, "
+        "insufficient_evidence, or strategic_drift. Do not emit an explanation, "
+        "message, command, or proposed intervention. A failed experiment or a "
+        "scientifically justified bounded sweep is not itself strategic drift."
     )
     if len(prefix) + len(suffix) >= max_chars:
         raise ValueError("ADVISOR.md exceeds the research review prompt budget")
     payload: dict[str, object] = {
         "retained_operational_trend": [
-            _trend_view(snapshot) for snapshot in snapshots[-3:]
+            _research_trend_view(snapshot) for snapshot in snapshots[-3:]
         ],
         "recent_mutation_audit": _mutation_audit_view(operation_audit),
         "recent_repair_audit": _repair_audit_view(repair_audit),
@@ -1701,7 +1786,6 @@ def operational_supervisor_main(
         parse_runner_args,
         resolve_config,
     )
-    from senpai_agent.operations import CampaignInventory
     from senpai_agent.repair_broker import RepairBrokerServer
     from senpai_agent.supervisor import ProgressLease
     from senpai_agent.weave_monitoring import finish_weave_monitoring
@@ -1869,11 +1953,19 @@ def operational_supervisor_main(
                         ),
                         repair_audit=repair_broker.recent_audit(limit=12),
                     )
-                    return _run_fresh_supervisor_turn(
+                    return _assess_and_maybe_nudge(
                         research_prompt,
                         runner_config,
                         progress,
-                        phase="research-review",
+                        inventory=inventory,
+                        backend=backend,
+                        operation_ledger_path=operation_ledger_path,
+                        advisor_conversation_id=(
+                            UUID(research_evidence.advisor_conversation_id)
+                            if research_evidence.advisor_conversation_id
+                            else None
+                        ),
+                        review_slot=due.next_research_review_at,
                     )
 
                 run_scheduled_research_review(store, review_research_direction)
@@ -1942,6 +2034,145 @@ def _run_fresh_supervisor_turn(
         return result if result else 1
     progress.update(f"{phase}-complete", 120, completed_turn=True)
     return result
+
+
+def _run_research_assessment(
+    prompt: str,
+    runner_config: object,
+    progress: object,
+) -> tuple[int, ResearchAssessmentDecision | None]:
+    """Run raw research evidence in a fresh conversation with one output tool."""
+
+    from senpai_agent.openhands_runner import run_openhands
+    from senpai_agent.research_assessment import (
+        ResearchAssessmentSubmissionError,
+        begin_research_assessment,
+        cancel_research_assessment,
+        finish_research_assessment,
+    )
+
+    instructions = Path(__file__).resolve().parents[1] / "system_instructions"
+    config = replace(
+        runner_config,
+        conversation_id=uuid.uuid4(),
+        supervisor_tool_mode="research_assessment",
+        harness_file=instructions / "RESEARCH_ASSESSOR_HARNESS.md",
+        role_file=instructions / "RESEARCH_ASSESSOR.md",
+        github_token=None,
+        command_secrets={},
+    )
+    assessment_id = config.conversation_id.hex
+    progress.update("research-review", config.timeout_seconds + 120)
+    begin_research_assessment(assessment_id)
+    try:
+        try:
+            result = run_openhands(prompt, config)
+        except Exception as error:  # noqa: BLE001
+            print(
+                "SENPAI_RESEARCH_ASSESSMENT_ERROR "
+                f"error={type(error).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1, None
+        if result != 0:
+            return result, None
+        try:
+            decision = finish_research_assessment(assessment_id)
+        except ResearchAssessmentSubmissionError:
+            print(
+                "SENPAI_RESEARCH_ASSESSMENT_INVALID",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1, None
+        progress.update(
+            "research-review-complete",
+            120,
+            completed_turn=True,
+        )
+        return 0, decision
+    finally:
+        cancel_research_assessment(assessment_id)
+
+
+def _assess_and_maybe_nudge(
+    prompt: str,
+    runner_config: object,
+    progress: object,
+    *,
+    inventory: CampaignInventory,
+    backend: OperationBackend,
+    operation_ledger_path: Path,
+    advisor_conversation_id: UUID | None,
+    review_slot: datetime,
+) -> int:
+    result, decision = _run_research_assessment(
+        prompt,
+        runner_config,
+        progress,
+    )
+    if result != 0 or decision is None:
+        return result or 1
+    if decision != "strategic_drift":
+        return 0
+    if advisor_conversation_id is None:
+        print(
+            "SENPAI_RESEARCH_NUDGE_FAILED error=MissingConversation",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
+    try:
+        disposition = _dispatch_research_principles_nudge(
+            inventory=inventory,
+            backend=backend,
+            operation_ledger_path=operation_ledger_path,
+            advisor_conversation_id=advisor_conversation_id,
+            review_slot=review_slot,
+        )
+    except Exception as error:  # noqa: BLE001
+        print(
+            "SENPAI_RESEARCH_NUDGE_FAILED "
+            f"error={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
+    print(
+        f"SENPAI_RESEARCH_NUDGE disposition={disposition}",
+        flush=True,
+    )
+    return 0
+
+
+def _dispatch_research_principles_nudge(
+    *,
+    inventory: CampaignInventory,
+    backend: OperationBackend,
+    operation_ledger_path: Path,
+    advisor_conversation_id: UUID,
+    review_slot: datetime,
+) -> Literal["executed", "replayed", "suppressed"]:
+    slot = _aware_utc(review_slot)
+    action = Nudge(
+        operation_key=(
+            "scheduled-research-review-"
+            f"{slot.strftime('%Y%m%dT%H%M%S%fZ')}"
+        ),
+        incident_key="scheduled-research-review-drift",
+        anomaly_category="research_drift",
+        reason="The isolated scheduled assessor reported sustained strategic drift.",
+        target=RoleTarget(
+            research_tag=inventory.research_tag,
+            role="advisor",
+        ),
+        expected_conversation_id=advisor_conversation_id,
+        message=RESEARCH_PRINCIPLES_NUDGE,
+    )
+    with OperationLedger(operation_ledger_path) as ledger:
+        outcome = OperationService(inventory, backend, ledger).execute(action)
+    return outcome.disposition
 
 
 def _reconcile_terminal_after_control_restart(

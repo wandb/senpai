@@ -956,6 +956,7 @@ def register_senpai_tools() -> None:
     if _TOOLS_REGISTERED:
         return
     from senpai_agent.operational_tools import SupervisorOperationTool
+    from senpai_agent.research_assessment import ResearchAssessmentTool
 
     # Keep the persisted factory identifier stable so existing OpenHands
     # conversations can verify their saved agent specification. The concrete
@@ -971,4 +972,5 @@ def register_senpai_tools() -> None:
     register_tool("task_tracker", SenpaiTaskTrackerTool)
     register_tool("senpai_terminal", SenpaiTerminalTool)
     register_tool("senpai_operations", SupervisorOperationTool)
+    register_tool("submit_research_assessment", ResearchAssessmentTool)
     _TOOLS_REGISTERED = True

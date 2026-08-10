@@ -588,6 +588,18 @@ def test_gpt56_marks_only_the_stable_system_cache_boundary():
             {"model": "openai/gpt-5.6", "agent_name": "explore"},
             "senpai:advisor:explore",
         ),
+        (
+            {"model": "openai/gpt-5.6", "role": "supervisor"},
+            "senpai:supervisor:operations",
+        ),
+        (
+            {
+                "model": "openai/gpt-5.6",
+                "role": "supervisor",
+                "supervisor_tool_mode": "research_assessment",
+            },
+            "senpai:supervisor:research_assessment",
+        ),
         ({"model": "anthropic/claude-opus-4-8"}, None),
     ],
 )

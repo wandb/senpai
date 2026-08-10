@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequenc
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
 
@@ -237,6 +238,9 @@ class RunnerConfig:
     delegation_depth: int = 0
     delegation_deadline_epoch: float | None = None
     delegation_task_id: str | None = None
+    supervisor_tool_mode: Literal[
+        "operations", "research_assessment"
+    ] = "operations"
 
 
 def parse_runner_args(argv: Sequence[str] | None = None) -> RunnerArgs:
@@ -1026,6 +1030,8 @@ def conversation_prompt_cache_key(config: RunnerConfig) -> str | None:
     if config.model.split("/", 1)[0].lower() != "openai":
         return None
     agent_kind = config.agent_name or ("child" if config.child else "main")
+    if config.role == "supervisor":
+        agent_kind = config.supervisor_tool_mode
     return f"senpai:{config.role}:{agent_kind}"
 
 
@@ -1208,7 +1214,19 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
     """Build Senpai's role-safe root tool surface."""
 
     if config.role == "supervisor":
+        if config.supervisor_tool_mode not in {
+            "operations",
+            "research_assessment",
+        }:
+            raise RuntimeError("unsupported supervisor tool mode")
         register_senpai_tools()
+        if config.supervisor_tool_mode == "research_assessment":
+            return [
+                Tool(
+                    name="submit_research_assessment",
+                    params={"assessment_id": config.conversation_id.hex},
+                )
+            ]
         register_isolated_terminal_tool()
         students = tuple(
             student.strip()
@@ -1697,6 +1715,11 @@ def run_openhands(
                 "state_dir": str(config.state_dir),
                 "conversation_id": str(config.conversation_id),
                 "role": config.role,
+                "supervisor_tool_mode": (
+                    config.supervisor_tool_mode
+                    if config.role == "supervisor"
+                    else None
+                ),
                 "model": config.model,
                 "smart_model": config.smart_model,
                 "smart_reasoning_effort": config.smart_reasoning_effort,
