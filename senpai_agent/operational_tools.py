@@ -26,11 +26,14 @@ from senpai_agent.operations import (
     CollectRole,
     CollectRoleReceipt,
     ContextReset,
+    ContextResetReceipt,
     Nudge,
+    NudgeReceipt,
     OperationLedger,
     OperationPolicy,
     OperationService,
     Restart,
+    RestartReceipt,
     RoleTarget,
 )
 
@@ -121,93 +124,67 @@ class _SupervisorOperationExecutor(
         action: SupervisorOperationAction,
         conversation: object | None = None,
     ) -> SupervisorOperationObservation:
-        target = RoleTarget(
-            research_tag=self.service.inventory.research_tag,
-            role=action.role,
-            student=action.student,
-        )
-        if action.operation == "inspect":
-            request = CollectRole(
-                operation_key=action.operation_key,
-                target=target,
+        try:
+            target = RoleTarget(
+                research_tag=self.service.inventory.research_tag,
+                role=action.role,
+                student=action.student,
             )
-        elif action.operation == "nudge":
-            request = Nudge(
-                operation_key=action.operation_key,
-                incident_key=action.incident_key,
-                anomaly_category=action.anomaly_category,
-                target=target,
-                expected_conversation_id=action.expected_conversation_id,
-                message=action.message,
-                reason=action.reason,
+            if action.operation == "inspect":
+                request = CollectRole(
+                    operation_key=action.operation_key,
+                    target=target,
+                )
+            elif action.operation == "nudge":
+                request = Nudge(
+                    operation_key=action.operation_key,
+                    incident_key=action.incident_key,
+                    anomaly_category=action.anomaly_category,
+                    target=target,
+                    expected_conversation_id=action.expected_conversation_id,
+                    message=action.message,
+                    reason=action.reason,
+                )
+            elif action.operation == "restart_controller":
+                request = Restart(
+                    operation_key=action.operation_key,
+                    incident_key=action.incident_key,
+                    anomaly_category=action.anomaly_category,
+                    target=target,
+                    expected_conversation_id=action.expected_conversation_id,
+                    reason=action.reason,
+                )
+            elif action.operation == "reset_context":
+                request = ContextReset(
+                    operation_key=action.operation_key,
+                    incident_key=action.incident_key,
+                    anomaly_category=action.anomaly_category,
+                    target=target,
+                    expected_conversation_id=action.expected_conversation_id,
+                    recovery_prompt=action.recovery_prompt,
+                    reason=action.reason,
+                )
+            else:
+                raise _InvalidOperationReceipt
+            outcome = self.service.execute(request)
+            result = (
+                _inspection_outcome_view(outcome)
+                if action.operation == "inspect"
+                else _mutation_outcome_view(action.operation, outcome)
             )
-        elif action.operation == "restart_controller":
-            request = Restart(
-                operation_key=action.operation_key,
-                incident_key=action.incident_key,
-                anomaly_category=action.anomaly_category,
-                target=target,
-                expected_conversation_id=action.expected_conversation_id,
-                reason=action.reason,
-            )
-        elif action.operation == "reset_context":
-            request = ContextReset(
-                operation_key=action.operation_key,
-                incident_key=action.incident_key,
-                anomaly_category=action.anomaly_category,
-                target=target,
-                expected_conversation_id=action.expected_conversation_id,
-                recovery_prompt=action.recovery_prompt,
-                reason=action.reason,
-            )
-        else:
-            raise ValueError(f"unsupported supervisor operation: {action.operation}")
-        outcome = self.service.execute(request)
-        if action.operation == "inspect":
-            receipt = outcome.receipt
-            if not isinstance(receipt, CollectRoleReceipt):
-                raise RuntimeError("role inspection returned an invalid receipt")
-            observed = receipt.observation
-            return SupervisorOperationObservation(
-                result={
-                    "operation_key": outcome.operation_key,
-                    "disposition": outcome.disposition,
-                    "observation": {
-                        "target": observed.target.model_dump(mode="json"),
-                        "observed_at": observed.observed_at.isoformat(),
-                        "controller_alive": observed.controller_alive,
-                        "phase": _controller_phase_category(
-                            observed.controller_phase
-                        ),
-                        "worker_generation": observed.worker_generation,
-                        "conversation_id": (
-                            str(observed.conversation_id)
-                            if observed.conversation_id is not None
-                            else None
-                        ),
-                        "active_turn": observed.active_turn,
-                        "unmatched_action_count": observed.unmatched_actions,
-                        "history_event_count": observed.raw_history_event_count,
-                        "history_fingerprint": (
-                            hashlib.sha256(
-                                observed.raw_history_digest.encode()
-                            ).hexdigest()[:16]
-                            if observed.raw_history_digest
-                            else None
-                        ),
-                        "pending_event_count": len(observed.pending_event_keys),
-                        "active_delegation_count": (
-                            observed.active_delegation_count
-                        ),
-                        "restart_authorized": (
-                            observed.restart_control_token is not None
-                        ),
-                    },
-                }
-            )
-        return SupervisorOperationObservation(
-            result=outcome.model_dump(mode="json")
-        )
+        except _InvalidOperationReceipt:
+            result = {
+                "operation": action.operation,
+                "disposition": "error",
+                "error_code": "invalid_receipt",
+            }
+        except Exception:  # Never echo backend or persisted exception text to the model.
+            result = {
+                "operation": action.operation,
+                "disposition": "error",
+                "error_code": "backend_failure",
+            }
+        return SupervisorOperationObservation(result=result)
 
     def close(self) -> None:
         self.service.close()
@@ -287,6 +264,103 @@ _CONTROLLER_PHASES = frozenset(
         "turn-complete",
     }
 )
+
+
+class _InvalidOperationReceipt(Exception):
+    pass
+
+
+def _fingerprint(value: str | None) -> str | None:
+    return hashlib.sha256(value.encode()).hexdigest()[:16] if value else None
+
+
+def _inspection_outcome_view(outcome: object) -> dict[str, object]:
+    receipt = getattr(outcome, "receipt", None)
+    if not isinstance(receipt, CollectRoleReceipt):
+        raise _InvalidOperationReceipt
+    observed = receipt.observation
+    return {
+        "operation": "inspect",
+        "disposition": outcome.disposition,
+        "observation": {
+            "target": observed.target.model_dump(mode="json"),
+            "observed_at": observed.observed_at.isoformat(),
+            "controller_alive": observed.controller_alive,
+            "phase": _controller_phase_category(observed.controller_phase),
+            "worker_generation": observed.worker_generation,
+            "conversation_id": (
+                str(observed.conversation_id)
+                if observed.conversation_id is not None
+                else None
+            ),
+            "active_turn": observed.active_turn,
+            "unmatched_action_count": observed.unmatched_actions,
+            "history_event_count": observed.raw_history_event_count,
+            "history_fingerprint": _fingerprint(observed.raw_history_digest),
+            "pending_event_count": len(observed.pending_event_keys),
+            "active_delegation_count": observed.active_delegation_count,
+            "restart_authorized": observed.restart_control_token is not None,
+        },
+    }
+
+
+def _mutation_outcome_view(
+    operation: Literal["nudge", "restart_controller", "reset_context"],
+    outcome: object,
+) -> dict[str, object]:
+    disposition = getattr(outcome, "disposition", None)
+    if disposition not in {"executed", "replayed", "suppressed"}:
+        raise _InvalidOperationReceipt
+    result: dict[str, object] = {
+        "operation": operation,
+        "disposition": disposition,
+    }
+    prior_status = getattr(outcome, "prior_status", None)
+    if prior_status is not None:
+        if prior_status not in {"running", "succeeded", "failed", "unknown"}:
+            raise _InvalidOperationReceipt
+        result["prior_status"] = prior_status
+    receipt = getattr(outcome, "receipt", None)
+    if receipt is None:
+        if disposition == "executed":
+            raise _InvalidOperationReceipt
+        return result
+    result["receipt"] = _mutation_receipt_view(operation, receipt)
+    return result
+
+
+def _mutation_receipt_view(
+    operation: Literal["nudge", "restart_controller", "reset_context"],
+    receipt: object,
+) -> dict[str, object]:
+    if operation == "nudge" and isinstance(receipt, NudgeReceipt):
+        return {
+            "conversation_id": str(receipt.conversation_id),
+            "accepted": True,
+        }
+    if operation == "restart_controller" and isinstance(receipt, RestartReceipt):
+        return {
+            "conversation_id": str(receipt.conversation_id),
+            "status": receipt.status,
+            "expected_worker_generation": receipt.expected_worker_generation,
+            "state_preserved": receipt.state_preserved,
+            "compute_preserved": receipt.compute_preserved,
+        }
+    if operation == "reset_context" and isinstance(receipt, ContextResetReceipt):
+        return {
+            "conversation_id": str(receipt.expected_conversation_id),
+            "status": receipt.status,
+            "expected_history_event_count": (
+                receipt.expected_raw_history_event_count
+            ),
+            "expected_history_fingerprint": _fingerprint(
+                receipt.expected_raw_history_digest
+            ),
+            "expected_pending_event_count": len(
+                receipt.expected_pending_event_keys
+            ),
+        }
+    raise _InvalidOperationReceipt
 
 
 def _controller_phase_category(phase: str | None) -> str | None:
