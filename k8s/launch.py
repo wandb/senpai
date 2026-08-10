@@ -57,6 +57,10 @@ from k8s.launch_helpers import (  # noqa: E402
     routing_labels,
     source_revision_for_image,
 )
+from k8s.supervisor_rollback import (  # noqa: E402
+    RollbackError,
+    SupervisorRollback,
+)
 from senpai_agent.protocols import (  # noqa: E402
     MANAGEMENT_PROTOCOL_VERSION,
     REPAIR_PROTOCOL_VERSION,
@@ -858,6 +862,89 @@ def render_operational_supervisor(
     return configmap + "\n---\n" + deployment
 
 
+def apply_operational_supervisor_release(
+    args: Args,
+    *,
+    network_policy: str,
+    secret_name: str,
+    secret: str,
+    manifest: str,
+) -> None:
+    """Atomically upgrade the mutable operational-supervisor release surface."""
+
+    try:
+        rollback = SupervisorRollback.capture(
+            tag=args.tag,
+            kube_context=args.kube_context,
+            namespace=args.namespace,
+            timeout_seconds=args.supervisor_ready_timeout_s,
+        )
+        recovery_command = shlex.join(rollback.manual_restore_argv())
+    except (OSError, RuntimeError) as error:
+        raise SystemExit(
+            "ERROR: could not capture operational supervisor rollback state; "
+            f"no supervisor resources were changed: {error}"
+        ) from error
+
+    phase = "launch"
+    try:
+        kubectl_apply(
+            network_policy,
+            "operational supervisor network policy",
+            kube_context=args.kube_context,
+            namespace=args.namespace,
+        )
+        kubectl_apply(
+            secret,
+            f"secret {secret_name}",
+            kube_context=args.kube_context,
+            namespace=args.namespace,
+        )
+        kubectl_apply(
+            manifest,
+            "operational supervisor",
+            kube_context=args.kube_context,
+            namespace=args.namespace,
+        )
+        phase = "rollout"
+        kubectl_rollout_status(
+            f"senpai-supervisor-{args.tag}",
+            timeout_seconds=args.supervisor_ready_timeout_s,
+            kube_context=args.kube_context,
+            namespace=args.namespace,
+        )
+    except (OSError, RuntimeError) as error:
+        try:
+            rollback.restore(timeout_seconds=args.supervisor_ready_timeout_s)
+        except RollbackError as rollback_error:
+            rollback_status = (
+                "AUTOMATIC ROLLBACK FAILED: "
+                f"{rollback_error}. Use the retained bundle for recovery."
+            )
+        else:
+            rollback_status = (
+                "Automatic rollback restored the prior mutable resources."
+            )
+        print(
+            f"ERROR: operational supervisor {phase} failed: {error}\n"
+            f"{rollback_status}\n"
+            "The operational supervisor's persistent SQLite state was never "
+            "rolled back. New immutable Secret or ConfigMap artifacts may remain.\n"
+            f"Rollback bundle retained at: {rollback.path}\n"
+            f"Manual recovery: {recovery_command}",
+            file=sys.stderr,
+        )
+        raise SystemExit(f"operational supervisor {phase} failed") from error
+
+    try:
+        rollback.commit()
+    except OSError as error:
+        raise SystemExit(
+            "ERROR: operational supervisor rollout succeeded, but its rollback "
+            f"bundle could not be removed: {rollback.path}: {error}"
+        ) from error
+
+
 def resolve_student_names(args: Args) -> list[str]:
     names = (
         [name.strip() for name in args.names.split(",") if name.strip()]
@@ -1410,13 +1497,6 @@ def main():
             print("--- Operational supervisor network policy ---")
             print(network_policy)
             print()
-        else:
-            kubectl_apply(
-                network_policy,
-                "operational supervisor network policy",
-                kube_context=args.kube_context,
-                namespace=args.namespace,
-            )
     launch_secret = ""
     if args.advisor or student_list:
         launch_secret = render_launch_secret(
@@ -1531,13 +1611,6 @@ def main():
             print(f"--- Secret: {supervisor_secret_name} ---")
             print(supervisor_secret)
             print()
-        else:
-            kubectl_apply(
-                supervisor_secret,
-                f"secret {supervisor_secret_name}",
-                kube_context=args.kube_context,
-                namespace=args.namespace,
-            )
         manifest = render_operational_supervisor(
             supervisor_template,
             args.tag,
@@ -1551,40 +1624,13 @@ def main():
             print(manifest)
             print()
         else:
-            kubectl_apply(
-                manifest,
-                "operational supervisor",
-                kube_context=args.kube_context,
-                namespace=args.namespace,
+            apply_operational_supervisor_release(
+                args,
+                network_policy=network_policy,
+                secret_name=supervisor_secret_name,
+                secret=supervisor_secret,
+                manifest=manifest,
             )
-            deployment_name = f"senpai-supervisor-{args.tag}"
-            try:
-                kubectl_rollout_status(
-                    deployment_name,
-                    timeout_seconds=args.supervisor_ready_timeout_s,
-                    kube_context=args.kube_context,
-                    namespace=args.namespace,
-                )
-            except RuntimeError as error:
-                rollback = shlex.join(
-                    kubectl_command(
-                        "rollout",
-                        "undo",
-                        f"deployment/{deployment_name}",
-                        kube_context=args.kube_context,
-                        namespace=args.namespace,
-                    )
-                )
-                print(
-                    "ERROR: operational supervisor rollout failed: "
-                    f"{error}\nDeployment template only: {rollback}\n"
-                    "This does not revert RBAC, NetworkPolicy, or persistent state; "
-                    "reapply the retained prior release manifest if those changed.",
-                    file=sys.stderr,
-                )
-                raise SystemExit(
-                    "operational supervisor rollout failed"
-                ) from error
 
     if not args.dry_run:
         print(f"\nLaunched {len(student_list)} students: {', '.join(student_list)}")

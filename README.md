@@ -251,10 +251,17 @@ the state claim concurrently, with a short supervisor-only outage during
 replacement. The launcher waits up to `--supervisor_ready_timeout_s` for the
 Deployment to become ready.
 
-On rollout failure, the printed `kubectl rollout undo` command rolls back only
-the supervisor Deployment template. It does not restore RBAC, NetworkPolicy, or
-the durable state claim; reapply the retained prior release manifest if those
-resources changed. Persistent state is never automatically rolled back.
+Immediately before the first mutable supervisor resource is changed, the
+launcher writes a mode-`0600` rollback bundle under
+`$XDG_STATE_HOME/senpai/rollback` (or `~/.local/state/senpai/rollback`). The
+bundle records the exact prior NetworkPolicy, ServiceAccount, Role,
+RoleBinding, and Deployment, including which resources did not exist. Any apply
+or readiness failure automatically restores the prior objects, deletes objects
+that were previously absent, and verifies a restored Deployment. The bundle is
+removed only after a healthy new rollout; a failed launch prints and retains
+its path and an exact manual retry command for recovery. Immutable release
+artifacts may remain after rollback. The supervisor's persistent SQLite state
+is never rolled back.
 
 The supervisor also receives a dedicated Kubernetes ServiceAccount and
 namespace-scoped Role/RoleBinding. This is a Kubernetes workload identity, not
@@ -780,13 +787,14 @@ Secret and ConfigMap, and reapply the ServiceAccount, Role, RoleBinding, and
 supervisor Deployment. They do not mutate advisor/student Deployments or the
 fixed role Secret, and prior supervisor bundles remain available. `Recreate`
 gives the state PVC one supervisor writer at the cost of replacement downtime.
-The launcher waits for readiness before it returns. If readiness fails, the
-printed rollback command restores only the previous Deployment template, whose
-ReplicaSet references the retained prior bundle; it does not restore RBAC,
-NetworkPolicy, or persistent state. Reapply the prior release manifest when
-those resources need rollback. Both preflight and the immediate pre-mutation
-recheck validate the namespace, dedicated state claim, exact inventory, and
-protocol annotations.
+The launcher waits for readiness before it returns. Before mutation it captures
+the five mutable release resources in a local mode-`0600` rollback bundle. An
+apply or readiness failure automatically restores the prior NetworkPolicy,
+ServiceAccount, Role, RoleBinding, and Deployment and removes any of those that
+were previously absent. A failed launch retains and prints the bundle; a healthy
+rollout deletes it. Rollback never rewinds the persistent SQLite state. Both
+preflight and the immediate pre-mutation recheck validate the namespace,
+dedicated state claim, exact inventory, and protocol annotations.
 
 To stop only the supervisor, delete `deployment/senpai-supervisor-<tag>` in the
 campaign namespace. This leaves research-role pods and repair sidecars, the

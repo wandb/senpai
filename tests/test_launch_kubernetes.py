@@ -1,5 +1,7 @@
+import json
 import re
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -281,6 +283,18 @@ def bypass_external_preflight(monkeypatch):
     )
 
 
+def bypass_supervisor_rollback_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        launch.SupervisorRollback,
+        "capture",
+        lambda **_kwargs: SimpleNamespace(
+            commit=lambda: None,
+            manual_restore_argv=lambda: ["python", "restore"],
+            restore=lambda **_kwargs: None,
+        ),
+    )
+
+
 def supervisor_launch_args(**overrides):
     overrides.setdefault("supervisor_network_policy_enforced", True)
     overrides.setdefault(
@@ -348,6 +362,7 @@ def test_supervisor_rechecks_live_storage_and_inventory_before_mutation(
     )
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
+    bypass_supervisor_rollback_snapshot(monkeypatch)
     checks = {"pvc": 0, "advisors": 0}
 
     def pvc(*_args, **_kwargs):
@@ -543,7 +558,7 @@ def successful_kubectl(calls):
         return subprocess.CompletedProcess(
             args=argv,
             returncode=0,
-            stdout="applied",
+            stdout="" if "get" in argv else "applied",
             stderr="",
         )
 
@@ -602,6 +617,7 @@ def test_incremental_supervisor_allows_a_compatible_older_advisor_revision(
     )
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
+    bypass_supervisor_rollback_snapshot(monkeypatch)
     monkeypatch.setattr(
         launch,
         "existing_advisor_deployments",
@@ -745,6 +761,7 @@ def test_supervisor_only_launch_preserves_role_secret_and_uses_immutable_bundle(
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
     compatible_existing_campaign(monkeypatch, args)
+    bypass_supervisor_rollback_snapshot(monkeypatch)
     calls = []
     monkeypatch.setattr(launch_helpers.subprocess, "run", successful_kubectl(calls))
 
@@ -841,6 +858,7 @@ def test_supervisor_only_upgrade_skips_role_credentials_and_repo_setup(monkeypat
     )
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     compatible_existing_campaign(monkeypatch, args)
+    bypass_supervisor_rollback_snapshot(monkeypatch)
 
     resolved = []
     checked = []
@@ -922,6 +940,7 @@ def test_supervisor_bundle_names_change_without_overwriting_prior_release(
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
     compatible_existing_campaign(monkeypatch, args)
+    bypass_supervisor_rollback_snapshot(monkeypatch)
     model_key = {"value": "openai-release-a"}
     monkeypatch.setattr(
         launch,
@@ -976,9 +995,10 @@ def test_supervisor_bundle_names_change_without_overwriting_prior_release(
     assert not any("delete" in argv for argv, _kwargs in calls)
 
 
-def test_supervisor_rollout_failure_surfaces_exact_rollback_command(
+def test_supervisor_rollout_failure_restores_the_exact_previous_release(
     monkeypatch,
     capsys,
+    tmp_path,
 ):
     args = supervisor_launch_args(
         advisor=False,
@@ -990,9 +1010,42 @@ def test_supervisor_rollout_failure_surfaces_exact_rollback_command(
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
     compatible_existing_campaign(monkeypatch, args)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    rollout_attempts = 0
+    previous = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": "senpai-supervisor-test-track",
+            "namespace": "senpai-test-track",
+            "resourceVersion": "before-upgrade",
+        },
+        "spec": {"replicas": 1},
+    }
 
     def run(argv, **kwargs):
+        nonlocal rollout_attempts
+        if "get" in argv:
+            if "deployment.apps/senpai-supervisor-test-track" in argv:
+                current = dict(previous)
+                current["metadata"] = dict(previous["metadata"])
+                current["metadata"]["resourceVersion"] = "current-version"
+                return subprocess.CompletedProcess(
+                    args=argv,
+                    returncode=0,
+                    stdout=json.dumps(current),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         if "rollout" in argv and "status" in argv:
+            rollout_attempts += 1
+            if rollout_attempts > 1:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout="restored",
+                    stderr="",
+                )
             return subprocess.CompletedProcess(
                 args=argv,
                 returncode=1,
@@ -1013,12 +1066,122 @@ def test_supervisor_rollout_failure_surfaces_exact_rollback_command(
 
     output = capsys.readouterr()
     assert "deployment exceeded its progress deadline" in output.err
-    assert (
-        "kubectl --context gpu-cluster --namespace senpai-test-track rollout undo "
-        "deployment/senpai-supervisor-test-track"
-    ) in output.err
-    assert "Deployment template only" in output.err
-    assert "does not revert RBAC, NetworkPolicy, or persistent state" in output.err
+    assert "Automatic rollback restored the prior mutable resources" in output.err
+    assert "persistent SQLite state was never rolled back" in output.err
+    assert "Rollback bundle retained at" in output.err
+    assert "Manual recovery:" in output.err
+    assert rollout_attempts == 2
+    assert list(tmp_path.rglob("*.json"))
+
+
+def test_supervisor_apply_failure_removes_every_new_mutable_resource(
+    monkeypatch,
+    capsys,
+    tmp_path,
+):
+    args = supervisor_launch_args(
+        advisor=False,
+        operational_supervisor=True,
+        names="",
+        n_students=0,
+        kube_context="gpu-cluster",
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    compatible_existing_campaign(monkeypatch, args)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if "get" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        if (
+            "apply" in argv
+            and "kind: ConfigMap" in kwargs.get("input", "")
+            and "kind: Deployment" in kwargs.get("input", "")
+        ):
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                stdout="",
+                stderr="admission denied the supervisor Deployment",
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout="restored", stderr="")
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+
+    with pytest.raises(SystemExit, match="operational supervisor launch failed"):
+        launch.main()
+
+    deleted = [argv for argv, _kwargs in calls if "delete" in argv]
+    first_apply = next(
+        index
+        for index, (argv, _kwargs) in enumerate(calls)
+        if "apply" in argv
+    )
+    assert all("get" in argv for argv, _kwargs in calls[:first_apply])
+    assert first_apply == 5
+    assert [argv[argv.index("delete") + 1] for argv in deleted] == [
+        "networkpolicy.networking.k8s.io/senpai-supervisor-egress-test-track",
+        "serviceaccount/senpai-supervisor-test-track",
+        "role.rbac.authorization.k8s.io/senpai-supervisor-test-track",
+        "rolebinding.rbac.authorization.k8s.io/senpai-supervisor-test-track",
+        "deployment.apps/senpai-supervisor-test-track",
+    ]
+    assert all(
+        argv[:5]
+        == [
+            "kubectl",
+            "--context",
+            "gpu-cluster",
+            "--namespace",
+            "senpai-test-track",
+        ]
+        for argv in deleted
+    )
+    output = capsys.readouterr()
+    assert "admission denied the supervisor Deployment" in output.err
+    assert "persistent SQLite state was never rolled back" in output.err
+    assert list(tmp_path.rglob("*.json"))
+
+
+def test_successful_supervisor_rollout_removes_the_rollback_bundle(
+    monkeypatch,
+    tmp_path,
+):
+    args = supervisor_launch_args(
+        advisor=False,
+        operational_supervisor=True,
+        names="",
+        n_students=0,
+        kube_context="gpu-cluster",
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    compatible_existing_campaign(monkeypatch, args)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="" if "get" in argv else "ready",
+            stderr="",
+        )
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+
+    launch.main()
+
+    assert not list(tmp_path.rglob("*.json"))
+    first_apply = next(
+        index for index, (argv, _kwargs) in enumerate(calls) if "apply" in argv
+    )
+    assert first_apply == 5
+    assert all("get" in argv for argv, _kwargs in calls[:first_apply])
 
 
 def test_supervisor_rejects_an_extra_exact_tag_advisor(monkeypatch):
