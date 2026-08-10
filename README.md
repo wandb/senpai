@@ -251,17 +251,24 @@ the state claim concurrently, with a short supervisor-only outage during
 replacement. The launcher waits up to `--supervisor_ready_timeout_s` for the
 Deployment to become ready.
 
-Immediately before the first mutable supervisor resource is changed, the
-launcher writes a mode-`0600` rollback bundle under
+Before the first mutable supervisor resource is changed, the launcher resolves
+and pins the Kubernetes context plus the cluster and campaign-namespace UIDs,
+acquires a campaign-scoped Lease, and writes a mode-`0600` rollback bundle under
 `$XDG_STATE_HOME/senpai/rollback` (or `~/.local/state/senpai/rollback`). The
-bundle records the exact prior NetworkPolicy, ServiceAccount, Role,
-RoleBinding, and Deployment, including which resources did not exist. Any apply
-or readiness failure automatically restores the prior objects, deletes objects
-that were previously absent, and verifies a restored Deployment. The bundle is
-removed only after a healthy new rollout; a failed launch prints and retains
-its path and an exact manual retry command for recovery. Immutable release
-artifacts may remain after rollback. The supervisor's persistent SQLite state
-is never rolled back.
+private, bounded, atomically fsynced bundle records the exact prior
+NetworkPolicy, ServiceAccount, Role, RoleBinding, and Deployment, including
+which resources did not exist and the Lease UID/transition epoch. Any apply,
+readiness, interruption, or unexpected process failure attempts rollback. It
+first removes the failed Deployment in foreground, restores and verifies the
+security resources, and only then recreates and verifies the old Deployment.
+Lease lineage prevents an old bundle from overwriting a newer release. A
+healthy rollout marks the cluster Lease committed before finalizing and
+removing the local journal; a finalized Lease reconciles a crash-stale local
+journal on the next launch. A failed launch prints and retains its path and a
+derived manual recovery command. If a healthy rollout cannot finish that
+bookkeeping, the launcher prints a separate `finalize-commit` command—never use
+the restore command for that case. Immutable release artifacts may remain after
+rollback. The supervisor's persistent SQLite state is never rolled back.
 
 The supervisor also receives a dedicated Kubernetes ServiceAccount and
 namespace-scoped Role/RoleBinding. This is a Kubernetes workload identity, not
@@ -787,14 +794,19 @@ Secret and ConfigMap, and reapply the ServiceAccount, Role, RoleBinding, and
 supervisor Deployment. They do not mutate advisor/student Deployments or the
 fixed role Secret, and prior supervisor bundles remain available. `Recreate`
 gives the state PVC one supervisor writer at the cost of replacement downtime.
-The launcher waits for readiness before it returns. Before mutation it captures
-the five mutable release resources in a local mode-`0600` rollback bundle. An
-apply or readiness failure automatically restores the prior NetworkPolicy,
-ServiceAccount, Role, RoleBinding, and Deployment and removes any of those that
-were previously absent. A failed launch retains and prints the bundle; a healthy
-rollout deletes it. Rollback never rewinds the persistent SQLite state. Both
-preflight and the immediate pre-mutation recheck validate the namespace,
-dedicated state claim, exact inventory, and protocol annotations.
+The launcher waits for readiness before it returns. Before mutation it pins the
+resolved cluster/namespace identity, takes a campaign transaction Lease, and
+captures the five mutable release resources in a private durable rollback
+bundle. Failure or interruption quiesces the failed Deployment before restoring
+and canonically verifying the security resources and old Deployment. The
+bundle's Lease lineage rejects stale recovery after a newer release. A failed
+launch retains and prints the bundle; the Lease carries the authoritative
+transaction phase across hosts and context aliases, while a private local lock
+serializes journal creation on one host. A healthy rollout finalizes that Lease
+before reconciling and deleting its local journal. Rollback never rewinds immutable release
+artifacts or the persistent SQLite state. Both preflight and the immediate
+pre-mutation recheck validate the namespace, dedicated state claim, exact
+inventory, and protocol annotations.
 
 To stop only the supervisor, delete `deployment/senpai-supervisor-<tag>` in the
 campaign namespace. This leaves research-role pods and repair sidecars, the

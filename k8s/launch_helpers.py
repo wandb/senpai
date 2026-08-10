@@ -936,22 +936,30 @@ def kubectl_apply(
     *,
     kube_context: str = "",
     namespace: str = "default",
+    process_timeout_seconds: int = 60,
 ) -> None:
     """Apply a manifest via kubectl."""
     print(f"Launching: {name}")
-    result = subprocess.run(
-        kubectl_command(
-            "apply",
-            "-f",
-            "-",
-            kube_context=kube_context,
-            namespace=namespace,
-        ),
-        input=manifest,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            kubectl_command(
+                "apply",
+                "-f",
+                "-",
+                kube_context=kube_context,
+                namespace=namespace,
+            ),
+            input=manifest,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=process_timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"kubectl apply timed out for {name} after "
+            f"{process_timeout_seconds}s"
+        ) from error
     if result.returncode != 0:
         detail = result.stderr.strip() or "kubectl returned no error text"
         raise RuntimeError(f"kubectl apply failed for {name}: {detail}")
@@ -968,19 +976,26 @@ def kubectl_rollout_status(
     """Wait until one Deployment rollout is healthy or fail with kubectl detail."""
 
     print(f"Waiting for rollout: {deployment}")
-    result = subprocess.run(
-        kubectl_command(
-            "rollout",
-            "status",
-            f"deployment/{deployment}",
-            f"--timeout={timeout_seconds}s",
-            kube_context=kube_context,
-            namespace=namespace,
-        ),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    process_timeout_seconds = timeout_seconds + 15
+    try:
+        result = subprocess.run(
+            kubectl_command(
+                "rollout",
+                "status",
+                f"deployment/{deployment}",
+                f"--timeout={timeout_seconds}s",
+                kube_context=kube_context,
+                namespace=namespace,
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=process_timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"kubectl rollout status timed out after {process_timeout_seconds}s"
+        ) from error
     if result.returncode != 0:
         detail = result.stderr.strip() or "kubectl returned no error text"
         raise RuntimeError(detail)

@@ -812,11 +812,21 @@ Deployment uses `Recreate` so the state claim has one supervisor writer, with a
 supervisor-only outage during replacement. The launcher waits for rollout
 readiness for the configured timeout.
 
-On failure, the exact namespace/context-qualified `kubectl rollout undo`
-command printed by the launcher restores only the previous Deployment template.
-It does not revert RBAC, NetworkPolicy, or any persistent-state mutation. The
-operator must reapply a retained prior release manifest if those resources
-changed; persistent state has no automatic rollback.
+Before mutation, the launcher resolves the explicit Kubernetes context, pins
+the cluster and campaign-namespace UIDs, acquires a campaign release Lease, and
+durably captures the exact mutable NetworkPolicy, ServiceAccount, Role,
+RoleBinding, and Deployment. A failed or interrupted release first removes the
+failed Deployment in foreground, then restores and canonically verifies the
+security resources before recreating and verifying the old Deployment. The
+private journal records Lease UID/transition lineage, while the Lease carries
+the authoritative transaction phase across hosts and kube-context aliases.
+Manual recovery can resume an expired transaction but cannot overwrite a newer
+release. A healthy release marks the Lease committed before reconciling and
+deleting its local journal; crash-stale local state is reconciled from an exact
+final Lease epoch. A separate explicit `finalize-commit` operation repairs
+bookkeeping only when the operator already knows the new rollout is healthy.
+Rollback intentionally excludes immutable Secret/ConfigMap artifacts and the
+persistent SQLite state.
 
 When enabled, the launcher also creates one dedicated supervisor
 ServiceAccount, namespace-scoped Role, RoleBinding, and Deployment. The Pod
@@ -896,8 +906,10 @@ and management/repair protocol versions, but do not require equal source
 revisions, Exa/Hugging Face credentials, branch creation, or student-label
 mutation. Each release uses a new immutable content-addressed Secret and
 ConfigMap, reapplies the supervisor-only NetworkPolicy/RBAC/Deployment resources,
-waits for readiness, retains the previous bundle, and emits the Deployment-only
-rollback command if the rollout fails. Deleting only
+and waits for readiness. Its scope-pinned, Lease-serialized rollback journal
+restores and verifies all five mutable release resources after apply, rollout,
+or interruption failure; it retains a derived manual recovery command when
+automatic recovery cannot finish. Deleting only
 `deployment/senpai-supervisor-<tag>` is the supervisor kill switch: it preserves
 advisor/student pods and repair sidecars, RBAC, NetworkPolicy, immutable bundles,
 the state PVC, and host capacity.

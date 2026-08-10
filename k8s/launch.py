@@ -883,37 +883,66 @@ def apply_operational_supervisor_release(
             f"no supervisor resources were changed: {error}"
         ) from error
 
+    kube_context = rollback.resolved_kube_context
+    try:
+        rollback.mark_mutation_started()
+    except BaseException as error:
+        cleanup_error: BaseException | None = None
+        try:
+            rollback.commit()
+        except BaseException as caught:
+            cleanup_error = caught
+        cleanup_status = (
+            f"Rollback journal cleanup also failed: {cleanup_error}. "
+            f"Retained at: {rollback.path}"
+            if cleanup_error is not None
+            else "The unused rollback journal and transaction Lease were retired."
+        )
+        print(
+            "ERROR: operational supervisor release preparation failed before "
+            f"any resource mutation: {error}\n{cleanup_status}",
+            file=sys.stderr,
+        )
+        if cleanup_error is not None and not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        if not isinstance(error, (OSError, RuntimeError)):
+            raise
+        raise SystemExit("operational supervisor release preparation failed") from error
+
     phase = "launch"
     try:
         kubectl_apply(
             network_policy,
             "operational supervisor network policy",
-            kube_context=args.kube_context,
+            kube_context=kube_context,
             namespace=args.namespace,
         )
         kubectl_apply(
             secret,
             f"secret {secret_name}",
-            kube_context=args.kube_context,
+            kube_context=kube_context,
             namespace=args.namespace,
         )
         kubectl_apply(
             manifest,
             "operational supervisor",
-            kube_context=args.kube_context,
+            kube_context=kube_context,
             namespace=args.namespace,
         )
         phase = "rollout"
+        rollback.renew_lease()
         kubectl_rollout_status(
             f"senpai-supervisor-{args.tag}",
             timeout_seconds=args.supervisor_ready_timeout_s,
-            kube_context=args.kube_context,
+            kube_context=kube_context,
             namespace=args.namespace,
         )
-    except (OSError, RuntimeError) as error:
+    except BaseException as error:
+        rollback_failure: BaseException | None = None
         try:
             rollback.restore(timeout_seconds=args.supervisor_ready_timeout_s)
-        except Exception as rollback_error:
+        except BaseException as rollback_error:
+            rollback_failure = rollback_error
             rollback_status = (
                 "AUTOMATIC ROLLBACK FAILED: "
                 f"{rollback_error}. Use the retained bundle for recovery."
@@ -931,14 +960,24 @@ def apply_operational_supervisor_release(
             f"Manual recovery: {recovery_command}",
             file=sys.stderr,
         )
+        if rollback_failure is not None and not isinstance(
+            rollback_failure, Exception
+        ):
+            raise rollback_failure
+        if not isinstance(error, (OSError, RuntimeError)):
+            raise
         raise SystemExit(f"operational supervisor {phase} failed") from error
 
     try:
         rollback.commit()
-    except OSError as error:
+    except (OSError, RuntimeError) as error:
+        finalize_command = shlex.join(rollback.manual_finalize_argv())
         raise SystemExit(
             "ERROR: operational supervisor rollout succeeded, but its rollback "
-            f"bundle could not be removed: {rollback.path}: {error}"
+            "transaction could not be finalized. Do not run rollback: the new "
+            f"rollout is healthy. Retained bundle: {rollback.path}: {error}. "
+            f"After the transaction Lease expires, reconcile it with: "
+            f"{finalize_command}"
         ) from error
 
 

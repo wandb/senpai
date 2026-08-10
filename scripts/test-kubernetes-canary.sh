@@ -286,6 +286,14 @@ print(rollback.path)
 ' "$tag" "$CONTEXT" "$NAMESPACE" "$directory"
 }
 
+expire_supervisor_rollback_lease() {
+  local tag=$1
+  kubectl_canary patch lease -n "$NAMESPACE" \
+    "senpai-supervisor-release-$tag" --type=merge \
+    -p '{"spec":{"leaseDurationSeconds":1,"renewTime":"1970-01-01T00:00:00Z"}}' \
+    >/dev/null
+}
+
 render initial "$INITIAL_MANIFEST"
 kubectl_canary apply -f "$INITIAL_MANIFEST"
 kubectl_canary wait -n "$OTHER_NAMESPACE" --for=condition=Ready \
@@ -643,6 +651,9 @@ ABSENT_ROLLBACK_BUNDLE=$(capture_supervisor_rollback \
   "$ABSENT_TAG" "$ROLLBACK_DIR")
 ABSENT_SERVICE_ACCOUNT="senpai-supervisor-$ABSENT_TAG"
 kubectl_canary create serviceaccount -n "$NAMESPACE" "$ABSENT_SERVICE_ACCOUNT"
+# The capture process deliberately exited without releasing its transaction.
+# Expire that exact Lease epoch before exercising cross-process recovery.
+expire_supervisor_rollback_lease "$ABSENT_TAG"
 "$PYTHON_BIN" k8s/supervisor_rollback.py restore \
   "$ABSENT_ROLLBACK_BUNDLE" --timeout-seconds 120
 if kubectl_canary get serviceaccount -n "$NAMESPACE" \
@@ -664,6 +675,7 @@ if kubectl_canary rollout status -n "$NAMESPACE" "$SUPERVISOR" --timeout=15s; th
   echo "deliberately broken supervisor release unexpectedly became ready" >&2
   exit 1
 fi
+expire_supervisor_rollback_lease "$TAG"
 "$PYTHON_BIN" k8s/supervisor_rollback.py restore \
   "$ROLLBACK_BUNDLE" --timeout-seconds 120
 test -f "$ROLLBACK_BUNDLE"

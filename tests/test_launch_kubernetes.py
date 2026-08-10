@@ -1,6 +1,7 @@
 import json
 import re
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -116,6 +117,31 @@ def test_kubectl_apply_raises_with_the_resource_and_error_detail(monkeypatch):
         "-",
     ]
     assert captured["kwargs"]["input"] == "kind: Service"
+    assert captured["kwargs"]["timeout"] == 60
+
+
+def test_kubectl_apply_and_rollout_have_process_deadlines(monkeypatch):
+    deadlines = []
+
+    def timeout(argv, **kwargs):
+        deadlines.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", timeout)
+
+    with pytest.raises(RuntimeError, match="apply timed out.*37s"):
+        launch_helpers.kubectl_apply(
+            "kind: Service",
+            "advisor service",
+            process_timeout_seconds=37,
+        )
+    with pytest.raises(RuntimeError, match="rollout status timed out.*62s"):
+        launch_helpers.kubectl_rollout_status(
+            "senpai-supervisor-maple",
+            timeout_seconds=47,
+        )
+
+    assert deadlines == [37, 62]
 
 
 def test_student_discovery_uses_the_requested_cluster_scope(monkeypatch):
@@ -284,14 +310,21 @@ def bypass_external_preflight(monkeypatch):
 
 
 def bypass_supervisor_rollback_snapshot(monkeypatch):
+    def capture(**kwargs):
+        return SimpleNamespace(
+            commit=lambda: None,
+            manual_finalize_argv=lambda: ["python", "finalize-commit"],
+            manual_restore_argv=lambda: ["python", "restore"],
+            mark_mutation_started=lambda: None,
+            renew_lease=lambda: None,
+            resolved_kube_context=kwargs["kube_context"] or "resolved-context",
+            restore=lambda **_kwargs: None,
+        )
+
     monkeypatch.setattr(
         launch.SupervisorRollback,
         "capture",
-        lambda **_kwargs: SimpleNamespace(
-            commit=lambda: None,
-            manual_restore_argv=lambda: ["python", "restore"],
-            restore=lambda **_kwargs: None,
-        ),
+        capture,
     )
 
 
@@ -830,6 +863,8 @@ def test_supervisor_only_launch_preserves_role_secret_and_uses_immutable_bundle(
     ] == [
         [
             "kubectl",
+            "--context",
+            "resolved-context",
             "--namespace",
             "senpai-test-track",
             "rollout",
@@ -995,74 +1030,44 @@ def test_supervisor_bundle_names_change_without_overwriting_prior_release(
     assert not any("delete" in argv for argv, _kwargs in calls)
 
 
-def test_supervisor_rollout_failure_restores_the_exact_previous_release(
+def test_supervisor_rollout_failure_invokes_transactional_restore(
     monkeypatch,
     capsys,
-    tmp_path,
 ):
-    args = supervisor_launch_args(
-        advisor=False,
-        operational_supervisor=True,
-        names="",
-        n_students=0,
-        kube_context="gpu-cluster",
+    events = []
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: events.append("commit"),
+        manual_restore_argv=lambda: ["python", "restore"],
+        mark_mutation_started=lambda: events.append("mutation-started"),
+        renew_lease=lambda: events.append("renew"),
+        resolved_kube_context="resolved-cluster",
+        restore=lambda **_kwargs: events.append("restore"),
     )
-    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
-    bypass_external_preflight(monkeypatch)
-    compatible_existing_campaign(monkeypatch, args)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
-    rollout_attempts = 0
-    previous = {
-        "apiVersion": "apps/v1",
-        "kind": "Deployment",
-        "metadata": {
-            "name": "senpai-supervisor-test-track",
-            "namespace": "senpai-test-track",
-            "resourceVersion": "before-upgrade",
-        },
-        "spec": {"replicas": 1},
-    }
-
-    def run(argv, **kwargs):
-        nonlocal rollout_attempts
-        if "get" in argv:
-            if "deployment.apps/senpai-supervisor-test-track" in argv:
-                current = dict(previous)
-                current["metadata"] = dict(previous["metadata"])
-                current["metadata"]["resourceVersion"] = "current-version"
-                return subprocess.CompletedProcess(
-                    args=argv,
-                    returncode=0,
-                    stdout=json.dumps(current),
-                    stderr="",
-                )
-            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-        if "rollout" in argv and "status" in argv:
-            rollout_attempts += 1
-            if rollout_attempts > 1:
-                return subprocess.CompletedProcess(
-                    argv,
-                    0,
-                    stdout="restored",
-                    stderr="",
-                )
-            return subprocess.CompletedProcess(
-                args=argv,
-                returncode=1,
-                stdout="",
-                stderr="deployment exceeded its progress deadline",
-            )
-        return subprocess.CompletedProcess(
-            args=argv,
-            returncode=0,
-            stdout="applied",
-            stderr="",
-        )
-
-    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+    monkeypatch.setattr(launch.SupervisorRollback, "capture", lambda **_kwargs: rollback)
+    applied_contexts = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **kwargs: applied_contexts.append(kwargs["kube_context"]),
+    )
+    monkeypatch.setattr(
+        launch,
+        "kubectl_rollout_status",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("deployment exceeded its progress deadline")
+        ),
+    )
+    args = supervisor_launch_args(kube_context="")
 
     with pytest.raises(SystemExit, match="operational supervisor rollout failed"):
-        launch.main()
+        launch.apply_operational_supervisor_release(
+            args,
+            network_policy="policy",
+            secret_name="secret",
+            secret="secret manifest",
+            manifest="supervisor manifest",
+        )
 
     output = capsys.readouterr()
     assert "deployment exceeded its progress deadline" in output.err
@@ -1070,118 +1075,210 @@ def test_supervisor_rollout_failure_restores_the_exact_previous_release(
     assert "persistent SQLite state was never rolled back" in output.err
     assert "Rollback bundle retained at" in output.err
     assert "Manual recovery:" in output.err
-    assert rollout_attempts == 2
-    assert list(tmp_path.rglob("*.json"))
+    assert events == ["mutation-started", "renew", "restore"]
+    assert applied_contexts == ["resolved-cluster"] * 3
 
 
-def test_supervisor_apply_failure_removes_every_new_mutable_resource(
+def test_supervisor_apply_failure_invokes_transactional_restore(
     monkeypatch,
     capsys,
-    tmp_path,
 ):
-    args = supervisor_launch_args(
-        advisor=False,
-        operational_supervisor=True,
-        names="",
-        n_students=0,
-        kube_context="gpu-cluster",
+    events = []
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: events.append("commit"),
+        manual_restore_argv=lambda: ["python", "restore"],
+        mark_mutation_started=lambda: events.append("mutation-started"),
+        renew_lease=lambda: events.append("renew"),
+        resolved_kube_context="gpu-cluster",
+        restore=lambda **_kwargs: events.append("restore"),
     )
-    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
-    bypass_external_preflight(monkeypatch)
-    compatible_existing_campaign(monkeypatch, args)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
-    calls = []
+    monkeypatch.setattr(launch.SupervisorRollback, "capture", lambda **_kwargs: rollback)
+    applies = 0
 
-    def run(argv, **kwargs):
-        calls.append((argv, kwargs))
-        if "get" in argv:
-            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-        if (
-            "apply" in argv
-            and "kind: ConfigMap" in kwargs.get("input", "")
-            and "kind: Deployment" in kwargs.get("input", "")
-        ):
-            return subprocess.CompletedProcess(
-                argv,
-                1,
-                stdout="",
-                stderr="admission denied the supervisor Deployment",
-            )
-        return subprocess.CompletedProcess(argv, 0, stdout="restored", stderr="")
+    def apply(*_args, **_kwargs):
+        nonlocal applies
+        applies += 1
+        if applies == 3:
+            raise RuntimeError("admission denied the supervisor Deployment")
 
-    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+    monkeypatch.setattr(launch, "kubectl_apply", apply)
+    args = supervisor_launch_args(kube_context="gpu-cluster")
 
     with pytest.raises(SystemExit, match="operational supervisor launch failed"):
-        launch.main()
-
-    deleted = [argv for argv, _kwargs in calls if "delete" in argv]
-    first_apply = next(
-        index
-        for index, (argv, _kwargs) in enumerate(calls)
-        if "apply" in argv
-    )
-    assert all("get" in argv for argv, _kwargs in calls[:first_apply])
-    assert first_apply == 5
-    assert [argv[argv.index("delete") + 1] for argv in deleted] == [
-        "networkpolicy.networking.k8s.io/senpai-supervisor-egress-test-track",
-        "serviceaccount/senpai-supervisor-test-track",
-        "role.rbac.authorization.k8s.io/senpai-supervisor-test-track",
-        "rolebinding.rbac.authorization.k8s.io/senpai-supervisor-test-track",
-        "deployment.apps/senpai-supervisor-test-track",
-    ]
-    assert all(
-        argv[:5]
-        == [
-            "kubectl",
-            "--context",
-            "gpu-cluster",
-            "--namespace",
-            "senpai-test-track",
-        ]
-        for argv in deleted
-    )
-    output = capsys.readouterr()
-    assert "admission denied the supervisor Deployment" in output.err
-    assert "persistent SQLite state was never rolled back" in output.err
-    assert list(tmp_path.rglob("*.json"))
-
-
-def test_successful_supervisor_rollout_removes_the_rollback_bundle(
-    monkeypatch,
-    tmp_path,
-):
-    args = supervisor_launch_args(
-        advisor=False,
-        operational_supervisor=True,
-        names="",
-        n_students=0,
-        kube_context="gpu-cluster",
-    )
-    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
-    bypass_external_preflight(monkeypatch)
-    compatible_existing_campaign(monkeypatch, args)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
-    calls = []
-
-    def run(argv, **kwargs):
-        calls.append((argv, kwargs))
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            stdout="" if "get" in argv else "ready",
-            stderr="",
+        launch.apply_operational_supervisor_release(
+            args,
+            network_policy="policy",
+            secret_name="secret",
+            secret="secret manifest",
+            manifest="supervisor manifest",
         )
 
-    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+    assert events == ["mutation-started", "restore"]
+    assert applies == 3
+    assert "admission denied the supervisor Deployment" in capsys.readouterr().err
 
-    launch.main()
 
-    assert not list(tmp_path.rglob("*.json"))
-    first_apply = next(
-        index for index, (argv, _kwargs) in enumerate(calls) if "apply" in argv
+def test_supervisor_interrupt_restores_before_propagating(monkeypatch):
+    events = []
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: events.append("commit"),
+        manual_restore_argv=lambda: ["python", "restore"],
+        mark_mutation_started=lambda: events.append("mutation-started"),
+        renew_lease=lambda: events.append("renew"),
+        resolved_kube_context="gpu-cluster",
+        restore=lambda **_kwargs: events.append("restore"),
     )
-    assert first_apply == 5
-    assert all("get" in argv for argv, _kwargs in calls[:first_apply])
+    monkeypatch.setattr(
+        launch.SupervisorRollback,
+        "capture",
+        lambda **_kwargs: rollback,
+    )
+
+    def interrupt(*_args, **_kwargs):
+        events.append("apply")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(launch, "kubectl_apply", interrupt)
+    args = supervisor_launch_args(kube_context="gpu-cluster")
+
+    with pytest.raises(KeyboardInterrupt):
+        launch.apply_operational_supervisor_release(
+            args,
+            network_policy="policy",
+            secret_name="secret",
+            secret="secret manifest",
+            manifest="supervisor manifest",
+        )
+
+    assert events == ["mutation-started", "apply", "restore"]
+
+
+def test_supervisor_unexpected_error_restores_before_propagating(monkeypatch):
+    events = []
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: events.append("commit"),
+        manual_restore_argv=lambda: ["python", "restore"],
+        mark_mutation_started=lambda: events.append("mutation-started"),
+        renew_lease=lambda: events.append("renew"),
+        resolved_kube_context="gpu-cluster",
+        restore=lambda **_kwargs: events.append("restore"),
+    )
+    monkeypatch.setattr(launch.SupervisorRollback, "capture", lambda **_kwargs: rollback)
+
+    def fail(*_args, **_kwargs):
+        events.append("apply")
+        raise TypeError("unexpected implementation failure")
+
+    monkeypatch.setattr(launch, "kubectl_apply", fail)
+
+    with pytest.raises(TypeError, match="unexpected implementation failure"):
+        launch.apply_operational_supervisor_release(
+            supervisor_launch_args(kube_context="gpu-cluster"),
+            network_policy="policy",
+            secret_name="secret",
+            secret="secret manifest",
+            manifest="supervisor manifest",
+        )
+
+    assert events == ["mutation-started", "apply", "restore"]
+
+
+def test_supervisor_preparation_failure_never_restarts_the_existing_release(
+    monkeypatch,
+):
+    events = []
+
+    def fail_preparation():
+        events.append("prepare")
+        raise RuntimeError("journal fsync failed")
+
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: events.append("commit"),
+        manual_restore_argv=lambda: ["python", "restore"],
+        mark_mutation_started=fail_preparation,
+        renew_lease=lambda: events.append("renew"),
+        resolved_kube_context="gpu-cluster",
+        restore=lambda **_kwargs: events.append("restore"),
+    )
+    monkeypatch.setattr(launch.SupervisorRollback, "capture", lambda **_kwargs: rollback)
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **_kwargs: events.append("apply"),
+    )
+
+    with pytest.raises(SystemExit, match="preparation failed"):
+        launch.apply_operational_supervisor_release(
+            supervisor_launch_args(kube_context="gpu-cluster"),
+            network_policy="policy",
+            secret_name="secret",
+            secret="secret manifest",
+            manifest="supervisor manifest",
+        )
+
+    assert events == ["prepare", "commit"]
+
+
+def test_successful_supervisor_rollout_commits_transaction(monkeypatch):
+    events = []
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: events.append("commit"),
+        manual_restore_argv=lambda: ["python", "restore"],
+        mark_mutation_started=lambda: events.append("mutation-started"),
+        renew_lease=lambda: events.append("renew"),
+        resolved_kube_context="gpu-cluster",
+        restore=lambda **_kwargs: events.append("restore"),
+    )
+    monkeypatch.setattr(launch.SupervisorRollback, "capture", lambda **_kwargs: rollback)
+    monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launch, "kubectl_rollout_status", lambda *_args, **_kwargs: None)
+
+    launch.apply_operational_supervisor_release(
+        supervisor_launch_args(kube_context="gpu-cluster"),
+        network_policy="policy",
+        secret_name="secret",
+        secret="secret manifest",
+        manifest="supervisor manifest",
+    )
+
+    assert events == ["mutation-started", "renew", "commit"]
+
+
+def test_healthy_rollout_finalization_failure_prints_finalize_not_restore(
+    monkeypatch,
+):
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: (_ for _ in ()).throw(OSError("journal disk failed")),
+        manual_finalize_argv=lambda: ["python", "finalize-commit", "bundle.json"],
+        manual_restore_argv=lambda: ["python", "restore", "bundle.json"],
+        mark_mutation_started=lambda: None,
+        renew_lease=lambda: None,
+        resolved_kube_context="gpu-cluster",
+        restore=lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(launch.SupervisorRollback, "capture", lambda **_kwargs: rollback)
+    monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launch, "kubectl_rollout_status", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(SystemExit) as raised:
+        launch.apply_operational_supervisor_release(
+            supervisor_launch_args(kube_context="gpu-cluster"),
+            network_policy="policy",
+            secret_name="secret",
+            secret="secret manifest",
+            manifest="supervisor manifest",
+        )
+
+    message = str(raised.value)
+    assert "Do not run rollback" in message
+    assert "python finalize-commit bundle.json" in message
+    assert "python restore" not in message
 
 
 def test_supervisor_rejects_an_extra_exact_tag_advisor(monkeypatch):
