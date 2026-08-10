@@ -29,6 +29,7 @@ REPAIR_STREAM_LIMIT_CHARS = REPAIR_STREAM_LIMIT_BYTES
 EXECUTOR_FRAME_LIMIT_BYTES = 2 * 1024 * 1024
 EXECUTOR_REQUEST_LIMIT_BYTES = 512 * 1024
 DEFAULT_EXECUTOR_SOCKET = "/run/senpai-repair-executor/executor.sock"
+_DEFAULT_EXECUTOR_HEALTH_SOCKET = "@senpai-repair-executor-health-v2"
 REPAIR_EXECUTOR_PROTOCOL = "senpai-repair-executor/v2"
 _POLL_SECONDS = 0.02
 _HEARTBEAT_INTERVAL_SECONDS = 0.2
@@ -182,6 +183,8 @@ def _is_managed_executor_socket_path(socket_path: Path) -> bool:
 
 
 def _health_socket_path(socket_path: str | Path) -> str:
+    if str(socket_path) == DEFAULT_EXECUTOR_SOCKET:
+        return _DEFAULT_EXECUTOR_HEALTH_SOCKET
     return f"{socket_path}.health"
 
 

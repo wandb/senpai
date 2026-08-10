@@ -366,7 +366,16 @@ def test_default_executor_socket_is_scoped_to_the_repair_only_mount():
     assert DEFAULT_EXECUTOR_SOCKET == (
         "/run/senpai-repair-executor/executor.sock"
     )
+    assert repair_executor._health_socket_path(DEFAULT_EXECUTOR_SOCKET) == (
+        "@senpai-repair-executor-health-v2"
+    )
     assert REPAIR_EXECUTOR_PROTOCOL == REPAIR_PROTOCOL_VERSION
+
+
+def test_explicit_executor_socket_keeps_a_sibling_health_socket(tmp_path):
+    socket_path = _test_socket(tmp_path, "custom")
+
+    assert repair_executor._health_socket_path(socket_path) == f"{socket_path}.health"
 
 
 def test_filesystem_executor_socket_refuses_a_poisoned_non_socket_path(tmp_path):
