@@ -119,6 +119,7 @@ def test_role_images_use_the_bootstrap_aware_health_wrapper():
         "/usr/local/bin/senpai-run-controller health"
         in HEALTH_SCRIPT.read_text()
     )
+    assert "PATH=/usr/bin:/bin\nexport PATH" in HEALTH_SCRIPT.read_text()
     for name in ("entrypoint-advisor.sh", "entrypoint-student.sh"):
         entrypoint = (ROOT / "k8s" / name).read_text()
         assert entrypoint.index(".bootstrap-started") < entrypoint.index("git clone")

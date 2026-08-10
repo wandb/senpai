@@ -5,6 +5,8 @@
 # SPDX-PackageName: senpai
 
 set -eu
+PATH=/usr/bin:/bin
+export PATH
 
 lease_path="$1"
 started_path="${SENPAI_BOOTSTRAP_STARTED_PATH:-/var/lib/senpai/.bootstrap-started}"
