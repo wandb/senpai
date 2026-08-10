@@ -17,6 +17,7 @@ from types import TracebackType
 from typing import Self
 from uuid import UUID
 
+from senpai_agent.sqlite_store import initialize_sqlite_store
 
 MAX_EVENTS_PER_TURN = 16
 MAX_EVENT_BYTES_PER_TURN = 64 * 1024
@@ -99,17 +100,18 @@ class PersistentInbox:
         legacy_path: Path | None = None,
     ):
         self.path = path
-        if path is not None:
-            path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._connection = sqlite3.connect(
-            str(path) if path is not None else ":memory:",
-            check_same_thread=False,
+        self._connection = initialize_sqlite_store(
+            path,
+            lambda database: self._initialize_schema(database, legacy_path),
         )
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA busy_timeout=5000")
-        self._connection.executescript(
+
+    def _initialize_schema(
+        self,
+        database: sqlite3.Connection,
+        legacy_path: Path | None,
+    ) -> None:
+        statements = (
             """
             CREATE TABLE IF NOT EXISTS inbox_turns (
                 turn_id TEXT PRIMARY KEY,
@@ -129,8 +131,9 @@ class PersistentInbox:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 processed_at TEXT,
                 acknowledged_at TEXT
-            );
-
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS inbox_messages (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id TEXT NOT NULL,
@@ -147,42 +150,48 @@ class PersistentInbox:
                 turn_id TEXT,
                 position INTEGER,
                 FOREIGN KEY (turn_id) REFERENCES inbox_turns(turn_id)
-            );
-
+            )
+            """,
+            """
             CREATE INDEX IF NOT EXISTS inbox_pending_by_conversation
-            ON inbox_messages(conversation_id, state, turn_id, sequence);
-
+            ON inbox_messages(conversation_id, state, turn_id, sequence)
+            """,
+            """
             CREATE INDEX IF NOT EXISTS inbox_event_identity
-            ON inbox_messages(conversation_id, event_key);
-
+            ON inbox_messages(conversation_id, event_key)
+            """,
+            """
             CREATE INDEX IF NOT EXISTS inbox_turns_by_conversation
-            ON inbox_turns(conversation_id, acknowledged, superseded_by, created_at);
-
+            ON inbox_turns(conversation_id, acknowledged, superseded_by, created_at)
+            """,
+            """
             CREATE TABLE IF NOT EXISTS legacy_deliveries (
                 conversation_id TEXT NOT NULL,
                 event_key TEXT NOT NULL,
                 delivery_id TEXT NOT NULL UNIQUE,
                 claimed INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (conversation_id, event_key)
-            );
-            """
+            )
+            """,
         )
+        for statement in statements:
+            database.execute(statement)
         turn_columns = {
             str(row[1])
-            for row in self._connection.execute("PRAGMA table_info(inbox_turns)")
+            for row in database.execute("PRAGMA table_info(inbox_turns)")
         }
         if "legacy_prompt_delivery_id" not in turn_columns:
-            self._connection.execute(
+            database.execute(
                 "ALTER TABLE inbox_turns ADD COLUMN legacy_prompt_delivery_id TEXT"
             )
         if "context_reset_completed" not in turn_columns:
-            self._connection.execute(
+            database.execute(
                 """
                 ALTER TABLE inbox_turns
                 ADD COLUMN context_reset_completed INTEGER NOT NULL DEFAULT 1
                 """
             )
-            self._connection.execute(
+            database.execute(
                 """
                 UPDATE inbox_turns
                 SET context_reset_completed = 0
@@ -190,24 +199,24 @@ class PersistentInbox:
                 """
             )
         if "stalled_attempts" not in turn_columns:
-            self._connection.execute(
+            database.execute(
                 """
                 ALTER TABLE inbox_turns
                 ADD COLUMN stalled_attempts INTEGER NOT NULL DEFAULT 0
                 """
             )
         if "progress_event_id" not in turn_columns:
-            self._connection.execute(
+            database.execute(
                 "ALTER TABLE inbox_turns ADD COLUMN progress_event_id TEXT"
             )
         if "recovery_generation" not in turn_columns:
-            self._connection.execute(
+            database.execute(
                 """
                 ALTER TABLE inbox_turns
                 ADD COLUMN recovery_generation INTEGER NOT NULL DEFAULT 0
                 """
             )
-            self._connection.execute(
+            database.execute(
                 """
                 UPDATE inbox_turns
                 SET recovery_generation = 1
@@ -215,23 +224,22 @@ class PersistentInbox:
                 """
             )
         if "quarantine_reason" not in turn_columns:
-            self._connection.execute(
+            database.execute(
                 "ALTER TABLE inbox_turns ADD COLUMN quarantine_reason TEXT"
             )
         message_columns = {
             str(row[1])
-            for row in self._connection.execute("PRAGMA table_info(inbox_messages)")
+            for row in database.execute("PRAGMA table_info(inbox_messages)")
         }
         if "legacy" not in message_columns:
-            self._connection.execute(
+            database.execute(
                 """
                 ALTER TABLE inbox_messages
                 ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0
                 """
             )
         if legacy_path is not None and legacy_path.is_file():
-            self._import_legacy_deliveries(legacy_path)
-        self._connection.commit()
+            self._import_legacy_deliveries(database, legacy_path)
 
     def enqueue(
         self,
@@ -1290,7 +1298,11 @@ class PersistentInbox:
     def _transaction(self):
         return _Transaction(self._connection, self._lock)
 
-    def _import_legacy_deliveries(self, path: Path) -> None:
+    def _import_legacy_deliveries(
+        self,
+        database: sqlite3.Connection,
+        path: Path,
+    ) -> None:
         value = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
             raise RuntimeError(f"invalid pending delivery ledger: {path}")
@@ -1302,7 +1314,7 @@ class PersistentInbox:
                 if not isinstance(event_key, str) or not isinstance(delivery_id, str):
                     raise RuntimeError(f"invalid pending delivery ledger: {path}")
                 UUID(delivery_id)
-                existing = self._connection.execute(
+                existing = database.execute(
                     """
                     SELECT delivery_id
                     FROM legacy_deliveries
@@ -1314,7 +1326,7 @@ class PersistentInbox:
                     raise RuntimeError(
                         f"legacy delivery {event_key!r} changed identity"
                     )
-                self._connection.execute(
+                database.execute(
                     """
                     INSERT OR IGNORE INTO legacy_deliveries (
                         conversation_id,

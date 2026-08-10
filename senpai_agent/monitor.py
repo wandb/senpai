@@ -18,6 +18,7 @@ from pydantic import Field
 
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.models import Contract
+from senpai_agent.sqlite_store import initialize_sqlite_store
 from senpai_agent.training import TrainingResult, TrainingState
 
 
@@ -219,54 +220,49 @@ class MonitorStore:
     """Thread-safe SQLite state for durable process-monitor ownership."""
 
     def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
-        self.connection = sqlite3.connect(path, check_same_thread=False)
         self._lock = threading.RLock()
-        self.connection.execute("BEGIN IMMEDIATE")
-        try:
-            self.connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS monitors (
-                    training_id TEXT PRIMARY KEY,
-                    spec_json TEXT NOT NULL,
-                    active INTEGER NOT NULL DEFAULT 1,
-                    previous_sample_json TEXT,
-                    baseline_sample_json TEXT,
-                    next_poll_at REAL NOT NULL DEFAULT 0
-                )
-                """
+        self.connection = initialize_sqlite_store(path, self._initialize_schema)
+
+    @staticmethod
+    def _initialize_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS monitors (
+                training_id TEXT PRIMARY KEY,
+                spec_json TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                previous_sample_json TEXT,
+                baseline_sample_json TEXT,
+                next_poll_at REAL NOT NULL DEFAULT 0
             )
-            self.connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS monitor_signals (
-                    dedupe_key TEXT PRIMARY KEY,
-                    training_id TEXT NOT NULL,
-                    signal_json TEXT NOT NULL,
-                    handled INTEGER NOT NULL DEFAULT 0
-                )
-                """
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS monitor_signals (
+                dedupe_key TEXT PRIMARY KEY,
+                training_id TEXT NOT NULL,
+                signal_json TEXT NOT NULL,
+                handled INTEGER NOT NULL DEFAULT 0
             )
-            monitor_columns = {
-                row[1] for row in self.connection.execute("PRAGMA table_info(monitors)")
-            }
-            if "baseline_sample_json" not in monitor_columns:
-                self.connection.execute(
-                    "ALTER TABLE monitors ADD COLUMN baseline_sample_json TEXT"
-                )
-            self.connection.execute(
-                """
-                UPDATE monitors
-                SET baseline_sample_json = previous_sample_json
-                WHERE baseline_sample_json IS NULL
-                  AND previous_sample_json IS NOT NULL
-                """
+            """
+        )
+        monitor_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(monitors)")
+        }
+        if "baseline_sample_json" not in monitor_columns:
+            connection.execute(
+                "ALTER TABLE monitors ADD COLUMN baseline_sample_json TEXT"
             )
-        except BaseException:
-            self.connection.rollback()
-            raise
-        else:
-            self.connection.commit()
+        connection.execute(
+            """
+            UPDATE monitors
+            SET baseline_sample_json = previous_sample_json
+            WHERE baseline_sample_json IS NULL
+              AND previous_sample_json IS NOT NULL
+            """
+        )
 
     def register(self, spec: TrainingMonitorSpec) -> bool:
         with self._lock:

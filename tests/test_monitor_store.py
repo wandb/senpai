@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from sqlite_test_support import assert_repeated_concurrent_first_open
 
 from senpai_agent.monitor import (
     MetricGate,
@@ -44,6 +45,23 @@ SIGNAL = MonitorSignal(
     state=TrainingState.RUNNING,
     detail="val/loss crossed the threshold.",
 )
+
+
+def test_monitor_store_allows_bounded_concurrent_first_open(tmp_path: Path):
+    """
+    Requirement: training tools and lifecycle observers may first discover the
+    monitor database concurrently without a lock error or partial schema.
+    Interface: MonitorStore construction and its active-monitor view.
+    """
+
+    assert_repeated_concurrent_first_open(
+        lambda attempt: MonitorStore(tmp_path / f"monitors-{attempt}.sqlite3"),
+        attempts=25,
+    )
+
+    database = tmp_path / "monitors-reopen.sqlite3"
+    with MonitorStore(database) as reopened:
+        assert reopened.active() == []
 
 
 def test_registration_survives_reopen_in_the_authoritative_database(tmp_path: Path):
