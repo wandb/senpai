@@ -62,8 +62,41 @@ def test_malformed_assignment_does_not_suppress_a_human_issue(monkeypatch):
         "malformed_assignment",
         "human_issue",
     ]
-    assert events[0].dedupe_key == f"malformed_assignment:17:{'a' * 40}"
+    assert events[0].dedupe_key.startswith(
+        f"malformed_assignment:v2:17:{'a' * 40}:"
+    )
     assert events[1].payload["human_message_id"] == 700
+
+
+def test_malformed_assignment_versions_only_actionable_error_changes(monkeypatch):
+    student = mailbox(role="student")
+    malformed = {
+        "number": 17,
+        "title": "Try bounded change",
+        "html_url": "https://github.test/acme/widgets/pull/17",
+        "updated_at": "2026-07-29T18:00:00Z",
+        "body": "<!-- senpai-assignment:v1 not-json -->",
+        "head": {"ref": "student/candidate", "sha": "a" * 40},
+        "labels": [
+            {"name": "research"},
+            {"name": "student:student-1"},
+            {"name": "status:wip"},
+        ],
+    }
+    monkeypatch.setattr(student, "_pulls", lambda: [malformed])
+    monkeypatch.setattr(student, "_issues", list)
+    first = student.poll()[0]
+
+    malformed["title"] = "Clarify the malformed assignment"
+    malformed["updated_at"] = "2026-07-29T19:00:00Z"
+    repeated = student.poll()[0]
+    assert repeated.dedupe_key == first.dedupe_key
+    assert repeated.to_prompt() == first.to_prompt()
+
+    malformed["labels"].append({"name": "student:student-2"})
+    changed = student.poll()[0]
+    assert changed.dedupe_key != first.dedupe_key
+    assert changed.payload["error"] != first.payload["error"]
 
 
 def test_human_issue_tracks_the_exact_latest_human_message(monkeypatch):
@@ -94,10 +127,66 @@ def test_human_issue_tracks_the_exact_latest_human_message(monkeypatch):
     event = advisor.poll()[0]
 
     assert event.kind == "human_issue"
-    assert event.dedupe_key == "human_issue:23:702"
+    assert event.dedupe_key.startswith("human_issue:v2:23:702:")
     assert event.payload["human_message_id"] == 702
     assert event.payload["author"] == "ada"
     assert event.payload["message"] == "Also compare memory."
+
+
+def test_editing_a_human_message_creates_a_new_event_version(monkeypatch):
+    advisor = mailbox()
+    human_issue = issue()
+    monkeypatch.setattr(advisor, "_pulls", list)
+    monkeypatch.setattr(advisor, "_issues", lambda: [human_issue])
+    monkeypatch.setattr(advisor, "_issue_comments", lambda _issue: [])
+    first = advisor.poll()[0]
+
+    human_issue["updated_at"] = "2026-07-29T18:20:00Z"
+    human_issue["labels"].append({"name": "operator-note"})
+    repeated = advisor.poll()[0]
+    assert repeated.dedupe_key == first.dedupe_key
+    assert repeated.to_prompt() == first.to_prompt()
+
+    human_issue["body"] = "Start with the stronger baseline."
+    edited = advisor.poll()[0]
+
+    assert edited.dedupe_key != first.dedupe_key
+    assert edited.payload["human_message_id"] == first.payload["human_message_id"]
+
+
+def test_editing_a_human_issue_title_creates_a_new_event_version(monkeypatch):
+    advisor = mailbox()
+    human_issue = issue()
+    monkeypatch.setattr(advisor, "_pulls", list)
+    monkeypatch.setattr(advisor, "_issues", lambda: [human_issue])
+    monkeypatch.setattr(advisor, "_issue_comments", lambda _issue: [])
+    first = advisor.poll()[0]
+
+    human_issue["title"] = "Clarify the direction"
+    edited = advisor.poll()[0]
+
+    assert edited.dedupe_key != first.dedupe_key
+    assert edited.payload["title"] == "Clarify the direction"
+
+
+def test_editing_the_omitted_prefix_of_a_long_human_message_versions_it(
+    monkeypatch,
+):
+    advisor = mailbox()
+    human_issue = issue()
+    human_issue["body"] = "prefix A\n" + "x" * 13_000
+    monkeypatch.setattr(advisor, "_pulls", list)
+    monkeypatch.setattr(advisor, "_issues", lambda: [human_issue])
+    monkeypatch.setattr(advisor, "_issue_comments", lambda _issue: [])
+    first = advisor.poll()[0]
+
+    human_issue["body"] = "prefix B\n" + "x" * 13_000
+    edited = advisor.poll()[0]
+
+    assert "prefix A" in first.payload["message"]
+    assert "prefix B" in edited.payload["message"]
+    assert "open the event URL for full text" in edited.payload["message"]
+    assert edited.dedupe_key != first.dedupe_key
 
 
 def test_third_party_bot_comment_cannot_replace_the_latest_human_message(
@@ -122,7 +211,7 @@ def test_third_party_bot_comment_cannot_replace_the_latest_human_message(
 
     event = advisor.poll()[0]
 
-    assert event.dedupe_key == "human_issue:23:700"
+    assert event.dedupe_key.startswith("human_issue:v2:23:700:")
     assert event.payload["human_message_id"] == 700
 
 
@@ -146,7 +235,7 @@ def test_untrusted_user_cannot_displace_the_latest_operator_message(monkeypatch)
 
     event = advisor.poll()[0]
 
-    assert event.dedupe_key == "human_issue:23:700"
+    assert event.dedupe_key.startswith("human_issue:v2:23:700:")
     assert event.payload["author"] == "ada"
 
 

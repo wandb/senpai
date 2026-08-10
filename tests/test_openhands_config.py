@@ -238,6 +238,47 @@ def test_local_condenser_limits_reject_negative_values(tmp_path, name, value):
         resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
+def test_inbox_recovery_budget_is_explicit_and_configurable(tmp_path):
+    default = resolve_config(
+        parse_runner_args(["--max-turns", "1"]),
+        runtime_env(tmp_path),
+    )
+    env = runtime_env(tmp_path)
+    env.update(
+        {
+            "SENPAI_INBOX_MAX_STALLED_ATTEMPTS": "4",
+            "SENPAI_INBOX_MAX_TURN_AGE_SECONDS": "7200",
+            "SENPAI_INBOX_MAX_RECOVERY_GENERATIONS": "2",
+        }
+    )
+
+    configured = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert default.inbox_max_stalled_attempts == 3
+    assert default.inbox_max_turn_age_seconds == 10_800
+    assert default.inbox_max_recovery_generations == 1
+    assert configured.inbox_max_stalled_attempts == 4
+    assert configured.inbox_max_turn_age_seconds == 7200
+    assert configured.inbox_max_recovery_generations == 2
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("SENPAI_INBOX_MAX_STALLED_ATTEMPTS", "0"),
+        ("SENPAI_INBOX_MAX_TURN_AGE_SECONDS", "never"),
+        ("SENPAI_INBOX_MAX_TURN_AGE_SECONDS", "nan"),
+        ("SENPAI_INBOX_MAX_RECOVERY_GENERATIONS", "-1"),
+    ],
+)
+def test_inbox_recovery_budget_rejects_invalid_values(tmp_path, key, value):
+    env = runtime_env(tmp_path)
+    env[key] = value
+
+    with pytest.raises(RuntimeError, match="inbox recovery budget"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+
 def test_default_model_profiles_are_explicit_and_provider_credentials_are_inferred(
     tmp_path: Path,
 ):

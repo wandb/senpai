@@ -3,6 +3,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -28,6 +29,7 @@ from senpai_agent.mailbox import (
 )
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.github.mailbox import ActiveGitHubWatcher
+from senpai_agent.inbox import DeliveryState, PersistentInbox, deliver_turn_messages
 from senpai_agent.state import AssignmentConversationRegistry
 from senpai_agent.operations import (
     ContextResetRequest,
@@ -55,6 +57,13 @@ class Mailbox:
 
     def acknowledge(self, _dedupe_keys):
         return
+
+
+def process_inbox_turn(inbox: PersistentInbox, turn_id: str) -> None:
+    turn = inbox.latest_turn(turn_id)
+    for message in turn.messages:
+        inbox.record_delivered(message.delivery_id, message.body)
+    inbox.record_processed(turn.turn_id)
 
 
 def feedback_event(revision_id="revision-2"):
@@ -101,7 +110,7 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
 
     def run_openhands(_prompt, config):
         class Conversation:
-            def send_message(self, message):
+            def send_message(self, message, sender=None):
                 messages.append(message)
 
         with AdvisorEventStore(
@@ -206,7 +215,7 @@ def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
 
     def run_openhands(_prompt, config):
         class Conversation:
-            def send_message(self, message):
+            def send_message(self, message, sender=None):
                 messages.append(message)
 
         with AdvisorEventStore(store_path) as store, AdvisorEventPump(
@@ -250,7 +259,7 @@ def test_full_visible_set_suppresses_events_handled_in_an_earlier_turn(
 
     def run_openhands(_prompt, _config):
         class Conversation:
-            def send_message(self, message):
+            def send_message(self, message, sender=None):
                 messages.append(message)
 
         with AdvisorEventStore(store_path) as store, AdvisorEventPump(
@@ -360,6 +369,35 @@ def test_active_watcher_retries_after_a_transient_github_read_error(
             event.dedupe_key
         ]
     assert "SENPAI_GITHUB_WATCHER_POLL_ERROR" in capsys.readouterr().err
+
+
+def test_active_watcher_honors_github_retry_delay(tmp_path: Path):
+    event = advisor_event()
+
+    class RateLimitedMailbox:
+        def __init__(self):
+            self.calls: list[float] = []
+
+        def poll(self):
+            self.calls.append(time.monotonic())
+            if len(self.calls) == 1:
+                raise GitHubReadError("rate limited", retry_after_seconds=0.03)
+            return (event,)
+
+    mailbox = RateLimitedMailbox()
+    store_path = tmp_path / "advisor-events.sqlite3"
+    with ActiveGitHubWatcher(
+        mailbox,
+        store_path,
+        known_keys=frozenset(),
+        poll_interval_seconds=0.001,
+    ):
+        deadline = time.monotonic() + 1
+        while len(mailbox.calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+    assert len(mailbox.calls) >= 2
+    assert mailbox.calls[1] - mailbox.calls[0] >= 0.025
 
 
 def test_context_exhaustion_retries_once_on_a_fresh_branch_with_the_same_id(
@@ -542,8 +580,13 @@ def test_queued_context_reset_wakes_an_otherwise_idle_controller(
         *,
         reset_context=False,
         context_reset_applied=None,
+        inbox=None,
+        inbox_turn_id=None,
+        recovery_prompt=None,
     ):
         calls.append((prompt, config.conversation_id, reset_context))
+        assert recovery_prompt is not None
+        process_inbox_turn(inbox, inbox_turn_id)
         assert context_reset_applied is not None
         context_reset_applied()
         return 0
@@ -634,8 +677,18 @@ def test_context_reset_preserves_a_local_nudge_batched_into_the_same_turn(
         *,
         reset_context=False,
         context_reset_applied=None,
+        inbox=None,
+        inbox_turn_id=None,
+        recovery_prompt=None,
     ):
         delivered.append((prompt, reset_context))
+        assert recovery_prompt is not None
+        turn = inbox.latest_turn(inbox_turn_id)
+        assert any(
+            "Check the preserved experiment state." in message.body
+            for message in turn.messages
+        )
+        process_inbox_turn(inbox, inbox_turn_id)
         assert context_reset_applied is not None
         context_reset_applied()
         return 0
@@ -667,9 +720,10 @@ def test_context_reset_preserves_a_local_nudge_batched_into_the_same_turn(
     with ContextResetRequestStore(queue_path) as store:
         completion = store.result(request.request_id).completion
     assert completion is not None
-    assert completion.pending_event_keys == (nudge.dedupe_key,)
+    assert completion.pending_event_keys == ()
+    assert completion.delivered_event_keys == (nudge.dedupe_key,)
     with AdvisorEventStore(event_store_path) as store:
-        assert [event.dedupe_key for event in store.pending()] == [nudge.dedupe_key]
+        assert store.pending() == []
 
 
 def test_context_reset_completion_allows_a_new_role_event_racing_after_claim(
@@ -823,8 +877,13 @@ def test_context_reset_records_a_late_github_event_delivered_in_the_reset_prompt
         *,
         reset_context=False,
         context_reset_applied=None,
+        inbox=None,
+        inbox_turn_id=None,
+        recovery_prompt=None,
     ):
         assert reset_context is True
+        assert recovery_prompt is not None
+        process_inbox_turn(inbox, inbox_turn_id)
         with AdvisorEventStore(event_store_path) as store:
             assert [event.dedupe_key for event in store.pending()] == [event_key]
         assert context_reset_applied is not None
@@ -923,6 +982,73 @@ def test_context_reset_claim_preserves_a_new_event_arriving_after_enqueue(
         assert resets.result(request.request_id).status == "processing"
     with AdvisorEventStore(event_store_path) as events:
         assert [event.dedupe_key for event in events.pending()] == ["existing", "new"]
+
+
+def test_terminal_turn_recovery_preserves_history_and_excludes_new_events(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """
+    Requirement: a terminally stalled turn gets one fresh canonical branch.
+    Interface: OpenHandsTurnRunner and the persistent inbox.
+    """
+    conversation_id = UUID("00000000-0000-0000-0000-000000000095")
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(conversation_id, "event:old", "old canonical event")
+    original = inbox.next_turn(conversation_id, "unchanged controller prompt")
+    assert original is not None
+
+    class Conversation:
+        def __init__(self):
+            self.events = []
+            self.state = SimpleNamespace(active_branch=lambda: list(self.events))
+
+        def send_message(self, message, sender=None):
+            self.events.append(SimpleNamespace(message=message, sender=sender))
+
+    # The model-visible append happened once on the preserved old branch.
+    conversation = Conversation()
+    deliver_turn_messages(conversation, inbox, original.turn_id)
+    for _attempt in range(3):
+        inbox.record_inference_attempt(original.turn_id)
+
+    inbox.enqueue(conversation_id, "event:new", "new event stays queued")
+    calls = []
+
+    def run_openhands(prompt, _config, **kwargs):
+        calls.append((prompt, kwargs))
+        recovery = inbox.recover_turn(
+            kwargs["inbox_turn_id"],
+            kwargs["recovery_prompt"],
+            max_generations=1,
+        )
+        assert recovery.recovery_of == original.turn_id
+        assert [event.event_key for event in recovery.events] == ["event:old"]
+        assert inbox.pending_count(conversation_id) == 1
+        for message in recovery.messages:
+            inbox.record_delivered(message.delivery_id, message.body)
+        inbox.record_processed(recovery.turn_id)
+        return 0
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+
+    result = OpenHandsTurnRunner(
+        Config("advisor", tmp_path / "state", conversation_id),
+        full_prompt="complete current research brief",
+    ).run(
+        original.prompt.body,
+        conversation_id=conversation_id,
+        event_keys=frozenset(original.event_keys),
+        inbox=inbox,
+        inbox_turn_id=original.turn_id,
+    )
+
+    assert result.exit_code == 0
+    assert len(calls) == 1
+    assert calls[0][0] == "unchanged controller prompt"
+    assert "complete current research brief" in calls[0][1]["recovery_prompt"]
+    recovery = inbox.turn(inbox.turn(original.turn_id).superseded_by)
+    assert recovery.state is DeliveryState.PROCESSED
 
 
 def test_context_recovery_attempt_is_not_retried(

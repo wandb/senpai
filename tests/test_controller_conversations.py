@@ -35,11 +35,25 @@ class Turns:
         conversation_id,
         event_keys,
         visible_event_keys=frozenset(),
+        inbox,
+        inbox_turn_id,
     ):
+        turn = inbox.turn(inbox_turn_id)
         self.calls.append(
-            (prompt, conversation_id, event_keys, visible_event_keys)
+            (
+                prompt,
+                conversation_id,
+                event_keys,
+                visible_event_keys,
+                tuple(message.body for message in turn.events),
+            )
         )
-        return TurnResult(exit_code=next(self.exit_codes, 0))
+        result = TurnResult(exit_code=next(self.exit_codes, 0))
+        if result.exit_code == 0:
+            for message in turn.messages:
+                inbox.record_delivered(message.delivery_id, message.body)
+            inbox.record_processed(inbox_turn_id)
+        return result
 
 
 def run_student_controller(tmp_path: Path, mailbox, turns):
@@ -70,7 +84,7 @@ def test_assignment_registry_persists_one_uuid_per_revision(tmp_path: Path):
     assert reopened.for_assignment("assignment-1", "revision-3") != first
 
 
-def test_local_child_wake_targets_only_the_oldest_pending_parent(tmp_path: Path):
+def test_local_child_events_are_delivered_directly_to_each_parent(tmp_path: Path):
     first_parent = UUID("00000000-0000-0000-0000-000000000011")
     second_parent = UUID("00000000-0000-0000-0000-000000000012")
     store_path = tmp_path / "student-events.sqlite3"
@@ -95,9 +109,21 @@ def test_local_child_wake_targets_only_the_oldest_pending_parent(tmp_path: Path)
         AssignmentConversationRegistry(tmp_path / "students.json")
     )(events)
 
-    assert len(events) == 1
-    assert events[0].payload["count"] == 1
-    assert batches[0].conversation_id == first_parent
+    assert [event.dedupe_key for event in events] == [
+        "agent_result:first",
+        "agent_result:second",
+    ]
+    assert [batch.conversation_id for batch in batches] == [
+        first_parent,
+        second_parent,
+    ]
+    assert "parent_conversation_id" not in events[0].to_prompt()
+
+    mailbox = LocalStudentMailbox(store_path)
+    mailbox.acknowledge((events[0].dedupe_key,))
+    assert [event.dedupe_key for event in mailbox.poll()] == [
+        "agent_result:second"
+    ]
 
 
 def test_assignment_feedback_and_monitor_wake_share_the_assignment_uuid(
@@ -147,9 +173,12 @@ def test_controller_partitions_and_acknowledges_events_by_conversation(
         payload={"conversation_id": str(first), "summary": "first only"},
     )
     second_event = ControllerEvent(
-        kind="local_events_pending",
+        kind="agent_result",
         dedupe_key="child:second",
-        payload={"conversation_id": str(second), "summary": "second only"},
+        payload={
+            "parent_conversation_id": str(second),
+            "summary": "second only",
+        },
     )
     mailbox = Mailbox((first_event, second_event))
     turns = Turns()
@@ -157,10 +186,16 @@ def test_controller_partitions_and_acknowledges_events_by_conversation(
     run_student_controller(tmp_path, mailbox, turns)
 
     assert [call[1] for call in turns.calls] == [first, second]
-    assert "first only" in turns.calls[0][0]
-    assert "second only" not in turns.calls[0][0]
-    assert "second only" in turns.calls[1][0]
-    assert "first only" not in turns.calls[1][0]
+    first_messages = "\n".join(turns.calls[0][4])
+    second_messages = "\n".join(turns.calls[1][4])
+    assert "first only" in first_messages
+    assert "second only" not in first_messages
+    assert "second only" in second_messages
+    assert "first only" not in second_messages
+    assert [call[2] for call in turns.calls] == [
+        frozenset({first_event.dedupe_key}),
+        frozenset({second_event.dedupe_key}),
+    ]
     assert mailbox.acknowledged == [
         (first_event.dedupe_key,),
         (second_event.dedupe_key,),
@@ -187,3 +222,27 @@ def test_failed_conversation_does_not_ack_or_starve_another(tmp_path: Path):
 
     assert [call[1] for call in turns.calls] == [first, second]
     assert mailbox.acknowledged == [(second_event.dedupe_key,)]
+
+
+def test_bounded_backlog_yields_to_another_ready_conversation(tmp_path: Path):
+    first = UUID("00000000-0000-0000-0000-000000000085")
+    second = UUID("00000000-0000-0000-0000-000000000086")
+    backlog = tuple(
+        ControllerEvent(
+            kind="agent_result",
+            dedupe_key=f"first:{index}",
+            payload={"parent_conversation_id": str(first), "index": index},
+        )
+        for index in range(20)
+    )
+    other = ControllerEvent(
+        kind="agent_result",
+        dedupe_key="second:0",
+        payload={"parent_conversation_id": str(second)},
+    )
+    turns = Turns()
+
+    run_student_controller(tmp_path, Mailbox((*backlog, other)), turns)
+
+    assert [call[1] for call in turns.calls] == [first, second, first]
+    assert [len(call[2]) for call in turns.calls] == [16, 1, 4]

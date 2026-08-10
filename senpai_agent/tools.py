@@ -336,11 +336,14 @@ class JobSpec(TrainingSpec):
             "do not modify workspace files."
         ),
     )
-    secret_env: tuple[Literal["WANDB_API_KEY"], ...] = Field(
+    secret_env: tuple[
+        Literal["WANDB_API_KEY", "MLXFAST_API_TOKEN"], ...
+    ] = Field(
         default=(),
         description=(
             "Registered credentials this process needs. Request WANDB_API_KEY "
-            "only for a process that communicates with W&B."
+            "only for W&B communication and MLXFAST_API_TOKEN only for an "
+            "official MLXFast API operation."
         ),
     )
 
@@ -544,11 +547,20 @@ class _GetJobStatusExecutor(ToolExecutor[GetJobStatusAction, JobResultObservatio
         action: GetJobStatusAction,
         conversation: LocalConversation | None = None,
     ) -> JobResultObservation:
-        _require_owned_job(self.store, action.job_id, conversation, "get_job_status")
-        return _job_observation(
-            self.supervisor.get_training_status(action.job_id),
-            conversation,
-        )
+        if conversation is None:
+            raise ValueError("get_job_status requires its parent conversation")
+        result = self.supervisor.get_training_status(action.job_id)
+        # The training runtime is already isolated to one role and workspace.
+        # Once a job is terminal, no process remains for another resumed root
+        # conversation to observe or control.
+        if result.state is TrainingState.RUNNING:
+            _require_owned_job(
+                self.store,
+                action.job_id,
+                conversation,
+                "get_job_status",
+            )
+        return _job_observation(result, conversation)
 
 
 class _CancelJobExecutor(ToolExecutor[CancelJobAction, JobResultObservation]):
@@ -588,7 +600,7 @@ def _job_environment(
     conversation: LocalConversation,
     secret_names: Sequence[str],
 ) -> tuple[dict[str, str], tuple[str, ...]]:
-    """Build a scrubbed child environment and resolve only requested W&B auth."""
+    """Build a scrubbed child environment and resolve only requested credentials."""
 
     environment = {
         name: value

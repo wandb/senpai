@@ -55,9 +55,14 @@ def assigned_workspace(tmp_path: Path):
     return remote, seed, workspace, base_sha, assigned_head
 
 
-def assignment_event(head_sha: str, base_sha: str):
+def assignment_event(
+    head_sha: str,
+    base_sha: str,
+    *,
+    kind: str = "student_assignment",
+):
     return ControllerEvent(
-        kind="student_assignment",
+        kind=kind,
         dedupe_key="assignment:restart",
         payload={
             "head_ref": "student/candidate",
@@ -99,20 +104,103 @@ def test_reconciliation_does_not_touch_checkout_while_mutable_job_is_active(
     assert git("rev-parse", "HEAD", cwd=workspace) == original_head
 
 
-def test_reconciliation_rejects_a_remote_head_newer_than_the_assignment(
+def test_reconciliation_surfaces_a_remote_head_not_present_locally(
     tmp_path: Path,
 ):
     _remote, seed, workspace, base_sha, assigned_head = assigned_workspace(tmp_path)
     (seed / "program.py").write_text("moved after assignment\n")
     git("commit", "-am", "move assignment branch", cwd=seed)
     git("push", "origin", "student/candidate", cwd=seed)
+    remote_head = git("rev-parse", "HEAD", cwd=seed)
 
-    with pytest.raises(RuntimeError, match="assignment head moved"):
+    with pytest.raises(WorkspaceDivergence) as raised:
         StudentWorkspaceReconciler(workspace)(
             (assignment_event(assigned_head, base_sha),)
         )
 
+    assert raised.value.event.payload["expected_remote_head"] == remote_head
     assert git("rev-parse", "HEAD", cwd=workspace) == assigned_head
+
+
+@pytest.mark.parametrize(
+    "event_kind",
+    ("student_assignment", "student_pr_feedback"),
+)
+def test_reconciliation_resumes_when_local_contains_the_advanced_remote(
+    tmp_path: Path,
+    event_kind: str,
+):
+    _remote, _seed, workspace, base_sha, assigned_head = assigned_workspace(tmp_path)
+    (workspace / "program.py").write_text("pushed student work\n")
+    git("commit", "-am", "pushed student work", cwd=workspace)
+    git("push", "origin", "student/candidate", cwd=workspace)
+    remote_head = git("rev-parse", "HEAD", cwd=workspace)
+    (workspace / "program.py").write_text("unpushed student work\n")
+    git("commit", "-am", "unpushed student work", cwd=workspace)
+    local_head = git("rev-parse", "HEAD", cwd=workspace)
+    (workspace / "program.py").write_text("unstaged measurements\n")
+    (workspace / "staged.txt").write_text("staged measurements\n")
+    git("add", "staged.txt", cwd=workspace)
+    (workspace / "notes.txt").write_text("dirty measurements\n")
+    status = git("status", "--porcelain=v1", cwd=workspace)
+    reconciler = StudentWorkspaceReconciler(workspace)
+
+    for _ in range(2):
+        reconciler(
+            (assignment_event(assigned_head, base_sha, kind=event_kind),)
+        )
+
+    assert git("merge-base", remote_head, local_head, cwd=workspace) == remote_head
+    assert git("rev-parse", "HEAD", cwd=workspace) == local_head
+    assert git("branch", "--show-current", cwd=workspace) == "student/candidate"
+    assert git("status", "--porcelain=v1", cwd=workspace) == status
+    assert (workspace / "notes.txt").read_text() == "dirty measurements\n"
+
+
+def test_reconciliation_rejects_a_non_fast_forward_remote_rewrite(
+    tmp_path: Path,
+):
+    _remote, seed, workspace, base_sha, assigned_head = assigned_workspace(tmp_path)
+    git("checkout", "--orphan", "replacement", cwd=seed)
+    git("rm", "-f", "program.py", cwd=seed)
+    (seed / "program.py").write_text("rewritten branch\n")
+    git("add", "program.py", cwd=seed)
+    git("commit", "-m", "rewrite assignment branch", cwd=seed)
+    git("push", "--force", "origin", "HEAD:student/candidate", cwd=seed)
+    rewritten_head = git("rev-parse", "HEAD", cwd=seed)
+    git("fetch", "origin", "student/candidate", cwd=workspace)
+    git("reset", "--hard", "FETCH_HEAD", cwd=workspace)
+    (workspace / "notes.txt").write_text("preserve after rewrite\n")
+    status = git("status", "--porcelain=v1", cwd=workspace)
+
+    with pytest.raises(WorkspaceDivergence) as raised:
+        StudentWorkspaceReconciler(workspace)(
+            (assignment_event(assigned_head, base_sha),)
+        )
+
+    assert raised.value.event.payload["expected_remote_head"] == rewritten_head
+    assert git("rev-parse", "HEAD", cwd=workspace) == rewritten_head
+    assert git("status", "--porcelain=v1", cwd=workspace) == status
+
+
+def test_reconciliation_does_not_adopt_an_advanced_remote_without_local_history(
+    tmp_path: Path,
+):
+    _remote, seed, workspace, base_sha, assigned_head = assigned_workspace(tmp_path)
+    git("switch", "-c", "other-work", cwd=workspace)
+    git("branch", "-D", "student/candidate", cwd=workspace)
+    local_head = git("rev-parse", "HEAD", cwd=workspace)
+    (seed / "program.py").write_text("remote-only continuation\n")
+    git("commit", "-am", "remote-only continuation", cwd=seed)
+    git("push", "origin", "student/candidate", cwd=seed)
+
+    with pytest.raises(WorkspaceDivergence):
+        StudentWorkspaceReconciler(workspace)(
+            (assignment_event(assigned_head, base_sha),)
+        )
+
+    assert git("branch", "--show-current", cwd=workspace) == "other-work"
+    assert git("rev-parse", "HEAD", cwd=workspace) == local_head
 
 
 def test_reconciliation_surfaces_and_preserves_a_diverged_active_branch(

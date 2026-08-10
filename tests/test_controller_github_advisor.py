@@ -110,14 +110,50 @@ def test_new_review_revision_at_the_same_head_wakes_the_advisor(monkeypatch):
     )
     second = next(event for event in advisor.poll() if event.kind == "review_ready")
 
-    assert first.dedupe_key == (
-        f"review_ready:17:assignment-17:revision-1:{'7' * 40}"
+    assert first.dedupe_key.startswith(
+        f"review_ready:v2:17:assignment-17:revision-1:{'7' * 40}:"
     )
-    assert second.dedupe_key == (
-        f"review_ready:17:assignment-17:revision-2:{'7' * 40}"
+    assert second.dedupe_key.startswith(
+        f"review_ready:v2:17:assignment-17:revision-2:{'7' * 40}:"
     )
     assert first.payload["revision_id"] == "revision-1"
     assert second.payload["revision_id"] == "revision-2"
+
+
+def test_review_event_ignores_mutable_pull_presentation(monkeypatch):
+    reviewed_pull = pull(
+        labels=("research", "student:student-1", "status:review"),
+        body=render_assignment_marker(assignment()),
+        head_sha="7" * 40,
+    )
+    advisor = mailbox(monkeypatch, [reviewed_pull])
+    first = next(event for event in advisor.poll() if event.kind == "review_ready")
+
+    reviewed_pull["title"] = "Clarify the review"
+    reviewed_pull["updated_at"] = "2099-07-29T19:00:00Z"
+    reviewed_pull["labels"].append({"name": "operator-note"})
+    repeated = next(
+        event for event in advisor.poll() if event.kind == "review_ready"
+    )
+
+    assert repeated.dedupe_key == first.dedupe_key
+    assert repeated.to_prompt() == first.to_prompt()
+
+
+def test_review_event_versions_a_branch_rename_at_the_same_head(monkeypatch):
+    reviewed_pull = pull(
+        labels=("research", "student:student-1", "status:review"),
+        body=render_assignment_marker(assignment()),
+        head_sha="7" * 40,
+    )
+    advisor = mailbox(monkeypatch, [reviewed_pull])
+    first = next(event for event in advisor.poll() if event.kind == "review_ready")
+
+    reviewed_pull["head"]["ref"] = "student/renamed-candidate"
+    renamed = next(event for event in advisor.poll() if event.kind == "review_ready")
+
+    assert renamed.dedupe_key != first.dedupe_key
+    assert renamed.payload["head_ref"] == "student/renamed-candidate"
 
 
 @pytest.mark.parametrize(
@@ -157,6 +193,60 @@ def test_advisor_action_reports_each_unsafe_assignment_state(
 
     assert len(actions) == 1
     assert actions[0].payload["reasons"] == [reason]
+
+
+def test_advisor_action_ignores_metadata_that_does_not_change_its_reasons(
+    monkeypatch,
+):
+    assigned_pull = pull(
+        labels=("research", "student:student-1", "status:wip", "status:blocked"),
+    )
+    advisor = mailbox(monkeypatch, [assigned_pull])
+    first = next(event for event in advisor.poll() if event.kind == "advisor_action")
+
+    assigned_pull["title"] = "Clarify the blocked work"
+    assigned_pull["updated_at"] = "2099-07-29T19:00:00Z"
+    assigned_pull["labels"].append({"name": "operator-note"})
+    repeated = next(
+        event for event in advisor.poll() if event.kind == "advisor_action"
+    )
+
+    assert repeated.dedupe_key == first.dedupe_key
+    assert repeated.to_prompt() == first.to_prompt()
+
+
+def test_advisor_action_versions_a_branch_rename_at_the_same_head(monkeypatch):
+    assigned_pull = pull(
+        labels=("research", "student:student-1", "status:wip", "status:blocked"),
+    )
+    advisor = mailbox(monkeypatch, [assigned_pull])
+    first = next(event for event in advisor.poll() if event.kind == "advisor_action")
+
+    assigned_pull["head"]["ref"] = "student/renamed-candidate"
+    renamed = next(event for event in advisor.poll() if event.kind == "advisor_action")
+
+    assert renamed.dedupe_key != first.dedupe_key
+    assert renamed.payload["head_ref"] == "student/renamed-candidate"
+
+
+def test_advisor_action_reports_hold_as_a_blocker(monkeypatch):
+    advisor = mailbox(
+        monkeypatch,
+        [
+            pull(
+                labels=(
+                    "research",
+                    "student:student-1",
+                    "status:wip",
+                    "status:hold",
+                )
+            )
+        ],
+    )
+
+    action = next(event for event in advisor.poll() if event.kind == "advisor_action")
+
+    assert action.payload["reasons"] == ["hold"]
 
 
 def test_duplicate_assignments_report_every_pr_for_the_student(monkeypatch):
@@ -209,9 +299,9 @@ def test_research_base_change_uses_the_fresh_live_branch_head_on_each_poll(
         event for event in advisor.poll() if event.kind == "research_base_changed"
     )
 
-    assert first.dedupe_key == (
-        f"research_base_changed:17:assignment-17:revision-2:"
-        f"{'7' * 40}:{assigned_sha}:{'c' * 40}"
+    assert first.dedupe_key.startswith(
+        f"research_base_changed:v2:17:assignment-17:revision-2:"
+        f"{'7' * 40}:research:{assigned_sha}:{'c' * 40}:"
     )
     assert first.payload["required_base_sha"] == assigned_sha
     assert first.payload["current_base_sha"] == "c" * 40
@@ -223,6 +313,58 @@ def test_research_base_change_uses_the_fresh_live_branch_head_on_each_poll(
         "/repos/acme/widgets/git/ref/heads/research",
         "/repos/acme/widgets/git/ref/heads/research",
     ]
+
+
+def test_research_base_event_ignores_mutable_pull_presentation(monkeypatch):
+    assigned_pull = pull(
+        labels=("research", "student:student-1", "status:wip"),
+        body=render_assignment_marker(assignment(base_sha="b" * 40)),
+        head_sha="7" * 40,
+    )
+    advisor = mailbox(monkeypatch, [assigned_pull])
+    monkeypatch.setattr(
+        advisor._github,
+        "get",
+        lambda _path: {"object": {"sha": "c" * 40}},
+    )
+    first = next(
+        event for event in advisor.poll() if event.kind == "research_base_changed"
+    )
+
+    assigned_pull["title"] = "Clarify the base change"
+    assigned_pull["updated_at"] = "2099-07-29T19:00:00Z"
+    assigned_pull["labels"].append({"name": "operator-note"})
+    repeated = next(
+        event for event in advisor.poll() if event.kind == "research_base_changed"
+    )
+
+    assert repeated.dedupe_key == first.dedupe_key
+    assert repeated.to_prompt() == first.to_prompt()
+
+
+def test_research_base_event_versions_a_branch_rename_at_the_same_head(monkeypatch):
+    assigned_pull = pull(
+        labels=("research", "student:student-1", "status:wip"),
+        body=render_assignment_marker(assignment(base_sha="b" * 40)),
+        head_sha="7" * 40,
+    )
+    advisor = mailbox(monkeypatch, [assigned_pull])
+    monkeypatch.setattr(
+        advisor._github,
+        "get",
+        lambda _path: {"object": {"sha": "c" * 40}},
+    )
+    first = next(
+        event for event in advisor.poll() if event.kind == "research_base_changed"
+    )
+
+    assigned_pull["head"]["ref"] = "student/renamed-candidate"
+    renamed = next(
+        event for event in advisor.poll() if event.kind == "research_base_changed"
+    )
+
+    assert renamed.dedupe_key != first.dedupe_key
+    assert renamed.payload["head_ref"] == "student/renamed-candidate"
 
 
 def terminal_result(*, summary="The candidate remains valid."):

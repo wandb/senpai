@@ -18,13 +18,19 @@ from string import Template
 from typing import Literal, Protocol
 from uuid import UUID
 
+from senpai_agent.agent_markdown import read_agent_markdown, strip_spdx_header
 from senpai_agent.advisor import (
     AdvisorEvent,
     AdvisorEventStore,
     compose_system_instructions,
 )
-from senpai_agent.agent_markdown import read_agent_markdown, strip_spdx_header
 from senpai_agent.github.mailbox import ActiveGitHubWatcher, GitHubMailbox
+from senpai_agent.inbox import (
+    DeliveryState,
+    InboxTurn,
+    InboxTurnQuarantined,
+    PersistentInbox,
+)
 from senpai_agent.mailbox import (
     CompositeMailbox,
     ContextResetMailbox,
@@ -51,6 +57,7 @@ from senpai_agent.workspace import (
     WorkspaceDivergence,
     WorkspaceJobRunning,
 )
+
 
 _EDGE_TRIGGERED_EVENT_KINDS = frozenset({"research_base_changed"})
 _PROMPT_TEMPLATE_VARIABLES = frozenset(
@@ -92,6 +99,8 @@ class TurnRunner(Protocol):
         conversation_id: UUID,
         event_keys: frozenset[str],
         visible_event_keys: frozenset[str] = frozenset(),
+        inbox: PersistentInbox,
+        inbox_turn_id: str,
     ) -> TurnResult: ...
 
 
@@ -103,7 +112,9 @@ def _is_context_history_failure(error: Exception) -> bool:
     )
 
     cause = (
-        error.original_exception if isinstance(error, ConversationRunError) else error
+        error.original_exception
+        if isinstance(error, ConversationRunError)
+        else error
     )
     return isinstance(
         cause,
@@ -130,7 +141,7 @@ class OpenHandsTurnRunner:
         *,
         full_prompt: str,
         github_mailbox: GitHubMailbox | None = None,
-        active_poll_interval_seconds: float = 30,
+        active_poll_interval_seconds: float = 120,
     ):
         self.config = config
         self.full_prompt = full_prompt.strip()
@@ -146,6 +157,8 @@ class OpenHandsTurnRunner:
         conversation_id: UUID,
         event_keys: frozenset[str],
         visible_event_keys: frozenset[str] = frozenset(),
+        inbox: PersistentInbox | None = None,
+        inbox_turn_id: str | None = None,
     ) -> TurnResult:
         from senpai_agent.openhands_runner import local_event_db_path, run_openhands
 
@@ -155,6 +168,20 @@ class OpenHandsTurnRunner:
         )
         reset_request = _claim_context_reset(config.state_dir, conversation_id)
         turn_deadline = time.monotonic() + config.timeout_seconds
+        if (inbox is None) != (inbox_turn_id is None):
+            raise ValueError("inbox and inbox turn ID must be provided together")
+
+        def inbox_options() -> dict[str, object]:
+            if inbox is None or inbox_turn_id is None:
+                return {}
+            return {
+                "inbox": inbox,
+                "inbox_turn_id": inbox_turn_id,
+                "recovery_prompt": _context_recovery_prompt(
+                    self.full_prompt,
+                    prompt,
+                ),
+            }
 
         def run_turn(
             reset_delivered_event_keys: frozenset[str] = frozenset(),
@@ -190,8 +217,9 @@ class OpenHandsTurnRunner:
                         config,
                         reset_context=True,
                         context_reset_applied=reset_callback,
+                        **inbox_options(),
                     )
-                return run_openhands(current_prompt, config)
+                return run_openhands(current_prompt, config, **inbox_options())
             except Exception as error:
                 if reset_request is not None or not _is_context_history_failure(error):
                     raise
@@ -204,7 +232,9 @@ class OpenHandsTurnRunner:
                 )
                 remaining = turn_deadline - time.monotonic()
                 if remaining <= 0:
-                    timeout = TimeoutError("no turn time remains for context recovery")
+                    timeout = TimeoutError(
+                        "no turn time remains for context recovery"
+                    )
                     raise ConversationRecoveryExhausted(
                         conversation_id,
                         timeout,
@@ -218,6 +248,7 @@ class OpenHandsTurnRunner:
                         _context_recovery_prompt(self.full_prompt, prompt),
                         recovery_config,
                         reset_context=True,
+                        **inbox_options(),
                     )
                 except Exception as recovery_error:
                     if _is_context_history_failure(recovery_error):
@@ -401,6 +432,7 @@ class Controller:
         full_prompt: str,
         system_context: str = "",
         conversation_state: ConversationStateLedger | None = None,
+        inbox: PersistentInbox | None = None,
         workspace_divergence_state: WorkspaceDivergenceLedger | None = None,
         conversation_for_events: (
             Callable[[Sequence[ControllerEvent]], Sequence[ConversationBatch]] | None
@@ -450,6 +482,7 @@ class Controller:
         self.full_prompt = full_prompt.strip()
         self.system_context = system_context.strip()
         self.conversation_state = conversation_state
+        self.inbox = inbox or PersistentInbox()
         self.workspace_divergence_state = workspace_divergence_state
         self.sleep = sleep
         self.poll_interval_seconds = poll_interval_seconds
@@ -463,180 +496,102 @@ class Controller:
         if self.event_reminder_seconds <= 0:
             raise ValueError("event reminder interval must be positive")
         self._started: set[UUID] = set()
-        self._visible: dict[str, float] = {}
+        resumed_at = time.monotonic()
+        self._visible: dict[str, float] = {
+            key: resumed_at for key in self.inbox.acknowledged_event_keys()
+        }
         self._deferred_until: dict[str, float] = {}
+        self._deferred_conversations: dict[UUID, float] = {}
         self._workspace_divergence: dict[UUID, str] = {}
 
     def run(self, *, max_cycles: int | None = None) -> None:
         self._wait_for_start_gates()
+        for turn in self.inbox.quarantined_turns():
+            print(
+                "SENPAI_TURN_QUARANTINED "
+                f"conversation_id={turn.conversation_id} "
+                f"turn_id={turn.turn_id} reason={turn.quarantine_reason}",
+                file=sys.stderr,
+                flush=True,
+            )
         cycles = 0
-        turn_failures = 0
+        turn_failures: dict[UUID, int] = {}
         while max_cycles is None or cycles < max_cycles:
-            self._publish_progress("poll")
-            events = self._new_events(self.mailbox.poll())
-            turn_failed = False
-            while events:
-                batches = self._event_batches(events)
-                events = ()
-                for batch in batches:
-                    batch_events = batch.events
-                    conversation_id = batch.conversation_id
-                    workspace_divergence: WorkspaceDivergence | None = None
-                    try:
-                        if self.reconcile is not None:
-                            self._publish_progress("reconcile")
-                            try:
-                                self.reconcile(batch_events)
-                            except WorkspaceJobRunning as busy:
-                                retry_delay = 30.0
-                                retry_at = time.monotonic() + retry_delay
-                                checkout_kinds = {
-                                    "student_assignment",
-                                    "student_pr_feedback",
-                                }
-                                deferred_events = tuple(
-                                    event
-                                    for event in batch_events
-                                    if event.kind in checkout_kinds
-                                )
-                                batch_events = tuple(
-                                    event
-                                    for event in batch_events
-                                    if event.kind not in checkout_kinds
-                                )
-                                for event in deferred_events:
-                                    self._visible.pop(event.dedupe_key, None)
-                                    self._deferred_until[event.dedupe_key] = retry_at
-                                print(
-                                    "SENPAI_WORKSPACE_JOB_DEFERRED "
-                                    f"conversation_id={conversation_id} "
-                                    f"retry_after_seconds={retry_delay:g} "
-                                    f"jobs={','.join(busy.job_ids)}",
-                                    file=sys.stderr,
-                                    flush=True,
-                                )
-                                if not batch_events:
-                                    continue
-                            except WorkspaceDivergence as conflict:
-                                workspace_divergence = conflict
-                                print(
-                                    f"SENPAI_WORKSPACE_DIVERGENCE {conflict}",
-                                    file=sys.stderr,
-                                    flush=True,
-                                )
-                                if (
-                                    self._workspace_divergence_key(conversation_id)
-                                    == conflict.event.dedupe_key
-                                ):
-                                    batch_events = tuple(
-                                        event
-                                        for event in batch_events
-                                        if event.kind != "student_assignment"
-                                    )
-                                    if not batch_events:
-                                        print(
-                                            "SENPAI_WORKSPACE_DIVERGENCE_SUPPRESSED "
-                                            f"conversation_id={conversation_id} "
-                                            f"event_key={conflict.event.dedupe_key}",
-                                            file=sys.stderr,
-                                            flush=True,
-                                        )
-                                        continue
-                                batch_events = (*batch_events, conflict.event)
-                            else:
-                                if any(
-                                    event.kind == "student_assignment"
-                                    for event in batch_events
-                                ):
-                                    self._clear_workspace_divergence(conversation_id)
-                        continuing = self._has_started(conversation_id)
-                        refresh_system_context = (
-                            continuing
-                            and self.conversation_state is not None
-                            and not self.conversation_state.is_context_current(
-                                conversation_id,
-                                self.system_context,
-                            )
-                        )
-                        prompt = self._prompt(
-                            batch_events,
-                            continuing=continuing,
-                            refresh_system_context=refresh_system_context,
-                        )
-                        self._publish_progress(
-                            "openhands-turn",
-                            self.turn_timeout_seconds,
-                            conversation_id=conversation_id,
-                        )
-                        batch_event_keys = frozenset(
-                            event.dedupe_key for event in batch_events
-                        )
-                        result = self.turns.run(
-                            prompt,
-                            conversation_id=conversation_id,
-                            event_keys=batch_event_keys,
-                            visible_event_keys=(
-                                frozenset(self._visible) | batch_event_keys
-                            ),
-                        )
-                    except ConversationRecoveryExhausted as error:
-                        retry_delay = max(self.poll_interval_seconds, 600)
-                        retry_at = time.monotonic() + retry_delay
-                        deferred_keys = tuple(
-                            event.dedupe_key for event in batch_events
-                        )
-                        for key in deferred_keys:
-                            self._visible.pop(key, None)
-                            self._deferred_until[key] = retry_at
-                        print(
-                            "SENPAI_TURN_DEFERRED "
-                            f"conversation_id={conversation_id} "
-                            f"event_keys={','.join(deferred_keys)} "
-                            f"retry_after_seconds={retry_delay:g} "
-                            f"error={error}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        continue
-                    except Exception as error:
-                        turn_failures += 1
-                        for event in batch_events:
-                            self._visible.pop(event.dedupe_key, None)
-                        print(
-                            f"SENPAI_TURN_EXCEPTION {type(error).__name__}: {error}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        if turn_failures >= self.max_consecutive_turn_failures:
-                            raise RuntimeError(
-                                "controller exceeded its consecutive turn-failure "
-                                f"limit ({self.max_consecutive_turn_failures})"
-                            ) from error
-                        turn_failed = True
-                        continue
-                    if result.exit_code == 0:
-                        self._mark_success(conversation_id)
-                        acknowledged = (
-                            *(event.dedupe_key for event in batch_events),
-                            *sorted(result.delivered_event_keys),
-                        )
-                        self.mailbox.acknowledge(tuple(dict.fromkeys(acknowledged)))
-                        if workspace_divergence is not None:
-                            self._record_workspace_divergence(
-                                conversation_id,
-                                workspace_divergence.event.dedupe_key,
-                            )
-                        self._publish_progress(
-                            "turn-complete",
-                            completed_turn=True,
-                        )
-                        delivered_at = time.monotonic()
-                        for key in acknowledged:
-                            self._visible[key] = delivered_at
-                        continue
-                    turn_failures += 1
-                    for event in batch_events:
-                        self._visible.pop(event.dedupe_key, None)
+            self._acknowledge_processed_turns()
+            self._poll_into_inbox()
+            cycle_had_failure = False
+            failed_conversations: set[UUID] = set()
+            served_conversations: set[UUID] = set()
+            while True:
+                turn = self._next_ready_turn(
+                    failed_conversations | served_conversations
+                )
+                if turn is None and served_conversations:
+                    served_conversations.clear()
+                    turn = self._next_ready_turn(failed_conversations)
+                if turn is None:
+                    break
+                conversation_id = UUID(turn.conversation_id)
+                try:
+                    self._publish_progress(
+                        "openhands-turn",
+                        self.turn_timeout_seconds,
+                        conversation_id=conversation_id,
+                    )
+                    result = self.turns.run(
+                        turn.prompt.body,
+                        conversation_id=conversation_id,
+                        event_keys=frozenset(turn.event_keys),
+                        visible_event_keys=(
+                            frozenset(self._visible) | frozenset(turn.event_keys)
+                        ),
+                        inbox=self.inbox,
+                        inbox_turn_id=turn.turn_id,
+                    )
+                except ConversationRecoveryExhausted as error:
+                    retry_delay = max(self.poll_interval_seconds, 600)
+                    retry_at = time.monotonic() + retry_delay
+                    self._deferred_conversations[conversation_id] = retry_at
+                    print(
+                        "SENPAI_TURN_DEFERRED "
+                        f"conversation_id={conversation_id} "
+                        f"event_keys={','.join(turn.event_keys)} "
+                        f"retry_after_seconds={retry_delay:g} "
+                        f"error={error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                except InboxTurnQuarantined as error:
+                    turn_failures.pop(conversation_id, None)
+                    served_conversations.add(conversation_id)
+                    print(
+                        "SENPAI_TURN_QUARANTINED "
+                        f"conversation_id={conversation_id} "
+                        f"turn_id={error.turn_id} reason={error.reason}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                except Exception as error:  # noqa: BLE001
+                    failures = turn_failures.get(conversation_id, 0) + 1
+                    turn_failures[conversation_id] = failures
+                    print(
+                        f"SENPAI_TURN_EXCEPTION {type(error).__name__}: {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    if failures >= self.max_consecutive_turn_failures:
+                        raise RuntimeError(
+                            "controller exceeded its consecutive turn-failure "
+                            f"limit ({self.max_consecutive_turn_failures})"
+                        ) from error
+                    failed_conversations.add(conversation_id)
+                    cycle_had_failure = True
+                    continue
+                if result.exit_code != 0:
+                    failures = turn_failures.get(conversation_id, 0) + 1
+                    turn_failures[conversation_id] = failures
                     print(
                         "SENPAI_TURN_ERROR "
                         f"exit_code={result.exit_code} "
@@ -644,42 +599,208 @@ class Controller:
                         file=sys.stderr,
                         flush=True,
                     )
-                    if turn_failures >= self.max_consecutive_turn_failures:
+                    if failures >= self.max_consecutive_turn_failures:
                         raise RuntimeError(
                             "controller exceeded its consecutive turn-failure "
                             f"limit ({self.max_consecutive_turn_failures})"
                         )
-                    turn_failed = True
-                if turn_failed:
-                    delay = min(
-                        self.poll_interval_seconds,
-                        2 ** min(turn_failures, 8),
-                    )
-                    self._sleep("turn-backoff", delay)
-                    break
-                turn_failures = 0
-                # Post-turn reconciliation avoids waiting one heartbeat for work
-                # that appeared while OpenHands was reasoning.
-                try:
-                    self._publish_progress("poll")
-                    events = self._new_events(
-                        self.mailbox.poll(),
-                        allow_reminders=False,
-                    )
-                except Exception as error:  # noqa: BLE001
-                    print(
-                        f"SENPAI_POST_TURN_POLL_ERROR {type(error).__name__}: {error}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    events = ()
+                    failed_conversations.add(conversation_id)
+                    cycle_had_failure = True
+                    continue
+
+                self._assert_processed(turn.turn_id)
+                self._acknowledge_processed_turns()
+                turn_failures.pop(conversation_id, None)
+                served_conversations.add(conversation_id)
+                self._poll_into_inbox(allow_reminders=False)
             cycles += 1
             if max_cycles is not None and cycles >= max_cycles:
                 return
-            if turn_failed:
+            if cycle_had_failure:
+                longest_streak = max(
+                    (turn_failures[value] for value in failed_conversations),
+                    default=1,
+                )
+                delay = min(
+                    self.poll_interval_seconds,
+                    2 ** min(longest_streak, 8),
+                )
+                self._sleep("turn-backoff", delay)
                 continue
             phase, delay = self._idle_delay()
             self._sleep(phase, delay)
+
+    def _poll_into_inbox(self, *, allow_reminders: bool = True) -> None:
+        self._publish_progress("poll")
+        try:
+            polled = self.mailbox.poll()
+        except Exception as error:  # noqa: BLE001
+            if allow_reminders:
+                raise
+            print(
+                f"SENPAI_POST_TURN_POLL_ERROR {type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        events = self._new_events(
+            polled,
+            allow_reminders=allow_reminders,
+        )
+        self._enqueue_events(events)
+
+    def _enqueue_events(self, events: Sequence[ControllerEvent]) -> None:
+        for batch in self._event_batches(events):
+            batch_events = batch.events
+            conversation_id = batch.conversation_id
+            if self.reconcile is not None:
+                self._publish_progress("reconcile")
+                try:
+                    self.reconcile(batch_events)
+                except WorkspaceJobRunning as busy:
+                    retry_delay = 30.0
+                    retry_at = time.monotonic() + retry_delay
+                    checkout_kinds = {
+                        "student_assignment",
+                        "student_pr_feedback",
+                    }
+                    deferred_events = tuple(
+                        event
+                        for event in batch_events
+                        if event.kind in checkout_kinds
+                    )
+                    batch_events = tuple(
+                        event
+                        for event in batch_events
+                        if event.kind not in checkout_kinds
+                    )
+                    for event in deferred_events:
+                        self._visible.pop(event.dedupe_key, None)
+                        self._deferred_until[event.dedupe_key] = retry_at
+                    print(
+                        "SENPAI_WORKSPACE_JOB_DEFERRED "
+                        f"conversation_id={conversation_id} "
+                        f"retry_after_seconds={retry_delay:g} "
+                        f"jobs={','.join(busy.job_ids)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    if not batch_events:
+                        continue
+                except WorkspaceDivergence as conflict:
+                    print(
+                        f"SENPAI_WORKSPACE_DIVERGENCE {conflict}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    if (
+                        self._workspace_divergence_key(conversation_id)
+                        == conflict.event.dedupe_key
+                    ):
+                        batch_events = tuple(
+                            event
+                            for event in batch_events
+                            if event.kind != "student_assignment"
+                        )
+                        if not batch_events:
+                            print(
+                                "SENPAI_WORKSPACE_DIVERGENCE_SUPPRESSED "
+                                f"conversation_id={conversation_id} "
+                                f"event_key={conflict.event.dedupe_key}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            continue
+                    batch_events = (*batch_events, conflict.event)
+                else:
+                    if any(
+                        event.kind == "student_assignment" for event in batch_events
+                    ):
+                        self._clear_workspace_divergence(conversation_id)
+            for event in batch_events:
+                self.inbox.enqueue(
+                    conversation_id,
+                    event.dedupe_key,
+                    event.to_prompt(),
+                )
+
+    def _next_ready_turn(
+        self,
+        excluded: set[UUID] | frozenset[UUID] = frozenset(),
+    ) -> InboxTurn | None:
+        now = time.monotonic()
+        self._deferred_conversations = {
+            conversation_id: retry_at
+            for conversation_id, retry_at in self._deferred_conversations.items()
+            if now < retry_at
+        }
+        for value in self.inbox.ready_conversation_ids():
+            conversation_id = UUID(value)
+            if (
+                conversation_id in excluded
+                or conversation_id in self._deferred_conversations
+            ):
+                continue
+            continuing = self._has_started(conversation_id)
+            refresh_system_context = (
+                continuing
+                and self.conversation_state is not None
+                and not self.conversation_state.is_context_current(
+                    conversation_id,
+                    self.system_context,
+                )
+            )
+            turn = self.inbox.next_turn(
+                conversation_id,
+                self._prompt(
+                    (),
+                    continuing=continuing,
+                    refresh_system_context=refresh_system_context,
+                ),
+                legacy_prompt_identity=(
+                    f"initial:{self.full_prompt}"
+                    if not continuing
+                    else (
+                        f"system-context:{self.system_context}"
+                        if refresh_system_context
+                        else None
+                    )
+                ),
+            )
+            if turn is not None:
+                return turn
+        return None
+
+    def _assert_processed(self, turn_id: str) -> None:
+        turn = self.inbox.latest_turn(turn_id)
+        if turn.state is not DeliveryState.PROCESSED:
+            raise RuntimeError(
+                "turn runner returned success without a processed inbox receipt: "
+                f"{turn.turn_id}"
+            )
+
+    def _acknowledge_processed_turns(self) -> None:
+        for turn in self.inbox.processed_turns():
+            keys = tuple(dict.fromkeys(turn.acknowledgement_keys))
+            if keys:
+                self._publish_progress("acknowledge")
+                self.mailbox.acknowledge(keys)
+            conversation_id = UUID(turn.conversation_id)
+            self._mark_success(conversation_id)
+            divergence = next(
+                (
+                    key
+                    for key in turn.event_keys
+                    if key.startswith("workspace_diverged:")
+                ),
+                None,
+            )
+            if divergence is not None:
+                self._record_workspace_divergence(conversation_id, divergence)
+            self.inbox.acknowledge(turn.turn_id)
+            for key in turn.event_keys:
+                self._visible[key] = time.monotonic()
+            self._publish_progress("turn-complete", completed_turn=True)
 
     def _event_batches(
         self,
@@ -818,22 +939,21 @@ class Controller:
 
     def _prompt(
         self,
-        events: Sequence[ControllerEvent],
+        _events: Sequence[ControllerEvent],
         *,
         continuing: bool,
         refresh_system_context: bool = False,
     ) -> str:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        event_prompt = "\n\n".join(event.to_prompt() for event in events)
         if not continuing:
             return (
                 f"{self.full_prompt}\n\nCurrent time (UTC): {now}\n\n"
-                f"# Current GitHub state\n\n{event_prompt}"
+                "# Current GitHub state\n\n"
+                "Actionable events follow as separately tracked messages."
             )
         prompt = (
             f"Continue the {self.role} loop. Current time (UTC): {now}. "
-            "GitHub now contains the following actionable state:\n\n"
-            f"{event_prompt}"
+            "Actionable GitHub events follow as separately tracked messages."
         )
         if refresh_system_context:
             prompt += (
@@ -859,7 +979,10 @@ def _full_prompt(role: Literal["advisor", "student"], env: Mapping[str, str]) ->
         .safe_substitute(template_env)
         .strip()
         if instructions.is_file()
-        else "Follow the repository AGENTS.md, the assigned GitHub work, and the Senpai role charter."
+        else (
+            "Follow the repository AGENTS.md, the assigned GitHub work, "
+            "and the Senpai role charter."
+        )
     )
     prompt = (
         "# Research programme\n\n"
@@ -1036,14 +1159,19 @@ def controller_main(
         read_role_instructions(runner_config.role_file),
     )
     continuation_context = (
-        f"{system_context.strip()}\n\n# Current research brief\n\n{full_prompt}"
+        f"{system_context.strip()}\n\n"
+        f"# Current research brief\n\n{full_prompt}"
+    )
+    inbox = PersistentInbox(
+        runner_config.state_dir / "delivery-inbox.sqlite3",
+        legacy_path=runner_config.state_dir / "pending-message-deliveries.json",
     )
     turns = OpenHandsTurnRunner(
         runner_config,
         full_prompt=full_prompt,
         github_mailbox=github_mailbox,
         active_poll_interval_seconds=float(
-            env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "30")
+            env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "120")
         ),
     )
     controller = Controller(
@@ -1055,6 +1183,7 @@ def controller_main(
         conversation_state=ConversationStateLedger(
             runner_config.state_dir / "conversation-state.json"
         ),
+        inbox=inbox,
         workspace_divergence_state=(
             WorkspaceDivergenceLedger(
                 runner_config.state_dir / "workspace-divergence.json"
@@ -1118,6 +1247,7 @@ def controller_main(
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
+        inbox.close()
         close_training_runtimes()
         finish_weave_monitoring()
     return 0

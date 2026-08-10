@@ -25,8 +25,9 @@ from .values import (
     github_datetime,
     label_names,
     object_value,
-    pull_payload,
+    pull_reference,
     result_matches_assignment,
+    versioned_event,
 )
 from .issues import human_issue_events
 
@@ -41,9 +42,7 @@ def advisor_events(
 ) -> tuple[ControllerEvent, ...]:
     events: list[ControllerEvent] = []
     active_assignments: list[tuple[dict[str, object], AssignmentRecord]] = []
-    active_by_student: dict[str, list[int]] = {
-        student: [] for student in mailbox.students
-    }
+    active_by_student: dict[str, list[int]] = {student: [] for student in mailbox.students}
     now = datetime.now(UTC)
     for pull in pulls:
         labels = label_names(pull)
@@ -57,41 +56,39 @@ def advisor_events(
         if "status:wip" in labels:
             for student in students:
                 active_by_student.setdefault(student, []).append(number)
-        payload = pull_payload(pull)
+        reference = pull_reference(pull)
         assignment = None
         if {"status:wip", "status:review"} & labels:
             try:
-                assignments = parse_assignment_markers(
-                    str(pull.get("body") or "")
-                )
+                assignments = parse_assignment_markers(str(pull.get("body") or ""))
             except ValueError:
                 assignments = []
             if len(assignments) == 1:
                 assignment = assignments[0]
                 active_assignments.append((pull, assignment))
         if "status:review" in labels:
-            dedupe_key = f"review_ready:{number}:{head_sha}"
-            review_payload = payload
+            review_payload = reference
+            review_identity: tuple[object, ...] = (number, head_sha)
             if assignment is not None:
-                dedupe_key = (
-                    f"review_ready:{number}:{assignment.assignment_id}:"
-                    f"{assignment.revision_id}:{head_sha}"
+                review_identity = (
+                    number,
+                    assignment.assignment_id,
+                    assignment.revision_id,
+                    head_sha,
                 )
                 review_payload = {
-                    **payload,
+                    **reference,
                     "assignment_id": assignment.assignment_id,
                     "revision_id": assignment.revision_id,
                 }
             events.append(
-                ControllerEvent(
-                    kind="review_ready",
-                    dedupe_key=dedupe_key,
-                    payload=review_payload,
-                )
+                versioned_event("review_ready", *review_identity, payload=review_payload)
             )
         reasons: list[str] = []
         if "status:blocked" in labels:
             reasons.append("blocked")
+        if "status:hold" in labels:
+            reasons.append("hold")
         if "status:needs-rebase" in labels:
             reasons.append("needs_rebase")
         if not students:
@@ -103,13 +100,14 @@ def advisor_events(
             if (now - updated).total_seconds() >= mailbox.stale_wip_seconds:
                 reasons.append("stale_wip")
         if reasons:
+            action_payload = {**reference, "reasons": reasons}
             events.append(
-                ControllerEvent(
-                    kind="advisor_action",
-                    dedupe_key=(
-                        f"advisor_action:{number}:{head_sha}:{','.join(reasons)}"
-                    ),
-                    payload={**payload, "reasons": reasons},
+                versioned_event(
+                    "advisor_action",
+                    number,
+                    head_sha,
+                    ",".join(reasons),
+                    payload=action_payload,
                 )
             )
 
@@ -183,27 +181,30 @@ def _research_base_events(
             )
         ):
             continue
+        payload = {
+            **pull_reference(pull),
+            "assignment_id": assignment.assignment_id,
+            "revision_id": assignment.revision_id,
+            "student": assignment.student,
+            "base_ref": assignment.base_ref,
+            "required_base_sha": assignment.base_sha,
+            "current_base_sha": current_base_sha,
+            "compare_url": (
+                f"{str(pull['html_url']).rsplit('/pull/', 1)[0]}"
+                f"/compare/{assignment.base_sha}...{current_base_sha}"
+            ),
+        }
         events.append(
-            ControllerEvent(
-                kind="research_base_changed",
-                dedupe_key=(
-                    f"research_base_changed:{number}:"
-                    f"{assignment.assignment_id}:{assignment.revision_id}:"
-                    f"{head_sha}:{assignment.base_sha}:{current_base_sha}"
-                ),
-                payload={
-                    **pull_payload(pull),
-                    "assignment_id": assignment.assignment_id,
-                    "revision_id": assignment.revision_id,
-                    "student": assignment.student,
-                    "base_ref": assignment.base_ref,
-                    "required_base_sha": assignment.base_sha,
-                    "current_base_sha": current_base_sha,
-                    "compare_url": (
-                        f"{str(pull['html_url']).rsplit('/pull/', 1)[0]}"
-                        f"/compare/{assignment.base_sha}...{current_base_sha}"
-                    ),
-                },
+            versioned_event(
+                "research_base_changed",
+                number,
+                assignment.assignment_id,
+                assignment.revision_id,
+                head_sha,
+                assignment.base_ref,
+                assignment.base_sha,
+                current_base_sha,
+                payload=payload,
             )
         )
     return events

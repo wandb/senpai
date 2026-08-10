@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
 
+from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.models import (
     AssignmentRecord,
     ExperimentResult,
@@ -25,19 +28,42 @@ class FeedbackBinding:
     assignment_id: str
     revision_id: str
     acknowledged: bool = False
+    source_key: str | None = None
+    content_digest: str | None = None
+    payload: dict[str, object] | None = None
 
 
-def pull_payload(pull: Mapping[str, object]) -> dict[str, object]:
+def pull_reference(pull: Mapping[str, object]) -> dict[str, object]:
     head = object_value(pull["head"])
     return {
         "number": int(pull["number"]),
-        "title": str(pull["title"]),
         "url": str(pull["html_url"]),
         "head_ref": str(head["ref"]),
         "head_sha": str(head["sha"]),
-        "labels": sorted(label_names(pull)),
-        "updated_at": str(pull["updated_at"]),
     }
+
+
+def payload_digest(payload: Mapping[str, object]) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    return sha256(encoded).hexdigest()
+
+
+def versioned_event(
+    kind: str,
+    *identity: object,
+    payload: dict[str, object],
+) -> ControllerEvent:
+    prefix = ":".join((kind, "v2", *(str(value) for value in identity)))
+    return ControllerEvent(
+        kind=kind,
+        dedupe_key=f"{prefix}:{payload_digest(payload)}",
+        payload=payload,
+    )
 
 
 def result_matches_assignment(
@@ -78,22 +104,38 @@ def github_datetime(value: str) -> datetime:
 
 
 def bounded_text(value: str, *, limit: int) -> str:
-    encoded = value.encode()
-    if len(encoded) <= limit:
-        return value
-    return encoded[-limit:].decode(errors="ignore")
+    return _middle_excerpt(
+        value,
+        limit=limit,
+        marker="\n\n[... middle omitted; open the event URL for full text ...]\n\n",
+    )[0]
 
 
 def feedback_excerpt(value: str, *, limit: int) -> tuple[str, bool]:
+    return _middle_excerpt(
+        value,
+        limit=limit,
+        marker=(
+            "\n\n[... middle omitted; open feedback_url for full text ...]\n\n"
+        ),
+    )
+
+
+def _middle_excerpt(
+    value: str,
+    *,
+    limit: int,
+    marker: str,
+) -> tuple[str, bool]:
     encoded = value.encode()
     if len(encoded) <= limit:
         return value, False
-    marker = "\n\n[... middle omitted; open feedback_url for full text ...]\n\n".encode()
-    content_bytes = limit - len(marker)
+    marker_bytes = marker.encode()
+    content_bytes = limit - len(marker_bytes)
     head_bytes = 3 * content_bytes // 4
     excerpt = (
         encoded[:head_bytes].decode(errors="ignore")
-        + marker.decode()
+        + marker
         + encoded[-(content_bytes - head_bytes) :].decode(errors="ignore")
     )
     return excerpt, True

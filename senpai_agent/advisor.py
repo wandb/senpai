@@ -12,6 +12,17 @@ from typing import Protocol, Self
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
 from pydantic import BaseModel, ConfigDict, Field
 
+from senpai_agent.inbox import PersistentInbox
+
+_TERMINAL_DELIVERY_STATUSES = frozenset(
+    {
+        ConversationExecutionStatus.FINISHED,
+        ConversationExecutionStatus.ERROR,
+        ConversationExecutionStatus.STUCK,
+        ConversationExecutionStatus.DELETING,
+    }
+)
+
 
 class AdvisorEvent(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -28,6 +39,17 @@ class AdvisorEvent(BaseModel):
             f"# Senpai event: {self.kind}\n\n"
             f"Observed at (UTC): {observed_at}\n\n"
             f"```json\n{payload}\n```"
+        )
+
+    def to_inbox_message(self) -> str:
+        payload = {
+            key: value
+            for key, value in self.payload.items()
+            if key != "parent_conversation_id"
+        }
+        return (
+            f"## {self.kind}\n\n"
+            f"{json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
         )
 
 
@@ -51,9 +73,20 @@ class AdvisorEventStore:
 
     def enqueue(self, event: AdvisorEvent) -> bool:
         with self._lock:
+            row = self._connection.execute(
+                "SELECT event_json FROM advisor_events WHERE dedupe_key = ?",
+                (event.dedupe_key,),
+            ).fetchone()
+            if row is not None:
+                existing = AdvisorEvent.model_validate_json(row[0])
+                if existing.kind != event.kind or existing.payload != event.payload:
+                    raise RuntimeError(
+                        f"event {event.dedupe_key!r} was reused with a different payload"
+                    )
+                return False
             cursor = self._connection.execute(
                 """
-                INSERT OR IGNORE INTO advisor_events (dedupe_key, event_json)
+                INSERT INTO advisor_events (dedupe_key, event_json)
                 VALUES (?, ?)
                 """,
                 (event.dedupe_key, event.model_dump_json()),
@@ -200,11 +233,22 @@ class AdvisorEventPump:
         *,
         poll_interval: float = 0.5,
         parent_conversation_id: str | None = None,
+        inbox: PersistentInbox | None = None,
+        conversation_id: str | uuid.UUID | None = None,
     ):
         self._store = store
         self._conversation = conversation
         self._poll_interval = poll_interval
         self._parent_conversation_id = parent_conversation_id
+        self._inbox = inbox
+        if inbox is not None:
+            if conversation_id is None:
+                raise ValueError("inbox event pump requires a conversation ID")
+            self._conversation_id = str(uuid.UUID(str(conversation_id)))
+        else:
+            self._conversation_id = str(
+                conversation_id or getattr(conversation, "id", "local")
+            )
         self._delivered_event_keys: set[str] = set()
         self._stop = threading.Event()
         self._error: BaseException | None = None
@@ -224,6 +268,8 @@ class AdvisorEventPump:
             self._stop.set()
 
     def _deliver_if_safe(self) -> int:
+        if self._inbox is not None:
+            return self._transfer_to_inbox()
         state = getattr(self._conversation, "state", None)
         if state is None:
             # Lightweight message adapters have no tool-action state to guard.
@@ -235,6 +281,8 @@ class AdvisorEventPump:
                 parent_conversation_id=self._parent_conversation_id,
             )
         with state:
+            if state.execution_status in _TERMINAL_DELIVERY_STATUSES:
+                return 0
             if ConversationState.get_unmatched_actions(state.active_branch()):
                 return 0
             return _deliver_pending_events(
@@ -244,6 +292,24 @@ class AdvisorEventPump:
                 already_delivered=self._delivered_event_keys,
                 parent_conversation_id=self._parent_conversation_id,
             )
+
+    def _transfer_to_inbox(self) -> int:
+        pending = self._store.pending()
+        if self._parent_conversation_id is not None:
+            pending = [
+                event
+                for event in pending
+                if event.payload.get("parent_conversation_id")
+                == self._parent_conversation_id
+            ]
+        for event in pending:
+            self._inbox.enqueue(
+                self._conversation_id,
+                event.dedupe_key,
+                event.to_inbox_message(),
+            )
+            self._store.acknowledge(event.dedupe_key)
+        return len(pending)
 
     def __enter__(self) -> Self:
         self._thread.start()
@@ -258,7 +324,7 @@ class AdvisorEventPump:
         self._stop.set()
         self._thread.join()
         # Failed turns may abandon their active branch; replay those events instead.
-        if exc_type is None and self._error is None:
+        if self._inbox is None and exc_type is None and self._error is None:
             state = getattr(self._conversation, "state", None)
             if (
                 state is None
