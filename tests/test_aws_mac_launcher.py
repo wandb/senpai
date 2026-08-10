@@ -199,10 +199,17 @@ class AwsMacInputTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "one host per student"):
             distribute_roles([student("fern")], hosts)
 
-    def test_ttl_zero_disables_shutdown_and_negative_values_are_rejected(self):
-        self.assertEqual(_user_data(0), "")
-        self.assertIn("/sbin/shutdown -h +150", _user_data(2.5))
+    def test_ttl_zero_disables_shutdown_but_still_publishes_ssh_host_keys(self):
+        no_ttl = _user_data(0)
+        self.assertNotIn("/sbin/shutdown", no_ttl)
+        self.assertIn("SENPAI_SSH_HOST_KEY", no_ttl)
+        self.assertIn("/etc/ssh/ssh_host_*_key.pub", no_ttl)
 
+        with_ttl = _user_data(2.5)
+        self.assertIn("/sbin/shutdown -h +150", with_ttl)
+        self.assertIn("SENPAI_SSH_HOST_KEY", with_ttl)
+
+    def test_negative_ttl_is_rejected(self):
         run_args = args(
             Path("/tmp/state"),
             aws_ttl_hours=-1,
@@ -255,6 +262,15 @@ class AwsMacInputTests(unittest.TestCase):
 
 
 class AwsMacInfrastructureValidationTests(unittest.TestCase):
+    def test_ssh_requires_a_pre_authorized_host_key(self):
+        command = aws_mac_backend._ssh_base(
+            Path("/tmp/state"),
+            {"instance_id": "i-test", "public_ip": "198.51.100.1"},
+        )
+
+        self.assertIn("StrictHostKeyChecking=yes", command)
+        self.assertNotIn("StrictHostKeyChecking=accept-new", command)
+
     def test_ssh_disconnects_stdin_when_no_payload_is_sent(self):
         node = {"instance_id": "i-test", "public_ip": "198.51.100.1"}
         completed = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
@@ -520,8 +536,9 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
         self.assertEqual(node["client_token"], "token-fern")
         user_data = command[command.index("--user-data") + 1]
         self.assertIn("/sbin/shutdown -h +1440", user_data)
+        self.assertIn("SENPAI_SSH_HOST_KEY", user_data)
 
-    def test_zero_ttl_omits_scheduled_shutdown_from_instance_launch(self):
+    def test_zero_ttl_publishes_host_keys_without_scheduled_shutdown(self):
         host = mac_host("h-a1", "fern")
         plan = AwsMacPlan(
             context=AwsContext("us-east-1", "sandbox"),
@@ -547,11 +564,73 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
             )
 
         command = aws_json.call_args.args
-        self.assertNotIn("--user-data", command)
+        user_data = command[command.index("--user-data") + 1]
+        self.assertNotIn("/sbin/shutdown", user_data)
+        self.assertIn("SENPAI_SSH_HOST_KEY", user_data)
+        self.assertIn("/etc/ssh/ssh_host_*_key.pub", user_data)
         self.assertEqual(
             command[command.index("--instance-initiated-shutdown-behavior") + 1],
             "stop",
         )
+
+    def test_recorded_instance_authenticates_host_after_persisting_public_ip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "state"
+            run_dir.mkdir()
+            host = mac_host("h-a1", "fern")
+            plan = AwsMacPlan(
+                context=AwsContext("us-east-1", "sandbox"),
+                account_id="770934259321",
+                ami_id="ami-mac",
+                root_device="/dev/sda1",
+                volume_gib=250,
+                security_group_id="sg-a1",
+                ssh_cidr="203.0.113.7/32",
+                hosts=(host,),
+            )
+            node = {
+                **asdict(host),
+                "client_token": "token-fern",
+                "instance_id": "i-fern",
+                "public_ip": "",
+            }
+            state = {"tag": "mlxfast-r1", "nodes": [node]}
+
+            def authorize(context, recorded_run_dir, recorded_node, *, timeout_s):
+                persisted = json.loads((run_dir / "state.json").read_text())
+                self.assertEqual(persisted["nodes"][0]["public_ip"], "198.51.100.1")
+                self.assertEqual(context, plan.context)
+                self.assertEqual(recorded_run_dir, run_dir)
+                self.assertIs(recorded_node, node)
+                self.assertEqual(timeout_s, 1_200)
+
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_wait_instance",
+                    return_value={"PublicIpAddress": "198.51.100.1"},
+                ),
+                patch.object(
+                    aws_mac_backend,
+                    "_authorize_ssh_host",
+                    side_effect=authorize,
+                    create=True,
+                ) as authorize_ssh_host,
+            ):
+                aws_mac_backend._wait_recorded_instance(
+                    args(run_dir.parent),
+                    plan,
+                    run_dir,
+                    state,
+                    node,
+                )
+
+            authorize_ssh_host.assert_called_once_with(
+                plan.context,
+                run_dir,
+                node,
+                timeout_s=1_200,
+            )
 
     def test_instance_readiness_polling_uses_health_status_without_stock_waiters(self):
         instance = {
@@ -859,6 +938,11 @@ class AwsMacLaunchTests(unittest.TestCase):
                     )
                 }
 
+            def authorize_host(context, _run_dir, node, *, timeout_s):
+                self.assertEqual(context, plan.context)
+                self.assertEqual(timeout_s, run_args.aws_ready_timeout_s)
+                events.append(f"authorize:{node['student']}")
+
             def sequential(label, actions):
                 events.append(label)
                 for action in actions.values():
@@ -895,6 +979,11 @@ class AwsMacLaunchTests(unittest.TestCase):
                     aws_mac_backend,
                     "_wait_instance",
                     side_effect=wait_instance,
+                ),
+                patch.object(
+                    aws_mac_backend,
+                    "_authorize_ssh_host",
+                    side_effect=authorize_host,
                 ),
                 patch.object(
                     aws_mac_backend,
@@ -946,6 +1035,15 @@ class AwsMacLaunchTests(unittest.TestCase):
                 events.index("canary:fern"),
                 events.index("instance:tanjiro"),
             )
+            for student_name in ("fern", "tanjiro"):
+                self.assertLess(
+                    events.index(f"wait:{student_name}"),
+                    events.index(f"authorize:{student_name}"),
+                )
+                self.assertLess(
+                    events.index(f"authorize:{student_name}"),
+                    events.index(f"prepare:{student_name}"),
+                )
             self.assertEqual(len(preflights), 2)
             self.assertEqual(len(launches), 2)
             self.assertEqual(len(gates), 2)
@@ -1180,7 +1278,7 @@ class AwsMacLifecycleTests(unittest.TestCase):
 
     def assert_lifecycle_state_rejected(
         self,
-        state: dict,
+        state: object,
         message: str,
     ) -> None:
         actions = {
@@ -1220,6 +1318,12 @@ class AwsMacLifecycleTests(unittest.TestCase):
                     ssh.assert_not_called()
                     self.assertEqual(json.loads(state_path.read_text()), state)
                     self.assertEqual(key_path.read_text(), "private-key")
+
+    def test_lifecycle_rejects_non_object_state_before_aws_or_local_mutation(self):
+        self.assert_lifecycle_state_rejected(
+            ["not", "a", "state object"],
+            "JSON object",
+        )
 
     def test_lifecycle_rejects_standard_aws_state_before_aws_or_local_mutation(self):
         self.assert_lifecycle_state_rejected(

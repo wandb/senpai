@@ -323,8 +323,84 @@ class AwsPlanningTests(unittest.TestCase):
 
         self.assertIn("shutdown -h +150", text)
         self.assertIn("nvidia-ctk runtime configure", text)
+        self.assertEqual(text.count("SENPAI_SSH_HOST_KEY"), 2)
+        self.assertIn("/etc/ssh/ssh_host_*_key.pub", text)
+        self.assertGreater(text.rfind("SENPAI_SSH_HOST_KEY"), text.find("usermod"))
         self.assertNotIn("docker run", text)
         self.assertNotIn("AWS_", text)
+
+    def test_ssh_host_identity_comes_from_authenticated_ec2_console_output(self):
+        console_key = (
+            "ssh-ed25519 "
+            "AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+        )
+        state = {"instance_id": "i-123", "public_ip": "203.0.113.10"}
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            with patch(
+                "senpai.launch.aws_backend._aws_raw",
+                return_value=f"boot log\nSENPAI_SSH_HOST_KEY {console_key}\n",
+            ) as aws:
+                aws_backend._authorize_ssh_host(
+                    AwsContext("us-east-1", "research"),
+                    run_dir,
+                    state,
+                    timeout_s=10,
+                )
+
+            self.assertEqual(
+                (run_dir / "known_hosts").read_text(),
+                f"203.0.113.10 {console_key}\n",
+            )
+            self.assertEqual((run_dir / "known_hosts").stat().st_mode & 0o777, 0o600)
+            self.assertIn("get-console-output", aws.call_args.args)
+            ssh = aws_backend._ssh_base(run_dir, state)
+            self.assertIn("StrictHostKeyChecking=yes", ssh)
+            self.assertNotIn("StrictHostKeyChecking=accept-new", ssh)
+
+    def test_ssh_host_identity_rejects_malformed_console_keys_without_writing(self):
+        state = {"instance_id": "i-123", "public_ip": "203.0.113.10"}
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            with (
+                patch(
+                    "senpai.launch.aws_backend._aws_raw",
+                    return_value=(
+                        "SENPAI_SSH_HOST_KEY ssh-ed25519 not-base64!!!\n"
+                    ),
+                ),
+                patch("senpai.launch.aws_backend.time.sleep"),
+                self.assertRaisesRegex(RuntimeError, "host key"),
+            ):
+                aws_backend._authorize_ssh_host(
+                    AwsContext("us-east-1", "research"),
+                    run_dir,
+                    state,
+                    timeout_s=0.01,
+                )
+            self.assertFalse((run_dir / "known_hosts").exists())
+
+    def test_ssh_host_identity_replaces_only_the_recorded_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "known_hosts").write_text(
+                "\n"
+                "example.test ssh-ed25519 retained-key\n"
+                "203.0.113.10 ssh-rsa stale-key\n"
+            )
+
+            aws_backend._write_known_host_keys(
+                run_dir,
+                "203.0.113.10",
+                ("203.0.113.10 ssh-ed25519 current-key",),
+            )
+
+            self.assertEqual(
+                (run_dir / "known_hosts").read_text(),
+                "\n"
+                "example.test ssh-ed25519 retained-key\n"
+                "203.0.113.10 ssh-ed25519 current-key\n",
+            )
 
     def test_local_contract_errors_happen_before_aws_calls(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1386,6 +1462,7 @@ class AwsTransportTests(unittest.TestCase):
                 path.write_bytes(b"bundle")
 
             with (
+                patch("senpai.launch.aws_backend._authorize_ssh_host") as authorize,
                 patch("senpai.launch.aws_backend._wait_for_ssh"),
                 patch("senpai.launch.aws_backend._wait_for_gpu"),
                 patch(
@@ -1403,6 +1480,12 @@ class AwsTransportTests(unittest.TestCase):
                     {"instance_id": "i-123", "public_ip": "203.0.113.10"},
                 )
 
+            authorize.assert_called_once_with(
+                AwsContext("us-east-1", "research"),
+                run_dir,
+                {"instance_id": "i-123", "public_ip": "203.0.113.10"},
+                timeout_s=900,
+            )
             bootstrap = ssh.call_args_list[1]
             command = bootstrap.args[2]
             self.assertTrue(command.startswith("set -eu; umask 077;"))
@@ -1587,6 +1670,8 @@ class AwsLaunchFlowTests(unittest.TestCase):
                 state = json.loads(
                     (root / "state" / "aws-r1" / "state.json").read_text()
                 )
+                self.assertEqual(state["backend"], "aws")
+                self.assertEqual(state["state_version"], 1)
                 self.assertEqual(state["phase"], "preparing-github")
                 self.assertNotIn("roles_starting", state)
                 events.append("github")
@@ -1728,6 +1813,98 @@ class AwsLaunchFlowTests(unittest.TestCase):
 
 
 class AwsLifecycleTests(unittest.TestCase):
+    def test_unambiguous_legacy_standard_state_remains_compatible(self):
+        aws_backend._validate_aws_state(
+            {
+                "account_id": "123456789012",
+                "ami_id": "ami-123",
+                "availability_zone": "us-east-1a",
+                "created_at": 1_786_000_000,
+                "instance_type": "g5.8xlarge",
+                "phase": "running",
+                "profile": "research",
+                "region": "us-east-1",
+                "roles": ["student-fern"],
+                "root_device": "/dev/sda1",
+                "ssh_cidr": "203.0.113.9/32",
+                "subnet_id": "subnet-a",
+                "tag": "aws-r1",
+                "volume_gib": 250,
+                "vpc_id": "vpc-123",
+            }
+        )
+
+    def test_standard_lifecycle_rejects_mac_or_unknown_state_before_aws(self):
+        states = (
+            {
+                "backend": "aws-mac",
+                "state_version": 1,
+                "tag": "aws-r1",
+                "region": "us-east-1",
+                "account_id": "123456789012",
+                "instance_type": "mac-m4pro.metal",
+                "nodes": [],
+            },
+            {
+                "backend": "aws",
+                "state_version": 99,
+                "tag": "aws-r1",
+                "region": "us-east-1",
+                "account_id": "123456789012",
+                "instance_type": "g5.8xlarge",
+            },
+            {
+                "backend": "aws",
+                "state_version": True,
+                "tag": "aws-r1",
+                "region": "us-east-1",
+                "account_id": "123456789012",
+                "instance_type": "g5.8xlarge",
+            },
+            {
+                "backend": "aws",
+                "tag": "aws-r1",
+                "region": "us-east-1",
+                "account_id": "123456789012",
+                "instance_type": "g5.8xlarge",
+            },
+            {
+                "state_version": 1,
+                "tag": "aws-r1",
+                "region": "us-east-1",
+                "account_id": "123456789012",
+                "instance_type": "g5.8xlarge",
+            },
+            {
+                "tag": "aws-r1",
+                "region": "us-east-1",
+                "account_id": "123456789012",
+                "instance_type": "mac-m4pro.metal",
+                "nodes": [],
+            },
+            {
+                "tag": "aws-r1",
+                "region": "us-east-1",
+                "account_id": "123456789012",
+                "instance_type": "g5.8xlarge",
+            },
+            [],
+        )
+        for state in states:
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
+                state_root = Path(tmp) / "state"
+                run_dir = state_root / "aws-r1"
+                run_dir.mkdir(parents=True)
+                state_path = run_dir / "state.json"
+                state_path.write_text(json.dumps(state))
+                with (
+                    patch("senpai.launch.aws_backend._aws_raw") as aws,
+                    self.assertRaisesRegex(RuntimeError, "AWS.*state"),
+                ):
+                    status_aws("aws-r1", str(state_root))
+                aws.assert_not_called()
+                self.assertTrue(state_path.is_file())
+
     def test_status_delegates_to_remote_docker_status_and_propagates_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_root = Path(tmp) / "state"
@@ -1738,6 +1915,7 @@ class AwsLifecycleTests(unittest.TestCase):
                 json.dumps(
                     {
                         "account_id": "123456789012",
+                        "backend": "aws",
                         "instance_id": "i-123",
                         "instance_type": "g5.8xlarge",
                         "phase": "running",
@@ -1746,6 +1924,7 @@ class AwsLifecycleTests(unittest.TestCase):
                         "region": "us-east-1",
                         "roles_starting": True,
                         "tag": "aws-r1",
+                        "state_version": 1,
                     }
                 )
             )
@@ -1803,6 +1982,7 @@ class AwsLifecycleTests(unittest.TestCase):
                         json.dumps(
                             {
                                 "account_id": "123456789012",
+                                "backend": "aws",
                                 "instance_id": "i-123",
                                 "instance_type": "g5.8xlarge",
                                 "phase": launch_phase,
@@ -1810,6 +1990,7 @@ class AwsLifecycleTests(unittest.TestCase):
                                 "public_ip": "203.0.113.10",
                                 "region": "us-east-1",
                                 "tag": "aws-r1",
+                                "state_version": 1,
                             }
                         )
                     )
