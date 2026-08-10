@@ -9,6 +9,7 @@ from uuid import UUID
 
 import pytest
 from openhands.sdk.event import ActionEvent, ObservationEvent
+from sqlite_test_support import assert_repeated_concurrent_first_open
 
 from senpai_agent.inbox import (
     DeliveryState,
@@ -16,7 +17,6 @@ from senpai_agent.inbox import (
     deliver_turn_messages,
     turn_has_finished_response,
 )
-
 
 CONVERSATION_ID = UUID("00000000-0000-0000-0000-000000000017")
 
@@ -31,6 +31,23 @@ class Conversation:
         assert sender is not None
         self.sent.append((message, sender))
         self.events.append(SimpleNamespace(message=message, sender=sender))
+
+
+def test_inbox_allows_bounded_concurrent_first_open(tmp_path: Path):
+    """
+    Requirement: overlapping controller components may initialize a fresh inbox
+    without a lock error, deadlock, or partial schema.
+    Interface: PersistentInbox construction and its durable turn view.
+    """
+
+    assert_repeated_concurrent_first_open(
+        lambda attempt: PersistentInbox(tmp_path / f"inbox-{attempt}.sqlite3"),
+        attempts=100,
+    )
+
+    database = tmp_path / "inbox-reopen.sqlite3"
+    with PersistentInbox(database) as reopened:
+        assert reopened.processed_turns() == ()
 
 
 def event_message(index: int, size: int = 0) -> str:

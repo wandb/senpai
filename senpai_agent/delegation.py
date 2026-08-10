@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field, model_validator
 from senpai_agent.advisor import AdvisorEvent, AdvisorEventStore
 from senpai_agent.processes import terminate_process_group
 from senpai_agent.secrets import scrub_github_credentials
+from senpai_agent.sqlite_store import connect_sqlite_store, initialize_sqlite_store
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation import LocalConversation
@@ -676,59 +677,75 @@ class DelegationRegistry:
 
     def __init__(self, path: Path):
         self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as database:
-            database.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS operations (
-                    operation_key TEXT PRIMARY KEY,
-                    tree_id TEXT NOT NULL,
-                    specs_json TEXT NOT NULL,
-                    task_ids_json TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS tasks (
-                    task_id TEXT PRIMARY KEY,
-                    tree_id TEXT NOT NULL,
-                    parent_conversation_id TEXT NOT NULL,
-                    parent_task_id TEXT,
-                    task_key TEXT,
-                    task TEXT NOT NULL,
-                    agent TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    search_mode TEXT,
-                    depth INTEGER NOT NULL,
-                    deadline_epoch REAL NOT NULL,
-                    status TEXT NOT NULL,
-                    result TEXT,
-                    error TEXT,
-                    pid INTEGER,
-                    process_group_id INTEGER,
-                    process_start_time REAL,
-                    state_dir TEXT,
-                    collected_at REAL,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS tasks_tree_id ON tasks(tree_id);
-                CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_conversation_id);
-                """
+        database = initialize_sqlite_store(
+            path,
+            self._initialize_schema,
+            runtime_busy_timeout_seconds=30,
+        )
+        database.close()
+
+    @staticmethod
+    def _initialize_schema(database: sqlite3.Connection) -> None:
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS operations (
+                operation_key TEXT PRIMARY KEY,
+                tree_id TEXT NOT NULL,
+                specs_json TEXT NOT NULL,
+                task_ids_json TEXT NOT NULL
             )
-            columns = {
-                row[1] for row in database.execute("PRAGMA table_info(tasks)")
-            }
-            if "parent_task_id" not in columns:
-                database.execute("ALTER TABLE tasks ADD COLUMN parent_task_id TEXT")
-            if "collected_at" not in columns:
-                database.execute("ALTER TABLE tasks ADD COLUMN collected_at REAL")
-            if "process_group_id" not in columns:
-                database.execute("ALTER TABLE tasks ADD COLUMN process_group_id INTEGER")
-            if "process_start_time" not in columns:
-                database.execute("ALTER TABLE tasks ADD COLUMN process_start_time REAL")
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id TEXT PRIMARY KEY,
+                tree_id TEXT NOT NULL,
+                parent_conversation_id TEXT NOT NULL,
+                parent_task_id TEXT,
+                task_key TEXT,
+                task TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                model TEXT NOT NULL,
+                search_mode TEXT,
+                depth INTEGER NOT NULL,
+                deadline_epoch REAL NOT NULL,
+                status TEXT NOT NULL,
+                result TEXT,
+                error TEXT,
+                pid INTEGER,
+                process_group_id INTEGER,
+                process_start_time REAL,
+                state_dir TEXT,
+                collected_at REAL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS tasks_tree_id ON tasks(tree_id)",
+            """
+            CREATE INDEX IF NOT EXISTS tasks_parent
+            ON tasks(parent_conversation_id)
+            """,
+        )
+        for statement in statements:
+            database.execute(statement)
+        columns = {
+            row[1] for row in database.execute("PRAGMA table_info(tasks)")
+        }
+        if "parent_task_id" not in columns:
+            database.execute("ALTER TABLE tasks ADD COLUMN parent_task_id TEXT")
+        if "collected_at" not in columns:
+            database.execute("ALTER TABLE tasks ADD COLUMN collected_at REAL")
+        if "process_group_id" not in columns:
+            database.execute("ALTER TABLE tasks ADD COLUMN process_group_id INTEGER")
+        if "process_start_time" not in columns:
+            database.execute("ALTER TABLE tasks ADD COLUMN process_start_time REAL")
 
     def _connect(self) -> sqlite3.Connection:
-        database = sqlite3.connect(self.path, timeout=30)
-        database.row_factory = sqlite3.Row
-        return database
+        return connect_sqlite_store(
+            self.path,
+            busy_timeout_seconds=30,
+            check_same_thread=True,
+        )
 
     @contextmanager
     def lifecycle(self):

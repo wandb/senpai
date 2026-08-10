@@ -9,6 +9,7 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
+from sqlite_test_support import assert_repeated_concurrent_first_open
 
 from senpai_agent.operations import (
     CampaignInventory,
@@ -16,33 +17,61 @@ from senpai_agent.operations import (
     CollectRoleReceipt,
     ContextReset,
     ContextResetCompletion,
+    ContextResetReceipt,
     ContextResetRequest,
     ContextResetRequestStore,
-    ContextResetReceipt,
     IdempotencyConflict,
     Nudge,
     NudgeReceipt,
     OperationBackend,
-    OperationInvariantError,
     OperationInProgress,
+    OperationInvariantError,
     OperationLedger,
     OperationPolicy,
     OperationService,
     RecordedOperationError,
     Restart,
     RestartCompletion,
+    RestartReceipt,
     RestartRequest,
     RestartRequestStore,
-    RestartReceipt,
     RoleObservation,
     RoleTarget,
     UnsafeContextReset,
 )
 
-
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
 ADVISOR_ID = UUID("00000000-0000-0000-0000-000000000101")
 STUDENT_ID = UUID("00000000-0000-0000-0000-000000000102")
+
+
+@pytest.mark.parametrize(
+    "store_type",
+    (ContextResetRequestStore, RestartRequestStore, OperationLedger),
+)
+def test_control_stores_allow_bounded_concurrent_first_open(tmp_path, store_type):
+    """
+    Requirement: controller and control-plane processes may discover a fresh
+    control database at the same time without a lock error or deadlock.
+    Interface: each durable control store's public constructor and close method.
+    """
+
+    def first_open(attempt):
+        return store_type(tmp_path / f"{store_type.__name__}-{attempt}.sqlite3")
+
+    assert_repeated_concurrent_first_open(
+        first_open,
+        attempts=20 if store_type is RestartRequestStore else 100,
+    )
+
+    database = tmp_path / f"{store_type.__name__}-reopen.sqlite3"
+    with store_type(database) as reopened:
+        if isinstance(reopened, ContextResetRequestStore):
+            assert reopened.statuses(target()) == ()
+        elif isinstance(reopened, RestartRequestStore):
+            assert reopened.allocate_worker_generation() == 1
+        else:
+            assert reopened.records() == []
 
 
 def target(role: str = "advisor", student: str | None = None) -> RoleTarget:

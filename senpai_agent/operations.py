@@ -12,7 +12,6 @@ import hashlib
 import json
 import sqlite3
 import threading
-import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,6 +28,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+from senpai_agent.sqlite_store import initialize_sqlite_store
 
 
 class _Contract(BaseModel):
@@ -413,13 +414,15 @@ class ContextResetRequestStore:
 
     def __init__(self, path: Path):
         self.path = path.expanduser().resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._connection = sqlite3.connect(self.path, check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA busy_timeout=5000")
-        self._connection.execute(
+        self._connection = initialize_sqlite_store(
+            self.path,
+            self._initialize_schema,
+        )
+
+    @staticmethod
+    def _initialize_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS context_reset_requests (
                 request_id TEXT PRIMARY KEY,
@@ -433,8 +436,6 @@ class ContextResetRequestStore:
             )
             """
         )
-        self._connection.commit()
-        self.path.chmod(0o600)
 
     def enqueue(self, request: ContextResetRequest) -> bool:
         encoded = request.model_dump_json()
@@ -701,79 +702,50 @@ class RestartRequestStore:
 
     def __init__(self, path: Path):
         self.path = path.expanduser().resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._connection = sqlite3.connect(
+        self._connection = initialize_sqlite_store(
             self.path,
-            check_same_thread=False,
-            timeout=30,
+            self._initialize_schema,
         )
-        self._connection.row_factory = sqlite3.Row
-        try:
-            # Install the busy handler before WAL negotiation: two processes can
-            # open an empty role-state directory at the same time during a rollout.
-            self._connection.execute("PRAGMA busy_timeout=30000")
-            deadline = time.monotonic() + 30
-            while True:
-                try:
-                    mode = self._connection.execute(
-                        "PRAGMA journal_mode=WAL"
-                    ).fetchone()
-                    if mode is None or str(mode[0]).lower() != "wal":
-                        raise RuntimeError("controller restart store requires WAL mode")
-                    break
-                except sqlite3.OperationalError as error:
-                    contention = str(error).lower()
-                    if (
-                        not any(word in contention for word in ("busy", "locked"))
-                        or time.monotonic() >= deadline
-                    ):
-                        raise
-                    time.sleep(0.01)
-            self._connection.execute("BEGIN IMMEDIATE")
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS controller_restart_requests (
-                    request_id TEXT PRIMARY KEY,
-                    research_tag TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    student TEXT,
-                    request_json TEXT NOT NULL,
-                    source_generation INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    planned_replacement_generation INTEGER,
-                    completion_json TEXT,
-                    rejection_code TEXT
-                )
-                """
+
+    @staticmethod
+    def _initialize_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS controller_restart_requests (
+                request_id TEXT PRIMARY KEY,
+                research_tag TEXT NOT NULL,
+                role TEXT NOT NULL,
+                student TEXT,
+                request_json TEXT NOT NULL,
+                source_generation INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                planned_replacement_generation INTEGER,
+                completion_json TEXT,
+                rejection_code TEXT
             )
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS controller_worker_generation (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    generation INTEGER NOT NULL
-                )
-                """
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS controller_worker_generation (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                generation INTEGER NOT NULL
             )
-            self._connection.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS one_controller_restart_per_generation
-                ON controller_restart_requests (
-                    research_tag,
-                    role,
-                    COALESCE(student, ''),
-                    source_generation
-                )
-                WHERE status IN ('pending', 'processing')
-                """
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS one_controller_restart_per_generation
+            ON controller_restart_requests (
+                research_tag,
+                role,
+                COALESCE(student, ''),
+                source_generation
             )
-            self._connection.commit()
-            self._connection.execute("PRAGMA busy_timeout=5000")
-        except BaseException:
-            self._connection.rollback()
-            self._connection.close()
-            raise
-        self.path.chmod(0o600)
+            WHERE status IN ('pending', 'processing')
+            """
+        )
 
     def allocate_worker_generation(self) -> int:
         with self._lock:
@@ -1181,13 +1153,15 @@ class OperationLedger:
 
     def __init__(self, path: Path):
         self.path = path.expanduser().resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._connection = sqlite3.connect(self.path, check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA busy_timeout=5000")
-        self._connection.execute(
+        self._connection = initialize_sqlite_store(
+            self.path,
+            self._initialize_schema,
+        )
+
+    @staticmethod
+    def _initialize_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS operation_audit (
                 operation_key TEXT PRIMARY KEY,
@@ -1210,28 +1184,29 @@ class OperationLedger:
         )
         columns = {
             str(row["name"])
-            for row in self._connection.execute(
+            for row in connection.execute(
                 "PRAGMA table_info(operation_audit)"
             ).fetchall()
         }
         if "anomaly_category" not in columns:
-            self._connection.execute(
+            connection.execute(
                 "ALTER TABLE operation_audit ADD COLUMN anomaly_category TEXT"
             )
-        self._connection.execute(
+        connection.execute(
             """
             CREATE INDEX IF NOT EXISTS operation_cooldown
             ON operation_audit (cooldown_key, requested_at DESC)
             """
         )
-        self._migrate_legacy_mutation_incidents()
-        self._connection.commit()
-        self.path.chmod(0o600)
+        OperationLedger._migrate_legacy_mutation_incidents(connection)
 
-    def _migrate_legacy_mutation_incidents(self) -> None:
+    @staticmethod
+    def _migrate_legacy_mutation_incidents(
+        connection: sqlite3.Connection,
+    ) -> None:
         """Give pre-category mutation rows the deterministic default identity."""
 
-        rows = self._connection.execute(
+        rows = connection.execute(
             """
             SELECT operation_key, action_kind, research_tag, role, student,
                    anomaly_category
@@ -1252,7 +1227,7 @@ class OperationLedger:
                 student=str(row["student"]) if row["student"] else None,
                 anomaly_category=anomaly_category,
             )
-            self._connection.execute(
+            connection.execute(
                 """
                 UPDATE operation_audit
                 SET anomaly_category = ?, cooldown_key = ?
