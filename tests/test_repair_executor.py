@@ -378,3 +378,24 @@ def test_filesystem_executor_socket_refuses_a_poisoned_non_socket_path(tmp_path)
         assert socket_path.is_dir()
     finally:
         socket_path.rmdir()
+
+
+def test_managed_executor_socket_cleanup_removes_poison_without_following_links(
+    tmp_path,
+):
+    target = tmp_path / "must-survive"
+    target.mkdir()
+    poisoned = tmp_path / "executor.sock"
+    poisoned.symlink_to(target)
+
+    repair_executor._remove_socket_path(poisoned, replace_poisoned=True)
+
+    assert not poisoned.exists()
+    assert target.is_dir()
+    poisoned.mkdir()
+    (poisoned / "junk").write_text("blocked")
+
+    repair_executor._remove_socket_path(poisoned, replace_poisoned=True)
+
+    assert not poisoned.exists()
+    assert target.is_dir()

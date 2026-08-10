@@ -155,14 +155,30 @@ def _filesystem_socket_path(socket_path: str | Path) -> Path | None:
     return None if str(socket_path).startswith("@") else Path(socket_path)
 
 
-def _remove_socket_path(socket_path: Path) -> None:
+def _remove_socket_path(
+    socket_path: Path,
+    *,
+    replace_poisoned: bool = False,
+) -> None:
     try:
         mode = socket_path.lstat().st_mode
     except FileNotFoundError:
         return
+    if stat.S_ISSOCK(mode) or (replace_poisoned and not stat.S_ISDIR(mode)):
+        socket_path.unlink()
+        return
+    if replace_poisoned:
+        shutil.rmtree(socket_path)
+        return
     if not stat.S_ISSOCK(mode):
         raise RepairExecutorError(f"refusing to replace non-socket path: {socket_path}")
-    socket_path.unlink()
+
+
+def _is_managed_executor_socket_path(socket_path: Path) -> bool:
+    return str(socket_path) in {
+        DEFAULT_EXECUTOR_SOCKET,
+        f"{DEFAULT_EXECUTOR_SOCKET}.health",
+    }
 
 
 def _health_socket_path(socket_path: str | Path) -> str:
@@ -226,7 +242,10 @@ class _HeartbeatPublisher:
         filesystem_path = _filesystem_socket_path(self.socket_path)
         if filesystem_path is not None:
             filesystem_path.parent.mkdir(parents=True, exist_ok=True)
-            _remove_socket_path(filesystem_path)
+            _remove_socket_path(
+                filesystem_path,
+                replace_poisoned=_is_managed_executor_socket_path(filesystem_path),
+            )
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(_socket_address(self.socket_path))
         if filesystem_path is not None:
@@ -261,7 +280,10 @@ class _HeartbeatPublisher:
             self._thread.join(timeout=1)
         filesystem_path = _filesystem_socket_path(self.socket_path)
         if filesystem_path is not None:
-            _remove_socket_path(filesystem_path)
+            _remove_socket_path(
+                filesystem_path,
+                replace_poisoned=_is_managed_executor_socket_path(filesystem_path),
+            )
 
     def _serve(self) -> None:
         listener = self._listener
@@ -917,7 +939,10 @@ class RepairExecutorServer:
         socket_path = _filesystem_socket_path(self.socket_path)
         if socket_path is None:
             return
-        _remove_socket_path(socket_path)
+        _remove_socket_path(
+            socket_path,
+            replace_poisoned=_is_managed_executor_socket_path(socket_path),
+        )
 
 
 class RepairExecutorClient:
