@@ -178,6 +178,7 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
         tmp_path,
         command_secrets={
             "WANDB_API_KEY": "wandb-key",
+            "HF_TOKEN": "hf-key",
             "MLXFAST_API_TOKEN": "mlxfast-key",
         },
     )
@@ -193,6 +194,7 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     assert captured["plugin"] == str(PLUGIN_DIR)
     assert captured["secrets"] == {
         "WANDB_API_KEY": "wandb-key",
+        "HF_TOKEN": "hf-key",
         "MLXFAST_API_TOKEN": "mlxfast-key",
     }
     assert captured["conversation_id_env"] == config.conversation_id.hex

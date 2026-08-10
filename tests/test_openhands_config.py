@@ -150,6 +150,7 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
             "GH_TOKEN": "secondary-github-key",
             "WANDB_API_KEY": "wandb-key",
             "EXA_API_KEY": "exa-key",
+            "HF_TOKEN": "hf-key",
             "MLXFAST_API_TOKEN": "mlxfast-key",
             "SENPAI_TIMEOUT_MINUTES": "0.5",
         }
@@ -165,6 +166,7 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
     assert config.command_secrets == {
         "WANDB_API_KEY": "wandb-key",
         "EXA_API_KEY": "exa-key",
+        "HF_TOKEN": "hf-key",
         "MLXFAST_API_TOKEN": "mlxfast-key",
     }
     assert "ANTHROPIC_API_KEY" not in config.command_secrets
@@ -177,6 +179,22 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
     assert delegated.smart_api_key == "openai-key"
     assert delegated.fast_api_key == "openai-key"
     assert delegated.frontier_api_key == "openai-key"
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_hugging_face_access_is_masked_for_every_research_role(tmp_path, role):
+    """
+    Requirement: optional Hugging Face access must never be an ambient,
+    unmasked credential in either model-facing research role.
+    Interface: the resolved OpenHands command-secret registry.
+    """
+
+    env = runtime_env(tmp_path)
+    env.update({"SENPAI_ROLE": role, "HF_TOKEN": "hf-role-key"})
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert config.command_secrets["HF_TOKEN"] == "hf-role-key"
 
 
 @pytest.mark.parametrize(
