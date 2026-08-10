@@ -1138,6 +1138,80 @@ class AwsMacLaunchTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertIn("if test -f", ssh.call_args.args[2])
 
+    def test_successful_instance_termination_supersedes_native_stop_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "state" / "mlxfast-r1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "id_ed25519").write_text("private")
+            state = {
+                "tag": "mlxfast-r1",
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "",
+                "ssh_authorized": False,
+                "nodes": [
+                    {
+                        "instance_id": "i-fern",
+                        "host_id": "h-a1",
+                        "public_ip": "198.51.100.1",
+                    }
+                ],
+            }
+
+            with (
+                patch.object(aws_mac_backend, "_aws_raw", return_value=""),
+                patch.object(
+                    aws_mac_backend,
+                    "_ssh",
+                    side_effect=RuntimeError("host is already unavailable"),
+                ),
+            ):
+                errors = _cleanup(run_dir, state, AwsContext("us-east-1", "sandbox"))
+                run_exists = run_dir.exists()
+
+        self.assertEqual(errors, [])
+        self.assertFalse(run_exists)
+
+    def test_failed_instance_termination_preserves_cleanup_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "state" / "mlxfast-r1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "id_ed25519").write_text("private")
+            state = {
+                "tag": "mlxfast-r1",
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "",
+                "ssh_authorized": False,
+                "nodes": [
+                    {
+                        "instance_id": "i-fern",
+                        "host_id": "h-a1",
+                        "public_ip": "198.51.100.1",
+                    }
+                ],
+            }
+
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_aws_raw",
+                    side_effect=AwsCommandError("UnauthorizedOperation"),
+                ),
+                patch.object(
+                    aws_mac_backend,
+                    "_ssh",
+                    side_effect=RuntimeError("host is unavailable"),
+                ),
+            ):
+                errors = _cleanup(run_dir, state, AwsContext("us-east-1", "sandbox"))
+                run_exists = run_dir.exists()
+
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(any(error.startswith("native stop i-fern") for error in errors))
+        self.assertTrue(any(error.startswith("terminate instances") for error in errors))
+        self.assertTrue(run_exists)
+
     def test_cleanup_recovers_an_instance_from_its_persisted_client_token(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "state" / "mlxfast-r1"

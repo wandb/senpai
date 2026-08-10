@@ -1165,8 +1165,14 @@ def _cleanup(run_dir: Path, state: dict, context: AwsContext | None = None) -> l
         for node in state.get("nodes", [])
         if node.get("instance_id")
     ]
+    native_stop_errors: list[tuple[str, str]] = []
     for node in state.get("nodes", []):
-        if node.get("public_ip") and (run_dir / "id_ed25519").is_file():
+        instance_id = node.get("instance_id")
+        if (
+            instance_id
+            and node.get("public_ip")
+            and (run_dir / "id_ed25519").is_file()
+        ):
             try:
                 manifest = f"{REMOTE_RUN_ROOT}/{state['tag']}/manifest.json"
                 _ssh(
@@ -1179,7 +1185,10 @@ def _cleanup(run_dir: Path, state: dict, context: AwsContext | None = None) -> l
                     timeout=60,
                 )
             except Exception as error:
-                errors.append(f"native stop {node['instance_id']}: {error}")
+                native_stop_errors.append(
+                    (instance_id, f"native stop {instance_id}: {error}")
+                )
+    terminated_ids: set[str] = set()
     if instance_ids:
         instances_terminated = False
         try:
@@ -1202,7 +1211,13 @@ def _cleanup(run_dir: Path, state: dict, context: AwsContext | None = None) -> l
             for node in state.get("nodes", []):
                 if node.get("instance_id") in instance_ids:
                     node["instance_id"] = ""
+            terminated_ids.update(instance_ids)
             _save_state(run_dir, state)
+    errors.extend(
+        message
+        for instance_id, message in native_stop_errors
+        if instance_id not in terminated_ids
+    )
 
     if state.get("key_name") and state.get("key_owned") is not False:
         key_deleted = False
