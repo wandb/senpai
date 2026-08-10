@@ -1042,7 +1042,9 @@ def test_supervisor_rejects_an_extra_exact_tag_advisor(monkeypatch):
     assert mutations == []
 
 
-def test_supervisor_rejects_unreplaced_students_on_an_old_revision(monkeypatch):
+def test_supervisor_rejects_unreplaced_students_without_compatible_protocols(
+    monkeypatch,
+):
     args = supervisor_launch_args(advisor=True, operational_supervisor=True)
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)

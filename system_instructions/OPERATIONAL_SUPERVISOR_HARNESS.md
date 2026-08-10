@@ -30,8 +30,12 @@ before removing the volatile directories.
 
 Use the typed tool for race-sensitive role inspection, nudges, context resets,
 and controller restarts because it binds those changes to observed state and
-records durable deduplication. For an arbitrary repair in one exact role
-workspace, use the campaign-bound client:
+records durable deduplication. A `succeeded` mutation means durable acceptance
+or queueing, not target-side completion. Confirm resets and restarts in later
+snapshot status, and confirm a nudge's effect from later campaign evidence. A
+context reset starts a clean model branch; it cannot selectively delete or
+rewind messages. For an arbitrary repair in one exact role workspace, use the
+campaign-bound client:
 
 ```bash
 senpai-role-shell --operation-id maple-advisor-status-20260810T1200Z \
@@ -44,30 +48,35 @@ senpai-role-shell --status maple-fern-state-20260810T1205Z
 
 The client accepts no namespace, pod, container, host, or mount path. The
 operation ID must be stable and chosen before execution. If the terminal loses
-the response, query `--status` and replay only with that same ID and exact
-command; a changed command with the same ID is rejected. An interrupted running
-operation is recorded as `unknown` and must not be executed again automatically.
-Only the newest 128 completed operations retain full output. Older operations
-remain queryable as durable tombstones; replaying one returns a typed
-expired-receipt outcome with its exit code and must never be treated as
-permission to run it again.
+the response, query `--status`. Replay only with that same ID and unchanged
+target, byte-for-byte command, working-directory choice, and timeout; changing
+any of them is rejected. An interrupted running operation is recorded as
+`unknown` and must not be executed again automatically. Only the newest 128
+completed operations retain full output. Older completions remain queryable as
+durable tombstones for the life of the supervisor-state volume; replaying one
+returns a typed expired-receipt outcome and must never be treated as permission
+to run it again.
+
 Each repair command also receives fresh home, temporary, and XDG directories.
-The
-credentialed broker validates the requested role against this campaign's
-immutable inventory, then sends the command only to that pod's fixed secret-free `repair` sidecar.
-`workspace`, `state`, and private `scratch` are
-the only working-directory choices. Commands have a hard timeout and bounded
-output; timed-out descendant process groups are killed. The repair sidecar
-shares only that exact role workspace and state, not the role's credentials,
-service-account token, PID namespace, dataset volume, or container root.
-There is no browser, project skill, or subagent surface.
+The credentialed broker validates the requested role against this campaign's
+immutable inventory, then sends the command only to that pod's
+fixed secret-free `repair` sidecar. `workspace`, `state`, and private `scratch`
+are the only working-directory choices. Commands have a hard timeout and
+bounded output; timed-out descendant process groups are killed. The repair
+sidecar shares only
+that exact role workspace and state, not the role's credentials, service-account
+token, PID namespace, dataset volume, or container root. There is no browser,
+project skill, or subagent surface.
 
 The control process's ServiceAccount pod list/log/exec verbs are namespace-wide
 because Kubernetes cannot label-scope them, but only the typed operations and
-the inventory-bound repair broker possess that token. GitHub credentials are not
-exposed to the terminal or repair sidecars; route authenticated repository
-mutations through the appropriate existing advisor or student conversation
-rather than treating an authentication failure as a command-policy denial.
+the inventory-bound repair broker possess that token. The namespace must contain
+only this campaign; if evidence contradicts that invariant, report an unsafe
+deployment and do not inspect the unrelated workload.
+GitHub credentials are not exposed to the terminal or repair sidecars; route
+authenticated repository mutations through the appropriate existing advisor or
+student conversation rather than treating an authentication failure as a
+command-policy denial.
 
 Each wake starts a fresh conversation. The prompt supplies the last three
 timestamped observations and a bounded audit of prior interventions. Treat all

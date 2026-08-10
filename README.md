@@ -225,9 +225,11 @@ Contents write access, resolves the target branch, rejects active student-label
 collisions, and checks immutable image references against one expected runner
 revision. A supervisor-only upgrade authenticates only the credentials the
 supervisor actually uses (GitHub, W&B, and its model provider), verifies the
-existing exact campaign inventory and source revision, and neither requires
-Exa/Hugging Face credentials nor creates branches or labels. Backend-specific
-checks are described below. Preflight never starts advisor or student roles.
+existing exact campaign inventory, advisor branch, and versioned management and
+repair protocols. Compatible role and supervisor images may come from different
+source revisions. The upgrade neither requires Exa/Hugging Face credentials nor
+creates branches or labels. Backend-specific checks are described below.
+Preflight never starts advisor or student roles.
 
 ### 7. Launch
 
@@ -242,27 +244,47 @@ fixed launch Secret when it is launching an advisor or students. The
 operational supervisor owns a separate least-privilege Secret and ConfigMap.
 Both supervisor objects are immutable and content-addressed, so a supervisor-
 only upgrade never rewrites credentials used by the research roles and retains
-the previous bundle for Kubernetes rollback. The launcher waits up to
-`--supervisor_ready_timeout_s` for the supervisor Deployment to become ready;
-on failure it reports the exact `kubectl rollout undo` command.
+the previous bundle. Such an upgrade applies the campaign NetworkPolicy,
+creates the new bundle, and reapplies the supervisor ServiceAccount, RBAC, and
+Deployment. Its `Recreate` strategy prevents two supervisor pods from writing
+the state claim concurrently, with a short supervisor-only outage during
+replacement. The launcher waits up to `--supervisor_ready_timeout_s` for the
+Deployment to become ready.
 
-The supervisor also receives a dedicated ServiceAccount and namespace-scoped
-Role/RoleBinding. Only its credentialed control container receives a projected
-ServiceAccount token. Its typed operation tool and repair broker enforce the
-campaign inventory; the separate model-visible terminal container has no
-Kubernetes token or credentials. Kubernetes still cannot label-scope the
-control container's pod list/log/exec verbs, so use a dedicated namespace for
-every campaign that enables the supervisor. The launcher does not create the
-namespace, PVC, Service, or general cluster RBAC.
+On rollout failure, the printed `kubectl rollout undo` command rolls back only
+the supervisor Deployment template. It does not restore RBAC, NetworkPolicy, or
+the durable state claim; reapply the retained prior release manifest if those
+resources changed. Persistent state is never automatically rolled back.
+
+The supervisor also receives a dedicated Kubernetes ServiceAccount and
+namespace-scoped Role/RoleBinding. This is a Kubernetes workload identity, not
+a Linux user, human account, or cloud identity. Senpai creates no cloud-role
+binding; on a managed cluster, verify that admission and workload-identity
+policy do not attach one. Only the credentialed control container receives its
+projected token while the Pod is running; a narrow startup init container also
+mounts it only to create the control container's token-file kubeconfig. The
+typed operation tool and repair broker enforce the campaign inventory; the
+separate model-visible terminal container has no Kubernetes token or
+credentials. Kubernetes cannot label-scope the control container's pod
+list/log/exec verbs, so every supervised campaign requires its own namespace.
+`--supervisor_dedicated_namespace` is the operator's attestation of that fact,
+not an automated proof. The launcher does not create the namespace, PVC,
+Service, or general cluster RBAC.
 
 Inspect and stop the launch:
 
 ```bash
 kubectl get deployments,pods -l research-tag=first-run
 kubectl logs -f deployment/senpai-first-run-frieren
-kubectl delete deployments,configmaps,secrets,serviceaccounts,roles,rolebindings \
+kubectl delete deployment/senpai-supervisor-first-run
+kubectl delete deployments,configmaps,secrets,serviceaccounts,roles,rolebindings,networkpolicies \
   -l research-tag=first-run
 ```
+
+The first delete is the supervisor-only kill switch. It leaves advisor and
+student pods, their repair sidecars, persistent state, and host capacity in
+place. The second command stops the whole campaign; these are intentionally
+different operations.
 
 Use `--kube_context` and `--namespace` when the desired cluster is not your current default. Use `--dry_run` to render redacted manifests without checking credentials or writing to the cluster.
 
@@ -705,16 +727,24 @@ and queued context resets; it is never shared across nodes. The separate
 operational supervisor uses Kubernetes pod inspection/exec as a management
 transport, not as a research communication channel.
 
-The opt-in operational supervisor wakes every 15 minutes with a fresh model
-conversation and a timestamped snapshot. It retains only the last three
-snapshots in its explicit working context, so it can detect stagnation without
-growing one long-lived history. Each fresh OpenHands conversation is in-memory.
-The three snapshots, typed-mutation receipts, and arbitrary-repair operation
-records are the only local durable supervisor state. Full arbitrary-repair
-output is retained only for the newest 128 completed operations; older records
-remain as permanent tombstones with identity, target, fingerprint, status,
-timestamps, and exit code. Its SQLite files must live on the dedicated
-`supervisor_state_pvc_claim_name`, never the dataset PVC. That claim must be a
+The opt-in operational supervisor starts a single-flight cycle every 15 minutes
+with a timestamped snapshot and fresh model conversation. Collection and the
+operational turn run sequentially; when the six-hour research review is due, it
+runs as a second fresh turn after the operational turn. Cycles never overlap.
+A long cycle delays the next one, which starts immediately if its interval has
+already elapsed. The supervisor retains only the last three snapshots in its
+explicit working context, so it can detect stagnation without growing one
+long-lived history. Each fresh OpenHands conversation is in-memory.
+
+The three snapshots, cadence timestamps, typed-mutation receipts, and
+arbitrary-repair records comprise the local durable supervisor state. Full
+arbitrary-repair receipts, including bounded stdout and stderr, are retained for
+the newest 128 completed operations. For the life of the supervisor-state PVC,
+older completions remain as metadata tombstones containing operation identity,
+target, command fingerprint, working directory, timeout, status, timestamps,
+exit code, prune time, and error type. Its SQLite files must live on the
+dedicated `supervisor_state_pvc_claim_name`, never the dataset PVC. That claim
+must be a
 Bound RWO or RWOP filesystem whose operator has verified POSIX advisory locks
 and atomic file create, rename, and delete behavior, then annotated it
 `senpai.wandb.com/sqlite-safe=true`; RWX/NFS/CIFS-style shared storage is not an
@@ -727,7 +757,10 @@ student inventory. Supervisor and role image revisions may differ when those
 protocol versions match, so a supervisor-only upgrade does not restart research
 roles. Replacing a role in an already supervised campaign requires
 `--operational_supervisor`, preventing an ordinary launch from silently removing
-its repair sidecar. Each snapshot contains:
+its repair sidecar. A change to socket framing, wire fields, or operation
+semantics that is not backward compatible must bump the relevant protocol and
+therefore requires an explicit role relaunch. Source revisions remain recorded
+for provenance, not compatibility. Each snapshot contains:
 
 - open PRs whose base is exactly this launch's advisor branch, including age,
   workflow labels, and issue/review/inline-comment counts;
@@ -735,16 +768,30 @@ its repair sidecar. Each snapshot contains:
   student training supervisors, independent of experiment grouping; and
 - each exact role pod's controller lease, completed turns, running training
   count, bounded machine utilization, reset status, and recent structured
-  error markers. Raw log and training-error text never leaves the role.
+  error markers. Raw `kubectl logs` lines exist transiently in the credentialed
+  control process and are immediately reduced to marker, timestamp, and
+  fingerprint; training failures are reduced inside the role before crossing
+  the control boundary. Neither raw source is persisted in snapshots or sent to
+  the model.
 
-Kubernetes supervisor-only launches are independently deployable. They create
-a new immutable, content-addressed supervisor Secret and ConfigMap, update only
-the supervisor Deployment, and leave both the fixed advisor/student Secret and
-prior supervisor bundles untouched. The launcher waits for readiness before it
-returns. If readiness fails, use the exact rollback command printed by the
-launcher; the prior ReplicaSet still references the retained prior bundle.
-Both preflight and the immediate pre-mutation recheck validate the namespace,
-dedicated state claim, exact inventory, and protocol annotations.
+Kubernetes supervisor-only launches are independently deployable. They apply
+the campaign NetworkPolicy, create a new immutable, content-addressed supervisor
+Secret and ConfigMap, and reapply the ServiceAccount, Role, RoleBinding, and
+supervisor Deployment. They do not mutate advisor/student Deployments or the
+fixed role Secret, and prior supervisor bundles remain available. `Recreate`
+gives the state PVC one supervisor writer at the cost of replacement downtime.
+The launcher waits for readiness before it returns. If readiness fails, the
+printed rollback command restores only the previous Deployment template, whose
+ReplicaSet references the retained prior bundle; it does not restore RBAC,
+NetworkPolicy, or persistent state. Reapply the prior release manifest when
+those resources need rollback. Both preflight and the immediate pre-mutation
+recheck validate the namespace, dedicated state claim, exact inventory, and
+protocol annotations.
+
+To stop only the supervisor, delete `deployment/senpai-supervisor-<tag>` in the
+campaign namespace. This leaves research-role pods and repair sidecars, the
+state PVC, RBAC, NetworkPolicy, immutable bundles, and host capacity untouched.
+It is a supervisor kill switch, not a full campaign stop.
 
 Supervisor-capable pods are selected by a campaign NetworkPolicy that allows
 ordinary Internet and cluster egress but denies IPv4 link-local, IPv6
@@ -765,17 +812,21 @@ The supervisor has OpenHands' native `terminal` interface plus one typed
 operation tool, but they execute across a deliberate two-container boundary.
 The credentialed control container owns GitHub, W&B, model, campaign-state, and
 projected Kubernetes credentials. The model's native terminal actions are
-forwarded over a private Unix socket to a secret-free shell container. That
-shell has a mutable private home, temporary directory, and workspace and is not
-wrapped by Senpai's advisor/student command policy, so Senpai does not filter
-shell or Git syntax. It has no Kubernetes token, campaign state, provider
-secret, GitHub token, W&B key, shared PID namespace, or view of the control
-container's root filesystem. The pinned runtime and instructions are mounted
-read-only, and persistent user-skill loading is disabled. Every wake receives a
-new terminal worker and process tree plus fresh `HOME`, `TMPDIR`, and XDG cache,
-config, and data directories. Those volatile directories and all descendants
-are removed before the wake completes; only the explicit supervisor workspace
-is mutable across wakes within the pod.
+forwarded over a Linux abstract Unix socket to a secret-free shell container.
+The control and shell containers still share their Pod network namespace and
+loopback; lack of a shared PID namespace or root filesystem does not isolate
+same-Pod networking. No credential-bearing control endpoint listens on TCP or
+UDP, and adding one would weaken this boundary. The shell has a mutable private
+home, temporary directory, and workspace and is not wrapped by Senpai's
+advisor/student command policy, so Senpai does not filter shell or Git syntax.
+It has no Kubernetes token, campaign state, provider secret, GitHub token, W&B
+key, shared PID namespace, or view of the control container's root filesystem.
+The pinned runtime and instructions are mounted read-only, and persistent user-
+skill loading is disabled. Every wake receives a new terminal worker and
+process tree plus fresh `HOME`, `TMPDIR`, and XDG cache, config, and data
+directories. Those volatile directories and all descendants are removed before
+the wake completes; only the explicit supervisor workspace is mutable across
+wakes within the pod.
 
 The typed tool may inspect a configured role, send one deduplicated nudge to
 its existing conversation, queue a same-UUID model-context reset, or request a
@@ -784,6 +835,11 @@ audited, idempotent, and cooldown-limited. Cooldown identity comes from the
 typed anomaly category, action, and exact role target rather than the model's
 free-form incident label. Inspections always execute fresh, and every fresh
 supervisor turn sees a bounded audit of the 12 most recent mutation outcomes.
+A `succeeded` tool result for a nudge, context reset, or restart means the
+request was durably accepted or queued, not that the target completed it. Later
+campaign evidence shows whether a nudge had its intended effect; later
+`context_resets` and `controller_restarts` snapshot entries prove completion or
+rejection of those requests.
 
 Arbitrary role repair uses `senpai-role-shell`. The shell client accepts only a
 configured advisor or student plus `workspace`, `state`, or private `scratch`;
@@ -793,16 +849,18 @@ role workspace and state, not its credentials, ServiceAccount token, PID
 namespace, dataset volume, or container root. Commands have a hard timeout,
 bounded output, descendant cleanup, and an audited outcome. Each repair gets a
 fresh `HOME`, temporary directory, and XDG directories. The caller must choose
-a stable operation ID before execution. The broker durably binds that ID to the
-exact target and command fingerprint: an exact replay returns the recorded
-receipt while its full payload is retained, a changed payload is rejected, and
-an operation interrupted with no authoritative response becomes `unknown` and
+a stable operation ID before execution. The broker durably binds that ID to a
+fingerprint over the exact target, byte-for-byte command, symbolic working
+directory, and timeout. An exact replay returns the recorded receipt while its
+full payload is retained; changing any of those fields under the same operation
+ID is rejected. If a response is lost, query `senpai-role-shell --status` first.
+An operation interrupted with no authoritative response becomes `unknown` and
 is never run again automatically. Replaying a completed operation after its
 payload has aged out returns a typed expired-receipt outcome carrying the
 durable tombstone; it never runs the command again. Receipt pruning is part of
 the same SQLite transaction that completes a command, and startup recovery also
-enforces the bound. SQLite reuses the freed payload pages, while the much
-smaller audit tombstones intentionally remain durable.
+enforces the bound. SQLite can reuse the freed payload pages, while the much
+smaller audit tombstones intentionally remain durable for the life of the PVC.
 Every fresh supervisor wake sees a bounded repair audit. Authenticated
 repository mutations remain available through a nudge to the existing
 credentialed advisor/student conversation; an authentication failure in the
@@ -820,7 +878,15 @@ replacement generation completes the durable receipt. A context reset is
 likewise consumed only by the owning controller at a safe turn boundary: it
 starts a clean active branch while preserving the raw OpenHands trace,
 conversation UUID, workspace, and pending events. It never deletes or rewrites
-event files.
+event files and cannot selectively remove messages or rewind to an arbitrary
+point.
+
+Inside each managed role Pod, the repair executor's command socket is a
+filesystem Unix socket on a memory-backed volume mounted only in the secret-free
+repair sidecar; the advisor/student container cannot open it. Its Kubernetes
+health probe uses a separate Linux abstract Unix socket that exposes only the
+executor heartbeat and current deadline state. That read-only health endpoint
+is same-Pod reachable, but it accepts no repair command.
 
 When supervised, `/repair/workspace` is the mutable target repository root;
 the pinned Senpai runner, dataset, credentials, and ServiceAccount are absent.
@@ -842,11 +908,12 @@ concise reminder into the existing advisor conversation. This does not change
 the advisor or student research prompts and does not continuously direct
 experiments.
 
-#### Planned Docker and AWS transports
+#### Current support and planned transports
 
-This PR does not yet launch the operational supervisor on #3472's Docker, AWS,
-or AWS Mac backends. The backend-neutral snapshot, ledger, prompt, and role
-control protocol will be reused; only discovery and transport should vary:
+The operational supervisor is currently Kubernetes-only; the launcher rejects
+`--operational_supervisor` with Docker, AWS GPU, or AWS Mac. Future backends
+should preserve the snapshot, ledger, prompt, and versioned role-control
+contracts while changing only discovery and transport:
 
 - Docker will start a separate supervisor container and a narrow host-side
   broker bound to the exact container IDs in that campaign's launch plan. The
@@ -861,7 +928,7 @@ control protocol will be reused; only discovery and transport should vary:
   LaunchDaemons. It may repair or restart role processes, but will receive no
   EC2 Dedicated Host release, instance-stop, or termination authority. A
   supervisor upgrade must preserve the running instances and host allocation;
-  the forced-command identity must not reuse #3472's broad bootstrap SSH key.
+  the forced-command identity must not reuse a broad bootstrap SSH key.
 
 The supervisor will retain its unrestricted native terminal locally. Access to
 another campaign container or host will go through one fixed
@@ -876,9 +943,10 @@ Raw Docker sockets and AWS lifecycle credentials remain outside the model
 container.
 
 Each transport should expose the same typed state-bound operations and native
-local terminal, persist the same three snapshots, and be covered by replay,
-scope, restart-safety, and no-host-release acceptance tests before the launcher
-accepts `--operational_supervisor` for that backend.
+local terminal, preserve the same bounded snapshot and durable receipt
+semantics, and be covered by scope, replay, restart-safety, credential-isolation,
+and no-host-release acceptance tests before the launcher accepts
+`--operational_supervisor` for that backend.
 
 Each role runs a small Python supervisor around the deterministic controller:
 
@@ -961,13 +1029,20 @@ uv run pytest -q
 bash -n k8s/*.sh scripts/*.sh plugins/senpai/scripts/*.sh
 ```
 
-Pull requests run a real credential-free Kind production canary. Kind is pinned
-by image digest; Calico v3.32.1 is fetched from its released tag, verified by
-SHA-256, and its CNI/node/controller images are rewritten to released
-multi-architecture digests before installation. The gate proves policy
-enforcement with a live IMDS-address decoy, advisor and student repair scoping,
-controller-owner restarts, a failed supervisor-only rollout and rollback, role
-pod continuity, and dedicated supervisor-state persistence.
+Pull requests run a credential-free Kind topology and mechanics canary. Kind is
+pinned by image digest; Calico v3.32.1 is fetched from its released tag,
+verified by SHA-256, and its CNI/node/controller images are rewritten to
+released multi-architecture digests before installation. The canary renders the
+production manifests and derives a thin test image from the real advisor image,
+but its advisor and student processes are purpose-built role simulators; it does
+not exercise the GPU student image, live GitHub or W&B APIs, or a model provider.
+It proves NetworkPolicy enforcement with a live IMDS-address decoy, advisor and
+student repair scoping, controller-owner restarts, a failed supervisor-only
+Deployment rollback, role-pod continuity, and dedicated supervisor-state
+persistence. Before broad production rollout, run a controlled live staging
+wake in a disposable campaign namespace with the intended credentials and model
+provider, and verify observation, mutation, repair, restart, and secret-redaction
+behavior end to end.
 
 Deep references:
 
