@@ -684,22 +684,30 @@ def test_restart_enqueue_is_race_safe_for_duplicate_and_competing_requests(
     )
 
     def race(path: Path, requests: tuple[RestartRequest, RestartRequest]):
-        barrier = threading.Barrier(2)
+        start = threading.Barrier(2, timeout=5)
+        initialized = threading.Barrier(2, timeout=5)
         results: list[bool | type[BaseException]] = []
 
         def enqueue(value: RestartRequest) -> None:
             try:
+                start.wait()
                 with RestartRequestStore(path) as store:
-                    barrier.wait()
+                    initialized.wait()
                     results.append(store.enqueue(value))
             except BaseException as error:
                 results.append(type(error))
 
-        threads = [threading.Thread(target=enqueue, args=(value,)) for value in requests]
+        threads = [
+            threading.Thread(target=enqueue, args=(value,), daemon=True)
+            for value in requests
+        ]
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join()
+            thread.join(timeout=10)
+        assert not any(thread.is_alive() for thread in threads), (
+            "restart-store initialization did not resolve within the test deadline"
+        )
         return results
 
     duplicates = race(tmp_path / "duplicates.sqlite3", (request, request))
@@ -708,7 +716,8 @@ def test_restart_enqueue_is_race_safe_for_duplicate_and_competing_requests(
         (request, request.model_copy(update={"request_id": "competitor"})),
     )
 
-    assert sorted(duplicates) == [False, True]
+    assert duplicates.count(True) == 1
+    assert duplicates.count(False) == 1
     assert competing.count(True) == 1
     assert competing.count(OperationInProgress) == 1
 
