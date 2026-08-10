@@ -29,6 +29,7 @@ from senpai_agent.model_compatibility import (
 from .aws_backend import (
     AwsCommandError,
     AwsContext,
+    _authorize_ssh_host,
     _aws_json,
     _aws_raw,
     _check_account,
@@ -37,6 +38,7 @@ from .aws_backend import (
     _resolve_region,
     _save_state,
     _ssh_cidr,
+    _ssh_host_key_console_script,
     _state_dir,
     _write_private_key,
 )
@@ -466,12 +468,13 @@ def _revoke_ssh(context: AwsContext, state: dict) -> None:
 
 
 def _user_data(ttl_hours: float) -> str:
-    if ttl_hours == 0:
-        return ""
-    minutes = max(1, round(ttl_hours * 60))
+    shutdown = ""
+    if ttl_hours:
+        minutes = max(1, round(ttl_hours * 60))
+        shutdown = f"/sbin/shutdown -h +{minutes}\n"
     return f"""#!/bin/bash
 set -eu
-/sbin/shutdown -h +{minutes}
+{shutdown}{_ssh_host_key_console_script()}
 """
 
 
@@ -484,7 +487,7 @@ def _run_instance(
 ) -> dict:
     name = f"{args.tag}-{host.student}"
     user_data = _user_data(args.aws_ttl_hours)
-    shutdown_behavior = "terminate" if user_data else "stop"
+    shutdown_behavior = "terminate" if args.aws_ttl_hours else "stop"
     network = json.dumps(
         [
             {
@@ -654,7 +657,7 @@ def _ssh_base(run_dir: Path, node: dict) -> list[str]:
         "-o",
         "ConnectTimeout=10",
         "-o",
-        "StrictHostKeyChecking=accept-new",
+        "StrictHostKeyChecking=yes",
         "-o",
         f"UserKnownHostsFile={run_dir / 'known_hosts'}",
         f"ec2-user@{node['public_ip']}",
@@ -1065,6 +1068,8 @@ def _is_legacy_mac_state(state: dict) -> bool:
 def _load_lifecycle_state(tag: str, state_root: str) -> tuple[Path, dict]:
     run_dir = _state_dir(state_root, tag)
     state = json.loads((run_dir / "state.json").read_text())
+    if not isinstance(state, dict):
+        raise RuntimeError("AWS Mac lifecycle state must be a JSON object")
     if "backend" in state or "state_version" in state:
         backend = state.get("backend")
         if backend != AWS_MAC_STATE_BACKEND:
@@ -1307,6 +1312,12 @@ def _wait_recorded_instance(
     )
     node["public_ip"] = instance["PublicIpAddress"]
     _save_state(run_dir, state)
+    _authorize_ssh_host(
+        plan.context,
+        run_dir,
+        node,
+        timeout_s=args.aws_ready_timeout_s,
+    )
 
 
 def launch_aws_mac(

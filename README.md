@@ -303,8 +303,9 @@ Install AWS CLI v2 and OpenSSH. The selected AWS identity needs
 types, images, networking, instances, security groups, volumes, and volume
 modifications, plus `CreateKeyPair`, `DeleteKeyPair`, `CreateSecurityGroup`,
 `AuthorizeSecurityGroupIngress`, `DeleteSecurityGroup`, `RunInstances`,
-`TerminateInstances`, `CreateTags`, and `ModifyVolume`. The region needs GPU
-quota and a public subnet with an internet-gateway route.
+`TerminateInstances`, `CreateTags`, `ModifyVolume`, and
+`ec2:GetConsoleOutput`. The region needs GPU quota and a public subnet with an
+internet-gateway route.
 
 For AWS SSO:
 
@@ -320,6 +321,14 @@ machine and are never copied to EC2. Runtime credentials still come from the
 gitignored `.env` described above; Senpai sends them over SSH into private
 remote Docker state. Local AWS state contains only lifecycle identifiers and
 the ephemeral SSH key.
+
+The launcher authenticates each new host before its first SSH connection. The
+guest publishes its OpenSSH public host keys to the EC2 serial console during
+boot; Senpai retrieves them through the authenticated AWS control plane,
+validates their encoding and embedded key type, and pins them in the run's
+private `known_hosts` file. SSH uses strict host-key checking. If AWS console
+output does not provide a valid key before the readiness deadline, launch
+fails before Senpai uploads runtime credentials or data.
 
 AWS currently needs anonymously pullable advisor and student images. Use
 matching `:sha-<40-character-commit>` tags, or digest-pinned images with an
@@ -469,7 +478,9 @@ AMI, host availability and capacity, subnet placement, security group, Xcode
 source, and Metal toolchain archive. Launch creates an ephemeral SSH key,
 temporarily permits the operator's IPv4 `/32`, validates one native canary,
 prepares the remaining Macs in parallel, and holds every role at a fleet-wide
-start gate before opening it.
+start gate before opening it. Each Mac uses the same authenticated EC2-console
+host-key pinning and strict, fail-closed SSH policy described above, including
+when `--aws_ttl_hours 0` disables scheduled shutdown.
 Host preparation installs tmux and Chromium and smoke-tests both with a fresh
 role-like `HOME`, matching the private-home environment used by native roles.
 Each native role also has a private, shortened tmux socket root under
