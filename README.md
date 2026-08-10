@@ -232,13 +232,21 @@ Inspect the preflight result, then launch with the same arguments:
 uv run python k8s/launch.py "${launch_args[@]}"
 ```
 
-The launcher creates routing labels, one launch Secret, role ConfigMaps and
-Deployments, plus a dedicated ServiceAccount and namespace-scoped
-Role/RoleBinding for the operational supervisor. Its typed operation tool
-enforces the campaign inventory, while its native terminal inherits
-namespace-wide pod list/log/exec verbs that Kubernetes cannot label-scope. Use
-a dedicated namespace for every campaign that enables the supervisor. The
-launcher does not create the namespace, PVC, Service, or general cluster RBAC.
+The launcher creates routing labels, role ConfigMaps and Deployments, and one
+fixed launch Secret when it is launching an advisor or students. The
+operational supervisor owns a separate least-privilege Secret and ConfigMap.
+Both supervisor objects are immutable and content-addressed, so a supervisor-
+only upgrade never rewrites credentials used by the research roles and retains
+the previous bundle for Kubernetes rollback. The launcher waits up to
+`--supervisor_ready_timeout_s` for the supervisor Deployment to become ready;
+on failure it reports the exact `kubectl rollout undo` command.
+
+The supervisor also receives a dedicated ServiceAccount and namespace-scoped
+Role/RoleBinding. Its typed operation tool enforces the campaign inventory,
+while its native terminal inherits namespace-wide pod list/log/exec verbs that
+Kubernetes cannot label-scope. Use a dedicated namespace for every campaign
+that enables the supervisor. The launcher does not create the namespace, PVC,
+Service, or general cluster RBAC.
 
 Inspect and stop the launch:
 
@@ -708,6 +716,13 @@ protocols. Each snapshot contains:
 - each exact role pod's controller lease, completed turns, running training
   count, bounded machine utilization, reset status, and recent structured
   error markers. Raw log and training-error text never leaves the role.
+
+Kubernetes supervisor-only launches are independently deployable. They create
+a new immutable, content-addressed supervisor Secret and ConfigMap, update only
+the supervisor Deployment, and leave both the fixed advisor/student Secret and
+prior supervisor bundles untouched. The launcher waits for readiness before it
+returns. If readiness fails, use the exact rollback command printed by the
+launcher; the prior ReplicaSet still references the retained prior bundle.
 
 Missing GitHub, W&B, pod, log, or process evidence is represented as unknown,
 never as a false zero. Repeated `SENPAI_TURN_DEFERRED` markers are intentionally

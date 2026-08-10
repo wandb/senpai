@@ -770,13 +770,21 @@ Launch preflight verifies:
 Exa is a progressive skill/script integration, not an always-connected MCP
 server.
 
-The Kubernetes launcher creates one Secret, ConfigMaps, role Deployments, and,
-when enabled, one dedicated supervisor ServiceAccount, namespace-scoped Role,
-RoleBinding, and Deployment. Kubernetes RBAC cannot constrain pod list/log/exec
-by label. The typed tool enforces exact campaign selectors, but the native
-terminal can use those verbs anywhere in its namespace. A campaign that enables
-the supervisor therefore requires a dedicated namespace for hard campaign
-isolation. The Role has no AWS, node,
+The Kubernetes launcher creates the fixed role Secret only when it launches an
+advisor or students. The operational supervisor owns a separate least-
+privilege Secret and ConfigMap. Both supervisor resources are immutable and
+content-addressed; a new release creates new objects and leaves the prior
+bundle available to the previous ReplicaSet. A supervisor-only launch never
+rewrites the role Secret. After applying the supervisor Deployment, the
+launcher waits for rollout readiness for the configured timeout and prints an
+exact namespace/context-qualified `kubectl rollout undo` command on failure.
+
+When enabled, the launcher also creates one dedicated supervisor
+ServiceAccount, namespace-scoped Role, RoleBinding, and Deployment. Kubernetes
+RBAC cannot constrain pod list/log/exec by label. The typed tool enforces exact
+campaign selectors, but the native terminal can use those verbs anywhere in
+its namespace. A campaign that enables the supervisor therefore requires a
+dedicated namespace for hard campaign isolation. The Role has no AWS, node,
 pod-deletion, or Deployment-mutation verbs. The launcher creates no Service or
 general cluster RBAC. Docker and local hosts need no shared network for
 advisor/student communication; another deployment backend may implement the
