@@ -14,7 +14,13 @@ SOURCE_REVISION=${SOURCE_REVISION:-$(git rev-parse HEAD)}
 BASE_IMAGE=${BASE_IMAGE:?BASE_IMAGE must name the locally loaded advisor image}
 CANARY_IMAGE=${CANARY_IMAGE:-senpai-kubernetes-canary:sha-$SOURCE_REVISION}
 CANARY_ID=${SENPAI_CANARY_ID:-local-$$}
-CANARY_ID=$(printf '%s' "$CANARY_ID" | tr -cd '[:alnum:]-' | cut -c1-30)
+CANARY_ID=$(printf '%s' "$CANARY_ID" \
+  | tr '[:upper:]' '[:lower:]' \
+  | tr -cd '[:alnum:]-' \
+  | cut -c1-30)
+[[ -n "$CANARY_ID" ]] || { echo "SENPAI_CANARY_ID has no safe characters" >&2; exit 2; }
+[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] \
+  || { echo "SOURCE_REVISION must be a full lowercase commit SHA" >&2; exit 2; }
 CLUSTER="senpai-ci-$CANARY_ID"
 CONTEXT="kind-$CLUSTER"
 NAMESPACE="senpai-ci-$CANARY_ID"
@@ -96,12 +102,12 @@ nodes:
 - role: control-plane
 EOF
 
+CLUSTER_CREATED=true
 "$KIND_BIN" create cluster \
   --name "$CLUSTER" \
   --image "kindest/node:v1.34.8@sha256:02722c2dedddcfc00febf5d27fbeb9b7b2c14294c82109ff4a85d89ac9ba3256" \
   --config "$WORK_DIR/kind.yaml" \
   --wait 120s
-CLUSTER_CREATED=true
 "$DOCKER_BIN" exec "$NODE" mkdir -p "/var/senpai-ci/$TAG"
 "$DOCKER_BIN" exec "$NODE" chmod 0777 "/var/senpai-ci/$TAG"
 "$KIND_BIN" load docker-image --name "$CLUSTER" "$CANARY_IMAGE"
