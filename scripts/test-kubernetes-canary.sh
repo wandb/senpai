@@ -57,6 +57,14 @@ cleanup() {
     collect_diagnostics
   fi
   if [[ "$CLUSTER_CREATED" == true ]]; then
+    # Drain namespaced users of the static volume before deleting the claim.
+    # Each namespace is unique to this canary, so --all remains exact here.
+    kubectl_canary delete deployment,pod --all -n "$NAMESPACE" \
+      --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
+    kubectl_canary delete pod --all -n "$OTHER_NAMESPACE" \
+      --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
+    kubectl_canary delete pvc "$PV" -n "$NAMESPACE" \
+      --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
     kubectl_canary delete namespace "$NAMESPACE" "$OTHER_NAMESPACE" \
       --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
     kubectl_canary delete pv "$PV" --ignore-not-found --wait=true \
