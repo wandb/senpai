@@ -35,6 +35,8 @@ spec:
         role: advisor
         research-tag: {{RESEARCH_TAG}}
     spec:
+      automountServiceAccountToken: false
+      shareProcessNamespace: false
       terminationGracePeriodSeconds: 90
       securityContext:
         runAsNonRoot: true
@@ -70,7 +72,11 @@ spec:
             git -C /workspace/senpai fetch --depth 1 "$REPO_URL" "$REPO_REVISION"
           git -C /workspace/senpai checkout --detach FETCH_HEAD
           cd /workspace/senpai
-          git remote add origin "$REPO_URL"
+          if git remote get-url origin >/dev/null 2>&1; then
+            git remote set-url origin "$REPO_URL"
+          else
+            git remote add origin "$REPO_URL"
+          fi
           test "$(git rev-parse HEAD)" = "$REPO_REVISION"
           test "$SENPAI_IMAGE_REVISION" = "$REPO_REVISION"
           token_handoff=/tmp/senpai-supervisor-github-token
@@ -133,13 +139,48 @@ spec:
           failureThreshold: 5
           terminationGracePeriodSeconds: 75
         volumeMounts:
+        - name: workspace
+          mountPath: /workspace
         - name: dataset
           mountPath: {{PVC_MOUNT_PATH}}
         - name: state
           mountPath: /var/lib/senpai
+      - name: repair
+        image: {{ADVISOR_IMAGE}}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+        command: ["/bin/bash", "-c"]
+        args: ["exec sleep infinity"]
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+        volumeMounts:
+        - name: workspace
+          mountPath: /repair/workspace
+        - name: state
+          mountPath: /repair/state
+        - name: repair-scratch
+          mountPath: /repair/scratch
+        - name: repair-scratch
+          mountPath: /home/senpai
+        - name: repair-tmp
+          mountPath: /tmp
       volumes:
+      - name: workspace
+        emptyDir: {}
       - name: dataset
         persistentVolumeClaim:
           claimName: {{PVC_CLAIM_NAME}}
       - name: state
+        emptyDir: {}
+      - name: repair-scratch
+        emptyDir: {}
+      - name: repair-tmp
         emptyDir: {}

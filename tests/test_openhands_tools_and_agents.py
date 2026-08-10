@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -183,7 +184,7 @@ def test_main_tools_replace_unsafe_defaults_with_role_scoped_boundaries(
     }
 
 
-def test_supervisor_receives_native_terminal_and_campaign_operations(
+def test_supervisor_receives_isolated_terminal_and_campaign_operations(
     tmp_path,
     monkeypatch,
 ):
@@ -195,8 +196,11 @@ def test_supervisor_receives_native_terminal_and_campaign_operations(
 
     tools = build_main_tools(config)
 
-    assert [tool.name for tool in tools] == ["terminal", "senpai_operations"]
-    assert tools[0].params == {}
+    assert [tool.name for tool in tools] == [
+        "terminal",
+        "senpai_operations",
+    ]
+    assert tools[0].params == {"socket_path": "/run/senpai-terminal/terminal.sock"}
     assert tools[1].params == {
         "state_dir": str(config.state_dir),
         "namespace": "research",
@@ -209,7 +213,7 @@ def test_supervisor_receives_native_terminal_and_campaign_operations(
     assert "senpai_terminal" not in {tool.name for tool in tools}
 
 
-def test_supervisor_terminal_resolves_to_native_executor_and_allows_git_push(
+def test_supervisor_terminal_resolves_to_isolated_executor_and_allows_git_push(
     tmp_path,
     monkeypatch,
 ):
@@ -250,23 +254,32 @@ def test_supervisor_terminal_resolves_to_native_executor_and_allows_git_push(
         "senpai_agent.hooks.terminal_policy",
         lambda *_args, **_kwargs: pytest.fail("research terminal policy was called"),
     )
+    from senpai_agent.isolated_terminal import (
+        IsolatedTerminalClientExecutor,
+        IsolatedTerminalServer,
+    )
+
     register_default_tools(enable_browser=False)
     state = SimpleNamespace(
         workspace=SimpleNamespace(working_dir=str(workspace)),
         env_observation_persistence_dir=None,
     )
-    terminal = resolve_tool(
-        build_main_tools(runtime_config(tmp_path, role="supervisor"))[0],
-        state,
-    )[0]
-
-    assert isinstance(terminal.executor, TerminalExecutor)
-    try:
+    socket_path = Path("/private/tmp") / f"{tmp_path.name}-git-terminal.sock"
+    monkeypatch.setenv("SENPAI_SUPERVISOR_TERMINAL_SOCKET", str(socket_path))
+    with IsolatedTerminalServer(
+        socket_path=socket_path,
+        working_dir=workspace,
+        environment={"HOME": str(tmp_path), "PATH": os.environ["PATH"]},
+        terminal_type="subprocess",
+    ):
+        terminal = resolve_tool(
+            build_main_tools(runtime_config(tmp_path, role="supervisor"))[0],
+            state,
+        )[0]
+        assert isinstance(terminal.executor, IsolatedTerminalClientExecutor)
         observation = terminal.executor(
             TerminalAction(command="git push origin HEAD:main")
         )
-    finally:
-        terminal.executor.close()
 
     assert observation.metadata.exit_code == 0
     assert subprocess.run(

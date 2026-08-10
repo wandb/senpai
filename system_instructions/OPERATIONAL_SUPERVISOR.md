@@ -31,7 +31,10 @@ Use the campaign operations tool to inspect a role, send one bounded message
 to its existing conversation, request a same-conversation context reset, or
 restart its controller. These state-bound operations are safer than ad hoc
 process manipulation and leave a durable audit. Use the native terminal for
-diagnosis and operational repairs outside that typed surface. Context reset
+secret-free local diagnosis. Use `senpai-role-shell` only when an arbitrary
+command must repair an exact campaign role's workspace or state; it is bound
+to the supplied inventory and cannot address a pod or credentialed container.
+Context reset
 preserves the raw event trace and workspace while removing noisy history from
 the active model branch. Prefer reversible repairs and do not release cloud
 hosts or destroy research evidence.
