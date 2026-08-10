@@ -1151,6 +1151,12 @@ def _trend_view(snapshot: CampaignSnapshot) -> dict[str, object]:
             {
                 "role": runtime.role,
                 "name": runtime.name,
+                "machine": runtime.machine,
+                "machine_stats": (
+                    runtime.stats.model_dump(mode="json")
+                    if runtime.stats is not None
+                    else None
+                ),
                 "healthy": runtime.controller_healthy,
                 "phase": runtime.lease_phase,
                 "completed_turns": runtime.completed_turns,

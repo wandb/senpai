@@ -16,6 +16,7 @@ from senpai_agent.operational_supervisor import (
     DiscussionCounts,
     GitHubActivity,
     GitHubPRCollector,
+    MachineStats,
     PullRequestObservation,
     RecentPullRequestObservation,
     RecentWandbRunObservation,
@@ -721,6 +722,40 @@ def test_prompt_preserves_repeated_deferred_markers_across_all_three_updates():
     assert prompt.count('"turn_deferred":2') == 3
     assert prompt.count('"fingerprints":[') >= 3
     assert prompt.count('"active_delegation_count":2') >= 3
+
+
+def test_operational_prompt_includes_bounded_machine_utilization():
+    current = snapshot(NOW).model_copy(
+        update={
+            "runtimes": (
+                RoleRuntimeObservation(
+                    role="student",
+                    name="alice",
+                    machine="alice-pod-7",
+                    stats=MachineStats(
+                        cpu_percent=21.5,
+                        memory_percent=62.25,
+                        disk_percent=44.0,
+                        gpu_percent=87.75,
+                    ),
+                ),
+            )
+        }
+    )
+    due = SupervisorDueState(
+        operational_due=True,
+        research_review_due=False,
+        next_operational_at=NOW,
+        next_research_review_at=NOW + timedelta(hours=6),
+    )
+
+    prompt = compose_supervisor_prompt((current,), due=due)
+
+    assert '"machine":"alice-pod-7"' in prompt
+    assert (
+        '"machine_stats":{"cpu_percent":21.5,"disk_percent":44.0,'
+        '"gpu_percent":87.75,"memory_percent":62.25}' in prompt
+    )
 
 
 def test_supervisor_instructions_do_not_double_count_overlapping_log_markers():
