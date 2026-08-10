@@ -243,6 +243,10 @@ def _load_state(tag: str, state_root: str) -> tuple[Path, dict]:
         raise RuntimeError(f"No AWS Senpai state found for {tag!r} at {path}")
     state = json.loads(path.read_text())
     _validate_aws_state(state)
+    if state.get("tag") != tag:
+        raise RuntimeError(
+            f"AWS lifecycle state records tag {state.get('tag')!r}, not {tag!r}"
+        )
     return run_dir, state
 
 

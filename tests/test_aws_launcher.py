@@ -1863,6 +1863,14 @@ class AwsLifecycleTests(unittest.TestCase):
             },
             {
                 "backend": "aws",
+                "state_version": 1,
+                "tag": "different-run",
+                "region": "us-east-1",
+                "account_id": "123456789012",
+                "instance_type": "g5.8xlarge",
+            },
+            {
+                "backend": "aws",
                 "tag": "aws-r1",
                 "region": "us-east-1",
                 "account_id": "123456789012",
