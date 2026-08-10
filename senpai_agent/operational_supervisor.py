@@ -1154,7 +1154,13 @@ def _repair_audit_view(
                 else None
             ),
             "status": record.status,
+            "receipt_retained": record.receipt_retained,
             "exit_code": record.exit_code,
+            "payload_pruned_at": (
+                record.payload_pruned_at.isoformat()
+                if record.payload_pruned_at is not None
+                else None
+            ),
             "error_type": record.error_type,
         }
         for record in records[:12]

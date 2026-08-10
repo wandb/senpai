@@ -96,7 +96,9 @@ def repair_audit_record(
         requested_at=requested_at,
         completed_at=requested_at + timedelta(seconds=3),
         status=status,
+        receipt_retained=status == "completed",
         exit_code=0 if status == "completed" else None,
+        payload_pruned_at=None,
         error_type=None,
     )
 

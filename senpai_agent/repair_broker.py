@@ -23,18 +23,18 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from senpai_agent.operations import CampaignInventory, RoleTarget
 from senpai_agent.protocols import REPAIR_PROTOCOL_VERSION
 from senpai_agent.repair_executor import REPAIR_STREAM_LIMIT_CHARS
-from senpai_agent.sqlite_store import initialize_sqlite_store
 from senpai_agent.socket_framing import (
     SocketFrameError,
     SocketFrameTooLarge,
     encode_json_frame,
     receive_frame,
 )
-
+from senpai_agent.sqlite_store import initialize_sqlite_store
 
 _MAX_MESSAGE_BYTES = 2 * 1024 * 1024
 _REQUEST_READ_TIMEOUT_SECONDS = 5
 _RESPONSE_GRACE_SECONDS = 30
+_RETAINED_REPAIR_PAYLOADS = 128
 _Fingerprint = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
@@ -147,8 +147,21 @@ class RepairOperationStatus(_Contract):
     requested_at: datetime
     completed_at: datetime | None
     status: RepairOperationState
+    receipt_retained: bool
+    exit_code: int | None
+    payload_pruned_at: datetime | None
     result: RepairResult | None = None
     error_type: str | None = None
+
+    @model_validator(mode="after")
+    def receipt_metadata_is_consistent(self) -> RepairOperationStatus:
+        if self.receipt_retained != (self.result is not None):
+            raise ValueError("repair receipt retention metadata is inconsistent")
+        if self.result is not None and self.result.exit_code != self.exit_code:
+            raise ValueError("repair receipt exit code is inconsistent")
+        if self.receipt_retained and self.payload_pruned_at is not None:
+            raise ValueError("retained repair receipt cannot have a prune timestamp")
+        return self
 
 
 class RepairAuditRecord(_Contract):
@@ -160,7 +173,9 @@ class RepairAuditRecord(_Contract):
     requested_at: datetime
     completed_at: datetime | None
     status: RepairOperationState
+    receipt_retained: bool
     exit_code: int | None
+    payload_pruned_at: datetime | None
     error_type: str | None
 
 
@@ -184,6 +199,17 @@ class RepairOutcomeUnknown(RepairTransportError):
         self.operation_id = operation_id
         super().__init__(
             f"repair operation {operation_id!r} outcome is unknown; query --status"
+        )
+
+
+class RepairReceiptExpired(RuntimeError):
+    """A completed operation whose bounded full receipt has been pruned."""
+
+    def __init__(self, status: RepairOperationStatus):
+        self.status = status
+        super().__init__(
+            f"repair operation {status.operation_id!r} completed with exit code "
+            f"{status.exit_code}, but its full receipt has expired"
         )
 
 
@@ -232,10 +258,56 @@ class RepairLedger:
                 completed_at REAL,
                 status TEXT NOT NULL,
                 result_json TEXT,
-                error_type TEXT
+                error_type TEXT,
+                receipt_retained INTEGER NOT NULL DEFAULT 0,
+                exit_code INTEGER,
+                payload_pruned_at REAL
             )
             """
         )
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(repair_operations)"
+            ).fetchall()
+        }
+        migrations = {
+            "receipt_retained": (
+                "ALTER TABLE repair_operations ADD COLUMN "
+                "receipt_retained INTEGER NOT NULL DEFAULT 0"
+            ),
+            "exit_code": ("ALTER TABLE repair_operations ADD COLUMN exit_code INTEGER"),
+            "payload_pruned_at": (
+                "ALTER TABLE repair_operations ADD COLUMN payload_pruned_at REAL"
+            ),
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                connection.execute(statement)
+        connection.execute(
+            """
+            UPDATE repair_operations
+            SET receipt_retained = 1, payload_pruned_at = NULL
+            WHERE result_json IS NOT NULL
+            """
+        )
+        legacy_receipts = connection.execute(
+            """
+            SELECT operation_id, result_json
+            FROM repair_operations
+            WHERE result_json IS NOT NULL AND exit_code IS NULL
+            """
+        ).fetchall()
+        for row in legacy_receipts:
+            result = RepairResult.model_validate_json(row["result_json"])
+            connection.execute(
+                """
+                UPDATE repair_operations
+                SET receipt_retained = 1, exit_code = ?
+                WHERE operation_id = ?
+                """,
+                (result.exit_code, row["operation_id"]),
+            )
 
     def recover_interrupted(self) -> None:
         """Make pre-restart executions explicitly ambiguous without replaying them."""
@@ -253,10 +325,29 @@ class RepairLedger:
                     """,
                     (now,),
                 )
+                self._prune_receipt_payloads(now)
                 self._connection.commit()
             except BaseException:
                 self._connection.rollback()
                 raise
+
+    def _prune_receipt_payloads(self, now: float) -> None:
+        self._connection.execute(
+            """
+            UPDATE repair_operations
+            SET result_json = NULL, receipt_retained = 0,
+                payload_pruned_at = COALESCE(payload_pruned_at, ?)
+            WHERE status = 'completed' AND result_json IS NOT NULL
+              AND operation_id NOT IN (
+                  SELECT operation_id
+                  FROM repair_operations
+                  WHERE status = 'completed' AND result_json IS NOT NULL
+                  ORDER BY completed_at DESC, rowid DESC
+                  LIMIT ?
+              )
+            """,
+            (now, _RETAINED_REPAIR_PAYLOADS),
+        )
 
     def __enter__(self) -> Self:
         return self
@@ -348,26 +439,43 @@ class RepairLedger:
         error_type: str | None,
     ) -> RepairOperationStatus:
         result_json = result.model_dump_json() if result is not None else None
+        completed_at = datetime.now(UTC).timestamp()
         with self._lock:
-            cursor = self._connection.execute(
-                """
-                UPDATE repair_operations
-                SET status = ?, completed_at = ?, result_json = ?, error_type = ?
-                WHERE operation_id = ? AND status = 'running'
-                """,
-                (
-                    status,
-                    datetime.now(UTC).timestamp(),
-                    result_json,
-                    error_type,
-                    operation_id,
-                ),
-            )
-            if cursor.rowcount != 1:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE repair_operations
+                    SET status = ?, completed_at = ?, result_json = ?,
+                        receipt_retained = ?, exit_code = ?,
+                        payload_pruned_at = NULL, error_type = ?
+                    WHERE operation_id = ? AND status = 'running'
+                    """,
+                    (
+                        status,
+                        completed_at,
+                        result_json,
+                        result is not None,
+                        result.exit_code if result is not None else None,
+                        error_type,
+                        operation_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        "repair operation reservation is no longer active"
+                    )
+                self._prune_receipt_payloads(completed_at)
+                row = self._connection.execute(
+                    "SELECT * FROM repair_operations WHERE operation_id = ?",
+                    (operation_id,),
+                ).fetchone()
+                self._connection.commit()
+            except BaseException:
                 self._connection.rollback()
-                raise RuntimeError("repair operation reservation is no longer active")
-            self._connection.commit()
-            return self.status(operation_id)
+                raise
+        assert row is not None
+        return self._status_from_row(row)
 
     def status(self, operation_id: str) -> RepairOperationStatus:
         with self._lock:
@@ -407,9 +515,13 @@ class RepairLedger:
                     else None
                 ),
                 status=str(row["status"]),
+                receipt_retained=bool(row["receipt_retained"]),
                 exit_code=(
-                    RepairResult.model_validate_json(row["result_json"]).exit_code
-                    if row["result_json"]
+                    int(row["exit_code"]) if row["exit_code"] is not None else None
+                ),
+                payload_pruned_at=(
+                    datetime.fromtimestamp(row["payload_pruned_at"], UTC)
+                    if row["payload_pruned_at"] is not None
                     else None
                 ),
                 error_type=str(row["error_type"]) if row["error_type"] else None,
@@ -432,6 +544,13 @@ class RepairLedger:
                 else None
             ),
             status=str(row["status"]),
+            receipt_retained=bool(row["receipt_retained"]),
+            exit_code=(int(row["exit_code"]) if row["exit_code"] is not None else None),
+            payload_pruned_at=(
+                datetime.fromtimestamp(row["payload_pruned_at"], UTC)
+                if row["payload_pruned_at"] is not None
+                else None
+            ),
             result=(
                 RepairResult.model_validate_json(row["result_json"])
                 if row["result_json"]
@@ -521,6 +640,8 @@ class RepairBrokerClient:
         status = RepairOperationStatus.model_validate(response.get("status"))
         if status.status == "completed" and status.result is not None:
             return status.result
+        if status.status == "completed" and not status.receipt_retained:
+            raise RepairReceiptExpired(status)
         if status.status in {"running", "unknown"}:
             raise RepairOutcomeUnknown(request.operation_id)
         raise RecordedRepairError(
@@ -759,8 +880,13 @@ class RepairBrokerServer:
         }
         if status is not None:
             record["status"] = status.status
-            if status.result is not None:
-                record["exit_code"] = status.result.exit_code
+            record["receipt_retained"] = status.receipt_retained
+            record["exit_code"] = status.exit_code
+            record["payload_pruned_at"] = (
+                status.payload_pruned_at.isoformat()
+                if status.payload_pruned_at is not None
+                else None
+            )
         if error is not None:
             record["error_type"] = type(error).__name__
         print(json.dumps(record, sort_keys=True), file=sys.stderr, flush=True)

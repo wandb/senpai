@@ -709,8 +709,11 @@ The opt-in operational supervisor wakes every 15 minutes with a fresh model
 conversation and a timestamped snapshot. It retains only the last three
 snapshots in its explicit working context, so it can detect stagnation without
 growing one long-lived history. Each fresh OpenHands conversation is in-memory.
-The three snapshots, typed-mutation receipts, and arbitrary-repair receipts are
-the only local durable supervisor state. Its SQLite files must live on the dedicated
+The three snapshots, typed-mutation receipts, and arbitrary-repair operation
+records are the only local durable supervisor state. Full arbitrary-repair
+output is retained only for the newest 128 completed operations; older records
+remain as permanent tombstones with identity, target, fingerprint, status,
+timestamps, and exit code. Its SQLite files must live on the dedicated
 `supervisor_state_pvc_claim_name`, never the dataset PVC. That claim must be a
 Bound RWO or RWOP filesystem whose operator has verified POSIX advisory locks
 and atomic file create, rename, and delete behavior, then annotated it
@@ -792,8 +795,14 @@ bounded output, descendant cleanup, and an audited outcome. Each repair gets a
 fresh `HOME`, temporary directory, and XDG directories. The caller must choose
 a stable operation ID before execution. The broker durably binds that ID to the
 exact target and command fingerprint: an exact replay returns the recorded
-receipt, a changed payload is rejected, and an operation interrupted with no
-authoritative response becomes `unknown` and is never run again automatically.
+receipt while its full payload is retained, a changed payload is rejected, and
+an operation interrupted with no authoritative response becomes `unknown` and
+is never run again automatically. Replaying a completed operation after its
+payload has aged out returns a typed expired-receipt outcome carrying the
+durable tombstone; it never runs the command again. Receipt pruning is part of
+the same SQLite transaction that completes a command, and startup recovery also
+enforces the bound. SQLite reuses the freed payload pages, while the much
+smaller audit tombstones intentionally remain durable.
 Every fresh supervisor wake sees a bounded repair audit. Authenticated
 repository mutations remain available through a nudge to the existing
 credentialed advisor/student conversation; an authentication failure in the

@@ -812,7 +812,11 @@ workspace and role state but not runner source, dataset, credentials,
 ServiceAccount token, PID namespace, or the credentialed container root.
 Requests and outcomes are bounded and audited, descendants are reaped on every
 exit path, and transport loss after command submission is reported as an
-unknown outcome rather than replayed.
+unknown outcome rather than replayed. The repair ledger retains full output for
+the newest 128 completed operations and permanent metadata tombstones for all
+operations. Pruning is transactional with completion and startup recovery;
+replaying a pruned operation returns a typed expired-receipt tombstone and
+never executes it again.
 
 Supervisor-only upgrades resolve only GitHub, W&B, and the configured model
 provider. They validate the existing exact-tag role inventory and revision but

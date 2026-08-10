@@ -3,6 +3,7 @@ import json
 import os
 import shlex
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -15,17 +16,18 @@ from pydantic import ValidationError
 
 from senpai_agent.kubernetes_operations import KubectlCampaignBackend
 from senpai_agent.operations import CampaignInventory, RoleTarget
+from senpai_agent.protocols import REPAIR_PROTOCOL_VERSION
 from senpai_agent.repair_broker import (
     RepairBrokerClient,
     RepairBrokerServer,
     RepairIdempotencyConflict,
     RepairLedger,
     RepairOutcomeUnknown,
+    RepairReceiptExpired,
     RepairRequest,
     RepairResult,
     repair_broker_main,
 )
-from senpai_agent.protocols import REPAIR_PROTOCOL_VERSION
 from senpai_agent.repair_executor import (
     DEFAULT_EXECUTOR_SOCKET,
     REPAIR_STREAM_LIMIT_BYTES,
@@ -471,6 +473,217 @@ def test_repair_receipt_replays_after_lost_reply_and_broker_restart(tmp_path):
     assert len(backend.calls) == 1
 
 
+def test_repair_ledger_retains_only_the_newest_128_full_receipts(tmp_path):
+    ledger_path = tmp_path / "repair.sqlite3"
+    requests = [repair_request(f"repair-retention-{index:03d}") for index in range(129)]
+
+    with RepairLedger(ledger_path) as ledger:
+        for index, request in enumerate(requests):
+            assert ledger.reserve(request).execute is True
+            ledger.complete(
+                request.operation_id,
+                RepairResult(exit_code=index, stdout=f"receipt-{index}", stderr=""),
+            )
+
+        oldest = ledger.status(requests[0].operation_id)
+        newest = ledger.status(requests[-1].operation_id)
+        retained = ledger._connection.execute(
+            "SELECT COUNT(*) FROM repair_operations WHERE result_json IS NOT NULL"
+        ).fetchone()
+
+    assert retained is not None
+    assert retained[0] == 128
+    assert oldest.status == "completed"
+    assert oldest.receipt_retained is False
+    assert oldest.result is None
+    assert oldest.exit_code == 0
+    assert oldest.payload_pruned_at is not None
+    assert oldest.command_fingerprint == requests[0].command_fingerprint
+    assert newest.receipt_retained is True
+    assert newest.result == RepairResult(exit_code=128, stdout="receipt-128", stderr="")
+    assert newest.exit_code == 128
+    assert newest.payload_pruned_at is None
+
+
+def test_pruned_repair_receipt_replay_is_typed_and_never_reexecutes_after_restart(
+    tmp_path,
+):
+    ledger_path = tmp_path / "repair.sqlite3"
+    requests = [repair_request(f"repair-expired-{index:03d}") for index in range(129)]
+    with RepairLedger(ledger_path) as ledger:
+        for index, request in enumerate(requests):
+            assert ledger.reserve(request).execute is True
+            ledger.complete(
+                request.operation_id,
+                RepairResult(exit_code=index, stdout=f"receipt-{index}", stderr=""),
+            )
+
+    backend = RecordingRepairBackend()
+    socket_path = _test_socket(tmp_path, "expired-repair")
+    with RepairBrokerServer(
+        socket_path,
+        inventory(),
+        backend,
+        ledger_path=ledger_path,
+    ):
+        client = RepairBrokerClient(socket_path)
+        with pytest.raises(RepairReceiptExpired) as raised:
+            client.execute(requests[0])
+        with pytest.raises(RepairIdempotencyConflict):
+            client.execute(
+                repair_request(requests[0].operation_id, command="changed command")
+            )
+        status = client.status(requests[0].operation_id)
+
+    assert backend.calls == []
+    assert raised.value.status == status
+    assert status.status == "completed"
+    assert status.receipt_retained is False
+    assert status.exit_code == 0
+    assert status.payload_pruned_at is not None
+
+
+def test_repair_completion_and_payload_pruning_are_one_transaction(
+    tmp_path,
+    monkeypatch,
+):
+    ledger_path = tmp_path / "repair.sqlite3"
+    request = repair_request("repair-atomic-retention")
+    result = RepairResult(exit_code=0, stdout="receipt", stderr="")
+
+    with RepairLedger(ledger_path) as ledger:
+        assert ledger.reserve(request).execute is True
+
+        def fail_pruning(_now):
+            raise RuntimeError("injected pruning failure")
+
+        original_pruning = ledger._prune_receipt_payloads
+        monkeypatch.setattr(ledger, "_prune_receipt_payloads", fail_pruning)
+        with pytest.raises(RuntimeError, match="injected pruning failure"):
+            ledger.complete(request.operation_id, result)
+        after_failure = ledger.status(request.operation_id)
+
+        monkeypatch.setattr(ledger, "_prune_receipt_payloads", original_pruning)
+        completed = ledger.complete(request.operation_id, result)
+
+    assert after_failure.status == "running"
+    assert after_failure.result is None
+    assert after_failure.receipt_retained is False
+    assert completed.status == "completed"
+    assert completed.result == result
+
+
+def test_repair_ledger_migrates_legacy_receipts_and_prunes_them_on_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    from senpai_agent import repair_broker
+
+    ledger_path = tmp_path / "repair.sqlite3"
+    request = repair_request("repair-legacy")
+    result = RepairResult(exit_code=17, stdout="legacy", stderr="")
+    with sqlite3.connect(ledger_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE repair_operations (
+                operation_id TEXT PRIMARY KEY,
+                command_fingerprint TEXT NOT NULL,
+                research_tag TEXT NOT NULL,
+                role TEXT NOT NULL,
+                student TEXT,
+                cwd TEXT NOT NULL,
+                timeout_seconds INTEGER NOT NULL,
+                requested_at REAL NOT NULL,
+                completed_at REAL,
+                status TEXT NOT NULL,
+                result_json TEXT,
+                error_type TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO repair_operations (
+                operation_id, command_fingerprint, research_tag, role, student,
+                cwd, timeout_seconds, requested_at, completed_at, status,
+                result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 2, 'completed', ?)
+            """,
+            (
+                request.operation_id,
+                request.command_fingerprint,
+                request.target.research_tag,
+                request.target.role,
+                request.target.student,
+                request.cwd,
+                request.timeout_seconds,
+                result.model_dump_json(),
+            ),
+        )
+
+    with RepairLedger(ledger_path) as ledger:
+        migrated = ledger.status(request.operation_id)
+        columns = {
+            row[1]
+            for row in ledger._connection.execute(
+                "PRAGMA table_info(repair_operations)"
+            ).fetchall()
+        }
+        monkeypatch.setattr(repair_broker, "_RETAINED_REPAIR_PAYLOADS", 0)
+        ledger.recover_interrupted()
+        pruned = ledger.status(request.operation_id)
+        audit = ledger.recent(limit=1)[0]
+
+    assert {"receipt_retained", "exit_code", "payload_pruned_at"} <= columns
+    assert migrated.receipt_retained is True
+    assert migrated.result == result
+    assert migrated.exit_code == 17
+    assert migrated.payload_pruned_at is None
+    assert pruned.receipt_retained is False
+    assert pruned.result is None
+    assert pruned.exit_code == 17
+    assert pruned.payload_pruned_at is not None
+    assert audit.receipt_retained is False
+    assert audit.exit_code == 17
+    assert audit.payload_pruned_at == pruned.payload_pruned_at
+
+
+def test_repair_payload_pages_are_reused_after_the_retention_window(
+    tmp_path,
+    monkeypatch,
+):
+    from senpai_agent import repair_broker
+
+    monkeypatch.setattr(repair_broker, "_RETAINED_REPAIR_PAYLOADS", 4)
+    ledger_path = tmp_path / "repair.sqlite3"
+    payload = "x" * (32 * 1024)
+    with RepairLedger(ledger_path) as ledger:
+        for index in range(8):
+            _complete_repair(ledger, index, payload)
+        first_page_count = ledger._connection.execute("PRAGMA page_count").fetchone()[0]
+        first_free_pages = ledger._connection.execute(
+            "PRAGMA freelist_count"
+        ).fetchone()[0]
+
+        for index in range(8, 40):
+            _complete_repair(ledger, index, payload)
+        second_page_count = ledger._connection.execute("PRAGMA page_count").fetchone()[
+            0
+        ]
+        second_free_pages = ledger._connection.execute(
+            "PRAGMA freelist_count"
+        ).fetchone()[0]
+        retained = ledger._connection.execute(
+            "SELECT COUNT(*) FROM repair_operations WHERE result_json IS NOT NULL"
+        ).fetchone()[0]
+
+    first_live_pages = first_page_count - first_free_pages
+    second_live_pages = second_page_count - second_free_pages
+    assert retained == 4
+    assert second_live_pages <= first_live_pages + 4
+    assert second_page_count <= first_page_count + 8
+
+
 def test_repair_operation_id_rejects_a_changed_command(tmp_path):
     socket_path = _test_socket(tmp_path, "conflict-repair")
     with RepairBrokerServer(
@@ -540,7 +753,7 @@ def test_repair_broker_rejects_missing_or_stale_protocol(tmp_path, protocol):
 
 
 def test_repair_broker_recovers_after_a_slow_drip_frame(tmp_path, monkeypatch):
-    import senpai_agent.repair_broker as repair_broker
+    from senpai_agent import repair_broker
 
     monkeypatch.setattr(repair_broker, "_REQUEST_READ_TIMEOUT_SECONDS", 0.12)
     socket_path = _test_socket(tmp_path, "slow-drip-repair")
@@ -575,3 +788,12 @@ def test_repair_broker_recovers_after_a_slow_drip_frame(tmp_path, monkeypatch):
 def _test_socket(tmp_path: Path, suffix: str) -> Path:
     digest = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:10]
     return Path("/private/tmp") / f"senpai-{os.getpid()}-{digest}-{suffix}.sock"
+
+
+def _complete_repair(ledger: RepairLedger, index: int, payload: str) -> None:
+    request = repair_request(f"repair-pages-{index:03d}")
+    assert ledger.reserve(request).execute is True
+    ledger.complete(
+        request.operation_id,
+        RepairResult(exit_code=index, stdout=payload, stderr=""),
+    )

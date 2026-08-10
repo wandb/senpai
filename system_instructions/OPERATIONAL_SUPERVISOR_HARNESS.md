@@ -47,6 +47,10 @@ operation ID must be stable and chosen before execution. If the terminal loses
 the response, query `--status` and replay only with that same ID and exact
 command; a changed command with the same ID is rejected. An interrupted running
 operation is recorded as `unknown` and must not be executed again automatically.
+Only the newest 128 completed operations retain full output. Older operations
+remain queryable as durable tombstones; replaying one returns a typed
+expired-receipt outcome with its exit code and must never be treated as
+permission to run it again.
 Each repair command also receives fresh home, temporary, and XDG directories.
 The
 credentialed broker validates the requested role against this campaign's
