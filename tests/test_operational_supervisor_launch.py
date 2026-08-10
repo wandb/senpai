@@ -213,10 +213,21 @@ def test_supervisor_health_recovers_unlinked_terminal_and_repair_sockets():
 
     for probe_name in ("startupProbe", "livenessProbe"):
         control_health = control[probe_name]["exec"]["command"][-1]
-        assert "test -S /run/senpai-terminal/terminal.sock" in control_health
+        assert "senpai_agent.isolated_terminal health" in control_health
+        assert "--socket @senpai-isolated-terminal" in control_health
         assert "test -S /run/senpai-repair/repair.sock" in control_health
-        shell_health = shell[probe_name]["exec"]["command"][-1]
-        assert shell_health == "test -S /run/senpai-terminal/terminal.sock"
+        shell_health = shell[probe_name]["exec"]["command"]
+        assert shell_health[:4] == [
+            "/opt/senpai-venv/bin/python",
+            "-I",
+            "-m",
+            "senpai_agent.isolated_terminal",
+        ]
+        assert shell_health[-3:] == [
+            "health",
+            "--socket",
+            "@senpai-isolated-terminal",
+        ]
 
 
 def test_advisor_and_students_have_secret_free_exact_role_repair_sidecars():

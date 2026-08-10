@@ -31,11 +31,18 @@ records durable deduplication. For an arbitrary repair in one exact role
 workspace, use the campaign-bound client:
 
 ```bash
-senpai-role-shell --role advisor --cwd workspace --command 'git status --short'
-senpai-role-shell --role student --student fern --cwd state --command 'find . -maxdepth 2 -type f'
+senpai-role-shell --operation-id maple-advisor-status-20260810T1200Z \
+  --role advisor --cwd workspace --command 'git status --short'
+senpai-role-shell --operation-id maple-fern-state-20260810T1205Z \
+  --role student --student fern --cwd state \
+  --command 'find . -maxdepth 2 -type f'
+senpai-role-shell --status maple-fern-state-20260810T1205Z
 ```
 
 The client accepts no namespace, pod, container, host, or mount path. The
+operation ID must be stable and chosen before execution. If the terminal loses
+the response, query `--status` and replay only with that same ID and exact
+command; a changed command with the same ID is rejected. The
 credentialed broker validates the requested role against this campaign's
 immutable inventory, then sends the command only to that pod's fixed secret-free `repair` sidecar.
 `workspace`, `state`, and private `scratch` are

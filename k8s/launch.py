@@ -439,7 +439,7 @@ def render_operational_supervisor(
             "SENPAI_KUBECTL_NAMESPACE": args.namespace,
             "SENPAI_SUPERVISOR_SECRET_HANDOFF": "1",
             "SENPAI_SUPERVISOR_TERMINAL_SOCKET": (
-                "/run/senpai-terminal/terminal.sock"
+                "@senpai-isolated-terminal"
             ),
             "SENPAI_SUPERVISOR_REPAIR_SOCKET": "/run/senpai-repair/repair.sock",
         },
@@ -586,7 +586,20 @@ def main():
     validate_timing_args(args)
     if args.gh_history_scope not in {"branch", "repo", "fresh"}:
         sys.exit("ERROR: --gh_history_scope must be one of: branch, repo, fresh")
-    if target_repo_slug(args.target_repo_url) == target_repo_slug(args.repo_url):
+    try:
+        target_slug = target_repo_slug(args.target_repo_url)
+        runner_slug = target_repo_slug(args.repo_url)
+    except ValueError as error:
+        raise SystemExit(f"ERROR: {error}") from error
+    if args.backend == "kubernetes" and not all(
+        url.startswith("https://github.com/")
+        for url in (args.target_repo_url, args.repo_url)
+    ):
+        sys.exit(
+            "ERROR: Kubernetes repository URLs must use uncredentialed "
+            "https://github.com/ transport"
+        )
+    if target_slug == runner_slug:
         sys.exit("ERROR: --target_repo_url must be a different repo from --repo_url")
 
     student_list = resolve_student_names(args)

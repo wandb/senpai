@@ -86,9 +86,11 @@ def test_backend_selects_exact_campaign_role_labels_and_parses_role_state(
     observation = backend.collect_role(target)
 
     selector = calls[0][0][calls[0][0].index("-l") + 1]
+    assert calls[0][0][0] == "/usr/local/bin/kubectl"
     assert selector == "app=senpai,role=student,research-tag=maple,student=fern"
-    assert calls[1][0][-3:] == (
-        "python",
+    assert calls[1][0][-4:] == (
+        "/opt/senpai-venv/bin/python",
+        "-I",
         "-m",
         "senpai_agent.role_control",
     )

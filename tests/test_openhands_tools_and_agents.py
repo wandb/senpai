@@ -200,7 +200,10 @@ def test_supervisor_receives_isolated_terminal_and_campaign_operations(
         "terminal",
         "senpai_operations",
     ]
-    assert tools[0].params == {"socket_path": "/run/senpai-terminal/terminal.sock"}
+    assert tools[0].params == {
+        "socket_path": "@senpai-isolated-terminal",
+        "wake_id": config.conversation_id.hex,
+    }
     assert tools[1].params == {
         "state_dir": str(config.state_dir),
         "namespace": "research",
@@ -257,6 +260,7 @@ def test_supervisor_terminal_resolves_to_isolated_executor_and_allows_git_push(
     from senpai_agent.isolated_terminal import (
         IsolatedTerminalClientExecutor,
         IsolatedTerminalServer,
+        begin_isolated_terminal_wake,
     )
 
     register_default_tools(enable_browser=False)
@@ -272,8 +276,10 @@ def test_supervisor_terminal_resolves_to_isolated_executor_and_allows_git_push(
         environment={"HOME": str(tmp_path), "PATH": os.environ["PATH"]},
         terminal_type="subprocess",
     ):
+        config = runtime_config(tmp_path, role="supervisor")
+        begin_isolated_terminal_wake(socket_path, config.conversation_id.hex)
         terminal = resolve_tool(
-            build_main_tools(runtime_config(tmp_path, role="supervisor"))[0],
+            build_main_tools(config)[0],
             state,
         )[0]
         assert isinstance(terminal.executor, IsolatedTerminalClientExecutor)

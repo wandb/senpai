@@ -20,6 +20,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from senpai.launch.specs import target_repo_slug
+
 STUDENT_NAMES = [
     "frieren",
     "fern",
@@ -295,11 +297,6 @@ def render_configmap(name: str, labels: dict[str, str], data: dict[str, str]) ->
 def pod_template_hash(configmap: str, launch_secret: str) -> str:
     """Hash the complete pod configuration that must trigger a rollout."""
     return hashlib.sha256(f"{configmap}\0{launch_secret}".encode()).hexdigest()
-
-
-def target_repo_slug(url: str) -> str:
-    """Extract owner/repo slug from a GitHub URL (for `gh --repo`)."""
-    return url.split("github.com", 1)[-1].lstrip(":/").removesuffix(".git")
 
 
 def _github_api(

@@ -33,6 +33,7 @@ from senpai_agent.role_control import (
     RoleRuntimeState,
 )
 from senpai_agent.repair_broker import RepairResult
+from senpai_agent.repair_executor import DEFAULT_EXECUTOR_SOCKET
 
 
 _LABEL_VALUE = re.compile(r"^[A-Za-z0-9](?:[-_.A-Za-z0-9]{0,61}[A-Za-z0-9])?$")
@@ -45,6 +46,31 @@ _LOG_TAIL_LINES = 400
 _LOG_WINDOW_MARGIN_SECONDS = 120
 _DEFAULT_SUPERVISOR_INTERVAL_SECONDS = 900
 _DEFAULT_SUPERVISOR_TURN_TIMEOUT_SECONDS = 900
+_KUBECTL_ENVIRONMENT_KEYS = frozenset(
+    {
+        "ALL_PROXY",
+        "CURL_CA_BUNDLE",
+        "HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "KUBECONFIG",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "NO_PROXY",
+        "PATH",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    }
+)
 
 
 class KubernetesOperationError(RuntimeError):
@@ -59,7 +85,7 @@ class KubectlCampaignBackend(OperationBackend):
         inventory: CampaignInventory,
         *,
         namespace: str,
-        kubectl: str = "kubectl",
+        kubectl: str = "/usr/local/bin/kubectl",
         environment: Mapping[str, str] = os.environ,
         command_timeout_seconds: float = 45,
     ):
@@ -71,7 +97,7 @@ class KubectlCampaignBackend(OperationBackend):
         self.environment = {
             key: value
             for key, value in environment.items()
-            if not _secret_name(key)
+            if key in _KUBECTL_ENVIRONMENT_KEYS
         }
         self.command_timeout_seconds = command_timeout_seconds
         interval = _positive_seconds(
@@ -180,7 +206,12 @@ class KubectlCampaignBackend(OperationBackend):
             "-c",
             "repair",
             "--",
+            "/opt/senpai-venv/bin/python",
+            "-I",
             "/usr/local/bin/senpai-repair-executor",
+            "client",
+            "--socket",
+            str(DEFAULT_EXECUTOR_SOCKET),
             "--cwd",
             root,
             "--timeout",
@@ -192,8 +223,13 @@ class KubectlCampaignBackend(OperationBackend):
             timeout_seconds=timeout_seconds + 15,
         )
         try:
-            return RepairResult.model_validate_json(output)
-        except ValueError as error:
+            response = json.loads(output)
+            if response.get("outcome") == "unknown":
+                raise KubernetesOperationError(
+                    "repair executor lost its authoritative response"
+                )
+            return RepairResult.model_validate(response)
+        except (AttributeError, TypeError, ValueError) as error:
             raise KubernetesOperationError(
                 "repair sidecar returned invalid JSON"
             ) from error
@@ -331,7 +367,8 @@ class KubectlCampaignBackend(OperationBackend):
             "-c",
             target.role,
             "--",
-            "python",
+            "/opt/senpai-venv/bin/python",
+            "-I",
             "-m",
             "senpai_agent.role_control",
         )
@@ -460,12 +497,6 @@ class KubectlCampaignBackend(OperationBackend):
             subject=target.key,
             detail=f"{operation} failed ({type(error).__name__}).",
         )
-
-
-def _secret_name(name: str) -> bool:
-    return name.endswith(
-        ("_API_KEY", "_TOKEN", "_PASSWORD", "_SECRET", "_CREDENTIAL")
-    )
 
 
 def _positive_seconds(

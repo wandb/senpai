@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,15 +26,23 @@ from senpai_agent.operational_supervisor import (
     SupervisorStateStore,
     WandbActivity,
     WandbRunCollector,
+    _run_fresh_supervisor_turn,
     collect_campaign_snapshot,
     compose_research_review_prompt,
     compose_supervisor_prompt,
     operational_supervisor_main,
 )
 from senpai_agent.operations import OperationAuditRecord, RoleTarget
+from senpai_agent.repair_broker import RepairAuditRecord
 
 
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+
+
+@dataclass(frozen=True)
+class FakeRunnerConfig:
+    conversation_id: object | None = None
+    timeout_seconds: float = 30
 
 
 def test_operational_supervisor_run_requires_pre_exec_secret_handoff():
@@ -61,6 +70,29 @@ def mutation_audit_record(
         completed_at=(requested_at + timedelta(seconds=2)),
         status=status,
         source_operation_key=None,
+        error_type=None,
+    )
+
+
+def repair_audit_record(
+    *,
+    requested_at: datetime = NOW,
+    status: str = "completed",
+) -> RepairAuditRecord:
+    return RepairAuditRecord(
+        operation_id=f"repair-{requested_at.minute}",
+        target=RoleTarget(
+            research_tag="maple-20260806",
+            role="student",
+            student="alice",
+        ),
+        command_fingerprint="a" * 64,
+        cwd="workspace",
+        timeout_seconds=300,
+        requested_at=requested_at,
+        completed_at=requested_at + timedelta(seconds=3),
+        status=status,
+        exit_code=0 if status == "completed" else None,
         error_type=None,
     )
 
@@ -628,6 +660,32 @@ def test_fresh_wake_prompt_includes_bounded_recent_mutation_outcomes():
     assert "operation-19" not in prompt
 
 
+def test_fresh_wake_prompt_includes_durable_repair_outcomes():
+    due = SupervisorDueState(
+        operational_due=True,
+        research_review_due=False,
+        next_operational_at=NOW,
+        next_research_review_at=NOW + timedelta(hours=6),
+    )
+    repairs = tuple(
+        repair_audit_record(requested_at=NOW + timedelta(minutes=index))
+        for index in range(15)
+    )
+
+    prompt = compose_supervisor_prompt(
+        (snapshot(NOW + timedelta(minutes=20)),),
+        due=due,
+        repair_audit=tuple(reversed(repairs)),
+    )
+
+    assert '"recent_repair_audit":[' in prompt
+    assert prompt.count('"command_fingerprint":') == 12
+    assert '"operation_id":"repair-14"' in prompt
+    assert '"target":"maple-20260806:student:alice"' in prompt
+    assert '"status":"completed"' in prompt
+    assert '"exit_code":0' in prompt
+
+
 def test_prompt_preserves_repeated_deferred_markers_across_all_three_updates():
     deferred = (
         "SENPAI_TURN_DEFERRED conversation_id=x retry_after_seconds=600",
@@ -755,3 +813,109 @@ def test_prompt_obeys_hard_character_bound_with_many_large_pr_titles():
 
     assert len(prompt) <= 8_000
     assert "omitted_pull_requests" in prompt or "detail_omitted" in prompt
+
+
+def test_fresh_supervisor_turn_aborts_when_terminal_wake_cannot_reset(
+    tmp_path,
+    monkeypatch,
+):
+    calls = []
+    runner_config = FakeRunnerConfig()
+    progress = SimpleNamespace(update=lambda *args: calls.append(args))
+    monkeypatch.setenv(
+        "SENPAI_SUPERVISOR_TERMINAL_SOCKET",
+        str(tmp_path / "missing.sock"),
+    )
+    monkeypatch.setattr(
+        "senpai_agent.isolated_terminal.begin_isolated_terminal_wake",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("wake cleanup failed")
+        ),
+    )
+    monkeypatch.setattr(
+        "senpai_agent.openhands_runner.run_openhands",
+        lambda *_args, **_kwargs: pytest.fail("model turn must not start"),
+    )
+
+    result = _run_fresh_supervisor_turn(
+        "review now",
+        runner_config,
+        progress,
+        phase="operational-review",
+    )
+
+    assert result == 1
+    assert calls
+
+
+@pytest.mark.parametrize("runner_fails", [False, True])
+def test_fresh_supervisor_turn_always_ends_a_started_terminal_wake(
+    monkeypatch,
+    runner_fails,
+):
+    events = []
+    runner_config = FakeRunnerConfig()
+    progress = SimpleNamespace(update=lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "senpai_agent.isolated_terminal.begin_isolated_terminal_wake",
+        lambda _socket, wake_id: events.append(("begin", wake_id)),
+    )
+    monkeypatch.setattr(
+        "senpai_agent.isolated_terminal.end_isolated_terminal_wake",
+        lambda _socket, wake_id: events.append(("end", wake_id)),
+    )
+
+    def run_openhands(*_args, **_kwargs):
+        events.append(("run", None))
+        if runner_fails:
+            raise RuntimeError("model turn failed")
+        return 0
+
+    monkeypatch.setattr(
+        "senpai_agent.openhands_runner.run_openhands",
+        run_openhands,
+    )
+
+    result = _run_fresh_supervisor_turn(
+        "review now",
+        runner_config,
+        progress,
+        phase="operational-review",
+    )
+
+    assert result == int(runner_fails)
+    assert [event[0] for event in events] == ["begin", "run", "end"]
+    assert events[0][1] == events[2][1]
+
+
+def test_fresh_supervisor_turn_is_not_completed_when_terminal_cleanup_fails(
+    monkeypatch,
+):
+    progress_events = []
+    monkeypatch.setattr(
+        "senpai_agent.isolated_terminal.begin_isolated_terminal_wake",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "senpai_agent.isolated_terminal.end_isolated_terminal_wake",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
+    )
+    monkeypatch.setattr(
+        "senpai_agent.openhands_runner.run_openhands",
+        lambda *_args: 0,
+    )
+
+    result = _run_fresh_supervisor_turn(
+        "review now",
+        FakeRunnerConfig(),
+        SimpleNamespace(
+            update=lambda *args, **kwargs: progress_events.append((args, kwargs))
+        ),
+        phase="operational-review",
+    )
+
+    assert result == 1
+    assert not any(
+        args and args[0] == "operational-review-complete"
+        for args, _kwargs in progress_events
+    )

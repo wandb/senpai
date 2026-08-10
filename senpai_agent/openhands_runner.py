@@ -1222,8 +1222,9 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
                 params={
                     "socket_path": os.environ.get(
                         "SENPAI_SUPERVISOR_TERMINAL_SOCKET",
-                        "/run/senpai-terminal/terminal.sock",
-                    )
+                        "@senpai-isolated-terminal",
+                    ),
+                    "wake_id": config.conversation_id.hex,
                 },
             ),
             Tool(

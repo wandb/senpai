@@ -13,6 +13,10 @@ from pathlib import Path, PurePosixPath
 from senpai_agent.launch_context import render_launch_context
 
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
+GITHUB_REPO_URL = re.compile(
+    r"^(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)"
+    r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$"
+)
 CONTAINER_STATE_ROOT = "/var/lib/senpai"
 CONTAINER_GATE_ROOT = "/senpai-launch"
 CONTAINER_WORKDIR = "/workspace/senpai"
@@ -101,7 +105,14 @@ def validate_pvc_mount_path(value: str, reserved_paths: tuple[str, ...]) -> None
 
 def target_repo_slug(url: str) -> str:
     """Extract an owner/repo slug from an HTTPS or SSH GitHub URL."""
-    return url.split("github.com", 1)[-1].lstrip(":/").removesuffix(".git")
+    match = GITHUB_REPO_URL.fullmatch(url)
+    if match is None:
+        raise ValueError(
+            "repository URL must be an uncredentialed HTTPS or git SSH "
+            "GitHub repository URL"
+        )
+    owner, repo = match.groups()
+    return f"{owner}/{repo}"
 
 
 def build_extra_instructions(args, tag: str, student_names: list[str]) -> str:

@@ -25,6 +25,7 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from senpai_agent.github.http import GitHubReader
 from senpai_agent.models import Contract
 from senpai_agent.operations import OperationAuditRecord, OperationLedger
+from senpai_agent.repair_broker import RepairAuditRecord
 from senpai_agent.operations import ContextResetStatus
 from senpai_agent.secrets import (
     SUPERVISOR_SECRET_DIR_ENV,
@@ -977,6 +978,7 @@ def compose_supervisor_prompt(
     *,
     due: SupervisorDueState,
     operation_audit: Sequence[OperationAuditRecord] = (),
+    repair_audit: Sequence[RepairAuditRecord] = (),
     max_chars: int = 48_000,
 ) -> str:
     """Render a bounded wake prompt with external strings quarantined as data."""
@@ -1013,7 +1015,12 @@ def compose_supervisor_prompt(
         "and any action taken. If no action is warranted, say so plainly."
     )
     evidence_budget = max_chars - len(prefix) - len(suffix)
-    payload = _prompt_payload(recent, operation_audit, evidence_budget)
+    payload = _prompt_payload(
+        recent,
+        operation_audit,
+        repair_audit,
+        evidence_budget,
+    )
     prompt = f"{prefix}{_safe_json(payload)}{suffix}"
     if len(prompt) > max_chars:
         raise RuntimeError("supervisor prompt exceeded its configured bound")
@@ -1023,16 +1030,19 @@ def compose_supervisor_prompt(
 def _prompt_payload(
     snapshots: Sequence[CampaignSnapshot],
     operation_audit: Sequence[OperationAuditRecord],
+    repair_audit: Sequence[RepairAuditRecord],
     budget: int,
 ) -> dict[str, object]:
     current = snapshots[-1].model_dump(mode="json")
     trend = [_trend_view(snapshot) for snapshot in snapshots]
     audit = _mutation_audit_view(operation_audit)
+    repairs = _repair_audit_view(repair_audit)
     payload: dict[str, object] = {
         "retained_snapshot_count": len(snapshots),
         "current": current,
         "trend": trend,
         "recent_mutation_audit": audit,
+        "recent_repair_audit": repairs,
     }
     pulls = list(current["github"]["pull_requests"])
     while pulls and len(_safe_json(payload)) > budget:
@@ -1049,10 +1059,11 @@ def _prompt_payload(
         "current": _trend_view(snapshots[-1]),
         "trend": trend,
         "recent_mutation_audit": audit,
+        "recent_repair_audit": repairs,
         "detail_omitted": "Observation detail exceeded the bounded prompt budget.",
     }
-    while audit and len(_safe_json(payload)) > budget:
-        audit.pop()
+    while (audit or repairs) and len(_safe_json(payload)) > budget:
+        (repairs if len(repairs) >= len(audit) else audit).pop()
     if len(_safe_json(payload)) <= budget:
         return payload
     return {
@@ -1062,6 +1073,7 @@ def _prompt_payload(
         "open_pr_count": snapshots[-1].github.open_pr_count,
         "running_wandb_count": snapshots[-1].wandb.running_count,
         "recent_mutation_audit": audit[:3],
+        "recent_repair_audit": repairs[:3],
         "detail_omitted": "Evidence exceeded the bounded prompt budget.",
     }
 
@@ -1085,6 +1097,32 @@ def _mutation_audit_view(
                 else None
             ),
             "status": record.status,
+        }
+        for record in records[:12]
+    ]
+
+
+def _repair_audit_view(
+    records: Sequence[RepairAuditRecord],
+) -> list[dict[str, object]]:
+    """Expose durable repair metadata without commands or command output."""
+
+    return [
+        {
+            "operation_id": record.operation_id,
+            "target": record.target.key,
+            "command_fingerprint": record.command_fingerprint,
+            "cwd": record.cwd,
+            "timeout_seconds": record.timeout_seconds,
+            "requested_at": record.requested_at.isoformat(),
+            "completed_at": (
+                record.completed_at.isoformat()
+                if record.completed_at is not None
+                else None
+            ),
+            "status": record.status,
+            "exit_code": record.exit_code,
+            "error_type": record.error_type,
         }
         for record in records[:12]
     ]
@@ -1312,6 +1350,7 @@ def compose_research_review_prompt(
     *,
     advisor_guidance: str,
     operation_audit: Sequence[OperationAuditRecord] = (),
+    repair_audit: Sequence[RepairAuditRecord] = (),
     max_chars: int = 96_000,
 ) -> str:
     """Render a separate six-hour review without carrying operational chat history."""
@@ -1358,6 +1397,7 @@ def compose_research_review_prompt(
             _trend_view(snapshot) for snapshot in snapshots[-3:]
         ],
         "recent_mutation_audit": _mutation_audit_view(operation_audit),
+        "recent_repair_audit": _repair_audit_view(repair_audit),
         "research_window": evidence.model_dump(mode="json"),
     }
     budget = max_chars - len(prefix) - len(suffix)
@@ -1466,10 +1506,12 @@ def operational_supervisor_main(
         namespace=env["SENPAI_KUBECTL_NAMESPACE"],
         environment=env,
     )
+    supervisor_state_dir = Path(env["SENPAI_SUPERVISOR_STATE_DIR"]).resolve()
     repair_broker = RepairBrokerServer(
         Path(env["SENPAI_SUPERVISOR_REPAIR_SOCKET"]),
         inventory,
         backend,
+        ledger_path=supervisor_state_dir / "repair-operations.sqlite3",
     )
     github = GitHubPRCollector.authenticated(runner_config.github_token)
     wandb_key = env.get("WANDB_API_KEY", "").strip()
@@ -1478,7 +1520,6 @@ def operational_supervisor_main(
     import wandb
 
     wandb_runs = WandbRunCollector(wandb.Api(api_key=wandb_key, timeout=30))
-    supervisor_state_dir = Path(env["SENPAI_SUPERVISOR_STATE_DIR"]).resolve()
     store = SupervisorStateStore(
         supervisor_state_dir / "state.json",
         operational_interval=timedelta(seconds=interval),
@@ -1523,6 +1564,7 @@ def operational_supervisor_main(
                 )
                 state = store.append(snapshot)
                 operation_audit = _recent_mutation_audit(operation_ledger_path)
+                repair_audit = repair_broker.recent_audit(limit=12)
             except Exception as error:  # noqa: BLE001
                 print(
                     "SENPAI_OPERATIONAL_SNAPSHOT_ERROR "
@@ -1539,6 +1581,7 @@ def operational_supervisor_main(
                 state.snapshots,
                 due=operational_due,
                 operation_audit=operation_audit,
+                repair_audit=repair_audit,
             )
             _run_fresh_supervisor_turn(
                 operational_prompt,
@@ -1562,6 +1605,7 @@ def operational_supervisor_main(
                     research_evidence,
                     advisor_guidance=advisor_guidance,
                     operation_audit=_recent_mutation_audit(operation_ledger_path),
+                    repair_audit=repair_broker.recent_audit(limit=12),
                 )
                 result = _run_fresh_supervisor_turn(
                     research_prompt,
@@ -1591,12 +1635,27 @@ def _run_fresh_supervisor_turn(
     *,
     phase: str,
 ) -> int:
+    from senpai_agent.isolated_terminal import (
+        begin_isolated_terminal_wake,
+        end_isolated_terminal_wake,
+    )
     from senpai_agent.openhands_runner import run_openhands
 
     config = replace(runner_config, conversation_id=uuid.uuid4())
     progress.update(phase, config.timeout_seconds + 120)
+    socket_path = os.environ.get(
+        "SENPAI_SUPERVISOR_TERMINAL_SOCKET",
+        "@senpai-isolated-terminal",
+    )
+    wake_id = config.conversation_id.hex
+    wake_started = False
+    turn_completed = False
+    wake_ended = False
     try:
+        begin_isolated_terminal_wake(socket_path, wake_id)
+        wake_started = True
         result = run_openhands(prompt, config)
+        turn_completed = True
     except Exception as error:  # noqa: BLE001
         print(
             f"SENPAI_OPERATIONAL_TURN_ERROR phase={phase} "
@@ -1604,7 +1663,21 @@ def _run_fresh_supervisor_turn(
             file=sys.stderr,
             flush=True,
         )
-        return 1
+        result = 1
+    finally:
+        if wake_started:
+            try:
+                end_isolated_terminal_wake(socket_path, wake_id)
+                wake_ended = True
+            except Exception as error:  # noqa: BLE001
+                print(
+                    f"SENPAI_TERMINAL_WAKE_END_ERROR phase={phase} "
+                    f"error={type(error).__name__}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    if not turn_completed or not wake_ended:
+        return result if result else 1
     progress.update(f"{phase}-complete", 120, completed_turn=True)
     return result
 

@@ -32,6 +32,18 @@ class BackendDefaultTests(unittest.TestCase):
             ):
                 launch.main()
 
+    def test_kubernetes_rejects_ssh_repository_transport(self):
+        args = launch.Args(
+            "tag",
+            "git@github.com:example/target.git",
+            backend="kubernetes",
+        )
+        with (
+            patch.object(launch.sp, "parse", return_value=args),
+            self.assertRaisesRegex(SystemExit, "must use uncredentialed https"),
+        ):
+            launch.main()
+
 
 class LaunchOrderingTests(unittest.TestCase):
     def test_aws_mac_official_submit_token_reaches_every_role(self):

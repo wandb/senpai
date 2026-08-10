@@ -189,7 +189,7 @@ spec:
             command:
             - /bin/sh
             - -c
-            - test -S /run/senpai-terminal/terminal.sock && test -S /run/senpai-repair/repair.sock && python -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
+            - /opt/senpai-venv/bin/python -I -m senpai_agent.isolated_terminal health --socket @senpai-isolated-terminal && test -S /run/senpai-repair/repair.sock && python -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 60
@@ -198,7 +198,7 @@ spec:
             command:
             - /bin/sh
             - -c
-            - test -S /run/senpai-terminal/terminal.sock && test -S /run/senpai-repair/repair.sock && python -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
+            - /opt/senpai-venv/bin/python -I -m senpai_agent.isolated_terminal health --socket @senpai-isolated-terminal && test -S /run/senpai-repair/repair.sock && python -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
           periodSeconds: 30
           timeoutSeconds: 5
           failureThreshold: 5
@@ -233,14 +233,15 @@ spec:
           install -m 0755 /workspace/senpai/k8s/senpai-role-shell \
             /home/senpai/.local/bin/senpai-role-shell
           cd /workspace/senpai
-          exec python -m senpai_agent.isolated_terminal serve \
+          exec /opt/senpai-venv/bin/python -I -m \
+            senpai_agent.isolated_terminal serve \
             --socket "$SENPAI_SUPERVISOR_TERMINAL_SOCKET" \
             --workspace /workspaces/supervisor
         env:
         - name: HOME
           value: /home/senpai
         - name: SENPAI_SUPERVISOR_TERMINAL_SOCKET
-          value: /run/senpai-terminal/terminal.sock
+          value: "@senpai-isolated-terminal"
         - name: SENPAI_SUPERVISOR_REPAIR_SOCKET
           value: /run/senpai-repair/repair.sock
         - name: SENPAI_RESEARCH_TAG
@@ -254,13 +255,13 @@ spec:
             memory: "2Gi"
         startupProbe:
           exec:
-            command: ["/bin/sh", "-c", "test -S /run/senpai-terminal/terminal.sock"]
+            command: ["/opt/senpai-venv/bin/python", "-I", "-m", "senpai_agent.isolated_terminal", "health", "--socket", "@senpai-isolated-terminal"]
           periodSeconds: 5
           timeoutSeconds: 2
           failureThreshold: 120
         livenessProbe:
           exec:
-            command: ["/bin/sh", "-c", "test -S /run/senpai-terminal/terminal.sock"]
+            command: ["/opt/senpai-venv/bin/python", "-I", "-m", "senpai_agent.isolated_terminal", "health", "--socket", "@senpai-isolated-terminal"]
           periodSeconds: 30
           timeoutSeconds: 2
           failureThreshold: 5
