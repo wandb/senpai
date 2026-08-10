@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from k8s.launch import legacy_runner_bootstrap
+
 ROOT = Path(__file__).parents[1]
 TEMPLATE_TOKEN = re.compile(r"\{\{[A-Z0-9_]+\}\}")
 BINARY_ONLY_RUNTIME_PACKAGES = (
@@ -20,7 +22,23 @@ BINARY_ONLY_RUNTIME_PACKAGES = (
 def load_kubernetes_template(name: str) -> dict:
     """Render Go-template tokens before asking PyYAML to parse the manifest."""
     template = (ROOT / "k8s" / name).read_text(encoding="utf-8")
-    template = template.replace("{{MODEL_PROVIDER_ENV}}", "- name: MODEL_API_KEY")
+    replacements = {
+        "{{MODEL_PROVIDER_ENV}}": "- name: MODEL_API_KEY",
+        "{{REPAIR_PROTOCOL_ANNOTATION}}": "",
+        "{{SUPERVISOR_ACCESS_LABEL}}": "",
+        "{{ROLE_INIT_CONTAINERS}}": "",
+        "{{ROLE_BOOTSTRAP}}": legacy_runner_bootstrap(),
+        "{{ROLE_WORKSPACE_MOUNTS}}": (
+            "        - name: workspace\n          mountPath: /workspace"
+        ),
+        "{{ROLE_WORKSPACE_VOLUMES}}": (
+            "      - name: workspace\n        emptyDir: {}"
+        ),
+        "{{REPAIR_CONTAINER}}": "",
+        "{{REPAIR_VOLUMES}}": "",
+    }
+    for token, value in replacements.items():
+        template = template.replace(token, value)
     return yaml.safe_load(TEMPLATE_TOKEN.sub("fixture", template))
 
 

@@ -80,7 +80,43 @@ def test_initial_canary_manifest_uses_dummy_credentials_and_real_boundaries():
     assert ("Namespace", "senpai-ci-123") in resources
     assert ("Namespace", "senpai-ci-123-other") in resources
     assert ("Deployment", "senpai-advisor-ci-123") in resources
+    assert ("Deployment", "senpai-ci-123-fern") in resources
     assert ("Deployment", "senpai-supervisor-ci-123") in resources
+    assert ("PersistentVolumeClaim", "senpai-ci-ci-123-supervisor-state") in resources
+    assert resources[(
+        "PersistentVolumeClaim",
+        "senpai-ci-ci-123-supervisor-state",
+    )]["metadata"]["annotations"] == {
+        "senpai.wandb.com/sqlite-safe": "true"
+    }
+    policy = resources[("NetworkPolicy", "senpai-supervisor-egress-ci-123")]
+    assert policy["spec"]["podSelector"]["matchLabels"] == {
+        "research-tag": "ci-123",
+        "senpai-supervisor-access": "true",
+    }
+    unrestricted = [
+        rule["to"][0]["ipBlock"]
+        for rule in policy["spec"]["egress"]
+        if "ports" not in rule
+    ]
+    assert {block["cidr"] for block in unrestricted} == {"0.0.0.0/0", "::/0"}
+    assert {value for block in unrestricted for value in block["except"]} == {
+        "169.254.0.0/16",
+        "fe80::/10",
+        "fd00:ec2::254/128",
+    }
+    dns_exceptions = [
+        rule for rule in policy["spec"]["egress"] if "ports" in rule
+    ]
+    assert {rule["to"][0]["ipBlock"]["cidr"] for rule in dns_exceptions} == {
+        "169.254.0.0/16",
+        "fe80::/10",
+    }
+    assert all(
+        {(port["protocol"], port["port"]) for port in rule["ports"]}
+        == {("TCP", 53), ("UDP", 53)}
+        for rule in dns_exceptions
+    )
 
     for document in documents:
         if document["kind"] != "Secret":
@@ -105,6 +141,20 @@ def test_initial_canary_manifest_uses_dummy_credentials_and_real_boundaries():
     )
     assert "env" not in repair and "envFrom" not in repair
     assert advisor_pod["automountServiceAccountToken"] is False
+    assert advisor["spec"]["template"]["metadata"]["labels"][
+        "senpai-supervisor-access"
+    ] == "true"
+    student = resources[("Deployment", "senpai-ci-123-fern")]
+    student_pod = student["spec"]["template"]["spec"]
+    assert {container["name"] for container in student_pod["containers"]} == {
+        "student",
+        "repair",
+    }
+    assert not any(
+        "nvidia.com/gpu" in resources
+        for container in student_pod["containers"]
+        for resources in container.get("resources", {}).values()
+    )
 
     _secret, _config, supervisor = supervisor_bundle(documents)
     supervisor_pod = supervisor["spec"]["template"]["spec"]
@@ -127,6 +177,9 @@ def test_initial_canary_manifest_uses_dummy_credentials_and_real_boundaries():
         mount["name"] for mount in shell["volumeMounts"]
     }
     assert supervisor_pod["automountServiceAccountToken"] is False
+    assert supervisor["spec"]["template"]["metadata"]["labels"][
+        "senpai-supervisor-access"
+    ] == "true"
     assert all(
         container["image"] == IMAGE
         for document in documents
@@ -220,6 +273,19 @@ def test_pull_request_canary_has_no_live_secret_or_checkout_credential_path():
         "50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54"
         in install_script
     )
+    assert "disableDefaultCNI: true" in script
+    assert "CALICO_VERSION=v3.32.1" in script
+    assert "projectcalico/calico/$CALICO_VERSION/manifests/calico.yaml" in script
+    assert "a1df919d9721cf667accdc3e72848911b0cb25cfab7d2478ad0c996302c95744" in script
+    for digest in (
+        "sha256:bb1567e3ed81e2e8414e9a68f186e1f7ffd4067a4871a9ae90896793af0190dd",
+        "sha256:18008f781c869376dbbc4dfb1ffe3afb46f7897887d4f20e080c420ac44a6612",
+        "sha256:7f874b3f0b540c2b523aea9961ef5e2f43b0af9056a47874c916d6cf348168d3",
+    ):
+        assert digest in script
+    assert "169.254.169.254/32" in script
+    assert "supervisor shell reached the metadata decoy" in script
+    assert "repair sidecar reached the metadata decoy" in script
     assert 'delete cluster --name "$CLUSTER"' in script
     assert "SUPERVISOR_STATE_SENTINEL" in script
     assert "SENPAI_CI_DUMMY_" not in workflow_text

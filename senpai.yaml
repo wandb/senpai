@@ -112,6 +112,12 @@ human_issues: true
 # minutes, with a separate ADVISOR.md-based research review every 6 hours
 operational_supervisor: false
 supervisor_dedicated_namespace: false
+# Set true only when the selected cluster CNI demonstrably enforces NetworkPolicy.
+supervisor_network_policy_enforced: false
+# Dedicated Bound RWO/RWOP Filesystem PVC annotated
+# senpai.wandb.com/sqlite-safe=true after verifying POSIX locking and atomic
+# create/rename/delete behavior. Never reuse pvc_claim_name here.
+supervisor_state_pvc_claim_name: ""
 supervisor_interval_s: 900
 supervisor_research_interval_s: 21600
 supervisor_action_cooldown_s: 1800

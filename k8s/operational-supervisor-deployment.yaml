@@ -54,6 +54,8 @@ metadata:
   annotations:
     senpai.wandb.com/source-revision: "{{REPO_REVISION}}"
     senpai.wandb.com/advisor-branch: {{ADVISOR_BRANCH_JSON}}
+    senpai.wandb.com/management-protocol: "{{MANAGEMENT_PROTOCOL_VERSION}}"
+    senpai.wandb.com/repair-protocol: "{{REPAIR_PROTOCOL_VERSION}}"
   labels:
     app: senpai
     role: supervisor
@@ -75,6 +77,7 @@ spec:
         app: senpai
         role: supervisor
         research-tag: {{RESEARCH_TAG}}
+        senpai-supervisor-access: "true"
     spec:
       serviceAccountName: {{SUPERVISOR_SERVICE_ACCOUNT_NAME}}
       automountServiceAccountToken: false
@@ -89,6 +92,14 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       initContainers:
+      - name: metadata-egress-guard
+        image: {{ADVISOR_IMAGE}}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+        command: ["/usr/local/bin/senpai-metadata-egress-guard"]
       - name: state-directory
         image: {{ADVISOR_IMAGE}}
         securityContext:
@@ -147,6 +158,49 @@ spec:
         volumeMounts:
         - name: runtime
           mountPath: /workspace
+      - name: kubeconfig
+        image: {{ADVISOR_IMAGE}}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -eu
+          host="$KUBERNETES_SERVICE_HOST"
+          case "$host" in
+            *:*) host="[$host]" ;;
+          esac
+          namespace="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+          cat > /var/run/senpai-kubeconfig/config <<EOF
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - name: campaign
+            cluster:
+              server: https://${host}:${KUBERNETES_SERVICE_PORT_HTTPS}
+              certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          users:
+          - name: supervisor
+            user:
+              tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+          contexts:
+          - name: campaign
+            context:
+              cluster: campaign
+              namespace: ${namespace}
+              user: supervisor
+          current-context: campaign
+          EOF
+          chmod 0600 /var/run/senpai-kubeconfig/config
+        volumeMounts:
+        - name: service-account
+          mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          readOnly: true
+        - name: kubeconfig
+          mountPath: /var/run/senpai-kubeconfig
       containers:
       - name: supervisor-control
         image: {{ADVISOR_IMAGE}}
@@ -177,6 +231,8 @@ spec:
               name: {{LAUNCH_SECRET_NAME}}
               key: github-token
         {{MODEL_PROVIDER_ENV}}
+        - name: KUBECONFIG
+          value: /var/run/senpai-kubeconfig/config
         resources:
           requests:
             cpu: "2"
@@ -218,6 +274,9 @@ spec:
           readOnly: true
         - name: repair-socket
           mountPath: /run/senpai-repair
+        - name: kubeconfig
+          mountPath: /var/run/senpai-kubeconfig
+          readOnly: true
       - name: supervisor-shell
         image: {{ADVISOR_IMAGE}}
         securityContext:
@@ -249,9 +308,11 @@ spec:
           requests:
             cpu: "1"
             memory: "1Gi"
+            ephemeral-storage: "1Gi"
           limits:
             cpu: "2"
             memory: "2Gi"
+            ephemeral-storage: "20Gi"
         startupProbe:
           exec:
             command: ["/bin/sh", "-c", "test -S /run/senpai-terminal/terminal.sock"]
@@ -284,7 +345,7 @@ spec:
         emptyDir: {}
       - name: state
         persistentVolumeClaim:
-          claimName: {{PVC_CLAIM_NAME}}
+          claimName: {{SUPERVISOR_STATE_PVC_CLAIM_NAME}}
       - name: service-account
         projected:
           defaultMode: 288
@@ -307,8 +368,13 @@ spec:
       - name: repair-socket
         emptyDir: {}
       - name: shell-workspace
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: 8Gi
       - name: shell-home
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: 4Gi
       - name: shell-tmp
+        emptyDir:
+          sizeLimit: 8Gi
+      - name: kubeconfig
         emptyDir: {}

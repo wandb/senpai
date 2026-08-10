@@ -235,6 +235,12 @@ def test_research_tail_contains_only_active_branch_agent_messages(
         "SENPAI_ROLE": "advisor",
         "EXA_API_KEY": "role-only-exa-secret",
     }
+    role_file = tmp_path / "deployed-ADVISOR.md"
+    role_file.write_text(
+        "Compare mechanisms before sweeps. role-only-exa-secret\n",
+        encoding="utf-8",
+    )
+    env["SENPAI_OPENHANDS_ROLE_FILE"] = str(role_file)
     state_dir = Path(env["SENPAI_OPENHANDS_STATE_DIR"])
     (state_dir / "advisor-conversation-id").write_text(f"{CONVERSATION_ID}\n")
     events_dir = state_dir / CONVERSATION_ID.hex / "events"
@@ -296,6 +302,7 @@ def test_research_tail_contains_only_active_branch_agent_messages(
     assert "role-only-exa-secret" not in " ".join(summaries)
     assert "secret user instruction" not in " ".join(summaries)
     assert "abandoned branch noise" not in " ".join(summaries)
+    assert tail.advisor_guidance == "Compare mechanisms before sweeps. <redacted>"
 
 
 def test_research_tail_fails_closed_if_history_changes_during_read(
@@ -307,6 +314,9 @@ def test_research_tail_fails_closed_if_history_changes_during_read(
         "SENPAI_ROLE": "advisor",
     }
     state_dir = Path(env["SENPAI_OPENHANDS_STATE_DIR"])
+    role_file = tmp_path / "deployed-ADVISOR.md"
+    role_file.write_text("Prefer causal research.\n", encoding="utf-8")
+    env["SENPAI_OPENHANDS_ROLE_FILE"] = str(role_file)
     (state_dir / "advisor-conversation-id").write_text(f"{CONVERSATION_ID}\n")
     checkpoints = iter(((1, "first"), (2, "second")))
     monkeypatch.setattr(

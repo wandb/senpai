@@ -91,6 +91,7 @@ class RoleResearchTail(BaseModel):
 
     conversation_id: UUID
     observed_at: datetime
+    advisor_guidance: str = Field(min_length=1, max_length=32_000)
     messages: tuple[RoleResearchTailItem, ...] = Field(default=(), max_length=3)
 
 
@@ -250,6 +251,33 @@ def advisor_research_tail(
     target = role_target(env)
     if target.role != "advisor":
         raise PermissionError("research-tail inspection is advisor-only")
+    role_file_value = env.get("SENPAI_OPENHANDS_ROLE_FILE", "").strip()
+    if not role_file_value:
+        raise RuntimeError("SENPAI_OPENHANDS_ROLE_FILE is required")
+    role_file = Path(role_file_value)
+    if role_file.is_symlink() or not role_file.is_file():
+        raise RuntimeError("the deployed advisor guidance must be a regular file")
+    before_guidance = role_file.stat()
+    with role_file.open(encoding="utf-8") as stream:
+        advisor_guidance = stream.read(32_001)
+    after_guidance = role_file.stat()
+    if (
+        len(advisor_guidance) > 32_000
+        or not advisor_guidance.strip()
+        or (
+            before_guidance.st_dev,
+            before_guidance.st_ino,
+            before_guidance.st_size,
+            before_guidance.st_mtime_ns,
+        )
+        != (
+            after_guidance.st_dev,
+            after_guidance.st_ino,
+            after_guidance.st_size,
+            after_guidance.st_mtime_ns,
+        )
+    ):
+        raise RuntimeError("the deployed advisor guidance is invalid or changed")
     state_dir = role_state_dir(env)
     lease = _read_lease(state_dir / "controller-lease.json")
     conversation_id = _conversation_id(state_dir, target, lease)
@@ -277,6 +305,10 @@ def advisor_research_tail(
     return RoleResearchTail(
         conversation_id=conversation_id,
         observed_at=(now or datetime.now(UTC)).astimezone(UTC),
+        advisor_guidance=_redact_role_secrets(
+            advisor_guidance.strip(),
+            env,
+        ),
         messages=tuple(messages[-3:]),
     )
 

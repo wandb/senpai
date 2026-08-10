@@ -18,7 +18,7 @@ GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 TARGET_REPO_BRANCH="${TARGET_REPO_BRANCH:-}"
 export SENPAI_ROLE="advisor"
 export ADVISOR_NAME="${ADVISOR_NAME:-advisor}"
-export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
+export TARGET_WORKDIR="${SENPAI_TARGET_WORKDIR:-$WORKDIR/$PROBLEM_DIR}"
 SOURCE_SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 export SENPAI_PLUGIN="$SOURCE_SENPAI_PLUGIN"
 GIT_ASKPASS_FILE="/tmp/senpai-git-askpass"
@@ -53,7 +53,7 @@ clone_single_target_branch() {
     local branch="$1"
     local depth=()
     [ "$GH_HISTORY_SCOPE" = "fresh" ] && depth=(--depth 1)
-    git clone --branch "$branch" --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$PROBLEM_DIR"
+    git clone --branch "$branch" --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$TARGET_WORKDIR"
 }
 
 clone_target_repo() {
@@ -65,11 +65,11 @@ clone_target_repo() {
             if [ -z "$TARGET_REPO_BRANCH" ]; then
                 return 1
             fi
-            rm -rf "$PROBLEM_DIR"
+            rm -rf "$TARGET_WORKDIR"
             if ! clone_single_target_branch "$TARGET_REPO_BRANCH"; then
                 return 1
             fi
-            cd "$WORKDIR/$PROBLEM_DIR"
+            cd "$TARGET_WORKDIR"
             git checkout -b "$ADVISOR_BRANCH"
             git push -u origin "$ADVISOR_BRANCH"
             cd "$WORKDIR"
@@ -81,7 +81,8 @@ clone_target_repo() {
 
 # Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
 # agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
-if [ ! -d "$PROBLEM_DIR/.git" ] && ! clone_target_repo; then
+mkdir -p "$(dirname "$TARGET_WORKDIR")"
+if [ ! -d "$TARGET_WORKDIR/.git" ] && ! clone_target_repo; then
     if [ -n "$TARGET_REPO_BRANCH" ]; then
         echo "ERROR: could not clone advisor branch '$ADVISOR_BRANCH' or target base branch '$TARGET_REPO_BRANCH'" >&2
         exit 1
@@ -89,8 +90,8 @@ if [ ! -d "$PROBLEM_DIR/.git" ] && ! clone_target_repo; then
     [ "$GH_HISTORY_SCOPE" = "repo" ] && exit 1
     depth=()
     [ "$GH_HISTORY_SCOPE" = "fresh" ] && depth=(--depth 1)
-    git clone --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$PROBLEM_DIR"
-    cd "$WORKDIR/$PROBLEM_DIR"
+    git clone --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$TARGET_WORKDIR"
+    cd "$TARGET_WORKDIR"
     git checkout -b "$ADVISOR_BRANCH"
     git push -u origin "$ADVISOR_BRANCH"
     cd "$WORKDIR"
@@ -109,7 +110,7 @@ export SENPAI_PLUGIN="$(
 )"
 
 # --- Git identity (inside the problem-package repo) ---
-cd "$WORKDIR/$PROBLEM_DIR"
+cd "$TARGET_WORKDIR"
 git config user.name "senpai-$ADVISOR_NAME"
 git config user.email "senpai-$ADVISOR_NAME@senpai"
 gh repo set-default "$GH_REPO"

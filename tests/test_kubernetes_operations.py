@@ -288,6 +288,7 @@ def test_backend_collects_only_the_exact_advisor_research_tail(monkeypatch):
             output = RoleResearchTail(
                 conversation_id=CONVERSATION_ID,
                 observed_at=datetime.now(UTC),
+                advisor_guidance="Prefer causal, mechanism-led research.",
                 messages=(
                     RoleResearchTailItem(
                         index=7,
@@ -306,5 +307,6 @@ def test_backend_collects_only_the_exact_advisor_research_tail(monkeypatch):
 
     assert tail.conversation_id == CONVERSATION_ID
     assert tail.messages[0].source == "agent"
+    assert tail.advisor_guidance == "Prefer causal, mechanism-led research."
     assert "role=advisor" in calls[0][0][calls[0][0].index("-l") + 1]
     assert json.loads(calls[1][1])["command"] == "research_tail"

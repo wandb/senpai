@@ -16,7 +16,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from string import Template
 from typing import Annotated, Literal, Protocol
 from urllib.parse import urlencode
 
@@ -194,6 +193,7 @@ class ResearchReviewEvidence(Contract):
         Field(max_length=100),
     ] = ()
     advisor_conversation_id: str | None = None
+    advisor_guidance: Annotated[str | None, Field(max_length=32_000)] = None
     advisor_active_tail: Annotated[
         tuple[ConversationTailItem, ...],
         Field(max_length=40),
@@ -1287,10 +1287,12 @@ def collect_research_review_evidence(
     )
     gaps.extend(wandb_gaps)
     conversation_id = None
+    advisor_guidance = None
     advisor_tail: tuple[ConversationTailItem, ...] = ()
     try:
         tail = runtime_backend.collect_advisor_research_tail()
         conversation_id = str(tail.conversation_id)
+        advisor_guidance = tail.advisor_guidance
         advisor_tail = tuple(
             ConversationTailItem(
                 index=item.index,
@@ -1314,6 +1316,7 @@ def collect_research_review_evidence(
         closed_pull_requests=closed_pulls,
         recent_wandb_runs=recent_runs,
         advisor_conversation_id=conversation_id,
+        advisor_guidance=advisor_guidance,
         advisor_active_tail=advisor_tail,
         evidence_gaps=tuple(gaps),
     )
@@ -1353,7 +1356,6 @@ def compose_research_review_prompt(
     snapshots: Sequence[CampaignSnapshot],
     evidence: ResearchReviewEvidence,
     *,
-    advisor_guidance: str,
     operation_audit: Sequence[OperationAuditRecord] = (),
     max_chars: int = 96_000,
 ) -> str:
@@ -1363,7 +1365,7 @@ def compose_research_review_prompt(
         raise ValueError("at least one operational snapshot is required")
     if max_chars < 32_000:
         raise ValueError("research review prompt budget must be at least 32000")
-    guidance = advisor_guidance.strip()
+    guidance = (evidence.advisor_guidance or "").strip()
     if not guidance:
         raise ValueError("the current ADVISOR.md guidance is required")
     current = snapshots[-1]
@@ -1401,7 +1403,10 @@ def compose_research_review_prompt(
             _trend_view(snapshot) for snapshot in snapshots[-3:]
         ],
         "recent_mutation_audit": _mutation_audit_view(operation_audit),
-        "research_window": evidence.model_dump(mode="json"),
+        "research_window": evidence.model_dump(
+            mode="json",
+            exclude={"advisor_guidance"},
+        ),
     }
     budget = max_chars - len(prefix) - len(suffix)
     research_window = payload["research_window"]
@@ -1484,7 +1489,6 @@ def operational_supervisor_main(
     from senpai_agent.weave_monitoring import initialize_weave_monitoring
 
     initialize_weave_monitoring(env)
-    from senpai_agent.agent_markdown import read_agent_markdown
     from senpai_agent.kubernetes_operations import KubectlCampaignBackend
     from senpai_agent.openhands_runner import (
         parse_runner_args,
@@ -1558,10 +1562,6 @@ def operational_supervisor_main(
     progress = ProgressLease(supervisor_state_dir / "lease.json")
     operation_ledger_path = runner_config.state_dir / "operations.sqlite3"
     progress.update("startup", 300)
-    advisor_path = runner_config.workspace / "system_instructions" / "ADVISOR.md"
-    advisor_guidance = Template(
-        read_agent_markdown(advisor_path)
-    ).safe_substitute(env)
     stop = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -1629,10 +1629,17 @@ def operational_supervisor_main(
                         state.snapshots[-1].runtimes,
                         since=state.last_research_review_at or state.started_at,
                     )
+                    if not research_evidence.advisor_guidance:
+                        print(
+                            "SENPAI_SUPERVISOR_RESEARCH_REVIEW_SKIPPED "
+                            "deployed advisor guidance was unavailable",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        return 1
                     research_prompt = compose_research_review_prompt(
                         state.snapshots,
                         research_evidence,
-                        advisor_guidance=advisor_guidance,
                         operation_audit=_recent_mutation_audit(
                             operation_ledger_path
                         ),

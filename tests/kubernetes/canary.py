@@ -44,8 +44,14 @@ def _namespace(name: str) -> dict:
     }
 
 
-def _storage(namespace: str, tag: str) -> tuple[dict, dict]:
-    name = f"senpai-ci-{tag}"
+def _storage(
+    namespace: str,
+    tag: str,
+    *,
+    name: str,
+    host_suffix: str,
+    sqlite_safe: bool = False,
+) -> tuple[dict, dict]:
     return (
         {
             "apiVersion": "v1",
@@ -57,7 +63,7 @@ def _storage(namespace: str, tag: str) -> tuple[dict, dict]:
             "spec": {
                 "accessModes": ["ReadWriteOnce"],
                 "capacity": {"storage": "1Gi"},
-                "hostPath": {"path": f"/var/senpai-ci/{tag}"},
+                "hostPath": {"path": f"/var/senpai-ci/{tag}/{host_suffix}"},
                 "persistentVolumeReclaimPolicy": "Retain",
                 "storageClassName": "",
             },
@@ -69,6 +75,15 @@ def _storage(namespace: str, tag: str) -> tuple[dict, dict]:
                 "name": name,
                 "namespace": namespace,
                 "labels": {"senpai-ci-canary": tag},
+                **(
+                    {
+                        "annotations": {
+                            "senpai.wandb.com/sqlite-safe": "true"
+                        }
+                    }
+                    if sqlite_safe
+                    else {}
+                ),
             },
             "spec": {
                 "accessModes": ["ReadWriteOnce"],
@@ -92,10 +107,13 @@ def _args(namespace: str, tag: str, image: str, revision: str):
         repo_url="https://example.invalid/wandb/senpai.git",
         repo_revision=revision,
         advisor_image=image,
+        student_image=image,
         advisor_branch="ci-advisor",
         advisor=True,
         operational_supervisor=True,
         supervisor_dedicated_namespace=True,
+        supervisor_network_policy_enforced=True,
+        supervisor_state_pvc_claim_name=f"senpai-ci-{tag}-supervisor-state",
         pvc_claim_name=f"senpai-ci-{tag}",
         pvc_mount_path="/mnt/senpai-ci",
         n_students=0,
@@ -147,7 +165,15 @@ def _render_advisor(namespace: str, tag: str, image: str, revision: str) -> list
         )
     advisor = _container(pod, "advisor")
     advisor["command"] = ["python", "/opt/senpai/tests/kubernetes/canary.py"]
-    advisor["args"] = ["role-owner", "--state-dir", state_dir]
+    advisor["args"] = [
+        "role-owner",
+        "--role",
+        "advisor",
+        "--state-dir",
+        state_dir,
+        "--target-dir",
+        "/workspace/target",
+    ]
     advisor["resources"] = {
         "requests": {"cpu": "100m", "memory": "128Mi"},
         "limits": {"cpu": "1", "memory": "1Gi"},
@@ -158,10 +184,82 @@ def _render_advisor(namespace: str, tag: str, image: str, revision: str) -> list
         probe["timeoutSeconds"] = 1
         probe["failureThreshold"] = 30
     repair = _container(pod, "repair")
-    repair["resources"] = {
-        "requests": {"cpu": "50m", "memory": "64Mi"},
-        "limits": {"cpu": "500m", "memory": "256Mi"},
+    repair["resources"]["requests"].update(cpu="50m", memory="64Mi")
+    repair["resources"]["limits"].update(cpu="500m", memory="256Mi")
+    for document in rendered:
+        document.setdefault("metadata", {}).setdefault("namespace", namespace)
+    return rendered
+
+
+def _render_student(namespace: str, tag: str, image: str, revision: str) -> list[dict]:
+    from k8s.launch import STUDENT_TEMPLATE, render_student
+    from k8s.launch_helpers import render_launch_secret
+
+    args = _args(namespace, tag, image, revision)
+    launch_secret = render_launch_secret(
+        tag,
+        f"{DUMMY}GITHUB_A",
+        f"{DUMMY}EXA_A",
+        f"{DUMMY}WANDB_A",
+        openai_api_key=f"{DUMMY}OPENAI_A",
+    )
+    rendered = _documents(
+        render_student(
+            STUDENT_TEMPLATE.read_text(encoding="utf-8"),
+            "fern",
+            tag,
+            f"senpai-launch-secrets-{tag}",
+            launch_secret,
+            args,
+        )
+    )
+    config = next(document for document in rendered if document["kind"] == "ConfigMap")
+    state_dir = "/var/lib/senpai/openhands_state"
+    config["data"].update(
+        {
+            "SENPAI_ROLE": "student",
+            "SENPAI_OPENHANDS_STATE_DIR": state_dir,
+        }
+    )
+    deployment = next(
+        document for document in rendered if document["kind"] == "Deployment"
+    )
+    deployment["metadata"]["namespace"] = namespace
+    pod = deployment["spec"]["template"]["spec"]
+    student = _container(pod, "student")
+    student["command"] = ["python", "/opt/senpai/tests/kubernetes/canary.py"]
+    student["args"] = [
+        "role-owner",
+        "--role",
+        "student",
+        "--state-dir",
+        state_dir,
+        "--target-dir",
+        "/workspace/target",
+    ]
+    student["resources"] = {
+        "requests": {"cpu": "100m", "memory": "128Mi"},
+        "limits": {"cpu": "1", "memory": "1Gi"},
     }
+    for probe_name in ("startupProbe", "livenessProbe"):
+        probe = student[probe_name]
+        probe["periodSeconds"] = 1
+        probe["timeoutSeconds"] = 1
+        probe["failureThreshold"] = 30
+    repair = _container(pod, "repair")
+    repair["resources"]["requests"].update(cpu="50m", memory="64Mi")
+    repair["resources"]["limits"].update(cpu="500m", memory="256Mi")
+    pod.pop("tolerations", None)
+    source = next(
+        container for container in pod["initContainers"] if container["name"] == "source"
+    )
+    source["command"] = ["/bin/bash", "-c"]
+    source["args"] = [
+        "set -eu; cp -a /opt/senpai/. /workspace/senpai; "
+        "test -f /workspace/senpai/tests/kubernetes/canary.py"
+    ]
+    source.pop("env", None)
+    source.pop("envFrom", None)
     for document in rendered:
         document.setdefault("metadata", {}).setdefault("namespace", namespace)
     return rendered
@@ -195,7 +293,7 @@ def _render_supervisor(
         + render_operational_supervisor(
             SUPERVISOR_TEMPLATE.read_text(encoding="utf-8"),
             tag,
-            [],
+            ["fern"],
             secret_name,
             secret,
             args,
@@ -298,6 +396,7 @@ def _decoy(other_namespace: str, tag: str, image: str) -> dict:
 
 
 def render_manifest(args: argparse.Namespace) -> int:
+    from k8s.launch import render_supervisor_network_policy
     from k8s.launch_helpers import render_launch_secret
 
     launch_secret = _documents(
@@ -311,14 +410,32 @@ def render_manifest(args: argparse.Namespace) -> int:
     )[0]
     launch_secret["metadata"]["namespace"] = args.namespace
     if args.phase == "initial":
-        volume, claim = _storage(args.namespace, args.tag)
+        volume, claim = _storage(
+            args.namespace,
+            args.tag,
+            name=f"senpai-ci-{args.tag}",
+            host_suffix="dataset",
+        )
+        state_volume, state_claim = _storage(
+            args.namespace,
+            args.tag,
+            name=f"senpai-ci-{args.tag}-supervisor-state",
+            host_suffix="supervisor-state",
+            sqlite_safe=True,
+        )
         documents = [
             _namespace(args.namespace),
             _namespace(args.other_namespace),
             volume,
             claim,
+            state_volume,
+            state_claim,
+            _documents(render_supervisor_network_policy(args.tag))[0],
             launch_secret,
             *_render_advisor(
+                args.namespace, args.tag, args.image, args.revision
+            ),
+            *_render_student(
                 args.namespace, args.tag, args.image, args.revision
             ),
             _decoy(args.other_namespace, args.tag, args.image),
@@ -330,6 +447,11 @@ def render_manifest(args: argparse.Namespace) -> int:
                 broken=False,
             ),
         ]
+        next(
+            document
+            for document in documents
+            if document["kind"] == "NetworkPolicy"
+        )["metadata"]["namespace"] = args.namespace
     else:
         documents = _render_supervisor(
             args.namespace,
@@ -375,12 +497,19 @@ def role_owner(args: argparse.Namespace) -> int:
     state_dir.mkdir(parents=True, exist_ok=True)
     marker = state_dir / "canary-state-marker"
     marker.write_text("owner-state-preserved\n", encoding="utf-8")
+    target_dir = args.target_dir.resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / ".git").mkdir(exist_ok=True)
+    (target_dir / "canary-target-marker").write_text(
+        f"{args.role}-target-workspace\n",
+        encoding="utf-8",
+    )
     command = (
         sys.executable,
         str(Path(__file__).resolve()),
         "fake-worker",
         "senpai_agent.controller",
-        "advisor",
+        args.role,
     )
     return WorkerSupervisor(
         command=command,
@@ -405,7 +534,7 @@ def supervisor_control(args: argparse.Namespace) -> int:
         research_tag=args.tag,
         repo="senpai/canary",
         advisor_branch="ci-advisor",
-        students=(),
+        students=("fern",),
     )
     backend = KubectlCampaignBackend(
         inventory,
@@ -435,53 +564,58 @@ def probe_control(args: argparse.Namespace) -> int:
         research_tag=args.tag,
         repo="senpai/canary",
         advisor_branch="ci-advisor",
-        students=(),
+        students=("fern",),
     )
     backend = KubectlCampaignBackend(
         inventory,
         namespace=args.namespace,
         environment=os.environ,
     )
-    target = RoleTarget(research_tag=args.tag, role="advisor")
-    before = backend.collect_role(target)
-    if (
-        before.controller_alive is not True
-        or before.controller_phase != "sleep"
-        or before.worker_generation != 1
-        or before.conversation_id != CANARY_CONVERSATION_ID
-        or before.restart_control_token is None
+    results = []
+    for target in (
+        RoleTarget(research_tag=args.tag, role="advisor"),
+        RoleTarget(research_tag=args.tag, role="student", student="fern"),
     ):
-        raise RuntimeError(f"role was not restartable: {before.model_dump_json()}")
-    receipt = backend.restart_controller(
-        target,
-        expected_conversation_id=CANARY_CONVERSATION_ID,
-        restart_control_token=before.restart_control_token,
-    )
-    deadline = time.monotonic() + args.timeout
-    after = before
-    while time.monotonic() < deadline:
-        after = backend.collect_role(target)
-        if after.worker_generation == 2 and after.controller_alive is True:
-            break
-        time.sleep(0.25)
-    else:
-        raise RuntimeError(
-            "owner did not replace the controller worker: "
-            f"{after.model_dump_json()}"
+        before = backend.collect_role(target)
+        if (
+            before.controller_alive is not True
+            or before.controller_phase != "sleep"
+            or before.worker_generation != 1
+            or before.conversation_id != CANARY_CONVERSATION_ID
+            or before.restart_control_token is None
+        ):
+            raise RuntimeError(
+                f"role was not restartable: {before.model_dump_json()}"
+            )
+        receipt = backend.restart_controller(
+            target,
+            expected_conversation_id=CANARY_CONVERSATION_ID,
+            restart_control_token=before.restart_control_token,
         )
-    if after.conversation_id != CANARY_CONVERSATION_ID:
-        raise RuntimeError("owner restart changed the conversation identity")
-    print(
-        json.dumps(
+        deadline = time.monotonic() + args.timeout
+        after = before
+        while time.monotonic() < deadline:
+            after = backend.collect_role(target)
+            if after.worker_generation == 2 and after.controller_alive is True:
+                break
+            time.sleep(0.25)
+        else:
+            raise RuntimeError(
+                "owner did not replace the controller worker: "
+                f"{after.model_dump_json()}"
+            )
+        if after.conversation_id != CANARY_CONVERSATION_ID:
+            raise RuntimeError("owner restart changed the conversation identity")
+        results.append(
             {
+                "target": target.model_dump(mode="json"),
                 "request_id": receipt.request_id,
                 "source_generation": before.worker_generation,
                 "replacement_generation": after.worker_generation,
                 "conversation_id": str(after.conversation_id),
-            },
-            sort_keys=True,
+            }
         )
-    )
+    print(json.dumps(results, sort_keys=True))
     return 0
 
 
@@ -497,7 +631,9 @@ def parser() -> argparse.ArgumentParser:
     render.add_argument("--revision", required=True)
     render.set_defaults(handler=render_manifest)
     owner = commands.add_parser("role-owner")
+    owner.add_argument("--role", choices=("advisor", "student"), required=True)
     owner.add_argument("--state-dir", type=Path, required=True)
+    owner.add_argument("--target-dir", type=Path, required=True)
     owner.set_defaults(handler=role_owner)
     worker = commands.add_parser("fake-worker")
     worker.add_argument("markers", nargs="*")

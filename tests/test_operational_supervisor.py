@@ -774,6 +774,7 @@ def test_research_prompt_keeps_full_guidance_and_quarantines_bounded_evidence():
     evidence = ResearchReviewEvidence(
         observed_at=NOW,
         since=NOW - timedelta(hours=6),
+        advisor_guidance=guidance,
         closed_pull_requests=(
             RecentPullRequestObservation(
                 number=9,
@@ -813,7 +814,6 @@ def test_research_prompt_keeps_full_guidance_and_quarantines_bounded_evidence():
     prompt = compose_research_review_prompt(
         (snapshot(NOW),),
         evidence,
-        advisor_guidance=guidance,
         operation_audit=(mutation_audit_record(),),
     )
 

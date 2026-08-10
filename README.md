@@ -156,6 +156,8 @@ max_epochs: 50
 operational_supervisor: true
 namespace: senpai-first-run
 supervisor_dedicated_namespace: true
+supervisor_network_policy_enforced: true
+supervisor_state_pvc_claim_name: senpai-first-run-supervisor-state
 supervisor_interval_s: 900
 supervisor_research_interval_s: 21600
 supervisor_action_cooldown_s: 1800
@@ -708,11 +710,21 @@ conversation and a timestamped snapshot. It retains only the last three
 snapshots in its explicit working context, so it can detect stagnation without
 growing one long-lived history. Each fresh OpenHands conversation is in-memory;
 the three snapshots and mutation audit are the only local durable supervisor
-state. Enable it while launching the advisor, or add it incrementally only when
-the exact-tag advisor and every unreplaced student Deployment carry the same
-pinned Senpai source revision and advisor branch, with an unchanged student
-inventory. The launcher rejects mixed, unversioned, or differently scoped role
-protocols. Each snapshot contains:
+state. Its SQLite files must live on the dedicated
+`supervisor_state_pvc_claim_name`, never the dataset PVC. That claim must be a
+Bound RWO or RWOP filesystem whose operator has verified POSIX advisory locks
+and atomic file create, rename, and delete behavior, then annotated it
+`senpai.wandb.com/sqlite-safe=true`; RWX/NFS/CIFS-style shared storage is not an
+accepted durability contract.
+
+Enable the supervisor while launching the advisor, or add/upgrade it
+incrementally when the exact-tag advisor and every unreplaced student carry the
+same versioned management and repair protocols, advisor branch, and unchanged
+student inventory. Supervisor and role image revisions may differ when those
+protocol versions match, so a supervisor-only upgrade does not restart research
+roles. Replacing a role in an already supervised campaign requires
+`--operational_supervisor`, preventing an ordinary launch from silently removing
+its repair sidecar. Each snapshot contains:
 
 - open PRs whose base is exactly this launch's advisor branch, including age,
   workflow labels, and issue/review/inline-comment counts;
@@ -728,6 +740,16 @@ the supervisor Deployment, and leave both the fixed advisor/student Secret and
 prior supervisor bundles untouched. The launcher waits for readiness before it
 returns. If readiness fails, use the exact rollback command printed by the
 launcher; the prior ReplicaSet still references the retained prior bundle.
+Both preflight and the immediate pre-mutation recheck validate the namespace,
+dedicated state claim, exact inventory, and protocol annotations.
+
+Supervisor-capable pods are selected by a campaign NetworkPolicy that allows
+ordinary Internet and cluster egress but denies IPv4 link-local, IPv6
+link-local, and AWS IPv6 IMDS. Link-local TCP/UDP port 53 remains available for
+NodeLocal DNS. A credential-free first init container also fails closed if an
+IMDS endpoint accepts TCP. Set `supervisor_network_policy_enforced: true` only
+after verifying that the selected CNI enforces Kubernetes NetworkPolicy; valid
+YAML alone is insufficient.
 
 Missing GitHub, W&B, pod, log, or process evidence is represented as unknown,
 never as a false zero. Repeated `SENPAI_TURN_DEFERRED` markers are intentionally
@@ -778,11 +800,25 @@ starts a clean active branch while preserving the raw OpenHands trace,
 conversation UUID, workspace, and pending events. It never deletes or rewrites
 event files.
 
-Every six hours, the next wake runs a second fresh research review against the
-current `system_instructions/ADVISOR.md`. It intervenes only for clear strategic
-drift, such as a sustained narrow sweep loop, by injecting a concise reminder
-into the existing advisor conversation. This does not change the advisor or
-student research prompts and does not continuously direct experiments.
+When supervised, `/repair/workspace` is the mutable target repository root;
+the pinned Senpai runner, dataset, credentials, and ServiceAccount are absent.
+Ordinary unsupervised roles keep their original single-workspace topology and
+receive no repair executor or supervisor policy label.
+
+The container launcher moves its GitHub, W&B, and model credentials through a
+private one-use directory, unsets them, and then execs Python. Python consumes
+and deletes that directory before importing OpenHands. The native terminal
+therefore inherits no credential values, and Linux cannot recover them from the
+Python process's initial environment.
+
+Every six hours, the next wake runs a second fresh research review against a
+bounded, secret-redacted copy of the advisor guidance actually deployed in that
+role, obtained through the versioned role-control protocol. It does not use the
+supervisor image's potentially different `ADVISOR.md`. It intervenes only for
+clear strategic drift, such as a sustained narrow sweep loop, by injecting a
+concise reminder into the existing advisor conversation. This does not change
+the advisor or student research prompts and does not continuously direct
+experiments.
 
 #### Planned Docker and AWS transports
 
@@ -874,7 +910,9 @@ Useful launch controls:
 - `--operational_supervisor` enables the independent campaign supervisor;
   it also requires a non-default campaign-only `--namespace` and the explicit
   `--supervisor_dedicated_namespace` acknowledgement because raw pod exec is
-  namespace-wide;
+  namespace-wide. It also requires a demonstrably enforcing NetworkPolicy CNI,
+  `--supervisor_network_policy_enforced`, and a separate annotated
+  `--supervisor_state_pvc_claim_name` with SQLite-safe filesystem semantics;
   `--supervisor_interval_s`, `--supervisor_research_interval_s`, and
   `--supervisor_action_cooldown_s` configure its durable cadences. Supervisor
   launch is currently Kubernetes-only.
@@ -900,6 +938,14 @@ uv sync --locked --extra dev
 uv run pytest -q
 bash -n k8s/*.sh scripts/*.sh plugins/senpai/scripts/*.sh
 ```
+
+Pull requests run a real credential-free Kind production canary. Kind is pinned
+by image digest; Calico v3.32.1 is fetched from its released tag, verified by
+SHA-256, and its CNI/node/controller images are rewritten to released
+multi-architecture digests before installation. The gate proves policy
+enforcement with a live IMDS-address decoy, advisor and student repair scoping,
+controller-owner restarts, a failed supervisor-only rollout and rollback, role
+pod continuity, and dedicated supervisor-state persistence.
 
 Deep references:
 

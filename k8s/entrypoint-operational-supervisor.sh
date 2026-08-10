@@ -26,6 +26,8 @@ export SENPAI_OPENHANDS_TIMEOUT_SECONDS="${SENPAI_OPENHANDS_TIMEOUT_SECONDS:-900
 export SENPAI_OPENHANDS_MAX_TURNS="${SENPAI_OPENHANDS_MAX_TURNS:-80}"
 
 cd "$WORKDIR"
-uv pip install --python "$SENPAI_PYTHON" --no-deps -e .
+if [ "${SENPAI_SKIP_EDITABLE_INSTALL:-0}" != "1" ]; then
+    uv pip install --python "$SENPAI_PYTHON" --no-deps -e .
+fi
 
 exec python -m senpai_agent.operational_supervisor run

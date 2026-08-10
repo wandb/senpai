@@ -222,6 +222,63 @@ def existing_advisor_deployments(
     return [line for line in result.stdout.splitlines() if line]
 
 
+def existing_operational_supervisors(
+    tag: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> list[str]:
+    """Return exact-tag operational supervisor Deployments."""
+    result = subprocess.run(
+        kubectl_command(
+            "get",
+            "deployments",
+            "-l",
+            f"app=senpai,role=supervisor,research-tag={tag}",
+            "-o",
+            'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def kubernetes_pvc_metadata(
+    claim_name: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> dict:
+    """Read one PVC through the exact launch context and namespace."""
+    result = subprocess.run(
+        kubectl_command(
+            "get",
+            "pvc",
+            claim_name,
+            "-o",
+            "json",
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or "kubectl failed"
+        raise RuntimeError(f"cannot read PVC {claim_name!r}: {detail}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"cannot read PVC {claim_name!r}: kubectl returned invalid JSON"
+        ) from error
+
+
 def existing_role_metadata(
     tag: str,
     role: str,
