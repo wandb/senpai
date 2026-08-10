@@ -906,6 +906,59 @@ def test_controller_restart_rechecks_jobs_immediately_before_queueing(
     assert killed == []
 
 
+@pytest.mark.parametrize(
+    ("final_active_delegations", "message"),
+    [
+        (1, "delegated task started before controller restart"),
+        (None, "delegation activity became unreadable before controller restart"),
+    ],
+)
+def test_controller_restart_rechecks_delegations_immediately_before_queueing(
+    tmp_path: Path,
+    monkeypatch,
+    final_active_delegations: int | None,
+    message: str,
+):
+    env = student_env(tmp_path)
+    target = RoleTarget(research_tag="maple", role="student", student="fern")
+    state = runtime_state(target)
+    lease = WorkerLease(
+        pid=123,
+        phase="sleep",
+        deadline=100,
+        completed_turns=state.completed_turns or 0,
+        generation=1,
+    )
+    monkeypatch.setattr(
+        "senpai_agent.role_control._require_restart_control_token",
+        lambda _token, _env: state,
+    )
+    monkeypatch.setattr("senpai_agent.role_control._read_lease", lambda _path: lease)
+    monkeypatch.setattr(
+        "senpai_agent.role_control._controller_alive",
+        lambda _lease, _role: True,
+    )
+    monkeypatch.setattr(
+        "senpai_agent.role_control._training_state",
+        lambda _state_dir, _role: (0, (), (), (), True),
+    )
+    monkeypatch.setattr(
+        "senpai_agent.role_control._active_delegation_count",
+        lambda _state_dir: final_active_delegations,
+    )
+    monkeypatch.setattr(
+        "senpai_agent.role_control._restart_control_token",
+        lambda *_args: "token-1",
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        restart_controller(CONVERSATION_ID, "token-1", env)
+
+    assert not (
+        Path(env["SENPAI_OPENHANDS_STATE_DIR"]) / "controller-restarts.sqlite3"
+    ).exists()
+
+
 def test_controller_restart_rejects_a_missing_conversation_uuid(tmp_path: Path):
     env = student_env(tmp_path)
 

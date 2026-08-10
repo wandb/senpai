@@ -410,12 +410,19 @@ def restart_controller(
         raise RuntimeError("training activity is unknown; refusing controller restart")
     if final_running_count:
         raise RuntimeError("a supervised job started before controller restart")
+    final_active_delegation_count = _active_delegation_count(role_state_dir(env))
+    if final_active_delegation_count is None:
+        raise RuntimeError(
+            "delegation activity became unreadable before controller restart"
+        )
+    if final_active_delegation_count:
+        raise RuntimeError("a delegated task started before controller restart")
     final_control_token = _control_token(
         lease,
         observation.conversation_id,
         observation.raw_history_digest,
         observation.pending_event_keys,
-        observation.active_delegation_count,
+        final_active_delegation_count,
     )
     if (
         _restart_control_token(final_control_token, lease, final_running_count)
