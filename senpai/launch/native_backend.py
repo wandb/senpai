@@ -899,12 +899,11 @@ def logs_native(
 def terminate_native(tag: str, run_root: str = DEFAULT_NATIVE_RUN_ROOT) -> None:
     """Unload recorded services and remove their private workspaces and secrets."""
     path, manifest = _load_manifest(tag, run_root)
-    installed_roles = _validate_installed_role_inventory(tag, manifest["roles"])
+    _validate_installed_role_inventory(tag, manifest["roles"])
     errors = []
     for role in reversed(manifest["roles"]):
         try:
-            if role["key"] in installed_roles:
-                _uninstall_recorded_role(manifest["domain"], role)
+            _uninstall_recorded_role(manifest["domain"], role)
             if tmux_root := role.get("tmux_root"):
                 _remove_tmux_root(
                     tmux_root,
