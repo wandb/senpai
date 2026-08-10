@@ -10,6 +10,7 @@ metadata:
     app: senpai
     role: supervisor
     research-tag: {{RESEARCH_TAG}}
+automountServiceAccountToken: false
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -76,6 +77,8 @@ spec:
         research-tag: {{RESEARCH_TAG}}
     spec:
       serviceAccountName: {{SUPERVISOR_SERVICE_ACCOUNT_NAME}}
+      automountServiceAccountToken: false
+      shareProcessNamespace: false
       terminationGracePeriodSeconds: 90
       securityContext:
         runAsNonRoot: true
@@ -86,6 +89,21 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       initContainers:
+      - name: state-directory
+        image: {{ADVISOR_IMAGE}}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -eu
+          mkdir -p "/state-root/{{SUPERVISOR_STATE_SUBPATH}}"
+        volumeMounts:
+        - name: state
+          mountPath: /state-root
       - name: source
         image: {{ADVISOR_IMAGE}}
         securityContext:
@@ -95,7 +113,7 @@ spec:
         command: ["/bin/bash", "-c"]
         args:
         - |
-          set -e
+          set -eu
           askpass=/tmp/senpai-git-askpass
           printf '%s\n' \
             '#!/bin/sh' \
@@ -104,18 +122,19 @@ spec:
             '  *Password*) printf "%s\n" "$GITHUB_TOKEN" ;;' \
             'esac' > "$askpass"
           chmod 700 "$askpass"
-          git init /workspace/senpai
+          git init /workspace/.source
           GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
-            git -C /workspace/senpai fetch --depth 1 "$REPO_URL" "$REPO_REVISION"
-          git -C /workspace/senpai checkout --detach FETCH_HEAD
-          if git -C /workspace/senpai remote get-url origin >/dev/null 2>&1; then
-            git -C /workspace/senpai remote set-url origin "$REPO_URL"
+            git -C /workspace/.source fetch --depth 1 "$REPO_URL" "$REPO_REVISION"
+          git -C /workspace/.source checkout --detach FETCH_HEAD
+          if git -C /workspace/.source remote get-url origin >/dev/null 2>&1; then
+            git -C /workspace/.source remote set-url origin "$REPO_URL"
           else
-            git -C /workspace/senpai remote add origin "$REPO_URL"
+            git -C /workspace/.source remote add origin "$REPO_URL"
           fi
-          test "$(git -C /workspace/senpai rev-parse HEAD)" = "$REPO_REVISION"
+          test "$(git -C /workspace/.source rev-parse HEAD)" = "$REPO_REVISION"
           test "$SENPAI_IMAGE_REVISION" = "$REPO_REVISION"
           rm -f "$askpass"
+          mv /workspace/.source /workspace/senpai
         envFrom:
         - configMapRef:
             name: {{SUPERVISOR_CONFIGMAP_NAME}}
@@ -127,9 +146,9 @@ spec:
               key: github-token
         volumeMounts:
         - name: runtime
-          mountPath: /workspace/senpai
+          mountPath: /workspace
       containers:
-      - name: supervisor
+      - name: supervisor-control
         image: {{ADVISOR_IMAGE}}
         securityContext:
           allowPrivilegeEscalation: false
@@ -170,7 +189,7 @@ spec:
             command:
             - /bin/sh
             - -c
-            - python -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
+            - test -S /run/senpai-terminal/terminal.sock && test -S /run/senpai-repair/repair.sock && python -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 60
@@ -179,20 +198,117 @@ spec:
             command:
             - /bin/sh
             - -c
-            - python -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
+            - test -S /run/senpai-terminal/terminal.sock && test -S /run/senpai-repair/repair.sock && python -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
           periodSeconds: 30
           timeoutSeconds: 5
           failureThreshold: 5
           terminationGracePeriodSeconds: 75
         volumeMounts:
         - name: runtime
-          mountPath: /workspace/senpai
+          mountPath: /workspace
           readOnly: true
         - name: state
-          mountPath: /var/lib/senpai
+          mountPath: {{SUPERVISOR_STATE_MOUNT_PATH}}
+          subPath: {{SUPERVISOR_STATE_SUBPATH}}
+        - name: service-account
+          mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          readOnly: true
+        - name: terminal-socket
+          mountPath: /run/senpai-terminal
+          readOnly: true
+        - name: repair-socket
+          mountPath: /run/senpai-repair
+      - name: supervisor-shell
+        image: {{ADVISOR_IMAGE}}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -eu
+          mkdir -p /home/senpai/.local/bin
+          install -m 0755 /workspace/senpai/k8s/senpai-role-shell \
+            /home/senpai/.local/bin/senpai-role-shell
+          cd /workspace/senpai
+          exec python -m senpai_agent.isolated_terminal serve \
+            --socket "$SENPAI_SUPERVISOR_TERMINAL_SOCKET" \
+            --workspace /workspaces/supervisor
+        env:
+        - name: HOME
+          value: /home/senpai
+        - name: SENPAI_SUPERVISOR_TERMINAL_SOCKET
+          value: /run/senpai-terminal/terminal.sock
+        - name: SENPAI_SUPERVISOR_REPAIR_SOCKET
+          value: /run/senpai-repair/repair.sock
+        - name: SENPAI_RESEARCH_TAG
+          value: {{RESEARCH_TAG}}
+        resources:
+          requests:
+            cpu: "1"
+            memory: "1Gi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+        startupProbe:
+          exec:
+            command: ["/bin/sh", "-c", "test -S /run/senpai-terminal/terminal.sock"]
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 120
+        livenessProbe:
+          exec:
+            command: ["/bin/sh", "-c", "test -S /run/senpai-terminal/terminal.sock"]
+          periodSeconds: 30
+          timeoutSeconds: 2
+          failureThreshold: 5
+        volumeMounts:
+        - name: runtime
+          mountPath: /workspace
+          readOnly: true
+        - name: terminal-socket
+          mountPath: /run/senpai-terminal
+        - name: repair-socket
+          mountPath: /run/senpai-repair
+          readOnly: true
+        - name: shell-workspace
+          mountPath: /workspaces/supervisor
+        - name: shell-home
+          mountPath: /home/senpai
+        - name: shell-tmp
+          mountPath: /tmp
       volumes:
       - name: runtime
         emptyDir: {}
       - name: state
         persistentVolumeClaim:
           claimName: {{PVC_CLAIM_NAME}}
+      - name: service-account
+        projected:
+          defaultMode: 288
+          sources:
+          - serviceAccountToken:
+              path: token
+              expirationSeconds: 3600
+          - configMap:
+              name: kube-root-ca.crt
+              items:
+              - key: ca.crt
+                path: ca.crt
+          - downwardAPI:
+              items:
+              - path: namespace
+                fieldRef:
+                  fieldPath: metadata.namespace
+      - name: terminal-socket
+        emptyDir: {}
+      - name: repair-socket
+        emptyDir: {}
+      - name: shell-workspace
+        emptyDir: {}
+      - name: shell-home
+        emptyDir: {}
+      - name: shell-tmp
+        emptyDir: {}

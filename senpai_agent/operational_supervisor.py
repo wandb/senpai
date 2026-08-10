@@ -1434,6 +1434,7 @@ def operational_supervisor_main(
         resolve_config,
     )
     from senpai_agent.operations import CampaignInventory
+    from senpai_agent.repair_broker import RepairBrokerServer
     from senpai_agent.supervisor import ProgressLease
     from senpai_agent.weave_monitoring import finish_weave_monitoring
 
@@ -1479,6 +1480,11 @@ def operational_supervisor_main(
         namespace=env["SENPAI_KUBECTL_NAMESPACE"],
         environment=env,
     )
+    repair_broker = RepairBrokerServer(
+        Path(env["SENPAI_SUPERVISOR_REPAIR_SOCKET"]),
+        inventory,
+        backend,
+    )
     github = GitHubPRCollector.authenticated(runner_config.github_token)
     wandb_key = env.get("WANDB_API_KEY", "").strip()
     if not wandb_key:
@@ -1508,6 +1514,7 @@ def operational_supervisor_main(
         signum: signal.signal(signum, request_stop)
         for signum in (signal.SIGTERM, signal.SIGINT)
     }
+    repair_broker.__enter__()
     try:
         while not stop.is_set():
             due = store.due_state()
@@ -1579,6 +1586,7 @@ def operational_supervisor_main(
                 if result == 0:
                     store.mark_research_review(datetime.now(UTC))
     finally:
+        repair_broker.close()
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
         finish_weave_monitoring()

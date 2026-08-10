@@ -32,6 +32,7 @@ from senpai_agent.role_control import (
     RoleResearchTail,
     RoleRuntimeState,
 )
+from senpai_agent.repair_broker import RepairResult
 
 
 _LABEL_VALUE = re.compile(r"^[A-Za-z0-9](?:[-_.A-Za-z0-9]{0,61}[A-Za-z0-9])?$")
@@ -147,6 +148,55 @@ class KubectlCampaignBackend(OperationBackend):
             context_reset_request=request,
         )
         return ContextResetReceipt.model_validate(self._role_control(target, payload))
+
+    def run_repair(
+        self,
+        target: RoleTarget,
+        *,
+        command: str,
+        cwd: str,
+        timeout_seconds: int,
+    ) -> RepairResult:
+        """Execute arbitrary shell only in the target's secret-free repair sidecar."""
+
+        self.inventory.require(target)
+        roots = {
+            "workspace": "/repair/workspace",
+            "state": "/repair/state",
+            "scratch": "/repair/scratch",
+        }
+        try:
+            root = roots[cwd]
+        except KeyError as error:
+            raise ValueError(f"unsupported repair working directory: {cwd}") from error
+        pod = self._pod(target)
+        transport = (
+            self.kubectl,
+            "exec",
+            "-i",
+            "-n",
+            self.namespace,
+            pod,
+            "-c",
+            "repair",
+            "--",
+            "/usr/local/bin/senpai-repair-executor",
+            "--cwd",
+            root,
+            "--timeout",
+            str(timeout_seconds),
+        )
+        output = self._run(
+            transport,
+            input_text=command,
+            timeout_seconds=timeout_seconds + 15,
+        )
+        try:
+            return RepairResult.model_validate_json(output)
+        except ValueError as error:
+            raise KubernetesOperationError(
+                "repair sidecar returned invalid JSON"
+            ) from error
 
     def collect_runtimes(
         self,

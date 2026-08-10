@@ -49,6 +49,7 @@ from senpai_agent.inbox import (
     events_after_turn_delivery,
     turn_has_finished_response,
 )
+from senpai_agent.isolated_terminal import register_isolated_terminal_tool
 from senpai_agent.secrets import (
     GITHUB_CREDENTIAL_ENV_NAMES,
     GITHUB_TOKEN_ENV_NAMES,
@@ -1207,6 +1208,7 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
 
     if config.role == "supervisor":
         register_senpai_tools()
+        register_isolated_terminal_tool()
         students = tuple(
             student.strip()
             for student in os.environ.get("STUDENT_NAMES", "").split(",")
@@ -1215,7 +1217,15 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
         if not students:
             raise RuntimeError("supervisor requires an exact student inventory")
         return [
-            Tool(name="terminal"),
+            Tool(
+                name="terminal",
+                params={
+                    "socket_path": os.environ.get(
+                        "SENPAI_SUPERVISOR_TERMINAL_SOCKET",
+                        "/run/senpai-terminal/terminal.sock",
+                    )
+                },
+            ),
             Tool(
                 name="senpai_operations",
                 params={

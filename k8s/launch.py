@@ -439,6 +439,10 @@ def render_operational_supervisor(
         ),
         "SENPAI_KUBECTL_NAMESPACE": args.namespace,
         "SENPAI_SUPERVISOR_SECRET_HANDOFF": "1",
+        "SENPAI_SUPERVISOR_TERMINAL_SOCKET": (
+            "/run/senpai-terminal/terminal.sock"
+        ),
+        "SENPAI_SUPERVISOR_REPAIR_SOCKET": "/run/senpai-repair/repair.sock",
     }
     configmap_name = content_addressed_name(
         f"senpai-config-supervisor-{tag}",
@@ -462,6 +466,10 @@ def render_operational_supervisor(
             "ADVISOR_BRANCH": args.advisor_branch,
             "ADVISOR_BRANCH_JSON": json.dumps(args.advisor_branch),
             "PVC_CLAIM_NAME": args.pvc_claim_name,
+            "SUPERVISOR_STATE_SUBPATH": f"{tag}/operational-supervisor",
+            "SUPERVISOR_STATE_MOUNT_PATH": (
+                f"/var/lib/senpai/{tag}/operational-supervisor"
+            ),
             "LAUNCH_SECRET_NAME": secret_name,
             "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
             "MODEL_PROVIDER_ENV": provider_env(
