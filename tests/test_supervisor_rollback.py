@@ -177,6 +177,33 @@ def old_network_policy():
     }
 
 
+def safety_network_policy():
+    policy = old_network_policy()
+    policy["metadata"]["labels"] = {"release": "first-launch-safety"}
+    policy["spec"] = {
+        "podSelector": {
+            "matchLabels": {
+                "research-tag": "campaign-a",
+                "senpai-supervisor-access": "true",
+            }
+        },
+        "policyTypes": ["Egress"],
+        "egress": [
+            {
+                "to": [
+                    {
+                        "ipBlock": {
+                            "cidr": "0.0.0.0/0",
+                            "except": ["169.254.0.0/16"],
+                        }
+                    }
+                ]
+            }
+        ],
+    }
+    return policy
+
+
 def capture(monkeypatch, tmp_path, fake, **kwargs):
     install_fake(monkeypatch, fake)
     return supervisor_rollback.SupervisorRollback.capture(
@@ -228,6 +255,51 @@ def test_capture_pins_scope_lineage_and_exact_mutable_resources(monkeypatch, tmp
     assert "status" not in saved["manifest"]
     assert "Secret" not in {item["kind"] for item in bundle["resources"]}
     assert all(call[1].get("timeout") for call in fake.calls)
+
+
+def test_first_launch_recovery_preserves_the_metadata_egress_policy(
+    monkeypatch,
+    tmp_path,
+):
+    fake = FakeKubernetes()
+    safety_policy = safety_network_policy()
+    rollback = capture(
+        monkeypatch,
+        tmp_path,
+        fake,
+        network_policy_safety_manifest=safety_policy,
+    )
+    bundle = json.loads(rollback.path.read_text())
+    saved_policy = next(
+        item for item in bundle["resources"] if item["kind"] == "NetworkPolicy"
+    )
+    assert saved_policy["present"] is False
+    assert saved_policy["manifest"] is None
+    assert saved_policy["safety_manifest"] == safety_policy
+
+    rollback.mark_mutation_started()
+    fake.put(safety_policy)
+    fake.put(old_service_account())
+    fake.put(old_deployment())
+    rollback._lease.release()
+
+    recovered = supervisor_rollback.SupervisorRollback(rollback.path)
+    recovered.restore(timeout_seconds=10)
+
+    restored_policy = fake.objects[
+        "networkpolicy.networking.k8s.io/senpai-supervisor-egress-campaign-a"
+    ]
+    assert supervisor_rollback._canonical_manifest(
+        restored_policy,
+        supervisor_rollback._targets("campaign-a")[0],
+        namespace=fake.namespace,
+    ) == supervisor_rollback._canonical_manifest(
+        safety_policy,
+        supervisor_rollback._targets("campaign-a")[0],
+        namespace=fake.namespace,
+    )
+    assert "serviceaccount/senpai-supervisor-campaign-a" not in fake.objects
+    assert "deployment.apps/senpai-supervisor-campaign-a" not in fake.objects
 
 
 def test_restore_quiesces_new_deployment_then_restores_security_then_old_deployment(

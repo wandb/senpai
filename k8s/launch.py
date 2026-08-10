@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import simple_parsing as sp
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -875,9 +876,10 @@ def apply_operational_supervisor_release(
             kube_context=args.kube_context,
             namespace=args.namespace,
             timeout_seconds=args.supervisor_ready_timeout_s,
+            network_policy_safety_manifest=yaml.safe_load(network_policy),
         )
         recovery_command = shlex.join(rollback.manual_restore_argv())
-    except (OSError, RuntimeError) as error:
+    except (OSError, RuntimeError, yaml.YAMLError) as error:
         raise SystemExit(
             "ERROR: could not capture operational supervisor rollback state; "
             f"no supervisor resources were changed: {error}"

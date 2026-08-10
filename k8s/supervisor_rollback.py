@@ -1079,6 +1079,7 @@ class SupervisorRollback:
         namespace: str,
         directory: Path | None = None,
         timeout_seconds: int = 900,
+        network_policy_safety_manifest: dict[str, Any] | None = None,
     ) -> SupervisorRollback:
         if timeout_seconds <= 0 or timeout_seconds > MAX_ROLLBACK_TIMEOUT_SECONDS:
             raise RuntimeError("rollback timeout must be between 1 and 3600 seconds")
@@ -1121,6 +1122,18 @@ class SupervisorRollback:
                 timeout_seconds=timeout_seconds,
             )
 
+            safety_policy = None
+            if network_policy_safety_manifest is not None:
+                if not isinstance(network_policy_safety_manifest, dict):
+                    raise RuntimeError(
+                        "network policy safety manifest must be a Kubernetes object"
+                    )
+                safety_policy = _restorable_manifest(
+                    network_policy_safety_manifest,
+                    _targets(tag)[0],
+                    namespace=scope.namespace,
+                )
+
             resources = []
             for target in _targets(tag):
                 document = _get(
@@ -1144,6 +1157,11 @@ class SupervisorRollback:
                                 namespace=scope.namespace,
                             )
                         ),
+                        "safety_manifest": (
+                            safety_policy
+                            if document is None and target.kind == "NetworkPolicy"
+                            else None
+                        ),
                     }
                 )
 
@@ -1162,6 +1180,8 @@ class SupervisorRollback:
                 "persistent_state_rolled_back": False,
                 "operator_notice": (
                     "This bundle restores only mutable Kubernetes release resources. "
+                    "A first-launch metadata-egress NetworkPolicy is retained as a "
+                    "fail-closed safety boundary. "
                     "Immutable Secret/ConfigMap artifacts and persistent SQLite state "
                     "are never rolled back."
                 ),
@@ -1273,11 +1293,16 @@ class SupervisorRollback:
             target = expected[key]
             present = record.get("present")
             manifest = record.get("manifest")
+            safety_manifest = record.get("safety_manifest")
             if not isinstance(present, bool):
                 raise RollbackError(
                     f"invalid presence marker for {_resource_name(target)}"
                 )
             if present:
+                if safety_manifest is not None:
+                    raise RollbackError(
+                        f"present {_resource_name(target)} has an unexpected safety manifest"
+                    )
                 if not isinstance(manifest, dict):
                     raise RollbackError(
                         f"missing manifest for {_resource_name(target)}"
@@ -1294,6 +1319,23 @@ class SupervisorRollback:
                 raise RollbackError(
                     f"absent {_resource_name(target)} has an unexpected manifest"
                 )
+            elif safety_manifest is not None:
+                if target.kind != "NetworkPolicy" or not isinstance(
+                    safety_manifest, dict
+                ):
+                    raise RollbackError(
+                        f"absent {_resource_name(target)} has an invalid safety manifest"
+                    )
+                try:
+                    safety_manifest = _restorable_manifest(
+                        safety_manifest,
+                        target,
+                        namespace=scope.namespace,
+                    )
+                except RuntimeError as error:
+                    raise RollbackError(str(error)) from error
+                present = True
+                manifest = safety_manifest
             plan.append((target, present, manifest))
         return (
             bundle,

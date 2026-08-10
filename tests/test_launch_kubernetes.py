@@ -1079,6 +1079,38 @@ def test_supervisor_rollout_failure_invokes_transactional_restore(
     assert applied_contexts == ["resolved-cluster"] * 3
 
 
+def test_supervisor_release_journals_the_first_launch_network_policy(monkeypatch):
+    captured = {}
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: None,
+        manual_restore_argv=lambda: ["python", "restore"],
+        mark_mutation_started=lambda: None,
+        renew_lease=lambda: None,
+        resolved_kube_context="gpu-cluster",
+        restore=lambda **_kwargs: None,
+    )
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        return rollback
+
+    monkeypatch.setattr(launch.SupervisorRollback, "capture", capture)
+    monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launch, "kubectl_rollout_status", lambda *_args, **_kwargs: None)
+    policy = launch.render_supervisor_network_policy("test-track")
+
+    launch.apply_operational_supervisor_release(
+        supervisor_launch_args(kube_context="gpu-cluster"),
+        network_policy=policy,
+        secret_name="secret",
+        secret="secret manifest",
+        manifest="supervisor manifest",
+    )
+
+    assert captured["network_policy_safety_manifest"] == yaml.safe_load(policy)
+
+
 def test_supervisor_apply_failure_invokes_transactional_restore(
     monkeypatch,
     capsys,
