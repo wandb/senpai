@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Sequence
 from pathlib import Path
@@ -23,6 +24,7 @@ from senpai_agent.operations import (
     AnomalyCategory,
     CampaignInventory,
     CollectRole,
+    CollectRoleReceipt,
     ContextReset,
     Nudge,
     OperationLedger,
@@ -161,6 +163,48 @@ class _SupervisorOperationExecutor(
         else:
             raise ValueError(f"unsupported supervisor operation: {action.operation}")
         outcome = self.service.execute(request)
+        if action.operation == "inspect":
+            receipt = outcome.receipt
+            if not isinstance(receipt, CollectRoleReceipt):
+                raise RuntimeError("role inspection returned an invalid receipt")
+            observed = receipt.observation
+            return SupervisorOperationObservation(
+                result={
+                    "operation_key": outcome.operation_key,
+                    "disposition": outcome.disposition,
+                    "observation": {
+                        "target": observed.target.model_dump(mode="json"),
+                        "observed_at": observed.observed_at.isoformat(),
+                        "controller_alive": observed.controller_alive,
+                        "phase": _controller_phase_category(
+                            observed.controller_phase
+                        ),
+                        "worker_generation": observed.worker_generation,
+                        "conversation_id": (
+                            str(observed.conversation_id)
+                            if observed.conversation_id is not None
+                            else None
+                        ),
+                        "active_turn": observed.active_turn,
+                        "unmatched_action_count": observed.unmatched_actions,
+                        "history_event_count": observed.raw_history_event_count,
+                        "history_fingerprint": (
+                            hashlib.sha256(
+                                observed.raw_history_digest.encode()
+                            ).hexdigest()[:16]
+                            if observed.raw_history_digest
+                            else None
+                        ),
+                        "pending_event_count": len(observed.pending_event_keys),
+                        "active_delegation_count": (
+                            observed.active_delegation_count
+                        ),
+                        "restart_authorized": (
+                            observed.restart_control_token is not None
+                        ),
+                    },
+                }
+            )
         return SupervisorOperationObservation(
             result=outcome.model_dump(mode="json")
         )
@@ -206,7 +250,7 @@ class SupervisorOperationTool(
                 description=(
                     "Inspect or repair only this supervisor's configured advisor "
                     "and students. Every inspect executes fresh; inspect first to "
-                    "obtain the exact conversation UUID and compare token. "
+                    "obtain the exact conversation UUID and typed role state. "
                     "Mutations are durably deduplicated and "
                     "cooldown-limited by typed anomaly category, action, and target. "
                     "Context reset preserves the complete raw "
@@ -226,3 +270,26 @@ class SupervisorOperationTool(
                 executor=_SupervisorOperationExecutor(service),
             )
         ]
+
+
+_CONTROLLER_PHASES = frozenset(
+    {
+        "acknowledge",
+        "monitor-backoff",
+        "monitor-sleep",
+        "openhands-turn",
+        "poll",
+        "reconcile",
+        "sleep",
+        "start-gate",
+        "startup",
+        "turn-backoff",
+        "turn-complete",
+    }
+)
+
+
+def _controller_phase_category(phase: str | None) -> str | None:
+    if phase is None:
+        return None
+    return phase if phase in _CONTROLLER_PHASES else "other"
