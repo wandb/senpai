@@ -29,6 +29,7 @@ from senpai_agent.operational_supervisor import (
     compose_research_review_prompt,
     compose_supervisor_prompt,
     operational_supervisor_main,
+    run_scheduled_research_review,
 )
 from senpai_agent.operations import OperationAuditRecord, RoleTarget
 
@@ -560,6 +561,64 @@ def test_durable_schedule_is_immediate_then_15_minutes_and_research_at_6_hours(
         NOW + timedelta(hours=11, minutes=59)
     ).research_review_due is False
     assert reopened.due_state(NOW + timedelta(hours=12)).research_review_due is True
+
+
+def test_failed_research_review_attempt_waits_for_the_next_six_hour_window(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+):
+    store = SupervisorStateStore(tmp_path / "state.json")
+    store.read(initialize_at=NOW)
+    attempted_at = NOW + timedelta(hours=6)
+
+    def fail_review() -> int:
+        raise RuntimeError("transient research evidence failure")
+
+    assert (
+        run_scheduled_research_review(
+            store,
+            fail_review,
+            attempted_at=attempted_at,
+        )
+        == 1
+    )
+
+    state = store.read()
+    assert state.last_research_review_at is None
+    assert state.last_research_review_attempt_at == attempted_at
+    assert "SENPAI_RESEARCH_REVIEW_ERROR RuntimeError" in capsys.readouterr().err
+    assert (
+        store.due_state(attempted_at + timedelta(hours=5, minutes=59))
+        .research_review_due
+        is False
+    )
+    assert store.due_state(attempted_at + timedelta(hours=6)).research_review_due
+
+
+def test_research_review_attempt_cannot_precede_a_migrated_success_timestamp(
+    tmp_path: Path,
+):
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "started_at": NOW.isoformat(),
+                "snapshots": [],
+                "last_research_review_at": (
+                    NOW + timedelta(hours=6)
+                ).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = SupervisorStateStore(path)
+
+    with pytest.raises(ValueError, match="timestamp order"):
+        store.mark_research_review(
+            NOW + timedelta(hours=5),
+            succeeded=False,
+        )
 
 
 def test_store_rejects_out_of_order_snapshots(tmp_path: Path):

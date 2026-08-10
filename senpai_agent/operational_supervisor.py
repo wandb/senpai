@@ -879,8 +879,13 @@ class SupervisorPersistentState(Contract):
     started_at: datetime
     snapshots: Annotated[tuple[CampaignSnapshot, ...], Field(max_length=3)] = ()
     last_research_review_at: datetime | None = None
+    last_research_review_attempt_at: datetime | None = None
 
-    @field_validator("started_at", "last_research_review_at")
+    @field_validator(
+        "started_at",
+        "last_research_review_at",
+        "last_research_review_attempt_at",
+    )
     @classmethod
     def state_timestamps_are_utc(cls, value: datetime | None) -> datetime | None:
         return _aware_utc(value) if value is not None else None
@@ -948,7 +953,11 @@ class SupervisorStateStore:
             if last_operational is not None
             else state.started_at
         )
-        research_anchor = state.last_research_review_at or state.started_at
+        research_anchor = (
+            state.last_research_review_attempt_at
+            or state.last_research_review_at
+            or state.started_at
+        )
         next_research = research_anchor + self.research_review_interval
         return SupervisorDueState(
             operational_due=observed_at >= next_operational,
@@ -960,15 +969,29 @@ class SupervisorStateStore:
     def mark_research_review(
         self,
         reviewed_at: datetime | None = None,
+        *,
+        succeeded: bool = True,
     ) -> SupervisorPersistentState:
         timestamp = _aware_utc(reviewed_at or datetime.now(UTC))
         state = self.read(initialize_at=timestamp)
-        if (
-            state.last_research_review_at is not None
-            and timestamp < state.last_research_review_at
-        ):
-            raise ValueError("research reviews must be recorded in timestamp order")
-        updated = state.model_copy(update={"last_research_review_at": timestamp})
+        recorded = tuple(
+            value
+            for value in (
+                state.last_research_review_at,
+                state.last_research_review_attempt_at,
+            )
+            if value is not None
+        )
+        if recorded and timestamp < max(recorded):
+            raise ValueError(
+                "research review attempts must be recorded in timestamp order"
+            )
+        update: dict[str, object] = {
+            "last_research_review_attempt_at": timestamp,
+        }
+        if succeeded:
+            update["last_research_review_at"] = timestamp
+        updated = state.model_copy(update=update)
         self._write(updated)
         return updated
 
@@ -1405,6 +1428,34 @@ def compose_research_review_prompt(
     return prompt
 
 
+def run_scheduled_research_review(
+    store: SupervisorStateStore,
+    review: Callable[[], int],
+    *,
+    attempted_at: datetime | None = None,
+) -> int:
+    """Run one due review without turning a transient failure into a hot loop."""
+
+    timestamp = _aware_utc(attempted_at or datetime.now(UTC))
+    try:
+        result = review()
+    except Exception as error:  # noqa: BLE001
+        print(
+            f"SENPAI_RESEARCH_REVIEW_ERROR {type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+        result = 1
+    if result != 0:
+        print(
+            f"SENPAI_RESEARCH_REVIEW_FAILED exit_code={result}",
+            file=sys.stderr,
+            flush=True,
+        )
+    store.mark_research_review(timestamp, succeeded=result == 0)
+    return result
+
+
 def operational_supervisor_main(
     argv: Sequence[str] | None = None,
     env: Mapping[str, str] = os.environ,
@@ -1562,29 +1613,32 @@ def operational_supervisor_main(
             )
 
             if due.research_review_due and not stop.is_set():
-                progress.update("research-collect", 1_800)
-                research_evidence = collect_research_review_evidence(
-                    scope,
-                    github,
-                    wandb_runs,
-                    backend,
-                    state.snapshots[-1].runtimes,
-                    since=state.last_research_review_at or state.started_at,
-                )
-                research_prompt = compose_research_review_prompt(
-                    state.snapshots,
-                    research_evidence,
-                    advisor_guidance=advisor_guidance,
-                    operation_audit=_recent_mutation_audit(operation_ledger_path),
-                )
-                result = _run_fresh_supervisor_turn(
-                    research_prompt,
-                    runner_config,
-                    progress,
-                    phase="research-review",
-                )
-                if result == 0:
-                    store.mark_research_review(datetime.now(UTC))
+                def review_research_direction() -> int:
+                    progress.update("research-collect", 1_800)
+                    research_evidence = collect_research_review_evidence(
+                        scope,
+                        github,
+                        wandb_runs,
+                        backend,
+                        state.snapshots[-1].runtimes,
+                        since=state.last_research_review_at or state.started_at,
+                    )
+                    research_prompt = compose_research_review_prompt(
+                        state.snapshots,
+                        research_evidence,
+                        advisor_guidance=advisor_guidance,
+                        operation_audit=_recent_mutation_audit(
+                            operation_ledger_path
+                        ),
+                    )
+                    return _run_fresh_supervisor_turn(
+                        research_prompt,
+                        runner_config,
+                        progress,
+                        phase="research-review",
+                    )
+
+                run_scheduled_research_review(store, review_research_direction)
     finally:
         repair_broker.close()
         for signum, handler in previous_handlers.items():
