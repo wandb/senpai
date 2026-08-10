@@ -560,6 +560,43 @@ def _uninstall_recorded_role(domain: str, role: dict) -> None:
     _uninstall_service(domain, label, expected)
 
 
+def _validate_recorded_roles(tag: str, roles: object) -> None:
+    if not isinstance(roles, list) or not roles:
+        raise RuntimeError("Native manifest has no valid native roles")
+
+    keys: set[str] = set()
+    for role in roles:
+        if not isinstance(role, dict):
+            raise RuntimeError("Native manifest has an unexpected native role")
+        key = role.get("key")
+        if key == "advisor":
+            pass
+        elif isinstance(key, str) and key.startswith("student-"):
+            try:
+                validate_identifier("Native student name", key.removeprefix("student-"))
+            except ValueError as error:
+                raise RuntimeError(
+                    f"Native manifest has an unexpected native role {key!r}"
+                ) from error
+        else:
+            raise RuntimeError(
+                f"Native manifest has an unexpected native role {key!r}"
+            )
+        if key in keys:
+            raise RuntimeError(f"Native manifest repeats native role {key!r}")
+        keys.add(key)
+
+        expected_label = f"{LAUNCHD_PREFIX}.{tag}.{key}"
+        expected_plist = _launchd_plist_path(expected_label)
+        if (
+            role.get("label") != expected_label
+            or role.get("plist") != str(expected_plist)
+        ):
+            raise RuntimeError(
+                f"Native manifest has an unexpected native role {key!r}"
+            )
+
+
 def _remove_tmux_root(path: str | Path, expected: Path) -> None:
     base = _native_tmux_base()
     recorded = Path(path)
@@ -749,6 +786,7 @@ def _load_manifest(
         raise RuntimeError(f"Native run manifest tag does not match {tag!r}")
     if manifest.get("domain") != "system":
         raise RuntimeError("Native run manifest does not use the system launchd domain")
+    _validate_recorded_roles(tag, manifest.get("roles"))
     return path, manifest
 
 
