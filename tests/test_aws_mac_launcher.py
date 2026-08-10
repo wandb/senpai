@@ -813,6 +813,14 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
 
 
 class AwsMacLaunchTests(unittest.TestCase):
+    def setUp(self):
+        self.termination_waiter_patch = patch.object(
+            aws_mac_backend,
+            "_wait_for_instances_terminated",
+        )
+        self.termination_waiter_patch.start()
+        self.addCleanup(self.termination_waiter_patch.stop)
+
     def test_key_pair_intent_is_recorded_before_the_aws_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1505,6 +1513,74 @@ class AwsMacLaunchTests(unittest.TestCase):
                 operations,
             )
 
+    def test_cleanup_preserves_access_when_the_termination_waiter_times_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "campaign-a"
+            run_dir.mkdir()
+            state = {
+                "backend": "aws-mac",
+                "state_version": 2,
+                "tag": "campaign-a",
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "senpai-key",
+                "key_create_started": True,
+                "key_owned": True,
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": True,
+                "ssh_authorized": True,
+                "ssh_cidr": "203.0.113.7/32",
+                "ssh_security_group_create_started": True,
+                "ssh_security_group_id": "sg-b1",
+                "ssh_security_group_name": "senpai-campaign-a-ssh",
+                "ssh_security_group_owned": True,
+                "vpc_id": "vpc-a1",
+                "nodes": [
+                    {
+                        "instance_id": "i-live",
+                        "host_id": "h-a1",
+                        "public_ip": "",
+                    }
+                ],
+            }
+            operations: list[tuple[str, ...]] = []
+
+            def aws_raw(_context, _service, operation, *arguments):
+                operations.append((operation, *arguments))
+                return ""
+
+            with (
+                patch.object(aws_mac_backend, "_aws_raw", side_effect=aws_raw),
+                patch.object(
+                    aws_mac_backend,
+                    "_wait_for_instances_terminated",
+                    side_effect=AwsCommandError("Max attempts exceeded"),
+                ),
+            ):
+                errors = _cleanup(
+                    run_dir,
+                    state,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+
+            persisted = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(len(errors), 1)
+            self.assertIn("wait for instance i-live termination", errors[0])
+            self.assertEqual(persisted["nodes"][0]["instance_id"], "i-live")
+            self.assertEqual(persisted["key_name"], "senpai-key")
+            self.assertEqual(persisted["ssh_security_group_id"], "sg-b1")
+            self.assertFalse(
+                any(
+                    operation
+                    in {
+                        "delete-key-pair",
+                        "revoke-security-group-ingress",
+                        "delete-security-group",
+                    }
+                    for operation, *_arguments in operations
+                )
+            )
+
     def test_legacy_cleanup_never_revokes_a_shared_ssh_rule(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "campaign-a"
@@ -1761,6 +1837,57 @@ class AwsMacLaunchTests(unittest.TestCase):
         )
         self.assertIn("Name=client-token,Values=token-fern", aws_json.call_args.args)
         self.assertIn("Name=tag:senpai:run,Values=mlxfast-r1", aws_json.call_args.args)
+
+    def test_cleanup_converges_when_an_ambiguous_launch_already_terminated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "state" / "mlxfast-r1"
+            run_dir.mkdir(parents=True)
+            state = {
+                "tag": "mlxfast-r1",
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "",
+                "ssh_authorized": False,
+                "nodes": [
+                    {
+                        "student": "fern",
+                        "client_token": "token-fern",
+                        "instance_id": "",
+                        "host_id": "h-a1",
+                        "public_ip": "",
+                    }
+                ],
+            }
+
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_aws_json",
+                    return_value={
+                        "Reservations": [
+                            {
+                                "Instances": [
+                                    {
+                                        "InstanceId": "i-already-gone",
+                                        "Placement": {"HostId": "h-a1"},
+                                        "State": {"Name": "terminated"},
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                ),
+                patch.object(aws_mac_backend, "_aws_raw") as aws_raw,
+            ):
+                errors = _cleanup(
+                    run_dir,
+                    state,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+
+            self.assertEqual(errors, [])
+            self.assertFalse(run_dir.exists())
+            aws_raw.assert_not_called()
 
     def test_cleanup_treats_missing_aws_resources_as_already_removed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2045,6 +2172,155 @@ class AwsMacLifecycleTests(unittest.TestCase):
         self.assertIn("--role advisor --tail 41", advisor_command)
         self.assertEqual(student_node["student"], "tanjiro")
         self.assertIn("--role student-tanjiro --tail 42", student_command)
+
+    def test_status_renders_mixed_confirmed_unresolved_and_live_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "aws"
+            run_dir = state_root / "mlxfast-r1"
+            run_dir.mkdir(parents=True)
+            state = {
+                "account_id": "770934259321",
+                "backend": "aws-mac",
+                "phase": "cleanup-failed",
+                "profile": "sandbox",
+                "region": "us-east-1",
+                "instance_type": "mac-m4pro.metal",
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": False,
+                "ssh_authorized": False,
+                "state_version": 2,
+                "tag": "mlxfast-r1",
+                "nodes": [
+                    {
+                        "student": "fern",
+                        "instance_id": "",
+                        "host_id": "h-a1",
+                        "public_ip": "",
+                        "termination_confirmed": True,
+                    },
+                    {
+                        "student": "tanjiro",
+                        "instance_id": "",
+                        "host_id": "h-b2",
+                        "public_ip": "",
+                    },
+                    {
+                        "student": "sprout",
+                        "instance_id": "i-live",
+                        "host_id": "h-c3",
+                        "public_ip": "",
+                    },
+                ],
+            }
+            (run_dir / "state.json").write_text(json.dumps(state))
+            output = io.StringIO()
+
+            with (
+                patch.object(aws_mac_backend, "_check_account"),
+                patch.object(
+                    aws_mac_backend,
+                    "_instance",
+                    return_value={"State": {"Name": "shutting-down"}},
+                ) as instance,
+                redirect_stdout(output),
+            ):
+                status_aws_mac("mlxfast-r1", str(state_root))
+
+            rendered = output.getvalue()
+            self.assertIn("student-fern: instance=- host=h-a1 state=terminated", rendered)
+            self.assertIn("student-tanjiro: instance=- host=h-b2 state=unresolved", rendered)
+            self.assertIn(
+                "student-sprout: instance=i-live host=h-c3 state=shutting-down",
+                rendered,
+            )
+            instance.assert_called_once()
+
+    def test_logs_rejects_non_live_nodes_before_ssh_and_allows_a_live_node(self):
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=b"live logs\n",
+            stderr=b"",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "aws"
+            run_dir = state_root / "mlxfast-r1"
+            run_dir.mkdir(parents=True)
+            state = {
+                "account_id": "770934259321",
+                "backend": "aws-mac",
+                "phase": "cleanup-failed",
+                "profile": "sandbox",
+                "region": "us-east-1",
+                "instance_type": "mac-m4pro.metal",
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": False,
+                "ssh_authorized": False,
+                "state_version": 2,
+                "tag": "mlxfast-r1",
+                "nodes": [
+                    {
+                        "student": "fern",
+                        "instance_id": "",
+                        "host_id": "h-a1",
+                        "public_ip": "",
+                        "termination_confirmed": True,
+                    },
+                    {
+                        "student": "tanjiro",
+                        "instance_id": "",
+                        "host_id": "h-b2",
+                        "public_ip": "",
+                    },
+                    {
+                        "student": "sprout",
+                        "instance_id": "i-live",
+                        "host_id": "h-c3",
+                        "public_ip": "198.51.100.3",
+                    },
+                ],
+            }
+            (run_dir / "state.json").write_text(json.dumps(state))
+
+            with (
+                patch.object(aws_mac_backend, "_check_account"),
+                patch.object(
+                    aws_mac_backend,
+                    "_ssh",
+                    return_value=completed,
+                ) as ssh,
+                self.assertRaisesRegex(RuntimeError, "terminated"),
+            ):
+                logs_aws_mac("mlxfast-r1", str(state_root), role_key="advisor")
+            ssh.assert_not_called()
+
+            with (
+                patch.object(aws_mac_backend, "_check_account"),
+                patch.object(aws_mac_backend, "_ssh") as ssh,
+                self.assertRaisesRegex(RuntimeError, "unresolved"),
+            ):
+                logs_aws_mac(
+                    "mlxfast-r1",
+                    str(state_root),
+                    role_key="student-tanjiro",
+                )
+            ssh.assert_not_called()
+
+            with (
+                patch.object(aws_mac_backend, "_check_account"),
+                patch.object(
+                    aws_mac_backend,
+                    "_ssh",
+                    return_value=completed,
+                ) as ssh,
+                redirect_stdout(io.StringIO()),
+            ):
+                logs_aws_mac(
+                    "mlxfast-r1",
+                    str(state_root),
+                    role_key="student-sprout",
+                )
+            self.assertEqual(ssh.call_args.args[1]["instance_id"], "i-live")
 
     def test_cli_parses_log_role_tail_profile_and_state_root(self):
         with (

@@ -40,6 +40,7 @@ from .aws_backend import (
     _ssh_cidr,
     _ssh_host_key_console_script,
     _state_dir,
+    _wait_for_instances_terminated,
     _write_private_key,
 )
 from .specs import RoleSpec, validate_identifier, validate_role_specs
@@ -1234,7 +1235,11 @@ def _missing_cleanup_resource(error: AwsCommandError) -> bool:
     return _missing_resource(error) or "InvalidPermission.NotFound" in str(error)
 
 
-def _instances_for_node(context: AwsContext, state: dict, node: dict) -> list[str]:
+def _instances_for_node(
+    context: AwsContext,
+    state: dict,
+    node: dict,
+) -> tuple[list[str], bool]:
     payload = _aws_json(
         context,
         "ec2",
@@ -1247,7 +1252,6 @@ def _instances_for_node(context: AwsContext, state: dict, node: dict) -> list[st
         instance
         for reservation in payload.get("Reservations", [])
         for instance in reservation.get("Instances", [])
-        if instance.get("State", {}).get("Name") != "terminated"
     ]
     wrong_hosts = [
         instance.get("InstanceId", "<unknown>")
@@ -1263,7 +1267,12 @@ def _instances_for_node(context: AwsContext, state: dict, node: dict) -> list[st
         raise RuntimeError(
             f"Client token {node['client_token']} resolved to multiple instances"
         )
-    return [instance["InstanceId"] for instance in instances]
+    if not instances:
+        return [], False
+    instance = instances[0]
+    if instance.get("State", {}).get("Name") == "terminated":
+        return [], True
+    return [instance["InstanceId"]], False
 
 
 def _cleanup(run_dir: Path, state: dict, context: AwsContext | None = None) -> list[str]:
@@ -1279,15 +1288,26 @@ def _cleanup(run_dir: Path, state: dict, context: AwsContext | None = None) -> l
             continue
         try:
             recovered: list[str] = []
+            resolved = False
             for attempt in range(12):
-                recovered = _instances_for_node(context, state, node)
+                recovered, already_terminated = _instances_for_node(
+                    context,
+                    state,
+                    node,
+                )
+                if already_terminated:
+                    node["termination_confirmed"] = True
+                    _save_state(run_dir, state)
+                    resolved = True
+                    break
                 if recovered:
                     node["instance_id"] = recovered[0]
                     _save_state(run_dir, state)
+                    resolved = True
                     break
                 if attempt < 11:
                     time.sleep(5)
-            if not recovered:
+            if not resolved:
                 errors.append(
                     f"instance launch outcome is still unknown for "
                     f"{node['student']} (client token {node['client_token']}); "
@@ -1334,7 +1354,6 @@ def _cleanup(run_dir: Path, state: dict, context: AwsContext | None = None) -> l
                 "--instance-ids",
                 instance_id,
             )
-            terminated_ids.add(instance_id)
         except AwsCommandError as error:
             if _missing_cleanup_resource(error):
                 terminated_ids.add(instance_id)
@@ -1342,6 +1361,21 @@ def _cleanup(run_dir: Path, state: dict, context: AwsContext | None = None) -> l
                 errors.append(f"terminate instance {instance_id}: {error}")
         except Exception as error:
             errors.append(f"terminate instance {instance_id}: {error}")
+        else:
+            try:
+                _wait_for_instances_terminated(context, [instance_id])
+                terminated_ids.add(instance_id)
+            except AwsCommandError as error:
+                if _missing_cleanup_resource(error):
+                    terminated_ids.add(instance_id)
+                else:
+                    errors.append(
+                        f"wait for instance {instance_id} termination: {error}"
+                    )
+            except Exception as error:
+                errors.append(
+                    f"wait for instance {instance_id} termination: {error}"
+                )
     if terminated_ids:
         for node in state.get("nodes", []):
             if node.get("instance_id") in terminated_ids:
@@ -1855,10 +1889,18 @@ def status_aws_mac(
     _check_account(context, state["account_id"])
     print(f"{tag}: launcher={state.get('phase', 'unknown')} region={state['region']}")
     for node in state.get("nodes", []):
-        instance = _instance(context, node["instance_id"])
-        phase = instance["State"]["Name"]
+        instance_id = node.get("instance_id", "")
+        if instance_id:
+            instance = _instance(context, instance_id)
+            phase = instance["State"]["Name"]
+        else:
+            phase = (
+                "terminated"
+                if node.get("termination_confirmed")
+                else "unresolved"
+            )
         print(
-            f"  student-{node['student']}: instance={node['instance_id']} "
+            f"  student-{node['student']}: instance={instance_id or '-'} "
             f"host={node['host_id']} state={phase} ip={node.get('public_ip', '')}"
         )
         if phase == "running" and node.get("public_ip"):
@@ -1907,6 +1949,13 @@ def logs_aws_mac(
     context = _context_from_state(state, profile)
     _check_account(context, state["account_id"])
     node = _node_for_role(state, role_key)
+    if node.get("termination_confirmed"):
+        raise RuntimeError(f"AWS Mac role {role_key!r} is terminated; no logs remain")
+    if not node.get("instance_id"):
+        raise RuntimeError(
+            f"AWS Mac role {role_key!r} has an unresolved instance; logs are "
+            "unavailable until lifecycle cleanup resolves it"
+        )
     result = _ssh(
         run_dir,
         node,
