@@ -863,7 +863,7 @@ def _drain_ready(
         os.close(descriptor)
 
 
-def _fresh_repair_environment() -> tuple[Path, dict[str, str]]:
+def _fresh_repair_environment(cwd: Path) -> tuple[Path, dict[str, str]]:
     root = Path(
         tempfile.mkdtemp(
             prefix=_VOLATILE_CHILD_PREFIX,
@@ -894,6 +894,9 @@ def _fresh_repair_environment() -> tuple[Path, dict[str, str]]:
                 "XDG_CACHE_HOME": str(cache),
                 "XDG_CONFIG_HOME": str(config),
                 "XDG_DATA_HOME": str(data),
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "safe.directory",
+                "GIT_CONFIG_VALUE_0": str(cwd),
             }
         )
     except BaseException:
@@ -929,7 +932,7 @@ def _execute_in_worker(
         signum: signal.signal(signum, request_stop)
         for signum in (signal.SIGTERM, signal.SIGINT)
     }
-    volatile_root, environment = _fresh_repair_environment()
+    volatile_root, environment = _fresh_repair_environment(request.cwd)
     process: subprocess.Popen[bytes] | None = None
     selector = selectors.DefaultSelector()
     try:

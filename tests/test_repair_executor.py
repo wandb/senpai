@@ -250,6 +250,18 @@ def test_repair_operations_get_fresh_home_and_temporary_state(tmp_path, monkeypa
     assert first["stdout"] != second["stdout"]
 
 
+def test_repair_git_trust_is_scoped_to_the_selected_root(tmp_path):
+    result = execute_local_repair(
+        "test \"$(git config --get-all safe.directory)\" = \"$(pwd)\"; "
+        "test \"$GIT_CONFIG_COUNT\" = 1; "
+        "test \"$GIT_CONFIG_KEY_0\" = safe.directory",
+        tmp_path,
+        5,
+    )
+
+    assert result["exit_code"] == 0, result["stderr"]
+
+
 def test_repair_completion_removes_permission_poison_without_following_links(
     tmp_path,
     monkeypatch,

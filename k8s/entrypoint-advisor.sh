@@ -51,6 +51,7 @@ echo "GitHub history: $GH_HISTORY_SCOPE"
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
 git config --global safe.directory "$WORKDIR"
+git config --global --add safe.directory "$TARGET_WORKDIR"
 source "$SOURCE_SENPAI_PLUGIN/scripts/git-guard.sh"
 install_senpai_git_guard "$WORKDIR" "$TARGET_WORKDIR" "$GIT_ASKPASS_FILE"
 

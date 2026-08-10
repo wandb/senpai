@@ -236,7 +236,11 @@ def test_entrypoints_delegate_runtime_lifecycle_to_the_python_supervisor(
     assert f"exec /usr/local/bin/senpai-run-controller {role}" in entrypoint
     assert "wait_for_senpai_start_gate" not in entrypoint
     trust_runner = 'git config --global safe.directory "$WORKDIR"'
+    trust_target = 'git config --global --add safe.directory "$TARGET_WORKDIR"'
     assert entrypoint.index(trust_runner) < entrypoint.index(
+        'install_senpai_git_guard "$WORKDIR"'
+    )
+    assert entrypoint.index(trust_target) < entrypoint.index(
         'install_senpai_git_guard "$WORKDIR"'
     )
     assert "readinessProbe" not in container

@@ -605,21 +605,22 @@ def role_owner(args: argparse.Namespace) -> int:
         encoding="utf-8",
     )
     if not (target_dir / ".git").is_dir():
+        trusted_git = ["git", "-c", f"safe.directory={target_dir}"]
         subprocess.run(
-            ["git", "init", "--initial-branch=main"],
+            [*trusted_git, "init", "--initial-branch=main"],
             cwd=target_dir,
             check=True,
             capture_output=True,
             text=True,
         )
         subprocess.run(
-            ["git", "add", "canary-target-marker"],
+            [*trusted_git, "add", "canary-target-marker"],
             cwd=target_dir,
             check=True,
         )
         subprocess.run(
             [
-                "git",
+                *trusted_git,
                 "-c",
                 "user.name=Senpai Canary",
                 "-c",
