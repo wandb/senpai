@@ -61,6 +61,22 @@ def test_repair_startup_scavenges_only_owned_stale_volatile_children(
     assert unrelated.read_text() == "keep"
 
 
+def test_repair_output_bounds_invalid_utf8_without_quadratic_trimming():
+    exact = repair_executor._BoundedByteTail(limit=4)
+    exact.append(b"abcd")
+
+    assert exact.text() == "abcd"
+    assert exact.truncated is False
+
+    tail = repair_executor._BoundedByteTail(limit=16)
+
+    tail.append(b"\xff" * 8)
+    value = tail.text()
+
+    assert len(value.encode("utf-8")) <= 16
+    assert tail.truncated is True
+
+
 def test_repair_executor_health_rejects_a_wedged_heartbeat():
     now = time.monotonic()
 

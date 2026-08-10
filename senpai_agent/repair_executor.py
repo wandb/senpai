@@ -344,14 +344,17 @@ class RepairExecutionRequest:
 
 class _BoundedByteTail:
     def __init__(self, limit: int = REPAIR_STREAM_LIMIT_BYTES):
+        if limit < 1:
+            raise ValueError("repair output limit must be positive")
         self.limit = limit
         self._value = bytearray()
         self.truncated = False
 
     def append(self, chunk: bytes) -> None:
         if len(chunk) >= self.limit:
+            if self._value or len(chunk) > self.limit:
+                self.truncated = True
             self._value[:] = chunk[-self.limit :]
-            self.truncated = True
             return
         self._value.extend(chunk)
         overflow = len(self._value) - self.limit
@@ -361,9 +364,17 @@ class _BoundedByteTail:
 
     def text(self) -> str:
         value = bytes(self._value).decode("utf-8", errors="replace")
-        while len(value.encode("utf-8")) > self.limit:
-            value = value[1:]
-        return value
+        encoded = value.encode("utf-8")
+        if len(encoded) <= self.limit:
+            return value
+        self.truncated = True
+        tail = encoded[-self.limit :]
+        for offset in range(min(4, len(tail) + 1)):
+            try:
+                return tail[offset:].decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+        raise RuntimeError("could not bound repair output at a UTF-8 boundary")
 
 
 def _receive_frame(
