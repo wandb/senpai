@@ -67,6 +67,8 @@ AWS_MAC_COMPATIBLE_STATE_VERSIONS = frozenset({1, AWS_MAC_STATE_VERSION})
 HOST_ID = re.compile(r"h-[0-9a-f]+")
 SUBNET_ID = re.compile(r"subnet-[0-9a-f]+")
 SECURITY_GROUP_ID = re.compile(r"sg-[0-9a-f]+")
+SSH_EGRESS_VERIFY_ATTEMPTS = 5
+SSH_EGRESS_VERIFY_DELAY_S = 1
 
 
 @dataclass(frozen=True)
@@ -503,14 +505,17 @@ def _harden_ssh_security_group(context: AwsContext, group_id: str) -> None:
         )
     except Exception as error:  # Verification resolves response-loss ambiguity.
         revoke_error = error
-    remaining = _security_group_egress(context, group_id)
-    if remaining:
-        failure = RuntimeError(
-            f"AWS Mac SSH security group {group_id} still permits egress"
-        )
-        if revoke_error is not None:
-            raise failure from revoke_error
-        raise failure
+    for attempt in range(SSH_EGRESS_VERIFY_ATTEMPTS):
+        if not _security_group_egress(context, group_id):
+            return
+        if attempt + 1 < SSH_EGRESS_VERIFY_ATTEMPTS:
+            time.sleep(SSH_EGRESS_VERIFY_DELAY_S)
+    failure = RuntimeError(
+        f"AWS Mac SSH security group {group_id} still permits egress"
+    )
+    if revoke_error is not None:
+        raise failure from revoke_error
+    raise failure
 
 
 def _recover_ssh_security_group(context: AwsContext, state: dict) -> str:

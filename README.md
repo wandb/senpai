@@ -302,7 +302,8 @@ Install AWS CLI v2 and OpenSSH. The selected AWS identity needs
 `sts:GetCallerIdentity`, `ssm:GetParameter`, EC2 `Describe*` access for instance
 types, images, networking, instances, security groups, volumes, and volume
 modifications, plus `CreateKeyPair`, `DeleteKeyPair`, `CreateSecurityGroup`,
-`AuthorizeSecurityGroupIngress`, `DeleteSecurityGroup`, `RunInstances`,
+`AuthorizeSecurityGroupIngress`, `RevokeSecurityGroupIngress`,
+`RevokeSecurityGroupEgress`, `DeleteSecurityGroup`, `RunInstances`,
 `TerminateInstances`, `CreateTags`, `ModifyVolume`, and
 `ec2:GetConsoleOutput`. The region needs GPU quota and a public subnet with an
 internet-gateway route.
@@ -437,8 +438,10 @@ its own Availability Zone and an existing base security group in the same VPC.
 The launcher attaches that group unchanged and creates a second,
 campaign-owned security group for the operator's temporary SSH `/32`. This
 keeps concurrent campaigns from revoking each other's access. Senpai removes
-and verifies the new group's default IPv4/IPv6 egress before launching an
-instance, so attaching it cannot broaden the base group's outbound policy.
+and verifies the new group's default IPv4/IPv6 egress, allowing bounded AWS
+eventual-consistency retries, before launching an instance. It fails closed if
+egress remains, so attaching the group cannot broaden the base group's
+outbound policy.
 
 Package the directory produced by Xcode's component export without changing
 its bundle layout:
