@@ -1,8 +1,9 @@
-import json
 import hashlib
+import json
 import multiprocessing
 import os
 import shlex
+import shutil
 import socket
 import sys
 import threading
@@ -11,19 +12,20 @@ from pathlib import Path
 
 import pytest
 
-import senpai_agent.repair_executor as repair_executor
-
+from senpai_agent import repair_executor
 from senpai_agent.protocols import REPAIR_PROTOCOL_VERSION
-from senpai_agent.repair_executor import EXECUTOR_REQUEST_LIMIT_BYTES
-from senpai_agent.repair_executor import DEFAULT_EXECUTOR_SOCKET
-from senpai_agent.repair_executor import REPAIR_EXECUTOR_PROTOCOL
-from senpai_agent.repair_executor import RepairExecutorClient
-from senpai_agent.repair_executor import RepairExecutorServer
-from senpai_agent.repair_executor import RepairExecutionRequest
-from senpai_agent.repair_executor import _heartbeat_status_is_healthy
-from senpai_agent.repair_executor import _encode_frame
-from senpai_agent.repair_executor import check_repair_executor_health
-from senpai_agent.repair_executor import execute_local_repair
+from senpai_agent.repair_executor import (
+    DEFAULT_EXECUTOR_SOCKET,
+    EXECUTOR_REQUEST_LIMIT_BYTES,
+    REPAIR_EXECUTOR_PROTOCOL,
+    RepairExecutionRequest,
+    RepairExecutorClient,
+    RepairExecutorServer,
+    _encode_frame,
+    _heartbeat_status_is_healthy,
+    check_repair_executor_health,
+    execute_local_repair,
+)
 
 
 def _serve(socket_path: str) -> None:
@@ -60,6 +62,52 @@ def test_repair_startup_scavenges_only_owned_stale_volatile_children(
     assert not link.exists()
     assert target.exists()
     assert unrelated.read_text() == "keep"
+
+
+def test_repair_startup_recovers_an_owned_permission_poisoned_stale_root(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(repair_executor.tempfile, "tempdir", str(tmp_path))
+    parent = tmp_path / "senpai-repair-operations"
+    parent.mkdir()
+    stale = parent / "operation-stale456"
+    poisoned = stale / "home" / "locked"
+    poisoned.mkdir(parents=True)
+    (poisoned / "junk").write_text("stale")
+    (stale / ".senpai-owner.json").write_text(
+        json.dumps({"pid": 999_999_999, "start_token": None})
+    )
+    poisoned.chmod(0)
+    stale.chmod(0)
+
+    try:
+        repair_executor._scavenge_stale_volatile_roots()
+        assert not stale.exists()
+    finally:
+        if stale.exists():
+            stale.chmod(0o700)
+            poisoned.chmod(0o700)
+            shutil.rmtree(stale)
+
+
+def test_repair_startup_fails_closed_for_a_malformed_owned_stale_root(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(repair_executor.tempfile, "tempdir", str(tmp_path))
+    parent = tmp_path / "senpai-repair-operations"
+    parent.mkdir()
+    malformed = parent / "operation-invalid1"
+    malformed.mkdir()
+    (malformed / ".senpai-owner.json").write_text("not-json")
+    payload = malformed / "must-remain"
+    payload.write_text("preserved")
+
+    with pytest.raises(repair_executor.RepairExecutorError, match="volatile root"):
+        repair_executor._scavenge_stale_volatile_roots()
+
+    assert payload.read_text() == "preserved"
 
 
 def test_repair_output_bounds_invalid_utf8_without_quadratic_trimming():
@@ -200,6 +248,68 @@ def test_repair_operations_get_fresh_home_and_temporary_state(tmp_path, monkeypa
     assert first["exit_code"] == 0
     assert second["exit_code"] == 0
     assert first["stdout"] != second["stdout"]
+
+
+def test_repair_completion_removes_permission_poison_without_following_links(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(repair_executor.tempfile, "tempdir", str(tmp_path))
+    recorded_root = tmp_path / "volatile-root"
+    target = tmp_path / "outside-target"
+    target.write_text("must survive")
+    root = None
+
+    try:
+        result = execute_local_repair(
+            "mkdir -p \"$HOME/locked/deeper\"; "
+            "printf poisoned > \"$HOME/locked/deeper/junk\"; "
+            f"ln -s {shlex.quote(str(target))} \"$HOME/outside-link\"; "
+            f"printf '%s' \"${{HOME%/home}}\" > {shlex.quote(str(recorded_root))}; "
+            "chmod 000 \"$HOME/locked\"",
+            tmp_path,
+            5,
+        )
+        root = Path(recorded_root.read_text())
+
+        assert result["exit_code"] == 0
+        assert not root.exists()
+        assert target.read_text() == "must survive"
+    finally:
+        if root is not None and root.exists():
+            (root / "home" / "locked").chmod(0o700)
+            shutil.rmtree(root)
+
+
+def test_repair_operation_fails_closed_when_cleanup_authority_is_poisoned(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(repair_executor.tempfile, "tempdir", str(tmp_path))
+    recorded_root = tmp_path / "volatile-root"
+    outside_marker = tmp_path / "outside-owner-marker"
+    outside_marker.write_text(
+        json.dumps({"pid": 999_999_999, "start_token": None})
+    )
+
+    with pytest.raises(repair_executor.RepairExecutorError, match="volatile root"):
+        execute_local_repair(
+            f"printf '%s' \"${{HOME%/home}}\" > {shlex.quote(str(recorded_root))}; "
+            "rm \"$HOME/../.senpai-owner.json\"; "
+            f"ln -s {shlex.quote(str(outside_marker))} "
+            "\"$HOME/../.senpai-owner.json\"",
+            tmp_path,
+            5,
+        )
+
+    root = Path(recorded_root.read_text())
+    assert root.exists()
+    assert outside_marker.read_text() == json.dumps(
+        {"pid": 999_999_999, "start_token": None}
+    )
+
+    (root / ".senpai-owner.json").unlink()
+    shutil.rmtree(root)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreapers")

@@ -1,8 +1,9 @@
 import hashlib
 import json
 import os
-import signal
 import shlex
+import shutil
+import signal
 import socket
 import struct
 import sys
@@ -11,11 +12,9 @@ import time
 from pathlib import Path
 
 import pytest
-
 from openhands.tools.terminal import TerminalAction
 
-import senpai_agent.isolated_terminal as isolated_terminal
-
+from senpai_agent import isolated_terminal, repair_executor
 from senpai_agent.isolated_terminal import (
     IsolatedTerminalClientExecutor,
     IsolatedTerminalServer,
@@ -65,6 +64,65 @@ def test_terminal_startup_scavenges_only_owned_stale_volatile_children(
     assert not link.exists()
     assert target.exists()
     assert unrelated.read_text() == "keep"
+
+
+def test_terminal_startup_recovers_an_owned_permission_poisoned_stale_root(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(isolated_terminal.tempfile, "tempdir", str(tmp_path))
+    parent = tmp_path / "senpai-terminal-wakes"
+    parent.mkdir()
+    stale = parent / "wake-stale456"
+    poisoned = stale / "home" / "locked"
+    poisoned.mkdir(parents=True)
+    (poisoned / "junk").write_text("stale")
+    (stale / ".senpai-owner.json").write_text(
+        json.dumps({"pid": 999_999_999, "start_token": None})
+    )
+    poisoned.chmod(0)
+    stale.chmod(0)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    try:
+        with IsolatedTerminalServer(
+            socket_path=_test_socket(tmp_path, "poisoned-stale-terminal"),
+            working_dir=workspace,
+            terminal_type="subprocess",
+        ):
+            pass
+        assert not stale.exists()
+    finally:
+        if stale.exists():
+            stale.chmod(0o700)
+            poisoned.chmod(0o700)
+            shutil.rmtree(stale)
+
+
+def test_terminal_startup_fails_closed_for_a_malformed_owned_stale_root(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(isolated_terminal.tempfile, "tempdir", str(tmp_path))
+    parent = tmp_path / "senpai-terminal-wakes"
+    parent.mkdir()
+    malformed = parent / "wake-invalid1"
+    malformed.mkdir()
+    (malformed / ".senpai-owner.json").write_text("not-json")
+    payload = malformed / "must-remain"
+    payload.write_text("preserved")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(TerminalTransportError, match="volatile root"):
+        IsolatedTerminalServer(
+            socket_path=_test_socket(tmp_path, "malformed-stale-terminal"),
+            working_dir=workspace,
+            terminal_type="subprocess",
+        )
+
+    assert payload.read_text() == "preserved"
 
 
 def test_terminal_socket_preserves_shell_fidelity_without_control_secrets(
@@ -240,6 +298,98 @@ def test_begin_wake_recreates_pristine_shell_and_rejects_stale_actions(tmp_path)
             first(TerminalAction(command="touch stale-wake-ran"))
 
     assert not (workspace / "stale-wake-ran").exists()
+
+
+def test_end_wake_synchronously_removes_permission_poison_without_following_links(
+    tmp_path,
+):
+    socket_path = _test_socket(tmp_path, "terminal-permission-cleanup")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    recorded_root = workspace / "volatile-root"
+    target = tmp_path / "outside-target"
+    target.write_text("must survive")
+    root = None
+
+    try:
+        with IsolatedTerminalServer(
+            socket_path=socket_path,
+            working_dir=workspace,
+            environment={"PATH": os.environ["PATH"]},
+            terminal_type="subprocess",
+        ):
+            begin_isolated_terminal_wake(socket_path, "wake-permission-cleanup")
+            result = IsolatedTerminalClientExecutor(
+                socket_path,
+                "wake-permission-cleanup",
+            )(
+                TerminalAction(
+                    command=(
+                        "mkdir -p \"$HOME/locked/deeper\"; "
+                        "printf poisoned > \"$HOME/locked/deeper/junk\"; "
+                        f"ln -s {shlex.quote(str(target))} \"$HOME/outside-link\"; "
+                        f"printf '%s' \"${{HOME%/home}}\" > "
+                        f"{shlex.quote(str(recorded_root))}; "
+                        "chmod 000 \"$HOME/locked\""
+                    )
+                )
+            )
+            assert result.metadata.exit_code == 0
+            root = Path(recorded_root.read_text())
+
+            end_isolated_terminal_wake(socket_path, "wake-permission-cleanup")
+
+            assert not root.exists()
+            assert target.read_text() == "must survive"
+    finally:
+        if root is not None and root.exists():
+            (root / "home" / "locked").chmod(0o700)
+            shutil.rmtree(root)
+
+
+def test_terminal_cleanup_failure_marks_server_dirty_until_authoritative_retry(
+    tmp_path,
+    monkeypatch,
+):
+    socket_path = _test_socket(tmp_path, "terminal-dirty-cleanup")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    recorded_root = workspace / "volatile-root"
+
+    with IsolatedTerminalServer(
+        socket_path=socket_path,
+        working_dir=workspace,
+        environment={"PATH": os.environ["PATH"]},
+        terminal_type="subprocess",
+    ):
+        begin_isolated_terminal_wake(socket_path, "wake-dirty-cleanup")
+        IsolatedTerminalClientExecutor(socket_path, "wake-dirty-cleanup")(
+            TerminalAction(
+                command=(
+                    f"printf '%s' \"${{HOME%/home}}\" > "
+                    f"{shlex.quote(str(recorded_root))}"
+                )
+            )
+        )
+        root = Path(recorded_root.read_text())
+        remove_directory = repair_executor.os.rmdir
+
+        def fail_root_removal(path, *args, **kwargs):
+            if path == root.name:
+                raise PermissionError("injected authoritative removal failure")
+            return remove_directory(path, *args, **kwargs)
+
+        monkeypatch.setattr(repair_executor.os, "rmdir", fail_root_removal)
+        with pytest.raises(TerminalTransportError, match="cleanup failed"):
+            end_isolated_terminal_wake(socket_path, "wake-dirty-cleanup")
+        with pytest.raises(TerminalTransportError, match="requires authoritative"):
+            check_isolated_terminal_health(socket_path)
+
+        monkeypatch.setattr(repair_executor.os, "rmdir", remove_directory)
+        end_isolated_terminal_wake(socket_path, "wake-dirty-cleanup")
+        check_isolated_terminal_health(socket_path)
+
+        assert not root.exists()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreapers")

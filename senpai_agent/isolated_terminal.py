@@ -6,7 +6,6 @@ import argparse
 import json
 import os
 import signal
-import shutil
 import socket
 import stat
 import subprocess
@@ -25,11 +24,13 @@ from openhands.sdk.tool import ToolDefinition, ToolExecutor, register_tool
 from openhands.tools.terminal import TerminalAction, TerminalObservation, TerminalTool
 
 from senpai_agent.repair_executor import (
+    RepairExecutorError,
     become_child_subreaper,
     clean_current_process_descendants,
     direct_children,
     kill_process_tree,
     reap_children,
+    remove_owned_volatile_root,
 )
 from senpai_agent.protocols import ISOLATED_TERMINAL_PROTOCOL_VERSION
 from senpai_agent.socket_framing import (
@@ -39,7 +40,6 @@ from senpai_agent.socket_framing import (
     receive_frame,
     unix_socket_address,
 )
-
 
 TERMINAL_PROTOCOL = ISOLATED_TERMINAL_PROTOCOL_VERSION
 DEFAULT_TERMINAL_SOCKET = "@senpai-isolated-terminal"
@@ -135,38 +135,43 @@ def _write_volatile_owner(path: Path) -> None:
     )
 
 
-def _volatile_owner_is_live(path: Path) -> bool:
+def _volatile_child_name_is_valid(name: str) -> bool:
+    suffix = name.removeprefix(_VOLATILE_CHILD_PREFIX)
+    return (
+        name.startswith(_VOLATILE_CHILD_PREFIX)
+        and len(suffix) >= 6
+        and all(character.isalnum() or character in "_-" for character in suffix)
+    )
+
+
+def _remove_terminal_volatile_root(path: Path, *, stale_only: bool) -> bool:
     try:
-        marker = json.loads((path / _VOLATILE_OWNER_FILE).read_text())
-        pid = int(marker["pid"])
-    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    expected = marker.get("start_token")
-    return expected is None or _process_start_token(pid) == expected
+        return remove_owned_volatile_root(
+            path,
+            parent=_volatile_parent(),
+            child_prefix=_VOLATILE_CHILD_PREFIX,
+            stale_only=stale_only,
+        )
+    except RepairExecutorError as error:
+        raise TerminalTransportError("terminal volatile root cleanup failed") from error
 
 
 def _scavenge_stale_volatile_roots() -> None:
-    for entry in _volatile_parent().iterdir():
-        suffix = entry.name.removeprefix(_VOLATILE_CHILD_PREFIX)
-        if (
-            not entry.name.startswith(_VOLATILE_CHILD_PREFIX)
-            or len(suffix) < 6
-            or not suffix.isalnum()
-        ):
+    parent = _volatile_parent()
+    for entry in parent.iterdir():
+        if not _volatile_child_name_is_valid(entry.name):
             continue
         metadata = entry.lstat()
         if metadata.st_uid != os.geteuid():
-            continue
+            raise TerminalTransportError("terminal volatile root is not owned")
         if stat.S_ISLNK(metadata.st_mode):
             entry.unlink()
-        elif stat.S_ISDIR(metadata.st_mode) and not _volatile_owner_is_live(entry):
-            shutil.rmtree(entry)
+        elif stat.S_ISDIR(metadata.st_mode):
+            _remove_terminal_volatile_root(entry, stale_only=True)
+        else:
+            raise TerminalTransportError(
+                "terminal volatile root candidate is malformed"
+            )
 
 
 @contextmanager
@@ -508,6 +513,7 @@ class IsolatedTerminalServer:
         self._worker: _TerminalWorker | None = None
         self._retired_wakes: set[str] = set()
         self._dirty = False
+        self._dirty_volatile_roots: set[Path] = set()
         self._handlers: set[threading.Thread] = set()
         self._handlers_lock = threading.Lock()
         self._closed = False
@@ -750,14 +756,25 @@ class IsolatedTerminalServer:
                 dir=_volatile_parent(),
             )
         )
-        _write_volatile_owner(volatile_root)
-        home = volatile_root / "home"
-        temporary = volatile_root / "tmp"
-        xdg_cache = volatile_root / "cache"
-        xdg_config = volatile_root / "config"
-        xdg_data = volatile_root / "data"
-        for directory in (home, temporary, xdg_cache, xdg_config, xdg_data):
-            directory.mkdir()
+        try:
+            _write_volatile_owner(volatile_root)
+            home = volatile_root / "home"
+            temporary = volatile_root / "tmp"
+            xdg_cache = volatile_root / "cache"
+            xdg_config = volatile_root / "config"
+            xdg_data = volatile_root / "data"
+            for directory in (home, temporary, xdg_cache, xdg_config, xdg_data):
+                directory.mkdir()
+        except BaseException:
+            parent.close()
+            child.close()
+            try:
+                self._cleanup_terminal_volatile_root(volatile_root)
+            except BaseException as cleanup_error:
+                raise TerminalTransportError(
+                    "terminal worker setup cleanup failed"
+                ) from cleanup_error
+            raise
         command = [
             sys.executable,
             "-I",
@@ -794,7 +811,12 @@ class IsolatedTerminalServer:
         except BaseException:
             parent.close()
             child.close()
-            shutil.rmtree(volatile_root, ignore_errors=True)
+            try:
+                self._cleanup_terminal_volatile_root(volatile_root)
+            except BaseException as cleanup_error:
+                raise TerminalTransportError(
+                    "terminal worker startup cleanup failed"
+                ) from cleanup_error
             raise
         child.close()
         worker = _TerminalWorker(
@@ -840,17 +862,28 @@ class IsolatedTerminalServer:
                 if termination_error is None:
                     termination_error = error
             finally:
-                threading.Thread(
-                    target=shutil.rmtree,
-                    args=(worker.volatile_root,),
-                    kwargs={"ignore_errors": True},
-                    name="senpai-terminal-volatile-cleanup",
-                    daemon=True,
-                ).start()
+                try:
+                    self._cleanup_terminal_volatile_root(worker.volatile_root)
+                except BaseException as error:  # noqa: BLE001
+                    if termination_error is None:
+                        termination_error = error
         if termination_error is not None:
+            with self._state_lock:
+                self._dirty = True
             raise TerminalTransportError(
                 f"terminal worker cleanup failed ({type(termination_error).__name__})"
             ) from termination_error
+
+    def _cleanup_terminal_volatile_root(self, volatile_root: Path) -> None:
+        try:
+            _remove_terminal_volatile_root(volatile_root, stale_only=False)
+        except BaseException:
+            with self._state_lock:
+                self._dirty_volatile_roots.add(volatile_root)
+                self._dirty = True
+            raise
+        with self._state_lock:
+            self._dirty_volatile_roots.discard(volatile_root)
 
     def _clean_server_adoptees(self) -> None:
         if sys.platform != "linux":
@@ -892,12 +925,18 @@ class IsolatedTerminalServer:
     def _reconcile_server_adoptees(self) -> None:
         try:
             self._clean_server_adoptees()
-        except BaseException:  # noqa: BLE001
+            with self._state_lock:
+                dirty_volatile_roots = tuple(self._dirty_volatile_roots)
+            for volatile_root in dirty_volatile_roots:
+                _remove_terminal_volatile_root(volatile_root, stale_only=False)
+                with self._state_lock:
+                    self._dirty_volatile_roots.discard(volatile_root)
+        except BaseException:
             with self._state_lock:
                 self._dirty = True
             raise
         with self._state_lock:
-            self._dirty = False
+            self._dirty = bool(self._dirty_volatile_roots)
 
     def _remove_stale_socket(self) -> None:
         if self._abstract_socket:

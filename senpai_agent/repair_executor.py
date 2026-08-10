@@ -23,7 +23,6 @@ from pathlib import Path
 from types import FrameType
 from typing import Any
 
-
 REPAIR_STREAM_LIMIT_BYTES = 128 * 1024
 REPAIR_STREAM_LIMIT_CHARS = REPAIR_STREAM_LIMIT_BYTES
 EXECUTOR_FRAME_LIMIT_BYTES = 2 * 1024 * 1024
@@ -39,6 +38,7 @@ _TRUSTED_COMMAND_PATH = "/opt/senpai-venv/bin:/usr/local/bin:/usr/bin:/bin"
 _VOLATILE_PARENT_NAME = "senpai-repair-operations"
 _VOLATILE_CHILD_PREFIX = "operation-"
 _VOLATILE_OWNER_FILE = ".senpai-owner.json"
+_VOLATILE_OWNER_LIMIT_BYTES = 4_096
 _PR_SET_CHILD_SUBREAPER = 36
 _REPAIR_ENVIRONMENT_KEYS = frozenset(
     {
@@ -109,12 +109,93 @@ def _write_volatile_owner(path: Path) -> None:
     )
 
 
-def _volatile_owner_is_live(path: Path) -> bool:
+def _volatile_child_name_is_valid(name: str, prefix: str) -> bool:
+    suffix = name.removeprefix(prefix)
+    return (
+        name.startswith(prefix)
+        and len(suffix) >= 6
+        and all(character.isalnum() or character in "_-" for character in suffix)
+    )
+
+
+def _read_volatile_owner(directory_fd: int) -> tuple[dict[str, object], bytes]:
     try:
-        marker = json.loads((path / _VOLATILE_OWNER_FILE).read_text())
-        pid = int(marker["pid"])
-    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return True
+        expected = os.stat(
+            _VOLATILE_OWNER_FILE,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise RepairExecutorError(
+            "repair volatile root owner marker is not authoritative"
+        ) from error
+    if not stat.S_ISREG(expected.st_mode) or expected.st_uid != os.geteuid():
+        raise RepairExecutorError(
+            "repair volatile root owner marker is not authoritative"
+        )
+    os.chmod(
+        _VOLATILE_OWNER_FILE,
+        0o600,
+        dir_fd=directory_fd,
+        follow_symlinks=False,
+    )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        marker_fd = os.open(_VOLATILE_OWNER_FILE, flags, dir_fd=directory_fd)
+    except OSError as error:
+        raise RepairExecutorError(
+            "repair volatile root owner marker is not authoritative"
+        ) from error
+    try:
+        metadata = os.fstat(marker_fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_dev != expected.st_dev
+            or metadata.st_ino != expected.st_ino
+        ):
+            raise RepairExecutorError(
+                "repair volatile root owner marker is not authoritative"
+            )
+        chunks: list[bytes] = []
+        remaining = _VOLATILE_OWNER_LIMIT_BYTES + 1
+        while remaining:
+            chunk = os.read(marker_fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+        if len(encoded) > _VOLATILE_OWNER_LIMIT_BYTES:
+            raise RepairExecutorError("repair volatile root owner marker is malformed")
+    finally:
+        os.close(marker_fd)
+    try:
+        marker = json.loads(encoded)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RepairExecutorError(
+            "repair volatile root owner marker is malformed"
+        ) from error
+    if not isinstance(marker, dict):
+        raise RepairExecutorError("repair volatile root owner marker is malformed")
+    pid = marker.get("pid")
+    start_token = marker.get("start_token")
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or pid > 2_147_483_647
+        or (
+            start_token is not None
+            and (not isinstance(start_token, str) or not start_token)
+        )
+    ):
+        raise RepairExecutorError("repair volatile root owner marker is malformed")
+    return marker, encoded
+
+
+def _volatile_owner_is_live(marker: dict[str, object]) -> bool:
+    pid = int(marker["pid"])
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -125,22 +206,176 @@ def _volatile_owner_is_live(path: Path) -> bool:
     return expected is None or _process_start_token(pid) == expected
 
 
-def _scavenge_stale_volatile_roots() -> None:
-    for entry in _volatile_parent().iterdir():
-        suffix = entry.name.removeprefix(_VOLATILE_CHILD_PREFIX)
+def _open_owned_directory(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
+    metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+    ):
+        raise RepairExecutorError("repair volatile root ownership is not authoritative")
+    os.chmod(name, 0o700, dir_fd=parent_fd, follow_symlinks=False)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory_fd = os.open(name, flags, dir_fd=parent_fd)
+    opened = os.fstat(directory_fd)
+    if (
+        opened.st_dev != metadata.st_dev
+        or opened.st_ino != metadata.st_ino
+        or opened.st_uid != os.geteuid()
+    ):
+        os.close(directory_fd)
+        raise RepairExecutorError("repair volatile root changed during cleanup")
+    return directory_fd, opened
+
+
+def _remove_owned_directory_contents(
+    directory_fd: int,
+    device: int,
+    *,
+    preserve: frozenset[str] = frozenset(),
+) -> None:
+    for name in os.listdir(directory_fd):
+        if name in preserve:
+            continue
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if metadata.st_uid != os.geteuid():
+            raise RepairExecutorError(
+                "repair volatile root contains an unowned filesystem entry"
+            )
+        if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+            if metadata.st_dev != device:
+                raise RepairExecutorError(
+                    "repair volatile root crosses a filesystem boundary"
+                )
+            child_fd, opened = _open_owned_directory(directory_fd, name)
+            try:
+                if opened.st_dev != device:
+                    raise RepairExecutorError(
+                        "repair volatile root crosses a filesystem boundary"
+                    )
+                _remove_owned_directory_contents(child_fd, device)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def _restore_volatile_owner(directory_fd: int, encoded: bytes) -> None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    marker_fd = os.open(
+        _VOLATILE_OWNER_FILE,
+        flags,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        written = 0
+        while written < len(encoded):
+            count = os.write(marker_fd, encoded[written:])
+            if count == 0:
+                raise RepairExecutorError(
+                    "repair volatile root owner marker could not be restored"
+                )
+            written += count
+        os.fsync(marker_fd)
+    finally:
+        os.close(marker_fd)
+    os.fsync(directory_fd)
+
+
+def remove_owned_volatile_root(
+    path: Path,
+    *,
+    parent: Path,
+    child_prefix: str,
+    stale_only: bool,
+) -> bool:
+    """Remove one authority-checked root without following any contained symlink."""
+
+    path = path.absolute()
+    parent = parent.absolute()
+    if path.parent != parent or not _volatile_child_name_is_valid(
+        path.name,
+        child_prefix,
+    ):
+        raise RepairExecutorError("repair volatile root path is not authoritative")
+    try:
+        parent_metadata = parent.lstat()
         if (
-            not entry.name.startswith(_VOLATILE_CHILD_PREFIX)
-            or len(suffix) < 6
-            or not suffix.isalnum()
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or stat.S_ISLNK(parent_metadata.st_mode)
+            or parent_metadata.st_uid != os.geteuid()
         ):
+            raise RepairExecutorError("repair volatile parent is not authoritative")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        parent_fd = os.open(parent, flags)
+        try:
+            root_fd, root_metadata = _open_owned_directory(parent_fd, path.name)
+            try:
+                marker, encoded_marker = _read_volatile_owner(root_fd)
+                if stale_only and _volatile_owner_is_live(marker):
+                    return False
+                _remove_owned_directory_contents(
+                    root_fd,
+                    root_metadata.st_dev,
+                    preserve=frozenset({_VOLATILE_OWNER_FILE}),
+                )
+                os.unlink(_VOLATILE_OWNER_FILE, dir_fd=root_fd)
+                try:
+                    os.rmdir(path.name, dir_fd=parent_fd)
+                except OSError:
+                    _restore_volatile_owner(root_fd, encoded_marker)
+                    raise
+            finally:
+                os.close(root_fd)
+            try:
+                os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return True
+            raise RepairExecutorError(
+                "repair volatile root removal was not authoritative"
+            )
+        finally:
+            os.close(parent_fd)
+    except RepairExecutorError:
+        raise
+    except OSError as error:
+        raise RepairExecutorError("repair volatile root cleanup failed") from error
+
+
+def _scavenge_stale_volatile_roots() -> None:
+    parent = _volatile_parent()
+    for entry in parent.iterdir():
+        if not _volatile_child_name_is_valid(entry.name, _VOLATILE_CHILD_PREFIX):
             continue
         metadata = entry.lstat()
         if metadata.st_uid != os.geteuid():
-            continue
+            raise RepairExecutorError("repair volatile root is not owned")
         if stat.S_ISLNK(metadata.st_mode):
             entry.unlink()
-        elif stat.S_ISDIR(metadata.st_mode) and not _volatile_owner_is_live(entry):
-            shutil.rmtree(entry)
+        elif stat.S_ISDIR(metadata.st_mode):
+            remove_owned_volatile_root(
+                entry,
+                parent=parent,
+                child_prefix=_VOLATILE_CHILD_PREFIX,
+                stale_only=True,
+            )
+        else:
+            raise RepairExecutorError("repair volatile root candidate is malformed")
 
 
 def _socket_address(socket_path: str | Path) -> str:
@@ -638,31 +873,45 @@ def _fresh_repair_environment() -> tuple[Path, dict[str, str]]:
             dir=_volatile_parent(),
         )
     )
-    _write_volatile_owner(root)
-    home = root / "home"
-    temporary = root / "tmp"
-    cache = root / "cache"
-    config = root / "config"
-    data = root / "data"
-    for directory in (home, temporary, cache, config, data):
-        directory.mkdir()
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if key in _REPAIR_ENVIRONMENT_KEYS
-    }
-    environment.update(
-        {
-            "PATH": _TRUSTED_COMMAND_PATH,
-            "HOME": str(home),
-            "TMPDIR": str(temporary),
-            "TMP": str(temporary),
-            "TEMP": str(temporary),
-            "XDG_CACHE_HOME": str(cache),
-            "XDG_CONFIG_HOME": str(config),
-            "XDG_DATA_HOME": str(data),
+    try:
+        _write_volatile_owner(root)
+        home = root / "home"
+        temporary = root / "tmp"
+        cache = root / "cache"
+        config = root / "config"
+        data = root / "data"
+        for directory in (home, temporary, cache, config, data):
+            directory.mkdir()
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key in _REPAIR_ENVIRONMENT_KEYS
         }
-    )
+        environment.update(
+            {
+                "PATH": _TRUSTED_COMMAND_PATH,
+                "HOME": str(home),
+                "TMPDIR": str(temporary),
+                "TMP": str(temporary),
+                "TEMP": str(temporary),
+                "XDG_CACHE_HOME": str(cache),
+                "XDG_CONFIG_HOME": str(config),
+                "XDG_DATA_HOME": str(data),
+            }
+        )
+    except BaseException:
+        try:
+            remove_owned_volatile_root(
+                root,
+                parent=_volatile_parent(),
+                child_prefix=_VOLATILE_CHILD_PREFIX,
+                stale_only=False,
+            )
+        except BaseException as cleanup_error:
+            raise RepairExecutorError(
+                "repair environment setup cleanup failed"
+            ) from cleanup_error
+        raise
     return root, environment
 
 
@@ -764,10 +1013,19 @@ def _execute_in_worker(
             if process is not None and process.poll() is None:
                 clean_current_process_descendants()
         finally:
-            selector.close()
-            shutil.rmtree(volatile_root, ignore_errors=True)
-            for signum, handler in previous_handlers.items():
-                signal.signal(signum, handler)
+            try:
+                selector.close()
+            finally:
+                try:
+                    remove_owned_volatile_root(
+                        volatile_root,
+                        parent=_volatile_parent(),
+                        child_prefix=_VOLATILE_CHILD_PREFIX,
+                        stale_only=False,
+                    )
+                finally:
+                    for signum, handler in previous_handlers.items():
+                        signal.signal(signum, handler)
 
 
 def _serve_worker(
@@ -929,6 +1187,7 @@ class RepairExecutorServer:
                 # crash can reparent detached command descendants to PID 1.
                 # Reconcile before the executor becomes reachable again.
                 clean_current_process_descendants()
+                _scavenge_stale_volatile_roots()
                 heartbeat.publish("idle")
         finally:
             heartbeat.close()
