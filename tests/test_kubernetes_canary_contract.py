@@ -211,6 +211,13 @@ def test_initial_canary_manifest_uses_dummy_credentials_and_real_boundaries():
     assert "envsubst" in advisor_source["args"][0]
     assert "SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE" in advisor_source["args"][0]
     assert advisor_pod["containers"][0]["envFrom"]
+    for config_name in (
+        "senpai-config-advisor-ci-123",
+        "senpai-config-student-ci-123-fern",
+    ):
+        assert resources[("ConfigMap", config_name)]["data"][
+            "SENPAI_SUPERVISOR_CONTROL_DIR"
+        ] == "/run/senpai-supervisor-control/private"
 
     _secret, _config, supervisor = supervisor_bundle(documents)
     supervisor_pod = supervisor["spec"]["template"]["spec"]

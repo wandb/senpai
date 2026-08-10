@@ -30,6 +30,7 @@ INTERRUPTED_REPAIR_COMMAND = (
     "/repair/scratch/canary-interrupted-repair-ran"
 )
 ROLE_LISTENER_PORT = 18_765
+ROLE_CONTROL_DIR = "/run/senpai-supervisor-control/private"
 
 
 def _documents(text: str) -> list[dict]:
@@ -196,6 +197,7 @@ def _render_advisor(
             "SENPAI_OPENHANDS_ROLE_FILE": config["data"][
                 "SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE"
             ],
+            "SENPAI_SUPERVISOR_CONTROL_DIR": ROLE_CONTROL_DIR,
         }
     )
     deployment = next(
@@ -274,6 +276,7 @@ def _render_student(
         {
             "SENPAI_ROLE": "student",
             "SENPAI_OPENHANDS_STATE_DIR": state_dir,
+            "SENPAI_SUPERVISOR_CONTROL_DIR": ROLE_CONTROL_DIR,
         }
     )
     deployment = next(
