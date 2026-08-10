@@ -592,6 +592,7 @@ def main():
         sys.exit("ERROR: --target_repo_url must be a different repo from --repo_url")
 
     student_list = resolve_student_names(args)
+    launches_roles = args.advisor or bool(student_list)
     if args.backend == "aws-mac":
         resolve_checkout_revision(args)
     else:
@@ -611,11 +612,12 @@ def main():
             provider_api_keys["anthropic"] = resolve_anthropic_api_key(DOTENV_PATH)
         if "openai" in model_providers:
             provider_api_keys["openai"] = resolve_openai_api_key(DOTENV_PATH)
-        exa_api_key = resolve_exa_api_key(DOTENV_PATH)
         wandb_api_key = resolve_wandb_api_key(DOTENV_PATH)
         if "wandb" in model_providers:
             provider_api_keys["wandb"] = wandb_api_key
-        hf_token = resolve_optional_secret(DOTENV_PATH, "HF_TOKEN")
+        if launches_roles:
+            exa_api_key = resolve_exa_api_key(DOTENV_PATH)
+            hf_token = resolve_optional_secret(DOTENV_PATH, "HF_TOKEN")
         if args.backend == "aws-mac" and args.aws_mac_official_submit:
             mlxfast_api_token = resolve_optional_secret(
                 DOTENV_PATH,
@@ -627,17 +629,18 @@ def main():
                     "MLXFAST_API_TOKEN"
                 )
         preflight_check_target_repo_access(args.target_repo_url, github_token)
-        args.target_repo_branch = preflight_check_target_repo_branch(
-            args.target_repo_url,
-            github_token,
-            args.target_repo_branch,
-        )
-        preflight_check_student_name_availability(
-            args.target_repo_url,
-            github_token,
-            student_list,
-            args.advisor_branch,
-        )
+        if launches_roles:
+            args.target_repo_branch = preflight_check_target_repo_branch(
+                args.target_repo_url,
+                github_token,
+                args.target_repo_branch,
+            )
+            preflight_check_student_name_availability(
+                args.target_repo_url,
+                github_token,
+                student_list,
+                args.advisor_branch,
+            )
         if anthropic_api_key := provider_api_keys.get("anthropic"):
             preflight_check_anthropic_api_key(anthropic_api_key)
         if openai_api_key := provider_api_keys.get("openai"):
@@ -648,7 +651,8 @@ def main():
                 args.wandb_entity,
                 args.wandb_project,
             )
-        preflight_check_exa_api_key(exa_api_key)
+        if launches_roles:
+            preflight_check_exa_api_key(exa_api_key)
         preflight_check_wandb_api_key(wandb_api_key)
 
     existing_supervised_students: list[str] | None = None
@@ -806,7 +810,7 @@ def main():
         return
 
     def prepare_github() -> None:
-        if args.dry_run:
+        if args.dry_run or not launches_roles:
             return
         ensure_advisor_branch(
             args.target_repo_url,

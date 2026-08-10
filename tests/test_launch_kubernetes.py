@@ -439,6 +439,86 @@ def test_supervisor_only_launch_preserves_role_secret_and_uses_immutable_bundle(
     ]
 
 
+def test_supervisor_only_upgrade_skips_role_credentials_and_repo_setup(monkeypatch):
+    """An incremental supervisor upgrade must not depend on or mutate role setup."""
+
+    args = supervisor_launch_args(
+        advisor=False,
+        operational_supervisor=True,
+        names="",
+        n_students=0,
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    compatible_existing_campaign(monkeypatch, args)
+
+    resolved = []
+    checked = []
+    monkeypatch.setattr(
+        launch,
+        "resolve_github_token",
+        lambda _path: resolved.append("github") or "github",
+    )
+    monkeypatch.setattr(
+        launch,
+        "resolve_openai_api_key",
+        lambda _path: resolved.append("openai") or "openai",
+    )
+    monkeypatch.setattr(
+        launch,
+        "resolve_wandb_api_key",
+        lambda _path: resolved.append("wandb") or "wandb",
+    )
+    for name in ("resolve_exa_api_key", "resolve_optional_secret"):
+        monkeypatch.setattr(
+            launch,
+            name,
+            lambda *_args, name=name: pytest.fail(
+                f"supervisor-only upgrade called {name}"
+            ),
+        )
+
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_target_repo_access",
+        lambda *_args: checked.append("github"),
+    )
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_openai_api_key",
+        lambda *_args: checked.append("openai"),
+    )
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_wandb_api_key",
+        lambda *_args: checked.append("wandb"),
+    )
+    for name in (
+        "preflight_check_target_repo_branch",
+        "preflight_check_student_name_availability",
+        "preflight_check_exa_api_key",
+        "ensure_advisor_branch",
+        "ensure_target_repo_labels",
+    ):
+        monkeypatch.setattr(
+            launch,
+            name,
+            lambda *_args, name=name: pytest.fail(
+                f"supervisor-only upgrade called {name}"
+            ),
+        )
+    monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        launch,
+        "kubectl_rollout_status",
+        lambda *_args, **_kwargs: None,
+    )
+
+    launch.main()
+
+    assert resolved == ["github", "openai", "wandb"]
+    assert checked == ["github", "openai", "wandb"]
+
+
 def test_supervisor_bundle_names_change_without_overwriting_prior_release(
     monkeypatch,
 ):
