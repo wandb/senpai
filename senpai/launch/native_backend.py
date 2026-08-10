@@ -16,6 +16,7 @@ import pwd
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -593,6 +594,67 @@ def _validate_recorded_roles(tag: str, roles: object) -> None:
             )
 
 
+def _installed_role_keys(tag: str) -> set[str]:
+    """Read the campaign inventory from root-owned LaunchDaemon plists."""
+
+    prefix = f"{LAUNCHD_PREFIX}.{tag}."
+    try:
+        candidates = tuple(LAUNCH_DAEMON_ROOT.glob(f"{prefix}*.plist"))
+    except OSError as error:
+        raise RuntimeError(
+            "Could not inspect the native LaunchDaemon inventory"
+        ) from error
+
+    keys: set[str] = set()
+    for path in candidates:
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise RuntimeError(
+                f"Could not inspect native LaunchDaemon {path}"
+            ) from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_mode & 0o022
+        ):
+            raise RuntimeError(
+                f"Native LaunchDaemon inventory entry is not root-controlled: {path}"
+            )
+        label = path.name.removesuffix(".plist")
+        key = label.removeprefix(prefix)
+        if key == "advisor":
+            pass
+        elif key.startswith("student-"):
+            try:
+                validate_identifier("Native student name", key.removeprefix("student-"))
+            except ValueError as error:
+                raise RuntimeError(
+                    f"Native LaunchDaemon inventory has an invalid role {key!r}"
+                ) from error
+        else:
+            raise RuntimeError(
+                f"Native LaunchDaemon inventory has an invalid role {key!r}"
+            )
+        if path != _launchd_plist_path(f"{prefix}{key}") or key in keys:
+            raise RuntimeError(
+                f"Native LaunchDaemon inventory has an invalid role {key!r}"
+            )
+        keys.add(key)
+    return keys
+
+
+def _validate_installed_role_inventory(tag: str, roles: list[dict]) -> set[str]:
+    recorded = {role["key"] for role in roles}
+    installed = _installed_role_keys(tag)
+    omitted = sorted(installed - recorded)
+    if omitted:
+        raise RuntimeError(
+            "Native manifest omits installed native role(s): " + ", ".join(omitted)
+        )
+    return installed
+
+
 def _remove_tmux_root(path: str | Path, expected: Path) -> None:
     base = _native_tmux_base()
     recorded = Path(path)
@@ -837,10 +899,12 @@ def logs_native(
 def terminate_native(tag: str, run_root: str = DEFAULT_NATIVE_RUN_ROOT) -> None:
     """Unload recorded services and remove their private workspaces and secrets."""
     path, manifest = _load_manifest(tag, run_root)
+    installed_roles = _validate_installed_role_inventory(tag, manifest["roles"])
     errors = []
     for role in reversed(manifest["roles"]):
         try:
-            _uninstall_recorded_role(manifest["domain"], role)
+            if role["key"] in installed_roles:
+                _uninstall_recorded_role(manifest["domain"], role)
             if tmux_root := role.get("tmux_root"):
                 _remove_tmux_root(
                     tmux_root,
