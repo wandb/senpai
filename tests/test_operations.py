@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
@@ -23,11 +24,15 @@ from senpai_agent.operations import (
     NudgeReceipt,
     OperationBackend,
     OperationInvariantError,
+    OperationInProgress,
     OperationLedger,
     OperationPolicy,
     OperationService,
     RecordedOperationError,
     Restart,
+    RestartCompletion,
+    RestartRequest,
+    RestartRequestStore,
     RestartReceipt,
     RoleObservation,
     RoleTarget,
@@ -69,6 +74,7 @@ def observation(
         restart_control_token=restart_control_token,
         controller_alive=True,
         controller_phase="sleep",
+        worker_generation=1,
         conversation_id=conversation_id,
         active_turn=active_turn,
         unmatched_actions=unmatched_actions,
@@ -102,8 +108,8 @@ class FakeBackend(OperationBackend):
         self.failure: BaseException | None = None
         self.damage_reset_request = False
         self.reset_requests: list[ContextResetRequest] = []
-        self.restart_preserves_state = True
-        self.restart_preserves_compute = True
+        self.restart_status = "queued"
+        self.restart_generation = 1
 
     def _fail(self):
         if self.failure is not None:
@@ -178,9 +184,10 @@ class FakeBackend(OperationBackend):
         )
         return RestartReceipt(
             target=role_target,
+            request_id=f"restart-request-{len(self.calls)}",
+            status=self.restart_status,
             conversation_id=expected_conversation_id,
-            state_preserved=self.restart_preserves_state,
-            compute_preserved=self.restart_preserves_compute,
+            expected_worker_generation=self.restart_generation,
         )
 
     def request_context_reset(
@@ -498,7 +505,7 @@ def test_stale_conversation_identity_rejects_a_nudge_before_delivery(
     assert [call[0] for call in backend.calls] == ["collect_role"]
 
 
-def test_restart_is_controller_only_and_must_preserve_state_and_compute(
+def test_restart_is_queued_for_the_controller_owner_without_claiming_completion(
     service: OperationService,
     backend: FakeBackend,
 ):
@@ -513,8 +520,9 @@ def test_restart_is_controller_only_and_must_preserve_state_and_compute(
     outcome = service.execute(action, now=NOW)
 
     assert isinstance(outcome.receipt, RestartReceipt)
-    assert outcome.receipt.state_preserved is True
-    assert outcome.receipt.compute_preserved is True
+    assert outcome.receipt.status == "queued"
+    assert outcome.receipt.state_preserved is None
+    assert outcome.receipt.compute_preserved is None
     assert backend.roles[action.target].conversation_id == STUDENT_ID
     assert "restart_controller" in [call[0] for call in backend.calls]
 
@@ -564,28 +572,201 @@ def test_restart_fails_closed_when_the_role_protocol_omits_restart_authorization
     assert [call[0] for call in backend.calls] == ["collect_role"]
 
 
-@pytest.mark.parametrize("lost", ["state", "compute"])
-def test_restart_fails_closed_if_the_backend_cannot_prove_preservation(
+@pytest.mark.parametrize("missing", ["status", "generation"])
+def test_restart_fails_closed_if_the_backend_does_not_acknowledge_owner_queueing(
     service: OperationService,
     backend: FakeBackend,
-    lost: str,
+    missing: str,
 ):
-    if lost == "state":
-        backend.restart_preserves_state = False
+    if missing == "status":
+        backend.restart_status = None
     else:
-        backend.restart_preserves_compute = False
+        backend.restart_generation = None
 
-    with pytest.raises(OperationInvariantError, match="preserve"):
+    with pytest.raises(OperationInvariantError, match="owner-queued"):
         service.execute(
             Restart(
-                operation_key=f"unsafe-restart-{lost}",
-                incident_key=f"unsafe-{lost}",
+                operation_key=f"unsafe-restart-{missing}",
+                incident_key=f"unsafe-{missing}",
                 target=target(),
                 expected_conversation_id=ADVISOR_ID,
                 reason="Try a safe controller restart.",
             ),
             now=NOW,
         )
+
+
+def test_restart_store_deduplicates_transport_retries_and_recovers_after_owner_crash(
+    tmp_path: Path,
+):
+    """
+    Requirement: a lost queue receipt or WorkerSupervisor crash cannot duplicate or
+    strand a planned restart.
+    Interface: RestartRequestStore reopened by the replacement supervisor process.
+    """
+
+    database = tmp_path / "controller-restarts.sqlite3"
+    request = RestartRequest(
+        request_id="restart-transport-loss",
+        target=target("student", "fern"),
+        expected_conversation_id=STUDENT_ID,
+        expected_restart_control_token="restart-1",
+        expected_worker_generation=1,
+        expected_completed_turns=3,
+    )
+    first_owner = RestartRequestStore(database)
+
+    assert first_owner.allocate_worker_generation() == 1
+    assert first_owner.enqueue(request) is True
+    assert first_owner.enqueue(request) is False
+    assert first_owner.claim_next(
+        request.target,
+        worker_generation=1,
+        replacement_generation=2,
+    ) == request
+    first_owner.close()
+
+    replacement_owner = RestartRequestStore(database)
+    assert replacement_owner.enqueue(request) is False
+    assert replacement_owner.result(request.request_id).status == "processing"
+    assert (
+        replacement_owner.result(request.request_id).planned_replacement_generation
+        == 2
+    )
+    assert replacement_owner.allocate_worker_generation() == 2
+    completion = RestartCompletion(
+        request_id=request.request_id,
+        target=request.target,
+        conversation_id=request.expected_conversation_id,
+        source_generation=1,
+        replacement_generation=2,
+        state_preserved=True,
+        compute_preserved=True,
+    )
+
+    assert replacement_owner.complete(completion) is True
+    assert replacement_owner.complete(completion) is False
+    assert replacement_owner.result(request.request_id).completion == completion
+    replacement_owner.close()
+
+
+def test_restart_store_rejects_reusing_a_transport_key_for_different_semantics(
+    tmp_path: Path,
+):
+    store = RestartRequestStore(tmp_path / "controller-restarts.sqlite3")
+    request = RestartRequest(
+        request_id="restart-idempotency-key",
+        target=target(),
+        expected_conversation_id=ADVISOR_ID,
+        expected_restart_control_token="restart-1",
+        expected_worker_generation=4,
+        expected_completed_turns=8,
+    )
+    store.enqueue(request)
+
+    with pytest.raises(IdempotencyConflict):
+        store.enqueue(request.model_copy(update={"expected_completed_turns": 9}))
+
+    with pytest.raises(OperationInProgress):
+        store.enqueue(request.model_copy(update={"request_id": "different-request"}))
+
+
+def test_restart_enqueue_is_race_safe_for_duplicate_and_competing_requests(
+    tmp_path: Path,
+):
+    request = RestartRequest(
+        request_id="concurrent-restart",
+        target=target(),
+        expected_conversation_id=ADVISOR_ID,
+        expected_restart_control_token="restart-1",
+        expected_worker_generation=1,
+        expected_completed_turns=0,
+    )
+
+    def race(path: Path, requests: tuple[RestartRequest, RestartRequest]):
+        barrier = threading.Barrier(2)
+        results: list[bool | type[BaseException]] = []
+
+        def enqueue(value: RestartRequest) -> None:
+            try:
+                with RestartRequestStore(path) as store:
+                    barrier.wait()
+                    results.append(store.enqueue(value))
+            except BaseException as error:
+                results.append(type(error))
+
+        threads = [threading.Thread(target=enqueue, args=(value,)) for value in requests]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return results
+
+    duplicates = race(tmp_path / "duplicates.sqlite3", (request, request))
+    competing = race(
+        tmp_path / "competing.sqlite3",
+        (request, request.model_copy(update={"request_id": "competitor"})),
+    )
+
+    assert sorted(duplicates) == [False, True]
+    assert competing.count(True) == 1
+    assert competing.count(OperationInProgress) == 1
+
+
+def test_restart_completion_requires_the_claimed_planned_replacement_generation(
+    tmp_path: Path,
+):
+    store = RestartRequestStore(tmp_path / "controller-restarts.sqlite3")
+    request = RestartRequest(
+        request_id="restart-exact-replacement",
+        target=target(),
+        expected_conversation_id=ADVISOR_ID,
+        expected_restart_control_token="restart-1",
+        expected_worker_generation=1,
+        expected_completed_turns=4,
+    )
+    store.enqueue(request)
+    completion = RestartCompletion(
+        request_id=request.request_id,
+        target=request.target,
+        conversation_id=request.expected_conversation_id,
+        source_generation=1,
+        replacement_generation=2,
+        state_preserved=True,
+        compute_preserved=True,
+    )
+
+    with pytest.raises(OperationInvariantError, match="claimed"):
+        store.complete(completion)
+    store.claim_next(
+        request.target,
+        worker_generation=1,
+        replacement_generation=2,
+    )
+    with pytest.raises(OperationInvariantError, match="unplanned generation"):
+        store.complete(completion.model_copy(update={"replacement_generation": 3}))
+
+    assert store.complete(completion) is True
+
+
+def test_legacy_restart_receipt_json_remains_readable_but_is_not_a_queue_ack():
+    legacy = RestartReceipt.model_validate_json(
+        json.dumps(
+            {
+                "kind": "restart",
+                "target": target().model_dump(mode="json"),
+                "conversation_id": str(ADVISOR_ID),
+                "state_preserved": True,
+                "compute_preserved": True,
+            }
+        )
+    )
+
+    assert legacy.state_preserved is True
+    assert legacy.compute_preserved is True
+    assert legacy.status is None
+    assert legacy.request_id is None
+    assert legacy.expected_worker_generation is None
 
 
 def test_context_reset_queues_an_owner_consumed_compare_and_reset_request(

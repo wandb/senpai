@@ -24,8 +24,12 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 
 from senpai_agent.github.http import GitHubReader
 from senpai_agent.models import Contract
-from senpai_agent.operations import OperationAuditRecord, OperationLedger
-from senpai_agent.operations import ContextResetStatus
+from senpai_agent.operations import (
+    ContextResetStatus,
+    OperationAuditRecord,
+    OperationLedger,
+    RestartStatus,
+)
 from senpai_agent.secrets import (
     SUPERVISOR_SECRET_DIR_ENV,
     consume_supervisor_secret_directory,
@@ -230,6 +234,10 @@ class RoleRuntimeObservation(Contract):
     ] = ()
     context_resets: Annotated[
         tuple[ContextResetStatus, ...],
+        Field(max_length=20),
+    ] = ()
+    controller_restarts: Annotated[
+        tuple[RestartStatus, ...],
         Field(max_length=20),
     ] = ()
     stats: MachineStats | None = None
@@ -1125,6 +1133,12 @@ def _trend_view(snapshot: CampaignSnapshot) -> dict[str, object]:
                 "completed_turns": runtime.completed_turns,
                 "running_training_count": runtime.running_training_count,
                 "active_delegation_count": runtime.active_delegation_count,
+                "controller_restart_count": len(runtime.controller_restarts),
+                "latest_controller_restart": (
+                    runtime.controller_restarts[0].model_dump(mode="json")
+                    if runtime.controller_restarts
+                    else None
+                ),
                 "recent_error_count": len(runtime.recent_errors),
                 "recent_error_markers": _error_trend(runtime.recent_errors),
             }
