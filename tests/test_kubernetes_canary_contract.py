@@ -474,6 +474,14 @@ def test_live_canary_proves_role_quiescence_and_poisoned_root_recovery():
     assert "ROLE_SHELL=/usr/local/bin/senpai-role-shell" in script
 
 
+def test_live_canary_uses_a_kubernetes_compatible_lease_expiry_timestamp():
+    """The API server's Lease schema requires fractional RFC3339 seconds."""
+
+    script = (ROOT / "scripts" / "test-kubernetes-canary.sh").read_text()
+
+    assert '"renewTime":"1970-01-01T00:00:00.000000Z"' in script
+
+
 def test_docs_state_shared_pod_loopback_and_fail_closed_repair_gate():
     """Do not overclaim sidecar isolation; make repair quiescence explicit."""
 

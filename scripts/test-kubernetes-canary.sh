@@ -307,7 +307,7 @@ expire_supervisor_rollback_lease() {
   local tag=$1
   kubectl_canary patch lease -n "$NAMESPACE" \
     "senpai-supervisor-release-$tag" --type=merge \
-    -p '{"spec":{"leaseDurationSeconds":1,"renewTime":"1970-01-01T00:00:00Z"}}' \
+    -p '{"spec":{"leaseDurationSeconds":1,"renewTime":"1970-01-01T00:00:00.000000Z"}}' \
     >/dev/null
 }
 
