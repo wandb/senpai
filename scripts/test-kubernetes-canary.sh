@@ -55,6 +55,60 @@ if actual != expected:
 ' "$1" "$2"
 }
 
+collect_role_container_logs() {
+  local pods="$DIAGNOSTICS_DIR/role-pods.json"
+  local inventory="$DIAGNOSTICS_DIR/container-restarts.tsv"
+  if ! kubectl_canary get pods -n "$NAMESPACE" -o json > "$pods" 2>&1; then
+    return
+  fi
+  if ! "$PYTHON_BIN" -c '
+import json
+import pathlib
+import sys
+
+document = json.loads(pathlib.Path(sys.argv[1]).read_text())
+print("pod\trole\tcontainer\trestart_count\tprevious_exit_code\tprevious_reason\tprevious_finished_at")
+for pod in document.get("items", []):
+    metadata = pod.get("metadata", {})
+    role = metadata.get("labels", {}).get("role")
+    if role not in {"advisor", "student", "supervisor"}:
+        continue
+    pod_name = metadata.get("name")
+    if not isinstance(pod_name, str):
+        continue
+    for status in pod.get("status", {}).get("containerStatuses", []):
+        container = status.get("name")
+        restarts = status.get("restartCount")
+        if not isinstance(container, str) or not isinstance(restarts, int):
+            continue
+        terminated = status.get("lastState", {}).get("terminated", {})
+        fields = (
+            pod_name,
+            role,
+            container,
+            str(restarts),
+            str(terminated.get("exitCode", "")),
+            str(terminated.get("reason", "")),
+            str(terminated.get("finishedAt", "")),
+        )
+        print("\t".join(value.replace("\t", " ").replace("\n", " ") for value in fields))
+' "$pods" > "$inventory" 2> "$DIAGNOSTICS_DIR/container-restarts.error.txt"; then
+    return
+  fi
+
+  while IFS=$'\t' read -r pod role container restarts _exit _reason _finished; do
+    [[ "$pod" != pod ]] || continue
+    local prefix="$DIAGNOSTICS_DIR/$pod.$container"
+    kubectl_canary logs -n "$NAMESPACE" "pod/$pod" -c "$container" \
+      --timestamps=true --tail=2000 > "$prefix.current.log" 2>&1 || true
+    if (( restarts > 0 )); then
+      kubectl_canary logs -n "$NAMESPACE" "pod/$pod" -c "$container" \
+        --previous --timestamps=true --tail=2000 \
+        > "$prefix.previous.log" 2>&1 || true
+    fi
+  done < "$inventory"
+}
+
 collect_diagnostics() {
   mkdir -p "$DIAGNOSTICS_DIR"
   if [[ "$CLUSTER_CREATED" == true ]]; then
@@ -64,14 +118,7 @@ collect_diagnostics() {
       > "$DIAGNOSTICS_DIR/events.txt" 2>&1 || true
     kubectl_canary describe deployment,pod -n "$NAMESPACE" \
       > "$DIAGNOSTICS_DIR/describe.txt" 2>&1 || true
-    for deployment in \
-      "senpai-advisor-$TAG" \
-      "senpai-$TAG-fern" \
-      "senpai-supervisor-$TAG"; do
-      kubectl_canary logs -n "$NAMESPACE" "deployment/$deployment" \
-        --all-containers --prefix --tail=500 \
-        > "$DIAGNOSTICS_DIR/${deployment}.log" 2>&1 || true
-    done
+    collect_role_container_logs || true
     "$DOCKER_BIN" logs "$NODE" > "$DIAGNOSTICS_DIR/kind-node.log" 2>&1 || true
   fi
 }

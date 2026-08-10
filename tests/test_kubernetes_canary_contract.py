@@ -378,6 +378,24 @@ def test_live_canary_covers_terminal_and_durable_operation_recovery():
     assert "repair replay executed twice" in script
 
 
+def test_failure_diagnostics_preserve_current_and_previous_container_logs():
+    """A restart must not erase the exception emitted by the prior container."""
+
+    script = (ROOT / "scripts" / "test-kubernetes-canary.sh").read_text()
+    cleanup = script.split("cleanup() {", 1)[1].split("trap cleanup EXIT", 1)[0]
+
+    assert "container-restarts.tsv" in script
+    assert "containerStatuses" in script
+    assert '{"advisor", "student", "supervisor"}' in script
+    assert 'if (( restarts > 0 )); then' in script
+    assert '"$prefix.current.log"' in script
+    assert '"$prefix.previous.log"' in script
+    assert "--previous --timestamps=true --tail=2000" in script
+    assert cleanup.index("collect_diagnostics") < cleanup.index(
+        "delete deployment,pod"
+    )
+
+
 def test_live_canary_proves_role_quiescence_and_poisoned_root_recovery():
     """The cluster gate must reproduce the production-only pause/restart risks."""
 
