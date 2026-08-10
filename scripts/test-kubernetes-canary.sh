@@ -31,9 +31,20 @@ PV="senpai-ci-$TAG"
 STATE_PV="$PV-supervisor-state"
 NODE="$CLUSTER-control-plane"
 DIAGNOSTICS_DIR=${DIAGNOSTICS_DIR:-$ROOT/.canary-diagnostics}
-PYTHON_BIN=${PYTHON_BIN:-python3}
+if [[ -z ${PYTHON_BIN:-} ]]; then
+  if [[ -x "$ROOT/.venv/bin/python" ]]; then
+    PYTHON_BIN="$ROOT/.venv/bin/python"
+  else
+    PYTHON_BIN=python3
+  fi
+fi
+"$PYTHON_BIN" -c 'import yaml' >/dev/null 2>&1 || {
+  echo "PYTHON_BIN must provide PyYAML for the Kubernetes canary" >&2
+  exit 2
+}
 ROLE_SHELL=/usr/local/bin/senpai-role-shell
-WORK_DIR=$(mktemp -d)
+TEMP_ROOT=$(cd "${TMPDIR:-/tmp}" && pwd -P)
+WORK_DIR=$(mktemp -d "$TEMP_ROOT/senpai-kubernetes-canary.XXXXXX")
 INITIAL_MANIFEST="$WORK_DIR/initial.yaml"
 UPGRADE_MANIFEST="$WORK_DIR/broken-upgrade.yaml"
 CLUSTER_CREATED=false
