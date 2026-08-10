@@ -1566,7 +1566,9 @@ def main():
                 )
                 print(
                     "ERROR: operational supervisor rollout failed: "
-                    f"{error}\nRollback: {rollback}",
+                    f"{error}\nDeployment template only: {rollback}\n"
+                    "This does not revert RBAC, NetworkPolicy, or persistent state; "
+                    "reapply the retained prior release manifest if those changed.",
                     file=sys.stderr,
                 )
                 raise SystemExit(
@@ -1593,6 +1595,13 @@ def main():
             print(
                 f"  {kubectl} logs -f "
                 f"deployment/senpai-{args.tag}-{student_list[0]}"
+            )
+        if args.operational_supervisor:
+            print("\nDisable only the operational supervisor")
+            print("(advisor/student pods and host capacity stay running):")
+            print(
+                f"  {kubectl} delete deployment/"
+                f"senpai-supervisor-{args.tag}"
             )
         print("\nStop:")
         print(

@@ -729,6 +729,7 @@ def test_incremental_supervisor_cannot_change_the_advisor_student_inventory(
 
 def test_supervisor_only_launch_preserves_role_secret_and_uses_immutable_bundle(
     monkeypatch,
+    capsys,
 ):
     args = supervisor_launch_args(
         advisor=False,
@@ -819,6 +820,13 @@ def test_supervisor_only_launch_preserves_role_secret_and_uses_immutable_bundle(
             "--timeout=900s",
         ]
     ]
+    output = capsys.readouterr().out
+    assert "Disable only the operational supervisor" in output
+    assert (
+        "kubectl --namespace senpai-test-track delete "
+        "deployment/senpai-supervisor-test-track"
+    ) in output
+    assert "advisor/student pods and host capacity stay running" in output
 
 
 def test_supervisor_only_upgrade_skips_role_credentials_and_repo_setup(monkeypatch):
@@ -1008,6 +1016,8 @@ def test_supervisor_rollout_failure_surfaces_exact_rollback_command(
         "kubectl --context gpu-cluster --namespace senpai-test-track rollout undo "
         "deployment/senpai-supervisor-test-track"
     ) in output.err
+    assert "Deployment template only" in output.err
+    assert "does not revert RBAC, NetworkPolicy, or persistent state" in output.err
 
 
 def test_supervisor_rejects_an_extra_exact_tag_advisor(monkeypatch):
