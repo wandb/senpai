@@ -30,4 +30,4 @@ if [ "${SENPAI_SKIP_EDITABLE_INSTALL:-0}" != "1" ]; then
     uv pip install --python "$SENPAI_PYTHON" --no-deps -e .
 fi
 
-exec python -m senpai_agent.operational_supervisor run
+exec /usr/local/bin/senpai-run-controller operational-supervisor

@@ -24,7 +24,7 @@ case "$started:$grace_seconds" in
         ;;
 esac
 
-if python -m senpai_agent.supervisor health "$lease_path"; then
+if /usr/local/bin/senpai-run-controller health "$lease_path"; then
     rm -f "$failure_path"
     exit 0
 fi

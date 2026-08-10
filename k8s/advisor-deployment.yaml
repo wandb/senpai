@@ -106,7 +106,7 @@ spec:
             command:
             - /bin/sh
             - -c
-            - python -m senpai_agent.supervisor health "/var/lib/senpai/$RESEARCH_TAG/advisor/openhands_state/controller-lease.json"
+            - /usr/local/bin/senpai-container-health "/var/lib/senpai/$RESEARCH_TAG/advisor/openhands_state/controller-lease.json"
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 60
@@ -115,7 +115,7 @@ spec:
             command:
             - /bin/sh
             - -c
-            - python -m senpai_agent.supervisor health "/var/lib/senpai/$RESEARCH_TAG/advisor/openhands_state/controller-lease.json"
+            - /usr/local/bin/senpai-container-health "/var/lib/senpai/$RESEARCH_TAG/advisor/openhands_state/controller-lease.json"
           periodSeconds: 30
           timeoutSeconds: 5
           failureThreshold: 5

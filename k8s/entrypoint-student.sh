@@ -113,4 +113,4 @@ if [ -z "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
 fi
 unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS
 rm -f "$GIT_ASKPASS_FILE"
-exec python -m senpai_agent.supervisor student
+exec /usr/local/bin/senpai-run-controller student

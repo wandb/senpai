@@ -29,10 +29,15 @@ if [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
 fi
 : "${GITHUB_TOKEN:?GitHub bootstrap token is required}"
 export SENPAI_OPENHANDS_STATE_DIR="$LOGDIR/openhands_state"
-export SENPAI_OPENHANDS_ROLE_FILE="$LOGDIR/ADVISOR.md"
-envsubst '$PROBLEM_DIR $TARGET_REPO_URL $GH_REPO $ADVISOR_BRANCH $RESEARCH_TAG $GPUS_PER_STUDENT $WANDB_ENTITY $WANDB_PROJECT' \
-    < "$WORKDIR/system_instructions/ADVISOR.md" \
-    > "$SENPAI_OPENHANDS_ROLE_FILE"
+if [ -n "${SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE:-}" ]; then
+    export SENPAI_OPENHANDS_ROLE_FILE="$SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE"
+    [ -f "$SENPAI_OPENHANDS_ROLE_FILE" ] && [ ! -L "$SENPAI_OPENHANDS_ROLE_FILE" ]
+else
+    export SENPAI_OPENHANDS_ROLE_FILE="$LOGDIR/ADVISOR.md"
+    envsubst '$PROBLEM_DIR $TARGET_REPO_URL $GH_REPO $ADVISOR_BRANCH $RESEARCH_TAG $GPUS_PER_STUDENT $WANDB_ENTITY $WANDB_PROJECT' \
+        < "$WORKDIR/system_instructions/ADVISOR.md" \
+        > "$SENPAI_OPENHANDS_ROLE_FILE"
+fi
 
 echo "=== Senpai Advisor ==="
 echo "Runner repo:  $REPO_URL (revision: $REPO_REVISION)"
@@ -74,7 +79,7 @@ clone_target_repo() {
             git push -u origin "$ADVISOR_BRANCH"
             cd "$WORKDIR"
             ;;
-        repo) git clone "$TARGET_REPO_URL" "$PROBLEM_DIR" ;;
+        repo) git clone "$TARGET_REPO_URL" "$TARGET_WORKDIR" ;;
         *) echo "ERROR: GH_HISTORY_SCOPE must be one of: branch, repo, fresh" >&2; exit 2 ;;
     esac
 }
@@ -156,4 +161,4 @@ if [ -z "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
 fi
 unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS
 rm -f "$GIT_ASKPASS_FILE"
-exec python -m senpai_agent.supervisor advisor
+exec /usr/local/bin/senpai-run-controller advisor

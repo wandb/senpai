@@ -340,6 +340,7 @@ def role_supervisor_replacements(
     image: str,
     configmap_name: str,
     secret_name: str,
+    role: str,
 ) -> dict[str, str]:
     """Render opt-in repair authority for roles managed by a supervisor."""
     if not args.operational_supervisor:
@@ -370,7 +371,7 @@ def role_supervisor_replacements(
         "ROLE_INIT_CONTAINERS": (
             "      initContainers:\n"
             f"{metadata_guard_init(image)}\n"
-            f"{runner_source_init(image, configmap_name, secret_name)}"
+            f"{runner_source_init(image, configmap_name, secret_name, role)}"
         ),
         "ROLE_BOOTSTRAP": '''          cd /workspace/senpai
           test "$(git rev-parse HEAD)" = "$REPO_REVISION"
@@ -458,8 +459,23 @@ def legacy_runner_bootstrap() -> str:
           test "$SENPAI_IMAGE_REVISION" = "$REPO_REVISION"'''
 
 
-def runner_source_init(image: str, configmap_name: str, secret_name: str) -> str:
+def runner_source_init(
+    image: str,
+    configmap_name: str,
+    secret_name: str,
+    role: str,
+) -> str:
     """Populate the pinned runner before mounting it read-only in a role."""
+    if role not in {"advisor", "student"}:
+        raise ValueError(f"unsupported role source init: {role}")
+    guidance = ""
+    if role == "advisor":
+        guidance = '''
+          mkdir -p /workspace/senpai/.senpai
+          envsubst '$PROBLEM_DIR $TARGET_REPO_URL $GH_REPO $ADVISOR_BRANCH $RESEARCH_TAG $GPUS_PER_STUDENT $WANDB_ENTITY $WANDB_PROJECT' \\
+            < /workspace/senpai/system_instructions/ADVISOR.md \\
+            > "$SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE"
+          chmod 0444 "$SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE"'''
     return f"""      - name: source
         image: {image}
         securityContext:
@@ -489,6 +505,7 @@ def runner_source_init(image: str, configmap_name: str, secret_name: str) -> str
           fi
           test "$(git -C /workspace/senpai rev-parse HEAD)" = "$REPO_REVISION"
           test "$SENPAI_IMAGE_REVISION" = "$REPO_REVISION"
+{guidance}
           rm -f "$askpass"
         envFrom:
         - configMapRef:
@@ -621,6 +638,7 @@ def render_student(
                 args.student_image,
                 student_configmap_name,
                 secret_name,
+                "student",
             ),
         },
     )
@@ -638,10 +656,15 @@ def render_advisor(
     spec = build_advisor_spec(args, tag, student_list, secrets={})
     advisor_configmap_name = f"senpai-config-advisor-{tag}"
     advisor_deployment_name = f"senpai-advisor-{tag}"
+    config_data = kubernetes_role_env(spec.env, args)
+    if args.operational_supervisor:
+        config_data["SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE"] = (
+            "/workspace/senpai/.senpai/ADVISOR.md"
+        )
     configmap = render_configmap(
         name=advisor_configmap_name,
         labels={"app": "senpai", "role": "advisor", "research-tag": tag},
-        data=kubernetes_role_env(spec.env, args),
+        data=config_data,
     )
     deployment = render_template(
         template,
@@ -664,6 +687,7 @@ def render_advisor(
                 args.advisor_image,
                 advisor_configmap_name,
                 secret_name,
+                "advisor",
             ),
         },
     )

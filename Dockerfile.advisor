@@ -12,6 +12,7 @@ ENV PATH="/opt/senpai-venv/bin:/home/senpai/.local/bin:${PATH}" \
     UV_PROJECT_ENVIRONMENT=/opt/senpai-venv \
     UV_PYTHON=/opt/senpai-venv/bin/python \
     UV_PYTHON_DOWNLOADS=never \
+    SENPAI_SKIP_EDITABLE_INSTALL=1 \
     BROWSER_USE_DISABLE_EXTENSIONS=1
 
 RUN apt-get update && \
@@ -50,6 +51,7 @@ RUN python -m pip install --no-cache-dir "uv==0.10.9" && \
 
 # Export from the project lock while pruning dependencies used only for training.
 COPY pyproject.toml uv.lock /tmp/senpai/
+COPY senpai_agent /tmp/senpai/senpai_agent
 RUN cd /tmp/senpai && \
     uv export --locked --python 3.13 --no-dev --no-emit-project \
       --format requirements.txt \
@@ -68,12 +70,13 @@ RUN cd /tmp/senpai && \
       --only-binary pydantic-core \
       --only-binary rpds-py \
       -r requirements.txt && \
-    python -c 'import importlib.metadata, importlib.util, openhands.sdk, sys; assert sys.version_info[:2] == (3, 13); assert importlib.util.find_spec("torch") is None; assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
-    chown -R 10001:10001 /opt/senpai-venv && \
+    uv pip install --python "$SENPAI_PYTHON" --no-deps /tmp/senpai && \
+    "$SENPAI_PYTHON" -I -c 'import importlib.metadata, importlib.util, openhands.sdk, sys; import senpai_agent; assert sys.version_info[:2] == (3, 13); assert importlib.util.find_spec("torch") is None; assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"; assert "/opt/senpai-venv/" in senpai_agent.__file__' && \
     rm -rf /root/.cache/uv
 
 COPY scripts/senpai-browser-smoke-test.py /usr/local/bin/senpai-browser-smoke-test
 COPY scripts/senpai-container-health.sh /usr/local/bin/senpai-container-health
+COPY scripts/senpai-run-controller.sh /usr/local/bin/senpai-run-controller
 COPY scripts/senpai-metadata-egress-guard.py /usr/local/bin/senpai-metadata-egress-guard
 COPY senpai_agent/repair_executor.py /usr/local/bin/senpai-repair-executor
 
@@ -86,6 +89,7 @@ RUN uvx --from "playwright==${PLAYWRIGHT_VERSION}" \
     ln -s "$chromium_path" /usr/local/bin/chromium && \
     chmod +x /usr/local/bin/senpai-browser-smoke-test \
       /usr/local/bin/senpai-container-health \
+      /usr/local/bin/senpai-run-controller \
       /usr/local/bin/senpai-metadata-egress-guard \
       /usr/local/bin/senpai-repair-executor && \
     mkdir -p /workspace /workspaces /var/lib/senpai && \
@@ -96,7 +100,7 @@ RUN uvx --from "playwright==${PLAYWRIGHT_VERSION}" \
 ENV HOME=/home/senpai
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10m --retries=5 \
-    CMD senpai-container-health \
+    CMD /usr/local/bin/senpai-container-health \
       "/var/lib/senpai/${RESEARCH_TAG}/advisor/openhands_state/controller-lease.json"
 
 WORKDIR /workspaces

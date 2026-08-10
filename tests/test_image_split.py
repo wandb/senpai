@@ -122,7 +122,20 @@ def test_both_images_expose_the_controller_lease_as_their_healthcheck():
         dockerfile = (ROOT / f"Dockerfile.{role}").read_text(encoding="utf-8")
 
         assert "HEALTHCHECK" in dockerfile
-        assert "CMD senpai-container-health" in dockerfile
+        assert "CMD /usr/local/bin/senpai-container-health" in dockerfile
+
+
+def test_role_images_install_an_immutable_isolated_control_runtime():
+    runner = (ROOT / "scripts" / "senpai-run-controller.sh").read_text()
+    assert "exec /opt/senpai-venv/bin/python -I -m" in runner
+    for role in ("advisor", "student"):
+        dockerfile = (ROOT / f"Dockerfile.{role}").read_text()
+        assert "COPY senpai_agent /tmp/senpai/senpai_agent" in dockerfile
+        assert 'uv pip install --python "$SENPAI_PYTHON" --no-deps /tmp/senpai' in dockerfile
+        assert 'assert "/opt/senpai-venv/" in senpai_agent.__file__' in dockerfile
+        assert "chown -R 10001:10001 /opt/senpai-venv" not in dockerfile
+        assert 'chown -R 10001:10001 /opt/senpai-venv "$UV_PYTHON_INSTALL_DIR"' not in dockerfile
+        assert "SENPAI_SKIP_EDITABLE_INSTALL=1" in dockerfile
 
 
 def test_both_images_record_the_exact_source_revision():
@@ -220,7 +233,7 @@ def test_entrypoints_delegate_runtime_lifecycle_to_the_python_supervisor(
 
     assert logdir in entrypoint
     assert "serve-events" not in entrypoint
-    assert f"exec python -m senpai_agent.supervisor {role}" in entrypoint
+    assert f"exec /usr/local/bin/senpai-run-controller {role}" in entrypoint
     assert "wait_for_senpai_start_gate" not in entrypoint
     trust_runner = 'git config --global safe.directory "$WORKDIR"'
     assert entrypoint.index(trust_runner) < entrypoint.index(
@@ -232,7 +245,7 @@ def test_entrypoints_delegate_runtime_lifecycle_to_the_python_supervisor(
         "-c",
     ]
     assert (
-        "senpai_agent.supervisor health"
+        "/usr/local/bin/senpai-container-health"
         in container["livenessProbe"]["exec"]["command"][2]
     )
     assert deployment["spec"]["strategy"] == {"type": "Recreate"}
@@ -267,7 +280,7 @@ def test_bootstrap_git_credentials_are_not_exposed_in_process_arguments():
     for role in ("advisor", "student"):
         container = container_for(load_kubernetes_template(f"{role}-deployment.yaml"))
         assert (
-            "senpai_agent.supervisor health"
+            "/usr/local/bin/senpai-container-health"
             in container["startupProbe"]["exec"]["command"][2]
         )
         assert container["startupProbe"]["failureThreshold"] == 60

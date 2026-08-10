@@ -156,12 +156,50 @@ def test_initial_canary_manifest_uses_dummy_credentials_and_real_boundaries():
         for resources in container.get("resources", {}).values()
     )
 
+    embedded_source = (
+        "set -eu; cp -a /opt/senpai/. /workspace/senpai; "
+        "test -f /workspace/senpai/tests/kubernetes/canary.py"
+    )
+    for pod in (advisor_pod, student_pod):
+        source = next(
+            container
+            for container in pod["initContainers"]
+            if container["name"] == "source"
+        )
+        assert source["args"][0].startswith(embedded_source)
+        assert "env" not in source
+        assert source["envFrom"] == [
+            {"configMapRef": {"name": source["envFrom"][0]["configMapRef"]["name"]}}
+        ]
+    advisor_source = next(
+        container
+        for container in advisor_pod["initContainers"]
+        if container["name"] == "source"
+    )
+    assert "envsubst" in advisor_source["args"][0]
+    assert "SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE" in advisor_source["args"][0]
+    assert advisor_pod["containers"][0]["envFrom"]
+
     _secret, _config, supervisor = supervisor_bundle(documents)
     supervisor_pod = supervisor["spec"]["template"]["spec"]
     assert {container["name"] for container in supervisor_pod["containers"]} == {
         "supervisor-control",
         "supervisor-shell",
     }
+    supervisor_source = next(
+        container
+        for container in supervisor_pod["initContainers"]
+        if container["name"] == "source"
+    )
+    assert supervisor_source["args"] == [embedded_source]
+    assert "env" not in supervisor_source
+    assert supervisor_source["envFrom"] == [
+        {
+            "configMapRef": {
+                "name": supervisor_source["envFrom"][0]["configMapRef"]["name"]
+            }
+        }
+    ]
     shell = next(
         container
         for container in supervisor_pod["containers"]

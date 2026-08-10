@@ -36,6 +36,30 @@ def _container(pod: dict, name: str) -> dict:
         ) from error
 
 
+def _use_embedded_source(pod: dict, *, render_advisor_guidance: bool = False) -> None:
+    """Make the canary's production source init local and credential-free."""
+
+    source = next(
+        container for container in pod["initContainers"] if container["name"] == "source"
+    )
+    source["command"] = ["/bin/bash", "-c"]
+    command = (
+        "set -eu; cp -a /opt/senpai/. /workspace/senpai; "
+        "test -f /workspace/senpai/tests/kubernetes/canary.py"
+    )
+    if render_advisor_guidance:
+        command += (
+            "; mkdir -p /workspace/senpai/.senpai; "
+            "envsubst '$PROBLEM_DIR $TARGET_REPO_URL $GH_REPO $ADVISOR_BRANCH "
+            "$RESEARCH_TAG $GPUS_PER_STUDENT $WANDB_ENTITY $WANDB_PROJECT' "
+            "< /workspace/senpai/system_instructions/ADVISOR.md "
+            "> \"$SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE\"; "
+            "chmod 0444 \"$SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE\""
+        )
+    source["args"] = [command]
+    source.pop("env", None)
+
+
 def _namespace(name: str) -> dict:
     return {
         "apiVersion": "v1",
@@ -148,6 +172,9 @@ def _render_advisor(namespace: str, tag: str, image: str, revision: str) -> list
         {
             "SENPAI_ROLE": "advisor",
             "SENPAI_OPENHANDS_STATE_DIR": state_dir,
+            "SENPAI_OPENHANDS_ROLE_FILE": config["data"][
+                "SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE"
+            ],
         }
     )
     deployment = next(
@@ -164,6 +191,7 @@ def _render_advisor(namespace: str, tag: str, image: str, revision: str) -> list
             "containers before the Kubernetes canary can run"
         )
     advisor = _container(pod, "advisor")
+    _use_embedded_source(pod, render_advisor_guidance=True)
     advisor["command"] = ["python", "/opt/senpai/tests/kubernetes/canary.py"]
     advisor["args"] = [
         "role-owner",
@@ -250,16 +278,7 @@ def _render_student(namespace: str, tag: str, image: str, revision: str) -> list
     repair["resources"]["requests"].update(cpu="50m", memory="64Mi")
     repair["resources"]["limits"].update(cpu="500m", memory="256Mi")
     pod.pop("tolerations", None)
-    source = next(
-        container for container in pod["initContainers"] if container["name"] == "source"
-    )
-    source["command"] = ["/bin/bash", "-c"]
-    source["args"] = [
-        "set -eu; cp -a /opt/senpai/. /workspace/senpai; "
-        "test -f /workspace/senpai/tests/kubernetes/canary.py"
-    ]
-    source.pop("env", None)
-    source.pop("envFrom", None)
+    _use_embedded_source(pod)
     for document in rendered:
         document.setdefault("metadata", {}).setdefault("namespace", namespace)
     return rendered
@@ -311,16 +330,7 @@ def _render_supervisor(
             "production supervisor must contain isolated control and shell "
             "containers before the Kubernetes canary can run"
         )
-    source = next(
-        container for container in pod["initContainers"] if container["name"] == "source"
-    )
-    source["command"] = ["/bin/bash", "-c"]
-    source["args"] = [
-        "set -eu; cp -a /opt/senpai/. /workspace/senpai; "
-        "test -f /workspace/senpai/tests/kubernetes/canary.py"
-    ]
-    source.pop("env", None)
-    source.pop("envFrom", None)
+    _use_embedded_source(pod)
     control = _container(pod, "supervisor-control")
     if broken:
         control["command"] = ["/bin/bash", "-c"]
@@ -504,6 +514,44 @@ def role_owner(args: argparse.Namespace) -> int:
         f"{args.role}-target-workspace\n",
         encoding="utf-8",
     )
+    (target_dir / "sitecustomize.py").write_text(
+        "from pathlib import Path\n"
+        "Path('/tmp/senpai-sitecustomize-poisoned').write_text('poisoned')\n",
+        encoding="utf-8",
+    )
+    fake_python = target_dir / "python"
+    fake_python.write_text(
+        "#!/bin/sh\nprintf poisoned > /tmp/senpai-path-poisoned\nexit 99\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    if args.role == "advisor":
+        from openhands.sdk.event import MessageEvent
+        from openhands.sdk.event.types import ROOT_PARENT_ID
+        from openhands.sdk.llm import Message, TextContent
+
+        (state_dir / "advisor-conversation-id").write_text(
+            f"{CANARY_CONVERSATION_ID}\n",
+            encoding="utf-8",
+        )
+        events_dir = state_dir / CANARY_CONVERSATION_ID.hex / "events"
+        events_dir.mkdir(parents=True)
+        event = MessageEvent(
+            source="agent",
+            parent_id=ROOT_PARENT_ID,
+            llm_message=Message(
+                role="assistant",
+                content=[TextContent(text="Canary research remains mechanism-led.")],
+            ),
+        )
+        (events_dir / f"event-00000-{event.id}.json").write_text(
+            event.model_dump_json(exclude_none=True),
+            encoding="utf-8",
+        )
+        (state_dir / CANARY_CONVERSATION_ID.hex / "base_state.json").write_text(
+            json.dumps({"leaf_event_id": str(event.id)}),
+            encoding="utf-8",
+        )
     command = (
         sys.executable,
         str(Path(__file__).resolve()),
@@ -571,6 +619,13 @@ def probe_control(args: argparse.Namespace) -> int:
         namespace=args.namespace,
         environment=os.environ,
     )
+    research_tail = backend.collect_advisor_research_tail()
+    if (
+        "# Research Advisor" not in research_tail.advisor_guidance
+        or research_tail.messages[-1].summary
+        != "Canary research remains mechanism-led."
+    ):
+        raise RuntimeError("immutable advisor guidance was not collected faithfully")
     results = []
     for target in (
         RoleTarget(research_tag=args.tag, role="advisor"),

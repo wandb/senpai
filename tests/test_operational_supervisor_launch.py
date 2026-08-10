@@ -360,6 +360,12 @@ def test_supervised_roles_have_protocol_bound_repair_of_the_target_workspace():
         ]
         assert "git init /workspace/senpai" in source["args"][0]
         assert "git init /workspace/senpai" not in main["args"][0]
+        if role == "advisor":
+            assert config["SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE"] == (
+                "/workspace/senpai/.senpai/ADVISOR.md"
+            )
+            assert "envsubst" in source["args"][0]
+            assert '"$SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE"' in source["args"][0]
         assert repair["command"] == [
             "/usr/local/bin/senpai-repair-executor",
             "serve",
@@ -429,6 +435,14 @@ def test_unsupervised_roles_do_not_expose_repair_execution_or_policy_labels():
         assert "senpai-supervisor-access" not in pod["metadata"]["labels"]
 
 
+def test_advisor_clone_modes_always_use_the_explicit_target_workdir():
+    entrypoint = (ROOT / "k8s" / "entrypoint-advisor.sh").read_text()
+
+    assert 'repo) git clone "$TARGET_REPO_URL" "$TARGET_WORKDIR" ;;' in entrypoint
+    assert 'git clone "$TARGET_REPO_URL" "$PROBLEM_DIR"' not in entrypoint
+    assert entrypoint.count('"$TARGET_REPO_URL" "$TARGET_WORKDIR"') == 3
+
+
 def test_supervisor_config_carries_exact_campaign_inventory_and_cadence():
     documents, _secret = rendered_supervisor(
         launch_args(
@@ -485,7 +499,9 @@ def test_supervisor_hands_off_and_unsets_credentials_before_python():
     scrub = handoff_script.index("unset GITHUB_TOKEN")
     assert handoff < scrub
     assert entrypoint.index("handoff_operational_supervisor_secrets") < (
-        entrypoint.index("exec python -m senpai_agent.operational_supervisor run")
+        entrypoint.index(
+            "exec /usr/local/bin/senpai-run-controller operational-supervisor"
+        )
     )
 
 

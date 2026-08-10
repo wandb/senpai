@@ -266,6 +266,16 @@ def advisor_research_tail(
     if not role_file_value:
         raise RuntimeError("SENPAI_OPENHANDS_ROLE_FILE is required")
     role_file = Path(role_file_value)
+    immutable_guidance_value = env.get(
+        "SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE", ""
+    ).strip()
+    immutable_guidance = Path(immutable_guidance_value) if immutable_guidance_value else None
+    if (
+        env.get("SENPAI_IMMUTABLE_RUNNER") != "1"
+        or immutable_guidance is None
+        or role_file.absolute() != immutable_guidance.absolute()
+    ):
+        raise RuntimeError("research review requires immutable advisor guidance")
     if role_file.is_symlink() or not role_file.is_file():
         raise RuntimeError("the deployed advisor guidance must be a regular file")
     before_guidance = role_file.stat()
@@ -275,6 +285,7 @@ def advisor_research_tail(
     if (
         len(advisor_guidance) > 32_000
         or not advisor_guidance.strip()
+        or before_guidance.st_mode & 0o222
         or (
             before_guidance.st_dev,
             before_guidance.st_ino,

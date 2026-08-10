@@ -48,7 +48,10 @@ collect_diagnostics() {
       > "$DIAGNOSTICS_DIR/events.txt" 2>&1 || true
     kubectl_canary describe deployment,pod -n "$NAMESPACE" \
       > "$DIAGNOSTICS_DIR/describe.txt" 2>&1 || true
-    for deployment in "senpai-advisor-$TAG" "senpai-supervisor-$TAG"; do
+    for deployment in \
+      "senpai-advisor-$TAG" \
+      "senpai-$TAG-fern" \
+      "senpai-supervisor-$TAG"; do
       kubectl_canary logs -n "$NAMESPACE" "deployment/$deployment" \
         --all-containers --prefix --tail=500 \
         > "$DIAGNOSTICS_DIR/${deployment}.log" 2>&1 || true
@@ -210,6 +213,38 @@ SUPERVISOR="deployment/senpai-supervisor-$TAG"
 ADVISOR="deployment/senpai-advisor-$TAG"
 STUDENT="deployment/senpai-$TAG-fern"
 ROLE_SECRET="senpai-launch-secrets-$TAG"
+
+# Trusted controller code and dependencies are image-installed and immutable to
+# the role UID. A malicious target cwd/PATH/PYTHONPATH cannot affect liveness.
+for role_spec in \
+  "$ADVISOR:advisor:/workspace/target:/var/lib/senpai/$TAG/advisor/openhands_state/controller-lease.json" \
+  "$STUDENT:student:/workspace/target:/var/lib/senpai/openhands_state/controller-lease.json"; do
+  IFS=: read -r deployment container target lease <<EOF
+$role_spec
+EOF
+  kubectl_canary exec -n "$NAMESPACE" "$deployment" -c "$container" -- \
+    /bin/sh -c '
+      set -eu
+      test ! -w /opt/senpai-venv/bin/python
+      package=$(/opt/senpai-venv/bin/python -I -c \
+        "import pathlib,senpai_agent; print(pathlib.Path(senpai_agent.__file__).parent)")
+      case "$package" in /opt/senpai-venv/*) ;; *) exit 1 ;; esac
+      test ! -w "$package"
+      cd "$1"
+      PATH="$1:$PATH" PYTHONPATH="$1" \
+        /usr/local/bin/senpai-container-health "$2"
+      test ! -e /tmp/senpai-path-poisoned
+      test ! -e /tmp/senpai-sitecustomize-poisoned
+    ' -- "$target" "$lease"
+done
+kubectl_canary exec -n "$NAMESPACE" "$ADVISOR" -c advisor -- \
+  /bin/sh -c '
+    test "$SENPAI_OPENHANDS_ROLE_FILE" = \
+      "$SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE"
+    test -f "$SENPAI_OPENHANDS_ROLE_FILE"
+    test ! -w "$SENPAI_OPENHANDS_ROLE_FILE"
+    grep -q "# Research Advisor" "$SENPAI_OPENHANDS_ROLE_FILE"
+  '
 
 # Prove the decoy itself is reachable from an ordinary, unselected pod. If
 # this fails, later denials would not demonstrate policy enforcement.
