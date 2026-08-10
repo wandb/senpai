@@ -737,46 +737,36 @@ class NativeLifecycleTests(NativeTmuxTestCase):
             uninstall.assert_not_called()
             self.assertTrue(run_path.exists())
 
-    def test_terminate_retry_skips_a_role_already_removed_from_root_inventory(self):
+    def test_terminate_retry_boots_out_a_loaded_job_after_its_plist_was_removed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "runs"
             run_path, manifest = self.write_manifest(root)
-            manifest["roles"].append(
-                {
-                    "key": "student-tanjiro",
-                    "label": "com.wandb.senpai.mlxfast-r1.student-tanjiro",
-                    "plist": (
-                        "/Library/LaunchDaemons/"
-                        "com.wandb.senpai.mlxfast-r1.student-tanjiro.plist"
-                    ),
-                }
+            failed = SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="temporary bootout failure",
             )
-            (run_path / "manifest.json").write_text(json.dumps(manifest))
-            calls: list[str] = []
-            fern_attempts = 0
-
-            def uninstall(_domain, role):
-                nonlocal fern_attempts
-                calls.append(role["key"])
-                if role["key"] == "student-fern":
-                    fern_attempts += 1
-                    if fern_attempts == 1:
-                        raise RuntimeError("temporary bootout failure")
+            completed = SimpleNamespace(returncode=0, stdout="", stderr="")
 
             with (
                 patch.object(
                     native_backend,
                     "_installed_role_keys",
                     side_effect=(
-                        {"student-fern", "student-tanjiro"},
                         {"student-fern"},
+                        set(),
                     ),
                 ),
                 patch.object(
                     native_backend,
-                    "_uninstall_recorded_role",
-                    side_effect=uninstall,
+                    "_job_state",
+                    return_value=("running", 42),
                 ),
+                patch.object(
+                    native_backend,
+                    "_sudo_run",
+                    side_effect=(failed, completed, completed, completed),
+                ) as sudo,
             ):
                 with self.assertRaisesRegex(RuntimeError, "temporary bootout failure"):
                     terminate_native("mlxfast-r1", str(root))
@@ -784,9 +774,19 @@ class NativeLifecycleTests(NativeTmuxTestCase):
 
                 terminate_native("mlxfast-r1", str(root))
 
+            bootouts = [
+                call.args[0]
+                for call in sudo.call_args_list
+                if call.args[0][1] == "bootout"
+            ]
+            self.assertEqual(len(bootouts), 2)
             self.assertEqual(
-                calls,
-                ["student-tanjiro", "student-fern", "student-fern"],
+                bootouts[0],
+                [
+                    "/bin/launchctl",
+                    "bootout",
+                    f"system/{manifest['roles'][0]['label']}",
+                ],
             )
             self.assertFalse(run_path.exists())
 
