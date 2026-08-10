@@ -61,6 +61,7 @@ from senpai_agent.protocols import (  # noqa: E402
     MANAGEMENT_PROTOCOL_VERSION,
     REPAIR_PROTOCOL_VERSION,
 )
+from senpai_agent.repair_executor import DEFAULT_EXECUTOR_SOCKET  # noqa: E402
 from senpai.launch.aws_backend import launch_aws, preflight_aws  # noqa: E402
 from senpai.launch.aws_mac_backend import (  # noqa: E402
     launch_aws_mac,
@@ -461,7 +462,7 @@ def role_supervisor_replacements(
           readOnlyRootFilesystem: true
           capabilities:
             drop: [ALL]
-        command: ["/opt/senpai-venv/bin/python", "-I", "/usr/local/bin/senpai-repair-executor", "serve", "--socket", "@senpai-repair-executor"]
+        command: ["/opt/senpai-venv/bin/python", "-I", "/usr/local/bin/senpai-repair-executor", "serve", "--socket", {json.dumps(DEFAULT_EXECUTOR_SOCKET)}]
         resources:
           requests:
             cpu: "250m"
@@ -473,13 +474,13 @@ def role_supervisor_replacements(
             ephemeral-storage: "12Gi"
         startupProbe:
           exec:
-            command: ["/opt/senpai-venv/bin/python", "-I", "/usr/local/bin/senpai-repair-executor", "health", "--socket", "@senpai-repair-executor"]
+            command: ["/opt/senpai-venv/bin/python", "-I", "/usr/local/bin/senpai-repair-executor", "health", "--socket", {json.dumps(DEFAULT_EXECUTOR_SOCKET)}]
           periodSeconds: 2
           timeoutSeconds: 2
           failureThreshold: 30
         livenessProbe:
           exec:
-            command: ["/opt/senpai-venv/bin/python", "-I", "/usr/local/bin/senpai-repair-executor", "health", "--socket", "@senpai-repair-executor"]
+            command: ["/opt/senpai-venv/bin/python", "-I", "/usr/local/bin/senpai-repair-executor", "health", "--socket", {json.dumps(DEFAULT_EXECUTOR_SOCKET)}]
           periodSeconds: 30
           timeoutSeconds: 2
           failureThreshold: 5
@@ -491,13 +492,19 @@ def role_supervisor_replacements(
         - name: repair-scratch
           mountPath: /repair/scratch
         - name: repair-tmp
-          mountPath: /tmp""",
+          mountPath: /tmp
+        - name: repair-executor-socket
+          mountPath: /run/senpai-repair-executor""",
         "REPAIR_VOLUMES": """      - name: repair-scratch
         emptyDir:
           sizeLimit: 4Gi
       - name: repair-tmp
         emptyDir:
-          sizeLimit: 8Gi""",
+          sizeLimit: 8Gi
+      - name: repair-executor-socket
+        emptyDir:
+          medium: Memory
+          sizeLimit: 1Mi""",
     }
 
 

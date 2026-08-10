@@ -13,6 +13,7 @@ import pytest
 
 import senpai_agent.repair_executor as repair_executor
 
+from senpai_agent.protocols import REPAIR_PROTOCOL_VERSION
 from senpai_agent.repair_executor import EXECUTOR_REQUEST_LIMIT_BYTES
 from senpai_agent.repair_executor import DEFAULT_EXECUTOR_SOCKET
 from senpai_agent.repair_executor import REPAIR_EXECUTOR_PROTOCOL
@@ -361,28 +362,19 @@ def test_executor_reaps_command_tree_after_request_worker_is_killed(tmp_path):
     assert not marker.exists()
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux abstract sockets")
-def test_default_executor_socket_cannot_be_poisoned_by_filesystem_state(tmp_path):
-    assert DEFAULT_EXECUTOR_SOCKET.startswith("@")
-    poisoned_legacy_path = tmp_path / "senpai-repair-executor.sock"
-    poisoned_legacy_path.mkdir()
-    (poisoned_legacy_path / "hostile").write_text("state")
-    server = multiprocessing.get_context("fork").Process(
-        target=_serve,
-        args=(DEFAULT_EXECUTOR_SOCKET,),
+def test_default_executor_socket_is_scoped_to_the_repair_only_mount():
+    assert DEFAULT_EXECUTOR_SOCKET == (
+        "/run/senpai-repair-executor/executor.sock"
     )
-    server.start()
-    time.sleep(0.1)
-    try:
-        result = RepairExecutorClient(DEFAULT_EXECUTOR_SOCKET).execute(
-            RepairExecutionRequest("true", tmp_path, 5)
-        )
-    finally:
-        server.terminate()
-        server.join(timeout=3)
-        if server.is_alive():
-            server.kill()
-            server.join(timeout=3)
+    assert REPAIR_EXECUTOR_PROTOCOL == REPAIR_PROTOCOL_VERSION
 
-    assert result["exit_code"] == 0
-    assert poisoned_legacy_path.is_dir()
+
+def test_filesystem_executor_socket_refuses_a_poisoned_non_socket_path(tmp_path):
+    socket_path = _test_socket(tmp_path, "poisoned")
+    socket_path.mkdir()
+    try:
+        with pytest.raises(repair_executor.RepairExecutorError, match="non-socket"):
+            RepairExecutorServer(socket_path).serve_forever()
+        assert socket_path.is_dir()
+    finally:
+        socket_path.rmdir()

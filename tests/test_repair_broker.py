@@ -27,6 +27,7 @@ from senpai_agent.repair_broker import (
 )
 from senpai_agent.protocols import REPAIR_PROTOCOL_VERSION
 from senpai_agent.repair_executor import (
+    DEFAULT_EXECUTOR_SOCKET,
     REPAIR_STREAM_LIMIT_BYTES,
     execute_local_repair,
 )
@@ -236,7 +237,8 @@ def test_kubectl_repair_transport_executes_only_the_repair_sidecar(monkeypatch):
         "/usr/local/bin/senpai-repair-executor",
         "client",
     )
-    assert "@senpai-repair-executor" in command
+    assert DEFAULT_EXECUTOR_SOCKET in command
+    assert DEFAULT_EXECUTOR_SOCKET.startswith("/run/senpai-repair-executor/")
     assert input_text == "env && git status"
     assert timeout == 105
 

@@ -359,7 +359,12 @@ def test_supervised_roles_have_protocol_bound_repair_of_the_target_workspace():
             "state",
             "repair-scratch",
             "repair-tmp",
+            "repair-executor-socket",
         }
+        assert "repair-executor-socket" not in main_mounts
+        assert repair_mounts["repair-executor-socket"]["mountPath"] == (
+            "/run/senpai-repair-executor"
+        )
         assert all(mount["mountPath"] != "/home/senpai" for mount in repair_mounts.values())
         assert repair_mounts["target-workspace"]["mountPath"] == "/repair/workspace"
         assert "runner" not in repair_mounts
@@ -390,7 +395,7 @@ def test_supervised_roles_have_protocol_bound_repair_of_the_target_workspace():
             "/usr/local/bin/senpai-repair-executor",
             "serve",
             "--socket",
-            "@senpai-repair-executor",
+            "/run/senpai-repair-executor/executor.sock",
         ]
         expected_health = [
             "/opt/senpai-venv/bin/python",
@@ -398,7 +403,7 @@ def test_supervised_roles_have_protocol_bound_repair_of_the_target_workspace():
             "/usr/local/bin/senpai-repair-executor",
             "health",
             "--socket",
-            "@senpai-repair-executor",
+            "/run/senpai-repair-executor/executor.sock",
         ]
         assert repair["startupProbe"]["exec"]["command"] == expected_health
         assert repair["livenessProbe"]["exec"]["command"] == expected_health
@@ -406,6 +411,10 @@ def test_supervised_roles_have_protocol_bound_repair_of_the_target_workspace():
         volumes = {volume["name"]: volume for volume in pod["volumes"]}
         assert volumes["repair-scratch"]["emptyDir"]["sizeLimit"] == "4Gi"
         assert volumes["repair-tmp"]["emptyDir"]["sizeLimit"] == "8Gi"
+        assert volumes["repair-executor-socket"]["emptyDir"] == {
+            "medium": "Memory",
+            "sizeLimit": "1Mi",
+        }
         dockerfile = (ROOT / f"Dockerfile.{role}").read_text()
         assert (
             "senpai_agent/repair_executor.py "
