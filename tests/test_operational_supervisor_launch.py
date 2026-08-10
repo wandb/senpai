@@ -10,15 +10,16 @@ from launch_test_support import (
 
 def rendered_supervisor(args=None):
     args = launch_args() if args is None else args
-    secret_name = f"senpai-launch-secrets-{args.tag}"
-    providers = launch.deployed_model_providers(args)
-    secret = launch_helpers.render_launch_secret(
+    provider = launch.model_provider(args.advisor_model)
+    provider_secret_name = (
+        None if provider == "wandb" else launch.MODEL_PROVIDERS[provider][1]
+    )
+    secret_name, secret = launch_helpers.render_supervisor_secret(
         args.tag,
         "github",
-        "exa",
         "wandb",
-        anthropic_api_key="anthropic" if "anthropic" in providers else None,
-        openai_api_key="openai" if "openai" in providers else None,
+        provider_secret_name=provider_secret_name,
+        provider_api_key=None if provider == "wandb" else provider,
     )
     template = (ROOT / "k8s" / "operational-supervisor-deployment.yaml").read_text()
     manifest = launch.render_operational_supervisor(
@@ -39,6 +40,7 @@ def test_supervisor_is_opt_in_with_fifteen_minute_and_six_hour_defaults():
     assert config["supervisor_dedicated_namespace"] is False
     assert config["supervisor_interval_s"] == 15 * 60
     assert config["supervisor_research_interval_s"] == 6 * 60 * 60
+    assert config["supervisor_ready_timeout_s"] == 15 * 60
 
 
 def test_supervisor_has_a_control_plane_specific_harness():

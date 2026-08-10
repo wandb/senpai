@@ -1,6 +1,8 @@
+import re
 import subprocess
 
 import pytest
+import yaml
 
 from launch_test_support import launch, launch_args, launch_helpers
 
@@ -145,6 +147,19 @@ def test_kubectl_default_scope_omits_an_empty_context():
     ]
 
 
+def test_content_addressed_names_fit_one_kubernetes_dns_label():
+    base = "senpai-supervisor-secrets-" + "long-campaign-" * 5
+
+    first = launch_helpers.content_addressed_name(base, {"token": "release-a"})
+    second = launch_helpers.content_addressed_name(base, {"token": "release-b"})
+
+    assert len(first) <= 63
+    assert re.fullmatch(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?", first)
+    assert first != second
+    assert first.rsplit("-", 1)[1].isalnum()
+    assert len(first.rsplit("-", 1)[1]) == 12
+
+
 def bypass_external_preflight(monkeypatch):
     for name, value in (
         ("resolve_github_token", "github"),
@@ -179,6 +194,46 @@ def supervisor_launch_args(**overrides):
         supervisor_dedicated_namespace=True,
         **overrides,
     )
+
+
+def compatible_existing_campaign(monkeypatch, args, students=("fern",)):
+    monkeypatch.setattr(
+        launch,
+        "existing_advisor_deployments",
+        lambda *_args, **_kwargs: [f"senpai-advisor-{args.tag}"],
+    )
+
+    def metadata(_tag, role, **_kwargs):
+        if role == "advisor":
+            return {
+                f"senpai-advisor-{args.tag}": {
+                    "senpai.wandb.com/source-revision": args.repo_revision,
+                    "senpai.wandb.com/advisor-branch": args.advisor_branch,
+                    "senpai.wandb.com/student-names": ",".join(students),
+                }
+            }
+        return {
+            student: {
+                "senpai.wandb.com/source-revision": args.repo_revision,
+                "senpai.wandb.com/advisor-branch": args.advisor_branch,
+            }
+            for student in students
+        }
+
+    monkeypatch.setattr(launch, "existing_role_metadata", metadata)
+
+
+def successful_kubectl(calls):
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="applied",
+            stderr="",
+        )
+
+    return run
 
 
 @pytest.mark.parametrize(
@@ -302,44 +357,195 @@ def test_incremental_supervisor_cannot_change_the_advisor_student_inventory(
     assert mutations == []
 
 
-def test_compatible_incremental_supervisor_launch_preserves_campaign_scope(
+def test_supervisor_only_launch_preserves_role_secret_and_uses_immutable_bundle(
     monkeypatch,
 ):
-    args = supervisor_launch_args(advisor=False, operational_supervisor=True)
+    args = supervisor_launch_args(
+        advisor=False,
+        operational_supervisor=True,
+        names="",
+        n_students=0,
+        advisor_model="openai/gpt-5.6-sol",
+        smart_model="anthropic/claude-opus-4-8",
+        fast_model="anthropic/claude-sonnet-4-6",
+        frontier_model="anthropic/claude-opus-4-8",
+    )
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
-    monkeypatch.setattr(
-        launch,
-        "existing_advisor_deployments",
-        lambda *_args, **_kwargs: ["senpai-advisor-test-track"],
-    )
-
-    def metadata(_tag, role, **_kwargs):
-        if role == "advisor":
-            return {
-                "senpai-advisor-test-track": {
-                    "senpai.wandb.com/source-revision": args.repo_revision,
-                    "senpai.wandb.com/advisor-branch": args.advisor_branch,
-                    "senpai.wandb.com/student-names": "fern",
-                }
-            }
-        return {}
-
-    monkeypatch.setattr(launch, "existing_role_metadata", metadata)
-    mutations = []
-    monkeypatch.setattr(
-        launch,
-        "kubectl_apply",
-        lambda _manifest, name, **_kwargs: mutations.append(name),
-    )
+    compatible_existing_campaign(monkeypatch, args)
+    calls = []
+    monkeypatch.setattr(launch_helpers.subprocess, "run", successful_kubectl(calls))
 
     launch.main()
 
-    assert mutations == [
-        "secret senpai-launch-secrets-test-track",
-        "student fern",
-        "operational supervisor",
+    applied = [kwargs["input"] for argv, kwargs in calls if "apply" in argv]
+    documents = [
+        document
+        for manifest in applied
+        for document in yaml.safe_load_all(manifest)
     ]
+    resources = {
+        (document["kind"], document["metadata"]["name"]): document
+        for document in documents
+    }
+    assert ("Secret", "senpai-launch-secrets-test-track") not in resources
+    assert not any(kind == "Deployment" and "fern" in name for kind, name in resources)
+
+    supervisor_secret_name = next(
+        name
+        for kind, name in resources
+        if kind == "Secret" and name.startswith("senpai-supervisor-secrets-test-track-")
+    )
+    supervisor_config_name = next(
+        name
+        for kind, name in resources
+        if kind == "ConfigMap" and name.startswith("senpai-config-supervisor-test-track-")
+    )
+    assert resources[("Secret", supervisor_secret_name)]["immutable"] is True
+    assert resources[("ConfigMap", supervisor_config_name)]["immutable"] is True
+    assert set(resources[("Secret", supervisor_secret_name)]["data"]) == {
+        "github-token",
+        "wandb-api-key",
+        "openai-api-key",
+    }
+
+    deployment = resources[("Deployment", "senpai-supervisor-test-track")]
+    pod = deployment["spec"]["template"]["spec"]
+    assert pod["initContainers"][0]["env"][0]["valueFrom"]["secretKeyRef"][
+        "name"
+    ] == supervisor_secret_name
+    assert {
+        env["valueFrom"]["secretKeyRef"]["name"]
+        for env in pod["containers"][0]["env"]
+    } == {supervisor_secret_name}
+    assert pod["containers"][0]["envFrom"][0]["configMapRef"]["name"] == (
+        supervisor_config_name
+    )
+
+    assert [
+        argv
+        for argv, _kwargs in calls
+        if "rollout" in argv and "status" in argv
+    ] == [
+        [
+            "kubectl",
+            "--namespace",
+            "senpai-test-track",
+            "rollout",
+            "status",
+            "deployment/senpai-supervisor-test-track",
+            "--timeout=900s",
+        ]
+    ]
+
+
+def test_supervisor_bundle_names_change_without_overwriting_prior_release(
+    monkeypatch,
+):
+    args = supervisor_launch_args(
+        advisor=False,
+        operational_supervisor=True,
+        names="",
+        n_students=0,
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    compatible_existing_campaign(monkeypatch, args)
+    model_key = {"value": "openai-release-a"}
+    monkeypatch.setattr(
+        launch,
+        "resolve_openai_api_key",
+        lambda _path: model_key["value"],
+    )
+    calls = []
+    monkeypatch.setattr(launch_helpers.subprocess, "run", successful_kubectl(calls))
+
+    launch.main()
+    first_count = len(calls)
+    model_key["value"] = "openai-release-b"
+    launch.main()
+
+    def applied_documents(records):
+        return [
+            document
+            for argv, kwargs in records
+            if "apply" in argv
+            for document in yaml.safe_load_all(kwargs["input"])
+        ]
+
+    def bundle_names(documents):
+        return {
+            document["metadata"]["name"]
+            for document in documents
+            if document["kind"] in {"Secret", "ConfigMap"}
+        }
+
+    def deployment_bundle(documents):
+        deployment = next(
+            document for document in documents if document["kind"] == "Deployment"
+        )
+        pod = deployment["spec"]["template"]["spec"]
+        return {
+            pod["containers"][0]["env"][0]["valueFrom"]["secretKeyRef"]["name"],
+            pod["containers"][0]["envFrom"][0]["configMapRef"]["name"],
+        }
+
+    first_documents = applied_documents(calls[:first_count])
+    second_documents = applied_documents(calls[first_count:])
+    first = bundle_names(first_documents)
+    second = bundle_names(second_documents)
+    assert next(name for name in first if "supervisor-secrets" in name) != next(
+        name for name in second if "supervisor-secrets" in name
+    )
+    assert next(name for name in first if "config-supervisor" in name) == next(
+        name for name in second if "config-supervisor" in name
+    )
+    assert deployment_bundle(first_documents) == first
+    assert deployment_bundle(second_documents) == second
+    assert not any("delete" in argv for argv, _kwargs in calls)
+
+
+def test_supervisor_rollout_failure_surfaces_exact_rollback_command(
+    monkeypatch,
+    capsys,
+):
+    args = supervisor_launch_args(
+        advisor=False,
+        operational_supervisor=True,
+        names="",
+        n_students=0,
+        kube_context="gpu-cluster",
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    compatible_existing_campaign(monkeypatch, args)
+
+    def run(argv, **kwargs):
+        if "rollout" in argv and "status" in argv:
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=1,
+                stdout="",
+                stderr="deployment exceeded its progress deadline",
+            )
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="applied",
+            stderr="",
+        )
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+
+    with pytest.raises(SystemExit, match="operational supervisor rollout failed"):
+        launch.main()
+
+    output = capsys.readouterr()
+    assert "deployment exceeded its progress deadline" in output.err
+    assert (
+        "kubectl --context gpu-cluster --namespace senpai-test-track rollout undo "
+        "deployment/senpai-supervisor-test-track"
+    ) in output.err
 
 
 def test_supervisor_rejects_an_extra_exact_tag_advisor(monkeypatch):

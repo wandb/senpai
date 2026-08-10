@@ -115,6 +115,8 @@ supervisor_dedicated_namespace: false
 supervisor_interval_s: 900
 supervisor_research_interval_s: 21600
 supervisor_action_cooldown_s: 1800
+# fail the launch if the supervisor Deployment does not become ready in time
+supervisor_ready_timeout_s: 900
 
 # students
 # Shared fleet defaults for Kubernetes, Docker, and AWS.

@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from k8s.launch_helpers import (  # noqa: E402
+    content_addressed_name,
     ensure_advisor_branch,
     ensure_target_repo_labels,
     existing_advisor_deployments,
@@ -30,6 +31,7 @@ from k8s.launch_helpers import (  # noqa: E402
     is_immutable_image_reference,
     kubectl_apply,
     kubectl_command,
+    kubectl_rollout_status,
     pod_template_hash,
     preflight_check_anthropic_api_key,
     preflight_check_exa_api_key,
@@ -41,6 +43,7 @@ from k8s.launch_helpers import (  # noqa: E402
     preflight_check_wandb_inference,
     render_configmap,
     render_launch_secret,
+    render_supervisor_secret,
     render_template,
     resolve_anthropic_api_key,
     resolve_exa_api_key,
@@ -131,6 +134,7 @@ class Args:
     supervisor_interval_s: int = 900  # operational supervisor wake cadence
     supervisor_research_interval_s: int = 21600  # research-philosophy review cadence
     supervisor_action_cooldown_s: int = 1800  # duplicate intervention cooldown
+    supervisor_ready_timeout_s: int = 900  # wait for the supervisor Deployment rollout
     start_gate_path: str = ""  # optional shared file path that must exist before advisor/student loops begin
     docker_run_root: str = "~/.senpai/runs"  # host directory for Docker workdirs, state, and credentials
     docker_student_gpu_ids: str = ""  # explicit map such as fern:0,tanjiro:1 or fern:0+1
@@ -295,6 +299,7 @@ def validate_timing_args(args: Args) -> None:
         "supervisor_interval_s",
         "supervisor_research_interval_s",
         "supervisor_action_cooldown_s",
+        "supervisor_ready_timeout_s",
     ]
     non_negative = [
         "poll_jitter_s",
@@ -409,36 +414,41 @@ def render_operational_supervisor(
     launch_secret: str,
     args: Args,
 ) -> str:
-    configmap_name = f"senpai-config-supervisor-{tag}"
     deployment_name = f"senpai-supervisor-{tag}"
     service_account_name = f"senpai-supervisor-{tag}"
+    config_data = {
+        **primary_model_config(args, "advisor"),
+        "SENPAI_OPENHANDS_API_KEY_ENV": MODEL_PROVIDERS[
+            model_provider(args.advisor_model)
+        ][0],
+        "REPO_URL": args.repo_url,
+        "REPO_REVISION": args.repo_revision,
+        "GH_REPO": target_repo_slug(args.target_repo_url),
+        "RESEARCH_TAG": tag,
+        "STUDENT_NAMES": ",".join(student_list),
+        "WANDB_ENTITY": args.wandb_entity,
+        "WANDB_PROJECT": args.wandb_project,
+        "SENPAI_WANDB_SCOPE": tag,
+        "ADVISOR_BRANCH": args.advisor_branch,
+        "SENPAI_SUPERVISOR_INTERVAL_SECONDS": str(args.supervisor_interval_s),
+        "SENPAI_SUPERVISOR_RESEARCH_INTERVAL_SECONDS": str(
+            args.supervisor_research_interval_s
+        ),
+        "SENPAI_SUPERVISOR_ACTION_COOLDOWN_SECONDS": str(
+            args.supervisor_action_cooldown_s
+        ),
+        "SENPAI_KUBECTL_NAMESPACE": args.namespace,
+        "SENPAI_SUPERVISOR_SECRET_HANDOFF": "1",
+    }
+    configmap_name = content_addressed_name(
+        f"senpai-config-supervisor-{tag}",
+        config_data,
+    )
     configmap = render_configmap(
         name=configmap_name,
         labels={"app": "senpai", "role": "supervisor", "research-tag": tag},
-        data={
-            **primary_model_config(args, "advisor"),
-            "SENPAI_OPENHANDS_API_KEY_ENV": MODEL_PROVIDERS[
-                model_provider(args.advisor_model)
-            ][0],
-            "REPO_URL": args.repo_url,
-            "REPO_REVISION": args.repo_revision,
-            "GH_REPO": target_repo_slug(args.target_repo_url),
-            "RESEARCH_TAG": tag,
-            "STUDENT_NAMES": ",".join(student_list),
-            "WANDB_ENTITY": args.wandb_entity,
-            "WANDB_PROJECT": args.wandb_project,
-            "SENPAI_WANDB_SCOPE": tag,
-            "ADVISOR_BRANCH": args.advisor_branch,
-            "SENPAI_SUPERVISOR_INTERVAL_SECONDS": str(args.supervisor_interval_s),
-            "SENPAI_SUPERVISOR_RESEARCH_INTERVAL_SECONDS": str(
-                args.supervisor_research_interval_s
-            ),
-            "SENPAI_SUPERVISOR_ACTION_COOLDOWN_SECONDS": str(
-                args.supervisor_action_cooldown_s
-            ),
-            "SENPAI_KUBECTL_NAMESPACE": args.namespace,
-            "SENPAI_SUPERVISOR_SECRET_HANDOFF": "1",
-        },
+        data=config_data,
+        immutable=True,
     )
     deployment = render_template(
         template,
@@ -852,32 +862,35 @@ def main():
             provider: f"<REDACTED_{MODEL_PROVIDERS[provider][0]}>"
             for provider in model_providers
         }
-    launch_secret = render_launch_secret(
-        args.tag,
-        github_token if not args.dry_run else "<REDACTED_GITHUB_TOKEN>",
-        exa_api_key if not args.dry_run else "<REDACTED_EXA_API_KEY>",
-        wandb_api_key if not args.dry_run else "<REDACTED_WANDB_API_KEY>",
-        anthropic_api_key=provider_api_keys.get("anthropic"),
-        openai_api_key=provider_api_keys.get("openai"),
-        hf_token=(
-            hf_token
-            if not args.dry_run
-            else ("<REDACTED_HF_TOKEN>" if hf_token else "")
-        ),
-    )
-
-    # --- Apply per-launch secret first (pods reference it on startup) ---
-    if args.dry_run:
-        print(f"--- Secret: {secret_name} ---")
-        print(launch_secret)
-        print()
-    else:
-        kubectl_apply(
-            launch_secret,
-            f"secret {secret_name}",
-            kube_context=args.kube_context,
-            namespace=args.namespace,
+    launch_secret = ""
+    if args.advisor or student_list:
+        launch_secret = render_launch_secret(
+            args.tag,
+            github_token if not args.dry_run else "<REDACTED_GITHUB_TOKEN>",
+            exa_api_key if not args.dry_run else "<REDACTED_EXA_API_KEY>",
+            wandb_api_key if not args.dry_run else "<REDACTED_WANDB_API_KEY>",
+            anthropic_api_key=provider_api_keys.get("anthropic"),
+            openai_api_key=provider_api_keys.get("openai"),
+            hf_token=(
+                hf_token
+                if not args.dry_run
+                else ("<REDACTED_HF_TOKEN>" if hf_token else "")
+            ),
         )
+
+        # Role launches own this fixed Secret. A supervisor-only launch must
+        # never rewrite credentials referenced by existing role Deployments.
+        if args.dry_run:
+            print(f"--- Secret: {secret_name} ---")
+            print(launch_secret)
+            print()
+        else:
+            kubectl_apply(
+                launch_secret,
+                f"secret {secret_name}",
+                kube_context=args.kube_context,
+                namespace=args.namespace,
+            )
 
     # --- Deploy students ---
     for name in student_list:
@@ -941,12 +954,41 @@ def main():
             )
 
     if args.operational_supervisor:
+        supervisor_provider = model_provider(args.advisor_model)
+        provider_secret_name = (
+            None
+            if supervisor_provider == "wandb"
+            else MODEL_PROVIDERS[supervisor_provider][1]
+        )
+        provider_api_key = (
+            None
+            if provider_secret_name is None
+            else provider_api_keys[supervisor_provider]
+        )
+        supervisor_secret_name, supervisor_secret = render_supervisor_secret(
+            args.tag,
+            github_token if not args.dry_run else "<REDACTED_GITHUB_TOKEN>",
+            wandb_api_key if not args.dry_run else "<REDACTED_WANDB_API_KEY>",
+            provider_secret_name=provider_secret_name,
+            provider_api_key=provider_api_key,
+        )
+        if args.dry_run:
+            print(f"--- Secret: {supervisor_secret_name} ---")
+            print(supervisor_secret)
+            print()
+        else:
+            kubectl_apply(
+                supervisor_secret,
+                f"secret {supervisor_secret_name}",
+                kube_context=args.kube_context,
+                namespace=args.namespace,
+            )
         manifest = render_operational_supervisor(
             supervisor_template,
             args.tag,
             advisor_student_list,
-            secret_name,
-            launch_secret,
+            supervisor_secret_name,
+            supervisor_secret,
             args,
         )
         if args.dry_run:
@@ -960,6 +1002,32 @@ def main():
                 kube_context=args.kube_context,
                 namespace=args.namespace,
             )
+            deployment_name = f"senpai-supervisor-{args.tag}"
+            try:
+                kubectl_rollout_status(
+                    deployment_name,
+                    timeout_seconds=args.supervisor_ready_timeout_s,
+                    kube_context=args.kube_context,
+                    namespace=args.namespace,
+                )
+            except RuntimeError as error:
+                rollback = shlex.join(
+                    kubectl_command(
+                        "rollout",
+                        "undo",
+                        f"deployment/{deployment_name}",
+                        kube_context=args.kube_context,
+                        namespace=args.namespace,
+                    )
+                )
+                print(
+                    "ERROR: operational supervisor rollout failed: "
+                    f"{error}\nRollback: {rollback}",
+                    file=sys.stderr,
+                )
+                raise SystemExit(
+                    "operational supervisor rollout failed"
+                ) from error
 
     if not args.dry_run:
         print(f"\nLaunched {len(student_list)} students: {', '.join(student_list)}")
