@@ -273,6 +273,9 @@ capture_supervisor_rollback() {
 import sys
 from pathlib import Path
 
+import yaml
+
+from k8s.launch import render_supervisor_network_policy
 from k8s.supervisor_rollback import SupervisorRollback
 
 rollback = SupervisorRollback.capture(
@@ -281,6 +284,9 @@ rollback = SupervisorRollback.capture(
     namespace=sys.argv[3],
     directory=Path(sys.argv[4]),
     timeout_seconds=120,
+    network_policy_safety_manifest=yaml.safe_load(
+        render_supervisor_network_policy(sys.argv[1])
+    ),
 )
 print(rollback.path)
 ' "$tag" "$CONTEXT" "$NAMESPACE" "$directory"
@@ -650,6 +656,7 @@ ABSENT_TAG="$TAG-absent"
 ABSENT_ROLLBACK_BUNDLE=$(capture_supervisor_rollback \
   "$ABSENT_TAG" "$ROLLBACK_DIR")
 ABSENT_SERVICE_ACCOUNT="senpai-supervisor-$ABSENT_TAG"
+ABSENT_NETWORK_POLICY="senpai-supervisor-egress-$ABSENT_TAG"
 kubectl_canary create serviceaccount -n "$NAMESPACE" "$ABSENT_SERVICE_ACCOUNT"
 # The capture process deliberately exited without releasing its transaction.
 # Expire that exact Lease epoch before exercising cross-process recovery.
@@ -661,6 +668,8 @@ if kubectl_canary get serviceaccount -n "$NAMESPACE" \
   echo "rollback retained a resource captured as absent" >&2
   exit 1
 fi
+kubectl_canary get networkpolicy -n "$NAMESPACE" \
+  "$ABSENT_NETWORK_POLICY" >/dev/null
 
 # A failed supervisor-only release must be observable and exactly reversible
 # from the durable snapshot, without rolling back its SQLite state PVC.

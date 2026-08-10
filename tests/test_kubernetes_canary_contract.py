@@ -538,6 +538,8 @@ def test_failed_upgrade_is_supervisor_only_and_retains_versioned_rollback_bundle
     assert "k8s/supervisor_rollback.py restore" in canary
     assert "persistent_state_rolled_back" in canary
     assert "ABSENT_SERVICE_ACCOUNT" in canary
+    assert "ABSENT_NETWORK_POLICY" in canary
+    assert "network_policy_safety_manifest" in canary
     assert "assert-interrupted-operations" in canary
     assert "rollout undo" not in canary
 
