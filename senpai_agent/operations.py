@@ -12,6 +12,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -702,47 +703,76 @@ class RestartRequestStore:
         self.path = path.expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._connection = sqlite3.connect(self.path, check_same_thread=False)
+        self._connection = sqlite3.connect(
+            self.path,
+            check_same_thread=False,
+            timeout=30,
+        )
         self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA busy_timeout=5000")
-        self._connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS controller_restart_requests (
-                request_id TEXT PRIMARY KEY,
-                research_tag TEXT NOT NULL,
-                role TEXT NOT NULL,
-                student TEXT,
-                request_json TEXT NOT NULL,
-                source_generation INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                planned_replacement_generation INTEGER,
-                completion_json TEXT,
-                rejection_code TEXT
+        try:
+            # Install the busy handler before WAL negotiation: two processes can
+            # open an empty role-state directory at the same time during a rollout.
+            self._connection.execute("PRAGMA busy_timeout=30000")
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    mode = self._connection.execute(
+                        "PRAGMA journal_mode=WAL"
+                    ).fetchone()
+                    if mode is None or str(mode[0]).lower() != "wal":
+                        raise RuntimeError("controller restart store requires WAL mode")
+                    break
+                except sqlite3.OperationalError as error:
+                    contention = str(error).lower()
+                    if (
+                        not any(word in contention for word in ("busy", "locked"))
+                        or time.monotonic() >= deadline
+                    ):
+                        raise
+                    time.sleep(0.01)
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS controller_restart_requests (
+                    request_id TEXT PRIMARY KEY,
+                    research_tag TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    student TEXT,
+                    request_json TEXT NOT NULL,
+                    source_generation INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    planned_replacement_generation INTEGER,
+                    completion_json TEXT,
+                    rejection_code TEXT
+                )
+                """
             )
-            """
-        )
-        self._connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS controller_worker_generation (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                generation INTEGER NOT NULL
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS controller_worker_generation (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    generation INTEGER NOT NULL
+                )
+                """
             )
-            """
-        )
-        self._connection.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS one_controller_restart_per_generation
-            ON controller_restart_requests (
-                research_tag,
-                role,
-                COALESCE(student, ''),
-                source_generation
+            self._connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS one_controller_restart_per_generation
+                ON controller_restart_requests (
+                    research_tag,
+                    role,
+                    COALESCE(student, ''),
+                    source_generation
+                )
+                WHERE status IN ('pending', 'processing')
+                """
             )
-            WHERE status IN ('pending', 'processing')
-            """
-        )
-        self._connection.commit()
+            self._connection.commit()
+            self._connection.execute("PRAGMA busy_timeout=5000")
+        except BaseException:
+            self._connection.rollback()
+            self._connection.close()
+            raise
         self.path.chmod(0o600)
 
     def allocate_worker_generation(self) -> int:
