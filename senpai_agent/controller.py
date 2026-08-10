@@ -51,7 +51,7 @@ from senpai_agent.state import (
     StudentConversationSelector,
     WorkspaceDivergenceLedger,
 )
-from senpai_agent.supervisor import LEASE_ENV, ProgressLease
+from senpai_agent.supervisor import GENERATION_ENV, LEASE_ENV, ProgressLease
 from senpai_agent.workspace import (
     StudentWorkspaceReconciler,
     WorkspaceDivergence,
@@ -1029,7 +1029,16 @@ def controller_main(
 ) -> int:
     import argparse
 
-    progress = ProgressLease(Path(env[LEASE_ENV])) if env.get(LEASE_ENV) else None
+    progress = (
+        ProgressLease(
+            Path(env[LEASE_ENV]),
+            generation=(
+                int(env[GENERATION_ENV]) if env.get(GENERATION_ENV) else None
+            ),
+        )
+        if env.get(LEASE_ENV)
+        else None
+    )
     if progress is not None:
         progress.update("startup", 300)
 

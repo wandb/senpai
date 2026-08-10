@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import signal
 import sqlite3
 import subprocess
 import sys
@@ -36,7 +35,10 @@ from senpai_agent.operations import (
     ContextResetRequestStore,
     ContextResetStatus,
     NudgeReceipt,
+    RestartRequest,
+    RestartRequestStore,
     RestartReceipt,
+    RestartStatus,
     RoleObservation,
     RoleTarget,
 )
@@ -67,6 +69,7 @@ class RoleRuntimeState(BaseModel):
     running_wandb_run_ids: tuple[str, ...] = Field(default=(), max_length=50)
     recent_wandb_run_ids: tuple[str, ...] = Field(default=(), max_length=200)
     context_resets: tuple[ContextResetStatus, ...] = Field(default=(), max_length=20)
+    controller_restarts: tuple[RestartStatus, ...] = Field(default=(), max_length=20)
     cpu_percent: float | None
     memory_percent: float | None
     disk_percent: float | None
@@ -163,6 +166,7 @@ def observe_role(
         run_inventory_complete,
     ) = _training_state(state_dir, target.role)
     context_resets = _context_reset_statuses(state_dir, target)
+    controller_restarts = _restart_statuses(state_dir, target)
     token = _control_token(
         lease,
         conversation_id,
@@ -170,7 +174,13 @@ def observe_role(
         pending_event_keys,
         active_delegation_count,
     )
-    restart_token = _restart_control_token(token, lease, running_count)
+    restart_token = (
+        _restart_control_token(token, lease, running_count)
+        if lease is not None
+        and lease.generation is not None
+        and controller_alive is True
+        else None
+    )
     return RoleRuntimeState(
         target=target,
         observation=RoleObservation(
@@ -180,6 +190,7 @@ def observe_role(
             restart_control_token=restart_token,
             controller_alive=controller_alive,
             controller_phase=lease.phase if lease is not None else None,
+            worker_generation=lease.generation if lease is not None else None,
             conversation_id=conversation_id,
             active_turn=active_turn,
             unmatched_actions=unmatched_actions,
@@ -198,6 +209,7 @@ def observe_role(
         running_wandb_run_ids=running_run_ids,
         recent_wandb_run_ids=recent_run_ids,
         context_resets=context_resets,
+        controller_restarts=controller_restarts,
         cpu_percent=_bounded_percent(psutil.cpu_percent(interval=0.05)),
         memory_percent=_bounded_percent(psutil.virtual_memory().percent),
         disk_percent=_disk_percent(state_dir),
@@ -214,6 +226,17 @@ def _context_reset_statuses(
     if not queue_path.is_file():
         return ()
     with ContextResetRequestStore(queue_path) as store:
+        return store.statuses(target, limit=20)
+
+
+def _restart_statuses(
+    state_dir: Path,
+    target: RoleTarget,
+) -> tuple[RestartStatus, ...]:
+    queue_path = state_dir / "controller-restarts.sqlite3"
+    if not queue_path.is_file():
+        return ()
+    with RestartRequestStore(queue_path) as store:
         return store.statuses(target, limit=20)
 
 
@@ -324,6 +347,10 @@ def restart_controller(
     lease = _read_lease(role_state_dir(env) / "controller-lease.json")
     if lease is None or not _controller_alive(lease, state.target.role):
         raise RuntimeError("the observed controller is no longer live")
+    if lease.generation is None:
+        raise RuntimeError(
+            "the controller lease has no worker generation; refusing ownerless restart"
+        )
     final_running_count, *_ = _training_state(role_state_dir(env), state.target.role)
     if final_running_count is None:
         raise RuntimeError("training activity is unknown; refusing controller restart")
@@ -341,12 +368,36 @@ def restart_controller(
         != restart_control_token
     ):
         raise RuntimeError("the controller left its quiescent restart boundary")
-    os.kill(lease.pid, signal.SIGTERM)
+    request_id = "restart:" + hashlib.sha256(
+        json.dumps(
+            {
+                "target": state.target.key,
+                "conversation_id": str(expected_conversation_id),
+                "restart_control_token": restart_control_token,
+                "worker_generation": lease.generation,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    request = RestartRequest(
+        request_id=request_id,
+        target=state.target,
+        expected_conversation_id=expected_conversation_id,
+        expected_restart_control_token=restart_control_token,
+        expected_worker_generation=lease.generation,
+        expected_completed_turns=lease.completed_turns,
+    )
+    with RestartRequestStore(
+        role_state_dir(env) / "controller-restarts.sqlite3"
+    ) as store:
+        store.enqueue(request)
     return RestartReceipt(
         target=state.target,
+        request_id=request.request_id,
+        status="queued",
         conversation_id=expected_conversation_id,
-        state_preserved=True,
-        compute_preserved=True,
+        expected_worker_generation=request.expected_worker_generation,
     )
 
 
@@ -735,6 +786,7 @@ def _restart_control_token(
         "control": control_token,
         "phase": lease.phase if lease is not None else None,
         "completed_turns": lease.completed_turns if lease is not None else None,
+        "generation": lease.generation if lease is not None else None,
         "running_training_count": running_training_count,
     }
     return hashlib.sha256(

@@ -225,6 +225,7 @@ class KubectlCampaignBackend(OperationBackend):
                     running_wandb_run_ids=state.running_wandb_run_ids,
                     recent_wandb_run_ids=state.recent_wandb_run_ids,
                     context_resets=state.context_resets,
+                    controller_restarts=state.controller_restarts,
                     stats=MachineStats(
                         cpu_percent=state.cpu_percent,
                         memory_percent=state.memory_percent,

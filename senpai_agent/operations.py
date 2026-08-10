@@ -115,6 +115,7 @@ class RoleObservation(_Contract):
     restart_control_token: _Key | None = None
     controller_alive: bool | None
     controller_phase: Annotated[str, Field(min_length=1, max_length=200)] | None
+    worker_generation: Annotated[int, Field(ge=1)] | None = None
     conversation_id: UUID | None
     active_turn: bool | None
     unmatched_actions: Annotated[int, Field(ge=0)] | None
@@ -181,9 +182,12 @@ class NudgeReceipt(_Contract):
 class RestartReceipt(_Contract):
     kind: Literal["restart"] = "restart"
     target: RoleTarget
+    request_id: _Key | None = None
+    status: Literal["queued"] | None = None
     conversation_id: UUID
-    state_preserved: bool
-    compute_preserved: bool
+    expected_worker_generation: Annotated[int, Field(ge=1)] | None = None
+    state_preserved: bool | None = None
+    compute_preserved: bool | None = None
 
 
 class ContextResetReceipt(_Contract):
@@ -218,6 +222,48 @@ class ContextResetRequest(_Contract):
     expected_raw_history_digest: _Key
     expected_pending_event_keys: tuple[_Key, ...]
     recovery_prompt: Annotated[str, Field(min_length=1, max_length=16_000)]
+
+
+class RestartRequest(_Contract):
+    """Durable restart intent consumed only by the controller process owner."""
+
+    request_id: _Key
+    target: RoleTarget
+    expected_conversation_id: UUID
+    expected_restart_control_token: _Key
+    expected_worker_generation: Annotated[int, Field(ge=1)]
+    expected_completed_turns: Annotated[int, Field(ge=0)]
+
+
+class RestartCompletion(_Contract):
+    """Evidence that a newer owned worker replaced the requested generation."""
+
+    request_id: _Key
+    target: RoleTarget
+    conversation_id: UUID
+    source_generation: Annotated[int, Field(ge=1)]
+    replacement_generation: Annotated[int, Field(ge=1)]
+    state_preserved: bool
+    compute_preserved: bool
+
+
+class RestartRequestStatus(_Contract):
+    request: RestartRequest
+    status: Literal["pending", "processing", "completed", "rejected"]
+    completion: RestartCompletion | None = None
+    rejection_code: str | None = None
+    planned_replacement_generation: Annotated[int, Field(ge=1)] | None = None
+
+
+class RestartStatus(_Contract):
+    """Sanitized restart queue state exposed by role diagnostics."""
+
+    request_id: _Key
+    status: Literal["queued", "processing", "completed", "rejected"]
+    conversation_id: UUID
+    source_generation: Annotated[int, Field(ge=1)]
+    replacement_generation: Annotated[int, Field(ge=1)] | None = None
+    rejection_code: Annotated[str, Field(min_length=1, max_length=200)] | None = None
 
 
 class ContextResetCompletion(_Contract):
@@ -627,6 +673,457 @@ class ContextResetRequestStore:
     def _row(self, request_id: str) -> sqlite3.Row:
         row = self._connection.execute(
             "SELECT * FROM context_reset_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(request_id)
+        return row
+
+    def close(self) -> None:
+        with self._lock:
+            self._connection.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+
+class RestartRequestStore:
+    """Durable handoff between role control and the worker-owning supervisor."""
+
+    def __init__(self, path: Path):
+        self.path = path.expanduser().resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._connection = sqlite3.connect(self.path, check_same_thread=False)
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection.execute("PRAGMA busy_timeout=5000")
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS controller_restart_requests (
+                request_id TEXT PRIMARY KEY,
+                research_tag TEXT NOT NULL,
+                role TEXT NOT NULL,
+                student TEXT,
+                request_json TEXT NOT NULL,
+                source_generation INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                planned_replacement_generation INTEGER,
+                completion_json TEXT,
+                rejection_code TEXT
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS controller_worker_generation (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                generation INTEGER NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS one_controller_restart_per_generation
+            ON controller_restart_requests (
+                research_tag,
+                role,
+                COALESCE(student, ''),
+                source_generation
+            )
+            WHERE status IN ('pending', 'processing')
+            """
+        )
+        self._connection.commit()
+        self.path.chmod(0o600)
+
+    def allocate_worker_generation(self) -> int:
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    "SELECT generation FROM controller_worker_generation "
+                    "WHERE singleton = 1"
+                ).fetchone()
+                generation = 1 if row is None else int(row["generation"]) + 1
+                self._connection.execute(
+                    """
+                    INSERT INTO controller_worker_generation (singleton, generation)
+                    VALUES (1, ?)
+                    ON CONFLICT(singleton) DO UPDATE SET generation = excluded.generation
+                    """,
+                    (generation,),
+                )
+                self._connection.commit()
+                return generation
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    def enqueue(self, request: RestartRequest) -> bool:
+        encoded = request.model_dump_json()
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._connection.execute(
+                    "SELECT request_json FROM controller_restart_requests "
+                    "WHERE request_id = ?",
+                    (request.request_id,),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        RestartRequest.model_validate_json(existing["request_json"])
+                        != request
+                    ):
+                        raise IdempotencyConflict(
+                            "controller restart request "
+                            f"{request.request_id!r} was reused"
+                        )
+                    self._connection.commit()
+                    return False
+                active = self._connection.execute(
+                    """
+                    SELECT request_id FROM controller_restart_requests
+                    WHERE research_tag = ?
+                      AND role = ?
+                      AND COALESCE(student, '') = ?
+                      AND source_generation = ?
+                      AND status IN ('pending', 'processing')
+                    """,
+                    (
+                        request.target.research_tag,
+                        request.target.role,
+                        request.target.student or "",
+                        request.expected_worker_generation,
+                    ),
+                ).fetchone()
+                if active is not None:
+                    raise OperationInProgress(
+                        "a controller restart is already active for worker generation "
+                        f"{request.expected_worker_generation}"
+                    )
+                self._connection.execute(
+                    """
+                    INSERT INTO controller_restart_requests (
+                        request_id, research_tag, role, student, request_json,
+                        source_generation, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                    """,
+                    (
+                        request.request_id,
+                        request.target.research_tag,
+                        request.target.role,
+                        request.target.student,
+                        encoded,
+                        request.expected_worker_generation,
+                    ),
+                )
+                self._connection.commit()
+                return True
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    def claim_next(
+        self,
+        target: RoleTarget,
+        *,
+        worker_generation: int,
+        replacement_generation: int,
+    ) -> RestartRequest | None:
+        if replacement_generation <= worker_generation:
+            raise ValueError("replacement generation must follow the source worker")
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self._connection.execute(
+                    """
+                    SELECT request_id, request_json
+                    FROM controller_restart_requests
+                    WHERE status = 'pending'
+                      AND research_tag = ?
+                      AND role = ?
+                      AND COALESCE(student, '') = ?
+                    ORDER BY rowid
+                    """,
+                    (target.research_tag, target.role, target.student or ""),
+                ).fetchall()
+                row = next(
+                    (
+                        candidate
+                        for candidate in rows
+                        if RestartRequest.model_validate_json(
+                            candidate["request_json"]
+                        ).expected_worker_generation
+                        == worker_generation
+                    ),
+                    None,
+                )
+                if row is None:
+                    self._connection.commit()
+                    return None
+                cursor = self._connection.execute(
+                    """
+                    UPDATE controller_restart_requests
+                    SET status = 'processing', planned_replacement_generation = ?
+                    WHERE request_id = ? AND status = 'pending'
+                    """,
+                    (replacement_generation, row["request_id"]),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("controller restart request claim raced")
+                self._connection.commit()
+                return RestartRequest.model_validate_json(row["request_json"])
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    def awaiting_replacement(
+        self,
+        target: RoleTarget,
+        *,
+        replacement_generation: int,
+    ) -> tuple[RestartRequest, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT request_json, planned_replacement_generation
+                FROM controller_restart_requests
+                WHERE status = 'processing'
+                  AND research_tag = ?
+                  AND role = ?
+                  AND COALESCE(student, '') = ?
+                ORDER BY rowid
+                """,
+                (target.research_tag, target.role, target.student or ""),
+            ).fetchall()
+        return tuple(
+            RestartRequest.model_validate_json(row["request_json"])
+            for row in rows
+            if int(row["planned_replacement_generation"]) == replacement_generation
+        )
+
+    def missed_replacements(
+        self,
+        target: RoleTarget,
+        *,
+        replacement_generation: int,
+    ) -> tuple[RestartRequest, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT request_json
+                FROM controller_restart_requests
+                WHERE status = 'processing'
+                  AND research_tag = ?
+                  AND role = ?
+                  AND COALESCE(student, '') = ?
+                  AND planned_replacement_generation < ?
+                ORDER BY rowid
+                """,
+                (
+                    target.research_tag,
+                    target.role,
+                    target.student or "",
+                    replacement_generation,
+                ),
+            ).fetchall()
+        return tuple(
+            RestartRequest.model_validate_json(row["request_json"]) for row in rows
+        )
+
+    def missed_sources(
+        self,
+        target: RoleTarget,
+        *,
+        live_generation: int,
+    ) -> tuple[RestartRequest, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT request_json
+                FROM controller_restart_requests
+                WHERE status = 'pending'
+                  AND research_tag = ?
+                  AND role = ?
+                  AND COALESCE(student, '') = ?
+                  AND source_generation < ?
+                ORDER BY rowid
+                """,
+                (
+                    target.research_tag,
+                    target.role,
+                    target.student or "",
+                    live_generation,
+                ),
+            ).fetchall()
+        return tuple(
+            RestartRequest.model_validate_json(row["request_json"]) for row in rows
+        )
+
+    def complete(self, completion: RestartCompletion) -> bool:
+        with self._lock:
+            row = self._row(completion.request_id)
+            request = RestartRequest.model_validate_json(row["request_json"])
+            if (
+                completion.target != request.target
+                or completion.conversation_id != request.expected_conversation_id
+                or completion.source_generation != request.expected_worker_generation
+                or completion.replacement_generation <= completion.source_generation
+                or not completion.state_preserved
+                or not completion.compute_preserved
+            ):
+                raise OperationInvariantError(
+                    "controller restart completion did not prove a safe replacement"
+                )
+            if row["status"] == "completed":
+                prior = RestartCompletion.model_validate_json(row["completion_json"])
+                if prior != completion:
+                    raise IdempotencyConflict(
+                        f"controller restart completion {completion.request_id!r} changed"
+                    )
+                return False
+            if row["status"] != "processing":
+                raise OperationInvariantError(
+                    "only a claimed controller restart can be completed"
+                )
+            if (
+                int(row["planned_replacement_generation"])
+                != completion.replacement_generation
+            ):
+                raise OperationInvariantError(
+                    "controller restart completion used an unplanned generation"
+                )
+            self._connection.execute(
+                """
+                UPDATE controller_restart_requests
+                SET status = 'completed', completion_json = ?
+                WHERE request_id = ?
+                """,
+                (completion.model_dump_json(), completion.request_id),
+            )
+            self._connection.commit()
+            return True
+
+    def reject(self, request_id: str, rejection_code: str) -> bool:
+        rejection_code = rejection_code.strip()
+        if not rejection_code or len(rejection_code) > 200:
+            raise ValueError("controller restart rejection code must be bounded")
+        with self._lock:
+            row = self._row(request_id)
+            if row["status"] == "rejected":
+                if row["rejection_code"] != rejection_code:
+                    raise IdempotencyConflict(
+                        f"controller restart rejection {request_id!r} changed"
+                    )
+                return False
+            if row["status"] == "completed":
+                raise OperationInvariantError(
+                    "a completed controller restart cannot be rejected"
+                )
+            self._connection.execute(
+                """
+                UPDATE controller_restart_requests
+                SET status = 'rejected', rejection_code = ?
+                WHERE request_id = ?
+                """,
+                (rejection_code, request_id),
+            )
+            self._connection.commit()
+            return True
+
+    def result(self, request_id: str) -> RestartRequestStatus:
+        with self._lock:
+            row = self._row(request_id)
+        return RestartRequestStatus(
+            request=RestartRequest.model_validate_json(row["request_json"]),
+            status=str(row["status"]),
+            completion=(
+                RestartCompletion.model_validate_json(row["completion_json"])
+                if row["completion_json"]
+                else None
+            ),
+            rejection_code=(
+                str(row["rejection_code"]) if row["rejection_code"] else None
+            ),
+            planned_replacement_generation=(
+                int(row["planned_replacement_generation"])
+                if row["planned_replacement_generation"] is not None
+                else None
+            ),
+        )
+
+    def statuses(
+        self,
+        target: RoleTarget,
+        *,
+        limit: int = 20,
+    ) -> tuple[RestartStatus, ...]:
+        if not 1 <= limit <= 100:
+            raise ValueError("controller restart status limit must be between 1 and 100")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT request_id, request_json, status,
+                       planned_replacement_generation, completion_json,
+                       rejection_code
+                FROM controller_restart_requests
+                WHERE research_tag = ?
+                  AND role = ?
+                  AND COALESCE(student, '') = ?
+                ORDER BY rowid DESC
+                LIMIT ?
+                """,
+                (
+                    target.research_tag,
+                    target.role,
+                    target.student or "",
+                    limit,
+                ),
+            ).fetchall()
+        statuses = []
+        for row in rows:
+            request = RestartRequest.model_validate_json(row["request_json"])
+            completion = (
+                RestartCompletion.model_validate_json(row["completion_json"])
+                if row["completion_json"]
+                else None
+            )
+            statuses.append(
+                RestartStatus(
+                    request_id=str(row["request_id"]),
+                    status=(
+                        "queued" if str(row["status"]) == "pending" else row["status"]
+                    ),
+                    conversation_id=request.expected_conversation_id,
+                    source_generation=request.expected_worker_generation,
+                    replacement_generation=(
+                        completion.replacement_generation
+                        if completion is not None
+                        else (
+                            int(row["planned_replacement_generation"])
+                            if row["planned_replacement_generation"] is not None
+                            else None
+                        )
+                    ),
+                    rejection_code=(
+                        str(row["rejection_code"]) if row["rejection_code"] else None
+                    ),
+                )
+            )
+        return tuple(statuses)
+
+    def _row(self, request_id: str) -> sqlite3.Row:
+        row = self._connection.execute(
+            "SELECT * FROM controller_restart_requests WHERE request_id = ?",
             (request_id,),
         ).fetchone()
         if row is None:
@@ -1108,20 +1605,31 @@ class OperationService:
                 raise OperationInvariantError(
                     "role observation did not provide restart authorization"
                 )
+            if observed.worker_generation is None:
+                raise OperationInvariantError(
+                    "role observation did not provide an owned worker generation"
+                )
             receipt = self.backend.restart_controller(
                 action.target,
                 expected_conversation_id=action.expected_conversation_id,
                 restart_control_token=observed.restart_control_token,
             )
             _require_target(action.target, receipt.target)
-            if not receipt.state_preserved or not receipt.compute_preserved:
+            if (
+                receipt.status != "queued"
+                or receipt.request_id is None
+                or receipt.expected_worker_generation is None
+            ):
                 raise OperationInvariantError(
-                    "controller restart did not prove it would preserve state and "
-                    "compute"
+                    "controller restart transport did not return an owner-queued receipt"
                 )
             if receipt.conversation_id != observed.conversation_id:
                 raise OperationInvariantError(
                     "controller restart did not preserve the conversation"
+                )
+            if receipt.expected_worker_generation != observed.worker_generation:
+                raise OperationInvariantError(
+                    "controller restart was queued for a different worker generation"
                 )
             return receipt
         if isinstance(action, ContextReset):
