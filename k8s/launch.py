@@ -56,6 +56,10 @@ from k8s.launch_helpers import (  # noqa: E402
     routing_labels,
     source_revision_for_image,
 )
+from senpai_agent.protocols import (  # noqa: E402
+    MANAGEMENT_PROTOCOL_VERSION,
+    REPAIR_PROTOCOL_VERSION,
+)
 from senpai.launch.aws_backend import launch_aws, preflight_aws  # noqa: E402
 from senpai.launch.aws_mac_backend import (  # noqa: E402
     launch_aws_mac,
@@ -80,8 +84,6 @@ ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-deployment.yaml"
 SUPERVISOR_TEMPLATE = Path(__file__).parent / "operational-supervisor-deployment.yaml"
 SENPAI_CONFIG = Path(__file__).parent.parent / "senpai.yaml"
 DOTENV_PATH = Path(__file__).parent.parent / ".env"
-REPAIR_PROTOCOL_VERSION = "senpai-repair-executor/v1"
-MANAGEMENT_PROTOCOL_VERSION = "senpai-management/v1"
 
 
 @dataclass

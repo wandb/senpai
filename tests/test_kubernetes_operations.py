@@ -9,7 +9,9 @@ import pytest
 
 from senpai_agent.kubernetes_operations import KubectlCampaignBackend
 from senpai_agent.operations import CampaignInventory, RoleObservation, RoleTarget
+from senpai_agent.protocols import MANAGEMENT_PROTOCOL_VERSION
 from senpai_agent.role_control import (
+    RoleControlRequest,
     RoleResearchTail,
     RoleResearchTailItem,
     RoleRuntimeState,
@@ -29,7 +31,7 @@ def inventory() -> CampaignInventory:
 
 
 def runtime_json(target: RoleTarget) -> str:
-    return RoleRuntimeState(
+    state = RoleRuntimeState(
         target=target,
         observation=RoleObservation(
             target=target,
@@ -54,7 +56,13 @@ def runtime_json(target: RoleTarget) -> str:
         memory_percent=20,
         disk_percent=30,
         gpu_percent=40,
-    ).model_dump_json()
+    )
+    return json.dumps(
+        {
+            "protocol_version": MANAGEMENT_PROTOCOL_VERSION,
+            "result": state.model_dump(mode="json"),
+        }
+    )
 
 
 def test_backend_selects_exact_campaign_role_labels_and_parses_role_state(
@@ -93,6 +101,10 @@ def test_backend_selects_exact_campaign_role_labels_and_parses_role_state(
         "senpai_agent.role_control",
     )
     assert json.loads(calls[1][1])["command"] == "observe"
+    assert (
+        json.loads(calls[1][1])["protocol_version"]
+        == MANAGEMENT_PROTOCOL_VERSION
+    )
     assert observation.conversation_id == CONVERSATION_ID
     assert observation.active_delegation_count == 2
 
@@ -285,7 +297,7 @@ def test_backend_collects_only_the_exact_advisor_research_tail(monkeypatch):
                 }
             )
         else:
-            output = RoleResearchTail(
+            tail = RoleResearchTail(
                 conversation_id=CONVERSATION_ID,
                 observed_at=datetime.now(UTC),
                 advisor_guidance="Prefer causal, mechanism-led research.",
@@ -297,7 +309,13 @@ def test_backend_collects_only_the_exact_advisor_research_tail(monkeypatch):
                         summary="Compare mechanisms before another sweep.",
                     ),
                 ),
-            ).model_dump_json()
+            )
+            output = json.dumps(
+                {
+                    "protocol_version": MANAGEMENT_PROTOCOL_VERSION,
+                    "result": tail.model_dump(mode="json"),
+                }
+            )
         return SimpleNamespace(returncode=0, stdout=output, stderr="")
 
     monkeypatch.setattr("senpai_agent.kubernetes_operations.subprocess.run", run)
@@ -310,3 +328,28 @@ def test_backend_collects_only_the_exact_advisor_research_tail(monkeypatch):
     assert tail.advisor_guidance == "Prefer causal, mechanism-led research."
     assert "role=advisor" in calls[0][0][calls[0][0].index("-l") + 1]
     assert json.loads(calls[1][1])["command"] == "research_tail"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"result": {}},
+        {"protocol_version": "senpai-management/v0", "result": {}},
+    ],
+)
+def test_backend_rejects_missing_or_stale_role_management_protocol(
+    monkeypatch,
+    response,
+):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-advisor-maple")
+    monkeypatch.setattr(backend, "_run", lambda *_args, **_kwargs: json.dumps(response))
+
+    with pytest.raises(RuntimeError, match="management protocol"):
+        backend._role_control(
+            RoleTarget(research_tag="maple", role="advisor"),
+            RoleControlRequest(
+                protocol_version=MANAGEMENT_PROTOCOL_VERSION,
+                command="observe",
+            ),
+        )

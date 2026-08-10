@@ -12,6 +12,8 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from uuid import UUID
 
+from pydantic import ValidationError
+
 from senpai_agent.operational_supervisor import (
     EvidenceGap,
     MachineStats,
@@ -27,8 +29,10 @@ from senpai_agent.operations import (
     RoleObservation,
     RoleTarget,
 )
+from senpai_agent.protocols import MANAGEMENT_PROTOCOL_VERSION
 from senpai_agent.role_control import (
     RoleControlRequest,
+    RoleControlResponse,
     RoleResearchTail,
     RoleRuntimeState,
 )
@@ -102,7 +106,10 @@ class KubectlCampaignBackend(OperationBackend):
             research_tag=self.inventory.research_tag,
             role="advisor",
         )
-        payload = RoleControlRequest(command="research_tail")
+        payload = RoleControlRequest(
+            protocol_version=MANAGEMENT_PROTOCOL_VERSION,
+            command="research_tail",
+        )
         return RoleResearchTail.model_validate(self._role_control(target, payload))
 
     def nudge(
@@ -115,6 +122,7 @@ class KubectlCampaignBackend(OperationBackend):
         control_token: str,
     ) -> NudgeReceipt:
         payload = RoleControlRequest(
+            protocol_version=MANAGEMENT_PROTOCOL_VERSION,
             command="nudge",
             expected_conversation_id=expected_conversation_id,
             control_token=control_token,
@@ -131,6 +139,7 @@ class KubectlCampaignBackend(OperationBackend):
         restart_control_token: str,
     ) -> RestartReceipt:
         payload = RoleControlRequest(
+            protocol_version=MANAGEMENT_PROTOCOL_VERSION,
             command="restart",
             expected_conversation_id=expected_conversation_id,
             restart_control_token=restart_control_token,
@@ -144,6 +153,7 @@ class KubectlCampaignBackend(OperationBackend):
         request: ContextResetRequest,
     ) -> ContextResetReceipt:
         payload = RoleControlRequest(
+            protocol_version=MANAGEMENT_PROTOCOL_VERSION,
             command="context_reset",
             context_reset_request=request,
         )
@@ -307,7 +317,10 @@ class KubectlCampaignBackend(OperationBackend):
         *,
         pod: str | None = None,
     ) -> RoleRuntimeState:
-        payload = RoleControlRequest(command="observe")
+        payload = RoleControlRequest(
+            protocol_version=MANAGEMENT_PROTOCOL_VERSION,
+            command="observe",
+        )
         return RoleRuntimeState.model_validate(
             self._role_control(target, payload, pod=pod)
         )
@@ -342,11 +355,13 @@ class KubectlCampaignBackend(OperationBackend):
             timeout_seconds=timeout_seconds,
         )
         try:
-            return json.loads(output)
-        except json.JSONDecodeError as error:
+            response = RoleControlResponse.model_validate_json(output)
+        except ValidationError as error:
             raise KubernetesOperationError(
-                "role control returned invalid JSON"
+                "role control returned invalid JSON or an incompatible "
+                "management protocol"
             ) from error
+        return response.result
 
     def _pod(self, target: RoleTarget) -> str:
         self.inventory.require(target)

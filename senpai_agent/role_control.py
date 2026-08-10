@@ -42,6 +42,7 @@ from senpai_agent.operations import (
     RoleObservation,
     RoleTarget,
 )
+from senpai_agent.protocols import MANAGEMENT_PROTOCOL_VERSION
 from senpai_agent.supervisor import WorkerLease
 from senpai_agent.training import (
     TrainingInventory,
@@ -98,6 +99,7 @@ class RoleResearchTail(BaseModel):
 class RoleControlRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    protocol_version: Literal["senpai-management/v1"]
     command: Literal[
         "observe",
         "research_tail",
@@ -112,6 +114,15 @@ class RoleControlRequest(BaseModel):
     operation_key: str | None = None
     recovery_prompt: str | None = None
     context_reset_request: ContextResetRequest | None = None
+
+
+class RoleControlResponse(BaseModel):
+    """Versioned envelope returned across the kubectl exec boundary."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    protocol_version: Literal["senpai-management/v1"]
+    result: dict[str, object]
 
 
 def role_target(env: Mapping[str, str] = os.environ) -> RoleTarget:
@@ -907,7 +918,13 @@ def role_control_main(
         result = request_context_reset(request.context_reset_request, env)
     else:
         raise RuntimeError(f"unsupported role control command: {request.command}")
-    print(result.model_dump_json(), flush=True)
+    print(
+        RoleControlResponse(
+            protocol_version=MANAGEMENT_PROTOCOL_VERSION,
+            result=result.model_dump(mode="json"),
+        ).model_dump_json(),
+        flush=True,
+    )
     return 0
 
 
