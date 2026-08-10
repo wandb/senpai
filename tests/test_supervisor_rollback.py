@@ -10,6 +10,8 @@ import pytest
 
 from k8s import supervisor_rollback
 
+LAST_APPLIED = "kubectl.kubernetes.io/last-applied-configuration"
+
 
 def completed(argv, *, stdout="", stderr="", returncode=0):
     return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)
@@ -113,6 +115,18 @@ class FakeKubernetes:
                 != current.get("metadata", {}).get("resourceVersion")
             ):
                 return completed(argv, returncode=1, stderr="Conflict")
+            if not any(argument.startswith("--raw=") for argument in argv):
+                annotations = metadata.get("annotations")
+                if isinstance(annotations, dict) and LAST_APPLIED in annotations:
+                    submitted = copy.deepcopy(document)
+                    submitted_annotations = submitted["metadata"].get("annotations")
+                    if isinstance(submitted_annotations, dict):
+                        submitted_annotations.pop(LAST_APPLIED, None)
+                    annotations[LAST_APPLIED] = json.dumps(
+                        submitted,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
             metadata["namespace"] = self.namespace
             metadata["resourceVersion"] = self._next_revision()
             if document["kind"] == "Lease":
@@ -215,6 +229,40 @@ def capture(monkeypatch, tmp_path, fake, **kwargs):
     )
 
 
+@pytest.mark.parametrize(
+    ("kind", "prefix", "plural"),
+    [
+        ("NetworkPolicy", "/apis/networking.k8s.io/v1", "networkpolicies"),
+        ("ServiceAccount", "/api/v1", "serviceaccounts"),
+        ("Role", "/apis/rbac.authorization.k8s.io/v1", "roles"),
+        ("RoleBinding", "/apis/rbac.authorization.k8s.io/v1", "rolebindings"),
+        ("Deployment", "/apis/apps/v1", "deployments"),
+    ],
+)
+def test_target_api_path_pins_namespaced_collection_and_member(
+    kind,
+    prefix,
+    plural,
+):
+    target = next(
+        item
+        for item in supervisor_rollback._targets("campaign-a")
+        if item.kind == kind
+    )
+    collection = f"{prefix}/namespaces/research%20%2Fa/{plural}"
+
+    assert supervisor_rollback._target_api_path(
+        target,
+        namespace="research /a",
+        member=False,
+    ) == collection
+    assert supervisor_rollback._target_api_path(
+        target,
+        namespace="research /a",
+        member=True,
+    ) == f"{collection}/{target.name}"
+
+
 def test_capture_pins_scope_lineage_and_exact_mutable_resources(monkeypatch, tmp_path):
     fake = FakeKubernetes()
     deployment = old_deployment()
@@ -257,43 +305,62 @@ def test_capture_pins_scope_lineage_and_exact_mutable_resources(monkeypatch, tmp
     assert all(call[1].get("timeout") for call in fake.calls)
 
 
-def test_canonical_manifest_normalizes_last_applied_server_metadata():
-    """A replace may persist resourceVersion inside kubectl's config annotation."""
-
-    target = supervisor_rollback._targets("campaign-a")[1]
-    original_config = old_service_account()
-    expected = copy.deepcopy(original_config)
-    expected["metadata"]["annotations"] = {
-        "kubectl.kubernetes.io/last-applied-configuration": json.dumps(
-            original_config, sort_keys=True
+def test_restore_uses_raw_api_and_preserves_last_applied_annotations(
+    monkeypatch,
+    tmp_path,
+):
+    def annotated(document):
+        document = copy.deepcopy(document)
+        applied = copy.deepcopy(document)
+        document["metadata"].setdefault("annotations", {})[LAST_APPLIED] = json.dumps(
+            applied,
+            sort_keys=True,
+            separators=(",", ":"),
         )
-    }
+        return document
 
-    versioned_config = copy.deepcopy(original_config)
-    versioned_config["metadata"]["resourceVersion"] = "1234"
-    actual = copy.deepcopy(original_config)
-    actual["metadata"]["annotations"] = {
-        "kubectl.kubernetes.io/last-applied-configuration": json.dumps(
-            versioned_config, sort_keys=True
-        )
-    }
+    fake = FakeKubernetes()
+    service_account = annotated(old_service_account())
+    deployment = annotated(old_deployment())
+    fake.put(service_account)
+    fake.put(deployment)
+    rollback = capture(monkeypatch, tmp_path, fake)
+    rollback.mark_mutation_started()
 
-    assert supervisor_rollback._canonical_manifest(
-        actual, target, namespace="research-a"
-    ) == supervisor_rollback._canonical_manifest(
-        expected, target, namespace="research-a"
+    replacement = annotated(old_service_account())
+    replacement["metadata"]["labels"] = {"release": "new"}
+    fake.put(replacement)
+    fake.objects.pop("deployment.apps/senpai-supervisor-campaign-a")
+    calls_before_restore = len(fake.calls)
+
+    rollback.restore(timeout_seconds=10)
+
+    assert (
+        fake.objects[
+            "serviceaccount/senpai-supervisor-campaign-a"
+        ]["metadata"]["annotations"][LAST_APPLIED]
+        == service_account["metadata"]["annotations"][LAST_APPLIED]
+    )
+    assert (
+        fake.objects[
+            "deployment.apps/senpai-supervisor-campaign-a"
+        ]["metadata"]["annotations"][LAST_APPLIED]
+        == deployment["metadata"]["annotations"][LAST_APPLIED]
     )
 
-    versioned_config["automountServiceAccountToken"] = True
-    actual["metadata"]["annotations"] = {
-        "kubectl.kubernetes.io/last-applied-configuration": json.dumps(
-            versioned_config, sort_keys=True
-        )
-    }
-    assert supervisor_rollback._canonical_manifest(
-        actual, target, namespace="research-a"
-    ) != supervisor_rollback._canonical_manifest(
-        expected, target, namespace="research-a"
+    restore_calls = [argv for argv, _kwargs in fake.calls[calls_before_restore:]]
+    assert any(
+        "replace" in argv
+        and (
+            "--raw=/api/v1/namespaces/research-a/serviceaccounts/"
+            "senpai-supervisor-campaign-a"
+        ) in argv
+        for argv in restore_calls
+    )
+    assert any(
+        "create" in argv
+        and "--raw=/apis/apps/v1/namespaces/research-a/deployments" in argv
+        for argv in restore_calls
     )
 
 

@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -63,7 +64,13 @@ _SERVER_METADATA = {
     "selfLink",
     "uid",
 }
-_LAST_APPLIED_ANNOTATION = "kubectl.kubernetes.io/last-applied-configuration"
+_API_RESOURCE_PLURALS = {
+    "NetworkPolicy": "networkpolicies",
+    "ServiceAccount": "serviceaccounts",
+    "Role": "roles",
+    "RoleBinding": "rolebindings",
+    "Deployment": "deployments",
+}
 
 
 class RollbackError(RuntimeError):
@@ -356,30 +363,33 @@ def _canonical_manifest(
     namespace: str,
 ) -> dict[str, Any]:
     manifest = _restorable_manifest(document, target, namespace=namespace)
-    annotations = manifest["metadata"].get("annotations")
-    if isinstance(annotations, dict):
-        last_applied = annotations.get(_LAST_APPLIED_ANNOTATION)
-        if isinstance(last_applied, str):
-            try:
-                applied = json.loads(last_applied)
-                if isinstance(applied, dict):
-                    applied = _restorable_manifest(
-                        applied,
-                        target,
-                        namespace=namespace,
-                    )
-                    annotations[_LAST_APPLIED_ANNOTATION] = json.dumps(
-                        applied,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-            except (json.JSONDecodeError, RuntimeError):
-                pass
-        if target.kind == "Deployment":
+    if target.kind == "Deployment":
+        annotations = manifest["metadata"].get("annotations")
+        if isinstance(annotations, dict):
             annotations.pop("deployment.kubernetes.io/revision", None)
-        if not annotations:
-            manifest["metadata"].pop("annotations", None)
+            if not annotations:
+                manifest["metadata"].pop("annotations", None)
     return manifest
+
+
+def _target_api_path(
+    target: _Target,
+    *,
+    namespace: str,
+    member: bool,
+) -> str:
+    plural = _API_RESOURCE_PLURALS.get(target.kind)
+    if plural is None:
+        raise ValueError(f"unsupported raw API target kind: {target.kind}")
+    prefix = (
+        "/api/v1"
+        if target.api_version == "v1"
+        else f"/apis/{target.api_version}"
+    )
+    path = f"{prefix}/namespaces/{quote(namespace, safe='')}/{plural}"
+    if member:
+        path += f"/{quote(target.name, safe='')}"
+    return path
 
 
 def _lease_metadata_for_replace(
@@ -1487,8 +1497,14 @@ class SupervisorRollback:
                 )
             desired["metadata"]["resourceVersion"] = resource_version
             operation = "replace"
+        api_path = _target_api_path(
+            target,
+            namespace=scope.namespace,
+            member=current is not None,
+        )
         result = _run(
             operation,
+            f"--raw={api_path}",
             "-f",
             "-",
             kube_context=scope.kube_context,
