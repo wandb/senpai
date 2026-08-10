@@ -63,6 +63,7 @@ _SERVER_METADATA = {
     "selfLink",
     "uid",
 }
+_LAST_APPLIED_ANNOTATION = "kubectl.kubernetes.io/last-applied-configuration"
 
 
 class RollbackError(RuntimeError):
@@ -355,12 +356,29 @@ def _canonical_manifest(
     namespace: str,
 ) -> dict[str, Any]:
     manifest = _restorable_manifest(document, target, namespace=namespace)
-    if target.kind == "Deployment":
-        annotations = manifest["metadata"].get("annotations")
-        if isinstance(annotations, dict):
+    annotations = manifest["metadata"].get("annotations")
+    if isinstance(annotations, dict):
+        last_applied = annotations.get(_LAST_APPLIED_ANNOTATION)
+        if isinstance(last_applied, str):
+            try:
+                applied = json.loads(last_applied)
+                if isinstance(applied, dict):
+                    applied = _restorable_manifest(
+                        applied,
+                        target,
+                        namespace=namespace,
+                    )
+                    annotations[_LAST_APPLIED_ANNOTATION] = json.dumps(
+                        applied,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+            except (json.JSONDecodeError, RuntimeError):
+                pass
+        if target.kind == "Deployment":
             annotations.pop("deployment.kubernetes.io/revision", None)
-            if not annotations:
-                manifest["metadata"].pop("annotations", None)
+        if not annotations:
+            manifest["metadata"].pop("annotations", None)
     return manifest
 
 

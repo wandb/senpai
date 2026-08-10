@@ -257,6 +257,46 @@ def test_capture_pins_scope_lineage_and_exact_mutable_resources(monkeypatch, tmp
     assert all(call[1].get("timeout") for call in fake.calls)
 
 
+def test_canonical_manifest_normalizes_last_applied_server_metadata():
+    """A replace may persist resourceVersion inside kubectl's config annotation."""
+
+    target = supervisor_rollback._targets("campaign-a")[1]
+    original_config = old_service_account()
+    expected = copy.deepcopy(original_config)
+    expected["metadata"]["annotations"] = {
+        "kubectl.kubernetes.io/last-applied-configuration": json.dumps(
+            original_config, sort_keys=True
+        )
+    }
+
+    versioned_config = copy.deepcopy(original_config)
+    versioned_config["metadata"]["resourceVersion"] = "1234"
+    actual = copy.deepcopy(original_config)
+    actual["metadata"]["annotations"] = {
+        "kubectl.kubernetes.io/last-applied-configuration": json.dumps(
+            versioned_config, sort_keys=True
+        )
+    }
+
+    assert supervisor_rollback._canonical_manifest(
+        actual, target, namespace="research-a"
+    ) == supervisor_rollback._canonical_manifest(
+        expected, target, namespace="research-a"
+    )
+
+    versioned_config["automountServiceAccountToken"] = True
+    actual["metadata"]["annotations"] = {
+        "kubectl.kubernetes.io/last-applied-configuration": json.dumps(
+            versioned_config, sort_keys=True
+        )
+    }
+    assert supervisor_rollback._canonical_manifest(
+        actual, target, namespace="research-a"
+    ) != supervisor_rollback._canonical_manifest(
+        expected, target, namespace="research-a"
+    )
+
+
 def test_first_launch_recovery_preserves_the_metadata_egress_policy(
     monkeypatch,
     tmp_path,
