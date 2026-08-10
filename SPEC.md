@@ -107,22 +107,30 @@ Each failed evidence source remains `unknown` with a typed evidence gap. In
 particular, a failed W&B query is not reported as zero running jobs. Repeated
 `SENPAI_TURN_DEFERRED` log markers survive in the bounded three-snapshot trend.
 
-The supervisor receives OpenHands' native terminal and one typed operations
-tool. Unlike advisor/student terminals, the native terminal is not wrapped by
-Senpai's command policy. It can run arbitrary commands permitted by the
-container's Unix identity and ServiceAccount. The exact runtime and instruction
-checkout is populated by an init container and mounted read-only into the model
-container, and user-skill loading is disabled. The typed tool remains the
-preferred surface for inspecting a role, enqueueing a deduplicated role event,
-queueing a context reset, or restarting the controller because targets can name
-only the configured advisor or students; callers cannot supply hosts, pods,
-namespaces, working directories, environments, or credentials. Typed mutations
-have durable idempotency keys, per-incident cooldowns, and metadata-only audit
-records. The enforced cooldown identity is derived from the anomaly category,
-mutation kind, and exact role target; changing a free-form incident label
-cannot bypass it. Role inspection is always fresh and is never replayed from
-the mutation ledger. Each fresh supervisor turn receives the 12 most recent
-mutation targets, categories, timestamps, and outcomes.
+The supervisor receives OpenHands' native `terminal` interface and one typed
+operations tool. The credentialed control container holds campaign state,
+GitHub, W&B, model, and projected Kubernetes credentials. Native terminal
+actions cross a private Unix socket into a separate secret-free shell container
+that has a mutable private home, temporary directory, and workspace. Senpai
+does not apply the advisor/student command policy there, so shell and Git syntax
+are unrestricted, but Unix/filesystem permissions and the absence of external
+credentials still apply. The shell has no ServiceAccount token, campaign state,
+provider secret, GitHub token, W&B key, shared PID namespace, or access to the
+control container's root filesystem. The exact runtime and instruction checkout
+is populated by an init container, mounted read-only, and excluded from
+persistent user-skill loading.
+
+The typed tool remains the preferred surface for inspecting a role, enqueueing
+a deduplicated role event, queueing a context reset, or requesting a controller
+restart because targets can name only the configured advisor or students;
+callers cannot supply hosts, pods, namespaces, working directories,
+environments, or credentials. Typed mutations have durable idempotency keys,
+per-incident cooldowns, and metadata-only audit records. The enforced cooldown
+identity is derived from the anomaly category, mutation kind, and exact role
+target; changing a free-form incident label cannot bypass it. Role inspection
+is always fresh and is never replayed from the mutation ledger. Each fresh
+supervisor turn receives the 12 most recent mutation targets, categories,
+timestamps, and outcomes.
 
 A context reset is an owner-consumed request. The external supervisor records
 the expected conversation UUID, controller identity, raw-event prefix digest
@@ -135,10 +143,14 @@ event trace, and pending events. External code never instantiates a second
 
 A controller restart is refused while an advisor or student supervised job or
 delegated agent is running, or when either activity inventory cannot be proven.
-It signals only the verified controller PID; the role's existing crash
-supervisor performs the restart. Kubernetes RBAC grants no AWS, node,
-pod-delete, or Deployment-patch verbs. The terminal receives no GitHub token,
-so authenticated branch and PR mutations remain with advisor/student tools.
+The request records the observed conversation, worker generation, and exact
+replacement generation. Only the role's process-owning supervisor may consume
+it, terminate that generation, and start the replacement; external code never
+signals a controller PID. A planned restart does not accrue crash backoff, and
+the replacement generation completes the durable receipt. Stale source
+generations fail closed. Kubernetes RBAC grants no AWS, node, pod-delete, or
+Deployment-patch verbs. The terminal receives no GitHub token, so authenticated
+branch and PR mutations remain with advisor/student tools or conversations.
 
 Every six hours, the next wake runs a second fresh review against the currently
 deployed `system_instructions/ADVISOR.md`. It may inject one concise reminder
@@ -780,23 +792,35 @@ launcher waits for rollout readiness for the configured timeout and prints an
 exact namespace/context-qualified `kubectl rollout undo` command on failure.
 
 When enabled, the launcher also creates one dedicated supervisor
-ServiceAccount, namespace-scoped Role, RoleBinding, and Deployment. Kubernetes
-RBAC cannot constrain pod list/log/exec by label. The typed tool enforces exact
-campaign selectors, but the native terminal can use those verbs anywhere in
-its namespace. A campaign that enables the supervisor therefore requires a
-dedicated namespace for hard campaign isolation. The Role has no AWS, node,
-pod-deletion, or Deployment-mutation verbs. The launcher creates no Service or
-general cluster RBAC. Docker and local hosts need no shared network for
-advisor/student communication; another deployment backend may implement the
-same typed supervisor operation protocol.
+ServiceAccount, namespace-scoped Role, RoleBinding, and Deployment. The Pod
+does not automount a token; only the credentialed control container receives a
+short-lived projected token. Kubernetes RBAC cannot constrain that container's
+pod list/log/exec verbs by label, so a campaign that enables the supervisor
+requires a dedicated namespace for hard campaign isolation. The Role has no
+AWS, node, pod-deletion, or Deployment-mutation verbs. The launcher creates no
+Service or general cluster RBAC.
 
-The Kubernetes container launcher transfers GitHub, W&B, and model credentials
-through a mode-checked, one-use directory, removes them from the environment,
-and execs Python. Python consumes and unlinks the directory before OpenHands is
-imported. Weave receives W&B authentication only during its synchronous
-initialization and the ambient environment is restored immediately afterward.
-The native terminal therefore receives no credentials through inheritance or
-the Python process's Linux initial environment.
+The model-visible shell runs in a second container with a read-only root and
+runtime, private writable home/tmp/workspace, no projected token or Secret, and
+no shared process namespace. Its native-terminal server owns one Unix socket;
+the control container mounts that socket directory read-only. Conversely, the
+credentialed repair broker owns a second socket directory that the shell mounts
+read-only. The broker accepts only an inventory-bound role target and one of
+three symbolic working directories. It invokes an immutable executor in that
+role's fixed secret-free repair sidecar, which shares the mutable target
+workspace and role state but not runner source, dataset, credentials,
+ServiceAccount token, PID namespace, or the credentialed container root.
+Requests and outcomes are bounded and audited, descendants are reaped on every
+exit path, and transport loss after command submission is reported as an
+unknown outcome rather than replayed.
+
+Supervisor-only upgrades resolve only GitHub, W&B, and the configured model
+provider. They validate the existing exact-tag role inventory and revision but
+do not require Exa/Hugging Face credentials, create advisor branches, or mutate
+student labels. Each supervisor release uses a new immutable content-addressed
+Secret and ConfigMap; the launcher updates only its Deployment, waits for
+readiness, retains the previous bundle, and emits an exact rollback command if
+the rollout fails.
 
 Docker, AWS GPU, and AWS Mac operational-supervisor transports are deliberately
 not implemented in this revision. Docker should use a narrow host-side broker

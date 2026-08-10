@@ -411,14 +411,24 @@ def test_supervisor_only_launch_preserves_role_secret_and_uses_immutable_bundle(
 
     deployment = resources[("Deployment", "senpai-supervisor-test-track")]
     pod = deployment["spec"]["template"]["spec"]
-    assert pod["initContainers"][0]["env"][0]["valueFrom"]["secretKeyRef"][
-        "name"
-    ] == supervisor_secret_name
+    source = next(
+        container
+        for container in pod["initContainers"]
+        if container["name"] == "source"
+    )
+    control = next(
+        container
+        for container in pod["containers"]
+        if container["name"] == "supervisor-control"
+    )
+    assert source["env"][0]["valueFrom"]["secretKeyRef"]["name"] == (
+        supervisor_secret_name
+    )
     assert {
         env["valueFrom"]["secretKeyRef"]["name"]
-        for env in pod["containers"][0]["env"]
+        for env in control["env"]
     } == {supervisor_secret_name}
-    assert pod["containers"][0]["envFrom"][0]["configMapRef"]["name"] == (
+    assert control["envFrom"][0]["configMapRef"]["name"] == (
         supervisor_config_name
     )
 

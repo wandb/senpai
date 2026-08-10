@@ -217,12 +217,15 @@ launch_args=(
 uv run python k8s/launch.py "${launch_args[@]}" --preflight_only
 ```
 
-Every preflight authenticates GitHub, Exa, W&B, and every model provider used by
-an active role or shared model profile. It verifies GitHub Contents write
-access, resolves the target branch, rejects active student-label collisions,
-and checks immutable image references against one expected runner revision.
-Backend-specific checks are described below. Preflight never changes GitHub or
-starts advisor or student roles.
+Every role-launch preflight authenticates GitHub, Exa, W&B, and every model
+provider used by an active role or shared model profile. It verifies GitHub
+Contents write access, resolves the target branch, rejects active student-label
+collisions, and checks immutable image references against one expected runner
+revision. A supervisor-only upgrade authenticates only the credentials the
+supervisor actually uses (GitHub, W&B, and its model provider), verifies the
+existing exact campaign inventory and source revision, and neither requires
+Exa/Hugging Face credentials nor creates branches or labels. Backend-specific
+checks are described below. Preflight never starts advisor or student roles.
 
 ### 7. Launch
 
@@ -242,11 +245,13 @@ the previous bundle for Kubernetes rollback. The launcher waits up to
 on failure it reports the exact `kubectl rollout undo` command.
 
 The supervisor also receives a dedicated ServiceAccount and namespace-scoped
-Role/RoleBinding. Its typed operation tool enforces the campaign inventory,
-while its native terminal inherits namespace-wide pod list/log/exec verbs that
-Kubernetes cannot label-scope. Use a dedicated namespace for every campaign
-that enables the supervisor. The launcher does not create the namespace, PVC,
-Service, or general cluster RBAC.
+Role/RoleBinding. Only its credentialed control container receives a projected
+ServiceAccount token. Its typed operation tool and repair broker enforce the
+campaign inventory; the separate model-visible terminal container has no
+Kubernetes token or credentials. Kubernetes still cannot label-scope the
+control container's pod list/log/exec verbs, so use a dedicated namespace for
+every campaign that enables the supervisor. The launcher does not create the
+namespace, PVC, Service, or general cluster RBAC.
 
 Inspect and stop the launch:
 
@@ -731,34 +736,47 @@ training errors can recur unchanged, the supervisor counts only distinct
 timestamp/fingerprint pairs rather than treating the same marker in two wakes
 as two failures.
 
-The supervisor has OpenHands' native terminal plus one typed operation tool.
-The terminal is not wrapped by Senpai's advisor/student command policy, so it
-can run arbitrary shell, Git, `gh`, and `kubectl` commands within the
-container's Unix permissions and ServiceAccount RBAC. Its pinned runtime and
-instruction checkout is mounted read-only, and persistent user-skill loading is
-disabled, so a wake cannot modify the pinned checkout or instructions in place.
-The terminal intentionally receives no GitHub token; authenticated repository
-writes remain with the existing credential-hiding advisor/student workflow. The
-typed tool may inspect a configured role, send one deduplicated nudge to its
-existing conversation,
-queue a same-UUID model-context reset, or restart only a quiescent controller.
-Every typed mutation is campaign-scoped, audited, idempotent, and
-cooldown-limited. Cooldown identity
-comes from the typed anomaly category, action, and exact role target rather
-than the model's free-form incident label. Inspections always execute fresh,
-and every fresh supervisor turn sees a bounded audit of the 12 most recent
-mutation outcomes. A controller restart is refused while an advisor or student
-job or delegated agent is active, or when either activity inventory is unknown.
-A context reset is consumed only by the owning controller at a safe turn
-boundary: it starts a clean active branch while preserving the raw OpenHands
-trace, conversation UUID, workspace, and pending events. It never deletes or
-rewrites event files.
+The supervisor has OpenHands' native `terminal` interface plus one typed
+operation tool, but they execute across a deliberate two-container boundary.
+The credentialed control container owns GitHub, W&B, model, campaign-state, and
+projected Kubernetes credentials. The model's native terminal actions are
+forwarded over a private Unix socket to a secret-free shell container. That
+shell has a mutable private home, temporary directory, and workspace and is not
+wrapped by Senpai's advisor/student command policy, so Senpai does not filter
+shell or Git syntax. It has no Kubernetes token, campaign state, provider
+secret, GitHub token, W&B key, shared PID namespace, or view of the control
+container's root filesystem. The pinned runtime and instructions are mounted
+read-only, and persistent user-skill loading is disabled.
 
-The container launcher moves its GitHub, W&B, and model credentials through a
-private one-use directory, unsets them, and then execs Python. Python consumes
-and deletes that directory before importing OpenHands. The native terminal
-therefore inherits no credential values, and Linux cannot recover them from the
-Python process's initial environment.
+The typed tool may inspect a configured role, send one deduplicated nudge to
+its existing conversation, queue a same-UUID model-context reset, or request a
+restart of a quiescent controller. Every typed mutation is campaign-scoped,
+audited, idempotent, and cooldown-limited. Cooldown identity comes from the
+typed anomaly category, action, and exact role target rather than the model's
+free-form incident label. Inspections always execute fresh, and every fresh
+supervisor turn sees a bounded audit of the 12 most recent mutation outcomes.
+
+Arbitrary role repair uses `senpai-role-shell`. The shell client accepts only a
+configured advisor or student plus `workspace`, `state`, or private `scratch`;
+the credentialed broker resolves that fixed inventory and executes in the
+target pod's secret-free `repair` sidecar. Repair sidecars share only the exact
+role workspace and state, not its credentials, ServiceAccount token, PID
+namespace, dataset volume, or container root. Commands have a hard timeout,
+bounded output, descendant cleanup, and an audited outcome. Authenticated
+repository mutations remain available through a nudge to the existing
+credentialed advisor/student conversation; an authentication failure in the
+secret-free shell is not a command-policy restriction.
+
+A controller restart is refused while an advisor or student job or delegated
+agent is active, or when either activity inventory is unknown. The request is
+persisted against the observed conversation and worker generation; only the
+role's process-owning supervisor may terminate that exact generation and start
+its replacement. Planned restarts do not accrue crash backoff, and the
+replacement generation completes the durable receipt. A context reset is
+likewise consumed only by the owning controller at a safe turn boundary: it
+starts a clean active branch while preserving the raw OpenHands trace,
+conversation UUID, workspace, and pending events. It never deletes or rewrites
+event files.
 
 Every six hours, the next wake runs a second fresh research review against the
 current `system_instructions/ADVISOR.md`. It intervenes only for clear strategic

@@ -208,8 +208,17 @@ def test_pull_request_canary_has_no_live_secret_or_checkout_credential_path():
 
     script = (ROOT / "scripts" / "test-kubernetes-canary.sh").read_text()
     assert (
-        "kindest/node:v1.33.4@sha256:"
-        "25a6018e48dfcaee478f4a59af81157a437f15e6e140bf103f85a2e7cd0cbbf2"
+        "kindest/node:v1.34.8@sha256:"
+        "02722c2dedddcfc00febf5d27fbeb9b7b2c14294c82109ff4a85d89ac9ba3256"
     ) in script
+    install_step = next(
+        step for step in build_steps if step["name"] == "Install pinned Kind"
+    )
+    install_script = install_step["run"]
+    assert "/v0.32.0/kind-linux-amd64" in install_script
+    assert (
+        "50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54"
+        in install_script
+    )
     assert 'delete cluster --name "$CLUSTER"' in script
     assert "SENPAI_CI_DUMMY_" not in workflow_text

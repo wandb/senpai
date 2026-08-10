@@ -98,7 +98,7 @@ EOF
 
 "$KIND_BIN" create cluster \
   --name "$CLUSTER" \
-  --image "kindest/node:v1.33.4@sha256:25a6018e48dfcaee478f4a59af81157a437f15e6e140bf103f85a2e7cd0cbbf2" \
+  --image "kindest/node:v1.34.8@sha256:02722c2dedddcfc00febf5d27fbeb9b7b2c14294c82109ff4a85d89ac9ba3256" \
   --config "$WORK_DIR/kind.yaml" \
   --wait 120s
 CLUSTER_CREATED=true
