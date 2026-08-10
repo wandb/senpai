@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from openhands.sdk.tool import ToolExecutor
 
-from senpai_agent import git_workflow
+from senpai_agent import git_assignment, git_workflow
 from senpai_agent.models import (
     AssignmentRecord,
     DispositionRecord,
@@ -15,6 +15,7 @@ from senpai_agent.models import (
 
 from .contracts import (
     AcceptResultOnCurrentBaseAction,
+    AdoptAssignmentAction,
     CloseExperimentAction,
     CreateAssignmentAction,
     GitHubMutationObservation,
@@ -66,6 +67,52 @@ class CreateAssignmentExecutor(
                 ),
                 title=action.title,
                 body=action.body,
+            )
+        return GitHubMutationObservation.from_result(result)
+
+
+class AdoptAssignmentExecutor(
+    ToolExecutor[AdoptAssignmentAction, GitHubMutationObservation]
+):
+    def __init__(self, runtime: GitHubToolRuntime):
+        self.runtime = runtime
+
+    def __call__(
+        self,
+        action: AdoptAssignmentAction,
+        conversation: LocalConversation | None = None,
+    ) -> GitHubMutationObservation:
+        base_branch = self.runtime.assignment_base_branch()
+        self.runtime.require_configured_student(action.student)
+        with self.runtime.workflow.serialized_assignment_mutation():
+            git_assignment.require_remote_assignment_history(
+                self.runtime.workspace,
+                branch=action.head_branch,
+                expected_head_sha=action.expected_pr_head_sha,
+                base_branch=base_branch,
+                expected_base_sha=action.expected_base_sha,
+                token=self.runtime.git_token,
+            )
+            result = self.runtime.workflow.adopt_assignment(
+                action.pr_number,
+                assignment=AssignmentRecord(
+                    repo=self.runtime.workflow.repo,
+                    assignment_id=action.assignment_id,
+                    revision_id=action.revision_id,
+                    student=action.student,
+                    base_ref=base_branch,
+                    base_sha=action.expected_base_sha,
+                    head_ref=action.head_branch,
+                    head_sha=action.expected_pr_head_sha,
+                ),
+            )
+            git_assignment.require_remote_assignment_history(
+                self.runtime.workspace,
+                branch=action.head_branch,
+                expected_head_sha=action.expected_pr_head_sha,
+                base_branch=base_branch,
+                expected_base_sha=action.expected_base_sha,
+                token=self.runtime.git_token,
             )
         return GitHubMutationObservation.from_result(result)
 

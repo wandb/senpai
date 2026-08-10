@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ from senpai_agent.models import (
     AssignmentRecord,
     ExperimentResult,
     parse_assignment_feedback_markers,
+    parse_assignment_markers,
 )
 
 
@@ -21,6 +23,7 @@ FEEDBACK_KEY_PREFIX = "student_pr_feedback:"
 FEEDBACK_EXCERPT_BYTES = 4_000
 DEFAULT_FEEDBACK_BATCH_EVENTS = 8
 DEFAULT_FEEDBACK_BATCH_BYTES = 32_000
+_GIT_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +44,80 @@ def pull_reference(pull: Mapping[str, object]) -> dict[str, object]:
         "head_ref": str(head["ref"]),
         "head_sha": str(head["sha"]),
     }
+
+
+def assignment_from_pull(
+    pull: Mapping[str, object],
+    *,
+    repo: str,
+    expected_student: str | None = None,
+) -> AssignmentRecord:
+    """Return the one assignment whose marker and live PR route agree."""
+
+    student_labels = sorted(
+        label.removeprefix("student:")
+        for label in label_names(pull)
+        if label.startswith("student:")
+    )
+    if len(student_labels) != 1:
+        raise ValueError("assigned PR must contain exactly one student label")
+    student = student_labels[0]
+    if expected_student is not None and student != expected_student:
+        raise ValueError("assigned PR student label does not match this student")
+
+    markers = parse_assignment_markers(str(pull.get("body") or ""))
+    if len(markers) != 1:
+        raise ValueError(
+            "assigned PR must contain exactly one Senpai assignment marker"
+        )
+    assignment = markers[0]
+    if assignment.student != student:
+        raise ValueError("assignment marker student does not match the student label")
+
+    head = pull.get("head")
+    base = pull.get("base")
+    if not isinstance(head, dict) or not isinstance(base, dict):
+        raise ValueError("assigned PR has invalid head or base metadata")
+    expected = {
+        "repo": (assignment.repo, repo),
+        "head_ref": (assignment.head_ref, str(head.get("ref") or "")),
+        "base_ref": (assignment.base_ref, str(base.get("ref") or "")),
+    }
+    mismatches = [
+        name for name, (recorded, live) in expected.items() if recorded != live
+    ]
+    if mismatches:
+        raise ValueError(
+            "assignment marker does not match PR routing: " + ", ".join(mismatches)
+        )
+    for name, value in (
+        ("assignment head SHA", assignment.head_sha),
+        ("assignment base SHA", assignment.base_sha),
+        ("live head SHA", str(head.get("sha") or "")),
+    ):
+        if _GIT_OBJECT_ID.fullmatch(value) is None:
+            raise ValueError(f"{name} is not a full Git object ID")
+    return assignment
+
+
+def malformed_assignment_event(
+    pull: Mapping[str, object], error: ValueError
+) -> ControllerEvent:
+    number = int(pull["number"])
+    head_sha = str(object_value(pull["head"])["sha"])
+    students = sorted(
+        label.removeprefix("student:")
+        for label in label_names(pull)
+        if label.startswith("student:")
+    )
+    payload = {
+        **pull_reference(pull),
+        "error": f"Assigned PR #{number}: {error}",
+        "students": students,
+    }
+    return versioned_event(
+        "malformed_assignment", number, head_sha, payload=payload
+    )
 
 
 def payload_digest(payload: Mapping[str, object]) -> str:

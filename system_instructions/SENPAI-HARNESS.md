@@ -80,8 +80,8 @@ only when its named tool is present in your schema:
   next step. Call it only when browser navigation or page inspection is useful;
   loading is idempotent and persists for the conversation.
 - When present, operation-specific GitHub tools own the complete mutation they
-  name. Advisors may receive `create_assignment`, `publish_advisor_branch`,
-  `repair_assignment_routing`, `send_assignment_feedback`,
+  name. Advisors may receive `create_assignment`, `adopt_assignment`,
+  `publish_advisor_branch`, `repair_assignment_routing`, `send_assignment_feedback`,
   `request_assignment_revision`, `accept_result_on_current_base`,
   `merge_experiment`, and `close_experiment`. Students may receive
   `submit_experiment_result`. Both roles may receive

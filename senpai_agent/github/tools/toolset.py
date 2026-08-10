@@ -13,6 +13,7 @@ from senpai_agent.github.workflow import GitHubWorkflow
 
 from .definitions import (
     AcceptResultOnCurrentBaseTool,
+    AdoptAssignmentTool,
     CloseExperimentTool,
     CreateAssignmentTool,
     MergeExperimentTool,
@@ -105,6 +106,7 @@ class GitHubWorkflowToolSet(
         return (
             *common,
             *CreateAssignmentTool.create(runtime),
+            *AdoptAssignmentTool.create(runtime),
             *PublishAdvisorBranchTool.create(runtime),
             *RepairAssignmentRoutingTool.create(runtime),
             *SendAssignmentFeedbackTool.create(runtime),

@@ -56,6 +56,7 @@ def test_pull_request_returns_an_immutable_typed_snapshot():
         head_sha=HEAD_SHA,
         base_ref="schmidhuber",
         head_ref="student-one/lower-lr",
+        author="senpai-bot",
         title="Try lower learning rate",
         body=cast(str, fake.pr["body"]),
         labels=("status:wip", "student:one"),

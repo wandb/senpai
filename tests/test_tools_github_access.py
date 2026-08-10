@@ -27,6 +27,7 @@ ADVISOR_GITHUB_TOOLS = {
     "get_prs",
     "respond_to_human_issue",
     "create_assignment",
+    "adopt_assignment",
     "publish_advisor_branch",
     "repair_assignment_routing",
     "send_assignment_feedback",

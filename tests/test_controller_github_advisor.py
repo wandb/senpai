@@ -21,6 +21,7 @@ def pull(
     number=17,
     body="",
     head_sha=None,
+    base_ref="research",
     comments_url=None,
     updated_at="2099-07-29T18:00:00Z",
 ):
@@ -34,6 +35,7 @@ def pull(
             "ref": f"student/candidate-{number}",
             "sha": head_sha or str(number % 10) * 40,
         },
+        "base": {"ref": base_ref, "sha": "b" * 40},
         "labels": [{"name": label} for label in labels],
     }
     if comments_url is not None:
@@ -60,12 +62,13 @@ def assignment(
     base_ref="research",
     number=17,
     revision_id="revision-2",
+    student="student-1",
 ):
     return AssignmentRecord(
         repo="acme/widgets",
         assignment_id=f"assignment-{number}",
         revision_id=revision_id,
-        student="student-1",
+        student=student,
         base_ref=base_ref,
         base_sha=base_sha,
         head_ref=f"student/candidate-{number}",
@@ -79,6 +82,7 @@ def test_review_label_wakes_the_advisor_and_releases_the_student_slot(monkeypatc
         [
             pull(
                 labels=("research", "student:student-1", "status:review"),
+                body=render_assignment_marker(assignment()),
             )
         ],
         students=("student-1", "student-2"),
@@ -94,6 +98,40 @@ def test_review_label_wakes_the_advisor_and_releases_the_student_slot(monkeypatc
     assert events[0].payload["number"] == 17
     assert events[1].payload == {"student": "student-1"}
     assert events[2].payload == {"student": "student-2"}
+
+
+def test_markerless_wip_wakes_the_advisor_without_claiming_the_student_slot(
+    monkeypatch,
+):
+    advisor = mailbox(
+        monkeypatch,
+        [pull(labels=("research", "student:student-1", "status:wip"))],
+        students=("student-1",),
+    )
+
+    events = advisor.poll()
+
+    assert [event.kind for event in events] == [
+        "malformed_assignment",
+        "idle_student",
+    ]
+    assert events[0].payload["students"] == ["student-1"]
+    assert "exactly one Senpai assignment marker" in events[0].payload["error"]
+
+
+def test_markerless_review_does_not_emit_review_ready(monkeypatch):
+    advisor = mailbox(
+        monkeypatch,
+        [pull(labels=("research", "student:student-1", "status:review"))],
+        students=("student-1",),
+    )
+
+    events = advisor.poll()
+
+    assert [event.kind for event in events] == [
+        "malformed_assignment",
+        "idle_student",
+    ]
 
 
 def test_new_review_revision_at_the_same_head_wakes_the_advisor(monkeypatch):
@@ -140,7 +178,7 @@ def test_review_event_ignores_mutable_pull_presentation(monkeypatch):
     assert repeated.to_prompt() == first.to_prompt()
 
 
-def test_review_event_versions_a_branch_rename_at_the_same_head(monkeypatch):
+def test_review_branch_rename_is_reported_as_a_malformed_assignment(monkeypatch):
     reviewed_pull = pull(
         labels=("research", "student:student-1", "status:review"),
         body=render_assignment_marker(assignment()),
@@ -150,10 +188,15 @@ def test_review_event_versions_a_branch_rename_at_the_same_head(monkeypatch):
     first = next(event for event in advisor.poll() if event.kind == "review_ready")
 
     reviewed_pull["head"]["ref"] = "student/renamed-candidate"
-    renamed = next(event for event in advisor.poll() if event.kind == "review_ready")
+    events = advisor.poll()
+    malformed = next(
+        event for event in events if event.kind == "malformed_assignment"
+    )
 
-    assert renamed.dedupe_key != first.dedupe_key
-    assert renamed.payload["head_ref"] == "student/renamed-candidate"
+    assert "review_ready" not in {event.kind for event in events}
+    assert malformed.dedupe_key != first.dedupe_key
+    assert malformed.payload["head_ref"] == "student/renamed-candidate"
+    assert "head_ref" in malformed.payload["error"]
 
 
 @pytest.mark.parametrize(
@@ -253,8 +296,16 @@ def test_duplicate_assignments_report_every_pr_for_the_student(monkeypatch):
     advisor = mailbox(
         monkeypatch,
         [
-            pull(labels=("student:student-1", "status:wip"), number=17),
-            pull(labels=("student:student-1", "status:wip"), number=18),
+            pull(
+                labels=("student:student-1", "status:wip"),
+                number=17,
+                body=render_assignment_marker(assignment(number=17)),
+            ),
+            pull(
+                labels=("student:student-1", "status:wip"),
+                number=18,
+                body=render_assignment_marker(assignment(number=18)),
+            ),
         ],
         students=("student-1",),
     )
@@ -265,6 +316,39 @@ def test_duplicate_assignments_report_every_pr_for_the_student(monkeypatch):
 
     assert duplicate.dedupe_key == "duplicate_assignment:student-1:17,18"
     assert duplicate.payload["pull_requests"] == [17, 18]
+
+
+def test_malformed_wip_does_not_turn_one_valid_assignment_into_a_duplicate(
+    monkeypatch,
+):
+    advisor = mailbox(
+        monkeypatch,
+        [
+            pull(
+                labels=("student:student-1", "status:wip"),
+                number=17,
+                body=render_assignment_marker(assignment(number=17)),
+            ),
+            pull(labels=("student:student-1", "status:wip"), number=18),
+        ],
+        students=("student-1",),
+    )
+    monkeypatch.setattr(
+        advisor._github,
+        "get",
+        lambda _path: {"object": {"sha": "b" * 40}},
+    )
+
+    events = advisor.poll()
+
+    malformed_numbers = [
+        event.payload["number"]
+        for event in events
+        if event.kind == "malformed_assignment"
+    ]
+    assert malformed_numbers == [18]
+    assert "duplicate_assignment" not in {event.kind for event in events}
+    assert "idle_student" not in {event.kind for event in events}
 
 
 def test_research_base_change_uses_the_fresh_live_branch_head_on_each_poll(
@@ -342,7 +426,9 @@ def test_research_base_event_ignores_mutable_pull_presentation(monkeypatch):
     assert repeated.to_prompt() == first.to_prompt()
 
 
-def test_research_base_event_versions_a_branch_rename_at_the_same_head(monkeypatch):
+def test_research_base_branch_rename_is_reported_as_a_malformed_assignment(
+    monkeypatch,
+):
     assigned_pull = pull(
         labels=("research", "student:student-1", "status:wip"),
         body=render_assignment_marker(assignment(base_sha="b" * 40)),
@@ -359,12 +445,15 @@ def test_research_base_event_versions_a_branch_rename_at_the_same_head(monkeypat
     )
 
     assigned_pull["head"]["ref"] = "student/renamed-candidate"
-    renamed = next(
-        event for event in advisor.poll() if event.kind == "research_base_changed"
+    events = advisor.poll()
+    malformed = next(
+        event for event in events if event.kind == "malformed_assignment"
     )
 
-    assert renamed.dedupe_key != first.dedupe_key
-    assert renamed.payload["head_ref"] == "student/renamed-candidate"
+    assert "research_base_changed" not in {event.kind for event in events}
+    assert malformed.dedupe_key != first.dedupe_key
+    assert malformed.payload["head_ref"] == "student/renamed-candidate"
+    assert "head_ref" in malformed.payload["error"]
 
 
 def terminal_result(*, summary="The candidate remains valid."):
@@ -716,13 +805,19 @@ def test_each_assignment_watches_its_own_research_base_ref(monkeypatch):
                 body=render_assignment_marker(
                     assignment(base_ref="research-a", number=17)
                 ),
+                base_ref="research-a",
             ),
             pull(
                 number=18,
                 labels=("research-b", "student:student-2", "status:wip"),
                 body=render_assignment_marker(
-                    assignment(base_ref="research-b", number=18)
+                    assignment(
+                        base_ref="research-b",
+                        number=18,
+                        student="student-2",
+                    )
                 ),
+                base_ref="research-b",
             ),
         ],
     )

@@ -7,6 +7,8 @@ from senpai_agent.git_workflow import PushResult
 from senpai_agent.github.tools import (
     AcceptResultOnCurrentBaseAction,
     AcceptResultOnCurrentBaseTool,
+    AdoptAssignmentAction,
+    AdoptAssignmentTool,
     AssignmentVersion,
     CloseExperimentAction,
     CloseExperimentTool,
@@ -155,6 +157,101 @@ def test_create_assignment_rejects_students_outside_the_launch_before_mutation(
 
     with pytest.raises(PermissionError, match="outside this launch"):
         tool(action)
+
+    assert workflow.calls == []
+
+
+def test_adopt_assignment_verifies_remote_history_before_attaching_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    workflow = RecordingWorkflow()
+    history_calls = []
+
+    def require_history(workspace, **kwargs):
+        workflow.calls.append(("require_history", None, {}))
+        history_calls.append((workspace, kwargs))
+
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.advisor.git_assignment.require_remote_assignment_history",
+        require_history,
+    )
+    tool = AdoptAssignmentTool.create(runtime(workflow, tmp_path))[0]
+    action = AdoptAssignmentAction(
+        pr_number=17,
+        assignment_id="assignment-18",
+        revision_id="revision-1",
+        student="student-one",
+        expected_base_sha="b" * 40,
+        head_branch="student-one/lower-lr",
+        expected_pr_head_sha="c" * 40,
+    )
+
+    observation = tool(action)
+
+    assert observation.state == "adopt_assignment"
+    assert history_calls == [
+        (
+            tmp_path,
+            {
+                "branch": "student-one/lower-lr",
+                "expected_head_sha": "c" * 40,
+                "base_branch": "advisor-branch",
+                "expected_base_sha": "b" * 40,
+                "token": None,
+            },
+        ),
+        (
+            tmp_path,
+            {
+                "branch": "student-one/lower-lr",
+                "expected_head_sha": "c" * 40,
+                "base_branch": "advisor-branch",
+                "expected_base_sha": "b" * 40,
+                "token": None,
+            },
+        ),
+    ]
+    assert [call[0] for call in workflow.calls] == [
+        "lock_enter",
+        "require_history",
+        "adopt_assignment",
+        "require_history",
+        "lock_exit",
+    ]
+    _, number, fields = workflow.calls[2]
+    adopted = fields["assignment"]
+    assert number == 17
+    assert adopted.repo == "acme/widgets"
+    assert adopted.base_ref == "advisor-branch"
+    assert adopted.base_sha == "b" * 40
+    assert adopted.head_ref == "student-one/lower-lr"
+    assert adopted.head_sha == "c" * 40
+
+
+def test_adopt_assignment_rejects_unconfigured_student_before_git_or_github(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    workflow = RecordingWorkflow()
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.advisor.git_assignment.require_remote_assignment_history",
+        lambda *_args, **_kwargs: pytest.fail("git verification reached"),
+    )
+    tool = AdoptAssignmentTool.create(runtime(workflow, tmp_path))[0]
+
+    with pytest.raises(PermissionError, match="outside this launch"):
+        tool(
+            AdoptAssignmentAction(
+                pr_number=17,
+                assignment_id="assignment-18",
+                revision_id="revision-1",
+                student="student-outside-launch",
+                expected_base_sha="b" * 40,
+                head_branch="student-outside-launch/lower-lr",
+                expected_pr_head_sha="c" * 40,
+            )
+        )
 
     assert workflow.calls == []
 

@@ -61,6 +61,9 @@ def pull_request(
     base_ref: str = "schmidhuber",
     head_ref: str = "student-one/lower-lr",
     head_sha: str = HEAD_SHA,
+    author: str = "senpai-bot",
+    author_type: str = "Bot",
+    author_association: str = "NONE",
 ) -> dict[str, object]:
     if body is None:
         body = render_assignment_marker(
@@ -83,6 +86,9 @@ def pull_request(
         "body": body,
         "base_ref": base_ref,
         "head_ref": head_ref,
+        "author": author,
+        "author_type": author_type,
+        "author_association": author_association,
     }
 
 
@@ -375,6 +381,11 @@ class FakeGitHub:
             "html_url": self.pr["html_url"],
             "base": {"ref": self.pr["base_ref"]},
             "head": {"sha": self.pr["head_sha"], "ref": self.pr["head_ref"]},
+            "user": {
+                "login": self.pr["author"],
+                "type": self.pr["author_type"],
+            },
+            "author_association": self.pr["author_association"],
             "title": self.pr["title"],
             "body": self.pr["body"],
             "labels": [

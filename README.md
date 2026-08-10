@@ -390,6 +390,27 @@ Useful launch controls:
 - `--extra_instructions` accepts a Markdown file or literal operator guidance.
 - `human_issues: false` disables GitHub Issue polling for isolated launches.
 
+Operators can use the same guarded assignment transitions as the advisor
+without constructing branches or pull requests through raw `git` or `gh`:
+
+```bash
+export GH_REPO=owner/repo
+# GITHUB_TOKEN or GH_TOKEN must already be set in the environment.
+uv run python -m senpai_agent.github.operator \
+  --workspace target --advisor-branch research --student-names fern,frieren \
+  adopt-assignment action.json
+```
+
+Use `create-assignment` for a new typed branch and draft PR. Each command reads
+its corresponding `CreateAssignmentAction` or `AdoptAssignmentAction` JSON from
+the named file, or from standard input when the path is `-`. Repository and
+GitHub credentials are accepted only through `GH_REPO` and
+`GITHUB_TOKEN`/`GH_TOKEN`; the command uses the same validated executors as the
+advisor tool.
+
+Do not edit an adopted PR body concurrently with this command; GitHub does not
+offer this client a body-write lease.
+
 Advisor and student images are built from the same source revision. The advisor image excludes CUDA and PyTorch; the student image contains the CUDA/PyTorch runtime; the cutoff image contains only the minimal job runtime and pinned `kubectl`. Advisor and student builds install Chromium and execute an OpenHands browser smoke test.
 
 For multi-day fleets, [`arm_senpai_cluster_cutoff.sh`](scripts/arm_senpai_cluster_cutoff.sh) creates a cluster-side hard cutoff that does not depend on an operator laptop remaining online. It can also hold a shared start gate until the expected fleet is ready or its readiness deadline expires.

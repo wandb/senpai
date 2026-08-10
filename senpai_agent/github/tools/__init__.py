@@ -2,6 +2,7 @@
 
 from .contracts import (
     AcceptResultOnCurrentBaseAction,
+    AdoptAssignmentAction,
     AssignmentVersion,
     CloseExperimentAction,
     CreateAssignmentAction,
@@ -16,6 +17,7 @@ from .contracts import (
 )
 from .definitions import (
     AcceptResultOnCurrentBaseTool,
+    AdoptAssignmentTool,
     CloseExperimentTool,
     CreateAssignmentTool,
     MergeExperimentTool,
@@ -43,6 +45,8 @@ from .toolset import GitHubWorkflowToolSet
 __all__ = (
     "AcceptResultOnCurrentBaseAction",
     "AcceptResultOnCurrentBaseTool",
+    "AdoptAssignmentAction",
+    "AdoptAssignmentTool",
     "AssignmentVersion",
     "CloseExperimentAction",
     "CloseExperimentTool",

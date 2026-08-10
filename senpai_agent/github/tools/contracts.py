@@ -75,6 +75,24 @@ class CreateAssignmentAction(Action):
     )
 
 
+class AdoptAssignmentAction(Action):
+    """Attach typed assignment identity to one exact pre-existing draft PR."""
+
+    pr_number: int = Field(gt=0, description="Existing assignment PR number.")
+    assignment_id: str = Field(min_length=1, description="New stable assignment ID.")
+    revision_id: str = Field(min_length=1, description="Initial revision ID.")
+    student: str = Field(min_length=1, description="Configured student owning the PR.")
+    expected_base_sha: str = Field(
+        min_length=1, description="Exact research-base commit contained by the PR head."
+    )
+    head_branch: str = Field(
+        min_length=1, description="Exact existing remote assignment branch."
+    )
+    expected_pr_head_sha: str = Field(
+        min_length=1, description="Exact current remote branch and PR-head commit."
+    )
+
+
 class PublishAdvisorBranchAction(Action):
     """Lease-publish the configured advisor branch at one exact local commit."""
 
