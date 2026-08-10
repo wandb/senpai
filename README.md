@@ -481,7 +481,9 @@ on Apple's component catalog. Each selected host also needs a public subnet in
 its own Availability Zone and an existing base security group in the same VPC.
 The launcher attaches that group unchanged and creates a second,
 campaign-owned security group for the operator's temporary SSH `/32`. This
-keeps concurrent campaigns from revoking each other's access.
+keeps concurrent campaigns from revoking each other's access. Senpai removes
+and verifies the new group's default IPv4/IPv6 egress before launching an
+instance, so attaching it cannot broaden the base group's outbound policy.
 
 Package the directory produced by Xcode's component export without changing
 its bundle layout:

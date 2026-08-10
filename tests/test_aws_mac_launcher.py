@@ -300,6 +300,53 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
             tags[0]["Tags"],
         )
 
+    def test_campaign_ssh_group_removes_and_verifies_all_default_egress(self):
+        permissions = [
+            {
+                "IpProtocol": "-1",
+                "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                "Ipv6Ranges": [{"CidrIpv6": "::/0"}],
+            }
+        ]
+        with (
+            patch.object(
+                aws_mac_backend,
+                "_aws_json",
+                side_effect=(
+                    {
+                        "SecurityGroups": [
+                            {
+                                "GroupId": "sg-b1",
+                                "IpPermissionsEgress": permissions,
+                            }
+                        ]
+                    },
+                    {
+                        "SecurityGroups": [
+                            {
+                                "GroupId": "sg-b1",
+                                "IpPermissionsEgress": [],
+                            }
+                        ]
+                    },
+                ),
+            ),
+            patch.object(aws_mac_backend, "_aws_raw") as aws_raw,
+        ):
+            aws_mac_backend._harden_ssh_security_group(
+                AwsContext("us-east-1", "sandbox"),
+                "sg-b1",
+            )
+
+        self.assertEqual(
+            aws_raw.call_args.args[1:5],
+            ("ec2", "revoke-security-group-egress", "--group-id", "sg-b1"),
+        )
+        encoded = aws_raw.call_args.args[
+            aws_raw.call_args.args.index("--ip-permissions") + 1
+        ]
+        self.assertEqual(json.loads(encoded), permissions)
+
     def test_ssh_requires_a_pre_authorized_host_key(self):
         command = aws_mac_backend._ssh_base(
             Path("/tmp/state"),
@@ -820,6 +867,12 @@ class AwsMacLaunchTests(unittest.TestCase):
         )
         self.termination_waiter_patch.start()
         self.addCleanup(self.termination_waiter_patch.stop)
+        self.ssh_group_hardening_patch = patch.object(
+            aws_mac_backend,
+            "_harden_ssh_security_group",
+        )
+        self.ssh_group_hardening_patch.start()
+        self.addCleanup(self.ssh_group_hardening_patch.stop)
 
     def test_key_pair_intent_is_recorded_before_the_aws_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -945,6 +998,62 @@ class AwsMacLaunchTests(unittest.TestCase):
 
         revoke_ssh.assert_called_once()
 
+    def test_ssh_group_hardening_failure_cleans_up_without_launching_an_instance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host = mac_host("h-a1", "fern")
+            plan = AwsMacPlan(
+                context=AwsContext("us-east-1", "sandbox"),
+                account_id="770934259321",
+                ami_id="ami-mac",
+                root_device="/dev/sda1",
+                volume_gib=250,
+                security_group_id="sg-a1",
+                ssh_cidr="203.0.113.7/32",
+                hosts=(host,),
+                vpc_id="vpc-a1",
+            )
+            operations: list[tuple[str, ...]] = []
+
+            def write_key(path, material):
+                path.write_text(material)
+                path.chmod(0o600)
+
+            def aws_raw(_context, _service, operation, *arguments):
+                operations.append((operation, *arguments))
+                return ""
+
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_aws_json",
+                    return_value={"KeyMaterial": "private-key"},
+                ),
+                patch.object(aws_mac_backend, "_key_name", return_value="senpai-key"),
+                patch.object(aws_mac_backend, "_write_private_key", side_effect=write_key),
+                patch.object(
+                    aws_mac_backend,
+                    "_create_ssh_security_group",
+                    return_value="sg-b1",
+                ),
+                patch.object(
+                    aws_mac_backend,
+                    "_harden_ssh_security_group",
+                    side_effect=RuntimeError("egress verification failed"),
+                ),
+                patch.object(aws_mac_backend, "_aws_raw", side_effect=aws_raw),
+                patch.object(aws_mac_backend, "_run_instance") as run_instance,
+                self.assertRaisesRegex(RuntimeError, "egress verification failed"),
+            ):
+                launch_aws_mac(args(root / "state"), [student("fern")], plan)
+
+            run_instance.assert_not_called()
+            self.assertIn(
+                ("delete-security-group", "--group-id", "sg-b1"),
+                operations,
+            )
+            self.assertFalse((root / "state" / "mlxfast-r1").exists())
+
     def test_launch_orders_remote_preflight_github_native_launch_and_gates(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1040,6 +1149,11 @@ class AwsMacLaunchTests(unittest.TestCase):
                 ),
                 patch.object(
                     aws_mac_backend,
+                    "_harden_ssh_security_group",
+                    side_effect=lambda *_args: events.append("harden-ssh-group"),
+                ),
+                patch.object(
+                    aws_mac_backend,
                     "_authorize_ssh",
                     side_effect=AwsCommandError(
                         "An error occurred (InvalidPermission.Duplicate)"
@@ -1102,6 +1216,10 @@ class AwsMacLaunchTests(unittest.TestCase):
                 if event.startswith("gate:")
             ]
             github = events.index("github")
+            self.assertLess(
+                events.index("harden-ssh-group"),
+                events.index("instance:fern"),
+            )
             self.assertLess(
                 events.index("canary:fern"),
                 events.index("instance:tanjiro"),
