@@ -81,10 +81,11 @@ Mac launchers reject it. It is not the per-role crash supervisor above and it
 does not join advisor/student research conversations. Each due 15-minute cycle
 is single-flight: it collects one timestamped campaign snapshot, retains the
 latest three, and runs one fresh bounded in-memory OpenHands conversation. When
-the six-hour research review is due, a second fresh conversation runs only
-after that operational turn. Cycles never overlap; a long cycle delays the next
-one, which is immediately due if its interval elapsed. Snapshot/cadence state,
-typed-mutation receipts, and repair-operation records persist locally.
+the six-hour research review is due, a fresh capability-free assessment
+conversation runs only after that operational turn. Cycles never overlap; a
+long cycle delays the next one, which is immediately due if its interval
+elapsed. Snapshot/cadence state, typed-mutation receipts, and repair-operation
+records persist locally.
 
 Every managed role Deployment records its exact Senpai source revision for
 provenance. An incremental supervisor launch is accepted when the existing
@@ -102,10 +103,15 @@ The snapshot scope is fixed at launch:
 
 - GitHub returns only open PRs whose current base ref exactly equals the
   configured advisor branch. Each PR includes age and paginated counts for
-  issue comments, submitted reviews, and inline comments.
+  issue comments, submitted reviews, and inline comments. The privileged prompt
+  receives only configured-student ownership, exact allowlisted protocol states,
+  and a count of unknown status labels; it receives no title, head ref, URL, or
+  arbitrary label text.
 - W&B resolves only exact run IDs discovered in the configured students'
   role-local training state. Experiment code may freely choose its own W&B
-  group without breaking campaign ownership.
+  group without breaking campaign ownership. The privileged prompt receives
+  per-configured-student running counts, never run IDs, names, URLs, configs, or
+  arbitrary state text.
 - Kubernetes selects exactly one running pod for each configured role using
   the research-tag, role, and student labels. Role-local inspection returns the
   controller lease, current conversation UUID, completed turns, running
@@ -135,6 +141,13 @@ container's root filesystem. The exact runtime and instruction checkout is
 populated by an init container, mounted read-only, and excluded from persistent
 user-skill loading.
 
+The unrestricted shell is intentionally capable of arbitrary terminal and Git
+commands. Its output is not trusted: deliberately reading raw PR text, logs,
+files, API responses, or command output can reintroduce prompt-injection risk
+into the privileged conversation. The ordinary prompt therefore carries only
+deterministic typed/numeric/timestamp projections, configured identities,
+closed enums, counts, and opaque fingerprints.
+
 The typed tool remains the preferred surface for inspecting a role, enqueueing
 a deduplicated role event, queueing a context reset, or requesting a controller
 restart because targets can name only the configured advisor or students;
@@ -147,6 +160,10 @@ is always fresh and is never replayed from the mutation ledger. Each fresh
 supervisor turn receives the 12 most recent mutation targets, categories,
 timestamps, and outcomes. A `succeeded` result for a nudge, context reset, or
 restart records durable acceptance or queueing, not target-side completion.
+All model-visible tool results are projected to closed status values, UUIDs,
+booleans, counts, generations, and fingerprints. Operation, request, delivery,
+pending-event, and backend error text is never echoed; failures become a fixed
+error code.
 Subsequent campaign evidence demonstrates a nudge's effect; subsequent
 `context_resets` and `controller_restarts` observations establish completion or
 rejection of those state-bound requests.
@@ -173,11 +190,18 @@ generations fail closed. Kubernetes RBAC grants no AWS, node, pod-delete, or
 Deployment-patch verbs. The terminal receives no GitHub token, so authenticated
 branch and PR mutations remain with advisor/student tools or conversations.
 
-Every six hours, the next wake runs a second fresh review against the currently
-deployed `system_instructions/ADVISOR.md`. It may inject one concise reminder
-into the existing advisor conversation only for clear sustained strategic
-drift. This periodic review does not modify the advisor prompt and does not
-micromanage ordinary scientific judgment.
+Every six hours, the next wake runs a fresh non-persistent assessment against
+the currently deployed `system_instructions/ADVISOR.md`. Raw PR, W&B, and
+advisor-tail evidence enters only that conversation. It receives exactly one
+output-only tool and no terminal, campaign operations, browser, project skills,
+subagents, GitHub credential, or command secrets. The tool accepts only
+`aligned`, `insufficient_evidence`, or `strategic_drift`; missing, invalid, or
+multiple submissions fail closed. No model-authored prose crosses back into the
+privileged path. Trusted code maps only `strategic_drift` to one fixed
+advisor-principles reminder and dispatches it through the ordinary state-bound,
+audited nudge service. Its idempotency key is derived from the durable scheduled
+review slot, so crash recovery cannot duplicate it. This periodic assessment
+does not modify the advisor prompt or micromanage ordinary scientific judgment.
 
 GitHub state is level-triggered:
 
@@ -328,7 +352,9 @@ The model receives:
 
 The operational supervisor instead uses the minimal
 `system_instructions/OPERATIONAL_SUPERVISOR_HARNESS.md`; it does not inherit
-target-workspace, research, or subagent instructions.
+target-workspace, research, or subagent instructions. The capability-free
+six-hour assessor uses the separate `RESEARCH_ASSESSOR_HARNESS.md` and
+`RESEARCH_ASSESSOR.md` pair.
 
 Harness and role remain separate source documents because they have different
 owners, but are merged into one system suffix so the agent knows both the

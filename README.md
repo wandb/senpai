@@ -768,8 +768,9 @@ transport, not as a research communication channel.
 
 The opt-in operational supervisor starts a single-flight cycle every 15 minutes
 with a timestamped snapshot and fresh model conversation. Collection and the
-operational turn run sequentially; when the six-hour research review is due, it
-runs as a second fresh turn after the operational turn. Cycles never overlap.
+privileged operational turn run sequentially. When the six-hour research review
+is due, a separate capability-free assessor runs after the operational turn.
+Cycles never overlap.
 A long cycle delays the next one, which starts immediately if its interval has
 already elapsed. The supervisor retains only the last three snapshots in its
 explicit working context, so it can detect stagnation without growing one
@@ -806,9 +807,11 @@ supervisor-only upgrade rejects retained roles without that exact aggregate
 version. Each snapshot contains:
 
 - open PRs whose base is exactly this launch's advisor branch, including age,
-  workflow labels, and issue/review/inline-comment counts;
+  configured-student ownership, an allowlisted protocol status (with an unknown
+  status count), and issue/review/inline-comment counts;
 - running W&B runs resolved from exact run IDs discovered by this launch's
-  student training supervisors, independent of experiment grouping; and
+  student training supervisors, summarized as per-configured-student running
+  counts independent of experiment grouping; and
 - each exact role pod's controller lease, completed turns, running training
   count, bounded machine utilization, reset status, and recent structured
   error markers. Raw `kubectl logs` lines exist transiently in the credentialed
@@ -857,8 +860,9 @@ training errors can recur unchanged, the supervisor counts only distinct
 timestamp/fingerprint pairs rather than treating the same marker in two wakes
 as two failures.
 
-The supervisor has OpenHands' native `terminal` interface plus one typed
-operation tool, but they execute across a deliberate two-container boundary.
+The privileged 15-minute supervisor has OpenHands' native `terminal` interface
+plus one typed operation tool, but they execute across a deliberate
+two-container boundary.
 The credentialed control container owns GitHub, W&B, model, campaign-state, and
 projected Kubernetes credentials. The model's native terminal actions are
 forwarded over a Linux abstract Unix socket to a secret-free shell container.
@@ -877,6 +881,15 @@ directories. Those volatile directories and all descendants are removed before
 the wake completes; only the explicit supervisor workspace is mutable across
 wakes within the pod.
 
+The unrestricted terminal is intentionally available for repairs that cannot
+be predicted in advance. This is a capability boundary, not a claim that shell
+output is trustworthy: deliberately reading a PR body, log, file, API response,
+or command output can reintroduce untrusted instructions into the privileged
+conversation. The normal wake therefore supplies only deterministic
+typed/numeric/timestamp projections, configured identities, closed enums,
+counts, and opaque fingerprints. The model must continue treating any raw
+terminal output it chooses to inspect as hostile evidence.
+
 Kubernetes sidecars still share the Pod network namespace, so filesystem and
 PID separation alone do not isolate loopback. The supervisor Pod exposes no
 credential-bearing TCP or UDP control endpoint. Before a role-side repair, the
@@ -893,6 +906,9 @@ audited, idempotent, and cooldown-limited. Cooldown identity comes from the
 typed anomaly category, action, and exact role target rather than the model's
 free-form incident label. Inspections always execute fresh, and every fresh
 supervisor turn sees a bounded audit of the 12 most recent mutation outcomes.
+A model-visible result contains only closed status values, UUIDs, booleans,
+counts, generations, and fingerprints. It never echoes operation, request,
+delivery, event, or backend error text; failures reduce to a fixed error code.
 A `succeeded` tool result for a nudge, context reset, or restart means the
 request was durably accepted or queued, not that the target completed it. Later
 campaign evidence shows whether a nudge had its intended effect; later
@@ -990,14 +1006,21 @@ and deletes that directory before importing OpenHands. The native terminal
 therefore inherits no credential values, and Linux cannot recover them from the
 Python process's initial environment.
 
-Every six hours, the next wake runs a second fresh research review against a
-bounded, secret-redacted copy of the advisor guidance actually deployed in that
-role, obtained through the versioned role-control protocol. It does not use the
-supervisor image's potentially different `ADVISOR.md`. It intervenes only for
-clear strategic drift, such as a sustained narrow sweep loop, by injecting a
-concise reminder into the existing advisor conversation. This does not change
-the advisor or student research prompts and does not continuously direct
-experiments.
+Every six hours, the next wake runs a fresh, non-persistent research assessment
+against a bounded, secret-redacted copy of the advisor guidance actually
+deployed in that role, obtained through the versioned role-control protocol. It
+does not use the supervisor image's potentially different `ADVISOR.md`. Raw PR,
+W&B, and advisor-tail evidence is confined to this assessor. It has no terminal,
+campaign operations, browser, project skills, subagents, GitHub credential, or
+command secrets; its only tool submits exactly one closed value:
+`aligned`, `insufficient_evidence`, or `strategic_drift`. Missing, invalid, or
+multiple submissions fail closed. No model-authored explanation or message
+crosses into the privileged control path. Only `strategic_drift` lets trusted
+code enqueue one fixed advisor-principles reminder through the same state-bound,
+audited operation service. The operation key is bound to the durable scheduled
+review slot, so a crash before cadence acknowledgement replays rather than
+duplicating the reminder. This does not change advisor/student prompts or
+continuously direct experiments.
 
 #### Current support and planned transports
 
@@ -1145,6 +1168,7 @@ Deep references:
 - [OpenHands plugin](plugins/senpai/README.md): skills and lifecycle hooks.
 - [Harness instructions](system_instructions/SENPAI-HARNESS.md): shared agent/tool contract.
 - [Operational-supervisor harness](system_instructions/OPERATIONAL_SUPERVISOR_HARNESS.md): isolated control-plane contract.
+- [Research-assessor harness](system_instructions/RESEARCH_ASSESSOR_HARNESS.md): capability-free six-hour classification contract.
 - [Advisor instructions](system_instructions/ADVISOR.md) and [student instructions](system_instructions/STUDENT.md): role workflows.
 - [OpenHands fork modifications](https://github.com/morganmcg1/software-agent-sdk/blob/main/FORK_MODS.md): provider continuation, compaction, reasoning, and cache changes.
 - [Contributing](CONTRIBUTING.md): development and CLA requirements.
