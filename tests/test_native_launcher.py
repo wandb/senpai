@@ -632,6 +632,34 @@ class NativeLifecycleTests(NativeTmuxTestCase):
             self.assertTrue(sibling.exists())
             self.assertTrue(run_path.exists())
 
+    def test_terminate_rejects_an_unrelated_launchdaemon_before_sudo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runs"
+            run_path, manifest = self.write_manifest(root)
+            manifest["roles"].append(
+                {
+                    "key": "student-tanjiro",
+                    "label": "com.vendor.security-agent",
+                    "plist": (
+                        "/Library/LaunchDaemons/com.vendor.security-agent.plist"
+                    ),
+                }
+            )
+            (run_path / "manifest.json").write_text(json.dumps(manifest))
+            completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch(
+                    "senpai.launch.native_backend._sudo_run",
+                    return_value=completed,
+                ) as sudo,
+                self.assertRaisesRegex(RuntimeError, "unexpected native role"),
+            ):
+                terminate_native("mlxfast-r1", str(root))
+
+            sudo.assert_not_called()
+            self.assertTrue(run_path.exists())
+
     def test_uninstall_boots_out_then_removes_the_root_launchdaemon(self):
         completed = SimpleNamespace(returncode=0, stdout="", stderr="")
         with tempfile.TemporaryDirectory() as tmp:
