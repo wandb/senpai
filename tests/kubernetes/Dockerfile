@@ -25,6 +25,8 @@ RUN site_packages=$(/opt/senpai-venv/bin/python -I -c \
       'import site; print(site.getsitepackages()[0])') && \
     rm -rf "$site_packages/senpai_agent" && \
     cp -a /opt/senpai/senpai_agent "$site_packages/senpai_agent" && \
+    chown -R 0:0 "$site_packages/senpai_agent" && \
+    chmod -R go-w "$site_packages/senpai_agent" && \
     chmod 0755 \
       /usr/local/bin/senpai-browser-smoke-test \
       /usr/local/bin/senpai-container-health \
