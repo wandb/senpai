@@ -107,6 +107,7 @@ def test_supervisor_is_separate_with_namespace_scoped_pod_rbac():
     )
     pod = deployment["spec"]["template"]["spec"]
     assert pod["automountServiceAccountToken"] is False
+    assert pod.get("hostPID", False) is False
     assert pod["shareProcessNamespace"] is False
     assert role["rules"] == [
         {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list"]},
@@ -341,6 +342,7 @@ def test_supervised_roles_have_protocol_bound_repair_of_the_target_workspace():
         repair_mounts = {mount["name"]: mount for mount in repair["volumeMounts"]}
 
         assert pod["automountServiceAccountToken"] is False
+        assert pod["hostPID"] is False
         assert pod["shareProcessNamespace"] is False
         assert deployment["metadata"]["annotations"][
             "senpai.wandb.com/repair-protocol"

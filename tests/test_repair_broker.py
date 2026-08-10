@@ -22,7 +22,9 @@ from senpai_agent.repair_broker import (
     RepairBrokerServer,
     RepairIdempotencyConflict,
     RepairLedger,
+    RepairNotStartedError,
     RepairOutcomeUnknown,
+    RepairPauseAuditEvidence,
     RepairReceiptExpired,
     RepairRequest,
     RepairResult,
@@ -100,6 +102,28 @@ def test_repair_broker_binds_arbitrary_commands_to_exact_role_target(tmp_path):
             123,
         )
     ]
+
+
+def test_known_pre_submit_failure_is_recorded_failed_not_unknown(tmp_path):
+    class PauseRejectedBackend:
+        def run_repair(self, *_args, **_kwargs):
+            raise RepairNotStartedError("pause was not acknowledged")
+
+    socket_path = _test_socket(tmp_path, "known-failure")
+    with RepairBrokerServer(
+        socket_path,
+        inventory(),
+        PauseRejectedBackend(),
+        ledger_path=tmp_path / "repair.sqlite3",
+    ) as server:
+        with pytest.raises(RuntimeError, match="previously failed"):
+            RepairBrokerClient(socket_path).execute(
+                repair_request("repair-known-not-started")
+            )
+        status = server.ledger.status("repair-known-not-started")
+
+    assert status.status == "failed"
+    assert status.error_type == "RepairNotStartedError"
 
 
 def test_repair_wire_preserves_exact_command_and_output_whitespace(tmp_path):
@@ -248,21 +272,28 @@ def test_role_shell_surfaces_a_completed_repair_whose_controller_did_not_resume(
 def test_kubectl_repair_transport_executes_only_the_repair_sidecar(monkeypatch):
     backend = KubectlCampaignBackend(inventory(), namespace="research")
     calls = []
+    resume_capability = "one-time-resume-capability"
     monkeypatch.setattr(backend, "_pod", lambda target: "senpai-maple-fern-abc")
 
-    def record(command, *, input_text=None, timeout_seconds=None):
+    def record(command, *, input_text=None, timeout_seconds=None, stage="kubectl"):
         calls.append((command, input_text, timeout_seconds))
         lease_id = command[command.index("--lease-id") + 1] if "--lease-id" in command else None
         if "repair-pause" in command:
-            now = time.time()
+            now = time.monotonic()
             duration = float(command[command.index("--duration-seconds") + 1])
             return json.dumps(
                 {
-                    "protocol": REPAIR_PAUSE_PROTOCOL,
-                    "lease_id": lease_id,
-                    "expires_at": now + duration,
-                    "acknowledged_at": now,
-                    "supervisor_pid": os.getpid(),
+                    "acknowledgement": {
+                        "protocol": REPAIR_PAUSE_PROTOCOL,
+                        "lease_id": lease_id,
+                        "expires_at": now + duration,
+                        "acknowledged_at": now,
+                        "supervisor_pid": 1,
+                        "resume_capability_sha256": hashlib.sha256(
+                            resume_capability.encode()
+                        ).hexdigest(),
+                    },
+                    "resume_capability": resume_capability,
                 }
             )
         if "repair-resume" in command:
@@ -299,6 +330,45 @@ def test_kubectl_repair_transport_executes_only_the_repair_sidecar(monkeypatch):
     assert "repair-pause" in calls[0][0]
     assert calls[0][0][calls[0][0].index("-c") + 1] == "student"
     assert "repair-resume" in calls[2][0]
+    assert calls[2][1] == resume_capability
+    assert resume_capability not in calls[2][0]
+    assert result.pause is not None
+    assert result.pause.protocol == REPAIR_PAUSE_PROTOCOL
+    assert result.pause.lease_id.startswith("repair-")
+    assert result.pause.supervisor_pid == 1
+
+
+def test_repair_pause_evidence_survives_receipt_pruning_and_reopen(tmp_path):
+    path = tmp_path / "repair.sqlite3"
+    request = repair_request("repair-pause-audit")
+    evidence = RepairPauseAuditEvidence(
+        protocol=REPAIR_PAUSE_PROTOCOL,
+        lease_id="repair-pause-audit-lease",
+        expires_at=time.time() + 300,
+        acknowledged_at=time.time(),
+        supervisor_pid=1,
+        resume_capability_sha256="a" * 64,
+    )
+    with RepairLedger(path) as ledger:
+        assert ledger.reserve(request).execute is True
+        ledger.complete(
+            request.operation_id,
+            RepairResult(exit_code=0, stdout="fixed", stderr="", pause=evidence),
+        )
+        ledger._connection.execute(
+            "UPDATE repair_operations SET result_json = NULL, "
+            "receipt_retained = 0, payload_pruned_at = ? WHERE operation_id = ?",
+            (time.time(), request.operation_id),
+        )
+        ledger._connection.commit()
+
+    with RepairLedger(path) as ledger:
+        status = ledger.status(request.operation_id)
+        audit = ledger.recent(limit=1)[0]
+
+    assert status.result is None
+    assert status.pause == evidence
+    assert audit.pause == evidence
 
 
 def test_kubectl_transport_uses_an_explicit_secret_free_environment(monkeypatch):

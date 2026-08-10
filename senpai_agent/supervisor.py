@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -32,12 +33,20 @@ from senpai_agent.secrets import (
     GITHUB_TOKEN_FILE_ENV,
     scrub_github_credentials,
 )
-from senpai_agent.supervisor_pause import RepairPause, RepairPauseStore
+from senpai_agent.supervisor_pause import (
+    DEFAULT_REPAIR_PAUSE_SOCKET,
+    RepairPause,
+    RepairPauseClient,
+    RepairPauseControlServer,
+    RepairPauseError,
+    RepairPauseStore,
+)
 
 LEASE_ENV = "SENPAI_CONTROLLER_LEASE_PATH"
 GENERATION_ENV = "SENPAI_CONTROLLER_GENERATION"
 CONTROL_DIR_ENV = "SENPAI_SUPERVISOR_CONTROL_DIR"
 WORKER_OWNERSHIP_ENV = "SENPAI_WORKER_OWNERSHIP_TOKEN"
+PAUSE_SOCKET_ENV = "SENPAI_SUPERVISOR_PAUSE_SOCKET"
 DEFAULT_CONTROL_DIR = Path("/run/senpai-supervisor-control")
 
 
@@ -157,6 +166,7 @@ class WorkerSupervisor:
         environment: Mapping[str, str] | None = None,
         github_token: SecretStr | None = None,
         control_dir: Path | None = None,
+        pause_socket: str | Path | None = None,
     ):
         if not command:
             raise ValueError("worker command must not be empty")
@@ -171,10 +181,34 @@ class WorkerSupervisor:
             or Path(self.environment.get(CONTROL_DIR_ENV, DEFAULT_CONTROL_DIR))
         ).resolve()
         self.pause_store = RepairPauseStore(self.control_dir)
+        configured_pause_socket = pause_socket or self.environment.get(PAUSE_SOCKET_ENV)
+        self.pause_socket = str(
+            configured_pause_socket
+            or (
+                DEFAULT_REPAIR_PAUSE_SOCKET
+                if sys.platform.startswith("linux")
+                else Path("/private/tmp")
+                / (
+                    "senpai-pause-"
+                    f"{hashlib.sha256(str(self.lease_path).encode()).hexdigest()[:16]}.sock"
+                )
+            )
+        )
+        self.pause_control = RepairPauseControlServer(
+            self.pause_store,
+            self.pause_socket,
+        )
         self.restart_path = self.lease_path.parent / "controller-restarts.sqlite3"
         self.role_target = self._role_target(self.environment)
 
     def run(self, stop: threading.Event | None = None) -> int:
+        self.pause_control.start()
+        try:
+            return self._run_loop(stop)
+        finally:
+            self.pause_control.close()
+
+    def _run_loop(self, stop: threading.Event | None = None) -> int:
         stop = stop or threading.Event()
         failures = 0
         with RestartRequestStore(self.restart_path) as restarts:
@@ -281,7 +315,7 @@ class WorkerSupervisor:
         stop: threading.Event,
     ) -> None:
         self.lease_path.unlink(missing_ok=True)
-        self.pause_store.acknowledge(pause, supervisor_pid=os.getpid())
+        self.pause_control.acknowledge(pause)
         print(
             f"SENPAI_REPAIR_PAUSED lease_id={pause.lease_id}",
             file=sys.stderr,
@@ -602,12 +636,14 @@ class WorkerSupervisor:
         return tuple(owned)
 
     @staticmethod
-    def _network_listeners_absent() -> bool:
+    def _network_listeners_absent(
+        *,
+        proc_network: Path = Path("/proc/net"),
+    ) -> bool:
         """Prove no TCP/CDP listener remains in the role Pod network namespace."""
 
-        proc_network = Path("/proc/net")
         if not proc_network.is_dir():
-            return True
+            return False
         try:
             for table_name in ("tcp", "tcp6"):
                 rows = (proc_network / table_name).read_text(encoding="ascii").splitlines()
@@ -667,10 +703,13 @@ class WorkerSupervisor:
 def lease_is_healthy(
     path: Path,
     *,
-    control_dir: Path = DEFAULT_CONTROL_DIR,
+    pause_socket: str | Path = DEFAULT_REPAIR_PAUSE_SOCKET,
 ) -> bool:
-    if RepairPauseStore(control_dir).is_acknowledged_by_live_supervisor():
-        return True
+    try:
+        if RepairPauseClient(pause_socket).is_quiescing_or_paused():
+            return True
+    except RepairPauseError:
+        pass
     try:
         lease = WorkerLease.read(path)
         process = psutil.Process(lease.pid)
@@ -712,23 +751,26 @@ def supervisor_main(
     args = parser.parse_args(argv)
 
     control_dir = Path(env.get(CONTROL_DIR_ENV, DEFAULT_CONTROL_DIR)).resolve()
+    pause_socket = env.get(PAUSE_SOCKET_ENV, DEFAULT_REPAIR_PAUSE_SOCKET)
 
     if args.command == "health":
-        return 0 if lease_is_healthy(args.lease_path, control_dir=control_dir) else 1
+        return 0 if lease_is_healthy(args.lease_path, pause_socket=pause_socket) else 1
     if args.command == "repair-pause":
-        store = RepairPauseStore(control_dir)
-        pause = store.request(
+        grant = RepairPauseClient(pause_socket).pause(
             args.lease_id,
             duration_seconds=args.duration_seconds,
+            wait_seconds=args.wait_seconds,
         )
-        acknowledgement = store.wait_for_acknowledgement(
-            pause,
-            timeout_seconds=args.wait_seconds,
-        )
-        print(json.dumps(asdict(acknowledgement), sort_keys=True))
+        print(json.dumps(asdict(grant), sort_keys=True))
         return 0
     if args.command == "repair-resume":
-        RepairPauseStore(control_dir).release(args.lease_id)
+        resume_capability = sys.stdin.read(256).strip()
+        if not resume_capability:
+            raise RepairPauseError("repair-resume capability is required on stdin")
+        RepairPauseClient(pause_socket).resume(
+            args.lease_id,
+            resume_capability,
+        )
         print(json.dumps({"lease_id": args.lease_id, "released": True}))
         return 0
 
@@ -755,6 +797,7 @@ def supervisor_main(
             environment=env,
             github_token=github_token,
             control_dir=control_dir,
+            pause_socket=pause_socket,
         ).run(stop)
     finally:
         for signum, handler in previous_handlers.items():

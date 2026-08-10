@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import time
 from datetime import UTC, datetime
@@ -21,6 +22,7 @@ from senpai_agent.role_control import (
 from senpai_agent.supervisor_pause import REPAIR_PAUSE_PROTOCOL
 
 CONVERSATION_ID = UUID("00000000-0000-0000-0000-000000000301")
+RESUME_CAPABILITY = "one-time-role-resume-capability"
 
 
 def inventory() -> CampaignInventory:
@@ -33,15 +35,21 @@ def inventory() -> CampaignInventory:
 
 
 def pause_receipt(command) -> str:
-    now = time.time()
+    now = time.monotonic()
     duration = float(command[command.index("--duration-seconds") + 1])
     return json.dumps(
         {
-            "protocol": REPAIR_PAUSE_PROTOCOL,
-            "lease_id": command[command.index("--lease-id") + 1],
-            "expires_at": now + duration,
-            "acknowledged_at": now,
-            "supervisor_pid": os.getpid(),
+            "acknowledgement": {
+                "protocol": REPAIR_PAUSE_PROTOCOL,
+                "lease_id": command[command.index("--lease-id") + 1],
+                "expires_at": now + duration,
+                "acknowledged_at": now,
+                "supervisor_pid": 1,
+                "resume_capability_sha256": hashlib.sha256(
+                    RESUME_CAPABILITY.encode()
+                ).hexdigest(),
+            },
+            "resume_capability": RESUME_CAPABILITY,
         }
     )
 
@@ -418,7 +426,44 @@ def test_repair_quiesces_the_role_before_entering_the_secret_free_sidecar(
     assert commands[0][commands[0].index("-c") + 1] == "student"
     assert commands[1][commands[1].index("-c") + 1] == "repair"
     assert "repair-resume" in commands[2]
+    assert calls[2][1]["input_text"] == RESUME_CAPABILITY
+    assert RESUME_CAPABILITY not in commands[2]
     assert result.stdout == "repaired"
+
+
+def test_kubectl_failure_logs_bounded_stage_without_command_or_stdin(
+    monkeypatch,
+    capsys,
+):
+    secret_input = "resume-capability-must-not-leak"
+    secret_argument = "pod-name-must-not-leak"
+    monkeypatch.setattr(
+        "senpai_agent.kubernetes_operations.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=17,
+            stdout="",
+            stderr=(
+                f"failed command {secret_argument}; input={secret_input}; "
+                + ("x" * 8_000)
+            ),
+        ),
+    )
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+
+    with pytest.raises(RuntimeError, match="exit code 17"):
+        backend._run(
+            ("kubectl", "exec", secret_argument),
+            input_text=secret_input,
+            stage="repair-resume",
+        )
+
+    audit = capsys.readouterr().err
+    record = json.loads(audit)
+    assert record["stage"] == "repair-resume"
+    assert record["exit_code"] == 17
+    assert len(record["stderr"]) <= 4_096
+    assert secret_input not in audit
+    assert secret_argument not in audit
 
 
 def test_repair_releases_the_pause_when_sidecar_transport_fails(monkeypatch):
@@ -437,7 +482,7 @@ def test_repair_releases_the_pause_when_sidecar_transport_fails(monkeypatch):
 
     monkeypatch.setattr(backend, "_run", run)
 
-    with pytest.raises(RuntimeError, match="repair transport failed"):
+    with pytest.raises(RuntimeError, match="outcome is unknown"):
         backend.run_repair(
             target,
             command="true",
@@ -476,7 +521,7 @@ def test_repair_preserves_a_completed_result_when_resume_fails(monkeypatch):
 
 
 @pytest.mark.parametrize("pause_failure", ["invalid-receipt", "lost-reply"])
-def test_uncertain_pause_outcome_is_always_released(
+def test_uncertain_pause_without_a_capability_waits_for_bounded_expiry(
     monkeypatch,
     pause_failure,
 ):
@@ -503,7 +548,39 @@ def test_uncertain_pause_outcome_is_always_released(
             timeout_seconds=60,
         )
 
-    assert "repair-resume" in calls[-1]
+    assert all("repair-resume" not in call for call in calls)
+
+
+def test_semantically_invalid_pause_grant_is_released_with_its_capability(
+    monkeypatch,
+):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    target = RoleTarget(research_tag="maple", role="advisor")
+    calls = []
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-advisor-maple")
+
+    def run(command, **kwargs):
+        calls.append((tuple(command), kwargs))
+        if "repair-pause" in command:
+            payload = json.loads(pause_receipt(command))
+            payload["acknowledgement"]["lease_id"] = "repair-mismatched"
+            return json.dumps(payload)
+        if "repair-resume" in command:
+            return resume_receipt(command)
+        raise AssertionError("executor must not start after an invalid pause grant")
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    with pytest.raises(RuntimeError, match="invalid repair-pause acknowledgement"):
+        backend.run_repair(
+            target,
+            command="true",
+            cwd="workspace",
+            timeout_seconds=60,
+        )
+
+    assert "repair-resume" in calls[-1][0]
+    assert calls[-1][1]["input_text"] == RESUME_CAPABILITY
 
 
 def test_invalid_resume_receipt_is_retained_on_the_repair_result(monkeypatch):

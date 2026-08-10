@@ -129,6 +129,23 @@ class RepairRequest(_Contract):
         )
 
 
+class RepairPauseAuditEvidence(_Contract):
+    """Authenticated PID 1 acknowledgement bound to one repair receipt."""
+
+    protocol: str = Field(min_length=1, max_length=128)
+    lease_id: _OperationId
+    expires_at: float = Field(gt=0)
+    acknowledged_at: float = Field(gt=0)
+    supervisor_pid: int = Field(gt=0)
+    resume_capability_sha256: _Fingerprint
+
+    @model_validator(mode="after")
+    def acknowledgement_precedes_expiry(self) -> RepairPauseAuditEvidence:
+        if self.acknowledged_at >= self.expires_at:
+            raise ValueError("repair-pause acknowledgement must precede expiry")
+        return self
+
+
 class RepairResult(_Contract):
     exit_code: int
     stdout: str = Field(max_length=REPAIR_STREAM_LIMIT_CHARS)
@@ -137,6 +154,7 @@ class RepairResult(_Contract):
     stderr_truncated: bool = False
     controller_resumed: bool = True
     resume_error_type: str | None = None
+    pause: RepairPauseAuditEvidence | None = None
 
     @field_validator("stdout", "stderr")
     @classmethod
@@ -167,6 +185,7 @@ class RepairOperationStatus(_Contract):
     controller_resumed: bool | None
     resume_error_type: str | None
     payload_pruned_at: datetime | None
+    pause: RepairPauseAuditEvidence | None = None
     result: RepairResult | None = None
     error_type: str | None = None
 
@@ -176,6 +195,8 @@ class RepairOperationStatus(_Contract):
             raise ValueError("repair receipt retention metadata is inconsistent")
         if self.result is not None and self.result.exit_code != self.exit_code:
             raise ValueError("repair receipt exit code is inconsistent")
+        if self.result is not None and self.result.pause != self.pause:
+            raise ValueError("repair-pause audit evidence is inconsistent")
         if self.receipt_retained and self.payload_pruned_at is not None:
             raise ValueError("retained repair receipt cannot have a prune timestamp")
         if self.status == "completed":
@@ -202,6 +223,7 @@ class RepairAuditRecord(_Contract):
     controller_resumed: bool | None
     resume_error_type: str | None
     payload_pruned_at: datetime | None
+    pause: RepairPauseAuditEvidence | None = None
     error_type: str | None
 
 
@@ -251,6 +273,14 @@ class RecordedRepairError(RuntimeError):
     pass
 
 
+class RepairNotStartedError(RuntimeError):
+    """The repair executor was authoritatively never submitted."""
+
+
+class RepairExecutionOutcomeUnknown(RuntimeError):
+    """The repair executor may have started but no receipt was recovered."""
+
+
 @dataclass(frozen=True, slots=True)
 class RepairReservation:
     execute: bool
@@ -289,7 +319,8 @@ class RepairLedger:
                 exit_code INTEGER,
                 controller_resumed INTEGER,
                 resume_error_type TEXT,
-                payload_pruned_at REAL
+                payload_pruned_at REAL,
+                pause_json TEXT
             )
             """
         )
@@ -314,6 +345,9 @@ class RepairLedger:
             "resume_error_type": (
                 "ALTER TABLE repair_operations ADD COLUMN resume_error_type TEXT"
             ),
+            "pause_json": (
+                "ALTER TABLE repair_operations ADD COLUMN pause_json TEXT"
+            ),
         }
         for column, statement in migrations.items():
             if column not in columns:
@@ -330,7 +364,6 @@ class RepairLedger:
             SELECT operation_id, result_json
             FROM repair_operations
             WHERE result_json IS NOT NULL
-              AND (exit_code IS NULL OR controller_resumed IS NULL)
             """
         ).fetchall()
         for row in legacy_receipts:
@@ -339,13 +372,18 @@ class RepairLedger:
                 """
                 UPDATE repair_operations
                 SET receipt_retained = 1, exit_code = ?,
-                    controller_resumed = ?, resume_error_type = ?
+                    controller_resumed = ?, resume_error_type = ?, pause_json = ?
                 WHERE operation_id = ?
                 """,
                 (
                     result.exit_code,
                     result.controller_resumed,
                     result.resume_error_type,
+                    (
+                        result.pause.model_dump_json()
+                        if result.pause is not None
+                        else None
+                    ),
                     row["operation_id"],
                 ),
             )
@@ -497,7 +535,7 @@ class RepairLedger:
                     SET status = ?, completed_at = ?, result_json = ?,
                         receipt_retained = ?, exit_code = ?,
                         controller_resumed = ?, resume_error_type = ?,
-                        payload_pruned_at = NULL, error_type = ?
+                        payload_pruned_at = NULL, pause_json = ?, error_type = ?
                     WHERE operation_id = ? AND status = 'running'
                     """,
                     (
@@ -508,6 +546,11 @@ class RepairLedger:
                         result.exit_code if result is not None else None,
                         result.controller_resumed if result is not None else None,
                         result.resume_error_type if result is not None else None,
+                        (
+                            result.pause.model_dump_json()
+                            if result is not None and result.pause is not None
+                            else None
+                        ),
                         error_type,
                         operation_id,
                     ),
@@ -585,6 +628,11 @@ class RepairLedger:
                     if row["payload_pruned_at"] is not None
                     else None
                 ),
+                pause=(
+                    RepairPauseAuditEvidence.model_validate_json(row["pause_json"])
+                    if row["pause_json"]
+                    else None
+                ),
                 error_type=str(row["error_type"]) if row["error_type"] else None,
             )
             for row in rows
@@ -620,6 +668,11 @@ class RepairLedger:
             payload_pruned_at=(
                 datetime.fromtimestamp(row["payload_pruned_at"], UTC)
                 if row["payload_pruned_at"] is not None
+                else None
+            ),
+            pause=(
+                RepairPauseAuditEvidence.model_validate_json(row["pause_json"])
+                if row["pause_json"]
                 else None
             ),
             result=(
@@ -663,6 +716,7 @@ def _wire_safe_result(result: RepairResult) -> RepairResult:
             stderr_truncated=stderr_truncated,
             controller_resumed=result.controller_resumed,
             resume_error_type=result.resume_error_type,
+            pause=result.pause,
         )
         try:
             encode_json_frame(
@@ -1033,6 +1087,16 @@ class RepairBrokerServer:
                     timeout_seconds=request.timeout_seconds,
                 )
             )
+        except RepairNotStartedError as error:
+            status = self.ledger.fail(request.operation_id, error)
+            self._audit(
+                raw_request,
+                request,
+                outcome="failed",
+                status=status,
+                error=error,
+            )
+            return {"status": status.model_dump(mode="json")}
         except Exception as error:  # noqa: BLE001
             status = self.ledger.unknown(request.operation_id, error)
             self._audit(
@@ -1052,7 +1116,7 @@ class RepairBrokerServer:
         raw_request: bytes,
         request: RepairRequest,
         *,
-        outcome: Literal["completed", "replayed", "denied", "unknown"],
+        outcome: Literal["completed", "replayed", "denied", "failed", "unknown"],
         status: RepairOperationStatus | None = None,
         error: BaseException | None = None,
     ) -> None:
@@ -1076,6 +1140,11 @@ class RepairBrokerServer:
             record["payload_pruned_at"] = (
                 status.payload_pruned_at.isoformat()
                 if status.payload_pruned_at is not None
+                else None
+            )
+            record["repair_pause"] = (
+                status.pause.model_dump(mode="json")
+                if status.pause is not None
                 else None
             )
         if error is not None:

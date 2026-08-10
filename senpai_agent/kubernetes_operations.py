@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from uuid import UUID, uuid4
@@ -31,7 +32,12 @@ from senpai_agent.operations import (
     RoleTarget,
 )
 from senpai_agent.protocols import MANAGEMENT_PROTOCOL_VERSION
-from senpai_agent.repair_broker import RepairResult
+from senpai_agent.repair_broker import (
+    RepairExecutionOutcomeUnknown,
+    RepairNotStartedError,
+    RepairPauseAuditEvidence,
+    RepairResult,
+)
 from senpai_agent.repair_executor import DEFAULT_EXECUTOR_SOCKET
 from senpai_agent.role_control import (
     RoleControlRequest,
@@ -39,7 +45,10 @@ from senpai_agent.role_control import (
     RoleResearchTail,
     RoleRuntimeState,
 )
-from senpai_agent.supervisor_pause import RepairPauseAcknowledgement
+from senpai_agent.supervisor_pause import (
+    RepairPauseAcknowledgement,
+    RepairPauseGrant,
+)
 
 _LABEL_VALUE = re.compile(r"^[A-Za-z0-9](?:[-_.A-Za-z0-9]{0,61}[A-Za-z0-9])?$")
 _ERROR_MARKER = re.compile(
@@ -206,7 +215,10 @@ class KubectlCampaignBackend(OperationBackend):
             root = roots[cwd]
         except KeyError as error:
             raise ValueError(f"unsupported repair working directory: {cwd}") from error
-        pod = self._pod(target)
+        try:
+            pod = self._pod(target)
+        except Exception as error:  # noqa: BLE001
+            raise RepairNotStartedError("repair target was not resolved") from error
         lease_id = f"repair-{uuid4()}"
         pause_duration_seconds = timeout_seconds + 180
         pause_command = (
@@ -250,8 +262,13 @@ class KubectlCampaignBackend(OperationBackend):
             lease_id,
         )
 
-        def resume_role() -> None:
-            output = self._run(resume_command, timeout_seconds=45)
+        def resume_role(resume_capability: str) -> None:
+            output = self._run(
+                resume_command,
+                input_text=resume_capability,
+                timeout_seconds=45,
+                stage="repair-resume",
+            )
             try:
                 receipt = json.loads(output)
             except (TypeError, ValueError) as error:
@@ -264,30 +281,47 @@ class KubectlCampaignBackend(OperationBackend):
                 )
 
         try:
-            pause_output = self._run(pause_command, timeout_seconds=105)
-        except BaseException:
-            try:
-                resume_role()
-            except Exception as resume_error:  # noqa: BLE001
-                self._log_resume_failure(target, resume_error)
-            raise
-        try:
-            pause_receipt = RepairPauseAcknowledgement(
-                **json.loads(pause_output)
+            pause_output = self._run(
+                pause_command,
+                timeout_seconds=105,
+                stage="repair-pause",
             )
+        except Exception as error:  # noqa: BLE001
+            raise RepairNotStartedError(
+                "role repair pause was not acknowledged"
+            ) from error
+        try:
+            pause_payload = json.loads(pause_output)
+            if set(pause_payload) != {"acknowledgement", "resume_capability"}:
+                raise ValueError("unexpected repair-pause grant fields")
+            pause_grant = RepairPauseGrant(
+                acknowledgement=RepairPauseAcknowledgement(
+                    **pause_payload["acknowledgement"]
+                ),
+                resume_capability=str(pause_payload["resume_capability"]),
+            )
+            pause_receipt = pause_grant.acknowledgement
+        except (TypeError, ValueError) as error:
+            raise RepairNotStartedError(
+                "role returned an invalid repair-pause grant"
+            ) from error
+        try:
             if (
                 pause_receipt.lease_id != lease_id
+                or pause_receipt.supervisor_pid != 1
                 or pause_receipt.expires_at <= pause_receipt.acknowledged_at
                 or pause_receipt.expires_at - pause_receipt.acknowledged_at
                 > pause_duration_seconds + 5
+                or pause_receipt.expires_at - time.monotonic()
+                < timeout_seconds + 45
             ):
                 raise ValueError("mismatched or expired repair-pause lease")
-        except (TypeError, ValueError) as error:
+        except ValueError as error:
             try:
-                resume_role()
+                resume_role(pause_grant.resume_capability)
             except Exception as resume_error:  # noqa: BLE001
                 self._log_resume_failure(target, resume_error)
-            raise KubernetesOperationError(
+            raise RepairNotStartedError(
                 "role returned an invalid repair-pause acknowledgement"
             ) from error
         transport = (
@@ -316,16 +350,19 @@ class KubectlCampaignBackend(OperationBackend):
                 transport,
                 input_text=command,
                 timeout_seconds=timeout_seconds + 15,
+                stage="repair-executor",
             )
-        except BaseException:
+        except Exception as error:  # noqa: BLE001
             try:
-                resume_role()
+                resume_role(pause_grant.resume_capability)
             except Exception as resume_error:  # noqa: BLE001
                 self._log_resume_failure(target, resume_error)
-            raise
+            raise RepairExecutionOutcomeUnknown(
+                "repair executor submission outcome is unknown"
+            ) from error
         resume_error: Exception | None = None
         try:
-            resume_role()
+            resume_role(pause_grant.resume_capability)
         except Exception as error:  # noqa: BLE001
             resume_error = error
         try:
@@ -334,9 +371,22 @@ class KubectlCampaignBackend(OperationBackend):
                 raise KubernetesOperationError(
                     "repair executor lost its authoritative response"
                 )
-            result = RepairResult.model_validate(response)
+            result = RepairResult.model_validate(response).model_copy(
+                update={
+                    "pause": RepairPauseAuditEvidence(
+                        protocol=pause_receipt.protocol,
+                        lease_id=pause_receipt.lease_id,
+                        expires_at=pause_receipt.expires_at,
+                        acknowledged_at=pause_receipt.acknowledged_at,
+                        supervisor_pid=pause_receipt.supervisor_pid,
+                        resume_capability_sha256=(
+                            pause_receipt.resume_capability_sha256
+                        ),
+                    )
+                }
+            )
         except (AttributeError, TypeError, ValueError) as error:
-            raise KubernetesOperationError(
+            raise RepairExecutionOutcomeUnknown(
                 "repair sidecar returned invalid JSON"
             ) from error
         if resume_error is None:
@@ -597,7 +647,10 @@ class KubectlCampaignBackend(OperationBackend):
         *,
         input_text: str | None = None,
         timeout_seconds: float | None = None,
+        stage: str = "kubectl",
     ) -> str:
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", stage):
+            raise ValueError("kubectl diagnostic stage is invalid")
         try:
             result = subprocess.run(
                 tuple(command),
@@ -609,14 +662,68 @@ class KubectlCampaignBackend(OperationBackend):
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
+            diagnostic = getattr(error, "stderr", "") or ""
+            self._log_kubectl_failure(
+                stage,
+                exit_code=None,
+                stderr=diagnostic,
+                sensitive_input=input_text,
+                command=command,
+                error_type=type(error).__name__,
+            )
             raise KubernetesOperationError(
                 f"kubectl transport failed ({type(error).__name__})"
             ) from error
         if result.returncode:
+            self._log_kubectl_failure(
+                stage,
+                exit_code=result.returncode,
+                stderr=result.stderr,
+                sensitive_input=input_text,
+                command=command,
+                error_type=None,
+            )
             raise KubernetesOperationError(
                 f"kubectl returned exit code {result.returncode}"
             )
         return result.stdout.strip()
+
+    @staticmethod
+    def _log_kubectl_failure(
+        stage: str,
+        *,
+        exit_code: int | None,
+        stderr: str | bytes,
+        sensitive_input: str | None,
+        command: Sequence[str],
+        error_type: str | None,
+    ) -> None:
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        if sensitive_input is not None:
+            bounded = "[redacted: stdin-bearing kubectl transport]"
+        else:
+            bounded = stderr[-4_096:]
+            for argument in sorted(
+                (value for value in command if len(value) >= 4),
+                key=len,
+                reverse=True,
+            ):
+                bounded = bounded.replace(argument, "[redacted-arg]")
+        print(
+            json.dumps(
+                {
+                    "event": "SENPAI_KUBECTL_TRANSPORT_FAILED",
+                    "stage": stage,
+                    "exit_code": exit_code,
+                    "error_type": error_type,
+                    "stderr": bounded,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
 
     @staticmethod
     def _gap(

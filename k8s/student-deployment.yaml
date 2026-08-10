@@ -39,6 +39,7 @@ spec:
 {{SUPERVISOR_ACCESS_LABEL}}
     spec:
       automountServiceAccountToken: false
+      hostPID: false
       shareProcessNamespace: false
       terminationGracePeriodSeconds: 90
       securityContext:
