@@ -561,6 +561,14 @@ def test_pull_request_canary_has_no_live_secret_or_checkout_credential_path():
     assert ".env" not in "\n".join(
         line for line in dockerfile.splitlines() if line.lstrip().startswith("COPY")
     )
+    assert (
+        'cp -a /opt/senpai/senpai_agent "$site_packages/senpai_agent"'
+    ) in dockerfile
+    assert (
+        "COPY senpai_agent/repair_executor.py "
+        "/usr/local/bin/senpai-repair-executor"
+    ) in dockerfile
+    assert "COPY k8s/senpai-role-shell /usr/local/bin/senpai-role-shell" in dockerfile
 
     script = (ROOT / "scripts" / "test-kubernetes-canary.sh").read_text()
     assert (
