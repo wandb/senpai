@@ -53,6 +53,10 @@ _WORKER_START_SECONDS = 30
 _WORKER_STOP_SECONDS = 0.25
 _WORKER_FORCE_STOP_SECONDS = 0.5
 _ADOPTEE_CLEANUP_SECONDS = 0.5
+_TRUSTED_COMMAND_PATH = "/opt/senpai-venv/bin:/usr/local/bin:/usr/bin:/bin"
+_VOLATILE_PARENT_NAME = "senpai-terminal-wakes"
+_VOLATILE_CHILD_PREFIX = "wake-"
+_VOLATILE_OWNER_FILE = ".senpai-owner.json"
 _TERMINAL_ENV_ALLOWLIST = {
     "ALL_PROXY",
     "CURL_CA_BUNDLE",
@@ -94,6 +98,76 @@ class _WorkerShutdown(BaseException):
     pass
 
 
+def _process_start_token(pid: int) -> str | None:
+    if sys.platform != "linux":
+        return None
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (FileNotFoundError, IndexError, PermissionError):
+        return None
+
+
+def _volatile_parent() -> Path:
+    parent = Path(tempfile.gettempdir()) / _VOLATILE_PARENT_NAME
+    try:
+        parent.mkdir(mode=0o700)
+    except FileExistsError:
+        metadata = parent.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise TerminalTransportError("terminal volatile root is not private")
+        parent.chmod(0o700)
+    return parent
+
+
+def _write_volatile_owner(path: Path) -> None:
+    (path / _VOLATILE_OWNER_FILE).write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "start_token": _process_start_token(os.getpid()),
+            }
+        )
+    )
+
+
+def _volatile_owner_is_live(path: Path) -> bool:
+    try:
+        marker = json.loads((path / _VOLATILE_OWNER_FILE).read_text())
+        pid = int(marker["pid"])
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    expected = marker.get("start_token")
+    return expected is None or _process_start_token(pid) == expected
+
+
+def _scavenge_stale_volatile_roots() -> None:
+    for entry in _volatile_parent().iterdir():
+        suffix = entry.name.removeprefix(_VOLATILE_CHILD_PREFIX)
+        if (
+            not entry.name.startswith(_VOLATILE_CHILD_PREFIX)
+            or len(suffix) < 6
+            or not suffix.isalnum()
+        ):
+            continue
+        metadata = entry.lstat()
+        if metadata.st_uid != os.geteuid():
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
+            entry.unlink()
+        elif stat.S_ISDIR(metadata.st_mode) and not _volatile_owner_is_live(entry):
+            shutil.rmtree(entry)
+
+
 @contextmanager
 def _process_environment(environment: Mapping[str, str] | None):
     if environment is None:
@@ -110,8 +184,12 @@ def _process_environment(environment: Mapping[str, str] | None):
             os.environ.update(inherited)
 
 
-def _receive_line(connection: socket.socket) -> bytes:
-    return receive_frame(connection, max_bytes=_MAX_MESSAGE_BYTES)
+def _receive_line(connection: socket.socket, timeout_seconds: float) -> bytes:
+    return receive_frame(
+        connection,
+        max_bytes=_MAX_MESSAGE_BYTES,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def _connect(socket_path: Path) -> socket.socket:
@@ -148,7 +226,7 @@ def _request(
         with connection:
             connection.sendall(frame)
             connection.settimeout(timeout_seconds)
-            envelope = json.loads(_receive_line(connection))
+            envelope = json.loads(_receive_line(connection, timeout_seconds))
     except (OSError, SocketFrameError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise TerminalOutcomeUnknown(unknown_message) from error
     if not isinstance(envelope, dict):
@@ -354,7 +432,7 @@ def _terminal_worker(
             encode_json_frame({"status": "ready"}, max_bytes=_MAX_MESSAGE_BYTES)
         )
         while True:
-            payload = _receive_line(connection)
+            payload = _receive_line(connection, _UNTIMED_RESPONSE_TIMEOUT_SECONDS)
             if not payload:
                 break
             try:
@@ -403,6 +481,7 @@ class IsolatedTerminalServer:
         environment: Mapping[str, str] | None = None,
         terminal_type: Literal["tmux", "subprocess", "powershell"] | None = None,
     ):
+        _scavenge_stale_volatile_roots()
         self.socket_path = Path(socket_path)
         self.working_dir = Path(working_dir).resolve()
         self.environment = dict(environment or {})
@@ -509,7 +588,9 @@ class IsolatedTerminalServer:
             with connection:
                 connection.settimeout(_REQUEST_READ_TIMEOUT_SECONDS)
                 try:
-                    request = json.loads(_receive_line(connection))
+                    request = json.loads(
+                        _receive_line(connection, _REQUEST_READ_TIMEOUT_SECONDS)
+                    )
                     if request.get("protocol") != TERMINAL_PROTOCOL:
                         raise TerminalTransportError(
                             "unsupported isolated terminal protocol"
@@ -611,7 +692,12 @@ class IsolatedTerminalServer:
                         max_bytes=_MAX_MESSAGE_BYTES,
                     )
                 )
-                response = json.loads(_receive_line(worker.connection))
+                response = json.loads(
+                    _receive_line(
+                        worker.connection,
+                        _UNTIMED_RESPONSE_TIMEOUT_SECONDS,
+                    )
+                )
             except (OSError, SocketFrameError, json.JSONDecodeError) as error:
                 raise TerminalOutcomeUnknown(
                     f"terminal wake {wake_id!r} action outcome is unknown"
@@ -657,7 +743,13 @@ class IsolatedTerminalServer:
         self._reconcile_server_adoptees()
         parent, child = socket.socketpair()
         child.set_inheritable(True)
-        volatile_root = Path(tempfile.mkdtemp(prefix="senpai-terminal-wake-"))
+        volatile_root = Path(
+            tempfile.mkdtemp(
+                prefix=_VOLATILE_CHILD_PREFIX,
+                dir=_volatile_parent(),
+            )
+        )
+        _write_volatile_owner(volatile_root)
         home = volatile_root / "home"
         temporary = volatile_root / "tmp"
         xdg_cache = volatile_root / "cache"
@@ -667,8 +759,8 @@ class IsolatedTerminalServer:
             directory.mkdir()
         command = [
             sys.executable,
-            "-m",
-            "senpai_agent.isolated_terminal",
+            "-I",
+            str(Path(__file__).resolve()),
             "worker",
             "--control-fd",
             str(child.fileno()),
@@ -679,6 +771,7 @@ class IsolatedTerminalServer:
             command.extend(("--terminal-type", self.terminal_type))
         environment = {
             **self.environment,
+            "PATH": _TRUSTED_COMMAND_PATH,
             "HOME": str(home),
             "TMPDIR": str(temporary),
             "TMP": str(temporary),
@@ -711,7 +804,7 @@ class IsolatedTerminalServer:
         )
         try:
             parent.settimeout(_WORKER_START_SECONDS)
-            response = json.loads(_receive_line(parent))
+            response = json.loads(_receive_line(parent, _WORKER_START_SECONDS))
             if response.get("status") != "ready":
                 raise TerminalTransportError("terminal worker did not become ready")
             parent.settimeout(None)

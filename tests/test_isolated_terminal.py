@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import signal
 import shlex
@@ -12,6 +14,8 @@ import pytest
 
 from openhands.tools.terminal import TerminalAction
 
+import senpai_agent.isolated_terminal as isolated_terminal
+
 from senpai_agent.isolated_terminal import (
     IsolatedTerminalClientExecutor,
     IsolatedTerminalServer,
@@ -24,13 +28,52 @@ from senpai_agent.isolated_terminal import (
 )
 
 
+def _test_socket(tmp_path: Path, suffix: str) -> Path:
+    digest = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:10]
+    return Path("/private/tmp") / f"senpai-{os.getpid()}-{digest}-{suffix}.sock"
+
+
+def test_terminal_startup_scavenges_only_owned_stale_volatile_children(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(isolated_terminal.tempfile, "tempdir", str(tmp_path))
+    parent = tmp_path / "senpai-terminal-wakes"
+    parent.mkdir()
+    stale = parent / "wake-stale123"
+    stale.mkdir()
+    (stale / ".senpai-owner.json").write_text(
+        json.dumps({"pid": 999_999_999, "start_token": None})
+    )
+    target = tmp_path / "must-survive"
+    target.mkdir()
+    link = parent / "wake-symlink1"
+    link.symlink_to(target)
+    unrelated = parent / "operator-notes"
+    unrelated.write_text("keep")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with IsolatedTerminalServer(
+        socket_path=_test_socket(tmp_path, "scavenge-terminal"),
+        working_dir=workspace,
+        terminal_type="subprocess",
+    ):
+        pass
+
+    assert not stale.exists()
+    assert not link.exists()
+    assert target.exists()
+    assert unrelated.read_text() == "keep"
+
+
 def test_terminal_socket_preserves_shell_fidelity_without_control_secrets(
     tmp_path,
     monkeypatch,
 ):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-terminal.sock"
+    socket_path = _test_socket(tmp_path, "terminal")
     canaries = {
         "GITHUB_TOKEN": "control-github-canary",
         "WANDB_API_KEY": "control-wandb-canary",
@@ -71,7 +114,7 @@ def test_terminal_socket_preserves_shell_fidelity_without_control_secrets(
 
 
 def test_terminal_socket_preserves_timeout_poll_and_reset_semantics(tmp_path):
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-terminal-reset.sock"
+    socket_path = _test_socket(tmp_path, "terminal-reset")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     environment = {"HOME": str(tmp_path), "PATH": os.environ["PATH"]}
@@ -97,7 +140,7 @@ def test_terminal_socket_preserves_timeout_poll_and_reset_semantics(tmp_path):
 
 
 def test_terminal_does_not_replay_an_action_after_the_request_was_sent(tmp_path):
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-terminal-drop.sock"
+    socket_path = _test_socket(tmp_path, "terminal-drop")
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
     listener.listen(20)
@@ -144,7 +187,7 @@ def test_terminal_does_not_replay_an_action_after_the_request_was_sent(tmp_path)
 
 
 def test_begin_wake_recreates_pristine_shell_and_rejects_stale_actions(tmp_path):
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-terminal-wakes.sock"
+    socket_path = _test_socket(tmp_path, "terminal-wakes")
     workspace = tmp_path / "workspace"
     nested = workspace / "nested"
     nested.mkdir(parents=True)
@@ -163,7 +206,10 @@ def test_begin_wake_recreates_pristine_shell_and_rejects_stale_actions(tmp_path)
                 command=(
                     "cd nested; export LEAKED_WAKE=yes; "
                     "printf persisted > ../workspace-state; "
-                    "printf '[user]\\nname = poisoned\\n' > \"$HOME/.gitconfig\"; pwd"
+                    "printf '[user]\\nname = poisoned\\n' > \"$HOME/.gitconfig\"; "
+                    "mkdir -p \"$HOME/.local/bin\"; "
+                    "printf '#!/bin/sh\\nexit 99\\n' > \"$HOME/.local/bin/git\"; "
+                    "chmod +x \"$HOME/.local/bin/git\"; pwd"
                 )
             )
         )
@@ -176,7 +222,11 @@ def test_begin_wake_recreates_pristine_shell_and_rejects_stale_actions(tmp_path)
                 command=(
                     "pwd; printf '|%s|' \"$LEAKED_WAKE\"; "
                     "test -f workspace-state && printf '|workspace-persisted|'; "
-                    "test ! -e \"$HOME/.gitconfig\" && printf '|home-clean|'"
+                    "test ! -e \"$HOME/.gitconfig\" && printf '|home-clean|'; "
+                    "test \"$PATH\" = "
+                    "'/opt/senpai-venv/bin:/usr/local/bin:/usr/bin:/bin' && "
+                    "test \"$(command -v git)\" != \"$HOME/.local/bin/git\" && "
+                    "printf '|path-clean|'"
                 )
             )
         )
@@ -185,6 +235,7 @@ def test_begin_wake_recreates_pristine_shell_and_rejects_stale_actions(tmp_path)
         assert "|yes|" not in pristine.text
         assert "|workspace-persisted|" in pristine.text
         assert "|home-clean|" in pristine.text
+        assert "|path-clean|" in pristine.text
         with pytest.raises(StaleTerminalWake):
             first(TerminalAction(command="touch stale-wake-ran"))
 
@@ -193,7 +244,7 @@ def test_begin_wake_recreates_pristine_shell_and_rejects_stale_actions(tmp_path)
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreapers")
 def test_end_wake_immediately_reaps_background_processes(tmp_path):
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-terminal-end.sock"
+    socket_path = _test_socket(tmp_path, "terminal-end")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     marker = workspace / "ended-wake-survived"
@@ -221,7 +272,7 @@ def test_end_wake_immediately_reaps_background_processes(tmp_path):
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux process trees")
 def test_begin_wake_preempts_a_long_foreground_action_within_a_bound(tmp_path):
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-terminal-preempt.sock"
+    socket_path = _test_socket(tmp_path, "terminal-preempt")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     old_outcome = []
@@ -267,7 +318,7 @@ def test_begin_wake_preempts_a_long_foreground_action_within_a_bound(tmp_path):
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreapers")
 def test_begin_wake_reaps_background_setsid_double_fork(tmp_path):
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-terminal-tree.sock"
+    socket_path = _test_socket(tmp_path, "terminal-tree")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     marker = workspace / "old-wake-survived"
@@ -302,7 +353,7 @@ def test_begin_wake_reaps_background_setsid_double_fork(tmp_path):
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreapers")
 def test_next_wake_reaps_detached_child_after_worker_crash(tmp_path):
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-terminal-crash.sock"
+    socket_path = _test_socket(tmp_path, "terminal-crash")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     child_ready = workspace / "detached-child.pid"
@@ -353,7 +404,7 @@ def test_later_begin_reconciles_an_orphan_after_one_cleanup_failure(
     tmp_path,
     monkeypatch,
 ):
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-terminal-reconcile.sock"
+    socket_path = _test_socket(tmp_path, "terminal-reconcile")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     child_ready = workspace / "orphan-ready.pid"
@@ -413,7 +464,7 @@ def test_later_begin_reconciles_an_orphan_after_one_cleanup_failure(
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreapers")
 def test_terminal_server_close_reaps_active_wake_background_processes(tmp_path):
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-terminal-close.sock"
+    socket_path = _test_socket(tmp_path, "terminal-close")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     marker = workspace / "closed-server-survived"

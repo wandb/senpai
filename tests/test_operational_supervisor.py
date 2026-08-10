@@ -17,6 +17,7 @@ from senpai_agent.operational_supervisor import (
     DiscussionCounts,
     GitHubActivity,
     GitHubPRCollector,
+    MachineStats,
     PullRequestObservation,
     RecentPullRequestObservation,
     RecentWandbRunObservation,
@@ -27,10 +28,12 @@ from senpai_agent.operational_supervisor import (
     WandbActivity,
     WandbRunCollector,
     _run_fresh_supervisor_turn,
+    _reconcile_terminal_after_control_restart,
     collect_campaign_snapshot,
     compose_research_review_prompt,
     compose_supervisor_prompt,
     operational_supervisor_main,
+    run_scheduled_research_review,
 )
 from senpai_agent.operations import OperationAuditRecord, RoleTarget
 from senpai_agent.repair_broker import RepairAuditRecord
@@ -54,6 +57,7 @@ def mutation_audit_record(
     *,
     requested_at: datetime = NOW,
     status: str = "succeeded",
+    error_type: str | None = None,
 ) -> OperationAuditRecord:
     return OperationAuditRecord(
         operation_key=f"operation-{requested_at.minute}",
@@ -70,7 +74,7 @@ def mutation_audit_record(
         completed_at=(requested_at + timedelta(seconds=2)),
         status=status,
         source_operation_key=None,
-        error_type=None,
+        error_type=error_type,
     )
 
 
@@ -594,6 +598,64 @@ def test_durable_schedule_is_immediate_then_15_minutes_and_research_at_6_hours(
     assert reopened.due_state(NOW + timedelta(hours=12)).research_review_due is True
 
 
+def test_failed_research_review_attempt_waits_for_the_next_six_hour_window(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+):
+    store = SupervisorStateStore(tmp_path / "state.json")
+    store.read(initialize_at=NOW)
+    attempted_at = NOW + timedelta(hours=6)
+
+    def fail_review() -> int:
+        raise RuntimeError("transient research evidence failure")
+
+    assert (
+        run_scheduled_research_review(
+            store,
+            fail_review,
+            attempted_at=attempted_at,
+        )
+        == 1
+    )
+
+    state = store.read()
+    assert state.last_research_review_at is None
+    assert state.last_research_review_attempt_at == attempted_at
+    assert "SENPAI_RESEARCH_REVIEW_ERROR RuntimeError" in capsys.readouterr().err
+    assert (
+        store.due_state(attempted_at + timedelta(hours=5, minutes=59))
+        .research_review_due
+        is False
+    )
+    assert store.due_state(attempted_at + timedelta(hours=6)).research_review_due
+
+
+def test_research_review_attempt_cannot_precede_a_migrated_success_timestamp(
+    tmp_path: Path,
+):
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "started_at": NOW.isoformat(),
+                "snapshots": [],
+                "last_research_review_at": (
+                    NOW + timedelta(hours=6)
+                ).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = SupervisorStateStore(path)
+
+    with pytest.raises(ValueError, match="timestamp order"):
+        store.mark_research_review(
+            NOW + timedelta(hours=5),
+            succeeded=False,
+        )
+
+
 def test_store_rejects_out_of_order_snapshots(tmp_path: Path):
     store = SupervisorStateStore(tmp_path / "state.json")
     store.append(snapshot(NOW))
@@ -686,6 +748,28 @@ def test_fresh_wake_prompt_includes_durable_repair_outcomes():
     assert '"exit_code":0' in prompt
 
 
+def test_fresh_wake_prompt_exposes_an_interrupted_operation_as_unknown():
+    due = SupervisorDueState(
+        operational_due=True,
+        research_review_due=False,
+        next_operational_at=NOW,
+        next_research_review_at=NOW + timedelta(hours=6),
+    )
+    interrupted = mutation_audit_record(
+        status="unknown",
+        error_type="SupervisorInterrupted",
+    )
+
+    prompt = compose_supervisor_prompt(
+        (snapshot(NOW),),
+        due=due,
+        operation_audit=(interrupted,),
+    )
+
+    assert '"status":"unknown"' in prompt
+    assert '"error_type":"SupervisorInterrupted"' in prompt
+
+
 def test_prompt_preserves_repeated_deferred_markers_across_all_three_updates():
     deferred = (
         "SENPAI_TURN_DEFERRED conversation_id=x retry_after_seconds=600",
@@ -722,6 +806,40 @@ def test_prompt_preserves_repeated_deferred_markers_across_all_three_updates():
     assert prompt.count('"active_delegation_count":2') >= 3
 
 
+def test_operational_prompt_includes_bounded_machine_utilization():
+    current = snapshot(NOW).model_copy(
+        update={
+            "runtimes": (
+                RoleRuntimeObservation(
+                    role="student",
+                    name="alice",
+                    machine="alice-pod-7",
+                    stats=MachineStats(
+                        cpu_percent=21.5,
+                        memory_percent=62.25,
+                        disk_percent=44.0,
+                        gpu_percent=87.75,
+                    ),
+                ),
+            )
+        }
+    )
+    due = SupervisorDueState(
+        operational_due=True,
+        research_review_due=False,
+        next_operational_at=NOW,
+        next_research_review_at=NOW + timedelta(hours=6),
+    )
+
+    prompt = compose_supervisor_prompt((current,), due=due)
+
+    assert '"machine":"alice-pod-7"' in prompt
+    assert (
+        '"machine_stats":{"cpu_percent":21.5,"disk_percent":44.0,'
+        '"gpu_percent":87.75,"memory_percent":62.25}' in prompt
+    )
+
+
 def test_supervisor_instructions_do_not_double_count_overlapping_log_markers():
     instructions = Path("system_instructions/OPERATIONAL_SUPERVISOR.md").read_text()
 
@@ -738,6 +856,7 @@ def test_research_prompt_keeps_full_guidance_and_quarantines_bounded_evidence():
     evidence = ResearchReviewEvidence(
         observed_at=NOW,
         since=NOW - timedelta(hours=6),
+        advisor_guidance=guidance,
         closed_pull_requests=(
             RecentPullRequestObservation(
                 number=9,
@@ -777,7 +896,6 @@ def test_research_prompt_keeps_full_guidance_and_quarantines_bounded_evidence():
     prompt = compose_research_review_prompt(
         (snapshot(NOW),),
         evidence,
-        advisor_guidance=guidance,
         operation_audit=(mutation_audit_record(),),
     )
 
@@ -919,3 +1037,35 @@ def test_fresh_supervisor_turn_is_not_completed_when_terminal_cleanup_fails(
         args and args[0] == "operational-review-complete"
         for args, _kwargs in progress_events
     )
+
+
+def test_control_restart_waits_for_shell_then_reconciles_one_startup_wake(
+    monkeypatch,
+):
+    from senpai_agent.isolated_terminal import TerminalTransportError
+
+    attempts = 0
+    events = []
+
+    def begin(_socket, wake_id):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise TerminalTransportError("shell is starting")
+        events.append(("begin", wake_id))
+
+    monkeypatch.setattr(
+        "senpai_agent.isolated_terminal.begin_isolated_terminal_wake",
+        begin,
+    )
+    monkeypatch.setattr(
+        "senpai_agent.isolated_terminal.end_isolated_terminal_wake",
+        lambda _socket, wake_id: events.append(("end", wake_id)),
+    )
+    monkeypatch.setattr("senpai_agent.operational_supervisor.time.sleep", lambda _: None)
+
+    _reconcile_terminal_after_control_restart("@terminal", ready_timeout_seconds=5)
+
+    assert attempts == 3
+    assert [event[0] for event in events] == ["begin", "end"]
+    assert events[0][1] == events[1][1]

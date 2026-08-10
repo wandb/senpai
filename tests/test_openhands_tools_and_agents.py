@@ -268,7 +268,10 @@ def test_supervisor_terminal_resolves_to_isolated_executor_and_allows_git_push(
         workspace=SimpleNamespace(working_dir=str(workspace)),
         env_observation_persistence_dir=None,
     )
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-git-terminal.sock"
+    socket_path = (
+        Path("/private/tmp")
+        / f"{tmp_path.name}-{os.getpid()}-git-terminal.sock"
+    )
     monkeypatch.setenv("SENPAI_SUPERVISOR_TERMINAL_SOCKET", str(socket_path))
     with IsolatedTerminalServer(
         socket_path=socket_path,

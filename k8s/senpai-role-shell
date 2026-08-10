@@ -5,4 +5,4 @@
 # SPDX-PackageName: senpai
 
 set -e
-exec python -m senpai_agent.repair_broker repair "$@"
+exec /opt/senpai-venv/bin/python -I -m senpai_agent.repair_broker repair "$@"

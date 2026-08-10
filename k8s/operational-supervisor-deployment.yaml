@@ -54,6 +54,8 @@ metadata:
   annotations:
     senpai.wandb.com/source-revision: "{{REPO_REVISION}}"
     senpai.wandb.com/advisor-branch: {{ADVISOR_BRANCH_JSON}}
+    senpai.wandb.com/management-protocol: "{{MANAGEMENT_PROTOCOL_VERSION}}"
+    senpai.wandb.com/repair-protocol: "{{REPAIR_PROTOCOL_VERSION}}"
   labels:
     app: senpai
     role: supervisor
@@ -75,6 +77,7 @@ spec:
         app: senpai
         role: supervisor
         research-tag: {{RESEARCH_TAG}}
+        senpai-supervisor-access: "true"
     spec:
       serviceAccountName: {{SUPERVISOR_SERVICE_ACCOUNT_NAME}}
       automountServiceAccountToken: false
@@ -89,6 +92,14 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       initContainers:
+      - name: metadata-egress-guard
+        image: {{ADVISOR_IMAGE}}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+        command: ["/usr/local/bin/senpai-metadata-egress-guard"]
       - name: state-directory
         image: {{ADVISOR_IMAGE}}
         securityContext:
@@ -101,6 +112,7 @@ spec:
         - |
           set -eu
           mkdir -p "/state-root/{{SUPERVISOR_STATE_SUBPATH}}"
+          chmod 0700 "/state-root/{{SUPERVISOR_STATE_SUBPATH}}"
         volumeMounts:
         - name: state
           mountPath: /state-root
@@ -108,6 +120,7 @@ spec:
         image: {{ADVISOR_IMAGE}}
         securityContext:
           allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
           capabilities:
             drop: [ALL]
         command: ["/bin/bash", "-c"]
@@ -147,11 +160,57 @@ spec:
         volumeMounts:
         - name: runtime
           mountPath: /workspace
+        - name: source-tmp
+          mountPath: /tmp
+      - name: kubeconfig
+        image: {{ADVISOR_IMAGE}}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -eu
+          host="$KUBERNETES_SERVICE_HOST"
+          case "$host" in
+            *:*) host="[$host]" ;;
+          esac
+          namespace="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+          cat > /var/run/senpai-kubeconfig/config <<EOF
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - name: campaign
+            cluster:
+              server: https://${host}:${KUBERNETES_SERVICE_PORT_HTTPS}
+              certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          users:
+          - name: supervisor
+            user:
+              tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+          contexts:
+          - name: campaign
+            context:
+              cluster: campaign
+              namespace: ${namespace}
+              user: supervisor
+          current-context: campaign
+          EOF
+          chmod 0600 /var/run/senpai-kubeconfig/config
+        volumeMounts:
+        - name: service-account
+          mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          readOnly: true
+        - name: kubeconfig
+          mountPath: /var/run/senpai-kubeconfig
       containers:
       - name: supervisor-control
         image: {{ADVISOR_IMAGE}}
         securityContext:
           allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
           capabilities:
             drop: [ALL]
         command: ["/bin/bash", "-c"]
@@ -177,6 +236,8 @@ spec:
               name: {{LAUNCH_SECRET_NAME}}
               key: github-token
         {{MODEL_PROVIDER_ENV}}
+        - name: KUBECONFIG
+          value: /var/run/senpai-kubeconfig/config
         resources:
           requests:
             cpu: "2"
@@ -189,7 +250,7 @@ spec:
             command:
             - /bin/sh
             - -c
-            - /opt/senpai-venv/bin/python -I -m senpai_agent.isolated_terminal health --socket @senpai-isolated-terminal && test -S /run/senpai-repair/repair.sock && python -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
+            - /opt/senpai-venv/bin/python -I -m senpai_agent.isolated_terminal health --socket '@senpai-isolated-terminal' && test -S /run/senpai-repair/repair.sock && /opt/senpai-venv/bin/python -I -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 60
@@ -198,7 +259,7 @@ spec:
             command:
             - /bin/sh
             - -c
-            - /opt/senpai-venv/bin/python -I -m senpai_agent.isolated_terminal health --socket @senpai-isolated-terminal && test -S /run/senpai-repair/repair.sock && python -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
+            - /opt/senpai-venv/bin/python -I -m senpai_agent.isolated_terminal health --socket '@senpai-isolated-terminal' && test -S /run/senpai-repair/repair.sock && /opt/senpai-venv/bin/python -I -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
           periodSeconds: 30
           timeoutSeconds: 5
           failureThreshold: 5
@@ -213,11 +274,15 @@ spec:
         - name: service-account
           mountPath: /var/run/secrets/kubernetes.io/serviceaccount
           readOnly: true
-        - name: terminal-socket
-          mountPath: /run/senpai-terminal
-          readOnly: true
         - name: repair-socket
           mountPath: /run/senpai-repair
+        - name: kubeconfig
+          mountPath: /var/run/senpai-kubeconfig
+          readOnly: true
+        - name: control-home
+          mountPath: /home/senpai
+        - name: control-tmp
+          mountPath: /tmp
       - name: supervisor-shell
         image: {{ADVISOR_IMAGE}}
         securityContext:
@@ -229,17 +294,14 @@ spec:
         args:
         - |
           set -eu
-          mkdir -p /home/senpai/.local/bin
-          install -m 0755 /workspace/senpai/k8s/senpai-role-shell \
-            /home/senpai/.local/bin/senpai-role-shell
+          mkdir -p /tmp/senpai-shell-server
           cd /workspace/senpai
-          exec /opt/senpai-venv/bin/python -I -m \
-            senpai_agent.isolated_terminal serve \
+          exec /opt/senpai-venv/bin/python -I -m senpai_agent.isolated_terminal serve \
             --socket "$SENPAI_SUPERVISOR_TERMINAL_SOCKET" \
             --workspace /workspaces/supervisor
         env:
         - name: HOME
-          value: /home/senpai
+          value: /tmp/senpai-shell-server
         - name: SENPAI_SUPERVISOR_TERMINAL_SOCKET
           value: "@senpai-isolated-terminal"
         - name: SENPAI_SUPERVISOR_REPAIR_SOCKET
@@ -250,9 +312,11 @@ spec:
           requests:
             cpu: "1"
             memory: "1Gi"
+            ephemeral-storage: "1Gi"
           limits:
             cpu: "2"
             memory: "2Gi"
+            ephemeral-storage: "20Gi"
         startupProbe:
           exec:
             command: ["/opt/senpai-venv/bin/python", "-I", "-m", "senpai_agent.isolated_terminal", "health", "--socket", "@senpai-isolated-terminal"]
@@ -269,23 +333,22 @@ spec:
         - name: runtime
           mountPath: /workspace
           readOnly: true
-        - name: terminal-socket
-          mountPath: /run/senpai-terminal
         - name: repair-socket
           mountPath: /run/senpai-repair
           readOnly: true
         - name: shell-workspace
           mountPath: /workspaces/supervisor
-        - name: shell-home
-          mountPath: /home/senpai
         - name: shell-tmp
           mountPath: /tmp
       volumes:
       - name: runtime
         emptyDir: {}
+      - name: source-tmp
+        emptyDir:
+          sizeLimit: 1Gi
       - name: state
         persistentVolumeClaim:
-          claimName: {{PVC_CLAIM_NAME}}
+          claimName: {{SUPERVISOR_STATE_PVC_CLAIM_NAME}}
       - name: service-account
         projected:
           defaultMode: 288
@@ -303,13 +366,19 @@ spec:
               - path: namespace
                 fieldRef:
                   fieldPath: metadata.namespace
-      - name: terminal-socket
-        emptyDir: {}
       - name: repair-socket
         emptyDir: {}
       - name: shell-workspace
-        emptyDir: {}
-      - name: shell-home
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: 8Gi
       - name: shell-tmp
+        emptyDir:
+          sizeLimit: 8Gi
+      - name: control-home
+        emptyDir:
+          sizeLimit: 4Gi
+      - name: control-tmp
+        emptyDir:
+          sizeLimit: 8Gi
+      - name: kubeconfig
         emptyDir: {}

@@ -41,6 +41,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ env.SOURCE_REVISION }}
+          persist-credentials: false
 
       - name: Log in to Container Registry
         if: github.event_name != 'pull_request'
@@ -67,9 +68,42 @@ jobs:
           context: .
           file: Dockerfile.${{ matrix.role }}
           push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' && matrix.role == 'advisor' }}
           pull: true
           no-cache: true
           build-args: |
             SENPAI_SOURCE_REVISION=${{ env.SOURCE_REVISION }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Install pinned Kind
+        if: github.event_name == 'pull_request' && matrix.role == 'advisor'
+        run: |
+          curl -fsSLo /tmp/kind https://kind.sigs.k8s.io/dl/v0.32.0/kind-linux-amd64
+          echo '50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54  /tmp/kind' | sha256sum --check
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+
+      - name: Run Kubernetes production canary
+        if: github.event_name == 'pull_request' && matrix.role == 'advisor'
+        env:
+          BASE_IMAGE: ghcr.io/${{ env.IMAGE_NAME }}:sha-${{ env.SOURCE_REVISION }}
+          CANARY_IMAGE: senpai-kubernetes-canary:sha-${{ env.SOURCE_REVISION }}
+          DIAGNOSTICS_DIR: ${{ runner.temp }}/senpai-kubernetes-canary
+          SENPAI_CANARY_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: scripts/test-kubernetes-canary.sh
+
+      - name: Upload Kubernetes canary diagnostics
+        if: failure() && github.event_name == 'pull_request' && matrix.role == 'advisor'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kubernetes-canary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/senpai-kubernetes-canary
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove exact Kubernetes canary cluster
+        if: always() && github.event_name == 'pull_request' && matrix.role == 'advisor'
+        run: |
+          if command -v kind >/dev/null 2>&1; then
+            kind delete cluster --name "senpai-ci-${{ github.run_id }}-${{ github.run_attempt }}"
+          fi

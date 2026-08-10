@@ -1,14 +1,17 @@
+import hashlib
 import json
 import os
 import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
 import tracemalloc
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from senpai_agent.kubernetes_operations import KubectlCampaignBackend
 from senpai_agent.operations import CampaignInventory, RoleTarget
@@ -16,11 +19,13 @@ from senpai_agent.repair_broker import (
     RepairBrokerClient,
     RepairBrokerServer,
     RepairIdempotencyConflict,
+    RepairLedger,
     RepairOutcomeUnknown,
     RepairRequest,
     RepairResult,
     repair_broker_main,
 )
+from senpai_agent.protocols import REPAIR_PROTOCOL_VERSION
 from senpai_agent.repair_executor import (
     REPAIR_STREAM_LIMIT_BYTES,
     execute_local_repair,
@@ -65,7 +70,7 @@ def repair_request(
 
 def test_repair_broker_binds_arbitrary_commands_to_exact_role_target(tmp_path):
     backend = RecordingRepairBackend()
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-repair.sock"
+    socket_path = _test_socket(tmp_path, "repair")
     with RepairBrokerServer(
         socket_path,
         inventory(),
@@ -93,6 +98,53 @@ def test_repair_broker_binds_arbitrary_commands_to_exact_role_target(tmp_path):
     ]
 
 
+def test_repair_wire_preserves_exact_command_and_output_whitespace(tmp_path):
+    backend = RecordingRepairBackend()
+    socket_path = _test_socket(tmp_path, "fidelity-repair")
+    command = "  printf 'first\\nsecond ' \\\n"
+    request = RepairRequest.create(
+        operation_id="repair-fidelity:1",
+        target=RoleTarget(research_tag="maple", role="advisor"),
+        command=command,
+    )
+
+    with RepairBrokerServer(
+        socket_path,
+        inventory(),
+        backend,
+        ledger_path=tmp_path / "repair.sqlite3",
+    ):
+        RepairBrokerClient(socket_path).execute(request)
+
+    assert request.command == command
+    assert backend.calls[0][1] == command
+    result = RepairResult(exit_code=0, stdout=" leading\ntrailing \n", stderr="\t")
+    assert RepairResult.model_validate_json(result.model_dump_json()) == result
+
+
+@pytest.mark.parametrize("command", ["", " ", "\n\t"])
+def test_repair_request_rejects_empty_commands_without_normalizing(command):
+    with pytest.raises(ValidationError):
+        RepairRequest.create(
+            operation_id="repair-empty",
+            target=RoleTarget(research_tag="maple", role="advisor"),
+            command=command,
+        )
+
+
+@pytest.mark.parametrize(
+    "operation_id",
+    [" leading", "trailing ", "contains/control\n", ""],
+)
+def test_repair_operation_id_is_an_audit_safe_canonical_token(operation_id):
+    with pytest.raises(ValidationError):
+        RepairRequest.create(
+            operation_id=operation_id,
+            target=RoleTarget(research_tag="maple", role="advisor"),
+            command="true",
+        )
+
+
 @pytest.mark.parametrize(
     "target",
     [
@@ -105,7 +157,7 @@ def test_repair_broker_rejects_cross_campaign_and_unknown_roles(
     target,
     capsys,
 ):
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-{target.role}-repair.sock"
+    socket_path = _test_socket(tmp_path, f"{target.role}-repair")
     with RepairBrokerServer(
         socket_path,
         inventory(),
@@ -254,7 +306,27 @@ def test_repair_executor_bounds_combined_json_response_below_socket_frame(tmp_pa
 
     assert len(result["stdout"].encode()) <= REPAIR_STREAM_LIMIT_BYTES
     assert len(result["stderr"].encode()) <= REPAIR_STREAM_LIMIT_BYTES
+    assert result["stdout_truncated"] is True
+    assert result["stderr_truncated"] is True
     assert len(response) < 2 * 1024 * 1024
+
+
+def test_repair_truncation_is_explicit_at_a_multibyte_utf8_boundary(tmp_path):
+    producer = (
+        "import sys; "
+        f"sys.stdout.buffer.write('€'.encode() * {REPAIR_STREAM_LIMIT_BYTES})"
+    )
+
+    result = execute_local_repair(
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(producer)}",
+        tmp_path,
+        10,
+    )
+
+    assert result["exit_code"] == 0
+    assert result["stdout_truncated"] is True
+    assert result["stderr_truncated"] is False
+    assert len(result["stdout"].encode()) <= REPAIR_STREAM_LIMIT_BYTES
 
 
 def test_repair_executor_drains_high_volume_output_with_bounded_caller_memory(tmp_path):
@@ -287,7 +359,7 @@ def test_repair_broker_returns_worst_case_unicode_within_one_valid_frame(tmp_pat
                 stderr="\N{COLLISION SYMBOL}" * REPAIR_STREAM_LIMIT_BYTES,
             )
 
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-unicode-repair.sock"
+    socket_path = _test_socket(tmp_path, "unicode-repair")
     with RepairBrokerServer(
         socket_path,
         inventory(),
@@ -298,8 +370,10 @@ def test_repair_broker_returns_worst_case_unicode_within_one_valid_frame(tmp_pat
             repair_request("repair-unicode")
         )
 
-    assert result.stdout == "\N{COLLISION SYMBOL}" * REPAIR_STREAM_LIMIT_BYTES
-    assert result.stderr == "\N{COLLISION SYMBOL}" * REPAIR_STREAM_LIMIT_BYTES
+    assert len(result.stdout.encode()) <= REPAIR_STREAM_LIMIT_BYTES
+    assert len(result.stderr.encode()) <= REPAIR_STREAM_LIMIT_BYTES
+    assert result.stdout_truncated is True
+    assert result.stderr_truncated is True
 
 
 def test_repair_executor_replaces_undecodable_command_output(tmp_path):
@@ -323,7 +397,7 @@ def test_repair_broker_audits_backend_errors_without_logging_command(
         def run_repair(self, target, *, command, cwd, timeout_seconds):
             raise RuntimeError("transport failed")
 
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-error-repair.sock"
+    socket_path = _test_socket(tmp_path, "error-repair")
     command = "sensitive diagnostic text"
     with RepairBrokerServer(
         socket_path,
@@ -348,11 +422,15 @@ def test_repair_broker_audits_backend_errors_without_logging_command(
 
 def test_repair_receipt_replays_after_lost_reply_and_broker_restart(tmp_path):
     backend = RecordingRepairBackend()
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-lost-repair.sock"
+    socket_path = _test_socket(tmp_path, "lost-repair")
     ledger_path = tmp_path / "repair.sqlite3"
     request = repair_request("repair-lost", command="printf fixed")
     envelope = json.dumps(
-        {"operation": "execute", "request": request.model_dump(mode="json")},
+        {
+            "protocol": REPAIR_PROTOCOL_VERSION,
+            "operation": "execute",
+            "request": request.model_dump(mode="json"),
+        },
         separators=(",", ":"),
     ).encode() + b"\n"
 
@@ -392,7 +470,7 @@ def test_repair_receipt_replays_after_lost_reply_and_broker_restart(tmp_path):
 
 
 def test_repair_operation_id_rejects_a_changed_command(tmp_path):
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-conflict-repair.sock"
+    socket_path = _test_socket(tmp_path, "conflict-repair")
     with RepairBrokerServer(
         socket_path,
         inventory(),
@@ -406,15 +484,92 @@ def test_repair_operation_id_rejects_a_changed_command(tmp_path):
 
 
 def test_running_repair_becomes_queryable_unknown_after_broker_restart(tmp_path):
-    from senpai_agent.repair_broker import RepairLedger
-
     ledger_path = tmp_path / "repair.sqlite3"
     request = repair_request("repair-interrupted", command="dangerous mutation")
     with RepairLedger(ledger_path) as ledger:
         assert ledger.reserve(request).status.status == "running"
 
-    with RepairLedger(ledger_path) as reopened:
-        status = reopened.status("repair-interrupted")
+    socket_path = _test_socket(tmp_path, "interrupted-repair")
+    with RepairBrokerServer(
+        socket_path,
+        inventory(),
+        RecordingRepairBackend(),
+        ledger_path=ledger_path,
+    ) as restarted:
+        status = restarted.ledger.status("repair-interrupted")
 
     assert status.status == "unknown"
     assert status.command_fingerprint == request.command_fingerprint
+
+
+def test_repair_ledger_uses_race_safe_rollback_journal(tmp_path):
+    from sqlite_test_support import assert_concurrent_first_open
+
+    path = tmp_path / "repair.sqlite3"
+    assert_concurrent_first_open(lambda: RepairLedger(path), workers=8)
+    with RepairLedger(path) as ledger:
+        mode = ledger._connection.execute("PRAGMA journal_mode").fetchone()
+
+    assert mode is not None
+    assert mode[0] == "delete"
+
+
+@pytest.mark.parametrize("protocol", [None, "senpai-repair-broker/v0"])
+def test_repair_broker_rejects_missing_or_stale_protocol(tmp_path, protocol):
+    socket_path = _test_socket(tmp_path, "protocol-repair")
+    envelope = {"operation": "status", "operation_id": "missing"}
+    if protocol is not None:
+        envelope["protocol"] = protocol
+
+    with RepairBrokerServer(
+        socket_path,
+        inventory(),
+        RecordingRepairBackend(),
+        ledger_path=tmp_path / "repair.sqlite3",
+    ):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.connect(str(socket_path))
+            connection.sendall(json.dumps(envelope).encode() + b"\n")
+            response = json.loads(connection.makefile("rb").readline())
+
+    assert response["protocol"] == REPAIR_PROTOCOL_VERSION
+    assert response["error_type"] == "ValueError"
+    assert "protocol" in response["error"]
+
+
+def test_repair_broker_recovers_after_a_slow_drip_frame(tmp_path, monkeypatch):
+    import senpai_agent.repair_broker as repair_broker
+
+    monkeypatch.setattr(repair_broker, "_REQUEST_READ_TIMEOUT_SECONDS", 0.12)
+    socket_path = _test_socket(tmp_path, "slow-drip-repair")
+    with RepairBrokerServer(
+        socket_path,
+        inventory(),
+        RecordingRepairBackend(),
+        ledger_path=tmp_path / "repair.sqlite3",
+    ):
+        attacker = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        attacker.connect(str(socket_path))
+
+        def drip() -> None:
+            try:
+                for byte in b'{"protocol":':
+                    attacker.send(bytes([byte]))
+                    time.sleep(0.04)
+            except OSError:
+                pass
+            finally:
+                attacker.close()
+
+        thread = threading.Thread(target=drip)
+        thread.start()
+        thread.join(timeout=2)
+        result = RepairBrokerClient(socket_path).execute(
+            repair_request("repair-after-slow-drip")
+        )
+
+    assert result.exit_code == 0
+
+def _test_socket(tmp_path: Path, suffix: str) -> Path:
+    digest = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:10]
+    return Path("/private/tmp") / f"senpai-{os.getpid()}-{digest}-{suffix}.sock"

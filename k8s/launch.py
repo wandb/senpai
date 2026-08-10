@@ -8,6 +8,7 @@
 
 import json
 import posixpath
+import re
 import shlex
 import subprocess
 import sys
@@ -21,15 +22,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from k8s.launch_helpers import (  # noqa: E402
+    content_addressed_name,
     ensure_advisor_branch,
     ensure_target_repo_labels,
     existing_advisor_deployments,
+    existing_operational_supervisors,
     existing_role_metadata,
     existing_student_names,
     expand_student_names,
     is_immutable_image_reference,
+    kubernetes_pvc_metadata,
     kubectl_apply,
     kubectl_command,
+    kubectl_rollout_status,
     pod_template_hash,
     preflight_check_anthropic_api_key,
     preflight_check_exa_api_key,
@@ -41,6 +46,7 @@ from k8s.launch_helpers import (  # noqa: E402
     preflight_check_wandb_inference,
     render_configmap,
     render_launch_secret,
+    render_supervisor_secret,
     render_template,
     resolve_anthropic_api_key,
     resolve_exa_api_key,
@@ -50,6 +56,10 @@ from k8s.launch_helpers import (  # noqa: E402
     resolve_wandb_api_key,
     routing_labels,
     source_revision_for_image,
+)
+from senpai_agent.protocols import (  # noqa: E402
+    MANAGEMENT_PROTOCOL_VERSION,
+    REPAIR_PROTOCOL_VERSION,
 )
 from senpai.launch.aws_backend import launch_aws, preflight_aws  # noqa: E402
 from senpai.launch.aws_mac_backend import (  # noqa: E402
@@ -61,9 +71,11 @@ from senpai.launch.docker_backend import (  # noqa: E402
     preflight_docker,
 )
 from senpai.launch.specs import (  # noqa: E402
+    CONTAINER_RESERVED_PATHS,
     build_advisor_spec,
     build_student_spec,
     target_repo_slug,
+    validate_pvc_mount_path,
 )
 from senpai_agent.model_compatibility import (  # noqa: E402
     REASONING_EFFORTS,
@@ -75,6 +87,11 @@ ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-deployment.yaml"
 SUPERVISOR_TEMPLATE = Path(__file__).parent / "operational-supervisor-deployment.yaml"
 SENPAI_CONFIG = Path(__file__).parent.parent / "senpai.yaml"
 DOTENV_PATH = Path(__file__).parent.parent / ".env"
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?")
+_DNS_SUBDOMAIN = re.compile(
+    r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*"
+)
 
 
 @dataclass
@@ -122,6 +139,8 @@ class Args:
     advisor: bool = False  # also deploy the advisor pod (default: students only)
     operational_supervisor: bool = False  # deploy one independent operational supervisor for this campaign
     supervisor_dedicated_namespace: bool = False  # acknowledge that the Kubernetes namespace contains only this campaign
+    supervisor_network_policy_enforced: bool = False  # acknowledge that the cluster enforces Kubernetes NetworkPolicy
+    supervisor_state_pvc_claim_name: str = ""  # dedicated RWO filesystem PVC for supervisor SQLite state
     extra_instructions: str = ""  # extra prompt text for the advisor: a .md file path or a literal string
     timeout_minutes: float = 30.0  # training run wall-clock limit (SENPAI_TIMEOUT_MINUTES)
     max_epochs: int = 50  # maximum training epochs (SENPAI_MAX_EPOCHS)
@@ -131,6 +150,7 @@ class Args:
     supervisor_interval_s: int = 900  # operational supervisor wake cadence
     supervisor_research_interval_s: int = 21600  # research-philosophy review cadence
     supervisor_action_cooldown_s: int = 1800  # duplicate intervention cooldown
+    supervisor_ready_timeout_s: int = 900  # wait for the supervisor Deployment rollout
     start_gate_path: str = ""  # optional shared file path that must exist before advisor/student loops begin
     docker_run_root: str = "~/.senpai/runs"  # host directory for Docker workdirs, state, and credentials
     docker_student_gpu_ids: str = ""  # explicit map such as fern:0,tanjiro:1 or fern:0+1
@@ -161,6 +181,66 @@ class Args:
     aws_mac_official_submit: bool = False  # give every active role the MLXFast submission token
     dry_run: bool = False  # render manifests only: do not apply them or validate credentials
     preflight_only: bool = False  # validate credentials/access only: do not render or apply manifests
+
+
+def _require_dns_label(kind: str, value: str) -> None:
+    if len(value) > 63 or _DNS_LABEL.fullmatch(value) is None:
+        raise ValueError(
+            f"{kind} must be a lowercase Kubernetes DNS label of at most 63 characters"
+        )
+
+
+def _require_dns_subdomain(kind: str, value: str) -> None:
+    if (
+        len(value) > 253
+        or _DNS_SUBDOMAIN.fullmatch(value) is None
+        or any(len(label) > 63 for label in value.split("."))
+    ):
+        raise ValueError(
+            f"{kind} must be a lowercase Kubernetes DNS subdomain of at most 253 characters"
+        )
+
+
+def validate_kubernetes_inputs(args: Args, student_list: list[str]) -> None:
+    """Reject unsafe Kubernetes identifiers and paths before cluster access."""
+
+    if args.backend != "kubernetes":
+        return
+    _require_dns_label("tag", args.tag)
+    _require_dns_label("namespace", args.namespace)
+    for student in student_list:
+        _require_dns_label("student name", student)
+    _require_dns_subdomain("PVC claim name", args.pvc_claim_name)
+    if args.supervisor_state_pvc_claim_name:
+        _require_dns_subdomain(
+            "supervisor state PVC claim name",
+            args.supervisor_state_pvc_claim_name,
+        )
+    if (
+        any(ord(character) < 32 for character in args.pvc_mount_path)
+        or "//" in args.pvc_mount_path
+        or posixpath.normpath(args.pvc_mount_path) != args.pvc_mount_path
+    ):
+        raise ValueError("pvc_mount_path must be a normalized path without controls")
+    validate_pvc_mount_path(args.pvc_mount_path, CONTAINER_RESERVED_PATHS)
+
+    names = [
+        f"senpai-launch-secrets-{args.tag}",
+        f"senpai-advisor-{args.tag}",
+        f"senpai-config-advisor-{args.tag}",
+    ]
+    names.extend(
+        resource
+        for student in student_list
+        for resource in (
+            f"senpai-{args.tag}-{student}",
+            f"senpai-config-student-{args.tag}-{student}",
+        )
+    )
+    if args.operational_supervisor:
+        names.append(f"senpai-supervisor-{args.tag}")
+    for name in names:
+        _require_dns_label("composed Kubernetes resource name", name)
 
 
 MODEL_PROVIDERS = {
@@ -295,6 +375,7 @@ def validate_timing_args(args: Args) -> None:
         "supervisor_interval_s",
         "supervisor_research_interval_s",
         "supervisor_action_cooldown_s",
+        "supervisor_ready_timeout_s",
     ]
     non_negative = [
         "poll_jitter_s",
@@ -322,6 +403,266 @@ def validate_timing_args(args: Args) -> None:
             )
 
 
+def role_supervisor_replacements(
+    args: Args,
+    image: str,
+    configmap_name: str,
+    secret_name: str,
+    role: str,
+) -> dict[str, str]:
+    """Render opt-in repair authority for roles managed by a supervisor."""
+    if not args.operational_supervisor:
+        return {
+            "REPAIR_PROTOCOL_ANNOTATION": "",
+            "SUPERVISOR_ACCESS_LABEL": "",
+            "ROLE_INIT_CONTAINERS": "",
+            "ROLE_BOOTSTRAP": legacy_runner_bootstrap(),
+            "ROLE_WORKSPACE_MOUNTS": (
+                "        - name: workspace\n          mountPath: /workspace"
+            ),
+            "ROLE_WORKSPACE_VOLUMES": (
+                "      - name: workspace\n        emptyDir: {}"
+            ),
+            "REPAIR_CONTAINER": "",
+            "REPAIR_VOLUMES": "",
+        }
+    rendered_image = json.dumps(image)
+    return {
+        "REPAIR_PROTOCOL_ANNOTATION": (
+            "    senpai.wandb.com/management-protocol: "
+            f'"{MANAGEMENT_PROTOCOL_VERSION}"\n'
+            "    senpai.wandb.com/repair-protocol: "
+            f'"{REPAIR_PROTOCOL_VERSION}"'
+        ),
+        "SUPERVISOR_ACCESS_LABEL": (
+            '        senpai-supervisor-access: "true"'
+        ),
+        "ROLE_INIT_CONTAINERS": (
+            "      initContainers:\n"
+            f"{metadata_guard_init(image)}\n"
+            f"{runner_source_init(image, configmap_name, secret_name, role)}"
+        ),
+        "ROLE_BOOTSTRAP": '''          cd /workspace/senpai
+          test "$(git rev-parse HEAD)" = "$REPO_REVISION"
+          test "$SENPAI_IMAGE_REVISION" = "$REPO_REVISION"''',
+        "ROLE_WORKSPACE_MOUNTS": """        - name: runner
+          mountPath: /workspace/senpai
+          readOnly: true
+        - name: target-workspace
+          mountPath: /workspace/target""",
+        "ROLE_WORKSPACE_VOLUMES": """      - name: runner
+        emptyDir: {}
+      - name: target-workspace
+        emptyDir: {}""",
+        "REPAIR_CONTAINER": f"""      - name: repair
+        image: {rendered_image}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+        command: ["/opt/senpai-venv/bin/python", "-I", "/usr/local/bin/senpai-repair-executor", "serve", "--socket", "@senpai-repair-executor"]
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+            ephemeral-storage: "256Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+            ephemeral-storage: "12Gi"
+        startupProbe:
+          exec:
+            command: ["/opt/senpai-venv/bin/python", "-I", "/usr/local/bin/senpai-repair-executor", "health", "--socket", "@senpai-repair-executor"]
+          periodSeconds: 2
+          timeoutSeconds: 2
+          failureThreshold: 30
+        livenessProbe:
+          exec:
+            command: ["/opt/senpai-venv/bin/python", "-I", "/usr/local/bin/senpai-repair-executor", "health", "--socket", "@senpai-repair-executor"]
+          periodSeconds: 30
+          timeoutSeconds: 2
+          failureThreshold: 5
+        volumeMounts:
+        - name: target-workspace
+          mountPath: /repair/workspace
+        - name: state
+          mountPath: /repair/state
+        - name: repair-scratch
+          mountPath: /repair/scratch
+        - name: repair-tmp
+          mountPath: /tmp""",
+        "REPAIR_VOLUMES": """      - name: repair-scratch
+        emptyDir:
+          sizeLimit: 4Gi
+      - name: repair-tmp
+        emptyDir:
+          sizeLimit: 8Gi""",
+    }
+
+
+def legacy_runner_bootstrap() -> str:
+    """Keep ordinary role startup byte-for-byte equivalent in behavior."""
+    return '''          askpass=/tmp/senpai-git-askpass
+          printf '%s\\n' \\
+            '#!/bin/sh' \\
+            'case "$1" in' \\
+            '  *Username*) printf "%s\\n" x-access-token ;;' \\
+            '  *Password*) printf "%s\\n" "$GITHUB_TOKEN" ;;' \\
+            'esac' > "$askpass"
+          chmod 700 "$askpass"
+          mkdir -p /workspace
+          git init /workspace/senpai
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \\
+            git -C /workspace/senpai fetch --depth 1 "$REPO_URL" "$REPO_REVISION"
+          git -C /workspace/senpai checkout --detach FETCH_HEAD
+          cd /workspace/senpai
+          if git remote get-url origin >/dev/null 2>&1; then
+            git remote set-url origin "$REPO_URL"
+          else
+            git remote add origin "$REPO_URL"
+          fi
+          test "$(git rev-parse HEAD)" = "$REPO_REVISION"
+          test "$SENPAI_IMAGE_REVISION" = "$REPO_REVISION"'''
+
+
+def runner_source_init(
+    image: str,
+    configmap_name: str,
+    secret_name: str,
+    role: str,
+) -> str:
+    """Populate the pinned runner before mounting it read-only in a role."""
+    if role not in {"advisor", "student"}:
+        raise ValueError(f"unsupported role source init: {role}")
+    guidance = ""
+    if role == "advisor":
+        guidance = '''
+          mkdir -p /workspace/senpai/.senpai
+          envsubst '$PROBLEM_DIR $TARGET_REPO_URL $GH_REPO $ADVISOR_BRANCH $RESEARCH_TAG $GPUS_PER_STUDENT $WANDB_ENTITY $WANDB_PROJECT' \\
+            < /workspace/senpai/system_instructions/ADVISOR.md \\
+            > "$SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE"
+          chmod 0444 "$SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE"'''
+    return f"""      - name: source
+        image: {json.dumps(image)}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -eu
+          askpass=/tmp/senpai-git-askpass
+          printf '%s\\n' \\
+            '#!/bin/sh' \\
+            'case "$1" in' \\
+            '  *Username*) printf "%s\\n" x-access-token ;;' \\
+            '  *Password*) printf "%s\\n" "$GITHUB_TOKEN" ;;' \\
+            'esac' > "$askpass"
+          chmod 700 "$askpass"
+          git init /workspace/senpai
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \\
+            git -C /workspace/senpai fetch --depth 1 "$REPO_URL" "$REPO_REVISION"
+          git -C /workspace/senpai checkout --detach FETCH_HEAD
+          if git -C /workspace/senpai remote get-url origin >/dev/null 2>&1; then
+            git -C /workspace/senpai remote set-url origin "$REPO_URL"
+          else
+            git -C /workspace/senpai remote add origin "$REPO_URL"
+          fi
+          test "$(git -C /workspace/senpai rev-parse HEAD)" = "$REPO_REVISION"
+          test "$SENPAI_IMAGE_REVISION" = "$REPO_REVISION"
+{guidance}
+          rm -f "$askpass"
+        envFrom:
+        - configMapRef:
+            name: {configmap_name}
+        env:
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {secret_name}
+              key: github-token
+        volumeMounts:
+        - name: runner
+          mountPath: /workspace/senpai"""
+
+
+def metadata_guard_init(image: str) -> str:
+    """Render a credential-free fail-closed metadata reachability check."""
+    return f"""      - name: metadata-egress-guard
+        image: {json.dumps(image)}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+        command: ["/usr/local/bin/senpai-metadata-egress-guard"]"""
+
+
+def render_supervisor_network_policy(tag: str) -> str:
+    """Allow ordinary egress while denying cloud metadata/link-local access."""
+    return f"""apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: senpai-supervisor-egress-{tag}
+  labels:
+    app: senpai
+    role: supervisor
+    research-tag: {tag}
+spec:
+  podSelector:
+    matchLabels:
+      research-tag: {tag}
+      senpai-supervisor-access: "true"
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 169.254.0.0/16
+  - to:
+    - ipBlock:
+        cidr: ::/0
+        except:
+        - fe80::/10
+        - fd00:ec2::254/128
+  - to:
+    - ipBlock:
+        cidr: 169.254.0.0/16
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  - to:
+    - ipBlock:
+        cidr: fe80::/10
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53"""
+
+
+def kubernetes_role_env(env: dict[str, str], args: Args) -> dict[str, str]:
+    """Bind the immutable runner and mutable target to distinct K8s paths."""
+    if not args.operational_supervisor:
+        return env
+    return {
+        **env,
+        "SENPAI_WORKDIR": "/workspace/senpai",
+        "SENPAI_TARGET_WORKDIR": "/workspace/target",
+        "SENPAI_SKIP_EDITABLE_INSTALL": "1",
+        "SENPAI_IMMUTABLE_RUNNER": "1",
+        "SENPAI_GIT_GUARD_ROOT": "/tmp/senpai-git-guard",
+        "SENPAI_MANAGEMENT_PROTOCOL_VERSION": MANAGEMENT_PROTOCOL_VERSION,
+        "SENPAI_REPAIR_PROTOCOL_VERSION": REPAIR_PROTOCOL_VERSION,
+        "PYTHONPATH": "/workspace/senpai",
+    }
+
+
 def render_student(
     template: str,
     student_name: str,
@@ -338,7 +679,7 @@ def render_student(
     configmap = render_configmap(
         name=student_configmap_name,
         labels={"app": "senpai", "role": "student", "research-tag": tag},
-        data=spec.env,
+        data=kubernetes_role_env(spec.env, args),
     )
     deployment = render_template(
         template,
@@ -348,17 +689,24 @@ def render_student(
             "STUDENT_NAME": student_name,
             "RESEARCH_TAG": tag,
             "REPO_REVISION": args.repo_revision,
-            "STUDENT_IMAGE": args.student_image,
+            "STUDENT_IMAGE": json.dumps(args.student_image),
             "ADVISOR_BRANCH": args.advisor_branch,
             "ADVISOR_BRANCH_JSON": json.dumps(args.advisor_branch),
-            "PVC_CLAIM_NAME": args.pvc_claim_name,
-            "PVC_MOUNT_PATH": args.pvc_mount_path,
+            "PVC_CLAIM_NAME": json.dumps(args.pvc_claim_name),
+            "PVC_MOUNT_PATH": json.dumps(args.pvc_mount_path),
             "LAUNCH_SECRET_NAME": secret_name,
             "STUDENT_CPU": str(student_cpu),
             "STUDENT_MEMORY": f"{student_memory_gi}Gi",
             "GPUS_PER_STUDENT": str(args.gpus_per_student),
             "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
             "MODEL_PROVIDER_ENV": model_provider_env(args, "student", secret_name),
+            **role_supervisor_replacements(
+                args,
+                args.student_image,
+                student_configmap_name,
+                secret_name,
+                "student",
+            ),
         },
     )
     return configmap + "\n---\n" + deployment
@@ -375,10 +723,15 @@ def render_advisor(
     spec = build_advisor_spec(args, tag, student_list, secrets={})
     advisor_configmap_name = f"senpai-config-advisor-{tag}"
     advisor_deployment_name = f"senpai-advisor-{tag}"
+    config_data = kubernetes_role_env(spec.env, args)
+    if args.operational_supervisor:
+        config_data["SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE"] = (
+            "/workspace/senpai/.senpai/ADVISOR.md"
+        )
     configmap = render_configmap(
         name=advisor_configmap_name,
         labels={"app": "senpai", "role": "advisor", "research-tag": tag},
-        data=spec.env,
+        data=config_data,
     )
     deployment = render_template(
         template,
@@ -387,15 +740,22 @@ def render_advisor(
             "ADVISOR_CONFIGMAP_NAME": advisor_configmap_name,
             "RESEARCH_TAG": tag,
             "REPO_REVISION": args.repo_revision,
-            "ADVISOR_IMAGE": args.advisor_image,
+            "ADVISOR_IMAGE": json.dumps(args.advisor_image),
             "ADVISOR_BRANCH": args.advisor_branch,
             "ADVISOR_BRANCH_JSON": json.dumps(args.advisor_branch),
             "STUDENT_NAMES": ",".join(student_list),
-            "PVC_CLAIM_NAME": args.pvc_claim_name,
-            "PVC_MOUNT_PATH": args.pvc_mount_path,
+            "PVC_CLAIM_NAME": json.dumps(args.pvc_claim_name),
+            "PVC_MOUNT_PATH": json.dumps(args.pvc_mount_path),
             "LAUNCH_SECRET_NAME": secret_name,
             "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
             "MODEL_PROVIDER_ENV": model_provider_env(args, "advisor", secret_name),
+            **role_supervisor_replacements(
+                args,
+                args.advisor_image,
+                advisor_configmap_name,
+                secret_name,
+                "advisor",
+            ),
         },
     )
     return configmap + "\n---\n" + deployment
@@ -409,40 +769,47 @@ def render_operational_supervisor(
     launch_secret: str,
     args: Args,
 ) -> str:
-    configmap_name = f"senpai-config-supervisor-{tag}"
     deployment_name = f"senpai-supervisor-{tag}"
     service_account_name = f"senpai-supervisor-{tag}"
+    config_data = {
+        **primary_model_config(args, "advisor"),
+        "SENPAI_OPENHANDS_API_KEY_ENV": MODEL_PROVIDERS[
+            model_provider(args.advisor_model)
+        ][0],
+        "REPO_URL": args.repo_url,
+        "REPO_REVISION": args.repo_revision,
+        "GH_REPO": target_repo_slug(args.target_repo_url),
+        "RESEARCH_TAG": tag,
+        "STUDENT_NAMES": ",".join(student_list),
+        "WANDB_ENTITY": args.wandb_entity,
+        "WANDB_PROJECT": args.wandb_project,
+        "SENPAI_WANDB_SCOPE": tag,
+        "ADVISOR_BRANCH": args.advisor_branch,
+        "SENPAI_SUPERVISOR_INTERVAL_SECONDS": str(args.supervisor_interval_s),
+        "SENPAI_SUPERVISOR_RESEARCH_INTERVAL_SECONDS": str(
+            args.supervisor_research_interval_s
+        ),
+        "SENPAI_SUPERVISOR_ACTION_COOLDOWN_SECONDS": str(
+            args.supervisor_action_cooldown_s
+        ),
+        "SENPAI_KUBECTL_NAMESPACE": args.namespace,
+        "SENPAI_SUPERVISOR_SECRET_HANDOFF": "1",
+        "SENPAI_SKIP_EDITABLE_INSTALL": "1",
+        "PYTHONPATH": "/workspace/senpai",
+        "SENPAI_MANAGEMENT_PROTOCOL_VERSION": MANAGEMENT_PROTOCOL_VERSION,
+        "SENPAI_REPAIR_PROTOCOL_VERSION": REPAIR_PROTOCOL_VERSION,
+        "SENPAI_SUPERVISOR_TERMINAL_SOCKET": "@senpai-isolated-terminal",
+        "SENPAI_SUPERVISOR_REPAIR_SOCKET": "/run/senpai-repair/repair.sock",
+    }
+    configmap_name = content_addressed_name(
+        f"senpai-config-supervisor-{tag}",
+        config_data,
+    )
     configmap = render_configmap(
         name=configmap_name,
         labels={"app": "senpai", "role": "supervisor", "research-tag": tag},
-        data={
-            **primary_model_config(args, "advisor"),
-            "SENPAI_OPENHANDS_API_KEY_ENV": MODEL_PROVIDERS[
-                model_provider(args.advisor_model)
-            ][0],
-            "REPO_URL": args.repo_url,
-            "REPO_REVISION": args.repo_revision,
-            "GH_REPO": target_repo_slug(args.target_repo_url),
-            "RESEARCH_TAG": tag,
-            "STUDENT_NAMES": ",".join(student_list),
-            "WANDB_ENTITY": args.wandb_entity,
-            "WANDB_PROJECT": args.wandb_project,
-            "SENPAI_WANDB_SCOPE": tag,
-            "ADVISOR_BRANCH": args.advisor_branch,
-            "SENPAI_SUPERVISOR_INTERVAL_SECONDS": str(args.supervisor_interval_s),
-            "SENPAI_SUPERVISOR_RESEARCH_INTERVAL_SECONDS": str(
-                args.supervisor_research_interval_s
-            ),
-            "SENPAI_SUPERVISOR_ACTION_COOLDOWN_SECONDS": str(
-                args.supervisor_action_cooldown_s
-            ),
-            "SENPAI_KUBECTL_NAMESPACE": args.namespace,
-            "SENPAI_SUPERVISOR_SECRET_HANDOFF": "1",
-            "SENPAI_SUPERVISOR_TERMINAL_SOCKET": (
-                "@senpai-isolated-terminal"
-            ),
-            "SENPAI_SUPERVISOR_REPAIR_SOCKET": "/run/senpai-repair/repair.sock",
-        },
+        data=config_data,
+        immutable=True,
     )
     deployment = render_template(
         template,
@@ -452,12 +819,16 @@ def render_operational_supervisor(
             "SUPERVISOR_SERVICE_ACCOUNT_NAME": service_account_name,
             "RESEARCH_TAG": tag,
             "REPO_REVISION": args.repo_revision,
-            "ADVISOR_IMAGE": args.advisor_image,
+            "ADVISOR_IMAGE": json.dumps(args.advisor_image),
             "ADVISOR_BRANCH": args.advisor_branch,
             "ADVISOR_BRANCH_JSON": json.dumps(args.advisor_branch),
-            "PVC_CLAIM_NAME": args.pvc_claim_name,
+            "MANAGEMENT_PROTOCOL_VERSION": MANAGEMENT_PROTOCOL_VERSION,
+            "REPAIR_PROTOCOL_VERSION": REPAIR_PROTOCOL_VERSION,
+            "SUPERVISOR_STATE_PVC_CLAIM_NAME": json.dumps(
+                args.supervisor_state_pvc_claim_name
+            ),
             "SUPERVISOR_STATE_SUBPATH": f"{tag}/operational-supervisor",
-            "SUPERVISOR_STATE_MOUNT_PATH": (
+            "SUPERVISOR_STATE_MOUNT_PATH": json.dumps(
                 f"/var/lib/senpai/{tag}/operational-supervisor"
             ),
             "LAUNCH_SECRET_NAME": secret_name,
@@ -531,6 +902,179 @@ def resolve_checkout_revision(args: Args) -> None:
     args.repo_revision = head
 
 
+def validate_supervisor_state_pvc(args: Args) -> None:
+    """Require one bound, filesystem, single-node claim for SQLite state."""
+    try:
+        pvc = kubernetes_pvc_metadata(
+            args.supervisor_state_pvc_claim_name,
+            kube_context=args.kube_context,
+            namespace=args.namespace,
+        )
+    except RuntimeError as error:
+        raise SystemExit(f"ERROR: {error}") from error
+    access_modes = set(pvc.get("spec", {}).get("accessModes", []))
+    annotations = pvc.get("metadata", {}).get("annotations", {})
+    volume_mode = pvc.get("spec", {}).get("volumeMode", "Filesystem")
+    phase = pvc.get("status", {}).get("phase")
+    if (
+        phase != "Bound"
+        or volume_mode != "Filesystem"
+        or not access_modes.intersection({"ReadWriteOnce", "ReadWriteOncePod"})
+        or access_modes.intersection({"ReadWriteMany", "ReadOnlyMany"})
+        or annotations.get("senpai.wandb.com/sqlite-safe") != "true"
+    ):
+        sys.exit(
+            "ERROR: supervisor state PVC must be Bound, use Filesystem volume "
+            "mode, expose only ReadWriteOnce or ReadWriteOncePod access, and "
+            "carry senpai.wandb.com/sqlite-safe=true after its operator has "
+            "verified POSIX locks and atomic create/rename/delete semantics"
+        )
+
+
+def inspect_supervised_campaign(args: Args, student_list: list[str]) -> list[str]:
+    """Validate Kubernetes state and retained role protocol compatibility."""
+    validate_supervisor_state_pvc(args)
+    advisors = existing_advisor_deployments(
+        args.tag,
+        kube_context=args.kube_context,
+        namespace=args.namespace,
+    )
+    expected_advisor = f"senpai-advisor-{args.tag}"
+    if args.advisor and set(advisors) - {expected_advisor}:
+        sys.exit(
+            "ERROR: existing exact-tag advisor Deployments would remain "
+            "alongside the managed advisor; remove or retag them first"
+        )
+    if not args.advisor and len(advisors) != 1:
+        sys.exit(
+            "ERROR: --operational_supervisor without --advisor requires "
+            f"exactly one existing advisor Deployment for tag {args.tag!r}; "
+            f"found {len(advisors)}"
+        )
+    advisor_record: dict[str, str] = {}
+    if not args.advisor:
+        advisor_metadata = existing_role_metadata(
+            args.tag,
+            "advisor",
+            kube_context=args.kube_context,
+            namespace=args.namespace,
+        )
+        advisor_record = advisor_metadata.get(advisors[0], {})
+        if (
+            set(advisor_metadata) != set(advisors)
+            or advisor_record.get("senpai.wandb.com/advisor-branch")
+            != args.advisor_branch
+        ):
+            sys.exit(
+                "ERROR: the existing advisor Deployment does not match the "
+                "requested advisor branch"
+            )
+        if (
+            advisor_record.get("senpai.wandb.com/management-protocol")
+            != MANAGEMENT_PROTOCOL_VERSION
+        ):
+            sys.exit(
+                "ERROR: the retained advisor does not advertise compatible "
+                f"management protocol {MANAGEMENT_PROTOCOL_VERSION!r}; relaunch "
+                "the advisor explicitly before enabling this supervisor"
+            )
+        if (
+            advisor_record.get("senpai.wandb.com/repair-protocol")
+            != REPAIR_PROTOCOL_VERSION
+        ):
+            sys.exit(
+                "ERROR: the retained advisor does not advertise compatible "
+                f"repair protocol {REPAIR_PROTOCOL_VERSION!r}; relaunch the "
+                "advisor explicitly before enabling this supervisor"
+            )
+    student_metadata = existing_role_metadata(
+        args.tag,
+        "student",
+        kube_context=args.kube_context,
+        namespace=args.namespace,
+    )
+    incompatible_students = {
+        student
+        for student, record in student_metadata.items()
+        if student not in student_list
+        and record.get("senpai.wandb.com/advisor-branch")
+        != args.advisor_branch
+    }
+    if incompatible_students:
+        names = ", ".join(sorted(incompatible_students))
+        sys.exit(
+            "ERROR: existing student Deployments not replaced by this launch "
+            f"do not match the requested advisor branch: {names}"
+        )
+    incompatible_repair = {
+        student
+        for student, record in student_metadata.items()
+        if student not in student_list
+        and record.get("senpai.wandb.com/repair-protocol")
+        != REPAIR_PROTOCOL_VERSION
+    }
+    if incompatible_repair:
+        names = ", ".join(sorted(incompatible_repair))
+        sys.exit(
+            "ERROR: retained student Deployments do not advertise compatible "
+            f"repair protocol {REPAIR_PROTOCOL_VERSION!r}: {names}; relaunch "
+            "those students explicitly before enabling this supervisor"
+        )
+    incompatible_management = {
+        student
+        for student, record in student_metadata.items()
+        if student not in student_list
+        and record.get("senpai.wandb.com/management-protocol")
+        != MANAGEMENT_PROTOCOL_VERSION
+    }
+    if incompatible_management:
+        names = ", ".join(sorted(incompatible_management))
+        sys.exit(
+            "ERROR: retained student Deployments do not advertise compatible "
+            f"management protocol {MANAGEMENT_PROTOCOL_VERSION!r}: {names}; "
+            "relaunch those students explicitly before enabling this supervisor"
+        )
+    existing_students = list(student_metadata)
+    if not args.advisor:
+        configured_students = {
+            name
+            for name in advisor_record.get(
+                "senpai.wandb.com/student-names",
+                "",
+            ).split(",")
+            if name
+        }
+        launched_students = {*existing_students, *student_list}
+        if configured_students != launched_students:
+            sys.exit(
+                "ERROR: incremental supervisor launch would change the existing "
+                "advisor's student inventory; relaunch with --advisor"
+            )
+    return existing_students
+
+
+def reject_unsupervised_role_replacement(
+    args: Args,
+    student_list: list[str],
+) -> None:
+    """Do not remove repair capability from a campaign with a live supervisor."""
+    if (
+        args.backend == "kubernetes"
+        and not args.operational_supervisor
+        and (args.advisor or student_list)
+        and existing_operational_supervisors(
+            args.tag,
+            kube_context=args.kube_context,
+            namespace=args.namespace,
+        )
+    ):
+        sys.exit(
+            "ERROR: this campaign already has an operational supervisor; "
+            "relaunch roles with --operational_supervisor so repair capability "
+            "is preserved"
+        )
+
+
 def main():
     args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
     if args.backend not in {"kubernetes", "docker", "aws", "aws-mac"}:
@@ -549,6 +1093,28 @@ def main():
             "ERROR: --operational_supervisor requires a non-default, "
             "campaign-dedicated --namespace and "
             "--supervisor_dedicated_namespace"
+        )
+    if (
+        args.operational_supervisor
+        and not args.supervisor_network_policy_enforced
+    ):
+        sys.exit(
+            "ERROR: --operational_supervisor requires explicit confirmation "
+            "that network policy enforcement is active via "
+            "--supervisor_network_policy_enforced"
+        )
+    if args.operational_supervisor and not args.supervisor_state_pvc_claim_name:
+        sys.exit(
+            "ERROR: --operational_supervisor requires a dedicated "
+            "--supervisor_state_pvc_claim_name"
+        )
+    if (
+        args.operational_supervisor
+        and args.supervisor_state_pvc_claim_name == args.pvc_claim_name
+    ):
+        sys.exit(
+            "ERROR: --supervisor_state_pvc_claim_name must be separate from "
+            "--pvc_claim_name"
         )
     if min(args.cpu_per_gpu, args.memory_gi_per_gpu) < 1:
         sys.exit("ERROR: --cpu_per_gpu and --memory_gi_per_gpu must be at least 1")
@@ -603,11 +1169,19 @@ def main():
         sys.exit("ERROR: --target_repo_url must be a different repo from --repo_url")
 
     student_list = resolve_student_names(args)
+    try:
+        validate_kubernetes_inputs(args, student_list)
+    except ValueError as error:
+        raise SystemExit(f"ERROR: {error}") from error
+    launches_roles = args.advisor or bool(student_list)
     if args.backend == "aws-mac":
         resolve_checkout_revision(args)
     else:
         resolve_runner_revision(args, has_students=bool(student_list))
     validate_model_config(args, has_students=bool(student_list))
+
+    if not args.dry_run and not args.preflight_only:
+        reject_unsupervised_role_replacement(args, student_list)
 
     model_providers = deployed_model_providers(
         args,
@@ -622,11 +1196,12 @@ def main():
             provider_api_keys["anthropic"] = resolve_anthropic_api_key(DOTENV_PATH)
         if "openai" in model_providers:
             provider_api_keys["openai"] = resolve_openai_api_key(DOTENV_PATH)
-        exa_api_key = resolve_exa_api_key(DOTENV_PATH)
         wandb_api_key = resolve_wandb_api_key(DOTENV_PATH)
         if "wandb" in model_providers:
             provider_api_keys["wandb"] = wandb_api_key
-        hf_token = resolve_optional_secret(DOTENV_PATH, "HF_TOKEN")
+        if launches_roles:
+            exa_api_key = resolve_exa_api_key(DOTENV_PATH)
+            hf_token = resolve_optional_secret(DOTENV_PATH, "HF_TOKEN")
         if args.backend == "aws-mac" and args.aws_mac_official_submit:
             mlxfast_api_token = resolve_optional_secret(
                 DOTENV_PATH,
@@ -638,17 +1213,18 @@ def main():
                     "MLXFAST_API_TOKEN"
                 )
         preflight_check_target_repo_access(args.target_repo_url, github_token)
-        args.target_repo_branch = preflight_check_target_repo_branch(
-            args.target_repo_url,
-            github_token,
-            args.target_repo_branch,
-        )
-        preflight_check_student_name_availability(
-            args.target_repo_url,
-            github_token,
-            student_list,
-            args.advisor_branch,
-        )
+        if launches_roles:
+            args.target_repo_branch = preflight_check_target_repo_branch(
+                args.target_repo_url,
+                github_token,
+                args.target_repo_branch,
+            )
+            preflight_check_student_name_availability(
+                args.target_repo_url,
+                github_token,
+                student_list,
+                args.advisor_branch,
+            )
         if anthropic_api_key := provider_api_keys.get("anthropic"):
             preflight_check_anthropic_api_key(anthropic_api_key)
         if openai_api_key := provider_api_keys.get("openai"):
@@ -659,7 +1235,8 @@ def main():
                 args.wandb_entity,
                 args.wandb_project,
             )
-        preflight_check_exa_api_key(exa_api_key)
+        if launches_roles:
+            preflight_check_exa_api_key(exa_api_key)
         preflight_check_wandb_api_key(wandb_api_key)
 
     existing_supervised_students: list[str] | None = None
@@ -667,84 +1244,11 @@ def main():
         args.backend == "kubernetes"
         and args.operational_supervisor
         and not args.dry_run
-        and not args.preflight_only
     ):
-        advisors = existing_advisor_deployments(
-            args.tag,
-            kube_context=args.kube_context,
-            namespace=args.namespace,
+        existing_supervised_students = inspect_supervised_campaign(
+            args,
+            student_list,
         )
-        expected_advisor = f"senpai-advisor-{args.tag}"
-        if args.advisor and set(advisors) - {expected_advisor}:
-            sys.exit(
-                "ERROR: existing exact-tag advisor Deployments would remain "
-                "alongside the managed advisor; remove or retag them first"
-            )
-        if not args.advisor and len(advisors) != 1:
-            sys.exit(
-                "ERROR: --operational_supervisor without --advisor requires "
-                f"exactly one existing advisor Deployment for tag {args.tag!r}; "
-                f"found {len(advisors)}"
-            )
-        if not args.advisor:
-            advisor_metadata = existing_role_metadata(
-                args.tag,
-                "advisor",
-                kube_context=args.kube_context,
-                namespace=args.namespace,
-            )
-            advisor_record = advisor_metadata.get(advisors[0], {})
-            if set(advisor_metadata) != set(advisors) or any(
-                (
-                    advisor_record.get("senpai.wandb.com/source-revision")
-                    != args.repo_revision,
-                    advisor_record.get("senpai.wandb.com/advisor-branch")
-                    != args.advisor_branch,
-                )
-            ):
-                sys.exit(
-                    "ERROR: the existing advisor Deployment does not match the "
-                    "requested Senpai source revision and advisor branch"
-                )
-        student_metadata = existing_role_metadata(
-            args.tag,
-            "student",
-            kube_context=args.kube_context,
-            namespace=args.namespace,
-        )
-        incompatible_students = {
-            student
-            for student, record in student_metadata.items()
-            if student not in student_list
-            and (
-                record.get("senpai.wandb.com/source-revision") != args.repo_revision
-                or record.get("senpai.wandb.com/advisor-branch")
-                != args.advisor_branch
-            )
-        }
-        if incompatible_students:
-            names = ", ".join(sorted(incompatible_students))
-            sys.exit(
-                "ERROR: existing student Deployments not replaced by this launch "
-                "do not match the requested Senpai source revision and advisor "
-                f"branch: {names}"
-            )
-        existing_supervised_students = list(student_metadata)
-        if not args.advisor:
-            configured_students = {
-                name
-                for name in advisor_record.get(
-                    "senpai.wandb.com/student-names",
-                    "",
-                ).split(",")
-                if name
-            }
-            launched_students = {*existing_supervised_students, *student_list}
-            if configured_students != launched_students:
-                sys.exit(
-                    "ERROR: incremental supervisor launch would change the "
-                    "existing advisor's student inventory; relaunch with --advisor"
-                )
 
     common_secrets = {
         "GITHUB_TOKEN": github_token,
@@ -799,8 +1303,9 @@ def main():
     if args.preflight_only:
         details = {
             "kubernetes": (
-                "credentials and repository access are ready; Kubernetes access "
-                "and capacity were not checked"
+                "credentials and repository access are ready; supervisor "
+                "launches also passed namespace, state PVC, inventory, and "
+                "repair-protocol checks; capacity was not checked"
             ),
             "docker": "credentials, repository, images, Docker, and CUDA are ready",
             "aws": (
@@ -817,7 +1322,7 @@ def main():
         return
 
     def prepare_github() -> None:
-        if args.dry_run:
+        if args.dry_run or not launches_roles:
             return
         ensure_advisor_branch(
             args.target_repo_url,
@@ -855,6 +1360,14 @@ def main():
             sys.exit(f"ERROR: {error}")
         return
 
+    if args.operational_supervisor and not args.dry_run:
+        existing_supervised_students = inspect_supervised_campaign(
+            args,
+            student_list,
+        )
+    elif not args.dry_run:
+        reject_unsupervised_role_replacement(args, student_list)
+
     prepare_github()
 
     if args.backend == "docker":
@@ -873,32 +1386,48 @@ def main():
             provider: f"<REDACTED_{MODEL_PROVIDERS[provider][0]}>"
             for provider in model_providers
         }
-    launch_secret = render_launch_secret(
-        args.tag,
-        github_token if not args.dry_run else "<REDACTED_GITHUB_TOKEN>",
-        exa_api_key if not args.dry_run else "<REDACTED_EXA_API_KEY>",
-        wandb_api_key if not args.dry_run else "<REDACTED_WANDB_API_KEY>",
-        anthropic_api_key=provider_api_keys.get("anthropic"),
-        openai_api_key=provider_api_keys.get("openai"),
-        hf_token=(
-            hf_token
-            if not args.dry_run
-            else ("<REDACTED_HF_TOKEN>" if hf_token else "")
-        ),
-    )
-
-    # --- Apply per-launch secret first (pods reference it on startup) ---
-    if args.dry_run:
-        print(f"--- Secret: {secret_name} ---")
-        print(launch_secret)
-        print()
-    else:
-        kubectl_apply(
-            launch_secret,
-            f"secret {secret_name}",
-            kube_context=args.kube_context,
-            namespace=args.namespace,
+    if args.operational_supervisor:
+        network_policy = render_supervisor_network_policy(args.tag)
+        if args.dry_run:
+            print("--- Operational supervisor network policy ---")
+            print(network_policy)
+            print()
+        else:
+            kubectl_apply(
+                network_policy,
+                "operational supervisor network policy",
+                kube_context=args.kube_context,
+                namespace=args.namespace,
+            )
+    launch_secret = ""
+    if args.advisor or student_list:
+        launch_secret = render_launch_secret(
+            args.tag,
+            github_token if not args.dry_run else "<REDACTED_GITHUB_TOKEN>",
+            exa_api_key if not args.dry_run else "<REDACTED_EXA_API_KEY>",
+            wandb_api_key if not args.dry_run else "<REDACTED_WANDB_API_KEY>",
+            anthropic_api_key=provider_api_keys.get("anthropic"),
+            openai_api_key=provider_api_keys.get("openai"),
+            hf_token=(
+                hf_token
+                if not args.dry_run
+                else ("<REDACTED_HF_TOKEN>" if hf_token else "")
+            ),
         )
+
+        # Role launches own this fixed Secret. A supervisor-only launch must
+        # never rewrite credentials referenced by existing role Deployments.
+        if args.dry_run:
+            print(f"--- Secret: {secret_name} ---")
+            print(launch_secret)
+            print()
+        else:
+            kubectl_apply(
+                launch_secret,
+                f"secret {secret_name}",
+                kube_context=args.kube_context,
+                namespace=args.namespace,
+            )
 
     # --- Deploy students ---
     for name in student_list:
@@ -962,12 +1491,41 @@ def main():
             )
 
     if args.operational_supervisor:
+        supervisor_provider = model_provider(args.advisor_model)
+        provider_secret_name = (
+            None
+            if supervisor_provider == "wandb"
+            else MODEL_PROVIDERS[supervisor_provider][1]
+        )
+        provider_api_key = (
+            None
+            if provider_secret_name is None
+            else provider_api_keys[supervisor_provider]
+        )
+        supervisor_secret_name, supervisor_secret = render_supervisor_secret(
+            args.tag,
+            github_token if not args.dry_run else "<REDACTED_GITHUB_TOKEN>",
+            wandb_api_key if not args.dry_run else "<REDACTED_WANDB_API_KEY>",
+            provider_secret_name=provider_secret_name,
+            provider_api_key=provider_api_key,
+        )
+        if args.dry_run:
+            print(f"--- Secret: {supervisor_secret_name} ---")
+            print(supervisor_secret)
+            print()
+        else:
+            kubectl_apply(
+                supervisor_secret,
+                f"secret {supervisor_secret_name}",
+                kube_context=args.kube_context,
+                namespace=args.namespace,
+            )
         manifest = render_operational_supervisor(
             supervisor_template,
             args.tag,
             advisor_student_list,
-            secret_name,
-            launch_secret,
+            supervisor_secret_name,
+            supervisor_secret,
             args,
         )
         if args.dry_run:
@@ -981,6 +1539,32 @@ def main():
                 kube_context=args.kube_context,
                 namespace=args.namespace,
             )
+            deployment_name = f"senpai-supervisor-{args.tag}"
+            try:
+                kubectl_rollout_status(
+                    deployment_name,
+                    timeout_seconds=args.supervisor_ready_timeout_s,
+                    kube_context=args.kube_context,
+                    namespace=args.namespace,
+                )
+            except RuntimeError as error:
+                rollback = shlex.join(
+                    kubectl_command(
+                        "rollout",
+                        "undo",
+                        f"deployment/{deployment_name}",
+                        kube_context=args.kube_context,
+                        namespace=args.namespace,
+                    )
+                )
+                print(
+                    "ERROR: operational supervisor rollout failed: "
+                    f"{error}\nRollback: {rollback}",
+                    file=sys.stderr,
+                )
+                raise SystemExit(
+                    "operational supervisor rollout failed"
+                ) from error
 
     if not args.dry_run:
         print(f"\nLaunched {len(student_list)} students: {', '.join(student_list)}")
@@ -1006,7 +1590,7 @@ def main():
         print("\nStop:")
         print(
             f"  {kubectl} delete deployments,configmaps,secrets,"
-            "serviceaccounts,roles,rolebindings "
+            "serviceaccounts,roles,rolebindings,networkpolicies "
             f"-l research-tag={args.tag}"
         )
 

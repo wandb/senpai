@@ -9,6 +9,7 @@ import pytest
 from openhands.sdk.conversation import ConversationExecutionStatus
 from openhands.sdk.event import ActionEvent, ObservationEvent
 from openhands.sdk.llm import MessageToolCall
+from sqlite_test_support import assert_repeated_concurrent_first_open
 
 from senpai_agent.advisor import (
     AdvisorEvent,
@@ -82,6 +83,25 @@ def test_advisor_conversation_id_is_persisted(tmp_path: Path):
 
     assert first == second
     assert (tmp_path / "advisor-conversation-id").read_text() == f"{first}\n"
+
+
+def test_event_store_allows_bounded_concurrent_first_open(tmp_path: Path):
+    """
+    Requirement: controller, watcher, delegation, and role-control processes may
+    first discover the event queue concurrently without losing the queue.
+    Interface: AdvisorEventStore construction and its pending-event view.
+    """
+
+    assert_repeated_concurrent_first_open(
+        lambda attempt: AdvisorEventStore(
+            tmp_path / f"advisor-events-{attempt}.sqlite3"
+        ),
+        attempts=100,
+    )
+
+    database = tmp_path / "advisor-events-reopen.sqlite3"
+    with AdvisorEventStore(database) as reopened:
+        assert reopened.pending() == []
 
 
 def test_event_store_deduplicates_and_survives_reopen(tmp_path: Path):

@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import signal
 import sqlite3
 import subprocess
 import sys
@@ -36,10 +35,14 @@ from senpai_agent.operations import (
     ContextResetRequestStore,
     ContextResetStatus,
     NudgeReceipt,
+    RestartRequest,
+    RestartRequestStore,
     RestartReceipt,
+    RestartStatus,
     RoleObservation,
     RoleTarget,
 )
+from senpai_agent.protocols import MANAGEMENT_PROTOCOL_VERSION
 from senpai_agent.supervisor import WorkerLease
 from senpai_agent.training import (
     TrainingInventory,
@@ -67,6 +70,7 @@ class RoleRuntimeState(BaseModel):
     running_wandb_run_ids: tuple[str, ...] = Field(default=(), max_length=50)
     recent_wandb_run_ids: tuple[str, ...] = Field(default=(), max_length=200)
     context_resets: tuple[ContextResetStatus, ...] = Field(default=(), max_length=20)
+    controller_restarts: tuple[RestartStatus, ...] = Field(default=(), max_length=20)
     cpu_percent: float | None
     memory_percent: float | None
     disk_percent: float | None
@@ -88,12 +92,14 @@ class RoleResearchTail(BaseModel):
 
     conversation_id: UUID
     observed_at: datetime
+    advisor_guidance: str = Field(min_length=1, max_length=32_000)
     messages: tuple[RoleResearchTailItem, ...] = Field(default=(), max_length=3)
 
 
 class RoleControlRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    protocol_version: Literal["senpai-management/v1"]
     command: Literal[
         "observe",
         "research_tail",
@@ -108,6 +114,15 @@ class RoleControlRequest(BaseModel):
     operation_key: str | None = None
     recovery_prompt: str | None = None
     context_reset_request: ContextResetRequest | None = None
+
+
+class RoleControlResponse(BaseModel):
+    """Versioned envelope returned across the kubectl exec boundary."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    protocol_version: Literal["senpai-management/v1"]
+    result: dict[str, object]
 
 
 def role_target(env: Mapping[str, str] = os.environ) -> RoleTarget:
@@ -163,6 +178,7 @@ def observe_role(
         run_inventory_complete,
     ) = _training_state(state_dir, target.role)
     context_resets = _context_reset_statuses(state_dir, target)
+    controller_restarts = _restart_statuses(state_dir, target)
     token = _control_token(
         lease,
         conversation_id,
@@ -170,7 +186,13 @@ def observe_role(
         pending_event_keys,
         active_delegation_count,
     )
-    restart_token = _restart_control_token(token, lease, running_count)
+    restart_token = (
+        _restart_control_token(token, lease, running_count)
+        if lease is not None
+        and lease.generation is not None
+        and controller_alive is True
+        else None
+    )
     return RoleRuntimeState(
         target=target,
         observation=RoleObservation(
@@ -180,6 +202,7 @@ def observe_role(
             restart_control_token=restart_token,
             controller_alive=controller_alive,
             controller_phase=lease.phase if lease is not None else None,
+            worker_generation=lease.generation if lease is not None else None,
             conversation_id=conversation_id,
             active_turn=active_turn,
             unmatched_actions=unmatched_actions,
@@ -198,6 +221,7 @@ def observe_role(
         running_wandb_run_ids=running_run_ids,
         recent_wandb_run_ids=recent_run_ids,
         context_resets=context_resets,
+        controller_restarts=controller_restarts,
         cpu_percent=_bounded_percent(psutil.cpu_percent(interval=0.05)),
         memory_percent=_bounded_percent(psutil.virtual_memory().percent),
         disk_percent=_disk_percent(state_dir),
@@ -217,6 +241,17 @@ def _context_reset_statuses(
         return store.statuses(target, limit=20)
 
 
+def _restart_statuses(
+    state_dir: Path,
+    target: RoleTarget,
+) -> tuple[RestartStatus, ...]:
+    queue_path = state_dir / "controller-restarts.sqlite3"
+    if not queue_path.is_file():
+        return ()
+    with RestartRequestStore(queue_path) as store:
+        return store.statuses(target, limit=20)
+
+
 def advisor_research_tail(
     env: Mapping[str, str] = os.environ,
     *,
@@ -227,6 +262,44 @@ def advisor_research_tail(
     target = role_target(env)
     if target.role != "advisor":
         raise PermissionError("research-tail inspection is advisor-only")
+    role_file_value = env.get("SENPAI_OPENHANDS_ROLE_FILE", "").strip()
+    if not role_file_value:
+        raise RuntimeError("SENPAI_OPENHANDS_ROLE_FILE is required")
+    role_file = Path(role_file_value)
+    immutable_guidance_value = env.get(
+        "SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE", ""
+    ).strip()
+    immutable_guidance = Path(immutable_guidance_value) if immutable_guidance_value else None
+    if (
+        env.get("SENPAI_IMMUTABLE_RUNNER") != "1"
+        or immutable_guidance is None
+        or role_file.absolute() != immutable_guidance.absolute()
+    ):
+        raise RuntimeError("research review requires immutable advisor guidance")
+    if role_file.is_symlink() or not role_file.is_file():
+        raise RuntimeError("the deployed advisor guidance must be a regular file")
+    before_guidance = role_file.stat()
+    with role_file.open(encoding="utf-8") as stream:
+        advisor_guidance = stream.read(32_001)
+    after_guidance = role_file.stat()
+    if (
+        len(advisor_guidance) > 32_000
+        or not advisor_guidance.strip()
+        or before_guidance.st_mode & 0o222
+        or (
+            before_guidance.st_dev,
+            before_guidance.st_ino,
+            before_guidance.st_size,
+            before_guidance.st_mtime_ns,
+        )
+        != (
+            after_guidance.st_dev,
+            after_guidance.st_ino,
+            after_guidance.st_size,
+            after_guidance.st_mtime_ns,
+        )
+    ):
+        raise RuntimeError("the deployed advisor guidance is invalid or changed")
     state_dir = role_state_dir(env)
     lease = _read_lease(state_dir / "controller-lease.json")
     conversation_id = _conversation_id(state_dir, target, lease)
@@ -254,6 +327,10 @@ def advisor_research_tail(
     return RoleResearchTail(
         conversation_id=conversation_id,
         observed_at=(now or datetime.now(UTC)).astimezone(UTC),
+        advisor_guidance=_redact_role_secrets(
+            advisor_guidance.strip(),
+            env,
+        ),
         messages=tuple(messages[-3:]),
     )
 
@@ -324,6 +401,10 @@ def restart_controller(
     lease = _read_lease(role_state_dir(env) / "controller-lease.json")
     if lease is None or not _controller_alive(lease, state.target.role):
         raise RuntimeError("the observed controller is no longer live")
+    if lease.generation is None:
+        raise RuntimeError(
+            "the controller lease has no worker generation; refusing ownerless restart"
+        )
     final_running_count, *_ = _training_state(role_state_dir(env), state.target.role)
     if final_running_count is None:
         raise RuntimeError("training activity is unknown; refusing controller restart")
@@ -341,12 +422,36 @@ def restart_controller(
         != restart_control_token
     ):
         raise RuntimeError("the controller left its quiescent restart boundary")
-    os.kill(lease.pid, signal.SIGTERM)
+    request_id = "restart:" + hashlib.sha256(
+        json.dumps(
+            {
+                "target": state.target.key,
+                "conversation_id": str(expected_conversation_id),
+                "restart_control_token": restart_control_token,
+                "worker_generation": lease.generation,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    request = RestartRequest(
+        request_id=request_id,
+        target=state.target,
+        expected_conversation_id=expected_conversation_id,
+        expected_restart_control_token=restart_control_token,
+        expected_worker_generation=lease.generation,
+        expected_completed_turns=lease.completed_turns,
+    )
+    with RestartRequestStore(
+        role_state_dir(env) / "controller-restarts.sqlite3"
+    ) as store:
+        store.enqueue(request)
     return RestartReceipt(
         target=state.target,
+        request_id=request.request_id,
+        status="queued",
         conversation_id=expected_conversation_id,
-        state_preserved=True,
-        compute_preserved=True,
+        expected_worker_generation=request.expected_worker_generation,
     )
 
 
@@ -735,6 +840,7 @@ def _restart_control_token(
         "control": control_token,
         "phase": lease.phase if lease is not None else None,
         "completed_turns": lease.completed_turns if lease is not None else None,
+        "generation": lease.generation if lease is not None else None,
         "running_training_count": running_training_count,
     }
     return hashlib.sha256(
@@ -823,7 +929,13 @@ def role_control_main(
         result = request_context_reset(request.context_reset_request, env)
     else:
         raise RuntimeError(f"unsupported role control command: {request.command}")
-    print(result.model_dump_json(), flush=True)
+    print(
+        RoleControlResponse(
+            protocol_version=MANAGEMENT_PROTOCOL_VERSION,
+            result=result.model_dump(mode="json"),
+        ).model_dump_json(),
+        flush=True,
+    )
     return 0
 
 

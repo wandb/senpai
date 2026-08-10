@@ -10,13 +10,13 @@ import os
 import signal
 import sys
 import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from string import Template
 from typing import Annotated, Literal, Protocol
 from urllib.parse import urlencode
 
@@ -24,9 +24,13 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 
 from senpai_agent.github.http import GitHubReader
 from senpai_agent.models import Contract
-from senpai_agent.operations import OperationAuditRecord, OperationLedger
+from senpai_agent.operations import (
+    ContextResetStatus,
+    OperationAuditRecord,
+    OperationLedger,
+    RestartStatus,
+)
 from senpai_agent.repair_broker import RepairAuditRecord
-from senpai_agent.operations import ContextResetStatus
 from senpai_agent.secrets import (
     SUPERVISOR_SECRET_DIR_ENV,
     consume_supervisor_secret_directory,
@@ -191,6 +195,7 @@ class ResearchReviewEvidence(Contract):
         Field(max_length=100),
     ] = ()
     advisor_conversation_id: str | None = None
+    advisor_guidance: Annotated[str | None, Field(max_length=32_000)] = None
     advisor_active_tail: Annotated[
         tuple[ConversationTailItem, ...],
         Field(max_length=40),
@@ -231,6 +236,10 @@ class RoleRuntimeObservation(Contract):
     ] = ()
     context_resets: Annotated[
         tuple[ContextResetStatus, ...],
+        Field(max_length=20),
+    ] = ()
+    controller_restarts: Annotated[
+        tuple[RestartStatus, ...],
         Field(max_length=20),
     ] = ()
     stats: MachineStats | None = None
@@ -872,8 +881,13 @@ class SupervisorPersistentState(Contract):
     started_at: datetime
     snapshots: Annotated[tuple[CampaignSnapshot, ...], Field(max_length=3)] = ()
     last_research_review_at: datetime | None = None
+    last_research_review_attempt_at: datetime | None = None
 
-    @field_validator("started_at", "last_research_review_at")
+    @field_validator(
+        "started_at",
+        "last_research_review_at",
+        "last_research_review_attempt_at",
+    )
     @classmethod
     def state_timestamps_are_utc(cls, value: datetime | None) -> datetime | None:
         return _aware_utc(value) if value is not None else None
@@ -941,7 +955,11 @@ class SupervisorStateStore:
             if last_operational is not None
             else state.started_at
         )
-        research_anchor = state.last_research_review_at or state.started_at
+        research_anchor = (
+            state.last_research_review_attempt_at
+            or state.last_research_review_at
+            or state.started_at
+        )
         next_research = research_anchor + self.research_review_interval
         return SupervisorDueState(
             operational_due=observed_at >= next_operational,
@@ -953,15 +971,29 @@ class SupervisorStateStore:
     def mark_research_review(
         self,
         reviewed_at: datetime | None = None,
+        *,
+        succeeded: bool = True,
     ) -> SupervisorPersistentState:
         timestamp = _aware_utc(reviewed_at or datetime.now(UTC))
         state = self.read(initialize_at=timestamp)
-        if (
-            state.last_research_review_at is not None
-            and timestamp < state.last_research_review_at
-        ):
-            raise ValueError("research reviews must be recorded in timestamp order")
-        updated = state.model_copy(update={"last_research_review_at": timestamp})
+        recorded = tuple(
+            value
+            for value in (
+                state.last_research_review_at,
+                state.last_research_review_attempt_at,
+            )
+            if value is not None
+        )
+        if recorded and timestamp < max(recorded):
+            raise ValueError(
+                "research review attempts must be recorded in timestamp order"
+            )
+        update: dict[str, object] = {
+            "last_research_review_attempt_at": timestamp,
+        }
+        if succeeded:
+            update["last_research_review_at"] = timestamp
+        updated = state.model_copy(update=update)
         self._write(updated)
         return updated
 
@@ -1097,6 +1129,7 @@ def _mutation_audit_view(
                 else None
             ),
             "status": record.status,
+            "error_type": record.error_type,
         }
         for record in records[:12]
     ]
@@ -1158,11 +1191,23 @@ def _trend_view(snapshot: CampaignSnapshot) -> dict[str, object]:
             {
                 "role": runtime.role,
                 "name": runtime.name,
+                "machine": runtime.machine,
+                "machine_stats": (
+                    runtime.stats.model_dump(mode="json")
+                    if runtime.stats is not None
+                    else None
+                ),
                 "healthy": runtime.controller_healthy,
                 "phase": runtime.lease_phase,
                 "completed_turns": runtime.completed_turns,
                 "running_training_count": runtime.running_training_count,
                 "active_delegation_count": runtime.active_delegation_count,
+                "controller_restart_count": len(runtime.controller_restarts),
+                "latest_controller_restart": (
+                    runtime.controller_restarts[0].model_dump(mode="json")
+                    if runtime.controller_restarts
+                    else None
+                ),
                 "recent_error_count": len(runtime.recent_errors),
                 "recent_error_markers": _error_trend(runtime.recent_errors),
             }
@@ -1282,10 +1327,12 @@ def collect_research_review_evidence(
     )
     gaps.extend(wandb_gaps)
     conversation_id = None
+    advisor_guidance = None
     advisor_tail: tuple[ConversationTailItem, ...] = ()
     try:
         tail = runtime_backend.collect_advisor_research_tail()
         conversation_id = str(tail.conversation_id)
+        advisor_guidance = tail.advisor_guidance
         advisor_tail = tuple(
             ConversationTailItem(
                 index=item.index,
@@ -1309,6 +1356,7 @@ def collect_research_review_evidence(
         closed_pull_requests=closed_pulls,
         recent_wandb_runs=recent_runs,
         advisor_conversation_id=conversation_id,
+        advisor_guidance=advisor_guidance,
         advisor_active_tail=advisor_tail,
         evidence_gaps=tuple(gaps),
     )
@@ -1348,7 +1396,6 @@ def compose_research_review_prompt(
     snapshots: Sequence[CampaignSnapshot],
     evidence: ResearchReviewEvidence,
     *,
-    advisor_guidance: str,
     operation_audit: Sequence[OperationAuditRecord] = (),
     repair_audit: Sequence[RepairAuditRecord] = (),
     max_chars: int = 96_000,
@@ -1359,7 +1406,7 @@ def compose_research_review_prompt(
         raise ValueError("at least one operational snapshot is required")
     if max_chars < 32_000:
         raise ValueError("research review prompt budget must be at least 32000")
-    guidance = advisor_guidance.strip()
+    guidance = (evidence.advisor_guidance or "").strip()
     if not guidance:
         raise ValueError("the current ADVISOR.md guidance is required")
     current = snapshots[-1]
@@ -1398,7 +1445,10 @@ def compose_research_review_prompt(
         ],
         "recent_mutation_audit": _mutation_audit_view(operation_audit),
         "recent_repair_audit": _repair_audit_view(repair_audit),
-        "research_window": evidence.model_dump(mode="json"),
+        "research_window": evidence.model_dump(
+            mode="json",
+            exclude={"advisor_guidance"},
+        ),
     }
     budget = max_chars - len(prefix) - len(suffix)
     research_window = payload["research_window"]
@@ -1431,6 +1481,34 @@ def compose_research_review_prompt(
     return prompt
 
 
+def run_scheduled_research_review(
+    store: SupervisorStateStore,
+    review: Callable[[], int],
+    *,
+    attempted_at: datetime | None = None,
+) -> int:
+    """Run one due review without turning a transient failure into a hot loop."""
+
+    timestamp = _aware_utc(attempted_at or datetime.now(UTC))
+    try:
+        result = review()
+    except Exception as error:  # noqa: BLE001
+        print(
+            f"SENPAI_RESEARCH_REVIEW_ERROR {type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+        result = 1
+    if result != 0:
+        print(
+            f"SENPAI_RESEARCH_REVIEW_FAILED exit_code={result}",
+            file=sys.stderr,
+            flush=True,
+        )
+    store.mark_research_review(timestamp, succeeded=result == 0)
+    return result
+
+
 def operational_supervisor_main(
     argv: Sequence[str] | None = None,
     env: Mapping[str, str] = os.environ,
@@ -1453,7 +1531,6 @@ def operational_supervisor_main(
     from senpai_agent.weave_monitoring import initialize_weave_monitoring
 
     initialize_weave_monitoring(env)
-    from senpai_agent.agent_markdown import read_agent_markdown
     from senpai_agent.kubernetes_operations import KubectlCampaignBackend
     from senpai_agent.openhands_runner import (
         parse_runner_args,
@@ -1527,11 +1604,15 @@ def operational_supervisor_main(
     )
     progress = ProgressLease(supervisor_state_dir / "lease.json")
     operation_ledger_path = runner_config.state_dir / "operations.sqlite3"
+    with OperationLedger(operation_ledger_path) as operation_ledger:
+        recovered_operations = operation_ledger.recover_interrupted()
+    if recovered_operations:
+        print(
+            "SENPAI_OPERATION_RECOVERY "
+            f"unknown_operation_count={recovered_operations}",
+            flush=True,
+        )
     progress.update("startup", 300)
-    advisor_path = runner_config.workspace / "system_instructions" / "ADVISOR.md"
-    advisor_guidance = Template(
-        read_agent_markdown(advisor_path)
-    ).safe_substitute(env)
     stop = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -1543,6 +1624,12 @@ def operational_supervisor_main(
     }
     repair_broker.__enter__()
     try:
+        _reconcile_terminal_after_control_restart(
+            env.get(
+                "SENPAI_SUPERVISOR_TERMINAL_SOCKET",
+                "@senpai-isolated-terminal",
+            )
+        )
         while not stop.is_set():
             due = store.due_state()
             if not due.operational_due:
@@ -1591,30 +1678,40 @@ def operational_supervisor_main(
             )
 
             if due.research_review_due and not stop.is_set():
-                progress.update("research-collect", 1_800)
-                research_evidence = collect_research_review_evidence(
-                    scope,
-                    github,
-                    wandb_runs,
-                    backend,
-                    state.snapshots[-1].runtimes,
-                    since=state.last_research_review_at or state.started_at,
-                )
-                research_prompt = compose_research_review_prompt(
-                    state.snapshots,
-                    research_evidence,
-                    advisor_guidance=advisor_guidance,
-                    operation_audit=_recent_mutation_audit(operation_ledger_path),
-                    repair_audit=repair_broker.recent_audit(limit=12),
-                )
-                result = _run_fresh_supervisor_turn(
-                    research_prompt,
-                    runner_config,
-                    progress,
-                    phase="research-review",
-                )
-                if result == 0:
-                    store.mark_research_review(datetime.now(UTC))
+                def review_research_direction() -> int:
+                    progress.update("research-collect", 1_800)
+                    research_evidence = collect_research_review_evidence(
+                        scope,
+                        github,
+                        wandb_runs,
+                        backend,
+                        state.snapshots[-1].runtimes,
+                        since=state.last_research_review_at or state.started_at,
+                    )
+                    if not research_evidence.advisor_guidance:
+                        print(
+                            "SENPAI_SUPERVISOR_RESEARCH_REVIEW_SKIPPED "
+                            "deployed advisor guidance was unavailable",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        return 1
+                    research_prompt = compose_research_review_prompt(
+                        state.snapshots,
+                        research_evidence,
+                        operation_audit=_recent_mutation_audit(
+                            operation_ledger_path
+                        ),
+                        repair_audit=repair_broker.recent_audit(limit=12),
+                    )
+                    return _run_fresh_supervisor_turn(
+                        research_prompt,
+                        runner_config,
+                        progress,
+                        phase="research-review",
+                    )
+
+                run_scheduled_research_review(store, review_research_direction)
     finally:
         repair_broker.close()
         for signum, handler in previous_handlers.items():
@@ -1680,6 +1777,34 @@ def _run_fresh_supervisor_turn(
         return result if result else 1
     progress.update(f"{phase}-complete", 120, completed_turn=True)
     return result
+
+
+def _reconcile_terminal_after_control_restart(
+    socket_path: str,
+    *,
+    ready_timeout_seconds: float = 60,
+) -> None:
+    """Wait for the shell sidecar, then synchronously remove any old wake."""
+
+    from senpai_agent.isolated_terminal import (
+        TerminalTransportError,
+        begin_isolated_terminal_wake,
+        end_isolated_terminal_wake,
+    )
+
+    wake_id = f"startup-cleanup-{uuid.uuid4().hex}"
+    deadline = time.monotonic() + ready_timeout_seconds
+    while True:
+        try:
+            begin_isolated_terminal_wake(socket_path, wake_id)
+            end_isolated_terminal_wake(socket_path, wake_id)
+            return
+        except TerminalTransportError as error:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "isolated terminal was not ready for startup cleanup"
+                ) from error
+            time.sleep(0.2)
 
 
 def _positive_seconds(

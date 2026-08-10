@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -30,6 +31,13 @@ EXECUTOR_REQUEST_LIMIT_BYTES = 512 * 1024
 DEFAULT_EXECUTOR_SOCKET = "@senpai-repair-executor"
 REPAIR_EXECUTOR_PROTOCOL = "senpai-repair-executor/v1"
 _POLL_SECONDS = 0.02
+_HEARTBEAT_INTERVAL_SECONDS = 0.2
+_HEARTBEAT_STALE_SECONDS = 2.0
+_OPERATION_DEADLINE_GRACE_SECONDS = 5.0
+_TRUSTED_COMMAND_PATH = "/opt/senpai-venv/bin:/usr/local/bin:/usr/bin:/bin"
+_VOLATILE_PARENT_NAME = "senpai-repair-operations"
+_VOLATILE_CHILD_PREFIX = "operation-"
+_VOLATILE_OWNER_FILE = ".senpai-owner.json"
 _PR_SET_CHILD_SUBREAPER = 36
 _REPAIR_ENVIRONMENT_KEYS = frozenset(
     {
@@ -64,6 +72,76 @@ class RepairExecutorOutcomeUnknown(RepairExecutorError):
     pass
 
 
+def _process_start_token(pid: int) -> str | None:
+    if sys.platform != "linux":
+        return None
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (FileNotFoundError, IndexError, PermissionError):
+        return None
+
+
+def _volatile_parent() -> Path:
+    parent = Path(tempfile.gettempdir()) / _VOLATILE_PARENT_NAME
+    try:
+        parent.mkdir(mode=0o700)
+    except FileExistsError:
+        metadata = parent.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise RepairExecutorError("repair volatile root is not private")
+        parent.chmod(0o700)
+    return parent
+
+
+def _write_volatile_owner(path: Path) -> None:
+    (path / _VOLATILE_OWNER_FILE).write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "start_token": _process_start_token(os.getpid()),
+            }
+        )
+    )
+
+
+def _volatile_owner_is_live(path: Path) -> bool:
+    try:
+        marker = json.loads((path / _VOLATILE_OWNER_FILE).read_text())
+        pid = int(marker["pid"])
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    expected = marker.get("start_token")
+    return expected is None or _process_start_token(pid) == expected
+
+
+def _scavenge_stale_volatile_roots() -> None:
+    for entry in _volatile_parent().iterdir():
+        suffix = entry.name.removeprefix(_VOLATILE_CHILD_PREFIX)
+        if (
+            not entry.name.startswith(_VOLATILE_CHILD_PREFIX)
+            or len(suffix) < 6
+            or not suffix.isalnum()
+        ):
+            continue
+        metadata = entry.lstat()
+        if metadata.st_uid != os.geteuid():
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
+            entry.unlink()
+        elif stat.S_ISDIR(metadata.st_mode) and not _volatile_owner_is_live(entry):
+            shutil.rmtree(entry)
+
+
 def _socket_address(socket_path: str | Path) -> str:
     value = str(socket_path)
     if not value.startswith("@"):
@@ -75,6 +153,158 @@ def _socket_address(socket_path: str | Path) -> str:
 
 def _filesystem_socket_path(socket_path: str | Path) -> Path | None:
     return None if str(socket_path).startswith("@") else Path(socket_path)
+
+
+def _remove_socket_path(socket_path: Path) -> None:
+    try:
+        mode = socket_path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(mode):
+        raise RepairExecutorError(f"refusing to replace non-socket path: {socket_path}")
+    socket_path.unlink()
+
+
+def _health_socket_path(socket_path: str | Path) -> str:
+    return f"{socket_path}.health"
+
+
+def _heartbeat_status_is_healthy(
+    status: object,
+    *,
+    expected_pid: int,
+    now: float | None = None,
+) -> bool:
+    """Validate a heartbeat published by the executor's PID-1 main loop."""
+
+    if not isinstance(status, dict):
+        return False
+    observed_at = time.monotonic() if now is None else now
+    try:
+        protocol = status["protocol"]
+        server_pid = int(status["server_pid"])
+        state = status["state"]
+        heartbeat = float(status["heartbeat_monotonic"])
+        deadline_value = status["operation_deadline_monotonic"]
+    except (KeyError, TypeError, ValueError):
+        return False
+    if (
+        protocol != REPAIR_EXECUTOR_PROTOCOL
+        or server_pid != expected_pid
+        or state not in {"idle", "active", "stopping"}
+        or heartbeat > observed_at + _HEARTBEAT_STALE_SECONDS
+        or observed_at - heartbeat > _HEARTBEAT_STALE_SECONDS
+    ):
+        return False
+    if state != "active":
+        return deadline_value is None
+    try:
+        deadline = float(deadline_value)
+    except (TypeError, ValueError):
+        return False
+    return observed_at <= deadline + _OPERATION_DEADLINE_GRACE_SECONDS
+
+
+class _HeartbeatPublisher:
+    """Expose main-loop liveness on an immutable abstract health endpoint."""
+
+    def __init__(self, socket_path: str | Path):
+        self.socket_path = _health_socket_path(socket_path)
+        self._lock = threading.Lock()
+        self._state = "idle"
+        self._updated_at = time.monotonic()
+        self._operation_deadline: float | None = None
+        self._stop = threading.Event()
+        self._listener: socket.socket | None = None
+        self._thread = threading.Thread(
+            target=self._serve,
+            name="senpai-repair-health",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        filesystem_path = _filesystem_socket_path(self.socket_path)
+        if filesystem_path is not None:
+            filesystem_path.parent.mkdir(parents=True, exist_ok=True)
+            _remove_socket_path(filesystem_path)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(_socket_address(self.socket_path))
+        if filesystem_path is not None:
+            os.chmod(filesystem_path, 0o600)
+        listener.listen(4)
+        listener.settimeout(_HEARTBEAT_INTERVAL_SECONDS)
+        self._listener = listener
+        self._thread.start()
+
+    def publish(
+        self,
+        state: str,
+        operation_deadline: float | None = None,
+    ) -> None:
+        with self._lock:
+            self._state = state
+            self._operation_deadline = operation_deadline
+            self._updated_at = time.monotonic()
+
+    def close_in_child(self) -> None:
+        if self._listener is not None:
+            self._listener.close()
+            self._listener = None
+
+    def close(self) -> None:
+        self.publish("stopping")
+        self._stop.set()
+        listener = self._listener
+        if listener is not None:
+            listener.close()
+        if self._thread.ident is not None:
+            self._thread.join(timeout=1)
+        filesystem_path = _filesystem_socket_path(self.socket_path)
+        if filesystem_path is not None:
+            _remove_socket_path(filesystem_path)
+
+    def _serve(self) -> None:
+        listener = self._listener
+        assert listener is not None
+        while not self._stop.is_set():
+            try:
+                connection, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            with connection, self._lock:
+                status = {
+                    "protocol": REPAIR_EXECUTOR_PROTOCOL,
+                    "server_pid": os.getpid(),
+                    "state": self._state,
+                    "heartbeat_monotonic": self._updated_at,
+                    "operation_deadline_monotonic": self._operation_deadline,
+                }
+                try:
+                    connection.sendall(_encode_frame(status, 16 * 1024))
+                except OSError:
+                    continue
+
+
+def check_repair_executor_health(
+    socket_path: str | Path,
+    *,
+    expected_pid: int = 1,
+) -> None:
+    """Fail unless the executor main loop is live or supervising an in-budget task."""
+
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(1)
+        connection.connect(_socket_address(_health_socket_path(socket_path)))
+        status = json.loads(_receive_frame(connection, 16 * 1024, 1))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RepairExecutorError("repair executor heartbeat is unavailable") from error
+    finally:
+        connection.close()
+    if not _heartbeat_status_is_healthy(status, expected_pid=expected_pid):
+        raise RepairExecutorError("repair executor heartbeat is stale or invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,36 +346,67 @@ class _BoundedByteTail:
     def __init__(self, limit: int = REPAIR_STREAM_LIMIT_BYTES):
         self.limit = limit
         self._value = bytearray()
+        self.truncated = False
 
     def append(self, chunk: bytes) -> None:
         if len(chunk) >= self.limit:
             self._value[:] = chunk[-self.limit :]
+            self.truncated = True
             return
         self._value.extend(chunk)
         overflow = len(self._value) - self.limit
         if overflow > 0:
             del self._value[:overflow]
+            self.truncated = True
 
     def text(self) -> str:
-        return bytes(self._value).decode("utf-8", errors="replace")
+        value = bytes(self._value).decode("utf-8", errors="replace")
+        while len(value.encode("utf-8")) > self.limit:
+            value = value[1:]
+        return value
 
 
-def _receive_frame(connection: socket.socket, max_bytes: int) -> bytes:
+def _receive_frame(
+    connection: socket.socket,
+    max_bytes: int,
+    timeout_seconds: float,
+) -> bytes:
+    if timeout_seconds <= 0:
+        raise RepairExecutorError("repair executor frame timeout must be positive")
+    deadline = time.monotonic() + timeout_seconds
+    previous_timeout = connection.gettimeout()
     payload = bytearray()
-    while True:
-        remaining = max_bytes - len(payload)
-        chunk = connection.recv(min(65_536, remaining + 1))
-        if not chunk:
-            return bytes(payload)
-        newline = chunk.find(b"\n")
-        if newline >= 0:
-            payload.extend(chunk[:newline])
+    try:
+        while True:
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0:
+                raise RepairExecutorError("repair executor frame deadline expired")
+            connection.settimeout(remaining_time)
+            remaining = max_bytes - len(payload)
+            try:
+                chunk = connection.recv(min(65_536, remaining + 1))
+            except TimeoutError as error:
+                raise RepairExecutorError(
+                    "repair executor frame deadline expired"
+                ) from error
+            if not chunk:
+                return bytes(payload)
+            newline = chunk.find(b"\n")
+            if newline >= 0:
+                payload.extend(chunk[:newline])
+                if len(payload) > max_bytes:
+                    raise RepairExecutorError(
+                        "repair executor frame exceeded its byte limit"
+                    )
+                return bytes(payload)
+            payload.extend(chunk)
             if len(payload) > max_bytes:
                 raise RepairExecutorError("repair executor frame exceeded its byte limit")
-            return bytes(payload)
-        payload.extend(chunk)
-        if len(payload) > max_bytes:
-            raise RepairExecutorError("repair executor frame exceeded its byte limit")
+    finally:
+        try:
+            connection.settimeout(previous_timeout)
+        except OSError:
+            pass
 
 
 def _encode_frame(value: Any, max_bytes: int = EXECUTOR_FRAME_LIMIT_BYTES) -> bytes:
@@ -335,7 +596,13 @@ def _drain_ready(
 
 
 def _fresh_repair_environment() -> tuple[Path, dict[str, str]]:
-    root = Path(tempfile.mkdtemp(prefix="senpai-repair-operation-"))
+    root = Path(
+        tempfile.mkdtemp(
+            prefix=_VOLATILE_CHILD_PREFIX,
+            dir=_volatile_parent(),
+        )
+    )
+    _write_volatile_owner(root)
     home = root / "home"
     temporary = root / "tmp"
     cache = root / "cache"
@@ -350,6 +617,7 @@ def _fresh_repair_environment() -> tuple[Path, dict[str, str]]:
     }
     environment.update(
         {
+            "PATH": _TRUSTED_COMMAND_PATH,
             "HOME": str(home),
             "TMPDIR": str(temporary),
             "TMP": str(temporary),
@@ -365,7 +633,7 @@ def _fresh_repair_environment() -> tuple[Path, dict[str, str]]:
 def _execute_in_worker(
     request: RepairExecutionRequest,
     connection: socket.socket,
-) -> dict[str, int | str]:
+) -> dict[str, bool | int | str]:
     become_child_subreaper()
     stdout_tail = _BoundedByteTail()
     stderr_tail = _BoundedByteTail()
@@ -397,6 +665,8 @@ def _execute_in_worker(
                 "exit_code": 126,
                 "stdout": "",
                 "stderr": f"repair command could not start ({type(error).__name__})",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
             }
         assert process.stdout is not None
         assert process.stderr is not None
@@ -450,6 +720,8 @@ def _execute_in_worker(
             "exit_code": exit_code,
             "stdout": stdout_tail.text(),
             "stderr": stderr_tail.text(),
+            "stdout_truncated": stdout_tail.truncated,
+            "stderr_truncated": stderr_tail.truncated,
         }
     finally:
         try:
@@ -486,6 +758,34 @@ def _serve_worker(
         connection.close()
 
 
+def _spawn_worker(
+    connection: socket.socket,
+    request: RepairExecutionRequest,
+) -> subprocess.Popen[bytes]:
+    """Exec a fresh interpreter so a threaded PID 1 never runs after fork."""
+
+    worker = subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            str(Path(__file__).resolve()),
+            "worker",
+            "--connection-fd",
+            str(connection.fileno()),
+        ],
+        stdin=subprocess.PIPE,
+        pass_fds=(connection.fileno(),),
+    )
+    assert worker.stdin is not None
+    try:
+        worker.stdin.write(
+            _encode_frame(request.payload(), EXECUTOR_REQUEST_LIMIT_BYTES)
+        )
+    finally:
+        worker.stdin.close()
+    return worker
+
+
 class RepairExecutorServer:
     """Own repair workers and reap them from the container's PID-1 process."""
 
@@ -504,6 +804,9 @@ class RepairExecutorServer:
 
     def serve_forever(self) -> None:
         become_child_subreaper()
+        _scavenge_stale_volatile_roots()
+        heartbeat = _HeartbeatPublisher(self.socket_path)
+        heartbeat.start()
         filesystem_path = _filesystem_socket_path(self.socket_path)
         if filesystem_path is not None:
             filesystem_path.parent.mkdir(parents=True, exist_ok=True)
@@ -513,6 +816,7 @@ class RepairExecutorServer:
         }
         try:
             while not self._stop:
+                heartbeat.publish("idle")
                 self._remove_stale_socket()
                 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 listener.bind(_socket_address(self.socket_path))
@@ -527,6 +831,7 @@ class RepairExecutorServer:
                             break
                         except TimeoutError:
                             reap_children()
+                            heartbeat.publish("idle")
                     else:
                         listener.close()
                         break
@@ -538,7 +843,11 @@ class RepairExecutorServer:
                 try:
                     connection.settimeout(5)
                     request = RepairExecutionRequest.parse(
-                        _receive_frame(connection, EXECUTOR_REQUEST_LIMIT_BYTES)
+                        _receive_frame(
+                            connection,
+                            EXECUTOR_REQUEST_LIMIT_BYTES,
+                            5,
+                        )
                     )
                 except Exception as error:  # noqa: BLE001
                     try:
@@ -562,17 +871,17 @@ class RepairExecutorServer:
                 # unaudited repair for later execution.
                 listener.close()
                 self._remove_stale_socket()
-                worker = os.fork()
-                if worker == 0:
-                    _serve_worker(connection, request)
-                    os._exit(0)
+                operation_deadline = time.monotonic() + request.timeout_seconds
+                heartbeat.publish("active", operation_deadline)
+                worker = _spawn_worker(connection, request)
                 connection.close()
-                self._active_worker = worker
+                self._active_worker = worker.pid
                 while True:
                     try:
-                        waited, _ = os.waitpid(worker, 0)
-                        if waited == worker:
+                        if worker.poll() is not None:
                             break
+                        heartbeat.publish("active", operation_deadline)
+                        time.sleep(_HEARTBEAT_INTERVAL_SECONDS)
                     except InterruptedError:
                         if self._stop:
                             self._request_stop(signal.SIGTERM, None)
@@ -584,7 +893,9 @@ class RepairExecutorServer:
                 # crash can reparent detached command descendants to PID 1.
                 # Reconcile before the executor becomes reachable again.
                 clean_current_process_descendants()
+                heartbeat.publish("idle")
         finally:
+            heartbeat.close()
             self._request_stop(signal.SIGTERM, None)
             self._remove_stale_socket()
             clean_current_process_descendants()
@@ -595,22 +906,14 @@ class RepairExecutorServer:
         socket_path = _filesystem_socket_path(self.socket_path)
         if socket_path is None:
             return
-        try:
-            mode = socket_path.lstat().st_mode
-        except FileNotFoundError:
-            return
-        if not stat.S_ISSOCK(mode):
-            raise RepairExecutorError(
-                f"refusing to replace non-socket path: {socket_path}"
-            )
-        socket_path.unlink()
+        _remove_socket_path(socket_path)
 
 
 class RepairExecutorClient:
     def __init__(self, socket_path: str | Path):
         self.socket_path = socket_path
 
-    def execute(self, request: RepairExecutionRequest) -> dict[str, int | str]:
+    def execute(self, request: RepairExecutionRequest) -> dict[str, bool | int | str]:
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             connection.settimeout(5)
@@ -627,7 +930,11 @@ class RepairExecutorClient:
                 )
                 connection.settimeout(request.timeout_seconds + 30)
                 response = json.loads(
-                    _receive_frame(connection, EXECUTOR_FRAME_LIMIT_BYTES)
+                    _receive_frame(
+                        connection,
+                        EXECUTOR_FRAME_LIMIT_BYTES,
+                        request.timeout_seconds + 30,
+                    )
                 )
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             if request_sent:
@@ -651,22 +958,24 @@ def execute_local_repair(
     command: str,
     cwd: Path,
     timeout_seconds: float,
-) -> dict[str, int | str]:
+) -> dict[str, bool | int | str]:
     """Execute through the same per-request subreaper used by the PID-1 daemon."""
 
     request = RepairExecutionRequest(command, cwd.resolve(), timeout_seconds)
     parent, worker_connection = socket.socketpair()
-    worker = os.fork()
-    if worker == 0:
-        parent.close()
-        _serve_worker(worker_connection, request)
-        os._exit(0)
+    worker = _spawn_worker(worker_connection, request)
     worker_connection.close()
     try:
-        response = json.loads(_receive_frame(parent, EXECUTOR_FRAME_LIMIT_BYTES))
+        response = json.loads(
+            _receive_frame(
+                parent,
+                EXECUTOR_FRAME_LIMIT_BYTES,
+                timeout_seconds + 30,
+            )
+        )
     finally:
         parent.close()
-        os.waitpid(worker, 0)
+        worker.wait()
     if "error" in response:
         raise RepairExecutorError(
             f"{response.get('error_type', 'RepairExecutorError')}: {response['error']}"
@@ -685,6 +994,8 @@ def repair_executor_main(argv: Sequence[str] | None = None) -> int:
     client.add_argument("--timeout", required=True, type=float)
     health = subparsers.add_parser("health")
     health.add_argument("--socket", default=DEFAULT_EXECUTOR_SOCKET)
+    worker = subparsers.add_parser("worker")
+    worker.add_argument("--connection-fd", required=True, type=int)
     args = parser.parse_args(argv)
 
     if args.operation == "serve":
@@ -697,12 +1008,19 @@ def repair_executor_main(argv: Sequence[str] | None = None) -> int:
         if sys.platform != "linux":
             return 1
         try:
-            command = Path("/proc/1/cmdline").read_bytes()
-        except OSError:
+            check_repair_executor_health(args.socket)
+        except RepairExecutorError:
             return 1
-        return int(
-            b"senpai-repair-executor" not in command or b"serve" not in command
-        )
+        return 0
+
+    if args.operation == "worker":
+        connection = socket.socket(fileno=args.connection_fd)
+        payload = sys.stdin.buffer.readline(EXECUTOR_REQUEST_LIMIT_BYTES + 2)
+        if not payload.endswith(b"\n") or len(payload) > EXECUTOR_REQUEST_LIMIT_BYTES + 1:
+            raise RepairExecutorError("repair executor frame exceeded its byte limit")
+        request = RepairExecutionRequest.parse(payload[:-1])
+        _serve_worker(connection, request)
+        return 0
 
     request = RepairExecutionRequest(
         command=sys.stdin.read(),

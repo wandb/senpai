@@ -1,16 +1,25 @@
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
+import pytest
 from pydantic import SecretStr
 
 import senpai_agent.supervisor as supervisor_module
-from senpai_agent.supervisor import SupervisorConfig, WorkerLease, WorkerSupervisor
+from senpai_agent.operations import RestartRequest, RestartRequestStore, RoleTarget
+from senpai_agent.supervisor import (
+    GENERATION_ENV,
+    ProgressLease,
+    SupervisorConfig,
+    WorkerLease,
+    WorkerSupervisor,
+)
 
 
 def wait_for(path: Path, timeout: float = 5) -> None:
@@ -45,6 +54,32 @@ def test_supervisor_default_termination_grace_is_sixty_seconds():
 
 def test_supervisor_caps_repeated_restart_backoff_at_five_minutes():
     assert SupervisorConfig().max_backoff_seconds == 300
+
+
+def test_progress_lease_carries_the_worker_generation_and_legacy_is_unowned(
+    tmp_path: Path,
+):
+    """
+    Requirement: the process owner can distinguish the worker it spawned from a
+    stale or legacy process before honoring a planned restart.
+    Interface: the controller lease exchanged by ProgressLease and WorkerSupervisor.
+    """
+
+    lease_path = tmp_path / "controller-lease.json"
+    ProgressLease(lease_path, generation=7).update("sleep", 30)
+
+    assert WorkerLease.read(lease_path).generation == 7
+
+    lease_path.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "phase": "sleep",
+                "deadline": time.monotonic() + 30,
+            }
+        )
+    )
+    assert WorkerLease.read(lease_path).generation is None
 
 
 def test_pid_one_reaps_adopted_children_without_reaping_its_worker(monkeypatch):
@@ -298,7 +333,7 @@ def test_worker_exit_samples_its_final_completed_turn(tmp_path: Path, monkeypatc
         def poll():
             return 19
 
-    reason, made_progress = supervisor._wait_for_worker(
+    reason, made_progress, planned = supervisor._wait_for_worker(
         ExitedProcess(),
         {},
         threading.Event(),
@@ -307,6 +342,7 @@ def test_worker_exit_samples_its_final_completed_turn(tmp_path: Path, monkeypatc
 
     assert reason == "exit:19"
     assert made_progress is True
+    assert planned is None
 
 
 def test_completed_turn_resets_restart_backoff(
@@ -363,6 +399,301 @@ while True:
 
     assert results == [0]
     assert restart_backoffs(capsys.readouterr().err) == [0.1, 0.1, 0.2]
+
+
+def test_planned_restart_is_owner_consumed_completed_and_has_no_crash_backoff(
+    tmp_path: Path,
+    capsys,
+):
+    """
+    Requirement: WorkerSupervisor alone replaces a quiescent controller, records
+    the replacement generation, and does not classify the planned stop as a crash.
+    Interface: durable restart status, worker lease, and supervisor restart log.
+    """
+
+    conversation_id = "00000000-0000-0000-0000-000000000211"
+    worker = tmp_path / "planned_worker.py"
+    worker.write_text(
+        """
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+state = Path(sys.argv[1])
+generation = int(os.environ["SENPAI_CONTROLLER_GENERATION"])
+with (state / "starts").open("a") as output:
+    output.write(f"{generation}\\n")
+lease = Path(os.environ["SENPAI_CONTROLLER_LEASE_PATH"])
+temporary = lease.with_suffix(".tmp")
+temporary.write_text(json.dumps({
+    "pid": os.getpid(),
+    "phase": "sleep",
+    "deadline": time.monotonic() + 30,
+    "completed_turns": 0,
+    "conversation_id": "00000000-0000-0000-0000-000000000211",
+    "generation": generation,
+}))
+temporary.replace(lease)
+if generation > 1:
+    (state / "replacement-ready").write_text(str(generation))
+while True:
+    time.sleep(1)
+""".strip()
+    )
+    lease_path = tmp_path / "controller-lease.json"
+    restart_path = tmp_path / "controller-restarts.sqlite3"
+    environment = {
+        **os.environ,
+        "SENPAI_ROLE": "student",
+        "RESEARCH_TAG": "maple",
+        "STUDENT_NAME": "fern",
+        "SENPAI_OPENHANDS_STATE_DIR": str(tmp_path),
+    }
+    supervisor = WorkerSupervisor(
+        command=(sys.executable, str(worker), str(tmp_path)),
+        lease_path=lease_path,
+        environment=environment,
+        config=SupervisorConfig(
+            startup_timeout_seconds=1,
+            check_interval_seconds=0.01,
+            terminate_grace_seconds=0.1,
+            initial_backoff_seconds=0.2,
+            max_backoff_seconds=0.2,
+        ),
+    )
+    stop = threading.Event()
+    thread, results = run_supervisor(supervisor, stop)
+    wait_for(lease_path)
+    first = WorkerLease.read(lease_path)
+    assert first.generation == 1
+    request = RestartRequest(
+        request_id="planned-restart-211",
+        target=RoleTarget(research_tag="maple", role="student", student="fern"),
+        expected_conversation_id=conversation_id,
+        expected_restart_control_token="opaque-role-authorization",
+        expected_worker_generation=1,
+        expected_completed_turns=0,
+    )
+    with RestartRequestStore(restart_path) as store:
+        store.enqueue(request)
+
+    wait_for(tmp_path / "replacement-ready")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with RestartRequestStore(restart_path) as store:
+            result = store.result(request.request_id)
+        if result.status == "completed":
+            break
+        time.sleep(0.01)
+    stop.set()
+    thread.join(5)
+
+    assert results == [0]
+    assert result.status == "completed"
+    assert result.completion is not None
+    assert result.completion.source_generation == 1
+    assert result.completion.replacement_generation == 2
+    stderr = capsys.readouterr().err
+    assert "SENPAI_CONTROLLER_PLANNED_RESTART" in stderr
+    assert "backoff_seconds=" not in stderr
+
+
+def test_worker_owner_rejects_a_restart_if_compute_became_active_after_queueing(
+    tmp_path: Path,
+):
+    """
+    Requirement: the process owner repeats safety checks immediately before stop,
+    even when role control observed an earlier quiescent boundary.
+    Interface: durable rejection status and unchanged worker generation.
+    """
+
+    conversation_id = "00000000-0000-0000-0000-000000000213"
+    worker = tmp_path / "guarded_worker.py"
+    worker.write_text(
+        f"""
+import json
+import os
+import time
+from pathlib import Path
+
+generation = int(os.environ["{GENERATION_ENV}"])
+Path({str(tmp_path / "starts")!r}).write_text(str(generation))
+lease = Path(os.environ["SENPAI_CONTROLLER_LEASE_PATH"])
+lease.write_text(json.dumps({{
+    "pid": os.getpid(),
+    "phase": "sleep",
+    "deadline": time.monotonic() + 30,
+    "completed_turns": 0,
+    "conversation_id": "{conversation_id}",
+    "generation": generation,
+}}))
+while True:
+    time.sleep(1)
+""".strip()
+    )
+    delegation_dir = tmp_path / "delegation"
+    delegation_dir.mkdir()
+    with sqlite3.connect(delegation_dir / "tasks.sqlite3") as database:
+        database.execute("CREATE TABLE tasks (status TEXT NOT NULL)")
+        database.execute("INSERT INTO tasks VALUES ('running')")
+    restart_path = tmp_path / "controller-restarts.sqlite3"
+    stop = threading.Event()
+    supervisor = WorkerSupervisor(
+        command=(sys.executable, str(worker)),
+        lease_path=tmp_path / "controller-lease.json",
+        environment={
+            **os.environ,
+            "SENPAI_ROLE": "advisor",
+            "RESEARCH_TAG": "maple",
+            "SENPAI_OPENHANDS_STATE_DIR": str(tmp_path),
+        },
+        config=SupervisorConfig(
+            startup_timeout_seconds=1,
+            check_interval_seconds=0.01,
+            terminate_grace_seconds=0.1,
+            initial_backoff_seconds=0.01,
+            max_backoff_seconds=0.01,
+        ),
+    )
+    thread, results = run_supervisor(supervisor, stop)
+    wait_for(tmp_path / "controller-lease.json")
+    request = RestartRequest(
+        request_id="guard-race-213",
+        target=RoleTarget(research_tag="maple", role="advisor"),
+        expected_conversation_id=conversation_id,
+        expected_restart_control_token="previously-quiescent",
+        expected_worker_generation=1,
+        expected_completed_turns=0,
+    )
+    with RestartRequestStore(restart_path) as store:
+        store.enqueue(request)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with RestartRequestStore(restart_path) as store:
+            result = store.result(request.request_id)
+        if result.status == "rejected":
+            break
+        time.sleep(0.01)
+    stop.set()
+    thread.join(5)
+
+    assert results == [0]
+    assert result.status == "rejected"
+    assert result.rejection_code == "compute-not-quiescent"
+    assert (tmp_path / "starts").read_text() == "1"
+
+
+@pytest.mark.parametrize(
+    ("claimed_before_crash", "expected_status", "rejection_code"),
+    [
+        (True, "completed", None),
+        (False, "rejected", "source-generation-missed"),
+    ],
+)
+def test_new_owner_reconciles_restart_requests_after_the_source_worker_is_gone(
+    tmp_path: Path,
+    claimed_before_crash: bool,
+    expected_status: str,
+    rejection_code: str | None,
+):
+    """
+    Requirement: if WorkerSupervisor crashes after claiming a restart, its next
+    process completes that same request after a newer worker publishes its lease.
+    Interface: RestartRequestStore across supervisor process generations.
+    """
+
+    conversation_id = "00000000-0000-0000-0000-000000000212"
+    restart_path = tmp_path / "controller-restarts.sqlite3"
+    request = RestartRequest(
+        request_id="crash-recovery-212",
+        target=RoleTarget(research_tag="maple", role="advisor"),
+        expected_conversation_id=conversation_id,
+        expected_restart_control_token="opaque-role-authorization",
+        expected_worker_generation=1,
+        expected_completed_turns=0,
+    )
+    with RestartRequestStore(restart_path) as store:
+        assert store.allocate_worker_generation() == 1
+        store.enqueue(request)
+        if claimed_before_crash:
+            assert store.claim_next(
+                request.target,
+                worker_generation=1,
+                replacement_generation=2,
+            ) == request
+
+    worker = tmp_path / "replacement_worker.py"
+    worker.write_text(
+        f"""
+import json
+import os
+import time
+from pathlib import Path
+
+generation = int(os.environ["{GENERATION_ENV}"])
+lease = Path(os.environ["SENPAI_CONTROLLER_LEASE_PATH"])
+lease.write_text(json.dumps({{
+    "pid": os.getpid(),
+    "phase": "startup",
+    "deadline": time.monotonic() + 30,
+    "completed_turns": 0,
+    "conversation_id": None,
+    "generation": generation,
+}}))
+time.sleep(0.05)
+lease.write_text(json.dumps({{
+    "pid": os.getpid(),
+    "phase": "sleep",
+    "deadline": time.monotonic() + 30,
+    "completed_turns": 0,
+    "conversation_id": "{conversation_id}",
+    "generation": generation,
+}}))
+Path({str(tmp_path / "ready")!r}).write_text(str(generation))
+while True:
+    time.sleep(1)
+""".strip()
+    )
+    stop = threading.Event()
+    supervisor = WorkerSupervisor(
+        command=(sys.executable, str(worker)),
+        lease_path=tmp_path / "controller-lease.json",
+        environment={
+            **os.environ,
+            "SENPAI_ROLE": "advisor",
+            "RESEARCH_TAG": "maple",
+            "SENPAI_OPENHANDS_STATE_DIR": str(tmp_path),
+        },
+        config=SupervisorConfig(
+            startup_timeout_seconds=1,
+            check_interval_seconds=0.01,
+            terminate_grace_seconds=0.1,
+            initial_backoff_seconds=0.01,
+            max_backoff_seconds=0.01,
+        ),
+    )
+    thread, results = run_supervisor(supervisor, stop)
+    wait_for(tmp_path / "ready")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with RestartRequestStore(restart_path) as store:
+            result = store.result(request.request_id)
+        if result.status == expected_status:
+            break
+        time.sleep(0.01)
+    stop.set()
+    thread.join(5)
+
+    assert results == [0]
+    assert result.status == expected_status
+    assert result.rejection_code == rejection_code
+    if claimed_before_crash:
+        assert result.completion is not None
+        assert result.completion.replacement_generation == 2
+    else:
+        assert result.completion is None
 
 
 def test_health_command_reports_live_and_expired_worker_leases(tmp_path: Path):

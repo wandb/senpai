@@ -18,7 +18,7 @@ GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 TARGET_REPO_BRANCH="${TARGET_REPO_BRANCH:-}"
 export SENPAI_ROLE="advisor"
 export ADVISOR_NAME="${ADVISOR_NAME:-advisor}"
-export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
+export TARGET_WORKDIR="${SENPAI_TARGET_WORKDIR:-$WORKDIR/$PROBLEM_DIR}"
 SOURCE_SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 export SENPAI_PLUGIN="$SOURCE_SENPAI_PLUGIN"
 GIT_ASKPASS_FILE="/tmp/senpai-git-askpass"
@@ -29,10 +29,15 @@ if [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
 fi
 : "${GITHUB_TOKEN:?GitHub bootstrap token is required}"
 export SENPAI_OPENHANDS_STATE_DIR="$LOGDIR/openhands_state"
-export SENPAI_OPENHANDS_ROLE_FILE="$LOGDIR/ADVISOR.md"
-envsubst '$PROBLEM_DIR $TARGET_REPO_URL $GH_REPO $ADVISOR_BRANCH $RESEARCH_TAG $GPUS_PER_STUDENT $WANDB_ENTITY $WANDB_PROJECT' \
-    < "$WORKDIR/system_instructions/ADVISOR.md" \
-    > "$SENPAI_OPENHANDS_ROLE_FILE"
+if [ -n "${SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE:-}" ]; then
+    export SENPAI_OPENHANDS_ROLE_FILE="$SENPAI_IMMUTABLE_ADVISOR_GUIDANCE_FILE"
+    [ -f "$SENPAI_OPENHANDS_ROLE_FILE" ] && [ ! -L "$SENPAI_OPENHANDS_ROLE_FILE" ]
+else
+    export SENPAI_OPENHANDS_ROLE_FILE="$LOGDIR/ADVISOR.md"
+    envsubst '$PROBLEM_DIR $TARGET_REPO_URL $GH_REPO $ADVISOR_BRANCH $RESEARCH_TAG $GPUS_PER_STUDENT $WANDB_ENTITY $WANDB_PROJECT' \
+        < "$WORKDIR/system_instructions/ADVISOR.md" \
+        > "$SENPAI_OPENHANDS_ROLE_FILE"
+fi
 
 echo "=== Senpai Advisor ==="
 echo "Runner repo:  $REPO_URL (revision: $REPO_REVISION)"
@@ -53,7 +58,7 @@ clone_single_target_branch() {
     local branch="$1"
     local depth=()
     [ "$GH_HISTORY_SCOPE" = "fresh" ] && depth=(--depth 1)
-    git clone --branch "$branch" --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$PROBLEM_DIR"
+    git clone --branch "$branch" --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$TARGET_WORKDIR"
 }
 
 clone_target_repo() {
@@ -65,23 +70,24 @@ clone_target_repo() {
             if [ -z "$TARGET_REPO_BRANCH" ]; then
                 return 1
             fi
-            rm -rf "$PROBLEM_DIR"
+            rm -rf "$TARGET_WORKDIR"
             if ! clone_single_target_branch "$TARGET_REPO_BRANCH"; then
                 return 1
             fi
-            cd "$WORKDIR/$PROBLEM_DIR"
+            cd "$TARGET_WORKDIR"
             git checkout -b "$ADVISOR_BRANCH"
             git push -u origin "$ADVISOR_BRANCH"
             cd "$WORKDIR"
             ;;
-        repo) git clone "$TARGET_REPO_URL" "$PROBLEM_DIR" ;;
+        repo) git clone "$TARGET_REPO_URL" "$TARGET_WORKDIR" ;;
         *) echo "ERROR: GH_HISTORY_SCOPE must be one of: branch, repo, fresh" >&2; exit 2 ;;
     esac
 }
 
 # Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
 # agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
-if [ ! -d "$PROBLEM_DIR/.git" ] && ! clone_target_repo; then
+mkdir -p "$(dirname "$TARGET_WORKDIR")"
+if [ ! -d "$TARGET_WORKDIR/.git" ] && ! clone_target_repo; then
     if [ -n "$TARGET_REPO_BRANCH" ]; then
         echo "ERROR: could not clone advisor branch '$ADVISOR_BRANCH' or target base branch '$TARGET_REPO_BRANCH'" >&2
         exit 1
@@ -89,8 +95,8 @@ if [ ! -d "$PROBLEM_DIR/.git" ] && ! clone_target_repo; then
     [ "$GH_HISTORY_SCOPE" = "repo" ] && exit 1
     depth=()
     [ "$GH_HISTORY_SCOPE" = "fresh" ] && depth=(--depth 1)
-    git clone --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$PROBLEM_DIR"
-    cd "$WORKDIR/$PROBLEM_DIR"
+    git clone --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$TARGET_WORKDIR"
+    cd "$TARGET_WORKDIR"
     git checkout -b "$ADVISOR_BRANCH"
     git push -u origin "$ADVISOR_BRANCH"
     cd "$WORKDIR"
@@ -109,7 +115,7 @@ export SENPAI_PLUGIN="$(
 )"
 
 # --- Git identity (inside the problem-package repo) ---
-cd "$WORKDIR/$PROBLEM_DIR"
+cd "$TARGET_WORKDIR"
 git config user.name "senpai-$ADVISOR_NAME"
 git config user.email "senpai-$ADVISOR_NAME@senpai"
 gh repo set-default "$GH_REPO"
@@ -155,4 +161,4 @@ if [ -z "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
 fi
 unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS
 rm -f "$GIT_ASKPASS_FILE"
-exec python -m senpai_agent.supervisor advisor
+exec /usr/local/bin/senpai-run-controller advisor

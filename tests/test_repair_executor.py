@@ -1,12 +1,17 @@
 import json
+import hashlib
 import multiprocessing
+import os
 import shlex
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 
 import pytest
+
+import senpai_agent.repair_executor as repair_executor
 
 from senpai_agent.repair_executor import EXECUTOR_REQUEST_LIMIT_BYTES
 from senpai_agent.repair_executor import DEFAULT_EXECUTOR_SOCKET
@@ -14,12 +19,130 @@ from senpai_agent.repair_executor import REPAIR_EXECUTOR_PROTOCOL
 from senpai_agent.repair_executor import RepairExecutorClient
 from senpai_agent.repair_executor import RepairExecutorServer
 from senpai_agent.repair_executor import RepairExecutionRequest
+from senpai_agent.repair_executor import _heartbeat_status_is_healthy
 from senpai_agent.repair_executor import _encode_frame
+from senpai_agent.repair_executor import check_repair_executor_health
 from senpai_agent.repair_executor import execute_local_repair
 
 
 def _serve(socket_path: str) -> None:
     RepairExecutorServer(Path(socket_path)).serve_forever()
+
+
+def _test_socket(tmp_path: Path, suffix: str) -> Path:
+    digest = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:10]
+    return Path("/private/tmp") / f"senpai-{os.getpid()}-{digest}-{suffix}.sock"
+
+
+def test_repair_startup_scavenges_only_owned_stale_volatile_children(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(repair_executor.tempfile, "tempdir", str(tmp_path))
+    parent = tmp_path / "senpai-repair-operations"
+    parent.mkdir()
+    stale = parent / "operation-stale123"
+    stale.mkdir()
+    (stale / ".senpai-owner.json").write_text(
+        json.dumps({"pid": 999_999_999, "start_token": None})
+    )
+    target = tmp_path / "must-survive"
+    target.mkdir()
+    link = parent / "operation-symlink1"
+    link.symlink_to(target)
+    unrelated = parent / "operator-notes"
+    unrelated.write_text("keep")
+
+    repair_executor._scavenge_stale_volatile_roots()
+
+    assert not stale.exists()
+    assert not link.exists()
+    assert target.exists()
+    assert unrelated.read_text() == "keep"
+
+
+def test_repair_executor_health_rejects_a_wedged_heartbeat():
+    now = time.monotonic()
+
+    assert not _heartbeat_status_is_healthy(
+        {
+            "protocol": REPAIR_EXECUTOR_PROTOCOL,
+            "server_pid": os.getpid(),
+            "state": "idle",
+            "heartbeat_monotonic": now - 10,
+            "operation_deadline_monotonic": None,
+        },
+        expected_pid=os.getpid(),
+        now=now,
+    )
+
+
+def test_repair_executor_health_accepts_an_in_deadline_long_command():
+    now = time.monotonic()
+
+    assert _heartbeat_status_is_healthy(
+        {
+            "protocol": REPAIR_EXECUTOR_PROTOCOL,
+            "server_pid": os.getpid(),
+            "state": "active",
+            "heartbeat_monotonic": now,
+            "operation_deadline_monotonic": now + 3_000,
+        },
+        expected_pid=os.getpid(),
+        now=now,
+    )
+
+
+def test_repair_executor_health_rejects_an_expired_command():
+    now = time.monotonic()
+
+    assert not _heartbeat_status_is_healthy(
+        {
+            "protocol": REPAIR_EXECUTOR_PROTOCOL,
+            "server_pid": os.getpid(),
+            "state": "active",
+            "heartbeat_monotonic": now,
+            "operation_deadline_monotonic": now - 10,
+        },
+        expected_pid=os.getpid(),
+        now=now,
+    )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux process health")
+def test_repair_executor_remains_healthy_during_a_long_command(tmp_path):
+    socket_path = _test_socket(tmp_path, "active-executor")
+    server = multiprocessing.get_context("fork").Process(
+        target=_serve,
+        args=(str(socket_path),),
+    )
+    server.start()
+    deadline = time.monotonic() + 3
+    while not socket_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    result: dict[str, object] = {}
+
+    def execute() -> None:
+        result.update(
+            RepairExecutorClient(socket_path).execute(
+                RepairExecutionRequest("sleep 2", tmp_path, 10)
+            )
+        )
+
+    worker = threading.Thread(target=execute)
+    worker.start()
+    time.sleep(0.5)
+    try:
+        check_repair_executor_health(socket_path, expected_pid=server.pid)
+    finally:
+        worker.join(timeout=5)
+        server.terminate()
+        server.join(timeout=3)
+        if server.is_alive():
+            server.kill()
+            server.join(timeout=3)
+
+    assert result["exit_code"] == 0
 
 
 def test_maximum_unicode_command_fits_the_executor_request_frame(tmp_path):
@@ -39,6 +162,9 @@ def test_repair_operations_get_fresh_home_and_temporary_state(tmp_path, monkeypa
     monkeypatch.setenv("DATABASE_URL", "postgres://credential@database/research")
     first = execute_local_repair(
         "printf poisoned > \"$HOME/.gitconfig\"; "
+        "mkdir -p \"$HOME/.local/bin\"; "
+        "printf '#!/bin/sh\\nexit 99\\n' > \"$HOME/.local/bin/git\"; "
+        "chmod +x \"$HOME/.local/bin/git\"; "
         "printf temporary > \"$TMPDIR/poison\"; printf '%s' \"$HOME\"",
         tmp_path,
         5,
@@ -46,7 +172,10 @@ def test_repair_operations_get_fresh_home_and_temporary_state(tmp_path, monkeypa
     second = execute_local_repair(
         "test ! -e \"$HOME/.gitconfig\"; "
         "test ! -e \"$TMPDIR/poison\"; "
-        "test -z \"$DATABASE_URL\"; printf '%s' \"$HOME\"",
+        "test -z \"$DATABASE_URL\"; "
+        "test \"$PATH\" = '/opt/senpai-venv/bin:/usr/local/bin:/usr/bin:/bin'; "
+        "test \"$(command -v git)\" != \"$HOME/.local/bin/git\"; "
+        "printf '%s' \"$HOME\"",
         tmp_path,
         5,
     )
@@ -58,7 +187,7 @@ def test_repair_operations_get_fresh_home_and_temporary_state(tmp_path, monkeypa
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreapers")
 def test_repair_executor_cleans_descendants_when_its_client_disconnects(tmp_path):
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-executor.sock"
+    socket_path = _test_socket(tmp_path, "executor")
     marker = tmp_path / "disconnected-command-survived"
     server = multiprocessing.get_context("fork").Process(
         target=_serve,
@@ -125,7 +254,7 @@ def test_repair_reaps_setsid_double_fork_descendants_on_timeout_and_success(
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreapers")
 def test_repair_command_cannot_enqueue_a_nested_executor_request(tmp_path):
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-nested-executor.sock"
+    socket_path = _test_socket(tmp_path, "nested-executor")
     marker = tmp_path / "nested-connected"
     server = multiprocessing.get_context("fork").Process(
         target=_serve,
@@ -168,7 +297,7 @@ def test_repair_command_cannot_enqueue_a_nested_executor_request(tmp_path):
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreapers")
 def test_executor_reaps_command_tree_after_request_worker_is_killed(tmp_path):
-    socket_path = Path("/private/tmp") / f"{tmp_path.name}-crashed-executor.sock"
+    socket_path = _test_socket(tmp_path, "crashed-executor")
     marker = tmp_path / "crashed-worker-command-survived"
     server = multiprocessing.get_context("fork").Process(
         target=_serve,

@@ -17,7 +17,7 @@ WORKDIR="${SENPAI_WORKDIR:-$WORKDIR}"
 GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 TARGET_REPO_BRANCH="${TARGET_REPO_BRANCH:-}"
 export SENPAI_ROLE="student"
-export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
+export TARGET_WORKDIR="${SENPAI_TARGET_WORKDIR:-$WORKDIR/$PROBLEM_DIR}"
 SOURCE_SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 export SENPAI_PLUGIN="$SOURCE_SENPAI_PLUGIN"
 GIT_ASKPASS_FILE="/tmp/senpai-git-askpass"
@@ -51,15 +51,16 @@ clone_target_repo() {
     local depth=()
     [ "$GH_HISTORY_SCOPE" = "fresh" ] && depth=(--depth 1)
     case "$GH_HISTORY_SCOPE" in
-        branch|fresh) git clone --branch "$ADVISOR_BRANCH" --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$PROBLEM_DIR" ;;
-        repo) git clone "$TARGET_REPO_URL" "$PROBLEM_DIR" ;;
+        branch|fresh) git clone --branch "$ADVISOR_BRANCH" --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$TARGET_WORKDIR" ;;
+        repo) git clone "$TARGET_REPO_URL" "$TARGET_WORKDIR" ;;
         *) echo "ERROR: GH_HISTORY_SCOPE must be one of: branch, repo, fresh" >&2; exit 2 ;;
     esac
 }
 
 # Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
 # agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
-[ -d "$PROBLEM_DIR/.git" ] || clone_target_repo
+mkdir -p "$(dirname "$TARGET_WORKDIR")"
+[ -d "$TARGET_WORKDIR/.git" ] || clone_target_repo
 git config --global --unset-all credential.helper 2>/dev/null || true
 
 if [ "${SENPAI_SKIP_EDITABLE_INSTALL:-0}" != "1" ]; then
@@ -74,7 +75,7 @@ export SENPAI_PLUGIN="$(
 )"
 
 # --- Git identity for commits (inside the problem-package repo) ---
-cd "$WORKDIR/$PROBLEM_DIR"
+cd "$TARGET_WORKDIR"
 git config user.name "senpai-$STUDENT_NAME"
 git config user.email "senpai-$STUDENT_NAME@senpai"
 gh repo set-default "$GH_REPO"
@@ -112,4 +113,4 @@ if [ -z "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
 fi
 unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS
 rm -f "$GIT_ASKPASS_FILE"
-exec python -m senpai_agent.supervisor student
+exec /usr/local/bin/senpai-run-controller student

@@ -6,9 +6,10 @@ import time
 import uuid
 from pathlib import Path
 
-import pytest
 import psutil
+import pytest
 from openhands.sdk.llm import Message, TextContent
+from sqlite_test_support import assert_repeated_concurrent_first_open
 
 from senpai_agent.advisor import AdvisorEventStore
 from senpai_agent.delegation import (
@@ -21,6 +22,22 @@ from senpai_agent.delegation import (
     render_child_prompt,
     run_child_process,
 )
+
+
+def test_delegation_registry_allows_bounded_concurrent_first_open(tmp_path: Path):
+    """
+    Requirement: parent and delegated child processes may first discover their
+    shared registry concurrently without a lock error or partial schema.
+    Interface: DelegationRegistry construction and its active-task view.
+    """
+
+    assert_repeated_concurrent_first_open(
+        lambda attempt: DelegationRegistry(tmp_path / f"tasks-{attempt}.sqlite3"),
+        attempts=25,
+    )
+
+    database = tmp_path / "tasks-reopen.sqlite3"
+    assert DelegationRegistry(database).active_rows() == []
 
 
 def delegation_request(

@@ -21,7 +21,9 @@ from typing import Annotated, Literal, Protocol, Self
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from senpai_agent.operations import CampaignInventory, RoleTarget
+from senpai_agent.protocols import REPAIR_PROTOCOL_VERSION
 from senpai_agent.repair_executor import REPAIR_STREAM_LIMIT_CHARS
+from senpai_agent.sqlite_store import initialize_sqlite_store
 from senpai_agent.socket_framing import (
     SocketFrameError,
     SocketFrameTooLarge,
@@ -37,7 +39,13 @@ _Fingerprint = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
 class _Contract(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+_OperationId = Annotated[
+    str,
+    Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"),
+]
 
 
 def repair_command_fingerprint(
@@ -63,7 +71,7 @@ def repair_command_fingerprint(
 class RepairRequest(_Contract):
     """One idempotent command bound to an exact role and fixed mount root."""
 
-    operation_id: Annotated[str, Field(min_length=1, max_length=200)]
+    operation_id: _OperationId
     target: RoleTarget
     command: str = Field(min_length=1, max_length=65_536)
     command_fingerprint: _Fingerprint
@@ -82,6 +90,13 @@ class RepairRequest(_Contract):
             raise ValueError("repair command fingerprint does not match its payload")
         return self
 
+    @field_validator("command")
+    @classmethod
+    def command_is_not_whitespace(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("repair command must contain non-whitespace text")
+        return value
+
     @classmethod
     def create(
         cls,
@@ -92,16 +107,15 @@ class RepairRequest(_Contract):
         cwd: Literal["workspace", "state", "scratch"] = "workspace",
         timeout_seconds: int = 300,
     ) -> RepairRequest:
-        normalized_command = command.strip()
         return cls(
             operation_id=operation_id,
             target=target,
-            command=normalized_command,
+            command=command,
             cwd=cwd,
             timeout_seconds=timeout_seconds,
             command_fingerprint=repair_command_fingerprint(
                 target=target,
-                command=normalized_command,
+                command=command,
                 cwd=cwd,
                 timeout_seconds=timeout_seconds,
             ),
@@ -112,6 +126,8 @@ class RepairResult(_Contract):
     exit_code: int
     stdout: str = Field(max_length=REPAIR_STREAM_LIMIT_CHARS)
     stderr: str = Field(max_length=REPAIR_STREAM_LIMIT_CHARS)
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
 
     @field_validator("stdout", "stderr")
     @classmethod
@@ -123,7 +139,7 @@ RepairOperationState = Literal["running", "completed", "failed", "unknown"]
 
 
 class RepairOperationStatus(_Contract):
-    operation_id: Annotated[str, Field(min_length=1, max_length=200)]
+    operation_id: _OperationId
     target: RoleTarget
     command_fingerprint: _Fingerprint
     cwd: Literal["workspace", "state", "scratch"]
@@ -136,7 +152,7 @@ class RepairOperationStatus(_Contract):
 
 
 class RepairAuditRecord(_Contract):
-    operation_id: Annotated[str, Field(min_length=1, max_length=200)]
+    operation_id: _OperationId
     target: RoleTarget
     command_fingerprint: _Fingerprint
     cwd: Literal["workspace", "state", "scratch"]
@@ -194,13 +210,15 @@ class RepairLedger:
 
     def __init__(self, path: Path):
         self.path = path.expanduser().resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._connection = sqlite3.connect(self.path, check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA busy_timeout=5000")
-        self._connection.execute(
+        self._connection = initialize_sqlite_store(
+            self.path,
+            self._initialize_schema,
+        )
+
+    @staticmethod
+    def _initialize_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS repair_operations (
                 operation_id TEXT PRIMARY KEY,
@@ -218,18 +236,27 @@ class RepairLedger:
             )
             """
         )
+
+    def recover_interrupted(self) -> None:
+        """Make pre-restart executions explicitly ambiguous without replaying them."""
+
         now = datetime.now(UTC).timestamp()
-        self._connection.execute(
-            """
-            UPDATE repair_operations
-            SET status = 'unknown', completed_at = COALESCE(completed_at, ?),
-                error_type = COALESCE(error_type, 'BrokerInterrupted')
-            WHERE status = 'running'
-            """,
-            (now,),
-        )
-        self._connection.commit()
-        self.path.chmod(0o600)
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._connection.execute(
+                    """
+                    UPDATE repair_operations
+                    SET status = 'unknown', completed_at = COALESCE(completed_at, ?),
+                        error_type = COALESCE(error_type, 'BrokerInterrupted')
+                    WHERE status = 'running'
+                    """,
+                    (now,),
+                )
+                self._connection.commit()
+            except BaseException:
+                self._connection.rollback()
+                raise
 
     def __enter__(self) -> Self:
         return self
@@ -427,13 +454,23 @@ class RepairLedger:
 
 
 def _wire_safe_result(result: RepairResult) -> RepairResult:
-    stdout = result.stdout
-    stderr = result.stderr
+    stdout, stdout_byte_truncated = _bounded_utf8_tail(
+        result.stdout,
+        REPAIR_STREAM_LIMIT_CHARS,
+    )
+    stderr, stderr_byte_truncated = _bounded_utf8_tail(
+        result.stderr,
+        REPAIR_STREAM_LIMIT_CHARS,
+    )
+    stdout_truncated = result.stdout_truncated or stdout_byte_truncated
+    stderr_truncated = result.stderr_truncated or stderr_byte_truncated
     while True:
         candidate = RepairResult(
             exit_code=result.exit_code,
             stdout=stdout,
             stderr=stderr,
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
         )
         try:
             encode_json_frame(
@@ -444,8 +481,25 @@ def _wire_safe_result(result: RepairResult) -> RepairResult:
         except SocketFrameTooLarge:
             if not stdout and not stderr:
                 raise
-            stdout = stdout[len(stdout) // 2 :]
-            stderr = stderr[len(stderr) // 2 :]
+            if stdout:
+                stdout = stdout[len(stdout) // 2 :]
+                stdout_truncated = True
+            if stderr:
+                stderr = stderr[len(stderr) // 2 :]
+                stderr_truncated = True
+
+
+def _bounded_utf8_tail(value: str, limit: int) -> tuple[str, bool]:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value, False
+    tail = encoded[-limit:]
+    for offset in range(min(4, len(tail) + 1)):
+        try:
+            return tail[offset:].decode("utf-8"), True
+        except UnicodeDecodeError:
+            continue
+    raise RuntimeError("could not find a UTF-8 boundary in bounded repair output")
 
 
 class RepairBrokerClient:
@@ -454,7 +508,11 @@ class RepairBrokerClient:
 
     def execute(self, request: RepairRequest) -> RepairResult:
         response = self._request(
-            {"operation": "execute", "request": request.model_dump(mode="json")},
+            {
+                "protocol": REPAIR_PROTOCOL_VERSION,
+                "operation": "execute",
+                "request": request.model_dump(mode="json"),
+            },
             timeout_seconds=request.timeout_seconds + _RESPONSE_GRACE_SECONDS,
             operation_id=request.operation_id,
         )
@@ -472,7 +530,11 @@ class RepairBrokerClient:
 
     def status(self, operation_id: str) -> RepairOperationStatus:
         response = self._request(
-            {"operation": "status", "operation_id": operation_id},
+            {
+                "protocol": REPAIR_PROTOCOL_VERSION,
+                "operation": "status",
+                "operation_id": operation_id,
+            },
             timeout_seconds=_REQUEST_READ_TIMEOUT_SECONDS,
             operation_id=None,
         )
@@ -503,7 +565,11 @@ class RepairBrokerClient:
                 connection.sendall(frame)
                 connection.settimeout(timeout_seconds)
                 response = json.loads(
-                    receive_frame(connection, max_bytes=_MAX_MESSAGE_BYTES)
+                    receive_frame(
+                        connection,
+                        max_bytes=_MAX_MESSAGE_BYTES,
+                        timeout_seconds=timeout_seconds,
+                    )
                 )
         except (OSError, SocketFrameError, json.JSONDecodeError, UnicodeDecodeError) as error:
             if sent and operation_id is not None:
@@ -511,6 +577,10 @@ class RepairBrokerClient:
             raise RepairTransportError("campaign repair broker is unavailable") from error
         if not isinstance(response, dict):
             raise RepairTransportError("campaign repair broker returned invalid data")
+        if response.get("protocol") != REPAIR_PROTOCOL_VERSION:
+            if operation_id is not None:
+                raise RepairOutcomeUnknown(operation_id)
+            raise RepairTransportError("campaign repair broker protocol mismatch")
         if "error" in response:
             error_type = str(response.get("error_type", "RepairError"))
             message = str(response["error"])
@@ -539,6 +609,7 @@ class RepairBrokerServer:
         self.inventory = inventory
         self.backend = backend
         self.ledger = RepairLedger(ledger_path)
+        self.ledger.recover_interrupted()
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         self._remove_stale_socket()
         self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -600,8 +671,13 @@ class RepairBrokerServer:
                     raw_request = receive_frame(
                         connection,
                         max_bytes=_MAX_MESSAGE_BYTES,
+                        timeout_seconds=_REQUEST_READ_TIMEOUT_SECONDS,
                     )
                     envelope = json.loads(raw_request)
+                    if not isinstance(envelope, dict):
+                        raise ValueError("invalid repair broker envelope")
+                    if envelope.get("protocol") != REPAIR_PROTOCOL_VERSION:
+                        raise ValueError("unsupported repair broker protocol")
                     if envelope.get("operation") == "status":
                         status = self.ledger.status(str(envelope["operation_id"]))
                         response = {"status": status.model_dump(mode="json")}
@@ -617,6 +693,7 @@ class RepairBrokerServer:
                         "error_type": type(error).__name__,
                         "error": str(error)[:4_096],
                     }
+                response["protocol"] = REPAIR_PROTOCOL_VERSION
                 try:
                     connection.sendall(
                         encode_json_frame(response, max_bytes=_MAX_MESSAGE_BYTES)

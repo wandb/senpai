@@ -23,7 +23,10 @@ may run arbitrary shell and Git commands allowed by its secret-free container.
 Native terminal calls retain OpenHands' ordinary soft-timeout, input, polling,
 and reset behavior. It has no Kubernetes token, campaign state mount, provider
 secret, GitHub token, W&B key, shared process namespace, or access to the
-control process's filesystem.
+control process's filesystem. Every wake gets a new worker and process tree plus
+fresh `HOME`, `TMPDIR`, and XDG directories; only the explicit shell workspace
+survives between wakes in the same pod. Wake completion kills all descendants
+before removing the volatile directories.
 
 Use the typed tool for race-sensitive role inspection, nudges, context resets,
 and controller restarts because it binds those changes to observed state and
@@ -42,7 +45,10 @@ senpai-role-shell --status maple-fern-state-20260810T1205Z
 The client accepts no namespace, pod, container, host, or mount path. The
 operation ID must be stable and chosen before execution. If the terminal loses
 the response, query `--status` and replay only with that same ID and exact
-command; a changed command with the same ID is rejected. The
+command; a changed command with the same ID is rejected. An interrupted running
+operation is recorded as `unknown` and must not be executed again automatically.
+Each repair command also receives fresh home, temporary, and XDG directories.
+The
 credentialed broker validates the requested role against this campaign's
 immutable inventory, then sends the command only to that pod's fixed secret-free `repair` sidecar.
 `workspace`, `state`, and private `scratch` are
