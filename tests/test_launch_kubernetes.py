@@ -370,6 +370,20 @@ def test_supervisor_preflight_only_checks_kubernetes_storage_and_inventory(
 def compatible_existing_campaign(monkeypatch, args, students=("fern",)):
     monkeypatch.setattr(
         launch,
+        "kubernetes_pvc_metadata",
+        lambda *_args, **_kwargs: {
+            "metadata": {
+                "annotations": {"senpai.wandb.com/sqlite-safe": "true"}
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeMode": "Filesystem",
+            },
+            "status": {"phase": "Bound"},
+        },
+    )
+    monkeypatch.setattr(
+        launch,
         "existing_advisor_deployments",
         lambda *_args, **_kwargs: [f"senpai-advisor-{args.tag}"],
     )
