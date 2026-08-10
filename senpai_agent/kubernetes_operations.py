@@ -9,7 +9,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from uuid import UUID, uuid4
@@ -292,7 +291,11 @@ class KubectlCampaignBackend(OperationBackend):
             ) from error
         try:
             pause_payload = json.loads(pause_output)
-            if set(pause_payload) != {"acknowledgement", "resume_capability"}:
+            if set(pause_payload) != {
+                "acknowledgement",
+                "resume_capability",
+                "remaining_seconds",
+            }:
                 raise ValueError("unexpected repair-pause grant fields")
             pause_grant = RepairPauseGrant(
                 acknowledgement=RepairPauseAcknowledgement(
@@ -301,6 +304,7 @@ class KubectlCampaignBackend(OperationBackend):
                 resume_capability=str(pause_payload["resume_capability"]),
             )
             pause_receipt = pause_grant.acknowledgement
+            remaining_seconds = float(pause_payload["remaining_seconds"])
         except (TypeError, ValueError) as error:
             raise RepairNotStartedError(
                 "role returned an invalid repair-pause grant"
@@ -312,8 +316,10 @@ class KubectlCampaignBackend(OperationBackend):
                 or pause_receipt.expires_at <= pause_receipt.acknowledged_at
                 or pause_receipt.expires_at - pause_receipt.acknowledged_at
                 > pause_duration_seconds + 5
-                or pause_receipt.expires_at - time.monotonic()
-                < timeout_seconds + 45
+                or not math.isfinite(remaining_seconds)
+                or remaining_seconds < timeout_seconds + 45
+                or remaining_seconds
+                > pause_receipt.expires_at - pause_receipt.acknowledged_at + 1
             ):
                 raise ValueError("mismatched or expired repair-pause lease")
         except ValueError as error:

@@ -12,7 +12,7 @@ import pytest
 
 from senpai_agent.kubernetes_operations import KubectlCampaignBackend
 from senpai_agent.operations import CampaignInventory, RoleObservation, RoleTarget
-from senpai_agent.protocols import MANAGEMENT_PROTOCOL_VERSION
+from senpai_agent.protocols import MANAGEMENT_PROTOCOL_VERSION, REPAIR_PROTOCOL_VERSION
 from senpai_agent.role_control import (
     RoleControlRequest,
     RoleResearchTail,
@@ -50,8 +50,13 @@ def pause_receipt(command) -> str:
                 ).hexdigest(),
             },
             "resume_capability": RESUME_CAPABILITY,
+            "remaining_seconds": duration,
         }
     )
+
+
+def test_authenticated_pause_requires_the_new_repair_wire_version():
+    assert REPAIR_PROTOCOL_VERSION == "senpai-repair-executor/v4"
 
 
 def resume_receipt(command) -> str:
@@ -428,6 +433,55 @@ def test_repair_quiesces_the_role_before_entering_the_secret_free_sidecar(
     assert "repair-resume" in commands[2]
     assert calls[2][1]["input_text"] == RESUME_CAPABILITY
     assert RESUME_CAPABILITY not in commands[2]
+    assert result.stdout == "repaired"
+
+
+def test_repair_uses_role_local_remaining_ttl_not_a_cross_node_monotonic_clock(
+    monkeypatch,
+):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    target = RoleTarget(research_tag="maple", role="advisor")
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-advisor-maple")
+
+    def run(command, **_kwargs):
+        if "repair-pause" in command:
+            lease_id = command[command.index("--lease-id") + 1]
+            return json.dumps(
+                {
+                    "acknowledgement": {
+                        "protocol": REPAIR_PAUSE_PROTOCOL,
+                        "lease_id": lease_id,
+                        "expires_at": 10_240.0,
+                        "acknowledged_at": 10_000.0,
+                        "supervisor_pid": 1,
+                        "resume_capability_sha256": hashlib.sha256(
+                            RESUME_CAPABILITY.encode()
+                        ).hexdigest(),
+                    },
+                    "resume_capability": RESUME_CAPABILITY,
+                    "remaining_seconds": 200.0,
+                }
+            )
+        if "repair-resume" in command:
+            return resume_receipt(command)
+        return json.dumps({"exit_code": 0, "stdout": "repaired", "stderr": ""})
+
+    monkeypatch.setattr(backend, "_run", run)
+    monkeypatch.setattr(
+        time,
+        "monotonic",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("supervisor monotonic time is a different node-local epoch")
+        ),
+    )
+
+    result = backend.run_repair(
+        target,
+        command="true",
+        cwd="workspace",
+        timeout_seconds=60,
+    )
+
     assert result.stdout == "repaired"
 
 

@@ -761,7 +761,17 @@ def supervisor_main(
             duration_seconds=args.duration_seconds,
             wait_seconds=args.wait_seconds,
         )
-        print(json.dumps(asdict(grant), sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    **asdict(grant),
+                    "remaining_seconds": (
+                        grant.acknowledgement.expires_at - time.monotonic()
+                    ),
+                },
+                sort_keys=True,
+            )
+        )
         return 0
     if args.command == "repair-resume":
         resume_capability = sys.stdin.read(256).strip()

@@ -294,6 +294,7 @@ def test_kubectl_repair_transport_executes_only_the_repair_sidecar(monkeypatch):
                         ).hexdigest(),
                     },
                     "resume_capability": resume_capability,
+                    "remaining_seconds": duration,
                 }
             )
         if "repair-resume" in command:

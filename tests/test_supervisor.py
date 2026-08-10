@@ -493,7 +493,9 @@ def test_kubectl_exec_pause_uses_pid_one_socket_not_runtime_private_directory(
         "socket_path": DEFAULT_REPAIR_PAUSE_SOCKET,
         "lease_id": "repair-container-env",
     }
-    assert json.loads(capsys.readouterr().out)["resume_capability"] == capability
+    output = json.loads(capsys.readouterr().out)
+    assert output["resume_capability"] == capability
+    assert 0 < output["remaining_seconds"] <= 300
 
 
 def test_pre_ack_wrong_and_replayed_resume_capabilities_never_release_pause(
