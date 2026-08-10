@@ -57,10 +57,7 @@ from k8s.launch_helpers import (  # noqa: E402
     routing_labels,
     source_revision_for_image,
 )
-from k8s.supervisor_rollback import (  # noqa: E402
-    RollbackError,
-    SupervisorRollback,
-)
+from k8s.supervisor_rollback import SupervisorRollback  # noqa: E402
 from senpai_agent.protocols import (  # noqa: E402
     MANAGEMENT_PROTOCOL_VERSION,
     REPAIR_PROTOCOL_VERSION,
@@ -916,7 +913,7 @@ def apply_operational_supervisor_release(
     except (OSError, RuntimeError) as error:
         try:
             rollback.restore(timeout_seconds=args.supervisor_ready_timeout_s)
-        except RollbackError as rollback_error:
+        except Exception as rollback_error:
             rollback_status = (
                 "AUTOMATIC ROLLBACK FAILED: "
                 f"{rollback_error}. Use the retained bundle for recovery."

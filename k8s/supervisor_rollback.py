@@ -457,7 +457,7 @@ class SupervisorRollback:
     def commit(self) -> None:
         """Discard the snapshot after the new supervisor rollout is healthy."""
 
-        self.path.unlink()
+        self.path.unlink(missing_ok=True)
 
 
 def main(argv: list[str] | None = None) -> int:
