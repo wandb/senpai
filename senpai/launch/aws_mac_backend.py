@@ -61,7 +61,8 @@ DEFAULT_AMI_PARAMETER = (
 )
 MAC_ARCHITECTURE = "arm64_mac"
 AWS_MAC_STATE_BACKEND = "aws-mac"
-AWS_MAC_STATE_VERSION = 1
+AWS_MAC_STATE_VERSION = 2
+AWS_MAC_COMPATIBLE_STATE_VERSIONS = frozenset({1, AWS_MAC_STATE_VERSION})
 HOST_ID = re.compile(r"h-[0-9a-f]+")
 SUBNET_ID = re.compile(r"subnet-[0-9a-f]+")
 SECURITY_GROUP_ID = re.compile(r"sg-[0-9a-f]+")
@@ -85,6 +86,7 @@ class AwsMacPlan:
     security_group_id: str
     ssh_cidr: str
     hosts: tuple[AwsMacHost, ...]
+    vpc_id: str = ""
 
 
 def _csv(value: str) -> tuple[str, ...]:
@@ -279,7 +281,7 @@ def _validate_network(
     context: AwsContext,
     hosts: tuple[AwsMacHost, ...],
     security_group_id: str,
-) -> None:
+) -> str:
     if not SECURITY_GROUP_ID.fullmatch(security_group_id):
         raise ValueError("--aws_mac_security_group_id is required")
     requested = sorted({host.subnet_id for host in hosts})
@@ -320,6 +322,7 @@ def _validate_network(
         raise RuntimeError(
             f"AWS security group {security_group_id} is not in the Mac subnet VPC"
         )
+    return next(iter(vpcs))
 
 
 def preflight_aws_mac(args, role_specs: list[RoleSpec]) -> AwsMacPlan:
@@ -387,7 +390,7 @@ def preflight_aws_mac(args, role_specs: list[RoleSpec]) -> AwsMacPlan:
         students,
         instance_type,
     )
-    _validate_network(context, hosts, args.aws_mac_security_group_id)
+    vpc_id = _validate_network(context, hosts, args.aws_mac_security_group_id)
     ami_id, root_device, minimum_volume = _resolve_ami(context, args.aws_ami_id)
     volume_gib = max(args.aws_volume_gib, minimum_volume)
     plan = AwsMacPlan(
@@ -399,6 +402,7 @@ def preflight_aws_mac(args, role_specs: list[RoleSpec]) -> AwsMacPlan:
         security_group_id=args.aws_mac_security_group_id,
         ssh_cidr=_ssh_cidr(args.aws_ssh_cidr),
         hosts=hosts,
+        vpc_id=vpc_id,
     )
     print(
         "AWS Mac preflight OK — "
@@ -413,7 +417,86 @@ def _key_name(tag: str) -> str:
     return f"senpai-{tag}-{uuid.uuid4().hex[:8]}"
 
 
-def _authorize_ssh(plan: AwsMacPlan) -> None:
+def _ssh_security_group_name(tag: str) -> str:
+    return f"senpai-{tag}-ssh-{uuid.uuid4().hex[:8]}"
+
+
+def _create_ssh_security_group(
+    plan: AwsMacPlan,
+    *,
+    name: str,
+    tag: str,
+) -> str:
+    if not plan.vpc_id:
+        raise RuntimeError("AWS Mac plan has no VPC for its SSH security group")
+    payload = _aws_json(
+        plan.context,
+        "ec2",
+        "create-security-group",
+        "--group-name",
+        name,
+        "--description",
+        f"Senpai AWS Mac SSH for {tag}",
+        "--vpc-id",
+        plan.vpc_id,
+        "--tag-specifications",
+        json.dumps(
+            [
+                {
+                    "ResourceType": "security-group",
+                    "Tags": [
+                        {"Key": "Campaign", "Value": tag},
+                        {"Key": "senpai:run", "Value": tag},
+                        {"Key": "SenpaiPurpose", "Value": "ssh"},
+                    ],
+                }
+            ]
+        ),
+    )
+    group_id = payload.get("GroupId", "")
+    if not isinstance(group_id, str) or not SECURITY_GROUP_ID.fullmatch(group_id):
+        raise RuntimeError("AWS did not return a valid SSH security group ID")
+    return group_id
+
+
+def _recover_ssh_security_group(context: AwsContext, state: dict) -> str:
+    group_id = state.get("ssh_security_group_id", "")
+    if group_id:
+        if not SECURITY_GROUP_ID.fullmatch(group_id):
+            raise RuntimeError("AWS Mac state has an invalid SSH security group ID")
+        return group_id
+    name = state.get("ssh_security_group_name", "")
+    vpc_id = state.get("vpc_id", "")
+    if not name or not vpc_id:
+        return ""
+    payload = _aws_json(
+        context,
+        "ec2",
+        "describe-security-groups",
+        "--filters",
+        f"Name=group-name,Values={name}",
+        f"Name=vpc-id,Values={vpc_id}",
+        f"Name=tag:senpai:run,Values={state['tag']}",
+        "Name=tag:SenpaiPurpose,Values=ssh",
+    )
+    groups = payload.get("SecurityGroups", [])
+    if len(groups) > 1:
+        raise RuntimeError(
+            f"AWS Mac SSH security group name {name!r} resolved ambiguously"
+        )
+    if not groups:
+        return ""
+    recovered = groups[0].get("GroupId", "")
+    if not isinstance(recovered, str) or not SECURITY_GROUP_ID.fullmatch(recovered):
+        raise RuntimeError("Recovered AWS Mac SSH security group ID is invalid")
+    return recovered
+
+
+def _authorize_ssh(
+    context: AwsContext,
+    security_group_id: str,
+    ssh_cidr: str,
+) -> None:
     permission = json.dumps(
         [
             {
@@ -422,7 +505,7 @@ def _authorize_ssh(plan: AwsMacPlan) -> None:
                 "ToPort": 22,
                 "IpRanges": [
                     {
-                        "CidrIp": plan.ssh_cidr,
+                        "CidrIp": ssh_cidr,
                         "Description": "Senpai AWS Mac operator",
                     }
                 ],
@@ -430,11 +513,11 @@ def _authorize_ssh(plan: AwsMacPlan) -> None:
         ]
     )
     _aws_raw(
-        plan.context,
+        context,
         "ec2",
         "authorize-security-group-ingress",
         "--group-id",
-        plan.security_group_id,
+        security_group_id,
         "--ip-permissions",
         permission,
     )
@@ -461,9 +544,52 @@ def _revoke_ssh(context: AwsContext, state: dict) -> None:
         "ec2",
         "revoke-security-group-ingress",
         "--group-id",
-        state["security_group_id"],
+        state["ssh_security_group_id"],
         "--ip-permissions",
         permission,
+    )
+
+
+def _delete_ssh_security_group(context: AwsContext, group_id: str) -> None:
+    _aws_raw(
+        context,
+        "ec2",
+        "delete-security-group",
+        "--group-id",
+        group_id,
+    )
+
+
+def _security_group_has_ssh_rule(
+    context: AwsContext,
+    group_id: str,
+    ssh_cidr: str,
+) -> bool:
+    if not SECURITY_GROUP_ID.fullmatch(group_id):
+        raise RuntimeError("Legacy AWS Mac state has an invalid security group ID")
+    payload = _aws_json(
+        context,
+        "ec2",
+        "describe-security-groups",
+        "--group-ids",
+        group_id,
+    )
+    groups = payload.get("SecurityGroups", [])
+    if not groups:
+        return False
+    if len(groups) != 1 or groups[0].get("GroupId") != group_id:
+        raise RuntimeError(
+            f"Legacy AWS Mac security group {group_id} resolved ambiguously"
+        )
+    return any(
+        permission.get("IpProtocol") == "tcp"
+        and permission.get("FromPort") == 22
+        and permission.get("ToPort") == 22
+        and any(
+            item.get("CidrIp") == ssh_cidr
+            for item in permission.get("IpRanges", [])
+        )
+        for permission in groups[0].get("IpPermissions", [])
     )
 
 
@@ -484,7 +610,11 @@ def _run_instance(
     host: AwsMacHost,
     key_name: str,
     client_token: str,
+    *,
+    ssh_security_group_id: str,
 ) -> dict:
+    if not SECURITY_GROUP_ID.fullmatch(ssh_security_group_id):
+        raise RuntimeError("AWS Mac launch requires its campaign SSH security group")
     name = f"{args.tag}-{host.student}"
     user_data = _user_data(args.aws_ttl_hours)
     shutdown_behavior = "terminate" if args.aws_ttl_hours else "stop"
@@ -493,7 +623,7 @@ def _run_instance(
             {
                 "DeviceIndex": 0,
                 "SubnetId": host.subnet_id,
-                "Groups": [plan.security_group_id],
+                "Groups": [plan.security_group_id, ssh_security_group_id],
                 "AssociatePublicIpAddress": True,
                 "DeleteOnTermination": True,
             }
@@ -1078,10 +1208,15 @@ def _load_lifecycle_state(tag: str, state_root: str) -> tuple[Path, dict]:
                 f"{AWS_MAC_STATE_BACKEND!r}"
             )
         version = state.get("state_version")
-        if isinstance(version, bool) or version != AWS_MAC_STATE_VERSION:
+        if (
+            isinstance(version, bool)
+            or version not in AWS_MAC_COMPATIBLE_STATE_VERSIONS
+        ):
             raise RuntimeError(
                 f"AWS Mac state version {version!r} is unsupported; expected "
-                f"{AWS_MAC_STATE_VERSION}"
+                + " or ".join(
+                    str(item) for item in sorted(AWS_MAC_COMPATIBLE_STATE_VERSIONS)
+                )
             )
     elif not _is_legacy_mac_state(state):
         raise RuntimeError(
@@ -1136,7 +1271,8 @@ def _cleanup(run_dir: Path, state: dict, context: AwsContext | None = None) -> l
     context = context or _context_from_state(state)
     for node in state.get("nodes", []):
         if (
-            node.get("instance_id")
+            node.get("termination_confirmed")
+            or node.get("instance_id")
             or not node.get("client_token")
             or node.get("launch_failed")
         ):
@@ -1189,35 +1325,55 @@ def _cleanup(run_dir: Path, state: dict, context: AwsContext | None = None) -> l
                     (instance_id, f"native stop {instance_id}: {error}")
                 )
     terminated_ids: set[str] = set()
-    if instance_ids:
-        instances_terminated = False
+    for instance_id in instance_ids:
         try:
             _aws_raw(
                 context,
                 "ec2",
                 "terminate-instances",
                 "--instance-ids",
-                *instance_ids,
+                instance_id,
             )
-            instances_terminated = True
+            terminated_ids.add(instance_id)
         except AwsCommandError as error:
             if _missing_cleanup_resource(error):
-                instances_terminated = True
+                terminated_ids.add(instance_id)
             else:
-                errors.append(f"terminate instances: {error}")
+                errors.append(f"terminate instance {instance_id}: {error}")
         except Exception as error:
-            errors.append(f"terminate instances: {error}")
-        if instances_terminated:
-            for node in state.get("nodes", []):
-                if node.get("instance_id") in instance_ids:
-                    node["instance_id"] = ""
-            terminated_ids.update(instance_ids)
-            _save_state(run_dir, state)
+            errors.append(f"terminate instance {instance_id}: {error}")
+    if terminated_ids:
+        for node in state.get("nodes", []):
+            if node.get("instance_id") in terminated_ids:
+                node["instance_id"] = ""
+                node["termination_confirmed"] = True
+        _save_state(run_dir, state)
     errors.extend(
         message
         for instance_id, message in native_stop_errors
         if instance_id not in terminated_ids
     )
+
+    unresolved_nodes = [
+        node
+        for node in state.get("nodes", [])
+        if node.get("instance_id")
+        or (
+            node.get("client_token")
+            and not node.get("launch_failed")
+            and not node.get("termination_confirmed")
+        )
+    ]
+    if unresolved_nodes:
+        if not errors:
+            errors.append(
+                "AWS Mac instance cleanup is unresolved; retry before removing "
+                "campaign access resources"
+            )
+        state["phase"] = "cleanup-failed"
+        state["cleanup_errors"] = errors
+        _save_state(run_dir, state)
+        return errors
 
     if state.get("key_name") and state.get("key_owned") is not False:
         key_deleted = False
@@ -1247,22 +1403,97 @@ def _cleanup(run_dir: Path, state: dict, context: AwsContext | None = None) -> l
         state.get("ssh_authorize_started")
         and state.get("ssh_authorized") is not False
     )
-    if revoke_ssh:
-        ssh_revoked = False
+    state_version = state.get("state_version")
+    if state_version != AWS_MAC_STATE_VERSION:
+        if revoke_ssh:
+            group_id = state.get("security_group_id", "")
+            ssh_cidr = state.get("ssh_cidr", "")
+            try:
+                rule_exists = _security_group_has_ssh_rule(
+                    context,
+                    group_id,
+                    ssh_cidr,
+                )
+            except AwsCommandError as error:
+                if _missing_cleanup_resource(error):
+                    rule_exists = False
+                else:
+                    errors.append(f"inspect legacy shared SSH rule: {error}")
+                    rule_exists = None
+            except Exception as error:
+                errors.append(f"inspect legacy shared SSH rule: {error}")
+                rule_exists = None
+            if rule_exists:
+                errors.append(
+                    "legacy shared SSH rule was not revoked automatically; "
+                    f"remove {ssh_cidr} from {group_id} only when safe, then "
+                    "rerun terminate"
+                )
+            elif rule_exists is False:
+                state["ssh_authorized"] = False
+                state["ssh_authorize_started"] = False
+                _save_state(run_dir, state)
+    else:
+        group_id = state.get("ssh_security_group_id", "")
         try:
-            _revoke_ssh(context, state)
-            ssh_revoked = True
-        except AwsCommandError as error:
-            if _missing_cleanup_resource(error):
-                ssh_revoked = True
-            else:
-                errors.append(f"revoke SSH ingress: {error}")
+            if (
+                not group_id
+                and state.get("ssh_security_group_create_started")
+                and state.get("ssh_security_group_owned") is not False
+            ):
+                group_id = _recover_ssh_security_group(context, state)
+                if not group_id:
+                    raise RuntimeError(
+                        "AWS Mac SSH security group creation outcome is still "
+                        "unknown; retry cleanup after EC2 discovery catches up"
+                    )
+                state["ssh_security_group_id"] = group_id
+                state["ssh_security_group_owned"] = True
+                _save_state(run_dir, state)
         except Exception as error:
-            errors.append(f"revoke SSH ingress: {error}")
-        if ssh_revoked:
-            state["ssh_authorized"] = False
-            state["ssh_authorize_started"] = False
-            _save_state(run_dir, state)
+            errors.append(f"recover SSH security group: {error}")
+
+        if group_id and state.get("ssh_security_group_owned") is not True:
+            errors.append(
+                f"SSH security group {group_id} is not recorded as campaign-owned"
+            )
+        elif group_id:
+            revoke_error = ""
+            if revoke_ssh:
+                try:
+                    _revoke_ssh(context, state)
+                except AwsCommandError as error:
+                    if not _missing_cleanup_resource(error):
+                        revoke_error = f"revoke SSH ingress: {error}"
+                except Exception as error:
+                    revoke_error = f"revoke SSH ingress: {error}"
+                else:
+                    state["ssh_authorized"] = False
+                    state["ssh_authorize_started"] = False
+                    _save_state(run_dir, state)
+
+            group_deleted = False
+            try:
+                _delete_ssh_security_group(context, group_id)
+                group_deleted = True
+            except AwsCommandError as error:
+                if _missing_cleanup_resource(error):
+                    group_deleted = True
+                else:
+                    if revoke_error:
+                        errors.append(revoke_error)
+                    errors.append(f"delete SSH security group: {error}")
+            except Exception as error:
+                if revoke_error:
+                    errors.append(revoke_error)
+                errors.append(f"delete SSH security group: {error}")
+            if group_deleted:
+                state["ssh_authorized"] = False
+                state["ssh_authorize_started"] = False
+                state["ssh_security_group_id"] = ""
+                state["ssh_security_group_create_started"] = False
+                state["ssh_security_group_owned"] = False
+                _save_state(run_dir, state)
     if errors:
         state["phase"] = "cleanup-failed"
         state["cleanup_errors"] = errors
@@ -1302,7 +1533,14 @@ def _launch_recorded_instance(
     state["nodes"].append(node)
     _save_state(run_dir, state)
     try:
-        launched = _run_instance(args, plan, host, key_name, client_token)
+        launched = _run_instance(
+            args,
+            plan,
+            host,
+            key_name,
+            client_token,
+            ssh_security_group_id=state["ssh_security_group_id"],
+        )
     except AwsCommandError as error:
         if "An error occurred (" in str(error):
             node["launch_failed"] = True
@@ -1373,11 +1611,16 @@ def launch_aws_mac(
         "profile": plan.context.profile,
         "region": plan.context.region,
         "security_group_id": plan.security_group_id,
+        "ssh_security_group_create_started": False,
+        "ssh_security_group_id": "",
+        "ssh_security_group_name": "",
+        "ssh_security_group_owned": None,
         "ssh_authorize_started": False,
         "ssh_authorized": None,
         "ssh_cidr": plan.ssh_cidr,
         "state_version": AWS_MAC_STATE_VERSION,
         "tag": args.tag,
+        "vpc_id": plan.vpc_id,
         "volume_gib": plan.volume_gib,
     }
     _save_state(run_dir, state)
@@ -1419,14 +1662,38 @@ def launch_aws_mac(
         _save_state(run_dir, state)
         _write_private_key(run_dir / "id_ed25519", key["KeyMaterial"])
 
+        ssh_security_group_name = _ssh_security_group_name(args.tag)
+        state["ssh_security_group_name"] = ssh_security_group_name
+        state["ssh_security_group_create_started"] = True
+        _save_state(run_dir, state)
+        try:
+            ssh_security_group_id = _create_ssh_security_group(
+                plan,
+                name=ssh_security_group_name,
+                tag=args.tag,
+            )
+        except AwsCommandError as error:
+            if "An error occurred (" in str(error):
+                state["ssh_security_group_create_started"] = False
+                state["ssh_security_group_owned"] = False
+                _save_state(run_dir, state)
+            raise
+        state["ssh_security_group_id"] = ssh_security_group_id
+        state["ssh_security_group_owned"] = True
+        _save_state(run_dir, state)
+
         state["ssh_authorize_started"] = True
         _save_state(run_dir, state)
         try:
-            _authorize_ssh(plan)
+            _authorize_ssh(
+                plan.context,
+                ssh_security_group_id,
+                plan.ssh_cidr,
+            )
         except AwsCommandError as error:
             if "InvalidPermission.Duplicate" in str(error):
                 state["ssh_authorize_started"] = False
-                state["ssh_authorized"] = False
+                state["ssh_authorized"] = True
                 _save_state(run_dir, state)
             else:
                 raise
