@@ -347,6 +347,72 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
         ]
         self.assertEqual(json.loads(encoded), permissions)
 
+    def test_campaign_ssh_group_tolerates_eventually_consistent_egress_reads(self):
+        permissions = [{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}]
+        with (
+            patch.object(
+                aws_mac_backend,
+                "_aws_json",
+                side_effect=(
+                    {
+                        "SecurityGroups": [
+                            {
+                                "GroupId": "sg-b1",
+                                "IpPermissionsEgress": permissions,
+                            }
+                        ]
+                    },
+                    {
+                        "SecurityGroups": [
+                            {
+                                "GroupId": "sg-b1",
+                                "IpPermissionsEgress": permissions,
+                            }
+                        ]
+                    },
+                    {
+                        "SecurityGroups": [
+                            {"GroupId": "sg-b1", "IpPermissionsEgress": []}
+                        ]
+                    },
+                ),
+            ) as aws_json,
+            patch.object(aws_mac_backend, "_aws_raw"),
+            patch.object(aws_mac_backend.time, "sleep") as sleep,
+        ):
+            aws_mac_backend._harden_ssh_security_group(
+                AwsContext("us-east-1", "sandbox"),
+                "sg-b1",
+            )
+
+        self.assertEqual(aws_json.call_count, 3)
+        sleep.assert_called_once_with(1)
+
+    def test_campaign_ssh_group_fails_closed_after_five_stale_egress_reads(self):
+        permissions = [{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}]
+        group = {
+            "SecurityGroups": [
+                {"GroupId": "sg-b1", "IpPermissionsEgress": permissions}
+            ]
+        }
+        with (
+            patch.object(
+                aws_mac_backend,
+                "_aws_json",
+                side_effect=[group] * 6,
+            ) as aws_json,
+            patch.object(aws_mac_backend, "_aws_raw"),
+            patch.object(aws_mac_backend.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "still permits egress"):
+                aws_mac_backend._harden_ssh_security_group(
+                    AwsContext("us-east-1", "sandbox"),
+                    "sg-b1",
+                )
+
+        self.assertEqual(aws_json.call_count, 6)
+        self.assertEqual(sleep.call_count, 4)
+
     def test_ssh_requires_a_pre_authorized_host_key(self):
         command = aws_mac_backend._ssh_base(
             Path("/tmp/state"),
