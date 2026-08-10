@@ -8,9 +8,11 @@ import math
 import os
 import re
 import subprocess
+import sys
+import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
@@ -30,15 +32,15 @@ from senpai_agent.operations import (
     RoleTarget,
 )
 from senpai_agent.protocols import MANAGEMENT_PROTOCOL_VERSION
+from senpai_agent.repair_broker import RepairResult
+from senpai_agent.repair_executor import DEFAULT_EXECUTOR_SOCKET
 from senpai_agent.role_control import (
     RoleControlRequest,
     RoleControlResponse,
     RoleResearchTail,
     RoleRuntimeState,
 )
-from senpai_agent.repair_broker import RepairResult
-from senpai_agent.repair_executor import DEFAULT_EXECUTOR_SOCKET
-
+from senpai_agent.supervisor_pause import RepairPauseAcknowledgement
 
 _LABEL_VALUE = re.compile(r"^[A-Za-z0-9](?:[-_.A-Za-z0-9]{0,61}[A-Za-z0-9])?$")
 _ERROR_MARKER = re.compile(
@@ -193,7 +195,7 @@ class KubectlCampaignBackend(OperationBackend):
         cwd: str,
         timeout_seconds: int,
     ) -> RepairResult:
-        """Execute arbitrary shell only in the target's secret-free repair sidecar."""
+        """Quiesce the role, then run shell in its secret-free repair sidecar."""
 
         self.inventory.require(target)
         roots = {
@@ -206,6 +208,88 @@ class KubectlCampaignBackend(OperationBackend):
         except KeyError as error:
             raise ValueError(f"unsupported repair working directory: {cwd}") from error
         pod = self._pod(target)
+        lease_id = f"repair-{uuid4()}"
+        pause_duration_seconds = timeout_seconds + 180
+        pause_command = (
+            self.kubectl,
+            "exec",
+            "-i",
+            "-n",
+            self.namespace,
+            pod,
+            "-c",
+            target.role,
+            "--",
+            "/opt/senpai-venv/bin/python",
+            "-I",
+            "-m",
+            "senpai_agent.supervisor",
+            "repair-pause",
+            "--lease-id",
+            lease_id,
+            "--duration-seconds",
+            str(pause_duration_seconds),
+            "--wait-seconds",
+            "90",
+        )
+        resume_command = (
+            self.kubectl,
+            "exec",
+            "-i",
+            "-n",
+            self.namespace,
+            pod,
+            "-c",
+            target.role,
+            "--",
+            "/opt/senpai-venv/bin/python",
+            "-I",
+            "-m",
+            "senpai_agent.supervisor",
+            "repair-resume",
+            "--lease-id",
+            lease_id,
+        )
+
+        def resume_role() -> None:
+            output = self._run(resume_command, timeout_seconds=45)
+            try:
+                receipt = json.loads(output)
+            except (TypeError, ValueError) as error:
+                raise KubernetesOperationError(
+                    "role returned an invalid repair-resume receipt"
+                ) from error
+            if receipt != {"lease_id": lease_id, "released": True}:
+                raise KubernetesOperationError(
+                    "role returned a mismatched repair-resume receipt"
+                )
+
+        try:
+            pause_output = self._run(pause_command, timeout_seconds=105)
+        except BaseException:
+            try:
+                resume_role()
+            except Exception as resume_error:  # noqa: BLE001
+                self._log_resume_failure(target, resume_error)
+            raise
+        try:
+            pause_receipt = RepairPauseAcknowledgement(
+                **json.loads(pause_output)
+            )
+            if (
+                pause_receipt.lease_id != lease_id
+                or pause_receipt.expires_at <= time.time()
+                or pause_receipt.acknowledged_at > time.time() + 5
+            ):
+                raise ValueError("mismatched or expired repair-pause lease")
+        except (TypeError, ValueError) as error:
+            try:
+                resume_role()
+            except Exception as resume_error:  # noqa: BLE001
+                self._log_resume_failure(target, resume_error)
+            raise KubernetesOperationError(
+                "role returned an invalid repair-pause acknowledgement"
+            ) from error
         transport = (
             self.kubectl,
             "exec",
@@ -227,22 +311,54 @@ class KubectlCampaignBackend(OperationBackend):
             "--timeout",
             str(timeout_seconds),
         )
-        output = self._run(
-            transport,
-            input_text=command,
-            timeout_seconds=timeout_seconds + 15,
-        )
+        try:
+            output = self._run(
+                transport,
+                input_text=command,
+                timeout_seconds=timeout_seconds + 15,
+            )
+        except BaseException:
+            try:
+                resume_role()
+            except Exception as resume_error:  # noqa: BLE001
+                self._log_resume_failure(target, resume_error)
+            raise
+        resume_error: Exception | None = None
+        try:
+            resume_role()
+        except Exception as error:  # noqa: BLE001
+            resume_error = error
         try:
             response = json.loads(output)
             if response.get("outcome") == "unknown":
                 raise KubernetesOperationError(
                     "repair executor lost its authoritative response"
                 )
-            return RepairResult.model_validate(response)
+            result = RepairResult.model_validate(response)
         except (AttributeError, TypeError, ValueError) as error:
             raise KubernetesOperationError(
                 "repair sidecar returned invalid JSON"
             ) from error
+        if resume_error is None:
+            return result
+        return result.model_copy(
+            update={
+                "controller_resumed": False,
+                "resume_error_type": type(resume_error).__name__,
+            }
+        )
+
+    @staticmethod
+    def _log_resume_failure(
+        target: RoleTarget,
+        error: BaseException,
+    ) -> None:
+        print(
+            "SENPAI_REPAIR_RESUME_FAILED "
+            f"target={target.key} error_type={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def collect_runtimes(
         self,

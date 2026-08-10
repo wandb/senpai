@@ -33,6 +33,7 @@ from senpai_agent.repair_executor import (
     REPAIR_STREAM_LIMIT_BYTES,
     execute_local_repair,
 )
+from senpai_agent.supervisor_pause import REPAIR_PAUSE_PROTOCOL
 
 
 class RecordingRepairBackend:
@@ -207,6 +208,43 @@ def test_role_shell_requires_a_stable_operation_id_before_execution(capsys):
     assert "--operation-id is required" in capsys.readouterr().err
 
 
+def test_role_shell_surfaces_a_completed_repair_whose_controller_did_not_resume(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(
+        RepairBrokerClient,
+        "execute",
+        lambda *_args, **_kwargs: RepairResult(
+            exit_code=0,
+            stdout="fixed",
+            stderr="",
+            controller_resumed=False,
+            resume_error_type="KubernetesOperationError",
+        ),
+    )
+
+    exit_code = repair_broker_main(
+        [
+            "repair",
+            "--research-tag",
+            "maple",
+            "--role",
+            "advisor",
+            "--operation-id",
+            "repair-resume-warning",
+            "--command",
+            "true",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert exit_code == 75
+    assert output.out == "fixed"
+    assert "SENPAI_REPAIR_CONTROLLER_NOT_RESUMED" in output.err
+    assert "KubernetesOperationError" in output.err
+
+
 def test_kubectl_repair_transport_executes_only_the_repair_sidecar(monkeypatch):
     backend = KubectlCampaignBackend(inventory(), namespace="research")
     calls = []
@@ -214,6 +252,20 @@ def test_kubectl_repair_transport_executes_only_the_repair_sidecar(monkeypatch):
 
     def record(command, *, input_text=None, timeout_seconds=None):
         calls.append((command, input_text, timeout_seconds))
+        lease_id = command[command.index("--lease-id") + 1] if "--lease-id" in command else None
+        if "repair-pause" in command:
+            now = time.time()
+            return json.dumps(
+                {
+                    "protocol": REPAIR_PAUSE_PROTOCOL,
+                    "lease_id": lease_id,
+                    "expires_at": now + 300,
+                    "acknowledged_at": now,
+                    "supervisor_pid": os.getpid(),
+                }
+            )
+        if "repair-resume" in command:
+            return json.dumps({"lease_id": lease_id, "released": True})
         return json.dumps({"exit_code": 0, "stdout": "ok", "stderr": ""})
 
     monkeypatch.setattr(backend, "_run", record)
@@ -225,7 +277,7 @@ def test_kubectl_repair_transport_executes_only_the_repair_sidecar(monkeypatch):
         timeout_seconds=90,
     )
 
-    command, input_text, timeout = calls[0]
+    command, input_text, timeout = calls[1]
     assert result.exit_code == 0
     assert command[command.index("-c") + 1] == "repair"
     assert "student" not in command
@@ -243,6 +295,9 @@ def test_kubectl_repair_transport_executes_only_the_repair_sidecar(monkeypatch):
     assert DEFAULT_EXECUTOR_SOCKET.startswith("/run/senpai-repair-executor/")
     assert input_text == "env && git status"
     assert timeout == 105
+    assert "repair-pause" in calls[0][0]
+    assert calls[0][0][calls[0][0].index("-c") + 1] == "student"
+    assert "repair-resume" in calls[2][0]
 
 
 def test_kubectl_transport_uses_an_explicit_secret_free_environment(monkeypatch):
@@ -482,7 +537,15 @@ def test_repair_ledger_retains_only_the_newest_128_full_receipts(tmp_path):
             assert ledger.reserve(request).execute is True
             ledger.complete(
                 request.operation_id,
-                RepairResult(exit_code=index, stdout=f"receipt-{index}", stderr=""),
+                RepairResult(
+                    exit_code=index,
+                    stdout=f"receipt-{index}",
+                    stderr="",
+                    controller_resumed=index != 0,
+                    resume_error_type=(
+                        "KubernetesOperationError" if index == 0 else None
+                    ),
+                ),
             )
 
         oldest = ledger.status(requests[0].operation_id)
@@ -497,6 +560,8 @@ def test_repair_ledger_retains_only_the_newest_128_full_receipts(tmp_path):
     assert oldest.receipt_retained is False
     assert oldest.result is None
     assert oldest.exit_code == 0
+    assert oldest.controller_resumed is False
+    assert oldest.resume_error_type == "KubernetesOperationError"
     assert oldest.payload_pruned_at is not None
     assert oldest.command_fingerprint == requests[0].command_fingerprint
     assert newest.receipt_retained is True

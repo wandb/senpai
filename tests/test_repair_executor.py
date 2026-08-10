@@ -367,7 +367,7 @@ def test_default_executor_socket_is_scoped_to_the_repair_only_mount():
         "/run/senpai-repair-executor/executor.sock"
     )
     assert repair_executor._health_socket_path(DEFAULT_EXECUTOR_SOCKET) == (
-        "@senpai-repair-executor-health-v2"
+        "@senpai-repair-executor-health-v3"
     )
     assert REPAIR_EXECUTOR_PROTOCOL == REPAIR_PROTOCOL_VERSION
 

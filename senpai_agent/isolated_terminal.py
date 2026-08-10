@@ -31,6 +31,7 @@ from senpai_agent.repair_executor import (
     kill_process_tree,
     reap_children,
 )
+from senpai_agent.protocols import ISOLATED_TERMINAL_PROTOCOL_VERSION
 from senpai_agent.socket_framing import (
     SocketFrameError,
     SocketFrameTooLarge,
@@ -40,7 +41,7 @@ from senpai_agent.socket_framing import (
 )
 
 
-TERMINAL_PROTOCOL = "senpai-isolated-terminal/v1"
+TERMINAL_PROTOCOL = ISOLATED_TERMINAL_PROTOCOL_VERSION
 DEFAULT_TERMINAL_SOCKET = "@senpai-isolated-terminal"
 _MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 _CONNECT_ATTEMPTS = 20

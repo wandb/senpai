@@ -1,5 +1,4 @@
 import yaml
-
 from launch_test_support import (
     ROOT,
     launch,
@@ -303,15 +302,15 @@ def test_supervisor_health_uses_authoritative_terminal_and_repair_checks():
 
     for probe_name in ("startupProbe", "livenessProbe"):
         control_health = control[probe_name]["exec"]["command"][-1]
-        assert "senpai_agent.isolated_terminal health" in control_health
+        assert "senpai_agent.isolated_terminal_health" in control_health
         assert "@senpai-isolated-terminal" in control_health
-        assert "test -S /run/senpai-repair/repair.sock" in control_health
+        assert "senpai_agent.repair_broker_health" in control_health
+        assert "--socket /run/senpai-repair/repair.sock" in control_health
         assert shell[probe_name]["exec"]["command"] == [
             "/opt/senpai-venv/bin/python",
             "-I",
             "-m",
-            "senpai_agent.isolated_terminal",
-            "health",
+            "senpai_agent.isolated_terminal_health",
             "--socket",
             "@senpai-isolated-terminal",
         ]
@@ -374,6 +373,22 @@ def test_supervised_roles_have_protocol_bound_repair_of_the_target_workspace():
             "readOnly": True,
         }
         assert main_mounts["target-workspace"]["mountPath"] == "/workspace/target"
+        assert main_mounts["supervisor-control"]["mountPath"] == (
+            "/run/senpai-supervisor-control"
+        )
+        assert "supervisor-control" not in repair_mounts
+        assert (
+            "mkdir -p /run/senpai-supervisor-control/private"
+            in main["args"][0]
+        )
+        assert (
+            "chmod 0700 /run/senpai-supervisor-control/private"
+            in main["args"][0]
+        )
+        assert (
+            "export SENPAI_SUPERVISOR_CONTROL_DIR=/run/senpai-supervisor-control/private"
+            in main["args"][0]
+        )
         assert config["SENPAI_WORKDIR"] == "/workspace/senpai"
         assert config["SENPAI_TARGET_WORKDIR"] == "/workspace/target"
         assert config["SENPAI_SKIP_EDITABLE_INSTALL"] == "1"
@@ -412,6 +427,10 @@ def test_supervised_roles_have_protocol_bound_repair_of_the_target_workspace():
         assert volumes["repair-scratch"]["emptyDir"]["sizeLimit"] == "4Gi"
         assert volumes["repair-tmp"]["emptyDir"]["sizeLimit"] == "8Gi"
         assert volumes["repair-executor-socket"]["emptyDir"] == {
+            "medium": "Memory",
+            "sizeLimit": "1Mi",
+        }
+        assert volumes["supervisor-control"]["emptyDir"] == {
             "medium": "Memory",
             "sizeLimit": "1Mi",
         }

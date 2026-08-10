@@ -14,12 +14,14 @@ from pydantic import SecretStr
 import senpai_agent.supervisor as supervisor_module
 from senpai_agent.operations import RestartRequest, RestartRequestStore, RoleTarget
 from senpai_agent.supervisor import (
+    CONTROL_DIR_ENV,
     GENERATION_ENV,
     ProgressLease,
     SupervisorConfig,
     WorkerLease,
     WorkerSupervisor,
 )
+from senpai_agent.supervisor_pause import RepairPauseStore
 
 
 def wait_for(path: Path, timeout: float = 5) -> None:
@@ -240,6 +242,212 @@ while True:
     assert not thread.is_alive()
     assert results == [0]
     assert int((tmp_path / "starts").read_text()) >= 2
+
+
+def test_repair_pause_stops_worker_before_ack_and_blocks_restart(tmp_path: Path):
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        """
+import json
+import os
+import time
+from pathlib import Path
+
+state = Path(os.environ["SENPAI_CONTROLLER_LEASE_PATH"]).parent
+with (state / "starts").open("a") as output:
+    output.write(f"{os.getpid()}\\n")
+lease = state / "controller-lease.json"
+lease.write_text(json.dumps({
+    "pid": os.getpid(),
+    "phase": "sleep",
+    "deadline": time.monotonic() + 30,
+}))
+while True:
+    time.sleep(1)
+""".strip()
+    )
+    control_dir = tmp_path / "control"
+    stop = threading.Event()
+    supervisor = WorkerSupervisor(
+        command=(sys.executable, str(worker)),
+        lease_path=tmp_path / "controller-lease.json",
+        control_dir=control_dir,
+        config=SupervisorConfig(
+            startup_timeout_seconds=1,
+            check_interval_seconds=0.01,
+            terminate_grace_seconds=0.1,
+            initial_backoff_seconds=0.01,
+            max_backoff_seconds=0.01,
+        ),
+    )
+    thread, results = run_supervisor(supervisor, stop)
+    wait_for(tmp_path / "controller-lease.json")
+    store = RepairPauseStore(control_dir)
+
+    pause = store.request("repair-lease-1", duration_seconds=10)
+    acknowledged = store.wait_for_acknowledgement(
+        pause,
+        timeout_seconds=5,
+    )
+    starts_while_paused = (tmp_path / "starts").read_text().splitlines()
+    time.sleep(0.1)
+
+    assert acknowledged.supervisor_pid == os.getpid()
+    assert (tmp_path / "starts").read_text().splitlines() == starts_while_paused
+    assert not (tmp_path / "controller-lease.json").exists()
+
+    store.release(pause.lease_id)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if len((tmp_path / "starts").read_text().splitlines()) >= 2:
+            break
+        time.sleep(0.01)
+    stop.set()
+    thread.join(5)
+
+    assert results == [0]
+    assert len((tmp_path / "starts").read_text().splitlines()) >= 2
+
+
+def test_health_accepts_only_an_acknowledged_live_repair_pause(tmp_path: Path):
+    control_dir = tmp_path / "control"
+    store = RepairPauseStore(control_dir)
+    pause = store.request("repair-lease-health", duration_seconds=30)
+
+    assert supervisor_module.lease_is_healthy(
+        tmp_path / "missing-lease.json",
+        control_dir=control_dir,
+    ) is False
+
+    store.acknowledge(pause, supervisor_pid=os.getpid())
+
+    assert supervisor_module.lease_is_healthy(
+        tmp_path / "missing-lease.json",
+        control_dir=control_dir,
+    ) is True
+
+    store.release(pause.lease_id)
+    assert supervisor_module.lease_is_healthy(
+        tmp_path / "missing-lease.json",
+        control_dir=control_dir,
+    ) is False
+
+
+def test_concurrent_repair_pause_cannot_destroy_the_active_acknowledgement(
+    tmp_path: Path,
+):
+    store = RepairPauseStore(tmp_path / "control")
+    pause = store.request("repair-active", duration_seconds=30)
+    acknowledgement = store.acknowledge(pause, supervisor_pid=os.getpid())
+
+    with pytest.raises(RuntimeError, match="already active"):
+        store.request("repair-racing", duration_seconds=30)
+
+    assert store.acknowledgement() == acknowledgement
+
+
+def test_repair_pause_requires_the_role_network_listener_boundary_to_be_empty(
+    tmp_path: Path,
+    monkeypatch,
+):
+    supervisor = WorkerSupervisor(
+        command=("worker",),
+        lease_path=tmp_path / "controller-lease.json",
+        control_dir=tmp_path / "control",
+        config=SupervisorConfig(
+            check_interval_seconds=0.001,
+            terminate_grace_seconds=0.005,
+        ),
+    )
+    monkeypatch.setattr(supervisor, "_network_listeners_absent", lambda: False)
+
+    assert supervisor._repair_boundary_is_quiescent(
+        {},
+        worker_ownership_token="worker-token",
+    ) is False
+
+    monkeypatch.setattr(supervisor, "_network_listeners_absent", lambda: True)
+    assert supervisor._repair_boundary_is_quiescent(
+        {},
+        worker_ownership_token="worker-token",
+    ) is True
+
+
+def test_worker_ownership_scan_selects_only_the_exact_inherited_capability(
+    tmp_path: Path,
+):
+    for pid, environment in (
+        ("41", b"SENPAI_WORKER_OWNERSHIP_TOKEN=owned\0OTHER=x\0"),
+        ("42", b"SENPAI_WORKER_OWNERSHIP_TOKEN=other\0"),
+        ("self", b"SENPAI_WORKER_OWNERSHIP_TOKEN=owned\0"),
+    ):
+        process = tmp_path / pid
+        process.mkdir()
+        (process / "environ").write_bytes(environment)
+
+    assert WorkerSupervisor._owned_worker_pids(
+        "owned",
+        proc_root=tmp_path,
+        require_pid_one=False,
+    ) == (41,)
+
+def test_repair_pause_cli_round_trip_uses_the_private_control_directory(
+    tmp_path: Path,
+):
+    control_dir = tmp_path / "control"
+    store = RepairPauseStore(control_dir)
+    environment = {**os.environ, CONTROL_DIR_ENV: str(control_dir)}
+
+    def acknowledge() -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            pause = store.current()
+            if pause is not None:
+                store.acknowledge(pause, supervisor_pid=os.getpid())
+                return
+            time.sleep(0.01)
+        raise TimeoutError("pause request not observed")
+
+    acknowledger = threading.Thread(target=acknowledge)
+    acknowledger.start()
+    paused = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "senpai_agent.supervisor",
+            "repair-pause",
+            "--lease-id",
+            "repair-cli-1",
+            "--duration-seconds",
+            "30",
+            "--wait-seconds",
+            "5",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    acknowledger.join(5)
+    resumed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "senpai_agent.supervisor",
+            "repair-resume",
+            "--lease-id",
+            "repair-cli-1",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert paused.returncode == 0
+    assert json.loads(paused.stdout)["lease_id"] == "repair-cli-1"
+    assert resumed.returncode == 0
+    assert store.current() is None
 
 
 def test_worker_uptime_without_a_completed_turn_does_not_reset_restart_backoff(

@@ -445,16 +445,25 @@ def role_supervisor_replacements(
         ),
         "ROLE_BOOTSTRAP": '''          cd /workspace/senpai
           test "$(git rev-parse HEAD)" = "$REPO_REVISION"
-          test "$SENPAI_IMAGE_REVISION" = "$REPO_REVISION"''',
+          test "$SENPAI_IMAGE_REVISION" = "$REPO_REVISION"
+          mkdir -p /run/senpai-supervisor-control/private
+          chmod 0700 /run/senpai-supervisor-control/private
+          export SENPAI_SUPERVISOR_CONTROL_DIR=/run/senpai-supervisor-control/private''',
         "ROLE_WORKSPACE_MOUNTS": """        - name: runner
           mountPath: /workspace/senpai
           readOnly: true
         - name: target-workspace
-          mountPath: /workspace/target""",
+          mountPath: /workspace/target
+        - name: supervisor-control
+          mountPath: /run/senpai-supervisor-control""",
         "ROLE_WORKSPACE_VOLUMES": """      - name: runner
         emptyDir: {}
       - name: target-workspace
-        emptyDir: {}""",
+        emptyDir: {}
+      - name: supervisor-control
+        emptyDir:
+          medium: Memory
+          sizeLimit: 1Mi""",
         "REPAIR_CONTAINER": f"""      - name: repair
         image: {rendered_image}
         securityContext:

@@ -27,8 +27,8 @@ from senpai_agent.operational_supervisor import (
     SupervisorStateStore,
     WandbActivity,
     WandbRunCollector,
-    _run_fresh_supervisor_turn,
     _reconcile_terminal_after_control_restart,
+    _run_fresh_supervisor_turn,
     collect_campaign_snapshot,
     compose_research_review_prompt,
     compose_supervisor_prompt,
@@ -37,7 +37,6 @@ from senpai_agent.operational_supervisor import (
 )
 from senpai_agent.operations import OperationAuditRecord, RoleTarget
 from senpai_agent.repair_broker import RepairAuditRecord
-
 
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
 
@@ -98,6 +97,8 @@ def repair_audit_record(
         status=status,
         receipt_retained=status == "completed",
         exit_code=0 if status == "completed" else None,
+        controller_resumed=True if status == "completed" else None,
+        resume_error_type=None,
         payload_pruned_at=None,
         error_type=None,
     )

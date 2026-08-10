@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID
@@ -16,7 +18,7 @@ from senpai_agent.role_control import (
     RoleResearchTailItem,
     RoleRuntimeState,
 )
-
+from senpai_agent.supervisor_pause import REPAIR_PAUSE_PROTOCOL
 
 CONVERSATION_ID = UUID("00000000-0000-0000-0000-000000000301")
 
@@ -27,6 +29,28 @@ def inventory() -> CampaignInventory:
         repo="example/research",
         advisor_branch="maple-advisor",
         students=("fern",),
+    )
+
+
+def pause_receipt(command) -> str:
+    now = time.time()
+    return json.dumps(
+        {
+            "protocol": REPAIR_PAUSE_PROTOCOL,
+            "lease_id": command[command.index("--lease-id") + 1],
+            "expires_at": now + 300,
+            "acknowledged_at": now,
+            "supervisor_pid": os.getpid(),
+        }
+    )
+
+
+def resume_receipt(command) -> str:
+    return json.dumps(
+        {
+            "lease_id": command[command.index("--lease-id") + 1],
+            "released": True,
+        }
     )
 
 
@@ -355,3 +379,152 @@ def test_backend_rejects_missing_or_stale_role_management_protocol(
                 command="observe",
             ),
         )
+
+
+def test_repair_quiesces_the_role_before_entering_the_secret_free_sidecar(
+    monkeypatch,
+):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    target = RoleTarget(research_tag="maple", role="student", student="fern")
+    calls = []
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-maple-fern")
+
+    def run(command, **kwargs):
+        calls.append((tuple(command), kwargs))
+        if "repair-pause" in command:
+            return pause_receipt(command)
+        if "repair-resume" in command:
+            return resume_receipt(command)
+        return json.dumps(
+            {
+                "exit_code": 0,
+                "stdout": "repaired",
+                "stderr": "",
+            }
+        )
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    result = backend.run_repair(
+        target,
+        command="git status --short",
+        cwd="workspace",
+        timeout_seconds=300,
+    )
+
+    commands = [call[0] for call in calls]
+    assert "repair-pause" in commands[0]
+    assert commands[0][commands[0].index("-c") + 1] == "student"
+    assert commands[1][commands[1].index("-c") + 1] == "repair"
+    assert "repair-resume" in commands[2]
+    assert result.stdout == "repaired"
+
+
+def test_repair_releases_the_pause_when_sidecar_transport_fails(monkeypatch):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    target = RoleTarget(research_tag="maple", role="advisor")
+    calls = []
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-advisor-maple")
+
+    def run(command, **kwargs):
+        calls.append(tuple(command))
+        if "repair-pause" in command:
+            return pause_receipt(command)
+        if "repair-resume" in command:
+            return resume_receipt(command)
+        raise RuntimeError("repair transport failed")
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    with pytest.raises(RuntimeError, match="repair transport failed"):
+        backend.run_repair(
+            target,
+            command="true",
+            cwd="workspace",
+            timeout_seconds=60,
+        )
+
+    assert "repair-resume" in calls[-1]
+
+
+def test_repair_preserves_a_completed_result_when_resume_fails(monkeypatch):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    target = RoleTarget(research_tag="maple", role="advisor")
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-advisor-maple")
+
+    def run(command, **kwargs):
+        if "repair-pause" in command:
+            return pause_receipt(command)
+        if "repair-resume" in command:
+            raise RuntimeError("resume transport unavailable")
+        return json.dumps({"exit_code": 0, "stdout": "done", "stderr": ""})
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    result = backend.run_repair(
+        target,
+        command="true",
+        cwd="workspace",
+        timeout_seconds=60,
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == "done"
+    assert result.controller_resumed is False
+    assert result.resume_error_type == "RuntimeError"
+
+
+@pytest.mark.parametrize("pause_failure", ["invalid-receipt", "lost-reply"])
+def test_uncertain_pause_outcome_is_always_released(
+    monkeypatch,
+    pause_failure,
+):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    target = RoleTarget(research_tag="maple", role="advisor")
+    calls = []
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-advisor-maple")
+
+    def run(command, **kwargs):
+        calls.append(tuple(command))
+        if "repair-resume" in command:
+            return resume_receipt(command)
+        if "repair-pause" in command and pause_failure == "lost-reply":
+            raise RuntimeError("pause reply was lost")
+        return "{}"
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    with pytest.raises(RuntimeError):
+        backend.run_repair(
+            target,
+            command="true",
+            cwd="workspace",
+            timeout_seconds=60,
+        )
+
+    assert "repair-resume" in calls[-1]
+
+
+def test_invalid_resume_receipt_is_retained_on_the_repair_result(monkeypatch):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    target = RoleTarget(research_tag="maple", role="advisor")
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-advisor-maple")
+
+    def run(command, **kwargs):
+        if "repair-pause" in command:
+            return pause_receipt(command)
+        if "repair-resume" in command:
+            return json.dumps({"released": True})
+        return json.dumps({"exit_code": 0, "stdout": "done", "stderr": ""})
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    result = backend.run_repair(
+        target,
+        command="true",
+        cwd="workspace",
+        timeout_seconds=60,
+    )
+
+    assert result.controller_resumed is False
+    assert result.resume_error_type == "KubernetesOperationError"

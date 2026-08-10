@@ -36,7 +36,6 @@ from senpai_agent.secrets import (
     consume_supervisor_secret_directory,
 )
 
-
 OPERATIONAL_INTERVAL = timedelta(minutes=15)
 RESEARCH_REVIEW_INTERVAL = timedelta(hours=6)
 _NonEmpty = Annotated[str, Field(min_length=1)]
@@ -1156,6 +1155,8 @@ def _repair_audit_view(
             "status": record.status,
             "receipt_retained": record.receipt_retained,
             "exit_code": record.exit_code,
+            "controller_resumed": record.controller_resumed,
+            "resume_error_type": record.resume_error_type,
             "payload_pruned_at": (
                 record.payload_pruned_at.isoformat()
                 if record.payload_pruned_at is not None

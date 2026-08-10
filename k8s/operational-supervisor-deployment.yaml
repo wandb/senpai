@@ -250,7 +250,7 @@ spec:
             command:
             - /bin/sh
             - -c
-            - /opt/senpai-venv/bin/python -I -m senpai_agent.isolated_terminal health --socket '@senpai-isolated-terminal' && test -S /run/senpai-repair/repair.sock && /opt/senpai-venv/bin/python -I -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
+            - /opt/senpai-venv/bin/python -I -m senpai_agent.isolated_terminal_health --socket '@senpai-isolated-terminal' && /opt/senpai-venv/bin/python -I -m senpai_agent.repair_broker_health --socket /run/senpai-repair/repair.sock && /opt/senpai-venv/bin/python -I -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 60
@@ -259,7 +259,7 @@ spec:
             command:
             - /bin/sh
             - -c
-            - /opt/senpai-venv/bin/python -I -m senpai_agent.isolated_terminal health --socket '@senpai-isolated-terminal' && test -S /run/senpai-repair/repair.sock && /opt/senpai-venv/bin/python -I -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
+            - /opt/senpai-venv/bin/python -I -m senpai_agent.isolated_terminal_health --socket '@senpai-isolated-terminal' && /opt/senpai-venv/bin/python -I -m senpai_agent.repair_broker_health --socket /run/senpai-repair/repair.sock && /opt/senpai-venv/bin/python -I -m senpai_agent.operational_supervisor health "/var/lib/senpai/$RESEARCH_TAG/operational-supervisor/lease.json"
           periodSeconds: 30
           timeoutSeconds: 5
           failureThreshold: 5
@@ -319,13 +319,13 @@ spec:
             ephemeral-storage: "20Gi"
         startupProbe:
           exec:
-            command: ["/opt/senpai-venv/bin/python", "-I", "-m", "senpai_agent.isolated_terminal", "health", "--socket", "@senpai-isolated-terminal"]
+            command: ["/opt/senpai-venv/bin/python", "-I", "-m", "senpai_agent.isolated_terminal_health", "--socket", "@senpai-isolated-terminal"]
           periodSeconds: 5
           timeoutSeconds: 2
           failureThreshold: 120
         livenessProbe:
           exec:
-            command: ["/opt/senpai-venv/bin/python", "-I", "-m", "senpai_agent.isolated_terminal", "health", "--socket", "@senpai-isolated-terminal"]
+            command: ["/opt/senpai-venv/bin/python", "-I", "-m", "senpai_agent.isolated_terminal_health", "--socket", "@senpai-isolated-terminal"]
           periodSeconds: 30
           timeoutSeconds: 2
           failureThreshold: 5

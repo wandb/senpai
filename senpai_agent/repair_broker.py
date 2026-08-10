@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import sys
 import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -22,12 +23,17 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from senpai_agent.operations import CampaignInventory, RoleTarget
 from senpai_agent.protocols import REPAIR_PROTOCOL_VERSION
+from senpai_agent.repair_broker_health import (
+    REPAIR_BROKER_HEALTH_PROTOCOL,
+    repair_broker_health_socket,
+)
 from senpai_agent.repair_executor import REPAIR_STREAM_LIMIT_CHARS
 from senpai_agent.socket_framing import (
     SocketFrameError,
     SocketFrameTooLarge,
     encode_json_frame,
     receive_frame,
+    unix_socket_address,
 )
 from senpai_agent.sqlite_store import initialize_sqlite_store
 
@@ -35,6 +41,7 @@ _MAX_MESSAGE_BYTES = 2 * 1024 * 1024
 _REQUEST_READ_TIMEOUT_SECONDS = 5
 _RESPONSE_GRACE_SECONDS = 30
 _RETAINED_REPAIR_PAYLOADS = 128
+_BROKER_HEALTH_FRAME_LIMIT_BYTES = 16 * 1024
 _Fingerprint = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
@@ -128,11 +135,19 @@ class RepairResult(_Contract):
     stderr: str = Field(max_length=REPAIR_STREAM_LIMIT_CHARS)
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+    controller_resumed: bool = True
+    resume_error_type: str | None = None
 
     @field_validator("stdout", "stderr")
     @classmethod
     def output_is_valid_utf8(cls, value: str) -> str:
         return value.encode("utf-8", errors="replace").decode("utf-8")
+
+    @model_validator(mode="after")
+    def resume_metadata_is_consistent(self) -> RepairResult:
+        if self.controller_resumed == (self.resume_error_type is not None):
+            raise ValueError("repair controller-resume metadata is inconsistent")
+        return self
 
 
 RepairOperationState = Literal["running", "completed", "failed", "unknown"]
@@ -149,6 +164,8 @@ class RepairOperationStatus(_Contract):
     status: RepairOperationState
     receipt_retained: bool
     exit_code: int | None
+    controller_resumed: bool | None
+    resume_error_type: str | None
     payload_pruned_at: datetime | None
     result: RepairResult | None = None
     error_type: str | None = None
@@ -161,6 +178,13 @@ class RepairOperationStatus(_Contract):
             raise ValueError("repair receipt exit code is inconsistent")
         if self.receipt_retained and self.payload_pruned_at is not None:
             raise ValueError("retained repair receipt cannot have a prune timestamp")
+        if self.status == "completed":
+            if self.controller_resumed is None:
+                raise ValueError("completed repair must record controller recovery")
+            if self.controller_resumed == (self.resume_error_type is not None):
+                raise ValueError("repair controller-resume metadata is inconsistent")
+        elif self.controller_resumed is not None or self.resume_error_type is not None:
+            raise ValueError("unfinished repair cannot record controller recovery")
         return self
 
 
@@ -175,6 +199,8 @@ class RepairAuditRecord(_Contract):
     status: RepairOperationState
     receipt_retained: bool
     exit_code: int | None
+    controller_resumed: bool | None
+    resume_error_type: str | None
     payload_pruned_at: datetime | None
     error_type: str | None
 
@@ -261,6 +287,8 @@ class RepairLedger:
                 error_type TEXT,
                 receipt_retained INTEGER NOT NULL DEFAULT 0,
                 exit_code INTEGER,
+                controller_resumed INTEGER,
+                resume_error_type TEXT,
                 payload_pruned_at REAL
             )
             """
@@ -280,6 +308,12 @@ class RepairLedger:
             "payload_pruned_at": (
                 "ALTER TABLE repair_operations ADD COLUMN payload_pruned_at REAL"
             ),
+            "controller_resumed": (
+                "ALTER TABLE repair_operations ADD COLUMN controller_resumed INTEGER"
+            ),
+            "resume_error_type": (
+                "ALTER TABLE repair_operations ADD COLUMN resume_error_type TEXT"
+            ),
         }
         for column, statement in migrations.items():
             if column not in columns:
@@ -295,7 +329,8 @@ class RepairLedger:
             """
             SELECT operation_id, result_json
             FROM repair_operations
-            WHERE result_json IS NOT NULL AND exit_code IS NULL
+            WHERE result_json IS NOT NULL
+              AND (exit_code IS NULL OR controller_resumed IS NULL)
             """
         ).fetchall()
         for row in legacy_receipts:
@@ -303,11 +338,24 @@ class RepairLedger:
             connection.execute(
                 """
                 UPDATE repair_operations
-                SET receipt_retained = 1, exit_code = ?
+                SET receipt_retained = 1, exit_code = ?,
+                    controller_resumed = ?, resume_error_type = ?
                 WHERE operation_id = ?
                 """,
-                (result.exit_code, row["operation_id"]),
+                (
+                    result.exit_code,
+                    result.controller_resumed,
+                    result.resume_error_type,
+                    row["operation_id"],
+                ),
             )
+        connection.execute(
+            """
+            UPDATE repair_operations
+            SET controller_resumed = 1
+            WHERE status = 'completed' AND controller_resumed IS NULL
+            """
+        )
 
     def recover_interrupted(self) -> None:
         """Make pre-restart executions explicitly ambiguous without replaying them."""
@@ -448,6 +496,7 @@ class RepairLedger:
                     UPDATE repair_operations
                     SET status = ?, completed_at = ?, result_json = ?,
                         receipt_retained = ?, exit_code = ?,
+                        controller_resumed = ?, resume_error_type = ?,
                         payload_pruned_at = NULL, error_type = ?
                     WHERE operation_id = ? AND status = 'running'
                     """,
@@ -457,6 +506,8 @@ class RepairLedger:
                         result_json,
                         result is not None,
                         result.exit_code if result is not None else None,
+                        result.controller_resumed if result is not None else None,
+                        result.resume_error_type if result is not None else None,
                         error_type,
                         operation_id,
                     ),
@@ -519,6 +570,16 @@ class RepairLedger:
                 exit_code=(
                     int(row["exit_code"]) if row["exit_code"] is not None else None
                 ),
+                controller_resumed=(
+                    bool(row["controller_resumed"])
+                    if row["controller_resumed"] is not None
+                    else None
+                ),
+                resume_error_type=(
+                    str(row["resume_error_type"])
+                    if row["resume_error_type"]
+                    else None
+                ),
                 payload_pruned_at=(
                     datetime.fromtimestamp(row["payload_pruned_at"], UTC)
                     if row["payload_pruned_at"] is not None
@@ -546,6 +607,16 @@ class RepairLedger:
             status=str(row["status"]),
             receipt_retained=bool(row["receipt_retained"]),
             exit_code=(int(row["exit_code"]) if row["exit_code"] is not None else None),
+            controller_resumed=(
+                bool(row["controller_resumed"])
+                if row["controller_resumed"] is not None
+                else None
+            ),
+            resume_error_type=(
+                str(row["resume_error_type"])
+                if row["resume_error_type"]
+                else None
+            ),
             payload_pruned_at=(
                 datetime.fromtimestamp(row["payload_pruned_at"], UTC)
                 if row["payload_pruned_at"] is not None
@@ -590,6 +661,8 @@ def _wire_safe_result(result: RepairResult) -> RepairResult:
             stderr=stderr,
             stdout_truncated=stdout_truncated,
             stderr_truncated=stderr_truncated,
+            controller_resumed=result.controller_resumed,
+            resume_error_type=result.resume_error_type,
         )
         try:
             encode_json_frame(
@@ -715,6 +788,96 @@ class RepairBrokerClient:
         return response
 
 
+class _RepairBrokerHeartbeat:
+    """Serve broker-thread liveness independently of a bounded repair call."""
+
+    def __init__(self, command_socket: str | Path):
+        self.socket_path = repair_broker_health_socket(command_socket)
+        self._lock = threading.Lock()
+        self._state = "idle"
+        self._updated_at = time.monotonic()
+        self._operation_deadline: float | None = None
+        self._stop = threading.Event()
+        self._listener: socket.socket | None = None
+        self._thread = threading.Thread(
+            target=self._serve,
+            name="senpai-repair-broker-health",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        filesystem_path = (
+            None if self.socket_path.startswith("@") else Path(self.socket_path)
+        )
+        if filesystem_path is not None:
+            filesystem_path.parent.mkdir(parents=True, exist_ok=True)
+            self._remove_filesystem_socket(filesystem_path)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(unix_socket_address(self.socket_path))
+        if filesystem_path is not None:
+            os.chmod(filesystem_path, 0o600)
+        listener.listen(4)
+        listener.settimeout(0.2)
+        self._listener = listener
+        self._thread.start()
+
+    def publish(self, state: Literal["idle", "active"], deadline: float | None = None) -> None:
+        with self._lock:
+            self._state = state
+            self._operation_deadline = deadline
+            self._updated_at = time.monotonic()
+
+    def close(self) -> None:
+        self._stop.set()
+        listener = self._listener
+        if listener is not None:
+            listener.close()
+        if self._thread.ident is not None:
+            self._thread.join(timeout=1)
+        if not self.socket_path.startswith("@"):
+            self._remove_filesystem_socket(Path(self.socket_path))
+
+    def _serve(self) -> None:
+        listener = self._listener
+        assert listener is not None
+        while not self._stop.is_set():
+            try:
+                connection, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            with connection, self._lock:
+                status = {
+                    "protocol": REPAIR_BROKER_HEALTH_PROTOCOL,
+                    "server_pid": os.getpid(),
+                    "state": self._state,
+                    "heartbeat_monotonic": self._updated_at,
+                    "operation_deadline_monotonic": self._operation_deadline,
+                }
+                try:
+                    connection.sendall(
+                        encode_json_frame(
+                            status,
+                            max_bytes=_BROKER_HEALTH_FRAME_LIMIT_BYTES,
+                        )
+                    )
+                except (OSError, SocketFrameError):
+                    continue
+
+    @staticmethod
+    def _remove_filesystem_socket(socket_path: Path) -> None:
+        try:
+            mode = socket_path.lstat().st_mode
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(mode):
+            raise RuntimeError(
+                f"refusing to replace non-socket path: {socket_path}"
+            )
+        socket_path.unlink()
+
+
 class RepairBrokerServer:
     """Map exact RoleTarget values to durable fixed-sidecar operations."""
 
@@ -739,6 +902,8 @@ class RepairBrokerServer:
         self._socket.listen(8)
         self._socket.settimeout(0.2)
         self._stop = threading.Event()
+        self._heartbeat = _RepairBrokerHeartbeat(socket_path)
+        self._closed = False
         self._thread = threading.Thread(
             target=self._serve,
             name="senpai-repair-broker",
@@ -746,7 +911,12 @@ class RepairBrokerServer:
         )
 
     def __enter__(self) -> Self:
-        self._thread.start()
+        self._heartbeat.start()
+        try:
+            self._thread.start()
+        except BaseException:
+            self._heartbeat.close()
+            raise
         return self
 
     def __exit__(
@@ -759,6 +929,9 @@ class RepairBrokerServer:
         self.close()
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._stop.set()
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -767,6 +940,7 @@ class RepairBrokerServer:
             pass
         if self._thread.ident is not None:
             self._thread.join(timeout=2)
+        self._heartbeat.close()
         self._socket.close()
         self._remove_stale_socket()
         self.ledger.close()
@@ -776,6 +950,7 @@ class RepairBrokerServer:
 
     def _serve(self) -> None:
         while not self._stop.is_set():
+            self._heartbeat.publish("idle")
             try:
                 connection, _ = self._socket.accept()
             except TimeoutError:
@@ -785,6 +960,12 @@ class RepairBrokerServer:
             with connection:
                 if self._stop.is_set():
                     return
+                self._heartbeat.publish(
+                    "active",
+                    time.monotonic()
+                    + _REQUEST_READ_TIMEOUT_SECONDS
+                    + _RESPONSE_GRACE_SECONDS,
+                )
                 connection.settimeout(_REQUEST_READ_TIMEOUT_SECONDS)
                 raw_request = b""
                 request: RepairRequest | None = None
@@ -804,6 +985,12 @@ class RepairBrokerServer:
                         response = {"status": status.model_dump(mode="json")}
                     elif envelope.get("operation") == "execute":
                         request = RepairRequest.model_validate(envelope["request"])
+                        self._heartbeat.publish(
+                            "active",
+                            time.monotonic()
+                            + request.timeout_seconds
+                            + _RESPONSE_GRACE_SECONDS,
+                        )
                         response = self._execute(raw_request, request)
                     else:
                         raise ValueError("unsupported repair broker operation")
@@ -821,6 +1008,8 @@ class RepairBrokerServer:
                     )
                 except (OSError, SocketFrameError):
                     continue
+                finally:
+                    self._heartbeat.publish("idle")
 
     def _execute(
         self,
@@ -882,6 +1071,8 @@ class RepairBrokerServer:
             record["status"] = status.status
             record["receipt_retained"] = status.receipt_retained
             record["exit_code"] = status.exit_code
+            record["controller_resumed"] = status.controller_resumed
+            record["resume_error_type"] = status.resume_error_type
             record["payload_pruned_at"] = (
                 status.payload_pruned_at.isoformat()
                 if status.payload_pruned_at is not None
@@ -957,7 +1148,12 @@ def repair_broker_main(argv: Sequence[str] | None = None) -> int:
     )
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
-    return result.exit_code
+    if not result.controller_resumed:
+        sys.stderr.write(
+            "\nSENPAI_REPAIR_CONTROLLER_NOT_RESUMED "
+            f"error_type={result.resume_error_type or 'UnknownError'}\n"
+        )
+    return result.exit_code or (75 if not result.controller_resumed else 0)
 
 
 if __name__ == "__main__":
