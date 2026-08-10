@@ -1,4 +1,3 @@
-import hashlib
 import json
 import multiprocessing
 import os
@@ -11,6 +10,8 @@ import time
 from pathlib import Path
 
 import pytest
+
+from socket_test_support import short_socket_path
 
 from senpai_agent import repair_executor
 from senpai_agent.protocols import REPAIR_PROTOCOL_VERSION
@@ -33,8 +34,7 @@ def _serve(socket_path: str) -> None:
 
 
 def _test_socket(tmp_path: Path, suffix: str) -> Path:
-    digest = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:10]
-    return Path("/private/tmp") / f"senpai-{os.getpid()}-{digest}-{suffix}.sock"
+    return short_socket_path(tmp_path, suffix)
 
 
 def test_repair_startup_scavenges_only_owned_stale_volatile_children(

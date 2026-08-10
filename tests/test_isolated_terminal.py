@@ -1,4 +1,3 @@
-import hashlib
 import json
 import os
 import shlex
@@ -14,6 +13,8 @@ from pathlib import Path
 import pytest
 from openhands.tools.terminal import TerminalAction
 
+from socket_test_support import short_socket_path
+
 from senpai_agent import isolated_terminal, repair_executor
 from senpai_agent.isolated_terminal import (
     IsolatedTerminalClientExecutor,
@@ -28,8 +29,7 @@ from senpai_agent.isolated_terminal import (
 
 
 def _test_socket(tmp_path: Path, suffix: str) -> Path:
-    digest = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:10]
-    return Path("/private/tmp") / f"senpai-{os.getpid()}-{digest}-{suffix}.sock"
+    return short_socket_path(tmp_path, suffix)
 
 
 def test_terminal_startup_scavenges_only_owned_stale_volatile_children(

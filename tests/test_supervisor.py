@@ -1,5 +1,5 @@
-import json
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
+
+from socket_test_support import short_socket_path
 
 import senpai_agent.supervisor as supervisor_module
 from senpai_agent.operations import RestartRequest, RestartRequestStore, RoleTarget
@@ -43,8 +45,7 @@ def wait_for(path: Path, timeout: float = 5) -> None:
 
 
 def pause_socket(tmp_path: Path) -> Path:
-    fingerprint = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:16]
-    return Path(f"/private/tmp/senpai-pause-test-{fingerprint}.sock")
+    return short_socket_path(tmp_path, "pause", prefix="senpai-pause-test")
 
 
 def run_supervisor(

@@ -18,6 +18,8 @@ from openhands.tools.terminal.impl import TerminalExecutor
 from openhands_support import AGENT_DIR, PLUGIN_DIR, REPO_ROOT, runtime_config
 from pydantic import SecretStr
 
+from socket_test_support import short_socket_path
+
 from senpai_agent.openhands_runner import (
     build_main_tools,
     delegation_config,
@@ -268,10 +270,7 @@ def test_supervisor_terminal_resolves_to_isolated_executor_and_allows_git_push(
         workspace=SimpleNamespace(working_dir=str(workspace)),
         env_observation_persistence_dir=None,
     )
-    socket_path = (
-        Path("/private/tmp")
-        / f"{tmp_path.name}-{os.getpid()}-git-terminal.sock"
-    )
+    socket_path = short_socket_path(tmp_path, "git-terminal")
     monkeypatch.setenv("SENPAI_SUPERVISOR_TERMINAL_SOCKET", str(socket_path))
     with IsolatedTerminalServer(
         socket_path=socket_path,
