@@ -1103,7 +1103,9 @@ def main():
             "--backend kubernetes"
         )
     if args.operational_supervisor and (
-        args.namespace == "default" or not args.supervisor_dedicated_namespace
+        not args.namespace
+        or args.namespace == "default"
+        or not args.supervisor_dedicated_namespace
     ):
         sys.exit(
             "ERROR: --operational_supervisor requires a non-default, "

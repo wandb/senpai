@@ -115,6 +115,33 @@ def campaign_scope() -> CampaignScope:
     )
 
 
+def test_scope_change_atomically_discards_incompatible_retained_snapshots(
+    tmp_path,
+    capsys,
+):
+    store = SupervisorStateStore(tmp_path / "state.json")
+    first = snapshot(NOW - timedelta(minutes=15))
+    second = snapshot(NOW)
+    store.append(first)
+    store.append(second)
+    changed = snapshot(NOW + timedelta(minutes=15)).model_copy(
+        update={
+            "scope": campaign_scope().model_copy(
+                update={"launch_scope": "maple-20260806-relaunched"}
+            )
+        }
+    )
+
+    updated = store.append(changed)
+    reopened = store.read()
+
+    assert updated.snapshots == (changed,)
+    assert reopened == updated
+    message = capsys.readouterr().err
+    assert "SENPAI_SUPERVISOR_SCOPE_CHANGED" in message
+    assert "snapshots_reset=2" in message
+
+
 def pull_payload(
     number: int = 7,
     *,
@@ -909,6 +936,41 @@ def test_research_prompt_keeps_full_guidance_and_quarantines_bounded_evidence():
     assert '"recent_mutation_audit":[' in prompt
     assert '"stable_incident_key":"incident-0123456789abcdef01234567"' in prompt
     assert len(prompt) <= 96_000
+
+
+def test_research_prompt_falls_back_to_counts_for_a_crowded_operational_trend():
+    pulls = tuple(
+        observed_pull(number, title="crowded-" + "x" * 490)
+        for number in range(1, 65)
+    )
+    crowded = snapshot(NOW).model_copy(
+        update={
+            "github": GitHubActivity(
+                open_pr_count=len(pulls),
+                pull_requests=pulls,
+            )
+        }
+    )
+    snapshots = tuple(
+        crowded.model_copy(update={"observed_at": NOW - timedelta(minutes=offset)})
+        for offset in (30, 15, 0)
+    )
+    evidence = ResearchReviewEvidence(
+        observed_at=NOW,
+        since=NOW - timedelta(hours=6),
+        advisor_guidance="Favor causal experiments over blind sweeps.",
+    )
+
+    prompt = compose_research_review_prompt(
+        snapshots,
+        evidence,
+        max_chars=32_000,
+    )
+
+    assert len(prompt) <= 32_000
+    assert '"open_pr_count":64' in prompt
+    assert '"retained_pull_request_count":64' in prompt
+    assert "retained_operational_detail_omitted" in prompt
 
 
 def test_prompt_obeys_hard_character_bound_with_many_large_pr_titles():

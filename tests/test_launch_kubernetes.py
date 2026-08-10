@@ -554,6 +554,7 @@ def successful_kubectl(calls):
     "overrides",
     (
         {"namespace": "default", "supervisor_dedicated_namespace": True},
+        {"namespace": "", "supervisor_dedicated_namespace": True},
         {"namespace": "shared-research", "supervisor_dedicated_namespace": False},
     ),
 )

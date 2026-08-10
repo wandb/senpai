@@ -935,12 +935,29 @@ class SupervisorStateStore:
 
     def append(self, snapshot: CampaignSnapshot) -> SupervisorPersistentState:
         state = self.read(initialize_at=snapshot.observed_at)
-        if state.snapshots and snapshot.observed_at < state.snapshots[-1].observed_at:
+        scope_changed = bool(state.snapshots) and any(
+            retained.scope != snapshot.scope for retained in state.snapshots
+        )
+        if (
+            state.snapshots
+            and not scope_changed
+            and snapshot.observed_at < state.snapshots[-1].observed_at
+        ):
             raise ValueError("snapshots must be appended in timestamp order")
+        retained = () if scope_changed else state.snapshots
         updated = state.model_copy(
-            update={"snapshots": (*state.snapshots, snapshot)[-3:]}
+            update={"snapshots": (*retained, snapshot)[-3:]}
         )
         self._write(updated)
+        if scope_changed:
+            print(
+                "SENPAI_SUPERVISOR_SCOPE_CHANGED "
+                f"previous={_scope_fingerprint(state.snapshots[-1].scope)} "
+                f"current={_scope_fingerprint(snapshot.scope)} "
+                f"snapshots_reset={len(state.snapshots)}",
+                file=sys.stderr,
+                flush=True,
+            )
         return updated
 
     def due_state(self, now: datetime | None = None) -> SupervisorDueState:
@@ -1228,6 +1245,35 @@ def _trend_view(snapshot: CampaignSnapshot) -> dict[str, object]:
     }
 
 
+def _trend_counts_view(snapshot: CampaignSnapshot) -> dict[str, object]:
+    return {
+        "observed_at": snapshot.observed_at.isoformat(),
+        "open_pr_count": snapshot.github.open_pr_count,
+        "retained_pull_request_count": len(snapshot.github.pull_requests),
+        "running_wandb_count": snapshot.wandb.running_count,
+        "retained_wandb_run_count": len(snapshot.wandb.runs),
+        "runtime_count": len(snapshot.runtimes),
+        "unhealthy_runtime_count": sum(
+            runtime.controller_healthy is False for runtime in snapshot.runtimes
+        ),
+        "running_training_count": sum(
+            runtime.running_training_count or 0 for runtime in snapshot.runtimes
+        ),
+        "active_delegation_count": sum(
+            runtime.active_delegation_count or 0 for runtime in snapshot.runtimes
+        ),
+        "evidence_gap_count": (
+            len(snapshot.evidence_gaps)
+            + len(snapshot.github.evidence_gaps)
+            + len(snapshot.wandb.evidence_gaps)
+        ),
+    }
+
+
+def _scope_fingerprint(scope: CampaignScope) -> str:
+    return hashlib.sha256(scope.model_dump_json().encode()).hexdigest()[:16]
+
+
 def _error_trend(errors: Sequence[str]) -> dict[str, object]:
     markers = {
         "turn_deferred": 0,
@@ -1478,10 +1524,37 @@ def compose_research_review_prompt(
         elif closed:
             closed.pop()
         else:
-            raise RuntimeError("research evidence exceeds its bounded prompt budget")
+            break
         research_window["detail_omitted"] = (
             "Older bounded research evidence was omitted to fit the prompt."
         )
+    if len(_safe_json(payload)) > budget:
+        payload["retained_operational_trend"] = [
+            _trend_counts_view(snapshot) for snapshot in snapshots[-3:]
+        ]
+        payload["retained_operational_detail_omitted"] = (
+            "Per-PR, per-run, and per-runtime trend detail was omitted to fit "
+            "the prompt."
+        )
+    if len(_safe_json(payload)) > budget:
+        payload = {
+            "retained_operational_trend": [
+                _trend_counts_view(snapshot) for snapshot in snapshots[-3:]
+            ],
+            "research_window": {
+                "observed_at": evidence.observed_at.isoformat(),
+                "since": evidence.since.isoformat(),
+                "closed_pull_request_count": len(evidence.closed_pull_requests),
+                "recent_wandb_run_count": len(evidence.recent_wandb_runs),
+                "advisor_tail_item_count": len(evidence.advisor_active_tail),
+                "evidence_gap_count": len(evidence.evidence_gaps),
+            },
+            "recent_mutation_audit_count": len(operation_audit),
+            "recent_repair_audit_count": len(repair_audit),
+            "retained_operational_detail_omitted": (
+                "All external detail was omitted to fit the prompt; counts remain."
+            ),
+        }
     prompt = f"{prefix}{_safe_json(payload)}{suffix}"
     if len(prompt) > max_chars:
         raise RuntimeError("research review prompt exceeded its configured bound")
