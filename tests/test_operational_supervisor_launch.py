@@ -51,9 +51,11 @@ def test_supervisor_has_a_control_plane_specific_harness():
 
     assert "OPERATIONAL_SUPERVISOR_HARNESS.md" in entrypoint
     assert "native `terminal`" in harness
-    assert "arbitrary shell, Git, `gh`, and `kubectl`" in harness
+    assert "arbitrary shell and Git" in harness
+    assert "senpai-role-shell" in harness
+    assert "fixed secret-free `repair` sidecar" in harness
     assert "GitHub credentials are not" in harness
-    assert "target checkout" in harness
+    assert "role workspace" in harness
     assert "program.md" not in harness
     assert "spawn_agents" not in harness
 
@@ -98,6 +100,9 @@ def test_supervisor_is_separate_with_namespace_scoped_pod_rbac():
     assert deployment["spec"]["template"]["spec"]["serviceAccountName"] == (
         "senpai-supervisor-test-track"
     )
+    pod = deployment["spec"]["template"]["spec"]
+    assert pod["automountServiceAccountToken"] is False
+    assert pod["shareProcessNamespace"] is False
     assert role["rules"] == [
         {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list"]},
         {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
@@ -105,31 +110,153 @@ def test_supervisor_is_separate_with_namespace_scoped_pod_rbac():
     ]
 
 
-def test_supervisor_runtime_and_instructions_are_mounted_read_only():
+def test_supervisor_runtime_is_atomically_prepared_then_read_only():
     documents, _secret = rendered_supervisor()
     deployment = next(doc for doc in documents if doc["kind"] == "Deployment")
     pod = deployment["spec"]["template"]["spec"]
-    initializer = pod["initContainers"][0]
-    supervisor = pod["containers"][0]
+    state_initializer, source_initializer = pod["initContainers"]
+    supervisor = next(
+        container for container in pod["containers"]
+        if container["name"] == "supervisor-control"
+    )
+    shell = next(
+        container for container in pod["containers"]
+        if container["name"] == "supervisor-shell"
+    )
 
-    assert initializer["name"] == "source"
-    assert initializer["volumeMounts"] == [
-        {"name": "runtime", "mountPath": "/workspace/senpai"}
+    assert state_initializer["name"] == "state-directory"
+    assert state_initializer["volumeMounts"] == [
+        {"name": "state", "mountPath": "/state-root"}
     ]
+    assert source_initializer["name"] == "source"
+    assert source_initializer["volumeMounts"] == [
+        {"name": "runtime", "mountPath": "/workspace"}
+    ]
+    assert {entry["name"] for entry in source_initializer["env"]} == {
+        "GITHUB_TOKEN"
+    }
     assert {mount["name"]: mount for mount in supervisor["volumeMounts"]}[
         "runtime"
     ] == {
         "name": "runtime",
-        "mountPath": "/workspace/senpai",
+        "mountPath": "/workspace",
         "readOnly": True,
     }
+    assert {mount["name"]: mount for mount in shell["volumeMounts"]}["runtime"][
+        "readOnly"
+    ] is True
     assert {volume["name"]: volume for volume in pod["volumes"]}["runtime"] == {
         "name": "runtime",
         "emptyDir": {},
     }
-    init_script = initializer["args"][0]
-    assert "remote get-url origin" in init_script
-    assert "remote set-url origin" in init_script
+    assert "env" not in state_initializer
+    assert "envFrom" not in state_initializer
+    source_script = source_initializer["args"][0]
+    assert "remote get-url origin" in source_script
+    assert "remote set-url origin" in source_script
+    assert "mv /workspace/.source /workspace/senpai" in source_script
+
+
+def test_supervisor_control_and_shell_have_disjoint_ambient_authority():
+    documents, _secret = rendered_supervisor()
+    deployment = next(doc for doc in documents if doc["kind"] == "Deployment")
+    pod = deployment["spec"]["template"]["spec"]
+    containers = {container["name"]: container for container in pod["containers"]}
+    control = containers["supervisor-control"]
+    shell = containers["supervisor-shell"]
+    volumes = {volume["name"]: volume for volume in pod["volumes"]}
+
+    credential_names = {entry["name"] for entry in control["env"]}
+    assert credential_names == {"GITHUB_TOKEN", "WANDB_API_KEY", "OPENAI_API_KEY"}
+    assert "envFrom" not in shell
+    assert all(
+        fragment not in entry["name"]
+        for entry in shell.get("env", [])
+        for fragment in ("TOKEN", "KEY", "SECRET", "CREDENTIAL")
+    )
+    assert shell["securityContext"]["readOnlyRootFilesystem"] is True
+
+    control_mounts = {mount["name"]: mount for mount in control["volumeMounts"]}
+    shell_mounts = {mount["name"]: mount for mount in shell["volumeMounts"]}
+    assert control_mounts["service-account"]["mountPath"] == (
+        "/var/run/secrets/kubernetes.io/serviceaccount"
+    )
+    assert "service-account" not in shell_mounts
+    assert "state" not in shell_mounts
+    assert control_mounts["terminal-socket"]["readOnly"] is True
+    assert "readOnly" not in control_mounts["repair-socket"]
+    assert "readOnly" not in shell_mounts["terminal-socket"]
+    assert shell_mounts["repair-socket"]["readOnly"] is True
+    assert control_mounts["state"]["subPath"] == "test-track/operational-supervisor"
+    assert set(shell_mounts) == {
+        "runtime",
+        "terminal-socket",
+        "repair-socket",
+        "shell-workspace",
+        "shell-home",
+        "shell-tmp",
+    }
+    token_projection = volumes["service-account"]["projected"]["sources"][0][
+        "serviceAccountToken"
+    ]
+    assert token_projection["expirationSeconds"] == 3600
+    assert "audience" not in token_projection
+
+
+def test_supervisor_health_recovers_unlinked_terminal_and_repair_sockets():
+    documents, _secret = rendered_supervisor()
+    deployment = next(doc for doc in documents if doc["kind"] == "Deployment")
+    containers = {
+        container["name"]: container
+        for container in deployment["spec"]["template"]["spec"]["containers"]
+    }
+    control = containers["supervisor-control"]
+    shell = containers["supervisor-shell"]
+
+    for probe_name in ("startupProbe", "livenessProbe"):
+        control_health = control[probe_name]["exec"]["command"][-1]
+        assert "test -S /run/senpai-terminal/terminal.sock" in control_health
+        assert "test -S /run/senpai-repair/repair.sock" in control_health
+        shell_health = shell[probe_name]["exec"]["command"][-1]
+        assert shell_health == "test -S /run/senpai-terminal/terminal.sock"
+
+
+def test_advisor_and_students_have_secret_free_exact_role_repair_sidecars():
+    args = launch_args(tag="campaign-a")
+    for role in ("advisor", "student"):
+        secret = launch_helpers.render_launch_secret(
+            args.tag, "github", "exa", "wandb", openai_api_key="openai"
+        )
+        template = (ROOT / "k8s" / f"{role}-deployment.yaml").read_text()
+        if role == "advisor":
+            manifest = launch.render_advisor(
+                template, args.tag, ["fern"], "secret", secret, args
+            )
+        else:
+            manifest = launch.render_student(
+                template, "fern", args.tag, "secret", secret, args
+            )
+        deployment = yaml.safe_load(manifest.split("\n---\n", 1)[1])
+        pod = deployment["spec"]["template"]["spec"]
+        containers = {container["name"]: container for container in pod["containers"]}
+        main = containers[role]
+        repair = containers["repair"]
+        main_mounts = {mount["name"] for mount in main["volumeMounts"]}
+        repair_mounts = {mount["name"] for mount in repair["volumeMounts"]}
+
+        assert pod["automountServiceAccountToken"] is False
+        assert pod["shareProcessNamespace"] is False
+        assert "env" not in repair
+        assert "envFrom" not in repair
+        assert repair["securityContext"]["readOnlyRootFilesystem"] is True
+        assert repair_mounts == {"workspace", "state", "repair-scratch", "repair-tmp"}
+        assert {"workspace", "state"} <= main_mounts
+        assert "dataset" not in repair_mounts
+        dockerfile = (ROOT / f"Dockerfile.{role}").read_text()
+        assert (
+            "senpai_agent/repair_executor.py "
+            "/usr/local/bin/senpai-repair-executor"
+        ) in dockerfile
 
 
 def test_supervisor_config_carries_exact_campaign_inventory_and_cadence():
@@ -158,9 +285,11 @@ def test_supervisor_mounts_only_github_wandb_and_model_credentials():
     deployment = next(doc for doc in documents if doc["kind"] == "Deployment")
     names = {
         item["name"]
-        for item in deployment["spec"]["template"]["spec"]["containers"][0][
-            "env"
-        ]
+        for item in next(
+            container
+            for container in deployment["spec"]["template"]["spec"]["containers"]
+            if container["name"] == "supervisor-control"
+        )["env"]
     }
 
     assert names == {"GITHUB_TOKEN", "WANDB_API_KEY", "OPENAI_API_KEY"}
@@ -200,9 +329,11 @@ def test_supervisor_mounts_only_its_primary_model_provider():
     deployment = next(doc for doc in documents if doc["kind"] == "Deployment")
     names = {
         item["name"]
-        for item in deployment["spec"]["template"]["spec"]["containers"][0][
-            "env"
-        ]
+        for item in next(
+            container
+            for container in deployment["spec"]["template"]["spec"]["containers"]
+            if container["name"] == "supervisor-control"
+        )["env"]
     }
 
     assert "SENPAI_OPENHANDS_FRONTIER_MODEL" not in config
