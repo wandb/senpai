@@ -460,6 +460,59 @@ def _create_ssh_security_group(
     return group_id
 
 
+def _security_group_egress(
+    context: AwsContext,
+    group_id: str,
+) -> list[dict]:
+    payload = _aws_json(
+        context,
+        "ec2",
+        "describe-security-groups",
+        "--group-ids",
+        group_id,
+    )
+    groups = payload.get("SecurityGroups", [])
+    if len(groups) != 1 or groups[0].get("GroupId") != group_id:
+        raise RuntimeError(f"AWS Mac SSH security group {group_id} is ambiguous")
+    permissions = groups[0].get("IpPermissionsEgress")
+    if not isinstance(permissions, list):
+        raise RuntimeError(
+            f"AWS Mac SSH security group {group_id} has invalid egress metadata"
+        )
+    if not all(isinstance(permission, dict) for permission in permissions):
+        raise RuntimeError(
+            f"AWS Mac SSH security group {group_id} has invalid egress permissions"
+        )
+    return permissions
+
+
+def _harden_ssh_security_group(context: AwsContext, group_id: str) -> None:
+    permissions = _security_group_egress(context, group_id)
+    if not permissions:
+        return
+    revoke_error: Exception | None = None
+    try:
+        _aws_raw(
+            context,
+            "ec2",
+            "revoke-security-group-egress",
+            "--group-id",
+            group_id,
+            "--ip-permissions",
+            json.dumps(permissions),
+        )
+    except Exception as error:  # Verification resolves response-loss ambiguity.
+        revoke_error = error
+    remaining = _security_group_egress(context, group_id)
+    if remaining:
+        failure = RuntimeError(
+            f"AWS Mac SSH security group {group_id} still permits egress"
+        )
+        if revoke_error is not None:
+            raise failure from revoke_error
+        raise failure
+
+
 def _recover_ssh_security_group(context: AwsContext, state: dict) -> str:
     group_id = state.get("ssh_security_group_id", "")
     if group_id:
@@ -1526,6 +1579,8 @@ def _cleanup(run_dir: Path, state: dict, context: AwsContext | None = None) -> l
                 state["ssh_authorize_started"] = False
                 state["ssh_security_group_id"] = ""
                 state["ssh_security_group_create_started"] = False
+                state["ssh_security_group_egress_hardened"] = False
+                state["ssh_security_group_egress_hardening_started"] = False
                 state["ssh_security_group_owned"] = False
                 _save_state(run_dir, state)
     if errors:
@@ -1554,6 +1609,10 @@ def _launch_recorded_instance(
     host: AwsMacHost,
     key_name: str,
 ) -> dict:
+    if state.get("ssh_security_group_egress_hardened") is not True:
+        raise RuntimeError(
+            "AWS Mac SSH security group egress was not verified before launch"
+        )
     existing_tokens = {node["client_token"] for node in state["nodes"]}
     client_token = uuid.uuid4().hex
     while client_token in existing_tokens:
@@ -1646,6 +1705,8 @@ def launch_aws_mac(
         "region": plan.context.region,
         "security_group_id": plan.security_group_id,
         "ssh_security_group_create_started": False,
+        "ssh_security_group_egress_hardened": False,
+        "ssh_security_group_egress_hardening_started": False,
         "ssh_security_group_id": "",
         "ssh_security_group_name": "",
         "ssh_security_group_owned": None,
@@ -1714,6 +1775,12 @@ def launch_aws_mac(
             raise
         state["ssh_security_group_id"] = ssh_security_group_id
         state["ssh_security_group_owned"] = True
+        _save_state(run_dir, state)
+
+        state["ssh_security_group_egress_hardening_started"] = True
+        _save_state(run_dir, state)
+        _harden_ssh_security_group(plan.context, ssh_security_group_id)
+        state["ssh_security_group_egress_hardened"] = True
         _save_state(run_dir, state)
 
         state["ssh_authorize_started"] = True
