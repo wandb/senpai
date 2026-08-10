@@ -47,6 +47,7 @@ def mutation_audit_record(
     *,
     requested_at: datetime = NOW,
     status: str = "succeeded",
+    error_type: str | None = None,
 ) -> OperationAuditRecord:
     return OperationAuditRecord(
         operation_key=f"operation-{requested_at.minute}",
@@ -63,7 +64,7 @@ def mutation_audit_record(
         completed_at=(requested_at + timedelta(seconds=2)),
         status=status,
         source_operation_key=None,
-        error_type=None,
+        error_type=error_type,
     )
 
 
@@ -686,6 +687,28 @@ def test_fresh_wake_prompt_includes_bounded_recent_mutation_outcomes():
     assert '"completed_at":"2026-08-06T12:19:02+00:00"' in prompt
     assert '"status":"succeeded"' in prompt
     assert "operation-19" not in prompt
+
+
+def test_fresh_wake_prompt_exposes_an_interrupted_operation_as_unknown():
+    due = SupervisorDueState(
+        operational_due=True,
+        research_review_due=False,
+        next_operational_at=NOW,
+        next_research_review_at=NOW + timedelta(hours=6),
+    )
+    interrupted = mutation_audit_record(
+        status="unknown",
+        error_type="SupervisorInterrupted",
+    )
+
+    prompt = compose_supervisor_prompt(
+        (snapshot(NOW),),
+        due=due,
+        operation_audit=(interrupted,),
+    )
+
+    assert '"status":"unknown"' in prompt
+    assert '"error_type":"SupervisorInterrupted"' in prompt
 
 
 def test_prompt_preserves_repeated_deferred_markers_across_all_three_updates():

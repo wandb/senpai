@@ -301,7 +301,7 @@ class OperationOutcome(_Contract):
     disposition: Literal["executed", "replayed", "suppressed"]
     receipt: OperationReceipt | None = None
     source_operation_key: str | None = None
-    prior_status: Literal["running", "succeeded", "failed"] | None = None
+    prior_status: Literal["running", "succeeded", "failed", "unknown"] | None = None
 
 
 class OperationAuditRecord(_Contract):
@@ -315,7 +315,7 @@ class OperationAuditRecord(_Contract):
     stable_incident_key: str | None
     requested_at: datetime
     completed_at: datetime | None
-    status: Literal["running", "succeeded", "failed", "suppressed"]
+    status: Literal["running", "succeeded", "failed", "suppressed", "unknown"]
     source_operation_key: str | None
     error_type: str | None
 
@@ -387,6 +387,17 @@ class RecordedOperationError(OperationError):
         super().__init__(
             f"operation {operation_key!r} previously failed with "
             f"{error_type or 'an unknown error'}"
+        )
+
+
+class OperationOutcomeUnknown(OperationError):
+    """An interrupted operation may have completed outside the ledger."""
+
+    def __init__(self, record: OperationAuditRecord):
+        self.record = record
+        super().__init__(
+            f"operation {record.operation_key!r} has an unknown outcome after "
+            "SupervisorInterrupted; inspect its target before taking a new action"
         )
 
 
@@ -1314,6 +1325,31 @@ class OperationLedger:
                 self._connection.rollback()
                 raise
 
+    def recover_interrupted(self, *, now: datetime | None = None) -> int:
+        """Seal reservations left running by a previous supervisor process."""
+
+        completed_at = now or datetime.now(UTC)
+        if completed_at.tzinfo is None or completed_at.utcoffset() is None:
+            raise ValueError("recovery timestamp must be timezone-aware")
+        timestamp = completed_at.astimezone(UTC).timestamp()
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE operation_audit
+                    SET status = 'unknown', completed_at = ?,
+                        error_type = 'SupervisorInterrupted'
+                    WHERE status = 'running'
+                    """,
+                    (timestamp,),
+                )
+                self._connection.commit()
+                return cursor.rowcount
+            except BaseException:
+                self._connection.rollback()
+                raise
+
     def _replay(self, row: sqlite3.Row, fingerprint: str) -> _Reservation:
         if row["fingerprint"] != fingerprint:
             raise IdempotencyConflict(
@@ -1330,6 +1366,8 @@ class OperationLedger:
                 str(row["operation_key"]),
                 str(row["error_type"]) if row["error_type"] else None,
             )
+        if status == "unknown":
+            raise OperationOutcomeUnknown(self._records([row])[0])
         receipt = (
             _RECEIPT_ADAPTER.validate_json(row["receipt_json"])
             if row["receipt_json"]

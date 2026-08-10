@@ -27,6 +27,7 @@ from senpai_agent.operations import (
     OperationInProgress,
     OperationInvariantError,
     OperationLedger,
+    OperationOutcomeUnknown,
     OperationPolicy,
     OperationService,
     RecordedOperationError,
@@ -409,6 +410,100 @@ def test_mutation_idempotency_and_cooldown_survive_a_service_restart(
     assert suppressed.source_operation_key == "nudge-1"
     assert after_cooldown.disposition == "executed"
     assert [call[0] for call in backend.calls].count("nudge") == 2
+
+
+def test_startup_recovery_marks_crash_interrupted_operations_unknown_without_replay(
+    tmp_path: Path,
+):
+    """
+    Requirement: after a supervisor process dies between reserving and recording a
+    result, startup must preserve that ambiguous outcome and never execute it again.
+    Interface: OperationLedger startup recovery and exact-key reservation replay.
+    """
+
+    database = tmp_path / "operations.sqlite3"
+    action = Nudge(
+        operation_key="interrupted-nudge",
+        incident_key="idle-fern",
+        target=target("student", "fern"),
+        expected_conversation_id=STUDENT_ID,
+        message="Resume the current assignment.",
+        reason="The student appears idle.",
+    )
+    crashed_process = OperationLedger(database)
+    reservation = crashed_process.reserve(
+        action,
+        fingerprint="same-request",
+        cooldown_key="student-idle",
+        cooldown_seconds=60,
+        now=NOW,
+    )
+    assert reservation.execute is True
+
+    replacement_process = OperationLedger(database)
+    with pytest.raises(OperationInProgress):
+        replacement_process.reserve(
+            action,
+            fingerprint="same-request",
+            cooldown_key="student-idle",
+            cooldown_seconds=60,
+            now=NOW + timedelta(seconds=1),
+        )
+
+    crashed_process.close()
+    assert replacement_process.recover_interrupted(
+        now=NOW + timedelta(seconds=2)
+    ) == 1
+
+    [record] = replacement_process.recent_mutations()
+    assert record.status == "unknown"
+    assert record.completed_at == NOW + timedelta(seconds=2)
+    assert record.error_type == "SupervisorInterrupted"
+    with pytest.raises(OperationOutcomeUnknown) as unknown:
+        replacement_process.reserve(
+            action,
+            fingerprint="same-request",
+            cooldown_key="student-idle",
+            cooldown_seconds=60,
+            now=NOW + timedelta(seconds=3),
+        )
+    assert unknown.value.record == record
+    replacement_process.close()
+
+
+def test_startup_recovery_is_explicit_and_idempotent(tmp_path: Path):
+    """
+    Requirement: constructing another in-process ledger must not recover a genuinely
+    live operation, while repeated startup recovery must not rewrite its receipt.
+    Interface: OperationLedger construction, recovery, and audit records.
+    """
+
+    database = tmp_path / "operations.sqlite3"
+    action = Nudge(
+        operation_key="live-nudge",
+        incident_key="idle-fern",
+        target=target("student", "fern"),
+        expected_conversation_id=STUDENT_ID,
+        message="Resume the current assignment.",
+        reason="The student appears idle.",
+    )
+    live_owner = OperationLedger(database)
+    live_owner.reserve(
+        action,
+        fingerprint="live-request",
+        cooldown_key="student-idle",
+        cooldown_seconds=60,
+        now=NOW,
+    )
+
+    startup = OperationLedger(database)
+    assert startup.records()[0].status == "running"
+    live_owner.close()
+    assert startup.recover_interrupted(now=NOW + timedelta(seconds=5)) == 1
+    recovered = startup.records()[0]
+    assert startup.recover_interrupted(now=NOW + timedelta(seconds=10)) == 0
+    assert startup.records()[0] == recovered
+    startup.close()
 
 
 def test_cooldown_is_per_typed_action_and_target_not_model_incident_name(

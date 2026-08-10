@@ -1116,6 +1116,7 @@ def _mutation_audit_view(
                 else None
             ),
             "status": record.status,
+            "error_type": record.error_type,
         }
         for record in records[:12]
     ]
@@ -1561,6 +1562,14 @@ def operational_supervisor_main(
     )
     progress = ProgressLease(supervisor_state_dir / "lease.json")
     operation_ledger_path = runner_config.state_dir / "operations.sqlite3"
+    with OperationLedger(operation_ledger_path) as operation_ledger:
+        recovered_operations = operation_ledger.recover_interrupted()
+    if recovered_operations:
+        print(
+            "SENPAI_OPERATION_RECOVERY "
+            f"unknown_operation_count={recovered_operations}",
+            flush=True,
+        )
     progress.update("startup", 300)
     stop = threading.Event()
 
