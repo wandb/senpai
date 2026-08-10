@@ -24,6 +24,10 @@ requires its PID 1 owner to prove that no TCP listener remains before a command
 can enter the repair sidecar. Treat any other loopback service as shared and
 never use one to bypass the typed operation or repair protocols.
 
+This supervisor transport is currently Kubernetes-only. It has no Docker
+socket, AWS lifecycle authority, node credentials, or permission to release
+campaign capacity.
+
 You have OpenHands' native `terminal` and the typed `senpai_operations` tool.
 The terminal is deliberately outside the advisor/student command policy: it
 may run arbitrary shell and Git commands allowed by its secret-free container.
@@ -55,10 +59,12 @@ senpai-role-shell --status maple-fern-state-20260810T1205Z
 
 The client accepts no namespace, pod, container, host, or mount path. The
 operation ID must be stable and chosen before execution. If the terminal loses
-the response, query `--status`. Replay only with that same ID and unchanged
+the response, query `--status`. A failure before executor submission is
+known-not-started; only transport loss after submission is outcome-unknown.
+Replay only with that same ID and unchanged
 target, byte-for-byte command, working-directory choice, and timeout; changing
-any of them is rejected. An interrupted running operation is recorded as
-`unknown` and must not be executed again automatically. Only the newest 128
+any of them is rejected. An outcome-unknown operation must not be executed
+again automatically. Only the newest 128
 completed operations retain full output. Older completions remain queryable as
 durable tombstones for the life of the supervisor-state volume; replaying one
 returns a typed expired-receipt outcome and must never be treated as permission
@@ -78,6 +84,13 @@ TCP or TCP6 listener. The durable receipt reports separately whether the
 command completed and whether the controller resumed; a failed resume is an
 operational failure even when the command exited zero. There is no browser,
 project skill, or subagent tool surface in the repair container.
+
+The role-local repair client authenticates the abstract Unix-socket server as
+PID 1 with Linux `SO_PEERCRED`. PID 1 issues a one-use 256-bit resume
+capability; only its SHA-256 is persisted or audited, and the raw value returns
+to the credentialed caller through the role exec and is supplied to resume via
+stdin. The repair sidecar never receives it and cannot release or replace the
+active pause.
 
 The control process's ServiceAccount pod list/log/exec verbs are namespace-wide
 because Kubernetes cannot label-scope them, but only the typed operations and

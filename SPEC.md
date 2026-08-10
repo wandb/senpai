@@ -92,8 +92,11 @@ exact-tag advisor and every student not replaced in the same launch advertise
 the required versioned management and repair protocols, use the requested
 advisor branch, and preserve the advisor's configured student inventory. Role
 and supervisor revisions may differ. Any backward-incompatible socket framing,
-wire field, or operation-semantic change must bump its protocol and forces an
-explicit relaunch of affected roles.
+wire field, or operation-semantic change must bump its protocol and force an
+explicit relaunch of affected roles. The aggregate repair annotation
+`senpai-repair-executor/v4` includes the executor/broker contract and
+`senpai-controller-repair-pause/v2`; a supervisor-only upgrade rejects retained
+roles without that exact version.
 
 The snapshot scope is fixed at launch:
 
@@ -871,7 +874,9 @@ role's PID 1 owner. The owner terminates the current controller generation and
 all processes carrying its one-generation ownership token, then refuses to
 acknowledge until recorded descendants are dead and no TCP or TCP6 listener
 remains in the shared Pod network namespace. A best-effort resume follows every
-repair outcome. The pause expires after a bounded interval if a resume reply is
+repair outcome. The role-local client accepts only a PID 1 peer, and resume
+requires the one-use capability returned with that acknowledgement. The pause
+expires after a bounded interval if a resume reply is
 lost; the durable result and audit distinguish command completion from
 controller-resume completion.
 
@@ -894,7 +899,12 @@ all processes that inherited its per-generation ownership capability, then
 proves the shared Pod network namespace has no TCP listener before it
 acknowledges the pause. This removes a live Chromium CDP or other loopback
 control surface before the credential-free repair sidecar begins. The
-main-container-only pause directory is not mounted into the repair sidecar.
+role-local client authenticates the abstract-socket server as PID 1 with Linux
+`SO_PEERCRED`. PID 1 returns a one-use 256-bit resume capability to the
+credentialed caller; only its SHA-256 is persisted or audited, and resume sends
+the raw value through stdin. The repair sidecar receives no raw capability and
+cannot release or replace the active pause. The private persisted pause state
+is not mounted into that sidecar.
 The controller is restarted from durable state after the command; pause expiry
 is the crash-recovery backstop. Command completion and controller recovery are
 distinct durable receipt fields, and the role-shell CLI reports a nonzero
@@ -915,7 +925,8 @@ advisor/student pods and repair sidecars, RBAC, NetworkPolicy, immutable bundles
 the state PVC, and host capacity.
 
 Docker, AWS GPU, and AWS Mac operational-supervisor transports are deliberately
-not implemented. Docker should use a narrow host-side broker
+not implemented. The following is planned architecture. Docker should use a
+narrow host-side broker
 bound to the exact planned container IDs rather than mounting the Docker socket
 into the model container. AWS GPU can reuse that broker on its single EC2 host
 without granting AWS lifecycle credentials. AWS Mac should run the supervisor
@@ -923,11 +934,12 @@ beside the advisor on host zero and reach exact student LaunchDaemons through
 campaign-scoped forced-command SSH identities. It must never receive instance
 stop/termination or Dedicated Host release authority; upgrades preserve the
 allocated Macs, and it must not reuse a broad bootstrap SSH key. The
-supervisor retains an unrestricted native terminal locally. Cross-container and
-cross-host access uses one fixed `senpai role-control` transport client that can
-carry an arbitrary command to an exact configured role. Its broker scopes
-reachable campaign runtimes rather than filtering Git or shell syntax,
-authenticates through a private per-launch Unix socket or forced SSH command,
+supervisor will retain an unrestricted native terminal locally. Cross-container
+and cross-host access will use one fixed `senpai role-control` transport client
+that can carry an arbitrary command to an exact configured role. Its broker
+will scope reachable campaign runtimes rather than filtering Git or shell
+syntax, authenticate through a private per-launch Unix socket or forced SSH
+command,
 loads an immutable role-to-runtime map from the launch plan, rejects unrecorded
 containers, hosts, and labels, bounds output and execution time, cleans up
 orphaned children, and audits every request and outcome. All transports reuse

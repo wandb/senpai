@@ -774,7 +774,11 @@ roles. Replacing a role in an already supervised campaign requires
 its repair sidecar. A change to socket framing, wire fields, or operation
 semantics that is not backward compatible must bump the relevant protocol and
 therefore requires an explicit role relaunch. Source revisions remain recorded
-for provenance, not compatibility. Each snapshot contains:
+for provenance, not compatibility. The aggregate repair annotation
+`senpai-repair-executor/v4` covers the executor, broker outcome contract, and
+the authenticated `senpai-controller-repair-pause/v2` exchange; a
+supervisor-only upgrade rejects retained roles without that exact aggregate
+version. Each snapshot contains:
 
 - open PRs whose base is exactly this launch's advisor branch, including age,
   workflow labels, and issue/review/inline-comment counts;
@@ -851,8 +855,9 @@ wakes within the pod.
 Kubernetes sidecars still share the Pod network namespace, so filesystem and
 PID separation alone do not isolate loopback. The supervisor Pod exposes no
 credential-bearing TCP or UDP control endpoint. Before a role-side repair, the
-role's PID 1 owner stops its controller and inherited descendants and proves
-that no TCP listener remains; an unproven pause refuses the repair. The required
+role-local client authenticates the pause owner as PID 1, which stops its
+controller and inherited descendants and proves that no TCP listener remains;
+an unproven pause refuses the repair. The required
 enforcing CNI and NetworkPolicy protect external egress such as cloud metadata,
 not container-to-container loopback.
 
@@ -882,7 +887,8 @@ fingerprint over the exact target, byte-for-byte command, symbolic working
 directory, and timeout. An exact replay returns the recorded receipt while its
 full payload is retained; changing any of those fields under the same operation
 ID is rejected. If a response is lost, query `senpai-role-shell --status` first.
-An operation interrupted with no authoritative response becomes `unknown` and
+Failure before executor submission is recorded as known-not-started. Only
+transport loss after submission becomes outcome-unknown, and such an operation
 is never run again automatically. Replaying a completed operation after its
 payload has aged out returns a typed expired-receipt outcome carrying the
 durable tombstone; it never runs the command again. Receipt pruning is part of
@@ -894,11 +900,16 @@ owner. That owner terminates the current controller generation, including
 escaped descendants carrying its one-generation ownership token, and refuses
 to acknowledge while any TCP or TCP6 listener remains in the shared Pod
 network namespace. The command is sent only after that proof. A best-effort
-resume follows every outcome, the pause expires after a bounded interval if the
-resume reply is lost, and both the command result and controller-resume status
-remain in the durable receipt and audit. Every fresh supervisor wake sees a
-bounded repair audit. Authenticated
-repository mutations remain available through a nudge to the existing
+resume follows every outcome. The role-local client authenticates PID 1 through
+Linux `SO_PEERCRED` on an abstract Unix socket. PID 1 issues a one-use 256-bit
+resume capability; only its SHA-256 is persisted or audited, and the raw value
+returns to the credentialed caller and is supplied to resume through stdin. The
+repair sidecar never receives that capability, so it cannot release or replace
+the active pause. The pause expires after a bounded interval if the resume reply
+is lost, and both the command result and controller-resume status remain in the
+durable receipt and audit. Every fresh supervisor wake sees a bounded repair
+audit. Authenticated repository mutations remain available through a nudge to
+the existing
 credentialed advisor/student conversation; an authentication failure in the
 secret-free shell is not a command-policy restriction. The unrestricted shell
 can run all local Git operations, including pushing to a local or otherwise
@@ -914,11 +925,12 @@ controller stays stopped for the command and resumes from its durable
 conversation afterward; a broker crash releases the pause at its fixed expiry.
 This deliberately interrupts the current agent turn and any child work, so
 arbitrary repair is for operational recovery, not observation. The pause
-directory is mounted only in the credentialed role container, never its repair
-sidecar. The role worker runs under the same Unix identity as its own process
-supervisor and is trusted with that role's credentials already; the security
-boundary here is against the credential-free supervisor shell and repair
-sidecar, neither of which can read or forge the pause channel. A completed
+state is private to the role container, while the abstract socket itself shares
+the Pod network namespace. Authenticity comes from the PID 1 peer check and the
+one-use resume capability, not socket reachability. The role worker runs under
+the same Unix identity as its own process supervisor and is trusted with that
+role's credentials already; the security boundary here is against the
+credential-free supervisor shell and repair sidecar. A completed
 command whose controller-resume receipt is missing remains recorded as
 completed with `controller_resumed=false`; the CLI returns a visible temporary
 failure and later wakes retain the resume error type.
