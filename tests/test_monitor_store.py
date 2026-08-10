@@ -1,4 +1,7 @@
+import json
+import math
 import sqlite3
+import sys
 import threading
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
@@ -73,6 +76,86 @@ def test_registration_survives_reopen_in_the_authoritative_database(tmp_path: Pa
 
     with MonitorStore(database) as reopened:
         assert reopened.active() == [monitor]
+
+
+def test_upgrade_migrates_legacy_intervals_without_retiring_monitors(
+    tmp_path: Path,
+    capsys,
+):
+    database = tmp_path / "monitors.sqlite3"
+    conversation_id = uuid4()
+    legacy_policy = {
+        "training_id": "legacy-active",
+        "conversation_id": str(conversation_id),
+        "metric": None,
+        "direction": None,
+        "gates": [],
+        "poll_interval_seconds": 0.5,
+        "stale_after_seconds": float("inf"),
+        "notify_on_status": ["finished", "failed", "timed_out", "cancelled"],
+        "registered_at": NOW.isoformat(),
+    }
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE monitors (
+                training_id TEXT PRIMARY KEY,
+                spec_json TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                previous_sample_json TEXT,
+                baseline_sample_json TEXT,
+                next_poll_at REAL NOT NULL DEFAULT 0
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO monitors (training_id, spec_json, active)
+            VALUES (?, ?, ?)
+            """,
+            (
+                ("legacy-active", json.dumps(legacy_policy), 1),
+                (
+                    "legacy-complete",
+                    json.dumps(
+                        {**legacy_policy, "training_id": "legacy-complete"}
+                    ),
+                    0,
+                ),
+            ),
+        )
+        connection.commit()
+
+    with MonitorStore(database) as store:
+        active = store.active()
+        inactive = store.spec("legacy-complete")
+        rows = store.connection.execute(
+            "SELECT training_id, spec_json, active FROM monitors ORDER BY training_id"
+        ).fetchall()
+
+    assert [item.training_id for item in active] == ["legacy-active"]
+    assert active[0].poll_interval_seconds == 5
+    assert math.isfinite(active[0].stale_after_seconds)
+    assert active[0].stale_after_seconds == sys.float_info.max
+    terminal, _ = evaluate_monitor(
+        active[0],
+        SimpleNamespace(state=TrainingState.FINISHED, exit_code=0),
+        None,
+        previous=None,
+        emitted=frozenset(),
+        now=NOW,
+    )
+    assert [signal.kind for signal in terminal.signals] == ["training_status"]
+    assert inactive.training_id == "legacy-complete"
+    assert [(row["training_id"], row["active"]) for row in rows] == [
+        ("legacy-active", 1),
+        ("legacy-complete", 0),
+    ]
+    assert all(
+        json.loads(row["spec_json"])["poll_interval_seconds"] == 5
+        for row in rows
+    )
+    assert "SENPAI_MONITOR_QUARANTINED" not in capsys.readouterr().err
 
 
 def test_same_policy_reregistration_preserves_derived_state(tmp_path: Path):

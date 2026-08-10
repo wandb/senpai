@@ -236,14 +236,12 @@ class MonitorTrainingAction(Action):
     )
     poll_interval_seconds: float = Field(
         default=60,
-        ge=5,
-        allow_inf_nan=False,
+        gt=0,
         description="Seconds between programmatic monitor polls.",
     )
     stale_after_seconds: float = Field(
         default=600,
         gt=0,
-        allow_inf_nan=False,
         description="Notify when the selected metric has not updated this long.",
     )
 

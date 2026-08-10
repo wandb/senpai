@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 import sys
@@ -59,6 +60,51 @@ class TrainingMonitorSpec(Contract):
             and self.direction is None
         ):
             raise ValueError("change gates require metric direction")
+
+
+def _migrate_legacy_monitor_spec(payload: str) -> str:
+    """Normalize policies that were legal before the five-second poll floor."""
+
+    try:
+        values = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return payload
+    if not isinstance(values, dict):
+        return payload
+
+    changed = False
+    poll_interval = values.get("poll_interval_seconds")
+    if (
+        isinstance(poll_interval, (int, float))
+        and not isinstance(poll_interval, bool)
+        and math.isfinite(poll_interval)
+        and 0 < poll_interval < 5
+    ):
+        values["poll_interval_seconds"] = 5
+        changed = True
+
+    stale_after = values.get("stale_after_seconds")
+    if "stale_after_seconds" in values and (
+        stale_after is None
+        or (
+            isinstance(stale_after, (int, float))
+            and not isinstance(stale_after, bool)
+            and math.isinf(stale_after)
+            and stale_after > 0
+        )
+    ):
+        # Older Pydantic serializers emitted either Infinity or null here.
+        # The largest finite float preserves the old "never stale" behavior.
+        values["stale_after_seconds"] = sys.float_info.max
+        changed = True
+
+    if not changed:
+        return payload
+    try:
+        migrated = TrainingMonitorSpec.model_validate(values)
+    except Exception:  # noqa: BLE001
+        return payload
+    return migrated.model_dump_json()
 
 
 class MetricSample(Contract):
@@ -263,6 +309,16 @@ class MonitorStore:
               AND previous_sample_json IS NOT NULL
             """
         )
+        rows = connection.execute(
+            "SELECT training_id, spec_json FROM monitors"
+        ).fetchall()
+        for training_id, payload in rows:
+            migrated = _migrate_legacy_monitor_spec(payload)
+            if migrated != payload:
+                connection.execute(
+                    "UPDATE monitors SET spec_json = ? WHERE training_id = ?",
+                    (migrated, training_id),
+                )
 
     def register(self, spec: TrainingMonitorSpec) -> bool:
         with self._lock:

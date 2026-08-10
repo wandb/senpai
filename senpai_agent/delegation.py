@@ -550,6 +550,42 @@ class OpenHandsChildProcess:
         raise RuntimeError("subagent emitted no terminal result record")
 
 
+class DelegateAgentAction(Action):
+    """Legacy action schema retained only for persisted event deserialization."""
+
+    task: str = Field(min_length=1)
+    agent: AgentKind = "general-purpose"
+    model: ModelTier = "smart"
+    background: bool = False
+    include_context: bool = False
+    search_mode: SearchMode | None = None
+
+
+class DelegateAgentObservation(Observation):
+    """Legacy observation schema retained only for persisted event deserialization."""
+
+    task_id: str
+    status: Literal["finished", "dispatched"]
+    result: str | None = None
+
+    @property
+    def to_llm_content(self) -> Sequence[TextContent]:
+        if self.status == "finished":
+            return [
+                TextContent(
+                    text=f"Subagent task {self.task_id} finished.\n\n{self.result or ''}"
+                )
+            ]
+        return [
+            TextContent(
+                text=(
+                    f"Subagent task {self.task_id} is running in the background. "
+                    "Its result or error will arrive as a durable local event."
+                )
+            )
+        ]
+
+
 def resolve_task_agent(agent: TaskAgentKind) -> tuple[AgentKind, SearchMode | None]:
     if agent == "search_general_web":
         return "search", "general-web"
