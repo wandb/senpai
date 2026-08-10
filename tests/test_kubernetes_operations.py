@@ -34,11 +34,12 @@ def inventory() -> CampaignInventory:
 
 def pause_receipt(command) -> str:
     now = time.time()
+    duration = float(command[command.index("--duration-seconds") + 1])
     return json.dumps(
         {
             "protocol": REPAIR_PAUSE_PROTOCOL,
             "lease_id": command[command.index("--lease-id") + 1],
-            "expires_at": now + 300,
+            "expires_at": now + duration,
             "acknowledged_at": now,
             "supervisor_pid": os.getpid(),
         }

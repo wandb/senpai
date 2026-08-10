@@ -9,7 +9,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from uuid import UUID, uuid4
@@ -278,8 +277,9 @@ class KubectlCampaignBackend(OperationBackend):
             )
             if (
                 pause_receipt.lease_id != lease_id
-                or pause_receipt.expires_at <= time.time()
-                or pause_receipt.acknowledged_at > time.time() + 5
+                or pause_receipt.expires_at <= pause_receipt.acknowledged_at
+                or pause_receipt.expires_at - pause_receipt.acknowledged_at
+                > pause_duration_seconds + 5
             ):
                 raise ValueError("mismatched or expired repair-pause lease")
         except (TypeError, ValueError) as error:

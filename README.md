@@ -742,7 +742,7 @@ arbitrary-repair receipts, including bounded stdout and stderr, are retained for
 the newest 128 completed operations. For the life of the supervisor-state PVC,
 older completions remain as metadata tombstones containing operation identity,
 target, command fingerprint, working directory, timeout, status, timestamps,
-exit code, prune time, and error type. Its SQLite files must live on the
+exit code, controller-resume outcome, prune time, and error type. Its SQLite files must live on the
 dedicated `supervisor_state_pvc_claim_name`, never the dataset PVC. That claim
 must be a
 Bound RWO or RWOP filesystem whose operator has verified POSIX advisory locks
@@ -869,6 +869,24 @@ can run all local Git operations, including pushing to a local or otherwise
 already-authenticated remote, but Senpai deliberately does not place ambient
 GitHub credentials in it.
 
+Before entering the repair sidecar, the broker acquires a time-bounded pause
+from the role container's process-owning supervisor. PID 1 stops the current
+controller, terminates processes carrying that worker generation's private
+ownership capability, and refuses to acknowledge the pause while any TCP
+listener—including Chromium CDP—remains in the Pod network namespace. The
+controller stays stopped for the command and resumes from its durable
+conversation afterward; a broker crash releases the pause at its fixed expiry.
+This deliberately interrupts the current agent turn and any child work, so
+arbitrary repair is for operational recovery, not observation. The pause
+directory is mounted only in the credentialed role container, never its repair
+sidecar. The role worker runs under the same Unix identity as its own process
+supervisor and is trusted with that role's credentials already; the security
+boundary here is against the credential-free supervisor shell and repair
+sidecar, neither of which can read or forge the pause channel. A completed
+command whose controller-resume receipt is missing remains recorded as
+completed with `controller_resumed=false`; the CLI returns a visible temporary
+failure and later wakes retain the resume error type.
+
 A controller restart is refused while an advisor or student job or delegated
 agent is active, or when either activity inventory is unknown. The request is
 persisted against the observed conversation and worker generation; only the
@@ -884,9 +902,9 @@ point.
 Inside each managed role Pod, the repair executor's command socket is a
 filesystem Unix socket on a memory-backed volume mounted only in the secret-free
 repair sidecar; the advisor/student container cannot open it. Its Kubernetes
-health probe uses a separate Linux abstract Unix socket that exposes only the
-executor heartbeat and current deadline state. That read-only health endpoint
-is same-Pod reachable, but it accepts no repair command.
+health probe uses a separate sibling filesystem socket on that same private
+volume. Neither command nor health endpoint is reachable from another Pod
+container.
 
 When supervised, `/repair/workspace` is the mutable target repository root;
 the pinned Senpai runner, dataset, credentials, and ServiceAccount are absent.

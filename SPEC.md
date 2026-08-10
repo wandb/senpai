@@ -850,9 +850,9 @@ repair sidecar, which shares the mutable target workspace and role state but not
 runner source, dataset, credentials, ServiceAccount token, PID namespace, or
 the credentialed container root. The executor command socket is a filesystem
 Unix socket on a memory-backed volume mounted only in the repair sidecar. The
-role's main container cannot open it. A separate Linux abstract Unix socket is
-a read-only heartbeat endpoint for Kubernetes health probes; it reports liveness
-and deadline state but accepts no command. Requests and outcomes are bounded and
+role's main container cannot open it. A sibling filesystem socket on that same
+private volume is the read-only heartbeat endpoint for Kubernetes health probes;
+it reports liveness and deadline state but accepts no command. Requests and outcomes are bounded and
 audited, descendants are reaped on every exit path, and transport loss after
 command submission is reported as an unknown outcome rather than replayed.
 
@@ -861,11 +861,24 @@ byte-for-byte command, symbolic working directory, and timeout. The repair
 ledger retains bounded stdout/stderr for the newest 128 completed operations.
 For the life of the supervisor-state PVC, all older completions retain metadata
 tombstones with operation identity, target, fingerprint, working directory,
-timeout, status, timestamps, exit code, prune time, and error type. Pruning is
+timeout, status, timestamps, exit code, controller-resume outcome, prune time,
+and error type. Pruning is
 transactional with completion and startup recovery. `--status` is authoritative
 after a lost response; an `unknown` operation is never retried automatically,
 and replaying a pruned operation returns a typed expired-receipt tombstone
 without executing it again.
+
+Every arbitrary repair first obtains a private, expiring pause from the role's
+PID-1 process supervisor. The supervisor terminates the active controller and
+all processes that inherited its per-generation ownership capability, then
+proves the shared Pod network namespace has no TCP listener before it
+acknowledges the pause. This removes a live Chromium CDP or other loopback
+control surface before the credential-free repair sidecar begins. The
+main-container-only pause directory is not mounted into the repair sidecar.
+The controller is restarted from durable state after the command; pause expiry
+is the crash-recovery backstop. Command completion and controller recovery are
+distinct durable receipt fields, and the role-shell CLI reports a nonzero
+operational result when the command completed but recovery was not proven.
 
 Supervisor-only upgrades resolve only GitHub, W&B, and the configured model
 provider. They validate the existing exact-tag role inventory, advisor branch,

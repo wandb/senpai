@@ -595,7 +595,7 @@ class WorkerSupervisor:
                 continue
             try:
                 environment = (process_dir / "environ").read_bytes().split(b"\0")
-            except (FileNotFoundError, PermissionError, ProcessLookupError):
+            except OSError:
                 continue
             if expected in environment:
                 owned.append(int(process_dir.name))

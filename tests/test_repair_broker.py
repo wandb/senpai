@@ -255,11 +255,12 @@ def test_kubectl_repair_transport_executes_only_the_repair_sidecar(monkeypatch):
         lease_id = command[command.index("--lease-id") + 1] if "--lease-id" in command else None
         if "repair-pause" in command:
             now = time.time()
+            duration = float(command[command.index("--duration-seconds") + 1])
             return json.dumps(
                 {
                     "protocol": REPAIR_PAUSE_PROTOCOL,
                     "lease_id": lease_id,
-                    "expires_at": now + 300,
+                    "expires_at": now + duration,
                     "acknowledged_at": now,
                     "supervisor_pid": os.getpid(),
                 }
