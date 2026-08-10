@@ -433,7 +433,10 @@ macOS AMI does not contain full Xcode or the Metal toolchain. Provide either a
 local Xcode app or a prepared `ditto` zip, plus a zip containing exactly one
 Metal `*.exportedBundle`. Launch imports that local artifact instead of relying
 on Apple's component catalog. Each selected host also needs a public subnet in
-its own Availability Zone and an existing security group in the same VPC.
+its own Availability Zone and an existing base security group in the same VPC.
+The launcher attaches that group unchanged and creates a second,
+campaign-owned security group for the operator's temporary SSH `/32`. This
+keeps concurrent campaigns from revoking each other's access.
 
 Package the directory produced by Xcode's component export without changing
 its bundle layout:
@@ -474,9 +477,10 @@ uv run python k8s/launch.py "${launch_args[@]}"
 ```
 
 Preflight is read-only: it validates the exact source revision, Apple Silicon
-AMI, host availability and capacity, subnet placement, security group, Xcode
-source, and Metal toolchain archive. Launch creates an ephemeral SSH key,
-temporarily permits the operator's IPv4 `/32`, validates one native canary,
+AMI, host availability and capacity, subnet placement, base security group,
+Xcode source, and Metal toolchain archive. Launch creates an ephemeral SSH key
+and a campaign-owned SSH security group, permits the operator's IPv4 `/32`
+only on that group, validates one native canary,
 prepares the remaining Macs in parallel, and holds every role at a fleet-wide
 start gate before opening it. Each Mac uses the same authenticated EC2-console
 host-key pinning and strict, fail-closed SSH policy described above, including
@@ -508,9 +512,14 @@ uv run python k8s/aws_mac.py terminate first-aws-mac-run
 ```
 
 Termination unloads the native services, removes their private state,
-terminates only the instances recorded for the run, deletes the ephemeral key,
-and revokes the temporary SSH rule. It preserves all pre-existing Dedicated
-Hosts and networking resources.
+terminates only the instances recorded for the run, and deletes the ephemeral
+key and campaign-owned SSH security group. It preserves all pre-existing
+Dedicated Hosts and networking resources. Cleanup retains access credentials
+until every instance is confirmed terminated or missing, and persists partial
+failures for a safe retry. Runs created by the older shared-rule launcher never
+revoke that shared rule automatically; cleanup preserves their state with an
+explicit manual-review message while the exact rule remains. Remove it only
+when safe, then rerun `terminate` so cleanup can verify its absence and finish.
 
 ## Experiment workflow
 
