@@ -12,7 +12,8 @@ KUBECTL_BIN=${KUBECTL_BIN:-kubectl}
 DOCKER_BIN=${DOCKER_BIN:-docker}
 SOURCE_REVISION=${SOURCE_REVISION:-$(git rev-parse HEAD)}
 BASE_IMAGE=${BASE_IMAGE:?BASE_IMAGE must name the locally loaded advisor image}
-CANARY_IMAGE=${CANARY_IMAGE:-senpai-kubernetes-canary:sha-$SOURCE_REVISION}
+ADVISOR_CANARY_IMAGE=${ADVISOR_CANARY_IMAGE:-senpai-kubernetes-canary-advisor:sha-$SOURCE_REVISION}
+STUDENT_CANARY_IMAGE=${STUDENT_CANARY_IMAGE:-senpai-kubernetes-canary-student:sha-$SOURCE_REVISION}
 CANARY_ID=${SENPAI_CANARY_ID:-local-$$}
 CANARY_ID=$(printf '%s' "$CANARY_ID" \
   | tr '[:upper:]' '[:lower:]' \
@@ -30,6 +31,8 @@ PV="senpai-ci-$TAG"
 STATE_PV="$PV-supervisor-state"
 NODE="$CLUSTER-control-plane"
 DIAGNOSTICS_DIR=${DIAGNOSTICS_DIR:-$ROOT/.canary-diagnostics}
+PYTHON_BIN=${PYTHON_BIN:-python3}
+ROLE_SHELL=/usr/local/bin/senpai-role-shell
 WORK_DIR=$(mktemp -d)
 INITIAL_MANIFEST="$WORK_DIR/initial.yaml"
 UPGRADE_MANIFEST="$WORK_DIR/broken-upgrade.yaml"
@@ -37,6 +40,19 @@ CLUSTER_CREATED=false
 
 kubectl_canary() {
   "$KUBECTL_BIN" --context "$CONTEXT" "$@"
+}
+
+verify_sha256() {
+  "$PYTHON_BIN" -c '
+import hashlib
+import pathlib
+import sys
+
+expected, path = sys.argv[1:]
+actual = hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+if actual != expected:
+    raise SystemExit(f"SHA-256 mismatch for {path}: {actual} != {expected}")
+' "$1" "$2"
 }
 
 collect_diagnostics() {
@@ -99,12 +115,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Building thin canary image $CANARY_IMAGE from $BASE_IMAGE"
+[[ "$ADVISOR_CANARY_IMAGE" != "$STUDENT_CANARY_IMAGE" ]] \
+  || { echo "advisor and student canary image names must differ" >&2; exit 2; }
+echo "Building thin canary images from $BASE_IMAGE"
 "$DOCKER_BIN" build \
   --file tests/kubernetes/Dockerfile \
   --build-arg "BASE_IMAGE=$BASE_IMAGE" \
-  --tag "$CANARY_IMAGE" \
+  --tag "$ADVISOR_CANARY_IMAGE" \
   .
+"$DOCKER_BIN" tag "$ADVISOR_CANARY_IMAGE" "$STUDENT_CANARY_IMAGE"
 
 cat > "$WORK_DIR/kind.yaml" <<EOF
 kind: Cluster
@@ -129,9 +148,9 @@ CALICO_VERSION=v3.32.1
 CALICO_MANIFEST="$WORK_DIR/calico-$CALICO_VERSION.yaml"
 curl --proto '=https' --tlsv1.2 -fsSLo "$CALICO_MANIFEST" \
   "https://raw.githubusercontent.com/projectcalico/calico/$CALICO_VERSION/manifests/calico.yaml"
-printf '%s  %s\n' \
+verify_sha256 \
   a1df919d9721cf667accdc3e72848911b0cb25cfab7d2478ad0c996302c95744 \
-  "$CALICO_MANIFEST" | sha256sum --check
+  "$CALICO_MANIFEST"
 sed -i.bak \
   's#quay.io/calico/cni:v3.32.1#quay.io/calico/cni@sha256:bb1567e3ed81e2e8414e9a68f186e1f7ffd4067a4871a9ae90896793af0190dd#g; s#quay.io/calico/kube-controllers:v3.32.1#quay.io/calico/kube-controllers@sha256:18008f781c869376dbbc4dfb1ffe3afb46f7897887d4f20e080c420ac44a6612#g; s#quay.io/calico/node:v3.32.1#quay.io/calico/node@sha256:7f874b3f0b540c2b523aea9961ef5e2f43b0af9056a47874c916d6cf348168d3#g' \
   "$CALICO_MANIFEST"
@@ -147,7 +166,8 @@ kubectl_canary wait --for=condition=Ready node --all --timeout=120s
 "$DOCKER_BIN" exec "$NODE" mkdir -p "/var/senpai-ci/$TAG/supervisor-state"
 "$DOCKER_BIN" exec "$NODE" chmod 0777 "/var/senpai-ci/$TAG/dataset"
 "$DOCKER_BIN" exec "$NODE" chmod 0777 "/var/senpai-ci/$TAG/supervisor-state"
-"$KIND_BIN" load docker-image --name "$CLUSTER" "$CANARY_IMAGE"
+"$KIND_BIN" load docker-image --name "$CLUSTER" "$ADVISOR_CANARY_IMAGE"
+"$KIND_BIN" load docker-image --name "$CLUSTER" "$STUDENT_CANARY_IMAGE"
 
 # Place an HTTP decoy on the exact IPv4 IMDS address. The unrestricted probe
 # must reach it, while every supervisor-capable pod must be denied by Calico.
@@ -164,7 +184,7 @@ spec:
   automountServiceAccountToken: false
   containers:
   - name: server
-    image: $CANARY_IMAGE
+    image: $ADVISOR_CANARY_IMAGE
     imagePullPolicy: IfNotPresent
     command: ["python", "-m", "http.server", "80", "--bind", "169.254.169.254"]
     securityContext:
@@ -188,14 +208,35 @@ kubectl_canary wait -n kube-system --for=condition=Ready \
 render() {
   local phase=$1
   local destination=$2
-  "$DOCKER_BIN" run --rm --entrypoint python "$CANARY_IMAGE" \
+  "$DOCKER_BIN" run --rm --entrypoint python "$ADVISOR_CANARY_IMAGE" \
     /opt/senpai/tests/kubernetes/canary.py render \
     --phase "$phase" \
     --namespace "$NAMESPACE" \
     --other-namespace "$OTHER_NAMESPACE" \
     --tag "$TAG" \
-    --image "$CANARY_IMAGE" \
+    --advisor-image "$ADVISOR_CANARY_IMAGE" \
+    --student-image "$STUDENT_CANARY_IMAGE" \
     --revision "$SOURCE_REVISION" > "$destination"
+}
+
+capture_supervisor_rollback() {
+  local tag=$1
+  local directory=$2
+  "$PYTHON_BIN" -c '
+import sys
+from pathlib import Path
+
+from k8s.supervisor_rollback import SupervisorRollback
+
+rollback = SupervisorRollback.capture(
+    tag=sys.argv[1],
+    kube_context=sys.argv[2],
+    namespace=sys.argv[3],
+    directory=Path(sys.argv[4]),
+    timeout_seconds=120,
+)
+print(rollback.path)
+' "$tag" "$CONTEXT" "$NAMESPACE" "$directory"
 }
 
 render initial "$INITIAL_MANIFEST"
@@ -214,6 +255,28 @@ ADVISOR="deployment/senpai-advisor-$TAG"
 STUDENT="deployment/senpai-$TAG-fern"
 ROLE_SECRET="senpai-launch-secrets-$TAG"
 
+role_listener_generation() {
+  kubectl_canary exec -n "$NAMESPACE" "$1" -c "$2" -- \
+    curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:18765/
+}
+
+wait_for_role_listener_advance() {
+  local deployment=$1
+  local container=$2
+  local previous=$3
+  local observed=""
+  for _ in $(seq 1 60); do
+    observed=$(role_listener_generation "$deployment" "$container" 2>/dev/null || true)
+    if [[ "$observed" =~ ^[0-9]+$ ]] && (( observed > previous )); then
+      printf '%s' "$observed"
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "role listener did not return on a replacement generation: $deployment" >&2
+  return 1
+}
+
 # Trusted controller code and dependencies are image-installed and immutable to
 # the role UID. A malicious target cwd/PATH/PYTHONPATH cannot affect liveness.
 for role_spec in \
@@ -230,12 +293,39 @@ EOF
         "import pathlib,senpai_agent; print(pathlib.Path(senpai_agent.__file__).parent)")
       case "$package" in /opt/senpai-venv/*) ;; *) exit 1 ;; esac
       test ! -w "$package"
+      test ! -e /run/senpai-repair-executor
       cd "$1"
       PATH="$1:$PATH" PYTHONPATH="$1" \
         /usr/local/bin/senpai-container-health "$2"
       test ! -e /tmp/senpai-path-poisoned
       test ! -e /tmp/senpai-sitecustomize-poisoned
     ' -- "$target" "$lease"
+done
+
+# The executor socket is a filesystem capability mounted only into the repair
+# sidecar. Resolve its path from the rendered workload instead of assuming a
+# transport address, then prove the live executor answers on that exact path.
+repair_socket_for() {
+  kubectl_canary get -n "$NAMESPACE" "$1" -o json | "$PYTHON_BIN" -c '
+import json
+import sys
+
+deployment = json.load(sys.stdin)
+repair = next(
+    container
+    for container in deployment["spec"]["template"]["spec"]["containers"]
+    if container["name"] == "repair"
+)
+command = repair["command"]
+print(command[command.index("--socket") + 1])
+'
+}
+for deployment in "$ADVISOR" "$STUDENT"; do
+  repair_socket=$(repair_socket_for "$deployment")
+  [[ "$repair_socket" == /run/senpai-repair-executor/* ]]
+  kubectl_canary exec -n "$NAMESPACE" "$deployment" -c repair -- \
+    /opt/senpai-venv/bin/python -I /usr/local/bin/senpai-repair-executor \
+    health --socket "$repair_socket"
 done
 kubectl_canary exec -n "$NAMESPACE" "$ADVISOR" -c advisor -- \
   /bin/sh -c '
@@ -259,22 +349,151 @@ kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" -c supervisor-shell -- \
   test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token
 
 # Its typed repair bridge may execute in the exact secret-free role sidecar.
+ADVISOR_LISTENER_BEFORE=$(role_listener_generation "$ADVISOR" advisor)
 REPAIR_OUTPUT=$(kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" \
-  -c supervisor-shell -- /home/senpai/.local/bin/senpai-role-shell \
-  --role advisor --command \
-  'test "$(pwd)" = /repair/workspace && test -d .git && grep -qx advisor-target-workspace canary-target-marker && test ! -e /workspace/senpai && printf canary-repair-ok')
+  -c supervisor-shell -- "$ROLE_SHELL" \
+  --operation-id canary-advisor-workspace --role advisor --command \
+  'test "$(pwd)" = /repair/workspace && test "$(git rev-parse --show-toplevel)" = /repair/workspace && test "$(git rev-parse --abbrev-ref HEAD)" = main && grep -qx advisor-target-workspace canary-target-marker && test ! -e /workspace/senpai && ! curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:18765/ >/dev/null 2>&1 && printf canary-repair-ok')
 [[ "$REPAIR_OUTPUT" == "canary-repair-ok" ]]
+ADVISOR_LISTENER_AFTER=$(wait_for_role_listener_advance \
+  "$ADVISOR" advisor "$ADVISOR_LISTENER_BEFORE")
+[[ "$ADVISOR_LISTENER_AFTER" =~ ^[0-9]+$ ]]
+STUDENT_LISTENER_BEFORE=$(role_listener_generation "$STUDENT" student)
 STUDENT_REPAIR_OUTPUT=$(kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" \
-  -c supervisor-shell -- /home/senpai/.local/bin/senpai-role-shell \
-  --role student --student fern --command \
-  'test "$(pwd)" = /repair/workspace && test -d .git && grep -qx student-target-workspace canary-target-marker && test ! -e /workspace/senpai && printf canary-student-repair-ok')
+  -c supervisor-shell -- "$ROLE_SHELL" \
+  --operation-id canary-student-workspace --role student --student fern --command \
+  'test "$(pwd)" = /repair/workspace && test "$(git rev-parse --show-toplevel)" = /repair/workspace && test "$(git rev-parse --abbrev-ref HEAD)" = main && grep -qx student-target-workspace canary-target-marker && test ! -e /workspace/senpai && ! curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:18765/ >/dev/null 2>&1 && printf canary-student-repair-ok')
 [[ "$STUDENT_REPAIR_OUTPUT" == "canary-student-repair-ok" ]]
+STUDENT_LISTENER_AFTER=$(wait_for_role_listener_advance \
+  "$STUDENT" student "$STUDENT_LISTENER_BEFORE")
+[[ "$STUDENT_LISTENER_AFTER" =~ ^[0-9]+$ ]]
 if kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" -c supervisor-shell -- \
-  /home/senpai/.local/bin/senpai-role-shell \
+  "$ROLE_SHELL" \
+  --operation-id canary-unconfigured-student \
   --role student --student unconfigured --command true; then
   echo "typed repair accepted a target outside the campaign inventory" >&2
   exit 1
 fi
+
+# Stable operation IDs make a lost reply safe: exact replay returns the first
+# receipt, while changing the payload is rejected and cannot execute twice.
+REPLAY_COMMAND='counter=/repair/scratch/canary-replay-count; value=0; test ! -f "$counter" || value=$(cat "$counter"); value=$((value + 1)); printf "%s" "$value" > "$counter"; printf "%s" "$value"'
+REPLAY_OUTPUT=$(kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" \
+  -c supervisor-shell -- "$ROLE_SHELL" \
+  --operation-id canary-repair-replay --role advisor --timeout 10 \
+  --command "$REPLAY_COMMAND")
+[[ "$REPLAY_OUTPUT" == "1" ]]
+REPLAY_STATUS=$(kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" \
+  -c supervisor-shell -- "$ROLE_SHELL" \
+  --status canary-repair-replay)
+[[ "$REPLAY_STATUS" == *'"status":"completed"'* ]]
+[[ "$(kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" \
+  -c supervisor-shell -- "$ROLE_SHELL" \
+  --operation-id canary-repair-replay --role advisor --timeout 10 \
+  --command "$REPLAY_COMMAND")" == "1" ]]
+[[ "$(kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" \
+  -c supervisor-shell -- "$ROLE_SHELL" \
+  --operation-id canary-replay-count-check --role advisor \
+  --command 'cat /repair/scratch/canary-replay-count')" == "1" ]] \
+  || { echo "repair replay executed twice" >&2; exit 1; }
+if kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" -c supervisor-shell -- \
+  "$ROLE_SHELL" \
+  --operation-id canary-repair-replay --role advisor --command 'printf changed'; then
+  echo "same operation ID accepted a different command" >&2
+  exit 1
+fi
+
+# The socket client deliberately drops its first reply, then resolves the
+# durable receipt and exact replay without incrementing the role-side counter.
+kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" -c supervisor-shell -- \
+  python /opt/senpai/tests/kubernetes/canary.py drop-repair-reply \
+  --socket /run/senpai-repair/repair.sock --tag "$TAG" \
+  --operation-id canary-lost-repair-reply
+[[ "$(kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" \
+  -c supervisor-shell -- "$ROLE_SHELL" \
+  --operation-id canary-lost-reply-count-check --role advisor \
+  --command 'cat /repair/scratch/canary-lost-reply-count')" == "1" ]]
+
+# Every supervisor wake gets a fresh shell process tree, HOME, TMP, cwd, and
+# environment while its explicit workspace survives. Retired wakes stay stale.
+kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" -c supervisor-control -- \
+  python /opt/senpai/tests/kubernetes/canary.py probe-terminal-wakes
+
+# A previous unrestricted command may leave a permission-poisoned volatile
+# root behind if its container exits at the wrong instant. Restart the real
+# sidecars with exact stale fixtures and prove startup removes them rather than
+# entering a permanent liveness loop.
+SUPERVISOR_POD=$(kubectl_canary get pod -n "$NAMESPACE" \
+  -l "app=senpai,role=supervisor,research-tag=$TAG" \
+  -o jsonpath='{.items[0].metadata.name}')
+ADVISOR_POD=$(kubectl_canary get pod -n "$NAMESPACE" \
+  -l "app=senpai,role=advisor,research-tag=$TAG" \
+  -o jsonpath='{.items[0].metadata.name}')
+
+container_restart_count() {
+  kubectl_canary get pod -n "$NAMESPACE" "$1" \
+    -o "jsonpath={.status.containerStatuses[?(@.name==\"$2\")].restartCount}"
+}
+
+wait_for_container_restart() {
+  local pod=$1
+  local container=$2
+  local previous=$3
+  local count=""
+  local ready=""
+  for _ in $(seq 1 90); do
+    count=$(container_restart_count "$pod" "$container" 2>/dev/null || true)
+    ready=$(kubectl_canary get pod -n "$NAMESPACE" "$pod" \
+      -o "jsonpath={.status.containerStatuses[?(@.name==\"$container\")].ready}" \
+      2>/dev/null || true)
+    if [[ "$count" =~ ^[0-9]+$ ]] && (( count > previous )) \
+      && [[ "$ready" == true ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "container did not recover from the exact stale-root fixture: $pod/$container" >&2
+  return 1
+}
+
+SHELL_RESTARTS=$(container_restart_count "$SUPERVISOR_POD" supervisor-shell)
+kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR_POD" -c supervisor-shell -- \
+  /bin/sh -ceu '
+    root=/tmp/senpai-terminal-wakes/wake-stale456
+    mkdir -p "$root/home/locked"
+    printf junk > "$root/home/locked/junk"
+    printf "{\"pid\":999999999,\"start_token\":null}" > \
+      "$root/.senpai-owner.json"
+    chmod 000 "$root/home/locked" "$root"
+  '
+kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR_POD" -c supervisor-shell -- \
+  kill -TERM 1 || true
+wait_for_container_restart "$SUPERVISOR_POD" supervisor-shell "$SHELL_RESTARTS"
+kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR_POD" -c supervisor-shell -- \
+  /bin/sh -c 'test ! -e /tmp/senpai-terminal-wakes/wake-stale456'
+kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR_POD" -c supervisor-shell -- \
+  /opt/senpai-venv/bin/python -I -m senpai_agent.isolated_terminal_health \
+  --socket '@senpai-isolated-terminal'
+
+REPAIR_RESTARTS=$(container_restart_count "$ADVISOR_POD" repair)
+kubectl_canary exec -n "$NAMESPACE" "$ADVISOR_POD" -c repair -- \
+  /bin/sh -ceu '
+    root=/tmp/senpai-repair-operations/operation-stale456
+    mkdir -p "$root/home/locked"
+    printf junk > "$root/home/locked/junk"
+    printf "{\"pid\":999999999,\"start_token\":null}" > \
+      "$root/.senpai-owner.json"
+    chmod 000 "$root/home/locked" "$root"
+  '
+kubectl_canary exec -n "$NAMESPACE" "$ADVISOR_POD" -c repair -- \
+  kill -TERM 1 || true
+wait_for_container_restart "$ADVISOR_POD" repair "$REPAIR_RESTARTS"
+kubectl_canary exec -n "$NAMESPACE" "$ADVISOR_POD" -c repair -- \
+  /bin/sh -c 'test ! -e /tmp/senpai-repair-operations/operation-stale456'
+ADVISOR_REPAIR_SOCKET=$(repair_socket_for "$ADVISOR")
+kubectl_canary exec -n "$NAMESPACE" "$ADVISOR_POD" -c repair -- \
+  /opt/senpai-venv/bin/python -I /usr/local/bin/senpai-repair-executor \
+  health --socket "$ADVISOR_REPAIR_SOCKET"
 
 # Neither the unrestricted model shell nor typed role repairs may reach IMDS.
 if kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" -c supervisor-shell -- \
@@ -282,11 +501,16 @@ if kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" -c supervisor-shell -- \
   echo "supervisor shell reached the metadata decoy" >&2
   exit 1
 fi
-for role_args in "--role advisor" "--role student --student fern"; do
+for role_spec in \
+  "canary-imds-advisor:--role advisor" \
+  "canary-imds-student:--role student --student fern"; do
+  IFS=: read -r operation_id role_args <<EOF
+$role_spec
+EOF
   # shellcheck disable=SC2086
   if kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" \
-    -c supervisor-shell -- /home/senpai/.local/bin/senpai-role-shell \
-    $role_args --timeout 5 --command \
+    -c supervisor-shell -- "$ROLE_SHELL" \
+    --operation-id "$operation_id" $role_args --timeout 5 --command \
     'curl --connect-timeout 1 --max-time 3 -fsS http://169.254.169.254/'; then
     echo "repair sidecar reached the metadata decoy: $role_args" >&2
     exit 1
@@ -344,8 +568,44 @@ SUPERVISOR_STATE_MARKER="/var/lib/senpai/$TAG/operational-supervisor/canary-stat
 kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" -c supervisor-control -- \
   /bin/sh -c 'printf "%s\n" "$1" > "$2"' -- \
   "$SUPERVISOR_STATE_SENTINEL" "$SUPERVISOR_STATE_MARKER"
+INTERRUPTED_OPERATION_KEY=canary-interrupted-general-operation
+INTERRUPTED_REPAIR_ID=canary-interrupted-repair-operation
+kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" -c supervisor-control -- \
+  python /opt/senpai/tests/kubernetes/canary.py seed-interrupted-operations \
+  --tag "$TAG" \
+  --operation-key "$INTERRUPTED_OPERATION_KEY" \
+  --repair-operation-id "$INTERRUPTED_REPAIR_ID"
 
-# A failed supervisor-only release must be observable and exactly reversible.
+# Capture the exact mutable supervisor release before attempting an upgrade.
+# All production targets are present; a second empty-tag bundle proves that a
+# resource introduced after an absent snapshot is removed during restoration.
+ROLLBACK_DIR="$WORK_DIR/rollback"
+ROLLBACK_BUNDLE=$(capture_supervisor_rollback "$TAG" "$ROLLBACK_DIR")
+"$PYTHON_BIN" -c '
+import json
+import pathlib
+import sys
+
+bundle = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert all(record["present"] for record in bundle["resources"])
+assert bundle["persistent_state_rolled_back"] is False
+' "$ROLLBACK_BUNDLE"
+
+ABSENT_TAG="$TAG-absent"
+ABSENT_ROLLBACK_BUNDLE=$(capture_supervisor_rollback \
+  "$ABSENT_TAG" "$ROLLBACK_DIR")
+ABSENT_SERVICE_ACCOUNT="senpai-supervisor-$ABSENT_TAG"
+kubectl_canary create serviceaccount -n "$NAMESPACE" "$ABSENT_SERVICE_ACCOUNT"
+"$PYTHON_BIN" k8s/supervisor_rollback.py restore \
+  "$ABSENT_ROLLBACK_BUNDLE" --timeout-seconds 120
+if kubectl_canary get serviceaccount -n "$NAMESPACE" \
+  "$ABSENT_SERVICE_ACCOUNT" >/dev/null 2>&1; then
+  echo "rollback retained a resource captured as absent" >&2
+  exit 1
+fi
+
+# A failed supervisor-only release must be observable and exactly reversible
+# from the durable snapshot, without rolling back its SQLite state PVC.
 render broken-upgrade "$UPGRADE_MANIFEST"
 kubectl_canary apply -f "$UPGRADE_MANIFEST"
 SECOND_SECRET=$(kubectl_canary get deployment -n "$NAMESPACE" \
@@ -357,8 +617,9 @@ if kubectl_canary rollout status -n "$NAMESPACE" "$SUPERVISOR" --timeout=15s; th
   echo "deliberately broken supervisor release unexpectedly became ready" >&2
   exit 1
 fi
-kubectl_canary rollout undo -n "$NAMESPACE" "$SUPERVISOR"
-kubectl_canary rollout status -n "$NAMESPACE" "$SUPERVISOR" --timeout=120s
+"$PYTHON_BIN" k8s/supervisor_rollback.py restore \
+  "$ROLLBACK_BUNDLE" --timeout-seconds 120
+test -f "$ROLLBACK_BUNDLE"
 
 [[ "$(kubectl_canary get deployment -n "$NAMESPACE" \
   "senpai-supervisor-$TAG" -o jsonpath='{.spec.template.spec.containers[?(@.name=="supervisor-control")].env[0].valueFrom.secretKeyRef.name}')" == "$FIRST_SECRET" ]]
@@ -376,5 +637,15 @@ kubectl_canary get configmap -n "$NAMESPACE" "$FIRST_CONFIG" "$SECOND_CONFIG" >/
   -o jsonpath='{.items[0].metadata.uid}')" == "$STUDENT_UID" ]]
 kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" -c supervisor-control -- \
   grep -qx "$SUPERVISOR_STATE_SENTINEL" "$SUPERVISOR_STATE_MARKER"
+kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" -c supervisor-control -- \
+  python /opt/senpai/tests/kubernetes/canary.py assert-interrupted-operations \
+  --socket /run/senpai-repair/repair.sock \
+  --tag "$TAG" \
+  --operation-key "$INTERRUPTED_OPERATION_KEY" \
+  --repair-operation-id "$INTERRUPTED_REPAIR_ID"
+[[ "$(kubectl_canary exec -n "$NAMESPACE" "$SUPERVISOR" \
+  -c supervisor-shell -- "$ROLE_SHELL" \
+  --operation-id canary-interrupted-marker-check --role advisor \
+  --command 'test ! -e /repair/scratch/canary-interrupted-repair-ran && printf absent')" == "absent" ]]
 
-echo "Kubernetes production canary passed: enforcing metadata isolation, advisor/student typed repair, owner restart, rollback, and dedicated durable state"
+echo "Kubernetes production canary passed: enforcing metadata isolation, wake isolation, durable typed repair, owner restart, exact snapshot rollback, and dedicated SQLite state"

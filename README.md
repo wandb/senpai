@@ -836,6 +836,14 @@ directories. Those volatile directories and all descendants are removed before
 the wake completes; only the explicit supervisor workspace is mutable across
 wakes within the pod.
 
+Kubernetes sidecars still share the Pod network namespace, so filesystem and
+PID separation alone do not isolate loopback. The supervisor Pod exposes no
+credential-bearing TCP or UDP control endpoint. Before a role-side repair, the
+role's PID 1 owner stops its controller and inherited descendants and proves
+that no TCP listener remains; an unproven pause refuses the repair. The required
+enforcing CNI and NetworkPolicy protect external egress such as cloud metadata,
+not container-to-container loopback.
+
 The typed tool may inspect a configured role, send one deduplicated nudge to
 its existing conversation, queue a same-UUID model-context reset, or request a
 restart of a quiescent controller. Every typed mutation is campaign-scoped,
@@ -869,7 +877,15 @@ durable tombstone; it never runs the command again. Receipt pruning is part of
 the same SQLite transaction that completes a command, and startup recovery also
 enforces the bound. SQLite can reuse the freed payload pages, while the much
 smaller audit tombstones intentionally remain durable for the life of the PVC.
-Every fresh supervisor wake sees a bounded repair audit. Authenticated
+The broker first obtains a bounded pause acknowledgement from the role's PID 1
+owner. That owner terminates the current controller generation, including
+escaped descendants carrying its one-generation ownership token, and refuses
+to acknowledge while any TCP or TCP6 listener remains in the shared Pod
+network namespace. The command is sent only after that proof. A best-effort
+resume follows every outcome, the pause expires after a bounded interval if the
+resume reply is lost, and both the command result and controller-resume status
+remain in the durable receipt and audit. Every fresh supervisor wake sees a
+bounded repair audit. Authenticated
 repository mutations remain available through a nudge to the existing
 credentialed advisor/student conversation; an authentication failure in the
 secret-free shell is not a command-policy restriction. The unrestricted shell
@@ -1055,20 +1071,24 @@ uv run pytest -q
 bash -n k8s/*.sh scripts/*.sh plugins/senpai/scripts/*.sh
 ```
 
-Pull requests run a credential-free Kind topology and mechanics canary. Kind is
-pinned by image digest; Calico v3.32.1 is fetched from its released tag,
-verified by SHA-256, and its CNI/node/controller images are rewritten to
-released multi-architecture digests before installation. The canary renders the
-production manifests and derives a thin test image from the real advisor image,
-but its advisor and student processes are purpose-built role simulators; it does
-not exercise the GPU student image, live GitHub or W&B APIs, or a model provider.
-It proves NetworkPolicy enforcement with a live IMDS-address decoy, advisor and
-student repair scoping, controller-owner restarts, a failed supervisor-only
-Deployment rollback, role-pod continuity, and dedicated supervisor-state
-persistence. Before broad production rollout, run a controlled live staging
-wake in a disposable campaign namespace with the intended credentials and model
-provider, and verify observation, mutation, repair, restart, and secret-redaction
-behavior end to end.
+Pull requests run a real credential-free Kind production canary. Kind is pinned
+by image digest; Calico v3.32.1 is fetched from its released tag, verified by
+SHA-256, and its CNI/node/controller images are rewritten to released
+multi-architecture digests before installation. The gate proves policy
+enforcement with a live IMDS-address decoy, advisor and student repair scoping,
+role quiescence before repair, permission-poisoned volatile-root recovery,
+terminal wake cleanup, durable repair replay and interrupted-outcome handling,
+controller-owner restarts, a failed supervisor-only rollout and rollback, role
+pod continuity, and dedicated supervisor-state persistence. The actual CUDA
+student image is built once and container-smoked for its immutable installed
+runtime and repair-executor lifecycle. The lightweight Kind topology uses
+purpose-built advisor and student role simulators with distinct image names
+derived from the advisor canary base; it verifies role routing and
+cross-container mechanics without claiming to exercise CUDA, live GitHub or
+W&B APIs, or a model provider. Before broad production rollout, run a controlled
+live staging wake in a disposable campaign namespace with the intended
+credentials and model provider, and verify observation, mutation, repair,
+restart, and secret-redaction behavior end to end.
 
 Deep references:
 

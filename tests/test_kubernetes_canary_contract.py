@@ -10,6 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 CANARY = ROOT / "tests" / "kubernetes" / "canary.py"
 REVISION = "a" * 40
 IMAGE = f"senpai-kubernetes-canary:sha-{REVISION}"
+ADVISOR_IMAGE = f"senpai-kubernetes-canary-advisor:sha-{REVISION}"
+STUDENT_IMAGE = f"senpai-kubernetes-canary-student:sha-{REVISION}"
 
 
 def render(phase: str) -> list[dict]:
@@ -28,6 +30,36 @@ def render(phase: str) -> list[dict]:
             "ci-123",
             "--image",
             IMAGE,
+            "--revision",
+            REVISION,
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return [document for document in yaml.safe_load_all(result.stdout) if document]
+
+
+def render_with_role_images(phase: str) -> list[dict]:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CANARY),
+            "render",
+            "--phase",
+            phase,
+            "--namespace",
+            "senpai-ci-123",
+            "--other-namespace",
+            "senpai-ci-123-other",
+            "--tag",
+            "ci-123",
+            "--advisor-image",
+            ADVISOR_IMAGE,
+            "--student-image",
+            STUDENT_IMAGE,
             "--revision",
             REVISION,
         ],
@@ -157,7 +189,7 @@ def test_initial_canary_manifest_uses_dummy_credentials_and_real_boundaries():
     )
 
     embedded_source = (
-        "set -eu; cp -a /opt/senpai/. /workspace/senpai; "
+        "set -eu; cp -R /opt/senpai/. /workspace/senpai; "
         "test -f /workspace/senpai/tests/kubernetes/canary.py"
     )
     for pod in (advisor_pod, student_pod):
@@ -229,6 +261,162 @@ def test_initial_canary_manifest_uses_dummy_credentials_and_real_boundaries():
     )
 
 
+def test_canary_renders_advisor_and_student_from_their_actual_distinct_images():
+    """
+    Requirement: the production canary must exercise the student image as a
+    student, rather than silently running both roles from the advisor image.
+    Interface: role-specific canary renderer arguments and emitted Deployments.
+    """
+
+    resources = by_kind_and_name(render_with_role_images("initial"))
+    advisor = resources[("Deployment", "senpai-advisor-ci-123")]
+    student = resources[("Deployment", "senpai-ci-123-fern")]
+    supervisor = resources[("Deployment", "senpai-supervisor-ci-123")]
+
+    assert {
+        container["image"]
+        for container in advisor["spec"]["template"]["spec"]["containers"]
+    } == {ADVISOR_IMAGE}
+    assert {
+        container["image"]
+        for container in student["spec"]["template"]["spec"]["containers"]
+    } == {STUDENT_IMAGE}
+    assert {
+        container["image"]
+        for container in supervisor["spec"]["template"]["spec"]["containers"]
+    } == {ADVISOR_IMAGE}
+
+
+def test_pull_request_loads_and_smokes_the_actual_student_production_image():
+    """
+    Requirement: each role image is built only by its existing matrix job, but
+    pull requests must load the real student image and exercise its immutable
+    runtime plus repair lifecycle before the lightweight Kind topology can pass.
+    Interface: the pull-request image workflow and student smoke script.
+    """
+
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "build.yaml").read_text()
+    )
+    steps = workflow["jobs"]["build"]["steps"]
+    image_build = next(step for step in steps if step["name"] == "Build and push")
+    student_smoke = next(
+        step for step in steps if step["name"] == "Run student image production smoke"
+    )
+    canary = next(
+        step for step in steps if step["name"] == "Run Kubernetes production canary"
+    )
+
+    assert image_build["with"]["load"] == (
+        "${{ github.event_name == 'pull_request' && matrix.role != 'cutoff' }}"
+    )
+    assert "github.event_name == 'pull_request'" in student_smoke["if"]
+    assert "matrix.role == 'student'" in student_smoke["if"]
+    assert student_smoke["env"]["STUDENT_IMAGE"] == (
+        "ghcr.io/${{ env.IMAGE_NAME }}:sha-${{ env.SOURCE_REVISION }}"
+    )
+    assert student_smoke["run"] == "scripts/test-student-image-smoke.sh"
+
+    smoke = (ROOT / "scripts" / "test-student-image-smoke.sh").read_text()
+    assert "/opt/senpai-venv/bin/python -I" in smoke
+    assert "senpai_agent" in smoke
+    assert "test ! -w" in smoke
+    assert "/usr/local/bin/senpai-repair-executor" in smoke
+    assert "/tmp/senpai-repair-executor-smoke/executor.sock" in smoke
+    assert "@senpai-repair-executor" not in smoke
+    assert " serve " in smoke
+    assert " client " in smoke
+
+    assert canary["env"]["ADVISOR_CANARY_IMAGE"] != canary["env"][
+        "STUDENT_CANARY_IMAGE"
+    ]
+    canary_script = (ROOT / "scripts" / "test-kubernetes-canary.sh").read_text()
+    assert '--advisor-image "$ADVISOR_CANARY_IMAGE"' in canary_script
+    assert '--student-image "$STUDENT_CANARY_IMAGE"' in canary_script
+    assert (
+        'load docker-image --name "$CLUSTER" "$ADVISOR_CANARY_IMAGE"'
+        in canary_script
+    )
+    assert (
+        'load docker-image --name "$CLUSTER" "$STUDENT_CANARY_IMAGE"'
+        in canary_script
+    )
+
+
+def test_live_role_repairs_prove_the_target_mount_is_a_real_git_worktree():
+    """
+    Requirement: a directory merely named `.git` must not let the production
+    canary claim that supervisor repairs reached the cloned target repository.
+    Interface: live advisor and student repair assertions in the canary script.
+    """
+
+    script = (ROOT / "scripts" / "test-kubernetes-canary.sh").read_text()
+
+    assert script.count(
+        'test "$(git rev-parse --show-toplevel)" = /repair/workspace'
+    ) >= 2
+    assert "test ! -e /run/senpai-repair-executor" in script
+    assert 'repair_socket=$(repair_socket_for "$deployment")' in script
+    assert "@senpai-repair-executor" not in script
+    helper = (ROOT / "tests" / "kubernetes" / "canary.py").read_text()
+    assert "cp -R /opt/senpai/. /workspace/senpai" in helper
+    assert "cp -a /opt/senpai/. /workspace/senpai" not in helper
+
+
+def test_live_canary_covers_terminal_and_durable_operation_recovery():
+    """The cluster gate must cover the supervisor's crash-sensitive boundaries."""
+
+    script = (ROOT / "scripts" / "test-kubernetes-canary.sh").read_text()
+
+    assert "probe-terminal-wakes" in script
+    assert "drop-repair-reply" in script
+    assert "seed-interrupted-operations" in script
+    assert "assert-interrupted-operations" in script
+    assert script.count("--operation-id") >= 8
+    assert "--status" in script
+    assert "same operation ID accepted a different command" in script
+    assert "repair replay executed twice" in script
+
+
+def test_live_canary_proves_role_quiescence_and_poisoned_root_recovery():
+    """The cluster gate must reproduce the production-only pause/restart risks."""
+
+    script = (ROOT / "scripts" / "test-kubernetes-canary.sh").read_text()
+    helper = (ROOT / "tests" / "kubernetes" / "canary.py").read_text()
+
+    assert "GENERATION_ENV" in helper
+    assert "signal.SIG_IGN" in helper
+    assert "start_new_session=True" in helper
+    assert 'server.bind(("127.0.0.1", {ROLE_LISTENER_PORT}))' in helper
+    assert script.count("http://127.0.0.1:18765/") >= 3
+    assert "wait_for_role_listener_advance" in script
+    assert "wake-stale456" in script
+    assert "operation-stale456" in script
+    assert script.count("kill -TERM 1") >= 2
+    assert "wait_for_container_restart" in script
+    assert "senpai_agent.isolated_terminal_health" in script
+    assert "ROLE_SHELL=/usr/local/bin/senpai-role-shell" in script
+
+
+def test_docs_state_shared_pod_loopback_and_fail_closed_repair_gate():
+    """Do not overclaim sidecar isolation; make repair quiescence explicit."""
+
+    readme = (ROOT / "README.md").read_text()
+    canary = (ROOT / "scripts" / "test-kubernetes-canary.sh").read_text()
+    normalized_readme = " ".join(readme.split())
+
+    assert "share the Pod network namespace" in readme
+    assert "loopback" in readme
+    assert "do not isolate loopback" in readme
+    assert "proves that no TCP listener remains" in normalized_readme
+    assert "an unproven pause refuses the repair" in normalized_readme
+    assert "disableDefaultCNI: true" in canary
+    assert "rollout status -n kube-system daemonset/calico-node" in canary
+    assert "senpai-metadata-decoy" in canary
+    assert "verify_sha256" in canary
+    assert "sha256sum --check" not in canary
+
+
 def test_failed_upgrade_is_supervisor_only_and_retains_versioned_rollback_bundles():
     """
     Requirement: a supervisor-only bad release changes both immutable bundle names,
@@ -268,6 +456,14 @@ def test_failed_upgrade_is_supervisor_only_and_retains_versioned_rollback_bundle
         if container["name"] == "supervisor-control"
     )
     assert "exit 42" in control["args"][0]
+
+    canary = (ROOT / "scripts" / "test-kubernetes-canary.sh").read_text()
+    assert "SupervisorRollback.capture" in canary
+    assert "k8s/supervisor_rollback.py restore" in canary
+    assert "persistent_state_rolled_back" in canary
+    assert "ABSENT_SERVICE_ACCOUNT" in canary
+    assert "assert-interrupted-operations" in canary
+    assert "rollout undo" not in canary
 
 
 def test_pull_request_canary_has_no_live_secret_or_checkout_credential_path():

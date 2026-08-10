@@ -68,13 +68,20 @@ jobs:
           context: .
           file: Dockerfile.${{ matrix.role }}
           push: ${{ github.event_name != 'pull_request' }}
-          load: ${{ github.event_name == 'pull_request' && matrix.role == 'advisor' }}
+          load: ${{ github.event_name == 'pull_request' && matrix.role != 'cutoff' }}
           pull: true
           no-cache: true
           build-args: |
             SENPAI_SOURCE_REVISION=${{ env.SOURCE_REVISION }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Run student image production smoke
+        if: github.event_name == 'pull_request' && matrix.role == 'student'
+        env:
+          STUDENT_IMAGE: ghcr.io/${{ env.IMAGE_NAME }}:sha-${{ env.SOURCE_REVISION }}
+          SENPAI_STUDENT_SMOKE_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: scripts/test-student-image-smoke.sh
 
       - name: Install pinned Kind
         if: github.event_name == 'pull_request' && matrix.role == 'advisor'
@@ -87,7 +94,8 @@ jobs:
         if: github.event_name == 'pull_request' && matrix.role == 'advisor'
         env:
           BASE_IMAGE: ghcr.io/${{ env.IMAGE_NAME }}:sha-${{ env.SOURCE_REVISION }}
-          CANARY_IMAGE: senpai-kubernetes-canary:sha-${{ env.SOURCE_REVISION }}
+          ADVISOR_CANARY_IMAGE: senpai-kubernetes-canary-advisor:sha-${{ env.SOURCE_REVISION }}
+          STUDENT_CANARY_IMAGE: senpai-kubernetes-canary-student:sha-${{ env.SOURCE_REVISION }}
           DIAGNOSTICS_DIR: ${{ runner.temp }}/senpai-kubernetes-canary
           SENPAI_CANARY_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: scripts/test-kubernetes-canary.sh

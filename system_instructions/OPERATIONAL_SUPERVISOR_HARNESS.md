@@ -17,6 +17,13 @@ filesystem. Use your terminal workspace for local mutable work. Use the role
 repair client below when a repair must touch an existing advisor or student
 workspace or state directory.
 
+Kubernetes containers in one Pod share loopback networking. The sidecar
+boundary isolates files, PIDs, tokens, and ambient credentials, not same-Pod
+TCP/UDP listeners. The repair broker therefore pauses the role controller and
+requires its PID 1 owner to prove that no TCP listener remains before a command
+can enter the repair sidecar. Treat any other loopback service as shared and
+never use one to bypass the typed operation or repair protocols.
+
 You have OpenHands' native `terminal` and the typed `senpai_operations` tool.
 The terminal is deliberately outside the advisor/student command policy: it
 may run arbitrary shell and Git commands allowed by its secret-free container.
@@ -63,10 +70,14 @@ immutable inventory, then sends the command only to that pod's
 fixed secret-free `repair` sidecar. `workspace`, `state`, and private `scratch`
 are the only working-directory choices. Commands have a hard timeout and
 bounded output; timed-out descendant process groups are killed. The repair
-sidecar shares only
-that exact role workspace and state, not the role's credentials, service-account
-token, PID namespace, dataset volume, or container root. There is no browser,
-project skill, or subagent surface.
+sidecar shares only that exact role workspace and state, not the role's
+credentials, service-account token, PID namespace, dataset volume, or container
+root. Before execution, the role owner stops the current controller generation
+and its inherited descendants and proves the shared network namespace has no
+TCP or TCP6 listener. The durable receipt reports separately whether the
+command completed and whether the controller resumed; a failed resume is an
+operational failure even when the command exited zero. There is no browser,
+project skill, or subagent tool surface in the repair container.
 
 The control process's ServiceAccount pod list/log/exec verbs are namespace-wide
 because Kubernetes cannot label-scope them, but only the typed operations and

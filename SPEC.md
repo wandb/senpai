@@ -856,17 +856,27 @@ it reports liveness and deadline state but accepts no command. Requests and outc
 audited, descendants are reaped on every exit path, and transport loss after
 command submission is reported as an unknown outcome rather than replayed.
 
+Before contacting that executor, the broker obtains a bounded pause from the
+role's PID 1 owner. The owner terminates the current controller generation and
+all processes carrying its one-generation ownership token, then refuses to
+acknowledge until recorded descendants are dead and no TCP or TCP6 listener
+remains in the shared Pod network namespace. A best-effort resume follows every
+repair outcome. The pause expires after a bounded interval if a resume reply is
+lost; the durable result and audit distinguish command completion from
+controller-resume completion.
+
 The operation ID is durably bound to a fingerprint over the exact target,
 byte-for-byte command, symbolic working directory, and timeout. The repair
 ledger retains bounded stdout/stderr for the newest 128 completed operations.
 For the life of the supervisor-state PVC, all older completions retain metadata
 tombstones with operation identity, target, fingerprint, working directory,
 timeout, status, timestamps, exit code, controller-resume outcome, prune time,
-and error type. Pruning is
-transactional with completion and startup recovery. `--status` is authoritative
-after a lost response; an `unknown` operation is never retried automatically,
-and replaying a pruned operation returns a typed expired-receipt tombstone
-without executing it again.
+and error type. Pruning is transactional with completion and startup recovery.
+`--status` is authoritative after a lost response; an `unknown` operation is
+never retried automatically, and replaying a pruned operation returns a typed
+expired-receipt tombstone without executing it again. Filesystem, credential,
+ServiceAccount, and PID separation still do not provide general same-Pod
+network isolation; NetworkPolicy remains an external-egress boundary.
 
 Every arbitrary repair first obtains a private, expiring pause from the role's
 PID-1 process supervisor. The supervisor terminates the active controller and
