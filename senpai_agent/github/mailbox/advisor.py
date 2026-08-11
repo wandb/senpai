@@ -29,7 +29,7 @@ from .values import (
     result_matches_assignment,
     versioned_event,
 )
-from .issues import human_issue_events
+from .communications import advisor_communication_events
 
 if TYPE_CHECKING:
     from .core import GitHubMailbox
@@ -136,7 +136,7 @@ def advisor_events(
             )
 
     events.extend(_research_base_events(mailbox, active_assignments))
-    events.extend(human_issue_events(mailbox, issues))
+    events.extend(advisor_communication_events(mailbox, active_assignments, issues))
     return tuple(events)
 
 

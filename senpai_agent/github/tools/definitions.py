@@ -24,6 +24,7 @@ from .contracts import (
     GitHubMutationObservation,
     MergeExperimentAction,
     PublishAdvisorBranchAction,
+    PostAssignmentCommentAction,
     RepairAssignmentRoutingAction,
     RequestAssignmentRevisionAction,
     RespondToHumanIssueAction,
@@ -32,6 +33,7 @@ from .contracts import (
 )
 from .runtime import (
     GitHubToolRuntime,
+    PostAssignmentCommentExecutor,
     SubmitExperimentResultExecutor,
     tool_annotations,
 )
@@ -227,4 +229,22 @@ class SubmitExperimentResultTool(
             "base, lease-push result.commit_sha, then publish the typed result and "
             "make the PR review-ready.",
             SubmitExperimentResultExecutor(runtime),
+        )
+
+
+class PostAssignmentCommentTool(
+    ToolDefinition[PostAssignmentCommentAction, GitHubMutationObservation]
+):
+    """Post one student-authored comment to its active assignment PR."""
+
+    @classmethod
+    def create(cls, runtime: GitHubToolRuntime) -> Sequence[Self]:
+        return _tool(
+            cls,
+            PostAssignmentCommentAction,
+            "Post assignment comment",
+            "Post or exactly replay one meaningful interim progress update, "
+            "question, blocker, evidence item, or response on this student's "
+            "current active assignment without pushing or changing workflow state.",
+            PostAssignmentCommentExecutor(runtime),
         )

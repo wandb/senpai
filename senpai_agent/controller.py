@@ -53,7 +53,9 @@ from senpai_agent.supervisor import LEASE_ENV, ProgressLease
 from senpai_agent.workspace import StudentWorkspaceReconciler, WorkspaceDivergence
 
 
-_EDGE_TRIGGERED_EVENT_KINDS = frozenset({"research_base_changed"})
+_EDGE_TRIGGERED_EVENT_KINDS = frozenset(
+    {"research_base_changed", "student_assignment_comment"}
+)
 _PROMPT_TEMPLATE_VARIABLES = frozenset(
     {
         "ADVISOR_BRANCH",

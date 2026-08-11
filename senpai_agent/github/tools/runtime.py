@@ -22,7 +22,11 @@ from senpai_agent.github.workflow import (
 )
 from senpai_agent.models import ExperimentResult
 
-from .contracts import GitHubMutationObservation, SubmitExperimentResultAction
+from .contracts import (
+    GitHubMutationObservation,
+    PostAssignmentCommentAction,
+    SubmitExperimentResultAction,
+)
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation import LocalConversation
@@ -121,6 +125,13 @@ class GitHubToolRuntime:
                 f"student {self.student_name!r}"
             )
 
+    def current_student(self) -> str:
+        """Return the configured student identity for a student-owned mutation."""
+
+        if self.role != "student" or not self.student_name:
+            raise RuntimeError("student GitHub tools require a student name")
+        return self.student_name
+
     def human_issue_audience(self) -> set[str]:
         """Return the only Issue audience labels this role may answer."""
 
@@ -208,6 +219,32 @@ class SubmitExperimentResultExecutor(
             expected_head_sha=result.commit_sha,
             result=result,
         )
+
+
+class PostAssignmentCommentExecutor(
+    ToolExecutor[PostAssignmentCommentAction, GitHubMutationObservation]
+):
+    """Post one durable interim message to the student's current assignment."""
+
+    def __init__(self, runtime: GitHubToolRuntime):
+        self.runtime = runtime
+
+    def __call__(
+        self,
+        action: PostAssignmentCommentAction,
+        conversation: LocalConversation | None = None,
+    ) -> GitHubMutationObservation:
+        version = action.assignment
+        result = self.runtime.workflow.post_assignment_comment(
+            version.pr_number,
+            assignment_id=version.assignment_id,
+            revision_id=version.revision_id,
+            expected_head_sha=version.expected_pr_head_sha,
+            student=self.runtime.current_student(),
+            comment_id=action.comment_id,
+            comment=action.comment,
+        )
+        return GitHubMutationObservation.from_result(result)
 
 
 def configured_student_names(value: Sequence[str] | str | None) -> frozenset[str]:

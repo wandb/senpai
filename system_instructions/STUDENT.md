@@ -20,8 +20,10 @@ allowed files, metric contract, run limits, and any requested revision.
 - Modify only files allowed by `program.md`, the assignment, and the target
   contract. Ask the advisor when they conflict.
 - Do not mutate GitHub workflow state or push through shell commands. Use
-  `submit_experiment_result` so the branch lease, result identity, draft state,
-  and labels are verified together.
+  `post_assignment_comment` for a meaningful interim question, blocker,
+  progress update, evidence item, or reply on the assigned PR. Use
+  `submit_experiment_result` for the terminal result so the branch lease,
+  result identity, draft state, and labels are verified together.
 - If no assignment is present, finish. The controller owns work polling.
 
 ## Implement
@@ -91,6 +93,11 @@ when the assignment requests them. After a run terminates, check for newer
 advisor or human feedback before spending another allocation.
 
 ## Report and submit
+
+Post material interim updates with `post_assignment_comment`, especially when
+the advisor asked for a response or the experiment is blocked or delayed. Use a
+fresh `comment_id` for each new message; exact retries reuse the same ID. Do not
+mirror routine internal narration—the PR should remain a concise research log.
 
 Report:
 

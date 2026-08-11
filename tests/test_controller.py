@@ -604,6 +604,40 @@ def test_unchanged_research_base_change_does_not_repeat_on_reminder_cadence(
     ]
 
 
+def test_student_assignment_comment_does_not_repeat_on_reminder_cadence(
+    monkeypatch,
+):
+    event = ControllerEvent(
+        kind="student_assignment_comment",
+        dedupe_key="student_assignment_comment:v2:message-1",
+        payload={"comment_id": "message-1"},
+    )
+    clock = [0.0]
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+
+    class PersistentMailbox(Mailbox):
+        def poll(self):
+            self.calls += 1
+            return (event,)
+
+    turns = Turns()
+    controller_module.Controller(
+        role="advisor",
+        mailbox=PersistentMailbox([]),
+        turns=turns,
+        conversation_id=CONVERSATION_ID,
+        full_prompt="programme",
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        poll_interval_seconds=600,
+        jitter_seconds=0,
+        event_reminder_seconds=600,
+    ).run(max_cycles=3)
+
+    assert [call[2] for call in turns.calls] == [
+        frozenset({event.dedupe_key}),
+    ]
+
+
 def test_changed_research_base_sha_wakes_immediately():
     first = research_base_event("def")
     changed = research_base_event("fed")
