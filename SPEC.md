@@ -292,9 +292,10 @@ summarizing subagent.
 GitHub mutations are separate, operation-specific tools without a union wrapper.
 There is no operation discriminator or model-supplied repository. The runtime
 binds repository, role, credentials, workspace, and configured branches outside
-the model-facing schema. It also canonicalizes every Senpai-authored comment to
-an `ADVISOR:` or `STUDENT:` prefix from that trusted role; models supply plain
-comment text and cannot impersonate the other role through a payload.
+the model-facing schema. It also puts an `ADVISOR:` or `STUDENT:` label from
+that trusted role on the first visible line of every Senpai-authored comment,
+inside a leading Markdown heading when present. Models supply plain comment
+text and cannot impersonate the other role through a payload.
 
 Advisor operations that act on an assignment share this object:
 

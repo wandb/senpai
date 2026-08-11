@@ -188,7 +188,10 @@ class ExperimentResult(Contract):
         Field(
             min_length=1,
             max_length=4_000,
-            description="Concise evidence-backed conclusion from the experiment.",
+            description=(
+                "Concise evidence-backed conclusion written as GitHub-flavored "
+                "Markdown with short paragraphs or bullets."
+            ),
         ),
     ]
     runs: tuple[WandbRunRef, ...] = Field(
@@ -374,21 +377,60 @@ def _quote_senpai_marker_lines(value: str) -> str:
     )
 
 
+def _metric_value(value: float | None) -> str:
+    return "—" if value is None else f"`{value}`"
+
+
 def render_result_comment(result: ExperimentResult) -> str:
+    commit = _quote_senpai_marker_lines(result.commit_sha)
+    repo = _quote_senpai_marker_lines(result.assignment.repo)
     lines = [
         render_result_marker(result),
         "",
-        f"Status: {result.status.value}",
-        f"Commit: `{result.commit_sha}`",
+        "## Experiment result",
+        "",
+        f"- **Status:** `{result.status.value}`",
+        (
+            "- **Student:** "
+            f"`{_quote_senpai_marker_lines(result.assignment.student)}`"
+        ),
+        (
+            f"- **Commit:** [`{commit[:12]}`]"
+            f"(https://github.com/{repo}/commit/{commit})"
+        ),
+        "",
+        "### Hypothesis",
+        "",
+        _quote_senpai_marker_lines(result.hypothesis),
+        "",
+        "### Summary",
         "",
         _quote_senpai_marker_lines(result.summary),
     ]
+    if metric := result.primary_metric:
+        lines.extend(
+            [
+                "",
+                "### Primary metric",
+                "",
+                f"- **Metric:** `{_quote_senpai_marker_lines(metric.name)}`",
+                f"- **Direction:** `{metric.direction}`",
+                f"- **Baseline:** {_metric_value(metric.baseline)}",
+                f"- **Candidate:** {_metric_value(metric.candidate)}",
+                f"- **Delta:** {_metric_value(metric.delta)}",
+            ]
+        )
     if result.runs:
         lines.extend(
             [
                 "",
-                "W&B runs:",
-                *(f"- {_quote_senpai_marker_lines(run.url)}" for run in result.runs),
+                "### W&B runs",
+                "",
+                *(
+                    f"- **{_quote_senpai_marker_lines(run.run_id)}**"
+                    f" — `{run.state}` — {_quote_senpai_marker_lines(run.url)}"
+                    for run in result.runs
+                ),
             ]
         )
     return "\n".join(lines)

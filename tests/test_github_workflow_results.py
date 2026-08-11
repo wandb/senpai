@@ -75,7 +75,11 @@ def test_submit_result_converges_review_state_and_replays_without_writes():
     assert fake.pr["draft"] is False
     assert fake.pr["labels"] == {"student:one", "status:review"}
     assert len(fake.comments) == 1
-    assert "\n\nSTUDENT: Status: succeeded" in str(fake.comments[0]["body"])
+    assert "\n\n## STUDENT: Experiment result" in str(
+        fake.comments[0]["body"]
+    )
+    assert "\n### Hypothesis\n" in str(fake.comments[0]["body"])
+    assert "\n### Summary\n" in str(fake.comments[0]["body"])
     assert fake.mutations == mutations_after_first
 
 
@@ -184,7 +188,7 @@ def test_changed_result_is_allowed_on_a_new_revision_or_head(advance):
 
     assert result.state == "result_submitted"
     expected = render_result_comment(changed).replace(
-        "\n\n", "\n\nSTUDENT: ", 1
+        "## Experiment result", "## STUDENT: Experiment result", 1
     )
     assert fake.comments == [
         comment(1, render_result_comment(original)),
@@ -199,12 +203,27 @@ def test_changed_result_is_allowed_on_a_new_revision_or_head(advance):
     ).state == "experiment_merged"
 
 
-def test_identical_duplicate_result_replay_upgrades_legacy_role_prefix_once():
+def test_duplicate_result_replay_upgrades_legacy_comment_formats_once():
     terminal = experiment_result()
-    body = render_result_comment(terminal)
+    legacy_body = "\n".join(
+        [
+            render_result_marker(terminal),
+            "",
+            "STUDENT: Status: succeeded",
+            f"Commit: `{HEAD_SHA}`",
+            "",
+            terminal.summary,
+            "",
+            "W&B runs:",
+            "- https://wandb.ai/acme/project/runs/run-123",
+        ]
+    )
     fake = FakeGitHub(
         pull_request(labels={"student:one", "status:review"}, draft=False),
-        comments=[comment(1, body), comment(2, body)],
+        comments=[
+            comment(1, legacy_body),
+            comment(2, legacy_body.replace("STUDENT: ", "", 1)),
+        ],
     )
     client = workflow(fake, role="student")
 
@@ -215,7 +234,9 @@ def test_identical_duplicate_result_replay_upgrades_legacy_role_prefix_once():
     assert submitted.state == "result_submitted"
     assert submitted.changed is True
     assert replayed.changed is False
-    expected = body.replace("\n\n", "\n\nSTUDENT: ", 1)
+    expected = render_result_comment(terminal).replace(
+        "## Experiment result", "## STUDENT: Experiment result", 1
+    )
     assert [item["body"] for item in fake.comments] == [expected, expected]
     assert sum(
         method == "PATCH" and "/issues/comments/" in path

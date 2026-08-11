@@ -29,7 +29,8 @@ complete model-facing description. The
 skills in this plugin explain when to use those tools and provide workflow
 examples; they do not implement mutations or carry credentials. The plugin has
 no MCP server. The Python runtime binds the authenticated role and adds the
-canonical `ADVISOR:` or `STUDENT:` prefix to Senpai-authored GitHub comments;
+canonical `ADVISOR:` or `STUDENT:` label to the first visible line of
+Senpai-authored GitHub comments, inside a leading Markdown heading when present;
 tool payloads contain only the unprefixed message text.
 
 Keep Senpai-owned workflow skills here rather than relying on a provider's user
