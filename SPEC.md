@@ -105,20 +105,22 @@ batches; immediate post-turn polls drain later batches without dropping them.
 While an OpenHands turn is running, `ActiveGitHubWatcher` polls the same GitHub
 state. It enqueues all newly visible advisor events, and only PR feedback bound
 to the currently running student UUID, in the role's local event store.
-OpenHands 1.40 supports concurrent `send_message`; `AdvisorEventPump` injects at
-its state lock boundary without cancelling unrelated work. Successfully
-injected student feedback is acknowledged in `github-feedback.json` only when
-the enclosing student turn succeeds.
+`AdvisorEventPump` transfers those events into the persistent delivery inbox;
+it does not change the immutable membership of an unresolved turn. The events
+therefore become model-visible, in order and exactly once, on the next turn
+boundary. Successfully processed student feedback is acknowledged in
+`github-feedback.json` only when its durable turn succeeds.
 
 Generic child results use a local SQLite WAL event store because parent and
 child run on the same advisor or student instance. That is not an inter-node
 protocol.
 
-The only SQLite databases are `advisor-events.sqlite3`, for unacknowledged
-advisor watcher/child events; `student-events.sqlite3`, for unacknowledged
-student feedback/child events; and `training/monitors.sqlite3`, for student
-monitor policy, samples, and deduplicated actionable signals. OpenHands
-conversation history is a separate file-backed per-UUID event log.
+The SQLite databases are `advisor-events.sqlite3`, for unacknowledged advisor
+watcher/child events; `student-events.sqlite3`, for unacknowledged student
+feedback/child events; `delivery-inbox.sqlite3`, for stable turn membership and
+delivery receipts; and `training/monitors.sqlite3`, for student monitor policy,
+samples, and deduplicated actionable signals. OpenHands conversation history is
+a separate file-backed per-UUID event log.
 
 ## State and conversations
 
@@ -129,6 +131,7 @@ Advisor state:
 ├── advisor-conversation-id
 ├── controller-lease.json
 ├── advisor-events.sqlite3
+├── delivery-inbox.sqlite3
 ├── conversation-state.json
 ├── github/
 └── conversations managed by OpenHands
@@ -145,6 +148,7 @@ Student state:
 ├── github-feedback.json
 ├── student-conversations.json
 ├── student-events.sqlite3
+├── delivery-inbox.sqlite3
 ├── conversation-state.json
 ├── training/
 │   ├── <training-id>.json
@@ -174,9 +178,19 @@ the previous `started-conversations.json` and
 legacy files' two writes resumes without replaying its initial brief and
 receives the current system context once.
 
-OpenHands stores base state and individual events beneath that UUID. A killed
-worker resumes from the last persisted event. An in-flight response or tool
-call without a durable event is retried from the preceding event.
+OpenHands stores base state and individual events beneath that UUID. The
+delivery inbox advances each bounded turn monotonically through `pending`,
+`delivered`, and `processed`. A killed worker resumes an already-delivered turn
+without appending its messages again; a processed turn reconciles mailbox
+acknowledgements without another model call. New events remain queued behind an
+unresolved turn in the same conversation.
+
+Successful tool observations renew the turn's stall clock at their persisted
+event timestamp and reset its consecutive recovery allowance. When a turn
+exhausts that no-progress allowance, Senpai preserves and quarantines only that
+turn. Later events continue on a fresh active branch with one typed quarantine
+notice; the dead-letter trace remains available for audit. A quarantined turn
+with queued later events is published as degraded-but-live controller health.
 
 The controller marks a conversation's initial instructions delivered and
 records its current system-context digest in the same atomic update, only after
@@ -591,10 +605,12 @@ Denied patterns include raw GitHub mutations, raw `git push`, direct training
 launches, sleeps, polling loops, `watch`, and `tail -f`, including nested shell
 and `env` wrappers.
 
-Every OpenHands turn has a controller-configured hard deadline. The deadline
-interrupts the conversation, produces a non-success result, and leaves durable
-events unacknowledged. The controller then retries with bounded exponential
-backoff. Controller termination interrupts and closes the current conversation,
+Every OpenHands turn has a controller-configured hard deadline. Reaching that
+deadline interrupts the current run as a resumable `paused_timeout`, preserves
+the delivered turn, and lets the controller poll and serve other ready
+conversations before continuing it without replay. Provider errors and other
+genuine failures remain failures and use bounded exponential backoff.
+Controller termination interrupts and closes the current conversation,
 cancels active supervised training, closes local stores, and flushes Weave
 before the controller exits. Standalone and child runners flush Weave at runner
 exit.

@@ -50,6 +50,7 @@ from senpai_agent.state import (
     WorkspaceDivergenceLedger,
 )
 from senpai_agent.supervisor import LEASE_ENV, ProgressLease
+from senpai_agent.turns import TurnOutcome
 from senpai_agent.workspace import StudentWorkspaceReconciler, WorkspaceDivergence
 
 
@@ -74,6 +75,10 @@ _PROMPT_TEMPLATE_VARIABLES = frozenset(
 class TurnResult:
     exit_code: int
     delivered_event_keys: frozenset[str] = frozenset()
+
+    @property
+    def outcome(self) -> TurnOutcome:
+        return TurnOutcome.from_exit_code(self.exit_code)
 
 
 class ConversationRecoveryExhausted(RuntimeError):
@@ -354,6 +359,7 @@ class Controller:
         self._deferred_until: dict[str, float] = {}
         self._deferred_conversations: dict[UUID, float] = {}
         self._workspace_divergence: dict[UUID, str] = {}
+        self._reported_degraded_backlog: tuple[int, int] | None = None
 
     def run(self, *, max_cycles: int | None = None) -> None:
         self._wait_for_start_gates()
@@ -422,6 +428,7 @@ class Controller:
                         file=sys.stderr,
                         flush=True,
                     )
+                    self._publish_progress("quarantine")
                     continue
                 except Exception as error:  # noqa: BLE001
                     failures = turn_failures.get(conversation_id, 0) + 1
@@ -439,7 +446,19 @@ class Controller:
                     failed_conversations.add(conversation_id)
                     cycle_had_failure = True
                     continue
-                if result.exit_code != 0:
+                if result.outcome is TurnOutcome.PAUSED_TIMEOUT:
+                    turn_failures.pop(conversation_id, None)
+                    served_conversations.add(conversation_id)
+                    print(
+                        "SENPAI_TURN_PAUSED_TIMEOUT "
+                        f"conversation_id={conversation_id} "
+                        f"turn_id={turn.turn_id}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    self._poll_into_inbox(allow_reminders=False)
+                    continue
+                if result.outcome is TurnOutcome.FAILED:
                     failures = turn_failures.get(conversation_id, 0) + 1
                     turn_failures[conversation_id] = failures
                     print(
@@ -500,6 +519,7 @@ class Controller:
             allow_reminders=allow_reminders,
         )
         self._enqueue_events(events)
+        self._publish_progress("poll")
 
     def _enqueue_events(self, events: Sequence[ControllerEvent]) -> None:
         for batch in self._event_batches(events):
@@ -647,11 +667,27 @@ class Controller:
         *,
         completed_turn: bool = False,
     ) -> None:
+        quarantined_turns, pending_events = self.inbox.degraded_backlog()
+        degraded_backlog = (quarantined_turns, pending_events)
+        if degraded_backlog != self._reported_degraded_backlog:
+            if quarantined_turns and pending_events:
+                print(
+                    "SENPAI_HEALTH_DEGRADED "
+                    f"quarantined_turns={quarantined_turns} "
+                    f"pending_events={pending_events}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif self._reported_degraded_backlog not in (None, (0, 0)):
+                print("SENPAI_HEALTH_RECOVERED", file=sys.stderr, flush=True)
+            self._reported_degraded_backlog = degraded_backlog
         if self.progress is not None:
             self.progress.update(
                 phase,
                 timeout_seconds or self.operation_timeout_seconds,
                 completed_turn=completed_turn,
+                quarantined_turns=quarantined_turns,
+                pending_events=pending_events,
             )
 
     def _sleep(self, phase: str, seconds: float) -> None:

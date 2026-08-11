@@ -391,6 +391,29 @@ def test_health_command_reports_live_and_expired_worker_leases(tmp_path: Path):
         json.dumps(
             {
                 "pid": os.getpid(),
+                "phase": "poll",
+                "deadline": time.monotonic() + 30,
+                "health": "degraded",
+                "quarantined_turns": 1,
+                "pending_events": 2,
+            }
+        )
+    )
+    degraded_lease = WorkerLease.read(lease)
+    degraded = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "senpai_agent.supervisor",
+            "health",
+            str(lease),
+        ],
+        check=False,
+    )
+    lease.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
                 "phase": "openhands-turn",
                 "deadline": time.monotonic() - 1,
             }
@@ -408,6 +431,10 @@ def test_health_command_reports_live_and_expired_worker_leases(tmp_path: Path):
     )
 
     assert healthy.returncode == 0
+    assert degraded.returncode == 0
+    assert degraded_lease.health == "degraded"
+    assert degraded_lease.quarantined_turns == 1
+    assert degraded_lease.pending_events == 2
     assert expired.returncode == 1
 
 

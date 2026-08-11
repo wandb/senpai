@@ -12,6 +12,7 @@ from openhands.sdk.event import ActionEvent, ObservationEvent
 
 from senpai_agent.inbox import (
     DeliveryState,
+    InboxTurnQuarantined,
     PersistentInbox,
     deliver_turn_messages,
     turn_has_finished_response,
@@ -246,7 +247,7 @@ def test_context_reset_preserves_old_turn_and_requeues_one_canonical_copy(
     assert [event.body for event in next_generation.events] == ["canonical event"]
 
 
-def test_terminal_recovery_policy_survives_restart_and_bounds_attempts_and_age(
+def test_terminal_recovery_policy_survives_restart_and_bounds_attempts(
     tmp_path: Path,
 ):
     """
@@ -275,18 +276,196 @@ def test_terminal_recovery_policy_survives_restart_and_bounds_attempts_and_age(
         max_age_seconds=10_000,
     )
 
-    age_path = tmp_path / "age-inbox.sqlite3"
-    aged = PersistentInbox(age_path)
-    aged.enqueue(CONVERSATION_ID, "event:age", "aged event")
-    aged_turn = aged.next_turn(CONVERSATION_ID, "aged prompt")
-    assert aged_turn is not None
-    deliver_turn_messages(Conversation(), aged, aged_turn.turn_id)
-    assert PersistentInbox(age_path).terminal_recovery_due(
-        aged_turn.turn_id,
+
+
+def test_productive_turn_age_is_measured_from_last_progress_across_restarts(
+    tmp_path: Path,
+):
+    """
+    Requirement: useful work may continue for hours without being declared stalled.
+    Interface: the persistent inbox's progress and terminal-recovery contract.
+    """
+    path = tmp_path / "age-inbox.sqlite3"
+    inbox = PersistentInbox(path)
+    inbox.enqueue(CONVERSATION_ID, "event:age", "aged event")
+    turn = inbox.next_turn(CONVERSATION_ID, "aged prompt")
+    assert turn is not None
+    deliver_turn_messages(Conversation(), inbox, turn.turn_id)
+    started = time.time()
+
+    PersistentInbox(path).record_progress(
+        turn.turn_id,
+        "observation-after-three-hours",
+        now=started + 3 * 60 * 60,
+    )
+    assert not PersistentInbox(path).terminal_recovery_due(
+        turn.turn_id,
+        max_attempts=99,
+        max_age_seconds=3 * 60 * 60,
+        now=started + 5 * 60 * 60,
+    )
+
+    PersistentInbox(path).record_progress(
+        turn.turn_id,
+        "observation-after-six-hours",
+        now=started + 6 * 60 * 60,
+    )
+    assert not PersistentInbox(path).terminal_recovery_due(
+        turn.turn_id,
+        max_attempts=99,
+        max_age_seconds=3 * 60 * 60,
+        now=started + 8 * 60 * 60,
+    )
+    assert PersistentInbox(path).terminal_recovery_due(
+        turn.turn_id,
+        max_attempts=99,
+        max_age_seconds=3 * 60 * 60,
+        now=started + 9 * 60 * 60 + 1,
+    )
+
+
+def test_existing_inbox_migrates_progress_into_the_new_stall_clock(tmp_path: Path):
+    """
+    Requirement: upgrading Senpai cannot immediately quarantine productive old turns.
+    Interface: reopening the pre-progress-clock SQLite schema.
+    """
+    path = tmp_path / "old-inbox.sqlite3"
+    database = sqlite3.connect(path)
+    database.execute(
+        """
+        CREATE TABLE inbox_turns (
+            turn_id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            recovery_of TEXT,
+            superseded_by TEXT,
+            legacy_prompt_delivery_id TEXT,
+            context_reset_completed INTEGER NOT NULL DEFAULT 1,
+            acknowledged INTEGER NOT NULL DEFAULT 0,
+            stalled_attempts INTEGER NOT NULL DEFAULT 0,
+            progress_event_id TEXT,
+            recovery_generation INTEGER NOT NULL DEFAULT 0,
+            quarantine_reason TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            processed_at TEXT,
+            acknowledged_at TEXT
+        )
+        """
+    )
+    database.executemany(
+        """
+        INSERT INTO inbox_turns (
+            turn_id,
+            conversation_id,
+            state,
+            progress_event_id,
+            recovery_generation,
+            created_at
+        ) VALUES (?, ?, 'delivered', ?, 1, datetime('now', '-1 day'))
+        """,
+        (
+            ("productive", str(CONVERSATION_ID), "tool-observation"),
+            ("stalled", str(CONVERSATION_ID), None),
+        ),
+    )
+    database.commit()
+    database.close()
+
+    inbox = PersistentInbox(path)
+    now = time.time()
+
+    assert not inbox.terminal_recovery_due(
+        "productive",
         max_attempts=99,
         max_age_seconds=60,
-        now=time.time() + 61,
+        now=now,
     )
+    assert inbox.turn("productive").recoveries_since_progress == 0
+    assert inbox.terminal_recovery_due(
+        "stalled",
+        max_attempts=99,
+        max_age_seconds=60,
+        now=now,
+    )
+    assert inbox.turn("stalled").recoveries_since_progress == 1
+
+
+def test_new_progress_resets_the_consecutive_recovery_allowance(tmp_path: Path):
+    """
+    Requirement: the recovery budget counts consecutive no-progress branches.
+    Interface: persistent progress, recovery, and quarantine transitions.
+    """
+    inbox = PersistentInbox(tmp_path / "recovery-inbox.sqlite3")
+    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    original = inbox.next_turn(CONVERSATION_ID, "original prompt")
+    assert original is not None
+    deliver_turn_messages(Conversation(), inbox, original.turn_id)
+
+    first_recovery = inbox.recover_turn(
+        original.turn_id,
+        "first recovery",
+        max_generations=1,
+    )
+    deliver_turn_messages(Conversation(), inbox, first_recovery.turn_id)
+    inbox.record_progress(first_recovery.turn_id, "new-tool-observation")
+
+    second_recovery = inbox.recover_turn(
+        first_recovery.turn_id,
+        "second recovery after progress",
+        max_generations=1,
+    )
+    deliver_turn_messages(Conversation(), inbox, second_recovery.turn_id)
+    with pytest.raises(InboxTurnQuarantined, match="recovery budget exhausted"):
+        inbox.recover_turn(
+            second_recovery.turn_id,
+            "third recovery without progress",
+            max_generations=1,
+        )
+
+
+def test_quarantined_turn_does_not_block_later_events(tmp_path: Path):
+    """
+    Requirement: one poisoned turn cannot starve later student or GitHub events.
+    Interface: durable quarantine and conversation scheduling.
+    """
+    inbox = PersistentInbox(tmp_path / "quarantine-inbox.sqlite3")
+    inbox.enqueue(CONVERSATION_ID, "event:poisoned", "poisoned event")
+    poisoned = inbox.next_turn(CONVERSATION_ID, "poisoned prompt")
+    assert poisoned is not None
+    deliver_turn_messages(Conversation(), inbox, poisoned.turn_id)
+    inbox.quarantine(poisoned.turn_id, "recovery budget exhausted")
+
+    inbox.enqueue(CONVERSATION_ID, "student:result", "Tanjiro completed")
+    inbox.enqueue(CONVERSATION_ID, "github:comment", "Please review the receipt")
+
+    assert inbox.ready_conversation_ids() == (str(CONVERSATION_ID),)
+    later = inbox.next_turn(CONVERSATION_ID, "continue after quarantine")
+    assert later is not None
+    assert later.context_reset_required
+    assert [event.event_key for event in later.events] == [
+        None,
+        "student:result",
+        "github:comment",
+    ]
+    assert "Senpai event: quarantined_turn" in later.events[0].body
+    assert poisoned.turn_id in later.events[0].body
+    assert "recovery budget exhausted" in later.events[0].body
+    assert poisoned.turn_id != later.turn_id
+    assert inbox.turn(poisoned.turn_id).quarantine_reason == (
+        "recovery budget exhausted"
+    )
+
+    continuation = Conversation()
+    deliver_turn_messages(continuation, inbox, later.turn_id)
+    inbox.record_processed(later.turn_id)
+    inbox.acknowledge(later.turn_id)
+    inbox.enqueue(CONVERSATION_ID, "student:second", "Nezuko completed")
+
+    second = inbox.next_turn(CONVERSATION_ID, "continue normally")
+    assert second is not None
+    assert not second.context_reset_required
+    assert [event.event_key for event in second.events] == ["student:second"]
+    assert all("quarantined_turn" not in event.body for event in second.events)
 
 
 def test_ordinary_tool_action_is_not_a_finished_response(tmp_path: Path):
