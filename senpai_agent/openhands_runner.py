@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Iterator, Mapping, MutableMapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
@@ -1311,6 +1311,8 @@ def _latest_completed_tool_progress(
                 and timestamp
             ):
                 observed_at = datetime.fromisoformat(timestamp)
+                if observed_at.tzinfo is None:
+                    observed_at = observed_at.replace(tzinfo=UTC)
                 return event_id, observed_at.timestamp()
     return None
 

@@ -1,7 +1,7 @@
 import json
 import signal
 import threading
-from datetime import datetime
+from datetime import UTC, datetime
 from io import StringIO
 from types import SimpleNamespace
 
@@ -806,7 +806,7 @@ def test_restart_uses_the_observation_timestamp_for_stall_age(
     assert result.outcome is TurnOutcome.FAILED
     assert navigations == [None]
     assert inbox.turn(turn.turn_id).last_progress_at == pytest.approx(
-        datetime.fromisoformat("2000-08-11T00:00:00").timestamp()
+        datetime.fromisoformat("2000-08-11T00:00:00").replace(tzinfo=UTC).timestamp()
     )
     assert inbox.turn(turn.turn_id).superseded_by is not None
 

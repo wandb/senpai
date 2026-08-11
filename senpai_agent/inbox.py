@@ -227,11 +227,42 @@ class PersistentInbox:
             )
             self._connection.execute(
                 """
+                WITH RECURSIVE recovery_counts(turn_id, consecutive) AS (
+                    SELECT
+                        turn.turn_id,
+                        CASE
+                            WHEN turn.progress_event_id IS NOT NULL THEN 0
+                            ELSE turn.recovery_generation
+                        END
+                    FROM inbox_turns AS turn
+                    LEFT JOIN inbox_turns AS parent
+                      ON parent.turn_id = turn.recovery_of
+                    WHERE parent.turn_id IS NULL
+
+                    UNION ALL
+
+                    SELECT
+                        child.turn_id,
+                        CASE
+                            WHEN child.progress_event_id IS NOT NULL THEN 0
+                            ELSE parent.consecutive + 1
+                        END
+                    FROM inbox_turns AS child
+                    JOIN recovery_counts AS parent
+                      ON child.recovery_of = parent.turn_id
+                )
                 UPDATE inbox_turns
-                SET recoveries_since_progress = CASE
-                    WHEN progress_event_id IS NULL THEN recovery_generation
-                    ELSE 0
-                END
+                SET recoveries_since_progress = COALESCE(
+                    (
+                        SELECT consecutive
+                        FROM recovery_counts
+                        WHERE recovery_counts.turn_id = inbox_turns.turn_id
+                    ),
+                    CASE
+                        WHEN progress_event_id IS NOT NULL THEN 0
+                        ELSE recovery_generation
+                    END
+                )
                 """
             )
         if "last_progress_at" not in turn_columns:
@@ -950,38 +981,55 @@ class PersistentInbox:
     ) -> InboxTurn:
         if max_generations < 0:
             raise ValueError("maximum recovery generations must be non-negative")
-        current = self.latest_turn(turn_id)
-        if current.recoveries_since_progress >= max_generations:
-            reason = "recovery budget exhausted"
-            self.quarantine(current.turn_id, reason)
-            raise InboxTurnQuarantined(current.turn_id, reason)
-        return self.reset_turn(current.turn_id, prompt)
+        reason = "recovery budget exhausted"
+        with self._transaction() as database:
+            current = self._turn(database, turn_id)
+            if current.superseded_by is not None:
+                return self._latest_turn(database, turn_id)
+            if current.state is DeliveryState.PROCESSED:
+                return current
+            if current.quarantine_reason is not None:
+                raise InboxTurnQuarantined(
+                    current.turn_id,
+                    current.quarantine_reason,
+                )
+            if current.recoveries_since_progress >= max_generations:
+                self._quarantine_turn(database, current.turn_id, reason)
+            else:
+                if not prompt:
+                    raise ValueError("recovery prompt must not be empty")
+                return self._create_recovery_turn(database, current, prompt)
+        raise InboxTurnQuarantined(current.turn_id, reason)
 
     def quarantine(self, turn_id: str, reason: str) -> InboxTurn:
         if not reason:
             raise ValueError("quarantine reason must not be empty")
         with self._transaction() as database:
-            turn = self._turn(database, turn_id)
-            if turn.state is DeliveryState.PROCESSED:
-                raise ValueError("cannot quarantine a processed turn")
-            row = database.execute(
-                "SELECT quarantine_reason FROM inbox_turns WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            existing = row["quarantine_reason"]
-            if existing is not None and existing != reason:
-                raise RuntimeError(
-                    f"inbox turn {turn_id} already quarantined for {existing}"
-                )
-            database.execute(
-                """
-                UPDATE inbox_turns
-                SET quarantine_reason = ?
-                WHERE turn_id = ?
-                """,
-                (reason, turn_id),
+            return self._quarantine_turn(database, turn_id, reason)
+
+    def _quarantine_turn(
+        self,
+        database: sqlite3.Connection,
+        turn_id: str,
+        reason: str,
+    ) -> InboxTurn:
+        turn = self._turn(database, turn_id)
+        if turn.state is DeliveryState.PROCESSED:
+            raise ValueError("cannot quarantine a processed turn")
+        existing = turn.quarantine_reason
+        if existing is not None and existing != reason:
+            raise RuntimeError(
+                f"inbox turn {turn_id} already quarantined for {existing}"
             )
-            return self._turn(database, turn_id)
+        database.execute(
+            """
+            UPDATE inbox_turns
+            SET quarantine_reason = ?
+            WHERE turn_id = ?
+            """,
+            (reason, turn_id),
+        )
+        return self._turn(database, turn_id)
 
     def quarantined_turns(self) -> tuple[InboxTurn, ...]:
         with self._lock:
@@ -1029,38 +1077,71 @@ class PersistentInbox:
             raise ValueError("recovery prompt must not be empty")
         with self._transaction() as database:
             original = self._turn(database, turn_id)
-            if original.superseded_by is not None:
-                return self._latest_turn(database, turn_id)
-            if original.state is DeliveryState.PROCESSED:
-                return original
-            if original.quarantine_reason is not None:
-                raise InboxTurnQuarantined(
-                    original.turn_id,
-                    original.quarantine_reason,
-                )
+            return self._create_recovery_turn(database, original, prompt)
 
-            recovery_id = str(uuid.uuid4())
-            database.execute(
-                """
-                INSERT INTO inbox_turns (
-                    turn_id,
-                    conversation_id,
-                    state,
-                    recovery_of,
-                    context_reset_completed,
-                    recovery_generation,
-                    recoveries_since_progress
-                ) VALUES (?, ?, 'pending', ?, 0, ?, ?)
-                """,
-                (
-                    recovery_id,
-                    original.conversation_id,
-                    turn_id,
-                    original.recovery_generation + 1,
-                    original.recoveries_since_progress + 1,
-                ),
+    def _create_recovery_turn(
+        self,
+        database: sqlite3.Connection,
+        original: InboxTurn,
+        prompt: str,
+    ) -> InboxTurn:
+        if original.superseded_by is not None:
+            return self._latest_turn(database, original.turn_id)
+        if original.state is DeliveryState.PROCESSED:
+            return original
+        if original.quarantine_reason is not None:
+            raise InboxTurnQuarantined(
+                original.turn_id,
+                original.quarantine_reason,
             )
-            prompt_id = str(uuid.uuid4())
+        recovery_id = str(uuid.uuid4())
+        database.execute(
+            """
+            INSERT INTO inbox_turns (
+                turn_id,
+                conversation_id,
+                state,
+                recovery_of,
+                context_reset_completed,
+                recovery_generation,
+                recoveries_since_progress
+            ) VALUES (?, ?, 'pending', ?, 0, ?, ?)
+            """,
+            (
+                recovery_id,
+                original.conversation_id,
+                original.turn_id,
+                original.recovery_generation + 1,
+                original.recoveries_since_progress + 1,
+            ),
+        )
+        prompt_id = str(uuid.uuid4())
+        database.execute(
+            """
+            INSERT INTO inbox_messages (
+                conversation_id,
+                event_key,
+                body,
+                body_sha256,
+                delivery_id,
+                sender,
+                state,
+                requires_ack,
+                turn_id,
+                position
+            ) VALUES (?, NULL, ?, ?, ?, ?, 'pending', 0, ?, 0)
+            """,
+            (
+                original.conversation_id,
+                prompt,
+                _digest(prompt),
+                prompt_id,
+                _sender(prompt_id),
+                recovery_id,
+            ),
+        )
+        for position, message in enumerate(original.events, start=1):
+            delivery_id = str(uuid.uuid4())
             database.execute(
                 """
                 INSERT INTO inbox_messages (
@@ -1072,55 +1153,29 @@ class PersistentInbox:
                     sender,
                     state,
                     requires_ack,
+                    legacy,
                     turn_id,
                     position
-                ) VALUES (?, NULL, ?, ?, ?, ?, 'pending', 0, ?, 0)
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
                 """,
                 (
                     original.conversation_id,
-                    prompt,
-                    _digest(prompt),
-                    prompt_id,
-                    _sender(prompt_id),
+                    message.event_key,
+                    message.body,
+                    _digest(message.body),
+                    delivery_id,
+                    _sender(delivery_id),
+                    int(message.requires_ack),
+                    int(self._is_legacy_message(database, message.delivery_id)),
                     recovery_id,
+                    position,
                 ),
             )
-            for position, message in enumerate(original.events, start=1):
-                delivery_id = str(uuid.uuid4())
-                database.execute(
-                    """
-                    INSERT INTO inbox_messages (
-                        conversation_id,
-                        event_key,
-                        body,
-                        body_sha256,
-                        delivery_id,
-                        sender,
-                        state,
-                        requires_ack,
-                        legacy,
-                        turn_id,
-                        position
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
-                    """,
-                    (
-                        original.conversation_id,
-                        message.event_key,
-                        message.body,
-                        _digest(message.body),
-                        delivery_id,
-                        _sender(delivery_id),
-                        int(message.requires_ack),
-                        int(self._is_legacy_message(database, message.delivery_id)),
-                        recovery_id,
-                        position,
-                    ),
-                )
-            database.execute(
-                "UPDATE inbox_turns SET superseded_by = ? WHERE turn_id = ?",
-                (recovery_id, turn_id),
-            )
-            return self._turn(database, recovery_id)
+        database.execute(
+            "UPDATE inbox_turns SET superseded_by = ? WHERE turn_id = ?",
+            (recovery_id, original.turn_id),
+        )
+        return self._turn(database, recovery_id)
 
     def record_context_reset(self, turn_id: str) -> InboxTurn:
         with self._transaction() as database:

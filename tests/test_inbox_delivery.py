@@ -1,6 +1,7 @@
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -358,14 +359,30 @@ def test_existing_inbox_migrates_progress_into_the_new_stall_clock(tmp_path: Pat
             turn_id,
             conversation_id,
             state,
+            recovery_of,
             progress_event_id,
             recovery_generation,
             created_at
-        ) VALUES (?, ?, 'delivered', ?, 1, datetime('now', '-1 day'))
+        ) VALUES (?, ?, 'delivered', ?, ?, ?, datetime('now', '-1 day'))
         """,
         (
-            ("productive", str(CONVERSATION_ID), "tool-observation"),
-            ("stalled", str(CONVERSATION_ID), None),
+            ("productive", str(CONVERSATION_ID), None, "tool-observation", 1),
+            ("stalled", str(CONVERSATION_ID), None, None, 1),
+            ("chain-root", str(CONVERSATION_ID), None, None, 0),
+            (
+                "chain-progress",
+                str(CONVERSATION_ID),
+                "chain-root",
+                "later-tool-observation",
+                1,
+            ),
+            (
+                "chain-after-progress",
+                str(CONVERSATION_ID),
+                "chain-progress",
+                None,
+                2,
+            ),
         ),
     )
     database.commit()
@@ -388,6 +405,8 @@ def test_existing_inbox_migrates_progress_into_the_new_stall_clock(tmp_path: Pat
         now=now,
     )
     assert inbox.turn("stalled").recoveries_since_progress == 1
+    assert inbox.turn("chain-progress").recoveries_since_progress == 0
+    assert inbox.turn("chain-after-progress").recoveries_since_progress == 1
 
 
 def test_new_progress_resets_the_consecutive_recovery_allowance(tmp_path: Path):
@@ -421,6 +440,146 @@ def test_new_progress_resets_the_consecutive_recovery_allowance(tmp_path: Path):
             "third recovery without progress",
             max_generations=1,
         )
+
+
+def test_recovery_decision_reads_progress_inside_its_write_transaction(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """
+    Requirement: committed progress cannot race with a stale recovery decision.
+    Interface: two inbox connections recovering and recording the same turn.
+    """
+    path = tmp_path / "atomic-recovery-inbox.sqlite3"
+    inbox = PersistentInbox(path)
+    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    original = inbox.next_turn(CONVERSATION_ID, "original prompt")
+    assert original is not None
+    deliver_turn_messages(Conversation(), inbox, original.turn_id)
+    recovery = inbox.recover_turn(
+        original.turn_id,
+        "first recovery",
+        max_generations=1,
+    )
+    deliver_turn_messages(Conversation(), inbox, recovery.turn_id)
+
+    writer = sqlite3.connect(path)
+    writer.execute("PRAGMA busy_timeout=5000")
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute(
+        """
+        UPDATE inbox_turns
+        SET progress_event_id = 'concurrent-progress',
+            recoveries_since_progress = 0,
+            stalled_attempts = 0,
+            last_progress_at = ?
+        WHERE turn_id = ?
+        """,
+        (time.time(), recovery.turn_id),
+    )
+
+    stale_read = threading.Event()
+    original_latest_turn = inbox.latest_turn
+
+    def record_stale_read(turn_id: str):
+        turn = original_latest_turn(turn_id)
+        stale_read.set()
+        return turn
+
+    monkeypatch.setattr(inbox, "latest_turn", record_stale_read)
+    result = []
+    errors = []
+
+    def recover() -> None:
+        try:
+            result.append(
+                inbox.recover_turn(
+                    recovery.turn_id,
+                    "recovery after concurrent progress",
+                    max_generations=1,
+                )
+            )
+        except Exception as error:  # noqa: BLE001
+            errors.append(error)
+
+    worker = threading.Thread(target=recover)
+    worker.start()
+    stale_read.wait(timeout=0.25)
+    writer.commit()
+    writer.close()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert not stale_read.is_set()
+    assert errors == []
+    assert len(result) == 1
+    assert result[0].recoveries_since_progress == 1
+    assert inbox.turn(recovery.turn_id).quarantine_reason is None
+
+
+def test_recovery_keeps_a_processed_turn_terminal(tmp_path: Path):
+    inbox = PersistentInbox(tmp_path / "processed-recovery-inbox.sqlite3")
+    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    turn = inbox.next_turn(CONVERSATION_ID, "processed prompt")
+    assert turn is not None
+    deliver_turn_messages(Conversation(), inbox, turn.turn_id)
+    inbox.record_processed(turn.turn_id)
+
+    recovered = inbox.recover_turn(
+        turn.turn_id,
+        "must not revive processed work",
+        max_generations=0,
+    )
+
+    assert recovered.state is DeliveryState.PROCESSED
+    assert recovered.turn_id == turn.turn_id
+    assert recovered.superseded_by is None
+    assert recovered.quarantine_reason is None
+
+
+def test_recovery_keeps_an_existing_quarantine_terminal(tmp_path: Path):
+    inbox = PersistentInbox(tmp_path / "quarantined-recovery-inbox.sqlite3")
+    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    turn = inbox.next_turn(CONVERSATION_ID, "quarantined prompt")
+    assert turn is not None
+    deliver_turn_messages(Conversation(), inbox, turn.turn_id)
+    inbox.quarantine(turn.turn_id, "operator quarantine")
+
+    with pytest.raises(InboxTurnQuarantined, match="operator quarantine"):
+        inbox.recover_turn(
+            turn.turn_id,
+            "must not revive quarantined work",
+            max_generations=0,
+        )
+
+    terminal = inbox.turn(turn.turn_id)
+    assert terminal.superseded_by is None
+    assert terminal.quarantine_reason == "operator quarantine"
+
+
+def test_duplicate_stale_recovery_returns_the_existing_successor(tmp_path: Path):
+    path = tmp_path / "duplicate-recovery-inbox.sqlite3"
+    first_worker = PersistentInbox(path)
+    first_worker.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    original = first_worker.next_turn(CONVERSATION_ID, "original prompt")
+    assert original is not None
+    deliver_turn_messages(Conversation(), first_worker, original.turn_id)
+
+    existing = first_worker.recover_turn(
+        original.turn_id,
+        "first worker recovery",
+        max_generations=1,
+    )
+    stale_worker = PersistentInbox(path)
+    duplicate = stale_worker.recover_turn(
+        original.turn_id,
+        "stale duplicate recovery",
+        max_generations=1,
+    )
+
+    assert duplicate.turn_id == existing.turn_id
+    assert duplicate.quarantine_reason is None
+    assert stale_worker.quarantined_turns() == ()
 
 
 def test_quarantined_turn_does_not_block_later_events(tmp_path: Path):
