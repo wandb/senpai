@@ -22,6 +22,7 @@ from senpai_agent.inbox import (
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.state import ConversationStateLedger, WorkspaceDivergenceLedger
 from senpai_agent.supervisor import ProgressLease, WorkerLease
+from senpai_agent.turns import TurnOutcome
 from senpai_agent.workspace import WorkspaceDivergence
 from test_agent_markdown import HTML_HEADER
 
@@ -64,7 +65,7 @@ class Turns:
         outcome = self.outcomes.pop(0) if self.outcomes else TurnResult(exit_code=0)
         if isinstance(outcome, Exception):
             raise outcome
-        if outcome.exit_code == 0:
+        if outcome.outcome is TurnOutcome.PROCESSED:
             turn = inbox.turn(inbox_turn_id)
             for message in turn.messages:
                 inbox.record_delivered(message.delivery_id, message.body)
@@ -118,6 +119,10 @@ class MultiGenerationRecoveryTurns:
 
 
 class QuarantiningTurns:
+    def __init__(self, late_event=None):
+        self.calls = 0
+        self.late_event = late_event
+
     def run(
         self,
         _prompt,
@@ -128,8 +133,27 @@ class QuarantiningTurns:
         inbox,
         inbox_turn_id,
     ):
-        inbox.quarantine(inbox_turn_id, "recovery budget exhausted")
-        raise InboxTurnQuarantined(inbox_turn_id, "recovery budget exhausted")
+        self.calls += 1
+        if self.calls == 1:
+            if self.late_event is not None:
+                inbox.enqueue(
+                    conversation_id,
+                    self.late_event.dedupe_key,
+                    self.late_event.to_prompt(),
+                )
+            inbox.quarantine(inbox_turn_id, "recovery budget exhausted")
+            raise InboxTurnQuarantined(inbox_turn_id, "recovery budget exhausted")
+        deliver_turn_messages(
+            SimpleNamespace(
+                events=[],
+                state=SimpleNamespace(active_branch=lambda: []),
+                send_message=lambda *_args, **_kwargs: None,
+            ),
+            inbox,
+            inbox_turn_id,
+        )
+        inbox.record_processed(inbox_turn_id)
+        return TurnResult(exit_code=0)
 
 def research_base_event(current_sha="def"):
     return ControllerEvent(
@@ -1066,24 +1090,57 @@ def test_controller_follows_the_complete_recovery_chain_before_acknowledging():
     assert mailbox.acknowledged == [(event.dedupe_key,)]
 
 
-def test_controller_quarantines_an_exhausted_turn_without_restarting(capsys):
+def test_controller_processes_later_events_after_quarantining_one_turn(
+    tmp_path: Path,
+    capsys,
+):
     """
     Requirement: exhausting recovery is a durable visible stop, not a restart loop.
     Interface: controller lifetime, stderr, mailbox acknowledgement, and inbox readiness.
     """
     event = review_event()
+    late = review_event(18)
     mailbox = Mailbox(((event,), ()))
+    lease_path = tmp_path / "controller-lease.json"
     runtime = controller(
         mailbox,
-        QuarantiningTurns(),
+        QuarantiningTurns(late),
         max_consecutive_turn_failures=1,
+        progress=ProgressLease(lease_path),
     )
 
     runtime.run(max_cycles=1)
 
-    assert mailbox.acknowledged == []
-    assert runtime.inbox.ready_conversation_ids() == ()
-    assert "SENPAI_TURN_QUARANTINED" in capsys.readouterr().err
+    assert mailbox.acknowledged == [(late.dedupe_key,)]
+    assert len(runtime.inbox.quarantined_turns()) == 1
+    stderr = capsys.readouterr().err
+    assert "SENPAI_TURN_QUARANTINED" in stderr
+    assert "SENPAI_HEALTH_DEGRADED quarantined_turns=1 pending_events=1" in stderr
+    assert WorkerLease.read(lease_path).health == "healthy"
+
+
+def test_repeated_timeout_pauses_do_not_exhaust_the_failure_budget(capsys):
+    event = review_event()
+    mailbox = Mailbox(((event,), (), ()))
+    turns = Turns(
+        (
+            TurnResult(exit_code=int(TurnOutcome.PAUSED_TIMEOUT)),
+            TurnResult(exit_code=int(TurnOutcome.PAUSED_TIMEOUT)),
+            TurnResult(exit_code=0),
+        )
+    )
+
+    controller(
+        mailbox,
+        turns,
+        max_consecutive_turn_failures=1,
+    ).run(max_cycles=1)
+
+    assert len(turns.calls) == 3
+    assert mailbox.acknowledged == [(event.dedupe_key,)]
+    stderr = capsys.readouterr().err
+    assert stderr.count("SENPAI_TURN_PAUSED_TIMEOUT") == 2
+    assert "SENPAI_TURN_ERROR" not in stderr
 
 
 def test_start_gate_wait_publishes_a_live_lease_before_polling(tmp_path: Path):

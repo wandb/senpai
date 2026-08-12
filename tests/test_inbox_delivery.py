@@ -1,6 +1,7 @@
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -12,6 +13,7 @@ from openhands.sdk.event import ActionEvent, ObservationEvent
 
 from senpai_agent.inbox import (
     DeliveryState,
+    InboxTurnQuarantined,
     PersistentInbox,
     deliver_turn_messages,
     turn_has_finished_response,
@@ -246,7 +248,7 @@ def test_context_reset_preserves_old_turn_and_requeues_one_canonical_copy(
     assert [event.body for event in next_generation.events] == ["canonical event"]
 
 
-def test_terminal_recovery_policy_survives_restart_and_bounds_attempts_and_age(
+def test_terminal_recovery_policy_survives_restart_and_bounds_attempts(
     tmp_path: Path,
 ):
     """
@@ -275,18 +277,354 @@ def test_terminal_recovery_policy_survives_restart_and_bounds_attempts_and_age(
         max_age_seconds=10_000,
     )
 
-    age_path = tmp_path / "age-inbox.sqlite3"
-    aged = PersistentInbox(age_path)
-    aged.enqueue(CONVERSATION_ID, "event:age", "aged event")
-    aged_turn = aged.next_turn(CONVERSATION_ID, "aged prompt")
-    assert aged_turn is not None
-    deliver_turn_messages(Conversation(), aged, aged_turn.turn_id)
-    assert PersistentInbox(age_path).terminal_recovery_due(
-        aged_turn.turn_id,
+
+
+def test_productive_turn_age_is_measured_from_last_progress_across_restarts(
+    tmp_path: Path,
+):
+    """
+    Requirement: useful work may continue for hours without being declared stalled.
+    Interface: the persistent inbox's progress and terminal-recovery contract.
+    """
+    path = tmp_path / "age-inbox.sqlite3"
+    inbox = PersistentInbox(path)
+    inbox.enqueue(CONVERSATION_ID, "event:age", "aged event")
+    turn = inbox.next_turn(CONVERSATION_ID, "aged prompt")
+    assert turn is not None
+    deliver_turn_messages(Conversation(), inbox, turn.turn_id)
+    started = time.time()
+
+    PersistentInbox(path).record_progress(
+        turn.turn_id,
+        "observation-after-three-hours",
+        now=started + 3 * 60 * 60,
+    )
+    assert not PersistentInbox(path).terminal_recovery_due(
+        turn.turn_id,
+        max_attempts=99,
+        max_age_seconds=3 * 60 * 60,
+        now=started + 5 * 60 * 60,
+    )
+
+    PersistentInbox(path).record_progress(
+        turn.turn_id,
+        "observation-after-six-hours",
+        now=started + 6 * 60 * 60,
+    )
+    assert not PersistentInbox(path).terminal_recovery_due(
+        turn.turn_id,
+        max_attempts=99,
+        max_age_seconds=3 * 60 * 60,
+        now=started + 8 * 60 * 60,
+    )
+    assert PersistentInbox(path).terminal_recovery_due(
+        turn.turn_id,
+        max_attempts=99,
+        max_age_seconds=3 * 60 * 60,
+        now=started + 9 * 60 * 60 + 1,
+    )
+
+
+def test_existing_inbox_migrates_progress_into_the_new_stall_clock(tmp_path: Path):
+    """
+    Requirement: upgrading Senpai cannot immediately quarantine productive old turns.
+    Interface: reopening the pre-progress-clock SQLite schema.
+    """
+    path = tmp_path / "old-inbox.sqlite3"
+    database = sqlite3.connect(path)
+    database.execute(
+        """
+        CREATE TABLE inbox_turns (
+            turn_id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            recovery_of TEXT,
+            superseded_by TEXT,
+            legacy_prompt_delivery_id TEXT,
+            context_reset_completed INTEGER NOT NULL DEFAULT 1,
+            acknowledged INTEGER NOT NULL DEFAULT 0,
+            stalled_attempts INTEGER NOT NULL DEFAULT 0,
+            progress_event_id TEXT,
+            recovery_generation INTEGER NOT NULL DEFAULT 0,
+            quarantine_reason TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            processed_at TEXT,
+            acknowledged_at TEXT
+        )
+        """
+    )
+    database.executemany(
+        """
+        INSERT INTO inbox_turns (
+            turn_id,
+            conversation_id,
+            state,
+            recovery_of,
+            progress_event_id,
+            recovery_generation,
+            created_at
+        ) VALUES (?, ?, 'delivered', ?, ?, ?, datetime('now', '-1 day'))
+        """,
+        (
+            ("productive", str(CONVERSATION_ID), None, "tool-observation", 1),
+            ("stalled", str(CONVERSATION_ID), None, None, 1),
+            ("chain-root", str(CONVERSATION_ID), None, None, 0),
+            (
+                "chain-progress",
+                str(CONVERSATION_ID),
+                "chain-root",
+                "later-tool-observation",
+                1,
+            ),
+            (
+                "chain-after-progress",
+                str(CONVERSATION_ID),
+                "chain-progress",
+                None,
+                2,
+            ),
+        ),
+    )
+    database.commit()
+    database.close()
+
+    inbox = PersistentInbox(path)
+    now = time.time()
+
+    assert not inbox.terminal_recovery_due(
+        "productive",
         max_attempts=99,
         max_age_seconds=60,
-        now=time.time() + 61,
+        now=now,
     )
+    assert inbox.turn("productive").recoveries_since_progress == 0
+    assert inbox.terminal_recovery_due(
+        "stalled",
+        max_attempts=99,
+        max_age_seconds=60,
+        now=now,
+    )
+    assert inbox.turn("stalled").recoveries_since_progress == 1
+    assert inbox.turn("chain-progress").recoveries_since_progress == 0
+    assert inbox.turn("chain-after-progress").recoveries_since_progress == 1
+
+
+def test_new_progress_resets_the_consecutive_recovery_allowance(tmp_path: Path):
+    """
+    Requirement: the recovery budget counts consecutive no-progress branches.
+    Interface: persistent progress, recovery, and quarantine transitions.
+    """
+    inbox = PersistentInbox(tmp_path / "recovery-inbox.sqlite3")
+    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    original = inbox.next_turn(CONVERSATION_ID, "original prompt")
+    assert original is not None
+    deliver_turn_messages(Conversation(), inbox, original.turn_id)
+
+    first_recovery = inbox.recover_turn(
+        original.turn_id,
+        "first recovery",
+        max_generations=1,
+    )
+    deliver_turn_messages(Conversation(), inbox, first_recovery.turn_id)
+    inbox.record_progress(first_recovery.turn_id, "new-tool-observation")
+
+    second_recovery = inbox.recover_turn(
+        first_recovery.turn_id,
+        "second recovery after progress",
+        max_generations=1,
+    )
+    deliver_turn_messages(Conversation(), inbox, second_recovery.turn_id)
+    with pytest.raises(InboxTurnQuarantined, match="recovery budget exhausted"):
+        inbox.recover_turn(
+            second_recovery.turn_id,
+            "third recovery without progress",
+            max_generations=1,
+        )
+
+
+def test_recovery_decision_reads_progress_inside_its_write_transaction(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """
+    Requirement: committed progress cannot race with a stale recovery decision.
+    Interface: two inbox connections recovering and recording the same turn.
+    """
+    path = tmp_path / "atomic-recovery-inbox.sqlite3"
+    inbox = PersistentInbox(path)
+    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    original = inbox.next_turn(CONVERSATION_ID, "original prompt")
+    assert original is not None
+    deliver_turn_messages(Conversation(), inbox, original.turn_id)
+    recovery = inbox.recover_turn(
+        original.turn_id,
+        "first recovery",
+        max_generations=1,
+    )
+    deliver_turn_messages(Conversation(), inbox, recovery.turn_id)
+
+    writer = sqlite3.connect(path)
+    writer.execute("PRAGMA busy_timeout=5000")
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute(
+        """
+        UPDATE inbox_turns
+        SET progress_event_id = 'concurrent-progress',
+            recoveries_since_progress = 0,
+            stalled_attempts = 0,
+            last_progress_at = ?
+        WHERE turn_id = ?
+        """,
+        (time.time(), recovery.turn_id),
+    )
+
+    stale_read = threading.Event()
+    original_latest_turn = inbox.latest_turn
+
+    def record_stale_read(turn_id: str):
+        turn = original_latest_turn(turn_id)
+        stale_read.set()
+        return turn
+
+    monkeypatch.setattr(inbox, "latest_turn", record_stale_read)
+    result = []
+    errors = []
+
+    def recover() -> None:
+        try:
+            result.append(
+                inbox.recover_turn(
+                    recovery.turn_id,
+                    "recovery after concurrent progress",
+                    max_generations=1,
+                )
+            )
+        except Exception as error:  # noqa: BLE001
+            errors.append(error)
+
+    worker = threading.Thread(target=recover)
+    worker.start()
+    stale_read.wait(timeout=0.25)
+    writer.commit()
+    writer.close()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert not stale_read.is_set()
+    assert errors == []
+    assert len(result) == 1
+    assert result[0].recoveries_since_progress == 1
+    assert inbox.turn(recovery.turn_id).quarantine_reason is None
+
+
+def test_recovery_keeps_a_processed_turn_terminal(tmp_path: Path):
+    inbox = PersistentInbox(tmp_path / "processed-recovery-inbox.sqlite3")
+    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    turn = inbox.next_turn(CONVERSATION_ID, "processed prompt")
+    assert turn is not None
+    deliver_turn_messages(Conversation(), inbox, turn.turn_id)
+    inbox.record_processed(turn.turn_id)
+
+    recovered = inbox.recover_turn(
+        turn.turn_id,
+        "must not revive processed work",
+        max_generations=0,
+    )
+
+    assert recovered.state is DeliveryState.PROCESSED
+    assert recovered.turn_id == turn.turn_id
+    assert recovered.superseded_by is None
+    assert recovered.quarantine_reason is None
+
+
+def test_recovery_keeps_an_existing_quarantine_terminal(tmp_path: Path):
+    inbox = PersistentInbox(tmp_path / "quarantined-recovery-inbox.sqlite3")
+    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    turn = inbox.next_turn(CONVERSATION_ID, "quarantined prompt")
+    assert turn is not None
+    deliver_turn_messages(Conversation(), inbox, turn.turn_id)
+    inbox.quarantine(turn.turn_id, "operator quarantine")
+
+    with pytest.raises(InboxTurnQuarantined, match="operator quarantine"):
+        inbox.recover_turn(
+            turn.turn_id,
+            "must not revive quarantined work",
+            max_generations=0,
+        )
+
+    terminal = inbox.turn(turn.turn_id)
+    assert terminal.superseded_by is None
+    assert terminal.quarantine_reason == "operator quarantine"
+
+
+def test_duplicate_stale_recovery_returns_the_existing_successor(tmp_path: Path):
+    path = tmp_path / "duplicate-recovery-inbox.sqlite3"
+    first_worker = PersistentInbox(path)
+    first_worker.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    original = first_worker.next_turn(CONVERSATION_ID, "original prompt")
+    assert original is not None
+    deliver_turn_messages(Conversation(), first_worker, original.turn_id)
+
+    existing = first_worker.recover_turn(
+        original.turn_id,
+        "first worker recovery",
+        max_generations=1,
+    )
+    stale_worker = PersistentInbox(path)
+    duplicate = stale_worker.recover_turn(
+        original.turn_id,
+        "stale duplicate recovery",
+        max_generations=1,
+    )
+
+    assert duplicate.turn_id == existing.turn_id
+    assert duplicate.quarantine_reason is None
+    assert stale_worker.quarantined_turns() == ()
+
+
+def test_quarantined_turn_does_not_block_later_events(tmp_path: Path):
+    """
+    Requirement: one poisoned turn cannot starve later student or GitHub events.
+    Interface: durable quarantine and conversation scheduling.
+    """
+    inbox = PersistentInbox(tmp_path / "quarantine-inbox.sqlite3")
+    inbox.enqueue(CONVERSATION_ID, "event:poisoned", "poisoned event")
+    poisoned = inbox.next_turn(CONVERSATION_ID, "poisoned prompt")
+    assert poisoned is not None
+    deliver_turn_messages(Conversation(), inbox, poisoned.turn_id)
+    inbox.quarantine(poisoned.turn_id, "recovery budget exhausted")
+
+    inbox.enqueue(CONVERSATION_ID, "student:result", "Tanjiro completed")
+    inbox.enqueue(CONVERSATION_ID, "github:comment", "Please review the receipt")
+
+    assert inbox.ready_conversation_ids() == (str(CONVERSATION_ID),)
+    later = inbox.next_turn(CONVERSATION_ID, "continue after quarantine")
+    assert later is not None
+    assert later.context_reset_required
+    assert [event.event_key for event in later.events] == [
+        None,
+        "student:result",
+        "github:comment",
+    ]
+    assert "Senpai event: quarantined_turn" in later.events[0].body
+    assert poisoned.turn_id in later.events[0].body
+    assert "recovery budget exhausted" in later.events[0].body
+    assert poisoned.turn_id != later.turn_id
+    assert inbox.turn(poisoned.turn_id).quarantine_reason == (
+        "recovery budget exhausted"
+    )
+
+    continuation = Conversation()
+    deliver_turn_messages(continuation, inbox, later.turn_id)
+    inbox.record_processed(later.turn_id)
+    inbox.acknowledge(later.turn_id)
+    inbox.enqueue(CONVERSATION_ID, "student:second", "Nezuko completed")
+
+    second = inbox.next_turn(CONVERSATION_ID, "continue normally")
+    assert second is not None
+    assert not second.context_reset_required
+    assert [event.event_key for event in second.events] == ["student:second"]
+    assert all("quarantined_turn" not in event.body for event in second.events)
 
 
 def test_ordinary_tool_action_is_not_a_finished_response(tmp_path: Path):

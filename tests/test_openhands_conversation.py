@@ -1,14 +1,13 @@
 import json
 import signal
 import threading
+from datetime import UTC, datetime
 from io import StringIO
 from types import SimpleNamespace
 
 import pytest
 from openhands.sdk.conversation import ConversationExecutionStatus
 from openhands.sdk.event import (
-    AgentErrorEvent,
-    ConversationStateUpdateEvent,
     InterruptEvent,
     MessageEvent,
     ObservationEvent,
@@ -22,6 +21,7 @@ from senpai_agent.inbox import (
     DeliveryState,
     InboxTurnQuarantined,
     PersistentInbox,
+    deliver_turn_messages,
 )
 from senpai_agent.openhands_runner import (
     graceful_interrupts,
@@ -29,6 +29,7 @@ from senpai_agent.openhands_runner import (
     reject_recovered_actions,
     run_openhands,
 )
+from senpai_agent.turns import TurnOutcome
 from openhands_support import (
     PLUGIN_DIR,
     isolate_agent_discovery,
@@ -145,21 +146,17 @@ def test_context_reset_preserves_history_and_starts_a_fresh_active_branch(
     assert calls[1] == ("navigate", None)
 
 
-def test_provider_timeout_resumes_inference_without_resending_the_turn(
+def test_harness_timeout_resumes_inference_without_resending_the_turn(
     tmp_path,
     monkeypatch,
 ):
     """
-    Requirement: a timed-out provider turn resumes with arun on its existing branch.
-    Interface: run_openhands, the persistent inbox, and model-visible messages.
+    Requirement: repeated hard-lease pauses resume without replay or false failure.
+    Interface: OpenHandsTurnRunner, persistent inbox, and model-visible messages.
     """
     history = []
     sent = []
     arun_calls = []
-    statuses = [
-        ConversationExecutionStatus.PAUSED,
-        ConversationExecutionStatus.FINISHED,
-    ]
 
     class FakeConversation:
         def __init__(self, **kwargs):
@@ -176,7 +173,101 @@ def test_provider_timeout_resumes_inference_without_resending_the_turn(
 
         async def arun(self):
             arun_calls.append(1)
-            self.state.execution_status = statuses.pop(0)
+            if len(arun_calls) <= 2:
+                await runner.asyncio.Event().wait()
+            self.state.execution_status = ConversationExecutionStatus.FINISHED
+
+        def interrupt(self):
+            self.state.execution_status = ConversationExecutionStatus.PAUSED
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(
+        runner.ConversationState,
+        "get_unmatched_actions",
+        lambda _events: [],
+    )
+    isolate_agent_discovery(monkeypatch, runner)
+    run_with_real_timeout = runner.run_conversation
+    monkeypatch.setattr(
+        runner,
+        "run_conversation",
+        lambda conversation, _remaining_lease: run_with_real_timeout(
+            conversation,
+            0.01,
+        ),
+    )
+    config = runtime_config(tmp_path, timeout_seconds=10)
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(config.conversation_id, "event:1", "first event")
+    turn = inbox.next_turn(config.conversation_id, "controller prompt")
+    assert turn is not None
+    turns = OpenHandsTurnRunner(config, full_prompt="complete research brief")
+
+    first = turns.run(
+        turn.prompt.body,
+        conversation_id=config.conversation_id,
+        event_keys=frozenset(turn.event_keys),
+        inbox=inbox,
+        inbox_turn_id=turn.turn_id,
+    )
+    second = turns.run(
+        turn.prompt.body,
+        conversation_id=config.conversation_id,
+        event_keys=frozenset(turn.event_keys),
+        inbox=PersistentInbox(inbox.path),
+        inbox_turn_id=turn.turn_id,
+    )
+    finished = turns.run(
+        turn.prompt.body,
+        conversation_id=config.conversation_id,
+        event_keys=frozenset(turn.event_keys),
+        inbox=PersistentInbox(inbox.path),
+        inbox_turn_id=turn.turn_id,
+    )
+
+    assert first.outcome is second.outcome is TurnOutcome.PAUSED_TIMEOUT
+    assert finished.outcome is TurnOutcome.PROCESSED
+    assert [message for message, _sender in sent] == [
+        "controller prompt",
+        "first event",
+    ]
+    assert len(arun_calls) == 3
+    assert PersistentInbox(inbox.path).turn(turn.turn_id).state is (
+        DeliveryState.PROCESSED
+    )
+
+
+def test_provider_timeout_error_is_not_classified_as_a_harness_pause(
+    tmp_path,
+    monkeypatch,
+):
+    """
+    Requirement: only Senpai's own lease boundary is a resumable timeout pause.
+    Interface: OpenHandsTurnRunner's typed outcome and durable inbox receipt.
+    """
+    history = []
+    interrupted = []
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                active_branch=lambda: list(history),
+                events=history,
+                execution_status=ConversationExecutionStatus.RUNNING,
+            )
+
+        def send_message(self, message, sender=None):
+            history.append(SimpleNamespace(message=message, sender=sender))
+
+        async def arun(self):
+            raise TimeoutError("provider request timed out")
+
+        def interrupt(self):
+            interrupted.append(True)
 
         def close(self):
             pass
@@ -194,27 +285,17 @@ def test_provider_timeout_resumes_inference_without_resending_the_turn(
     turn = inbox.next_turn(config.conversation_id, "controller prompt")
     assert turn is not None
 
-    assert run_openhands(
-        "unused retry prompt",
-        config,
-        inbox=inbox,
-        inbox_turn_id=turn.turn_id,
-    ) == 1
-    assert run_openhands(
-        "another unused retry prompt",
-        config,
-        inbox=PersistentInbox(inbox.path),
-        inbox_turn_id=turn.turn_id,
-    ) == 0
+    with pytest.raises(TimeoutError, match="provider request timed out"):
+        OpenHandsTurnRunner(config, full_prompt="complete research brief").run(
+            turn.prompt.body,
+            conversation_id=config.conversation_id,
+            event_keys=frozenset(turn.event_keys),
+            inbox=inbox,
+            inbox_turn_id=turn.turn_id,
+        )
 
-    assert [message for message, _sender in sent] == [
-        "controller prompt",
-        "first event",
-    ]
-    assert len(arun_calls) == 2
-    assert PersistentInbox(inbox.path).turn(turn.turn_id).state is (
-        DeliveryState.PROCESSED
-    )
+    assert interrupted == []
+    assert inbox.turn(turn.turn_id).state is DeliveryState.DELIVERED
 
 
 def test_processed_turn_recovers_without_append_or_inference(tmp_path, monkeypatch):
@@ -533,7 +614,7 @@ def test_stalled_recovery_is_bounded_and_quarantined_with_the_full_brief(
         inbox_turn_id=turn.turn_id,
     )
 
-    assert first.exit_code == second.exit_code == 1
+    assert first.outcome is second.outcome is TurnOutcome.FAILED
     assert [name for name, _value in calls].count("navigate") == 1
     assert "complete research brief" in active[0].message
     assert "Conversation context recovery" in active[0].message
@@ -551,7 +632,26 @@ def test_stalled_recovery_is_bounded_and_quarantined_with_the_full_brief(
     quarantined = PersistentInbox(inbox.path).quarantined_turns()
     assert len(quarantined) == 1
     assert quarantined[0].quarantine_reason == "recovery budget exhausted"
-    assert inbox.next_turn(config.conversation_id, "must remain blocked") is None
+    inbox.enqueue(config.conversation_id, "student:result", "late student result")
+    resumed = inbox.next_turn(config.conversation_id, "continue with later work")
+    assert resumed is not None
+    assert [event.event_key for event in resumed.events] == [None, "student:result"]
+    assert resumed.turn_id != quarantined[0].turn_id
+    resumed_result = turns.run(
+        resumed.prompt.body,
+        conversation_id=config.conversation_id,
+        event_keys=frozenset(resumed.event_keys),
+        inbox=inbox,
+        inbox_turn_id=resumed.turn_id,
+    )
+
+    assert resumed_result.outcome is TurnOutcome.FAILED
+    assert [name for name, _value in calls].count("navigate") == 2
+    assert [event.message for event in active] == [
+        "continue with later work",
+        resumed.events[0].body,
+        "late student result",
+    ]
 
 
 def test_model_visible_progress_renews_the_stalled_attempt_budget(
@@ -628,6 +728,89 @@ def test_model_visible_progress_renews_the_stalled_attempt_budget(
     assert inbox.turn(turn.turn_id).superseded_by is None
 
 
+def test_restart_uses_the_observation_timestamp_for_stall_age(
+    tmp_path,
+    monkeypatch,
+):
+    """
+    Requirement: rediscovering an old observation cannot manufacture fresh progress.
+    Interface: persisted OpenHands history and durable inbox recovery after restart.
+    """
+    active = []
+    archived = []
+    navigations = []
+    config = runtime_config(
+        tmp_path,
+        inbox_max_stalled_attempts=99,
+        inbox_max_turn_age_seconds=60,
+        inbox_max_recovery_generations=1,
+    )
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(config.conversation_id, "event:1", "canonical event")
+    turn = inbox.next_turn(config.conversation_id, "ordinary continuation")
+    assert turn is not None
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                active_branch=lambda: list(active),
+                events=archived,
+                execution_status=ConversationExecutionStatus.PAUSED,
+            )
+
+        def navigate_to(self, event_id):
+            navigations.append(event_id)
+            active.clear()
+
+        def send_message(self, message, sender=None):
+            event = SimpleNamespace(message=message, sender=sender)
+            active.append(event)
+            archived.append(event)
+
+        async def arun(self):
+            self.state.execution_status = ConversationExecutionStatus.PAUSED
+
+        def close(self):
+            pass
+
+    persisted = FakeConversation(conversation_id=config.conversation_id)
+    deliver_turn_messages(persisted, inbox, turn.turn_id)
+    old_observation = ObservationEvent.model_construct(
+        id="old-tool-observation",
+        timestamp="2000-08-11T00:00:00",
+        source="environment",
+    )
+    active.append(old_observation)
+    archived.append(old_observation)
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(
+        runner.ConversationState,
+        "get_unmatched_actions",
+        lambda _events: [],
+    )
+    isolate_agent_discovery(monkeypatch, runner)
+
+    result = OpenHandsTurnRunner(
+        config,
+        full_prompt="complete research brief",
+    ).run(
+        turn.prompt.body,
+        conversation_id=config.conversation_id,
+        event_keys=frozenset(turn.event_keys),
+        inbox=inbox,
+        inbox_turn_id=turn.turn_id,
+    )
+
+    assert result.outcome is TurnOutcome.FAILED
+    assert navigations == [None]
+    assert inbox.turn(turn.turn_id).last_progress_at == pytest.approx(
+        datetime.fromisoformat("2000-08-11T00:00:00").replace(tzinfo=UTC).timestamp()
+    )
+    assert inbox.turn(turn.turn_id).superseded_by is not None
+
+
 def test_timeout_and_error_artifacts_do_not_renew_the_stalled_attempt_budget(
     tmp_path,
     monkeypatch,
@@ -640,13 +823,17 @@ def test_timeout_and_error_artifacts_do_not_renew_the_stalled_attempt_budget(
     archived = []
     navigations = []
     artifacts = [
+        ObservationEvent.model_construct(
+            id="failed-tool-observation",
+            timestamp="2026-08-11T07:00:00+00:00",
+            source="environment",
+            observation=SimpleNamespace(is_error=True),
+        ),
         InterruptEvent.model_construct(id="interrupt-1"),
-        AgentErrorEvent.model_construct(id="error-1"),
-        ConversationStateUpdateEvent.model_construct(id="state-1"),
     ]
     config = runtime_config(
         tmp_path,
-        inbox_max_stalled_attempts=2,
+        inbox_max_stalled_attempts=1,
         inbox_max_turn_age_seconds=10_000,
         inbox_max_recovery_generations=1,
     )
@@ -691,7 +878,7 @@ def test_timeout_and_error_artifacts_do_not_renew_the_stalled_attempt_budget(
     isolate_agent_discovery(monkeypatch, runner)
     turns = OpenHandsTurnRunner(config, full_prompt="complete research brief")
 
-    for _attempt in range(3):
+    for _attempt in range(2):
         assert turns.run(
             turn.prompt.body,
             conversation_id=config.conversation_id,
@@ -1117,7 +1304,10 @@ def test_runtime_credentials_remain_configured_through_lazy_tool_initialization(
         resolve_tool(captured["specs"]["spawn_agents"], captured["state"])
 
 
-def test_turn_deadline_requests_conversation_interrupt(tmp_path, monkeypatch):
+def test_turn_deadline_without_a_durable_inbox_interrupts_and_fails(
+    tmp_path,
+    monkeypatch,
+):
     interrupted = threading.Event()
     cancelled = threading.Event()
 
@@ -1151,7 +1341,7 @@ def test_turn_deadline_requests_conversation_interrupt(tmp_path, monkeypatch):
                 "task",
                 runtime_config(tmp_path, timeout_seconds=0.2),
             )
-        == 1
+        is TurnOutcome.FAILED
     )
     assert interrupted.is_set()
     assert cancelled.is_set()

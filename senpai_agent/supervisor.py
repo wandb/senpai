@@ -56,6 +56,9 @@ class WorkerLease:
     phase: str
     deadline: float
     completed_turns: int = 0
+    health: str = "healthy"
+    quarantined_turns: int = 0
+    pending_events: int = 0
 
     @classmethod
     def read(cls, path: Path) -> WorkerLease:
@@ -65,8 +68,17 @@ class WorkerLease:
             phase=str(value["phase"]),
             deadline=float(value["deadline"]),
             completed_turns=int(value.get("completed_turns", 0)),
+            health=str(value.get("health", "healthy")),
+            quarantined_turns=int(value.get("quarantined_turns", 0)),
+            pending_events=int(value.get("pending_events", 0)),
         )
-        if lease.pid <= 0 or not lease.phase or lease.completed_turns < 0:
+        if (
+            lease.pid <= 0
+            or not lease.phase
+            or lease.completed_turns < 0
+            or lease.health not in {"healthy", "degraded"}
+            or min(lease.quarantined_turns, lease.pending_events) < 0
+        ):
             raise ValueError("invalid controller lease")
         return lease
 
@@ -84,8 +96,14 @@ class ProgressLease:
         timeout_seconds: float,
         *,
         completed_turn: bool = False,
+        quarantined_turns: int = 0,
+        pending_events: int = 0,
     ) -> None:
-        if not phase or timeout_seconds <= 0:
+        if (
+            not phase
+            or timeout_seconds <= 0
+            or min(quarantined_turns, pending_events) < 0
+        ):
             raise ValueError("progress phase and timeout must be positive")
         if completed_turn:
             self.completed_turns += 1
@@ -98,6 +116,13 @@ class ProgressLease:
                     "phase": phase,
                     "deadline": time.monotonic() + timeout_seconds,
                     "completed_turns": self.completed_turns,
+                    "health": (
+                        "degraded"
+                        if quarantined_turns and pending_events
+                        else "healthy"
+                    ),
+                    "quarantined_turns": quarantined_turns,
+                    "pending_events": pending_events,
                 },
                 sort_keys=True,
             ),

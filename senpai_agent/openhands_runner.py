@@ -17,6 +17,7 @@ import uuid
 from collections.abc import Iterator, Mapping, MutableMapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
@@ -49,6 +50,7 @@ from senpai_agent.secrets import (
     GITHUB_TOKEN_FILE_ENV,
     scrub_github_credentials,
 )
+from senpai_agent.turns import TurnOutcome
 from senpai_agent.weave_monitoring import (
     finish_weave_monitoring,
     initialize_weave_monitoring,
@@ -1152,26 +1154,27 @@ def graceful_interrupts(conversation: object) -> Iterator[None]:
 async def arun_conversation(
     conversation: object,
     timeout_seconds: float,
-) -> None:
+) -> bool:
     """Run the async OpenHands path so timeout cancellation reaches tools."""
 
     task = asyncio.create_task(conversation.arun())
-    try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
-    except TimeoutError:
-        print(
-            f"OPENHANDS_TIMEOUT seconds={timeout_seconds:g}",
-            file=sys.stderr,
-            flush=True,
-        )
-        conversation.interrupt()
-        if not task.done():
-            task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+    done, _pending = await asyncio.wait({task}, timeout=timeout_seconds)
+    if task in done:
+        await task
+        return False
+    print(
+        f"OPENHANDS_TIMEOUT seconds={timeout_seconds:g}",
+        file=sys.stderr,
+        flush=True,
+    )
+    conversation.interrupt()
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+    return True
 
 
-def run_conversation(conversation: object, timeout_seconds: float) -> None:
+def run_conversation(conversation: object, timeout_seconds: float) -> bool:
     if timeout_seconds <= 0:
         print(
             f"OPENHANDS_TIMEOUT seconds={max(timeout_seconds, 0):g}",
@@ -1179,8 +1182,8 @@ def run_conversation(conversation: object, timeout_seconds: float) -> None:
             flush=True,
         )
         conversation.interrupt()
-        return
-    asyncio.run(arun_conversation(conversation, timeout_seconds))
+        return True
+    return asyncio.run(arun_conversation(conversation, timeout_seconds))
 
 
 def event_summary(event: object) -> dict[str, object]:
@@ -1290,16 +1293,44 @@ def _activate_inbox_turn(
     return deliver_turn_messages(conversation, inbox, turn_id)
 
 
-def _latest_completed_tool_event_id(
+def _latest_completed_tool_progress(
     conversation: object,
     turn: InboxTurn,
-) -> str | None:
+) -> tuple[str, float] | None:
     for event in reversed(events_after_turn_delivery(conversation, turn)):
         if type(event) is ObservationEvent:
+            observation = getattr(event, "observation", None)
+            if getattr(observation, "is_error", False):
+                continue
             event_id = getattr(event, "id", None)
-            if isinstance(event_id, str) and event_id:
-                return event_id
+            timestamp = getattr(event, "timestamp", None)
+            if (
+                isinstance(event_id, str)
+                and event_id
+                and isinstance(timestamp, str)
+                and timestamp
+            ):
+                observed_at = datetime.fromisoformat(timestamp)
+                if observed_at.tzinfo is None:
+                    observed_at = observed_at.replace(tzinfo=UTC)
+                return event_id, observed_at.timestamp()
     return None
+
+
+def _record_latest_tool_progress(
+    conversation: object,
+    inbox: PersistentInbox,
+    turn_id: str,
+) -> None:
+    progress = _latest_completed_tool_progress(
+        conversation,
+        inbox.turn(turn_id),
+    )
+    if progress is None:
+        inbox.record_progress(turn_id, None)
+        return
+    event_id, observed_at = progress
+    inbox.record_progress(turn_id, event_id, now=observed_at)
 
 
 def run_openhands(
@@ -1310,7 +1341,7 @@ def run_openhands(
     inbox: PersistentInbox | None = None,
     inbox_turn_id: str | None = None,
     recovery_prompt: str | None = None,
-) -> int:
+) -> TurnOutcome:
     if (inbox is None) != (inbox_turn_id is None):
         raise ValueError("inbox and inbox_turn_id must be provided together")
     started_at = time.time()
@@ -1393,6 +1424,7 @@ def run_openhands(
     conversation = None
     cleanup_error: BaseException | None = None
     active_inbox_turn_id = inbox_turn_id
+    paused_timeout = False
     try:
         llm = LLM(
             model=config.model,
@@ -1508,10 +1540,10 @@ def run_openhands(
                 inference_required = False
         if inference_required:
             if inbox is not None and active_inbox_turn_id is not None:
-                turn = inbox.turn(active_inbox_turn_id)
-                inbox.record_progress(
+                _record_latest_tool_progress(
+                    conversation,
+                    inbox,
                     active_inbox_turn_id,
-                    _latest_completed_tool_event_id(conversation, turn),
                 )
                 if inbox.terminal_recovery_due(
                     active_inbox_turn_id,
@@ -1533,17 +1565,15 @@ def run_openhands(
                         file=sys.stderr,
                         flush=True,
                     )
-                    recovery_turn = _activate_inbox_turn(
+                    _activate_inbox_turn(
                         conversation,
                         inbox,
                         active_inbox_turn_id,
                     )
-                    inbox.record_progress(
+                    _record_latest_tool_progress(
+                        conversation,
+                        inbox,
                         active_inbox_turn_id,
-                        _latest_completed_tool_event_id(
-                            conversation,
-                            recovery_turn,
-                        ),
                     )
                 inbox.record_inference_attempt(active_inbox_turn_id)
             with graceful_interrupts(conversation):
@@ -1562,9 +1592,21 @@ def run_openhands(
                             conversation_id=config.conversation_id,
                         ),
                     ):
-                        run_conversation(conversation, run_deadline - time.time())
+                        paused_timeout = run_conversation(
+                            conversation,
+                            run_deadline - time.time(),
+                        )
                 else:
-                    run_conversation(conversation, run_deadline - time.time())
+                    paused_timeout = run_conversation(
+                        conversation,
+                        run_deadline - time.time(),
+                    )
+            if inbox is not None and active_inbox_turn_id is not None:
+                _record_latest_tool_progress(
+                    conversation,
+                    inbox,
+                    active_inbox_turn_id,
+                )
         status = conversation.state.execution_status
         if (
             inference_required
@@ -1645,9 +1687,11 @@ def run_openhands(
         and active_inbox_turn_id is not None
         and inbox.latest_turn(active_inbox_turn_id).state is DeliveryState.PROCESSED
     )
-    return 0 if (
-        status == ConversationExecutionStatus.FINISHED or durable_turn_processed
-    ) else 1
+    if status == ConversationExecutionStatus.FINISHED or durable_turn_processed:
+        return TurnOutcome.PROCESSED
+    if paused_timeout and inbox is not None and not config.child:
+        return TurnOutcome.PAUSED_TIMEOUT
+    return TurnOutcome.FAILED
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1659,7 +1703,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise RuntimeError("OpenHands runner requires a prompt on stdin")
             config = resolve_config(args)
             os.environ.pop(config.api_key_env, None)
-            return run_openhands(prompt, config)
+            return int(run_openhands(prompt, config))
         except BaseException as error:  # noqa: BLE001
             if task_id := os.environ.get("SENPAI_DELEGATION_TASK_ID"):
                 record_delegated_task_result(
