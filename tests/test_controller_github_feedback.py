@@ -451,6 +451,28 @@ def test_student_does_not_launch_a_doubly_labeled_assignment(monkeypatch):
     assert "exactly one student label" in events[0].payload["error"]
 
 
+def test_malformed_wip_does_not_suppress_a_valid_student_assignment(monkeypatch):
+    mailbox = student_mailbox(monkeypatch, feedback_responses())
+    valid = mailbox._pulls()[0]
+    malformed = {
+        **valid,
+        "number": 18,
+        "html_url": "https://github.test/acme/widgets/pull/18",
+        "body": "",
+        "head": {"ref": "student/candidate-18", "sha": "8" * 40},
+    }
+    monkeypatch.setattr(mailbox, "_pulls", lambda: [valid, malformed])
+
+    events = mailbox.poll()
+
+    assert [event.kind for event in events] == [
+        "malformed_assignment",
+        "student_assignment",
+    ]
+    assert events[0].payload["number"] == 18
+    assert events[1].payload["number"] == 17
+
+
 def test_student_does_not_launch_an_assignment_marked_for_another_student(
     monkeypatch,
 ):

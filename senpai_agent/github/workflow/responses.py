@@ -46,6 +46,7 @@ class PullRequestSnapshot:
     base_ref: str
     head_ref: str
     head_sha: str
+    author: str
     labels: tuple[str, ...]
     draft: bool
     state: Literal["open", "closed"]
@@ -134,6 +135,7 @@ class PullRequestResponse(GitHubResponse):
     body: StrictStr | None
     base: GitHubRef
     head: GitHubHead
+    user: GitHubAuthor
     labels: tuple[GitHubLabel, ...]
     draft: StrictBool
     state: Literal["open", "closed"]
@@ -151,6 +153,7 @@ class PullRequestResponse(GitHubResponse):
             base_ref=self.base.ref,
             head_ref=self.head.ref,
             head_sha=self.head.sha,
+            author=self.user.login,
             labels=tuple(sorted({label.name for label in self.labels})),
             draft=self.draft,
             state=self.state,

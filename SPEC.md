@@ -310,6 +310,7 @@ Advisor operations that act on an assignment share this object:
 | Tool | Role | Input beyond the shared `assignment` object |
 |---|---|---|
 | `create_assignment` | advisor | `assignment_id`, `revision_id`, `student`, `expected_base_sha`, `head_branch`, `title`, `body`; the base is the configured advisor branch |
+| `adopt_assignment` | advisor | `pr_number`, `assignment_id`, `revision_id`, `student`, `expected_base_sha`, `head_branch`, `expected_pr_head_sha`; the base is the configured advisor branch |
 | `publish_advisor_branch` | advisor | `remote_branch_sha_before_push`, `local_commit_sha` |
 | `repair_assignment_routing` | advisor | `working_state` (`wip` or `review`) and a `blockers` list containing only `blocked`, `hold`, or `needs-rebase` |
 | `send_assignment_feedback` | advisor | `feedback_id`, `comment` |
@@ -330,6 +331,17 @@ Assignment creation checks the remote base SHA, creates an isolated empty
 assignment commit with `git commit-tree`, publishes with force-with-lease,
 refuses a second active assignment for the student, creates or reconciles one
 draft PR, embeds a typed assignment marker, and verifies routing state.
+
+Assignment adoption is a separate, explicit recovery transition for an
+existing markerless draft PR. It verifies the configured student and base,
+exact remote head and Git ancestry, authenticated PR author, WIP routing, and
+absence of conflicting protocol state before adding one marker; it never
+infers assignment identity from PR prose. `repair_assignment_routing` remains
+limited to labels and draft state after a valid marker already exists.
+
+The transition re-reads the body immediately before its PATCH and verifies the
+marker afterward, but this client has no PR-body write lease; operators must
+not edit that body concurrently with adoption.
 
 Advisor feedback carries exact assignment, revision, and PR-head preconditions.
 It creates one immutable feedback ID without changing the assignment marker,

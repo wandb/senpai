@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from senpai_agent.github.tools import (
     AcceptResultOnCurrentBaseTool,
+    AdoptAssignmentTool,
     CloseExperimentTool,
     CreateAssignmentTool,
     GitHubToolRuntime,
@@ -30,6 +31,15 @@ EXPECTED_FIELDS = {
         "head_branch",
         "title",
         "body",
+    },
+    "adopt_assignment": {
+        "pr_number",
+        "assignment_id",
+        "revision_id",
+        "student",
+        "expected_base_sha",
+        "head_branch",
+        "expected_pr_head_sha",
     },
     "publish_advisor_branch": {
         "remote_branch_sha_before_push",
@@ -80,6 +90,7 @@ def github_tools(tmp_path: Path):
     )
     tool_types = (
         CreateAssignmentTool,
+        AdoptAssignmentTool,
         PublishAdvisorBranchTool,
         RepairAssignmentRoutingTool,
         SendAssignmentFeedbackTool,

@@ -9,6 +9,7 @@ from openhands.sdk.tool import ToolDefinition, ToolExecutor
 
 from .advisor import (
     AcceptResultOnCurrentBaseExecutor,
+    AdoptAssignmentExecutor,
     CloseExperimentExecutor,
     CreateAssignmentExecutor,
     MergeExperimentExecutor,
@@ -19,6 +20,7 @@ from .advisor import (
 )
 from .contracts import (
     AcceptResultOnCurrentBaseAction,
+    AdoptAssignmentAction,
     CloseExperimentAction,
     CreateAssignmentAction,
     GitHubMutationObservation,
@@ -91,6 +93,22 @@ class CreateAssignmentTool(
         )
 
 
+class AdoptAssignmentTool(
+    ToolDefinition[AdoptAssignmentAction, GitHubMutationObservation]
+):
+    """Adopt one exact existing assignment PR for a configured student."""
+
+    @classmethod
+    def create(cls, runtime: GitHubToolRuntime) -> Sequence[Self]:
+        return _tool(
+            cls, AdoptAssignmentAction, "Adopt assignment PR",
+            "Attach typed assignment identity to one exact markerless draft PR "
+            "after verifying its configured student, routing, and Git history. "
+            "This never creates a branch or infers identity from PR prose.",
+            AdoptAssignmentExecutor(runtime),
+        )
+
+
 class PublishAdvisorBranchTool(
     ToolDefinition[PublishAdvisorBranchAction, GitHubMutationObservation]
 ):
@@ -114,10 +132,9 @@ class RepairAssignmentRoutingTool(
     @classmethod
     def create(cls, runtime: GitHubToolRuntime) -> Sequence[Self]:
         return _tool(
-            cls, RepairAssignmentRoutingAction, "Repair assignment routing",
-            "Repair one current assignment's protocol routing after labels or draft "
-            "state drift. Choose wip or review and only named blockers; do not use "
-            "this for ordinary assignment decisions.",
+            cls, RepairAssignmentRoutingAction, "Repair assignment labels and draft",
+            "Repair labels and draft state for an assignment that already has a "
+            "valid marker. This cannot create or adopt assignment identity.",
             RepairAssignmentRoutingExecutor(runtime.workflow),
         )
 

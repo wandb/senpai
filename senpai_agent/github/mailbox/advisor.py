@@ -16,14 +16,15 @@ from senpai_agent.models import (
     ResultMarkerError,
     authoritative_marker_line,
     experiment_result_digest,
-    parse_assignment_markers,
     parse_research_base_acceptance_markers,
     parse_result_markers,
 )
 
 from .values import (
+    assignment_from_pull,
     github_datetime,
     label_names,
+    malformed_assignment_event,
     object_value,
     pull_reference,
     result_matches_assignment,
@@ -42,7 +43,9 @@ def advisor_events(
 ) -> tuple[ControllerEvent, ...]:
     events: list[ControllerEvent] = []
     active_assignments: list[tuple[dict[str, object], AssignmentRecord]] = []
-    active_by_student: dict[str, list[int]] = {student: [] for student in mailbox.students}
+    active_by_student: dict[str, list[int]] = {
+        student: [] for student in mailbox.students
+    }
     now = datetime.now(UTC)
     for pull in pulls:
         labels = label_names(pull)
@@ -53,36 +56,33 @@ def advisor_events(
             for label in labels
             if label.startswith("student:")
         )
-        if "status:wip" in labels:
-            for student in students:
-                active_by_student.setdefault(student, []).append(number)
         reference = pull_reference(pull)
         assignment = None
-        if {"status:wip", "status:review"} & labels:
+        if {"status:wip", "status:review"} & labels and len(students) == 1:
             try:
-                assignments = parse_assignment_markers(str(pull.get("body") or ""))
-            except ValueError:
-                assignments = []
-            if len(assignments) == 1:
-                assignment = assignments[0]
+                assignment = assignment_from_pull(pull, repo=mailbox.repo)
+            except ValueError as error:
+                events.append(malformed_assignment_event(pull, error))
+            else:
                 active_assignments.append((pull, assignment))
-        if "status:review" in labels:
-            review_payload = reference
-            review_identity: tuple[object, ...] = (number, head_sha)
-            if assignment is not None:
-                review_identity = (
-                    number,
-                    assignment.assignment_id,
-                    assignment.revision_id,
-                    head_sha,
-                )
-                review_payload = {
-                    **reference,
-                    "assignment_id": assignment.assignment_id,
-                    "revision_id": assignment.revision_id,
-                }
+        if assignment is not None and "status:wip" in labels:
+            active_by_student.setdefault(assignment.student, []).append(number)
+        if assignment is not None and "status:review" in labels:
+            review_identity: tuple[object, ...] = (
+                number,
+                assignment.assignment_id,
+                assignment.revision_id,
+                head_sha,
+            )
+            review_payload = {
+                **reference,
+                "assignment_id": assignment.assignment_id,
+                "revision_id": assignment.revision_id,
+            }
             events.append(
-                versioned_event("review_ready", *review_identity, payload=review_payload)
+                versioned_event(
+                    "review_ready", *review_identity, payload=review_payload
+                )
             )
         reasons: list[str] = []
         if "status:blocked" in labels:

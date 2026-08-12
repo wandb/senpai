@@ -1,6 +1,7 @@
 """Public GitHub workflow client assembled from cohesive domain operations."""
 
 from senpai_agent.github.workflow.assignments import AssignmentMixin
+from senpai_agent.github.workflow.adoption import AdoptionMixin
 from senpai_agent.github.workflow.comments import CommentsMixin
 from senpai_agent.github.workflow.core import WorkflowCore
 from senpai_agent.github.workflow.issues import HumanIssueMixin
@@ -17,6 +18,7 @@ class GitHubWorkflow(
     ReviewMixin,
     ResultMixin,
     RevisionMixin,
+    AdoptionMixin,
     AssignmentMixin,
     LookupMixin,
     CommentsMixin,

@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 import senpai_agent.git_workflow as git_workflow
+from senpai_agent.git_assignment import require_remote_assignment_history
 from senpai_agent.git_workflow import (
     GitWorkflowPreconditionError,
     create_assignment_branch,
@@ -108,3 +109,97 @@ def test_create_assignment_branch_rejects_a_base_that_moves_during_fetch(
         )
 
     assert git(remote, "branch", "--list", "student-one/lower-lr") == ""
+
+
+def test_require_remote_assignment_history_accepts_work_after_an_older_base(
+    tmp_path: Path,
+):
+    workspace, remote, base_sha = advisor_repository(tmp_path)
+    git(workspace, "checkout", "-b", "student-one/lower-lr")
+    head_sha = commit_file(workspace, "candidate.py", "candidate = True\n", "candidate")
+    git(workspace, "push", "origin", "student-one/lower-lr")
+    advanced_base = detached_commit(workspace, base_sha, "advance base")
+    git(workspace, "push", str(remote), f"{advanced_base}:refs/heads/schmidhuber")
+
+    require_remote_assignment_history(
+        workspace,
+        branch="student-one/lower-lr",
+        expected_head_sha=head_sha,
+        base_branch="schmidhuber",
+        expected_base_sha=base_sha,
+    )
+
+
+def test_require_remote_assignment_history_rejects_an_unknown_head(tmp_path: Path):
+    workspace, _remote, base_sha = advisor_repository(tmp_path)
+    git(workspace, "checkout", "-b", "student-one/lower-lr")
+    commit_file(workspace, "candidate.py", "candidate = True\n", "candidate")
+    git(workspace, "push", "origin", "student-one/lower-lr")
+
+    with pytest.raises(GitWorkflowPreconditionError, match="fetched Git commits"):
+        require_remote_assignment_history(
+            workspace,
+            branch="student-one/lower-lr",
+            expected_head_sha="f" * 40,
+            base_branch="schmidhuber",
+            expected_base_sha=base_sha,
+        )
+
+
+def test_require_remote_assignment_history_rejects_foreign_history(tmp_path: Path):
+    workspace, _remote, base_sha = advisor_repository(tmp_path)
+    tree = git(workspace, "rev-parse", f"{base_sha}^{{tree}}")
+    unrelated = git(workspace, "commit-tree", tree, "-m", "unrelated root")
+    git(workspace, "checkout", "--detach", unrelated)
+    head_sha = commit_file(workspace, "candidate.py", "candidate = True\n", "candidate")
+    git(workspace, "push", "origin", f"{head_sha}:refs/heads/student-one/lower-lr")
+
+    with pytest.raises(GitWorkflowPreconditionError, match="does not share"):
+        require_remote_assignment_history(
+            workspace,
+            branch="student-one/lower-lr",
+            expected_head_sha=head_sha,
+            base_branch="schmidhuber",
+            expected_base_sha=base_sha,
+        )
+
+
+def test_require_remote_assignment_history_accepts_a_replayed_ancestor_head(
+    tmp_path: Path,
+):
+    workspace, _remote, base_sha = advisor_repository(tmp_path)
+    git(workspace, "checkout", "-b", "student-one/lower-lr")
+    expected_head = commit_file(
+        workspace, "candidate.py", "candidate = True\n", "candidate"
+    )
+    commit_file(workspace, "notes.md", "continued work\n", "continue")
+    git(workspace, "push", "origin", "student-one/lower-lr")
+
+    require_remote_assignment_history(
+        workspace,
+        branch="student-one/lower-lr",
+        expected_head_sha=expected_head,
+        base_branch="schmidhuber",
+        expected_base_sha=base_sha,
+    )
+
+
+def test_require_remote_assignment_history_rejects_an_older_ancestral_base(
+    tmp_path: Path,
+):
+    workspace, remote, old_base = advisor_repository(tmp_path)
+    current_base = detached_commit(workspace, old_base, "advance base")
+    git(workspace, "push", str(remote), f"{current_base}:refs/heads/schmidhuber")
+    git(workspace, "checkout", "--detach", current_base)
+    git(workspace, "checkout", "-b", "student-one/lower-lr")
+    head_sha = commit_file(workspace, "candidate.py", "candidate = True\n", "candidate")
+    git(workspace, "push", "origin", "student-one/lower-lr")
+
+    with pytest.raises(GitWorkflowPreconditionError, match="diverges at"):
+        require_remote_assignment_history(
+            workspace,
+            branch="student-one/lower-lr",
+            expected_head_sha=head_sha,
+            base_branch="schmidhuber",
+            expected_base_sha=old_base,
+        )
