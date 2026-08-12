@@ -7,12 +7,13 @@ from senpai_agent.github.workflow.errors import WorkflowPreconditionError
 from senpai_agent.models import AssignmentRecord, render_assignment_marker
 
 
-_ROLE_COMMENT_PREFIX = re.compile(r"^(?:ADVISOR|STUDENT(?: [^:\s]+)?):[ \t]*")
+_ROLE_COMMENT_PREFIX = re.compile(
+    r"^(?:ADVISOR|STUDENT(?: [^:\s]+)?):(?:[ \t]*\r?\n){0,2}[ \t]*"
+)
 _ROLE_HEADING_PREFIX = re.compile(
     r"^(?P<heading>#{1,6})[ \t]+"
     r"(?:ADVISOR|STUDENT(?: [^:\s]+)?):[ \t]*"
 )
-_MARKDOWN_HEADING = re.compile(r"^(?P<heading>#{1,6})[ \t]+")
 
 
 def marker_body(marker: str, content: str) -> str:
@@ -40,13 +41,7 @@ def role_prefixed_comment(
         marker, separator, content = "", "", body
     content = _ROLE_HEADING_PREFIX.sub(r"\g<heading> ", content)
     content = _ROLE_COMMENT_PREFIX.sub("", content)
-    if heading := _MARKDOWN_HEADING.match(content):
-        content = (
-            f"{heading.group('heading')} {role.upper()}: "
-            f"{content[heading.end():]}"
-        )
-        return f"{marker}{separator}{content}"
-    return f"{marker}{separator}{role.upper()}: {content}"
+    return f"{marker}{separator}{role.upper()}:\n\n{content}"
 
 
 def replace_assignment_marker(

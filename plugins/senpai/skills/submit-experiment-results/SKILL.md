@@ -31,9 +31,8 @@ text, per-run metrics, hyperparameters, or aliases such as `head_sha`,
 `previous_head_sha`, `success`, or `min`; put those details in the bounded
 `summary` instead. Write the summary as concise GitHub-flavored Markdown: lead
 with the outcome, then use short paragraphs or bullets for supporting evidence,
-validation, caveats, and suggested follow-ups. Do not repeat the typed
-hypothesis, status, commit, primary metric, or W&B run links; Senpai renders
-those fields as dedicated sections.
+validation, caveats, and suggested follow-ups. When appropriate, include W&B
+run IDs and present metrics as metric-value pairs or compact tables.
 
 ```json
 {
@@ -50,7 +49,7 @@ those fields as dedicated sections.
     },
     "status": "succeeded",
     "hypothesis": "The falsifiable hypothesis tested.",
-    "summary": "**Outcome:** The conclusion.\n\n**Evidence:**\n- Important per-run metrics and configuration.\n\n**Validation:**\n- Exact checks or reproduction command.\n\n**Caveats:** Remaining uncertainty.\n\n**Suggested follow-ups:** Focused next steps (maximum 4,000 characters).",
+    "summary": "**Outcome:** The conclusion.\n\n**Evidence:**\n- W&B run `wandb-run-id`: `validation/metric = 1.10` (baseline `1.23`; delta `-0.13`).\n\n**Validation:**\n- Exact checks or reproduction command.\n\n**Caveats:** Remaining uncertainty.\n\n**Suggested follow-ups:** Focused next steps (maximum 4,000 characters).",
     "runs": [
       {
         "run_id": "wandb-run-id",

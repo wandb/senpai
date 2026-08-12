@@ -88,13 +88,18 @@ def test_workflow_authenticates_with_the_secret_but_does_not_render_it():
     assert "github-secret" not in repr(client)
 
 
-def test_role_prefix_is_part_of_a_leading_markdown_heading():
-    body = "## ADVISOR: Experiment result\n\nEvidence follows."
+def test_role_prefix_precedes_a_leading_markdown_heading():
+    body = "## Experiment result\n\nEvidence follows."
+    expected = "STUDENT:\n\n## Experiment result\n\nEvidence follows."
 
     rendered = role_prefixed_comment(body, "student")
 
-    assert rendered == "## STUDENT: Experiment result\n\nEvidence follows."
-    assert role_prefixed_comment(rendered, "student") == rendered
+    assert rendered == expected
+    assert role_prefixed_comment(rendered, "student") == expected
+    assert role_prefixed_comment(f"ADVISOR:\n\n{body}", "student") == expected
+    assert role_prefixed_comment(
+        "## ADVISOR: Experiment result\n\nEvidence follows.", "student"
+    ) == expected
 
 
 def test_api_errors_do_not_expose_the_token():
