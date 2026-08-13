@@ -8,17 +8,20 @@ set -e
 set -o pipefail
 umask "${SENPAI_UMASK:-0022}"
 LOGDIR="/var/lib/senpai"
+LOGDIR="${SENPAI_LOGDIR:-$LOGDIR}"
 rm -f "$LOGDIR/openhands_state/controller-lease.json"
 date +%s > "${SENPAI_BOOTSTRAP_STARTED_PATH:-/var/lib/senpai/.bootstrap-started}"
 
 WORKDIR="/workspace/senpai"
+WORKDIR="${SENPAI_WORKDIR:-$WORKDIR}"
 GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 TARGET_REPO_BRANCH="${TARGET_REPO_BRANCH:-}"
 export SENPAI_ROLE="student"
-export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
+export TARGET_WORKDIR="${SENPAI_TARGET_WORKDIR:-$WORKDIR/$PROBLEM_DIR}"
 SOURCE_SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 export SENPAI_PLUGIN="$SOURCE_SENPAI_PLUGIN"
 GIT_ASKPASS_FILE="/tmp/senpai-git-askpass"
+GIT_ASKPASS_FILE="${SENPAI_GIT_ASKPASS_FILE:-$GIT_ASKPASS_FILE}"
 mkdir -p "$LOGDIR"
 if [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
     export GITHUB_TOKEN="$(<"$SENPAI_GITHUB_TOKEN_FILE")"
@@ -30,11 +33,18 @@ echo "Runner repo:  $REPO_URL (revision: $REPO_REVISION)"
 echo "Target repo:  $TARGET_REPO_URL (base branch: ${TARGET_REPO_BRANCH:-<default>}; advisor branch: $ADVISOR_BRANCH)"
 echo "Problem dir:  $PROBLEM_DIR"
 echo "GitHub history: $GH_HISTORY_SCOPE"
-echo "GPUs:         $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l) x $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+if command -v nvidia-smi >/dev/null 2>&1; then
+    echo "GPUs:         $(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l) x $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+elif [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+    echo "Accelerator:  Apple Silicon"
+else
+    echo "Accelerator:  unavailable"
+fi
 
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
 git config --global safe.directory "$WORKDIR"
+git config --global --add safe.directory "$TARGET_WORKDIR"
 source "$SOURCE_SENPAI_PLUGIN/scripts/git-guard.sh"
 install_senpai_git_guard "$WORKDIR" "$TARGET_WORKDIR" "$GIT_ASKPASS_FILE"
 
@@ -42,28 +52,31 @@ clone_target_repo() {
     local depth=()
     [ "$GH_HISTORY_SCOPE" = "fresh" ] && depth=(--depth 1)
     case "$GH_HISTORY_SCOPE" in
-        branch|fresh) git clone --branch "$ADVISOR_BRANCH" --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$PROBLEM_DIR" ;;
-        repo) git clone "$TARGET_REPO_URL" "$PROBLEM_DIR" ;;
+        branch|fresh) git clone --branch "$ADVISOR_BRANCH" --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$TARGET_WORKDIR" ;;
+        repo) git clone "$TARGET_REPO_URL" "$TARGET_WORKDIR" ;;
         *) echo "ERROR: GH_HISTORY_SCOPE must be one of: branch, repo, fresh" >&2; exit 2 ;;
     esac
 }
 
 # Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
 # agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
-[ -d "$PROBLEM_DIR/.git" ] || clone_target_repo
+mkdir -p "$(dirname "$TARGET_WORKDIR")"
+[ -d "$TARGET_WORKDIR/.git" ] || clone_target_repo
 git config --global --unset-all credential.helper 2>/dev/null || true
 
-uv pip install --python "$SENPAI_PYTHON" --no-deps -e .
+if [ "${SENPAI_SKIP_EDITABLE_INSTALL:-0}" != "1" ]; then
+    uv pip install --python "$SENPAI_PYTHON" --no-deps -e .
+fi
 
 source "$SOURCE_SENPAI_PLUGIN/scripts/agent-context.sh"
-AGENT_CONTEXT_ROOT="$(mktemp -d /tmp/senpai-agent-context.XXXXXX)"
+AGENT_CONTEXT_ROOT="$(mktemp -d "${SENPAI_TMPDIR:-${TMPDIR:-/tmp}}/senpai-agent-context.XXXXXX")"
 export SENPAI_PLUGIN="$(
     install_senpai_agent_context \
         "$WORKDIR" "$SOURCE_SENPAI_PLUGIN" "$AGENT_CONTEXT_ROOT"
 )"
 
 # --- Git identity for commits (inside the problem-package repo) ---
-cd "$WORKDIR/$PROBLEM_DIR"
+cd "$TARGET_WORKDIR"
 git config user.name "senpai-$STUDENT_NAME"
 git config user.email "senpai-$STUDENT_NAME@senpai"
 gh repo set-default "$GH_REPO"
@@ -101,4 +114,4 @@ if [ -z "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
 fi
 unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS
 rm -f "$GIT_ASKPASS_FILE"
-exec python -m senpai_agent.supervisor student
+exec /usr/local/bin/senpai-run-controller student

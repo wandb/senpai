@@ -1,11 +1,14 @@
 import re
+import shlex
 import tomllib
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
 import pytest
+import yaml
 from openhands.sdk import Agent, LLM, LocalConversation
+from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.llm import Message, TextContent
 from pydantic import SecretStr
 
@@ -13,6 +16,7 @@ from senpai_agent.openhands_runner import (
     EVENT_TEXT_LIMIT,
     anthropic_compaction_configuration,
     apply_reasoning_profile,
+    configured_local_condenser,
     conversation_prompt_cache_key,
     event_summary,
     model_runtime_configuration,
@@ -20,16 +24,22 @@ from senpai_agent.openhands_runner import (
     openhands_reasoning_effort,
     parse_runner_args,
     prompt_cache_configuration,
+    require_exact_tokenizer,
+)
+from senpai_agent.model_compatibility import (
+    CLAUDE_OPUS_5_MODEL_INFO,
+    register_litellm_model_compatibility,
 )
 from senpai_agent.inbox import DeliveryState, PersistentInbox, deliver_turn_messages
 from openhands_support import REPO_ROOT, runtime_config
 
 
-def test_openhands_fork_main_is_consistent_across_install_paths():
+def test_openhands_fork_pin_is_consistent_across_install_paths():
     package_names = {"openhands-sdk", "openhands-tools"}
     fork_url = "git+https://github.com/morganmcg1/software-agent-sdk.git"
+    revision = "33608f0b8242ca0e1f6251efc8f535e249cd6101"
     expected_requirements = {
-        f"{name} @ {fork_url}@main#subdirectory={name}"
+        f"{name} @ {fork_url}@{revision}#subdirectory={name}"
         for name in package_names
     }
 
@@ -42,21 +52,6 @@ def test_openhands_fork_main_is_consistent_across_install_paths():
         if requirement.partition(" @ ")[0] in package_names
     }
     assert project_requirements == expected_requirements
-
-    workflow = (REPO_ROOT / ".github" / "workflows" / "test.yaml").read_text(
-        encoding="utf-8"
-    )
-    ci_requirements = {
-        match.group(1)
-        for line in workflow.splitlines()
-        if (
-            match := re.fullmatch(
-                r'\s*"(openhands-(?:sdk|tools) @ git\+[^"]+)"(?:\s+\\)?\s*',
-                line,
-            )
-        )
-    }
-    assert ci_requirements == expected_requirements
 
     lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
     locked_packages = {
@@ -74,12 +69,45 @@ def test_openhands_fork_main_is_consistent_across_install_paths():
         assert source.path == "/morganmcg1/software-agent-sdk.git"
         assert parse_qs(source.query) == {
             "subdirectory": [name],
-            "rev": ["main"],
+            "rev": [revision],
         }
         assert re.fullmatch(r"[0-9a-f]{40}", source.fragment)
         resolved_revisions.add(source.fragment)
 
-    assert len(resolved_revisions) == 1
+    assert resolved_revisions == {revision}
+
+    workflow = yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "test.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    install_script = next(
+        step["run"]
+        for step in workflow["jobs"]["runtime"]["steps"]
+        if step.get("name") == "Install runtime test dependencies"
+    )
+    commands = [
+        shlex.split(line)
+        for line in re.sub(r"\\\n\s*", " ", install_script).splitlines()
+        if line.strip()
+    ]
+    export_command = next(
+        command for command in commands if command[:2] == ["uv", "export"]
+    )
+    assert {"--locked", "--no-dev", "--no-emit-project"} <= set(export_command)
+    excluded_packages = {
+        package
+        for option, package in zip(export_command, export_command[1:])
+        if option in {"--prune", "--no-emit-package"}
+    }
+    assert package_names.isdisjoint(excluded_packages)
+    exported_requirements = export_command[export_command.index(">") + 1]
+
+    install_command = next(
+        command for command in commands if command[:3] == ["uv", "pip", "install"]
+    )
+    requirements_option = install_command.index("-r")
+    assert install_command[requirements_option + 1] == exported_requirements
 
 
 @pytest.mark.parametrize(
@@ -90,6 +118,8 @@ def test_openhands_fork_main_is_consistent_across_install_paths():
         ("xhigh", "anthropic/claude-opus-4-8", "xhigh"),
         ("high", "wandb/zai-org/GLM-5.2", "high"),
         ("max", "wandb/zai-org/GLM-5.2", "max"),
+        ("xhigh", "anthropic/claude-opus-5", "xhigh"),
+        ("max", "anthropic/claude-fable-5", "max"),
     ],
 )
 def test_supported_reasoning_effort_is_preserved(
@@ -106,7 +136,7 @@ def test_supported_reasoning_effort_is_preserved(
 @pytest.mark.parametrize(
     ("effort", "model"),
     [
-        ("max", "anthropic/claude-opus-4-8"),
+        ("max", "anthropic/claude-haiku-4-5"),
         ("max", "openai/gpt-5.4"),
         ("max", "openai/gpt-5.60"),
         ("medium", "wandb/zai-org/GLM-5.2"),
@@ -120,6 +150,32 @@ def test_unsupported_reasoning_effort_fails_instead_of_being_rewritten(
 ):
     with pytest.raises(ValueError, match="unsupported reasoning effort|unsupported for"):
         openhands_reasoning_effort(effort, model)
+
+
+def test_ultra_is_rejected_as_a_cli_reasoning_effort():
+    with pytest.raises(SystemExit):
+        parse_runner_args(["--max-turns", "1", "--reasoning-effort", "ultra"])
+
+
+def test_opus_5_litellm_metadata_is_available_without_the_remote_catalog(
+    monkeypatch,
+):
+    import litellm
+
+    model_cost = dict(litellm.model_cost)
+    model_cost.pop("claude-opus-5", None)
+    monkeypatch.setattr(litellm, "model_cost", model_cost)
+    register_litellm_model_compatibility()
+
+    assert model_cost["claude-opus-5"] == CLAUDE_OPUS_5_MODEL_INFO
+    assert model_cost["claude-opus-5"]["supports_adaptive_thinking"] is True
+    assert model_cost["claude-opus-5"]["supports_xhigh_reasoning_effort"] is True
+    llm = LLM(
+        model="anthropic/claude-opus-5",
+        api_key=SecretStr("test-key"),
+        reasoning_effort="xhigh",
+    )
+    assert llm.reasoning_effort == "xhigh"
 
 
 @pytest.mark.parametrize(
@@ -175,6 +231,103 @@ def test_openai_response_configuration_is_accepted_by_the_pinned_sdk():
     assert llm.responses_use_previous_response_id is True
     assert llm.responses_compact_threshold == 200_000
     assert openai_responses_configuration("anthropic/claude-opus-4-8") == {}
+
+
+def test_local_condenser_cap_applies_only_without_provider_native_compaction():
+    wandb_configuration = model_runtime_configuration(
+        "wandb/zai-org/GLM-5.2",
+        "max",
+        wandb_entity="research-team",
+        wandb_project="mlxfast",
+    )
+    wandb = LLM(
+        model="wandb/zai-org/GLM-5.2",
+        api_key=SecretStr("test-key"),
+        reasoning_effort="max",
+        **{
+            key: value
+            for key, value in wandb_configuration.items()
+            if key != "custom_tokenizer"
+        },
+    )
+    openai = LLM(
+        model="openai/gpt-5.6-sol",
+        api_key=SecretStr("test-key"),
+        reasoning_effort="max",
+        **model_runtime_configuration("openai/gpt-5.6-sol", "max"),
+    )
+    anthropic = LLM(
+        model="anthropic/claude-opus-4-8",
+        api_key=SecretStr("test-key"),
+        reasoning_effort="xhigh",
+        **model_runtime_configuration("anthropic/claude-opus-4-8", "xhigh"),
+    )
+
+    existing = configured_local_condenser(wandb, 0)
+    resized = configured_local_condenser(
+        wandb,
+        700,
+        existing,
+        max_tokens=190_000,
+        target_events=50,
+    )
+
+    assert (existing.max_size, existing.max_tokens, existing.target_size) == (
+        600,
+        180_000,
+        40,
+    )
+    assert (resized.max_size, resized.max_tokens, resized.target_size) == (
+        700,
+        190_000,
+        50,
+    )
+    assert configured_local_condenser(openai, 180) is None
+    assert configured_local_condenser(anthropic, 180) is None
+
+
+def test_local_condenser_preserves_legacy_positional_condenser_argument():
+    llm = LLM(
+        model="wandb/other-model",
+        api_key=SecretStr("test-key"),
+        base_url="https://api.inference.wandb.ai/v1",
+        api_mode="chat",
+    )
+    existing = LLMSummarizingCondenser(llm=llm, max_size=100, keep_first=2)
+
+    defaulted = configured_local_condenser(llm, 0, existing)
+    configured = configured_local_condenser(llm, 180, existing)
+
+    assert defaulted.max_size == 80
+    assert defaulted.max_tokens is None
+    assert defaulted.target_size is None
+    assert configured.max_size == 180
+    assert configured.max_tokens is None
+    assert configured.target_size is None
+
+
+@pytest.mark.parametrize("target_events", [3, 95])
+def test_local_condenser_rejects_targets_that_cannot_make_progress(target_events):
+    llm = LLM(
+        model="wandb/other-model",
+        api_key=SecretStr("test-key"),
+        base_url="https://api.inference.wandb.ai/v1",
+        api_mode="chat",
+    )
+    existing = LLMSummarizingCondenser(
+        llm=llm,
+        max_size=100,
+        keep_first=2,
+        minimum_progress=0.1,
+    )
+
+    with pytest.raises(ValueError, match="progress|keep_first"):
+        configured_local_condenser(
+            llm,
+            100,
+            existing,
+            target_events=target_events,
+        )
 
 
 def test_openai_max_uses_pro_mode_on_the_wire():
@@ -262,6 +415,21 @@ def test_file_agent_reasoning_override_replaces_the_parent_request_profile(
     }
 
 
+def test_file_agent_reasoning_override_rejects_ultra():
+    model = "openai/gpt-5.6-sol"
+    parent = LLM(
+        model=model,
+        api_key=SecretStr("test-key"),
+        reasoning_effort="xhigh",
+        **model_runtime_configuration(model, "xhigh"),
+    )
+
+    with pytest.raises(ValueError, match="unsupported reasoning effort"):
+        apply_reasoning_profile(
+            parent.model_copy(update={"reasoning_effort": "ultra"})
+        )
+
+
 def test_wandb_gateway_uses_chat_thinking_and_project_routing():
     configuration = model_runtime_configuration(
         "wandb/zai-org/GLM-5.2",
@@ -273,7 +441,11 @@ def test_wandb_gateway_uses_chat_thinking_and_project_routing():
         model="wandb/zai-org/GLM-5.2",
         api_key=SecretStr("test-key"),
         reasoning_effort="max",
-        **configuration,
+        **{
+            key: value
+            for key, value in configuration.items()
+            if key != "custom_tokenizer"
+        },
     )
     _messages, _tools, _mocked, call_kwargs, _telemetry = (
         llm._prepare_completion_params(
@@ -294,6 +466,7 @@ def test_wandb_gateway_uses_chat_thinking_and_project_routing():
         },
         "max_input_tokens": 262_144,
         "max_output_tokens": 16_384,
+        "custom_tokenizer": "zai-org/GLM-5.2",
         "litellm_extra_body": {
             "chat_template_kwargs": {
                 "enable_thinking": True,
@@ -314,6 +487,48 @@ def test_wandb_gateway_uses_chat_thinking_and_project_routing():
     assert "reasoning_effort" not in call_kwargs
     assert llm._provider_info.name == "wandb"
     assert llm._provider_info.api_base == "https://api.inference.wandb.ai/v1"
+
+
+def test_glm_exact_tokenizer_readiness_is_checked_without_network(monkeypatch):
+    import transformers
+
+    class ExactTokenizer:
+        def apply_chat_template(self, *_args, **_kwargs):
+            return [1]
+
+    loaded = []
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        lambda identifier: loaded.append(identifier) or ExactTokenizer(),
+    )
+    configuration = model_runtime_configuration(
+        "wandb/zai-org/GLM-5.2",
+        "max",
+        wandb_entity="research-team",
+        wandb_project="mlxfast",
+    )
+
+    llm = LLM(
+        model="wandb/zai-org/GLM-5.2",
+        api_key=SecretStr("test-key"),
+        reasoning_effort="max",
+        **configuration,
+    )
+
+    require_exact_tokenizer(llm)
+    assert llm.has_chat_template_tokenizer()
+    assert loaded == ["zai-org/GLM-5.2"]
+
+
+def test_glm_fails_clearly_without_an_exact_chat_template_tokenizer():
+    llm = SimpleNamespace(
+        model="wandb/zai-org/glm-5.2",
+        has_chat_template_tokenizer=lambda: False,
+    )
+
+    with pytest.raises(RuntimeError, match="exact.*chat-template tokenizer"):
+        require_exact_tokenizer(llm)
 
 
 @pytest.mark.parametrize(
@@ -392,6 +607,18 @@ def test_gpt56_marks_only_the_stable_system_cache_boundary():
         (
             {"model": "openai/gpt-5.6", "agent_name": "explore"},
             "senpai:advisor:explore",
+        ),
+        (
+            {"model": "openai/gpt-5.6", "role": "supervisor"},
+            "senpai:supervisor:operations",
+        ),
+        (
+            {
+                "model": "openai/gpt-5.6",
+                "role": "supervisor",
+                "supervisor_tool_mode": "research_assessment",
+            },
+            "senpai:supervisor:research_assessment",
         ),
         ({"model": "anthropic/claude-opus-4-8"}, None),
     ],

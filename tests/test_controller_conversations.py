@@ -38,12 +38,18 @@ class Turns:
         inbox,
         inbox_turn_id,
     ):
+        turn = inbox.turn(inbox_turn_id)
         self.calls.append(
-            (prompt, conversation_id, event_keys, visible_event_keys)
+            (
+                prompt,
+                conversation_id,
+                event_keys,
+                visible_event_keys,
+                tuple(message.body for message in turn.events),
+            )
         )
         result = TurnResult(exit_code=next(self.exit_codes, 0))
         if result.exit_code == 0:
-            turn = inbox.turn(inbox_turn_id)
             for message in turn.messages:
                 inbox.record_delivered(message.delivery_id, message.body)
             inbox.record_processed(inbox_turn_id)
@@ -143,8 +149,8 @@ def test_assignment_feedback_and_monitor_wake_share_the_assignment_uuid(
             },
         ),
         ControllerEvent(
-            kind="training_monitor",
-            dedupe_key="training_monitor:run-1:finished",
+            kind="job_monitor",
+            dedupe_key="job_monitor:run-1:finished",
             payload={"conversation_id": str(conversation_id)},
         ),
     )
@@ -180,6 +186,12 @@ def test_controller_partitions_and_acknowledges_events_by_conversation(
     run_student_controller(tmp_path, mailbox, turns)
 
     assert [call[1] for call in turns.calls] == [first, second]
+    first_messages = "\n".join(turns.calls[0][4])
+    second_messages = "\n".join(turns.calls[1][4])
+    assert "first only" in first_messages
+    assert "second only" not in first_messages
+    assert "second only" in second_messages
+    assert "first only" not in second_messages
     assert [call[2] for call in turns.calls] == [
         frozenset({first_event.dedupe_key}),
         frozenset({second_event.dedupe_key}),

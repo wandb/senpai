@@ -1,8 +1,115 @@
+import json
+import re
 import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from launch_test_support import launch, launch_args, launch_helpers
+
+
+def test_canary_can_import_network_policy_without_the_cli_parser():
+    code = """
+import builtins
+
+real_import = builtins.__import__
+
+def without_cli_parser(name, *args, **kwargs):
+    if name == "simple_parsing":
+        raise ModuleNotFoundError(name)
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = without_cli_parser
+from k8s.launch import render_supervisor_network_policy
+print(render_supervisor_network_policy("canary"))
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "name: senpai-supervisor-egress-canary" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    ("updates", "students"),
+    [
+        ({"tag": "../escape"}, ["fern"]),
+        ({"tag": "Uppercase"}, ["fern"]),
+        ({"tag": "bad\nkind: Secret"}, ["fern"]),
+        ({"namespace": "bad_namespace"}, ["fern"]),
+        ({"pvc_claim_name": "bad/claim"}, ["fern"]),
+        ({"supervisor_state_pvc_claim_name": "../state"}, ["fern"]),
+        ({"pvc_mount_path": "/mnt/data\n- name: injected"}, ["fern"]),
+        ({}, ["bad/student"]),
+        ({"tag": "x" * 50}, ["student-name"]),
+    ],
+)
+def test_kubernetes_input_boundary_rejects_unsafe_values_before_kubectl(
+    updates,
+    students,
+    monkeypatch,
+):
+    args = launch_args(**updates)
+    kubectl = monkeypatch.setattr(
+        launch_helpers.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("kubectl must not run"),
+    )
+
+    with pytest.raises(ValueError):
+        launch.validate_kubernetes_inputs(args, students)
+
+    assert kubectl is None
+
+
+def test_configmap_values_round_trip_yaml_metacharacters():
+    rendered = launch_helpers.render_configmap(
+        "safe-name",
+        {"research-tag": 'quote" slash\\ newline\n'},
+        {
+            "VALUE": 'quote" slash\\ newline\nkind: Secret',
+            "PLAIN": "normal",
+        },
+    )
+
+    parsed = yaml.safe_load(rendered)
+    assert parsed["metadata"]["labels"]["research-tag"] == (
+        'quote" slash\\ newline\n'
+    )
+    assert parsed["data"]["VALUE"] == 'quote" slash\\ newline\nkind: Secret'
+    assert parsed["data"]["PLAIN"] == "normal"
+
+
+def test_rendered_image_value_cannot_inject_a_yaml_document():
+    hostile = 'ghcr.io/example/image:tag"\n---\nkind: Secret'
+    args = launch_args(advisor_image=hostile)
+    secret = launch_helpers.render_launch_secret(
+        args.tag,
+        "github",
+        "exa",
+        "wandb",
+        openai_api_key="openai",
+    )
+    rendered = launch.render_advisor(
+        (launch.ROOT / "k8s/advisor-deployment.yaml").read_text(),
+        args.tag,
+        ["fern"],
+        "secret",
+        secret,
+        args,
+    )
+    documents = list(yaml.safe_load_all(rendered))
+
+    assert len(documents) == 2
+    assert documents[1]["spec"]["template"]["spec"]["containers"][0]["image"] == hostile
 
 
 def test_kubectl_apply_raises_with_the_resource_and_error_detail(monkeypatch):
@@ -38,6 +145,31 @@ def test_kubectl_apply_raises_with_the_resource_and_error_detail(monkeypatch):
         "-",
     ]
     assert captured["kwargs"]["input"] == "kind: Service"
+    assert captured["kwargs"]["timeout"] == 60
+
+
+def test_kubectl_apply_and_rollout_have_process_deadlines(monkeypatch):
+    deadlines = []
+
+    def timeout(argv, **kwargs):
+        deadlines.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", timeout)
+
+    with pytest.raises(RuntimeError, match="apply timed out.*37s"):
+        launch_helpers.kubectl_apply(
+            "kind: Service",
+            "advisor service",
+            process_timeout_seconds=37,
+        )
+    with pytest.raises(RuntimeError, match="rollout status timed out.*62s"):
+        launch_helpers.kubectl_rollout_status(
+            "senpai-supervisor-maple",
+            timeout_seconds=47,
+        )
+
+    assert deadlines == [37, 62]
 
 
 def test_student_discovery_uses_the_requested_cluster_scope(monkeypatch):
@@ -71,6 +203,69 @@ def test_student_discovery_uses_the_requested_cluster_scope(monkeypatch):
     assert "app=senpai,role=student,research-tag=track-a" in captured["argv"]
 
 
+def test_advisor_discovery_uses_the_exact_campaign_scope(monkeypatch):
+    captured = {}
+
+    def run(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="senpai-advisor-track-a\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+
+    names = launch_helpers.existing_advisor_deployments(
+        "track-a",
+        kube_context="gpu-cluster",
+        namespace="research",
+    )
+
+    assert names == ["senpai-advisor-track-a"]
+    assert "app=senpai,role=advisor,research-tag=track-a" in captured["argv"]
+
+
+def test_role_revision_discovery_is_exact_and_reports_missing_annotations(
+    monkeypatch,
+):
+    captured = {}
+
+    def run(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout=(
+                '{"items":['
+                '{"metadata":{"name":"senpai-track-a-fern",'
+                '"labels":{"student":"fern"},'
+                '"annotations":{"senpai.wandb.com/source-revision":"abc"}}},'
+                '{"metadata":{"name":"senpai-track-a-frieren",'
+                '"labels":{"student":"frieren"}}}'
+                "]}"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+
+    metadata = launch_helpers.existing_role_metadata(
+        "track-a",
+        "student",
+        kube_context="gpu-cluster",
+        namespace="research",
+    )
+
+    assert metadata == {
+        "fern": {"senpai.wandb.com/source-revision": "abc"},
+        "frieren": {},
+    }
+    assert "app=senpai,role=student,research-tag=track-a" in captured["argv"]
+    assert captured["argv"][-2:] == ["-o", "json"]
+
+
 def test_kubectl_default_scope_omits_an_empty_context():
     assert launch_helpers.kubectl_command("apply", "-f", "-") == [
         "kubectl",
@@ -80,6 +275,19 @@ def test_kubectl_default_scope_omits_an_empty_context():
         "-f",
         "-",
     ]
+
+
+def test_content_addressed_names_fit_one_kubernetes_dns_label():
+    base = "senpai-supervisor-secrets-" + "long-campaign-" * 5
+
+    first = launch_helpers.content_addressed_name(base, {"token": "release-a"})
+    second = launch_helpers.content_addressed_name(base, {"token": "release-b"})
+
+    assert len(first) <= 63
+    assert re.fullmatch(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?", first)
+    assert first != second
+    assert first.rsplit("-", 1)[1].isalnum()
+    assert len(first.rsplit("-", 1)[1]) == 12
 
 
 def bypass_external_preflight(monkeypatch):
@@ -108,6 +316,1089 @@ def bypass_external_preflight(monkeypatch):
         "preflight_check_target_repo_branch",
         lambda *_args: "main",
     )
+    monkeypatch.setattr(
+        launch,
+        "existing_operational_supervisors",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        launch,
+        "kubernetes_pvc_metadata",
+        lambda *_args, **_kwargs: {
+            "metadata": {
+                "annotations": {"senpai.wandb.com/sqlite-safe": "true"}
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeMode": "Filesystem",
+            },
+            "status": {"phase": "Bound"},
+        },
+    )
+
+
+def bypass_supervisor_rollback_snapshot(monkeypatch):
+    def capture(**kwargs):
+        return SimpleNamespace(
+            commit=lambda: None,
+            manual_finalize_argv=lambda: ["python", "finalize-commit"],
+            manual_restore_argv=lambda: ["python", "restore"],
+            mark_mutation_started=lambda: None,
+            renew_lease=lambda: None,
+            resolved_kube_context=kwargs["kube_context"] or "resolved-context",
+            restore=lambda **_kwargs: None,
+        )
+
+    monkeypatch.setattr(
+        launch.SupervisorRollback,
+        "capture",
+        capture,
+    )
+
+
+def supervisor_launch_args(**overrides):
+    overrides.setdefault("supervisor_network_policy_enforced", True)
+    overrides.setdefault(
+        "supervisor_state_pvc_claim_name",
+        "senpai-supervisor-state-test-track",
+    )
+    return launch_args(
+        namespace="senpai-test-track",
+        supervisor_dedicated_namespace=True,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    (
+        ({"supervisor_state_pvc_claim_name": ""}, "state_pvc_claim_name"),
+        (
+            {"supervisor_state_pvc_claim_name": "new-pvc"},
+            "separate from --pvc_claim_name",
+        ),
+    ),
+)
+def test_supervisor_requires_dedicated_acknowledged_state_storage(
+    monkeypatch, overrides, message
+):
+    args = supervisor_launch_args(operational_supervisor=True, **overrides)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+
+    with pytest.raises(SystemExit, match=message):
+        launch.main()
+
+
+def test_supervisor_requires_sqlite_safe_annotation_on_the_live_state_claim(
+    monkeypatch,
+):
+    args = supervisor_launch_args(operational_supervisor=True)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "kubernetes_pvc_metadata",
+        lambda *_args, **_kwargs: {
+            "metadata": {"annotations": {}},
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeMode": "Filesystem",
+            },
+            "status": {"phase": "Bound"},
+        },
+    )
+
+    with pytest.raises(SystemExit, match="sqlite-safe=true"):
+        launch.main()
+
+
+def test_supervisor_rechecks_live_storage_and_inventory_before_mutation(
+    monkeypatch,
+):
+    args = supervisor_launch_args(
+        advisor=True,
+        operational_supervisor=True,
+        names="",
+        n_students=0,
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    bypass_supervisor_rollback_snapshot(monkeypatch)
+    checks = {"pvc": 0, "advisors": 0}
+
+    def pvc(*_args, **_kwargs):
+        checks["pvc"] += 1
+        return {
+            "metadata": {
+                "annotations": {"senpai.wandb.com/sqlite-safe": "true"}
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeMode": "Filesystem",
+            },
+            "status": {"phase": "Bound"},
+        }
+
+    def advisors(*_args, **_kwargs):
+        checks["advisors"] += 1
+        return []
+
+    monkeypatch.setattr(launch, "kubernetes_pvc_metadata", pvc)
+    monkeypatch.setattr(launch, "existing_advisor_deployments", advisors)
+    monkeypatch.setattr(
+        launch,
+        "existing_role_metadata",
+        lambda *_args, **_kwargs: {},
+    )
+    mutation_checks = []
+    monkeypatch.setattr(
+        launch,
+        "ensure_advisor_branch",
+        lambda *_args, **_kwargs: mutation_checks.append(dict(checks)),
+    )
+    monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        launch,
+        "kubectl_rollout_status",
+        lambda *_args, **_kwargs: None,
+    )
+
+    launch.main()
+
+    assert mutation_checks == [{"pvc": 2, "advisors": 2}]
+
+
+def test_supervisor_preflight_only_checks_kubernetes_storage_and_inventory(
+    monkeypatch,
+):
+    args = supervisor_launch_args(
+        advisor=True,
+        operational_supervisor=True,
+        names="",
+        n_students=0,
+        preflight_only=True,
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    checked = []
+    monkeypatch.setattr(
+        launch,
+        "kubernetes_pvc_metadata",
+        lambda *_args, **_kwargs: checked.append("pvc")
+        or {
+            "metadata": {
+                "annotations": {"senpai.wandb.com/sqlite-safe": "true"}
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeMode": "Filesystem",
+            },
+            "status": {"phase": "Bound"},
+        },
+    )
+    monkeypatch.setattr(
+        launch,
+        "existing_advisor_deployments",
+        lambda *_args, **_kwargs: checked.append("advisor-inventory") or [],
+    )
+    monkeypatch.setattr(
+        launch,
+        "existing_role_metadata",
+        lambda *_args, **_kwargs: checked.append("student-inventory") or {},
+    )
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **_kwargs: pytest.fail("preflight mutated Kubernetes"),
+    )
+
+    launch.main()
+
+    assert checked == ["pvc", "advisor-inventory", "student-inventory"]
+
+
+def compatible_existing_campaign(monkeypatch, args, students=("fern",)):
+    monkeypatch.setattr(
+        launch,
+        "kubernetes_pvc_metadata",
+        lambda *_args, **_kwargs: {
+            "metadata": {
+                "annotations": {"senpai.wandb.com/sqlite-safe": "true"}
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeMode": "Filesystem",
+            },
+            "status": {"phase": "Bound"},
+        },
+    )
+    monkeypatch.setattr(
+        launch,
+        "existing_advisor_deployments",
+        lambda *_args, **_kwargs: [f"senpai-advisor-{args.tag}"],
+    )
+
+    def metadata(_tag, role, **_kwargs):
+        if role == "advisor":
+            return {
+                f"senpai-advisor-{args.tag}": {
+                    "senpai.wandb.com/source-revision": args.repo_revision,
+                    "senpai.wandb.com/advisor-branch": args.advisor_branch,
+                    "senpai.wandb.com/student-names": ",".join(students),
+                    "senpai.wandb.com/management-protocol": launch.MANAGEMENT_PROTOCOL_VERSION,
+                    "senpai.wandb.com/repair-protocol": launch.REPAIR_PROTOCOL_VERSION,
+                }
+            }
+        return {
+            student: {
+                "senpai.wandb.com/source-revision": args.repo_revision,
+                "senpai.wandb.com/advisor-branch": args.advisor_branch,
+                "senpai.wandb.com/management-protocol": launch.MANAGEMENT_PROTOCOL_VERSION,
+                "senpai.wandb.com/repair-protocol": launch.REPAIR_PROTOCOL_VERSION,
+            }
+            for student in students
+        }
+
+    monkeypatch.setattr(launch, "existing_role_metadata", metadata)
+
+
+def test_supervisor_only_upgrade_rejects_retained_roles_without_repair_protocol(
+    monkeypatch,
+):
+    args = supervisor_launch_args(
+        advisor=False,
+        operational_supervisor=True,
+        names="",
+        n_students=0,
+    )
+    args.supervisor_network_policy_enforced = True
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    compatible_existing_campaign(monkeypatch, args)
+    original = launch.existing_role_metadata
+
+    def missing_protocol(tag, role, **kwargs):
+        records = original(tag, role, **kwargs)
+        return {
+            name: {
+                key: value
+                for key, value in record.items()
+                if key != "senpai.wandb.com/repair-protocol"
+            }
+            for name, record in records.items()
+        }
+
+    monkeypatch.setattr(launch, "existing_role_metadata", missing_protocol)
+    mutations = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **_kwargs: mutations.append("apply"),
+    )
+
+    with pytest.raises(SystemExit, match="repair protocol"):
+        launch.main()
+
+    assert mutations == []
+
+
+def test_supervisor_requires_an_explicit_network_policy_enforcement_invariant(
+    monkeypatch,
+):
+    args = supervisor_launch_args(operational_supervisor=True)
+    args.supervisor_network_policy_enforced = False
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+
+    with pytest.raises(SystemExit, match="network policy enforcement"):
+        launch.main()
+
+
+def successful_kubectl(calls):
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="" if "get" in argv else "applied",
+            stderr="",
+        )
+
+    return run
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"namespace": "default", "supervisor_dedicated_namespace": True},
+        {"namespace": "", "supervisor_dedicated_namespace": True},
+        {"namespace": "shared-research", "supervisor_dedicated_namespace": False},
+    ),
+)
+def test_supervisor_requires_explicit_campaign_dedicated_namespace(
+    monkeypatch,
+    overrides,
+):
+    args = launch_args(operational_supervisor=True, **overrides)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+
+    with pytest.raises(SystemExit, match="campaign-dedicated"):
+        launch.main()
+
+
+def test_incremental_supervisor_requires_one_existing_exact_tag_advisor(monkeypatch):
+    args = supervisor_launch_args(advisor=False, operational_supervisor=True)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "existing_advisor_deployments",
+        lambda *_args, **_kwargs: [],
+    )
+    mutations = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **_kwargs: mutations.append("apply"),
+    )
+
+    with pytest.raises(SystemExit, match="exactly one existing advisor Deployment"):
+        launch.main()
+
+    assert mutations == []
+
+
+def test_incremental_supervisor_allows_a_compatible_older_advisor_revision(
+    monkeypatch,
+):
+    args = supervisor_launch_args(
+        advisor=False,
+        operational_supervisor=True,
+        names="",
+        n_students=0,
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    bypass_supervisor_rollback_snapshot(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "existing_advisor_deployments",
+        lambda *_args, **_kwargs: ["senpai-advisor-test-track"],
+    )
+    monkeypatch.setattr(
+        launch,
+        "existing_role_metadata",
+        lambda _tag, role, **_kwargs: (
+            {
+                "senpai-advisor-test-track": {
+                    "senpai.wandb.com/source-revision": "b" * 40,
+                    "senpai.wandb.com/advisor-branch": args.advisor_branch,
+                    "senpai.wandb.com/student-names": "fern",
+                    "senpai.wandb.com/management-protocol": launch.MANAGEMENT_PROTOCOL_VERSION,
+                    "senpai.wandb.com/repair-protocol": launch.REPAIR_PROTOCOL_VERSION,
+                }
+            }
+            if role == "advisor"
+            else {
+                "fern": {
+                    "senpai.wandb.com/source-revision": "b" * 40,
+                    "senpai.wandb.com/advisor-branch": args.advisor_branch,
+                    "senpai.wandb.com/management-protocol": launch.MANAGEMENT_PROTOCOL_VERSION,
+                    "senpai.wandb.com/repair-protocol": launch.REPAIR_PROTOCOL_VERSION,
+                }
+            }
+        ),
+    )
+    calls = []
+    monkeypatch.setattr(launch_helpers.subprocess, "run", successful_kubectl(calls))
+
+    launch.main()
+
+    applied = [
+        document
+        for argv, kwargs in calls
+        if "apply" in argv
+        for document in yaml.safe_load_all(kwargs["input"])
+    ]
+    assert not any(
+        document["kind"] == "Deployment"
+        and document["metadata"]["name"].startswith("senpai-advisor-")
+        for document in applied
+    )
+    supervisor = next(
+        document
+        for document in applied
+        if document["kind"] == "Deployment"
+        and document["metadata"]["name"] == "senpai-supervisor-test-track"
+    )
+    assert supervisor["metadata"]["annotations"][
+        "senpai.wandb.com/management-protocol"
+    ] == launch.MANAGEMENT_PROTOCOL_VERSION
+
+
+def test_role_replacement_cannot_silently_strip_live_supervisor_capability(
+    monkeypatch,
+):
+    args = supervisor_launch_args(operational_supervisor=False)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "existing_operational_supervisors",
+        lambda *_args, **_kwargs: ["senpai-supervisor-test-track"],
+    )
+    mutations = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **_kwargs: mutations.append("apply"),
+    )
+
+    with pytest.raises(SystemExit, match="--operational_supervisor.*repair capability"):
+        launch.main()
+
+    assert mutations == []
+
+
+def test_incremental_supervisor_cannot_change_the_advisor_student_inventory(
+    monkeypatch,
+):
+    args = supervisor_launch_args(advisor=False, operational_supervisor=True)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "existing_advisor_deployments",
+        lambda *_args, **_kwargs: ["senpai-advisor-test-track"],
+    )
+
+    def metadata(_tag, role, **_kwargs):
+        if role == "advisor":
+            return {
+                "senpai-advisor-test-track": {
+                    "senpai.wandb.com/source-revision": args.repo_revision,
+                    "senpai.wandb.com/advisor-branch": args.advisor_branch,
+                    "senpai.wandb.com/student-names": "fern",
+                    "senpai.wandb.com/management-protocol": launch.MANAGEMENT_PROTOCOL_VERSION,
+                    "senpai.wandb.com/repair-protocol": launch.REPAIR_PROTOCOL_VERSION,
+                }
+            }
+        return {
+            "frieren": {
+                "senpai.wandb.com/source-revision": args.repo_revision,
+                "senpai.wandb.com/advisor-branch": args.advisor_branch,
+                "senpai.wandb.com/management-protocol": launch.MANAGEMENT_PROTOCOL_VERSION,
+                "senpai.wandb.com/repair-protocol": launch.REPAIR_PROTOCOL_VERSION,
+            }
+        }
+
+    monkeypatch.setattr(launch, "existing_role_metadata", metadata)
+    mutations = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **_kwargs: mutations.append("apply"),
+    )
+
+    with pytest.raises(SystemExit, match="would change.*student inventory"):
+        launch.main()
+
+    assert mutations == []
+
+
+def test_supervisor_only_launch_preserves_role_secret_and_uses_immutable_bundle(
+    monkeypatch,
+    capsys,
+):
+    args = supervisor_launch_args(
+        advisor=False,
+        operational_supervisor=True,
+        names="",
+        n_students=0,
+        advisor_model="openai/gpt-5.6-sol",
+        smart_model="anthropic/claude-opus-4-8",
+        fast_model="anthropic/claude-sonnet-4-6",
+        frontier_model="anthropic/claude-opus-4-8",
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    compatible_existing_campaign(monkeypatch, args)
+    bypass_supervisor_rollback_snapshot(monkeypatch)
+    calls = []
+    monkeypatch.setattr(launch_helpers.subprocess, "run", successful_kubectl(calls))
+
+    launch.main()
+
+    applied = [kwargs["input"] for argv, kwargs in calls if "apply" in argv]
+    assert yaml.safe_load(applied[0])["kind"] == "NetworkPolicy"
+    documents = [
+        document
+        for manifest in applied
+        for document in yaml.safe_load_all(manifest)
+    ]
+    resources = {
+        (document["kind"], document["metadata"]["name"]): document
+        for document in documents
+    }
+    assert ("Secret", "senpai-launch-secrets-test-track") not in resources
+    assert not any(kind == "Deployment" and "fern" in name for kind, name in resources)
+
+    supervisor_secret_name = next(
+        name
+        for kind, name in resources
+        if kind == "Secret" and name.startswith("senpai-supervisor-secrets-test-track-")
+    )
+    supervisor_config_name = next(
+        name
+        for kind, name in resources
+        if kind == "ConfigMap" and name.startswith("senpai-config-supervisor-test-track-")
+    )
+    assert resources[("Secret", supervisor_secret_name)]["immutable"] is True
+    assert resources[("ConfigMap", supervisor_config_name)]["immutable"] is True
+    assert set(resources[("Secret", supervisor_secret_name)]["data"]) == {
+        "github-token",
+        "wandb-api-key",
+        "openai-api-key",
+    }
+
+    deployment = resources[("Deployment", "senpai-supervisor-test-track")]
+    pod = deployment["spec"]["template"]["spec"]
+    source = next(
+        container
+        for container in pod["initContainers"]
+        if container["name"] == "source"
+    )
+    control = next(
+        container
+        for container in pod["containers"]
+        if container["name"] == "supervisor-control"
+    )
+    assert source["env"][0]["valueFrom"]["secretKeyRef"]["name"] == (
+        supervisor_secret_name
+    )
+    assert {
+        env["valueFrom"]["secretKeyRef"]["name"]
+        for env in control["env"]
+        if "valueFrom" in env
+    } == {supervisor_secret_name}
+    assert control["envFrom"][0]["configMapRef"]["name"] == (
+        supervisor_config_name
+    )
+
+    assert [
+        argv
+        for argv, _kwargs in calls
+        if "rollout" in argv and "status" in argv
+    ] == [
+        [
+            "kubectl",
+            "--context",
+            "resolved-context",
+            "--namespace",
+            "senpai-test-track",
+            "rollout",
+            "status",
+            "deployment/senpai-supervisor-test-track",
+            "--timeout=900s",
+        ]
+    ]
+    output = capsys.readouterr().out
+    assert "Disable only the operational supervisor" in output
+    assert (
+        "kubectl --namespace senpai-test-track delete "
+        "deployment/senpai-supervisor-test-track"
+    ) in output
+    assert "advisor/student pods and host capacity stay running" in output
+
+
+def test_supervisor_only_upgrade_skips_role_credentials_and_repo_setup(monkeypatch):
+    """An incremental supervisor upgrade must not depend on or mutate role setup."""
+
+    args = supervisor_launch_args(
+        advisor=False,
+        operational_supervisor=True,
+        names="",
+        n_students=0,
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    compatible_existing_campaign(monkeypatch, args)
+    bypass_supervisor_rollback_snapshot(monkeypatch)
+
+    resolved = []
+    checked = []
+    monkeypatch.setattr(
+        launch,
+        "resolve_github_token",
+        lambda _path: resolved.append("github") or "github",
+    )
+    monkeypatch.setattr(
+        launch,
+        "resolve_openai_api_key",
+        lambda _path: resolved.append("openai") or "openai",
+    )
+    monkeypatch.setattr(
+        launch,
+        "resolve_wandb_api_key",
+        lambda _path: resolved.append("wandb") or "wandb",
+    )
+    for name in ("resolve_exa_api_key", "resolve_optional_secret"):
+        monkeypatch.setattr(
+            launch,
+            name,
+            lambda *_args, name=name: pytest.fail(
+                f"supervisor-only upgrade called {name}"
+            ),
+        )
+
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_target_repo_access",
+        lambda *_args: checked.append("github"),
+    )
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_openai_api_key",
+        lambda *_args: checked.append("openai"),
+    )
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_wandb_api_key",
+        lambda *_args: checked.append("wandb"),
+    )
+    for name in (
+        "preflight_check_target_repo_branch",
+        "preflight_check_student_name_availability",
+        "preflight_check_exa_api_key",
+        "ensure_advisor_branch",
+        "ensure_target_repo_labels",
+    ):
+        monkeypatch.setattr(
+            launch,
+            name,
+            lambda *_args, name=name: pytest.fail(
+                f"supervisor-only upgrade called {name}"
+            ),
+        )
+    monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        launch,
+        "kubectl_rollout_status",
+        lambda *_args, **_kwargs: None,
+    )
+
+    launch.main()
+
+    assert resolved == ["github", "openai", "wandb"]
+    assert checked == ["github", "openai", "wandb"]
+
+
+def test_supervisor_bundle_names_change_without_overwriting_prior_release(
+    monkeypatch,
+):
+    args = supervisor_launch_args(
+        advisor=False,
+        operational_supervisor=True,
+        names="",
+        n_students=0,
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    compatible_existing_campaign(monkeypatch, args)
+    bypass_supervisor_rollback_snapshot(monkeypatch)
+    model_key = {"value": "openai-release-a"}
+    monkeypatch.setattr(
+        launch,
+        "resolve_openai_api_key",
+        lambda _path: model_key["value"],
+    )
+    calls = []
+    monkeypatch.setattr(launch_helpers.subprocess, "run", successful_kubectl(calls))
+
+    launch.main()
+    first_count = len(calls)
+    model_key["value"] = "openai-release-b"
+    launch.main()
+
+    def applied_documents(records):
+        return [
+            document
+            for argv, kwargs in records
+            if "apply" in argv
+            for document in yaml.safe_load_all(kwargs["input"])
+        ]
+
+    def bundle_names(documents):
+        return {
+            document["metadata"]["name"]
+            for document in documents
+            if document["kind"] in {"Secret", "ConfigMap"}
+        }
+
+    def deployment_bundle(documents):
+        deployment = next(
+            document for document in documents if document["kind"] == "Deployment"
+        )
+        pod = deployment["spec"]["template"]["spec"]
+        return {
+            pod["containers"][0]["env"][0]["valueFrom"]["secretKeyRef"]["name"],
+            pod["containers"][0]["envFrom"][0]["configMapRef"]["name"],
+        }
+
+    first_documents = applied_documents(calls[:first_count])
+    second_documents = applied_documents(calls[first_count:])
+    first = bundle_names(first_documents)
+    second = bundle_names(second_documents)
+    assert next(name for name in first if "supervisor-secrets" in name) != next(
+        name for name in second if "supervisor-secrets" in name
+    )
+    assert next(name for name in first if "config-supervisor" in name) == next(
+        name for name in second if "config-supervisor" in name
+    )
+    assert deployment_bundle(first_documents) == first
+    assert deployment_bundle(second_documents) == second
+    assert not any("delete" in argv for argv, _kwargs in calls)
+
+
+def test_supervisor_rollout_failure_invokes_transactional_restore(
+    monkeypatch,
+    capsys,
+):
+    events = []
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: events.append("commit"),
+        manual_restore_argv=lambda: ["python", "restore"],
+        mark_mutation_started=lambda: events.append("mutation-started"),
+        renew_lease=lambda: events.append("renew"),
+        resolved_kube_context="resolved-cluster",
+        restore=lambda **_kwargs: events.append("restore"),
+    )
+    monkeypatch.setattr(launch.SupervisorRollback, "capture", lambda **_kwargs: rollback)
+    applied_contexts = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **kwargs: applied_contexts.append(kwargs["kube_context"]),
+    )
+    monkeypatch.setattr(
+        launch,
+        "kubectl_rollout_status",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("deployment exceeded its progress deadline")
+        ),
+    )
+    args = supervisor_launch_args(kube_context="")
+
+    with pytest.raises(SystemExit, match="operational supervisor rollout failed"):
+        launch.apply_operational_supervisor_release(
+            args,
+            network_policy="policy",
+            secret_name="secret",
+            secret="secret manifest",
+            manifest="supervisor manifest",
+        )
+
+    output = capsys.readouterr()
+    assert "deployment exceeded its progress deadline" in output.err
+    assert "Automatic rollback restored the prior mutable resources" in output.err
+    assert "persistent SQLite state was never rolled back" in output.err
+    assert "Rollback bundle retained at" in output.err
+    assert "Manual recovery:" in output.err
+    assert events == ["mutation-started", "renew", "restore"]
+    assert applied_contexts == ["resolved-cluster"] * 3
+
+
+def test_supervisor_release_journals_the_first_launch_network_policy(monkeypatch):
+    captured = {}
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: None,
+        manual_restore_argv=lambda: ["python", "restore"],
+        mark_mutation_started=lambda: None,
+        renew_lease=lambda: None,
+        resolved_kube_context="gpu-cluster",
+        restore=lambda **_kwargs: None,
+    )
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        return rollback
+
+    monkeypatch.setattr(launch.SupervisorRollback, "capture", capture)
+    monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launch, "kubectl_rollout_status", lambda *_args, **_kwargs: None)
+    policy = launch.render_supervisor_network_policy("test-track")
+
+    launch.apply_operational_supervisor_release(
+        supervisor_launch_args(kube_context="gpu-cluster"),
+        network_policy=policy,
+        secret_name="secret",
+        secret="secret manifest",
+        manifest="supervisor manifest",
+    )
+
+    assert captured["network_policy_safety_manifest"] == yaml.safe_load(policy)
+
+
+def test_supervisor_apply_failure_invokes_transactional_restore(
+    monkeypatch,
+    capsys,
+):
+    events = []
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: events.append("commit"),
+        manual_restore_argv=lambda: ["python", "restore"],
+        mark_mutation_started=lambda: events.append("mutation-started"),
+        renew_lease=lambda: events.append("renew"),
+        resolved_kube_context="gpu-cluster",
+        restore=lambda **_kwargs: events.append("restore"),
+    )
+    monkeypatch.setattr(launch.SupervisorRollback, "capture", lambda **_kwargs: rollback)
+    applies = 0
+
+    def apply(*_args, **_kwargs):
+        nonlocal applies
+        applies += 1
+        if applies == 3:
+            raise RuntimeError("admission denied the supervisor Deployment")
+
+    monkeypatch.setattr(launch, "kubectl_apply", apply)
+    args = supervisor_launch_args(kube_context="gpu-cluster")
+
+    with pytest.raises(SystemExit, match="operational supervisor launch failed"):
+        launch.apply_operational_supervisor_release(
+            args,
+            network_policy="policy",
+            secret_name="secret",
+            secret="secret manifest",
+            manifest="supervisor manifest",
+        )
+
+    assert events == ["mutation-started", "restore"]
+    assert applies == 3
+    assert "admission denied the supervisor Deployment" in capsys.readouterr().err
+
+
+def test_supervisor_interrupt_restores_before_propagating(monkeypatch):
+    events = []
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: events.append("commit"),
+        manual_restore_argv=lambda: ["python", "restore"],
+        mark_mutation_started=lambda: events.append("mutation-started"),
+        renew_lease=lambda: events.append("renew"),
+        resolved_kube_context="gpu-cluster",
+        restore=lambda **_kwargs: events.append("restore"),
+    )
+    monkeypatch.setattr(
+        launch.SupervisorRollback,
+        "capture",
+        lambda **_kwargs: rollback,
+    )
+
+    def interrupt(*_args, **_kwargs):
+        events.append("apply")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(launch, "kubectl_apply", interrupt)
+    args = supervisor_launch_args(kube_context="gpu-cluster")
+
+    with pytest.raises(KeyboardInterrupt):
+        launch.apply_operational_supervisor_release(
+            args,
+            network_policy="policy",
+            secret_name="secret",
+            secret="secret manifest",
+            manifest="supervisor manifest",
+        )
+
+    assert events == ["mutation-started", "apply", "restore"]
+
+
+def test_supervisor_unexpected_error_restores_before_propagating(monkeypatch):
+    events = []
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: events.append("commit"),
+        manual_restore_argv=lambda: ["python", "restore"],
+        mark_mutation_started=lambda: events.append("mutation-started"),
+        renew_lease=lambda: events.append("renew"),
+        resolved_kube_context="gpu-cluster",
+        restore=lambda **_kwargs: events.append("restore"),
+    )
+    monkeypatch.setattr(launch.SupervisorRollback, "capture", lambda **_kwargs: rollback)
+
+    def fail(*_args, **_kwargs):
+        events.append("apply")
+        raise TypeError("unexpected implementation failure")
+
+    monkeypatch.setattr(launch, "kubectl_apply", fail)
+
+    with pytest.raises(TypeError, match="unexpected implementation failure"):
+        launch.apply_operational_supervisor_release(
+            supervisor_launch_args(kube_context="gpu-cluster"),
+            network_policy="policy",
+            secret_name="secret",
+            secret="secret manifest",
+            manifest="supervisor manifest",
+        )
+
+    assert events == ["mutation-started", "apply", "restore"]
+
+
+def test_supervisor_preparation_failure_never_restarts_the_existing_release(
+    monkeypatch,
+):
+    events = []
+
+    def fail_preparation():
+        events.append("prepare")
+        raise RuntimeError("journal fsync failed")
+
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: events.append("commit"),
+        manual_restore_argv=lambda: ["python", "restore"],
+        mark_mutation_started=fail_preparation,
+        renew_lease=lambda: events.append("renew"),
+        resolved_kube_context="gpu-cluster",
+        restore=lambda **_kwargs: events.append("restore"),
+    )
+    monkeypatch.setattr(launch.SupervisorRollback, "capture", lambda **_kwargs: rollback)
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **_kwargs: events.append("apply"),
+    )
+
+    with pytest.raises(SystemExit, match="preparation failed"):
+        launch.apply_operational_supervisor_release(
+            supervisor_launch_args(kube_context="gpu-cluster"),
+            network_policy="policy",
+            secret_name="secret",
+            secret="secret manifest",
+            manifest="supervisor manifest",
+        )
+
+    assert events == ["prepare", "commit"]
+
+
+def test_successful_supervisor_rollout_commits_transaction(monkeypatch):
+    events = []
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: events.append("commit"),
+        manual_restore_argv=lambda: ["python", "restore"],
+        mark_mutation_started=lambda: events.append("mutation-started"),
+        renew_lease=lambda: events.append("renew"),
+        resolved_kube_context="gpu-cluster",
+        restore=lambda **_kwargs: events.append("restore"),
+    )
+    monkeypatch.setattr(launch.SupervisorRollback, "capture", lambda **_kwargs: rollback)
+    monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launch, "kubectl_rollout_status", lambda *_args, **_kwargs: None)
+
+    launch.apply_operational_supervisor_release(
+        supervisor_launch_args(kube_context="gpu-cluster"),
+        network_policy="policy",
+        secret_name="secret",
+        secret="secret manifest",
+        manifest="supervisor manifest",
+    )
+
+    assert events == ["mutation-started", "renew", "commit"]
+
+
+def test_healthy_rollout_finalization_failure_prints_finalize_not_restore(
+    monkeypatch,
+):
+    rollback = SimpleNamespace(
+        path=Path("/tmp/senpai-test-rollback.json"),
+        commit=lambda: (_ for _ in ()).throw(OSError("journal disk failed")),
+        manual_finalize_argv=lambda: ["python", "finalize-commit", "bundle.json"],
+        manual_restore_argv=lambda: ["python", "restore", "bundle.json"],
+        mark_mutation_started=lambda: None,
+        renew_lease=lambda: None,
+        resolved_kube_context="gpu-cluster",
+        restore=lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(launch.SupervisorRollback, "capture", lambda **_kwargs: rollback)
+    monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launch, "kubectl_rollout_status", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(SystemExit) as raised:
+        launch.apply_operational_supervisor_release(
+            supervisor_launch_args(kube_context="gpu-cluster"),
+            network_policy="policy",
+            secret_name="secret",
+            secret="secret manifest",
+            manifest="supervisor manifest",
+        )
+
+    message = str(raised.value)
+    assert "Do not run rollback" in message
+    assert "python finalize-commit bundle.json" in message
+    assert "python restore" not in message
+
+
+def test_supervisor_rejects_an_extra_exact_tag_advisor(monkeypatch):
+    args = supervisor_launch_args(advisor=True, operational_supervisor=True)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "existing_advisor_deployments",
+        lambda *_args, **_kwargs: ["senpai-advisor-test-track", "stray-advisor"],
+    )
+    mutations = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **_kwargs: mutations.append("apply"),
+    )
+
+    with pytest.raises(SystemExit, match="remain alongside"):
+        launch.main()
+
+    assert mutations == []
+
+
+def test_supervisor_rejects_unreplaced_students_without_compatible_protocols(
+    monkeypatch,
+):
+    args = supervisor_launch_args(advisor=True, operational_supervisor=True)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "existing_advisor_deployments",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        launch,
+        "existing_role_metadata",
+        lambda _tag, role, **_kwargs: (
+            {
+                "legacy-student": {
+                    "senpai.wandb.com/source-revision": "b" * 40,
+                    "senpai.wandb.com/advisor-branch": args.advisor_branch,
+                }
+            }
+            if role == "student"
+            else {}
+        ),
+    )
+    mutations = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda *_args, **_kwargs: mutations.append("apply"),
+    )
+
+    with pytest.raises(SystemExit, match="legacy-student"):
+        launch.main()
+
+    assert mutations == []
 
 
 def test_wandb_gateway_uses_the_wandb_key_for_openai_compatible_inference(
@@ -213,6 +1504,39 @@ def test_students_only_launch_ignores_the_inactive_advisor_provider(
     )
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
+    resolved = []
+
+    for provider in ("anthropic", "openai"):
+        monkeypatch.setattr(
+            launch,
+            f"resolve_{provider}_api_key",
+            lambda _path, provider=provider: resolved.append(provider)
+            or f"{provider}-key",
+        )
+    monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+
+    launch.main()
+
+    assert resolved == ["anthropic"]
+
+
+def test_advisor_only_launch_ignores_the_inactive_student_provider(monkeypatch):
+    args = launch_args(
+        names="",
+        n_students=0,
+        advisor=True,
+        student_image="",
+        advisor_model="anthropic/claude-opus-4-8",
+        student_model="openai/gpt-5.6-sol",
+        student_reasoning_effort="max",
+        smart_model="anthropic/claude-opus-4-8",
+        fast_model="anthropic/claude-haiku-4-5",
+        frontier_model="anthropic/claude-opus-4-8",
+        frontier_reasoning_effort="xhigh",
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(launch, "existing_student_names", lambda *_args, **_kwargs: [])
     resolved = []
 
     for provider in ("anthropic", "openai"):

@@ -5,11 +5,13 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from openhands.sdk.plugin import Plugin
 
 from senpai_agent.hooks import hook_main
+from senpai_agent.monitor import MonitorStore, TrainingMonitorSpec
 
 PLUGIN_DIR = Path(__file__).parents[1] / "plugins" / "senpai"
 TRAINING_ID = "b81440b1-b803-471e-9fe0-6dcabd756b83"
@@ -38,9 +40,13 @@ def write_running_training(state_dir: Path, *, monitored: bool) -> None:
     training_dir.mkdir(parents=True)
     (training_dir / f"{TRAINING_ID}.json").write_text('{"state":"running"}')
     if monitored:
-        monitor_dir = training_dir / "monitors"
-        monitor_dir.mkdir()
-        (monitor_dir / f"{TRAINING_ID}.json").write_text("{}")
+        with MonitorStore(training_dir / "monitors.sqlite3") as store:
+            store.register(
+                TrainingMonitorSpec(
+                    training_id=TRAINING_ID,
+                    conversation_id=uuid4(),
+                )
+            )
 
 
 def test_pre_tool_hook_emits_a_native_denial(
@@ -84,11 +90,13 @@ def test_plugin_loads_terminal_safety_and_lifecycle_hooks():
     assert hooks["Stop"] and hooks["SessionEnd"]
 
 
-def test_student_stop_denies_unmonitored_training(
+@pytest.mark.parametrize("role", ["student", "advisor"])
+def test_roles_stop_denies_unmonitored_job(
     assignment_workspace: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    role: str,
 ):
     state_dir = tmp_path / "state"
     write_running_training(state_dir, monitored=False)
@@ -99,7 +107,7 @@ def test_student_stop_denies_unmonitored_training(
         monkeypatch,
         capsys,
         {
-            "SENPAI_ROLE": "student",
+            "SENPAI_ROLE": role,
             "SENPAI_OPENHANDS_STATE_DIR": str(state_dir),
         },
     )
@@ -108,7 +116,7 @@ def test_student_stop_denies_unmonitored_training(
     assert TRAINING_ID in str(output["reason"])
 
 
-def test_student_stop_allows_durable_monitored_training(
+def test_student_stop_allows_sqlite_registered_monitored_job(
     assignment_workspace: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -3,29 +3,51 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
+import secrets
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import psutil
 from pydantic import SecretStr
 
+from senpai_agent.operations import (
+    RestartCompletion,
+    RestartRequest,
+    RestartRequestStore,
+    RoleTarget,
+)
 from senpai_agent.processes import terminate_process_group
 from senpai_agent.secrets import (
     GITHUB_TOKEN_FD_ENV,
     GITHUB_TOKEN_FILE_ENV,
     scrub_github_credentials,
 )
+from senpai_agent.supervisor_pause import (
+    DEFAULT_REPAIR_PAUSE_SOCKET,
+    RepairPause,
+    RepairPauseClient,
+    RepairPauseControlServer,
+    RepairPauseError,
+    RepairPauseStore,
+)
 
 LEASE_ENV = "SENPAI_CONTROLLER_LEASE_PATH"
+GENERATION_ENV = "SENPAI_CONTROLLER_GENERATION"
+CONTROL_DIR_ENV = "SENPAI_SUPERVISOR_CONTROL_DIR"
+WORKER_OWNERSHIP_ENV = "SENPAI_WORKER_OWNERSHIP_TOKEN"
+PAUSE_SOCKET_ENV = "SENPAI_SUPERVISOR_PAUSE_SOCKET"
+DEFAULT_CONTROL_DIR = Path("/run/senpai-supervisor-control")
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +78,8 @@ class WorkerLease:
     phase: str
     deadline: float
     completed_turns: int = 0
+    conversation_id: str | None = None
+    generation: int | None = None
 
     @classmethod
     def read(cls, path: Path) -> WorkerLease:
@@ -65,8 +89,23 @@ class WorkerLease:
             phase=str(value["phase"]),
             deadline=float(value["deadline"]),
             completed_turns=int(value.get("completed_turns", 0)),
+            conversation_id=(
+                str(value["conversation_id"])
+                if value.get("conversation_id") is not None
+                else None
+            ),
+            generation=(
+                int(value["generation"])
+                if value.get("generation") is not None
+                else None
+            ),
         )
-        if lease.pid <= 0 or not lease.phase or lease.completed_turns < 0:
+        if (
+            lease.pid <= 0
+            or not lease.phase
+            or lease.completed_turns < 0
+            or (lease.generation is not None and lease.generation <= 0)
+        ):
             raise ValueError("invalid controller lease")
         return lease
 
@@ -74,9 +113,13 @@ class WorkerLease:
 class ProgressLease:
     """Publish the worker's current phase and non-cooperative hard deadline."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, generation: int | None = None):
         self.path = path.resolve()
+        if generation is not None and generation <= 0:
+            raise ValueError("worker generation must be positive")
+        self.generation = generation
         self.completed_turns = 0
+        self.conversation_id: str | None = None
 
     def update(
         self,
@@ -84,11 +127,14 @@ class ProgressLease:
         timeout_seconds: float,
         *,
         completed_turn: bool = False,
+        conversation_id: str | None = None,
     ) -> None:
         if not phase or timeout_seconds <= 0:
             raise ValueError("progress phase and timeout must be positive")
         if completed_turn:
             self.completed_turns += 1
+        if conversation_id is not None:
+            self.conversation_id = conversation_id
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(
@@ -98,6 +144,8 @@ class ProgressLease:
                     "phase": phase,
                     "deadline": time.monotonic() + timeout_seconds,
                     "completed_turns": self.completed_turns,
+                    "conversation_id": self.conversation_id,
+                    "generation": self.generation,
                 },
                 sort_keys=True,
             ),
@@ -117,6 +165,8 @@ class WorkerSupervisor:
         config: SupervisorConfig | None = None,
         environment: Mapping[str, str] | None = None,
         github_token: SecretStr | None = None,
+        control_dir: Path | None = None,
+        pause_socket: str | Path | None = None,
     ):
         if not command:
             raise ValueError("worker command must not be empty")
@@ -126,64 +176,168 @@ class WorkerSupervisor:
         self.environment = dict(os.environ if environment is None else environment)
         scrub_github_credentials(self.environment)
         self.github_token = github_token
+        self.control_dir = (
+            control_dir
+            or Path(self.environment.get(CONTROL_DIR_ENV, DEFAULT_CONTROL_DIR))
+        ).resolve()
+        self.pause_store = RepairPauseStore(self.control_dir)
+        configured_pause_socket = pause_socket or self.environment.get(PAUSE_SOCKET_ENV)
+        self.pause_socket = str(
+            configured_pause_socket
+            or (
+                DEFAULT_REPAIR_PAUSE_SOCKET
+                if sys.platform.startswith("linux")
+                else Path("/private/tmp")
+                / (
+                    "senpai-pause-"
+                    f"{hashlib.sha256(str(self.lease_path).encode()).hexdigest()[:16]}.sock"
+                )
+            )
+        )
+        self.pause_control = RepairPauseControlServer(
+            self.pause_store,
+            self.pause_socket,
+        )
+        self.restart_path = self.lease_path.parent / "controller-restarts.sqlite3"
+        self.role_target = self._role_target(self.environment)
 
     def run(self, stop: threading.Event | None = None) -> int:
+        self.pause_control.start()
+        try:
+            return self._run_loop(stop)
+        finally:
+            self.pause_control.close()
+
+    def _run_loop(self, stop: threading.Event | None = None) -> int:
         stop = stop or threading.Event()
         failures = 0
-        while not stop.is_set():
-            self.lease_path.unlink(missing_ok=True)
-            environment = {
-                **self.environment,
-                LEASE_ENV: str(self.lease_path),
-            }
-            token_fd = self._open_github_token_pipe()
-            if token_fd is not None:
-                environment[GITHUB_TOKEN_FD_ENV] = str(token_fd)
-            try:
-                process = subprocess.Popen(
-                    self.command,
-                    env=environment,
-                    start_new_session=True,
-                    pass_fds=(token_fd,) if token_fd is not None else (),
-                )
-            finally:
+        with RestartRequestStore(self.restart_path) as restarts:
+            while not stop.is_set():
+                pause = self.pause_store.current()
+                if pause is not None:
+                    self._hold_repair_pause(pause, stop)
+                    continue
+                generation = restarts.allocate_worker_generation()
+                worker_ownership_token = secrets.token_hex(32)
+                self.lease_path.unlink(missing_ok=True)
+                environment = {
+                    **self.environment,
+                    LEASE_ENV: str(self.lease_path),
+                    GENERATION_ENV: str(generation),
+                    WORKER_OWNERSHIP_ENV: worker_ownership_token,
+                }
+                token_fd = self._open_github_token_pipe()
                 if token_fd is not None:
-                    os.close(token_fd)
-            started = time.monotonic()
-            descendants: dict[int, float] = {}
-            try:
-                reason, made_progress = self._wait_for_worker(
-                    process,
-                    descendants,
-                    stop,
-                    started,
-                )
-            finally:
-                self._terminate_worker(process, descendants)
-                self._reap_orphaned_children(None)
-            if stop.is_set():
-                return 0
+                    environment[GITHUB_TOKEN_FD_ENV] = str(token_fd)
+                try:
+                    process = subprocess.Popen(
+                        self.command,
+                        env=environment,
+                        start_new_session=True,
+                        pass_fds=(token_fd,) if token_fd is not None else (),
+                    )
+                finally:
+                    if token_fd is not None:
+                        os.close(token_fd)
+                started = time.monotonic()
+                descendants: dict[int, float] = {}
+                try:
+                    reason, made_progress, planned = self._wait_for_worker(
+                        process,
+                        descendants,
+                        stop,
+                        started,
+                        generation=generation,
+                        restarts=restarts,
+                    )
+                finally:
+                    self._terminate_worker(
+                        process,
+                        descendants,
+                        worker_ownership_token=worker_ownership_token,
+                    )
+                    self._reap_orphaned_children(None)
+                if stop.is_set():
+                    return 0
+                if reason.startswith("repair-pause:"):
+                    pause = self.pause_store.current()
+                    if pause is not None and reason == f"repair-pause:{pause.lease_id}":
+                        self.lease_path.unlink(missing_ok=True)
+                        if self._repair_boundary_is_quiescent(
+                            descendants,
+                            worker_ownership_token=worker_ownership_token,
+                        ):
+                            self._hold_repair_pause(pause, stop)
+                        else:
+                            print(
+                                "SENPAI_REPAIR_PAUSE_REFUSED "
+                                f"lease_id={pause.lease_id} reason=descendants-alive",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            self._wait_for_pause_release(pause, stop)
+                    continue
+                if planned is not None:
+                    print(
+                        "SENPAI_CONTROLLER_PLANNED_RESTART "
+                        f"request_id={planned.request_id} "
+                        f"source_generation={planned.expected_worker_generation}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
 
-            runtime = time.monotonic() - started
-            failures = 1 if made_progress else failures + 1
-            exponential_delay = min(
-                self.config.max_backoff_seconds,
-                self.config.initial_backoff_seconds * (2 ** min(failures - 1, 16)),
-            )
-            delay = min(
-                self.config.max_backoff_seconds,
-                exponential_delay * random.uniform(0.8, 1.2),
-            )
-            print(
-                "SENPAI_CONTROLLER_RESTART "
-                f"reason={reason} runtime_seconds={runtime:.1f} "
-                f"completed_turn={str(made_progress).lower()} "
-                f"restart_failures={failures} backoff_seconds={delay:.1f}",
-                file=sys.stderr,
-                flush=True,
-            )
-            stop.wait(delay)
+                runtime = time.monotonic() - started
+                failures = 1 if made_progress else failures + 1
+                exponential_delay = min(
+                    self.config.max_backoff_seconds,
+                    self.config.initial_backoff_seconds
+                    * (2 ** min(failures - 1, 16)),
+                )
+                delay = min(
+                    self.config.max_backoff_seconds,
+                    exponential_delay * random.uniform(0.8, 1.2),
+                )
+                print(
+                    "SENPAI_CONTROLLER_RESTART "
+                    f"reason={reason} runtime_seconds={runtime:.1f} "
+                    f"completed_turn={str(made_progress).lower()} "
+                    f"restart_failures={failures} backoff_seconds={delay:.1f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                stop.wait(delay)
         return 0
+
+    def _hold_repair_pause(
+        self,
+        pause: RepairPause,
+        stop: threading.Event,
+    ) -> None:
+        self.lease_path.unlink(missing_ok=True)
+        self.pause_control.acknowledge(pause)
+        print(
+            f"SENPAI_REPAIR_PAUSED lease_id={pause.lease_id}",
+            file=sys.stderr,
+            flush=True,
+        )
+        self._wait_for_pause_release(pause, stop)
+        print(
+            f"SENPAI_REPAIR_RESUMED lease_id={pause.lease_id}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _wait_for_pause_release(
+        self,
+        pause: RepairPause,
+        stop: threading.Event,
+    ) -> None:
+        while not stop.is_set():
+            current = self.pause_store.current()
+            if current is None or current.lease_id != pause.lease_id:
+                return
+            stop.wait(self.config.check_interval_seconds)
 
     def _open_github_token_pipe(self) -> int | None:
         if self.github_token is None:
@@ -207,19 +361,36 @@ class WorkerSupervisor:
         descendants: dict[int, float],
         stop: threading.Event,
         started: float,
-    ) -> tuple[str, bool]:
+        *,
+        generation: int | None = None,
+        restarts: RestartRequestStore | None = None,
+    ) -> tuple[str, bool, RestartRequest | None]:
         made_progress = False
         while not stop.is_set():
             self._remember_descendants(process, descendants)
             self._reap_orphaned_children(process.pid)
+            pause = self.pause_store.current()
+            if pause is not None:
+                return f"repair-pause:{pause.lease_id}", made_progress, None
             lease = self._read_lease()
             now = time.monotonic()
             if lease is not None and lease.pid == process.pid:
                 made_progress = made_progress or lease.completed_turns > 0
+                if (
+                    generation is not None
+                    and restarts is not None
+                    and lease.generation == generation
+                    and self.role_target is not None
+                    and now <= lease.deadline
+                ):
+                    self._complete_replacements(restarts, lease)
+                    planned = self._claim_planned_restart(restarts, lease)
+                    if planned is not None:
+                        return f"planned:{planned.request_id}", made_progress, planned
                 if now > lease.deadline:
-                    return f"overdue:{lease.phase}", made_progress
+                    return f"overdue:{lease.phase}", made_progress, None
             elif now - started > self.config.startup_timeout_seconds:
-                return "startup-timeout", made_progress
+                return "startup-timeout", made_progress, None
 
             exit_code = process.poll()
             if exit_code is not None:
@@ -228,9 +399,120 @@ class WorkerSupervisor:
                     made_progress = (
                         made_progress or final_lease.completed_turns > 0
                     )
-                return f"exit:{exit_code}", made_progress
+                return f"exit:{exit_code}", made_progress, None
             stop.wait(self.config.check_interval_seconds)
-        return "shutdown", made_progress
+        return "shutdown", made_progress, None
+
+    def _claim_planned_restart(
+        self,
+        restarts: RestartRequestStore,
+        lease: WorkerLease,
+    ) -> RestartRequest | None:
+        assert self.role_target is not None
+        if (
+            lease.generation is None
+            or lease.phase != "sleep"
+            or time.monotonic() > lease.deadline
+        ):
+            return None
+        request = restarts.claim_next(
+            self.role_target,
+            worker_generation=lease.generation,
+            replacement_generation=lease.generation + 1,
+        )
+        if request is None:
+            return None
+        if lease.conversation_id != str(request.expected_conversation_id):
+            restarts.reject(request.request_id, "conversation-changed")
+            return None
+        if lease.completed_turns != request.expected_completed_turns:
+            restarts.reject(request.request_id, "worker-progressed")
+            return None
+        if not self._compute_is_quiescent():
+            restarts.reject(request.request_id, "compute-not-quiescent")
+            return None
+        return request
+
+    def _complete_replacements(
+        self,
+        restarts: RestartRequestStore,
+        lease: WorkerLease,
+    ) -> None:
+        assert self.role_target is not None and lease.generation is not None
+        if lease.conversation_id is None:
+            return
+        for request in restarts.missed_sources(
+            self.role_target,
+            live_generation=lease.generation,
+        ):
+            restarts.reject(request.request_id, "source-generation-missed")
+        for request in restarts.missed_replacements(
+            self.role_target,
+            replacement_generation=lease.generation,
+        ):
+            restarts.reject(request.request_id, "replacement-generation-missed")
+        for request in restarts.awaiting_replacement(
+            self.role_target,
+            replacement_generation=lease.generation,
+        ):
+            if lease.conversation_id != str(request.expected_conversation_id):
+                restarts.reject(request.request_id, "replacement-conversation-changed")
+                continue
+            restarts.complete(
+                RestartCompletion(
+                    request_id=request.request_id,
+                    target=request.target,
+                    conversation_id=request.expected_conversation_id,
+                    source_generation=request.expected_worker_generation,
+                    replacement_generation=lease.generation,
+                    state_preserved=True,
+                    compute_preserved=True,
+                )
+            )
+
+    def _compute_is_quiescent(self) -> bool:
+        if self.role_target is None:
+            return False
+        state_dir = self.lease_path.parent
+        training_dir = state_dir / "training"
+        if training_dir.exists():
+            from senpai_agent.training import read_training_inventory
+
+            try:
+                if read_training_inventory(training_dir).active:
+                    return False
+            except (OSError, ValueError):
+                return False
+        delegation_db = state_dir / "delegation" / "tasks.sqlite3"
+        if not delegation_db.is_file():
+            return True
+        try:
+            database = sqlite3.connect(
+                f"file:{delegation_db}?mode=ro",
+                uri=True,
+                timeout=2,
+            )
+            try:
+                row = database.execute(
+                    "SELECT COUNT(*) FROM tasks "
+                    "WHERE status IN ('queued', 'starting', 'running')"
+                ).fetchone()
+            finally:
+                database.close()
+        except sqlite3.Error:
+            return False
+        return row is not None and row[0] == 0
+
+    @staticmethod
+    def _role_target(environment: Mapping[str, str]) -> RoleTarget | None:
+        role = environment.get("SENPAI_ROLE")
+        research_tag = environment.get("RESEARCH_TAG")
+        if role not in {"advisor", "student"} or not research_tag:
+            return None
+        student = environment.get("STUDENT_NAME") if role == "student" else None
+        if role == "student" and not student:
+            return None
+        return RoleTarget(research_tag=research_tag, role=role, student=student)
 
     def _read_lease(self) -> WorkerLease | None:
         try:
@@ -263,13 +545,128 @@ class WorkerSupervisor:
         self,
         process: subprocess.Popen[bytes],
         descendants: Mapping[int, float],
+        *,
+        worker_ownership_token: str,
     ) -> None:
         self._signal_descendants(descendants, signal.SIGTERM)
+        self._signal_owned_worker_processes(
+            worker_ownership_token,
+            signal.SIGTERM,
+        )
         terminate_process_group(
             process,
             grace_seconds=self.config.terminate_grace_seconds,
         )
         self._signal_descendants(descendants, signal.SIGKILL)
+        self._signal_owned_worker_processes(
+            worker_ownership_token,
+            signal.SIGKILL,
+        )
+
+    def _repair_boundary_is_quiescent(
+        self,
+        descendants: Mapping[int, float],
+        *,
+        worker_ownership_token: str,
+    ) -> bool:
+        deadline = time.monotonic() + self.config.terminate_grace_seconds
+        while time.monotonic() < deadline:
+            descendants_stopped = not any(
+                self._process_identity_is_live(pid, started_at)
+                for pid, started_at in descendants.items()
+            )
+            if (
+                descendants_stopped
+                and self._owned_worker_processes_absent(worker_ownership_token)
+                and self._network_listeners_absent()
+            ):
+                return True
+            time.sleep(min(0.05, self.config.check_interval_seconds))
+        descendants_stopped = not any(
+            self._process_identity_is_live(pid, started_at)
+            for pid, started_at in descendants.items()
+        )
+        return (
+            descendants_stopped
+            and self._owned_worker_processes_absent(worker_ownership_token)
+            and self._network_listeners_absent()
+        )
+
+    @staticmethod
+    def _signal_owned_worker_processes(
+        worker_ownership_token: str,
+        signal_to_send: signal.Signals,
+    ) -> None:
+        for pid in WorkerSupervisor._owned_worker_pids(worker_ownership_token):
+            try:
+                os.kill(pid, signal_to_send)
+            except (OSError, ValueError):
+                continue
+
+    @staticmethod
+    def _owned_worker_processes_absent(worker_ownership_token: str) -> bool:
+        return not WorkerSupervisor._owned_worker_pids(worker_ownership_token)
+
+    @staticmethod
+    def _owned_worker_pids(
+        worker_ownership_token: str,
+        *,
+        proc_root: Path = Path("/proc"),
+        require_pid_one: bool = True,
+    ) -> tuple[int, ...]:
+        """Find only processes inheriting this PID 1-issued worker capability."""
+
+        if require_pid_one and (
+            os.getpid() != 1 or not sys.platform.startswith("linux")
+        ):
+            return ()
+        expected = (
+            f"{WORKER_OWNERSHIP_ENV}={worker_ownership_token}".encode()
+        )
+        owned: list[int] = []
+        for process_dir in proc_root.iterdir():
+            if not process_dir.name.isdigit() or process_dir.name == "1":
+                continue
+            try:
+                environment = (process_dir / "environ").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if expected in environment:
+                owned.append(int(process_dir.name))
+        return tuple(owned)
+
+    @staticmethod
+    def _network_listeners_absent(
+        *,
+        proc_network: Path = Path("/proc/net"),
+    ) -> bool:
+        """Prove no TCP/CDP listener remains in the role Pod network namespace."""
+
+        if not proc_network.is_dir():
+            return False
+        try:
+            for table_name in ("tcp", "tcp6"):
+                rows = (proc_network / table_name).read_text(encoding="ascii").splitlines()
+                if any(
+                    len(fields := row.split()) > 3 and fields[3] == "0A"
+                    for row in rows[1:]
+                ):
+                    return False
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _process_identity_is_live(pid: int, started_at: float) -> bool:
+        try:
+            process = psutil.Process(pid)
+            return (
+                process.create_time() == started_at
+                and process.is_running()
+                and process.status() != psutil.STATUS_ZOMBIE
+            )
+        except (OSError, psutil.Error):
+            return False
 
     @staticmethod
     def _signal_descendants(
@@ -303,7 +700,16 @@ class WorkerSupervisor:
                 continue
 
 
-def lease_is_healthy(path: Path) -> bool:
+def lease_is_healthy(
+    path: Path,
+    *,
+    pause_socket: str | Path = DEFAULT_REPAIR_PAUSE_SOCKET,
+) -> bool:
+    try:
+        if RepairPauseClient(pause_socket).is_quiescing_or_paused():
+            return True
+    except RepairPauseError:
+        pass
     try:
         lease = WorkerLease.read(path)
         process = psutil.Process(lease.pid)
@@ -336,10 +742,47 @@ def supervisor_main(
         subparsers.add_parser(role)
     health = subparsers.add_parser("health")
     health.add_argument("lease_path", type=Path)
+    repair_pause = subparsers.add_parser("repair-pause")
+    repair_pause.add_argument("--lease-id", required=True)
+    repair_pause.add_argument("--duration-seconds", type=float, required=True)
+    repair_pause.add_argument("--wait-seconds", type=float, required=True)
+    repair_resume = subparsers.add_parser("repair-resume")
+    repair_resume.add_argument("--lease-id", required=True)
     args = parser.parse_args(argv)
 
+    control_dir = Path(env.get(CONTROL_DIR_ENV, DEFAULT_CONTROL_DIR)).resolve()
+    pause_socket = env.get(PAUSE_SOCKET_ENV, DEFAULT_REPAIR_PAUSE_SOCKET)
+
     if args.command == "health":
-        return 0 if lease_is_healthy(args.lease_path) else 1
+        return 0 if lease_is_healthy(args.lease_path, pause_socket=pause_socket) else 1
+    if args.command == "repair-pause":
+        grant = RepairPauseClient(pause_socket).pause(
+            args.lease_id,
+            duration_seconds=args.duration_seconds,
+            wait_seconds=args.wait_seconds,
+        )
+        print(
+            json.dumps(
+                {
+                    **asdict(grant),
+                    "remaining_seconds": (
+                        grant.acknowledgement.expires_at - time.monotonic()
+                    ),
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.command == "repair-resume":
+        resume_capability = sys.stdin.read(256).strip()
+        if not resume_capability:
+            raise RepairPauseError("repair-resume capability is required on stdin")
+        RepairPauseClient(pause_socket).resume(
+            args.lease_id,
+            resume_capability,
+        )
+        print(json.dumps({"lease_id": args.lease_id, "released": True}))
+        return 0
 
     state_dir = Path(env["SENPAI_OPENHANDS_STATE_DIR"]).resolve()
     github_token = _consume_github_token(env)
@@ -363,6 +806,8 @@ def supervisor_main(
             lease_path=state_dir / "controller-lease.json",
             environment=env,
             github_token=github_token,
+            control_dir=control_dir,
+            pause_socket=pause_socket,
         ).run(stop)
     finally:
         for signum, handler in previous_handlers.items():

@@ -9,6 +9,11 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ADVISOR_DEPLOYMENT_NAME}}
+  annotations:
+    senpai.wandb.com/source-revision: "{{REPO_REVISION}}"
+    senpai.wandb.com/advisor-branch: {{ADVISOR_BRANCH_JSON}}
+    senpai.wandb.com/student-names: "{{STUDENT_NAMES}}"
+{{REPAIR_PROTOCOL_ANNOTATION}}
   labels:
     app: senpai
     role: advisor
@@ -30,7 +35,11 @@ spec:
         app: senpai
         role: advisor
         research-tag: {{RESEARCH_TAG}}
+{{SUPERVISOR_ACCESS_LABEL}}
     spec:
+      automountServiceAccountToken: false
+      hostPID: false
+      shareProcessNamespace: false
       terminationGracePeriodSeconds: 90
       securityContext:
         runAsNonRoot: true
@@ -40,6 +49,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
+{{ROLE_INIT_CONTAINERS}}
       containers:
       - name: advisor
         image: {{ADVISOR_IMAGE}}
@@ -52,29 +62,12 @@ spec:
         - |
           set -e
           rm -f "/var/lib/senpai/$RESEARCH_TAG/advisor/openhands_state/controller-lease.json"
-          askpass=/tmp/senpai-git-askpass
-          printf '%s\n' \
-            '#!/bin/sh' \
-            'case "$1" in' \
-            '  *Username*) printf "%s\n" x-access-token ;;' \
-            '  *Password*) printf "%s\n" "$GITHUB_TOKEN" ;;' \
-            'esac' > "$askpass"
-          chmod 700 "$askpass"
-          mkdir -p /workspace
-          git init /workspace/senpai
-          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
-            git -C /workspace/senpai fetch --depth 1 "$REPO_URL" "$REPO_REVISION"
-          git -C /workspace/senpai checkout --detach FETCH_HEAD
-          cd /workspace/senpai
-          git remote add origin "$REPO_URL"
-          test "$(git rev-parse HEAD)" = "$REPO_REVISION"
-          test "$SENPAI_IMAGE_REVISION" = "$REPO_REVISION"
+{{ROLE_BOOTSTRAP}}
           token_handoff=/tmp/senpai-supervisor-github-token
           umask 077
           printf '%s' "$GITHUB_TOKEN" > "$token_handoff"
           export SENPAI_GITHUB_TOKEN_FILE="$token_handoff"
           unset GITHUB_TOKEN GH_TOKEN
-          rm -f "$askpass"
           exec bash k8s/entrypoint-advisor.sh
         envFrom:
         - configMapRef:
@@ -96,6 +89,12 @@ spec:
             secretKeyRef:
               name: {{LAUNCH_SECRET_NAME}}
               key: exa-api-key
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{LAUNCH_SECRET_NAME}}
+              key: hf-token
+              optional: true
         resources:
           requests:
             cpu: "4"
@@ -108,7 +107,7 @@ spec:
             command:
             - /bin/sh
             - -c
-            - python -m senpai_agent.supervisor health "/var/lib/senpai/$RESEARCH_TAG/advisor/openhands_state/controller-lease.json"
+            - /usr/local/bin/senpai-container-health "/var/lib/senpai/$RESEARCH_TAG/advisor/openhands_state/controller-lease.json"
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 60
@@ -117,19 +116,23 @@ spec:
             command:
             - /bin/sh
             - -c
-            - python -m senpai_agent.supervisor health "/var/lib/senpai/$RESEARCH_TAG/advisor/openhands_state/controller-lease.json"
+            - /usr/local/bin/senpai-container-health "/var/lib/senpai/$RESEARCH_TAG/advisor/openhands_state/controller-lease.json"
           periodSeconds: 30
           timeoutSeconds: 5
           failureThreshold: 5
           terminationGracePeriodSeconds: 75
         volumeMounts:
+{{ROLE_WORKSPACE_MOUNTS}}
         - name: dataset
           mountPath: {{PVC_MOUNT_PATH}}
         - name: state
           mountPath: /var/lib/senpai
+{{REPAIR_CONTAINER}}
       volumes:
+{{ROLE_WORKSPACE_VOLUMES}}
       - name: dataset
         persistentVolumeClaim:
           claimName: {{PVC_CLAIM_NAME}}
       - name: state
         emptyDir: {}
+{{REPAIR_VOLUMES}}

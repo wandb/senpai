@@ -20,6 +20,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from senpai.launch.specs import target_repo_slug
+
 STUDENT_NAMES = [
     "frieren",
     "fern",
@@ -196,6 +198,134 @@ def existing_student_names(
     return [line for line in result.stdout.splitlines() if line]
 
 
+def existing_advisor_deployments(
+    tag: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> list[str]:
+    """Return exact-tag advisor Deployments for incremental launches."""
+
+    result = subprocess.run(
+        kubectl_command(
+            "get",
+            "deployments",
+            "-l",
+            f"app=senpai,role=advisor,research-tag={tag}",
+            "-o",
+            'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def existing_operational_supervisors(
+    tag: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> list[str]:
+    """Return exact-tag operational supervisor Deployments."""
+    result = subprocess.run(
+        kubectl_command(
+            "get",
+            "deployments",
+            "-l",
+            f"app=senpai,role=supervisor,research-tag={tag}",
+            "-o",
+            'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def kubernetes_pvc_metadata(
+    claim_name: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> dict:
+    """Read one PVC through the exact launch context and namespace."""
+    result = subprocess.run(
+        kubectl_command(
+            "get",
+            "pvc",
+            claim_name,
+            "-o",
+            "json",
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or "kubectl failed"
+        raise RuntimeError(f"cannot read PVC {claim_name!r}: {detail}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"cannot read PVC {claim_name!r}: kubectl returned invalid JSON"
+        ) from error
+
+
+def existing_role_metadata(
+    tag: str,
+    role: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> dict[str, dict[str, str]]:
+    """Return exact-tag role identities and their managed launch annotations."""
+
+    if role not in {"advisor", "student"}:
+        raise ValueError("role must be advisor or student")
+    result = subprocess.run(
+        kubectl_command(
+            "get",
+            "deployments",
+            "-l",
+            f"app=senpai,role={role},research-tag={tag}",
+            "-o",
+            "json",
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    records: dict[str, dict[str, str]] = {}
+    for item in json.loads(result.stdout).get("items", []):
+        metadata = item.get("metadata", {})
+        identity = (
+            metadata.get("labels", {}).get("student")
+            if role == "student"
+            else metadata.get("name")
+        )
+        if not identity or identity in records:
+            raise RuntimeError(f"invalid or duplicate {role} Deployment identity")
+        annotations = metadata.get("annotations", {})
+        records[str(identity)] = {
+            key: str(value)
+            for key, value in annotations.items()
+            if key.startswith("senpai.wandb.com/")
+        }
+    return records
+
+
 def render_template(template: str, replacements: dict[str, str]) -> str:
     """Replace {{PLACEHOLDER}} tokens in a K8s manifest template."""
     out = template
@@ -204,7 +334,13 @@ def render_template(template: str, replacements: dict[str, str]) -> str:
     return out
 
 
-def render_configmap(name: str, labels: dict[str, str], data: dict[str, str]) -> str:
+def render_configmap(
+    name: str,
+    labels: dict[str, str],
+    data: dict[str, str],
+    *,
+    immutable: bool = False,
+) -> str:
     """Generate a ConfigMap YAML document."""
     lines = [
         "apiVersion: v1",
@@ -214,10 +350,12 @@ def render_configmap(name: str, labels: dict[str, str], data: dict[str, str]) ->
         "  labels:",
     ]
     for k, v in labels.items():
-        lines.append(f"    {k}: {v}")
+        lines.append(f"    {k}: {json.dumps(str(v))}")
+    if immutable:
+        lines.append("immutable: true")
     lines.append("data:")
     for k, v in data.items():
-        lines.append(f'  {k}: "{v}"')
+        lines.append(f"  {k}: {json.dumps(str(v))}")
     return "\n".join(lines)
 
 
@@ -226,9 +364,19 @@ def pod_template_hash(configmap: str, launch_secret: str) -> str:
     return hashlib.sha256(f"{configmap}\0{launch_secret}".encode()).hexdigest()
 
 
-def target_repo_slug(url: str) -> str:
-    """Extract owner/repo slug from a GitHub URL (for `gh --repo`)."""
-    return url.split("github.com", 1)[-1].lstrip(":/").removesuffix(".git")
+def content_addressed_name(base: str, data: dict[str, str]) -> str:
+    """Name one immutable Kubernetes object within one DNS label."""
+
+    payload = json.dumps(
+        {"base": base, "data": data},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    suffix = hashlib.sha256(payload.encode()).hexdigest()[:12]
+    prefix = base.rstrip("-")[: 63 - len(suffix) - 1].rstrip("-")
+    if not prefix:
+        raise ValueError("content-addressed Kubernetes name needs a non-empty base")
+    return f"{prefix}-{suffix}"
 
 
 def _github_api(
@@ -395,6 +543,7 @@ LAUNCH_CREDENTIAL_ENV_NAMES = (
     "OPENAI_API_KEY",
     "EXA_API_KEY",
     "WANDB_API_KEY",
+    "HF_TOKEN",
 )
 
 
@@ -476,6 +625,13 @@ def resolve_wandb_api_key(dotenv_path: Path) -> str:
     return resolve_required_secret(dotenv_path, "WANDB_API_KEY", "W&B API key")
 
 
+def resolve_optional_secret(dotenv_path: Path, env_name: str) -> str:
+    """Resolve an optional secret from the shell environment, then .env."""
+    return os.environ.get(env_name, "").strip() or _dotenv_values(dotenv_path).get(
+        env_name, ""
+    ).strip()
+
+
 def render_launch_secret(
     tag: str,
     github_token: str,
@@ -484,6 +640,7 @@ def render_launch_secret(
     *,
     anthropic_api_key: str | None = None,
     openai_api_key: str | None = None,
+    hf_token: str = "",
 ) -> str:
     """Per-launch k8s Secret holding API credentials used by advisor/student pods."""
     credentials = {
@@ -495,6 +652,8 @@ def render_launch_secret(
         credentials["anthropic-api-key"] = anthropic_api_key
     if openai_api_key is not None:
         credentials["openai-api-key"] = openai_api_key
+    if hf_token:
+        credentials["hf-token"] = hf_token
     encoded = {
         name: base64.b64encode(value.encode()).decode()
         for name, value in credentials.items()
@@ -512,6 +671,49 @@ def render_launch_secret(
     ]
     lines.extend(f"  {name}: {value}" for name, value in encoded.items())
     return "\n".join(lines) + "\n"
+
+
+def render_supervisor_secret(
+    tag: str,
+    github_token: str,
+    wandb_api_key: str,
+    *,
+    provider_secret_name: str | None = None,
+    provider_api_key: str | None = None,
+) -> tuple[str, str]:
+    """Render one least-privilege immutable supervisor credential bundle."""
+
+    if (provider_secret_name is None) != (provider_api_key is None):
+        raise ValueError("supervisor provider secret name and value must be paired")
+    credentials = {
+        "github-token": github_token,
+        "wandb-api-key": wandb_api_key,
+    }
+    if provider_secret_name is not None and provider_api_key is not None:
+        credentials[provider_secret_name] = provider_api_key
+    name = content_addressed_name(
+        f"senpai-supervisor-secrets-{tag}",
+        credentials,
+    )
+    encoded = {
+        key: base64.b64encode(value.encode()).decode()
+        for key, value in credentials.items()
+    }
+    lines = [
+        "apiVersion: v1",
+        "kind: Secret",
+        "metadata:",
+        f"  name: {name}",
+        "  labels:",
+        "    app: senpai",
+        "    role: supervisor",
+        f"    research-tag: {tag}",
+        "immutable: true",
+        "type: Opaque",
+        "data:",
+    ]
+    lines.extend(f"  {key}: {value}" for key, value in encoded.items())
+    return name, "\n".join(lines) + "\n"
 
 
 def _redact_secrets(text: str, *secrets: str) -> str:
@@ -734,23 +936,67 @@ def kubectl_apply(
     *,
     kube_context: str = "",
     namespace: str = "default",
+    process_timeout_seconds: int = 60,
 ) -> None:
     """Apply a manifest via kubectl."""
     print(f"Launching: {name}")
-    result = subprocess.run(
-        kubectl_command(
-            "apply",
-            "-f",
-            "-",
-            kube_context=kube_context,
-            namespace=namespace,
-        ),
-        input=manifest,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            kubectl_command(
+                "apply",
+                "-f",
+                "-",
+                kube_context=kube_context,
+                namespace=namespace,
+            ),
+            input=manifest,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=process_timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"kubectl apply timed out for {name} after "
+            f"{process_timeout_seconds}s"
+        ) from error
     if result.returncode != 0:
         detail = result.stderr.strip() or "kubectl returned no error text"
         raise RuntimeError(f"kubectl apply failed for {name}: {detail}")
+    print(f"  {result.stdout.strip()}")
+
+
+def kubectl_rollout_status(
+    deployment: str,
+    *,
+    timeout_seconds: int,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> None:
+    """Wait until one Deployment rollout is healthy or fail with kubectl detail."""
+
+    print(f"Waiting for rollout: {deployment}")
+    process_timeout_seconds = timeout_seconds + 15
+    try:
+        result = subprocess.run(
+            kubectl_command(
+                "rollout",
+                "status",
+                f"deployment/{deployment}",
+                f"--timeout={timeout_seconds}s",
+                kube_context=kube_context,
+                namespace=namespace,
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=process_timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"kubectl rollout status timed out after {process_timeout_seconds}s"
+        ) from error
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "kubectl returned no error text"
+        raise RuntimeError(detail)
     print(f"  {result.stdout.strip()}")

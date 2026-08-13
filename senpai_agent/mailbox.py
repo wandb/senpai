@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Protocol
 
 from senpai_agent.advisor import AdvisorEventStore
+from senpai_agent.operations import ContextResetRequestStore, RoleTarget
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,3 +113,47 @@ class LocalStudentMailbox:
         with AdvisorEventStore(self.store_path) as store:
             for key in dedupe_keys:
                 store.acknowledge(key)
+
+
+class ContextResetMailbox:
+    """Wake the exact conversation that owns a queued context reset."""
+
+    def __init__(self, store_path: Path, target: RoleTarget):
+        self.store_path = store_path
+        self.target = target
+
+    def poll(self) -> tuple[ControllerEvent, ...]:
+        if not self.store_path.is_file():
+            return ()
+        with ContextResetRequestStore(self.store_path) as store:
+            pending = store.pending(self.target)
+        if not pending:
+            return ()
+
+        # Expose only the oldest reset for each conversation. The owner marks it
+        # completed or rejected before the next poll reveals a later request.
+        oldest_by_conversation = {}
+        for request in pending:
+            oldest_by_conversation.setdefault(
+                request.expected_conversation_id,
+                request,
+            )
+        return tuple(
+            ControllerEvent(
+                kind="context_reset_pending",
+                dedupe_key=f"context_reset:{request.request_id}",
+                payload={
+                    "conversation_id": str(request.expected_conversation_id),
+                    "request_id": request.request_id,
+                    "delivery": (
+                        "The owning controller will apply this queued context reset "
+                        "at the next safe conversation boundary."
+                    ),
+                },
+            )
+            for request in oldest_by_conversation.values()
+        )
+
+    def acknowledge(self, _dedupe_keys: Sequence[str]) -> None:
+        # The owning turn runner completes or rejects the durable request.
+        return

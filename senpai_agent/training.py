@@ -1,17 +1,21 @@
+import hashlib
 import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 import psutil
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from senpai_agent.processes import signal_process_group, terminate_process_group
 
@@ -25,6 +29,10 @@ _WANDB_COMPLETE_RUN_URL_BYTES = re.compile(
 _LOG_READ_BYTES = 64 * 1024
 _WANDB_SCAN_OVERLAP_BYTES = 4096
 _ERROR_TAIL_BYTES = 8192
+TRAINING_INVENTORY_FILENAME = "inventory.json"
+_RECENT_TRAINING_LIMIT = 64
+_RECENT_WANDB_RUN_LIMIT = 200
+_RECENT_ERROR_LIMIT = 20
 
 
 class TrainingState(StrEnum):
@@ -41,6 +49,7 @@ class TrainingSpec(BaseModel):
     argv: tuple[str, ...] = Field(min_length=1)
     cwd: Path
     timeout_seconds: int = Field(gt=0)
+    workspace_access: Literal["read_only", "mutable"] = "mutable"
 
 
 class TrainingResult(BaseModel):
@@ -56,6 +65,132 @@ class TrainingResult(BaseModel):
     log_path: str
     wandb_run_ids: tuple[str, ...] = ()
     error_tail: str = ""
+    workspace_access: Literal["read_only", "mutable"] = "mutable"
+
+
+class TrainingInventoryEntry(BaseModel):
+    """One current or recently terminal result in the bounded inventory."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    result: TrainingResult
+    updated_at: AwareDatetime
+
+
+class TrainingInventoryError(BaseModel):
+    """Sanitized error evidence retained independently of result history."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    training_id: str
+    state: TrainingState
+    observed_at: AwareDatetime
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{16}$")
+
+
+class TrainingInventory(BaseModel):
+    """Bounded observation index; full per-training results remain on disk."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: Literal[1] = 1
+    active: tuple[TrainingInventoryEntry, ...] = ()
+    recent_terminal: tuple[TrainingInventoryEntry, ...] = Field(
+        default=(),
+        max_length=_RECENT_TRAINING_LIMIT,
+    )
+    recent_wandb_run_ids: tuple[str, ...] = Field(
+        default=(),
+        max_length=_RECENT_WANDB_RUN_LIMIT,
+    )
+    wandb_run_inventory_overflow: bool = False
+    recent_errors: tuple[TrainingInventoryError, ...] = Field(
+        default=(),
+        max_length=_RECENT_ERROR_LIMIT,
+    )
+
+
+def training_inventory_path(state_dir: Path) -> Path:
+    directory = state_dir.resolve()
+    path = (directory / TRAINING_INVENTORY_FILENAME).resolve()
+    if path.parent != directory:
+        raise ValueError("training inventory must remain inside its state directory")
+    return path
+
+
+def training_result_path(state_dir: Path, training_id: str) -> Path:
+    directory = state_dir.resolve()
+    path = (directory / f"{training_id}.json").resolve()
+    if (
+        not training_id
+        or path.parent != directory
+        or path.name == TRAINING_INVENTORY_FILENAME
+    ):
+        raise ValueError("training id does not name a local result")
+    return path
+
+
+def read_training_inventory(state_dir: Path) -> TrainingInventory:
+    return TrainingInventory.model_validate_json(
+        training_inventory_path(state_dir).read_text(encoding="utf-8")
+    )
+
+
+def _inventory_with_result(
+    inventory: TrainingInventory,
+    result: TrainingResult,
+    observed_at: datetime,
+) -> TrainingInventory:
+    entry = TrainingInventoryEntry(result=result, updated_at=observed_at)
+    active = {
+        item.result.training_id: item
+        for item in inventory.active
+        if item.result.training_id != result.training_id
+    }
+    terminal = [
+        item
+        for item in inventory.recent_terminal
+        if item.result.training_id != result.training_id
+    ]
+    if result.state is TrainingState.RUNNING:
+        active[result.training_id] = entry
+    else:
+        terminal.append(entry)
+
+    run_ids = dict.fromkeys(inventory.recent_wandb_run_ids)
+    overflow = inventory.wandb_run_inventory_overflow
+    for run_id in result.wandb_run_ids:
+        if run_id in run_ids:
+            continue
+        run_ids[run_id] = None
+        if len(run_ids) > _RECENT_WANDB_RUN_LIMIT:
+            run_ids.pop(next(iter(run_ids)))
+            overflow = True
+
+    errors = [
+        item
+        for item in inventory.recent_errors
+        if item.training_id != result.training_id
+    ]
+    if result.error_tail:
+        errors.append(
+            TrainingInventoryError(
+                training_id=result.training_id,
+                state=result.state,
+                observed_at=observed_at,
+                fingerprint=hashlib.sha256(
+                    result.error_tail.encode(errors="ignore")
+                ).hexdigest()[:16],
+            )
+        )
+
+    return TrainingInventory(
+        active=tuple(active.values()),
+        recent_terminal=tuple(terminal[-_RECENT_TRAINING_LIMIT:]),
+        recent_wandb_run_ids=tuple(run_ids),
+        wandb_run_inventory_overflow=overflow,
+        recent_errors=tuple(errors[-_RECENT_ERROR_LIMIT:]),
+    )
 
 
 def training_result_paths(state_dir: Path) -> Iterator[Path]:
@@ -78,6 +213,8 @@ class _ActiveTraining:
     started: float
     timeout_seconds: int
     log_path: Path
+    redacted_values: tuple[bytes, ...] = ()
+    workspace_access: Literal["read_only", "mutable"] = "mutable"
     cancelled: bool = False
     thread: threading.Thread | None = None
 
@@ -98,34 +235,77 @@ class TrainingSupervisor:
             raise ValueError("max_timeout_seconds must be positive")
         self.max_timeout_seconds = max_timeout_seconds
         self._lock = threading.Lock()
+        self._inventory_lock = threading.Lock()
         self._active: dict[str, _ActiveTraining] = {}
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_inventory()
         self._cancel_orphaned_runs()
 
     def _cancel_orphaned_runs(self) -> None:
-        for path in training_result_paths(self.state_dir):
-            result = TrainingResult.model_validate_json(path.read_text())
-            if result.state is TrainingState.RUNNING:
-                process_was_terminated = self._terminate_recovered_process(result)
-                recovered = result.model_copy(
-                    update={
-                        "state": TrainingState.CANCELLED,
-                        "error_tail": (
-                            "Training state was recovered after its "
-                            "supervisor restarted."
-                            if process_was_terminated
-                            else (
-                                "Training state was recovered after its "
-                                "supervisor restarted; its persisted process "
-                                "identity was no longer live, so no signal "
-                                "was sent."
-                            )
-                        ),
-                    }
-                )
-                self._write_result(recovered)
+        inventory = read_training_inventory(self.state_dir)
+        for entry in inventory.active:
+            result = entry.result
+            process_was_terminated = self._terminate_recovered_process(result)
+            recovered = result.model_copy(
+                update={
+                    "state": TrainingState.CANCELLED,
+                    "error_tail": (
+                        "Training state was recovered after its supervisor restarted."
+                        if process_was_terminated
+                        else (
+                            "Training state was recovered after its supervisor "
+                            "restarted; its persisted process identity was no longer "
+                            "live, so no signal was sent."
+                        )
+                    ),
+                }
+            )
+            self._write_result(recovered)
 
-    def run_training(self, spec: TrainingSpec) -> TrainingResult:
+    def _ensure_inventory(self) -> None:
+        path = training_inventory_path(self.state_dir)
+        if path.is_file():
+            inventory = read_training_inventory(self.state_dir)
+            self._repair_indexed_results(inventory)
+            return
+
+        inventory = TrainingInventory()
+        paths = sorted(
+            training_result_paths(self.state_dir),
+            key=lambda candidate: (candidate.stat().st_mtime, candidate.name),
+        )
+        for candidate in paths:
+            result = TrainingResult.model_validate_json(
+                candidate.read_text(encoding="utf-8")
+            )
+            if candidate.stem != result.training_id:
+                raise ValueError("training result path does not match its id")
+            inventory = _inventory_with_result(
+                inventory,
+                result,
+                datetime.fromtimestamp(candidate.stat().st_mtime, UTC),
+            )
+        self._write_inventory(inventory)
+
+    def _repair_indexed_results(self, inventory: TrainingInventory) -> None:
+        for entry in (*inventory.active, *inventory.recent_terminal):
+            path = training_result_path(self.state_dir, entry.result.training_id)
+            try:
+                persisted = TrainingResult.model_validate_json(
+                    path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError):
+                persisted = None
+            if persisted != entry.result:
+                self._write_result_file(entry.result)
+
+    def run_training(
+        self,
+        spec: TrainingSpec,
+        *,
+        env: Mapping[str, str] | None = None,
+        redacted_values: Sequence[str] = (),
+    ) -> TrainingResult:
         if isinstance(spec.argv, str) or not spec.argv:
             raise ValueError("argv must be a non-empty sequence, not a shell string")
         if (
@@ -144,47 +324,108 @@ class TrainingSupervisor:
         training_id = str(uuid.uuid4())
         log_path = self.state_dir / f"{training_id}.log"
         started = time.monotonic()
-        with log_path.open("wb") as log:
-            process = subprocess.Popen(
-                list(spec.argv),
-                cwd=cwd,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                shell=False,
-                start_new_session=True,
-            )
-        process_start_time = psutil.Process(process.pid).create_time()
-        process_group_id = process.pid
-
-        result = TrainingResult(
-            training_id=training_id,
-            state=TrainingState.RUNNING,
-            pid=process.pid,
-            process_group_id=process_group_id,
-            process_start_time=process_start_time,
-            exit_code=None,
-            elapsed_seconds=0,
-            log_path=str(log_path),
-        )
-        self._write_result(result)
-        active = _ActiveTraining(
-            process=process,
-            process_group_id=process_group_id,
-            process_start_time=process_start_time,
-            started=started,
-            timeout_seconds=spec.timeout_seconds,
-            log_path=log_path,
-        )
-        thread = threading.Thread(
-            target=self._monitor,
-            args=(training_id,),
-            name=f"senpai-training-{training_id}",
-        )
-        active.thread = thread
+        process: subprocess.Popen[bytes] | None = None
+        result_written = False
+        active_registered = False
         with self._lock:
-            self._active[training_id] = active
-            thread.start()
+            if spec.workspace_access == "mutable":
+                active_mutable = self._active_mutable_job_ids_locked()
+                if active_mutable:
+                    raise RuntimeError(
+                        "a mutable workspace job is already running: "
+                        + ", ".join(active_mutable)
+                    )
+            try:
+                log_descriptor = os.open(
+                    log_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                with os.fdopen(log_descriptor, "wb") as log:
+                    process = subprocess.Popen(
+                        list(spec.argv),
+                        cwd=cwd,
+                        env=dict(env) if env is not None else None,
+                        stdin=subprocess.DEVNULL,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        shell=False,
+                        start_new_session=True,
+                    )
+                process_start_time = psutil.Process(process.pid).create_time()
+                process_group_id = process.pid
+                result = TrainingResult(
+                    training_id=training_id,
+                    state=TrainingState.RUNNING,
+                    pid=process.pid,
+                    process_group_id=process_group_id,
+                    process_start_time=process_start_time,
+                    exit_code=None,
+                    elapsed_seconds=0,
+                    log_path=str(log_path),
+                    workspace_access=spec.workspace_access,
+                )
+                self._write_result(result)
+                result_written = True
+                active = _ActiveTraining(
+                    process=process,
+                    process_group_id=process_group_id,
+                    process_start_time=process_start_time,
+                    started=started,
+                    timeout_seconds=spec.timeout_seconds,
+                    log_path=log_path,
+                    redacted_values=tuple(
+                        value.encode() for value in redacted_values if value
+                    ),
+                    workspace_access=spec.workspace_access,
+                )
+                thread = threading.Thread(
+                    target=self._monitor,
+                    args=(training_id,),
+                    name=f"senpai-training-{training_id}",
+                )
+                active.thread = thread
+                self._active[training_id] = active
+                active_registered = True
+                thread.start()
+            except BaseException as error:
+                if active_registered:
+                    self._active.pop(training_id, None)
+                if process is not None and process.poll() is None:
+                    self._terminate_process_group(
+                        process,
+                        process.pid,
+                        grace_seconds=self.terminate_grace_seconds,
+                    )
+                if result_written:
+                    self._write_result(
+                        result.model_copy(
+                            update={
+                                "state": TrainingState.CANCELLED,
+                                "exit_code": process.returncode if process else None,
+                                "elapsed_seconds": time.monotonic() - started,
+                                "error_tail": (
+                                    "Job launch rolled back after "
+                                    f"{type(error).__name__}."
+                                ),
+                            }
+                        )
+                    )
+                raise
         return result
+
+    def active_mutable_job_ids(self) -> tuple[str, ...]:
+        """Return durable workspace leases held by mutable running jobs."""
+
+        with self._lock:
+            return self._active_mutable_job_ids_locked()
+
+    def _active_mutable_job_ids_locked(self) -> tuple[str, ...]:
+        return tuple(
+            training_id
+            for training_id, active in self._active.items()
+            if active.workspace_access == "mutable"
+        )
 
     def get_training_status(self, training_id: str) -> TrainingResult:
         path = self.state_dir / f"{uuid.UUID(training_id)}.json"
@@ -218,10 +459,74 @@ class TrainingSupervisor:
     def _monitor(self, training_id: str) -> None:
         with self._lock:
             active = self._active[training_id]
+        try:
+            self._monitor_process(training_id, active)
+        except BaseException as error:  # noqa: BLE001
+            try:
+                if active.process.poll() is None:
+                    self._terminate_process_group(
+                        active.process,
+                        active.process_group_id,
+                    )
+            except BaseException as terminate_error:  # noqa: BLE001
+                try:
+                    signal_process_group(active.process_group_id, signal.SIGKILL)
+                except BaseException as kill_error:  # noqa: BLE001
+                    print(
+                        "SENPAI_JOB_CLEANUP_ERROR "
+                        f"job_id={training_id} "
+                        f"terminate_error={type(terminate_error).__name__} "
+                        f"kill_error={type(kill_error).__name__}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            try:
+                self._write_result(
+                    TrainingResult(
+                        training_id=training_id,
+                        state=TrainingState.FAILED,
+                        pid=active.process.pid,
+                        process_group_id=active.process_group_id,
+                        process_start_time=active.process_start_time,
+                        exit_code=active.process.poll(),
+                        elapsed_seconds=time.monotonic() - active.started,
+                        log_path=str(active.log_path),
+                        error_tail=(
+                            "Job supervisor failed internally "
+                            f"({type(error).__name__})."
+                        ),
+                        workspace_access=active.workspace_access,
+                    )
+                )
+            except BaseException as persistence_error:  # noqa: BLE001
+                print(
+                    "SENPAI_JOB_STATE_WRITE_ERROR "
+                    f"job_id={training_id} "
+                    f"error={type(persistence_error).__name__}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        finally:
+            with self._lock:
+                self._active.pop(training_id, None)
+
+    def _monitor_process(
+        self,
+        training_id: str,
+        active: _ActiveTraining,
+    ) -> None:
         run_ids: dict[str, None] = {}
         published_run_ids: tuple[str, ...] = ()
         error_tail = b""
         scan_overlap = b""
+        tail_bytes = (
+            _ERROR_TAIL_BYTES
+            + max(
+                (len(value) for value in active.redacted_values),
+                default=1,
+            )
+            - 1
+        )
         deadline = active.started + active.timeout_seconds
         terminate_at = max(
             active.started,
@@ -241,6 +546,7 @@ class TrainingSupervisor:
                     error_tail,
                     scan_overlap,
                     run_ids,
+                    tail_bytes=tail_bytes,
                 )
                 discovered_run_ids = tuple(run_ids)
                 if discovered_run_ids != published_run_ids:
@@ -255,6 +561,7 @@ class TrainingSupervisor:
                             elapsed_seconds=time.monotonic() - active.started,
                             log_path=str(active.log_path),
                             wandb_run_ids=discovered_run_ids,
+                            workspace_access=active.workspace_access,
                         )
                     )
                     published_run_ids = discovered_run_ids
@@ -299,6 +606,7 @@ class TrainingSupervisor:
                 error_tail,
                 scan_overlap,
                 run_ids,
+                tail_bytes=tail_bytes,
             )
             while log.peek(1):
                 error_tail, scan_overlap = self._consume_log(
@@ -306,6 +614,7 @@ class TrainingSupervisor:
                     error_tail,
                     scan_overlap,
                     run_ids,
+                    tail_bytes=tail_bytes,
                 )
             for match in _WANDB_RUN_URL_BYTES.findall(scan_overlap):
                 run_ids.setdefault(match.decode(), None)
@@ -321,14 +630,15 @@ class TrainingSupervisor:
             log_path=str(active.log_path),
             wandb_run_ids=tuple(run_ids),
             error_tail=(
-                error_tail.decode(errors="ignore")
+                _redact_bytes(error_tail, active.redacted_values)[
+                    -_ERROR_TAIL_BYTES:
+                ].decode(errors="ignore")
                 if state is not TrainingState.FINISHED
                 else ""
             ),
+            workspace_access=active.workspace_access,
         )
         self._write_result(result)
-        with self._lock:
-            self._active.pop(training_id, None)
 
     @staticmethod
     def _consume_log(
@@ -336,6 +646,8 @@ class TrainingSupervisor:
         error_tail: bytes,
         scan_overlap: bytes,
         run_ids: dict[str, None],
+        *,
+        tail_bytes: int = _ERROR_TAIL_BYTES,
     ) -> tuple[bytes, bytes]:
         chunk = log.read(_LOG_READ_BYTES)
         if not chunk:
@@ -344,7 +656,7 @@ class TrainingSupervisor:
         for match in _WANDB_COMPLETE_RUN_URL_BYTES.findall(scan):
             run_ids.setdefault(match.decode(), None)
         scan_overlap = scan[-_WANDB_SCAN_OVERLAP_BYTES:]
-        error_tail = (error_tail + chunk)[-_ERROR_TAIL_BYTES:]
+        error_tail = (error_tail + chunk)[-tail_bytes:]
         return error_tail, scan_overlap
 
     def _terminate_process_group(
@@ -358,9 +670,7 @@ class TrainingSupervisor:
             process,
             process_group_id=process_group_id,
             grace_seconds=(
-                self.terminate_grace_seconds
-                if grace_seconds is None
-                else grace_seconds
+                self.terminate_grace_seconds if grace_seconds is None else grace_seconds
             ),
             wait_full_grace=True,
         )
@@ -379,19 +689,7 @@ class TrainingSupervisor:
 
     @staticmethod
     def _process_identity_matches(result: TrainingResult) -> bool:
-        assert result.pid is not None
-        assert result.process_group_id is not None
-        assert result.process_start_time is not None
-        try:
-            process = psutil.Process(result.pid)
-            return (
-                process.is_running()
-                and process.status() != psutil.STATUS_ZOMBIE
-                and os.getpgid(result.pid) == result.process_group_id
-                and process.create_time() == result.process_start_time
-            )
-        except (ProcessLookupError, psutil.NoSuchProcess):
-            return False
+        return training_process_is_live(result)
 
     def close(self) -> None:
         with self._lock:
@@ -414,7 +712,51 @@ class TrainingSupervisor:
             thread.join()
 
     def _write_result(self, result: TrainingResult) -> None:
-        path = self.state_dir / f"{result.training_id}.json"
+        with self._inventory_lock:
+            training_result_path(self.state_dir, result.training_id)
+            inventory = _inventory_with_result(
+                read_training_inventory(self.state_dir),
+                result,
+                datetime.now(UTC),
+            )
+            self._write_inventory(inventory)
+            self._write_result_file(result)
+
+    def _write_inventory(self, inventory: TrainingInventory) -> None:
+        path = training_inventory_path(self.state_dir)
         temporary = path.with_suffix(".tmp")
-        temporary.write_text(result.model_dump_json(indent=2))
+        temporary.write_text(inventory.model_dump_json(indent=2), encoding="utf-8")
         temporary.replace(path)
+
+    def _write_result_file(self, result: TrainingResult) -> None:
+        path = training_result_path(self.state_dir, result.training_id)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+        temporary.replace(path)
+
+
+def training_process_is_live(result: TrainingResult) -> bool:
+    """Verify a persisted RUNNING result still names the same live process."""
+
+    if (
+        result.pid is None
+        or result.process_group_id is None
+        or result.process_start_time is None
+    ):
+        return False
+    try:
+        process = psutil.Process(result.pid)
+        return (
+            process.is_running()
+            and process.status() != psutil.STATUS_ZOMBIE
+            and os.getpgid(result.pid) == result.process_group_id
+            and process.create_time() == result.process_start_time
+        )
+    except (ProcessLookupError, psutil.NoSuchProcess):
+        return False
+
+def _redact_bytes(content: bytes, values: Sequence[bytes]) -> bytes:
+    for value in values:
+        if value:
+            content = content.replace(value, b"<secret-hidden>")
+    return content

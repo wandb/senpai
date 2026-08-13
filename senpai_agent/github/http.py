@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 import json
+import math
+import time
+from collections.abc import Callable
 from urllib import request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 
 from pydantic import SecretStr
 
+MAX_GITHUB_RETRY_SECONDS = 3_600.0
+
 
 class GitHubReadError(RuntimeError):
     """A GitHub read failed or returned an invalid response."""
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class GitHubReader:
@@ -59,7 +68,8 @@ class GitHubReader:
                 )
         except HTTPError as error:
             raise GitHubReadError(
-                f"GitHub GET {self._safe_path(url)} returned HTTP {error.code}"
+                f"GitHub GET {self._safe_path(url)} returned HTTP {error.code}",
+                retry_after_seconds=_retry_after_seconds(error),
             ) from error
         except (URLError, TimeoutError) as error:
             raise GitHubReadError(
@@ -95,6 +105,41 @@ class GitHubReader:
                 raise GitHubReadError("GitHub returned an invalid paginated list")
             objects.extend(page)
         return objects
+
+    def objects_bounded(
+        self,
+        path: str,
+        *,
+        limit: int,
+        stop: Callable[[dict[str, object]], bool] | None = None,
+    ) -> tuple[list[dict[str, object]], bool]:
+        """Read a sorted list only until its useful window or hard bound ends.
+
+        The boolean is true when the remote sequence ended or ``stop`` ended the
+        requested window. It is false when ``limit`` truncated matching data.
+        """
+
+        if limit <= 0:
+            raise ValueError("GitHub object limit must be positive")
+        objects: list[dict[str, object]] = []
+        url: str | None = self._url(path)
+        visited: set[str] = set()
+        while url is not None:
+            if url in visited:
+                raise GitHubReadError("GitHub pagination contains a cycle")
+            visited.add(url)
+            page, url = self._request(url)
+            if not isinstance(page, list) or any(
+                not isinstance(item, dict) for item in page
+            ):
+                raise GitHubReadError("GitHub returned an invalid paginated list")
+            for item in page:
+                if stop is not None and stop(item):
+                    return objects, True
+                if len(objects) == limit:
+                    return objects, False
+                objects.append(item)
+        return objects, True
 
     def actor(self) -> str:
         """Return and cache the authenticated GitHub login."""
@@ -134,3 +179,32 @@ def next_link(value: str | None) -> str | None:
             if target.startswith("<") and target.endswith(">"):
                 return target[1:-1]
     return None
+
+
+def _retry_after_seconds(error: HTTPError) -> float | None:
+    """Return GitHub's requested retry delay without retaining response headers."""
+
+    headers = error.headers
+    if headers is None:
+        return None
+
+    retry_after = headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            return _bounded_retry_delay(float(retry_after))
+        except ValueError:
+            pass
+
+    reset = headers.get("X-RateLimit-Reset")
+    if reset is None or headers.get("X-RateLimit-Remaining") != "0":
+        return None
+    try:
+        return _bounded_retry_delay(max(0.0, float(reset) - time.time()) + 1.0)
+    except ValueError:
+        return None
+
+
+def _bounded_retry_delay(value: float) -> float | None:
+    if not math.isfinite(value):
+        return None
+    return min(max(0.0, value), MAX_GITHUB_RETRY_SECONDS)

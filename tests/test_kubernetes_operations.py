@@ -1,0 +1,662 @@
+from __future__ import annotations
+
+import json
+import hashlib
+import os
+import time
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from uuid import UUID
+
+import pytest
+
+from senpai_agent.kubernetes_operations import KubectlCampaignBackend
+from senpai_agent.operations import CampaignInventory, RoleObservation, RoleTarget
+from senpai_agent.protocols import MANAGEMENT_PROTOCOL_VERSION, REPAIR_PROTOCOL_VERSION
+from senpai_agent.role_control import (
+    RoleControlRequest,
+    RoleResearchTail,
+    RoleResearchTailItem,
+    RoleRuntimeState,
+)
+from senpai_agent.supervisor_pause import REPAIR_PAUSE_PROTOCOL
+
+CONVERSATION_ID = UUID("00000000-0000-0000-0000-000000000301")
+RESUME_CAPABILITY = "one-time-role-resume-capability"
+
+
+def inventory() -> CampaignInventory:
+    return CampaignInventory(
+        research_tag="maple",
+        repo="example/research",
+        advisor_branch="maple-advisor",
+        students=("fern",),
+    )
+
+
+def pause_receipt(command) -> str:
+    now = time.monotonic()
+    duration = float(command[command.index("--duration-seconds") + 1])
+    return json.dumps(
+        {
+            "acknowledgement": {
+                "protocol": REPAIR_PAUSE_PROTOCOL,
+                "lease_id": command[command.index("--lease-id") + 1],
+                "expires_at": now + duration,
+                "acknowledged_at": now,
+                "supervisor_pid": 1,
+                "resume_capability_sha256": hashlib.sha256(
+                    RESUME_CAPABILITY.encode()
+                ).hexdigest(),
+            },
+            "resume_capability": RESUME_CAPABILITY,
+            "remaining_seconds": duration,
+        }
+    )
+
+
+def test_authenticated_pause_requires_the_new_repair_wire_version():
+    assert REPAIR_PROTOCOL_VERSION == "senpai-repair-executor/v4"
+
+
+def resume_receipt(command) -> str:
+    return json.dumps(
+        {
+            "lease_id": command[command.index("--lease-id") + 1],
+            "released": True,
+        }
+    )
+
+
+def runtime_json(target: RoleTarget) -> str:
+    state = RoleRuntimeState(
+        target=target,
+        observation=RoleObservation(
+            target=target,
+            observed_at=datetime.now(UTC),
+            control_token="token-1",
+            restart_control_token="restart-token-1",
+            controller_alive=True,
+            controller_phase="sleep",
+            conversation_id=CONVERSATION_ID,
+            active_turn=False,
+            unmatched_actions=0,
+            raw_history_event_count=4,
+            raw_history_digest="digest-1",
+            active_delegation_count=2,
+        ),
+        lease_deadline_seconds=600,
+        completed_turns=2,
+        running_training_count=0,
+        active_delegation_count=2,
+        wandb_run_inventory_complete=True,
+        cpu_percent=10,
+        memory_percent=20,
+        disk_percent=30,
+        gpu_percent=40,
+    )
+    return json.dumps(
+        {
+            "protocol_version": MANAGEMENT_PROTOCOL_VERSION,
+            "result": state.model_dump(mode="json"),
+        }
+    )
+
+
+def test_backend_selects_exact_campaign_role_labels_and_parses_role_state(
+    monkeypatch,
+):
+    calls = []
+    target = RoleTarget(research_tag="maple", role="student", student="fern")
+
+    def run(command, **kwargs):
+        calls.append((tuple(command), kwargs.get("input")))
+        if "get" in command:
+            output = json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {"name": "senpai-maple-fern"},
+                            "status": {"phase": "Running"},
+                        }
+                    ]
+                }
+            )
+        else:
+            output = runtime_json(target)
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    monkeypatch.setattr("senpai_agent.kubernetes_operations.subprocess.run", run)
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+
+    observation = backend.collect_role(target)
+
+    selector = calls[0][0][calls[0][0].index("-l") + 1]
+    assert calls[0][0][0] == "/usr/local/bin/kubectl"
+    assert selector == "app=senpai,role=student,research-tag=maple,student=fern"
+    assert calls[1][0][-4:] == (
+        "/opt/senpai-venv/bin/python",
+        "-I",
+        "-m",
+        "senpai_agent.role_control",
+    )
+    assert json.loads(calls[1][1])["command"] == "observe"
+    assert (
+        json.loads(calls[1][1])["protocol_version"]
+        == MANAGEMENT_PROTOCOL_VERSION
+    )
+    assert observation.conversation_id == CONVERSATION_ID
+    assert observation.active_delegation_count == 2
+
+
+def test_backend_rejects_roles_outside_inventory_before_kubectl(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "senpai_agent.kubernetes_operations.subprocess.run",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+
+    with pytest.raises(PermissionError, match="campaign inventory"):
+        backend.collect_role(
+            RoleTarget(research_tag="maple", role="student", student="other")
+        )
+
+    assert calls == []
+
+
+def test_log_window_covers_cadence_and_both_supervisor_turns():
+    backend = KubectlCampaignBackend(
+        inventory(),
+        namespace="research",
+        environment={
+            "SENPAI_SUPERVISOR_INTERVAL_SECONDS": "120",
+            "SENPAI_OPENHANDS_TIMEOUT_SECONDS": "45",
+        },
+    )
+
+    assert backend.log_since_seconds == 120 + (2 * 45) + 120
+
+
+def test_runtime_collection_preserves_errors_and_repeated_deferred_markers(
+    monkeypatch,
+):
+    advisor = RoleTarget(research_tag="maple", role="advisor")
+    student = RoleTarget(research_tag="maple", role="student", student="fern")
+
+    log_commands = []
+
+    def run(command, **kwargs):
+        if "get" in command:
+            role = command[command.index("-l") + 1].split("role=", 1)[1].split(",", 1)[0]
+            name = "senpai-advisor-maple" if role == "advisor" else "senpai-maple-fern"
+            output = json.dumps(
+                {"items": [{"metadata": {"name": name}, "status": {"phase": "Running"}}]}
+            )
+        elif "logs" in command:
+            log_commands.append(tuple(command))
+            output = (
+                "ordinary line\n"
+                "candidate failed to improve after an error analysis\n"
+                "2026-08-06T12:00:01Z SENPAI_TURN_DEFERRED "
+                "student-only-secret conversation_id=x\n"
+                "2026-08-06T12:00:02Z SENPAI_TURN_DEFERRED "
+                "conversation_id=x\n"
+            )
+        else:
+            target = advisor if "advisor" in command else student
+            output = runtime_json(target)
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    monkeypatch.setattr("senpai_agent.kubernetes_operations.subprocess.run", run)
+    backend = KubectlCampaignBackend(
+        inventory(),
+        namespace="research",
+        environment={
+            "SENPAI_SUPERVISOR_INTERVAL_SECONDS": "900",
+            "EXA_API_KEY": "student-only-secret",
+        },
+    )
+
+    observations, gaps = backend.collect_runtimes()
+
+    assert gaps == ()
+    assert len(observations) == 2
+    assert all(runtime.controller_healthy is True for runtime in observations)
+    assert all(runtime.active_delegation_count == 2 for runtime in observations)
+    assert all(len(runtime.recent_errors) == 2 for runtime in observations)
+    assert all(
+        "SENPAI_TURN_DEFERRED" in marker
+        for runtime in observations
+        for marker in runtime.recent_errors
+    )
+    assert "student-only-secret" not in json.dumps(
+        [runtime.model_dump(mode="json") for runtime in observations]
+    )
+    assert all(
+        "fingerprint=" in marker
+        for runtime in observations
+        for marker in runtime.recent_errors
+    )
+    assert all("--timestamps=true" in command for command in log_commands)
+    assert all("--since=2820s" in command for command in log_commands)
+
+
+def test_runtime_collection_reports_a_truncated_log_window(monkeypatch):
+    advisor = RoleTarget(research_tag="maple", role="advisor")
+    student = RoleTarget(research_tag="maple", role="student", student="fern")
+
+    def run(command, **kwargs):
+        if "get" in command:
+            selector = command[command.index("-l") + 1]
+            name = (
+                "senpai-advisor-maple"
+                if "role=advisor" in selector
+                else "senpai-maple-fern"
+            )
+            output = json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {"name": name},
+                            "status": {"phase": "Running"},
+                        }
+                    ]
+                }
+            )
+        elif "logs" in command:
+            output = "\n".join(f"ordinary line {index}" for index in range(400))
+        else:
+            target = advisor if "advisor" in command else student
+            output = runtime_json(target)
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    monkeypatch.setattr("senpai_agent.kubernetes_operations.subprocess.run", run)
+
+    observations, gaps = KubectlCampaignBackend(
+        inventory(), namespace="research"
+    ).collect_runtimes()
+
+    assert len(observations) == 2
+    assert {gap.subject for gap in gaps} == {"maple:advisor", "maple:student:fern"}
+    assert all("bounded 400-line tail" in gap.detail for gap in gaps)
+
+
+def test_runtime_collection_rejects_a_mismatched_role_payload(monkeypatch):
+    advisor = RoleTarget(research_tag="maple", role="advisor")
+
+    def run(command, **kwargs):
+        if "get" in command:
+            selector = command[command.index("-l") + 1]
+            name = (
+                "senpai-advisor-maple"
+                if "role=advisor" in selector
+                else "senpai-maple-fern"
+            )
+            output = json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {"name": name},
+                            "status": {"phase": "Running"},
+                        }
+                    ]
+                }
+            )
+        elif "logs" in command:
+            output = ""
+        else:
+            output = runtime_json(advisor)
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    monkeypatch.setattr("senpai_agent.kubernetes_operations.subprocess.run", run)
+
+    observations, gaps = KubectlCampaignBackend(
+        inventory(), namespace="research"
+    ).collect_runtimes()
+
+    assert observations[0].machine == "senpai-advisor-maple"
+    assert observations[1].machine == "unavailable"
+    assert gaps[0].subject == "maple:student:fern"
+
+
+def test_backend_collects_only_the_exact_advisor_research_tail(monkeypatch):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((tuple(command), kwargs.get("input")))
+        if "get" in command:
+            output = json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {"name": "senpai-advisor-maple"},
+                            "status": {"phase": "Running"},
+                        }
+                    ]
+                }
+            )
+        else:
+            tail = RoleResearchTail(
+                conversation_id=CONVERSATION_ID,
+                observed_at=datetime.now(UTC),
+                advisor_guidance="Prefer causal, mechanism-led research.",
+                messages=(
+                    RoleResearchTailItem(
+                        index=7,
+                        kind="MessageEvent",
+                        source="agent",
+                        summary="Compare mechanisms before another sweep.",
+                    ),
+                ),
+            )
+            output = json.dumps(
+                {
+                    "protocol_version": MANAGEMENT_PROTOCOL_VERSION,
+                    "result": tail.model_dump(mode="json"),
+                }
+            )
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    monkeypatch.setattr("senpai_agent.kubernetes_operations.subprocess.run", run)
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+
+    tail = backend.collect_advisor_research_tail()
+
+    assert tail.conversation_id == CONVERSATION_ID
+    assert tail.messages[0].source == "agent"
+    assert tail.advisor_guidance == "Prefer causal, mechanism-led research."
+    assert "role=advisor" in calls[0][0][calls[0][0].index("-l") + 1]
+    assert json.loads(calls[1][1])["command"] == "research_tail"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"result": {}},
+        {"protocol_version": "senpai-management/v0", "result": {}},
+    ],
+)
+def test_backend_rejects_missing_or_stale_role_management_protocol(
+    monkeypatch,
+    response,
+):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-advisor-maple")
+    monkeypatch.setattr(backend, "_run", lambda *_args, **_kwargs: json.dumps(response))
+
+    with pytest.raises(RuntimeError, match="management protocol"):
+        backend._role_control(
+            RoleTarget(research_tag="maple", role="advisor"),
+            RoleControlRequest(
+                protocol_version=MANAGEMENT_PROTOCOL_VERSION,
+                command="observe",
+            ),
+        )
+
+
+def test_repair_quiesces_the_role_before_entering_the_secret_free_sidecar(
+    monkeypatch,
+):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    target = RoleTarget(research_tag="maple", role="student", student="fern")
+    calls = []
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-maple-fern")
+
+    def run(command, **kwargs):
+        calls.append((tuple(command), kwargs))
+        if "repair-pause" in command:
+            return pause_receipt(command)
+        if "repair-resume" in command:
+            return resume_receipt(command)
+        return json.dumps(
+            {
+                "exit_code": 0,
+                "stdout": "repaired",
+                "stderr": "",
+            }
+        )
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    result = backend.run_repair(
+        target,
+        command="git status --short",
+        cwd="workspace",
+        timeout_seconds=300,
+    )
+
+    commands = [call[0] for call in calls]
+    assert "repair-pause" in commands[0]
+    assert commands[0][commands[0].index("-c") + 1] == "student"
+    assert commands[1][commands[1].index("-c") + 1] == "repair"
+    assert "repair-resume" in commands[2]
+    assert calls[2][1]["input_text"] == RESUME_CAPABILITY
+    assert RESUME_CAPABILITY not in commands[2]
+    assert result.stdout == "repaired"
+
+
+def test_repair_uses_role_local_remaining_ttl_not_a_cross_node_monotonic_clock(
+    monkeypatch,
+):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    target = RoleTarget(research_tag="maple", role="advisor")
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-advisor-maple")
+
+    def run(command, **_kwargs):
+        if "repair-pause" in command:
+            lease_id = command[command.index("--lease-id") + 1]
+            return json.dumps(
+                {
+                    "acknowledgement": {
+                        "protocol": REPAIR_PAUSE_PROTOCOL,
+                        "lease_id": lease_id,
+                        "expires_at": 10_240.0,
+                        "acknowledged_at": 10_000.0,
+                        "supervisor_pid": 1,
+                        "resume_capability_sha256": hashlib.sha256(
+                            RESUME_CAPABILITY.encode()
+                        ).hexdigest(),
+                    },
+                    "resume_capability": RESUME_CAPABILITY,
+                    "remaining_seconds": 200.0,
+                }
+            )
+        if "repair-resume" in command:
+            return resume_receipt(command)
+        return json.dumps({"exit_code": 0, "stdout": "repaired", "stderr": ""})
+
+    monkeypatch.setattr(backend, "_run", run)
+    monkeypatch.setattr(
+        time,
+        "monotonic",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("supervisor monotonic time is a different node-local epoch")
+        ),
+    )
+
+    result = backend.run_repair(
+        target,
+        command="true",
+        cwd="workspace",
+        timeout_seconds=60,
+    )
+
+    assert result.stdout == "repaired"
+
+
+def test_kubectl_failure_logs_bounded_stage_without_command_or_stdin(
+    monkeypatch,
+    capsys,
+):
+    secret_input = "resume-capability-must-not-leak"
+    secret_argument = "pod-name-must-not-leak"
+    monkeypatch.setattr(
+        "senpai_agent.kubernetes_operations.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=17,
+            stdout="",
+            stderr=(
+                f"failed command {secret_argument}; input={secret_input}; "
+                + ("x" * 8_000)
+            ),
+        ),
+    )
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+
+    with pytest.raises(RuntimeError, match="exit code 17"):
+        backend._run(
+            ("kubectl", "exec", secret_argument),
+            input_text=secret_input,
+            stage="repair-resume",
+        )
+
+    audit = capsys.readouterr().err
+    record = json.loads(audit)
+    assert record["stage"] == "repair-resume"
+    assert record["exit_code"] == 17
+    assert len(record["stderr"]) <= 4_096
+    assert secret_input not in audit
+    assert secret_argument not in audit
+
+
+def test_repair_releases_the_pause_when_sidecar_transport_fails(monkeypatch):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    target = RoleTarget(research_tag="maple", role="advisor")
+    calls = []
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-advisor-maple")
+
+    def run(command, **kwargs):
+        calls.append(tuple(command))
+        if "repair-pause" in command:
+            return pause_receipt(command)
+        if "repair-resume" in command:
+            return resume_receipt(command)
+        raise RuntimeError("repair transport failed")
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    with pytest.raises(RuntimeError, match="outcome is unknown"):
+        backend.run_repair(
+            target,
+            command="true",
+            cwd="workspace",
+            timeout_seconds=60,
+        )
+
+    assert "repair-resume" in calls[-1]
+
+
+def test_repair_preserves_a_completed_result_when_resume_fails(monkeypatch):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    target = RoleTarget(research_tag="maple", role="advisor")
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-advisor-maple")
+
+    def run(command, **kwargs):
+        if "repair-pause" in command:
+            return pause_receipt(command)
+        if "repair-resume" in command:
+            raise RuntimeError("resume transport unavailable")
+        return json.dumps({"exit_code": 0, "stdout": "done", "stderr": ""})
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    result = backend.run_repair(
+        target,
+        command="true",
+        cwd="workspace",
+        timeout_seconds=60,
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == "done"
+    assert result.controller_resumed is False
+    assert result.resume_error_type == "RuntimeError"
+
+
+@pytest.mark.parametrize("pause_failure", ["invalid-receipt", "lost-reply"])
+def test_uncertain_pause_without_a_capability_waits_for_bounded_expiry(
+    monkeypatch,
+    pause_failure,
+):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    target = RoleTarget(research_tag="maple", role="advisor")
+    calls = []
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-advisor-maple")
+
+    def run(command, **kwargs):
+        calls.append(tuple(command))
+        if "repair-resume" in command:
+            return resume_receipt(command)
+        if "repair-pause" in command and pause_failure == "lost-reply":
+            raise RuntimeError("pause reply was lost")
+        return "{}"
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    with pytest.raises(RuntimeError):
+        backend.run_repair(
+            target,
+            command="true",
+            cwd="workspace",
+            timeout_seconds=60,
+        )
+
+    assert all("repair-resume" not in call for call in calls)
+
+
+def test_semantically_invalid_pause_grant_is_released_with_its_capability(
+    monkeypatch,
+):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    target = RoleTarget(research_tag="maple", role="advisor")
+    calls = []
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-advisor-maple")
+
+    def run(command, **kwargs):
+        calls.append((tuple(command), kwargs))
+        if "repair-pause" in command:
+            payload = json.loads(pause_receipt(command))
+            payload["acknowledgement"]["lease_id"] = "repair-mismatched"
+            return json.dumps(payload)
+        if "repair-resume" in command:
+            return resume_receipt(command)
+        raise AssertionError("executor must not start after an invalid pause grant")
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    with pytest.raises(RuntimeError, match="invalid repair-pause acknowledgement"):
+        backend.run_repair(
+            target,
+            command="true",
+            cwd="workspace",
+            timeout_seconds=60,
+        )
+
+    assert "repair-resume" in calls[-1][0]
+    assert calls[-1][1]["input_text"] == RESUME_CAPABILITY
+
+
+def test_invalid_resume_receipt_is_retained_on_the_repair_result(monkeypatch):
+    backend = KubectlCampaignBackend(inventory(), namespace="research")
+    target = RoleTarget(research_tag="maple", role="advisor")
+    monkeypatch.setattr(backend, "_pod", lambda _target: "senpai-advisor-maple")
+
+    def run(command, **kwargs):
+        if "repair-pause" in command:
+            return pause_receipt(command)
+        if "repair-resume" in command:
+            return json.dumps({"released": True})
+        return json.dumps({"exit_code": 0, "stdout": "done", "stderr": ""})
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    result = backend.run_repair(
+        target,
+        command="true",
+        cwd="workspace",
+        timeout_seconds=60,
+    )
+
+    assert result.controller_resumed is False
+    assert result.resume_error_type == "KubernetesOperationError"

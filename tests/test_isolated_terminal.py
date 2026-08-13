@@ -1,0 +1,638 @@
+import json
+import os
+import shlex
+import shutil
+import signal
+import socket
+import struct
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pytest
+from openhands.tools.terminal import TerminalAction
+
+from socket_test_support import short_socket_path
+
+from senpai_agent import isolated_terminal, repair_executor
+from senpai_agent.isolated_terminal import (
+    IsolatedTerminalClientExecutor,
+    IsolatedTerminalServer,
+    StaleTerminalWake,
+    TerminalOutcomeUnknown,
+    TerminalTransportError,
+    begin_isolated_terminal_wake,
+    check_isolated_terminal_health,
+    end_isolated_terminal_wake,
+)
+
+
+def _test_socket(tmp_path: Path, suffix: str) -> Path:
+    return short_socket_path(tmp_path, suffix)
+
+
+def test_terminal_startup_scavenges_only_owned_stale_volatile_children(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(isolated_terminal.tempfile, "tempdir", str(tmp_path))
+    parent = tmp_path / "senpai-terminal-wakes"
+    parent.mkdir()
+    stale = parent / "wake-stale123"
+    stale.mkdir()
+    (stale / ".senpai-owner.json").write_text(
+        json.dumps({"pid": 999_999_999, "start_token": None})
+    )
+    target = tmp_path / "must-survive"
+    target.mkdir()
+    link = parent / "wake-symlink1"
+    link.symlink_to(target)
+    unrelated = parent / "operator-notes"
+    unrelated.write_text("keep")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with IsolatedTerminalServer(
+        socket_path=_test_socket(tmp_path, "scavenge-terminal"),
+        working_dir=workspace,
+        terminal_type="subprocess",
+    ):
+        pass
+
+    assert not stale.exists()
+    assert not link.exists()
+    assert target.exists()
+    assert unrelated.read_text() == "keep"
+
+
+def test_terminal_startup_recovers_an_owned_permission_poisoned_stale_root(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(isolated_terminal.tempfile, "tempdir", str(tmp_path))
+    parent = tmp_path / "senpai-terminal-wakes"
+    parent.mkdir()
+    stale = parent / "wake-stale456"
+    poisoned = stale / "home" / "locked"
+    poisoned.mkdir(parents=True)
+    (poisoned / "junk").write_text("stale")
+    (stale / ".senpai-owner.json").write_text(
+        json.dumps({"pid": 999_999_999, "start_token": None})
+    )
+    poisoned.chmod(0)
+    stale.chmod(0)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    try:
+        with IsolatedTerminalServer(
+            socket_path=_test_socket(tmp_path, "poisoned-stale-terminal"),
+            working_dir=workspace,
+            terminal_type="subprocess",
+        ):
+            pass
+        assert not stale.exists()
+    finally:
+        if stale.exists():
+            stale.chmod(0o700)
+            poisoned.chmod(0o700)
+            shutil.rmtree(stale)
+
+
+def test_terminal_startup_fails_closed_for_a_malformed_owned_stale_root(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(isolated_terminal.tempfile, "tempdir", str(tmp_path))
+    parent = tmp_path / "senpai-terminal-wakes"
+    parent.mkdir()
+    malformed = parent / "wake-invalid1"
+    malformed.mkdir()
+    (malformed / ".senpai-owner.json").write_text("not-json")
+    payload = malformed / "must-remain"
+    payload.write_text("preserved")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(TerminalTransportError, match="volatile root"):
+        IsolatedTerminalServer(
+            socket_path=_test_socket(tmp_path, "malformed-stale-terminal"),
+            working_dir=workspace,
+            terminal_type="subprocess",
+        )
+
+    assert payload.read_text() == "preserved"
+
+
+def test_terminal_socket_preserves_shell_fidelity_without_control_secrets(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    socket_path = _test_socket(tmp_path, "terminal")
+    canaries = {
+        "GITHUB_TOKEN": "control-github-canary",
+        "WANDB_API_KEY": "control-wandb-canary",
+        "OPENAI_API_KEY": "control-model-canary",
+    }
+    for name, value in canaries.items():
+        monkeypatch.setenv(name, value)
+    shell_environment = {
+        "HOME": str(tmp_path / "home"),
+        "PATH": os.environ["PATH"],
+        "SHELL_MARKER": "sidecar",
+    }
+    (tmp_path / "home").mkdir()
+
+    with IsolatedTerminalServer(
+        socket_path=socket_path,
+        working_dir=workspace,
+        environment=shell_environment,
+        terminal_type="subprocess",
+    ):
+        begin_isolated_terminal_wake(socket_path, "wake-fidelity")
+        client = IsolatedTerminalClientExecutor(socket_path, "wake-fidelity")
+        action = TerminalAction(
+            command=(
+                "printf '%s\\n' \"$SHELL_MARKER\"; "
+                f"{shlex.quote(sys.executable)} -c "
+                + shlex.quote(
+                    "import os; print('|'.join(sorted(os.environ)))"
+                )
+            )
+        )
+        observation = client(action)
+
+    assert observation.metadata.exit_code == 0
+    assert "sidecar" in observation.text
+    assert all(name not in observation.text for name in canaries)
+    assert all(value not in observation.text for value in canaries.values())
+
+
+def test_terminal_socket_preserves_timeout_poll_and_reset_semantics(tmp_path):
+    socket_path = _test_socket(tmp_path, "terminal-reset")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = {"HOME": str(tmp_path), "PATH": os.environ["PATH"]}
+
+    with IsolatedTerminalServer(
+        socket_path=socket_path,
+        working_dir=workspace,
+        environment=environment,
+        terminal_type="subprocess",
+    ):
+        begin_isolated_terminal_wake(socket_path, "wake-reset")
+        client = IsolatedTerminalClientExecutor(socket_path, "wake-reset")
+        timed_out = client(
+            TerminalAction(command="sleep 1; printf done", timeout=0.1)
+        )
+        continued = client(TerminalAction(command="", timeout=2))
+        reset = client(TerminalAction(command="", reset=True))
+
+    assert timed_out.exit_code == -1
+    assert continued.exit_code == 0
+    assert "done" in continued.text
+    assert reset.exit_code == 0
+
+
+def test_terminal_does_not_replay_an_action_after_the_request_was_sent(tmp_path):
+    socket_path = _test_socket(tmp_path, "terminal-drop")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(20)
+    listener.settimeout(0.5)
+    executions = []
+
+    def drop_replies() -> None:
+        try:
+            while True:
+                connection, _ = listener.accept()
+                with connection:
+                    payload = b""
+                    while not payload.endswith(b"\n"):
+                        chunk = connection.recv(65_536)
+                        if not chunk:
+                            break
+                        payload += chunk
+                    executions.append(payload)
+                    connection.setsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_LINGER,
+                        struct.pack("ii", 1, 0),
+                    )
+        except TimeoutError:
+            return
+
+    server = threading.Thread(target=drop_replies)
+    server.start()
+    try:
+        with pytest.raises(TerminalOutcomeUnknown, match="may have executed"):
+            IsolatedTerminalClientExecutor(socket_path, "wake-unknown")(
+                TerminalAction(command="touch important-state")
+            )
+    finally:
+        server.join(timeout=3)
+        listener.close()
+        try:
+            socket_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    time.sleep(0.1)
+    assert len(executions) == 1
+
+
+def test_begin_wake_recreates_pristine_shell_and_rejects_stale_actions(tmp_path):
+    socket_path = _test_socket(tmp_path, "terminal-wakes")
+    workspace = tmp_path / "workspace"
+    nested = workspace / "nested"
+    nested.mkdir(parents=True)
+    environment = {"HOME": str(tmp_path), "PATH": os.environ["PATH"]}
+
+    with IsolatedTerminalServer(
+        socket_path=socket_path,
+        working_dir=workspace,
+        environment=environment,
+        terminal_type="subprocess",
+    ):
+        begin_isolated_terminal_wake(socket_path, "wake-one")
+        first = IsolatedTerminalClientExecutor(socket_path, "wake-one")
+        changed = first(
+            TerminalAction(
+                command=(
+                    "cd nested; export LEAKED_WAKE=yes; "
+                    "printf persisted > ../workspace-state; "
+                    "printf '[user]\\nname = poisoned\\n' > \"$HOME/.gitconfig\"; "
+                    "mkdir -p \"$HOME/.local/bin\"; "
+                    "printf '#!/bin/sh\\nexit 99\\n' > \"$HOME/.local/bin/git\"; "
+                    "chmod +x \"$HOME/.local/bin/git\"; pwd"
+                )
+            )
+        )
+        assert str(nested) in changed.text
+
+        begin_isolated_terminal_wake(socket_path, "wake-two")
+        second = IsolatedTerminalClientExecutor(socket_path, "wake-two")
+        pristine = second(
+            TerminalAction(
+                command=(
+                    "pwd; printf '|%s|' \"$LEAKED_WAKE\"; "
+                    "test -f workspace-state && printf '|workspace-persisted|'; "
+                    "test ! -e \"$HOME/.gitconfig\" && printf '|home-clean|'; "
+                    "test \"$PATH\" = "
+                    "'/opt/senpai-venv/bin:/usr/local/bin:/usr/bin:/bin' && "
+                    "test \"$(command -v git)\" != \"$HOME/.local/bin/git\" && "
+                    "printf '|path-clean|'"
+                )
+            )
+        )
+
+        assert str(workspace) in pristine.text
+        assert "|yes|" not in pristine.text
+        assert "|workspace-persisted|" in pristine.text
+        assert "|home-clean|" in pristine.text
+        assert "|path-clean|" in pristine.text
+        with pytest.raises(StaleTerminalWake):
+            first(TerminalAction(command="touch stale-wake-ran"))
+
+    assert not (workspace / "stale-wake-ran").exists()
+
+
+def test_end_wake_synchronously_removes_permission_poison_without_following_links(
+    tmp_path,
+):
+    socket_path = _test_socket(tmp_path, "terminal-permission-cleanup")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    recorded_root = workspace / "volatile-root"
+    target = tmp_path / "outside-target"
+    target.write_text("must survive")
+    root = None
+
+    try:
+        with IsolatedTerminalServer(
+            socket_path=socket_path,
+            working_dir=workspace,
+            environment={"PATH": os.environ["PATH"]},
+            terminal_type="subprocess",
+        ):
+            begin_isolated_terminal_wake(socket_path, "wake-permission-cleanup")
+            result = IsolatedTerminalClientExecutor(
+                socket_path,
+                "wake-permission-cleanup",
+            )(
+                TerminalAction(
+                    command=(
+                        "mkdir -p \"$HOME/locked/deeper\"; "
+                        "printf poisoned > \"$HOME/locked/deeper/junk\"; "
+                        f"ln -s {shlex.quote(str(target))} \"$HOME/outside-link\"; "
+                        f"printf '%s' \"${{HOME%/home}}\" > "
+                        f"{shlex.quote(str(recorded_root))}; "
+                        "chmod 000 \"$HOME/locked\""
+                    )
+                )
+            )
+            assert result.metadata.exit_code == 0
+            root = Path(recorded_root.read_text())
+
+            end_isolated_terminal_wake(socket_path, "wake-permission-cleanup")
+
+            assert not root.exists()
+            assert target.read_text() == "must survive"
+    finally:
+        if root is not None and root.exists():
+            (root / "home" / "locked").chmod(0o700)
+            shutil.rmtree(root)
+
+
+def test_terminal_cleanup_failure_marks_server_dirty_until_authoritative_retry(
+    tmp_path,
+    monkeypatch,
+):
+    socket_path = _test_socket(tmp_path, "terminal-dirty-cleanup")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    recorded_root = workspace / "volatile-root"
+
+    with IsolatedTerminalServer(
+        socket_path=socket_path,
+        working_dir=workspace,
+        environment={"PATH": os.environ["PATH"]},
+        terminal_type="subprocess",
+    ):
+        begin_isolated_terminal_wake(socket_path, "wake-dirty-cleanup")
+        IsolatedTerminalClientExecutor(socket_path, "wake-dirty-cleanup")(
+            TerminalAction(
+                command=(
+                    f"printf '%s' \"${{HOME%/home}}\" > "
+                    f"{shlex.quote(str(recorded_root))}"
+                )
+            )
+        )
+        root = Path(recorded_root.read_text())
+        remove_directory = repair_executor.os.rmdir
+
+        def fail_root_removal(path, *args, **kwargs):
+            if path == root.name:
+                raise PermissionError("injected authoritative removal failure")
+            return remove_directory(path, *args, **kwargs)
+
+        monkeypatch.setattr(repair_executor.os, "rmdir", fail_root_removal)
+        with pytest.raises(TerminalTransportError, match="cleanup failed"):
+            end_isolated_terminal_wake(socket_path, "wake-dirty-cleanup")
+        with pytest.raises(TerminalTransportError, match="requires authoritative"):
+            check_isolated_terminal_health(socket_path)
+
+        monkeypatch.setattr(repair_executor.os, "rmdir", remove_directory)
+        end_isolated_terminal_wake(socket_path, "wake-dirty-cleanup")
+        check_isolated_terminal_health(socket_path)
+
+        assert not root.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreapers")
+def test_end_wake_immediately_reaps_background_processes(tmp_path):
+    socket_path = _test_socket(tmp_path, "terminal-end")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    marker = workspace / "ended-wake-survived"
+
+    with IsolatedTerminalServer(
+        socket_path=socket_path,
+        working_dir=workspace,
+        environment={"PATH": os.environ["PATH"]},
+        terminal_type="subprocess",
+    ):
+        begin_isolated_terminal_wake(socket_path, "wake-end")
+        IsolatedTerminalClientExecutor(socket_path, "wake-end")(
+            TerminalAction(
+                command=(
+                    f"(sleep .5; printf survived > {shlex.quote(str(marker))}) &"
+                )
+            )
+        )
+        end_isolated_terminal_wake(socket_path, "wake-end")
+        end_isolated_terminal_wake(socket_path, "wake-end")
+        time.sleep(0.7)
+
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux process trees")
+def test_begin_wake_preempts_a_long_foreground_action_within_a_bound(tmp_path):
+    socket_path = _test_socket(tmp_path, "terminal-preempt")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    old_outcome = []
+
+    with IsolatedTerminalServer(
+        socket_path=socket_path,
+        working_dir=workspace,
+        environment={"HOME": str(tmp_path), "PATH": os.environ["PATH"]},
+        terminal_type="subprocess",
+    ):
+        begin_isolated_terminal_wake(socket_path, "wake-long")
+        old_client = IsolatedTerminalClientExecutor(socket_path, "wake-long")
+
+        def run_old_action() -> None:
+            try:
+                old_client(TerminalAction(command="sleep 30"))
+            except TerminalTransportError as error:
+                old_outcome.append(error)
+
+        old_turn = threading.Thread(target=run_old_action)
+        old_turn.start()
+        time.sleep(0.2)
+        started = time.monotonic()
+        next_wake = threading.Thread(
+            target=begin_isolated_terminal_wake,
+            args=(socket_path, "wake-next"),
+        )
+        next_wake.start()
+        old_turn.join(timeout=3)
+        preempt_elapsed = time.monotonic() - started
+
+        assert not old_turn.is_alive()
+        assert preempt_elapsed < 3
+        assert old_outcome
+        next_wake.join(timeout=10)
+        assert not next_wake.is_alive()
+        next_observation = IsolatedTerminalClientExecutor(
+            socket_path,
+            "wake-next",
+        )(TerminalAction(command="printf ready"))
+        assert "ready" in next_observation.text
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreapers")
+def test_begin_wake_reaps_background_setsid_double_fork(tmp_path):
+    socket_path = _test_socket(tmp_path, "terminal-tree")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    marker = workspace / "old-wake-survived"
+    daemonizer = (
+        "import os,time,pathlib; pid=os.fork(); pid and os._exit(0); "
+        "os.setsid(); "
+        "pid=os.fork(); pid and os._exit(0); "
+        f"time.sleep(.5); pathlib.Path({str(marker)!r}).write_text('survived')"
+    )
+
+    with IsolatedTerminalServer(
+        socket_path=socket_path,
+        working_dir=workspace,
+        environment={"HOME": str(tmp_path), "PATH": os.environ["PATH"]},
+        terminal_type="subprocess",
+    ):
+        begin_isolated_terminal_wake(socket_path, "wake-one")
+        first = IsolatedTerminalClientExecutor(socket_path, "wake-one")
+        first(
+            TerminalAction(
+                command=(
+                    f"{shlex.quote(sys.executable)} -c "
+                    f"{shlex.quote(daemonizer)} >/dev/null 2>&1 &"
+                )
+            )
+        )
+        begin_isolated_terminal_wake(socket_path, "wake-two")
+        time.sleep(0.7)
+
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreapers")
+def test_next_wake_reaps_detached_child_after_worker_crash(tmp_path):
+    socket_path = _test_socket(tmp_path, "terminal-crash")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    child_ready = workspace / "detached-child.pid"
+    marker = workspace / "crashed-worker-child-survived"
+    daemonizer = (
+        "import os,time,pathlib; pid=os.fork(); pid and os._exit(0); "
+        "os.setsid(); "
+        "pid=os.fork(); pid and os._exit(0); "
+        f"pathlib.Path({str(child_ready)!r}).write_text(str(os.getpid())); "
+        f"time.sleep(.7); pathlib.Path({str(marker)!r}).write_text('survived')"
+    )
+
+    with IsolatedTerminalServer(
+        socket_path=socket_path,
+        working_dir=workspace,
+        environment={"PATH": os.environ["PATH"]},
+        terminal_type="subprocess",
+    ) as server:
+        begin_isolated_terminal_wake(socket_path, "wake-crash")
+        IsolatedTerminalClientExecutor(socket_path, "wake-crash")(
+            TerminalAction(
+                command=(
+                    f"{shlex.quote(sys.executable)} -c "
+                    f"{shlex.quote(daemonizer)} >/dev/null 2>&1 &"
+                )
+            )
+        )
+        deadline = time.monotonic() + 2
+        while not child_ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert child_ready.exists()
+        with server._state_lock:
+            assert server._worker is not None
+            os.kill(server._worker.process.pid, signal.SIGKILL)
+        deadline = time.monotonic() + 2
+        while server._worker.process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        with pytest.raises(TerminalTransportError, match="requires authoritative"):
+            check_isolated_terminal_health(socket_path)
+        begin_isolated_terminal_wake(socket_path, "wake-after-crash")
+        time.sleep(0.9)
+
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreapers")
+def test_later_begin_reconciles_an_orphan_after_one_cleanup_failure(
+    tmp_path,
+    monkeypatch,
+):
+    socket_path = _test_socket(tmp_path, "terminal-reconcile")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    child_ready = workspace / "orphan-ready.pid"
+    marker = workspace / "orphan-was-blessed"
+    daemonizer = (
+        "import os,time,pathlib; pid=os.fork(); pid and os._exit(0); "
+        "os.setsid(); "
+        "pid=os.fork(); pid and os._exit(0); "
+        f"pathlib.Path({str(child_ready)!r}).write_text(str(os.getpid())); "
+        f"time.sleep(.8); pathlib.Path({str(marker)!r}).write_text('survived')"
+    )
+
+    with IsolatedTerminalServer(
+        socket_path=socket_path,
+        working_dir=workspace,
+        environment={"PATH": os.environ["PATH"]},
+        terminal_type="subprocess",
+    ) as server:
+        begin_isolated_terminal_wake(socket_path, "wake-poisoned")
+        IsolatedTerminalClientExecutor(socket_path, "wake-poisoned")(
+            TerminalAction(
+                command=(
+                    f"{shlex.quote(sys.executable)} -c "
+                    f"{shlex.quote(daemonizer)} >/dev/null 2>&1 &"
+                )
+            )
+        )
+        deadline = time.monotonic() + 2
+        while not child_ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert child_ready.exists()
+        with server._state_lock:
+            assert server._worker is not None
+            os.kill(server._worker.process.pid, signal.SIGKILL)
+
+        clean = server._clean_server_adoptees
+        monkeypatch.setattr(
+            server,
+            "_clean_server_adoptees",
+            lambda: (_ for _ in ()).throw(RuntimeError("injected cleanup failure")),
+        )
+        with pytest.raises(TerminalTransportError, match="cleanup failed"):
+            begin_isolated_terminal_wake(socket_path, "wake-cleanup-failed")
+        with pytest.raises(TerminalTransportError, match="requires authoritative"):
+            check_isolated_terminal_health(socket_path)
+        monkeypatch.setattr(server, "_clean_server_adoptees", clean)
+
+        end_isolated_terminal_wake(socket_path, "wake-poisoned")
+        check_isolated_terminal_health(socket_path)
+
+        begin_isolated_terminal_wake(socket_path, "wake-reconciled")
+        check_isolated_terminal_health(socket_path)
+        time.sleep(1)
+
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreapers")
+def test_terminal_server_close_reaps_active_wake_background_processes(tmp_path):
+    socket_path = _test_socket(tmp_path, "terminal-close")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    marker = workspace / "closed-server-survived"
+
+    with IsolatedTerminalServer(
+        socket_path=socket_path,
+        working_dir=workspace,
+        environment={"HOME": str(tmp_path), "PATH": os.environ["PATH"]},
+        terminal_type="subprocess",
+    ):
+        begin_isolated_terminal_wake(socket_path, "wake-close")
+        IsolatedTerminalClientExecutor(socket_path, "wake-close")(
+            TerminalAction(
+                command=(
+                    f"(sleep .5; printf survived > {shlex.quote(str(marker))}) &"
+                )
+            )
+        )
+
+    time.sleep(0.7)
+    assert not marker.exists()

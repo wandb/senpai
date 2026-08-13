@@ -1,6 +1,7 @@
 FROM python:3.13-slim-bookworm
 
 ARG PLAYWRIGHT_VERSION=1.55.0
+ARG KUBECTL_VERSION=v1.33.4
 ARG SENPAI_SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.revision="${SENPAI_SOURCE_REVISION}"
 
@@ -11,6 +12,7 @@ ENV PATH="/opt/senpai-venv/bin:/home/senpai/.local/bin:${PATH}" \
     UV_PROJECT_ENVIRONMENT=/opt/senpai-venv \
     UV_PYTHON=/opt/senpai-venv/bin/python \
     UV_PYTHON_DOWNLOADS=never \
+    SENPAI_SKIP_EDITABLE_INSTALL=1 \
     BROWSER_USE_DISABLE_EXTENSIONS=1
 
 RUN apt-get update && \
@@ -29,11 +31,27 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y gh && \
     rm -rf /var/lib/apt/lists/*
 
+# The operational-supervisor deployment uses kubectl through both its typed
+# campaign operations and native terminal. Pin and verify the shipped client.
+RUN architecture="$(dpkg --print-architecture)" && \
+    case "$architecture" in \
+      amd64|arm64) ;; \
+      *) echo "unsupported kubectl architecture: $architecture" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSLo /tmp/kubectl \
+      "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${architecture}/kubectl" && \
+    curl -fsSLo /tmp/kubectl.sha256 \
+      "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${architecture}/kubectl.sha256" && \
+    printf '%s  %s\n' "$(cat /tmp/kubectl.sha256)" /tmp/kubectl | sha256sum --check && \
+    install -m 0755 /tmp/kubectl /usr/local/bin/kubectl && \
+    rm -f /tmp/kubectl /tmp/kubectl.sha256
+
 RUN python -m pip install --no-cache-dir "uv==0.10.9" && \
     uv venv --python /usr/local/bin/python /opt/senpai-venv
 
 # Export from the project lock while pruning dependencies used only for training.
 COPY pyproject.toml uv.lock /tmp/senpai/
+COPY senpai_agent /tmp/senpai/senpai_agent
 RUN cd /tmp/senpai && \
     uv export --locked --python 3.13 --no-dev --no-emit-project \
       --format requirements.txt \
@@ -52,12 +70,16 @@ RUN cd /tmp/senpai && \
       --only-binary pydantic-core \
       --only-binary rpds-py \
       -r requirements.txt && \
-    python -c 'import importlib.metadata, importlib.util, openhands.sdk, sys; assert sys.version_info[:2] == (3, 13); assert importlib.util.find_spec("torch") is None; assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
-    chown -R 10001:10001 /opt/senpai-venv && \
+    uv pip install --python "$SENPAI_PYTHON" --no-deps /tmp/senpai && \
+    "$SENPAI_PYTHON" -I -c 'import importlib.metadata, importlib.util, openhands.sdk, sys, wandb; import senpai_agent; assert sys.version_info[:2] == (3, 13); assert importlib.util.find_spec("torch") is None; assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"; assert "/opt/senpai-venv/" in senpai_agent.__file__' && \
     rm -rf /root/.cache/uv
 
 COPY scripts/senpai-browser-smoke-test.py /usr/local/bin/senpai-browser-smoke-test
 COPY scripts/senpai-container-health.sh /usr/local/bin/senpai-container-health
+COPY scripts/senpai-run-controller.sh /usr/local/bin/senpai-run-controller
+COPY scripts/senpai-metadata-egress-guard.py /usr/local/bin/senpai-metadata-egress-guard
+COPY senpai_agent/repair_executor.py /usr/local/bin/senpai-repair-executor
+COPY k8s/senpai-role-shell /usr/local/bin/senpai-role-shell
 
 # Expose the pinned browser on PATH because launchers give roles a persistent HOME.
 RUN uvx --from "playwright==${PLAYWRIGHT_VERSION}" \
@@ -67,7 +89,11 @@ RUN uvx --from "playwright==${PLAYWRIGHT_VERSION}" \
     test -x "$chromium_path" && \
     ln -s "$chromium_path" /usr/local/bin/chromium && \
     chmod +x /usr/local/bin/senpai-browser-smoke-test \
-      /usr/local/bin/senpai-container-health && \
+      /usr/local/bin/senpai-container-health \
+      /usr/local/bin/senpai-run-controller \
+      /usr/local/bin/senpai-metadata-egress-guard \
+      /usr/local/bin/senpai-repair-executor \
+      /usr/local/bin/senpai-role-shell && \
     mkdir -p /workspace /workspaces /var/lib/senpai && \
     chown -R 10001:10001 \
       /home/senpai /workspace /workspaces /var/lib/senpai && \
@@ -76,7 +102,7 @@ RUN uvx --from "playwright==${PLAYWRIGHT_VERSION}" \
 ENV HOME=/home/senpai
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10m --retries=5 \
-    CMD senpai-container-health \
+    CMD /usr/local/bin/senpai-container-health \
       "/var/lib/senpai/${RESEARCH_TAG}/advisor/openhands_state/controller-lease.json"
 
 WORKDIR /workspaces

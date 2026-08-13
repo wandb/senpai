@@ -12,22 +12,26 @@ install_senpai_git_guard() {
         return 2
     fi
 
-    git remote set-url --push origin DISABLED
-    git config remote.origin.pushurl DISABLED
-    git config --unset-all url."https://${GITHUB_TOKEN}@github.com/".insteadOf 2>/dev/null || true
+    local guard_root="${SENPAI_GIT_GUARD_ROOT:-$workdir}"
+    if [ "${SENPAI_IMMUTABLE_RUNNER:-0}" != "1" ]; then
+        git remote set-url --push origin DISABLED
+        git config remote.origin.pushurl DISABLED
+        git config --unset-all url."https://${GITHUB_TOKEN}@github.com/".insteadOf 2>/dev/null || true
 
-    export TARGET_WORKDIR="$target_workdir"
-    export SENPAI_REAL_GIT="${SENPAI_REAL_GIT:-$(command -v git)}"
-
-    mkdir -p .git/hooks "$workdir/git-guard-bin"
-    cat > .git/hooks/pre-push <<'EOF'
+        mkdir -p .git/hooks
+        cat > .git/hooks/pre-push <<'EOF'
 #!/bin/sh
 echo "ERROR: refusing to push from the senpai runner repo; use the cloned target repo instead." >&2
 exit 1
 EOF
-    chmod +x .git/hooks/pre-push
+        chmod +x .git/hooks/pre-push
+    fi
 
-    cat > "$workdir/git-guard-bin/git" <<'EOF'
+    export TARGET_WORKDIR="$target_workdir"
+    export SENPAI_REAL_GIT="${SENPAI_REAL_GIT:-$(command -v git)}"
+
+    mkdir -p "$guard_root/git-guard-bin"
+    cat > "$guard_root/git-guard-bin/git" <<'EOF'
 #!/bin/sh
 real_git="${SENPAI_REAL_GIT:-/usr/bin/git}"
 if [ "$1" = "push" ]; then
@@ -39,8 +43,8 @@ if [ "$1" = "push" ]; then
 fi
 exec "$real_git" "$@"
 EOF
-    chmod +x "$workdir/git-guard-bin/git"
-    export PATH="$workdir/git-guard-bin:$PATH"
+    chmod +x "$guard_root/git-guard-bin/git"
+    export PATH="$guard_root/git-guard-bin:$PATH"
 
     cat > "$askpass_file" <<'EOF'
 #!/bin/sh

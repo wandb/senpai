@@ -1,4 +1,5 @@
 import json
+import os
 
 import pytest
 from opentelemetry import trace
@@ -52,6 +53,59 @@ def test_monitoring_uses_the_senpai_wandb_project_and_student_identity(monkeypat
     monitoring.finish_weave_monitoring()
 
     assert calls[-1] == "finish"
+
+
+def test_monitoring_exposes_private_wandb_auth_only_during_initialization(
+    monkeypatch,
+):
+    monkeypatch.setattr(monitoring, "_initialized", False)
+    monkeypatch.setattr(monitoring, "_project_name", None)
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+
+    def initialize(*_args, **_kwargs):
+        assert os.environ["WANDB_API_KEY"] == "one-use-wandb-key"
+
+    monkeypatch.setattr(monitoring, "weave_init", initialize)
+    monkeypatch.setattr(monitoring, "weave_finish", lambda: None)
+
+    monitoring.initialize_weave_monitoring(
+        {
+            "WANDB_ENTITY": "wandb-applied-ai-team",
+            "WANDB_PROJECT": "senpai-v1",
+            "WANDB_API_KEY": "one-use-wandb-key",
+        }
+    )
+
+    assert "WANDB_API_KEY" not in os.environ
+    monitoring.finish_weave_monitoring()
+
+
+def test_monitoring_restores_an_existing_wandb_environment_key(monkeypatch):
+    monkeypatch.setattr(monitoring, "_initialized", False)
+    monkeypatch.setattr(monitoring, "_project_name", None)
+    monkeypatch.setenv("WANDB_API_KEY", "ambient-key")
+    monkeypatch.setattr(monitoring, "weave_init", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(monitoring, "weave_finish", lambda: None)
+
+    monitoring.initialize_weave_monitoring(
+        {
+            "WANDB_ENTITY": "wandb-applied-ai-team",
+            "WANDB_PROJECT": "senpai-v1",
+            "WANDB_API_KEY": "private-key",
+        }
+    )
+
+    assert os.environ["WANDB_API_KEY"] == "ambient-key"
+    monitoring.finish_weave_monitoring()
+
+
+def test_advisor_identity_is_distinct_without_changing_the_default():
+    assert monitoring.weave_agent_name(
+        {"SENPAI_ROLE": "advisor", "ADVISOR_NAME": "aurora"}
+    ) == "advisor-aurora"
+    assert monitoring.weave_agent_name(
+        {"SENPAI_ROLE": "advisor", "ADVISOR_NAME": "advisor"}
+    ) == "advisor"
 
 
 @pytest.mark.parametrize(

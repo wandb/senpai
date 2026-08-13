@@ -44,17 +44,26 @@ class ActiveGitHubWatcher:
     def _run(self) -> None:
         try:
             with AdvisorEventStore(self.store_path) as store:
-                while not self.stop.wait(self.poll_interval_seconds):
+                delay = self.poll_interval_seconds
+                while not self.stop.wait(delay):
                     try:
                         events = self.mailbox.poll()
                     except GitHubReadError as error:
+                        delay = max(
+                            self.poll_interval_seconds,
+                            error.retry_after_seconds
+                            if error.retry_after_seconds is not None
+                            else min(delay * 2, 600),
+                        )
                         print(
                             "SENPAI_GITHUB_WATCHER_POLL_ERROR "
-                            f"{type(error).__name__}: {error}",
+                            f"{type(error).__name__}: {error}; "
+                            f"retry_after_seconds={delay:g}",
                             file=sys.stderr,
                             flush=True,
                         )
                         continue
+                    delay = self.poll_interval_seconds
                     current = {event.dedupe_key for event in events}
                     for event in events:
                         if event.dedupe_key in self.known_keys:

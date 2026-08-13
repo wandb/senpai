@@ -6,9 +6,10 @@ import time
 import uuid
 from pathlib import Path
 
-import pytest
 import psutil
+import pytest
 from openhands.sdk.llm import Message, TextContent
+from sqlite_test_support import assert_repeated_concurrent_first_open
 
 from senpai_agent.advisor import AdvisorEventStore
 from senpai_agent.delegation import (
@@ -21,6 +22,22 @@ from senpai_agent.delegation import (
     render_child_prompt,
     run_child_process,
 )
+
+
+def test_delegation_registry_allows_bounded_concurrent_first_open(tmp_path: Path):
+    """
+    Requirement: parent and delegated child processes may first discover their
+    shared registry concurrently without a lock error or partial schema.
+    Interface: DelegationRegistry construction and its active-task view.
+    """
+
+    assert_repeated_concurrent_first_open(
+        lambda attempt: DelegationRegistry(tmp_path / f"tasks-{attempt}.sqlite3"),
+        attempts=25,
+    )
+
+    database = tmp_path / "tasks-reopen.sqlite3"
+    assert DelegationRegistry(database).active_rows() == []
 
 
 def delegation_request(
@@ -79,6 +96,9 @@ def delegation_config(tmp_path: Path, **updates) -> DelegationConfig:
         "enable_browser": True,
         "command_secrets": {"EXA_API_KEY": "exa-secret"},
         "role": "advisor",
+        "local_condenser_max_events": 600,
+        "local_condenser_max_tokens": 180_000,
+        "local_condenser_target_events": 40,
     }
     values.update(updates)
     return DelegationConfig(**values)
@@ -203,6 +223,13 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
     )
     assert fast.environment["SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT"] == (
         config.frontier_reasoning_effort
+    )
+    assert fast.environment["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"] == "600"
+    assert fast.environment["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS"] == (
+        "180000"
+    )
+    assert fast.environment["SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS"] == (
+        "40"
     )
 
 

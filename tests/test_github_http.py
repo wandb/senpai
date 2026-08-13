@@ -52,6 +52,56 @@ def test_reader_follows_pagination_with_typed_auth(monkeypatch):
     assert reader.objects("/items?per_page=1") == [{"id": 1}, {"id": 2}]
 
 
+def test_bounded_reader_stops_before_fetching_an_irrelevant_page(monkeypatch):
+    calls = []
+
+    def urlopen(github_request, timeout):
+        calls.append(github_request.full_url)
+        return Response(
+            [{"id": 1}, {"id": 2}],
+            link='<https://api.github.test/items?page=2>; rel="next"',
+        )
+
+    monkeypatch.setattr(github_http.request, "urlopen", urlopen)
+    reader = GitHubReader(
+        SecretStr("github-secret"),
+        api_url="https://api.github.test",
+    )
+
+    objects, complete = reader.objects_bounded(
+        "/items?page=1",
+        limit=100,
+        stop=lambda item: item["id"] == 2,
+    )
+
+    assert objects == [{"id": 1}]
+    assert complete is True
+    assert calls == ["https://api.github.test/items?page=1"]
+
+
+def test_bounded_reader_reports_a_hard_limit_without_following_next(monkeypatch):
+    calls = []
+
+    def urlopen(github_request, timeout):
+        calls.append(github_request.full_url)
+        return Response(
+            [{"id": 1}, {"id": 2}],
+            link='<https://api.github.test/items?page=2>; rel="next"',
+        )
+
+    monkeypatch.setattr(github_http.request, "urlopen", urlopen)
+    reader = GitHubReader(
+        SecretStr("github-secret"),
+        api_url="https://api.github.test",
+    )
+
+    objects, complete = reader.objects_bounded("/items?page=1", limit=1)
+
+    assert objects == [{"id": 1}]
+    assert complete is False
+    assert calls == ["https://api.github.test/items?page=1"]
+
+
 def test_reader_rejects_foreign_pagination_origin(monkeypatch):
     monkeypatch.setattr(
         github_http.request,
@@ -109,6 +159,57 @@ def test_reader_errors_do_not_expose_token(monkeypatch):
 
     assert "github-secret" not in str(raised.value)
     assert "/user" in str(raised.value)
+
+
+def test_reader_preserves_github_rate_limit_reset(monkeypatch):
+    monkeypatch.setattr(github_http.time, "time", lambda: 1_000)
+
+    def fail(github_request, timeout):
+        raise HTTPError(
+            github_request.full_url,
+            403,
+            "rate limited",
+            {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1120"},
+            None,
+        )
+
+    monkeypatch.setattr(github_http.request, "urlopen", fail)
+
+    with pytest.raises(GitHubReadError) as raised:
+        GitHubReader(SecretStr("github-secret")).get("/user")
+
+    assert raised.value.retry_after_seconds == 121
+    assert "github-secret" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        (None, None),
+        ({"Retry-After": "inf"}, None),
+        ({"Retry-After": "999999999"}, 3_600),
+    ],
+)
+def test_reader_bounds_invalid_or_unsafe_retry_headers(
+    monkeypatch,
+    headers,
+    expected,
+):
+    def fail(github_request, timeout):
+        raise HTTPError(
+            github_request.full_url,
+            403,
+            "rate limited",
+            headers,
+            None,
+        )
+
+    monkeypatch.setattr(github_http.request, "urlopen", fail)
+
+    with pytest.raises(GitHubReadError) as raised:
+        GitHubReader(SecretStr("github-secret")).get("/user")
+
+    assert raised.value.retry_after_seconds == expected
 
 
 def test_next_link_extracts_only_the_next_relation():

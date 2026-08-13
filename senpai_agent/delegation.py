@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field, model_validator
 from senpai_agent.advisor import AdvisorEvent, AdvisorEventStore
 from senpai_agent.processes import terminate_process_group
 from senpai_agent.secrets import scrub_github_credentials
+from senpai_agent.sqlite_store import connect_sqlite_store, initialize_sqlite_store
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation import LocalConversation
@@ -144,6 +145,9 @@ class DelegationConfig:
     enable_browser: bool
     command_secrets: Mapping[str, str]
     role: str
+    local_condenser_max_events: int = 0
+    local_condenser_max_tokens: int = 0
+    local_condenser_target_events: int = 0
     root_state_dir: Path | None = None
     tree_id: str | None = None
     depth: int = 0
@@ -357,6 +361,15 @@ class OpenHandsChildProcess:
                 "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": (
                     self._config.frontier_reasoning_effort
                 ),
+                "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS": str(
+                    self._config.local_condenser_max_events
+                ),
+                "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS": str(
+                    self._config.local_condenser_max_tokens
+                ),
+                "SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS": str(
+                    self._config.local_condenser_target_events
+                ),
                 "SENPAI_PARENT_CONVERSATION_HISTORY_DIR": str(
                     self._config.state_dir
                     / uuid.UUID(self._request.parent_conversation_id).hex
@@ -538,7 +551,7 @@ class OpenHandsChildProcess:
 
 
 class DelegateAgentAction(Action):
-    """Legacy action schema retained so persisted conversations can resume."""
+    """Legacy action schema retained only for persisted event deserialization."""
 
     task: str = Field(min_length=1)
     agent: AgentKind = "general-purpose"
@@ -549,7 +562,7 @@ class DelegateAgentAction(Action):
 
 
 class DelegateAgentObservation(Observation):
-    """Legacy observation schema retained for durable event deserialization."""
+    """Legacy observation schema retained only for persisted event deserialization."""
 
     task_id: str
     status: Literal["finished", "dispatched"]
@@ -700,59 +713,75 @@ class DelegationRegistry:
 
     def __init__(self, path: Path):
         self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as database:
-            database.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS operations (
-                    operation_key TEXT PRIMARY KEY,
-                    tree_id TEXT NOT NULL,
-                    specs_json TEXT NOT NULL,
-                    task_ids_json TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS tasks (
-                    task_id TEXT PRIMARY KEY,
-                    tree_id TEXT NOT NULL,
-                    parent_conversation_id TEXT NOT NULL,
-                    parent_task_id TEXT,
-                    task_key TEXT,
-                    task TEXT NOT NULL,
-                    agent TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    search_mode TEXT,
-                    depth INTEGER NOT NULL,
-                    deadline_epoch REAL NOT NULL,
-                    status TEXT NOT NULL,
-                    result TEXT,
-                    error TEXT,
-                    pid INTEGER,
-                    process_group_id INTEGER,
-                    process_start_time REAL,
-                    state_dir TEXT,
-                    collected_at REAL,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS tasks_tree_id ON tasks(tree_id);
-                CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_conversation_id);
-                """
+        database = initialize_sqlite_store(
+            path,
+            self._initialize_schema,
+            runtime_busy_timeout_seconds=30,
+        )
+        database.close()
+
+    @staticmethod
+    def _initialize_schema(database: sqlite3.Connection) -> None:
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS operations (
+                operation_key TEXT PRIMARY KEY,
+                tree_id TEXT NOT NULL,
+                specs_json TEXT NOT NULL,
+                task_ids_json TEXT NOT NULL
             )
-            columns = {
-                row[1] for row in database.execute("PRAGMA table_info(tasks)")
-            }
-            if "parent_task_id" not in columns:
-                database.execute("ALTER TABLE tasks ADD COLUMN parent_task_id TEXT")
-            if "collected_at" not in columns:
-                database.execute("ALTER TABLE tasks ADD COLUMN collected_at REAL")
-            if "process_group_id" not in columns:
-                database.execute("ALTER TABLE tasks ADD COLUMN process_group_id INTEGER")
-            if "process_start_time" not in columns:
-                database.execute("ALTER TABLE tasks ADD COLUMN process_start_time REAL")
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id TEXT PRIMARY KEY,
+                tree_id TEXT NOT NULL,
+                parent_conversation_id TEXT NOT NULL,
+                parent_task_id TEXT,
+                task_key TEXT,
+                task TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                model TEXT NOT NULL,
+                search_mode TEXT,
+                depth INTEGER NOT NULL,
+                deadline_epoch REAL NOT NULL,
+                status TEXT NOT NULL,
+                result TEXT,
+                error TEXT,
+                pid INTEGER,
+                process_group_id INTEGER,
+                process_start_time REAL,
+                state_dir TEXT,
+                collected_at REAL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS tasks_tree_id ON tasks(tree_id)",
+            """
+            CREATE INDEX IF NOT EXISTS tasks_parent
+            ON tasks(parent_conversation_id)
+            """,
+        )
+        for statement in statements:
+            database.execute(statement)
+        columns = {
+            row[1] for row in database.execute("PRAGMA table_info(tasks)")
+        }
+        if "parent_task_id" not in columns:
+            database.execute("ALTER TABLE tasks ADD COLUMN parent_task_id TEXT")
+        if "collected_at" not in columns:
+            database.execute("ALTER TABLE tasks ADD COLUMN collected_at REAL")
+        if "process_group_id" not in columns:
+            database.execute("ALTER TABLE tasks ADD COLUMN process_group_id INTEGER")
+        if "process_start_time" not in columns:
+            database.execute("ALTER TABLE tasks ADD COLUMN process_start_time REAL")
 
     def _connect(self) -> sqlite3.Connection:
-        database = sqlite3.connect(self.path, timeout=30)
-        database.row_factory = sqlite3.Row
-        return database
+        return connect_sqlite_store(
+            self.path,
+            busy_timeout_seconds=30,
+            check_same_thread=True,
+        )
 
     @contextmanager
     def lifecycle(self):
@@ -1834,64 +1863,6 @@ class _CancelAgentsExecutor(ToolExecutor[CancelAgentsAction, CancelAgentsObserva
         return CancelAgentsObservation(
             tasks=self.manager.cancel(action.task_ids, conversation)
         )
-
-
-_DELEGATE_AGENT_DEPRECATION = (
-    "delegate_agent is deprecated and cannot launch an agent. Use spawn_agents "
-    "with a stable batch_key, then pass its task IDs to await_agents."
-)
-
-
-class _DeprecatedDelegateAgentExecutor(
-    ToolExecutor[DelegateAgentAction, DelegateAgentObservation]
-):
-    def __call__(
-        self,
-        action: DelegateAgentAction,  # noqa: ARG002
-        conversation: LocalConversation | None = None,  # noqa: ARG002
-    ) -> DelegateAgentObservation:
-        return DelegateAgentObservation(
-            task_id="deprecated",
-            status="finished",
-            result=_DELEGATE_AGENT_DEPRECATION,
-        )
-
-
-class DelegateAgentTool(
-    ToolDefinition[DelegateAgentAction, DelegateAgentObservation]
-):
-    """Non-launching compatibility tool for pre-lifecycle conversations."""
-
-    name = "delegate_agent"
-
-    def declared_resources(self, action: Action) -> DeclaredResources:  # noqa: ARG002
-        return DeclaredResources(keys=(), declared=True)
-
-    @classmethod
-    def create(
-        cls,
-        conv_state: object | None = None,  # noqa: ARG003
-        *,
-        event_db_path: str | Path | None = None,  # noqa: ARG003
-    ) -> Sequence[Self]:
-        return [
-            cls(
-                description=(
-                    "Deprecated compatibility tool. It never launches an agent; "
-                    "use spawn_agents and await_agents instead."
-                ),
-                action_type=DelegateAgentAction,
-                observation_type=DelegateAgentObservation,
-                annotations=ToolAnnotations(
-                    title="Deprecated agent delegation",
-                    readOnlyHint=True,
-                    destructiveHint=False,
-                    idempotentHint=True,
-                    openWorldHint=False,
-                ),
-                executor=_DeprecatedDelegateAgentExecutor(),
-            )
-        ]
 
 
 class _DelegationTool(ToolDefinition):

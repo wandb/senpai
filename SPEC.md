@@ -11,7 +11,7 @@ composing fragile tool calls:
 
 - GitHub polling, workflow operations, and verification;
 - assignment branch publication;
-- training process supervision and W&B metric monitoring;
+- generic long-running process supervision and optional W&B metric monitoring;
 - conversation selection and durable local events;
 - command policy and stop checks; and
 - cadence, retry, deadlines, and shutdown.
@@ -30,7 +30,7 @@ dependencies.
 5. GitHub mutations are typed, preconditioned, convergent on replay, and
    verified against remote state.
 6. The advisor uses one durable conversation UUID. A student uses one UUID per
-   assignment revision, and monitor wakes continue it.
+   assignment revision, and job-monitor wakes continue the owning conversation.
 7. Conversation and generated artifact state cannot fall back into the target
    checkout.
 8. Senpai does not prune conversation history.
@@ -38,6 +38,9 @@ dependencies.
 10. Secrets are passed at narrow executor boundaries and redacted before
     monitored content is attached.
 11. Hivemind is disabled, not redesigned, in this change.
+12. The campaign operational supervisor is separate from advisor/student
+    research prompts, scopes every observation and write to the immutable
+    launch inventory, and never turns missing evidence into a healthy zero.
 
 ## Control loop and remote protocol
 
@@ -69,6 +72,136 @@ supervisor provides the same recovery on a plain host.
 
 The core controller imports no Kubernetes API and needs no Service, port, DNS
 record, ServiceAccount, RBAC, cross-node token, or tailnet.
+
+### Campaign operational supervisor
+
+Kubernetes launches optionally add one independent operational-supervisor
+Deployment. The feature is currently Kubernetes-only; Docker, AWS GPU, and AWS
+Mac launchers reject it. It is not the per-role crash supervisor above and it
+does not join advisor/student research conversations. Each due 15-minute cycle
+is single-flight: it collects one timestamped campaign snapshot, retains the
+latest three, and runs one fresh bounded in-memory OpenHands conversation. When
+the six-hour research review is due, a fresh capability-free assessment
+conversation runs only after that operational turn. Cycles never overlap; a
+long cycle delays the next one, which is immediately due if its interval
+elapsed. Snapshot/cadence state, typed-mutation receipts, and repair-operation
+records persist locally.
+
+Every managed role Deployment records its exact Senpai source revision for
+provenance. An incremental supervisor launch is accepted when the existing
+exact-tag advisor and every student not replaced in the same launch advertise
+the required versioned management and repair protocols, use the requested
+advisor branch, and preserve the advisor's configured student inventory. Role
+and supervisor revisions may differ. Any backward-incompatible socket framing,
+wire field, or operation-semantic change must bump its protocol and force an
+explicit relaunch of affected roles. The aggregate repair annotation
+`senpai-repair-executor/v4` includes the executor/broker contract and
+`senpai-controller-repair-pause/v2`; a supervisor-only upgrade rejects retained
+roles without that exact version.
+
+The snapshot scope is fixed at launch:
+
+- GitHub returns only open PRs whose current base ref exactly equals the
+  configured advisor branch. Each PR includes age and paginated counts for
+  issue comments, submitted reviews, and inline comments. The privileged prompt
+  receives only configured-student ownership, exact allowlisted protocol states,
+  and a count of unknown status labels; it receives no title, head ref, URL, or
+  arbitrary label text.
+- W&B resolves only exact run IDs discovered in the configured students'
+  role-local training state. Experiment code may freely choose its own W&B
+  group without breaking campaign ownership. The privileged prompt receives
+  per-configured-student running counts, never run IDs, names, URLs, configs, or
+  arbitrary state text.
+- Kubernetes selects exactly one running pod for each configured role using
+  the research-tag, role, and student labels. Role-local inspection returns the
+  controller lease, current conversation UUID, completed turns, running
+  training count, bounded utilization, reset status, and recent structured
+  error markers. Raw `kubectl logs` lines transiently enter the credentialed
+  control process and are immediately reduced to marker, timestamp, and
+  fingerprint. Training failures are reduced in the role before they cross the
+  control boundary. Neither raw source is persisted or sent to the model.
+
+Each failed evidence source remains `unknown` with a typed evidence gap. In
+particular, a failed W&B query is not reported as zero running jobs. Repeated
+`SENPAI_TURN_DEFERRED` log markers survive in the bounded three-snapshot trend.
+
+The supervisor receives OpenHands' native `terminal` interface and one typed
+operations tool. The credentialed control container holds campaign state,
+GitHub, W&B, model, and projected Kubernetes credentials. Native terminal
+actions cross a Linux abstract Unix socket into a separate secret-free shell
+container that has a mutable private home, temporary directory, and workspace.
+The containers do not share a PID namespace or root filesystem, but they still
+share the Pod network namespace and loopback. No credential-bearing control
+endpoint listens on TCP or UDP. Senpai does not apply the advisor/student
+command policy in the shell, so shell and Git syntax are unrestricted, but
+Unix/filesystem permissions and the absence of external credentials still
+apply. The shell has no ServiceAccount token, campaign state, provider secret,
+GitHub token, W&B key, shared PID namespace, or access to the control
+container's root filesystem. The exact runtime and instruction checkout is
+populated by an init container, mounted read-only, and excluded from persistent
+user-skill loading.
+
+The unrestricted shell is intentionally capable of arbitrary terminal and Git
+commands. Its output is not trusted: deliberately reading raw PR text, logs,
+files, API responses, or command output can reintroduce prompt-injection risk
+into the privileged conversation. The ordinary prompt therefore carries only
+deterministic typed/numeric/timestamp projections, configured identities,
+closed enums, counts, and opaque fingerprints.
+
+The typed tool remains the preferred surface for inspecting a role, enqueueing
+a deduplicated role event, queueing a context reset, or requesting a controller
+restart because targets can name only the configured advisor or students;
+callers cannot supply hosts, pods, namespaces, working directories,
+environments, or credentials. Typed mutations have durable idempotency keys,
+per-incident cooldowns, and metadata-only audit records. The enforced cooldown
+identity is derived from the anomaly category, mutation kind, and exact role
+target; changing a free-form incident label cannot bypass it. Role inspection
+is always fresh and is never replayed from the mutation ledger. Each fresh
+supervisor turn receives the 12 most recent mutation targets, categories,
+timestamps, and outcomes. A `succeeded` result for a nudge, context reset, or
+restart records durable acceptance or queueing, not target-side completion.
+All model-visible tool results are projected to closed status values, UUIDs,
+booleans, counts, generations, and fingerprints. Operation, request, delivery,
+pending-event, and backend error text is never echoed; failures become a fixed
+error code.
+Subsequent campaign evidence demonstrates a nudge's effect; subsequent
+`context_resets` and `controller_restarts` observations establish completion or
+rejection of those state-bound requests.
+
+A context reset is an owner-consumed request. The external supervisor records
+the expected conversation UUID, controller identity, raw-event prefix digest
+and count, and pending-event keys. Only that role's controller may claim it at
+a quiescent turn boundary. The controller calls
+`run_openhands(..., reset_context=True)`, records completion before ordinary
+event acknowledgement, and keeps the same UUID, workspace, complete append-only
+event trace, and pending events. External code never instantiates a second
+`LocalConversation` over live state or deletes individual events. A reset starts
+a clean active model branch; it cannot selectively delete messages or rewind to
+an arbitrary event.
+
+A controller restart is refused while an advisor or student supervised job or
+delegated agent is running, or when either activity inventory cannot be proven.
+The request records the observed conversation, worker generation, and exact
+replacement generation. Only the role's process-owning supervisor may consume
+it, terminate that generation, and start the replacement; external code never
+signals a controller PID. A planned restart does not accrue crash backoff, and
+the replacement generation completes the durable receipt. Stale source
+generations fail closed. Kubernetes RBAC grants no AWS, node, pod-delete, or
+Deployment-patch verbs. The terminal receives no GitHub token, so authenticated
+branch and PR mutations remain with advisor/student tools or conversations.
+
+Every six hours, the next wake runs a fresh non-persistent assessment against
+the currently deployed `system_instructions/ADVISOR.md`. Raw PR, W&B, and
+advisor-tail evidence enters only that conversation. It receives exactly one
+output-only tool and no terminal, campaign operations, browser, project skills,
+subagents, GitHub credential, or command secrets. The tool accepts only
+`aligned`, `insufficient_evidence`, or `strategic_drift`; missing, invalid, or
+multiple submissions fail closed. No model-authored prose crosses back into the
+privileged path. Trusted code maps only `strategic_drift` to one fixed
+advisor-principles reminder and dispatches it through the ordinary state-bound,
+audited nudge service. Its idempotency key is derived from the durable scheduled
+review slot, so crash recovery cannot duplicate it. This periodic assessment
+does not modify the advisor prompt or micromanage ordinary scientific judgment.
 
 GitHub state is level-triggered:
 
@@ -114,11 +247,15 @@ Generic child results use a local SQLite WAL event store because parent and
 child run on the same advisor or student instance. That is not an inter-node
 protocol.
 
-The only SQLite databases are `advisor-events.sqlite3`, for unacknowledged
-advisor watcher/child events; `student-events.sqlite3`, for unacknowledged
-student feedback/child events; and `training/monitors.sqlite3`, for student
-monitor policy, samples, and deduplicated actionable signals. OpenHands
-conversation history is a separate file-backed per-UUID event log.
+Role SQLite databases are `advisor-events.sqlite3`, for unacknowledged advisor
+watcher/child/supervisor events; `student-events.sqlite3`, for unacknowledged
+student feedback/child/supervisor events; `context-resets.sqlite3`, for the
+owner-consumed reset queue; and `training/monitors.sqlite3`, for role-local job
+monitor policy, samples, and deduplicated actionable signals. The `training/`
+state-directory name is retained so live persisted conversations and supervised
+jobs remain recoverable across the generalized job surface. The operational
+supervisor separately stores `operations.sqlite3` for metadata-only action
+audit. OpenHands conversation history remains a file-backed per-UUID event log.
 
 ## State and conversations
 
@@ -129,7 +266,13 @@ Advisor state:
 ├── advisor-conversation-id
 ├── controller-lease.json
 ├── advisor-events.sqlite3
+├── context-resets.sqlite3
 ├── conversation-state.json
+├── training/
+│   ├── <job-id>.json
+│   ├── <job-id>.log
+│   ├── monitors.sqlite3
+│   └── monitors/<job-id>.json
 ├── github/
 └── conversations managed by OpenHands
 ```
@@ -145,12 +288,13 @@ Student state:
 ├── github-feedback.json
 ├── student-conversations.json
 ├── student-events.sqlite3
+├── context-resets.sqlite3
 ├── conversation-state.json
 ├── training/
-│   ├── <training-id>.json
-│   ├── <training-id>.log
+│   ├── <job-id>.json
+│   ├── <job-id>.log
 │   ├── monitors.sqlite3
-│   └── monitors/<training-id>.json
+│   └── monitors/<job-id>.json
 ├── github/
 └── conversations managed by OpenHands
 ```
@@ -160,8 +304,8 @@ UUID. `conversation-state.json` records, per UUID, both successful initial
 instruction delivery and the digest of the delivered merged system context.
 The controller replaces this one document atomically after a successful turn,
 so a restart cannot observe those two facts at different revisions. A
-`training_monitor` event carries its original conversation UUID and therefore
-resumes, rather than replaces, the student conversation.
+`job_monitor` carries its original conversation UUID and therefore resumes,
+rather than replaces, the owning advisor or student conversation.
 
 `github-feedback.json` records every immutable PR feedback key's first-seen
 assignment revision, then marks it acknowledged only after its student turn
@@ -205,6 +349,12 @@ The model receives:
 4. A compact skill catalog whose bodies are loaded only when invoked.
 5. User turns containing `program.md`, target role instructions, current state,
    and current UTC time.
+
+The operational supervisor instead uses the minimal
+`system_instructions/OPERATIONAL_SUPERVISOR_HARNESS.md`; it does not inherit
+target-workspace, research, or subagent instructions. The capability-free
+six-hour assessor uses the separate `RESEARCH_ASSESSOR_HARNESS.md` and
+`RESEARCH_ASSESSOR.md` pair.
 
 Harness and role remain separate source documents because they have different
 owners, but are merged into one system suffix so the agent knows both the
@@ -262,6 +412,12 @@ token trigger. OpenHands persists the returned typed compaction block in the
 normal event log and replays it first in each later request, including after a
 process restart. The local condenser is disabled for these conversations.
 Other providers retain the high-quality OpenHands condenser.
+
+Every advisor root turn appends one controller-derived liveness invariant to
+the system-message suffix, outside condensed history. It states that the
+campaign is active, that this runtime has no campaign round limit, and that
+`max_turns` limits one OpenHands turn rather than the research programme. Round
+labels, final-round claims, and summaries cannot authorize stopping.
 
 The complete durable transcript remains available as plain event JSON under
 `$SENPAI_OPENHANDS_STATE_DIR/$SENPAI_CONVERSATION_ID/events/`. The harness
@@ -507,95 +663,113 @@ Bash Runner have no delegation tools. A depth-one General Purpose child can use
 the lifecycle tools for depth-two leaf work, subject to the same tree budget
 and deadline. Children receive neither GitHub credentials nor GitHub
 read/write tools; the parent prepares any large PR Markdown artifact and owns
-every typed GitHub operation. They do not receive training tools.
+every typed GitHub operation. They do not receive job tools.
 
 When `review_ready` arrives during other advisor work, the advisor can spawn a
 smart, full-context General Purpose review and continue unrelated work. Every
 terminal record includes its root conversation identity, allowing the
 controller to resume the exact advisor or student conversation after its turn.
 
-### Training and monitoring
+### Long-running jobs and monitoring
 
-Students receive:
+Advisor and student root conversations receive:
 
 ```text
-run_training(spec: TrainingSpec) -> TrainingResult
-get_training_status(training_id: str) -> TrainingResult
-cancel_training(training_id: str) -> TrainingResult
-monitor_training(
-  training_id,
-  metric=None,
+run_job(spec: JobSpec) -> JobResult
+get_job_status(job_id: str) -> JobResult
+cancel_job(job_id: str) -> JobResult
+monitor_job(
+  job_id,
+  wandb_metric=None,
   direction=None,
   gates=(),
   poll_interval_seconds=60,
   stale_after_seconds=600,
-) -> MonitorTrainingObservation
+) -> MonitorJobObservation
 ```
 
-`TrainingSupervisor` owns one process group, the configured timeout ceiling,
+The process supervisor owns one process group, the configured timeout ceiling,
 TERM/KILL cleanup, restart identity checks using PID/PGID/create-time, a bounded
 8 KiB error tail, streamed 64 KiB log parsing, persisted state, and discovered
-W&B run IDs. Run IDs are persisted while training is still running so metric
-monitoring can begin immediately.
+W&B run IDs. Run IDs are persisted while the job is still running so optional
+metric monitoring can begin immediately.
 
-The student commits the exact implementation and cleans the worktree before an
-expensive launch. Every successful `run_training` launch immediately registers
-a terminal-state monitor bound to the current conversation. `monitor_training`
-is an optional policy upgrade for useful metric gates or staleness detection;
-repeating it replaces the default or previous policy.
+The generic job supervisor confines `cwd` to the role workspace. Jobs declare
+`workspace_access` as `mutable` or `read_only`. A student mutable job requires a
+clean worktree at launch and holds an exclusive workspace lease, so assignment
+hydration, feedback checkout, and branch reconciliation wait until it reaches a
+terminal state. Advisor jobs and truly passive student watchers may be
+`read_only` and remain usable while notes are being edited. Jobs receive a
+scrubbed environment and may request only registered credentials explicitly;
+the current public grant is `WANDB_API_KEY`. Every successful `run_job` call
+immediately registers a terminal-state monitor bound to the current
+conversation. `monitor_job` sets or replaces optional W&B metric gates and
+staleness detection for an already-running job; it never disables terminal
+wakes.
 
 The timeout is a total wall-clock ceiling, not merely the point at which
 shutdown begins. TERM is sent early enough that the configured grace period
 ends at the deadline, after which the complete process group is killed.
-`cancel_training` follows the same process-group cleanup path and does not
-return until the supervisor has persisted a terminal state. Target training
-code remains responsible for handling SIGTERM and flushing external services
+`cancel_job` follows the same process-group cleanup path and does not return
+until the supervisor has persisted a terminal state. Target job code remains
+responsible for handling SIGTERM and flushing external services
 such as W&B before the grace period expires.
 
 The controller polls only monitors that are due. It fetches one latest selected
 metric value from W&B, evaluates deterministic threshold/change/staleness and
 terminal-state rules, and persists deduplicated compact signals. Ordinary
-polls use no LLM tokens.
+polls use no LLM tokens. The monitor store reports its earliest due poll to the
+controller, which shortens the ordinary heartbeat sleep accordingly; a
+minute-scale job therefore does not wait for the default ten-minute cadence.
 
-Metric samples reject NaN and infinities. A failure in one monitor's training
-status or W&B lookup advances that monitor's schedule and emits one
-deduplicated `monitor_error` hard signal; it cannot block other monitors,
+Metric samples reject NaN and infinities. Due monitors are ordered and processed
+in a capped batch with an overall time budget. A failure in one monitor's job
+status or W&B lookup advances that monitor's schedule and emits one deduplicated
+`monitor_error` hard signal. A slow external request can delay the current batch
+within its timeout and budget, but it cannot prevent later controller cycles,
 GitHub events, child results, or an already-pending hard-failure wake. A changed
-monitor policy resets its derived samples and signals to match the new marker.
+monitor policy resets its derived samples and signals to match the new persisted
+policy. The SQLite monitor store is the single source of truth for ownership,
+schedule, and active state; there is no second marker to reconcile.
 
-Every persisted actionable signal directly creates a compact
-`training_monitor` wake for the signal's original student conversation UUID.
-No intermediate LLM call gates these events: registering the monitor policy is
-the student's request to resume when one of its conditions emits a signal. The
+Every persisted actionable signal directly creates a compact `job_monitor`
+wake for the signal's original advisor or student conversation UUID. No
+intermediate LLM call gates these events: registering the monitor policy is the
+role's request to resume when one of its conditions emits a signal. The
 signal remains pending until that exact conversation successfully handles it.
 
 Controller events are partitioned by their exact conversation UUID before a
 turn. Each partition is acknowledged only after its own successful turn, so a
-child result for one assignment cannot consume or permanently block a training
+child result for one assignment cannot consume or permanently block a job
 event for another.
 
-The Stop hook verifies the automatic monitor marker and a clean worktree,
-allowing the student turn to end while the controller supervises the process.
-The advisor and advisor children never receive training tools.
+The advisor and student Stop hooks verify that every live supervised job has an
+active SQLite monitor record. The student hook also verifies a clean worktree,
+allowing its turn to end while the controller supervises the process. Advisor
+and student children never receive job tools.
 
 ## Hooks, deadlines, and shutdown
 
 The native plugin declares OpenHands `PreToolUse`, `Stop`, and `SessionEnd`
 hooks. Its pre-tool hook covers both `senpai_terminal` and the raw `terminal`
-used by file-defined children, so delegation cannot bypass workflow or training
+used by file-defined children, so delegation cannot bypass workflow or job
 boundaries. Hooks give early model-visible feedback. `senpai_terminal` also
 evaluates the same pure policy in-process and fails closed if policy evaluation
 fails.
 
-Denied patterns include raw GitHub mutations, raw `git push`, direct training
-launches, sleeps, polling loops, `watch`, and `tail -f`, including nested shell
-and `env` wrappers.
+The operational supervisor does not load this research-role plugin. Its native
+terminal therefore has no Senpai command filter or 600-second Senpai wrapper.
+OpenHands' native 30-second no-output continuation behavior, the overall turn
+deadline, and infrastructure permissions still apply.
+For advisor, student, and child conversations, denied patterns include raw
+GitHub mutations, raw `git push`, direct training launches, sleeps, polling
+loops, `watch`, and `tail -f`, including nested shell and `env` wrappers.
 
 Every OpenHands turn has a controller-configured hard deadline. The deadline
 interrupts the conversation, produces a non-success result, and leaves durable
 events unacknowledged. The controller then retries with bounded exponential
 backoff. Controller termination interrupts and closes the current conversation,
-cancels active supervised training, closes local stores, and flushes Weave
+cancels active supervised jobs, closes local stores, and flushes Weave
 before the controller exits. Standalone and child runners flush Weave at runner
 exit.
 
@@ -633,8 +807,8 @@ Observability and queried with `get_agent_spans()`, not the legacy Calls API;
 
 Three images are built from the same exact source commit:
 
-- advisor: Python/OpenHands, GitHub CLI, and Chromium; no PyTorch, CUDA, or
-  Kubernetes tooling;
+- advisor: Python/OpenHands, GitHub CLI, Chromium, and pinned `kubectl`; no
+  PyTorch or CUDA. Only the separate supervisor pod receives campaign RBAC;
 - student: the CUDA/PyTorch stack plus the same OpenHands and Chromium runtime;
 - cutoff: a minimal shell/Python runtime with one checksum-verified, pinned
   `kubectl`.
@@ -655,9 +829,149 @@ Launch preflight verifies:
 Exa is a progressive skill/script integration, not an always-connected MCP
 server.
 
-The Kubernetes launcher creates one Secret, ConfigMaps, and Deployments. It
-creates no Service or RBAC. Docker and local hosts need no shared network for
-Senpai communication.
+The Kubernetes launcher creates the fixed role Secret only when it launches an
+advisor or students. The operational supervisor owns a separate least-
+privilege Secret and ConfigMap. Both supervisor resources are immutable and
+content-addressed; a new release creates new objects and leaves the prior
+bundle available to the previous ReplicaSet. A supervisor-only launch never
+rewrites the role Secret or role Deployments. It applies the campaign
+NetworkPolicy, creates the new Secret and ConfigMap, and reapplies the
+ServiceAccount, namespace Role, RoleBinding, and supervisor Deployment. The
+Deployment uses `Recreate` so the state claim has one supervisor writer, with a
+supervisor-only outage during replacement. The launcher waits for rollout
+readiness for the configured timeout.
+
+Before mutation, the launcher resolves the explicit Kubernetes context, pins
+the cluster and campaign-namespace UIDs, acquires a campaign release Lease, and
+durably captures the exact mutable NetworkPolicy, ServiceAccount, Role,
+RoleBinding, and Deployment. A failed or interrupted release first removes the
+failed Deployment in foreground, then restores and canonically verifies the
+security resources before recreating and verifying the old Deployment. The
+private journal records Lease UID/transition lineage, while the Lease carries
+the authoritative transaction phase across hosts and kube-context aliases.
+Manual recovery can resume an expired transaction but cannot overwrite a newer
+release. A healthy release marks the Lease committed before reconciling and
+deleting its local journal; crash-stale local state is reconciled from an exact
+final Lease epoch. A separate explicit `finalize-commit` operation repairs
+bookkeeping only when the operator already knows the new rollout is healthy.
+Rollback intentionally excludes immutable Secret/ConfigMap artifacts and the
+persistent SQLite state.
+
+When enabled, the launcher also creates one dedicated supervisor
+ServiceAccount, namespace-scoped Role, RoleBinding, and Deployment. The Pod
+does not automount a token. A narrow kubeconfig init container mounts the
+short-lived projected token to create a token-file kubeconfig; among long-lived
+containers, only the credentialed control container mounts it. Kubernetes RBAC
+cannot constrain that container's pod list/log/exec verbs by label, so a
+campaign that enables the supervisor requires a dedicated namespace for hard
+campaign isolation. The Role has no AWS, node, pod-deletion, or Deployment-
+mutation verbs. The launcher creates no Service or general cluster RBAC. The
+ServiceAccount is Kubernetes workload identity only: it is not a Linux account,
+human identity, or cloud identity.
+Senpai adds no cloud-role binding, and an operator on a managed cluster must
+verify that admission or workload-identity policy does not add one.
+`--supervisor_dedicated_namespace` is an operator attestation, not proof that
+the namespace contains no unrelated workload.
+
+The model-visible shell runs in a second container with a read-only root and
+runtime, private writable home/tmp/workspace, no projected token or Secret, and
+no shared process namespace. Its native-terminal server listens on a Linux
+abstract Unix socket, so there is no terminal socket directory to mount. The
+control and shell containers nevertheless share Pod loopback and their network
+namespace; the design exposes no credential-bearing control TCP/UDP listener.
+The credentialed repair broker owns a filesystem Unix socket on a separate
+volume that the shell mounts read-only, which permits connection but prevents
+the shell from replacing the socket entry. The broker accepts only an
+inventory-bound role target and one of three symbolic working directories.
+
+The broker invokes an immutable executor in that role's fixed secret-free
+repair sidecar, which shares the mutable target workspace and role state but not
+runner source, dataset, credentials, ServiceAccount token, PID namespace, or
+the credentialed container root. The executor command socket is a filesystem
+Unix socket on a memory-backed volume mounted only in the repair sidecar. The
+role's main container cannot open it. A sibling filesystem socket on that same
+private volume is the read-only heartbeat endpoint for Kubernetes health probes;
+it reports liveness and deadline state but accepts no command. Requests and outcomes are bounded and
+audited, descendants are reaped on every exit path, and transport loss after
+command submission is reported as an unknown outcome rather than replayed.
+
+Before contacting that executor, the broker obtains a bounded pause from the
+role's PID 1 owner. The owner terminates the current controller generation and
+all processes carrying its one-generation ownership token, then refuses to
+acknowledge until recorded descendants are dead and no TCP or TCP6 listener
+remains in the shared Pod network namespace. A best-effort resume follows every
+repair outcome. The role-local client accepts only a PID 1 peer, and resume
+requires the one-use capability returned with that acknowledgement. The pause
+expires after a bounded interval if a resume reply is
+lost; the durable result and audit distinguish command completion from
+controller-resume completion.
+
+The operation ID is durably bound to a fingerprint over the exact target,
+byte-for-byte command, symbolic working directory, and timeout. The repair
+ledger retains bounded stdout/stderr for the newest 128 completed operations.
+For the life of the supervisor-state PVC, all older completions retain metadata
+tombstones with operation identity, target, fingerprint, working directory,
+timeout, status, timestamps, exit code, controller-resume outcome, prune time,
+and error type. Pruning is transactional with completion and startup recovery.
+`--status` is authoritative after a lost response; an `unknown` operation is
+never retried automatically, and replaying a pruned operation returns a typed
+expired-receipt tombstone without executing it again. Filesystem, credential,
+ServiceAccount, and PID separation still do not provide general same-Pod
+network isolation; NetworkPolicy remains an external-egress boundary.
+
+Every arbitrary repair first obtains a private, expiring pause from the role's
+PID-1 process supervisor. The supervisor terminates the active controller and
+all processes that inherited its per-generation ownership capability, then
+proves the shared Pod network namespace has no TCP listener before it
+acknowledges the pause. This removes a live Chromium CDP or other loopback
+control surface before the credential-free repair sidecar begins. The
+role-local client authenticates the abstract-socket server as PID 1 with Linux
+`SO_PEERCRED`. PID 1 returns a one-use 256-bit resume capability to the
+credentialed caller; only its SHA-256 is persisted or audited, and resume sends
+the raw value through stdin. The repair sidecar receives no raw capability and
+cannot release or replace the active pause. The private persisted pause state
+is not mounted into that sidecar.
+The controller is restarted from durable state after the command; pause expiry
+is the crash-recovery backstop. Command completion and controller recovery are
+distinct durable receipt fields, and the role-shell CLI reports a nonzero
+operational result when the command completed but recovery was not proven.
+
+Supervisor-only upgrades resolve only GitHub, W&B, and the configured model
+provider. They validate the existing exact-tag role inventory, advisor branch,
+and management/repair protocol versions, but do not require equal source
+revisions, Exa/Hugging Face credentials, branch creation, or student-label
+mutation. Each release uses a new immutable content-addressed Secret and
+ConfigMap, reapplies the supervisor-only NetworkPolicy/RBAC/Deployment resources,
+and waits for readiness. Its scope-pinned, Lease-serialized rollback journal
+restores and verifies all five mutable release resources after apply, rollout,
+or interruption failure; it retains a derived manual recovery command when
+automatic recovery cannot finish. Deleting only
+`deployment/senpai-supervisor-<tag>` is the supervisor kill switch: it preserves
+advisor/student pods and repair sidecars, RBAC, NetworkPolicy, immutable bundles,
+the state PVC, and host capacity.
+
+Docker, AWS GPU, and AWS Mac operational-supervisor transports are deliberately
+not implemented. The following is planned architecture. Docker should use a
+narrow host-side broker
+bound to the exact planned container IDs rather than mounting the Docker socket
+into the model container. AWS GPU can reuse that broker on its single EC2 host
+without granting AWS lifecycle credentials. AWS Mac should run the supervisor
+beside the advisor on host zero and reach exact student LaunchDaemons through
+campaign-scoped forced-command SSH identities. It must never receive instance
+stop/termination or Dedicated Host release authority; upgrades preserve the
+allocated Macs, and it must not reuse a broad bootstrap SSH key. The
+supervisor will retain an unrestricted native terminal locally. Cross-container
+and cross-host access will use one fixed `senpai role-control` transport client
+that can carry an arbitrary command to an exact configured role. Its broker
+will scope reachable campaign runtimes rather than filtering Git or shell
+syntax, authenticate through a private per-launch Unix socket or forced SSH
+command,
+loads an immutable role-to-runtime map from the launch plan, rejects unrecorded
+containers, hosts, and labels, bounds output and execution time, cleans up
+orphaned children, and audits every request and outcome. All transports reuse
+the same snapshot, ledger, prompt, and role-control protocol and must pass
+scope, replay, restart-safety, and no-host-release tests before their launcher
+backend accepts the supervisor flag.
 
 Hivemind startup remains commented with a clear note. The Python controller
 waits for the optional cluster start gate while continuously refreshing a
@@ -687,11 +1001,16 @@ Removed:
 Retained intentionally:
 
 - Agent skills and their model/effort metadata under `.agents`;
-- OpenHands Browser, task tracker, Think, and the high-quality default
+- OpenHands Browser, task tracker, and the high-quality default
   condenser for providers not using stored OpenAI Responses continuation or
   Anthropic native compaction;
 - the pinned `weave-openhands` agent, LLM, and tool tracing integration; and
 - only a small bootstrap shell path for clone, identity, and Git push guards.
+
+The task tracker is described as optional persisted coordination memory for parallel
+work, delegated agents, and long-running jobs; it does not impose a single
+`in_progress` item. The legacy model-visible `think` scratchpad is omitted from
+root and child tool surfaces while provider-native reasoning stays enabled.
 
 ## Acceptance
 
@@ -699,13 +1018,19 @@ The change is acceptable when:
 
 - unit and local integration tests pass;
 - shell scripts pass `bash -n`;
-- manifests render matching immutable source revisions without Service/RBAC;
+- ordinary role manifests render immutable source revisions without a Service
+  or Kubernetes RBAC, while supervisor manifests render only the documented
+  namespace-scoped ServiceAccount/RBAC;
 - browser smoke succeeds in both image builds;
 - no operational prompt advertises a missing tool or service;
 - no runtime role requires Claude Code semantics;
 - secrets do not appear in serialized tool specs or captured content;
 - monitor wakes resume the original student UUID;
 - cutoff arming completes after a bounded readiness window even when a pod
-  never becomes Ready; and
-- a live credential preflight plus GitHub read-only smoke succeeds before
+  never becomes Ready;
+- the credential-free Kind topology/mechanics canary passes, without treating
+  its thin role simulators as evidence for the GPU student image, live GitHub or
+  W&B APIs, or a model provider; and
+- a live credential preflight, GitHub read-only smoke, and one controlled live
+  staging wake in a disposable campaign namespace succeed before broad
   production rollout.

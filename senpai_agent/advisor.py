@@ -1,6 +1,5 @@
 import argparse
 import json
-import sqlite3
 import threading
 import uuid
 from collections.abc import Callable, Sequence, Set
@@ -13,6 +12,16 @@ from openhands.sdk.conversation import ConversationExecutionStatus, Conversation
 from pydantic import BaseModel, ConfigDict, Field
 
 from senpai_agent.inbox import PersistentInbox
+from senpai_agent.sqlite_store import initialize_sqlite_store
+
+_TERMINAL_DELIVERY_STATUSES = frozenset(
+    {
+        ConversationExecutionStatus.FINISHED,
+        ConversationExecutionStatus.ERROR,
+        ConversationExecutionStatus.STUCK,
+        ConversationExecutionStatus.DELETING,
+    }
+)
 
 
 class AdvisorEvent(BaseModel):
@@ -46,12 +55,12 @@ class AdvisorEvent(BaseModel):
 
 class AdvisorEventStore:
     def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._connection = sqlite3.connect(path, check_same_thread=False)
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA busy_timeout=5000")
-        self._connection.execute(
+        self._connection = initialize_sqlite_store(path, self._initialize_schema)
+
+    @staticmethod
+    def _initialize_schema(connection) -> None:
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS advisor_events (
                 dedupe_key TEXT PRIMARY KEY,
@@ -60,7 +69,6 @@ class AdvisorEventStore:
             )
             """
         )
-        self._connection.commit()
 
     def enqueue(self, event: AdvisorEvent) -> bool:
         with self._lock:
@@ -272,6 +280,8 @@ class AdvisorEventPump:
                 parent_conversation_id=self._parent_conversation_id,
             )
         with state:
+            if state.execution_status in _TERMINAL_DELIVERY_STATUSES:
+                return 0
             if ConversationState.get_unmatched_actions(state.active_branch()):
                 return 0
             return _deliver_pending_events(

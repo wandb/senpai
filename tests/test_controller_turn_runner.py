@@ -1,4 +1,6 @@
 import time
+import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,15 +15,29 @@ from openhands.sdk.llm.exceptions import (
 
 from senpai_agent.advisor import AdvisorEvent, AdvisorEventPump, AdvisorEventStore
 from senpai_agent.controller import (
+    Controller,
     ConversationRecoveryExhausted,
     OpenHandsTurnRunner,
+    _claim_context_reset,
     _context_recovery_prompt,
+)
+from senpai_agent.mailbox import (
+    CompositeMailbox,
+    ContextResetMailbox,
+    ControllerEvent,
+    LocalAdvisorMailbox,
 )
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.github.mailbox import ActiveGitHubWatcher
 from senpai_agent.inbox import DeliveryState, PersistentInbox, deliver_turn_messages
-from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.state import AssignmentConversationRegistry
+from senpai_agent.operations import (
+    ContextResetRequest,
+    ContextResetRequestStore,
+    RoleTarget,
+)
+from senpai_agent.role_control import _control_token, _raw_history_checkpoint
+from senpai_agent.supervisor import WorkerLease
 
 
 @dataclass(frozen=True)
@@ -38,6 +54,16 @@ class Mailbox:
 
     def poll(self):
         return self.events
+
+    def acknowledge(self, _dedupe_keys):
+        return
+
+
+def process_inbox_turn(inbox: PersistentInbox, turn_id: str) -> None:
+    turn = inbox.latest_turn(turn_id)
+    for message in turn.messages:
+        inbox.record_delivered(message.delivery_id, message.body)
+    inbox.record_processed(turn.turn_id)
 
 
 def feedback_event(revision_id="revision-2"):
@@ -84,7 +110,7 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
 
     def run_openhands(_prompt, config):
         class Conversation:
-            def send_message(self, message):
+            def send_message(self, message, sender=None):
                 messages.append(message)
 
         with AdvisorEventStore(
@@ -189,7 +215,7 @@ def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
 
     def run_openhands(_prompt, config):
         class Conversation:
-            def send_message(self, message):
+            def send_message(self, message, sender=None):
                 messages.append(message)
 
         with AdvisorEventStore(store_path) as store, AdvisorEventPump(
@@ -233,7 +259,7 @@ def test_full_visible_set_suppresses_events_handled_in_an_earlier_turn(
 
     def run_openhands(_prompt, _config):
         class Conversation:
-            def send_message(self, message):
+            def send_message(self, message, sender=None):
                 messages.append(message)
 
         with AdvisorEventStore(store_path) as store, AdvisorEventPump(
@@ -345,6 +371,35 @@ def test_active_watcher_retries_after_a_transient_github_read_error(
     assert "SENPAI_GITHUB_WATCHER_POLL_ERROR" in capsys.readouterr().err
 
 
+def test_active_watcher_honors_github_retry_delay(tmp_path: Path):
+    event = advisor_event()
+
+    class RateLimitedMailbox:
+        def __init__(self):
+            self.calls: list[float] = []
+
+        def poll(self):
+            self.calls.append(time.monotonic())
+            if len(self.calls) == 1:
+                raise GitHubReadError("rate limited", retry_after_seconds=0.03)
+            return (event,)
+
+    mailbox = RateLimitedMailbox()
+    store_path = tmp_path / "advisor-events.sqlite3"
+    with ActiveGitHubWatcher(
+        mailbox,
+        store_path,
+        known_keys=frozenset(),
+        poll_interval_seconds=0.001,
+    ):
+        deadline = time.monotonic() + 1
+        while len(mailbox.calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+    assert len(mailbox.calls) >= 2
+    assert mailbox.calls[1] - mailbox.calls[0] >= 0.025
+
+
 def test_context_exhaustion_retries_once_on_a_fresh_branch_with_the_same_id(
     tmp_path: Path,
     monkeypatch,
@@ -388,6 +443,545 @@ def test_context_exhaustion_retries_once_on_a_fresh_branch_with_the_same_id(
     assert "complete current research brief" in calls[1][0]
     assert "current actionable event" in calls[1][0]
     assert "raw trace and workspace are preserved" in calls[1][0]
+
+
+def test_queued_context_reset_is_consumed_by_the_owner_with_the_same_uuid(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    conversation_id = UUID("00000000-0000-0000-0000-000000000095")
+    (state_dir / conversation_id.hex).mkdir(parents=True)
+    count, digest = _raw_history_checkpoint(state_dir, conversation_id)
+    assert count == 0 and digest is not None
+    lease = WorkerLease(
+        pid=os.getpid(),
+        phase="sleep",
+        deadline=10_000,
+        conversation_id=str(conversation_id),
+    )
+    lease_path = state_dir / "controller-lease.json"
+    lease_path.write_text(
+        json.dumps(
+            {
+                "pid": lease.pid,
+                "phase": lease.phase,
+                "deadline": lease.deadline,
+                "conversation_id": lease.conversation_id,
+            }
+        )
+    )
+    target = RoleTarget(research_tag="maple", role="advisor")
+    request = ContextResetRequest(
+        request_id="reset-95",
+        target=target,
+        expected_conversation_id=conversation_id,
+        expected_control_token=_control_token(
+            lease,
+            conversation_id,
+            digest,
+            (),
+        ),
+        expected_raw_history_event_count=count,
+        expected_raw_history_digest=digest,
+        expected_pending_event_keys=(),
+        recovery_prompt="Discard the noisy active branch and resume the current work.",
+    )
+    with ContextResetRequestStore(state_dir / "context-resets.sqlite3") as store:
+        store.enqueue(request)
+
+    calls = []
+
+    def run_openhands(
+        prompt,
+        config,
+        *,
+        reset_context=False,
+        context_reset_applied=None,
+    ):
+        calls.append((prompt, config.conversation_id, reset_context))
+        assert context_reset_applied is not None
+        context_reset_applied()
+        return 0
+
+    monkeypatch.setenv("SENPAI_ROLE", "advisor")
+    monkeypatch.setenv("RESEARCH_TAG", "maple")
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+
+    result = OpenHandsTurnRunner(
+        Config("advisor", state_dir, conversation_id),
+        full_prompt="complete research brief",
+    ).run(
+        "current actionable event",
+        conversation_id=conversation_id,
+        event_keys=frozenset(),
+    )
+
+    assert result.exit_code == 0
+    assert calls[0][1:] == (conversation_id, True)
+    assert request.recovery_prompt in calls[0][0]
+    with ContextResetRequestStore(state_dir / "context-resets.sqlite3") as store:
+        status = store.result(request.request_id)
+    assert status.status == "completed"
+    assert status.completion is not None
+    assert status.completion.conversation_id == conversation_id
+
+
+def test_queued_context_reset_wakes_an_otherwise_idle_controller(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    conversation_id = UUID("00000000-0000-0000-0000-000000000096")
+    (state_dir / conversation_id.hex).mkdir(parents=True)
+    count, digest = _raw_history_checkpoint(state_dir, conversation_id)
+    assert count == 0 and digest is not None
+    lease = WorkerLease(
+        pid=os.getpid(),
+        phase="sleep",
+        deadline=10_000,
+        conversation_id=str(conversation_id),
+    )
+    (state_dir / "controller-lease.json").write_text(
+        json.dumps(
+            {
+                "pid": lease.pid,
+                "phase": lease.phase,
+                "deadline": lease.deadline,
+                "conversation_id": lease.conversation_id,
+            }
+        )
+    )
+    target = RoleTarget(research_tag="maple", role="advisor")
+    request = ContextResetRequest(
+        request_id="reset-idle-96",
+        target=target,
+        expected_conversation_id=conversation_id,
+        expected_control_token=_control_token(
+            lease,
+            conversation_id,
+            digest,
+            (),
+        ),
+        expected_raw_history_event_count=count,
+        expected_raw_history_digest=digest,
+        expected_pending_event_keys=(),
+        recovery_prompt="Resume useful work from a clean active branch.",
+    )
+    queue_path = state_dir / "context-resets.sqlite3"
+    with ContextResetRequestStore(queue_path) as store:
+        store.enqueue(request)
+
+    calls = []
+
+    def run_openhands(
+        prompt,
+        config,
+        *,
+        reset_context=False,
+        context_reset_applied=None,
+        inbox=None,
+        inbox_turn_id=None,
+        recovery_prompt=None,
+    ):
+        calls.append((prompt, config.conversation_id, reset_context))
+        assert recovery_prompt is not None
+        process_inbox_turn(inbox, inbox_turn_id)
+        assert context_reset_applied is not None
+        context_reset_applied()
+        return 0
+
+    monkeypatch.setenv("SENPAI_ROLE", "advisor")
+    monkeypatch.setenv("RESEARCH_TAG", "maple")
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+    mailbox = ContextResetMailbox(queue_path, target)
+    Controller(
+        role="advisor",
+        mailbox=mailbox,
+        turns=OpenHandsTurnRunner(
+            Config("advisor", state_dir, conversation_id),
+            full_prompt="complete research brief",
+        ),
+        conversation_id=conversation_id,
+        full_prompt="complete research brief",
+        sleep=lambda _seconds: None,
+        poll_interval_seconds=600,
+        jitter_seconds=0,
+    ).run(max_cycles=1)
+
+    assert len(calls) == 1
+    assert calls[0][1:] == (conversation_id, True)
+    assert request.recovery_prompt in calls[0][0]
+    with ContextResetRequestStore(queue_path) as store:
+        assert store.result(request.request_id).status == "completed"
+
+
+def test_context_reset_preserves_a_local_nudge_batched_into_the_same_turn(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    conversation_id = UUID("00000000-0000-0000-0000-000000000097")
+    (state_dir / conversation_id.hex).mkdir(parents=True)
+    count, digest = _raw_history_checkpoint(state_dir, conversation_id)
+    assert count == 0 and digest is not None
+    target = RoleTarget(research_tag="maple", role="advisor")
+    event_store_path = state_dir / "advisor-events.sqlite3"
+    nudge = AdvisorEvent(
+        kind="supervisor_nudge",
+        dedupe_key="supervisor-nudge:nudge-97",
+        payload={"message": "Check the preserved experiment state."},
+    )
+    with AdvisorEventStore(event_store_path) as store:
+        store.enqueue(nudge)
+    lease = WorkerLease(
+        pid=os.getpid(),
+        phase="sleep",
+        deadline=10_000,
+        conversation_id=str(conversation_id),
+    )
+    (state_dir / "controller-lease.json").write_text(
+        json.dumps(
+            {
+                "pid": lease.pid,
+                "phase": lease.phase,
+                "deadline": lease.deadline,
+                "conversation_id": lease.conversation_id,
+            }
+        )
+    )
+    request = ContextResetRequest(
+        request_id="reset-with-nudge-97",
+        target=target,
+        expected_conversation_id=conversation_id,
+        expected_control_token=_control_token(
+            lease,
+            conversation_id,
+            digest,
+            (nudge.dedupe_key,),
+        ),
+        expected_raw_history_event_count=count,
+        expected_raw_history_digest=digest,
+        expected_pending_event_keys=(nudge.dedupe_key,),
+        recovery_prompt="Recover without losing the already queued nudge.",
+    )
+    queue_path = state_dir / "context-resets.sqlite3"
+    with ContextResetRequestStore(queue_path) as store:
+        store.enqueue(request)
+
+    delivered = []
+
+    def run_openhands(
+        prompt,
+        _config,
+        *,
+        reset_context=False,
+        context_reset_applied=None,
+        inbox=None,
+        inbox_turn_id=None,
+        recovery_prompt=None,
+    ):
+        delivered.append((prompt, reset_context))
+        assert recovery_prompt is not None
+        turn = inbox.latest_turn(inbox_turn_id)
+        assert any(
+            "Check the preserved experiment state." in message.body
+            for message in turn.messages
+        )
+        process_inbox_turn(inbox, inbox_turn_id)
+        assert context_reset_applied is not None
+        context_reset_applied()
+        return 0
+
+    monkeypatch.setenv("SENPAI_ROLE", "advisor")
+    monkeypatch.setenv("RESEARCH_TAG", "maple")
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+    mailbox = CompositeMailbox(
+        LocalAdvisorMailbox(event_store_path),
+        ContextResetMailbox(queue_path, target),
+    )
+    Controller(
+        role="advisor",
+        mailbox=mailbox,
+        turns=OpenHandsTurnRunner(
+            Config("advisor", state_dir, conversation_id),
+            full_prompt="complete research brief",
+            github_mailbox=Mailbox(()),
+            active_poll_interval_seconds=0.001,
+        ),
+        conversation_id=conversation_id,
+        full_prompt="complete research brief",
+        sleep=lambda _seconds: None,
+        poll_interval_seconds=600,
+        jitter_seconds=0,
+    ).run(max_cycles=1)
+
+    assert delivered and delivered[0][1] is True
+    with ContextResetRequestStore(queue_path) as store:
+        completion = store.result(request.request_id).completion
+    assert completion is not None
+    assert completion.pending_event_keys == ()
+    assert completion.delivered_event_keys == (nudge.dedupe_key,)
+    with AdvisorEventStore(event_store_path) as store:
+        assert store.pending() == []
+
+
+def test_context_reset_completion_allows_a_new_role_event_racing_after_claim(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    conversation_id = UUID("00000000-0000-0000-0000-000000000098")
+    (state_dir / conversation_id.hex).mkdir(parents=True)
+    count, digest = _raw_history_checkpoint(state_dir, conversation_id)
+    assert count == 0 and digest is not None
+    lease = WorkerLease(
+        pid=os.getpid(),
+        phase="sleep",
+        deadline=10_000,
+        conversation_id=str(conversation_id),
+    )
+    (state_dir / "controller-lease.json").write_text(
+        json.dumps(
+            {
+                "pid": lease.pid,
+                "phase": lease.phase,
+                "deadline": lease.deadline,
+                "conversation_id": lease.conversation_id,
+            }
+        )
+    )
+    target = RoleTarget(research_tag="maple", role="advisor")
+    request = ContextResetRequest(
+        request_id="reset-race-98",
+        target=target,
+        expected_conversation_id=conversation_id,
+        expected_control_token=_control_token(lease, conversation_id, digest, ()),
+        expected_raw_history_event_count=count,
+        expected_raw_history_digest=digest,
+        expected_pending_event_keys=(),
+        recovery_prompt="Recover while preserving any newly arrived work.",
+    )
+    queue_path = state_dir / "context-resets.sqlite3"
+    event_store_path = state_dir / "advisor-events.sqlite3"
+    with ContextResetRequestStore(queue_path) as store:
+        store.enqueue(request)
+
+    def run_openhands(
+        _prompt,
+        _config,
+        *,
+        reset_context=False,
+        context_reset_applied=None,
+    ):
+        assert reset_context is True
+        with AdvisorEventStore(event_store_path) as store:
+            store.enqueue(
+                AdvisorEvent(
+                    kind="supervisor_nudge",
+                    dedupe_key="supervisor-nudge:raced-98",
+                    payload={"message": "New work arrived during reset."},
+                )
+            )
+        assert context_reset_applied is not None
+        context_reset_applied()
+        return 0
+
+    monkeypatch.setenv("SENPAI_ROLE", "advisor")
+    monkeypatch.setenv("RESEARCH_TAG", "maple")
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+
+    result = OpenHandsTurnRunner(
+        Config("advisor", state_dir, conversation_id),
+        full_prompt="complete research brief",
+    ).run(
+        "current actionable event",
+        conversation_id=conversation_id,
+        event_keys=frozenset(),
+    )
+
+    assert result.exit_code == 0
+    with ContextResetRequestStore(queue_path) as store:
+        completion = store.result(request.request_id).completion
+    assert completion is not None
+    assert completion.pending_event_keys == ("supervisor-nudge:raced-98",)
+    with AdvisorEventStore(event_store_path) as store:
+        assert [event.dedupe_key for event in store.pending()] == [
+            "supervisor-nudge:raced-98"
+        ]
+
+
+def test_context_reset_records_a_late_github_event_delivered_in_the_reset_prompt(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    conversation_id = UUID("00000000-0000-0000-0000-000000000099")
+    (state_dir / conversation_id.hex).mkdir(parents=True)
+    count, digest = _raw_history_checkpoint(state_dir, conversation_id)
+    assert count == 0 and digest is not None
+    lease = WorkerLease(
+        pid=os.getpid(),
+        phase="sleep",
+        deadline=10_000,
+        conversation_id=str(conversation_id),
+    )
+    (state_dir / "controller-lease.json").write_text(
+        json.dumps(
+            {
+                "pid": lease.pid,
+                "phase": lease.phase,
+                "deadline": lease.deadline,
+                "conversation_id": lease.conversation_id,
+            }
+        )
+    )
+    event_key = "github:issue-comment:99"
+    event_store_path = state_dir / "advisor-events.sqlite3"
+    with AdvisorEventStore(event_store_path) as store:
+        store.enqueue(
+            AdvisorEvent(
+                kind="github_comment",
+                dedupe_key=event_key,
+                payload={"message": "Review feedback delivered in this prompt."},
+            )
+        )
+    target = RoleTarget(research_tag="maple", role="advisor")
+    request = ContextResetRequest(
+        request_id="reset-github-99",
+        target=target,
+        expected_conversation_id=conversation_id,
+        expected_control_token=_control_token(
+            lease,
+            conversation_id,
+            digest,
+            (event_key,),
+        ),
+        expected_raw_history_event_count=count,
+        expected_raw_history_digest=digest,
+        expected_pending_event_keys=(event_key,),
+        recovery_prompt="Recover and act on the feedback in this prompt.",
+    )
+    queue_path = state_dir / "context-resets.sqlite3"
+    with ContextResetRequestStore(queue_path) as store:
+        store.enqueue(request)
+    github_event = ControllerEvent(
+        kind="github_comment",
+        dedupe_key=event_key,
+        payload={"message": "Review feedback delivered in this prompt."},
+    )
+
+    def run_openhands(
+        _prompt,
+        _config,
+        *,
+        reset_context=False,
+        context_reset_applied=None,
+        inbox=None,
+        inbox_turn_id=None,
+        recovery_prompt=None,
+    ):
+        assert reset_context is True
+        assert recovery_prompt is not None
+        process_inbox_turn(inbox, inbox_turn_id)
+        with AdvisorEventStore(event_store_path) as store:
+            assert [event.dedupe_key for event in store.pending()] == [event_key]
+        assert context_reset_applied is not None
+        context_reset_applied()
+        return 0
+
+    monkeypatch.setenv("SENPAI_ROLE", "advisor")
+    monkeypatch.setenv("RESEARCH_TAG", "maple")
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+    mailbox = CompositeMailbox(
+        Mailbox((github_event,)),
+        ContextResetMailbox(queue_path, target),
+    )
+    Controller(
+        role="advisor",
+        mailbox=mailbox,
+        turns=OpenHandsTurnRunner(
+            Config("advisor", state_dir, conversation_id),
+            full_prompt="complete research brief",
+            github_mailbox=Mailbox(()),
+            active_poll_interval_seconds=0.001,
+        ),
+        conversation_id=conversation_id,
+        full_prompt="complete research brief",
+        sleep=lambda _seconds: None,
+        poll_interval_seconds=600,
+        jitter_seconds=0,
+    ).run(max_cycles=1)
+
+    with AdvisorEventStore(event_store_path) as store:
+        assert store.pending() == []
+    with ContextResetRequestStore(queue_path) as store:
+        completion = store.result(request.request_id).completion
+    assert completion is not None
+    assert completion.pending_event_keys == ()
+    assert completion.delivered_event_keys == (event_key,)
+
+
+def test_context_reset_claim_preserves_a_new_event_arriving_after_enqueue(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    conversation_id = UUID("00000000-0000-0000-0000-000000000099")
+    (state_dir / conversation_id.hex).mkdir(parents=True)
+    count, digest = _raw_history_checkpoint(state_dir, conversation_id)
+    assert count == 0 and digest is not None
+    lease = WorkerLease(
+        pid=os.getpid(),
+        phase="sleep",
+        deadline=10_000,
+        conversation_id=str(conversation_id),
+    )
+    (state_dir / "controller-lease.json").write_text(
+        json.dumps(
+            {
+                "pid": lease.pid,
+                "phase": lease.phase,
+                "deadline": lease.deadline,
+                "conversation_id": lease.conversation_id,
+            }
+        )
+    )
+    target = RoleTarget(research_tag="maple", role="advisor")
+    event_store_path = state_dir / "advisor-events.sqlite3"
+    with AdvisorEventStore(event_store_path) as events:
+        events.enqueue(
+            AdvisorEvent(kind="nudge", dedupe_key="existing", payload={})
+        )
+    request = ContextResetRequest(
+        request_id="reset-before-claim-99",
+        target=target,
+        expected_conversation_id=conversation_id,
+        expected_control_token=_control_token(
+            lease,
+            conversation_id,
+            digest,
+            ("existing",),
+        ),
+        expected_raw_history_event_count=count,
+        expected_raw_history_digest=digest,
+        expected_pending_event_keys=("existing",),
+        recovery_prompt="Recover while preserving all pending work.",
+    )
+    queue_path = state_dir / "context-resets.sqlite3"
+    with ContextResetRequestStore(queue_path) as resets:
+        resets.enqueue(request)
+    with AdvisorEventStore(event_store_path) as events:
+        events.enqueue(AdvisorEvent(kind="nudge", dedupe_key="new", payload={}))
+
+    monkeypatch.setenv("SENPAI_ROLE", "advisor")
+    monkeypatch.setenv("RESEARCH_TAG", "maple")
+
+    assert _claim_context_reset(state_dir, conversation_id) == request
+    with ContextResetRequestStore(queue_path) as resets:
+        assert resets.result(request.request_id).status == "processing"
+    with AdvisorEventStore(event_store_path) as events:
+        assert [event.dedupe_key for event in events.pending()] == ["existing", "new"]
 
 
 def test_terminal_turn_recovery_preserves_history_and_excludes_new_events(

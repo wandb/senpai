@@ -2,12 +2,15 @@ import os
 from pathlib import Path
 
 import pytest
+from openhands_support import runtime_config, runtime_env
 from pydantic import SecretStr
+from test_agent_markdown import HTML_HEADER, PLAIN_HEADER
 
 import senpai_agent.openhands_runner as runner
 from senpai_agent.openhands_runner import (
     build_main_agent_context,
     find_role_file,
+    live_controller_invariant,
     parse_runner_args,
     read_role_instructions,
     resolve_config,
@@ -15,8 +18,6 @@ from senpai_agent.openhands_runner import (
     sanitized_project_skills,
     scrub_model_credentials,
 )
-from openhands_support import runtime_config, runtime_env
-from test_agent_markdown import HTML_HEADER, PLAIN_HEADER
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -51,22 +52,49 @@ def test_main_agent_context_places_harness_and_role_before_project_skills():
     context = build_main_agent_context("harness instructions", "advisor role")
 
     assert context.system_message_suffix == (
-        "# Senpai harness\n\nharness instructions\n\n"
-        "# Senpai role\n\nadvisor role\n"
+        "# Senpai harness\n\nharness instructions\n\n# Senpai role\n\nadvisor role\n"
     )
     assert context.current_datetime is None
     assert context.load_user_skills is True
     assert context.load_project_skills is False
 
 
-def test_student_charter_requires_typed_tools_for_every_training_operation():
+def test_supervisor_context_does_not_load_persistent_user_skills():
+    context = build_main_agent_context(
+        "harness",
+        "supervisor",
+        load_user_skills=False,
+    )
+
+    assert context.load_user_skills is False
+
+
+def test_live_advisor_invariant_is_part_of_non_condensed_system_context(tmp_path):
+    advisor = runtime_config(tmp_path, role="advisor", max_turns=100000)
+    invariant = live_controller_invariant(advisor)
+    context = build_main_agent_context("harness", "advisor", (), invariant)
+
+    assert "advisor campaign is active" in context.system_message_suffix
+    assert "no configured campaign round limit" in context.system_message_suffix
+    assert "max_turns=100000 bounds one OpenHands turn" in context.system_message_suffix
+    assert 'round label such as "FINAL ROUND"' in context.system_message_suffix
+    assert live_controller_invariant(runtime_config(tmp_path, role="student")) == ""
+    assert (
+        live_controller_invariant(runtime_config(tmp_path, role="advisor", child=True))
+        == ""
+    )
+
+
+def test_student_charter_requires_typed_tools_for_every_long_job():
     instructions = (ROOT / "system_instructions" / "STUDENT.md").read_text()
 
-    assert "must use `run_training`" in instructions
-    assert "Never launch training through the terminal" in instructions
-    assert "`monitor_training`" in instructions
-    assert "`get_training_status`" in instructions
-    assert "`cancel_training`" in instructions
+    assert "must use `run_job`" in instructions
+    assert (
+        "Never launch these long-running processes through the terminal" in instructions
+    )
+    assert "`monitor_job`" in instructions
+    assert "`get_job_status`" in instructions
+    assert "`cancel_job`" in instructions
 
 
 def test_project_instructions_and_file_agents_are_sanitized_without_mutation(
@@ -88,8 +116,12 @@ def test_project_instructions_and_file_agents_are_sanitized_without_mutation(
     skills = sanitized_project_skills(workspace)
     definitions = sanitized_agent_definitions(workspace)
 
-    assert "SPDX-" not in next(skill.content for skill in skills if skill.name == "agents")
-    assert "SPDX-" not in next(item.system_prompt for item in definitions if item.name == "review")
+    assert "SPDX-" not in next(
+        skill.content for skill in skills if skill.name == "agents"
+    )
+    assert "SPDX-" not in next(
+        item.system_prompt for item in definitions if item.name == "review"
+    )
     assert instructions.read_text(encoding="utf-8").startswith("<!--\nSPDX-")
     assert "# SPDX-" in definition.read_text(encoding="utf-8")
 
@@ -118,6 +150,8 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
             "GH_TOKEN": "secondary-github-key",
             "WANDB_API_KEY": "wandb-key",
             "EXA_API_KEY": "exa-key",
+            "HF_TOKEN": "hf-key",
+            "MLXFAST_API_TOKEN": "mlxfast-key",
             "SENPAI_TIMEOUT_MINUTES": "0.5",
         }
     )
@@ -132,6 +166,8 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
     assert config.command_secrets == {
         "WANDB_API_KEY": "wandb-key",
         "EXA_API_KEY": "exa-key",
+        "HF_TOKEN": "hf-key",
+        "MLXFAST_API_TOKEN": "mlxfast-key",
     }
     assert "ANTHROPIC_API_KEY" not in config.command_secrets
     assert "OPENAI_API_KEY" not in config.command_secrets
@@ -143,6 +179,22 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
     assert delegated.smart_api_key == "openai-key"
     assert delegated.fast_api_key == "openai-key"
     assert delegated.frontier_api_key == "openai-key"
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_hugging_face_access_is_masked_for_every_research_role(tmp_path, role):
+    """
+    Requirement: optional Hugging Face access must never be an ambient,
+    unmasked credential in either model-facing research role.
+    Interface: the resolved OpenHands command-secret registry.
+    """
+
+    env = runtime_env(tmp_path)
+    env.update({"SENPAI_ROLE": role, "HF_TOKEN": "hf-role-key"})
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert config.command_secrets["HF_TOKEN"] == "hf-role-key"
 
 
 @pytest.mark.parametrize(
@@ -157,6 +209,50 @@ def test_runtime_stall_bounds_are_validated(tmp_path, updates, message):
     env.update(updates)
 
     with pytest.raises(RuntimeError, match=message):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+
+def test_local_condenser_limits_are_explicit_and_configurable(tmp_path):
+    default = resolve_config(
+        parse_runner_args(["--max-turns", "1"]),
+        runtime_env(tmp_path),
+    )
+    env = runtime_env(tmp_path)
+    env["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"] = "180"
+    env["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS"] = "190000"
+    env["SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS"] = "40"
+
+    configured = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert default.local_condenser_max_events == 0
+    assert default.local_condenser_max_tokens == 0
+    assert default.local_condenser_target_events == 0
+    assert configured.local_condenser_max_events == 180
+    assert configured.local_condenser_max_tokens == 190_000
+    assert configured.local_condenser_target_events == 40
+
+
+@pytest.mark.parametrize("value", ["eleven", "11"])
+def test_local_condenser_event_cap_rejects_invalid_values(tmp_path, value):
+    env = runtime_env(tmp_path)
+    env["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"] = value
+
+    with pytest.raises(RuntimeError, match="condenser|integers|at least 12"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS", "-1"),
+        ("SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS", "-1"),
+    ],
+)
+def test_local_condenser_limits_reject_negative_values(tmp_path, name, value):
+    env = runtime_env(tmp_path)
+    env[name] = value
+
+    with pytest.raises(RuntimeError, match="non-negative"):
         resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
@@ -273,6 +369,55 @@ def test_wandb_gateway_configuration_is_explicit_and_uses_max_glm_reasoning(
     assert config.frontier_reasoning_effort == "max"
 
 
+@pytest.mark.parametrize(
+    ("model", "effort", "key_env", "key"),
+    [
+        (
+            "anthropic/claude-opus-4-8",
+            "xhigh",
+            "ANTHROPIC_API_KEY",
+            "anthropic-key",
+        ),
+        ("wandb/zai-org/GLM-5.2", "max", "WANDB_API_KEY", "wandb-key"),
+    ],
+)
+def test_supervisor_uses_only_its_primary_model_profile(
+    tmp_path: Path,
+    model: str,
+    effort: str,
+    key_env: str,
+    key: str,
+):
+    env = runtime_env(tmp_path, role="supervisor")
+    env.update(
+        {
+            key_env: key,
+            "WANDB_ENTITY": "research-team",
+            "WANDB_PROJECT": "mlxfast",
+            "SENPAI_OPENHANDS_MODEL": model,
+            "SENPAI_OPENHANDS_REASONING_EFFORT": effort,
+        }
+    )
+    for unused in {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "WANDB_API_KEY"} - {
+        key_env
+    }:
+        env.pop(unused, None)
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert config.model == config.smart_model == config.fast_model
+    assert config.model == config.frontier_model == model
+    assert config.api_key_env == config.smart_api_key_env == key_env
+    assert config.api_key_env == config.fast_api_key_env == config.frontier_api_key_env
+    assert config.api_key.get_secret_value() == key
+    assert config.smart_api_key.get_secret_value() == key
+    assert config.fast_api_key.get_secret_value() == key
+    assert config.frontier_api_key.get_secret_value() == key
+    assert config.reasoning_effort == config.smart_reasoning_effort == effort
+    assert config.reasoning_effort == config.fast_reasoning_effort
+    assert config.reasoning_effort == config.frontier_reasoning_effort
+
+
 def test_fast_model_uses_luna_for_an_openai_main_profile(tmp_path: Path):
     env = runtime_env(tmp_path)
     env.update(
@@ -361,7 +506,7 @@ def test_all_model_profiles_accept_independent_cli_model_and_effort_settings(
             "unsupported",
         ),
         (
-            {"SENPAI_OPENHANDS_FRONTIER_MODEL": "anthropic/claude-opus-4-8"},
+            {"SENPAI_OPENHANDS_FRONTIER_MODEL": "anthropic/claude-haiku-4-5"},
             "unsupported for",
         ),
     ],
@@ -376,6 +521,44 @@ def test_invalid_model_profile_effort_fails_configuration(
 
     with pytest.raises(ValueError, match=message):
         resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+
+def test_requested_anthropic_profiles_resolve_with_documented_efforts(
+    tmp_path: Path,
+):
+    env = runtime_env(tmp_path)
+    env.update(
+        {
+            "ANTHROPIC_API_KEY": "anthropic-key",
+            "SENPAI_OPENHANDS_MODEL": "anthropic/claude-opus-5",
+            "SENPAI_OPENHANDS_REASONING_EFFORT": "xhigh",
+            "SENPAI_OPENHANDS_SMART_MODEL": "anthropic/claude-opus-5",
+            "SENPAI_OPENHANDS_SMART_REASONING_EFFORT": "xhigh",
+            "SENPAI_OPENHANDS_FAST_MODEL": "anthropic/claude-sonnet-5",
+            "SENPAI_OPENHANDS_FAST_REASONING_EFFORT": "high",
+            "SENPAI_OPENHANDS_FRONTIER_MODEL": "anthropic/claude-fable-5",
+            "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": "max",
+        }
+    )
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert (config.model, config.reasoning_effort) == (
+        "anthropic/claude-opus-5",
+        "xhigh",
+    )
+    assert (config.smart_model, config.smart_reasoning_effort) == (
+        "anthropic/claude-opus-5",
+        "xhigh",
+    )
+    assert (config.fast_model, config.fast_reasoning_effort) == (
+        "anthropic/claude-sonnet-5",
+        "high",
+    )
+    assert (config.frontier_model, config.frontier_reasoning_effort) == (
+        "anthropic/claude-fable-5",
+        "max",
+    )
 
 
 def test_explicit_api_key_env_preserves_custom_provider_support(tmp_path: Path):
@@ -510,6 +693,18 @@ def test_advisor_config_reuses_its_durable_conversation_id(tmp_path: Path):
     second = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
     assert first.conversation_id == second.conversation_id
+
+
+def test_operational_supervisor_uses_a_fresh_conversation_per_resolved_turn(
+    tmp_path: Path,
+):
+    env = runtime_env(tmp_path, role="supervisor")
+
+    first = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+    second = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert first.role == "supervisor"
+    assert first.conversation_id != second.conversation_id
 
 
 @pytest.mark.parametrize("state_location", [None, "inside-workspace"])

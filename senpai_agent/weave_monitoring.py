@@ -10,7 +10,10 @@ from uuid import UUID
 from weave_openhands import finish as weave_finish
 from weave_openhands import init as weave_init
 
-from senpai_agent.secrets import GITHUB_TOKEN_ENV_NAMES
+from senpai_agent.secrets import (
+    GITHUB_TOKEN_ENV_NAMES,
+    is_secret_environment_variable,
+)
 
 _initialized = False
 _project_name: str | None = None
@@ -24,9 +27,7 @@ TRACE_SECRET_ENV_NAMES = (
 
 
 def _is_secret_env(name: str) -> bool:
-    return name in TRACE_SECRET_ENV_NAMES or name.endswith(
-        ("_API_KEY", "_TOKEN", "_PASSWORD", "_SECRET", "_CREDENTIAL")
-    )
+    return name in TRACE_SECRET_ENV_NAMES or is_secret_environment_variable(name)
 
 
 def weave_project_name(env: Mapping[str, str]) -> str | None:
@@ -44,6 +45,9 @@ def weave_agent_name(env: Mapping[str, str]) -> str:
     student_name = env.get("STUDENT_NAME")
     if role == "student" and student_name:
         return f"student-{student_name}"
+    advisor_name = env.get("ADVISOR_NAME")
+    if role == "advisor" and advisor_name and advisor_name != "advisor":
+        return f"advisor-{advisor_name}"
     return role
 
 
@@ -115,12 +119,22 @@ def initialize_weave_monitoring(
         return None
 
     redactor = secret_redactor(env)
-    weave_init(
-        project_name,
-        agent_name=weave_agent_name(env),
-        capture_content=True,
-        content_transform=redactor,
-    )
+    wandb_key = env.get("WANDB_API_KEY")
+    previous_wandb_key = os.environ.get("WANDB_API_KEY")
+    if wandb_key is not None:
+        os.environ["WANDB_API_KEY"] = wandb_key
+    try:
+        weave_init(
+            project_name,
+            agent_name=weave_agent_name(env),
+            capture_content=True,
+            content_transform=redactor,
+        )
+    finally:
+        if previous_wandb_key is None:
+            os.environ.pop("WANDB_API_KEY", None)
+        else:
+            os.environ["WANDB_API_KEY"] = previous_wandb_key
     _content_redactor = redactor
     _initialized = True
     _project_name = project_name

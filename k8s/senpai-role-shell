@@ -1,0 +1,8 @@
+#!/bin/bash
+
+# SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-PackageName: senpai
+
+set -e
+exec /opt/senpai-venv/bin/python -I -m senpai_agent.repair_broker repair "$@"

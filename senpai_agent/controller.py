@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import signal
@@ -32,6 +33,7 @@ from senpai_agent.inbox import (
 )
 from senpai_agent.mailbox import (
     CompositeMailbox,
+    ContextResetMailbox,
     ControllerEvent,
     LocalAdvisorMailbox,
     LocalStudentMailbox,
@@ -49,8 +51,12 @@ from senpai_agent.state import (
     StudentConversationSelector,
     WorkspaceDivergenceLedger,
 )
-from senpai_agent.supervisor import LEASE_ENV, ProgressLease
-from senpai_agent.workspace import StudentWorkspaceReconciler, WorkspaceDivergence
+from senpai_agent.supervisor import GENERATION_ENV, LEASE_ENV, ProgressLease
+from senpai_agent.workspace import (
+    StudentWorkspaceReconciler,
+    WorkspaceDivergence,
+    WorkspaceJobRunning,
+)
 
 
 _EDGE_TRIGGERED_EVENT_KINDS = frozenset({"research_base_changed"})
@@ -135,7 +141,7 @@ class OpenHandsTurnRunner:
         *,
         full_prompt: str,
         github_mailbox: GitHubMailbox | None = None,
-        active_poll_interval_seconds: float = 30,
+        active_poll_interval_seconds: float = 120,
     ):
         self.config = config
         self.full_prompt = full_prompt.strip()
@@ -160,6 +166,7 @@ class OpenHandsTurnRunner:
             self.config,
             conversation_id=conversation_id,
         )
+        reset_request = _claim_context_reset(config.state_dir, conversation_id)
         turn_deadline = time.monotonic() + config.timeout_seconds
         if (inbox is None) != (inbox_turn_id is None):
             raise ValueError("inbox and inbox turn ID must be provided together")
@@ -176,11 +183,45 @@ class OpenHandsTurnRunner:
                 ),
             }
 
-        def run_turn() -> int:
+        def run_turn(
+            reset_delivered_event_keys: frozenset[str] = frozenset(),
+        ) -> int:
+            current_prompt = prompt
+            reset_callback = None
+            if reset_request is not None:
+                current_prompt = _context_recovery_prompt(
+                    self.full_prompt,
+                    f"{reset_request.recovery_prompt}\n\n{prompt}",
+                )
+
+                def reset_callback() -> None:
+                    if reset_delivered_event_keys:
+                        with AdvisorEventStore(local_event_db_path(config)) as store:
+                            for event_key in reset_delivered_event_keys:
+                                store.acknowledge(event_key)
+                    _complete_context_reset(
+                        config.state_dir,
+                        reset_request,
+                        delivered_event_keys=tuple(
+                            sorted(
+                                reset_delivered_event_keys.intersection(
+                                    reset_request.expected_pending_event_keys
+                                )
+                            )
+                        ),
+                    )
             try:
-                return run_openhands(prompt, config, **inbox_options())
+                if reset_callback is not None:
+                    return run_openhands(
+                        current_prompt,
+                        config,
+                        reset_context=True,
+                        context_reset_applied=reset_callback,
+                        **inbox_options(),
+                    )
+                return run_openhands(current_prompt, config, **inbox_options())
             except Exception as error:
-                if not _is_context_history_failure(error):
+                if reset_request is not None or not _is_context_history_failure(error):
                     raise
                 print(
                     "SENPAI_CONTEXT_RECOVERY "
@@ -235,9 +276,10 @@ class OpenHandsTurnRunner:
         # A late watcher event may still be pending locally when the next
         # controller prompt carries that same GitHub event. The prompt is the
         # delivery path for this turn, so keep the event pump from repeating it.
-        with AdvisorEventStore(store_path) as store:
-            for event_key in event_keys:
-                store.acknowledge(event_key)
+        if reset_request is None:
+            with AdvisorEventStore(store_path) as store:
+                for event_key in event_keys:
+                    store.acknowledge(event_key)
         with ActiveGitHubWatcher(
             self.github_mailbox,
             store_path,
@@ -245,12 +287,111 @@ class OpenHandsTurnRunner:
             poll_interval_seconds=self.active_poll_interval_seconds,
             map_event=map_event,
         ) as watcher:
-            exit_code = run_turn()
+            exit_code = run_turn(
+                event_keys if reset_request is not None else frozenset()
+            )
         with AdvisorEventStore(store_path) as store:
             delivered = store.acknowledged(tuple(watcher.enqueued_keys))
         return TurnResult(
             exit_code=exit_code,
             delivered_event_keys=frozenset(delivered),
+        )
+
+
+def _claim_context_reset(state_dir: Path, conversation_id: UUID):
+    from senpai_agent.operations import ContextResetRequestStore, RoleTarget
+    from senpai_agent.role_control import (
+        _active_delegation_count,
+        _control_token,
+        _pending_event_keys,
+        _raw_history_checkpoint,
+        _read_lease,
+    )
+
+    queue_path = state_dir / "context-resets.sqlite3"
+    if not queue_path.is_file():
+        return None
+    role = os.environ.get("SENPAI_ROLE")
+    research_tag = os.environ.get("RESEARCH_TAG")
+    if role not in {"advisor", "student"} or not research_tag:
+        return None
+    target = RoleTarget(
+        research_tag=research_tag,
+        role=role,
+        student=os.environ.get("STUDENT_NAME") if role == "student" else None,
+    )
+    with ContextResetRequestStore(queue_path) as store:
+        request = store.claim_next(target, conversation_id=conversation_id)
+        if request is None:
+            return None
+        count, digest = _raw_history_checkpoint(state_dir, conversation_id)
+        pending = _pending_event_keys(state_dir, target, conversation_id)
+        token = _control_token(
+            _read_lease(state_dir / "controller-lease.json"),
+            conversation_id,
+            digest,
+            request.expected_pending_event_keys,
+            _active_delegation_count(state_dir),
+        )
+        if count != request.expected_raw_history_event_count:
+            store.reject(request.request_id, "raw-history-count-changed")
+            return None
+        if digest != request.expected_raw_history_digest:
+            store.reject(request.request_id, "raw-history-prefix-changed")
+            return None
+        if not set(request.expected_pending_event_keys).issubset(pending):
+            store.reject(request.request_id, "pending-events-lost")
+            return None
+        if token != request.expected_control_token:
+            store.reject(request.request_id, "controller-identity-changed")
+            return None
+        return request
+
+
+def _complete_context_reset(
+    state_dir: Path,
+    request: object,
+    *,
+    delivered_event_keys: tuple[str, ...] = (),
+) -> None:
+    from senpai_agent.operations import (
+        ContextResetCompletion,
+        ContextResetRequest,
+        ContextResetRequestStore,
+    )
+    from senpai_agent.role_control import (
+        _pending_event_keys,
+        _raw_history_checkpoint,
+    )
+
+    reset = ContextResetRequest.model_validate(request)
+    total_count, _ = _raw_history_checkpoint(
+        state_dir,
+        reset.expected_conversation_id,
+    )
+    _, prefix_digest = _raw_history_checkpoint(
+        state_dir,
+        reset.expected_conversation_id,
+        event_count=reset.expected_raw_history_event_count,
+    )
+    if total_count is None or prefix_digest is None:
+        raise RuntimeError("context reset history checkpoint is unreadable")
+    pending = _pending_event_keys(
+        state_dir,
+        reset.target,
+        reset.expected_conversation_id,
+    )
+    with ContextResetRequestStore(state_dir / "context-resets.sqlite3") as store:
+        store.complete(
+            ContextResetCompletion(
+                request_id=reset.request_id,
+                target=reset.target,
+                conversation_id=reset.expected_conversation_id,
+                raw_history_event_count_after=total_count,
+                raw_history_digest=prefix_digest,
+                pending_event_keys=pending,
+                delivered_event_keys=delivered_event_keys,
+            )
         )
 
 
@@ -308,8 +449,15 @@ class Controller:
         sleep: Callable[[float], None] = time.sleep,
         poll_interval_seconds: float = 600,
         jitter_seconds: float = 120,
+        next_monitor_poll_seconds: Callable[[], float | None] | None = None,
     ):
-        if min(poll_interval_seconds, jitter_seconds) < 0:
+        if (
+            not all(
+                math.isfinite(value)
+                for value in (poll_interval_seconds, jitter_seconds)
+            )
+            or min(poll_interval_seconds, jitter_seconds) < 0
+        ):
             raise ValueError("poll and jitter intervals must not be negative")
         if start_gate_poll_seconds <= 0:
             raise ValueError("start-gate polling interval must be positive")
@@ -339,6 +487,7 @@ class Controller:
         self.sleep = sleep
         self.poll_interval_seconds = poll_interval_seconds
         self.jitter_seconds = jitter_seconds
+        self.next_monitor_poll_seconds = next_monitor_poll_seconds
         self.event_reminder_seconds = (
             max(poll_interval_seconds, 600)
             if event_reminder_seconds is None
@@ -387,6 +536,7 @@ class Controller:
                     self._publish_progress(
                         "openhands-turn",
                         self.turn_timeout_seconds,
+                        conversation_id=conversation_id,
                     )
                     result = self.turns.run(
                         turn.prompt.body,
@@ -477,10 +627,8 @@ class Controller:
                 )
                 self._sleep("turn-backoff", delay)
                 continue
-            self._sleep(
-                "sleep",
-                self.poll_interval_seconds + random.uniform(0, self.jitter_seconds),
-            )
+            phase, delay = self._idle_delay()
+            self._sleep(phase, delay)
 
     def _poll_into_inbox(self, *, allow_reminders: bool = True) -> None:
         self._publish_progress("poll")
@@ -509,6 +657,36 @@ class Controller:
                 self._publish_progress("reconcile")
                 try:
                     self.reconcile(batch_events)
+                except WorkspaceJobRunning as busy:
+                    retry_delay = 30.0
+                    retry_at = time.monotonic() + retry_delay
+                    checkout_kinds = {
+                        "student_assignment",
+                        "student_pr_feedback",
+                    }
+                    deferred_events = tuple(
+                        event
+                        for event in batch_events
+                        if event.kind in checkout_kinds
+                    )
+                    batch_events = tuple(
+                        event
+                        for event in batch_events
+                        if event.kind not in checkout_kinds
+                    )
+                    for event in deferred_events:
+                        self._visible.pop(event.dedupe_key, None)
+                        self._deferred_until[event.dedupe_key] = retry_at
+                    print(
+                        "SENPAI_WORKSPACE_JOB_DEFERRED "
+                        f"conversation_id={conversation_id} "
+                        f"retry_after_seconds={retry_delay:g} "
+                        f"jobs={','.join(busy.job_ids)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    if not batch_events:
+                        continue
                 except WorkspaceDivergence as conflict:
                     print(
                         f"SENPAI_WORKSPACE_DIVERGENCE {conflict}",
@@ -646,12 +824,16 @@ class Controller:
         timeout_seconds: float | None = None,
         *,
         completed_turn: bool = False,
+        conversation_id: UUID | None = None,
     ) -> None:
         if self.progress is not None:
             self.progress.update(
                 phase,
                 timeout_seconds or self.operation_timeout_seconds,
                 completed_turn=completed_turn,
+                conversation_id=(
+                    str(conversation_id) if conversation_id is not None else None
+                ),
             )
 
     def _sleep(self, phase: str, seconds: float) -> None:
@@ -660,6 +842,33 @@ class Controller:
             max(seconds + self.operation_timeout_seconds, 1),
         )
         self.sleep(seconds)
+
+    def _idle_delay(self) -> tuple[str, float]:
+        heartbeat = max(
+            1.0,
+            self.poll_interval_seconds + random.uniform(0, self.jitter_seconds),
+        )
+        if self.next_monitor_poll_seconds is None:
+            return "sleep", heartbeat
+        try:
+            monitor_delay = self.next_monitor_poll_seconds()
+        except Exception as error:  # noqa: BLE001
+            print(
+                f"SENPAI_MONITOR_SCHEDULE_ERROR {type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return "monitor-backoff", min(heartbeat, 5.0)
+        if monitor_delay is None:
+            return "sleep", heartbeat
+        if not math.isfinite(monitor_delay) or monitor_delay < 0:
+            print(
+                f"SENPAI_MONITOR_SCHEDULE_INVALID delay={monitor_delay!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return "monitor-backoff", min(heartbeat, 5.0)
+        return "monitor-sleep", max(1.0, min(heartbeat, monitor_delay))
 
     def _has_started(self, conversation_id: UUID) -> bool:
         return conversation_id in self._started or (
@@ -760,17 +969,26 @@ def _full_prompt(role: Literal["advisor", "student"], env: Mapping[str, str]) ->
     workspace = Path(env["SENPAI_OPENHANDS_WORKSPACE"]).resolve()
     instructions = workspace / "instructions" / f"prompt-{role}.md"
     program = workspace / "program.md"
+    if not program.is_file() and (workspace / "senpai" / "program.md").is_file():
+        program = workspace / "senpai" / "program.md"
     template_env = {
         key: env[key] for key in _PROMPT_TEMPLATE_VARIABLES if key in env
     }
-    role_prompt = Template(read_agent_markdown(instructions)).safe_substitute(
-        template_env
+    role_prompt = (
+        Template(read_agent_markdown(instructions))
+        .safe_substitute(template_env)
+        .strip()
+        if instructions.is_file()
+        else (
+            "Follow the repository AGENTS.md, the assigned GitHub work, "
+            "and the Senpai role charter."
+        )
     )
     prompt = (
         "# Research programme\n\n"
         f"{read_agent_markdown(program).strip()}\n\n"
         f"# {role.title()} task\n\n"
-        f"{role_prompt.strip()}"
+        f"{role_prompt}"
     )
     encoded_extra = env.get("EXTRA_INSTRUCTIONS_B64")
     if encoded_extra:
@@ -785,7 +1003,10 @@ def _full_prompt(role: Literal["advisor", "student"], env: Mapping[str, str]) ->
         f"W&B: {env['WANDB_ENTITY']}/{env['WANDB_PROJECT']}."
     )
     if role == "advisor":
-        identity += f" Students: {env.get('STUDENT_NAMES', '')}."
+        identity += (
+            f" Advisor: {env.get('ADVISOR_NAME', 'advisor')}."
+            f" Students: {env.get('STUDENT_NAMES', '')}."
+        )
     else:
         identity += f" Student: {env['STUDENT_NAME']}."
     return f"{prompt}\n\n# Runtime identity\n\n{identity}"
@@ -808,7 +1029,16 @@ def controller_main(
 ) -> int:
     import argparse
 
-    progress = ProgressLease(Path(env[LEASE_ENV])) if env.get(LEASE_ENV) else None
+    progress = (
+        ProgressLease(
+            Path(env[LEASE_ENV]),
+            generation=(
+                int(env[GENERATION_ENV]) if env.get(GENERATION_ENV) else None
+            ),
+        )
+        if env.get(LEASE_ENV)
+        else None
+    )
     if progress is not None:
         progress.update("startup", 300)
 
@@ -819,6 +1049,7 @@ def controller_main(
         resolve_config,
         scrub_model_credentials,
     )
+    from senpai_agent.operations import RoleTarget
     from senpai_agent.tools import (
         close_training_runtimes,
         training_runtime,
@@ -873,29 +1104,52 @@ def controller_main(
     mailbox: Mailbox = github_mailbox
     conversation_selector = None
     reconcile = None
+    job_supervisor, monitor_store = training_runtime(
+        runner_config.workspace,
+        runner_config.state_dir / "training",
+        max_timeout_seconds=runner_config.training_max_timeout_seconds,
+    )
+    monitor_mailbox = MonitorMailbox(
+        TrainingMonitorEngine(
+            monitor_store,
+            job_supervisor,
+            WandbMetricSource(
+                env["WANDB_ENTITY"],
+                env["WANDB_PROJECT"],
+                api_key=runner_config.command_secrets.get("WANDB_API_KEY"),
+            ),
+        ),
+        monitor_store,
+    )
 
     if role == "advisor":
+        role_target = RoleTarget(
+            research_tag=env["RESEARCH_TAG"],
+            role="advisor",
+        )
         mailbox = CompositeMailbox(
             github_mailbox,
             LocalAdvisorMailbox(runner_config.state_dir / "advisor-events.sqlite3"),
+            ContextResetMailbox(
+                runner_config.state_dir / "context-resets.sqlite3",
+                role_target,
+            ),
+            monitor_mailbox,
         )
     else:
-        training, monitor_store = training_runtime(
-            runner_config.workspace,
-            runner_config.state_dir / "training",
-            max_timeout_seconds=runner_config.training_max_timeout_seconds,
-        )
-        metrics = WandbMetricSource(
-            env["WANDB_ENTITY"],
-            env["WANDB_PROJECT"],
+        role_target = RoleTarget(
+            research_tag=env["RESEARCH_TAG"],
+            role="student",
+            student=env["STUDENT_NAME"],
         )
         mailbox = CompositeMailbox(
             github_mailbox,
             LocalStudentMailbox(runner_config.state_dir / "student-events.sqlite3"),
-            MonitorMailbox(
-                TrainingMonitorEngine(monitor_store, training, metrics),
-                monitor_store,
+            ContextResetMailbox(
+                runner_config.state_dir / "context-resets.sqlite3",
+                role_target,
             ),
+            monitor_mailbox,
         )
         registry = AssignmentConversationRegistry(
             runner_config.state_dir / "student-conversations.json"
@@ -905,6 +1159,7 @@ def controller_main(
             runner_config.workspace,
             repo=runner_config.github_repo,
             token=runner_config.github_token,
+            active_mutable_job_ids=job_supervisor.active_mutable_job_ids,
         )
 
     full_prompt = _full_prompt(role, env)
@@ -925,7 +1180,7 @@ def controller_main(
         full_prompt=full_prompt,
         github_mailbox=github_mailbox,
         active_poll_interval_seconds=float(
-            env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "30")
+            env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "120")
         ),
     )
     controller = Controller(
@@ -984,6 +1239,7 @@ def controller_main(
             "POLL_JITTER_S",
             120,
         ),
+        next_monitor_poll_seconds=monitor_store.seconds_until_next_poll,
     )
 
     def interrupt(_signum: int, _frame: object) -> None:

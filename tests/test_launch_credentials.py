@@ -7,6 +7,7 @@ import urllib.parse
 import pytest
 
 from launch_test_support import launch_helpers
+from senpai.launch.specs import target_repo_slug
 
 
 class JSONResponse:
@@ -21,6 +22,37 @@ class JSONResponse:
 
     def read(self):
         return self.body
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://token@github.com/example/problem.git",
+        "https://user:password@github.com/example/problem.git",
+        "ssh://token@github.com/example/problem.git",
+        "https://github.com/example/problem.git?token=credential",
+        "https://git.example.com/example/problem.git",
+        "/workspace/credentialed-repository",
+    ],
+)
+def test_repository_urls_reject_credentials_and_non_github_forms(url):
+    with pytest.raises(ValueError, match="uncredentialed"):
+        target_repo_slug(url)
+    with pytest.raises(ValueError, match="uncredentialed"):
+        launch_helpers.target_repo_slug(url)
+
+
+@pytest.mark.parametrize(
+    ("url", "slug"),
+    [
+        ("https://github.com/example/problem.git", "example/problem"),
+        ("git@github.com:example/problem.git", "example/problem"),
+        ("ssh://git@github.com/example/problem", "example/problem"),
+    ],
+)
+def test_repository_urls_accept_uncredentialed_github_https_and_ssh(url, slug):
+    assert target_repo_slug(url) == slug
+    assert launch_helpers.target_repo_slug(url) == slug
 
 
 def capture_request(monkeypatch, payload):

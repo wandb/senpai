@@ -3,11 +3,13 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from openhands.sdk.conversation import ConversationExecutionStatus
 from openhands.sdk.event import ActionEvent, ObservationEvent
 from openhands.sdk.llm import MessageToolCall
+from sqlite_test_support import assert_repeated_concurrent_first_open
 
 from senpai_agent.advisor import (
     AdvisorEvent,
@@ -26,7 +28,7 @@ class ConversationStateStub:
     def __init__(
         self,
         events=(),
-        execution_status=ConversationExecutionStatus.FINISHED,
+        execution_status=ConversationExecutionStatus.RUNNING,
     ):
         self.events = list(events)
         self.execution_status = execution_status
@@ -81,6 +83,25 @@ def test_advisor_conversation_id_is_persisted(tmp_path: Path):
 
     assert first == second
     assert (tmp_path / "advisor-conversation-id").read_text() == f"{first}\n"
+
+
+def test_event_store_allows_bounded_concurrent_first_open(tmp_path: Path):
+    """
+    Requirement: controller, watcher, delegation, and role-control processes may
+    first discover the event queue concurrently without losing the queue.
+    Interface: AdvisorEventStore construction and its pending-event view.
+    """
+
+    assert_repeated_concurrent_first_open(
+        lambda attempt: AdvisorEventStore(
+            tmp_path / f"advisor-events-{attempt}.sqlite3"
+        ),
+        attempts=100,
+    )
+
+    database = tmp_path / "advisor-events-reopen.sqlite3"
+    with AdvisorEventStore(database) as reopened:
+        assert reopened.pending() == []
 
 
 def test_event_store_deduplicates_and_survives_reopen(tmp_path: Path):
@@ -146,7 +167,7 @@ def test_deliver_pending_events_acknowledges_only_messages_sent(tmp_path: Path):
             self.state = ConversationStateStub()
             self.messages: list[str] = []
 
-        def send_message(self, message: str) -> None:
+        def send_message(self, message: str, sender: str | None = None) -> None:
             if self.messages:
                 raise RuntimeError("conversation unavailable")
             self.messages.append(message)
@@ -177,8 +198,9 @@ def test_event_pump_keeps_events_queued_while_a_tool_action_is_unmatched(
             self.state = ConversationStateStub([pending_tool_action()])
             self.messages: list[str] = []
 
-        def send_message(self, message: str) -> None:
+        def send_message(self, message: str, sender: str | None = None) -> None:
             self.messages.append(message)
+            self.state.append(SimpleNamespace(sender=sender))
 
     with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
         store.enqueue(event)
@@ -207,8 +229,9 @@ def test_event_pump_delivers_queued_event_after_the_tool_boundary_is_safe(
             self.messages: list[str] = []
             self.received = threading.Event()
 
-        def send_message(self, message: str) -> None:
+        def send_message(self, message: str, sender: str | None = None) -> None:
             self.messages.append(message)
+            self.state.append(SimpleNamespace(sender=sender))
             self.received.set()
 
     with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
@@ -221,6 +244,7 @@ def test_event_pump_delivers_queued_event_after_the_tool_boundary_is_safe(
 
             conversation.state.append(completed_tool_action(action))
             assert conversation.received.wait(1)
+            conversation.state.execution_status = ConversationExecutionStatus.FINISHED
 
         assert conversation.messages == [event.to_user_message()]
         assert store.pending() == []
@@ -240,8 +264,9 @@ def test_event_pump_injects_new_events_while_conversation_is_running(
             self.state = ConversationStateStub()
             self.messages: list[str] = []
 
-        def send_message(self, message: str) -> None:
+        def send_message(self, message: str, sender: str | None = None) -> None:
             self.messages.append(message)
+            self.state.append(SimpleNamespace(sender=sender))
 
     with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
         conversation = Conversation()
@@ -251,6 +276,7 @@ def test_event_pump_injects_new_events_while_conversation_is_running(
             while not conversation.messages and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert store.pending() == [event]
+            conversation.state.execution_status = ConversationExecutionStatus.FINISHED
 
         assert conversation.messages == [event.to_user_message()]
         assert store.pending() == []
@@ -276,8 +302,9 @@ def test_event_pump_queues_into_the_controller_inbox_without_mid_turn_injection(
             self.messages: list[str] = []
             self.received = threading.Event()
 
-        def send_message(self, message: str) -> None:
+        def send_message(self, message: str, sender: str | None = None) -> None:
             self.messages.append(message)
+            self.state.append(SimpleNamespace(sender=sender))
             self.received.set()
 
     with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
@@ -334,8 +361,9 @@ def test_non_finished_turn_leaves_delivered_child_result_pending(
             self.messages: list[str] = []
             self.received = threading.Event()
 
-        def send_message(self, message: str) -> None:
+        def send_message(self, message: str, sender: str | None = None) -> None:
             self.messages.append(message)
+            self.state.append(SimpleNamespace(sender=sender))
             self.received.set()
 
     with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
@@ -370,8 +398,9 @@ def test_event_pump_routes_child_results_to_their_parent_conversation(
             self.state = ConversationStateStub()
             self.messages: list[str] = []
 
-        def send_message(self, message: str) -> None:
+        def send_message(self, message: str, sender: str | None = None) -> None:
             self.messages.append(message)
+            self.state.append(SimpleNamespace(sender=sender))
 
     with AdvisorEventStore(tmp_path / "student-events.sqlite3") as store:
         store.enqueue(first)
@@ -386,9 +415,40 @@ def test_event_pump_routes_child_results_to_their_parent_conversation(
             deadline = time.monotonic() + 1
             while not conversation.messages and time.monotonic() < deadline:
                 time.sleep(0.01)
+            conversation.state.execution_status = ConversationExecutionStatus.FINISHED
 
         assert conversation.messages == [first.to_user_message()]
         assert store.pending() == [second]
+
+
+def test_event_pump_leaves_late_event_pending_after_conversation_finishes(
+    tmp_path: Path,
+):
+    event = AdvisorEvent(
+        kind="submission_slot_free",
+        dedupe_key="submission_slot_free:cedar",
+        payload={"campaign": "cedar"},
+    )
+
+    class Conversation:
+        def __init__(self):
+            self.state = ConversationStateStub(
+                execution_status=ConversationExecutionStatus.FINISHED
+            )
+            self.messages: list[str] = []
+
+        def send_message(self, message: str, sender: str | None = None) -> None:
+            self.messages.append(message)
+
+    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+        store.enqueue(event)
+        conversation = Conversation()
+
+        with AdvisorEventPump(store, conversation, poll_interval=0.01):
+            time.sleep(0.03)
+
+        assert conversation.messages == []
+        assert store.pending() == [event]
 
 
 def test_event_pump_surfaces_delivery_failure_and_leaves_event_pending(
@@ -404,7 +464,11 @@ def test_event_pump_surfaces_delivery_failure_and_leaves_event_pending(
         def __init__(self):
             self.state = ConversationStateStub()
 
-        def send_message(self, _message: str) -> None:
+        def send_message(
+            self,
+            _message: str,
+            sender: str | None = None,
+        ) -> None:
             raise RuntimeError("conversation rejected event")
 
     with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
