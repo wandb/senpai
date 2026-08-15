@@ -17,6 +17,7 @@ from .definitions import (
     CreateAssignmentTool,
     MergeExperimentTool,
     PublishAdvisorBranchTool,
+    PostAssignmentCommentTool,
     RepairAssignmentRoutingTool,
     RequestAssignmentRevisionTool,
     RespondToHumanIssueTool,
@@ -101,7 +102,11 @@ class GitHubWorkflowToolSet(
             *RespondToHumanIssueTool.create(runtime),
         )
         if role == "student":
-            return (*common, *SubmitExperimentResultTool.create(runtime))
+            return (
+                *common,
+                *PostAssignmentCommentTool.create(runtime),
+                *SubmitExperimentResultTool.create(runtime),
+            )
         return (
             *common,
             *CreateAssignmentTool.create(runtime),

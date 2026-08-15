@@ -37,6 +37,7 @@ ADVISOR_GITHUB_TOOLS = {
 }
 STUDENT_GITHUB_TOOLS = {
     "get_prs",
+    "post_assignment_comment",
     "respond_to_human_issue",
     "submit_experiment_result",
 }

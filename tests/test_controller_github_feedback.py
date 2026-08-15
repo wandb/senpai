@@ -9,9 +9,11 @@ from senpai_agent.github.mailbox import GitHubMailbox
 from senpai_agent.inbox import PersistentInbox
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.models import (
+    AssignmentCommentRecord,
     AssignmentFeedbackRecord,
     AssignmentRecord,
     render_assignment_feedback_marker,
+    render_assignment_comment_marker,
     render_assignment_marker,
 )
 from senpai_agent.state import (
@@ -516,6 +518,37 @@ def test_untrusted_people_bots_and_automation_comments_are_not_feedback(
     ]
 
     assert [event.payload["feedback_id"] for event in events] == [101]
+
+
+def test_student_assignment_comment_is_not_replayed_to_its_student(monkeypatch):
+    marker = render_assignment_comment_marker(
+        AssignmentCommentRecord(
+            repo="acme/widgets",
+            pr_number=17,
+            assignment_id="assignment-17",
+            revision_id="revision-2",
+            student="student-1",
+            comment_id="paired-run-started",
+        )
+    )
+    mailbox = student_mailbox(
+        monkeypatch,
+        feedback_responses(
+            issue_comments=[
+                feedback(
+                    105,
+                    f"{marker}\n\nSTUDENT: The paired run has started.",
+                    author="morganmcg1",
+                    association="OWNER",
+                    user_type="User",
+                )
+            ]
+        ),
+    )
+
+    assert not any(
+        event.kind == "student_pr_feedback" for event in mailbox.poll()
+    )
 
 
 def test_typed_actor_feedback_keeps_its_marked_revision_and_hides_other_protocol(

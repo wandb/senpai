@@ -296,7 +296,7 @@ the model-facing schema. It also canonicalizes every Senpai-authored comment to
 an `ADVISOR:` or `STUDENT:` prefix from that trusted role; models supply plain
 comment text and cannot impersonate the other role through a payload.
 
-Advisor operations that act on an assignment share this object:
+Assignment-scoped advisor and student operations share this object:
 
 ```json
 {
@@ -313,6 +313,7 @@ Advisor operations that act on an assignment share this object:
 | `publish_advisor_branch` | advisor | `remote_branch_sha_before_push`, `local_commit_sha` |
 | `repair_assignment_routing` | advisor | `working_state` (`wip` or `review`) and a `blockers` list containing only `blocked`, `hold`, or `needs-rebase` |
 | `send_assignment_feedback` | advisor | `feedback_id`, `comment` |
+| `post_assignment_comment` | student | `comment_id`, `comment` |
 | `request_assignment_revision` | advisor | `new_revision_id`, `required_base_sha`, `comment` |
 | `accept_result_on_current_base` | advisor | `expected_current_base_sha`, `reason` |
 | `merge_experiment` | advisor | `expected_current_base_sha`, `merge_method` |
@@ -320,11 +321,18 @@ Advisor operations that act on an assignment share this object:
 | `respond_to_human_issue` | advisor or student | `issue_number`, `human_message_id`, `response` |
 | `submit_experiment_result` | student | `branch`, `remote_branch_sha_before_push`, `result` |
 
-Student publication happens only inside `submit_experiment_result`, which
-derives the PR and proposed local head from the structured result, then validates
-repository, assignment, revision, student, and current remote head before it can
-push. Marker comments are trusted only when authored by the authenticated token
-actor.
+Interim student communication happens through `post_assignment_comment`. The
+runtime binds the configured student identity and validates the exact open WIP
+or review assignment, revision, and PR head before posting an immutable typed comment.
+Exact replay is a no-op; changed text uses a new `comment_id`. The comment does
+not push, change routing, or end the assignment, and its trusted marker wakes the
+advisor without replaying into the student's own feedback inbox.
+
+Terminal student publication happens only inside `submit_experiment_result`,
+which derives the PR and proposed local head from the structured result, then
+validates repository, assignment, revision, student, and current remote head
+before it can push. Marker comments are trusted only when authored by the
+authenticated token actor.
 
 Assignment creation checks the remote base SHA, creates an isolated empty
 assignment commit with `git commit-tree`, publishes with force-with-lease,

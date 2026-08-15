@@ -11,6 +11,7 @@ from senpai_agent.github.tools import (
     GitHubToolRuntime,
     MergeExperimentTool,
     PublishAdvisorBranchTool,
+    PostAssignmentCommentTool,
     RepairAssignmentRoutingTool,
     RequestAssignmentRevisionTool,
     RespondToHumanIssueTool,
@@ -35,6 +36,7 @@ EXPECTED_FIELDS = {
         "remote_branch_sha_before_push",
         "local_commit_sha",
     },
+    "post_assignment_comment": {"assignment", "comment_id", "comment"},
     "repair_assignment_routing": {"assignment", "working_state", "blockers"},
     "send_assignment_feedback": {"assignment", "feedback_id", "comment"},
     "request_assignment_revision": {
@@ -81,6 +83,7 @@ def github_tools(tmp_path: Path):
     tool_types = (
         CreateAssignmentTool,
         PublishAdvisorBranchTool,
+        PostAssignmentCommentTool,
         RepairAssignmentRoutingTool,
         SendAssignmentFeedbackTool,
         RequestAssignmentRevisionTool,

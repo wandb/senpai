@@ -84,7 +84,7 @@ only when its named tool is present in your schema:
   `repair_assignment_routing`, `send_assignment_feedback`,
   `request_assignment_revision`, `accept_result_on_current_base`,
   `merge_experiment`, and `close_experiment`. Students may receive
-  `submit_experiment_result`. Both roles may receive
+  `post_assignment_comment` and `submit_experiment_result`. Both roles may receive
   `respond_to_human_issue`. Do not reproduce these operations with `gh`, raw
   REST calls, or `git push`.
 

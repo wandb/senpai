@@ -435,6 +435,7 @@ def test_file_agent_definitions_keep_bounded_tools_and_no_github_mutations(
         "get_prs",
         "create_assignment",
         "publish_advisor_branch",
+        "post_assignment_comment",
         "repair_assignment_routing",
         "send_assignment_feedback",
         "request_assignment_revision",
