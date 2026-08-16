@@ -77,15 +77,35 @@ def test_main_agent_context_appends_program_after_harness_and_role():
 
 def test_student_charter_requires_typed_workflow_and_training_tools():
     instructions = (ROOT / "system_instructions" / "STUDENT.md").read_text()
+    submission_skill = (
+        ROOT
+        / "plugins"
+        / "senpai"
+        / "skills"
+        / "submit-experiment-results"
+        / "SKILL.md"
+    ).read_text()
 
-    assert "When `post_assignment_comment` is present" in instructions
+    assert "Use `post_assignment_comment`" in instructions
+    assert "When `post_assignment_comment` is present" not in instructions
     assert "ask the advisor a meaningful interim question" in instructions
+    assert "fresh `comment_id`" not in instructions
+    assert "fresh `comment_id`" in submission_skill
+    assert "Keep the PR concise" in submission_skill
     assert "Use `submit_experiment_result` for the terminal result" in instructions
     assert "must use `run_training`" in instructions
     assert "Never launch training through the terminal" in instructions
     assert "`monitor_training`" in instructions
     assert "`get_training_status`" in instructions
     assert "`cancel_training`" in instructions
+
+
+def test_advisor_charter_explains_student_comment_events():
+    instructions = (ROOT / "system_instructions" / "ADVISOR.md").read_text()
+
+    assert "`student_assignment_comment` event" in instructions
+    assert "retain an earlier revision" in instructions
+    assert "reply on the current revision with `send_assignment_feedback`" in instructions
 
 
 def test_project_instruction_files_are_not_loaded_but_explicit_skills_are(

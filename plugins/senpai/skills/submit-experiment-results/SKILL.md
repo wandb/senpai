@@ -5,14 +5,21 @@
 
 name: submit-experiment-results
 description: >
-  Commit and submit a terminal experiment result for advisor review through the
-  typed Senpai GitHub result tool.
+  Post material interim assignment updates, then commit and submit a terminal
+  experiment result through the typed Senpai GitHub tools.
 argument-hint: "<pr-number> <problem-dir>"
 model: claude-sonnet-4-6
 effort: high
 ---
 
 # Submit experiment results
+
+## Interim assignment comments
+
+Use `post_assignment_comment` when the advisor asked for a response or the
+experiment is blocked or materially delayed. Use a fresh `comment_id` for each
+new message and reuse that ID only for an exact retry. Keep the PR concise
+rather than mirroring routine internal narration.
 
 First make the repository worktree clean by committing only the assigned change.
 Collect the current local commit SHA and the current remote assignment-branch

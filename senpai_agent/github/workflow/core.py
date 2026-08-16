@@ -27,8 +27,11 @@ from senpai_agent.github.workflow.responses import (
 from senpai_agent.github.workflow.transport import UrllibTransport
 from senpai_agent.github.workflow.validation import (
     positive_number,
+    require_active_assignment_routing,
     require_assignment_identity,
+    require_current_revision,
     require_head,
+    require_open,
     validate_labels,
 )
 
@@ -159,6 +162,29 @@ class WorkflowCore:
             snapshot,
             repo=self._repo,
             assignment_id=assignment_id,
+        )
+        return snapshot, assignment
+
+    def _routed_assignment_at_head(
+        self,
+        number: int,
+        *,
+        assignment_id: str,
+        revision_id: str,
+        expected_head_sha: str,
+        allowed_statuses: frozenset[str] = frozenset({"status:wip"}),
+    ) -> tuple[PullRequestSnapshot, AssignmentRecord]:
+        snapshot, assignment = self._assigned_pull_at_head(
+            number,
+            assignment_id=assignment_id,
+            expected_head_sha=expected_head_sha,
+        )
+        require_open(snapshot)
+        require_current_revision(assignment, revision_id)
+        require_active_assignment_routing(
+            snapshot,
+            assignment,
+            allowed_statuses=allowed_statuses,
         )
         return snapshot, assignment
 

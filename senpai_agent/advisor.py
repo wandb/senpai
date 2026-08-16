@@ -19,6 +19,8 @@ from senpai_agent.PROMPTS import (
     render_prompt,
 )
 
+_EVENT_STORE_SETUP_LOCK = threading.Lock()
+
 
 class AdvisorEvent(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -55,19 +57,30 @@ class AdvisorEventStore:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._connection = sqlite3.connect(path, check_same_thread=False)
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA busy_timeout=5000")
-        self._connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS advisor_events (
-                dedupe_key TEXT PRIMARY KEY,
-                event_json TEXT NOT NULL,
-                acknowledged INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-        self._connection.commit()
+        with _EVENT_STORE_SETUP_LOCK:
+            self._connection = sqlite3.connect(path, check_same_thread=False)
+            self._connection.execute("PRAGMA busy_timeout=5000")
+            journal_mode = self._connection.execute("PRAGMA journal_mode").fetchone()
+            if journal_mode != ("wal",):
+                self._connection.execute("PRAGMA journal_mode=WAL")
+            table_exists = self._connection.execute(
+                """
+                SELECT 1
+                FROM sqlite_schema
+                WHERE type = 'table' AND name = 'advisor_events'
+                """
+            ).fetchone()
+            if table_exists is None:
+                self._connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS advisor_events (
+                        dedupe_key TEXT PRIMARY KEY,
+                        event_json TEXT NOT NULL,
+                        acknowledged INTEGER NOT NULL DEFAULT 0
+                    )
+                    """
+                )
+                self._connection.commit()
 
     def enqueue(self, event: AdvisorEvent) -> bool:
         with self._lock:
