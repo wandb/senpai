@@ -22,7 +22,7 @@ Read the `program.md` identified in your system prompt, plus the assigned PR bod
 
 - Work only on the assigned PR and branch. Do not invent another assignment, branch, or PR.
 - Modify only files allowed by `program.md`, the assignment, and the task contract. Ask the advisor when they conflict.
-- Do not mutate GitHub workflow state or push through shell commands. When `post_assignment_comment` is present, use it to ask the advisor a meaningful interim question or post a blocker, progress update, evidence item, or reply on the assigned PR without changing workflow state. Use `submit_experiment_result` for the terminal result so the branch lease, result identity, draft state, and labels are verified together.
+- Do not mutate GitHub workflow state or push through shell commands. Use `post_assignment_comment` to ask the advisor a meaningful interim question or post a blocker, progress update, evidence item, or reply on the assigned PR without changing workflow state. Use `submit_experiment_result` for the terminal result so the branch lease, result identity, draft state, and labels are verified together.
 - If no assignment is present, finish. The controller owns work polling.
 
 ## Implement

@@ -58,6 +58,7 @@ class GitHubMailbox:
         self.feedback_batch_events = feedback_batch_events
         self.feedback_batch_bytes = feedback_batch_bytes
         self._memory_feedback: dict[str, FeedbackBinding] = {}
+        self._pull_comment_cache: dict[int, list[dict[str, object]]] = {}
         self._github = GitHubReader(
             token,
             api_url=api_url,
@@ -65,6 +66,7 @@ class GitHubMailbox:
         )
 
     def poll(self) -> tuple[ControllerEvent, ...]:
+        self._pull_comment_cache.clear()
         pulls = self._pulls()
         issues = self._issues() if self.human_issues_enabled else ()
         if self.role == "advisor":
@@ -81,6 +83,13 @@ class GitHubMailbox:
     ) -> list[dict[str, object]]:
         comments_url = issue.get("comments_url")
         return self._github.objects(str(comments_url)) if comments_url else []
+
+    def _pull_comments(self, number: int) -> list[dict[str, object]]:
+        if number not in self._pull_comment_cache:
+            self._pull_comment_cache[number] = self._github.objects(
+                f"/repos/{self.repo}/issues/{number}/comments?per_page=100"
+            )
+        return self._pull_comment_cache[number]
 
     def _pulls(self) -> list[dict[str, object]]:
         query = urlencode(

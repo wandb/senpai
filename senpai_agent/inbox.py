@@ -247,22 +247,7 @@ class PersistentInbox:
             raise ValueError("event body must not be empty")
         conversation = str(conversation_id)
         with self._transaction() as database:
-            payload_conflict = database.execute(
-                """
-                SELECT 1
-                FROM inbox_messages
-                WHERE conversation_id = ?
-                  AND event_key = ?
-                  AND legacy = 0
-                  AND body != ?
-                LIMIT 1
-                """,
-                (conversation, event_key, body),
-            ).fetchone()
-            if payload_conflict is not None:
-                raise RuntimeError(
-                    f"event {event_key!r} was reused with a different payload"
-                )
+            _require_event_payload(database, conversation, event_key, body)
             existing = database.execute(
                 """
                 SELECT message.sequence, message.requires_ack
@@ -337,6 +322,24 @@ class PersistentInbox:
                     (conversation, event_key),
                 )
             return True
+
+    def require_event_payload(
+        self,
+        conversation_id: UUID | str,
+        event_key: str,
+        body: str,
+    ) -> None:
+        """Reject a polled identity that conflicts with durable inbox history."""
+
+        if not event_key or not body:
+            raise ValueError("event key and body must not be empty")
+        with self._lock:
+            _require_event_payload(
+                self._connection,
+                str(conversation_id),
+                event_key,
+                body,
+            )
 
     def next_turn(
         self,
@@ -1492,6 +1495,30 @@ def _event_call_ids(event: object) -> set[str]:
         for attribute in ("tool_call_id", "action_id", "id")
         if isinstance((value := getattr(event, attribute, None)), str) and value
     }
+
+
+def _require_event_payload(
+    database: sqlite3.Connection,
+    conversation_id: str,
+    event_key: str,
+    body: str,
+) -> None:
+    conflict = database.execute(
+        """
+        SELECT 1
+        FROM inbox_messages
+        WHERE conversation_id = ?
+          AND event_key = ?
+          AND legacy = 0
+          AND body != ?
+        LIMIT 1
+        """,
+        (conversation_id, event_key, body),
+    ).fetchone()
+    if conflict is not None:
+        raise RuntimeError(
+            f"event {event_key!r} was reused with a different payload"
+        )
 
 
 def _message(row: sqlite3.Row) -> InboxMessage:

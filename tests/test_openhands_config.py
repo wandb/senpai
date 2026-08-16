@@ -97,7 +97,22 @@ def test_live_advisor_invariant_is_part_of_non_condensed_system_context(tmp_path
 
 def test_student_charter_requires_typed_tools_for_every_long_job():
     instructions = (ROOT / "system_instructions" / "STUDENT.md").read_text()
+    submission_skill = (
+        ROOT
+        / "plugins"
+        / "senpai"
+        / "skills"
+        / "submit-experiment-results"
+        / "SKILL.md"
+    ).read_text()
 
+    assert "Use `post_assignment_comment`" in instructions
+    assert "When `post_assignment_comment` is present" not in instructions
+    assert "ask the advisor a meaningful interim question" in instructions
+    assert "fresh `comment_id`" not in instructions
+    assert "fresh `comment_id`" in submission_skill
+    assert "Keep the PR concise" in submission_skill
+    assert "Use `submit_experiment_result` for the terminal result" in instructions
     assert "must use `run_job`" in instructions
     assert (
         "Never launch these long-running processes through the terminal" in instructions
@@ -105,6 +120,14 @@ def test_student_charter_requires_typed_tools_for_every_long_job():
     assert "`monitor_job`" in instructions
     assert "`get_job_status`" in instructions
     assert "`cancel_job`" in instructions
+
+
+def test_advisor_charter_explains_student_comment_events():
+    instructions = (ROOT / "system_instructions" / "ADVISOR.md").read_text()
+
+    assert "`student_assignment_comment` event" in instructions
+    assert "retain an earlier revision" in instructions
+    assert "reply on the current revision with `send_assignment_feedback`" in instructions
 
 
 def test_project_instruction_files_are_not_loaded_but_explicit_skills_are(

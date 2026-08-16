@@ -7,7 +7,10 @@ from senpai_agent.github.workflow.errors import WorkflowPreconditionError
 from senpai_agent.models import AssignmentRecord, render_assignment_marker
 
 
-_ROLE_COMMENT_PREFIX = re.compile(r"^(?:ADVISOR|STUDENT(?: [^:\s]+)?):[ \t]*")
+_ROLE_COMMENT_PREFIX = re.compile(
+    r"^[ \t]*(?:ADVISOR|STUDENT(?: [^:\s]+)?):[ \t]*",
+    re.MULTILINE,
+)
 
 
 def marker_body(marker: str, content: str) -> str:

@@ -6,7 +6,7 @@ import json
 import re
 from enum import StrEnum
 from hashlib import sha256
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -96,6 +96,18 @@ class AssignmentFeedbackRecord(Contract):
     assignment_id: _NonEmptyString
     revision_id: _NonEmptyString
     feedback_id: _NonEmptyString
+
+
+class AssignmentCommentRecord(Contract):
+    """One immutable student message on its exact assignment revision."""
+
+    schema_version: Literal[1] = 1
+    repo: _NonEmptyString
+    pr_number: int = Field(gt=0)
+    assignment_id: _NonEmptyString
+    revision_id: _NonEmptyString
+    student: _NonEmptyString
+    comment_id: _NonEmptyString
 
 
 class ResearchBaseAcceptanceRecord(Contract):
@@ -229,6 +241,11 @@ _ASSIGNMENT_FEEDBACK_MARKER = re.compile(
     r"<!-- senpai-assignment-feedback:v(?P<version>[0-9]+) "
     r"(?P<payload>\{.*\}) -->"
 )
+_ASSIGNMENT_COMMENT_PREFIX = "<!-- senpai-assignment-comment:"
+_ASSIGNMENT_COMMENT_MARKER = re.compile(
+    r"<!-- senpai-assignment-comment:v(?P<version>[0-9]+) "
+    r"(?P<payload>\{.*\}) -->"
+)
 _RESEARCH_BASE_ACCEPTANCE_PREFIX = "<!-- senpai-research-base-acceptance:"
 _RESEARCH_BASE_ACCEPTANCE_MARKER = re.compile(
     r"<!-- senpai-research-base-acceptance:v(?P<version>[0-9]+) "
@@ -277,28 +294,62 @@ def render_assignment_feedback_marker(feedback: AssignmentFeedbackRecord) -> str
     return f"<!-- senpai-assignment-feedback:v1 {_marker_payload(feedback)} -->"
 
 
+def render_assignment_comment_marker(comment: AssignmentCommentRecord) -> str:
+    return f"<!-- senpai-assignment-comment:v1 {_marker_payload(comment)} -->"
+
+
+_MarkerContract = TypeVar("_MarkerContract", bound=Contract)
+
+
+def _parse_contract_markers(
+    body: str,
+    *,
+    prefix: str,
+    pattern: re.Pattern[str],
+    contract: type[_MarkerContract],
+    name: str,
+) -> tuple[_MarkerContract, ...]:
+    values: list[_MarkerContract] = []
+    for line_number, line in enumerate(body.splitlines(), start=1):
+        if not line.startswith(prefix):
+            continue
+        marker = pattern.fullmatch(line)
+        if marker is None or marker.group("version") != "1":
+            raise ValueError(
+                f"malformed or unsupported Senpai {name} marker on line "
+                f"{line_number}"
+            )
+        try:
+            values.append(contract.model_validate_json(marker.group("payload")))
+        except (ValidationError, ValueError) as error:
+            raise ValueError(
+                f"invalid Senpai {name} marker on line {line_number}"
+            ) from error
+    return tuple(values)
+
+
+def parse_assignment_comment_markers(
+    body: str,
+) -> tuple[AssignmentCommentRecord, ...]:
+    return _parse_contract_markers(
+        body,
+        prefix=_ASSIGNMENT_COMMENT_PREFIX,
+        pattern=_ASSIGNMENT_COMMENT_MARKER,
+        contract=AssignmentCommentRecord,
+        name="assignment comment",
+    )
+
+
 def parse_assignment_feedback_markers(
     body: str,
 ) -> tuple[AssignmentFeedbackRecord, ...]:
-    feedback: list[AssignmentFeedbackRecord] = []
-    for line_number, line in enumerate(body.splitlines(), start=1):
-        if not line.startswith(_ASSIGNMENT_FEEDBACK_PREFIX):
-            continue
-        marker = _ASSIGNMENT_FEEDBACK_MARKER.fullmatch(line)
-        if marker is None or marker.group("version") != "1":
-            raise ValueError(
-                "malformed or unsupported Senpai assignment feedback marker "
-                f"on line {line_number}"
-            )
-        try:
-            feedback.append(
-                AssignmentFeedbackRecord.model_validate_json(marker.group("payload"))
-            )
-        except (ValidationError, ValueError) as error:
-            raise ValueError(
-                f"invalid Senpai assignment feedback marker on line {line_number}"
-            ) from error
-    return tuple(feedback)
+    return _parse_contract_markers(
+        body,
+        prefix=_ASSIGNMENT_FEEDBACK_PREFIX,
+        pattern=_ASSIGNMENT_FEEDBACK_MARKER,
+        contract=AssignmentFeedbackRecord,
+        name="assignment feedback",
+    )
 
 
 def render_research_base_acceptance_marker(
@@ -313,28 +364,13 @@ def render_research_base_acceptance_marker(
 def parse_research_base_acceptance_markers(
     body: str,
 ) -> tuple[ResearchBaseAcceptanceRecord, ...]:
-    acceptances: list[ResearchBaseAcceptanceRecord] = []
-    for line_number, line in enumerate(body.splitlines(), start=1):
-        if not line.startswith(_RESEARCH_BASE_ACCEPTANCE_PREFIX):
-            continue
-        marker = _RESEARCH_BASE_ACCEPTANCE_MARKER.fullmatch(line)
-        if marker is None or marker.group("version") != "1":
-            raise ValueError(
-                "malformed or unsupported Senpai research-base acceptance marker "
-                f"on line {line_number}"
-            )
-        try:
-            acceptances.append(
-                ResearchBaseAcceptanceRecord.model_validate_json(
-                    marker.group("payload")
-                )
-            )
-        except (ValidationError, ValueError) as error:
-            raise ValueError(
-                "invalid Senpai research-base acceptance marker on line "
-                f"{line_number}"
-            ) from error
-    return tuple(acceptances)
+    return _parse_contract_markers(
+        body,
+        prefix=_RESEARCH_BASE_ACCEPTANCE_PREFIX,
+        pattern=_RESEARCH_BASE_ACCEPTANCE_MARKER,
+        contract=ResearchBaseAcceptanceRecord,
+        name="research-base acceptance",
+    )
 
 
 def render_disposition_marker(disposition: DispositionRecord) -> str:
@@ -342,25 +378,13 @@ def render_disposition_marker(disposition: DispositionRecord) -> str:
 
 
 def parse_assignment_markers(body: str) -> tuple[AssignmentRecord, ...]:
-    assignments: list[AssignmentRecord] = []
-    for line_number, line in enumerate(body.splitlines(), start=1):
-        if not line.startswith(_ASSIGNMENT_PREFIX):
-            continue
-        marker = _ASSIGNMENT_MARKER.fullmatch(line)
-        if marker is None or marker.group("version") != "1":
-            raise ValueError(
-                f"malformed or unsupported Senpai assignment marker on line "
-                f"{line_number}"
-            )
-        try:
-            assignments.append(
-                AssignmentRecord.model_validate_json(marker.group("payload"))
-            )
-        except (ValidationError, ValueError) as error:
-            raise ValueError(
-                f"invalid Senpai assignment marker on line {line_number}"
-            ) from error
-    return tuple(assignments)
+    return _parse_contract_markers(
+        body,
+        prefix=_ASSIGNMENT_PREFIX,
+        pattern=_ASSIGNMENT_MARKER,
+        contract=AssignmentRecord,
+        name="assignment",
+    )
 
 
 def render_result_marker(result: ExperimentResult) -> str:

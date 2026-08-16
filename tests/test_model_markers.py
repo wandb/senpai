@@ -8,16 +8,19 @@ import pytest
 
 from model_test_support import HEAD_SHA, assignment, result
 from senpai_agent.models import (
+    AssignmentCommentRecord,
     ResearchBaseAcceptanceRecord,
     ResultMarkerError,
     ResultStatus,
     WandbRunRef,
     authoritative_marker_line,
     experiment_result_digest,
+    parse_assignment_comment_markers,
     parse_assignment_markers,
     parse_research_base_acceptance_markers,
     parse_result_markers,
     render_assignment_marker,
+    render_assignment_comment_marker,
     render_research_base_acceptance_marker,
     render_result_comment,
     render_result_marker,
@@ -40,6 +43,37 @@ def test_assignment_marker_round_trips_as_one_line():
     assert marker.startswith("<!-- senpai-assignment:v1 {")
     assert "\n" not in marker
     assert parse_assignment_markers(marker) == (original,)
+
+
+def test_assignment_comment_marker_round_trips_as_one_line():
+    original = AssignmentCommentRecord(
+        repo="acme/widgets",
+        pr_number=17,
+        assignment_id="assignment-17",
+        revision_id="revision-2",
+        student="student-1",
+        comment_id="paired-run-started",
+    )
+
+    marker = render_assignment_comment_marker(original)
+
+    assert "\n" not in marker
+    assert marker.startswith("<!-- senpai-assignment-comment:v1 {")
+    assert parse_assignment_comment_markers(marker) == (original,)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "<!-- senpai-assignment-comment:v2 {} -->",
+        "<!-- senpai-assignment-comment:v1 not-json -->",
+        "<!-- senpai-assignment-comment:v1 {} --> trailing",
+        "<!-- senpai-assignment-comment:v1 {} -->",
+    ],
+)
+def test_assignment_comment_parser_rejects_invalid_markers(line: str):
+    with pytest.raises(ValueError, match="assignment comment marker"):
+        parse_assignment_comment_markers(line)
 
 
 @pytest.mark.parametrize(

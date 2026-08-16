@@ -37,6 +37,7 @@ ADVISOR_GITHUB_TOOLS = {
 }
 STUDENT_GITHUB_TOOLS = {
     "get_prs",
+    "post_assignment_comment",
     "respond_to_human_issue",
     "submit_experiment_result",
 }
@@ -48,6 +49,8 @@ def test_github_tools_package_preserves_public_contract_types():
         "PRManifestObservation",
         "GitHubMutationObservation",
         "GitHubCredentials",
+        "PostAssignmentCommentAction",
+        "PostAssignmentCommentTool",
     }
 
     assert expected <= set(github_tools_module.__all__)
