@@ -133,3 +133,5 @@ spec:
           claimName: {{PVC_CLAIM_NAME}}
       - name: state
         emptyDir: {}
+      nodeSelector:
+        compute.coreweave.com/node-pool: cpu

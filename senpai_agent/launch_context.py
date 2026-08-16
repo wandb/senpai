@@ -64,7 +64,8 @@ def render_role_prompt(
 def render_launch_context(
     *,
     backend: str,
-    gpus_per_student: int,
+    nodes_per_student: int,
+    gpus_per_student_node: int,
     timeout_minutes: float,
     max_epochs: int,
     tag: str,
@@ -78,7 +79,8 @@ def render_launch_context(
         LAUNCH_CONTEXT_TEMPLATE,
         {
             "BACKEND": backend,
-            "GPUS_PER_STUDENT": str(gpus_per_student),
+            "NODES_PER_STUDENT": str(nodes_per_student),
+            "GPUS_PER_STUDENT_NODE": str(gpus_per_student_node),
             "TIMEOUT_MINUTES": f"{timeout_minutes:g}",
             "MAX_EPOCHS": str(max_epochs),
             "TAG": tag,

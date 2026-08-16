@@ -269,7 +269,7 @@ def test_launch_uses_one_scope_for_apply_discovery_and_handoff_commands(
         for line in capsys.readouterr().out.splitlines()
         if line.strip().startswith("kubectl ")
     ]
-    assert len(handoff_commands) == 4
+    assert len(handoff_commands) == 6
     assert all(command.startswith(prefix) for command in handoff_commands)
 
 

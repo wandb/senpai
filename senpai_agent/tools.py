@@ -7,7 +7,7 @@ import os
 import threading
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Self
+from typing import TYPE_CHECKING, Literal, Protocol, Self
 
 from openhands.sdk.llm import TextContent
 from openhands.sdk.tool import (
@@ -37,9 +37,12 @@ from senpai_agent.delegation import (
 )
 from senpai_agent.git_workflow import require_clean_training_worktree
 from senpai_agent.github.tools import GitHubWorkflowToolSet
+from senpai_agent.kubernetes_training import KubernetesTrainingSupervisor
 from senpai_agent.monitor import MetricGate, MonitorStore, TrainingMonitorSpec
 from senpai_agent.PROMPTS import MONITOR_TRAINING_STARTED_PROMPT, render_prompt
 from senpai_agent.training import (
+    KubernetesResourceRef,
+    KubernetesTrainingSpec,
     TrainingResult,
     TrainingSpec,
     TrainingState,
@@ -50,10 +53,19 @@ if TYPE_CHECKING:
     from openhands.sdk.conversation import ConversationState, LocalConversation
 
 
-_TRAINING_RUNTIMES: dict[
-    Path,
-    tuple[TrainingSupervisor, MonitorStore],
-] = {}
+class TrainingRuntime(Protocol):
+    workspace: Path
+
+    def run_training(self, spec: TrainingSpec) -> TrainingResult: ...
+
+    def get_training_status(self, training_id: str) -> TrainingResult: ...
+
+    def cancel_training(self, training_id: str) -> TrainingResult: ...
+
+    def close(self) -> None: ...
+
+
+_TRAINING_RUNTIMES: dict[Path, tuple[TrainingRuntime, MonitorStore]] = {}
 _BROWSER_ENABLED_STATE_KEY = "senpai.browser_enabled"
 
 
@@ -165,18 +177,27 @@ def training_runtime(
     state_dir: Path,
     *,
     max_timeout_seconds: int | None = None,
-) -> tuple[TrainingSupervisor, MonitorStore]:
+) -> tuple[TrainingRuntime, MonitorStore]:
     key = state_dir.resolve()
     runtime = _TRAINING_RUNTIMES.get(key)
     if runtime is None:
-        runtime = (
-            TrainingSupervisor(
+        nodes = int(os.environ.get("NODES_PER_STUDENT", "1"))
+        supervisor: TrainingRuntime
+        if nodes > 1:
+            supervisor = KubernetesTrainingSupervisor(
+                workspace=workspace,
+                state_dir=key,
+                nodes=nodes,
+                gpus_per_node=int(os.environ["GPUS_PER_STUDENT_NODE"]),
+                max_timeout_seconds=max_timeout_seconds,
+            )
+        else:
+            supervisor = TrainingSupervisor(
                 workspace=workspace,
                 state_dir=key,
                 max_timeout_seconds=max_timeout_seconds,
-            ),
-            MonitorStore(key / "monitors.sqlite3"),
-        )
+            )
+        runtime = (supervisor, MonitorStore(key / "monitors.sqlite3"))
         _TRAINING_RUNTIMES[key] = runtime
     return runtime
 
@@ -281,6 +302,13 @@ class TrainingResultObservation(Observation):
     log_path: str
     wandb_run_ids: tuple[str, ...] = ()
     error_tail: str = ""
+    started_at: float | None = None
+    deadline_at: float | None = None
+    kubernetes_spec: KubernetesTrainingSpec | None = None
+    kubernetes_resource: KubernetesResourceRef | None = None
+    kubernetes_released: bool | None = None
+    source_snapshot: str | None = None
+    source_commit: str | None = None
 
     @classmethod
     def from_result(cls, result: TrainingResult) -> Self:
@@ -297,6 +325,10 @@ class TrainingResultObservation(Observation):
             "log_path": self.log_path,
             "wandb_run_ids": self.wandb_run_ids,
         }
+        if self.kubernetes_resource is not None:
+            result["kubernetes_resource"] = self.kubernetes_resource.model_dump()
+        if self.kubernetes_released is not None:
+            result["kubernetes_released"] = self.kubernetes_released
         if self.error_tail:
             result["error_tail"] = self.error_tail
         text = json.dumps(result, separators=(",", ":"), default=str)
@@ -304,7 +336,7 @@ class TrainingResultObservation(Observation):
 
 
 class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObservation]):
-    def __init__(self, training: TrainingSupervisor, monitor_store: MonitorStore):
+    def __init__(self, training: TrainingRuntime, monitor_store: MonitorStore):
         self.training = training
         self.monitor_store = monitor_store
         self._lock = threading.Lock()
@@ -353,7 +385,7 @@ class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObserva
 class _GetTrainingStatusExecutor(
     ToolExecutor[GetTrainingStatusAction, TrainingResultObservation]
 ):
-    def __init__(self, training: TrainingSupervisor):
+    def __init__(self, training: TrainingRuntime):
         self.training = training
 
     def __call__(
@@ -369,7 +401,7 @@ class _GetTrainingStatusExecutor(
 class _CancelTrainingExecutor(
     ToolExecutor[CancelTrainingAction, TrainingResultObservation]
 ):
-    def __init__(self, training: TrainingSupervisor, store: MonitorStore):
+    def __init__(self, training: TrainingRuntime, store: MonitorStore):
         self.training = training
         self.store = store
 
@@ -399,7 +431,7 @@ class RunTrainingTool(ToolDefinition[RunTrainingAction, TrainingResultObservatio
     @classmethod
     def create(
         cls,
-        training: TrainingSupervisor,
+        training: TrainingRuntime,
         monitor_store: MonitorStore,
     ) -> Sequence[Self]:
         return [
@@ -430,7 +462,7 @@ class GetTrainingStatusTool(
     @classmethod
     def create(
         cls,
-        training: TrainingSupervisor,
+        training: TrainingRuntime,
     ) -> Sequence[Self]:
         return [
             cls(
@@ -457,7 +489,7 @@ class CancelTrainingTool(
     @classmethod
     def create(
         cls,
-        training: TrainingSupervisor,
+        training: TrainingRuntime,
         monitor_store: MonitorStore,
     ) -> Sequence[Self]:
         return [
@@ -485,7 +517,7 @@ class CancelTrainingTool(
 class _MonitorTrainingExecutor(
     ToolExecutor[MonitorTrainingAction, MonitorTrainingObservation]
 ):
-    def __init__(self, training: TrainingSupervisor, store: MonitorStore):
+    def __init__(self, training: TrainingRuntime, store: MonitorStore):
         self.training = training
         self.store = store
 
@@ -527,7 +559,7 @@ class MonitorTrainingTool(
     @classmethod
     def create(
         cls,
-        training: TrainingSupervisor,
+        training: TrainingRuntime,
         monitor_store: MonitorStore,
     ) -> Sequence[Self]:
         return [

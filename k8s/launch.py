@@ -7,13 +7,16 @@
 """Launch senpai advisor and student agents as K8s resources."""
 
 import base64
+import json
 import posixpath
 import shlex
 import sys
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
 import simple_parsing as sp
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -31,6 +34,7 @@ from launch_helpers import (
     ensure_target_repo_labels,
     existing_student_names,
     expand_student_names,
+    is_digest_image_reference,
     is_immutable_image_reference,
     kubectl_apply,
     kubectl_command,
@@ -74,7 +78,8 @@ class Args:
     names: str = ""  # comma-separated student names (e.g. "frieren,fern")
     n_students: int = 4  # number of students to launch (ignored if --names is provided)
     student_prefix: str = ""  # make assignment labels unique across parallel launches using the same base names
-    gpus_per_student: int = 1  # GPUs requested by each student pod
+    nodes_per_student: int = 1  # worker nodes available to one supervised run
+    gpus_per_student_node: int = 1  # GPUs on each remote training worker
     cpu_per_gpu: int = 15  # CPU requested per student GPU
     memory_gi_per_gpu: int = 120  # memory Gi requested per student GPU
     senpai_repo_url: str = (
@@ -85,6 +90,7 @@ class Args:
     )
     advisor_image: str = ""  # advisor source-SHA tag or image digest — REQUIRED
     student_image: str = ""  # student source-SHA tag or image digest — REQUIRED
+    executor_image: str = ""  # credentialed Kubernetes broker image; required for multi-node students
     kube_context: str = ""  # kubectl context; empty uses the current context
     namespace: str = "default"  # Kubernetes namespace for all launch resources
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
@@ -306,7 +312,8 @@ def build_launch_context(
 ) -> str:
     return render_launch_context(
         backend=backend,
-        gpus_per_student=args.gpus_per_student,
+        nodes_per_student=args.nodes_per_student,
+        gpus_per_student_node=args.gpus_per_student_node,
         timeout_minutes=args.timeout_minutes,
         max_epochs=args.max_epochs,
         tag=tag,
@@ -339,6 +346,200 @@ def encoded_operator_instructions(args: Args) -> str:
     ).decode()
 
 
+def _student_resources(args: Args) -> str:
+    if args.nodes_per_student > 1:
+        return json.dumps(
+            {
+                "requests": {"cpu": "2", "memory": "8Gi"},
+                "limits": {"cpu": "4", "memory": "16Gi"},
+            }
+        )
+    resources = {
+        "cpu": str(args.cpu_per_gpu * args.gpus_per_student_node),
+        "memory": f"{args.memory_gi_per_gpu * args.gpus_per_student_node}Gi",
+        "nvidia.com/gpu": str(args.gpus_per_student_node),
+    }
+    return json.dumps({"requests": resources, "limits": resources})
+
+
+def _yaml_list_insertion(value: dict, indentation: int) -> str:
+    return "enabled\n" + textwrap.indent(
+        yaml.safe_dump([value], sort_keys=False).rstrip(),
+        " " * indentation,
+    )
+
+
+def _executor_socket_mount(args: Args) -> str:
+    if args.nodes_per_student == 1:
+        return ""
+    return _yaml_list_insertion(
+        {
+            "name": "executor-socket",
+            "mountPath": "/var/run/senpai-kubernetes",
+        },
+        8,
+    )
+
+
+def _executor_container(
+    args: Args,
+    secret_name: str,
+    configmap_name: str,
+) -> str:
+    if args.nodes_per_student == 1:
+        return ""
+    return _yaml_list_insertion(
+        {
+            "name": "kubernetes-executor",
+            "image": args.executor_image,
+            "imagePullPolicy": "IfNotPresent",
+            "securityContext": {
+                "allowPrivilegeEscalation": False,
+                "capabilities": {"drop": ["ALL"]},
+            },
+            "envFrom": [
+                {"configMapRef": {"name": configmap_name}}
+            ],
+            "env": [
+                {"name": "SENPAI_LAUNCH_SECRET_NAME", "value": secret_name},
+                {
+                    "name": "SENPAI_POD_NAME",
+                    "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}},
+                },
+                {
+                    "name": "SENPAI_POD_UID",
+                    "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}},
+                },
+            ],
+            "resources": {
+                "requests": {"cpu": "250m", "memory": "256Mi"},
+                "limits": {"cpu": "1", "memory": "1Gi"},
+            },
+            "readinessProbe": {
+                "exec": {
+                    "command": [
+                        "/bin/sh",
+                        "-c",
+                        'test -S "$SENPAI_KUBERNETES_EXECUTOR_SOCKET"',
+                    ]
+                },
+                "periodSeconds": 2,
+                "timeoutSeconds": 1,
+                "failureThreshold": 60,
+            },
+            "volumeMounts": [
+                {
+                    "name": "executor-socket",
+                    "mountPath": "/var/run/senpai-kubernetes",
+                },
+                {
+                    "name": "executor-state",
+                    "mountPath": "/var/lib/senpai-executor",
+                },
+                {
+                    "name": "executor-token",
+                    "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                    "readOnly": True,
+                },
+            ],
+        },
+        6,
+    )
+
+
+def _executor_volumes(args: Args) -> str:
+    if args.nodes_per_student == 1:
+        return ""
+    volumes = [
+        {"name": "executor-socket", "emptyDir": {}},
+        {"name": "executor-state", "emptyDir": {}},
+        {
+            "name": "executor-token",
+            "projected": {
+                "defaultMode": 0o440,
+                "sources": [
+                    {
+                        "serviceAccountToken": {
+                            "path": "token",
+                            "expirationSeconds": 3600,
+                        }
+                    },
+                    {
+                        "configMap": {
+                            "name": "kube-root-ca.crt",
+                            "items": [{"key": "ca.crt", "path": "ca.crt"}],
+                        }
+                    },
+                ],
+            },
+        },
+    ]
+    return "enabled\n" + textwrap.indent(
+        yaml.safe_dump(volumes, sort_keys=False).rstrip(),
+        " " * 6,
+    )
+
+
+def _student_training_access(student_name: str, tag: str, namespace: str) -> str:
+    name = f"senpai-training-{tag}-{student_name}"
+    labels = {"app": "senpai", "role": "student", "research-tag": tag}
+    documents = [
+        {
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {"name": name, "namespace": namespace, "labels": labels},
+            "automountServiceAccountToken": False,
+        },
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "Role",
+            "metadata": {"name": name, "namespace": namespace, "labels": labels},
+            "rules": [
+                {
+                    "apiGroups": ["batch"],
+                    "resources": ["jobs"],
+                    "verbs": ["create", "get", "patch", "delete"],
+                },
+                {
+                    "apiGroups": ["kubeflow.org"],
+                    "resources": ["mpijobs"],
+                    "verbs": ["create", "get", "patch", "delete"],
+                },
+                {
+                    "apiGroups": [""],
+                    "resources": ["pods"],
+                    "verbs": ["get", "list"],
+                },
+                {
+                    "apiGroups": [""],
+                    "resources": ["pods/log"],
+                    "verbs": ["get"],
+                },
+            ],
+        },
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": {"name": name, "namespace": namespace, "labels": labels},
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": name,
+            },
+            "subjects": [
+                {
+                    "kind": "ServiceAccount",
+                    "name": name,
+                    "namespace": namespace,
+                }
+            ],
+        },
+    ]
+    return "\n---\n".join(
+        yaml.safe_dump(document, sort_keys=False).rstrip() for document in documents
+    )
+
+
 def render_student(
     template: str,
     student_name: str,
@@ -349,8 +550,6 @@ def render_student(
 ) -> str:
     student_configmap_name = f"senpai-config-student-{tag}-{student_name}"
     student_deployment_name = f"senpai-{tag}-{student_name}"
-    student_cpu = args.cpu_per_gpu * args.gpus_per_student
-    student_memory_gi = args.memory_gi_per_gpu * args.gpus_per_student
     configmap = render_configmap(
         name=student_configmap_name,
         labels={"app": "senpai", "role": "student", "research-tag": tag},
@@ -364,7 +563,10 @@ def render_student(
             "GH_REPO": target_repo_slug(args.target_repo_url),
             "STUDENT_NAME": student_name,
             "RESEARCH_TAG": tag,
-            "GPUS_PER_STUDENT": str(args.gpus_per_student),
+            "NODES_PER_STUDENT": str(args.nodes_per_student),
+            "GPUS_PER_STUDENT_NODE": str(args.gpus_per_student_node),
+            "CPU_PER_STUDENT_GPU": str(args.cpu_per_gpu),
+            "MEMORY_GI_PER_STUDENT_GPU": str(args.memory_gi_per_gpu),
             "WANDB_ENTITY": args.wandb_entity,
             "WANDB_PROJECT": args.wandb_project,
             "WANDB_MODE": "online",
@@ -384,6 +586,23 @@ def render_student(
             "EXTRA_INSTRUCTIONS_B64": encoded_operator_instructions(args),
             "PROBLEM_DIR": args.problem_dir,
             "PVC_MOUNT_PATH": args.pvc_mount_path,
+            "SENPAI_TRAINING_SNAPSHOT_ROOT": (
+                f"{args.pvc_mount_path.rstrip('/')}/.senpai/snapshots/"
+                f"{tag}/{student_name}"
+            ),
+            "SENPAI_KUBERNETES_NAMESPACE": args.namespace,
+            "SENPAI_KUBERNETES_EXECUTOR_SOCKET": (
+                "/var/run/senpai-kubernetes/executor.sock"
+            ),
+            "SENPAI_KUBERNETES_EXECUTOR_STATE": (
+                "/var/lib/senpai-executor/reservation.json"
+            ),
+            "SENPAI_EXECUTOR_IMAGE": args.executor_image,
+            "SENPAI_MAX_TRAINING_TIMEOUT_SECONDS": str(
+                round(args.timeout_minutes * 60)
+            ),
+            "PVC_CLAIM_NAME": args.pvc_claim_name,
+            "SENPAI_LAUNCH_SECRET_NAME": secret_name,
             "SENPAI_START_GATE_PATH": args.start_gate_path,
         },
     )
@@ -395,18 +614,49 @@ def render_student(
             "STUDENT_NAME": student_name,
             "RESEARCH_TAG": tag,
             "STUDENT_IMAGE": args.student_image,
+            "EXECUTOR_IMAGE": args.executor_image,
             "ADVISOR_BRANCH": args.advisor_branch,
             "PVC_CLAIM_NAME": args.pvc_claim_name,
             "PVC_MOUNT_PATH": args.pvc_mount_path,
             "LAUNCH_SECRET_NAME": secret_name,
-            "STUDENT_CPU": str(student_cpu),
-            "STUDENT_MEMORY": f"{student_memory_gi}Gi",
-            "GPUS_PER_STUDENT": str(args.gpus_per_student),
+            "STUDENT_SERVICE_ACCOUNT_NAME": (
+                f"senpai-training-{tag}-{student_name}"
+                if args.nodes_per_student > 1
+                else "default"
+            ),
+            "STUDENT_RESOURCES": _student_resources(args),
+            "STUDENT_NODE_SELECTOR": json.dumps(
+                {"compute.coreweave.com/node-pool": "cpu"}
+                if args.nodes_per_student > 1
+                else {}
+            ),
+            "STUDENT_TOLERATIONS": json.dumps(
+                []
+                if args.nodes_per_student > 1
+                else [
+                    {
+                        "key": "nvidia.com/gpu",
+                        "operator": "Exists",
+                        "effect": "NoSchedule",
+                    }
+                ]
+            ),
+            "EXECUTOR_SOCKET_MOUNT": _executor_socket_mount(args),
+            "KUBERNETES_EXECUTOR_CONTAINER": _executor_container(
+                args,
+                secret_name,
+                student_configmap_name,
+            ),
+            "KUBERNETES_EXECUTOR_VOLUMES": _executor_volumes(args),
             "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
             "MODEL_PROVIDER_ENV": model_provider_env(args, "student", secret_name),
         },
     )
-    return configmap + "\n---\n" + deployment
+    documents = [configmap]
+    if args.nodes_per_student > 1:
+        documents.append(_student_training_access(student_name, tag, args.namespace))
+    documents.append(deployment)
+    return "\n---\n".join(documents)
 
 
 def render_advisor(
@@ -429,7 +679,8 @@ def render_advisor(
         "GH_REPO": target_repo_slug(args.target_repo_url),
         "RESEARCH_TAG": tag,
         "STUDENT_NAMES": ",".join(student_list),
-        "GPUS_PER_STUDENT": str(args.gpus_per_student),
+        "NODES_PER_STUDENT": str(args.nodes_per_student),
+        "GPUS_PER_STUDENT_NODE": str(args.gpus_per_student_node),
         "WANDB_ENTITY": args.wandb_entity,
         "WANDB_PROJECT": args.wandb_project,
         "WANDB_MODE": "online",
@@ -474,38 +725,46 @@ def render_advisor(
 
 def main():
     args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
-    if min(args.gpus_per_student, args.cpu_per_gpu, args.memory_gi_per_gpu) < 1:
+    if min(
+        args.nodes_per_student,
+        args.gpus_per_student_node,
+        args.cpu_per_gpu,
+        args.memory_gi_per_gpu,
+    ) < 1:
         sys.exit(
-            "ERROR: --gpus_per_student, --cpu_per_gpu, and --memory_gi_per_gpu must all be at least 1"
+            "ERROR: --nodes_per_student, --gpus_per_student_node, "
+            "--cpu_per_gpu, and --memory_gi_per_gpu must all be at least 1"
         )
     validate_timing_args(args)
     validate_program_path(args)
     validate_model_config(args)
     if not args.preflight_only:
-        for role, image in (
+        role_images = [
             ("advisor", args.advisor_image),
             ("student", args.student_image),
-        ):
+        ]
+        if args.nodes_per_student > 1:
+            role_images.append(("executor", args.executor_image))
+        for role, image in role_images:
+            if role == "executor" and not is_digest_image_reference(image):
+                sys.exit("ERROR: --executor_image must use an immutable @sha256 digest")
             if not is_immutable_image_reference(image):
                 sys.exit(
                     f"ERROR: --{role}_image must be an immutable digest or "
                     "a :sha-<40-character-commit> tag"
                 )
         try:
-            advisor_revision = source_revision_for_image(
-                args.advisor_image, args.senpai_repo_revision
-            )
-            student_revision = source_revision_for_image(
-                args.student_image, args.senpai_repo_revision
-            )
+            revisions = {
+                source_revision_for_image(image, args.senpai_repo_revision)
+                for _role, image in role_images
+            }
         except ValueError as error:
             sys.exit(f"ERROR: {error}")
-        if advisor_revision != student_revision:
+        if len(revisions) != 1:
             sys.exit(
-                "ERROR: --advisor_image and --student_image must use the "
-                "same source revision"
+                "ERROR: role images must use the same source revision"
             )
-        args.senpai_repo_revision = advisor_revision
+        args.senpai_repo_revision = revisions.pop()
     if args.gh_history_scope not in {"branch", "repo", "fresh"}:
         sys.exit("ERROR: --gh_history_scope must be one of: branch, repo, fresh")
     if target_repo_slug(args.target_repo_url) == target_repo_slug(
@@ -681,10 +940,13 @@ def main():
             print(
                 f"  {kubectl} logs -f "
                 f"deployment/senpai-{args.tag}-{student_list[0]}"
+                " -c student"
             )
         print("\nStop:")
+        print(f"  {kubectl} delete deployments -l research-tag={args.tag}")
+        print(f"  {kubectl} delete jobs,mpijobs -l research-tag={args.tag}")
         print(
-            f"  {kubectl} delete deployments,configmaps,secrets "
+            f"  {kubectl} delete configmaps,secrets,serviceaccounts,roles,rolebindings "
             f"-l research-tag={args.tag}"
         )
 

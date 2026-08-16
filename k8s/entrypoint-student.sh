@@ -98,4 +98,22 @@ if [ -z "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
 fi
 unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS
 rm -f "$GIT_ASKPASS_FILE"
+if [ "${NODES_PER_STUDENT:-1}" -gt 1 ]; then
+    proxy_dir="$LOGDIR/bin"
+    mkdir -p "$proxy_dir"
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'exec python -m senpai_agent.kubernetes_executor kubectl "$@"' \
+        > "$proxy_dir/kubectl"
+    chmod 500 "$proxy_dir/kubectl"
+    export PATH="$proxy_dir:$PATH"
+    for _ in $(seq 1 180); do
+        [ -S "$SENPAI_KUBERNETES_EXECUTOR_SOCKET" ] && break
+        sleep 1
+    done
+    [ -S "$SENPAI_KUBERNETES_EXECUTOR_SOCKET" ] || {
+        echo "ERROR: Kubernetes executor socket did not become ready" >&2
+        exit 1
+    }
+fi
 exec python -m senpai_agent.supervisor student

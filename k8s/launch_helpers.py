@@ -145,6 +145,11 @@ def is_immutable_image_reference(image: str) -> bool:
     return bool(FULL_SHA_IMAGE.fullmatch(image) or DIGEST_IMAGE.fullmatch(image))
 
 
+def is_digest_image_reference(image: str) -> bool:
+    """Return whether an image is pinned by an immutable registry digest."""
+    return bool(DIGEST_IMAGE.fullmatch(image))
+
+
 def source_revision_for_image(image: str, senpai_repo_revision: str = "") -> str:
     """Resolve the exact runner commit that must match the image metadata."""
     tagged = FULL_SHA_IMAGE.fullmatch(image)
