@@ -334,6 +334,21 @@ def test_source_checkout_reuses_rw_dataset_pvc_with_read_only_bundle_mount(tmp_p
         }
 
 
+def test_executor_rejects_an_explicitly_read_only_dataset_pvc(tmp_path):
+    broker = executor(tmp_path)
+    reserve(broker)
+    document = manifest()
+    document["spec"]["mpiReplicaSpecs"]["Launcher"]["template"]["spec"][
+        "volumes"
+    ][1]["persistentVolumeClaim"]["readOnly"] = True
+
+    with pytest.raises(
+        ValueError,
+        match="dataset PVC must be read-write for status and checkpoints",
+    ):
+        apply(broker, document)
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [

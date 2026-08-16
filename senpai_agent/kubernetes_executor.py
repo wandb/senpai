@@ -556,7 +556,12 @@ class KubernetesExecutor:
         if len(dataset_volumes) != 1:
             raise ValueError("training manifest must define exactly one dataset PVC volume")
         dataset_volume = dataset_volumes[0]
-        dataset_volume["persistentVolumeClaim"]["readOnly"] = False
+        dataset_claim = dataset_volume["persistentVolumeClaim"]
+        if dataset_claim.get("readOnly") is True:
+            raise ValueError(
+                "training dataset PVC must be read-write for status and checkpoints"
+            )
+        dataset_claim["readOnly"] = False
         volumes.append({"name": _WORKSPACE_VOLUME, "emptyDir": {}})
 
         for container in containers:
