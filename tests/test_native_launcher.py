@@ -30,7 +30,7 @@ from senpai.launch.specs import RoleSpec
 def args(root: Path, **overrides):
     values = {
         "tag": "mlxfast-r1",
-        "repo_revision": "a" * 40,
+        "senpai_repo_revision": "a" * 40,
         "native_run_root": str(root),
         "native_ready_timeout_s": 30,
         "dry_run": False,
@@ -45,7 +45,7 @@ def student(secret: str = "service-secret", *, name: str = "fern") -> RoleSpec:
         name=name,
         env={
             "PROBLEM_DIR": "target",
-            "REPO_REVISION": "a" * 40,
+            "SENPAI_REPO_REVISION": "a" * 40,
             "RESEARCH_TAG": "mlxfast-r1",
         },
         secrets={
@@ -458,7 +458,7 @@ class NativeLaunchTests(NativeTmuxTestCase):
                     {
                         "args": {
                             "tag": "mlxfast-r1",
-                            "repo_revision": "a" * 40,
+                            "senpai_repo_revision": "a" * 40,
                             "native_run_root": str(Path(tmp) / "runs"),
                             "native_ready_timeout_s": 30,
                             "dry_run": False,

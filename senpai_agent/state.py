@@ -6,7 +6,6 @@ import json
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from hashlib import sha256
 from pathlib import Path
 from uuid import UUID
 
@@ -49,82 +48,32 @@ class AssignmentConversationRegistry:
         return value
 
 
-class ConversationStateLedger:
-    """Record successful first delivery and system context in one atomic file."""
+class StartedConversationLedger:
+    """Record conversations that received their initial controller context."""
 
     def __init__(self, path: Path):
         self.path = path
-        self._migrate_legacy_files()
 
     def has_started(self, conversation_id: UUID) -> bool:
         return str(conversation_id) in self._read()
 
-    def is_context_current(self, conversation_id: UUID, context: str) -> bool:
-        return self._read().get(str(conversation_id)) == self._digest(context)
-
-    def mark_success(self, conversation_id: UUID, context: str) -> None:
+    def mark_started(self, conversation_id: UUID) -> None:
         values = self._read()
-        key = str(conversation_id)
-        digest = self._digest(context)
-        if values.get(key) == digest:
+        value = str(conversation_id)
+        if value in values:
             return
-        values[key] = digest
-        _replace_json(self.path, values)
+        values.add(value)
+        _replace_json(self.path, sorted(values))
 
-    @staticmethod
-    def _digest(context: str) -> str:
-        return sha256(context.encode()).hexdigest()
-
-    def _read(self) -> dict[str, str]:
+    def _read(self) -> set[str]:
         if not self.path.exists():
-            return {}
-        value = json.loads(self.path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict) or not all(
-            isinstance(key, str) and isinstance(item, str)
-            for key, item in value.items()
-        ):
-            raise RuntimeError(f"invalid conversation state ledger: {self.path}")
-        return value
-
-    def _migrate_legacy_files(self) -> None:
-        if self.path.exists():
-            return
-        started_path = self.path.parent / "started-conversations.json"
-        context_path = self.path.parent / "system-context-revisions.json"
-        if not started_path.exists() and not context_path.exists():
-            return
-
-        started = self._read_legacy_started(started_path)
-        contexts = self._read_legacy_contexts(context_path)
-        # The old controller recorded "started" before its context digest. An
-        # empty digest keeps that conversation resumable while forcing one
-        # system-context refresh after a crash between those two writes.
-        values = {conversation_id: "" for conversation_id in started}
-        values.update(contexts)
-        _replace_json(self.path, values)
-
-    @staticmethod
-    def _read_legacy_started(path: Path) -> set[str]:
-        if not path.exists():
             return set()
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(self.path.read_text(encoding="utf-8"))
         if not isinstance(value, list) or not all(
             isinstance(item, str) for item in value
         ):
-            raise RuntimeError(f"invalid conversation ledger: {path}")
+            raise RuntimeError(f"invalid conversation ledger: {self.path}")
         return set(value)
-
-    @staticmethod
-    def _read_legacy_contexts(path: Path) -> dict[str, str]:
-        if not path.exists():
-            return {}
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict) or not all(
-            isinstance(key, str) and isinstance(item, str)
-            for key, item in value.items()
-        ):
-            raise RuntimeError(f"invalid system context ledger: {path}")
-        return value
 
 
 class WorkspaceDivergenceLedger:

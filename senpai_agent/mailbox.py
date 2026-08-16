@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Protocol
 
 from senpai_agent.advisor import AdvisorEventStore
+from senpai_agent.PROMPTS import EVENT_PROMPT, render_prompt
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,9 +25,10 @@ class ControllerEvent:
             for key, value in self.payload.items()
             if key != "parent_conversation_id"
         }
-        return (
-            f"## {self.kind}\n\n"
-            f"{json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
+        return render_prompt(
+            EVENT_PROMPT,
+            KIND=self.kind,
+            PAYLOAD=json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
 
 

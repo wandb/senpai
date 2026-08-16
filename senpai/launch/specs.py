@@ -10,7 +10,12 @@ import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from senpai_agent.launch_context import render_launch_context
+from senpai_agent.launch_context import (
+    LAUNCH_CONTEXT_ENV,
+    load_operator_instructions,
+    render_launch_context,
+)
+from senpai_agent.program_context import PROGRAM_PATH_ENV
 
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
 CONTAINER_STATE_ROOT = "/var/lib/senpai"
@@ -104,33 +109,34 @@ def target_repo_slug(url: str) -> str:
     return url.split("github.com", 1)[-1].lstrip(":/").removesuffix(".git")
 
 
-def build_extra_instructions(args, tag: str, student_names: list[str]) -> str:
-    """Render backend-neutral, authoritative context for both agent roles."""
-    return render_launch_context(
-        backend=args.backend,
-        gpus_per_student=args.gpus_per_student,
-        timeout_minutes=args.timeout_minutes,
-        max_epochs=args.max_epochs,
-        tag=tag,
-        advisor_branch=args.advisor_branch,
-        target_base=args.target_repo_branch,
-        students=student_names,
-        extra_instructions=args.extra_instructions,
-    )
-
-
-def _encoded_extra_instructions(args, tag: str, student_names: list[str]) -> str:
+def _encoded_launch_context(args, tag: str, student_names: list[str]) -> str:
     return base64.b64encode(
-        build_extra_instructions(args, tag, student_names).encode()
+        render_launch_context(
+            backend=args.backend,
+            gpus_per_student=args.gpus_per_student,
+            timeout_minutes=args.timeout_minutes,
+            max_epochs=args.max_epochs,
+            tag=tag,
+            advisor_branch=args.advisor_branch,
+            target_base=args.target_repo_branch,
+            students=student_names,
+        ).encode()
+    ).decode()
+
+
+def _encoded_operator_instructions(args) -> str:
+    return base64.b64encode(
+        load_operator_instructions(args.extra_instructions).encode()
     ).decode()
 
 
 def _common_env(args, tag: str) -> dict[str, str]:
     return {
-        "REPO_URL": args.repo_url,
-        "REPO_REVISION": args.repo_revision,
+        "SENPAI_REPO_URL": args.senpai_repo_url,
+        "SENPAI_REPO_REVISION": args.senpai_repo_revision,
         "TARGET_REPO_URL": args.target_repo_url,
         "TARGET_REPO_BRANCH": args.target_repo_branch,
+        PROGRAM_PATH_ENV: args.program_path,
         "GH_REPO": target_repo_slug(args.target_repo_url),
         "RESEARCH_TAG": tag,
         "GPUS_PER_STUDENT": str(args.gpus_per_student),
@@ -192,9 +198,10 @@ def build_student_spec(
             "STUDENT_NAME": student_name,
             "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
             "SENPAI_MAX_EPOCHS": str(args.max_epochs),
-            "EXTRA_INSTRUCTIONS_B64": _encoded_extra_instructions(
+            LAUNCH_CONTEXT_ENV: _encoded_launch_context(
                 args, tag, [student_name]
             ),
+            "EXTRA_INSTRUCTIONS_B64": _encoded_operator_instructions(args),
         }
     )
     return RoleSpec("student", student_name, env, secrets)
@@ -213,9 +220,10 @@ def build_advisor_spec(
             "ADVISOR_NAME": args.advisor_name,
             "STUDENT_NAMES": ",".join(student_names),
             "SENPAI_STALE_WIP_SECONDS": str(args.stale_wip_seconds),
-            "EXTRA_INSTRUCTIONS_B64": _encoded_extra_instructions(
+            LAUNCH_CONTEXT_ENV: _encoded_launch_context(
                 args, tag, student_names
             ),
+            "EXTRA_INSTRUCTIONS_B64": _encoded_operator_instructions(args),
         }
     )
     return RoleSpec("advisor", args.advisor_name, env, secrets)

@@ -9,10 +9,15 @@ backend: kubernetes
 # problem-package repo's root ends up at ./target/ in the pod workspace.
 problem_dir: target/
 
-# git (senpai itself)
-repo_url: https://github.com/wandb/senpai.git
+# Target-repository-relative program.md to append to every role's system
+# prompt. Blank requires exactly one program.md at root or one level below.
+program_path: ""
+
+# Public Senpai runner source, fetched read-only. Override this only when the
+# images were built from a fork or private Senpai repository.
+senpai_repo_url: https://github.com/wandb/senpai.git
 # Required only for digest-pinned images; source-SHA tags derive it automatically.
-repo_revision: ""
+senpai_repo_revision: ""
 
 # problem-package repo is REQUIRED and must be passed on the CLI
 #   python k8s/launch.py --tag <tag> --target_repo_url https://github.com/<org>/<repo>.git

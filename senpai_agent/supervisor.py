@@ -14,11 +14,17 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import psutil
 from pydantic import SecretStr
 
+from senpai_agent.launch_context import render_role_prompt
 from senpai_agent.processes import terminate_process_group
+from senpai_agent.program_context import (
+    PROGRAM_PATH_ENV,
+    load_program_system_prompt,
+)
 from senpai_agent.secrets import (
     GITHUB_TOKEN_FD_ENV,
     GITHUB_TOKEN_FILE_ENV,
@@ -342,6 +348,11 @@ def supervisor_main(
         return 0 if lease_is_healthy(args.lease_path) else 1
 
     state_dir = Path(env["SENPAI_OPENHANDS_STATE_DIR"]).resolve()
+    worker_environment = prepare_system_context_environment(
+        args.command,
+        state_dir,
+        env,
+    )
     github_token = _consume_github_token(env)
     stop = threading.Event()
 
@@ -361,12 +372,54 @@ def supervisor_main(
                 args.command,
             ),
             lease_path=state_dir / "controller-lease.json",
-            environment=env,
+            environment=worker_environment,
             github_token=github_token,
         ).run(stop)
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
+
+
+def prepare_system_context_environment(
+    role: Literal["advisor", "student"],
+    state_dir: Path,
+    env: Mapping[str, str],
+) -> dict[str, str]:
+    """Snapshot the stable system context before any model process starts."""
+
+    environment = dict(env)
+    program = load_program_system_prompt(
+        Path(environment["SENPAI_OPENHANDS_WORKSPACE"]),
+        environment.get(PROGRAM_PATH_ENV, ""),
+    )
+    environment[PROGRAM_PATH_ENV] = program.program_path
+    role_prompt = state_dir / "system-instructions" / f"{role}.md"
+    if role_prompt.exists():
+        if not role_prompt.read_text(encoding="utf-8").strip():
+            raise RuntimeError(f"persisted role prompt is empty: {role_prompt}")
+    else:
+        source_value = environment.get("SENPAI_OPENHANDS_ROLE_FILE")
+        if not source_value:
+            raise RuntimeError(
+                "OpenHands role instructions are required; set "
+                "SENPAI_OPENHANDS_ROLE_FILE"
+            )
+        rendered = render_role_prompt(
+            Path(source_value).resolve(),
+            role,
+            environment,
+        )
+        role_prompt.parent.mkdir(parents=True, exist_ok=True)
+        temporary = role_prompt.with_suffix(".tmp")
+        temporary.write_text(f"{rendered}\n", encoding="utf-8")
+        temporary.replace(role_prompt)
+    environment["SENPAI_OPENHANDS_ROLE_FILE"] = str(role_prompt)
+    print(
+        f"SENPAI_PROGRAM_CONTEXT path={program.program_path}",
+        flush=True,
+    )
+    print(f"SENPAI_ROLE_PROMPT path={role_prompt}", flush=True)
+    return environment
 
 
 def _consume_github_token(env: Mapping[str, str]) -> SecretStr:

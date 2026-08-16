@@ -39,6 +39,11 @@ def test_default_config_exposes_every_model_profile_and_effort():
         "local_condenser_max_tokens": 0,
         "local_condenser_target_events": 0,
     }.items() <= config.items()
+    assert config["program_path"] == ""
+    assert config["senpai_repo_url"] == "https://github.com/wandb/senpai.git"
+    assert config["senpai_repo_revision"] == ""
+    assert "repo_url" not in config
+    assert "repo_revision" not in config
 
 
 @pytest.mark.parametrize(
@@ -77,7 +82,9 @@ def test_digest_image_requires_an_explicit_source_revision():
     image = f"ghcr.io/wandb/senpai@sha256:{'b' * 64}"
 
     assert launch_helpers.source_revision_for_image(image, REVISION) == REVISION
-    with pytest.raises(ValueError, match="require an explicit repo_revision"):
+    with pytest.raises(
+        ValueError, match="require an explicit senpai_repo_revision"
+    ):
         launch_helpers.source_revision_for_image(image)
 
 
@@ -114,10 +121,24 @@ def test_dry_run_binds_each_role_image_to_the_derived_source_revision():
         for role, deployment in deployments.items()
     } == {"advisor": ADVISOR_IMAGE, "student": STUDENT_IMAGE}
     assert {
-        document["data"]["REPO_REVISION"]
+        document["data"]["SENPAI_REPO_REVISION"]
         for document in documents
         if document.get("kind") == "ConfigMap"
     } == {REVISION}
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_runner_repository_is_explicit_in_every_role_configmap(role):
+    args = launch_args(
+        senpai_repo_url="https://github.com/example/senpai-fork.git"
+    )
+
+    configmap, _deployment, _secret = render_role(role, args)
+    config = yaml.safe_load(configmap)["data"]
+
+    assert config["SENPAI_REPO_URL"] == args.senpai_repo_url
+    assert config["SENPAI_REPO_REVISION"] == REVISION
+    assert config["TARGET_REPO_URL"] == args.target_repo_url
 
 
 def test_launch_rejects_role_images_from_different_source_revisions():
@@ -170,7 +191,7 @@ def test_student_only_launch_validates_only_the_student_image():
 
     launch.resolve_runner_revision(args, has_students=True)
 
-    assert args.repo_revision == REVISION
+    assert args.senpai_repo_revision == REVISION
 
 
 def test_advisor_only_launch_validates_only_the_advisor_image():
@@ -178,7 +199,7 @@ def test_advisor_only_launch_validates_only_the_advisor_image():
 
     launch.resolve_runner_revision(args, has_students=False)
 
-    assert args.repo_revision == REVISION
+    assert args.senpai_repo_revision == REVISION
 
 
 def test_launch_help_keeps_descriptions_with_their_options():
@@ -187,13 +208,13 @@ def test_launch_help_keeps_descriptions_with_their_options():
 
     assert result.returncode == 0, result.stderr
     for option_help in (
-        "--repo_url str git repo URL (senpai runner)",
-        "--repo_revision str exact runner commit",
-        "--advisor_image str immutable advisor image; required with --advisor",
-        "--student_image str immutable student image; required when students are launched",
+        "--senpai_repo_url str public read-only runner source",
+        "--senpai_repo_revision str exact runner commit",
+        "--advisor_image str advisor source-SHA tag or image digest — REQUIRED",
+        "--student_image str student source-SHA tag or image digest — REQUIRED",
         "--human_issues, --nohuman_issues bool allow human GitHub issue triage",
         "--advisor, --noadvisor bool also deploy the advisor pod",
-        "--extra_instructions str extra prompt text for the advisor",
+        "--extra_instructions str shared operator instructions",
         "--timeout_minutes float training run wall-clock limit",
         "--max_epochs int maximum training epochs",
         "--poll_interval_s int default advisor/student outer-loop sleep",
@@ -210,9 +231,13 @@ def test_role_bootstrap_verifies_both_checkout_and_image_source_revision(role):
         0
     ]["args"][0]
 
-    assert 'fetch --depth 1 "$REPO_URL" "$REPO_REVISION"' in command
-    assert 'test "$(git rev-parse HEAD)" = "$REPO_REVISION"' in command
-    assert 'test "$SENPAI_IMAGE_REVISION" = "$REPO_REVISION"' in command
+    assert (
+        'fetch --depth 1 "$SENPAI_REPO_URL" "$SENPAI_REPO_REVISION"' in command
+    )
+    assert 'test "$(git rev-parse HEAD)" = "$SENPAI_REPO_REVISION"' in command
+    assert (
+        'test "$SENPAI_IMAGE_REVISION" = "$SENPAI_REPO_REVISION"' in command
+    )
 
 
 @pytest.mark.parametrize(
@@ -238,6 +263,17 @@ def test_start_gate_is_rendered_when_it_is_beneath_the_shared_pvc():
     assert yaml.safe_load(configmap)["data"]["SENPAI_START_GATE_PATH"] == (
         "/mnt/shared/gates/start"
     )
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/program.md", "../program.md", "senpai/../program.md", "policy.md"],
+)
+def test_launch_rejects_a_program_path_outside_the_target_repo(path):
+    result = run_launch("--program_path", path)
+
+    assert result.returncode != 0
+    assert "--program_path" in result.stderr
 
 
 def test_launch_secret_contains_each_credential_and_both_roles_reference_it():
@@ -342,6 +378,23 @@ def test_openai_ultra_launch_value_is_rejected():
 
     with pytest.raises(SystemExit, match="must be one of"):
         launch.validate_model_config(args)
+
+
+def test_launch_accepts_anthropic_max_for_every_model_profile():
+    args = launch_args(
+        advisor_model="anthropic/claude-fable-5",
+        advisor_reasoning_effort="max",
+        student_model="anthropic/claude-opus-5",
+        student_reasoning_effort="max",
+        smart_model="anthropic/claude-opus-5",
+        smart_reasoning_effort="max",
+        fast_model="anthropic/claude-sonnet-5",
+        fast_reasoning_effort="max",
+        frontier_model="anthropic/claude-fable-5",
+        frontier_reasoning_effort="max",
+    )
+
+    launch.validate_model_config(args)
 
 
 def test_wandb_gateway_is_rendered_for_every_role():

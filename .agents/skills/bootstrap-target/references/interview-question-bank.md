@@ -48,7 +48,7 @@ can read.
 - What do feature and target channels mean?
 - Which splits test in-distribution performance, OOD generalization, or
   paper-facing claims?
-- Are there known hard regimes, rare cases, physical constraints, or failure
+- Are there known hard regimes, rare cases, domain constraints, or failure
   modes that advisors should account for?
 
 ## Operations

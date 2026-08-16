@@ -62,11 +62,11 @@ def advisor_event(number=17):
 
 def test_context_recovery_prompt_does_not_repeat_an_embedded_research_brief():
     prompt = _context_recovery_prompt(
-        "complete research brief",
-        "updated operating context\n\ncomplete research brief\n\nactionable event",
+        "complete initial controller context",
+        "updated operating context\n\ncomplete initial controller context\n\nactionable event",
     )
 
-    assert prompt.count("complete research brief") == 1
+    assert prompt.count("complete initial controller context") == 1
 
 
 def test_running_student_receives_only_feedback_bound_to_its_conversation(
@@ -104,7 +104,7 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
 
     result = OpenHandsTurnRunner(
         Config("student", state_dir, conversation_id),
-        full_prompt="student research brief",
+        full_prompt="student initial controller context",
         github_mailbox=Mailbox((current, other_revision)),
         active_poll_interval_seconds=0.001,
     ).run(
@@ -147,7 +147,7 @@ def test_observed_feedback_is_not_reported_delivered_until_the_event_pump_sends_
 
     result = OpenHandsTurnRunner(
         Config("student", state_dir, conversation_id),
-        full_prompt="student research brief",
+        full_prompt="student initial controller context",
         github_mailbox=Mailbox((feedback,)),
         active_poll_interval_seconds=0.001,
     ).run(
@@ -205,7 +205,7 @@ def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
 
     result = OpenHandsTurnRunner(
         Config("student", state_dir, conversation_id),
-        full_prompt="student research brief",
+        full_prompt="student initial controller context",
         github_mailbox=Mailbox((feedback,)),
         active_poll_interval_seconds=0.001,
     ).run(
@@ -248,7 +248,7 @@ def test_full_visible_set_suppresses_events_handled_in_an_earlier_turn(
 
     result = OpenHandsTurnRunner(
         Config("advisor", state_dir, conversation_id),
-        full_prompt="advisor research brief",
+        full_prompt="advisor initial controller context",
         github_mailbox=Mailbox((handled, current)),
         active_poll_interval_seconds=0.001,
     ).run(
@@ -292,7 +292,7 @@ def test_acknowledged_store_rows_are_not_reported_as_this_turn_deliveries(
 
     result = OpenHandsTurnRunner(
         Config("advisor", state_dir, conversation_id),
-        full_prompt="advisor research brief",
+        full_prompt="advisor initial controller context",
         github_mailbox=Mailbox((handled,)),
         active_poll_interval_seconds=0.001,
     ).run(
@@ -404,7 +404,7 @@ def test_context_exhaustion_retries_once_on_a_fresh_branch_with_the_same_id(
 
     result = OpenHandsTurnRunner(
         Config("advisor", tmp_path / "state", conversation_id, timeout_seconds=100),
-        full_prompt="complete current research brief",
+        full_prompt="complete current controller context",
     ).run(
         "current actionable event",
         conversation_id=conversation_id,
@@ -414,7 +414,7 @@ def test_context_exhaustion_retries_once_on_a_fresh_branch_with_the_same_id(
     assert result.exit_code == 0
     assert calls[0] == ("current actionable event", conversation_id, False, 100)
     assert calls[1][1:] == (conversation_id, True, 75)
-    assert "complete current research brief" in calls[1][0]
+    assert "complete current controller context" in calls[1][0]
     assert "current actionable event" in calls[1][0]
     assert "raw trace and workspace are preserved" in calls[1][0]
 
@@ -469,7 +469,7 @@ def test_terminal_turn_recovery_preserves_history_and_excludes_new_events(
 
     result = OpenHandsTurnRunner(
         Config("advisor", tmp_path / "state", conversation_id),
-        full_prompt="complete current research brief",
+        full_prompt="complete current controller context",
     ).run(
         original.prompt.body,
         conversation_id=conversation_id,
@@ -481,7 +481,7 @@ def test_terminal_turn_recovery_preserves_history_and_excludes_new_events(
     assert result.exit_code == 0
     assert len(calls) == 1
     assert calls[0][0] == "unchanged controller prompt"
-    assert "complete current research brief" in calls[0][1]["recovery_prompt"]
+    assert "complete current controller context" in calls[0][1]["recovery_prompt"]
     recovery = inbox.turn(inbox.turn(original.turn_id).superseded_by)
     assert recovery.state is DeliveryState.PROCESSED
 
@@ -510,7 +510,7 @@ def test_context_recovery_attempt_is_not_retried(
     with pytest.raises(ConversationRecoveryExhausted) as raised:
         OpenHandsTurnRunner(
             Config("advisor", tmp_path / "state", conversation_id),
-            full_prompt="complete current research brief",
+            full_prompt="complete current controller context",
         ).run(
             "current actionable event",
             conversation_id=conversation_id,
@@ -544,7 +544,7 @@ def test_exhausted_turn_budget_defers_without_starting_a_doomed_recovery(
     with pytest.raises(ConversationRecoveryExhausted) as raised:
         OpenHandsTurnRunner(
             Config("advisor", tmp_path / "state", conversation_id, timeout_seconds=100),
-            full_prompt="complete current research brief",
+            full_prompt="complete current controller context",
         ).run(
             "current actionable event",
             conversation_id=conversation_id,
@@ -577,7 +577,7 @@ def test_transient_failure_during_context_recovery_uses_normal_retry_semantics(
     with pytest.raises(RuntimeError, match="temporary provider outage"):
         OpenHandsTurnRunner(
             Config("advisor", tmp_path / "state", conversation_id),
-            full_prompt="complete current research brief",
+            full_prompt="complete current controller context",
         ).run(
             "current actionable event",
             conversation_id=conversation_id,

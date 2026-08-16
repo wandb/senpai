@@ -21,7 +21,7 @@ def launch_args(**overrides) -> launch.Args:
         "advisor": True,
         "advisor_image": ADVISOR_IMAGE,
         "student_image": STUDENT_IMAGE,
-        "repo_revision": REVISION,
+        "senpai_repo_revision": REVISION,
     }
     values.update(overrides)
     return launch.Args(**values)

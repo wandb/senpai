@@ -5,8 +5,7 @@ specific, and operational.
 
 ## Title And Target Summary
 
-Name the target plainly. In the first paragraph, say what inputs come in, what
-outputs are predicted or optimized, and what kind of research program this is.
+Name the target plainly. In the first paragraph, say what inputs come in, what outputs are predicted or optimized, and what research problem `program.md` governs.
 
 Example:
 
@@ -68,7 +67,7 @@ is part of the benchmark contract, say that changing it invalidates results.
 Document the callable interface and invariants that evaluation depends on:
 
 - input and output tensor shapes
-- normalized versus physical target spaces
+- normalized versus original target spaces
 - masking and padding behavior
 - checkpoint-selection metric
 - final validation/test evaluation behavior
@@ -174,10 +173,9 @@ hyperparameter search.
 
 ## Roles
 
-End by pointing to the target role overlays:
+End with the target's coordination model when it adds useful context:
 
 ```markdown
 Research is coordinated through GitHub PRs with an advisor/student model. GitHub
-Issues are used for communication with the human researcher team. See
-`instructions/prompt-advisor.md` and `instructions/prompt-student.md`.
+Issues are used for communication with the human researcher team.
 ```

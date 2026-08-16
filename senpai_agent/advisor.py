@@ -13,6 +13,11 @@ from openhands.sdk.conversation import ConversationExecutionStatus, Conversation
 from pydantic import BaseModel, ConfigDict, Field
 
 from senpai_agent.inbox import PersistentInbox
+from senpai_agent.PROMPTS import (
+    ADVISOR_EVENT_PROMPT,
+    EVENT_PROMPT,
+    render_prompt,
+)
 
 _TERMINAL_DELIVERY_STATUSES = frozenset(
     {
@@ -35,10 +40,11 @@ class AdvisorEvent(BaseModel):
     def to_user_message(self) -> str:
         payload = json.dumps(self.payload, indent=2, sort_keys=True)
         observed_at = self.observed_at.astimezone(UTC).isoformat()
-        return (
-            f"# Senpai event: {self.kind}\n\n"
-            f"Observed at (UTC): {observed_at}\n\n"
-            f"```json\n{payload}\n```"
+        return render_prompt(
+            ADVISOR_EVENT_PROMPT,
+            KIND=self.kind,
+            OBSERVED_AT=observed_at,
+            PAYLOAD=payload,
         )
 
     def to_inbox_message(self) -> str:
@@ -47,9 +53,10 @@ class AdvisorEvent(BaseModel):
             for key, value in self.payload.items()
             if key != "parent_conversation_id"
         }
-        return (
-            f"## {self.kind}\n\n"
-            f"{json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
+        return render_prompt(
+            EVENT_PROMPT,
+            KIND=self.kind,
+            PAYLOAD=json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
 
 
@@ -155,10 +162,6 @@ class AdvisorEventStore:
         _traceback: TracebackType | None,
     ) -> None:
         self.close()
-
-
-def compose_system_instructions(harness: str, role: str) -> str:
-    return f"# Senpai harness\n\n{harness.strip()}\n\n# Senpai role\n\n{role.strip()}\n"
 
 
 def advisor_conversation_id(

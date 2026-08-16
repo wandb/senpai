@@ -29,7 +29,7 @@ fi
 : "${GITHUB_TOKEN:?GitHub bootstrap token is required}"
 
 echo "=== Senpai Student: $STUDENT_NAME ==="
-echo "Runner repo:  $REPO_URL (revision: $REPO_REVISION)"
+echo "Runner repo:  $SENPAI_REPO_URL (revision: $SENPAI_REPO_REVISION)"
 echo "Target repo:  $TARGET_REPO_URL (base branch: ${TARGET_REPO_BRANCH:-<default>}; advisor branch: $ADVISOR_BRANCH)"
 echo "Problem dir:  $PROBLEM_DIR"
 echo "GitHub history: $GH_HISTORY_SCOPE"
@@ -90,7 +90,7 @@ ls \
     "$HOME/.agents/agents/general-purpose.md" \
     "$HOME/.agents/agents/explore.md" \
     "$HOME/.agents/agents/search.md" \
-    "$HOME/.agents/skills/wandb-primary/SKILL.md"
+    "$SENPAI_PLUGIN/skills/wandb-primary/SKILL.md"
 
 # --- Hivemind is intentionally disabled pending its OpenHands rewrite. ---
 # source "$WORKDIR/k8s/start-hivemind.sh"
@@ -99,10 +99,7 @@ ls \
 export IS_SANDBOX=1
 
 export SENPAI_OPENHANDS_STATE_DIR="$LOGDIR/openhands_state"
-export SENPAI_OPENHANDS_ROLE_FILE="$LOGDIR/STUDENT.md"
-envsubst '$PROBLEM_DIR $TARGET_REPO_URL $GH_REPO $ADVISOR_BRANCH $RESEARCH_TAG $STUDENT_NAME $GPUS_PER_STUDENT $WANDB_ENTITY $WANDB_PROJECT' \
-    < "$WORKDIR/system_instructions/STUDENT.md" \
-    > "$SENPAI_OPENHANDS_ROLE_FILE"
+export SENPAI_OPENHANDS_ROLE_FILE="$WORKDIR/system_instructions/STUDENT.md"
 export SENPAI_OPENHANDS_WORKSPACE="$TARGET_WORKDIR"
 export SENPAI_OPENHANDS_HARNESS_FILE="$WORKDIR/system_instructions/SENPAI-HARNESS.md"
 export SENPAI_OPENHANDS_TIMEOUT_SECONDS="${SENPAI_OPENHANDS_TIMEOUT_SECONDS:-3600}"

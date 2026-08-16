@@ -287,7 +287,7 @@ def preflight_native(args, role_specs: list[RoleSpec]) -> NativeLaunchPlan:
         raise RuntimeError(
             "Native Senpai is missing required commands: " + ", ".join(missing)
         )
-    _check_source_revision(plan.source_root, args.repo_revision)
+    _check_source_revision(plan.source_root, args.senpai_repo_revision)
     for script in ("entrypoint-advisor.sh", "entrypoint-student.sh"):
         if not (plan.source_root / "k8s" / script).is_file():
             raise RuntimeError(f"Native Senpai source is missing k8s/{script}")
@@ -431,7 +431,11 @@ def _create_role_files(args, plan: NativeLaunchPlan, role: NativeRolePlan) -> No
         role.tmp_root,
     ):
         _private_directory(path)
-    _prepare_runner_workdir(plan.source_root, role.workdir, args.repo_revision)
+    _prepare_runner_workdir(
+        plan.source_root,
+        role.workdir,
+        args.senpai_repo_revision,
+    )
     role.workdir.chmod(0o700)
     for path in (role.stdout_log, role.stderr_log):
         path.touch(mode=0o600, exist_ok=False)
@@ -630,7 +634,7 @@ def _wait_until_ready(plan: NativeLaunchPlan, timeout_s: float) -> None:
 
 def _print_plan(args, plan: NativeLaunchPlan) -> None:
     print(f"Native Senpai run: {plan.run_root}")
-    print(f"Runner source: {plan.source_root} ({args.repo_revision})")
+    print(f"Runner source: {plan.source_root} ({args.senpai_repo_revision})")
     print(f"launchd domain: {plan.domain}")
     for role in plan.roles:
         print(f"\n--- Native {role.spec.key} ---")

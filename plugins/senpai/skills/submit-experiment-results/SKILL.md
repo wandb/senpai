@@ -14,7 +14,7 @@ effort: high
 
 # Submit experiment results
 
-First make the target worktree clean by committing only the assigned change.
+First make the repository worktree clean by committing only the assigned change.
 Collect the current local commit SHA and the current remote assignment-branch
 SHA. Build the strict `ExperimentResult` required by
 `submit_experiment_result`:

@@ -165,6 +165,11 @@ Before accepting a result, prove that:
 - the required workload was preserved,
 - the compiler and runtime used the intended implementation.
 
+Keep this verification proportional to the risk. A concise reachability check
+is useful; repeatedly rechecking settled facts without new evidence is not.
+Prefer the lightest check that can disprove the important failure mode, then
+return to running experiments.
+
 ### Treat Quality As A System, Not One Number
 
 Perplexity is necessary when the contract requires it, but it is not sufficient.
@@ -225,6 +230,36 @@ new drafter, ask which budget line it attacks:
 - network or benchmark overhead.
 
 If the idea does not map to a measured cost, it is probably premature.
+
+The budget must describe the dependency graph as well as the sum of component
+times. Removing a dispatch may save nothing when it was overlapped. Fusion may
+delay an independent branch, replicate a producer reduction, increase live
+state, or reduce occupancy. Fission may add a launch yet shorten the critical
+path. For every fusion, materialization, or scheduling proposal, ask whether it
+removes work, moves work, overlaps work, or merely changes where the profiler
+attributes it.
+
+### Treat Metadata And Invariants As Optimization Inputs
+
+Inference moves and recomputes more than weights and activations. Indices,
+bounds, masks, permutations, scales, routing decisions, layout descriptors, and
+cache state can be substantial costs or can force downstream materialization.
+Inventory them as first-class data products.
+
+Two broad research families follow:
+
+- Have a producer publish a compact result that several consumers currently
+  rediscover, such as exact bounds, a permutation, a sparse-work map, or a
+  layout certificate.
+- Find invariants created by a checkpoint transform or upstream computation,
+  then encode the same information more cheaply and reconstruct it exactly at
+  the consumer.
+
+These levers are safest when the invariant is proved by construction, carried
+with explicit shape and provenance, and invalidated whenever its source state
+changes. Keep a fail-closed fallback for inputs that do not satisfy the proof.
+Price the certificate itself: maintaining or checking an invariant can cost
+more than the work it removes.
 
 ### Treat Speculation As A Data Flywheel
 
@@ -423,7 +458,9 @@ different request path should block promotion.
 
 ### Phase 3: Make A Decode Budget
 
-Profile one token at a time. For transformer inference, split the budget into:
+Profile one token at a time, but also make separate budgets for the other
+important regimes identified in the serving contract. For transformer
+inference, split each applicable budget into:
 
 - embedding and input preparation,
 - attention,
@@ -438,6 +475,11 @@ Profile one token at a time. For transformer inference, split the budget into:
 
 Then assign each proposed optimization to a budget line. This keeps the research
 portfolio balanced and avoids over-investing in an already-small component.
+
+Include phase transitions and lifecycle costs where they matter: model and
+weight preparation, first touch, compilation or autotuning, initial cache
+growth, the first decode step, output selection, and shape-specific fallbacks.
+Do not amortize them away unless production traffic genuinely does.
 
 ### Phase 4: Establish The Weight-Byte Floor
 
@@ -554,6 +596,13 @@ Try:
 - launch-overhead reduction,
 - host-loop removal.
 
+Experiment with how each kernel divides work across the accelerator. A larger
+block may reuse data well but run fewer blocks in parallel; a smaller block may
+create more parallel work but repeat setup or leave part of the hardware idle.
+Try a few sensible divisions of the work, including the smallest and largest
+real request shapes, because the best choice may change with the workload and
+hardware.
+
 Cost a kernel change before building it:
 
 - bytes moved,
@@ -566,6 +615,20 @@ Cost a kernel change before building it:
 Every kernel optimization needs a numerical-equivalence gate. If the gate is
 "same selected token" rather than bit-exact equality, state that explicitly and
 test the margin where token choices can flip.
+
+Compilation and specialization are part of the runtime budget. Audit the full
+request lifecycle for JIT compilation, graph creation, autotuning, pipeline
+cache misses, and lazy page or artifact loading. Warm the exact phase, shape,
+branch, and epilogue identities that production will reuse; a forward-only
+warmup may leave sampling or a fallback shape cold. Balance specialization
+against compile time, cache pressure, binary size, and the number of identities
+that must be prepared.
+
+Preserve arithmetic semantics, not merely algebra. Contraction, reduction
+order, intermediate rounding, and reassociation can change outputs even when
+two expressions are mathematically equivalent. Use component differential
+tests and full-model gates, and keep generated, AOT, and JIT implementations in
+sync when more than one artifact represents the same kernel.
 
 Drafters need their own runtime scrutiny. They are smaller than the target, so
 they may fail to saturate the accelerator and may pay proportionally more host
@@ -680,6 +743,58 @@ Common failure modes:
 - deterministic settings that restore correctness but impose a large speed tax,
 - private prompts with longer context changing the bottleneck.
 
+### Sparse And Mixture-Of-Experts Dataflow
+
+Sparse models add a control and data-movement problem around the dense expert
+math. Measure the real distribution rather than reasoning only from the mean:
+active experts, routes per expert, empty and tiny groups, skew, tail shapes, and
+how these change across workloads.
+
+Promising experiments:
+
+- exact or hierarchical routing and selection algorithms that preserve full
+  ordering keys and tie-breaking,
+- carrying routing indices, expert bounds, permutations, and other producer
+  metadata to downstream consumers,
+- compacting sparse work and mapping execution ownership to active rows,
+- grouping, sorting, gather/scatter, and inverse-permutation alternatives,
+- ragged versus padded expert kernels and geometry chosen for the measured
+  distribution,
+- shared-expert and routed-expert overlap, locality, and load balancing,
+- eliminating intermediate materialization while preserving accumulation
+  order,
+- exact fallback paths for dense or unusual routing distributions.
+
+Common failure modes:
+
+- sizing kernels for average occupancy while the distribution has a long tail,
+- reducing high-level operations but disabling a specialized sparse backend,
+- changing comparator tie-breaking or floating-point accumulation order,
+- spending more to create, validate, or transport a sparse certificate than it
+  saves,
+- assuming a sparse win at one batch or phase transfers to another.
+
+### Representation And Lifecycle Co-Design
+
+Treat offline transformation, model loading, runtime preparation, and hot-path
+layout as one design space. The same prepacking, permutation, transposition, or
+metadata construction can be cheap at one lifecycle stage and dominated at
+another.
+
+Promising experiments:
+
+- prepacking weights or metadata for the consumer's real access pattern,
+- lossless compression of producer-certified redundant representation,
+- zero-copy views when shape, stride, offset, type, and ownership permit them,
+- removing materialization or repeated conversion between adjacent stages,
+- producing reusable bounds, indices, or layout descriptors upstream,
+- moving invariant preparation out of the repeated request path.
+
+Price startup latency, peak and resident memory, duplicated representations,
+artifact size, compile time, caching, mutability, and invalidation alongside
+steady-state latency. The right answer may be offline, at load time, lazily
+cached, or recomputed; no lifecycle stage is universally best.
+
 ### Decode Loop, Scheduling, And Host Overhead
 
 Promising experiments:
@@ -743,9 +858,10 @@ Result:
 The system should keep a ledger of rejected ideas. The ledger should include the
 reason an idea failed, not only the result number.
 
-## High-Value Defaults For The Next Model
+## High-Value Defaults
 
-Start with these unless the new model gives a clear reason not to:
+Start with these unless the model or serving workload gives a clear reason not
+to:
 
 - Build the validation harness first.
 - Reproduce the unoptimized baseline locally and officially.
@@ -760,6 +876,12 @@ Start with these unless the new model gives a clear reason not to:
 - Model acceptance length and roofline costs before training a new speculator.
 - Reuse application traces for evaluation, speculator training, and later
   distillation, while keeping held-out quality gates clean.
+- Partition prefill, decode, transitions, cold start, and important request
+  shapes before choosing a bottleneck.
+- Inventory sparse-routing metadata, layout conversions, and intermediate
+  materializations alongside weight and activation bytes.
+- Audit compilation, specialization, and the complete request epilogue rather
+  than warming only the model forward pass.
 - Prefer prompt-invariant levers for private stability.
 - Use downstream quality gates when perplexity is a weak proxy.
 - Use paired speed measurements for small deltas.

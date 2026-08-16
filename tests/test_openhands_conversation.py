@@ -186,8 +186,10 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     assert captured["prompt"] == "first task"
     assert captured["role"] == (
         "# Senpai harness\n\nharness instructions\n\n"
-        "# Senpai role\n\nadvisor role\n"
-        "\n# Live controller invariant\n\n"
+        "# Senpai role\n\nadvisor role\n\n"
+        "# program.md - program.md\n\nTest programme.\n\n"
+        "# Authoritative launch context\n\nTest launch policy.\n\n"
+        "# Live controller invariant\n\n"
         f"{runner.live_controller_invariant(config)}\n"
     )
     assert captured["plugin"] == str(PLUGIN_DIR)
@@ -657,7 +659,7 @@ def test_terminal_budget_reconciles_a_finished_response_before_recovery(
 
     result = OpenHandsTurnRunner(
         config,
-        full_prompt="complete research brief",
+        full_prompt="complete initial controller context",
     ).run(
         turn.prompt.body,
         conversation_id=config.conversation_id,
@@ -791,7 +793,9 @@ def test_stalled_recovery_is_bounded_and_quarantined_with_the_full_brief(
         lambda _events: [],
     )
     isolate_agent_discovery(monkeypatch, runner)
-    turns = OpenHandsTurnRunner(config, full_prompt="complete research brief")
+    turns = OpenHandsTurnRunner(
+        config, full_prompt="complete initial controller context"
+    )
 
     first = turns.run(
         turn.prompt.body,
@@ -810,7 +814,7 @@ def test_stalled_recovery_is_bounded_and_quarantined_with_the_full_brief(
 
     assert first.exit_code == second.exit_code == 1
     assert [name for name, _value in calls].count("navigate") == 1
-    assert "complete research brief" in active[0].message
+    assert "complete initial controller context" in active[0].message
     assert "Conversation context recovery" in active[0].message
     assert [event.message for event in active[1:]] == ["canonical event"]
 
@@ -888,7 +892,9 @@ def test_model_visible_progress_renews_the_stalled_attempt_budget(
         lambda _events: [],
     )
     isolate_agent_discovery(monkeypatch, runner)
-    turns = OpenHandsTurnRunner(config, full_prompt="complete research brief")
+    turns = OpenHandsTurnRunner(
+        config, full_prompt="complete initial controller context"
+    )
 
     for _attempt in range(2):
         assert turns.run(
@@ -964,7 +970,9 @@ def test_timeout_and_error_artifacts_do_not_renew_the_stalled_attempt_budget(
         lambda _events: [],
     )
     isolate_agent_discovery(monkeypatch, runner)
-    turns = OpenHandsTurnRunner(config, full_prompt="complete research brief")
+    turns = OpenHandsTurnRunner(
+        config, full_prompt="complete initial controller context"
+    )
 
     for _attempt in range(3):
         assert turns.run(
@@ -1261,6 +1269,12 @@ def test_named_agent_compaction_uses_its_own_provider(tmp_path, monkeypatch):
 
     isolate_agent_discovery(monkeypatch, runner)
     monkeypatch.setattr(runner, "find_named_agent", lambda *_: object())
+    monkeypatch.setattr(runner, "resolve_agent_skills", lambda *_: [])
+    monkeypatch.setattr(
+        runner,
+        "without_eager_skill_discovery",
+        lambda definition: definition,
+    )
     monkeypatch.setattr(
         runner,
         "agent_definition_to_factory",

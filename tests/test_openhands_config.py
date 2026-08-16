@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 import pytest
-from openhands_support import runtime_config, runtime_env
+from openhands_support import TEST_LAUNCH_CONTEXT, runtime_config, runtime_env
 from pydantic import SecretStr
 from test_agent_markdown import HTML_HEADER, PLAIN_HEADER
 
@@ -12,12 +12,16 @@ from senpai_agent.openhands_runner import (
     find_role_file,
     live_controller_invariant,
     parse_runner_args,
-    read_role_instructions,
+    read_instruction_file,
+    resolve_agent_skills,
     resolve_config,
     sanitized_agent_definitions,
     sanitized_project_skills,
     scrub_model_credentials,
+    without_eager_skill_discovery,
 )
+from senpai_agent.program_context import ProgramSystemPrompt
+from senpai_agent.system_instructions import SenpaiSystemInstructions
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,7 +41,7 @@ def test_explicit_role_file_is_loaded(tmp_path: Path):
     selected = find_role_file(str(role_file))
 
     assert selected == role_file
-    assert read_role_instructions(selected) == "student role"
+    assert read_instruction_file(selected) == "student role"
 
 
 @pytest.mark.parametrize("explicit", [None, "missing.md"])
@@ -48,21 +52,37 @@ def test_role_file_must_be_explicit_and_exist(tmp_path: Path, explicit: str | No
         find_role_file(path)
 
 
-def test_main_agent_context_places_harness_and_role_before_project_skills():
-    context = build_main_agent_context("harness instructions", "advisor role")
+def test_main_agent_context_appends_program_after_harness_and_role():
+    context = build_main_agent_context(
+        SenpaiSystemInstructions(
+            harness="harness instructions",
+            role="advisor role",
+            program=ProgramSystemPrompt(
+                program_path="senpai/program.md",
+                prompt="# program.md - senpai/program.md\n\nResearch policy.",
+            ),
+            launch="# Authoritative launch context\n\nRuntime policy.",
+        ),
+    )
 
     assert context.system_message_suffix == (
-        "# Senpai harness\n\nharness instructions\n\n# Senpai role\n\nadvisor role\n"
+        "# Senpai harness\n\nharness instructions\n\n"
+        "# Senpai role\n\nadvisor role\n\n"
+        "# program.md - senpai/program.md\n\nResearch policy.\n\n"
+        "# Authoritative launch context\n\nRuntime policy.\n"
     )
     assert context.current_datetime is None
-    assert context.load_user_skills is True
+    assert context.load_user_skills is False
     assert context.load_project_skills is False
 
 
 def test_live_advisor_invariant_is_part_of_non_condensed_system_context(tmp_path):
     advisor = runtime_config(tmp_path, role="advisor", max_turns=100000)
     invariant = live_controller_invariant(advisor)
-    context = build_main_agent_context("harness", "advisor", (), invariant)
+    context = build_main_agent_context(
+        advisor.instructions,
+        runtime_invariant=invariant,
+    )
 
     assert "advisor campaign is active" in context.system_message_suffix
     assert "no configured campaign round limit" in context.system_message_suffix
@@ -87,17 +107,37 @@ def test_student_charter_requires_typed_tools_for_every_long_job():
     assert "`cancel_job`" in instructions
 
 
-def test_project_instructions_and_file_agents_are_sanitized_without_mutation(
+def test_project_instruction_files_are_not_loaded_but_explicit_skills_are(
     tmp_path: Path,
 ):
     workspace = tmp_path / "target"
     agents = workspace / ".agents" / "agents"
+    skill_dir = workspace / ".agents" / "skills" / "agents"
     agents.mkdir(parents=True)
-    instructions = workspace / "AGENTS.md"
+    skill_dir.mkdir(parents=True)
+    instructions = (
+        workspace / "AGENTS.md",
+        workspace / "CLAUDE.md",
+        workspace / "nested" / "AGENT.md",
+        workspace / ".agents" / "skills" / "AGENTS.md",
+        workspace / ".openhands" / "skills" / "CLAUDE.md",
+    )
     definition = agents / "review.md"
-    instructions.write_text(HTML_HEADER + "# Project rules\n", encoding="utf-8")
+    for path in instructions:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(HTML_HEADER + "# Project rules\n", encoding="utf-8")
+    (workspace / ".agents" / "skills" / "linked.md").symlink_to(
+        workspace / "AGENTS.md"
+    )
+    skill_file = skill_dir / "SKILL.md"
+    skill_file.write_text(
+        "---\nname: agents\ndescription: Review code.\n---\n\n"
+        + PLAIN_HEADER
+        + "Review carefully.\n",
+        encoding="utf-8",
+    )
     definition.write_text(
-        "---\nname: review\ndescription: Review code.\n---\n\n"
+        "---\nname: review\ndescription: Review code.\nskills:\n  - agents\n---\n\n"
         + PLAIN_HEADER
         + "Review carefully.\n",
         encoding="utf-8",
@@ -106,13 +146,21 @@ def test_project_instructions_and_file_agents_are_sanitized_without_mutation(
     skills = sanitized_project_skills(workspace)
     definitions = sanitized_agent_definitions(workspace)
 
-    assert "SPDX-" not in next(
-        skill.content for skill in skills if skill.name == "agents"
+    assert [skill.name for skill in skills] == ["agents"]
+    assert skills[0].source == str(skill_file)
+    assert "SPDX-" not in skills[0].content
+    assert "Review carefully." in skills[0].content
+    assert "Project rules" not in skills[0].content
+    review = next(item for item in definitions if item.name == "review")
+    assert "SPDX-" not in review.system_prompt
+    assert review.skills == ["agents"]
+    assert resolve_agent_skills(review, skills) == [skills[0]]
+    assert without_eager_skill_discovery(review).skills == []
+    assert all(
+        path.read_text(encoding="utf-8").startswith("<!--\nSPDX-")
+        for path in instructions
     )
-    assert "SPDX-" not in next(
-        item.system_prompt for item in definitions if item.name == "review"
-    )
-    assert instructions.read_text(encoding="utf-8").startswith("<!--\nSPDX-")
+    assert "# SPDX-" in skill_file.read_text(encoding="utf-8")
     assert "# SPDX-" in definition.read_text(encoding="utf-8")
 
 
@@ -167,6 +215,65 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
     assert delegated.smart_api_key == "openai-key"
     assert delegated.fast_api_key == "openai-key"
     assert delegated.frontier_api_key == "openai-key"
+
+
+def test_resolved_config_discovers_one_level_program_from_target_workspace(
+    tmp_path: Path,
+):
+    env = runtime_env(
+        tmp_path,
+        program_path="senpai/program.md",
+        program_content="# Mission\n\nImprove the model.\n",
+    )
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert config.instructions.program.program_path == "senpai/program.md"
+    assert config.instructions.program.prompt == (
+        "# program.md - senpai/program.md\n\n"
+        "# Mission\n\nImprove the model."
+    )
+    assert config.instructions.launch == TEST_LAUNCH_CONTEXT
+    assert config.instructions.prompt == (
+        "# Senpai harness\n\nharness instructions\n\n"
+        "# Senpai role\n\nadvisor role\n\n"
+        "# program.md - senpai/program.md\n\n"
+        "# Mission\n\nImprove the model.\n\n"
+        f"{TEST_LAUNCH_CONTEXT}\n"
+    )
+    delegated = runner.delegation_config(config)
+    assert delegated.program_path == config.instructions.program.program_path
+
+
+def test_resolved_system_instructions_do_not_change_with_source_files(
+    tmp_path: Path,
+):
+    env = runtime_env(tmp_path)
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+    prompt = config.instructions.prompt
+
+    Path(env["SENPAI_OPENHANDS_HARNESS_FILE"]).write_text("changed harness")
+    Path(env["SENPAI_OPENHANDS_ROLE_FILE"]).write_text("changed role")
+    (Path(env["SENPAI_OPENHANDS_WORKSPACE"]) / "program.md").write_text(
+        "changed program"
+    )
+    env["SENPAI_LAUNCH_CONTEXT_B64"] = "Y2hhbmdlZCBsYXVuY2g="
+
+    assert config.instructions.prompt == prompt
+
+
+@pytest.mark.parametrize("encoded", [None, "", "not base64", "8A==", "IA=="])
+def test_launch_context_must_be_present_valid_utf8_and_nonempty(
+    tmp_path: Path,
+    encoded: str | None,
+):
+    env = runtime_env(tmp_path)
+    if encoded is None:
+        env.pop("SENPAI_LAUNCH_CONTEXT_B64")
+    else:
+        env["SENPAI_LAUNCH_CONTEXT_B64"] = encoded
+
+    with pytest.raises(ValueError, match="SENPAI_LAUNCH_CONTEXT_B64"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
 @pytest.mark.parametrize(
@@ -413,6 +520,41 @@ def test_all_model_profiles_accept_independent_cli_model_and_effort_settings(
     )
     assert (config.frontier_model, config.frontier_reasoning_effort) == (
         "openai/gpt-5.6-sol",
+        "max",
+    )
+
+
+def test_anthropic_max_is_accepted_across_model_profiles(tmp_path: Path):
+    env = runtime_env(tmp_path)
+    env.update(
+        {
+            "SENPAI_OPENHANDS_MODEL": "anthropic/claude-fable-5",
+            "SENPAI_OPENHANDS_REASONING_EFFORT": "max",
+            "SENPAI_OPENHANDS_SMART_MODEL": "anthropic/claude-opus-5",
+            "SENPAI_OPENHANDS_SMART_REASONING_EFFORT": "max",
+            "SENPAI_OPENHANDS_FAST_MODEL": "anthropic/claude-sonnet-5",
+            "SENPAI_OPENHANDS_FAST_REASONING_EFFORT": "max",
+            "SENPAI_OPENHANDS_FRONTIER_MODEL": "anthropic/claude-fable-5",
+            "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": "max",
+        }
+    )
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert (config.model, config.reasoning_effort) == (
+        "anthropic/claude-fable-5",
+        "max",
+    )
+    assert (config.smart_model, config.smart_reasoning_effort) == (
+        "anthropic/claude-opus-5",
+        "max",
+    )
+    assert (config.fast_model, config.fast_reasoning_effort) == (
+        "anthropic/claude-sonnet-5",
+        "max",
+    )
+    assert (config.frontier_model, config.frontier_reasoning_effort) == (
+        "anthropic/claude-fable-5",
         "max",
     )
 

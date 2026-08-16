@@ -7,10 +7,16 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
 from pydantic import SecretStr
 
 import senpai_agent.supervisor as supervisor_module
-from senpai_agent.supervisor import SupervisorConfig, WorkerLease, WorkerSupervisor
+from senpai_agent.supervisor import (
+    SupervisorConfig,
+    WorkerLease,
+    WorkerSupervisor,
+    prepare_system_context_environment,
+)
 
 
 def wait_for(path: Path, timeout: float = 5) -> None:
@@ -45,6 +51,108 @@ def test_supervisor_default_termination_grace_is_sixty_seconds():
 
 def test_supervisor_caps_repeated_restart_backoff_at_five_minutes():
     assert SupervisorConfig().max_backoff_seconds == 300
+
+
+def test_supervisor_snapshots_program_and_rendered_role_before_starting_workers(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+):
+    workspace = tmp_path / "target"
+    program = workspace / "senpai" / "program.md"
+    program.parent.mkdir(parents=True)
+    program.write_text("Research policy.")
+    role_template = tmp_path / "ADVISOR.md"
+    role_template.write_text(
+        "Role={{ROLE}} Repo={{GH_REPO}} Project={{WANDB_PROJECT}}\n"
+    )
+    state_dir = tmp_path / "state"
+
+    environment = prepare_system_context_environment(
+        "advisor",
+        state_dir,
+        {
+            "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
+            "SENPAI_OPENHANDS_ROLE_FILE": str(role_template),
+            "GH_REPO": "acme/widgets",
+            "WANDB_PROJECT": "cfd",
+            "GITHUB_TOKEN": "github-secret-sentinel",
+            "WANDB_API_KEY": "wandb-secret-sentinel",
+        },
+    )
+
+    assert environment["SENPAI_PROGRAM_PATH"] == "senpai/program.md"
+    role_prompt = Path(environment["SENPAI_OPENHANDS_ROLE_FILE"])
+    assert role_prompt == state_dir / "system-instructions" / "advisor.md"
+    assert role_prompt.read_text() == "Role=advisor Repo=acme/widgets Project=cfd\n"
+    assert role_template.read_text().startswith("Role={{ROLE}}")
+    assert capsys.readouterr().out == (
+        "SENPAI_PROGRAM_CONTEXT path=senpai/program.md\n"
+        f"SENPAI_ROLE_PROMPT path={role_prompt}\n"
+    )
+
+    restarted = prepare_system_context_environment(
+        "advisor",
+        state_dir,
+        {
+            "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
+            "GH_REPO": "changed/widgets",
+            "WANDB_PROJECT": "changed",
+        },
+    )
+
+    assert restarted["SENPAI_OPENHANDS_ROLE_FILE"] == str(role_prompt)
+    assert role_prompt.read_text() == "Role=advisor Repo=acme/widgets Project=cfd\n"
+
+
+def test_supervisor_fails_before_snapshotting_a_role_with_missing_values(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    (workspace / "program.md").write_text("Research policy.")
+    role_template = tmp_path / "STUDENT.md"
+    role_template.write_text("Student={{STUDENT_NAME}} Repo={{GH_REPO}}\n")
+
+    with pytest.raises(ValueError, match="Missing STUDENT.md values: STUDENT_NAME"):
+        prepare_system_context_environment(
+            "student",
+            tmp_path / "state",
+            {
+                "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
+                "SENPAI_OPENHANDS_ROLE_FILE": str(role_template),
+                "GH_REPO": "acme/widgets",
+            },
+        )
+
+    assert not (tmp_path / "state" / "system-instructions" / "student.md").exists()
+
+
+def test_supervisor_does_not_start_a_worker_without_a_discoverable_program(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("No programme here.")
+
+    def unexpected_worker(*_args, **_kwargs):
+        pytest.fail("worker must not be constructed when program.md is missing")
+
+    monkeypatch.setattr(supervisor_module, "WorkerSupervisor", unexpected_worker)
+
+    with pytest.raises(RuntimeError) as error:
+        supervisor_module.supervisor_main(
+            ["advisor"],
+            {
+                "SENPAI_OPENHANDS_STATE_DIR": str(tmp_path / "state"),
+                "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
+            },
+        )
+
+    message = str(error.value)
+    assert "searched program.md and */program.md" in message
+    assert "--program_path" in message
+    assert "senpai.yaml" in message
 
 
 def test_pid_one_reaps_adopted_children_without_reaping_its_worker(monkeypatch):

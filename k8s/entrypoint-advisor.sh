@@ -29,13 +29,10 @@ if [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
 fi
 : "${GITHUB_TOKEN:?GitHub bootstrap token is required}"
 export SENPAI_OPENHANDS_STATE_DIR="$LOGDIR/openhands_state"
-export SENPAI_OPENHANDS_ROLE_FILE="$LOGDIR/ADVISOR.md"
-envsubst '$PROBLEM_DIR $TARGET_REPO_URL $GH_REPO $ADVISOR_BRANCH $RESEARCH_TAG $GPUS_PER_STUDENT $WANDB_ENTITY $WANDB_PROJECT' \
-    < "$WORKDIR/system_instructions/ADVISOR.md" \
-    > "$SENPAI_OPENHANDS_ROLE_FILE"
+export SENPAI_OPENHANDS_ROLE_FILE="$WORKDIR/system_instructions/ADVISOR.md"
 
 echo "=== Senpai Advisor ==="
-echo "Runner repo:  $REPO_URL (revision: $REPO_REVISION)"
+echo "Runner repo:  $SENPAI_REPO_URL (revision: $SENPAI_REPO_REVISION)"
 echo "Target repo:  $TARGET_REPO_URL (base branch: ${TARGET_REPO_BRANCH:-<default>}; advisor branch: $ADVISOR_BRANCH)"
 echo "Problem dir:  $PROBLEM_DIR"
 echo "Tag:          $RESEARCH_TAG"
@@ -139,7 +136,7 @@ ls \
     "$HOME/.agents/agents/general-purpose.md" \
     "$HOME/.agents/agents/explore.md" \
     "$HOME/.agents/agents/search.md" \
-    "$HOME/.agents/skills/wandb-primary/SKILL.md"
+    "$SENPAI_PLUGIN/skills/wandb-primary/SKILL.md"
 
 # --- Hivemind is intentionally disabled pending its OpenHands rewrite. ---
 # source "$WORKDIR/k8s/start-hivemind.sh"

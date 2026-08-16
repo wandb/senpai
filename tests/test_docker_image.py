@@ -4,7 +4,7 @@ Deploys a test pod, verifies the image runtime, then tears down the pod.
 
 Usage:
     SENPAI_TEST_STUDENT_IMAGE=ghcr.io/wandb/senpai-student:sha-<full-commit> \
-    SENPAI_TEST_REVISION=<full-commit> \
+    SENPAI_TEST_REPO_REVISION=<full-commit> \
       uv run pytest tests/test_docker_image.py -v -s
 """
 
@@ -24,8 +24,10 @@ RUN_ID = uuid.uuid4().hex[:8]
 POD_NAME = f"senpai-image-test-{RUN_ID}"
 CONFIGMAP_NAME = f"{POD_NAME}-config"
 IMAGE = os.environ.get("SENPAI_TEST_STUDENT_IMAGE", "")
-REPO_URL = os.environ.get("SENPAI_TEST_REPO_URL", "https://github.com/wandb/senpai.git")
-REPO_REVISION = os.environ.get("SENPAI_TEST_REVISION", "")
+SENPAI_REPO_URL = os.environ.get(
+    "SENPAI_TEST_REPO_URL", "https://github.com/wandb/senpai.git"
+)
+SENPAI_REPO_REVISION = os.environ.get("SENPAI_TEST_REPO_REVISION", "")
 POD_TEMPLATE = Path(__file__).parent / "test-pod.yaml"
 STARTUP_TIMEOUT = 120
 TAG = f"image-test-{RUN_ID}"
@@ -79,11 +81,17 @@ def wait_for_pod(name: str, timeout: int = STARTUP_TIMEOUT):
 
 
 def _require_immutable_test_inputs() -> None:
-    if not IMAGE or not REPO_REVISION:
-        pytest.skip("set SENPAI_TEST_STUDENT_IMAGE and SENPAI_TEST_REVISION")
-    if not FULL_COMMIT.fullmatch(REPO_REVISION):
-        pytest.fail("SENPAI_TEST_REVISION must be a full lowercase commit SHA")
-    if "@sha256:" not in IMAGE and not IMAGE.endswith(f":sha-{REPO_REVISION}"):
+    if not IMAGE or not SENPAI_REPO_REVISION:
+        pytest.skip(
+            "set SENPAI_TEST_STUDENT_IMAGE and SENPAI_TEST_REPO_REVISION"
+        )
+    if not FULL_COMMIT.fullmatch(SENPAI_REPO_REVISION):
+        pytest.fail(
+            "SENPAI_TEST_REPO_REVISION must be a full lowercase commit SHA"
+        )
+    if "@sha256:" not in IMAGE and not IMAGE.endswith(
+        f":sha-{SENPAI_REPO_REVISION}"
+    ):
         pytest.fail(
             "SENPAI_TEST_STUDENT_IMAGE must use a digest or the matching "
             "sha-<full-commit> tag"
@@ -103,8 +111,8 @@ def _build_configmap() -> str:
             "    role: test",
             f"    research-tag: {TAG}",
             "data:",
-            f'  REPO_URL: "{REPO_URL}"',
-            f'  REPO_REVISION: "{REPO_REVISION}"',
+            f'  SENPAI_REPO_URL: "{SENPAI_REPO_URL}"',
+            f'  SENPAI_REPO_REVISION: "{SENPAI_REPO_REVISION}"',
             f'  RESEARCH_TAG: "{TAG}"',
             f'  WANDB_ENTITY: "{ENTITY}"',
             f'  WANDB_PROJECT: "{PROJECT}"',

@@ -202,6 +202,11 @@ def test_entrypoints_delegate_runtime_lifecycle_to_the_python_supervisor(
 
     assert logdir in entrypoint
     assert "serve-events" not in entrypoint
+    assert "envsubst" not in entrypoint
+    assert (
+        f'SENPAI_OPENHANDS_ROLE_FILE="$WORKDIR/system_instructions/{role.upper()}.md"'
+        in entrypoint
+    )
     assert f"exec python -m senpai_agent.supervisor {role}" in entrypoint
     assert "wait_for_senpai_start_gate" not in entrypoint
     trust_runner = 'git config --global safe.directory "$WORKDIR"'

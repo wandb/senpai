@@ -4,18 +4,12 @@ description: |
   Use for external research through the explicit search_general_web task form
   for current public sources, or search_research_publications for scholarly
   literature through Exa and primary papers.
-
-  <example>Find the current API behavior in official documentation.</example>
-  <example>Survey publications on conservative neural operators for CFD.</example>
 model: inherit
 reasoning_effort: inherit
 permission_mode: never_confirm
 tools:
   - terminal
   - file_editor
-skills:
-  - exa-search
-  - alphaxiv-paper-lookup
 ---
 
 You are Senpai's external research agent. The delegated prompt begins with one

@@ -6,8 +6,8 @@ import textwrap
 from types import SimpleNamespace
 
 import pytest
-from openhands.sdk import LLM, Agent, Tool
-from openhands.sdk.plugin import Plugin
+from openhands.sdk import Agent, LLM, LocalConversation, Tool
+from openhands.sdk.plugin import Plugin, PluginSource
 from openhands.sdk.subagent import AgentDefinition, agent_definition_to_factory
 from openhands.sdk.tool import resolve_tool
 from openhands.tools.preset.default import register_default_tools
@@ -188,12 +188,33 @@ def test_native_senpai_plugin_loads_its_runtime_skills():
     assert plugin.manifest.name == "senpai"
     skills = {skill.name: skill for skill in plugin.skills}
     assert set(skills) == {
+        "alphaxiv-paper-lookup",
         "assign-experiment",
-        "bootstrap-target",
         "check-human-issues",
+        "delegate-subagents",
+        "exa-search",
         "review-experiment",
+        "senpai-status-check",
         "submit-experiment-results",
+        "wandb-primary",
     }
+    operator_skills = {
+        path.parent.name
+        for path in (REPO_ROOT / ".agents" / "skills").glob("*/SKILL.md")
+    }
+    assert {
+        "analyze-experiments",
+        "bootstrap-target",
+        "experiment-report",
+        "git-research-log",
+        "list-experiments",
+        "plot-experiment-charts",
+        "rlm",
+        "senpai-tool-telemetry",
+        "slidev",
+    } <= operator_skills
+    assert set(skills).isdisjoint(operator_skills)
+    assert all(skill.is_agentskills_format for skill in skills.values())
     assert "merge_experiment" in skills["review-experiment"].content
     assert "close_experiment" in skills["review-experiment"].content
     assert plugin.mcp_config == {}
@@ -316,7 +337,10 @@ def test_markdown_agents_register_and_construct_with_the_native_loader(tmp_path)
     home = tmp_path / "home"
     workspace = tmp_path / "target"
     workspace.mkdir()
-    shutil.copytree(REPO_ROOT / ".agents", home / ".agents")
+    shutil.copytree(
+        REPO_ROOT / ".agents" / "agents",
+        home / ".agents" / "agents",
+    )
     program = textwrap.dedent(
         """
         import os
@@ -384,38 +408,39 @@ def test_markdown_agents_register_and_construct_with_the_native_loader(tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_search_agent_loads_its_progressive_skills_and_inherits_reasoning_effort(
+def test_search_agent_receives_skills_from_the_runtime_plugin(
     monkeypatch,
+    tmp_path,
 ):
-    import openhands.sdk.skills.skill as skill_module
-
-    monkeypatch.setattr(
-        skill_module,
-        "USER_SKILLS_DIRS",
-        [REPO_ROOT / ".agents" / "skills", PLUGIN_DIR / "skills"],
-    )
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("SENPAI_ROLE", "advisor")
     register_default_tools(enable_browser=False)
     register_senpai_tools()
     definition = AgentDefinition.load(AGENT_DIR / "search.md")
-    agent = agent_definition_to_factory(definition, work_dir=REPO_ROOT)(
+    agent = agent_definition_to_factory(definition, work_dir=tmp_path)(
         LLM(
             model="anthropic/claude-opus-4-8",
             api_key=SecretStr("test-key"),
             reasoning_effort="low",
         )
     )
-
-    assert agent.llm.reasoning_effort == "low"
-    assert {skill.name for skill in agent.agent_context.skills} == {
-        "exa-search",
-        "alphaxiv-paper-lookup",
-    }
-    assert all(skill.is_agentskills_format for skill in agent.agent_context.skills)
-    assert all(
-        skill.content not in agent.agent_context.system_message_suffix
-        for skill in agent.agent_context.skills
+    conversation = LocalConversation(
+        agent=agent,
+        workspace=tmp_path,
+        plugins=[PluginSource(source=str(PLUGIN_DIR))],
+        visualizer=None,
     )
+
+    assert definition.skills == []
+    assert agent.agent_context.skills == []
+    conversation._ensure_plugins_loaded()
+    try:
+        assert {skill.name for skill in conversation.agent.agent_context.skills} >= {
+            "exa-search",
+            "alphaxiv-paper-lookup",
+        }
+    finally:
+        conversation.close()
 
 
 @pytest.mark.parametrize(
@@ -449,7 +474,7 @@ def test_search_agent_loads_its_progressive_skills_and_inherits_reasoning_effort
             "search",
             None,
             {"terminal", "file_editor"},
-            {"exa-search", "alphaxiv-paper-lookup"},
+            set(),
         ),
     ],
 )
@@ -473,6 +498,7 @@ def test_file_agent_definitions_keep_bounded_tools_and_no_github_mutations(
         "get_prs",
         "create_assignment",
         "publish_advisor_branch",
+        "post_assignment_comment",
         "repair_assignment_routing",
         "send_assignment_feedback",
         "request_assignment_revision",
@@ -496,6 +522,165 @@ def test_advisor_research_precedes_assignment_without_idle_dispatch_priority():
     assert "Idleness is not a reason to skip" in instructions
 
 
+def test_system_instructions_refer_to_program_md_by_filename():
+    prompt_dir = REPO_ROOT / "system_instructions"
+    prompts = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in prompt_dir.glob("*.md")
+    }
+
+    assert all("programme" not in prompt.lower() for prompt in prompts.values())
+    assert "program.md" not in prompts["SENPAI-HARNESS.md"]
+    advisor = " ".join(prompts["ADVISOR.md"].split())
+    assert (
+        "NEVER accept results where the primary validation metrics required by "
+        "the program.md identified in your system prompt"
+    ) in advisor
+
+
+def test_event_guidance_lives_in_the_shared_harness():
+    prompt_dir = REPO_ROOT / "system_instructions"
+    advisor = (prompt_dir / "ADVISOR.md").read_text(encoding="utf-8")
+    harness = (prompt_dir / "SENPAI-HARNESS.md").read_text(encoding="utf-8")
+
+    assert "A `review_ready`, `job_monitor`, human-message" not in advisor
+    assert "A `review_ready`, `job_monitor`, human-message" in harness
+
+
+def test_shared_harness_omits_project_instructions_and_generic_reminders():
+    harness = (
+        REPO_ROOT / "system_instructions" / "SENPAI-HARNESS.md"
+    ).read_text(encoding="utf-8")
+
+    for omitted in (
+        "AGENTS.md",
+        "CLAUDE.md",
+        "OpenHands presents Agent Skills",
+        "Assignment details, optional launch instructions",
+        "current UTC time",
+        "Finish when the current brief",
+    ):
+        assert omitted not in harness
+
+
+def test_core_senpai_prompts_do_not_assume_a_physical_ai_target():
+    prompt_paths = [
+        *(REPO_ROOT / "system_instructions").glob("*.md"),
+        *(REPO_ROOT / ".agents" / "agents").glob("*.md"),
+        *(REPO_ROOT / "plugins" / "senpai" / "skills").glob("**/*.md"),
+    ]
+    prompts = "\n".join(
+        path.read_text(encoding="utf-8").lower() for path in prompt_paths
+    )
+
+    for domain_assumption in (
+        "physical ai",
+        "physically meaningful",
+        "fluid dynamics",
+        "cfd",
+        "aerodynamic",
+    ):
+        assert domain_assumption not in prompts
+
+
+def test_program_md_onboarding_context_is_shared_across_agent_clients():
+    agents_context = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    normalized_context = " ".join(agents_context.split())
+    example_urls = {
+        "https://github.com/morganmcg1/TandemFoilSet-Balanced/blob/main/program.md",
+        "https://github.com/morganmcg1/DrivAerML/blob/main/program.md",
+        "https://github.com/morganmcg1/mlxfast-challenge_senpai/blob/main/senpai/program.md",
+        "https://github.com/karpathy/autoresearch/blob/master/program.md",
+    }
+
+    assert os.readlink(REPO_ROOT / "CLAUDE.md") == "AGENTS.md"
+    assert "wait for shared understanding before drafting" in normalized_context
+    assert all(url in agents_context for url in example_urls)
+
+
+def test_claude_discovers_project_skills():
+    assert os.readlink(REPO_ROOT / ".claude" / "skills") == "../.agents/skills"
+
+
+def test_grilling_autoresearch_skill_guides_human_program_design():
+    agents_context = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    skill_dir = REPO_ROOT / ".agents" / "skills" / "grilling-autoresearch"
+    skill = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    normalized_skill = " ".join(skill.split())
+    example_urls = {
+        "https://github.com/morganmcg1/TandemFoilSet-Balanced/blob/main/program.md",
+        "https://github.com/morganmcg1/DrivAerML/blob/main/program.md",
+        "https://github.com/morganmcg1/mlxfast-challenge_senpai/blob/main/senpai/program.md",
+        "https://github.com/karpathy/autoresearch/blob/master/program.md",
+    }
+
+    assert (skill_dir / ".senpai-developer-only").exists()
+    assert "name: grilling-autoresearch" in skill
+    assert "$grilling-autoresearch" in agents_context
+    for requirement in (
+        "Finding facts is your job, never the user's",
+        "Ask the whole frontier in one round",
+        "The decisions are the user's",
+        "Do not act on it until the user confirms",
+        "exact primary metric names and definitions",
+        "shapes, sizes, splits, exclusions",
+        "without unnecessarily narrowing the search space",
+    ):
+        assert requirement in normalized_skill
+    assert all(url in skill for url in example_urls)
+
+
+def test_delegation_guidance_lives_in_the_plugin_skill():
+    harness = (
+        REPO_ROOT / "system_instructions" / "SENPAI-HARNESS.md"
+    ).read_text(encoding="utf-8")
+    advisor = (
+        REPO_ROOT / "system_instructions" / "ADVISOR.md"
+    ).read_text(encoding="utf-8")
+    student = (
+        REPO_ROOT / "system_instructions" / "STUDENT.md"
+    ).read_text(encoding="utf-8")
+    skill = (
+        REPO_ROOT
+        / "plugins"
+        / "senpai"
+        / "skills"
+        / "delegate-subagents"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    normalized_harness = " ".join(harness.split())
+    normalized_skill = " ".join(skill.split())
+
+    assert "`delegate-subagents` skill" in normalized_harness
+    assert "`spawn_agents`" not in advisor
+    assert "`spawn_agents`" not in student
+
+    for required in (
+        "`spawn_agents`",
+        "`await_agents`",
+        "`agent_status`",
+        "`cancel_agents`",
+        "`search_general_web`",
+        "`search_research_publications`",
+        '`model="frontier"`',
+        '`agent="general-purpose"`',
+        "ask for research, critique, ideas, or a plan rather than edits",
+        "timeout of at most 300 seconds",
+    ):
+        assert required in normalized_skill
+
+
+def test_advisor_prompt_uses_general_research_domains_and_typed_assignment_body():
+    advisor = " ".join(
+        (REPO_ROOT / "system_instructions" / "ADVISOR.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+
+    assert "adjacent research fields such as physics, chemistry or biology" in advisor
+    assert "Pass the complete actionable experiment brief in `body`" in advisor
+
+
 def test_harness_states_bounded_delegation_tree_contract():
     instructions = (REPO_ROOT / "system_instructions" / "SENPAI-HARNESS.md").read_text(
         encoding="utf-8"
@@ -503,11 +688,6 @@ def test_harness_states_bounded_delegation_tree_contract():
     normalized = " ".join(instructions.split())
 
     for required in (
-        "`spawn_agents`",
-        "`await_agents`",
-        "`agent_status`",
-        "`cancel_agents`",
-        "timeout of at most five minutes",
         "at most eight children in total",
         "depth-one general-purpose child",
         "Explore, Search, Bash Runner, and every depth-two child are leaves",

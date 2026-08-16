@@ -1,0 +1,4 @@
+interface:
+  display_name: "Delegate subagents"
+  short_description: "Launch and coordinate bounded Senpai subagents"
+  default_prompt: "Use $delegate-subagents to plan and coordinate this delegated work."

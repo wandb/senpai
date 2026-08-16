@@ -66,6 +66,7 @@ from senpai_agent.model_compatibility import (  # noqa: E402
     REASONING_EFFORTS,
     supports_reasoning_effort,
 )
+from senpai_agent.program_context import normalize_program_path  # noqa: E402
 
 STUDENT_TEMPLATE = Path(__file__).parent / "student-deployment.yaml"
 ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-deployment.yaml"
@@ -82,16 +83,17 @@ class Args:
     backend: str = "kubernetes"  # compute backend: kubernetes, docker, aws, or aws-mac
     target_repo_branch: str = ""  # target repo branch used as the base when creating advisor_branch; empty = target repo default branch
     problem_dir: str = "target/"  # active problem directory — entrypoint clones target_repo_url here (from senpai.yaml)
+    program_path: str = ""  # target-repo-relative program.md; blank requires exactly one root/one-level match
     names: str = ""  # comma-separated student names (e.g. "frieren,fern")
     n_students: int = 4  # students to launch on every backend; ignored when --names is set
     student_prefix: str = ""  # make assignment labels unique across parallel launches using the same base names
     gpus_per_student: int = 1  # GPUs allocated to each student on every backend
     cpu_per_gpu: int = 15  # CPU requested per student GPU
     memory_gi_per_gpu: int = 120  # memory Gi requested per student GPU
-    repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL (senpai runner)
-    repo_revision: str = ""  # exact runner commit; derived from :sha-<commit> image tags
-    advisor_image: str = ""  # immutable advisor image; required with --advisor
-    student_image: str = ""  # immutable student image; required when students are launched
+    senpai_repo_url: str = "https://github.com/wandb/senpai.git"  # public read-only runner source
+    senpai_repo_revision: str = ""  # exact runner commit; derived from :sha-<commit> image tags
+    advisor_image: str = ""  # advisor source-SHA tag or image digest — REQUIRED
+    student_image: str = ""  # student source-SHA tag or image digest — REQUIRED
     kube_context: str = ""  # kubectl context; empty uses the current context
     namespace: str = "default"  # Kubernetes namespace for all launch resources
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
@@ -116,7 +118,7 @@ class Args:
     pvc_claim_name: str = "new-pvc"  # PVC name mounted into pods
     pvc_mount_path: str = "/mnt/new-pvc"  # mount path for the dataset PVC inside the containers
     advisor: bool = False  # also deploy the advisor pod (default: students only)
-    extra_instructions: str = ""  # extra prompt text for the advisor: a .md file path or a literal string
+    extra_instructions: str = ""  # shared operator instructions: a .md file path or literal text
     timeout_minutes: float = 30.0  # training run wall-clock limit (SENPAI_TIMEOUT_MINUTES)
     max_epochs: int = 50  # maximum training epochs (SENPAI_MAX_EPOCHS)
     poll_interval_s: int = 600  # default advisor/student outer-loop sleep between GitHub polls
@@ -283,6 +285,13 @@ def validate_timing_args(args: Args) -> None:
             )
 
 
+def validate_program_path(args: Args) -> None:
+    try:
+        normalize_program_path(args.program_path)
+    except ValueError as error:
+        sys.exit(f"ERROR: --program_path: {error}")
+
+
 def render_student(
     template: str,
     student_name: str,
@@ -386,7 +395,9 @@ def resolve_runner_revision(args: Args, *, has_students: bool) -> None:
                 "a :sha-<40-character-commit> tag"
             )
         try:
-            revisions.append(source_revision_for_image(image, args.repo_revision))
+            revisions.append(
+                source_revision_for_image(image, args.senpai_repo_revision)
+            )
         except ValueError as error:
             sys.exit(f"ERROR: {error}")
     if len(revisions) == 2 and revisions[0] != revisions[1]:
@@ -394,7 +405,7 @@ def resolve_runner_revision(args: Args, *, has_students: bool) -> None:
             "ERROR: --advisor_image and --student_image must use the same "
             "source revision"
         )
-    args.repo_revision = revisions[0]
+    args.senpai_repo_revision = revisions[0]
 
 
 def resolve_checkout_revision(args: Args) -> None:
@@ -405,12 +416,12 @@ def resolve_checkout_revision(args: Args) -> None:
         text=True,
         check=True,
     ).stdout.strip()
-    if args.repo_revision and args.repo_revision != head:
+    if args.senpai_repo_revision and args.senpai_repo_revision != head:
         sys.exit(
-            f"ERROR: --repo_revision is {args.repo_revision}, but this checkout "
-            f"is {head}"
+            "ERROR: --senpai_repo_revision is "
+            f"{args.senpai_repo_revision}, but this checkout is {head}"
         )
-    args.repo_revision = head
+    args.senpai_repo_revision = head
 
 
 def main():
@@ -453,10 +464,16 @@ def main():
             "--local_condenser_max_events"
         )
     validate_timing_args(args)
+    validate_program_path(args)
     if args.gh_history_scope not in {"branch", "repo", "fresh"}:
         sys.exit("ERROR: --gh_history_scope must be one of: branch, repo, fresh")
-    if target_repo_slug(args.target_repo_url) == target_repo_slug(args.repo_url):
-        sys.exit("ERROR: --target_repo_url must be a different repo from --repo_url")
+    if target_repo_slug(args.target_repo_url) == target_repo_slug(
+        args.senpai_repo_url
+    ):
+        sys.exit(
+            "ERROR: --target_repo_url must be a different repo from "
+            "--senpai_repo_url"
+        )
 
     student_list = resolve_student_names(args)
     if args.backend == "aws-mac":

@@ -145,19 +145,31 @@ def is_immutable_image_reference(image: str) -> bool:
     return bool(FULL_SHA_IMAGE.fullmatch(image) or DIGEST_IMAGE.fullmatch(image))
 
 
-def source_revision_for_image(image: str, explicit_revision: str = "") -> str:
+def source_revision_for_image(image: str, senpai_repo_revision: str = "") -> str:
     """Resolve the exact runner commit that must match the image metadata."""
     tagged = FULL_SHA_IMAGE.fullmatch(image)
     tagged_revision = tagged.group(1) if tagged else ""
-    if explicit_revision and not re.fullmatch(r"[0-9a-f]{40}", explicit_revision):
-        raise ValueError("repo_revision must be a full lowercase commit SHA")
-    if tagged_revision and explicit_revision and tagged_revision != explicit_revision:
-        raise ValueError("repo_revision does not match the image source-SHA tag")
+    if senpai_repo_revision and not re.fullmatch(
+        r"[0-9a-f]{40}", senpai_repo_revision
+    ):
+        raise ValueError(
+            "senpai_repo_revision must be a full lowercase commit SHA"
+        )
+    if (
+        tagged_revision
+        and senpai_repo_revision
+        and tagged_revision != senpai_repo_revision
+    ):
+        raise ValueError(
+            "senpai_repo_revision does not match the image source-SHA tag"
+        )
     if tagged_revision:
         return tagged_revision
-    if DIGEST_IMAGE.fullmatch(image) and explicit_revision:
-        return explicit_revision
-    raise ValueError("digest-pinned images require an explicit repo_revision")
+    if DIGEST_IMAGE.fullmatch(image) and senpai_repo_revision:
+        return senpai_repo_revision
+    raise ValueError(
+        "digest-pinned images require an explicit senpai_repo_revision"
+    )
 
 
 def kubectl_command(

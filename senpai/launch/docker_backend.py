@@ -711,7 +711,7 @@ def _check_container_names_available(names: list[str]) -> None:
 def preflight_docker(args, role_specs: list[RoleSpec]) -> DockerLaunchPlan:
     """Validate a real Docker launch without changing host or GitHub state."""
     preview = plan_docker(args, role_specs)
-    _check_runner_source(args.repo_url, args.repo_revision)
+    _check_runner_source(args.senpai_repo_url, args.senpai_repo_revision)
     _check_docker()
     _check_container_names_available(
         [role.container_name for role in preview.roles]
@@ -725,9 +725,9 @@ def preflight_docker(args, role_specs: list[RoleSpec]) -> DockerLaunchPlan:
         flush=True,
     )
     if has_advisor:
-        _check_image(args.advisor_image, args.repo_revision)
+        _check_image(args.advisor_image, args.senpai_repo_revision)
     if has_students:
-        _check_image(args.student_image, args.repo_revision)
+        _check_image(args.student_image, args.senpai_repo_revision)
     if args.data_dir:
         data_dir = Path(args.data_dir).expanduser().resolve()
         if has_advisor:
@@ -769,7 +769,11 @@ def _share_with_container_group(path: Path) -> None:
 def _create_role_files(args, role: DockerRolePlan) -> None:
     role.state_root.mkdir(parents=True)
     (role.state_root / "home").mkdir()
-    _prepare_runner_workdir(args.repo_url, role.workdir, args.repo_revision)
+    _prepare_runner_workdir(
+        args.senpai_repo_url,
+        role.workdir,
+        args.senpai_repo_revision,
+    )
     _share_with_container_group(role.state_root)
     _share_with_container_group(role.workdir)
     role.env_file.write_text(
@@ -993,7 +997,10 @@ def terminate_docker(tag: str, run_root: str = "~/.senpai/runs") -> None:
 
 def _print_plan(args, plan: DockerLaunchPlan) -> None:
     print(f"Docker Senpai run: {plan.run_root}")
-    print(f"Runner source: {args.repo_url} ({args.repo_revision})")
+    print(
+        f"Runner source: {args.senpai_repo_url} "
+        f"({args.senpai_repo_revision})"
+    )
     print(f"Advisor image: {args.advisor_image}")
     print(f"Student image: {args.student_image}")
     for role in plan.roles:

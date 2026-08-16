@@ -1,14 +1,15 @@
 ---
 name: git-research-log
 description: >
-  How to document and publish ML experiment results to GitHub as a pull request.
-  Use this skill whenever a student agent has finished running experiments and
-  needs to create or update a PR — even if the instruction is just "wrap up" or
-  "log your results" or "open a PR". Also use it mid-session to update an
-  in-progress PR as trials complete.
+  Developer reference for Senpai's retired direct-GitHub experiment logging
+  workflow. Use only when auditing or migrating legacy research tracks.
 ---
 
 # Experiment PR Skill
+
+This guide is not installed into live advisor or student runtimes. Current
+students use the plugin's `submit-experiment-results` skill and typed result
+tool instead.
 
 The master agent creates an empty PR and hands it to you. Your job is to fill it out as you run trials and finalize it when you're done. The master reads these PRs to decide what to explore next — completeness and honest analysis matter more than polish.
 

@@ -32,7 +32,10 @@ no MCP server. The Python runtime binds the authenticated role and adds the
 canonical `ADVISOR:` or `STUDENT:` prefix to Senpai-authored GitHub comments;
 tool payloads contain only the unprefixed message text.
 
-Keep Senpai-owned workflow skills here rather than relying on a provider's user
-skill directory. Never commit secret values. The plugin remains the source of
-truth for reusable workflow guidance, while Python remains the source of truth
-for verified state changes.
+Keep every Senpai-owned skill used by a live advisor or student here rather
+than relying on a provider's user skill directory. Target repositories may
+supply project skills separately. Human onboarding and developer guides stay
+under the runner's `.agents/skills` and are not installed into pods. Never
+commit secret values. The plugin remains the source of truth for reusable
+runtime guidance, while Python remains the source of truth for verified state
+changes.

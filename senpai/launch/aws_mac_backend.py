@@ -342,7 +342,7 @@ def preflight_aws_mac(args, role_specs: list[RoleSpec]) -> AwsMacPlan:
             f"AWS Mac state already exists at {run_dir}; choose a new tag or "
             "terminate the recorded run"
         )
-    _check_source_revision(args.repo_revision)
+    _check_source_revision(args.senpai_repo_revision)
     if not shutil.which("ssh") or not shutil.which("ditto"):
         raise RuntimeError("AWS Mac launch requires OpenSSH and ditto")
     archive = (
@@ -749,8 +749,8 @@ def _uses_glm(args) -> bool:
 
 
 def _remote_setup_script(args) -> bytes:
-    repo_url = shlex.quote(args.repo_url)
-    revision = shlex.quote(args.repo_revision)
+    repo_url = shlex.quote(args.senpai_repo_url)
+    revision = shlex.quote(args.senpai_repo_revision)
     tokenizer_setup = ""
     if _uses_glm(args):
         tokenizer_setup = f"""mkdir -p {REMOTE_HF_HOME}
@@ -902,7 +902,7 @@ def _native_payload(args, specs: tuple[RoleSpec, ...]) -> bytes:
         "args": {
             "tag": args.tag,
             "native_run_root": REMOTE_RUN_ROOT,
-            "repo_revision": args.repo_revision,
+            "senpai_repo_revision": args.senpai_repo_revision,
             "native_ready_timeout_s": args.native_ready_timeout_s,
         },
         "roles": [

@@ -10,15 +10,15 @@ official `exa_py` client, loads the nearest `.env` through `python-dotenv`, and
 preserves an `EXA_API_KEY` already set in the environment.
 
 ```bash
-python "$HOME/.agents/skills/exa-search/scripts/search_exa.py" \
+python "$SENPAI_PLUGIN/skills/exa-search/scripts/search_exa.py" \
   general-web \
   "current OpenHands SDK file-based agent documentation"
 ```
 
 ```bash
-python "$HOME/.agents/skills/exa-search/scripts/search_exa.py" \
+python "$SENPAI_PLUGIN/skills/exa-search/scripts/search_exa.py" \
   research-publications \
-  "mesh-based neural operators for aerodynamic surrogate modeling"
+  "uncertainty calibration for neural networks"
 ```
 
 The script returns Markdown rather than raw JSON. Each result contains a direct

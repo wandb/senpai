@@ -1,0 +1,4 @@
+interface:
+  display_name: "Grilling Autoresearch"
+  short_description: "Clarify a high-signal program.md with the user"
+  default_prompt: "Use $grilling-autoresearch to help me define a clear program.md for this research repository."

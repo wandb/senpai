@@ -15,6 +15,7 @@ from pydantic import SecretStr
 
 from senpai_agent.git_workflow import git_process_env
 from senpai_agent.mailbox import ControllerEvent
+from senpai_agent.PROMPTS import WORKSPACE_DIVERGENCE_PROMPT
 
 _HEAD_REF = "refs/senpai/assignment/head"
 _BASE_REF = "refs/senpai/assignment/base"
@@ -107,13 +108,7 @@ class WorkspaceDivergence(RuntimeError):
                 "worktree_fingerprint": hashlib.sha256(
                     worktree_state.encode()
                 ).hexdigest(),
-                "instructions": (
-                    "The workspace cannot be reconciled automatically because local "
-                    "assignment history diverged or dirty work belongs to another "
-                    "checkout. Senpai preserved every local commit and dirty file "
-                    "without changing the checkout. Inspect and reconcile it "
-                    "explicitly; do not reset or discard local work."
-                ),
+                "instructions": WORKSPACE_DIVERGENCE_PROMPT,
             },
         )
         super().__init__(

@@ -59,13 +59,13 @@ This skill covers everything an agent needs to work with Weights & Biases:
 
 | I need to... | Use |
 |---|---|
-| Query training runs, loss curves, hyperparameters | **W&B SDK** (`wandb.Api()`) — see `references/WANDB_SDK.md` |
-| Query GenAI traces, calls, evaluations | **Weave SDK** (`weave.init()`, `client.get_calls()`) — see `references/WEAVE_SDK.md` |
+| Query training runs, loss curves, hyperparameters | **W&B SDK** (`wandb.Api()`) — see `$SENPAI_PLUGIN/skills/wandb-primary/references/WANDB_SDK.md` |
+| Query GenAI traces, calls, evaluations | **Weave SDK** (`weave.init()`, `client.get_calls()`) — see `$SENPAI_PLUGIN/skills/wandb-primary/references/WEAVE_SDK.md` |
 | Convert Weave wrapper types to plain Python | **`weave_helpers.unwrap()`** |
 | Build a DataFrame from training runs | **`wandb_helpers.runs_to_dataframe()`** |
 | Extract eval results for analysis | **`weave_helpers.eval_results_to_dicts()`** |
-| Need low-level Weave filtering (CallsFilter, Query) | **Raw Weave SDK** (`weave.init()`, `client.get_calls()`) — see `references/WEAVE_SDK.md` |
-| Judge curve shape (spikes, smoothness, slope, overfit) | **`training_diagnostics` + `curve_plots`** — use the workflow below, then load `references/TRAINING_DIAGNOSTICS.md` for the heuristics |
+| Need low-level Weave filtering (CallsFilter, Query) | **Raw Weave SDK** (`weave.init()`, `client.get_calls()`) — see `$SENPAI_PLUGIN/skills/wandb-primary/references/WEAVE_SDK.md` |
+| Judge curve shape (spikes, smoothness, slope, overfit) | **`training_diagnostics` + `curve_plots`** — use the workflow below, then load `$SENPAI_PLUGIN/skills/wandb-primary/references/TRAINING_DIAGNOSTICS.md` for the heuristics |
 
 ---
 
@@ -74,8 +74,9 @@ This skill covers everything an agent needs to work with Weights & Biases:
 ### Helper libraries
 
 ```python
+import os
 import sys
-sys.path.insert(0, ".agents/skills/wandb-primary/scripts")
+sys.path.insert(0, f"{os.environ['SENPAI_PLUGIN']}/skills/wandb-primary/scripts")
 
 # Weave helpers (traces, evals, GenAI)
 from weave_helpers import (
@@ -125,9 +126,9 @@ from curve_plots import (
 
 Read these as needed — they contain full API surfaces and recipes:
 
-- **`references/WEAVE_SDK.md`** — Weave SDK for GenAI traces (`client.get_calls()`, `CallsFilter`, `Query`, stats). Start here for Weave queries.
-- **`references/WANDB_SDK.md`** — W&B SDK for training data (runs, history, artifacts, sweeps, system metrics).
-- **`references/TRAINING_DIAGNOSTICS.md`** — reference heuristics for reading loss / LR / grad-norm / grad-histogram charts. Load this when you are actively interpreting training curves.
+- **`$SENPAI_PLUGIN/skills/wandb-primary/references/WEAVE_SDK.md`** — Weave SDK for GenAI traces (`client.get_calls()`, `CallsFilter`, `Query`, stats). Start here for Weave queries.
+- **`$SENPAI_PLUGIN/skills/wandb-primary/references/WANDB_SDK.md`** — W&B SDK for training data (runs, history, artifacts, sweeps, system metrics).
+- **`$SENPAI_PLUGIN/skills/wandb-primary/references/TRAINING_DIAGNOSTICS.md`** — reference heuristics for reading loss / LR / grad-norm / grad-histogram charts. Load this when you are actively interpreting training curves.
 
 ---
 
@@ -216,7 +217,7 @@ df = pd.DataFrame(rows)
 print(df.describe())
 ```
 
-For full W&B SDK reference (filters, history, artifacts, sweeps), read `references/WANDB_SDK.md`.
+For full W&B SDK reference (filters, history, artifacts, sweeps), read `$SENPAI_PLUGIN/skills/wandb-primary/references/WANDB_SDK.md`.
 
 ### Weave — SDK
 
@@ -226,7 +227,7 @@ client = weave.init(f"{entity}/{project}")  # positional string, NOT keyword arg
 calls = client.get_calls(limit=10)
 ```
 
-For raw SDK patterns (CallsFilter, Query, advanced filtering), read `references/WEAVE_SDK.md`.
+For raw SDK patterns (CallsFilter, Query, advanced filtering), read `$SENPAI_PLUGIN/skills/wandb-primary/references/WEAVE_SDK.md`.
 
 ---
 
@@ -307,7 +308,7 @@ For structured failure analysis on eval results:
 3. **Axial coding** — write a second Scorer that classifies notes into a taxonomy
 4. **Summarize** — count primary labels with `collections.Counter`
 
-See `references/WEAVE_SDK.md` for the full SDK reference.
+See `$SENPAI_PLUGIN/skills/wandb-primary/references/WEAVE_SDK.md` for the full SDK reference.
 
 ### W&B Reports
 
@@ -344,7 +345,7 @@ Keep the inline workflow short and load detail on demand:
 1. Confirm `step_key` before doing any curve work. Never assume `_step`.
 2. Compute features with the bundled helpers instead of hand-rolling spike or slope logic.
 3. Render PNGs and inspect them visually.
-4. Load `references/TRAINING_DIAGNOSTICS.md` while you interpret the results.
+4. Load `$SENPAI_PLUGIN/skills/wandb-primary/references/TRAINING_DIAGNOSTICS.md` while you interpret the results.
 5. End with a verdict, evidence tied to step ranges, and concrete next actions.
 
 ### Required sequence
@@ -370,7 +371,7 @@ Next actions:
 - <concrete hyperparameter, logging, or code change>
 ```
 
-Load `references/TRAINING_DIAGNOSTICS.md` for the interpretation heuristics, especially when the numbers and the image disagree.
+Load `$SENPAI_PLUGIN/skills/wandb-primary/references/TRAINING_DIAGNOSTICS.md` for the interpretation heuristics, especially when the numbers and the image disagree.
 
 ---
 

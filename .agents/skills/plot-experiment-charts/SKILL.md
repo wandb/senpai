@@ -5,19 +5,20 @@
 
 name: plot-experiment-charts
 description: >
-  Generate a training curve comparison chart and embed it in a GitHub PR description.
-  Use this skill whenever a student has finished running experiments and is preparing
-  to submit their PR for advisor review. Triggers on: "plot training curves", "add chart
-  to PR", "visualize experiment", "training curve comparison", "plot-experiment-charts",
-  "add chart", "generate comparison chart". Run this before marking the PR ready for review.
+  Operator-side guide for generating a target-specific training curve chart
+  for a legacy experiment PR. Use when auditing or presenting historical runs.
 ---
 
 # Plot Experiment Charts
 
-You've just finished one or more training runs. Before submitting for review, generate a
-comparison chart so the advisor can see the training dynamics at a glance — not just the
-final numbers, but how the experiment got there. A bolded best-run line and a properly
-scaled y-axis make the story immediately readable, even if some runs diverged.
+This guide is not installed into live advisor or student runtimes. Target
+repositories that require experiment charts should provide their own project
+skill with the correct metrics and plotting code.
+
+Generate a comparison chart so a reviewer can see the training dynamics at a
+glance—not just the final numbers, but how the experiment got there. A bolded
+best-run line and a properly scaled y-axis make the story immediately readable,
+even if some runs diverged.
 
 This skill takes about 30 seconds. It's worth it.
 
@@ -25,7 +26,7 @@ This skill takes about 30 seconds. It's worth it.
 
 - **Baseline W&B run ID**: in the PR body under `## Baseline`, look for the `W&B run: \`xxxxxxxx\`` line.
 - **Your own run IDs**: the 8-character W&B IDs of the runs you just completed. Find them in the W&B run URLs or in the training output (the run ID is printed at launch).
-- **W&B credentials**: `WANDB_ENTITY` and `WANDB_PROJECT` env vars (already set in the pod environment).
+- **W&B credentials**: `WANDB_ENTITY` and `WANDB_PROJECT` in the current environment.
 
 ## Step 1 — Run the script
 

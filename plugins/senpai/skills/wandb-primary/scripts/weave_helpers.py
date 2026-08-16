@@ -9,8 +9,9 @@ evaluations, and scorers. These helpers convert Weave's wrapper types to plain
 Python and extract structured data from calls and evals for pandas analysis.
 
 Usage (in sandbox):
+    import os
     import sys
-    sys.path.insert(0, ".agents/skills/wandb-primary/scripts")
+    sys.path.insert(0, f"{os.environ['SENPAI_PLUGIN']}/skills/wandb-primary/scripts")
     from weave_helpers import (
         unwrap,                  # Recursively convert Weave types -> plain Python
         get_token_usage,         # Extract token counts from a call's summary

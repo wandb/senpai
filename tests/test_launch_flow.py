@@ -40,7 +40,7 @@ class LaunchOrderingTests(unittest.TestCase):
             patch.object(
                 launch,
                 "resolve_checkout_revision",
-                side_effect=lambda value: setattr(value, "repo_revision", REVISION),
+                side_effect=lambda value: setattr(value, "senpai_repo_revision", REVISION),
             ),
             patch.object(launch, "resolve_github_token", return_value="github"),
             patch.object(launch, "resolve_anthropic_api_key", return_value="anthropic"),

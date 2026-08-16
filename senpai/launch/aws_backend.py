@@ -628,7 +628,7 @@ def preflight_aws(args, role_specs: list[RoleSpec]) -> AwsLaunchPlan:
     requirements = _validate_aws_inputs(args, role_specs)
     if not shutil.which("ssh"):
         raise RuntimeError("OpenSSH is required to launch on AWS")
-    _check_source_revision(args.repo_revision)
+    _check_source_revision(args.senpai_repo_revision)
 
     profile = (
         args.aws_profile
@@ -895,14 +895,14 @@ def _remote_payload(
             "docker_run_root": REMOTE_RUN_ROOT,
             "data_dir": REMOTE_DATA if include_data and args.data_dir else "",
             "dry_run": False,
-            "repo_url": REMOTE_SOURCE,
+            "senpai_repo_url": REMOTE_SOURCE,
             "start_gate_path": "",
         }
     )
     roles = []
     for spec in role_specs:
         values = asdict(spec)
-        values["env"]["REPO_URL"] = REMOTE_SOURCE
+        values["env"]["SENPAI_REPO_URL"] = REMOTE_SOURCE
         if not include_secrets:
             values["secrets"] = {}
         roles.append(values)
@@ -1216,7 +1216,7 @@ def _prepare_host(args, run_dir: Path, state: dict) -> None:
                     f"test ! -e {REMOTE_SOURCE}; "
                     'cat > "$bundle"; git clone -q "$bundle" "$source_tmp"; '
                     f'test "$(git -C "$source_tmp" rev-parse HEAD)" = '
-                    f"{shlex.quote(args.repo_revision)}; "
+                    f"{shlex.quote(args.senpai_repo_revision)}; "
                     f"mv \"$source_tmp\" {REMOTE_SOURCE}"
                 ),
                 input_file=bundle,

@@ -5,12 +5,11 @@
 
 name: bootstrap-target
 description: >
-  Create or improve Senpai target-repository onboarding files: program.md plus
-  instructions/prompt-advisor.md and instructions/prompt-student.md. Use this
-  skill whenever the user wants to point Senpai at a fresh ML or research target
+  Create or improve a Senpai target repository's program.md. Use this skill
+  whenever the user wants to point Senpai at a fresh ML or research target
   repository, define the research objective, primary metric, benchmark contract,
-  allowed edit boundaries, W&B reporting contract, advisor/student prompts, or
-  prepare a repo for autonomous advisor/student experiment loops.
+  allowed edit boundaries, W&B reporting contract, or prepare a repo for
+  autonomous advisor/student experiment loops.
 argument-hint: "<target-repo-path-or-url>"
 model: claude-opus-4-8
 effort: high
@@ -18,18 +17,7 @@ effort: high
 
 # bootstrap-target
 
-Turn an arbitrary ML or research repository into a Senpai-ready target package.
-
-The output is usually three files in the target repo:
-
-- `program.md` - the authoritative research contract.
-- `instructions/prompt-advisor.md` - the target-specific advisor overlay.
-- `instructions/prompt-student.md` - the target-specific student overlay.
-
-These files are not generic documentation. They are the launch briefing for an
-autonomous research lab. Write them so the advisor knows what kind of science to
-direct, the student knows what is legitimate to edit and run, and both roles
-agree on what counts as a valid result.
+Turn an arbitrary ML or research repository into a Senpai-ready target package by writing `program.md`, the authoritative research contract. It is not generic documentation: it is the shared launch briefing for an autonomous research lab. Write it so the advisor knows what science to direct, the student knows what is legitimate to edit and run, and both roles agree on a valid result.
 
 ## References
 
@@ -100,28 +88,8 @@ Load these only when they help the current task:
    benchmark equivalence. For a fuller skeleton, read
    `references/program-template.md`.
 
-5. **Write short role overlays with target flavor.**
-   The files in `instructions/` should not repeat the global Senpai loop. They
-   are overlays: concise, target-specific steering that helps the advisor and
-   student inhabit this particular research program.
-
-   `prompt-advisor.md` should contain only target-specific experiment-selection
-   judgment: promising hypothesis families, metric tradeoffs, target-specific
-   mistakes, and context worth reading first.
-
-   `prompt-student.md` should contain only target-specific implementation
-   guidance: important files, protected invariants, exact run-command patterns,
-   and interpretation pitfalls.
-
-   Do not repeat runtime identity, branch or W&B setup, generic role workflow,
-   tool instructions, or reporting rules already supplied by the control plane
-   and `program.md`.
-
-6. **Validate the target package.**
-   Check that referenced paths exist, command patterns are plausible, metric
-   names match code where possible, protected files are explicit, and the role
-   overlays do not contradict `program.md`. If commands cannot be run locally,
-   state what was verified statically.
+5. **Validate the target package.**
+   Check that referenced paths exist, command patterns are plausible, metric names match code where possible, and protected files are explicit. If commands cannot be run locally, state what was verified statically.
 
 ## Writing Principles
 
@@ -141,10 +109,6 @@ tradeoff.
 Make benchmark integrity painfully clear. Spell out data leakage risks, split
 immutability, forbidden shortcuts, external-source bans, seed/cherry-picking
 rules, hidden-test rules, and metric finality.
-
-Keep `instructions/` light. The global Senpai role files already define the
-loop; target prompts should only add target-specific setup, commands, and
-judgment.
 
 Fail loudly on ambiguity. If the primary metric, target command, protected
 files, or benchmark rules are unclear, interview the user before finalizing the

@@ -14,8 +14,8 @@ spec:
     command: ["/bin/bash", "-c"]
     args:
     - |
-      if [ "${SENPAI_IMAGE_REVISION}" != "${REPO_REVISION}" ]; then
-        echo "Image revision ${SENPAI_IMAGE_REVISION} does not match requested source ${REPO_REVISION}" >&2
+      if [ "${SENPAI_IMAGE_REVISION}" != "${SENPAI_REPO_REVISION}" ]; then
+        echo "Image revision ${SENPAI_IMAGE_REVISION} does not match requested source ${SENPAI_REPO_REVISION}" >&2
         exit 1
       fi
       askpass=/tmp/senpai-test-git-askpass
@@ -28,9 +28,9 @@ spec:
       chmod 700 "$askpass"
       git init /workspaces/senpai
       GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
-        git -C /workspaces/senpai fetch --depth 1 "${REPO_URL}" "${REPO_REVISION}"
+        git -C /workspaces/senpai fetch --depth 1 "${SENPAI_REPO_URL}" "${SENPAI_REPO_REVISION}"
       git -C /workspaces/senpai checkout --detach FETCH_HEAD
-      test "$(git -C /workspaces/senpai rev-parse HEAD)" = "${REPO_REVISION}"
+      test "$(git -C /workspaces/senpai rev-parse HEAD)" = "${SENPAI_REPO_REVISION}"
       sleep infinity
     envFrom:
     - configMapRef:

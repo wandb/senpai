@@ -4,14 +4,19 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-PackageName: senpai
 -->
 
-# senpai
+# SENPAI
 
-Senpai is an autonomous ML research loop built on the OpenHands Agent SDK. An advisor proposes and reviews experiments; GPU students implement one assigned experiment each, train, and return evidence through GitHub and W&B.
+***[reseearch preview]*** -- Paper: [*SENPAI: Self-ExperimentatioN for Physical AI—An Observability-Based Research Harness*](https://openreview.net/forum?id=g0bJFA9gVT)
 
-Senpai is problem-agnostic. It runs against a separate target repository, and every experiment branch, commit, and PR lands there—not in this runner repository.
+SENPAI is an semi-autonomous ML research loop - an `Advisor` proposes and reviews experiments; `Students` implement one assigned experiment each, train, and return evidence through GitHub and W&B. SENPAI works best with occasional steering from a domain-expert, steering happens by opening a Github Issue.
 
-- **ICML 2026:** [*SENPAI: Self-ExperimentatioN for Physical AI—An Observability-Based Research Harness*](https://openreview.net/forum?id=g0bJFA9gVT) was presented at the AI for Science Workshop; see the [project site](https://wandb.github.io/senpai/).
-- **ICLR 2026:** Kagent, a Senpai variant, placed fourth in the [GRaM competition](https://gram-competition.github.io/).
+SENPAI is problem-agnostic. It runs against a separate target repository, and every experiment branch, commit, and PR lands there—not in this runner repository.
+
+
+## News
+- **[August 2026] MLX.fast challenge:** SENPAI places 7th in MLX.fast - an inference optimization speedup challenge on Mac for Poolside's Laguna 2.1 XS 30B LLM
+- **[July 2026]   ICML 2026:** [*SENPAI: Self-ExperimentatioN for Physical AI—An Observability-Based Research Harness*](https://openreview.net/forum?id=g0bJFA9gVT) was presented at the AI for Science Workshop; see the [project site](https://wandb.github.io/senpai/).
+- **[June 2026]   ICLR 2026:** Kagent, a SENPAI variant, placed fourth in the [GRaM competition](https://gram-competition.github.io/).
 
 ## Quick start
 
@@ -88,27 +93,30 @@ subagents.
 
 ### 4. Prepare the target repository
 
-The target branch normally contains:
+The target repository needs one concise `program.md` describing the research
+goal, metrics, data, constraints, allowed edits, and target-specific guidance.
 
-```text
-program.md
-instructions/
-├── prompt-advisor.md
-└── prompt-student.md
-```
+A useful structure is:
 
-- `program.md` defines the research objective, baseline, metrics, benchmark rules, training limits, and allowed edit surface.
-- `prompt-advisor.md` adds target-specific experiment-selection and review guidance.
-- `prompt-student.md` adds target-specific implementation, training, and reporting guidance.
+- `## Mission` — Explain why the research is being run and name the primary target metric or metrics being optimized.
+- `## Data` — Describe where the data lives, its type and structure, train/validation/test splits, and important nuances, exclusions, or caveats.
+- `## Evaluation` — Define each evaluation metric concretely and, when using W&B, give its exact logged name, such as `val/loss` rather than "validation loss."
+- `## Files` — List the key data-loading, preprocessing, training, scoring, and evaluation files, briefly describing each and whether agents may edit it.
+- `## Research` — Add useful task or domain background and possible research directions without prescribing a narrow approach that limits the agents' creativity.
 
-Targets that keep their Senpai configuration in a subdirectory may use
-`senpai/program.md`. Role prompt overlays are optional in that layout; without
-them, both roles follow the repository instructions and their built-in Senpai
-role charter.
+Put it at the repository root or one directory below it, such as
+`senpai/program.md`. A blank `program_path` auto-discovers exactly one match in
+those locations; otherwise set `program_path` in `senpai.yaml` or pass
+`--program_path` at launch. Senpai appends the selected file to every agent's
+system prompt. The built-in role charters need no target-specific prompt
+overlay.
 
-Use the [bootstrap-target guide](plugins/senpai/skills/bootstrap-target/SKILL.md) to inspect a new target and create these files. Target `AGENTS.md`, compatible `CLAUDE.md`, and `.agents/skills/` are also loaded through OpenHands project context and progressive disclosure.
+Use the [bootstrap-target guide](.agents/skills/bootstrap-target/SKILL.md) to
+inspect a new target and create the file. Target repositories may also provide
+project skills, but their `AGENTS.md`, `AGENT.md`, and `CLAUDE.md` files are not
+loaded as Senpai project context.
 
-The target repository must be different from the Senpai runner repository.
+The target repository must be different from the SENPAI runner repository.
 
 ### 5. Configure the launch
 
@@ -123,6 +131,7 @@ The most important settings are:
 ```yaml
 target_repo_branch: main
 advisor_branch: senpai-research
+program_path: ""  # auto-discover, or set e.g. senpai/program.md
 
 wandb_entity: your-team
 wandb_project: your-project
@@ -153,6 +162,12 @@ memory_gi_per_gpu: 64
 timeout_minutes: 30
 max_epochs: 50
 ```
+
+OpenHands uses LiteLLM, so LLM provider names are required as prefixes. For
+example, configure Claude Fable 5 as `anthropic/claude-fable-5`. Anthropic
+`reasoning_effort: max` on Claude Fable 5, Opus 5, and Sonnet 5 stays
+provider-native and is sent as `output_config.effort: max`; it does not enable
+OpenAI Pro mode.
 
 W&B Inference uses LiteLLM's native `wandb/` provider. For example, set every
 model profile to `wandb/zai-org/GLM-5.2` with reasoning effort `max`. Senpai
@@ -189,9 +204,12 @@ The defaults in `senpai.yaml` describe W&B's deployment and should not be copied
 
 Deployments require one immutable image per active role, all built from the same
 Senpai revision. Full `sha-<40-character-commit>` tags identify it directly;
-digest-pinned role images require an explicit shared `repo_revision`.
-Kubernetes and Docker fetch that commit from `repo_url`. AWS transfers the exact
-clean local commit instead. PR image checks build but do not publish images.
+digest-pinned role images require an explicit shared `senpai_repo_revision`.
+Kubernetes and Docker fetch that commit from `senpai_repo_url`. The public
+default is read-only and needs no PR permission; override it only for images
+built from another Senpai repository. AWS transfers the exact clean local
+commit instead. `target_repo_url` is the separate repository where agents
+create commits and PRs. PR image checks build but do not publish images.
 
 ### 6. Run preflight
 
@@ -219,7 +237,8 @@ starts advisor or student roles.
 
 ### 7. Launch
 
-Inspect the preflight result, then launch with the same arguments:
+For a Senpai commit whose images have been published, inspect the preflight
+result and then launch with the same arguments:
 
 ```bash
 uv run python k8s/launch.py "${launch_args[@]}"
@@ -304,8 +323,9 @@ the ephemeral SSH key.
 
 AWS currently needs anonymously pullable advisor and student images. Use
 matching `:sha-<40-character-commit>` tags, or digest-pinned images with an
-explicit matching `repo_revision`. Commit local changes before launching: AWS
-requires a clean checkout whose `HEAD` exactly matches that revision.
+explicit matching `senpai_repo_revision`. Commit local changes before
+launching: AWS requires a clean checkout whose `HEAD` exactly matches that
+revision.
 
 ### Preflight and launch
 
@@ -427,7 +447,7 @@ launch_args=(
   --advisor
   --n_students 2
   --gpus_per_student 1
-  --repo_revision "$revision"
+  --senpai_repo_revision "$revision"
   --aws_region us-east-1
   --aws_instance_type mac-m4pro.metal
   --aws_mac_host_ids h-HOST1,h-HOST2
@@ -507,9 +527,9 @@ flowchart LR
 
 The structured result records its terminal status, exact result commit, W&B run IDs and URLs, bounded conclusion, and baseline/candidate metric comparison when available. Once published for an assignment revision and head, that evidence is immutable: exact duplicate publication is an idempotent replay, while changed evidence requires a new commit or revision. Non-revision feedback continues the same student conversation; a revision request intentionally creates a fresh revision identity and conversation.
 
-`status:wip` owns a student compute slot; `status:review` does not. The advisor can therefore review one result while that student starts another experiment. Sibling assignment mutations within one worker are serialized end to end, including advisor-base publication and student preflight, push, and result publication. Across advisor and student workers, exact assignment, revision, head, and branch-lease preconditions detect stale work; if a revision wins during result publication, Senpai restores the current revision's WIP routing before returning the stale-result error.
+`status:wip` owns a student compute slot; `status:review` does not. The advisor can therefore review one result while that student starts another experiment. Sibling assignment mutations within one worker are serialized end to end, including advisor-base publication and student preflight, push, and result publication. Across advisor and student workers, exact assignment, revision, head, and branch-lease preconditions detect stale work; if a revision wins during result publication, SENPAI restores the current revision's WIP routing before returning the stale-result error.
 
-Trusted collaborator comments, submitted reviews, and inline review comments are delivered automatically to the relevant student; feedback from untrusted authors and unrecognized bots is ignored. `get_prs` can still retrieve the complete discussion explicitly. If the configured research base changes while an experiment is running, Senpai emits `research_base_changed` with the assignment's `required_base_sha` and the live `current_base_sha` without cancelling the assignment. When reviewing its terminal result, the advisor either requests a revision on the current base or records why that exact result remains valid with `accept_result_on_current_base`; `merge_experiment` still verifies the live SHA immediately before merging.
+Trusted collaborator comments, submitted reviews, and inline review comments are delivered automatically to the relevant student; feedback from untrusted authors and unrecognized bots is ignored. `get_prs` can still retrieve the complete discussion explicitly. If the configured research base changes while an experiment is running, SENPAI emits `research_base_changed` with the assignment's `required_base_sha` and the live `current_base_sha` without cancelling the assignment. When reviewing its terminal result, the advisor either requests a revision on the current base or records why that exact result remains valid with `accept_result_on_current_base`; `merge_experiment` still verifies the live SHA immediately before merging.
 
 Before each assignment or PR-feedback turn, the student controller authenticates
 and hydrates the exact assignment head and recorded baseline into
@@ -620,26 +640,30 @@ Children share the parent workspace, so their process and conversation are isola
 
 ## Task guides
 
-OpenHands receives these as progressively disclosed skills; their bodies are loaded only when the task calls for them.
+Live advisors and students load Senpai-owned skills only from
+`plugins/senpai/skills`; target repositories may also supply project skills.
+Guides under `.agents/skills` are for human users and Senpai developers and
+are not installed into autoresearch pods.
 
-### Core research workflow
+### Live autoresearch
 
 | Guide | Purpose |
 |---|---|
-| [Bootstrap a target](plugins/senpai/skills/bootstrap-target/SKILL.md) | Build `program.md` and the advisor/student overlays from a new ML repository. |
 | [Assign an experiment](plugins/senpai/skills/assign-experiment/SKILL.md) | Turn a hypothesis into a typed student branch and draft PR. |
+| [Delegate subagents](plugins/senpai/skills/delegate-subagents/SKILL.md) | Launch and coordinate bounded parallel research, review, and implementation help. |
 | [Submit experiment results](plugins/senpai/skills/submit-experiment-results/SKILL.md) | Commit the tested implementation and publish a structured, evidence-backed result. |
 | [Review an experiment](plugins/senpai/skills/review-experiment/SKILL.md) | Merge a reproducible winner, close a useful negative, or request the missing evidence. |
 | [Handle human Issues](plugins/senpai/skills/check-human-issues/SKILL.md) | Respond to authenticated human-to-agent messages delivered through GitHub Issues. |
+| [Senpai status check](plugins/senpai/skills/senpai-status-check/SKILL.md) | Produce a bounded, read-only GitHub, W&B, and local-controller status report. |
+| [Exa search](plugins/senpai/skills/exa-search/SKILL.md) | Search the current web or scholarly publications with mode-specific defaults. |
+| [AlphaXiv paper lookup](plugins/senpai/skills/alphaxiv-paper-lookup/SKILL.md) | Get a structured overview before reading a primary paper deeply. |
+| [W&B and Weave](plugins/senpai/skills/wandb-primary/SKILL.md) | Inspect runs, metrics, artifacts, evaluations, and agent traces. |
 
-### Evidence and research
+### Human and developer guides
 
 | Guide | Purpose |
 |---|---|
-| [Senpai status check](.agents/skills/senpai-status-check/SKILL.md) | Produce a bounded, read-only GitHub, W&B, and local-controller status report. |
-| [Exa search](.agents/skills/exa-search/SKILL.md) | Search the current web or scholarly publications with mode-specific defaults. |
-| [AlphaXiv paper lookup](.agents/skills/alphaxiv-paper-lookup/SKILL.md) | Get a structured overview before reading a primary paper deeply. |
-| [W&B and Weave](.agents/skills/wandb-primary/SKILL.md) | Inspect runs, metrics, artifacts, evaluations, and agent traces. |
+| [Bootstrap a target](.agents/skills/bootstrap-target/SKILL.md) | Build `program.md` from a new ML repository. |
 | [Experiment report](.agents/skills/experiment-report/SKILL.md) | Create the project-standard `nn_cfd` W&B comparison report; this guide is target-specific rather than part of the generic runtime. |
 | [Training code style](literature_and_guidance/TRAINING-CODE-STYLE.md) | Structure expensive ML entrypoints so configuration, artifacts, validation, and failure boundaries stay explicit. |
 
@@ -663,7 +687,7 @@ flowchart LR
     S --> WB
 ```
 
-There is no Senpai RPC service or cross-node database. GitHub PR labels, typed comments, reviews, and human-tagged Issues are the only advisor/student communication protocol; W&B is the shared experiment store. Role-local SQLite stores the ordered delivery inbox and its receipts plus training-monitor policies; it is never shared across nodes.
+GitHub PR labels, typed comments, reviews, and human-tagged Issues are the only advisor/student communication protocol; W&B is the shared experiment store. Role-local SQLite stores the ordered delivery inbox and its receipts plus training-monitor policies; it is never shared across nodes.
 
 Each role runs a small Python supervisor around the deterministic controller:
 
@@ -687,12 +711,12 @@ The controller owns cadence, durable events, conversation selection, verified Gi
 - Still-actionable GitHub state is re-delivered on the configured reminder cadence, which defaults to at least ten minutes even when GitHub is polled more frequently. Immediate post-turn polls deliver changed state but not timed reminders, so a successful research-only turn cannot enter a no-sleep reminder loop. `research_base_changed` is keyed by assignment, revision, PR head, and the exact required/current base pair; each identity or base movement requires a new decision. Merge repeats the live-base check immediately before its mutation, while external base writers still require strict up-to-date branch protection or a merge queue for an atomic guarantee.
 - Each model request gets one bounded 15-minute attempt. Foreground terminal calls return control within ten minutes for explicit continuation, the whole turn retains its one-hour hard lease, and two consecutive failed turns exit to the supervisor for a clean worker restart. Restart backoff grows across failed workers to a five-minute ceiling; only a successfully acknowledged turn resets that streak, not process uptime or idle sleep.
 - Every controller prompt, GitHub event, monitor signal, and child result follows one durable `pending -> delivered -> processed` inbox. A provider failure resumes the already-delivered turn without resending it, and a crash after inference performs mailbox acknowledgement without another model call. New events wait behind an unresolved turn in the same conversation; normal drains are FIFO and bounded to 16 events or 64 KiB, while ready conversations take fair turns.
-- A newly completed tool observation renews the consecutive retry budget; timeout, error, interruption, state, and delivery events do not. A persisted final response is reconciled even if cancellation left the SDK status paused. After three no-progress attempts or three total hours, Senpai preserves the raw trace and retries one canonical copy on a fresh branch with the complete research brief. If that recovery exhausts the same budget, the turn is durably quarantined, reported as `SENPAI_TURN_QUARANTINED` on every controller start, and excluded from scheduling rather than entering a restart loop. `SENPAI_INBOX_MAX_STALLED_ATTEMPTS`, `SENPAI_INBOX_MAX_TURN_AGE_SECONDS`, and `SENPAI_INBOX_MAX_RECOVERY_GENERATIONS` configure these positive attempt/age limits and the non-negative number of fresh branches.
+- A newly completed tool observation renews the consecutive retry budget; timeout, error, interruption, state, and delivery events do not. A persisted final response is reconciled even if cancellation left the SDK status paused. After three no-progress attempts or three total hours, Senpai preserves the raw trace and retries one canonical copy on a fresh branch with the complete initial controller context. If that recovery exhausts the same budget, the turn is durably quarantined, reported as `SENPAI_TURN_QUARANTINED` on every controller start, and excluded from scheduling rather than entering a restart loop. `SENPAI_INBOX_MAX_STALLED_ATTEMPTS`, `SENPAI_INBOX_MAX_TURN_AGE_SECONDS`, and `SENPAI_INBOX_MAX_RECOVERY_GENERATIONS` configure these positive attempt/age limits and the non-negative number of fresh branches.
 - A typed context-window or malformed-history failure uses the same bounded fresh-branch recovery. The reset and its canonical recovery copy are durable across crashes; transient failures remain unacknowledged and retry after at least ten minutes.
 - On restart, an incomplete persisted tool action is rejected rather than replayed implicitly. A checked-out assignment branch that was deliberately rebased or extended locally is preserved and surfaced to its existing student conversation for explicit reconciliation.
 - The complete OpenHands event log remains locally searchable. Senpai does not prune conversation directories; operators own retention.
 - Student state may be ephemeral because the branch, PR, typed result, W&B runs, and Weave trace are the durable handoff.
-- Project `AGENTS.md`, compatible `CLAUDE.md`, and skills are loaded progressively instead of being inlined into every prompt.
+- Explicit project skills remain available through OpenHands skill context. Repository `AGENTS.md`, `AGENT.md`, and `CLAUDE.md` instruction files are reserved for human-facing development tools and are not loaded as Senpai project context.
 
 The command policy blocks raw GitHub mutations, direct training, `git push`, polling loops, and log streams. Operation-specific typed tools enforce repository, branch, assignment, revision, head-SHA, label, and replay preconditions. This policy keeps routine operations deterministic while leaving high-entropy research work to the agent.
 
@@ -707,7 +731,7 @@ Useful launch controls:
 - `--timeout_minutes` and `--max_epochs` are hard per-training limits.
 - `--poll_interval_s` and `--poll_jitter_s` control idle GitHub cadence without teaching the model to poll.
 - `--gh_history_scope branch` keeps normal advisor-branch memory, `fresh` creates a shallow ablation checkout, and `repo` exposes full repository history.
-- `--extra_instructions` accepts a Markdown file or literal operator guidance.
+- `--extra_instructions` accepts optional human operator guidance as a Markdown file or literal user context.
 - `human_issues: false` disables GitHub Issue polling for isolated launches.
 
 Advisor and student images are built from the same source revision. The advisor image excludes CUDA and PyTorch; the student image contains the CUDA/PyTorch runtime; the cutoff image contains only the minimal job runtime and pinned `kubectl`. Advisor and student builds install Chromium and execute an OpenHands browser smoke test.

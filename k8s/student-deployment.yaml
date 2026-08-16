@@ -65,12 +65,12 @@ spec:
           mkdir -p /workspace
           git init /workspace/senpai
           GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
-            git -C /workspace/senpai fetch --depth 1 "$REPO_URL" "$REPO_REVISION"
+            git -C /workspace/senpai fetch --depth 1 "$SENPAI_REPO_URL" "$SENPAI_REPO_REVISION"
           git -C /workspace/senpai checkout --detach FETCH_HEAD
           cd /workspace/senpai
-          git remote add origin "$REPO_URL"
-          test "$(git rev-parse HEAD)" = "$REPO_REVISION"
-          test "$SENPAI_IMAGE_REVISION" = "$REPO_REVISION"
+          git remote add origin "$SENPAI_REPO_URL"
+          test "$(git rev-parse HEAD)" = "$SENPAI_REPO_REVISION"
+          test "$SENPAI_IMAGE_REVISION" = "$SENPAI_REPO_REVISION"
           token_handoff=/tmp/senpai-supervisor-github-token
           umask 077
           printf '%s' "$GITHUB_TOKEN" > "$token_handoff"

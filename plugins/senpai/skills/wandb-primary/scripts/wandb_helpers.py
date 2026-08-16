@@ -9,8 +9,9 @@ hyperparameter sweeps, artifacts, and system metrics. These helpers convert
 run data into pandas-friendly structures for analysis.
 
 Usage (in sandbox):
+    import os
     import sys
-    sys.path.insert(0, ".agents/skills/wandb-primary/scripts")
+    sys.path.insert(0, f"{os.environ['SENPAI_PLUGIN']}/skills/wandb-primary/scripts")
     from wandb_helpers import (
         runs_to_dataframe,   # Convert runs to a clean pandas DataFrame
         diagnose_run,        # Quick diagnostic summary of a training run

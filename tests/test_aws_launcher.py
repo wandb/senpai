@@ -72,8 +72,8 @@ def args(**overrides):
         "memory_gi_per_gpu": 120,
         "start_gate_path": "",
         "pvc_mount_path": "/mnt/data",
-        "repo_url": "https://github.com/wandb/senpai.git",
-        "repo_revision": "a" * 40,
+        "senpai_repo_url": "https://github.com/wandb/senpai.git",
+        "senpai_repo_revision": "a" * 40,
         "advisor_image": "ghcr.io/wandb/senpai-advisor:sha-" + "a" * 40,
         "student_image": "ghcr.io/wandb/senpai-student:sha-" + "a" * 40,
         "dry_run": False,
@@ -86,7 +86,7 @@ def student(secret="service-secret"):
     return RoleSpec(
         role="student",
         name="fern",
-        env={"REPO_URL": "runner", "REPO_REVISION": "a" * 40},
+        env={"SENPAI_REPO_URL": "runner", "SENPAI_REPO_REVISION": "a" * 40},
         secrets={"WANDB_API_KEY": secret},
     )
 
@@ -681,8 +681,8 @@ class AwsTransportTests(unittest.TestCase):
             encoded = json.dumps(payload)
 
         self.assertEqual(payload["args"]["backend"], "docker")
-        self.assertEqual(payload["args"]["repo_url"], "/home/ubuntu/senpai-source")
-        self.assertEqual(payload["args"]["repo_revision"], "a" * 40)
+        self.assertEqual(payload["args"]["senpai_repo_url"], "/home/ubuntu/senpai-source")
+        self.assertEqual(payload["args"]["senpai_repo_revision"], "a" * 40)
         self.assertEqual(payload["args"]["data_dir"], "/home/ubuntu/senpai-data")
         self.assertEqual(payload["roles"][0]["secrets"]["WANDB_API_KEY"], "service-secret")
         self.assertNotIn("temporary-access-id", encoded)
@@ -701,9 +701,9 @@ class AwsTransportTests(unittest.TestCase):
 
         self.assertEqual(payload["args"]["data_dir"], "")
         self.assertEqual(payload["roles"][0]["secrets"], {})
-        self.assertEqual(payload["roles"][0]["env"]["REPO_URL"], aws_backend.REMOTE_SOURCE)
+        self.assertEqual(payload["roles"][0]["env"]["SENPAI_REPO_URL"], aws_backend.REMOTE_SOURCE)
         self.assertEqual(role.secrets, {"WANDB_API_KEY": "service-secret"})
-        self.assertEqual(role.env["REPO_URL"], "runner")
+        self.assertEqual(role.env["SENPAI_REPO_URL"], "runner")
 
     def test_image_preflight_invokes_remote_without_data_or_secrets(self):
         with (

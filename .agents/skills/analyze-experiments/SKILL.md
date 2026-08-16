@@ -1,7 +1,7 @@
 ---
 name: analyze-experiments
 description: >
-  Analyzes and categorizes all ML experiment PRs in the senpai research track.
+  Operator-side analysis of historical ML experiment PRs in Senpai research tracks.
   Use this skill whenever the user asks to: analyze experiments, categorize PRs, bucket
   experiments, summarize what's been tried, understand experiment history, review merged
   vs closed results, or asks "what experiments have we run / worked / failed".
@@ -13,9 +13,11 @@ description: >
 
 # Analyze Experiments Skill
 
-Fetches fresh experiment PR data via the list-experiments skill, categorizes each PR
-using a team of parallel readers, and produces a 5-section report: full catalogue,
-category breakdown with merge rates, merged-only wins, closed-only failures, key narratives.
+This is a human/operator analysis guide, not a live advisor or student skill.
+It fetches fresh experiment PR data via the list-experiments skill, categorizes
+each PR using parallel readers, and produces a 5-section report: full catalogue,
+category breakdown with merge rates, merged-only wins, closed-only failures,
+and key narratives.
 
 ---
 

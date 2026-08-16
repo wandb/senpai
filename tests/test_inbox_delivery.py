@@ -414,7 +414,6 @@ def test_108_events_and_four_failed_resumes_leave_one_visible_copy_per_event(
     "prompt_identity",
     (
         "initial:full historical prompt",
-        "system-context:historical system context",
         "turn:00000000-0000-0000-0000-000000000117",
     ),
 )

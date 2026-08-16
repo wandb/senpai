@@ -37,6 +37,7 @@ from senpai_agent.git_workflow import require_clean_job_worktree
 from senpai_agent.github.tools import GitHubWorkflowToolSet
 from senpai_agent.hooks import supervised_job_policy
 from senpai_agent.monitor import MetricGate, MonitorStore, TrainingMonitorSpec
+from senpai_agent.PROMPTS import MONITOR_TRAINING_STARTED_PROMPT, render_prompt
 from senpai_agent.secrets import is_secret_environment_variable
 from senpai_agent.training import (
     TrainingResult,
@@ -270,10 +271,10 @@ class MonitorTrainingObservation(Observation):
     def to_llm_content(self) -> Sequence[TextContent]:
         return [
             TextContent(
-                text=(
-                    f"Training {self.training_id} is durably monitored. You may "
-                    "finish this turn; the controller will resume this same "
-                    f"conversation ({self.conversation_id}) when action is needed."
+                text=render_prompt(
+                    MONITOR_TRAINING_STARTED_PROMPT,
+                    TRAINING_ID=self.training_id,
+                    CONVERSATION_ID=self.conversation_id,
                 )
             )
         ]

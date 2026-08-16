@@ -24,7 +24,6 @@ from senpai_agent.advisor import (
     AdvisorEventPump,
     AdvisorEventStore,
     advisor_conversation_id,
-    compose_system_instructions,
 )
 from senpai_agent.delegation import (
     MAX_DELEGATION_DEPTH,
@@ -72,12 +71,15 @@ from openhands.sdk.conversation import ConversationExecutionStatus, Conversation
 from openhands.sdk.event import ActionEvent, MessageEvent, ObservationEvent
 from openhands.sdk.llm import TextContent
 from openhands.sdk.plugin import PluginSource
-from openhands.sdk.skills import Skill, load_project_skills
+from openhands.sdk.skills import (
+    Skill,
+    load_skills_from_dir,
+    merge_skills_by_name,
+)
 from openhands.sdk.subagent import (
     AgentDefinition,
     agent_definition_to_factory,
     discover_agents,
-    register_agent_if_absent,
 )
 from openhands.tools.preset.default import (
     get_default_condenser,
@@ -93,6 +95,13 @@ from senpai_agent.github.tools import (
     clear_github_credentials,
     configure_github_credentials,
 )
+from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV, decode_launch_context
+from senpai_agent.program_context import (
+    PROGRAM_PATH_ENV,
+    load_program_system_prompt,
+)
+from senpai_agent.PROMPTS import RECOVERED_ACTION_PROMPT
+from senpai_agent.system_instructions import SenpaiSystemInstructions
 from senpai_agent.tools import register_senpai_tools
 
 DEFAULT_MODEL = "openai/gpt-5.6-sol"
@@ -104,6 +113,9 @@ DEFAULT_FRONTIER_REASONING_EFFORT = "max"
 WANDB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
 SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore", "search")
 SENPAI_AGENT_DIR = Path(__file__).resolve().parents[1] / ".agents" / "agents"
+REPOSITORY_INSTRUCTION_FILENAMES = frozenset(
+    {"agents.md", "agent.md", "claude.md"}
+)
 PROVIDER_API_KEY_ENVS = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
@@ -213,6 +225,7 @@ class RunnerConfig:
     harness_file: Path
     role_file: Path
     plugin_dir: Path
+    instructions: SenpaiSystemInstructions
     advisor_branch: str | None = None
     student_names: tuple[str, ...] | None = None
     student_name: str | None = None
@@ -438,25 +451,48 @@ def find_harness_file(explicit: str | None = None) -> Path:
     return path
 
 
-def read_role_instructions(path: Path) -> str:
+def read_instruction_file(path: Path) -> str:
     instructions = read_agent_markdown(path).strip()
     if not instructions:
-        raise RuntimeError(f"OpenHands role file is empty: {path}")
+        raise RuntimeError(f"OpenHands instruction file is empty: {path}")
     return instructions
 
 
+def is_exposed_skill(skill: Skill, root: Path | None = None) -> bool:
+    if not skill.source:
+        return True
+    source = Path(skill.source)
+    source_path = source if source.is_absolute() else (root or Path()) / source
+    resolved = source_path.resolve()
+    return (
+        source.name.casefold() not in REPOSITORY_INSTRUCTION_FILENAMES
+        and resolved.name.casefold() not in REPOSITORY_INSTRUCTION_FILENAMES
+        and (root is None or resolved.is_relative_to(root.resolve()))
+        and not (source_path.parent / ".senpai-developer-only").is_file()
+    )
+
+
 def sanitized_project_skills(workspace: Path) -> list[Skill]:
-    """Load project instructions without exposing their SPDX boilerplate."""
+    """Load explicit project skills without repository instruction files."""
+
+    skills: list[Skill] = []
+    for relative_path in (
+        ".agents/skills",
+        ".openhands/skills",
+        ".openhands/microagents",
+    ):
+        groups = load_skills_from_dir(workspace / relative_path)
+        candidates = (
+            skill
+            for group in groups
+            for skill in group.values()
+            if is_exposed_skill(skill, workspace)
+        )
+        skills = merge_skills_by_name(skills, candidates)
 
     return [
         skill.model_copy(update={"content": strip_spdx_header(skill.content)})
-        for skill in load_project_skills(workspace)
-        if not (
-            skill.source
-            and (
-                workspace / Path(skill.source).parent / ".senpai-developer-only"
-            ).is_file()
-        )
+        for skill in skills
     ]
 
 
@@ -482,6 +518,32 @@ def sanitized_agent_definitions(workspace: Path) -> list[AgentDefinition]:
     ]
 
 
+def resolve_agent_skills(
+    definition: AgentDefinition,
+    project_skills: Sequence[Skill],
+) -> list[Skill]:
+    """Resolve declared skills without invoking SDK project-instruction loading."""
+
+    if not definition.skills:
+        return []
+    available = {skill.name: skill for skill in project_skills}
+    missing = [name for name in definition.skills if name not in available]
+    if missing:
+        raise ValueError(
+            f"Skills {', '.join(missing)} were not found for agent "
+            f"{definition.name}."
+        )
+    return [available[name] for name in definition.skills]
+
+
+def without_eager_skill_discovery(
+    definition: AgentDefinition,
+) -> AgentDefinition:
+    """Keep skill resolution on Senpai's explicit, filtered path."""
+
+    return definition.model_copy(update={"skills": []})
+
+
 def depth_aware_child_definition(
     definition: AgentDefinition,
     *,
@@ -497,17 +559,6 @@ def depth_aware_child_definition(
     return definition.model_copy(
         update={"tools": [tool for tool in definition.tools if tool != "spawn_agents"]}
     )
-
-
-def register_agent_definitions(
-    definitions: Sequence[AgentDefinition], workspace: Path
-) -> None:
-    for definition in definitions:
-        register_agent_if_absent(
-            name=definition.name,
-            factory_func=agent_definition_to_factory(definition, work_dir=workspace),
-            description=definition,
-        )
 
 
 def resolve_plugin_dir(explicit: str | None = None) -> Path:
@@ -548,9 +599,29 @@ def resolve_config(
         raise RuntimeError(
             "OpenHands state directory must be outside the target workspace"
         )
+    program = load_program_system_prompt(
+        workspace,
+        env.get(PROGRAM_PATH_ENV, ""),
+    )
     role = env.get("SENPAI_ROLE", "")
     if role not in {"advisor", "student"}:
         raise RuntimeError("SENPAI_ROLE must be advisor or student")
+    harness_file = find_harness_file(
+        env_value(
+            args.harness_file,
+            env,
+            "SENPAI_OPENHANDS_HARNESS_FILE",
+        )
+    )
+    role_file = find_role_file(
+        env_value(args.role_file, env, "SENPAI_OPENHANDS_ROLE_FILE"),
+    )
+    instructions = SenpaiSystemInstructions(
+        harness=read_instruction_file(harness_file),
+        role=read_instruction_file(role_file),
+        program=program,
+        launch=decode_launch_context(env.get(LAUNCH_CONTEXT_ENV, "")),
+    )
     try:
         training_max_timeout_seconds = round(
             float(env.get("SENPAI_TIMEOUT_MINUTES", "30")) * 60
@@ -856,19 +927,12 @@ def resolve_config(
         role=role,
         enable_browser=args.enable_browser,
         agent_name=env_value(args.agent, env, "SENPAI_OPENHANDS_AGENT"),
-        harness_file=find_harness_file(
-            env_value(
-                args.harness_file,
-                env,
-                "SENPAI_OPENHANDS_HARNESS_FILE",
-            )
-        ),
-        role_file=find_role_file(
-            env_value(args.role_file, env, "SENPAI_OPENHANDS_ROLE_FILE"),
-        ),
+        harness_file=harness_file,
+        role_file=role_file,
         plugin_dir=resolve_plugin_dir(
             env_value(args.plugin_dir, env, "SENPAI_PLUGIN"),
         ),
+        instructions=instructions,
         advisor_branch=env.get("ADVISOR_BRANCH") or None,
         student_names=tuple(
             name.strip()
@@ -907,22 +971,28 @@ def find_named_agent(
     raise RuntimeError(f"OpenHands agent not found: {name}")
 
 
-def with_role_and_project_context(
+def system_instructions_prompt(
+    instructions: SenpaiSystemInstructions,
+    runtime_invariant: str = "",
+) -> str:
+    prompt = instructions.prompt
+    if runtime_invariant:
+        prompt += (
+            f"\n# Live controller invariant\n\n{runtime_invariant.strip()}\n"
+        )
+    return prompt
+
+
+def with_system_instructions(
     agent: Agent,
-    harness_instructions: str,
-    role_instructions: str,
+    instructions: SenpaiSystemInstructions,
     project_skills: Sequence[Skill] = (),
     runtime_invariant: str = "",
 ) -> Agent:
     context = agent.agent_context or AgentContext()
     skills = {skill.name: skill for skill in context.skills}
     skills.update({skill.name: skill for skill in project_skills})
-    role_suffix = compose_system_instructions(
-        harness_instructions,
-        role_instructions,
-    )
-    if runtime_invariant:
-        role_suffix += f"\n# Live controller invariant\n\n{runtime_invariant.strip()}\n"
+    role_suffix = system_instructions_prompt(instructions, runtime_invariant)
     system_suffix = (
         f"{context.system_message_suffix}\n\n{role_suffix}"
         if context.system_message_suffix
@@ -935,6 +1005,7 @@ def with_role_and_project_context(
                     "system_message_suffix": system_suffix,
                     "current_datetime": None,
                     "skills": list(skills.values()),
+                    "load_user_skills": False,
                     "load_project_skills": False,
                 }
             )
@@ -943,25 +1014,19 @@ def with_role_and_project_context(
 
 
 def build_main_agent_context(
-    harness_instructions: str,
-    role_instructions: str,
+    instructions: SenpaiSystemInstructions,
     project_skills: Sequence[Skill] = (),
     runtime_invariant: str = "",
 ) -> AgentContext:
-    system_suffix = compose_system_instructions(
-        harness_instructions,
-        role_instructions,
-    )
-    if runtime_invariant:
-        system_suffix += (
-            f"\n# Live controller invariant\n\n{runtime_invariant.strip()}\n"
-        )
     return AgentContext(
         skills=list(project_skills),
-        system_message_suffix=system_suffix,
+        system_message_suffix=system_instructions_prompt(
+            instructions,
+            runtime_invariant,
+        ),
         current_datetime=None,
         load_public_skills=False,
-        load_user_skills=True,
+        load_user_skills=False,
         load_project_skills=False,
     )
 
@@ -1399,6 +1464,8 @@ def delegation_config(
         local_condenser_max_events=config.local_condenser_max_events,
         local_condenser_max_tokens=config.local_condenser_max_tokens,
         local_condenser_target_events=config.local_condenser_target_events,
+        program_path=config.instructions.program.program_path,
+        launch_context=config.instructions.launch,
         root_state_dir=config.delegation_root_state_dir,
         tree_id=config.delegation_tree_id,
         depth=config.delegation_depth,
@@ -1513,12 +1580,7 @@ def reject_recovered_actions(conversation: object) -> int:
     pending = ConversationState.get_unmatched_actions(active_branch())
     if not pending:
         return 0
-    conversation.reject_pending_actions(
-        reason=(
-            "Senpai restarted before this action completed. Inspect the preserved "
-            "workspace and rerun it explicitly only if it is still needed."
-        )
-    )
+    conversation.reject_pending_actions(reason=RECOVERED_ACTION_PROMPT)
     print(
         f"OPENHANDS_RECOVERED_ACTIONS rejected={len(pending)}",
         file=sys.stderr,
@@ -1604,12 +1666,9 @@ def run_openhands(
     if run_timeout <= 0:
         raise TimeoutError("the inherited OpenHands deadline has expired")
     scrub_model_credentials(os.environ, config)
-    harness_instructions = read_role_instructions(config.harness_file)
-    role_instructions = read_role_instructions(config.role_file)
     register_default_tools(enable_browser=False)
     register_senpai_tools()
     file_agents = sanitized_agent_definitions(config.workspace)
-    register_agent_definitions(file_agents, config.workspace)
     available_agents = [definition.name for definition in file_agents]
     project_skills = sanitized_project_skills(config.workspace)
     os.environ["SENPAI_CONVERSATION_ID"] = config.conversation_id.hex
@@ -1712,16 +1771,22 @@ def run_openhands(
                 child=config.child,
                 depth=config.delegation_depth,
             )
+            resolved_skills = resolve_agent_skills(definition, project_skills)
             agent = agent_definition_to_factory(
-                definition,
-                work_dir=config.workspace,
+                without_eager_skill_discovery(definition),
             )(llm)
-            agent = agent.model_copy(update={"llm": apply_reasoning_profile(agent.llm)})
+            agent = agent.model_copy(
+                update={
+                    "llm": apply_reasoning_profile(agent.llm),
+                    "agent_context": (
+                        agent.agent_context or AgentContext()
+                    ).model_copy(update={"skills": resolved_skills}),
+                }
+            )
             require_exact_tokenizer(agent.llm)
-            agent = with_role_and_project_context(
+            agent = with_system_instructions(
                 agent,
-                harness_instructions,
-                role_instructions,
+                config.instructions,
                 project_skills,
                 live_controller_invariant(config),
             )
@@ -1748,8 +1813,7 @@ def run_openhands(
                 llm=llm,
                 tools=build_main_tools(config),
                 agent_context=build_main_agent_context(
-                    harness_instructions,
-                    role_instructions,
+                    config.instructions,
                     project_skills,
                     live_controller_invariant(config),
                 ),

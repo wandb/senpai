@@ -47,7 +47,7 @@ def student(name: str) -> RoleSpec:
     return RoleSpec(
         role="student",
         name=name,
-        env={"REPO_REVISION": REVISION},
+        env={"SENPAI_REPO_REVISION": REVISION},
         secrets={"GITHUB_TOKEN": f"github-{name}"},
     )
 
@@ -56,7 +56,7 @@ def advisor() -> RoleSpec:
     return RoleSpec(
         role="advisor",
         name="advisor",
-        env={"REPO_REVISION": REVISION},
+        env={"SENPAI_REPO_REVISION": REVISION},
         secrets={"GITHUB_TOKEN": "github-advisor"},
     )
 
@@ -69,8 +69,8 @@ def args(state_root: Path, **overrides) -> SimpleNamespace:
         "aws_ttl_hours": 24.0,
         "aws_ready_timeout_s": 1_200,
         "aws_data_timeout_s": 7_200,
-        "repo_revision": REVISION,
-        "repo_url": "https://github.com/wandb/senpai.git",
+        "senpai_repo_revision": REVISION,
+        "senpai_repo_url": "https://github.com/wandb/senpai.git",
         "docker_ready_timeout_s": 91,
         "native_ready_timeout_s": 37,
         "dry_run": False,
@@ -294,8 +294,8 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
     def test_remote_setup_smoke_tests_native_tools_for_private_homes(self):
         script = _remote_setup_script(
             SimpleNamespace(
-                repo_url="https://github.com/wandb/senpai.git",
-                repo_revision=REVISION,
+                senpai_repo_url="https://github.com/wandb/senpai.git",
+                senpai_repo_revision=REVISION,
                 advisor_model="wandb/zai-org/GLM-5.2",
             )
         ).decode()
@@ -352,8 +352,8 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
     def test_remote_setup_skips_glm_tokenizer_for_other_model_profiles(self):
         script = _remote_setup_script(
             SimpleNamespace(
-                repo_url="https://github.com/wandb/senpai.git",
-                repo_revision=REVISION,
+                senpai_repo_url="https://github.com/wandb/senpai.git",
+                senpai_repo_revision=REVISION,
                 advisor_model="openai/gpt-5.6-sol",
                 student_model="anthropic/claude-opus-5",
             )
@@ -365,8 +365,8 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
     def test_remote_setup_imports_the_supplied_metal_toolchain(self):
         script = _remote_setup_script(
             SimpleNamespace(
-                repo_url="https://github.com/wandb/senpai.git",
-                repo_revision=REVISION,
+                senpai_repo_url="https://github.com/wandb/senpai.git",
+                senpai_repo_revision=REVISION,
             )
         ).decode()
 

@@ -96,10 +96,12 @@ def test_openhands_fork_pin_is_consistent_across_install_paths():
         ("max", "openai/gpt-5.6-sol", "max"),
         ("high", "openai/gpt-5.6", "high"),
         ("xhigh", "anthropic/claude-opus-4-8", "xhigh"),
+        ("max", "anthropic/claude-fable-5", "max"),
+        ("max", "anthropic/claude-opus-5", "max"),
+        ("max", "anthropic/claude-sonnet-5", "max"),
         ("high", "wandb/zai-org/GLM-5.2", "high"),
         ("max", "wandb/zai-org/GLM-5.2", "max"),
         ("xhigh", "anthropic/claude-opus-5", "xhigh"),
-        ("max", "anthropic/claude-fable-5", "max"),
     ],
 )
 def test_supported_reasoning_effort_is_preserved(
@@ -408,6 +410,38 @@ def test_file_agent_reasoning_override_rejects_ultra():
         apply_reasoning_profile(
             parent.model_copy(update={"reasoning_effort": "ultra"})
         )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "anthropic/claude-fable-5",
+        "anthropic/claude-opus-5",
+        "anthropic/claude-sonnet-5",
+    ],
+)
+def test_anthropic_max_uses_provider_native_effort(model):
+    llm = apply_reasoning_profile(
+        LLM(
+            model=model,
+            api_key=SecretStr("test-key"),
+            reasoning_effort="max",
+            **model_runtime_configuration(model, "max"),
+        )
+    )
+    _messages, _tools, _mocked, call_kwargs, _telemetry = (
+        llm._prepare_completion_params(
+            [Message(role="user", content=[TextContent(text="Investigate")])],
+            tools=None,
+            add_security_risk_prediction=False,
+            kwargs={},
+        )
+    )
+
+    assert llm.reasoning_effort == "max"
+    assert call_kwargs["reasoning_effort"] == "max"
+    assert "reasoning" not in (llm.litellm_extra_body or {})
+    assert "reasoning" not in call_kwargs.get("extra_body", {})
 
 
 def test_wandb_gateway_uses_chat_thinking_and_project_routing():

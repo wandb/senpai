@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import uuid
+from base64 import b64encode
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -32,7 +33,17 @@ from openhands.sdk.tool import (
 from pydantic import BaseModel, Field, model_validator
 
 from senpai_agent.advisor import AdvisorEvent, AdvisorEventStore
+from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV
 from senpai_agent.processes import terminate_process_group
+from senpai_agent.program_context import PROGRAM_PATH_ENV
+from senpai_agent.PROMPTS import (
+    AWAIT_AGENTS_SATISFIED_PROMPT,
+    AWAIT_AGENTS_TIMEOUT_PROMPT,
+    DELEGATED_SEARCH_MODE_PROMPT,
+    DELEGATED_TASK_PROMPT,
+    DELEGATED_TASK_WITH_CONTEXT_PROMPT,
+    render_prompt,
+)
 from senpai_agent.secrets import scrub_github_credentials
 
 if TYPE_CHECKING:
@@ -144,6 +155,8 @@ class DelegationConfig:
     enable_browser: bool
     command_secrets: Mapping[str, str]
     role: str
+    program_path: str
+    launch_context: str
     local_condenser_max_events: int = 0
     local_condenser_max_tokens: int = 0
     local_condenser_target_events: int = 0
@@ -202,24 +215,27 @@ def configured_child_runner_factory() -> ChildAgentRunnerFactory:
 def render_child_prompt(request: DelegationRequest, task: str) -> str:
     assignment = task.strip()
     if request.search_mode is not None:
-        assignment = f"Search mode: {request.search_mode}\n\n{assignment}"
+        assignment = render_prompt(
+            DELEGATED_SEARCH_MODE_PROMPT,
+            SEARCH_MODE=request.search_mode,
+            ASSIGNMENT=assignment,
+        )
     if not request.parent_context:
         return (
-            "# Delegated task\n\n"
-            "You are a fresh Senpai subagent. Perform only the assigned task "
-            "and return a concise, evidence-linked report to the parent.\n\n"
-            f"{assignment}\n"
+            render_prompt(
+                DELEGATED_TASK_PROMPT,
+                ASSIGNMENT=assignment,
+            )
+            + "\n"
         )
     context = [message.model_dump(mode="json") for message in request.parent_context]
     return (
-        "# Delegated task with parent context\n\n"
-        "The JSON below is the complete model-visible parent context at "
-        "delegation time. Use it as evidence, perform only the assigned task, "
-        "and return a concise, evidence-linked report.\n\n"
-        "<parent_context_json>\n"
-        f"{json.dumps(context, separators=(',', ':'))}\n"
-        "</parent_context_json>\n\n"
-        f"{assignment}\n"
+        render_prompt(
+            DELEGATED_TASK_WITH_CONTEXT_PROMPT,
+            PARENT_CONTEXT_JSON=json.dumps(context, separators=(",", ":")),
+            ASSIGNMENT=assignment,
+        )
+        + "\n"
     )
 
 
@@ -401,6 +417,10 @@ class OpenHandsChildProcess:
             )
         if self._config.github_trusted_actor is not None:
             environment["SENPAI_GITHUB_ACTOR"] = self._config.github_trusted_actor
+        environment[PROGRAM_PATH_ENV] = self._config.program_path
+        environment[LAUNCH_CONTEXT_ENV] = b64encode(
+            self._config.launch_context.encode()
+        ).decode()
         return environment
 
     def start(
@@ -1746,10 +1766,7 @@ class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservatio
                     tasks=tasks,
                     changed_task_ids=changed,
                     waited_seconds=round(time.monotonic() - started, 3),
-                    guidance=(
-                        "Use the returned state now; unfinished sibling tasks keep "
-                        "running unless you cancel them explicitly."
-                    ),
+                    guidance=AWAIT_AGENTS_SATISFIED_PROMPT,
                 )
             remaining = deadline - time.time()
             if remaining <= 0 or self._interrupted.wait(min(0.1, remaining)):
@@ -1761,12 +1778,7 @@ class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservatio
                     tasks=tasks,
                     changed_task_ids=changed,
                     waited_seconds=round(time.monotonic() - started, 3),
-                    guidance=(
-                        "The tasks keep running. Continue useful parent work, inspect "
-                        "later with agent_status, or use join='change' for the next "
-                        "bounded wait; repeating the same long all-results "
-                        "wait will block on the same unfinished tasks."
-                    ),
+                    guidance=AWAIT_AGENTS_TIMEOUT_PROMPT,
                 )
             tasks, uncollected_terminal = self.manager.await_snapshot(
                 action.task_ids,

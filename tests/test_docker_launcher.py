@@ -42,12 +42,13 @@ def args(**overrides):
     values = {
         "tag": "aws-r1",
         "backend": "docker",
-        "repo_url": "https://github.com/wandb/senpai.git",
-        "repo_revision": revision,
+        "senpai_repo_url": "https://github.com/wandb/senpai.git",
+        "senpai_repo_revision": revision,
         "advisor_image": f"ghcr.io/wandb/senpai-advisor:sha-{revision}",
         "student_image": f"ghcr.io/wandb/senpai-student:sha-{revision}",
         "target_repo_url": "https://github.com/example/problem.git",
         "target_repo_branch": "main",
+        "program_path": "",
         "problem_dir": "target/",
         "gpus_per_student": 0,
         "cpu_per_gpu": 15,
@@ -109,7 +110,7 @@ class LaunchSpecTests(unittest.TestCase):
         self.assertEqual(spec.key, "student-fern")
         self.assertEqual(spec.env["GH_REPO"], "example/problem")
         self.assertEqual(spec.env["STUDENT_NAME"], "fern")
-        self.assertEqual(spec.env["REPO_REVISION"], "a" * 40)
+        self.assertEqual(spec.env["SENPAI_REPO_REVISION"], "a" * 40)
         self.assertNotIn("REPO_BRANCH", spec.env)
         decoded = base64.b64decode(spec.env["EXTRA_INSTRUCTIONS_B64"]).decode()
         self.assertIn("AWS experiment", decoded)
@@ -363,7 +364,7 @@ class DockerPreflightTests(unittest.TestCase):
 
         check_image.assert_called_once_with(
             run_args.advisor_image,
-            run_args.repo_revision,
+            run_args.senpai_repo_revision,
         )
 
     def test_image_probe_requires_the_exact_source_revision(self):
@@ -555,8 +556,8 @@ class DockerPreflightTests(unittest.TestCase):
         self.assertEqual(
             [call.args for call in check_image.call_args_list],
             [
-                (run_args.advisor_image, run_args.repo_revision),
-                (run_args.student_image, run_args.repo_revision),
+                (run_args.advisor_image, run_args.senpai_repo_revision),
+                (run_args.student_image, run_args.senpai_repo_revision),
             ],
         )
 

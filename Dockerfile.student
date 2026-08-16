@@ -13,7 +13,7 @@ ENV PATH="/opt/senpai-venv/bin:/home/senpai/.local/bin:${PATH}" \
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      ca-certificates curl gettext-base git gnupg procps && \
+      ca-certificates curl git gnupg procps && \
     groupadd --gid 10001 senpai && \
     useradd --uid 10001 --gid 10001 --create-home senpai && \
     rm -rf /var/lib/apt/lists/*

@@ -107,9 +107,7 @@ still answer the assigned question with one bounded correction.
 
 ## Record the outcome
 
-Update the target-prescribed baseline or research log with the PR, metrics, run
-IDs and links, reproduction command, and conclusion. Commit that advisor-owned
-change and publish it only through:
+Update the baseline or research log in the format prescribed by `program.md`, including the PR, metrics, run IDs and links, reproduction command, and conclusion. Commit that advisor-owned change and publish it only through:
 
 ```json
 {
