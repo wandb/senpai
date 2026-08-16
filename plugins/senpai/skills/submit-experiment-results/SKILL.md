@@ -29,7 +29,10 @@ SHA. Build the strict `ExperimentResult` required by
 Call `submit_experiment_result` with exactly this operation-specific payload. Do not add PR-body
 text, per-run metrics, hyperparameters, or aliases such as `head_sha`,
 `previous_head_sha`, `success`, or `min`; put those details in the bounded
-`summary` instead.
+`summary` instead. Write the summary as concise GitHub-flavored Markdown: lead
+with the outcome, then use short paragraphs or bullets for supporting evidence,
+validation, caveats, and suggested follow-ups. When appropriate, include W&B
+run IDs and present metrics as metric-value pairs or compact tables.
 
 ```json
 {
@@ -46,7 +49,7 @@ text, per-run metrics, hyperparameters, or aliases such as `head_sha`,
     },
     "status": "succeeded",
     "hypothesis": "The falsifiable hypothesis tested.",
-    "summary": "The conclusion, evidence, caveats, and important per-run metrics (maximum 4,000 characters).",
+    "summary": "**Outcome:** The conclusion.\n\n**Evidence:**\n- W&B run `wandb-run-id`: `validation/metric = 1.10` (baseline `1.23`; delta `-0.13`).\n\n**Validation:**\n- Exact checks or reproduction command.\n\n**Caveats:** Remaining uncertainty.\n\n**Suggested follow-ups:** Focused next steps (maximum 4,000 characters).",
     "runs": [
       {
         "run_id": "wandb-run-id",

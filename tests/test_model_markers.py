@@ -146,18 +146,65 @@ def test_visible_result_comment_contains_status_commit_summary_and_runs():
     assert render_result_comment(experiment_result).splitlines() == [
         render_result_marker(experiment_result),
         "",
-        "Status: succeeded",
-        f"Commit: `{HEAD_SHA}`",
+        "## Experiment result",
+        "",
+        "- **Status:** `succeeded`",
+        "- **Student:** `student-one`",
+        (
+            f"- **Commit:** [`{HEAD_SHA[:12]}`]"
+            f"(https://github.com/acme/widgets/commit/{HEAD_SHA})"
+        ),
+        "",
+        "### Hypothesis",
+        "",
+        "Lowering the learning rate improves generalization.",
+        "",
+        "### Summary",
         "",
         "The candidate improved validation loss.",
         "",
-        "W&B runs:",
-        "- https://wandb.ai/acme/widgets/runs/run-123",
-        "- https://wandb.ai/acme/widgets/runs/run-456",
+        "### Primary metric",
+        "",
+        "- **Metric:** `validation/loss`",
+        "- **Direction:** `minimize`",
+        "- **Baseline:** `0.42`",
+        "- **Candidate:** `0.38`",
+        "- **Delta:** `-0.04`",
+        "",
+        "### W&B runs",
+        "",
+        "- **run-123** — `finished` — https://wandb.ai/acme/widgets/runs/run-123",
+        "- **run-456** — `failed` — https://wandb.ai/acme/widgets/runs/run-456",
     ]
+    assert parse_result_markers(render_result_comment(experiment_result)) == (
+        experiment_result,
+    )
+
+
+def test_result_comment_preserves_markdown_summary_and_omits_empty_sections():
+    summary = "\n".join(
+        [
+            "**Outcome:** The candidate is ready for review.",
+            "",
+            "**Validation:**",
+            "- `pytest -q`",
+            "- `git diff --check`",
+        ]
+    )
+    experiment_result = result(summary=summary, runs=()).model_copy(
+        update={"primary_metric": None}
+    )
+
+    body = render_result_comment(experiment_result)
+
+    assert f"### Summary\n\n{summary}" in body
+    assert "### Primary metric" not in body
+    assert "### W&B runs" not in body
+    assert parse_result_markers(body) == (experiment_result,)
 
 
 def test_result_comment_quotes_protocol_marker_lines_from_visible_fields():
+    hypothesis_marker = "<!-- senpai-assignment:v2 {} -->"
     result_marker = "  <!-- senpai-result:v2 {} -->"
     response_marker = "\t<!-- senpai-human-response:student:fern:700 -->"
     runs = (
@@ -170,10 +217,17 @@ def test_result_comment_quotes_protocol_marker_lines_from_visible_fields():
     experiment_result = result(
         summary=f"The run completed.\n{result_marker}\nEvidence follows.",
         runs=runs,
+    ).model_copy(
+        update={
+            "hypothesis": (
+                f"Test the bounded candidate.\n{hypothesis_marker}"
+            )
+        }
     )
 
     body = render_result_comment(experiment_result)
 
+    assert f"> {hypothesis_marker}" in body.splitlines()
     assert f"> {result_marker}" in body.splitlines()
     assert f"> {response_marker}" in body.splitlines()
     assert parse_result_markers(body) == (experiment_result,)

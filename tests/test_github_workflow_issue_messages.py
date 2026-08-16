@@ -43,7 +43,7 @@ def test_respond_to_issue_writes_one_verified_idempotent_reply():
         comment(
             1,
             "<!-- senpai-human-response:advisor:700 -->\n\n"
-            "ADVISOR: I will investigate this now.",
+            "ADVISOR:\n\nI will investigate this now.",
         )
     ]
     assert fake.mutations == mutations_after_first
@@ -70,7 +70,7 @@ def test_respond_to_issue_accepts_a_specific_human_comment():
         "<!-- senpai-human-response:student:fern:42 -->"
     )
     assert cast(str, fake.comments[-1]["body"]).endswith(
-        "\n\nSTUDENT: I included memory in the comparison."
+        "\n\nSTUDENT:\n\nI included memory in the comparison."
     )
 
 
