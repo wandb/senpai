@@ -265,7 +265,7 @@ def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(tmp_path
             "value": "a" * 40,
         }
         assert checkout[0]["volumeMounts"][0] == {
-            "name": "senpai-source",
+            "name": "dataset",
             "mountPath": "/var/lib/senpai-source/source.bundle",
             "subPath": f"snapshots/{'a' * 40}.bundle",
             "readOnly": True,
@@ -288,6 +288,50 @@ def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(tmp_path
             }
         },
     }
+
+
+def test_source_checkout_reuses_rw_dataset_pvc_with_read_only_bundle_mount(tmp_path):
+    api = FakeApi()
+    broker = executor(tmp_path, api)
+    reserve(broker)
+    document = manifest()
+    for role in ("Launcher", "Worker"):
+        container = document["spec"]["mpiReplicaSpecs"][role]["template"]["spec"][
+            "containers"
+        ][0]
+        container["volumeMounts"] = [
+            {"name": "dataset", "mountPath": "/mnt/amf1-pvc"}
+        ]
+
+    apply(broker, document)
+
+    assert api.document_value is not None
+    for role in ("Launcher", "Worker"):
+        pod_spec = api.document_value["spec"]["mpiReplicaSpecs"][role]["template"][
+            "spec"
+        ]
+        pvc_volumes = [
+            volume for volume in pod_spec["volumes"] if "persistentVolumeClaim" in volume
+        ]
+        assert pvc_volumes == [
+            {
+                "name": "dataset",
+                "persistentVolumeClaim": {
+                    "claimName": "amf1-pvc",
+                    "readOnly": False,
+                },
+            }
+        ]
+        assert pod_spec["containers"][0]["volumeMounts"][0] == {
+            "name": "dataset",
+            "mountPath": "/mnt/amf1-pvc",
+        }
+        assert pod_spec["initContainers"][0]["volumeMounts"][0] == {
+            "name": "dataset",
+            "mountPath": "/var/lib/senpai-source/source.bundle",
+            "subPath": f"snapshots/{'a' * 40}.bundle",
+            "readOnly": True,
+        }
 
 
 @pytest.mark.parametrize(

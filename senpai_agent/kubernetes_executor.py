@@ -33,7 +33,6 @@ _SOURCE_ANNOTATION = "senpai.wandb.com/source-commit"
 _OWNERSHIP_LABELS = ("research-tag", "student", "senpai-training-id")
 _TRAINING_RESOURCE_NAMES = {"cpu", "memory", "nvidia.com/gpu"}
 _SOURCE_BUNDLE_MOUNT = "/var/lib/senpai-source/source.bundle"
-_SOURCE_VOLUME = "senpai-source"
 _WORKSPACE_MOUNT = "/workspace"
 _WORKSPACE_VOLUME = "senpai-workspace"
 
@@ -546,30 +545,23 @@ class KubernetesExecutor:
             raise ValueError("training source bundle is outside the configured PVC") from error
 
         volumes = pod_spec.setdefault("volumes", [])
-        if any(
-            volume.get("name") in {_SOURCE_VOLUME, _WORKSPACE_VOLUME}
-            for volume in volumes
-        ):
+        if any(volume.get("name") == _WORKSPACE_VOLUME for volume in volumes):
             raise ValueError("training manifest uses a reserved Senpai volume name")
-        volumes.extend(
-            [
-                {
-                    "name": _SOURCE_VOLUME,
-                    "persistentVolumeClaim": {
-                        "claimName": self.pvc_claim_name,
-                        "readOnly": True,
-                    },
-                },
-                {"name": _WORKSPACE_VOLUME, "emptyDir": {}},
-            ]
-        )
+        dataset_volumes = [
+            volume
+            for volume in volumes
+            if volume.get("persistentVolumeClaim", {}).get("claimName")
+            == self.pvc_claim_name
+        ]
+        if len(dataset_volumes) != 1:
+            raise ValueError("training manifest must define exactly one dataset PVC volume")
+        dataset_volume = dataset_volumes[0]
+        dataset_volume["persistentVolumeClaim"]["readOnly"] = False
+        volumes.append({"name": _WORKSPACE_VOLUME, "emptyDir": {}})
 
         for container in containers:
             mounts = container.setdefault("volumeMounts", [])
-            if any(
-                mount.get("name") in {_SOURCE_VOLUME, _WORKSPACE_VOLUME}
-                for mount in mounts
-            ):
+            if any(mount.get("name") == _WORKSPACE_VOLUME for mount in mounts):
                 raise ValueError("training container uses a reserved Senpai volume name")
             nested_workspace_mounts = [
                 mount
@@ -611,7 +603,7 @@ class KubernetesExecutor:
                 },
                 "volumeMounts": [
                     {
-                        "name": _SOURCE_VOLUME,
+                        "name": dataset_volume["name"],
                         "mountPath": _SOURCE_BUNDLE_MOUNT,
                         "subPath": str(source_subpath),
                         "readOnly": True,
