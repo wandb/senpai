@@ -426,8 +426,9 @@ registries, or IAM instance profiles.
 AWS Mac reuses an already allocated fleet of `mac-m4pro.metal` Dedicated Hosts
 and runs Senpai natively under per-user `launchd` services. It assigns exactly
 one student to each host and co-locates the optional advisor on the first host.
-The backend creates and terminates EC2 instances, but never releases the
-Dedicated Hosts.
+Fresh mode creates and terminates EC2 instances. Reuse mode adopts an exact
+fleet of already-running instances without stopping or terminating them. The
+backend never releases Dedicated Hosts.
 
 Use a clean checkout at the exact committed revision being launched. The base
 macOS AMI does not contain full Xcode or the Metal toolchain. Provide either a
@@ -472,7 +473,7 @@ launch_args=(
   --aws_mac_security_group_id sg-EXAMPLE
   --aws_mac_xcode_archive /absolute/path/to/Xcode.zip
   --aws_mac_metal_toolchain_archive /absolute/path/to/MetalToolchain.zip
-  --aws_mac_mlxfast_bundle "$HOME/.local/share/mlxfast/mlxfast.js"
+  --aws_mac_yukon_bundle "$HOME/.local/share/yukon/yukon.js"
   --aws_mac_official_submit
   --aws_ttl_hours 0
 )
@@ -481,8 +482,79 @@ uv run python k8s/launch.py "${launch_args[@]}" --preflight_only
 uv run python k8s/launch.py "${launch_args[@]}"
 ```
 
-Preflight is read-only: it validates the exact source revision, Apple Silicon
-AMI, host availability and capacity, subnet placement, base security group,
+### Adopt running Mac instances
+
+Reuse mode takes the complete fleet and its existing SSH access from a
+schema-v1 manifest. Access files must be nonempty regular files, not symlinks,
+and not writable by group or other users; the private key must additionally be
+inaccessible to them. Every student, instance, host, placement, and
+security-group set is exact; mixed created/adopted fleets are not supported.
+
+```yaml
+schema_version: 1
+access:
+  private_key_path: /absolute/path/to/id_ed25519
+  known_hosts_path: /absolute/path/to/known_hosts
+  ownership: external
+nodes:
+  - student: fern
+    source:
+      adopted_instance_id: i-0123456789abcdef0
+    expect:
+      host_id: h-0123456789abcdef0
+      availability_zone: us-east-1a
+      subnet_id: subnet-0123456789abcdef0
+      security_group_ids:
+        - sg-0123456789abcdef0
+    prior_native_run: prior-fern-run
+```
+
+```bash
+tag=adopted-aws-mac-run
+revision=$(git rev-parse HEAD)
+
+launch_args=(
+  --config_path senpai.local.yaml
+  --backend aws-mac
+  --tag "$tag"
+  --target_repo_url https://github.com/OWNER/TARGET.git
+  --advisor
+  --names fern,tanjiro
+  --gpus_per_student 1
+  --senpai_repo_revision "$revision"
+  --aws_region us-east-1
+  --aws_instance_type mac-m4pro.metal
+  --aws_mac_bootstrap_mode reuse
+  --aws_mac_nodes_path /absolute/path/to/aws-mac-nodes.yaml
+  --aws_mac_yukon_bundle "$HOME/.local/share/yukon/yukon.js"
+  --aws_mac_official_submit
+  --aws_ttl_hours 0
+)
+
+uv run python k8s/launch.py "${launch_args[@]}" --preflight_only
+uv run python k8s/launch.py "${launch_args[@]}"
+```
+
+Reuse preflight makes only read calls to AWS. It proves that every instance is
+running on the manifest's exact Dedicated Host, AZ, subnet, VPC, and security
+groups, then connects with the imported host keys under
+`StrictHostKeyChecking=yes`. Guest IMDSv2 must report the expected instance ID,
+the reusable Xcode/Metal/Homebrew/Chromium tools must be present, and every
+LaunchDaemon recorded by `prior_native_run` must already be unloaded. A
+changed public IP fails closed until access is authenticated out of band.
+
+Reuse requires `--aws_ttl_hours 0` and rejects the fresh-placement flags
+`--aws_mac_host_ids`, `--aws_mac_subnet_ids`, and
+`--aws_mac_security_group_id`. It does not upload Xcode or Metal and does not
+overwrite prior source, virtualenv, or native-run roots. Launch uploads and
+installs the selected submission CLI: Yukon when `--aws_mac_yukon_bundle` is
+set, otherwise the backward-compatible MLXFast bundle. It leaves the unselected
+CLI untouched. Each campaign gets an isolated source and virtualenv below
+`~/.senpai/aws-mac-runners/<tag>/`. The external key and `known_hosts` remain
+untouched; only private copies are placed in the new lifecycle directory.
+
+Fresh preflight is read-only: it validates the exact source revision, Apple
+Silicon AMI, host availability and capacity, subnet placement, base security group,
 Xcode source, and Metal toolchain archive. Launch creates an ephemeral SSH key
 and a campaign-owned SSH security group, permits the operator's IPv4 `/32`
 only on that group, validates one native canary,
@@ -498,7 +570,9 @@ while giving co-located roles and their recursive subagents separate tmux
 namespaces. All native roles still run under the configured Unix user; this is
 namespace isolation, not a hostile-process security boundary.
 With `--aws_mac_official_submit`, the launcher also requires
-`MLXFAST_API_TOKEN` and gives every active role official dispatch capability.
+`YUKON_API_TOKEN` when `--aws_mac_yukon_bundle` is set, or the legacy
+`MLXFAST_API_TOKEN` otherwise, and gives every active role official dispatch
+capability.
 Coordinate submissions so students send distinct, validated candidates rather
 than duplicate jobs.
 
@@ -516,15 +590,20 @@ uv run python k8s/aws_mac.py logs first-aws-mac-run --role student-fern
 uv run python k8s/aws_mac.py terminate first-aws-mac-run
 ```
 
-Termination unloads the native services, removes their private state,
-terminates only the instances recorded for the run, and deletes the ephemeral
-key and campaign-owned SSH security group. It preserves all pre-existing
-Dedicated Hosts and networking resources. Cleanup retains access credentials
-until every instance is confirmed terminated or missing, and persists partial
-failures for a safe retry. Runs created by the older shared-rule launcher never
-revoke that shared rule automatically; cleanup preserves their state with an
-explicit manual-review message while the exact rule remains. Remove it only
-when safe, then rerun `terminate` so cleanup can verify its absence and finish.
+Termination unloads only the new native tag and removes its private state.
+Fresh runs terminate only instances explicitly recorded as `created`, then
+delete their ephemeral key and campaign-owned SSH security group. Reuse runs
+remove only their tag-scoped runner and local access copies; adopted instances,
+external keys, security groups, Dedicated Hosts, prior native roots, and other
+networking resources are preserved. The selected global submission CLI remains
+installed on adopted Macs for subsequent runs. Missing or invalid ownership
+stops cleanup before any AWS or remote mutation and retains lifecycle state for
+operator reconciliation. Cleanup also retains access while a created instance outcome
+is unresolved and persists partial failures for a safe retry. Runs created by
+the older shared-rule launcher never revoke that shared rule automatically;
+cleanup preserves their state with an explicit manual-review message while the
+exact rule remains. Remove it only when safe, then rerun `terminate` so cleanup
+can verify its absence and finish.
 
 ## Experiment workflow
 

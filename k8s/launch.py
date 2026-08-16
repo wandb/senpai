@@ -50,6 +50,7 @@ from k8s.launch_helpers import (  # noqa: E402
 )
 from senpai.launch.aws_backend import launch_aws, preflight_aws  # noqa: E402
 from senpai.launch.aws_mac_backend import (  # noqa: E402
+    aws_mac_submission_token_env,
     launch_aws_mac,
     preflight_aws_mac,
 )
@@ -144,6 +145,8 @@ class Args:
     aws_ttl_hours: float = 24.0  # self-termination backstop; 0 disables it only on AWS Mac
     native_run_root: str = "~/.senpai/native"  # native macOS role state and logs
     native_ready_timeout_s: int = 600  # wait for native supervisor leases
+    aws_mac_nodes_path: str = ""  # schema-v1 manifest for an all-adopted Mac fleet
+    aws_mac_bootstrap_mode: str = "fresh"  # fresh provisions hosts; reuse adopts manifest instances
     aws_mac_host_ids: str = ""  # existing Dedicated Host IDs, one per student
     aws_mac_subnet_ids: str = ""  # AZ=subnet-id map for the selected hosts
     aws_mac_security_group_id: str = ""  # existing SSH security group
@@ -151,7 +154,8 @@ class Args:
     aws_mac_xcode_archive: str = ""  # optional prepared Xcode zip; avoids re-archiving
     aws_mac_metal_toolchain_archive: str = ""  # exported Metal toolchain bundle zip
     aws_mac_mlxfast_bundle: str = "~/.local/share/mlxfast/mlxfast.js"  # local CLI bundle installed on every Mac
-    aws_mac_official_submit: bool = False  # give every active role the MLXFast submission token
+    aws_mac_yukon_bundle: str = ""  # optional Yukon CLI bundle; replaces MLXFast when set
+    aws_mac_official_submit: bool = False  # give every active role the selected submission token
     dry_run: bool = False  # render manifests only: do not apply them or validate credentials
     preflight_only: bool = False  # validate credentials/access only: do not render or apply manifests
 
@@ -488,7 +492,8 @@ def main():
     )
     github_token = exa_api_key = wandb_api_key = hf_token = ""
     provider_api_keys: dict[str, str] = {}
-    mlxfast_api_token = ""
+    official_submit_token_env = ""
+    official_submit_token = ""
     if not args.dry_run or args.preflight_only:
         github_token = resolve_github_token(DOTENV_PATH)
         if "anthropic" in model_providers:
@@ -501,14 +506,15 @@ def main():
             provider_api_keys["wandb"] = wandb_api_key
         hf_token = resolve_optional_secret(DOTENV_PATH, "HF_TOKEN")
         if args.backend == "aws-mac" and args.aws_mac_official_submit:
-            mlxfast_api_token = resolve_optional_secret(
+            official_submit_token_env = aws_mac_submission_token_env(args)
+            official_submit_token = resolve_optional_secret(
                 DOTENV_PATH,
-                "MLXFAST_API_TOKEN",
+                official_submit_token_env,
             )
-            if not mlxfast_api_token:
+            if not official_submit_token:
                 sys.exit(
                     "ERROR: --aws_mac_official_submit requires "
-                    "MLXFAST_API_TOKEN"
+                    f"{official_submit_token_env}"
                 )
         preflight_check_target_repo_access(args.target_repo_url, github_token)
         args.target_repo_branch = preflight_check_target_repo_branch(
@@ -550,8 +556,8 @@ def main():
                 for provider in configured_model_providers(args, role)
             },
         }
-        if mlxfast_api_token:
-            secrets["MLXFAST_API_TOKEN"] = mlxfast_api_token
+        if official_submit_token:
+            secrets[official_submit_token_env] = official_submit_token
         return secrets
 
     role_specs = [

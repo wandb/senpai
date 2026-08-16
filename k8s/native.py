@@ -39,6 +39,8 @@ def main() -> None:
             command.add_argument("--role", default="")
             command.add_argument("--tail", type=int, default=200)
             command.add_argument("--follow", action="store_true")
+        elif name == "terminate":
+            command.add_argument("--ownership-token", default="")
     args = parser.parse_args()
 
     try:
@@ -57,7 +59,11 @@ def main() -> None:
                 tail=args.tail,
             )
         else:
-            terminate_native(args.tag, args.run_root)
+            terminate_native(
+                args.tag,
+                args.run_root,
+                ownership_token=args.ownership_token,
+            )
     except (
         ValueError,
         RuntimeError,

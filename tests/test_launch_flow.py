@@ -19,7 +19,13 @@ class BackendDefaultTests(unittest.TestCase):
 
 
 class LaunchOrderingTests(unittest.TestCase):
-    def test_aws_mac_official_submit_token_reaches_every_role(self):
+    def aws_mac_official_submit_specs(
+        self,
+        *,
+        yukon: bool,
+        token: str = "submission-token",
+    ):
+        token_env = "YUKON_API_TOKEN" if yukon else "MLXFAST_API_TOKEN"
         args = launch.Args(
             "safe-tag",
             "https://github.com/example/target.git",
@@ -27,6 +33,7 @@ class LaunchOrderingTests(unittest.TestCase):
             names="fern",
             advisor=True,
             gpus_per_student=1,
+            aws_mac_yukon_bundle="/tmp/yukon.js" if yukon else "",
             aws_mac_official_submit=True,
         )
         captured_specs = {}
@@ -51,7 +58,7 @@ class LaunchOrderingTests(unittest.TestCase):
                 launch,
                 "resolve_optional_secret",
                 side_effect=lambda _path, name: (
-                    "mlxfast-token" if name == "MLXFAST_API_TOKEN" else ""
+                    token if name == token_env else ""
                 ),
             ),
             patch.object(launch, "preflight_check_target_repo_access"),
@@ -71,15 +78,41 @@ class LaunchOrderingTests(unittest.TestCase):
             patch.object(launch, "launch_aws_mac"),
         ):
             launch.main()
+        return token_env, captured_specs
+
+    def test_aws_mac_mlxfast_token_reaches_every_role(self):
+        token_env, captured_specs = self.aws_mac_official_submit_specs(
+            yukon=False
+        )
 
         self.assertEqual(
-            captured_specs["advisor"].secrets["MLXFAST_API_TOKEN"],
-            "mlxfast-token",
+            captured_specs["advisor"].secrets[token_env],
+            "submission-token",
         )
         self.assertEqual(
-            captured_specs["student-fern"].secrets["MLXFAST_API_TOKEN"],
-            "mlxfast-token",
+            captured_specs["student-fern"].secrets[token_env],
+            "submission-token",
         )
+
+    def test_aws_mac_yukon_token_reaches_every_role(self):
+        token_env, captured_specs = self.aws_mac_official_submit_specs(
+            yukon=True
+        )
+
+        self.assertEqual(token_env, "YUKON_API_TOKEN")
+        self.assertEqual(
+            captured_specs["advisor"].secrets[token_env],
+            "submission-token",
+        )
+        self.assertEqual(
+            captured_specs["student-fern"].secrets[token_env],
+            "submission-token",
+        )
+        self.assertNotIn("MLXFAST_API_TOKEN", captured_specs["advisor"].secrets)
+
+    def test_aws_mac_yukon_official_submit_requires_yukon_token(self):
+        with self.assertRaisesRegex(SystemExit, "YUKON_API_TOKEN"):
+            self.aws_mac_official_submit_specs(yukon=True, token="")
 
     def test_docker_compute_preflight_precedes_github_mutations(self):
         args = launch.Args(

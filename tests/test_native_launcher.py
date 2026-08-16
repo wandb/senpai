@@ -97,6 +97,17 @@ class NativePlanTests(NativeTmuxTestCase):
         self.assertEqual(role.state_root.name, "state")
         self.assertTrue(role.lease.is_relative_to(role.state_root))
 
+    def test_plan_rejects_an_invalid_ownership_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "ownership_token"):
+                plan_native(
+                    args(
+                        Path(tmp) / "runs",
+                        native_ownership_token="not-a-token",
+                    ),
+                    [student()],
+                )
+
     def test_roles_get_distinct_tmux_socket_roots(self):
         with tempfile.TemporaryDirectory() as tmp:
             plan = plan_native(
@@ -233,7 +244,10 @@ class NativePlanTests(NativeTmuxTestCase):
 class NativeLaunchTests(NativeTmuxTestCase):
     def test_launch_writes_private_state_and_secret_free_persistent_plist(self):
         with tempfile.TemporaryDirectory() as tmp:
-            run_args = args(Path(tmp) / "runs")
+            run_args = args(
+                Path(tmp) / "runs",
+                native_ownership_token="a" * 32,
+            )
             spec = student()
             plan = plan_native(run_args, [spec])
             with (
@@ -276,6 +290,7 @@ class NativeLaunchTests(NativeTmuxTestCase):
             self.assertEqual(
                 descriptor["environment"]["TMUX_TMPDIR"], str(role.tmux_root)
             )
+            self.assertEqual(manifest["ownership_token"], "a" * 32)
             self.assertEqual(manifest["roles"][0]["tmux_root"], str(role.tmux_root))
             command_path = descriptor["environment"]["PATH"].split(os.pathsep)
             self.assertIn("/opt/homebrew/bin", command_path)
@@ -628,6 +643,28 @@ class NativeLifecycleTests(NativeTmuxTestCase):
 
             uninstall.assert_called_once_with("system", manifest["roles"][0])
             self.assertFalse(run_path.exists())
+
+    def test_terminate_rejects_a_mismatched_ownership_token_before_sudo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runs"
+            run_path, manifest = self.write_manifest(root)
+            manifest["ownership_token"] = "a" * 32
+            (run_path / "manifest.json").write_text(json.dumps(manifest))
+
+            with (
+                patch(
+                    "senpai.launch.native_backend._uninstall_recorded_role"
+                ) as uninstall,
+                self.assertRaisesRegex(RuntimeError, "ownership token"),
+            ):
+                terminate_native(
+                    "mlxfast-r1",
+                    str(root),
+                    ownership_token="b" * 32,
+                )
+
+            uninstall.assert_not_called()
+            self.assertTrue(run_path.exists())
 
     def test_terminate_removes_the_recorded_tmux_root_after_bootout(self):
         with tempfile.TemporaryDirectory() as tmp:

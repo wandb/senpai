@@ -179,6 +179,7 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
         command_secrets={
             "WANDB_API_KEY": "wandb-key",
             "MLXFAST_API_TOKEN": "mlxfast-key",
+            "YUKON_API_TOKEN": "yukon-key",
         },
     )
 
@@ -196,6 +197,7 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     assert captured["secrets"] == {
         "WANDB_API_KEY": "wandb-key",
         "MLXFAST_API_TOKEN": "mlxfast-key",
+        "YUKON_API_TOKEN": "yukon-key",
     }
     assert captured["conversation_id_env"] == config.conversation_id.hex
     assert captured["delete_on_close"] is False

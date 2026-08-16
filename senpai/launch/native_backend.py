@@ -38,6 +38,7 @@ DEFAULT_NATIVE_TMUX_ROOT = "~/.senpai/t"
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHD_PREFIX = "com.wandb.senpai"
 LAUNCHD_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]+")
+OWNERSHIP_TOKEN = re.compile(r"[0-9a-f]{32}")
 LAUNCH_DAEMON_ROOT = Path("/Library/LaunchDaemons")
 LAUNCHCTL = "/bin/launchctl"
 CAFFEINATE = "/usr/bin/caffeinate"
@@ -93,6 +94,7 @@ class NativeLaunchPlan:
     user_name: str
     group_name: str
     roles: tuple[NativeRolePlan, ...]
+    ownership_token: str = ""
 
 
 def _path_beneath(root: Path, *parts: str) -> Path:
@@ -160,6 +162,9 @@ def plan_native(args, role_specs: list[RoleSpec]) -> NativeLaunchPlan:
     timeout = float(getattr(args, "native_ready_timeout_s", 600))
     if timeout <= 0:
         raise ValueError("native_ready_timeout_s must be greater than 0")
+    ownership_token = getattr(args, "native_ownership_token", "")
+    if ownership_token and not OWNERSHIP_TOKEN.fullmatch(ownership_token):
+        raise ValueError("native_ownership_token must be 32 lowercase hex characters")
 
     run_root = _run_root(args.tag, _configured_run_root(args))
     if run_root.is_relative_to(SOURCE_ROOT):
@@ -208,6 +213,7 @@ def plan_native(args, role_specs: list[RoleSpec]) -> NativeLaunchPlan:
         user_name=user_name,
         group_name=group_name,
         roles=tuple(roles),
+        ownership_token=ownership_token,
     )
 
 
@@ -475,6 +481,7 @@ def _write_manifest(plan: NativeLaunchPlan) -> None:
         plan.run_root / "manifest.json",
         {
             "domain": plan.domain,
+            "ownership_token": plan.ownership_token,
             "tag": plan.tag,
             "roles": [
                 {
@@ -900,9 +907,24 @@ def logs_native(
     subprocess.run([*command, *existing], check=True)
 
 
-def terminate_native(tag: str, run_root: str = DEFAULT_NATIVE_RUN_ROOT) -> None:
+def terminate_native(
+    tag: str,
+    run_root: str = DEFAULT_NATIVE_RUN_ROOT,
+    *,
+    ownership_token: str = "",
+) -> None:
     """Unload recorded services and remove their private workspaces and secrets."""
     path, manifest = _load_manifest(tag, run_root)
+    if ownership_token:
+        if not OWNERSHIP_TOKEN.fullmatch(ownership_token):
+            raise ValueError(
+                "native ownership token must be 32 lowercase hex characters"
+            )
+        if manifest.get("ownership_token") != ownership_token:
+            raise RuntimeError(
+                "Native run ownership token does not match; preserving services "
+                "and private state"
+            )
     _validate_installed_role_inventory(tag, manifest["roles"])
     errors = []
     for role in reversed(manifest["roles"]):

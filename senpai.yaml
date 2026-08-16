@@ -66,6 +66,10 @@ aws_ttl_hours: 24.0
 # AWS Mac reuses allocated Dedicated Hosts and runs roles natively on macOS.
 native_run_root: ~/.senpai/native
 native_ready_timeout_s: 600
+# A schema-v1 fleet manifest enables safe adoption of already-running instances.
+aws_mac_nodes_path: ""
+# fresh provisions instances; reuse requires aws_mac_nodes_path and aws_ttl_hours: 0.
+aws_mac_bootstrap_mode: fresh
 aws_mac_host_ids: ""
 # Comma-separated AZ=subnet-id entries covering every selected host.
 aws_mac_subnet_ids: ""
@@ -76,7 +80,9 @@ aws_mac_xcode_archive: ""
 # Required zip containing one exported Metal toolchain bundle.
 aws_mac_metal_toolchain_archive: ""
 aws_mac_mlxfast_bundle: ~/.local/share/mlxfast/mlxfast.js
-# When enabled, every active role receives MLXFAST_API_TOKEN for official dispatch.
+# Set to install Yukon instead of MLXFast on fresh or adopted Macs.
+aws_mac_yukon_bundle: ""
+# Every active role receives the selected CLI's API token for official dispatch.
 aws_mac_official_submit: false
 
 # W&B
