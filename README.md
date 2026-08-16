@@ -625,7 +625,7 @@ flowchart LR
 1. The advisor creates a falsifiable assignment with the exact required research-base SHA, baseline metrics, expected mechanism, implementation scope, and stopping rules.
 2. `create_assignment` creates the student branch and draft PR, embeds a typed assignment record, and applies the routing labels.
 3. The assigned student receives one OpenHands conversation for that assignment revision. New PR comments and reviews are queued durably even while a turn is active, then delivered in the next bounded turn.
-4. The student commits the exact implementation, launches supervised training, and records every referenced run in W&B.
+4. The student commits the exact implementation, launches supervised training, records every referenced run in W&B, and uses `post_assignment_comment` for material progress, questions, blockers, or replies. Each typed comment wakes the advisor without changing the PR head, draft state, or labels.
 5. The student calls `submit_experiment_result`; the tool validates and publishes the branch before changing the PR to `status:review`.
 6. The advisor compares the evidence, then uses the corresponding operation-specific tool to merge a reproducible winner, close a useful negative result, request a new revision, or send non-revision feedback.
 

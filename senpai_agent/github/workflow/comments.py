@@ -43,6 +43,8 @@ class CommentsMixin:
         *,
         marker: str,
         body: str,
+        conflict_message: str | None = None,
+        exact_conflict: bool = False,
     ) -> tuple[bool, IssueComment]:
         return self._upsert_comment(
             number,
@@ -50,6 +52,8 @@ class CommentsMixin:
             matches=lambda: self._marker_comments(number, marker),
             subject=f"comments for marker {marker!r}",
             desired_state="marker comment",
+            conflict_message=conflict_message,
+            exact_conflict=exact_conflict,
         )
 
     def _upsert_result_comment(
@@ -137,11 +141,22 @@ class CommentsMixin:
         matches: Callable[[], tuple[IssueComment, ...]],
         subject: str,
         desired_state: str,
+        conflict_message: str | None = None,
+        exact_conflict: bool = False,
     ) -> tuple[bool, IssueComment]:
         body = role_prefixed_comment(body, self._role)
         existing = matches()
         if len(existing) > 1:
             raise ReconciliationError(f"GitHub contains multiple {subject}")
+        existing_body = existing[0].body if existing else None
+        if existing_body is not None and not exact_conflict:
+            existing_body = role_prefixed_comment(existing_body, self._role)
+        if (
+            conflict_message is not None
+            and existing
+            and existing_body != body
+        ):
+            raise WorkflowPreconditionError(conflict_message)
         if existing and existing[0].body == body:
             return False, existing[0]
         if existing:

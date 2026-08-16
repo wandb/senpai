@@ -1448,6 +1448,7 @@ def test_runtime_credentials_remain_configured_through_lazy_tool_initialization(
     assert captured["resolved"] == {
         "senpai_github": {
             "get_prs",
+            "post_assignment_comment",
             "respond_to_human_issue",
             "submit_experiment_result",
         },

@@ -246,6 +246,8 @@ def require_current_revision(
 def require_active_assignment_routing(
     snapshot: PullRequestSnapshot,
     assignment: AssignmentRecord,
+    *,
+    allowed_statuses: frozenset[str] = frozenset({"status:wip"}),
 ) -> None:
     labels = set(snapshot.labels)
     student_labels = {label for label in labels if label.startswith("student:")}
@@ -253,9 +255,12 @@ def require_active_assignment_routing(
         raise WorkflowPreconditionError(
             "pull request must retain exactly its assigned student label"
         )
-    if "status:wip" not in labels or "status:review" in labels:
+    active_statuses = labels & {"status:wip", "status:review"}
+    if len(active_statuses) != 1 or not active_statuses <= allowed_statuses:
+        allowed = " or ".join(sorted(allowed_statuses))
         raise WorkflowPreconditionError(
-            "pull request must have status:wip as its only active assignment status"
+            f"pull request must have exactly one of {allowed} as its active "
+            "assignment status"
         )
 
 
