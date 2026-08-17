@@ -38,16 +38,22 @@ Read the `program.md` identified in the system prompt for its goals, metric cont
    `$ADVISOR_BRANCH`. Check assignment, workflow state, update time, linked W&B
    runs, and results. Keep the query bounded to relevant open and recently
    completed work.
-3. **Current controller and training:** inspect
-   `$SENPAI_OPENHANDS_STATE_DIR/training/*.json` for supervised training state.
+3. **Current controller and jobs:** inspect
+   `$SENPAI_OPENHANDS_STATE_DIR/jobs/*.json` for supervised job state.
    Treat this as local evidence for the current advisor or student only. Do not
    infer another node's process state; its GitHub transitions and W&B run state
    are the portable evidence boundary.
 
-Cross-check timestamps, branch assignments, terminal training records, W&B run
+Cross-check timestamps, branch assignments, terminal job records, W&B run
 state, and PR claims. State contradictions explicitly. Missing access or absent
 records are evidence gaps, not evidence that nothing happened. Senpai uses no
 cross-node RPC or cluster API for status collection.
+
+Before calling the current controller stopped or hung, inspect its active,
+non-quarantined inbox turn and recent paired `ActionEvent`/`ObservationEvent`
+timestamps. A job may become terminal while that same conversation is still
+working; absence of a new `OPENHANDS_RUN`, `MessageEvent`, or `FinishAction`
+after the transition is not evidence that the agent stopped.
 
 This workflow is observational. Do not mutate GitHub, Kubernetes, W&B, local
 state, or agent sessions.
@@ -63,7 +69,7 @@ Return a compact report with:
    benchmark or target, gap, W&B run, PR, and evaluation caveat.
 4. **PR queue and routing:** active work, assignment integrity, stale work, and
    evidence-backed blockers.
-5. **Runtime health:** current assignment, persisted local training and monitor
+5. **Runtime health:** current assignment, persisted local job and monitor
    state, W&B run liveness, stale GitHub transitions, and any
    branch-to-assignment mismatch.
 6. **Contradictions and confidence:** where GitHub, W&B, persisted state, logs,

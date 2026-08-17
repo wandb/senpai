@@ -4,21 +4,21 @@ from pathlib import Path
 
 import psutil
 
-from senpai_agent.training import (
-    TrainingResult,
-    TrainingSpec,
-    TrainingState,
-    TrainingSupervisor,
+from senpai_agent.jobs import (
+    JobResult,
+    JobSpec,
+    JobState,
+    JobSupervisor,
 )
 
 
 def make_supervisor(
     tmp_path: Path,
     **kwargs,
-) -> tuple[Path, TrainingSupervisor]:
+) -> tuple[Path, JobSupervisor]:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    return workspace, TrainingSupervisor(
+    return workspace, JobSupervisor(
         workspace=workspace,
         state_dir=tmp_path / "state",
         **kwargs,
@@ -26,14 +26,14 @@ def make_supervisor(
 
 
 def run_python(
-    supervisor: TrainingSupervisor,
+    supervisor: JobSupervisor,
     workspace: Path,
     code: str,
     *args: str,
     timeout_seconds: int = 20,
-) -> TrainingResult:
-    return supervisor.run_training(
-        TrainingSpec(
+) -> JobResult:
+    return supervisor.run_job(
+        JobSpec(
             argv=(sys.executable, "-c", code, *args),
             cwd=workspace,
             timeout_seconds=timeout_seconds,
@@ -42,18 +42,18 @@ def run_python(
 
 
 def wait_for_terminal(
-    supervisor: TrainingSupervisor,
-    training_id: str,
+    supervisor: JobSupervisor,
+    job_id: str,
     *,
     timeout: float = 5,
-) -> TrainingResult:
+) -> JobResult:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        result = supervisor.get_training_status(training_id)
-        if result.state is not TrainingState.RUNNING:
+        result = supervisor.get_job_status(job_id)
+        if result.state is not JobState.RUNNING:
             return result
         time.sleep(0.02)
-    raise AssertionError("training did not reach a terminal state")
+    raise AssertionError("job did not reach a terminal state")
 
 
 def wait_for_path(path: Path, *, timeout: float = 3) -> None:
@@ -72,4 +72,4 @@ def assert_process_stopped(pid: int, *, timeout: float = 3) -> None:
         except psutil.NoSuchProcess:
             return
         time.sleep(0.05)
-    raise AssertionError(f"training descendant {pid} is still running")
+    raise AssertionError(f"job descendant {pid} is still running")

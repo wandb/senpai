@@ -123,6 +123,7 @@ def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
         "check-human-issues",
         "delegate-subagents",
         "exa-search",
+        "monitor-jobs",
         "review-experiment",
         "senpai-status-check",
         "submit-experiment-results",
@@ -139,3 +140,13 @@ def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
     assert {
         path: path.read_text(encoding="utf-8") for path in originals
     } == originals
+
+
+def test_status_skill_uses_active_turn_and_tool_activity_for_liveness():
+    text = (
+        PLUGIN_DIR / "skills" / "senpai-status-check" / "SKILL.md"
+    ).read_text()
+
+    assert "non-quarantined inbox turn" in text
+    assert "`ActionEvent`/`ObservationEvent`" in text
+    assert "absence of a new `OPENHANDS_RUN`" in text

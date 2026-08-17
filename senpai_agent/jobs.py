@@ -18,18 +18,18 @@ from pydantic import BaseModel, ConfigDict, Field
 from senpai_agent.processes import signal_process_group, terminate_process_group
 
 _WANDB_RUN_URL_BYTES = re.compile(
-    rb"https?://wandb\.ai/[^/\s]+/[^/\s]+/runs/([A-Za-z0-9_-]+)"
+    rb"https?://wandb\.ai/[^/\s]+/[^/\s]+/runs/([^:;,#?/\'\"\s]+)"
 )
 _WANDB_COMPLETE_RUN_URL_BYTES = re.compile(
     rb"https?://wandb\.ai/[^/\s]+/[^/\s]+/runs/"
-    rb"([A-Za-z0-9_-]+)(?=[^A-Za-z0-9_-])"
+    rb"([^:;,#?/\'\"\s]+)(?=[:;,#?/\'\"\s])"
 )
 _LOG_READ_BYTES = 64 * 1024
 _WANDB_SCAN_OVERLAP_BYTES = 4096
 _ERROR_TAIL_BYTES = 8192
 
 
-class TrainingState(StrEnum):
+class JobState(StrEnum):
     RUNNING = "running"
     FINISHED = "finished"
     FAILED = "failed"
@@ -37,7 +37,7 @@ class TrainingState(StrEnum):
     CANCELLED = "cancelled"
 
 
-class TrainingSpec(BaseModel):
+class JobSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     argv: tuple[str, ...] = Field(min_length=1)
@@ -46,11 +46,11 @@ class TrainingSpec(BaseModel):
     workspace_access: Literal["read_only", "mutable"] = "mutable"
 
 
-class TrainingResult(BaseModel):
+class JobResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    training_id: str
-    state: TrainingState
+    job_id: str
+    state: JobState
     pid: int | None = Field(default=None, gt=0)
     process_group_id: int | None = Field(default=None, gt=0)
     process_start_time: float | None = Field(default=None, gt=0)
@@ -62,20 +62,20 @@ class TrainingResult(BaseModel):
     workspace_access: Literal["read_only", "mutable"] = "mutable"
 
 
-def training_result_paths(state_dir: Path) -> Iterator[Path]:
-    """Yield only process records owned by the training supervisor."""
+def job_result_paths(state_dir: Path) -> Iterator[Path]:
+    """Yield only process records owned by the job supervisor."""
 
     for path in state_dir.glob("*.json"):
         try:
-            training_id = uuid.UUID(path.stem)
+            job_id = uuid.UUID(path.stem)
         except ValueError:
             continue
-        if path.name == f"{training_id}.json":
+        if path.name == f"{job_id}.json":
             yield path
 
 
 @dataclass
-class _ActiveTraining:
+class _ActiveJob:
     process: subprocess.Popen[bytes]
     process_group_id: int
     process_start_time: float
@@ -88,7 +88,7 @@ class _ActiveTraining:
     thread: threading.Thread | None = None
 
 
-class TrainingSupervisor:
+class JobSupervisor:
     def __init__(
         self,
         *,
@@ -104,24 +104,24 @@ class TrainingSupervisor:
             raise ValueError("max_timeout_seconds must be positive")
         self.max_timeout_seconds = max_timeout_seconds
         self._lock = threading.Lock()
-        self._active: dict[str, _ActiveTraining] = {}
+        self._active: dict[str, _ActiveJob] = {}
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._cancel_orphaned_runs()
 
     def _cancel_orphaned_runs(self) -> None:
-        for path in training_result_paths(self.state_dir):
-            result = TrainingResult.model_validate_json(path.read_text())
-            if result.state is TrainingState.RUNNING:
+        for path in job_result_paths(self.state_dir):
+            result = JobResult.model_validate_json(path.read_text())
+            if result.state is JobState.RUNNING:
                 process_was_terminated = self._terminate_recovered_process(result)
                 recovered = result.model_copy(
                     update={
-                        "state": TrainingState.CANCELLED,
+                        "state": JobState.CANCELLED,
                         "error_tail": (
-                            "Training state was recovered after its "
+                            "Job state was recovered after its "
                             "supervisor restarted."
                             if process_was_terminated
                             else (
-                                "Training state was recovered after its "
+                                "Job state was recovered after its "
                                 "supervisor restarted; its persisted process "
                                 "identity was no longer live, so no signal "
                                 "was sent."
@@ -131,13 +131,13 @@ class TrainingSupervisor:
                 )
                 self._write_result(recovered)
 
-    def run_training(
+    def run_job(
         self,
-        spec: TrainingSpec,
+        spec: JobSpec,
         *,
         env: Mapping[str, str] | None = None,
         redacted_values: Sequence[str] = (),
-    ) -> TrainingResult:
+    ) -> JobResult:
         if isinstance(spec.argv, str) or not spec.argv:
             raise ValueError("argv must be a non-empty sequence, not a shell string")
         if (
@@ -145,16 +145,16 @@ class TrainingSupervisor:
             and spec.timeout_seconds > self.max_timeout_seconds
         ):
             raise ValueError(
-                "training timeout exceeds the configured maximum of "
+                "job timeout exceeds the configured maximum of "
                 f"{self.max_timeout_seconds} seconds"
             )
 
         cwd = Path(spec.cwd).resolve()
         if cwd != self.workspace and not cwd.is_relative_to(self.workspace):
-            raise ValueError("training cwd must be inside the assignment workspace")
+            raise ValueError("job cwd must be inside the assignment workspace")
 
-        training_id = str(uuid.uuid4())
-        log_path = self.state_dir / f"{training_id}.log"
+        job_id = str(uuid.uuid4())
+        log_path = self.state_dir / f"{job_id}.log"
         started = time.monotonic()
         process: subprocess.Popen[bytes] | None = None
         result_written = False
@@ -186,9 +186,9 @@ class TrainingSupervisor:
                     )
                 process_start_time = psutil.Process(process.pid).create_time()
                 process_group_id = process.pid
-                result = TrainingResult(
-                    training_id=training_id,
-                    state=TrainingState.RUNNING,
+                result = JobResult(
+                    job_id=job_id,
+                    state=JobState.RUNNING,
                     pid=process.pid,
                     process_group_id=process_group_id,
                     process_start_time=process_start_time,
@@ -199,7 +199,7 @@ class TrainingSupervisor:
                 )
                 self._write_result(result)
                 result_written = True
-                active = _ActiveTraining(
+                active = _ActiveJob(
                     process=process,
                     process_group_id=process_group_id,
                     process_start_time=process_start_time,
@@ -213,16 +213,16 @@ class TrainingSupervisor:
                 )
                 thread = threading.Thread(
                     target=self._monitor,
-                    args=(training_id,),
-                    name=f"senpai-training-{training_id}",
+                    args=(job_id,),
+                    name=f"senpai-job-{job_id}",
                 )
                 active.thread = thread
-                self._active[training_id] = active
+                self._active[job_id] = active
                 active_registered = True
                 thread.start()
             except BaseException as error:
                 if active_registered:
-                    self._active.pop(training_id, None)
+                    self._active.pop(job_id, None)
                 if process is not None and process.poll() is None:
                     self._terminate_process_group(
                         process,
@@ -233,7 +233,7 @@ class TrainingSupervisor:
                     self._write_result(
                         result.model_copy(
                             update={
-                                "state": TrainingState.CANCELLED,
+                                "state": JobState.CANCELLED,
                                 "exit_code": process.returncode if process else None,
                                 "elapsed_seconds": time.monotonic() - started,
                                 "error_tail": (
@@ -254,31 +254,31 @@ class TrainingSupervisor:
 
     def _active_mutable_job_ids_locked(self) -> tuple[str, ...]:
         return tuple(
-            training_id
-            for training_id, active in self._active.items()
+            job_id
+            for job_id, active in self._active.items()
             if active.workspace_access == "mutable"
         )
 
-    def get_training_status(self, training_id: str) -> TrainingResult:
-        path = self.state_dir / f"{uuid.UUID(training_id)}.json"
-        result = TrainingResult.model_validate_json(path.read_text())
+    def get_job_status(self, job_id: str) -> JobResult:
+        path = self.state_dir / f"{uuid.UUID(job_id)}.json"
+        result = JobResult.model_validate_json(path.read_text())
         with self._lock:
-            active = self._active.get(training_id)
-            if active is not None and result.state is TrainingState.RUNNING:
+            active = self._active.get(job_id)
+            if active is not None and result.state is JobState.RUNNING:
                 result = result.model_copy(
                     update={"elapsed_seconds": time.monotonic() - active.started}
                 )
         return result
 
-    def cancel_training(self, training_id: str) -> TrainingResult:
+    def cancel_job(self, job_id: str) -> JobResult:
         """Cancel one supervised run and wait for its terminal state."""
 
-        result = self.get_training_status(training_id)
-        if result.state is not TrainingState.RUNNING:
+        result = self.get_job_status(job_id)
+        if result.state is not JobState.RUNNING:
             return result
 
         with self._lock:
-            active = self._active.get(training_id)
+            active = self._active.get(job_id)
             if active is not None:
                 active.cancelled = True
                 thread = active.thread
@@ -286,13 +286,13 @@ class TrainingSupervisor:
                 thread = None
         if thread is not None:
             thread.join()
-        return self.get_training_status(training_id)
+        return self.get_job_status(job_id)
 
-    def _monitor(self, training_id: str) -> None:
+    def _monitor(self, job_id: str) -> None:
         with self._lock:
-            active = self._active[training_id]
+            active = self._active[job_id]
         try:
-            self._monitor_process(training_id, active)
+            self._monitor_process(job_id, active)
         except BaseException as error:  # noqa: BLE001
             try:
                 if active.process.poll() is None:
@@ -306,7 +306,7 @@ class TrainingSupervisor:
                 except BaseException as kill_error:  # noqa: BLE001
                     print(
                         "SENPAI_JOB_CLEANUP_ERROR "
-                        f"job_id={training_id} "
+                        f"job_id={job_id} "
                         f"terminate_error={type(terminate_error).__name__} "
                         f"kill_error={type(kill_error).__name__}",
                         file=sys.stderr,
@@ -314,9 +314,9 @@ class TrainingSupervisor:
                     )
             try:
                 self._write_result(
-                    TrainingResult(
-                        training_id=training_id,
-                        state=TrainingState.FAILED,
+                    JobResult(
+                        job_id=job_id,
+                        state=JobState.FAILED,
                         pid=active.process.pid,
                         process_group_id=active.process_group_id,
                         process_start_time=active.process_start_time,
@@ -333,19 +333,19 @@ class TrainingSupervisor:
             except BaseException as persistence_error:  # noqa: BLE001
                 print(
                     "SENPAI_JOB_STATE_WRITE_ERROR "
-                    f"job_id={training_id} "
+                    f"job_id={job_id} "
                     f"error={type(persistence_error).__name__}",
                     file=sys.stderr,
                     flush=True,
                 )
         finally:
             with self._lock:
-                self._active.pop(training_id, None)
+                self._active.pop(job_id, None)
 
     def _monitor_process(
         self,
-        training_id: str,
-        active: _ActiveTraining,
+        job_id: str,
+        active: _ActiveJob,
     ) -> None:
         run_ids: dict[str, None] = {}
         published_run_ids: tuple[str, ...] = ()
@@ -383,9 +383,9 @@ class TrainingSupervisor:
                 discovered_run_ids = tuple(run_ids)
                 if discovered_run_ids != published_run_ids:
                     self._write_result(
-                        TrainingResult(
-                            training_id=training_id,
-                            state=TrainingState.RUNNING,
+                        JobResult(
+                            job_id=job_id,
+                            state=JobState.RUNNING,
                             pid=active.process.pid,
                             process_group_id=active.process_group_id,
                             process_start_time=active.process_start_time,
@@ -398,7 +398,7 @@ class TrainingSupervisor:
                     )
                     published_run_ids = discovered_run_ids
                 if active.cancelled:
-                    state = TrainingState.CANCELLED
+                    state = JobState.CANCELLED
                     self._terminate_process_group(
                         active.process,
                         active.process_group_id,
@@ -409,12 +409,12 @@ class TrainingSupervisor:
                 exit_code = active.process.poll()
                 if exit_code is not None:
                     state = (
-                        TrainingState.CANCELLED
+                        JobState.CANCELLED
                         if active.cancelled
                         else (
-                            TrainingState.FINISHED
+                            JobState.FINISHED
                             if exit_code == 0
-                            else TrainingState.FAILED
+                            else JobState.FAILED
                         )
                     )
                     self._terminate_process_group(
@@ -424,7 +424,7 @@ class TrainingSupervisor:
                     )
                     break
                 if time.monotonic() >= terminate_at:
-                    state = TrainingState.TIMED_OUT
+                    state = JobState.TIMED_OUT
                     self._terminate_process_group(
                         active.process,
                         active.process_group_id,
@@ -451,8 +451,8 @@ class TrainingSupervisor:
             for match in _WANDB_RUN_URL_BYTES.findall(scan_overlap):
                 run_ids.setdefault(match.decode(), None)
 
-        result = TrainingResult(
-            training_id=training_id,
+        result = JobResult(
+            job_id=job_id,
             state=state,
             pid=active.process.pid,
             process_group_id=active.process_group_id,
@@ -465,7 +465,7 @@ class TrainingSupervisor:
                 _redact_bytes(error_tail, active.redacted_values)[
                     -_ERROR_TAIL_BYTES:
                 ].decode(errors="ignore")
-                if state is not TrainingState.FINISHED
+                if state is not JobState.FINISHED
                 else ""
             ),
             workspace_access=active.workspace_access,
@@ -507,7 +507,7 @@ class TrainingSupervisor:
             wait_full_grace=True,
         )
 
-    def _terminate_recovered_process(self, result: TrainingResult) -> bool:
+    def _terminate_recovered_process(self, result: JobResult) -> bool:
         if (
             result.pid is None
             or result.process_group_id is None
@@ -520,7 +520,7 @@ class TrainingSupervisor:
         return True
 
     @staticmethod
-    def _process_identity_matches(result: TrainingResult) -> bool:
+    def _process_identity_matches(result: JobResult) -> bool:
         assert result.pid is not None
         assert result.process_group_id is not None
         assert result.process_start_time is not None
@@ -538,25 +538,25 @@ class TrainingSupervisor:
     def close(self) -> None:
         with self._lock:
             threads = []
-            for training in self._active.values():
-                training.cancelled = True
-                if training.thread is not None:
-                    threads.append(training.thread)
+            for job in self._active.values():
+                job.cancelled = True
+                if job.thread is not None:
+                    threads.append(job.thread)
         for thread in threads:
             thread.join()
 
     def drain(self) -> None:
         with self._lock:
             threads = tuple(
-                training.thread
-                for training in self._active.values()
-                if training.thread is not None
+                job.thread
+                for job in self._active.values()
+                if job.thread is not None
             )
         for thread in threads:
             thread.join()
 
-    def _write_result(self, result: TrainingResult) -> None:
-        path = self.state_dir / f"{result.training_id}.json"
+    def _write_result(self, result: JobResult) -> None:
+        path = self.state_dir / f"{result.job_id}.json"
         temporary = path.with_suffix(".tmp")
         temporary.write_text(result.model_dump_json(indent=2))
         temporary.replace(path)

@@ -23,10 +23,14 @@ Prefer typed Senpai tools over shell commands. Each capability below applies onl
   timeout, log, terminal state, and discovered W&B run IDs, and automatically
   registers terminal-state monitoring for the current conversation.
   `get_job_status` returns one immediate typed snapshot. `monitor_job` sets or
-  replaces optional W&B metric gates and staleness policy for an already-running
-  job without disabling terminal wakes. `cancel_job` stops the complete process
-  group and retires its monitor. Finish the turn instead of sleeping, streaming
-  logs, or polling these tools in a loop.
+  replaces up to three W&B metric policies without disabling terminal wakes;
+  students bind metrics to an exact associated `wandb_run_id` (or omit it only
+  when exactly one is known), while advisors use a configured-project W&B run
+  ID as `job_id` without gaining control of those external jobs. Quiet checks
+  stay outside model context and actionable events wait for the next safe turn.
+  `cancel_job` stops the complete process group and retires its monitor. Finish
+  the turn instead of sleeping, streaming logs, or polling these tools in a
+  loop.
 - When present, `load_browser` adds the full interactive browser family on the
   next step. Call it only when browser navigation or page inspection is useful;
   loading is idempotent and persists for the conversation.

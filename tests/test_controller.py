@@ -591,36 +591,7 @@ def test_older_visible_event_does_not_lose_its_reminder_to_another_turn(
             self.calls += 1
             return (older,) if self.calls <= 2 else (older, newer)
 
-    class WatcherAwareTurns(Turns):
-        def run(
-            self,
-            prompt,
-            *,
-            conversation_id,
-            event_keys,
-            visible_event_keys=frozenset(),
-            inbox,
-            inbox_turn_id,
-        ):
-            result = super().run(
-                prompt,
-                conversation_id=conversation_id,
-                event_keys=event_keys,
-                visible_event_keys=visible_event_keys,
-                inbox=inbox,
-                inbox_turn_id=inbox_turn_id,
-            )
-            if (
-                event_keys == frozenset({newer.dedupe_key})
-                and older.dedupe_key not in visible_event_keys
-            ):
-                return TurnResult(
-                    exit_code=result.exit_code,
-                    delivered_event_keys=frozenset({older.dedupe_key}),
-                )
-            return result
-
-    turns = WatcherAwareTurns()
+    turns = Turns()
     Controller(
         role="advisor",
         mailbox=PersistentMailbox([]),
@@ -804,7 +775,7 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
         github_trusted_actor=None,
         state_dir=tmp_path,
         workspace=tmp_path,
-        training_max_timeout_seconds=1800,
+        job_max_timeout_seconds=1800,
         command_secrets={"WANDB_API_KEY": "wandb-key"},
         conversation_id=CONVERSATION_ID,
         timeout_seconds=3600,
@@ -827,7 +798,7 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
         lambda _args, _env: config,
     )
     monkeypatch.setattr(runner_module, "scrub_model_credentials", lambda *_: None)
-    monkeypatch.setattr(tools_module, "close_training_runtimes", lambda: None)
+    monkeypatch.setattr(tools_module, "close_job_runtimes", lambda: None)
     monkeypatch.setattr(weave_module, "finish_weave_monitoring", lambda: None)
     monkeypatch.setattr(
         controller_module,
@@ -1195,12 +1166,7 @@ def test_feedback_polled_after_a_turn_is_processed_in_the_next_turn():
     )
     mailbox = Mailbox([(assignment,), (feedback,)])
     turns = Turns(
-        [
-            TurnResult(
-                exit_code=0,
-                delivered_event_keys=frozenset({feedback.dedupe_key}),
-            )
-        ]
+        [TurnResult(exit_code=0)]
     )
 
     controller(mailbox, turns, role="student").run(max_cycles=1)

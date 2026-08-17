@@ -168,7 +168,7 @@ def test_controller_partitions_and_acknowledges_events_by_conversation(
     first = UUID("00000000-0000-0000-0000-000000000081")
     second = UUID("00000000-0000-0000-0000-000000000082")
     first_event = ControllerEvent(
-        kind="training_monitor",
+        kind="job_monitor",
         dedupe_key="monitor:first",
         payload={"conversation_id": str(first), "summary": "first only"},
     )
@@ -206,12 +206,12 @@ def test_failed_conversation_does_not_ack_or_starve_another(tmp_path: Path):
     first = UUID("00000000-0000-0000-0000-000000000083")
     second = UUID("00000000-0000-0000-0000-000000000084")
     first_event = ControllerEvent(
-        kind="training_monitor",
+        kind="job_monitor",
         dedupe_key="monitor:first",
         payload={"conversation_id": str(first)},
     )
     second_event = ControllerEvent(
-        kind="training_monitor",
+        kind="job_monitor",
         dedupe_key="monitor:second",
         payload={"conversation_id": str(second)},
     )

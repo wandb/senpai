@@ -1,11 +1,11 @@
 import time
 from pathlib import Path
 
-from senpai_agent.training import TrainingState
-from training_test_support import make_supervisor, run_python, wait_for_terminal
+from senpai_agent.jobs import JobState
+from job_test_support import make_supervisor, run_python, wait_for_terminal
 
 
-def test_running_training_publishes_wandb_id_before_exit(tmp_path: Path):
+def test_running_job_publishes_wandb_id_before_exit(tmp_path: Path):
     workspace, supervisor = make_supervisor(
         tmp_path,
         terminate_grace_seconds=0.1,
@@ -23,12 +23,12 @@ def test_running_training_publishes_wandb_id_before_exit(tmp_path: Path):
     try:
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
-            status = supervisor.get_training_status(running.training_id)
+            status = supervisor.get_job_status(running.job_id)
             if status.wandb_run_ids:
                 break
             time.sleep(0.02)
 
-        assert status.state is TrainingState.RUNNING
+        assert status.state is JobState.RUNNING
         assert status.wandb_run_ids == ("live-run",)
     finally:
         supervisor.close()
@@ -45,9 +45,9 @@ def test_large_failed_log_keeps_run_ids_and_only_the_bounded_tail(tmp_path: Path
     )
     running = run_python(supervisor, workspace, output_code)
 
-    terminal = wait_for_terminal(supervisor, running.training_id)
+    terminal = wait_for_terminal(supervisor, running.job_id)
 
-    assert terminal.state is TrainingState.FAILED
+    assert terminal.state is JobState.FAILED
     assert terminal.exit_code == 7
     assert terminal.wandb_run_ids == ("first-run", "last-run")
     assert len(terminal.error_tail.encode()) <= 8192
@@ -65,7 +65,7 @@ def test_wandb_url_can_span_log_read_chunks(tmp_path: Path):
         f"import os; os.write(1, {output!r})",
     )
 
-    terminal = wait_for_terminal(supervisor, running.training_id)
+    terminal = wait_for_terminal(supervisor, running.job_id)
 
-    assert terminal.state is TrainingState.FINISHED
+    assert terminal.state is JobState.FINISHED
     assert terminal.wandb_run_ids == ("split-run",)

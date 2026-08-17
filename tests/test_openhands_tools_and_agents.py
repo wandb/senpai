@@ -42,7 +42,7 @@ def test_child_mode_keeps_bounded_delegation_lifecycle_tools(tmp_path):
         "agent_status",
         "cancel_agents",
     } <= names
-    assert "senpai_training" not in names
+    assert "senpai_jobs" not in names
     assert "think" not in names
     assert delegation_config(config).depth == 0
 
@@ -121,7 +121,8 @@ def test_browser_loader_uses_runtime_tools_and_persists_activation(monkeypatch):
                 "await_agents",
                 "agent_status",
                 "cancel_agents",
-                "senpai_training",
+                "senpai_jobs",
+                "senpai_advisor_job_monitor",
             },
         ),
         (
@@ -133,7 +134,7 @@ def test_browser_loader_uses_runtime_tools_and_persists_activation(monkeypatch):
                 "await_agents",
                 "agent_status",
                 "cancel_agents",
-                "senpai_training",
+                "senpai_jobs",
             },
         ),
     ],
@@ -149,6 +150,8 @@ def test_main_tools_replace_unsafe_defaults_with_role_scoped_boundaries(
         advisor_branch="advisor-branch" if role == "advisor" else None,
         student_names=("student-one",) if role == "advisor" else None,
         student_name="student-one" if role == "student" else None,
+        wandb_entity="research-team",
+        wandb_project="project",
     )
     by_name = {tool.name: tool for tool in build_main_tools(config)}
 
@@ -174,10 +177,22 @@ def test_main_tools_replace_unsafe_defaults_with_role_scoped_boundaries(
         "student_names": ("student-one",) if role == "advisor" else None,
         "student_name": "student-one" if role == "student" else None,
     }
-    assert by_name["senpai_training"].params == {
-        "state_dir": str(config.state_dir / "training"),
+    expected_job_params = {
+        "state_dir": str(config.state_dir / "jobs"),
         "max_timeout_seconds": 1800,
     }
+    if role == "student":
+        expected_job_params.update(
+            wandb_entity="research-team",
+            wandb_project="project",
+        )
+    assert by_name["senpai_jobs"].params == expected_job_params
+    if role == "advisor":
+        assert by_name["senpai_advisor_job_monitor"].params == {
+            "state_dir": str(config.state_dir / "advisor-job-monitors"),
+            "wandb_entity": "research-team",
+            "wandb_project": "project",
+        }
 
 
 def test_native_senpai_plugin_loads_its_runtime_skills():
@@ -193,6 +208,7 @@ def test_native_senpai_plugin_loads_its_runtime_skills():
         "check-human-issues",
         "delegate-subagents",
         "exa-search",
+        "monitor-jobs",
         "review-experiment",
         "senpai-status-check",
         "submit-experiment-results",

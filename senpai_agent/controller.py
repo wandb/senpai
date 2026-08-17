@@ -10,6 +10,7 @@ import sys
 import time
 from base64 import b64decode
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
@@ -19,7 +20,7 @@ from uuid import UUID
 
 from senpai_agent.agent_markdown import strip_spdx_header
 from senpai_agent.advisor import AdvisorEvent, AdvisorEventStore
-from senpai_agent.github.mailbox import ActiveGitHubWatcher, GitHubMailbox
+from senpai_agent.github.mailbox import GitHubMailbox
 from senpai_agent.inbox import (
     DeliveryState,
     InboxTurn,
@@ -33,9 +34,14 @@ from senpai_agent.mailbox import (
     LocalStudentMailbox,
     Mailbox,
 )
+from senpai_agent.mailbox_watcher import ActiveMailboxWatcher, MailboxFactory
 from senpai_agent.monitor import (
-    MonitorMailbox,
-    TrainingMonitorEngine,
+    JobMonitorEngine,
+    JobMonitorMailbox,
+    JobMonitorStore,
+    JobStatusSource,
+    MetricSource,
+    WandbJobStatusSource,
     WandbMetricSource,
 )
 from senpai_agent.PROMPTS import (
@@ -45,12 +51,15 @@ from senpai_agent.PROMPTS import (
     OPERATOR_INSTRUCTIONS_PROMPT,
     render_prompt,
 )
+from senpai_agent.persisted_conversation_migration import migrate_persisted_job_state
 from senpai_agent.state import (
     AssignmentConversationRegistry,
     ConversationBatch,
     StartedConversationLedger,
     StudentConversationSelector,
     WorkspaceDivergenceLedger,
+    advisor_job_monitor_state_dir,
+    job_state_dir,
 )
 from senpai_agent.supervisor import LEASE_ENV, ProgressLease
 from senpai_agent.workspace import (
@@ -68,7 +77,6 @@ _EDGE_TRIGGERED_EVENT_KINDS = frozenset(
 @dataclass(frozen=True, slots=True)
 class TurnResult:
     exit_code: int
-    delivered_event_keys: frozenset[str] = frozenset()
 
 
 class ConversationRecoveryExhausted(RuntimeError):
@@ -130,12 +138,18 @@ class OpenHandsTurnRunner:
         *,
         full_prompt: str,
         github_mailbox: GitHubMailbox | None = None,
+        active_mailbox_factories: Sequence[MailboxFactory] = (),
         active_poll_interval_seconds: float = 120,
+        active_monitor_poll_interval_seconds: float = 5,
     ):
         self.config = config
         self.full_prompt = full_prompt.strip()
         self.github_mailbox = github_mailbox
+        self.active_mailbox_factories = tuple(active_mailbox_factories)
         self.active_poll_interval_seconds = active_poll_interval_seconds
+        self.active_monitor_poll_interval_seconds = (
+            active_monitor_poll_interval_seconds
+        )
 
     def run(
         self,
@@ -210,7 +224,7 @@ class OpenHandsTurnRunner:
                         ) from recovery_error
                     raise
 
-        if self.github_mailbox is None:
+        if self.github_mailbox is None and not self.active_mailbox_factories:
             return TurnResult(exit_code=run_turn())
 
         store_path = local_event_db_path(config)
@@ -220,7 +234,7 @@ class OpenHandsTurnRunner:
                 config.state_dir / "student-conversations.json"
             )
             map_event = partial(
-                _student_feedback_event,
+                _student_active_event,
                 conversation_id=conversation_id,
                 registry=registry,
             )
@@ -231,34 +245,51 @@ class OpenHandsTurnRunner:
         with AdvisorEventStore(store_path) as store:
             for event_key in event_keys:
                 store.acknowledge(event_key)
-        with ActiveGitHubWatcher(
-            self.github_mailbox,
-            store_path,
-            known_keys=visible_event_keys | event_keys,
-            poll_interval_seconds=self.active_poll_interval_seconds,
-            map_event=map_event,
-        ) as watcher:
+        with ExitStack() as watchers:
+            if self.github_mailbox is not None:
+                watchers.enter_context(
+                    ActiveMailboxWatcher(
+                        self.github_mailbox,
+                        store_path,
+                        known_keys=visible_event_keys | event_keys,
+                        poll_interval_seconds=self.active_poll_interval_seconds,
+                        map_event=map_event,
+                    )
+                )
+            for index, mailbox_factory in enumerate(
+                self.active_mailbox_factories
+            ):
+                watchers.enter_context(
+                    ActiveMailboxWatcher(
+                        mailbox_factory,
+                        store_path,
+                        known_keys=visible_event_keys | event_keys,
+                        poll_interval_seconds=(
+                            self.active_monitor_poll_interval_seconds
+                        ),
+                        map_event=map_event,
+                        thread_name=f"senpai-job-monitor-{index}",
+                    )
+                )
             exit_code = run_turn()
-        with AdvisorEventStore(store_path) as store:
-            delivered = store.acknowledged(tuple(watcher.enqueued_keys))
-        return TurnResult(
-            exit_code=exit_code,
-            delivered_event_keys=frozenset(delivered),
-        )
+        return TurnResult(exit_code=exit_code)
 
 
-def _student_feedback_event(
+def _student_active_event(
     event: ControllerEvent,
     *,
     conversation_id: UUID,
     registry: AssignmentConversationRegistry,
 ) -> AdvisorEvent | None:
-    if event.kind != "student_pr_feedback":
+    if event.kind == "student_pr_feedback":
+        target = registry.for_assignment(
+            str(event.payload["assignment_id"]),
+            str(event.payload["revision_id"]),
+        )
+    elif event.kind == "job_monitor":
+        target = UUID(str(event.payload["conversation_id"]))
+    else:
         return None
-    target = registry.for_assignment(
-        str(event.payload["assignment_id"]),
-        str(event.payload["revision_id"]),
-    )
     if target != conversation_id:
         return None
     return AdvisorEvent(
@@ -269,6 +300,33 @@ def _student_feedback_event(
             "parent_conversation_id": str(conversation_id),
         },
     )
+
+
+def _job_monitor_mailbox(
+    store: JobMonitorStore,
+    jobs: JobStatusSource,
+    metrics: MetricSource,
+) -> JobMonitorMailbox:
+    return JobMonitorMailbox(JobMonitorEngine(store, jobs, metrics), store)
+
+
+@contextmanager
+def _open_job_monitor_mailbox(
+    store_path: Path,
+    jobs: JobStatusSource,
+    metrics: MetricSource,
+):
+    with JobMonitorStore(store_path) as store:
+        yield _job_monitor_mailbox(store, jobs, metrics)
+
+
+def _next_job_monitor_poll(stores: Sequence[JobMonitorStore]) -> float | None:
+    delays = [
+        delay
+        for store in stores
+        if (delay := store.seconds_until_next_poll()) is not None
+    ]
+    return min(delays) if delays else None
 
 
 class Controller:
@@ -578,6 +636,7 @@ class Controller:
                     conversation_id,
                     event.dedupe_key,
                     event.to_prompt(),
+                    priority=event.priority,
                 )
 
     def _next_ready_turn(
@@ -827,8 +886,9 @@ def controller_main(
         scrub_model_credentials,
     )
     from senpai_agent.tools import (
-        close_training_runtimes,
-        training_runtime,
+        advisor_job_monitor_store,
+        close_job_runtimes,
+        job_runtime,
     )
     from senpai_agent.weave_monitoring import finish_weave_monitoring
 
@@ -880,35 +940,62 @@ def controller_main(
     mailbox: Mailbox = github_mailbox
     conversation_selector = None
     reconcile = None
-    job_supervisor, monitor_store = training_runtime(
+    migrate_persisted_job_state(runner_config.state_dir)
+    job_supervisor, job_monitor_store = job_runtime(
         runner_config.workspace,
-        runner_config.state_dir / "training",
-        max_timeout_seconds=runner_config.training_max_timeout_seconds,
+        job_state_dir(runner_config.state_dir),
+        max_timeout_seconds=runner_config.job_max_timeout_seconds,
     )
-    monitor_mailbox = MonitorMailbox(
-        TrainingMonitorEngine(
-            monitor_store,
+    wandb_api_key = runner_config.command_secrets.get("WANDB_API_KEY")
+    wandb_metrics = WandbMetricSource(
+        env["WANDB_ENTITY"],
+        env["WANDB_PROJECT"],
+        api_key=wandb_api_key,
+    )
+    monitor_stores = [job_monitor_store]
+    monitor_mailboxes = [
+        _job_monitor_mailbox(job_monitor_store, job_supervisor, wandb_metrics)
+    ]
+    active_monitor_factories = [
+        partial(
+            _open_job_monitor_mailbox,
+            job_monitor_store.path,
             job_supervisor,
-            WandbMetricSource(
-                env["WANDB_ENTITY"],
-                env["WANDB_PROJECT"],
-                api_key=runner_config.command_secrets.get("WANDB_API_KEY"),
-            ),
-        ),
-        monitor_store,
-    )
+            wandb_metrics,
+        )
+    ]
 
     if role == "advisor":
+        advisor_store = advisor_job_monitor_store(
+            advisor_job_monitor_state_dir(runner_config.state_dir)
+        )
+        advisor_jobs = WandbJobStatusSource(
+            env["WANDB_ENTITY"],
+            env["WANDB_PROJECT"],
+            api_key=wandb_api_key,
+        )
+        monitor_stores.append(advisor_store)
+        monitor_mailboxes.append(
+            _job_monitor_mailbox(advisor_store, advisor_jobs, wandb_metrics)
+        )
+        active_monitor_factories.append(
+            partial(
+                _open_job_monitor_mailbox,
+                advisor_store.path,
+                advisor_jobs,
+                wandb_metrics,
+            )
+        )
         mailbox = CompositeMailbox(
             github_mailbox,
             LocalAdvisorMailbox(runner_config.state_dir / "advisor-events.sqlite3"),
-            monitor_mailbox,
+            *monitor_mailboxes,
         )
     else:
         mailbox = CompositeMailbox(
             github_mailbox,
             LocalStudentMailbox(runner_config.state_dir / "student-events.sqlite3"),
-            monitor_mailbox,
+            *monitor_mailboxes,
         )
         registry = AssignmentConversationRegistry(
             runner_config.state_dir / "student-conversations.json"
@@ -930,8 +1017,12 @@ def controller_main(
         runner_config,
         full_prompt=full_prompt,
         github_mailbox=github_mailbox,
+        active_mailbox_factories=active_monitor_factories,
         active_poll_interval_seconds=float(
             env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "120")
+        ),
+        active_monitor_poll_interval_seconds=float(
+            env.get("SENPAI_ACTIVE_MONITOR_POLL_INTERVAL_S", "5")
         ),
     )
     controller = Controller(
@@ -989,7 +1080,10 @@ def controller_main(
             "POLL_JITTER_S",
             120,
         ),
-        next_monitor_poll_seconds=monitor_store.seconds_until_next_poll,
+        next_monitor_poll_seconds=partial(
+            _next_job_monitor_poll,
+            tuple(monitor_stores),
+        ),
     )
 
     def interrupt(_signum: int, _frame: object) -> None:
@@ -1007,7 +1101,7 @@ def controller_main(
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
         inbox.close()
-        close_training_runtimes()
+        close_job_runtimes()
         finish_weave_monitoring()
     return 0
 

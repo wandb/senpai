@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Protocol
 
 from senpai_agent.advisor import AdvisorEventStore
+from senpai_agent.inbox import event_priority
 from senpai_agent.PROMPTS import EVENT_PROMPT, render_prompt
 
 
@@ -18,6 +19,10 @@ class ControllerEvent:
     kind: str
     dedupe_key: str
     payload: dict[str, object]
+
+    @property
+    def priority(self) -> int:
+        return event_priority(self.kind)
 
     def to_prompt(self) -> str:
         payload = {

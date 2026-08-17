@@ -551,19 +551,26 @@ use them for repository-side watchers or other bounded long-running commands.
 |---|---|
 | `run_job` | Accepts structured `argv`, `cwd`, a hard timeout, a `read_only` or `mutable` workspace-access declaration, and an optional W&B credential grant. It starts a supervised process group without blocking, persists its identity, full log, and bounded error tail, discovers W&B run IDs, and automatically registers terminal-state monitoring for the current conversation. Suitable work includes training, inference, evaluation, builds, and receipt watchers. |
 | `get_job_status` | Performs one bounded read of the latest persisted state, exit code, elapsed time, W&B run IDs, and error tail. |
-| `monitor_job` | Sets or replaces optional W&B policy for an already-running job: metric, minimize/maximize direction, `lte`, `gte`, `improved_by`, or `regressed_by` gates, poll interval, and stale-update detection. It cannot disable terminal wakes. |
+| `monitor_job` | Sets or replaces up to three W&B metric policies, each with its own minimize/maximize direction, `lte`, `gte`, `improved_by`, or `regressed_by` gates and stale-update timeout. Students monitor a local `run_job` ID and may bind an exact associated `wandb_run_id`; omission is accepted only when one associated run is unambiguous. Advisors use a configured-project W&B run ID as `job_id` without gaining launch, status, or cancellation authority over it. It cannot disable terminal wakes. |
 | `cancel_job` | Stops the complete process group through the supervised TERM/KILL path, waits for a durable terminal state, and retires its monitor. |
 
-After launch, the role can finish its turn. The deterministic controller polls
-process state and at most one selected W&B metric without consuming model
-tokens. A threshold crossing, regression, stale metric, terminal state, or
-monitor error creates one compact durable event and resumes the same
-conversation. Due monitors are processed in bounded batches with a time budget;
-a slow or broken monitor can delay its batch only within those bounds and cannot
-prevent later jobs, GitHub feedback, or child-agent results from being
-processed. Monitor policy and ownership have one durable SQLite source of truth.
-While any monitor is active, the controller sleeps only until its earliest due
-poll rather than the ordinary advisor/student heartbeat.
+After launch, the role can finish its turn or continue unrelated work. The
+deterministic controller polls process state and up to three selected W&B
+metrics in the background without consuming model tokens. Quiet polls never
+enter conversation history. A threshold crossing, regression, stale metric,
+terminal state, or monitor error creates one compact durable event for the next
+safe turn; it does not preempt an active turn. Human messages remain higher
+priority, and bounded batching reserves room for ordinary results. Due monitors
+are processed in capped batches with bounded external requests, so one broken
+monitor cannot suppress later controller cycles. Monitor policy and ownership
+have one durable SQLite source of truth. While any monitor is active, the
+controller sleeps only until its earliest due poll rather than the ordinary
+advisor/student heartbeat.
+
+Every terminal job receives exactly one durable `job_status` observation,
+including when `get_job_status` or `cancel_job` collects the terminal result
+during an already-active turn. The observation may cause one later sequential
+wake, but never a concurrent duplicate conversation.
 
 `workspace_access="mutable"` is the default for builds, training, evaluation,
 or any command that can write in the checkout. A student must have a clean
@@ -651,6 +658,7 @@ are not installed into autoresearch pods.
 |---|---|
 | [Assign an experiment](plugins/senpai/skills/assign-experiment/SKILL.md) | Turn a hypothesis into a typed student branch and draft PR. |
 | [Delegate subagents](plugins/senpai/skills/delegate-subagents/SKILL.md) | Launch and coordinate bounded parallel research, review, and implementation help. |
+| [Monitor jobs](plugins/senpai/skills/monitor-jobs/SKILL.md) | Wake on terminal state, staleness, or decision-changing W&B metrics without manual polling. |
 | [Submit experiment results](plugins/senpai/skills/submit-experiment-results/SKILL.md) | Commit the tested implementation and publish a structured, evidence-backed result. |
 | [Review an experiment](plugins/senpai/skills/review-experiment/SKILL.md) | Merge a reproducible winner, close a useful negative, or request the missing evidence. |
 | [Handle human Issues](plugins/senpai/skills/check-human-issues/SKILL.md) | Respond to authenticated human-to-agent messages delivered through GitHub Issues. |
@@ -687,7 +695,7 @@ flowchart LR
     S --> WB
 ```
 
-GitHub PR labels, typed comments, reviews, and human-tagged Issues are the only advisor/student communication protocol; W&B is the shared experiment store. Role-local SQLite stores the ordered delivery inbox and its receipts plus training-monitor policies; it is never shared across nodes.
+GitHub PR labels, typed comments, reviews, and human-tagged Issues are the only advisor/student communication protocol; W&B is the shared experiment store. Role-local SQLite stores the ordered delivery inbox and its receipts plus job-monitor policies; it is never shared across nodes.
 
 Each role runs a small Python supervisor around the deterministic controller:
 

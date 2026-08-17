@@ -16,11 +16,9 @@ from senpai_agent.models import (
 from senpai_agent.tools import (
     JobResultObservation,
     JobSpec,
-    MonitorTrainingAction,
     RunJobAction,
-    TrainingResultObservation,
 )
-from senpai_agent.training import TrainingState
+from senpai_agent.jobs import JobState
 
 
 def round_trip(event: Event) -> Event:
@@ -49,58 +47,6 @@ def experiment_result(
         primary_metric=primary_metric,
         commit_sha=head_sha,
     )
-
-
-def test_legacy_monitor_actions_restore_without_the_removed_status_filter():
-    action = MonitorTrainingAction(
-        training_id="training-17",
-        metric="validation/loss",
-        direction="min",
-    )
-    event = ActionEvent(
-        thought=[],
-        action=action,
-        tool_name="monitor_training",
-        tool_call_id="legacy-monitor",
-        tool_call=MessageToolCall(
-            id="legacy-monitor",
-            name="monitor_training",
-            arguments=json.dumps(action.model_dump(mode="json")),
-            origin="completion",
-        ),
-        llm_response_id="legacy-response",
-    )
-    persisted = event.model_dump(mode="json")
-    persisted["action"]["notify_on_status"] = ["finished"]
-
-    restored = Event.model_validate_json(json.dumps(persisted))
-
-    assert isinstance(restored, ActionEvent)
-    assert isinstance(restored.action, MonitorTrainingAction)
-    assert restored.action.training_id == "training-17"
-    assert "notify_on_status" not in restored.action.model_dump()
-
-
-def test_running_training_observation_survives_event_log_restore():
-    restored = round_trip(
-        ObservationEvent(
-            tool_name="run_training",
-            tool_call_id="call-17",
-            action_id="action-17",
-            observation=TrainingResultObservation(
-                training_id="training-17",
-                state=TrainingState.RUNNING,
-                exit_code=None,
-                elapsed_seconds=12.5,
-                log_path="/state/training-17.log",
-            ),
-        )
-    )
-
-    assert isinstance(restored, ObservationEvent)
-    assert isinstance(restored.observation, TrainingResultObservation)
-    assert restored.observation.state is TrainingState.RUNNING
-    assert restored.observation.exit_code is None
 
 
 def test_job_actions_and_observations_survive_event_log_restore():
@@ -133,7 +79,7 @@ def test_job_actions_and_observations_survive_event_log_restore():
             action_id="job-action",
             observation=JobResultObservation(
                 job_id="job-17",
-                state=TrainingState.RUNNING,
+                state=JobState.RUNNING,
                 elapsed_seconds=12.5,
                 log_path="/state/job-17.log",
             ),

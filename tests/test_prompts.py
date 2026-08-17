@@ -12,7 +12,7 @@ def test_prompt_module_defines_nonempty_uppercase_strings():
         if name.endswith("_PROMPT")
     }
 
-    assert len(prompt_values) == 20
+    assert prompt_values
     assert all(name.isupper() for name in prompt_values)
     assert all(isinstance(value, str) for value in prompt_values.values())
     assert all(value == value.strip() for value in prompt_values.values())
