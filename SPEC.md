@@ -64,6 +64,9 @@ deadline, and completed-turn counter. The supervisor resets bounded restart
 backoff only after a turn is successfully acknowledged; process uptime and
 idle sleep do not count as progress. The supervisor is independent of
 OpenHands and Kubernetes.
+OpenHands events renew the root turn's lease; its configured timeout measures
+inactivity rather than total elapsed time. Provider, tool, training, and child
+deadlines remain hard.
 Kubernetes liveness and Docker health checks inspect the same lease, while the
 supervisor provides the same recovery on a plain host.
 
@@ -86,9 +89,11 @@ GitHub state is level-triggered:
   label is a human message.
 
 Human Issue events use the exact latest human-authored body/comment ID as their
-dedupe key and `human_message_id`. An agent reply updates the Issue but does not
-create a new wake for its own comment. `respond_to_human_issue` verifies the exact
-human message before writing an idempotent response.
+dedupe key and `human_message_id`. Trusted messages may share the authenticated
+actor's GitHub identity; an authoritative Senpai protocol marker distinguishes
+agent output and prevents it from creating a new wake. `respond_to_human_issue`
+reapplies the same classification to the exact message before writing an
+idempotent response.
 Launches with human-Issue handling disabled skip that GitHub query entirely.
 
 Assigned-PR issue comments, submitted reviews, and inline comments each use
@@ -103,10 +108,17 @@ ledger. Oldest unacknowledged events are delivered in bounded count/byte
 batches; immediate post-turn polls drain later batches without dropping them.
 
 While an OpenHands turn is running, `ActiveMailboxWatcher` polls GitHub and job
-monitor mailboxes into the role's local event store. It never injects messages
-into the active conversation. Newly visible advisor events, and student events
-bound to the running assignment UUID, remain pending for the next safe
-sequential turn and are acknowledged only after that turn succeeds.
+monitor mailboxes into the role's local event store. It enqueues all newly
+visible advisor events. For students, it maps authenticated human Issues,
+assignment-bound PR feedback, and job-monitor events into the active UUID.
+Authenticated humans are the interrupt tier: tools get up to 60 seconds to
+finish before Senpai interrupts and resumes the run, even when its inbox batch
+is full. Student assignments and trusted PR feedback share a FIFO queue tier;
+feedback and job-monitor events wait for the next safe sequential turn without
+cancelling it. Ordinary events remain FIFO. Turn formation and non-human
+attachments are bounded to 16 events or 64 KiB; prioritized overflow remains
+pending to lead the next turn. Events are acknowledged only after the enclosing
+turn succeeds; successful student feedback also advances `github-feedback.json`.
 
 Generic child results use a local SQLite WAL event store because parent and
 child run on the same advisor or student instance. That is not an inter-node
@@ -118,6 +130,12 @@ student feedback/child events, and `jobs/monitors.sqlite3` for supervised-job
 monitor policy, samples, and deduplicated actionable signals. The advisor's
 external W&B monitor policies use `advisor-job-monitors/monitors.sqlite3`.
 OpenHands conversation history is a separate file-backed per-UUID event log.
+
+A completed tool observation resets the three-attempt no-progress budget. A
+separate 36-inference-start backstop applies to each turn branch across worker
+restarts without limiting one productive run. Either exhausted budget enters
+bounded fresh-branch recovery and then quarantine. Only authenticated human
+steering can reopen quarantine; trusted PR feedback remains pending.
 
 ## State and conversations
 
@@ -495,11 +513,11 @@ at depth two. Explore, Search, Bash Runner, and every depth-two agent are leaves
 This makes chains such as Explore -> Explore impossible without constraining a
 later research phase to the first batch's lifetime budget.
 
-The tree inherits one absolute root-turn deadline. Each task also has a tier
-runtime cap: 600 seconds for `fast`, 1,800 for `smart`, and 3,600 for `frontier`.
-The effective deadline is the earlier of that cap and the inherited root
-deadline. Reaching it interrupts the complete process group and records a
-terminal timeout; no descendant survives the tree deadline.
+Each task has an absolute tier runtime cap: 1,200 seconds for `fast`, 3,600 for
+`smart`, and 7,200 for `frontier`. A descendant's effective deadline is the
+earlier of that cap and its inherited ancestor deadline. Reaching it interrupts
+the complete process group and records a terminal timeout; no descendant
+outlives an ancestor deadline.
 
 Each tier selects one explicit model-and-effort profile. `model=fast` defaults
 to `openai/gpt-5.6-luna` at `high` for mechanical search, command execution,
@@ -642,8 +660,10 @@ event for another.
 
 The advisor and student Stop hooks verify that every live supervised job has an
 active SQLite monitor record. The student hook also verifies a clean worktree,
-allowing its turn to end while the controller supervises the process. Advisor
-and student children never receive job tools.
+allowing its turn to end while the controller supervises the process. While
+queued PR feedback waits for a safe boundary, a role-local marker waives only
+the clean-worktree check; the pump clears it before delivery and on entry and
+exit. Advisor and student children never receive job tools.
 
 ## Hooks, deadlines, and shutdown
 

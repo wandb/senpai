@@ -6,14 +6,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import signal
 import stat
 import sys
 import time
 import uuid
-from collections.abc import Iterator, Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -144,7 +143,6 @@ WANDB_GLM_52_MAX_EVENTS = 600
 WANDB_GLM_52_MAX_TOKENS = 180_000
 WANDB_GLM_52_TARGET_EVENTS = 40
 DEFAULT_INBOX_MAX_STALLED_ATTEMPTS = 3
-DEFAULT_INBOX_MAX_TURN_AGE_SECONDS = 3 * 60 * 60
 DEFAULT_INBOX_MAX_RECOVERY_GENERATIONS = 1
 
 
@@ -230,14 +228,13 @@ class RunnerConfig:
     wandb_entity: str | None = None
     wandb_project: str | None = None
     job_max_timeout_seconds: int = 1800
-    timeout_seconds: float = 3600
-    llm_timeout_seconds: int = 900
+    timeout_seconds: float = 7200
+    llm_timeout_seconds: int = 5400
     llm_num_retries: int = 1
     local_condenser_max_events: int = DEFAULT_LOCAL_CONDENSER_MAX_EVENTS
     local_condenser_max_tokens: int = DEFAULT_LOCAL_CONDENSER_MAX_TOKENS
     local_condenser_target_events: int = DEFAULT_LOCAL_CONDENSER_TARGET_EVENTS
     inbox_max_stalled_attempts: int = DEFAULT_INBOX_MAX_STALLED_ATTEMPTS
-    inbox_max_turn_age_seconds: float = DEFAULT_INBOX_MAX_TURN_AGE_SECONDS
     inbox_max_recovery_generations: int = DEFAULT_INBOX_MAX_RECOVERY_GENERATIONS
     child: bool = False
     delegation_root_state_dir: Path | None = None
@@ -629,7 +626,7 @@ def resolve_config(
     if job_max_timeout_seconds <= 0:
         raise RuntimeError("SENPAI_TIMEOUT_MINUTES must be positive")
     try:
-        timeout_seconds = float(env.get("SENPAI_OPENHANDS_TIMEOUT_SECONDS", "3600"))
+        timeout_seconds = float(env.get("SENPAI_OPENHANDS_TIMEOUT_SECONDS", "7200"))
     except ValueError as error:
         raise RuntimeError(
             "SENPAI_OPENHANDS_TIMEOUT_SECONDS must be numeric"
@@ -637,7 +634,7 @@ def resolve_config(
     if timeout_seconds <= 0:
         raise RuntimeError("SENPAI_OPENHANDS_TIMEOUT_SECONDS must be positive")
     try:
-        llm_timeout_seconds = int(env.get("SENPAI_LLM_TIMEOUT_SECONDS", "900"))
+        llm_timeout_seconds = int(env.get("SENPAI_LLM_TIMEOUT_SECONDS", "5400"))
         llm_num_retries = int(env.get("SENPAI_LLM_NUM_RETRIES", "1"))
     except ValueError as error:
         raise RuntimeError("Senpai LLM timeout settings must be numeric") from error
@@ -696,12 +693,6 @@ def resolve_config(
                 str(DEFAULT_INBOX_MAX_STALLED_ATTEMPTS),
             )
         )
-        inbox_max_turn_age_seconds = float(
-            env.get(
-                "SENPAI_INBOX_MAX_TURN_AGE_SECONDS",
-                str(DEFAULT_INBOX_MAX_TURN_AGE_SECONDS),
-            )
-        )
         inbox_max_recovery_generations = int(
             env.get(
                 "SENPAI_INBOX_MAX_RECOVERY_GENERATIONS",
@@ -710,14 +701,9 @@ def resolve_config(
         )
     except ValueError as error:
         raise RuntimeError("inbox recovery budget must be numeric") from error
-    if (
-        inbox_max_stalled_attempts <= 0
-        or not math.isfinite(inbox_max_turn_age_seconds)
-        or inbox_max_turn_age_seconds <= 0
-        or inbox_max_recovery_generations < 0
-    ):
+    if inbox_max_stalled_attempts <= 0 or inbox_max_recovery_generations < 0:
         raise RuntimeError(
-            "inbox recovery budget requires positive attempt/age limits and a "
+            "inbox recovery budget requires a positive attempt limit and a "
             "non-negative recovery-generation limit"
         )
     wandb_entity = env.get("WANDB_ENTITY", "").strip() or None
@@ -948,7 +934,6 @@ def resolve_config(
         local_condenser_max_tokens=local_condenser_max_tokens,
         local_condenser_target_events=local_condenser_target_events,
         inbox_max_stalled_attempts=inbox_max_stalled_attempts,
-        inbox_max_turn_age_seconds=inbox_max_turn_age_seconds,
         inbox_max_recovery_generations=inbox_max_recovery_generations,
         child=args.child,
         delegation_root_state_dir=delegation_root_state_dir,
@@ -1384,7 +1369,7 @@ def delegation_config(
 
 
 @contextmanager
-def graceful_interrupts(conversation: object) -> Iterator[None]:
+def graceful_interrupts(conversation: object) -> Iterator[Callable[[], bool]]:
     interrupted_by: list[int] = []
 
     def interrupt(signum: int, _frame: object) -> None:
@@ -1398,7 +1383,7 @@ def graceful_interrupts(conversation: object) -> Iterator[None]:
         for signum in (signal.SIGTERM, signal.SIGINT)
     }
     try:
-        yield
+        yield lambda: bool(interrupted_by)
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
@@ -1409,26 +1394,62 @@ def graceful_interrupts(conversation: object) -> Iterator[None]:
 async def arun_conversation(
     conversation: object,
     timeout_seconds: float,
+    activity: Callable[[], float] | None = None,
+    *,
+    started: Callable[[], None] | None = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> None:
-    """Run the async OpenHands path so timeout cancellation reaches tools."""
+    """Run until completion or one full timeout passes without activity."""
 
     task = asyncio.create_task(conversation.arun())
-    try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
-    except TimeoutError:
-        print(
-            f"OPENHANDS_TIMEOUT seconds={timeout_seconds:g}",
-            file=sys.stderr,
-            flush=True,
-        )
+
+    async def cancel_run() -> None:
         conversation.interrupt()
-        if not task.done():
-            task.cancel()
+        task.cancel()
         with suppress(asyncio.CancelledError):
             await task
 
+    await asyncio.sleep(0)
+    if started is not None:
+        started()
+    if stop_requested is not None and stop_requested():
+        await cancel_run()
+        return
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=max(0, deadline - time.monotonic()),
+            )
+            return
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise
+            return
+        except TimeoutError:
+            if task.done():
+                await task
+                return
+            renewed = (
+                activity() + timeout_seconds if activity is not None else deadline
+            )
+            if renewed > time.monotonic():
+                deadline = renewed
+                continue
+            print(
+                f"OPENHANDS_TIMEOUT seconds={timeout_seconds:g}",
+                file=sys.stderr,
+                flush=True,
+            )
+            await cancel_run()
+            return
 
-def run_conversation(conversation: object, timeout_seconds: float) -> None:
+
+def run_conversation(
+    conversation: object,
+    timeout_seconds: float,
+) -> None:
     if timeout_seconds <= 0:
         print(
             f"OPENHANDS_TIMEOUT seconds={max(timeout_seconds, 0):g}",
@@ -1438,6 +1459,47 @@ def run_conversation(conversation: object, timeout_seconds: float) -> None:
         conversation.interrupt()
         return
     asyncio.run(arun_conversation(conversation, timeout_seconds))
+
+
+async def arun_steerable_conversation(
+    conversation: object,
+    pump: AdvisorEventPump,
+    timeout_seconds: float,
+    activity: Callable[[], float] | None = None,
+    stop_requested: Callable[[], bool] | None = None,
+) -> None:
+    while stop_requested is None or not stop_requested():
+        if not pump.prepare_run():
+            continue
+        if stop_requested is not None and stop_requested():
+            return
+        await arun_conversation(
+            conversation,
+            timeout_seconds,
+            activity,
+            started=pump.run_started,
+            stop_requested=stop_requested,
+        )
+        if not pump.finish_run():
+            return
+
+
+def run_steerable_conversation(
+    conversation: object,
+    pump: AdvisorEventPump,
+    timeout_seconds: float,
+    activity: Callable[[], float] | None = None,
+    stop_requested: Callable[[], bool] | None = None,
+) -> None:
+    asyncio.run(
+        arun_steerable_conversation(
+            conversation,
+            pump,
+            timeout_seconds,
+            activity,
+            stop_requested,
+        )
+    )
 
 
 def event_summary(event: object) -> dict[str, object]:
@@ -1562,16 +1624,20 @@ def run_openhands(
     inbox: PersistentInbox | None = None,
     inbox_turn_id: str | None = None,
     recovery_prompt: str | None = None,
+    on_activity: Callable[[], None] | None = None,
 ) -> int:
     if (inbox is None) != (inbox_turn_id is None):
         raise ValueError("inbox and inbox_turn_id must be provided together")
     started_at = time.time()
-    run_deadline = min(
-        started_at + config.timeout_seconds,
-        config.delegation_deadline_epoch or float("inf"),
+    run_deadline = (
+        min(
+            started_at + config.timeout_seconds,
+            config.delegation_deadline_epoch or float("inf"),
+        )
+        if config.child
+        else None
     )
-    run_timeout = run_deadline - started_at
-    if run_timeout <= 0:
+    if run_deadline is not None and run_deadline <= started_at:
         raise TimeoutError("the inherited OpenHands deadline has expired")
     scrub_model_credentials(os.environ, config)
     register_default_tools(enable_browser=False)
@@ -1757,13 +1823,22 @@ def run_openhands(
                 file=sys.stderr,
                 flush=True,
             )
+        last_activity = time.monotonic()
+
+        def observe_event(event: object) -> None:
+            nonlocal last_activity
+            last_activity = time.monotonic()
+            if on_activity is not None:
+                on_activity()
+            print_event(event)
+
         conversation = LocalConversation(
             agent=agent,
             workspace=config.workspace,
             plugins=[PluginSource(source=str(config.plugin_dir))],
             persistence_dir=config.state_dir,
             conversation_id=config.conversation_id,
-            callbacks=[] if config.child else [print_event],
+            callbacks=[] if config.child else [observe_event],
             max_iteration_per_run=config.max_turns,
             visualizer=None,
             secrets=dict(config.command_secrets),
@@ -1815,7 +1890,6 @@ def run_openhands(
                 if inbox.terminal_recovery_due(
                     active_inbox_turn_id,
                     max_attempts=config.inbox_max_stalled_attempts,
-                    max_age_seconds=config.inbox_max_turn_age_seconds,
                 ):
                     stalled_turn_id = active_inbox_turn_id
                     recovery = inbox.recover_turn(
@@ -1845,11 +1919,12 @@ def run_openhands(
                         ),
                     )
                 inbox.record_inference_attempt(active_inbox_turn_id)
-            with graceful_interrupts(conversation):
+            with graceful_interrupts(conversation) as stop_requested:
                 if not config.child:
-                    with (
-                        AdvisorEventStore(local_event_db_path(config)) as event_store,
-                        AdvisorEventPump(
+                    with AdvisorEventStore(
+                        local_event_db_path(config)
+                    ) as event_store:
+                        event_pump = AdvisorEventPump(
                             event_store,
                             conversation,
                             parent_conversation_id=(
@@ -1859,10 +1934,17 @@ def run_openhands(
                             ),
                             inbox=inbox,
                             conversation_id=config.conversation_id,
-                        ),
-                    ):
-                        run_conversation(conversation, run_deadline - time.time())
+                        )
+                        with event_pump:
+                            run_steerable_conversation(
+                                conversation,
+                                event_pump,
+                                config.timeout_seconds,
+                                lambda: last_activity,
+                                stop_requested,
+                            )
                 else:
+                    assert run_deadline is not None
                     run_conversation(conversation, run_deadline - time.time())
         status = conversation.state.execution_status
         if (

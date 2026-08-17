@@ -231,7 +231,8 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
     assert "ANTHROPIC_API_KEY" not in config.command_secrets
     assert "OPENAI_API_KEY" not in config.command_secrets
     assert config.job_max_timeout_seconds == 30
-    assert config.llm_timeout_seconds == 900
+    assert config.timeout_seconds == 7200
+    assert config.llm_timeout_seconds == 5400
     assert config.llm_num_retries == 1
 
     delegated = runner.delegation_config(config)
@@ -367,7 +368,6 @@ def test_inbox_recovery_budget_is_explicit_and_configurable(tmp_path):
     env.update(
         {
             "SENPAI_INBOX_MAX_STALLED_ATTEMPTS": "4",
-            "SENPAI_INBOX_MAX_TURN_AGE_SECONDS": "7200",
             "SENPAI_INBOX_MAX_RECOVERY_GENERATIONS": "2",
         }
     )
@@ -375,10 +375,8 @@ def test_inbox_recovery_budget_is_explicit_and_configurable(tmp_path):
     configured = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
     assert default.inbox_max_stalled_attempts == 3
-    assert default.inbox_max_turn_age_seconds == 10_800
     assert default.inbox_max_recovery_generations == 1
     assert configured.inbox_max_stalled_attempts == 4
-    assert configured.inbox_max_turn_age_seconds == 7200
     assert configured.inbox_max_recovery_generations == 2
 
 
@@ -386,8 +384,6 @@ def test_inbox_recovery_budget_is_explicit_and_configurable(tmp_path):
     ("key", "value"),
     [
         ("SENPAI_INBOX_MAX_STALLED_ATTEMPTS", "0"),
-        ("SENPAI_INBOX_MAX_TURN_AGE_SECONDS", "never"),
-        ("SENPAI_INBOX_MAX_TURN_AGE_SECONDS", "nan"),
         ("SENPAI_INBOX_MAX_RECOVERY_GENERATIONS", "-1"),
     ],
 )

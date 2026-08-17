@@ -12,7 +12,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from senpai_agent.jobs import job_result_paths
-from senpai_agent.state import job_state_dir
+
+
+QUEUED_FEEDBACK_MARKER = "queued-feedback-pending"
+
+
+def queued_feedback_marker(state_dir: Path) -> Path:
+    return state_dir / QUEUED_FEEDBACK_MARKER
 
 
 @dataclass(frozen=True, slots=True)
@@ -712,10 +718,14 @@ def _stop_policy(
     role: str,
     working_dir: Path,
     state_dir: Path | None,
+    *,
+    require_clean_workspace: bool = True,
 ) -> PolicyDecision:
     if role not in {"advisor", "student"} or not (working_dir / ".git").exists():
         return PolicyDecision(True)
     if state_dir is not None:
+        from senpai_agent.state import job_state_dir
+
         jobs_dir = job_state_dir(state_dir)
         running = {
             path.stem
@@ -735,19 +745,20 @@ def _stop_policy(
             )
     if role == "advisor":
         return PolicyDecision(True)
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=working_dir,
-        text=True,
-        capture_output=True,
-        check=True,
-    ).stdout
-    if status.strip():
-        return PolicyDecision(
-            False,
-            "Commit the exact implementation before a job or discard incidental "
-            "assignment changes before finishing.",
-        )
+    if require_clean_workspace:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=working_dir,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout
+        if status.strip():
+            return PolicyDecision(
+                False,
+                "Commit the exact implementation before a job or discard "
+                "incidental assignment changes before finishing.",
+            )
     return PolicyDecision(True)
 
 
@@ -790,7 +801,18 @@ def hook_main(
         if command == "stop":
             state_dir_value = env.get("SENPAI_OPENHANDS_STATE_DIR")
             state_dir = Path(state_dir_value).resolve() if state_dir_value else None
-            return _emit(_stop_policy(role, working_dir, state_dir))
+            queued_feedback = (
+                state_dir is not None
+                and queued_feedback_marker(state_dir).is_file()
+            )
+            return _emit(
+                _stop_policy(
+                    role,
+                    working_dir,
+                    state_dir,
+                    require_clean_workspace=not queued_feedback,
+                )
+            )
         if command == "session-end":
             return _emit(PolicyDecision(True))
         raise ValueError(f"unknown hook command: {command}")

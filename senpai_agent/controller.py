@@ -22,6 +22,8 @@ from senpai_agent.agent_markdown import strip_spdx_header
 from senpai_agent.advisor import AdvisorEvent, AdvisorEventStore
 from senpai_agent.github.mailbox import GitHubMailbox
 from senpai_agent.inbox import (
+    QUEUE_PRIORITY,
+    STEERING_PRIORITIES,
     DeliveryState,
     InboxTurn,
     InboxTurnQuarantined,
@@ -72,6 +74,7 @@ from senpai_agent.workspace import (
 _EDGE_TRIGGERED_EVENT_KINDS = frozenset(
     {"research_base_changed", "student_assignment_comment"}
 )
+_ACTIVITY_LEASE_RENEWAL_SECONDS = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +134,30 @@ def _context_recovery_prompt(full_prompt: str, current_prompt: str) -> str:
     )
 
 
+def _activity_lease(
+    progress: ProgressLease,
+    timeout_seconds: float,
+) -> Callable[[], None]:
+    last_attempt = float("-inf")
+
+    def renew() -> None:
+        nonlocal last_attempt
+        now = time.monotonic()
+        if now - last_attempt < _ACTIVITY_LEASE_RENEWAL_SECONDS:
+            return
+        last_attempt = now
+        try:
+            progress.update("openhands-turn", timeout_seconds)
+        except OSError as error:
+            print(
+                f"SENPAI_LEASE_UPDATE_ERROR {type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    return renew
+
+
 class OpenHandsTurnRunner:
     def __init__(
         self,
@@ -139,8 +166,9 @@ class OpenHandsTurnRunner:
         full_prompt: str,
         github_mailbox: GitHubMailbox | None = None,
         active_mailbox_factories: Sequence[MailboxFactory] = (),
-        active_poll_interval_seconds: float = 120,
+        active_poll_interval_seconds: float = 30,
         active_monitor_poll_interval_seconds: float = 5,
+        on_activity: Callable[[], None] | None = None,
     ):
         self.config = config
         self.full_prompt = full_prompt.strip()
@@ -150,6 +178,7 @@ class OpenHandsTurnRunner:
         self.active_monitor_poll_interval_seconds = (
             active_monitor_poll_interval_seconds
         )
+        self.on_activity = on_activity
 
     def run(
         self,
@@ -167,25 +196,27 @@ class OpenHandsTurnRunner:
             self.config,
             conversation_id=conversation_id,
         )
-        turn_deadline = time.monotonic() + config.timeout_seconds
         if (inbox is None) != (inbox_turn_id is None):
             raise ValueError("inbox and inbox turn ID must be provided together")
 
-        def inbox_options() -> dict[str, object]:
-            if inbox is None or inbox_turn_id is None:
-                return {}
-            return {
-                "inbox": inbox,
-                "inbox_turn_id": inbox_turn_id,
-                "recovery_prompt": _context_recovery_prompt(
-                    self.full_prompt,
-                    prompt,
-                ),
-            }
+        def run_options() -> dict[str, object]:
+            options: dict[str, object] = {}
+            if inbox is not None and inbox_turn_id is not None:
+                options.update(
+                    inbox=inbox,
+                    inbox_turn_id=inbox_turn_id,
+                    recovery_prompt=_context_recovery_prompt(
+                        self.full_prompt,
+                        prompt,
+                    ),
+                )
+            if self.on_activity is not None:
+                options["on_activity"] = self.on_activity
+            return options
 
         def run_turn() -> int:
             try:
-                return run_openhands(prompt, config, **inbox_options())
+                return run_openhands(prompt, config, **run_options())
             except Exception as error:
                 if not _is_context_history_failure(error):
                     raise
@@ -196,25 +227,12 @@ class OpenHandsTurnRunner:
                     file=sys.stderr,
                     flush=True,
                 )
-                remaining = turn_deadline - time.monotonic()
-                if remaining <= 0:
-                    timeout = TimeoutError(
-                        "no turn time remains for context recovery"
-                    )
-                    raise ConversationRecoveryExhausted(
-                        conversation_id,
-                        timeout,
-                    ) from error
-                recovery_config = replace(
-                    config,
-                    timeout_seconds=remaining,
-                )
                 try:
                     return run_openhands(
                         _context_recovery_prompt(self.full_prompt, prompt),
-                        recovery_config,
+                        config,
                         reset_context=True,
-                        **inbox_options(),
+                        **run_options(),
                     )
                 except Exception as recovery_error:
                     if _is_context_history_failure(recovery_error):
@@ -234,7 +252,7 @@ class OpenHandsTurnRunner:
                 config.state_dir / "student-conversations.json"
             )
             map_event = partial(
-                _student_active_event,
+                _student_live_event,
                 conversation_id=conversation_id,
                 registry=registry,
             )
@@ -275,7 +293,7 @@ class OpenHandsTurnRunner:
         return TurnResult(exit_code=exit_code)
 
 
-def _student_active_event(
+def _student_live_event(
     event: ControllerEvent,
     *,
     conversation_id: UUID,
@@ -286,11 +304,13 @@ def _student_active_event(
             str(event.payload["assignment_id"]),
             str(event.payload["revision_id"]),
         )
+        if target != conversation_id:
+            return None
     elif event.kind == "job_monitor":
         target = UUID(str(event.payload["conversation_id"]))
-    else:
-        return None
-    if target != conversation_id:
+        if target != conversation_id:
+            return None
+    elif event.kind != "human_issue":
         return None
     return AdvisorEvent(
         kind=event.kind,
@@ -349,7 +369,7 @@ class Controller:
         reconcile: Callable[[Sequence[ControllerEvent]], None] | None = None,
         progress: ProgressLease | None = None,
         operation_timeout_seconds: float = 300,
-        turn_timeout_seconds: float = 3660,
+        turn_timeout_seconds: float = 7260,
         max_consecutive_turn_failures: int = 2,
         event_reminder_seconds: float | None = None,
         start_gate_path: Path | None = None,
@@ -632,12 +652,25 @@ class Controller:
                     ):
                         self._clear_workspace_divergence(conversation_id)
             for event in batch_events:
-                self.inbox.enqueue(
-                    conversation_id,
-                    event.dedupe_key,
-                    event.to_prompt(),
-                    priority=event.priority,
-                )
+                steering_priority = STEERING_PRIORITIES.get(event.kind)
+                if steering_priority is not None:
+                    self.inbox.steer(
+                        conversation_id,
+                        event.dedupe_key,
+                        event.to_prompt(),
+                        priority=steering_priority,
+                    )
+                else:
+                    self.inbox.enqueue(
+                        conversation_id,
+                        event.dedupe_key,
+                        event.to_prompt(),
+                        priority=(
+                            QUEUE_PRIORITY
+                            if event.kind == "student_assignment"
+                            else event.priority
+                        ),
+                    )
 
     def _next_ready_turn(
         self,
@@ -1013,16 +1046,22 @@ def controller_main(
         runner_config.state_dir / "delivery-inbox.sqlite3",
         legacy_path=runner_config.state_dir / "pending-message-deliveries.json",
     )
+    turn_lease_seconds = runner_config.timeout_seconds + 60
     turns = OpenHandsTurnRunner(
         runner_config,
         full_prompt=full_prompt,
         github_mailbox=github_mailbox,
         active_mailbox_factories=active_monitor_factories,
         active_poll_interval_seconds=float(
-            env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "120")
+            env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "30")
         ),
         active_monitor_poll_interval_seconds=float(
             env.get("SENPAI_ACTIVE_MONITOR_POLL_INTERVAL_S", "5")
+        ),
+        on_activity=(
+            _activity_lease(progress, turn_lease_seconds)
+            if progress is not None
+            else None
         ),
     )
     controller = Controller(
@@ -1047,7 +1086,7 @@ def controller_main(
         operation_timeout_seconds=float(
             env.get("SENPAI_CONTROLLER_OPERATION_TIMEOUT_SECONDS", "300")
         ),
-        turn_timeout_seconds=runner_config.timeout_seconds + 60,
+        turn_timeout_seconds=turn_lease_seconds,
         max_consecutive_turn_failures=int(
             env.get("SENPAI_CONTROLLER_MAX_CONSECUTIVE_TURN_FAILURES", "2")
         ),

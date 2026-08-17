@@ -74,6 +74,52 @@ def test_respond_to_issue_accepts_a_specific_human_comment():
     )
 
 
+@pytest.mark.parametrize(
+    ("issue", "comments", "message_id"),
+    [
+        (
+            human_issue(author="SENPAI-BOT", association="OWNER"),
+            [],
+            700,
+        ),
+        (
+            human_issue(),
+            [
+                comment(
+                    42,
+                    "Please also compare memory use.",
+                    author="SENPAI-BOT",
+                    author_type="User",
+                    association="OWNER",
+                )
+            ],
+            42,
+        ),
+    ],
+    ids=("issue-body", "issue-comment"),
+)
+def test_respond_to_issue_accepts_unmarked_shared_actor_messages(
+    issue,
+    comments,
+    message_id,
+):
+    fake = FakeGitHub(pull_request(), issue=issue, comments=comments)
+
+    result = workflow(fake).respond_to_issue(
+        7,
+        human_message_id=message_id,
+        audience_labels={"team"},
+        responder="advisor",
+        response="I will investigate this now.",
+    )
+
+    assert result.changed is True
+    assert cast(str, fake.comments[-1]["body"]).startswith(
+        f"<!-- senpai-human-response:advisor:{message_id} -->"
+    )
+    assert len(fake.mutations) == 1
+
+
 def test_advisor_and_two_student_replies_to_one_human_message_coexist():
     fake = FakeGitHub(pull_request(), issue=human_issue())
     advisor = workflow(fake, role="advisor")
@@ -189,20 +235,50 @@ def test_human_issue_responses_share_the_workflow_mutation_lock(monkeypatch):
             700,
             "pull request",
         ),
-        (human_issue(author="senpai-bot"), [], 700, "authenticated actor"),
+        (
+            human_issue(author="senpai-bot", author_type="Bot"),
+            [],
+            700,
+            "OWNER",
+        ),
+        (
+            human_issue(
+                author="senpai-bot",
+                body=(
+                    "<!-- senpai-human-response:advisor:700 -->\n\n"
+                    "ADVISOR: Already answered."
+                ),
+            ),
+            [],
+            700,
+            "Senpai protocol",
+        ),
         (human_issue(author="outsider", association="NONE"), [], 700, "OWNER"),
         (
             human_issue(),
             [
                 comment(
                     42,
-                    "Already answered.",
+                    "Automated status update.",
+                    author="senpai-bot",
+                )
+            ],
+            42,
+            "OWNER",
+        ),
+        (
+            human_issue(),
+            [
+                comment(
+                    43,
+                    "<!-- senpai-human-response:advisor:700 -->\n\n"
+                    "ADVISOR: Already answered.",
                     author="senpai-bot",
                     author_type="User",
                 )
             ],
-            42,
-            "authenticated actor",
+            43,
+            "Senpai protocol",
         ),
         (
             human_issue(),
@@ -225,8 +301,10 @@ def test_human_issue_responses_share_the_workflow_mutation_lock(monkeypatch):
         "missing-audience-label",
         "pull-request",
         "bot-authored-issue",
+        "senpai-response-issue",
         "outsider-authored-issue",
         "bot-authored-comment",
+        "senpai-response-comment",
         "outsider-authored-comment",
         "unknown-message",
     ),

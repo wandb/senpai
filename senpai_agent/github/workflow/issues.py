@@ -2,12 +2,12 @@
 
 from urllib.parse import quote
 
-from senpai_agent.github.workflow.errors import WorkflowPreconditionError
 from senpai_agent.github.workflow.responses import MutationResult
 from senpai_agent.github.workflow.text import marker_body
 from senpai_agent.github.workflow.validation import (
     positive_message_id,
     positive_number,
+    require_trusted_human_message,
     validate_labels,
 )
 
@@ -63,15 +63,18 @@ class HumanIssueMixin:
             responder_key = f"student:{quote(responder, safe='')}"
 
         issue = self._human_issue(number, audience_labels=audience_labels)
-        source_author = self._human_message_author(
+        source = self._human_message(
             number,
             issue=issue,
             human_message_id=human_message_id,
         )
-        if source_author.casefold() == self._actor().casefold():
-            raise WorkflowPreconditionError(
-                "human message must not be authored by the authenticated actor"
-            )
+        require_trusted_human_message(
+            author=source.author,
+            author_type=source.author_type,
+            association=source.author_association,
+            body=source.body,
+            actor=self._actor(),
+        )
 
         marker = f"<!-- senpai-human-response:{responder_key}:{human_message_id} -->"
         comment_body = marker_body(marker, body)

@@ -13,6 +13,7 @@ from senpai_agent.controller import (
     Controller,
     ConversationRecoveryExhausted,
     TurnResult,
+    _activity_lease,
     _full_prompt,
 )
 from senpai_agent.inbox import (
@@ -103,6 +104,14 @@ def review_event(number=17):
 
 def delivered_text(call) -> str:
     return "\n\n".join(call[4])
+
+
+def human_event(message_id=101):
+    return ControllerEvent(
+        kind="human_issue",
+        dedupe_key=f"human_issue:1:{message_id}",
+        payload={"number": 1, "human_message_id": message_id},
+    )
 
 
 class MultiGenerationRecoveryTurns:
@@ -778,7 +787,7 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
         job_max_timeout_seconds=1800,
         command_secrets={"WANDB_API_KEY": "wandb-key"},
         conversation_id=CONVERSATION_ID,
-        timeout_seconds=3600,
+        timeout_seconds=7200,
         harness_file=tmp_path / "harness.md",
         role_file=tmp_path / "role.md",
         instructions=SenpaiSystemInstructions(
@@ -832,6 +841,7 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
     assert created[0].event_reminder_seconds == 600
     assert created[0].full_prompt == "programme"
     assert created[0].turns.full_prompt == "programme"
+    assert created[0].turn_timeout_seconds == 7260
 
 
 def test_repeated_turn_failures_exit_to_the_supervisor_for_a_clean_restart():
@@ -1181,6 +1191,36 @@ def test_feedback_polled_after_a_turn_is_processed_in_the_next_turn():
     ]
 
 
+def test_initial_assignment_precedes_feedback_when_the_batch_splits():
+    base_assignment = student_assignment_event()
+    assignment = ControllerEvent(
+        kind=base_assignment.kind,
+        dedupe_key=base_assignment.dedupe_key,
+        payload={**base_assignment.payload, "brief": "x" * (70 * 1024)},
+    )
+    feedback = ControllerEvent(
+        kind="student_pr_feedback",
+        dedupe_key="student_pr_feedback:issue_comment:17:101",
+        payload={
+            "assignment_id": "assignment-17",
+            "revision_id": "revision-2",
+            "message": "Apply this after reading the assignment.",
+        },
+    )
+    turns = Turns()
+
+    controller(
+        Mailbox(((assignment, feedback), ())),
+        turns,
+        role="student",
+    ).run(max_cycles=1)
+
+    assert [call[2] for call in turns.calls] == [
+        frozenset({assignment.dedupe_key}),
+        frozenset({feedback.dedupe_key}),
+    ]
+
+
 def test_controller_follows_the_complete_recovery_chain_before_acknowledging():
     """
     Requirement: any bounded number of recovery generations completes one logical turn.
@@ -1212,6 +1252,73 @@ def test_controller_quarantines_an_exhausted_turn_without_restarting(capsys):
     assert mailbox.acknowledged == []
     assert runtime.inbox.ready_conversation_ids() == ()
     assert "SENPAI_TURN_QUARANTINED" in capsys.readouterr().err
+
+
+def test_new_human_instruction_reopens_the_same_quarantined_advisor():
+    runtime = controller(
+        Mailbox(((review_event(),), ())),
+        QuarantiningTurns(),
+        max_consecutive_turn_failures=1,
+    )
+    runtime.run(max_cycles=1)
+    quarantined = runtime.inbox.quarantined_turns()[0]
+    instruction = human_event()
+    mailbox = Mailbox(((instruction,), ()))
+    turns = Turns()
+
+    controller(
+        mailbox,
+        turns,
+        inbox=runtime.inbox,
+    ).run(max_cycles=1)
+
+    assert len(turns.calls) == 1
+    assert turns.calls[0][1] == CONVERSATION_ID
+    assert turns.calls[0][2] == frozenset(
+        {review_event().dedupe_key, instruction.dedupe_key}
+    )
+    assert "programme" in turns.calls[0][0]
+    assert runtime.inbox.turn(quarantined.turn_id).quarantine_reason is None
+    assert mailbox.acknowledged == [
+        (review_event().dedupe_key, instruction.dedupe_key)
+    ]
+
+
+def test_new_feedback_waits_behind_a_quarantined_student():
+    assignment = student_assignment_event()
+    runtime = controller(
+        Mailbox(((assignment,), ())),
+        QuarantiningTurns(),
+        role="student",
+        max_consecutive_turn_failures=1,
+    )
+    runtime.run(max_cycles=1)
+    quarantined = runtime.inbox.quarantined_turns()[0]
+    feedback = ControllerEvent(
+        kind="student_pr_feedback",
+        dedupe_key="student_pr_feedback:issue_comment:17:101",
+        payload={
+            "assignment_id": "assignment-17",
+            "revision_id": "revision-2",
+            "message": "Try the narrower experiment next.",
+        },
+    )
+    mailbox = Mailbox(((feedback,), ()))
+    turns = Turns()
+
+    controller(
+        mailbox,
+        turns,
+        role="student",
+        inbox=runtime.inbox,
+    ).run(max_cycles=1)
+
+    assert turns.calls == []
+    assert runtime.inbox.turn(quarantined.turn_id).quarantine_reason == (
+        "recovery budget exhausted"
+    )
+    assert runtime.inbox.pending_count(CONVERSATION_ID) == 1
+    assert mailbox.acknowledged == []
 
 
 def test_start_gate_wait_publishes_a_live_lease_before_polling(tmp_path: Path):
@@ -1370,6 +1477,54 @@ def test_turn_lease_uses_the_configured_hard_deadline(tmp_path: Path):
 
     assert observed[0].phase == "openhands-turn"
     assert before + 456 <= observed[0].deadline <= after + 456
+
+
+def test_activity_lease_is_renewed_at_most_every_thirty_seconds(monkeypatch):
+    clock = [100.0]
+    updates = []
+    progress = SimpleNamespace(
+        update=lambda phase, timeout: updates.append((phase, timeout, clock[0]))
+    )
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+    renew = _activity_lease(progress, 3660)
+
+    renew()
+    clock[0] = 129.9
+    renew()
+    clock[0] = 130.0
+    renew()
+
+    assert updates == [
+        ("openhands-turn", 3660, 100.0),
+        ("openhands-turn", 3660, 130.0),
+    ]
+
+
+def test_activity_lease_write_failure_does_not_escape_the_event_path(
+    monkeypatch,
+    capsys,
+):
+    clock = [100.0]
+    attempts = []
+
+    def update(_phase, _timeout):
+        attempts.append(clock[0])
+        if len(attempts) == 1:
+            raise OSError("lease volume unavailable")
+
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+    renew = _activity_lease(SimpleNamespace(update=update), 3660)
+
+    renew()
+    clock[0] = 101.0
+    renew()
+    clock[0] = 130.0
+    renew()
+
+    assert attempts == [100.0, 130.0]
+    assert "SENPAI_LEASE_UPDATE_ERROR OSError: lease volume unavailable" in (
+        capsys.readouterr().err
+    )
 
 
 def test_only_an_acknowledged_turn_advances_supervisor_progress(tmp_path: Path):

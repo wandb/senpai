@@ -133,6 +133,56 @@ def test_human_issue_tracks_the_exact_latest_human_message(monkeypatch):
     assert event.payload["message"] == "Also compare memory."
 
 
+def test_shared_actor_messages_ignore_only_senpai_protocol_output(monkeypatch):
+    advisor = mailbox()
+    human_issue = issue(
+        author="SENPAI-BOT",
+        author_type="User",
+        association="OWNER",
+    )
+    comments = []
+    monkeypatch.setattr(advisor, "_pulls", list)
+    monkeypatch.setattr(advisor, "_issues", lambda: [human_issue])
+    monkeypatch.setattr(advisor, "_issue_comments", lambda _issue: comments)
+
+    first = advisor.poll()[0]
+
+    assert first.payload["human_message_id"] == 700
+    assert first.payload["author"] == "SENPAI-BOT"
+
+    comments.append(
+        {
+            "id": 701,
+            "body": (
+                "<!-- senpai-human-response:advisor:700 -->\n\n"
+                "ADVISOR: acknowledged"
+            ),
+            "created_at": "2026-07-29T18:05:00Z",
+            "user": {"login": "senpai-bot", "type": "User"},
+            "author_association": "OWNER",
+        }
+    )
+
+    after_response = advisor.poll()[0]
+
+    assert after_response.dedupe_key == first.dedupe_key
+
+    comments.append(
+        {
+            "id": 702,
+            "body": "Also compare memory.",
+            "created_at": "2026-07-29T18:10:00Z",
+            "user": {"login": "senpai-bot", "type": "User"},
+            "author_association": "OWNER",
+        }
+    )
+
+    follow_up = advisor.poll()[0]
+
+    assert follow_up.payload["human_message_id"] == 702
+    assert follow_up.payload["message"] == "Also compare memory."
+
+
 def test_editing_a_human_message_creates_a_new_event_version(monkeypatch):
     advisor = mailbox()
     human_issue = issue()
