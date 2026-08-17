@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -19,12 +19,14 @@ from senpai_agent.jobs import JobState
 
 
 NOW = datetime(2026, 7, 30, tzinfo=UTC)
+CONVERSATION_ID = UUID("00000000-0000-0000-0000-000000000001")
 
 
 def spec(**changes):
     values = {
         "job_id": "job-1",
-        "conversation_id": uuid4(),
+        "conversation_id": CONVERSATION_ID,
+        "wandb_run_id": "run-1",
         "metrics": (
             MetricMonitorSpec(
                 metric="val/loss",
@@ -42,6 +44,8 @@ SIGNAL = MonitorSignal(
     kind="metric_gate",
     dedupe_key="job-1:2026-07-30T00:00:00+00:00:metric:val/loss:gate:0",
     job_id="job-1",
+    conversation_id=CONVERSATION_ID,
+    wandb_run_id="run-1",
     metric="val/loss",
     value=0.19,
     state=JobState.RUNNING,
@@ -148,6 +152,32 @@ def test_changed_policy_reactivates_monitor_and_clears_old_state(tmp_path: Path)
         assert store.due(NOW + timedelta(minutes=5)) == [changed]
 
 
+def test_changing_wandb_binding_resets_metric_evidence(tmp_path: Path):
+    original = spec(wandb_run_id="run-old")
+    rebound = original.model_copy(
+        update={
+            "wandb_run_id": "run-new",
+            "registered_at": NOW + timedelta(minutes=1),
+        }
+    )
+    sample = MetricSample(value=0.19, observed_at=NOW)
+
+    with JobMonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(original)
+        store.record_poll(
+            original,
+            MonitorEvaluation(signals=(SIGNAL,)),
+            {"val/loss": sample},
+            now=NOW,
+        )
+
+        assert store.register(rebound) is True
+        assert store.spec(original.job_id) == rebound
+        assert store.previous_sample(original.job_id, "val/loss") is None
+        assert store.baseline_sample(original.job_id, "val/loss") is None
+        assert store.pending_signals() == []
+
+
 def test_signal_is_durable_deduplicated_and_acknowledged(tmp_path: Path):
     database = tmp_path / "monitors.sqlite3"
     monitor = spec()
@@ -174,7 +204,6 @@ def test_terminal_observation_survives_policy_reactivation(tmp_path: Path):
         job_id=monitor.job_id,
         state=JobState.FAILED,
         exit_code=2,
-        wandb_run_ids=(),
     )
 
     with JobMonitorStore(tmp_path / "monitors.sqlite3") as store:
@@ -292,6 +321,7 @@ def test_metric_samples_keep_independent_previous_and_baseline_values(
     monitor = JobMonitorSpec(
         job_id="job-1",
         conversation_id=uuid4(),
+        wandb_run_id="run-1",
         metrics=(
             MetricMonitorSpec(metric="loss"),
             MetricMonitorSpec(metric="throughput"),
@@ -350,4 +380,37 @@ def test_monitor_mailbox_emits_canonical_job_event(tmp_path: Path):
     assert len(events) == 1
     assert events[0].kind == "job_monitor"
     assert events[0].payload["job_id"] == "job-1"
+    assert events[0].payload["wandb_run_id"] == "run-1"
     assert events[0].payload["signal"]["job_id"] == "job-1"
+    assert "conversation_id" not in events[0].payload["signal"]
+    assert "wandb_run_id" not in events[0].payload["signal"]
+
+
+def test_pending_terminal_event_keeps_its_registration_provenance(tmp_path: Path):
+    original = spec(wandb_run_id="run-old")
+    replacement = original.model_copy(
+        update={
+            "conversation_id": uuid4(),
+            "wandb_run_id": "run-new",
+            "registered_at": NOW + timedelta(minutes=1),
+        }
+    )
+    result = SimpleNamespace(
+        job_id=original.job_id,
+        state=JobState.FAILED,
+        exit_code=2,
+    )
+
+    with JobMonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(original)
+        store.record_terminal_and_complete(result)
+        store.register(replacement)
+
+        [event] = JobMonitorMailbox(
+            SimpleNamespace(poll=lambda: ()),
+            store,
+        ).poll()
+
+        assert store.spec(original.job_id) == replacement
+        assert event.payload["conversation_id"] == str(original.conversation_id)
+        assert event.payload["wandb_run_id"] == "run-old"

@@ -52,6 +52,7 @@ def test_job_monitor_mailbox_routes_and_acknowledges_each_signal_independently(
         kind="job_status",
         dedupe_key="job-first:status:failed",
         job_id="job-first",
+        conversation_id=first_id,
         state=JobState.FAILED,
         detail="first job failed",
     )
@@ -59,6 +60,7 @@ def test_job_monitor_mailbox_routes_and_acknowledges_each_signal_independently(
         kind="job_status",
         dedupe_key="job-second:status:finished",
         job_id="job-second",
+        conversation_id=second_id,
         state=JobState.FINISHED,
         detail="second job finished",
     )

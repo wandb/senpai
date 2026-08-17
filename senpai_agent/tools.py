@@ -255,10 +255,38 @@ class MonitorJobAction(Action):
     job_id: str = Field(
         min_length=1,
         pattern=r"^[^:;,#?/\"'\s]+$",
+        description="Local job ID returned by run_job.",
+    )
+    wandb_run_id: str | None = Field(
+        default=None,
+        min_length=1,
+        pattern=r"^[^:;,#?/\"'\s]+$",
         description=(
-            "Local job ID returned by run_job, or a configured-project W&B run "
-            "ID when the advisor monitors external work."
+            "Exact associated W&B run ID for local metric monitoring. Omit only "
+            "when the local job has exactly one associated W&B run."
         ),
+    )
+    metrics: tuple[MetricMonitorSpec, ...] = Field(
+        default=(),
+        max_length=3,
+        description=(
+            "Up to three independent W&B metric policies. Omit to keep "
+            "terminal-state monitoring only."
+        ),
+    )
+    poll_interval_seconds: float = Field(
+        default=60,
+        ge=5,
+        allow_inf_nan=False,
+        description="Seconds between programmatic monitor polls.",
+    )
+
+
+class AdvisorMonitorJobAction(Action):
+    job_id: str = Field(
+        min_length=1,
+        pattern=r"^[^:;,#?/\"'\s]+$",
+        description="W&B run ID in the advisor's configured entity and project.",
     )
     metrics: tuple[MetricMonitorSpec, ...] = Field(
         default=(),
@@ -279,14 +307,20 @@ class MonitorJobAction(Action):
 class MonitorJobObservation(Observation):
     job_id: str
     conversation_id: str
+    wandb_run_id: str | None = None
     status: Literal["monitoring"] = "monitoring"
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
+        binding = (
+            f" W&B run: {self.wandb_run_id}."
+            if self.wandb_run_id is not None
+            else ""
+        )
         return [
             TextContent(
                 text=(
-                    f"Job {self.job_id} is durably monitored. You may finish "
+                    f"Job {self.job_id} is durably monitored.{binding} You may finish "
                     "this turn; the controller will resume this same "
                     f"conversation ({self.conversation_id}) when action is needed."
                 )
@@ -490,6 +524,23 @@ def _job_environment(
     return environment, tuple(redacted_values)
 
 
+def _validate_wandb_run(
+    entity: str,
+    project: str,
+    run_id: str,
+    conversation: LocalConversation,
+) -> None:
+    registry = getattr(getattr(conversation, "state", None), "secret_registry", None)
+    api_key = (
+        registry.get_secret_value("WANDB_API_KEY") if registry is not None else None
+    )
+    WandbJobStatusSource(
+        entity,
+        project,
+        api_key=api_key,
+    ).get_job_status(run_id)
+
+
 def _job_observation(
     result: JobResult,
     conversation: LocalConversation | None,
@@ -599,9 +650,18 @@ class CancelJobTool(ToolDefinition[CancelJobAction, JobResultObservation]):
 
 
 class _MonitorJobExecutor(ToolExecutor[MonitorJobAction, MonitorJobObservation]):
-    def __init__(self, supervisor: JobSupervisor, store: JobMonitorStore):
+    def __init__(
+        self,
+        supervisor: JobSupervisor,
+        store: JobMonitorStore,
+        *,
+        wandb_entity: str | None,
+        wandb_project: str | None,
+    ):
         self.supervisor = supervisor
         self.store = store
+        self.wandb_entity = wandb_entity
+        self.wandb_project = wandb_project
 
     def __call__(
         self,
@@ -609,11 +669,24 @@ class _MonitorJobExecutor(ToolExecutor[MonitorJobAction, MonitorJobObservation])
         conversation: LocalConversation | None = None,
     ) -> MonitorJobObservation:
         _require_owned_job(self.store, action.job_id, conversation, "monitor_job")
-        self.supervisor.get_job_status(action.job_id)
+        result = self.supervisor.get_job_status(action.job_id)
         assert conversation is not None
+        wandb_run_id = self._resolve_wandb_run_id(action, result)
+        if wandb_run_id is not None:
+            if not (self.wandb_entity and self.wandb_project):
+                raise ValueError(
+                    "W&B entity and project are required for metric monitoring"
+                )
+            _validate_wandb_run(
+                self.wandb_entity,
+                self.wandb_project,
+                wandb_run_id,
+                conversation,
+            )
         spec = JobMonitorSpec(
             job_id=action.job_id,
             conversation_id=conversation.id,
+            wandb_run_id=wandb_run_id,
             metrics=action.metrics,
             poll_interval_seconds=action.poll_interval_seconds,
         )
@@ -621,7 +694,31 @@ class _MonitorJobExecutor(ToolExecutor[MonitorJobAction, MonitorJobObservation])
         return MonitorJobObservation(
             job_id=spec.job_id,
             conversation_id=str(spec.conversation_id),
+            wandb_run_id=spec.wandb_run_id,
         )
+
+    @staticmethod
+    def _resolve_wandb_run_id(
+        action: MonitorJobAction,
+        result: JobResult,
+    ) -> str | None:
+        if not action.metrics:
+            if action.wandb_run_id is not None:
+                raise ValueError("wandb_run_id requires at least one metric policy")
+            return None
+        if action.wandb_run_id is not None:
+            if action.wandb_run_id not in result.wandb_run_ids:
+                raise ValueError(
+                    f"W&B run {action.wandb_run_id!r} is not associated with job "
+                    f"{action.job_id}"
+                )
+            return action.wandb_run_id
+        if len(result.wandb_run_ids) != 1:
+            raise ValueError(
+                "metric monitoring requires wandb_run_id unless the job has "
+                "exactly one associated W&B run"
+            )
+        return result.wandb_run_ids[0]
 
     def close(self) -> None:
         return
@@ -636,6 +733,9 @@ class MonitorJobTool(ToolDefinition[MonitorJobAction, MonitorJobObservation]):
         cls,
         supervisor: JobSupervisor,
         monitor_store: JobMonitorStore,
+        *,
+        wandb_entity: str | None = None,
+        wandb_project: str | None = None,
     ) -> Sequence[Self]:
         return [
             cls(
@@ -643,8 +743,10 @@ class MonitorJobTool(ToolDefinition[MonitorJobAction, MonitorJobObservation]):
                     "Set or replace the monitoring policy for an already-running "
                     "job. run_job automatically registers terminal-state monitoring; "
                     "this tool adds or replaces optional W&B metric gates and "
-                    "staleness policy without disabling terminal wakes. Programmatic "
-                    "polls use no model turns."
+                    "staleness policy without disabling terminal wakes. Bind metrics "
+                    "to an exact associated wandb_run_id; omit it only when the job "
+                    "has exactly one associated W&B run. Programmatic polls use no "
+                    "model turns."
                 ),
                 action_type=MonitorJobAction,
                 observation_type=MonitorJobObservation,
@@ -655,13 +757,18 @@ class MonitorJobTool(ToolDefinition[MonitorJobAction, MonitorJobObservation]):
                     idempotentHint=True,
                     openWorldHint=True,
                 ),
-                executor=_MonitorJobExecutor(supervisor, monitor_store),
+                executor=_MonitorJobExecutor(
+                    supervisor,
+                    monitor_store,
+                    wandb_entity=wandb_entity,
+                    wandb_project=wandb_project,
+                ),
             )
         ]
 
 
 class _AdvisorMonitorJobExecutor(
-    ToolExecutor[MonitorJobAction, MonitorJobObservation]
+    ToolExecutor[AdvisorMonitorJobAction, MonitorJobObservation]
 ):
     def __init__(self, entity: str, project: str, store: JobMonitorStore):
         self.entity = entity
@@ -670,25 +777,21 @@ class _AdvisorMonitorJobExecutor(
 
     def __call__(
         self,
-        action: MonitorJobAction,
+        action: AdvisorMonitorJobAction,
         conversation: LocalConversation | None = None,
     ) -> MonitorJobObservation:
         if conversation is None:
             raise ValueError("monitor_job requires its advisor conversation")
-        registry = getattr(getattr(conversation, "state", None), "secret_registry", None)
-        api_key = (
-            registry.get_secret_value("WANDB_API_KEY")
-            if registry is not None
-            else None
-        )
-        WandbJobStatusSource(
+        _validate_wandb_run(
             self.entity,
             self.project,
-            api_key=api_key,
-        ).get_job_status(action.job_id)
+            action.job_id,
+            conversation,
+        )
         spec = JobMonitorSpec(
             job_id=action.job_id,
             conversation_id=conversation.id,
+            wandb_run_id=action.job_id if action.metrics else None,
             metrics=action.metrics,
             poll_interval_seconds=action.poll_interval_seconds,
         )
@@ -696,6 +799,7 @@ class _AdvisorMonitorJobExecutor(
         return MonitorJobObservation(
             job_id=spec.job_id,
             conversation_id=str(spec.conversation_id),
+            wandb_run_id=spec.wandb_run_id,
         )
 
     def close(self) -> None:
@@ -703,7 +807,7 @@ class _AdvisorMonitorJobExecutor(
 
 
 class AdvisorMonitorJobToolSet(
-    ToolDefinition[MonitorJobAction, MonitorJobObservation]
+    ToolDefinition[AdvisorMonitorJobAction, MonitorJobObservation]
 ):
     """Expose configured-project W&B monitoring to the advisor."""
 
@@ -724,11 +828,12 @@ class AdvisorMonitorJobToolSet(
                 description=(
                     "Monitor one W&B job in the configured project. Terminal state "
                     "is always monitored; optionally add up to three independent "
-                    "metric policies. Quiet checks run in the background without "
-                    "growing model context. Only a deduplicated actionable event is "
-                    "prioritized for this conversation's next safe turn."
+                    "metric policies. Pass the W&B run ID as job_id. Quiet checks "
+                    "run in the background without growing model context. Only a "
+                    "deduplicated actionable event is prioritized for this "
+                    "conversation's next safe turn."
                 ),
-                action_type=MonitorJobAction,
+                action_type=AdvisorMonitorJobAction,
                 observation_type=MonitorJobObservation,
                 annotations=ToolAnnotations(
                     title="Monitor job",
@@ -757,6 +862,8 @@ class JobToolSet(ToolDefinition[RunJobAction, JobResultObservation]):
         state_dir: str | Path,
         max_timeout_seconds: int | None = None,
         role: str | None = None,
+        wandb_entity: str | None = None,
+        wandb_project: str | None = None,
     ) -> Sequence[ToolDefinition]:
         role = role or os.environ.get("SENPAI_ROLE")
         if role not in {"advisor", "student"}:
@@ -786,6 +893,8 @@ class JobToolSet(ToolDefinition[RunJobAction, JobResultObservation]):
                 MonitorJobTool.create(
                     supervisor=supervisor,
                     monitor_store=monitor_store,
+                    wandb_entity=wandb_entity,
+                    wandb_project=wandb_project,
                 )
             )
         return tools

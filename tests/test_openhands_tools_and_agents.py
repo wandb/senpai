@@ -150,8 +150,8 @@ def test_main_tools_replace_unsafe_defaults_with_role_scoped_boundaries(
         advisor_branch="advisor-branch" if role == "advisor" else None,
         student_names=("student-one",) if role == "advisor" else None,
         student_name="student-one" if role == "student" else None,
-        wandb_entity="research-team" if role == "advisor" else None,
-        wandb_project="project" if role == "advisor" else None,
+        wandb_entity="research-team",
+        wandb_project="project",
     )
     by_name = {tool.name: tool for tool in build_main_tools(config)}
 
@@ -177,10 +177,16 @@ def test_main_tools_replace_unsafe_defaults_with_role_scoped_boundaries(
         "student_names": ("student-one",) if role == "advisor" else None,
         "student_name": "student-one" if role == "student" else None,
     }
-    assert by_name["senpai_jobs"].params == {
+    expected_job_params = {
         "state_dir": str(config.state_dir / "jobs"),
         "max_timeout_seconds": 1800,
     }
+    if role == "student":
+        expected_job_params.update(
+            wandb_entity="research-team",
+            wandb_project="project",
+        )
+    assert by_name["senpai_jobs"].params == expected_job_params
     if role == "advisor":
         assert by_name["senpai_advisor_job_monitor"].params == {
             "state_dir": str(config.state_dir / "advisor-job-monitors"),

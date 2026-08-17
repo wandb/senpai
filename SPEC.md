@@ -555,12 +555,19 @@ Advisor and student root conversations receive:
 run_job(spec: JobSpec) -> JobResult
 get_job_status(job_id: str) -> JobResult
 cancel_job(job_id: str) -> JobResult
-monitor_job(
+student monitor_job(
   job_id,
+  wandb_run_id=None,
   metrics=(
     MetricMonitorSpec(metric, direction=None, gates=(), stale_after_seconds=600),
     ...,
   ),
+  poll_interval_seconds=60,
+) -> MonitorJobObservation
+
+advisor monitor_job(
+  job_id,
+  metrics=(MetricMonitorSpec(...), ...),
   poll_interval_seconds=60,
 ) -> MonitorJobObservation
 ```
@@ -580,11 +587,14 @@ terminal state. Advisor jobs and truly passive student watchers may be
 scrubbed environment and may request only registered credentials explicitly;
 the current public grant is `WANDB_API_KEY`. Every successful `run_job` call
 immediately registers a terminal-state monitor bound to the current
-conversation. A student uses `monitor_job` with its local `run_job` ID. An
-advisor may instead monitor a W&B run ID in the configured project without
-gaining process-status or cancellation authority over that external job. Each
-call sets or replaces zero to three independent metric policies; it never
-disables terminal wakes.
+conversation. A student uses `monitor_job` with its local `run_job` ID and may
+bind metric policies to an exact associated `wandb_run_id`. Omission is allowed
+only when the job has exactly one associated W&B run. Registration validates
+the selected run in the configured project and persists that binding, so later
+log discovery cannot retarget metric evidence. An advisor instead uses a W&B
+run ID in the configured project as `job_id` without gaining process-status or
+cancellation authority over that external job. Each call sets or replaces zero
+to three independent metric policies; it never disables terminal wakes.
 
 The timeout is a total wall-clock ceiling, not merely the point at which
 shutdown begins. TERM is sent early enough that the configured grace period
@@ -595,14 +605,15 @@ responsible for handling SIGTERM and flushing external services
 such as W&B before the grace period expires.
 
 The controller polls only monitors that are due. It fetches the latest value for
-up to three selected metrics from W&B, evaluates deterministic
-threshold/change/staleness and terminal-state rules, and persists deduplicated
-compact signals. Polling continues in a background watcher while a model turn
-is active; quiet polls use no LLM tokens and add nothing to model context. A
-signal is prioritized for the next safe turn and never preempts the active
-conversation. The monitor store reports its earliest due poll to the controller,
-which shortens the ordinary heartbeat sleep accordingly; a minute-scale job
-therefore does not wait for the default ten-minute cadence.
+up to three selected metrics from the monitor's persisted W&B run binding,
+evaluates deterministic threshold/change/staleness and terminal-state rules,
+and persists deduplicated compact signals. Polling continues in a background
+watcher while a model turn is active; quiet polls use no LLM tokens and add
+nothing to model context. A signal is prioritized for the next safe turn and
+never preempts the active conversation. The monitor store reports its earliest
+due poll to the controller, which shortens the ordinary heartbeat sleep
+accordingly; a minute-scale job therefore does not wait for the default
+ten-minute cadence.
 
 Metric samples reject NaN and infinities. Due monitors are ordered and processed
 in a capped batch with an overall time budget. A failure in one monitor's job

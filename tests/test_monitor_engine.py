@@ -37,6 +37,7 @@ def monitor(job_id="job-1", *, metric=None):
     return JobMonitorSpec(
         job_id=job_id,
         conversation_id=uuid4(),
+        wandb_run_id=f"run-{job_id}" if metric else None,
         metrics=(MetricMonitorSpec(metric=metric),) if metric else (),
         poll_interval_seconds=60,
         registered_at=NOW,
@@ -262,7 +263,6 @@ def test_wandb_status_source_maps_run_states(
 
     assert status.state is job_state
     assert status.exit_code == exit_code
-    assert status.wandb_run_ids == ("run-1",)
 
 
 def test_wandb_status_source_accepts_dotted_run_id(monkeypatch):
@@ -321,10 +321,43 @@ def test_quiet_monitor_polls_never_create_signals(tmp_path: Path):
         assert store.pending_signals() == []
 
 
+def test_metric_poll_uses_the_persisted_wandb_binding_not_discovery_order(
+    tmp_path: Path,
+):
+    spec = JobMonitorSpec(
+        job_id="job-1",
+        conversation_id=uuid4(),
+        wandb_run_id="run-bound",
+        metrics=(MetricMonitorSpec(metric="val/loss"),),
+        poll_interval_seconds=60,
+        registered_at=NOW,
+    )
+
+    class Jobs:
+        def get_job_status(self, job_id):
+            return result(tmp_path, job_id).model_copy(
+                update={"wandb_run_ids": ("run-bound", "run-discovered-later")}
+            )
+
+    requested: list[tuple[str, str]] = []
+
+    class Metrics:
+        def latest(self, run_id, metric):
+            requested.append((run_id, metric))
+            return MetricSample(value=0.2, observed_at=NOW)
+
+    with JobMonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(spec)
+        JobMonitorEngine(store, Jobs(), Metrics()).poll(NOW)
+
+    assert requested == [("run-bound", "val/loss")]
+
+
 def test_one_metric_failure_does_not_block_another_metric_gate(tmp_path: Path):
     spec = JobMonitorSpec(
         job_id="job-1",
         conversation_id=uuid4(),
+        wandb_run_id="run-job-1",
         metrics=(
             MetricMonitorSpec(metric="broken"),
             MetricMonitorSpec(
@@ -371,6 +404,7 @@ def test_in_flight_poll_cannot_mutate_a_replaced_policy(
     old = JobMonitorSpec(
         job_id="job-1",
         conversation_id=uuid4(),
+        wandb_run_id="run-job-1",
         metrics=(
             MetricMonitorSpec(
                 metric="old",
@@ -382,6 +416,7 @@ def test_in_flight_poll_cannot_mutate_a_replaced_policy(
     replacement = JobMonitorSpec(
         job_id=old.job_id,
         conversation_id=old.conversation_id,
+        wandb_run_id="run-job-1",
         metrics=(MetricMonitorSpec(metric="new"),),
         registered_at=NOW + timedelta(seconds=1),
     )

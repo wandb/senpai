@@ -1301,6 +1301,15 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
             "state_dir": str(job_state_dir(config.state_dir)),
             "max_timeout_seconds": config.job_max_timeout_seconds,
         }
+        if (
+            config.role == "student"
+            and config.wandb_entity
+            and config.wandb_project
+        ):
+            job_params.update(
+                wandb_entity=config.wandb_entity,
+                wandb_project=config.wandb_project,
+            )
         tools.append(Tool(name="senpai_jobs", params=job_params))
         if config.role == "advisor" and config.wandb_entity and config.wandb_project:
             tools.append(

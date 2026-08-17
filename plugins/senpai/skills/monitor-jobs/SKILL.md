@@ -18,9 +18,11 @@ and a stale timeout longer than its expected logging interval. Use `lte` and
 the policy's first observed sample and require `direction`. Omit metric
 policies when completion is enough.
 
-Students pass the job ID returned by `run_job`. Advisors may also pass a W&B
-run ID from the configured project to monitor another role's job; this grants
-no launch, immediate-status, or cancellation authority over that job.
+Students pass the job ID returned by `run_job` and, for metric policies, the
+exact associated `wandb_run_id`. It may be omitted only when the job has one
+unambiguous associated W&B run; the selected run is validated and durably bound
+when the policy is registered. Advisors pass a configured-project W&B run ID as
+`job_id`; this grants no launch, immediate-status, or cancellation authority.
 
 After registration, continue unrelated work or finish the turn. Ordinary
 checks run in the background and add nothing to model context. A deduplicated

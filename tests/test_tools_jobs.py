@@ -14,6 +14,7 @@ from senpai_agent.monitor import (
     WandbJobStatusSource,
 )
 from senpai_agent.tools import (
+    AdvisorMonitorJobAction,
     CancelJobAction,
     CancelJobTool,
     GetJobStatusAction,
@@ -27,6 +28,11 @@ from senpai_agent.tools import (
     register_senpai_tools,
 )
 from senpai_agent.jobs import JobResult, JobState
+
+
+WANDB_ENTITY = "milieu"
+WANDB_PROJECT = "nn_cfd"
+WANDB_API_KEY = "registered-wandb-key"
 
 
 class StubJob:
@@ -80,6 +86,75 @@ def finished_result(tmp_path: Path) -> JobResult:
         log_path=str(tmp_path / "supervisor.log"),
         wandb_run_ids=("run-abc",),
     )
+
+
+def running_result(
+    tmp_path: Path,
+    wandb_run_ids: tuple[str, ...],
+) -> JobResult:
+    return finished_result(tmp_path).model_copy(
+        update={
+            "state": JobState.RUNNING,
+            "exit_code": None,
+            "wandb_run_ids": wandb_run_ids,
+        }
+    )
+
+
+def launch_local_job(
+    tmp_path: Path,
+    wandb_run_ids: tuple[str, ...],
+) -> tuple[StubJob, JobMonitorStore, uuid.UUID]:
+    workspace = init_workspace(tmp_path)
+    supervisor = StubJob(workspace, running_result(tmp_path, wandb_run_ids))
+    monitors = JobMonitorStore(tmp_path / "monitors.sqlite3")
+    conversation_id = uuid.uuid4()
+    RunJobTool.create(supervisor, monitors)[0].executor(
+        RunJobAction(
+            spec=JobSpec(
+                argv=("python", "train.py"),
+                cwd=workspace,
+                timeout_seconds=20,
+            )
+        ),
+        SimpleNamespace(id=conversation_id),
+    )
+    return supervisor, monitors, conversation_id
+
+
+def conversation_with_wandb_key(conversation_id: uuid.UUID) -> SimpleNamespace:
+    registry = SecretRegistry()
+    registry.update_secrets({"WANDB_API_KEY": WANDB_API_KEY})
+    return SimpleNamespace(
+        id=conversation_id,
+        state=SimpleNamespace(secret_registry=registry),
+    )
+
+
+def local_monitor_tool(
+    supervisor: StubJob,
+    monitors: JobMonitorStore,
+):
+    return MonitorJobTool.create(
+        supervisor,
+        monitors,
+        wandb_entity=WANDB_ENTITY,
+        wandb_project=WANDB_PROJECT,
+    )[0]
+
+
+def capture_wandb_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, str, str, str | None]]:
+    checked: list[tuple[str, str, str, str | None]] = []
+    monkeypatch.setattr(
+        WandbJobStatusSource,
+        "get_job_status",
+        lambda source, run_id: checked.append(
+            (source.entity, source.project, run_id, source.api_key)
+        ),
+    )
+    return checked
 
 
 def test_run_job_registers_a_monitor_for_its_conversation(tmp_path: Path):
@@ -351,13 +426,17 @@ def test_monitor_job_validates_the_job_id_before_registration(
         monitors.close()
 
 
-def test_monitor_job_replaces_the_default_policy(tmp_path: Path):
+def test_monitor_job_replaces_the_default_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     workspace = init_workspace(tmp_path)
     supervisor = StubJob(workspace, finished_result(tmp_path))
     monitors = JobMonitorStore(tmp_path / "monitors.sqlite3")
     conversation_id = uuid.uuid4()
     run_tool = RunJobTool.create(supervisor, monitors)[0]
-    monitor_tool = MonitorJobTool.create(supervisor, monitors)[0]
+    monitor_tool = local_monitor_tool(supervisor, monitors)
+    checked = capture_wandb_validation(monkeypatch)
 
     try:
         run_tool.executor(
@@ -384,17 +463,178 @@ def test_monitor_job_replaces_the_default_policy(tmp_path: Path):
             monitor_tool.executor(action, SimpleNamespace(id=uuid.uuid4()))
         observation = monitor_tool.executor(
             action,
-            SimpleNamespace(id=conversation_id),
+            conversation_with_wandb_key(conversation_id),
         )
 
         monitor = monitors.spec("job-17")
         assert supervisor.status_checks == ["job-17"]
         assert monitor.metrics == action.metrics
+        assert monitor.wandb_run_id == "run-abc"
+        assert checked == [
+            (WANDB_ENTITY, WANDB_PROJECT, "run-abc", WANDB_API_KEY)
+        ]
         assert observation.to_llm_content[0].text == (
-            "Job job-17 is durably monitored. You may finish this turn; "
+            "Job job-17 is durably monitored. W&B run: "
+            "run-abc. You may finish this turn; "
             "the controller will resume this same conversation "
             f"({conversation_id}) when action is needed."
         )
+    finally:
+        monitors.close()
+
+
+def test_student_metric_monitor_accepts_an_associated_explicit_wandb_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    supervisor, monitors, conversation_id = launch_local_job(
+        tmp_path,
+        ("run-first", "run-selected"),
+    )
+
+    try:
+        checked = capture_wandb_validation(monkeypatch)
+        local_monitor_tool(supervisor, monitors).executor(
+            MonitorJobAction(
+                job_id="job-17",
+                wandb_run_id="run-selected",
+                metrics=(MetricMonitorSpec(metric="validation/loss"),),
+            ),
+            conversation_with_wandb_key(conversation_id),
+        )
+
+        assert monitors.spec("job-17").wandb_run_id == "run-selected"
+        assert checked == [
+            (WANDB_ENTITY, WANDB_PROJECT, "run-selected", WANDB_API_KEY)
+        ]
+    finally:
+        monitors.close()
+
+
+def test_student_metric_monitor_rejects_an_unassociated_explicit_wandb_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    supervisor, monitors, conversation_id = launch_local_job(
+        tmp_path,
+        ("run-owned",),
+    )
+
+    try:
+        checked = capture_wandb_validation(monkeypatch)
+        with pytest.raises(ValueError, match="associated with job"):
+            local_monitor_tool(supervisor, monitors).executor(
+                MonitorJobAction(
+                    job_id="job-17",
+                    wandb_run_id="run-foreign",
+                    metrics=(MetricMonitorSpec(metric="validation/loss"),),
+                ),
+                conversation_with_wandb_key(conversation_id),
+            )
+
+        assert checked == []
+        monitor = monitors.spec("job-17")
+        assert monitor.metrics == ()
+        assert monitor.wandb_run_id is None
+    finally:
+        monitors.close()
+
+
+@pytest.mark.parametrize(
+    "wandb_run_ids",
+    [(), ("run-first", "run-second")],
+    ids=["no-discovered-run", "ambiguous-discovered-runs"],
+)
+def test_student_metric_monitor_requires_explicit_wandb_binding_when_not_unique(
+    tmp_path: Path,
+    wandb_run_ids: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    supervisor, monitors, conversation_id = launch_local_job(
+        tmp_path,
+        wandb_run_ids,
+    )
+
+    try:
+        checked = capture_wandb_validation(monkeypatch)
+        with pytest.raises(ValueError, match="wandb_run_id"):
+            local_monitor_tool(supervisor, monitors).executor(
+                MonitorJobAction(
+                    job_id="job-17",
+                    metrics=(MetricMonitorSpec(metric="validation/loss"),),
+                ),
+                conversation_with_wandb_key(conversation_id),
+            )
+        assert checked == []
+    finally:
+        monitors.close()
+
+
+def test_student_metric_monitor_rejects_a_run_outside_the_configured_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    supervisor, monitors, conversation_id = launch_local_job(
+        tmp_path,
+        ("run-owned",),
+    )
+    checked: list[tuple[str, str, str, str | None]] = []
+
+    def reject(source, run_id):
+        checked.append((source.entity, source.project, run_id, source.api_key))
+        raise ValueError("run is unavailable in the configured project")
+
+    monkeypatch.setattr(WandbJobStatusSource, "get_job_status", reject)
+
+    try:
+        with pytest.raises(ValueError, match="configured project"):
+            local_monitor_tool(supervisor, monitors).executor(
+                MonitorJobAction(
+                    job_id="job-17",
+                    metrics=(MetricMonitorSpec(metric="validation/loss"),),
+                ),
+                conversation_with_wandb_key(conversation_id),
+            )
+
+        assert checked == [
+            (WANDB_ENTITY, WANDB_PROJECT, "run-owned", WANDB_API_KEY)
+        ]
+        monitor = monitors.spec("job-17")
+        assert monitor.metrics == ()
+        assert monitor.wandb_run_id is None
+    finally:
+        monitors.close()
+
+
+def test_student_terminal_only_monitor_needs_no_wandb_run(tmp_path: Path):
+    supervisor, monitors, conversation_id = launch_local_job(tmp_path, ())
+
+    try:
+        observation = MonitorJobTool.create(supervisor, monitors)[0].executor(
+            MonitorJobAction(job_id="job-17"),
+            SimpleNamespace(id=conversation_id),
+        )
+
+        assert observation.status == "monitoring"
+        monitor = monitors.spec("job-17")
+        assert monitor.metrics == ()
+        assert monitor.wandb_run_id is None
+    finally:
+        monitors.close()
+
+
+def test_student_terminal_only_monitor_rejects_unused_wandb_binding(tmp_path: Path):
+    supervisor, monitors, conversation_id = launch_local_job(
+        tmp_path,
+        ("run-owned",),
+    )
+
+    try:
+        with pytest.raises(ValueError, match="requires at least one metric"):
+            MonitorJobTool.create(supervisor, monitors)[0].executor(
+                MonitorJobAction(job_id="job-17", wandb_run_id="run-owned"),
+                SimpleNamespace(id=conversation_id),
+            )
     finally:
         monitors.close()
 
@@ -659,7 +899,11 @@ def test_advisor_monitor_job_uses_external_wandb_ids_without_local_ownership(
         "get_job_status",
         lambda source, job_id: checked.append((job_id, source.api_key)),
     )
-    action = MonitorJobAction(job_id="wandb.run-17")
+    action = AdvisorMonitorJobAction(job_id="wandb.run-17")
+    metric_action = AdvisorMonitorJobAction(
+        job_id="wandb.run-17",
+        metrics=(MetricMonitorSpec(metric="validation/loss"),),
+    )
     first = uuid.uuid4()
     second = uuid.uuid4()
     registry = SecretRegistry()
@@ -675,15 +919,19 @@ def test_advisor_monitor_job_uses_external_wandb_ids_without_local_ownership(
     )
 
     try:
-        executor(action, first_conversation)
-        observation = executor(action, second_conversation)
+        terminal_observation = executor(action, first_conversation)
+        assert "W&B run:" not in terminal_observation.to_llm_content[0].text
+        observation = executor(metric_action, second_conversation)
 
         assert checked == [
             ("wandb.run-17", "registered-wandb-key"),
             ("wandb.run-17", "registered-wandb-key"),
         ]
         assert observation.job_id == "wandb.run-17"
-        assert executor.store.spec("wandb.run-17").conversation_id == second
+        monitor = executor.store.spec("wandb.run-17")
+        assert monitor.conversation_id == second
+        assert monitor.wandb_run_id == "wandb.run-17"
+        assert "wandb_run_id" not in tools[0].action_type.model_fields
     finally:
         close_job_runtimes()
 

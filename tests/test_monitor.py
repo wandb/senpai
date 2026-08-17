@@ -39,6 +39,7 @@ def test_absolute_gate_emits_once_when_the_threshold_is_crossed(
     spec = JobMonitorSpec(
         job_id="job-1",
         conversation_id=uuid4(),
+        wandb_run_id="run-1",
         metrics=(
             MetricMonitorSpec(
                 metric="score",
@@ -101,6 +102,7 @@ def test_change_gate_compares_with_the_first_sample_not_the_previous_one(
     spec = JobMonitorSpec(
         job_id="job-1",
         conversation_id=uuid4(),
+        wandb_run_id="run-1",
         metrics=(
             MetricMonitorSpec(
                 metric="score",
@@ -168,6 +170,7 @@ def test_terminal_status_preempts_metric_and_staleness_signals(
     spec = JobMonitorSpec(
         job_id="job-1",
         conversation_id=uuid4(),
+        wandb_run_id="run-1",
         metrics=(
             MetricMonitorSpec(
                 metric="accuracy",
@@ -205,6 +208,7 @@ def test_old_metric_sample_emits_one_stale_signal():
     spec = JobMonitorSpec(
         job_id="job-1",
         conversation_id=uuid4(),
+        wandb_run_id="run-1",
         metrics=(MetricMonitorSpec(metric="accuracy", stale_after_seconds=60),),
     )
     old = MetricSample(value=0.7, observed_at=NOW - timedelta(minutes=2))
@@ -253,6 +257,7 @@ def test_three_metric_policies_evaluate_independently():
     spec = JobMonitorSpec(
         job_id="job-1",
         conversation_id=uuid4(),
+        wandb_run_id="run-1",
         metrics=(
             MetricMonitorSpec(
                 metric="val/loss",
@@ -297,10 +302,17 @@ def test_three_metric_policies_evaluate_independently():
 
 def test_metric_policy_count_and_names_are_validated():
     conversation_id = uuid4()
+    with pytest.raises(ValueError, match="require a W&B run ID"):
+        JobMonitorSpec(
+            job_id="job-1",
+            conversation_id=conversation_id,
+            metrics=(MetricMonitorSpec(metric="loss"),),
+        )
     with pytest.raises(ValueError, match="at most 3 items"):
         JobMonitorSpec(
             job_id="job-1",
             conversation_id=conversation_id,
+            wandb_run_id="run-1",
             metrics=tuple(
                 MetricMonitorSpec(metric=f"metric-{index}") for index in range(4)
             ),
@@ -309,6 +321,7 @@ def test_metric_policy_count_and_names_are_validated():
         JobMonitorSpec(
             job_id="job-1",
             conversation_id=conversation_id,
+            wandb_run_id="run-1",
             metrics=(
                 MetricMonitorSpec(metric="loss"),
                 MetricMonitorSpec(metric="loss"),
@@ -333,6 +346,7 @@ def test_changed_policy_gets_distinct_signal_identity():
     first = JobMonitorSpec(
         job_id="run-1",
         conversation_id=conversation_id,
+        wandb_run_id="run-1",
         metrics=(
             MetricMonitorSpec(
                 metric="score",
@@ -344,6 +358,7 @@ def test_changed_policy_gets_distinct_signal_identity():
     changed = JobMonitorSpec(
         job_id=first.job_id,
         conversation_id=conversation_id,
+        wandb_run_id="run-1",
         metrics=(
             MetricMonitorSpec(
                 metric="score",

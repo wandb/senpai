@@ -63,6 +63,11 @@ class JobMonitorSpec(Contract):
 
     job_id: str = Field(min_length=1)
     conversation_id: UUID
+    wandb_run_id: str | None = Field(
+        default=None,
+        min_length=1,
+        description="W&B run bound to every metric policy for this registration.",
+    )
     metrics: tuple[MetricMonitorSpec, ...] = Field(default=(), max_length=3)
     poll_interval_seconds: float = Field(default=60, ge=5)
     registered_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -71,6 +76,8 @@ class JobMonitorSpec(Contract):
         names = [policy.metric for policy in self.metrics]
         if len(names) != len(set(names)):
             raise ValueError("metric policies must use unique metric names")
+        if self.metrics and self.wandb_run_id is None:
+            raise ValueError("metric policies require a W&B run ID")
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +102,8 @@ class MonitorSignal(Contract):
     ]
     dedupe_key: str
     job_id: str
+    conversation_id: UUID
+    wandb_run_id: str | None = None
     metric: str | None = None
     value: float | None = None
     state: JobState | None = None
@@ -113,7 +122,6 @@ class MonitorEvaluation(Contract):
 class MonitoredJobStatus(Protocol):
     state: JobState
     exit_code: int | None
-    wandb_run_ids: tuple[str, ...]
 
 
 def evaluate_monitor(
@@ -144,7 +152,7 @@ def evaluate_monitor(
     }
 
     if result.state is not JobState.RUNNING:
-        signal = _terminal_signal(spec.job_id, result)
+        signal = _terminal_signal(spec, result)
         return (
             MonitorEvaluation(
                 signals=() if signal.dedupe_key in emitted else (signal,)
@@ -174,6 +182,8 @@ def evaluate_monitor(
                         kind="metric_gate",
                         dedupe_key=key,
                         job_id=spec.job_id,
+                        conversation_id=spec.conversation_id,
+                        wandb_run_id=spec.wandb_run_id,
                         metric=policy.metric,
                         value=sample.value,
                         state=result.state,
@@ -201,6 +211,8 @@ def evaluate_monitor(
                     kind="metric_stale",
                     dedupe_key=stale_key,
                     job_id=spec.job_id,
+                    conversation_id=spec.conversation_id,
+                    wandb_run_id=spec.wandb_run_id,
                     metric=policy.metric,
                     value=latest.value if latest is not None else None,
                     state=result.state,
@@ -246,7 +258,7 @@ def _signal_key(spec: JobMonitorSpec, suffix: str) -> str:
 
 
 def _terminal_signal(
-    job_id: str,
+    spec: JobMonitorSpec,
     result: MonitoredJobStatus,
 ) -> MonitorSignal:
     hard_failure = result.state in {
@@ -256,8 +268,10 @@ def _terminal_signal(
     }
     return MonitorSignal(
         kind="job_status",
-        dedupe_key=f"{job_id}:status:{result.state.value}",
-        job_id=job_id,
+        dedupe_key=f"{spec.job_id}:status:{result.state.value}",
+        job_id=spec.job_id,
+        conversation_id=spec.conversation_id,
+        wandb_run_id=spec.wandb_run_id,
         state=result.state,
         detail=(
             f"Job reached terminal state {result.state.value}"
@@ -618,6 +632,8 @@ class JobMonitorStore:
                 f"monitor_error:{metric or 'status'}:{type(error).__name__}",
             ),
             job_id=spec.job_id,
+            conversation_id=spec.conversation_id,
+            wandb_run_id=spec.wandb_run_id,
             metric=metric,
             state=state,
             detail=_monitor_error_detail(error),
@@ -710,7 +726,7 @@ class JobMonitorStore:
                 return None
             if generation is not None and int(row[2]) != generation:
                 return None
-            signal = _terminal_signal(job_id, result)
+            signal = _terminal_signal(current, result)
             cursor = self.connection.execute(
                 """
                 INSERT OR IGNORE INTO monitor_signals
@@ -798,7 +814,6 @@ class WandbJobStatus:
     job_id: str
     state: JobState
     exit_code: int | None
-    wandb_run_ids: tuple[str, ...]
 
 
 class WandbJobStatusSource:
@@ -833,7 +848,6 @@ class WandbJobStatusSource:
             job_id=job_id,
             state=job_state,
             exit_code=None,
-            wandb_run_ids=(job_id,),
         )
 
     def _run(self, run_id: str) -> WandbRunState:
@@ -959,15 +973,14 @@ class JobMonitorEngine:
             previous: dict[str, MetricSample | None] = {}
             baseline: dict[str, MetricSample | None] = {}
             unavailable: set[str] = set()
+            wandb_run_id = spec.wandb_run_id
+            if spec.metrics:
+                assert wandb_run_id is not None
             for policy in spec.metrics:
                 try:
-                    samples[policy.metric] = (
-                        self.metrics.latest(
-                            result.wandb_run_ids[-1],
-                            policy.metric,
-                        )
-                        if result.wandb_run_ids
-                        else None
+                    samples[policy.metric] = self.metrics.latest(
+                        wandb_run_id,
+                        policy.metric,
                     )
                 except Exception as error:  # noqa: BLE001
                     unavailable.add(policy.metric)
@@ -1050,22 +1063,29 @@ class JobMonitorMailbox:
 
     def poll(self) -> tuple[ControllerEvent, ...]:
         self.engine.poll()
-        return tuple(
-            ControllerEvent(
-                kind="job_monitor",
-                dedupe_key=signal.dedupe_key,
-                payload={
-                    "conversation_id": str(
-                        self.store.spec(signal.job_id).conversation_id
-                    ),
-                    "job_id": signal.job_id,
-                    "summary": signal.detail,
-                    "reason": "The registered job monitor emitted this signal.",
-                    "signal": signal.model_dump(mode="json", exclude_none=True),
-                },
+        events: list[ControllerEvent] = []
+        for signal in self.store.pending_signals():
+            payload = {
+                "conversation_id": str(signal.conversation_id),
+                "job_id": signal.job_id,
+                "summary": signal.detail,
+                "reason": "The registered job monitor emitted this signal.",
+                "signal": signal.model_dump(
+                    mode="json",
+                    exclude_none=True,
+                    exclude={"conversation_id", "wandb_run_id"},
+                ),
+            }
+            if signal.wandb_run_id is not None:
+                payload["wandb_run_id"] = signal.wandb_run_id
+            events.append(
+                ControllerEvent(
+                    kind="job_monitor",
+                    dedupe_key=signal.dedupe_key,
+                    payload=payload,
+                )
             )
-            for signal in self.store.pending_signals()
-        )
+        return tuple(events)
 
     def acknowledge(self, dedupe_keys: Sequence[str]) -> None:
         for key in dedupe_keys:
