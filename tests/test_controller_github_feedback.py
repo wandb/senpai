@@ -138,7 +138,12 @@ class Turns:
         inbox_turn_id,
     ):
         self.calls.append(
-            (prompt, conversation_id, event_keys, visible_event_keys)
+            (
+                prompt,
+                conversation_id,
+                event_keys,
+                visible_event_keys,
+            )
         )
         result = TurnResult(exit_code=next(self.exit_codes, 0))
         if result.exit_code == 0:
@@ -633,7 +638,7 @@ def test_feedback_stays_pending_and_bound_until_a_student_turn_succeeds(
     run_student_controller(tmp_path, revised, turns)
     assert [
         next(iter(event_keys)).split(":", 1)[0]
-        for _, _, event_keys, _ in turns.calls
+        for _, _, event_keys, *_ in turns.calls
     ] == ["student_pr_feedback", "student_assignment"]
 
     restarted = student_mailbox(
@@ -674,7 +679,7 @@ def test_controller_drains_feedback_batches_oldest_first_after_success(
             for key in event_keys
             if key.startswith("student_pr_feedback:")
         )
-        for _, _, event_keys, _ in turns.calls
+        for _, _, event_keys, *_ in turns.calls
     ]
     assert feedback_batches == [[140, 141], [142, 143], [144]]
     assert not any(event.kind == "student_pr_feedback" for event in mailbox.poll())

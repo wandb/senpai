@@ -4,13 +4,14 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from senpai_agent.training import training_result_paths
+from senpai_agent.jobs import job_result_paths
 
 
 QUEUED_FEEDBACK_MARKER = "queued-feedback-pending"
@@ -113,19 +114,14 @@ def _without_literal_file_heredocs(command: str) -> str:
     tree = Parser(Language(tree_sitter_bash.language())).parse(source)
     if tree.root_node.has_error:
         return command
-    if any(
-        node.type == "function_definition"
-        for node in _descendants(tree.root_node)
-    ):
+    if any(node.type == "function_definition" for node in _descendants(tree.root_node)):
         return command
 
     policy_source = bytearray(source)
     nodes = [tree.root_node]
     while nodes:
         node = nodes.pop()
-        if node.type == "heredoc_redirect" and _is_literal_cat_file_sink(
-            node, source
-        ):
+        if node.type == "heredoc_redirect" and _is_literal_cat_file_sink(node, source):
             start = next(
                 child for child in node.children if child.type == "heredoc_start"
             )
@@ -158,9 +154,7 @@ def _is_literal_cat_file_sink(node: object, source: bytes) -> bool:
         if redirect.type == "file_redirect"
     ]
     stdout_redirects = [
-        redirect
-        for redirect in redirects
-        if _redirects_stdout(redirect, source)
+        redirect for redirect in redirects if _redirects_stdout(redirect, source)
     ]
     if not stdout_redirects:
         return False
@@ -195,9 +189,11 @@ def _redirects_stdout_to_literal_file(redirect: object, source: bytes) -> bool:
     ):
         return False
     target = source[destination.start_byte : destination.end_byte].strip(b"'\"")
-    return target not in {b"-", b"/dev/stdout", b"/dev/stderr"} and not target.startswith(
-        (b"/dev/fd/", b"/proc/")
-    )
+    return target not in {
+        b"-",
+        b"/dev/stdout",
+        b"/dev/stderr",
+    } and not target.startswith((b"/dev/fd/", b"/proc/"))
 
 
 def _descendants(root: object) -> list[object]:
@@ -296,8 +292,12 @@ def _gh_policy(tokens: list[str], index: int) -> PolicyDecision:
             False,
             f"Use a typed Senpai GitHub tool for `gh {noun}` mutations.",
         )
-    if noun == "pr" and operation == "checks" and any(
-        value == "--watch" or value.startswith("--watch=") for value in remaining
+    if (
+        noun == "pr"
+        and operation == "checks"
+        and any(
+            value == "--watch" or value.startswith("--watch=") for value in remaining
+        )
     ):
         return PolicyDecision(
             False,
@@ -496,7 +496,13 @@ def _git_policy(arguments: list[str]) -> PolicyDecision:
     )
 
 
-def _segment_policy(tokens: list[str]) -> PolicyDecision:
+def _segment_policy(
+    tokens: list[str],
+    *,
+    role: str,
+    workspace: Path,
+    supervised: bool = False,
+) -> PolicyDecision:
     index = _program_index(tokens)
     if index is None:
         return PolicyDecision(True)
@@ -504,23 +510,69 @@ def _segment_policy(tokens: list[str]) -> PolicyDecision:
 
     arguments = tokens[index + 1 :]
     if program in _SHELL_BODY_PREFIXES:
-        return _segment_policy(arguments)
+        return _segment_policy(
+            arguments,
+            role=role,
+            workspace=workspace,
+            supervised=supervised,
+        )
     if program == "env":
         command = _env_command(arguments)
-        return _segment_policy(command) if command else PolicyDecision(True)
+        return (
+            _segment_policy(
+                command,
+                role=role,
+                workspace=workspace,
+                supervised=supervised,
+            )
+            if command
+            else PolicyDecision(True)
+        )
     if program in {"command", "exec", "nohup"}:
         command = _wrapper_command(arguments)
-        return _segment_policy(command) if command else PolicyDecision(True)
+        return (
+            _segment_policy(
+                command,
+                role=role,
+                workspace=workspace,
+                supervised=supervised,
+            )
+            if command
+            else PolicyDecision(True)
+        )
     if program == "timeout":
         command = _timeout_command(arguments)
-        return _segment_policy(command) if command else PolicyDecision(True)
+        return (
+            _segment_policy(
+                command,
+                role=role,
+                workspace=workspace,
+                supervised=supervised,
+            )
+            if command
+            else PolicyDecision(True)
+        )
     if program == "setsid":
         command = _wrapper_command(arguments)
-        return _segment_policy(command) if command else PolicyDecision(True)
+        return (
+            _segment_policy(
+                command,
+                role=role,
+                workspace=workspace,
+                supervised=supervised,
+            )
+            if command
+            else PolicyDecision(True)
+        )
     if program in {"bash", "dash", "sh", "zsh"}:
         command = _shell_command(arguments)
         if command is not None:
-            return terminal_policy(command, "", Path.cwd())
+            return _command_policy(
+                command,
+                role=role,
+                workspace=workspace,
+                supervised=supervised,
+            )
     if program == "eval":
         return PolicyDecision(
             False,
@@ -535,21 +587,32 @@ def _segment_policy(tokens: list[str]) -> PolicyDecision:
         return _curl_policy(tokens, index)
 
     if program == "uv" and arguments[:1] == ["run"]:
-        return _segment_policy(tokens[index + 2 :])
-    if program.startswith("python") and _python_launches_training(tokens, index):
-        return PolicyDecision(
-            False,
-            "Use run_training so timeouts, logs, status, and W&B IDs are supervised.",
+        return _segment_policy(
+            tokens[index + 2 :],
+            role=role,
+            workspace=workspace,
+            supervised=supervised,
         )
     if (
-        program in _TRAIN_LAUNCHERS or _TRAIN_SCRIPT.fullmatch(program)
-    ) and not _help_only(arguments):
+        not supervised
+        and program.startswith("python")
+        and _python_launches_training(tokens, index)
+    ):
         return PolicyDecision(
             False,
-            "Use run_training so timeouts, logs, status, and W&B IDs are supervised.",
+            "Use run_job so timeouts, logs, status, and W&B IDs are supervised.",
+        )
+    if (
+        not supervised
+        and (program in _TRAIN_LAUNCHERS or _TRAIN_SCRIPT.fullmatch(program))
+        and not _help_only(arguments)
+    ):
+        return PolicyDecision(
+            False,
+            "Use run_job so timeouts, logs, status, and W&B IDs are supervised.",
         )
 
-    if program == "for":
+    if not supervised and program == "for":
         if any("((" in argument for argument in arguments):
             return PolicyDecision(
                 False,
@@ -557,20 +620,63 @@ def _segment_policy(tokens: list[str]) -> PolicyDecision:
                 "events or status tools.",
             )
         return PolicyDecision(True)
-    if program in {"sleep", "watch", "while", "until"}:
+    if not supervised and program in {"sleep", "watch", "while", "until"}:
         return PolicyDecision(
             False,
             "Do not run foreground polling loops; use Senpai events or status tools.",
         )
-    if program == "tail" and any(
-        argument == "--follow" or argument.startswith("-") and "f" in argument[1:]
-        for argument in tokens[index + 1 :]
+    if (
+        not supervised
+        and program == "tail"
+        and any(
+            argument == "--follow" or argument.startswith("-") and "f" in argument[1:]
+            for argument in tokens[index + 1 :]
+        )
     ):
         return PolicyDecision(
             False,
-            "Do not stream logs; use get_training_status for bounded updates.",
+            "Do not stream logs; use get_job_status for bounded updates.",
         )
     return PolicyDecision(True)
+
+
+def _command_policy(
+    command: str,
+    *,
+    role: str,
+    workspace: Path,
+    supervised: bool,
+) -> PolicyDecision:
+    if not supervised and _has_background_command(command):
+        return PolicyDecision(
+            False,
+            "Use run_job for background or detached work so its process group, "
+            "workspace lease, logs, and terminal state remain supervised.",
+        )
+    for segment in _command_segments(command):
+        decision = _segment_policy(
+            segment,
+            role=role,
+            workspace=workspace,
+            supervised=supervised,
+        )
+        if not decision.allowed:
+            return decision
+    return PolicyDecision(True)
+
+
+def _has_background_command(command: str) -> bool:
+    import tree_sitter_bash
+    from tree_sitter import Language, Parser
+
+    source = _without_literal_file_heredocs(command).encode()
+    root = Parser(Language(tree_sitter_bash.language())).parse(source).root_node
+    return any(
+        node.type == "&"
+        and node.parent is not None
+        and node.parent.type != "binary_expression"
+        for node in _descendants(root)
+    )
 
 
 def terminal_policy(
@@ -578,12 +684,34 @@ def terminal_policy(
     role: str,
     workspace: Path,
 ) -> PolicyDecision:
-    del role, workspace
-    for segment in _command_segments(command):
-        decision = _segment_policy(segment)
-        if not decision.allowed:
-            return decision
-    return PolicyDecision(True)
+    return _command_policy(
+        command,
+        role=role,
+        workspace=workspace,
+        supervised=False,
+    )
+
+
+def supervised_job_policy(
+    argv: Sequence[str],
+    role: str,
+    workspace: Path,
+) -> PolicyDecision:
+    """Apply terminal safety rules to structured, supervisor-bounded argv.
+
+    Supervision makes long-running commands safe to launch, but it does not
+    make hidden shell evaluation or GitHub mutations safe. Nested shell bodies
+    and wrappers therefore receive the same recursive policy evaluation.
+    """
+
+    if not argv or not argv[0] or any("\0" in value for value in argv):
+        return PolicyDecision(False, "Job argv must contain valid non-empty words.")
+    return _segment_policy(
+        list(argv),
+        role=role,
+        workspace=workspace,
+        supervised=True,
+    )
 
 
 def _stop_policy(
@@ -593,26 +721,30 @@ def _stop_policy(
     *,
     require_clean_workspace: bool = True,
 ) -> PolicyDecision:
-    if role != "student" or not (working_dir / ".git").exists():
+    if role not in {"advisor", "student"} or not (working_dir / ".git").exists():
         return PolicyDecision(True)
     if state_dir is not None:
+        from senpai_agent.state import job_state_dir
+
+        jobs_dir = job_state_dir(state_dir)
         running = {
             path.stem
-            for path in training_result_paths(state_dir / "training")
+            for path in job_result_paths(jobs_dir)
             if json.loads(path.read_text()).get("state") == "running"
         }
-        monitored = {
-            path.stem for path in (state_dir / "training" / "monitors").glob("*.json")
-        }
+        monitored = _active_monitor_ids(jobs_dir / "monitors.sqlite3")
         unmonitored = running - monitored
         if unmonitored:
             return PolicyDecision(
                 False,
-                "Training is still running without the terminal monitor that "
-                "run_training normally registers; call monitor_training to "
-                "repair it before finishing: "
+                "A job is still running without the terminal monitor that "
+                "run_job normally registers. Do not finish until the orphan "
+                "has been inspected and cancelled or the controller has been "
+                "repaired: "
                 f"{', '.join(sorted(unmonitored))}",
             )
+    if role == "advisor":
+        return PolicyDecision(True)
     if require_clean_workspace:
         status = subprocess.run(
             ["git", "status", "--porcelain"],
@@ -624,10 +756,25 @@ def _stop_policy(
         if status.strip():
             return PolicyDecision(
                 False,
-                "Commit the exact implementation before training or discard "
+                "Commit the exact implementation before a job or discard "
                 "incidental assignment changes before finishing.",
             )
     return PolicyDecision(True)
+
+
+def _active_monitor_ids(database: Path) -> set[str]:
+    if not database.is_file():
+        return set()
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    try:
+        return {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT job_id FROM monitors WHERE active = 1"
+            )
+        }
+    finally:
+        connection.close()
 
 
 def _emit(decision: PolicyDecision) -> int:

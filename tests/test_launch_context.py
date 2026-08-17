@@ -6,7 +6,9 @@ import yaml
 from launch_test_support import launch, launch_args, render_role
 from senpai_agent.launch_context import (
     INSTRUCTIONS_ROOT,
+    LAUNCH_CONTEXT_ENV,
     PLACEHOLDER,
+    render_launch_context,
     render_role_prompt,
 )
 from senpai_agent.program_context import ProgramSystemPrompt
@@ -14,10 +16,7 @@ from senpai_agent.system_instructions import SenpaiSystemInstructions
 
 
 def test_default_fleet_is_four_students_with_one_gpu_each():
-    args = launch.Args(
-        tag="defaults",
-        target_repo_url="https://github.com/example/problem.git",
-    )
+    args = launch_args()
 
     assert args.n_students == 4
     assert args.gpus_per_student == 1
@@ -35,11 +34,15 @@ def test_launch_context_records_resolved_runtime_facts(backend):
         max_epochs=7,
     )
 
-    context = launch.build_launch_context(
-        args,
-        args.tag,
-        ["fern", "frieren"],
+    context = render_launch_context(
         backend=backend,
+        gpus_per_student=args.gpus_per_student,
+        timeout_minutes=args.timeout_minutes,
+        max_epochs=args.max_epochs,
+        tag=args.tag,
+        advisor_branch=args.advisor_branch,
+        target_base=args.target_repo_branch,
+        students=["fern", "frieren"],
     )
 
     assert "resolved by the Senpai launcher" in context
@@ -60,17 +63,25 @@ def test_launch_context_records_resolved_runtime_facts(backend):
 def test_launch_context_limits_each_role_to_its_assigned_students():
     args = launch_args(tag="bounded", advisor_branch="research")
 
-    advisor = launch.build_launch_context(
-        args,
-        args.tag,
-        ["fern", "stark"],
+    advisor = render_launch_context(
         backend="kubernetes",
+        gpus_per_student=args.gpus_per_student,
+        timeout_minutes=args.timeout_minutes,
+        max_epochs=args.max_epochs,
+        tag=args.tag,
+        advisor_branch=args.advisor_branch,
+        target_base=args.target_repo_branch,
+        students=["fern", "stark"],
     )
-    student = launch.build_launch_context(
-        args,
-        args.tag,
-        ["stark"],
+    student = render_launch_context(
         backend="kubernetes",
+        gpus_per_student=args.gpus_per_student,
+        timeout_minutes=args.timeout_minutes,
+        max_epochs=args.max_epochs,
+        tag=args.tag,
+        advisor_branch=args.advisor_branch,
+        target_base=args.target_repo_branch,
+        students=["stark"],
     )
 
     assert "fern, stark" in advisor
@@ -90,7 +101,7 @@ def test_each_role_receives_authoritative_launch_context(role):
     configmap, _deployment, _secret = render_role(role, args)
     data = yaml.safe_load(configmap)["data"]
     context = base64.b64decode(
-        data[launch.LAUNCH_CONTEXT_ENV], validate=True
+        data[LAUNCH_CONTEXT_ENV], validate=True
     ).decode()
     operator = base64.b64decode(
         data["EXTRA_INSTRUCTIONS_B64"], validate=True
@@ -104,6 +115,27 @@ def test_each_role_receives_authoritative_launch_context(role):
     )
     assert "Prefer small, measurable experiments." not in context
     assert operator == "Prefer small, measurable experiments."
+
+
+def test_long_multiline_operator_instructions_remain_mutable_literal_text():
+    instructions = (
+        "program.md can be found in senpai/program.md\n\n"
+        "Campaign authority:\n"
+        + "- Every role may submit a distinct validated candidate.\n" * 20
+    )
+    args = launch_args(extra_instructions=instructions)
+
+    configmap, _deployment, _secret = render_role("advisor", args)
+    data = yaml.safe_load(configmap)["data"]
+    context = base64.b64decode(
+        data[LAUNCH_CONTEXT_ENV], validate=True
+    ).decode()
+    operator = base64.b64decode(
+        data["EXTRA_INSTRUCTIONS_B64"], validate=True
+    ).decode()
+
+    assert instructions.rstrip() not in context
+    assert operator == instructions.rstrip()
 
 
 def test_launch_context_source_is_combined():

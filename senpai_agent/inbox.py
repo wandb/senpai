@@ -23,12 +23,23 @@ MAX_EVENT_BYTES_PER_TURN = 64 * 1024
 # Bounds failed worker restarts, not time or activity within one inference run.
 MAX_INFERENCE_ATTEMPTS_PER_TURN = 36
 QUEUE_PRIORITY = 1
-STEER_PRIORITY = 2
+JOB_PRIORITY = 100
+STEER_PRIORITY = 200
 STEERING_PRIORITIES = {
     "human_issue": STEER_PRIORITY,
     "student_pr_feedback": QUEUE_PRIORITY,
 }
 _SENDER_PREFIX = "senpai-delivery:"
+
+
+def event_priority(kind: str) -> int:
+    if kind == "human_issue":
+        return STEER_PRIORITY
+    if kind == "job_monitor":
+        return JOB_PRIORITY
+    if kind == "student_pr_feedback":
+        return QUEUE_PRIORITY
+    return 0
 
 
 class DeliveryState(StrEnum):
@@ -293,6 +304,8 @@ class PersistentInbox:
             raise ValueError("event key must not be empty")
         if not body:
             raise ValueError("event body must not be empty")
+        if priority < 0:
+            raise ValueError("event priority must not be negative")
         _require_event_payload(database, conversation, event_key, body)
         existing = self._live_event_message(database, conversation, event_key)
         if existing is not None:
@@ -506,21 +519,35 @@ class PersistentInbox:
                 """,
                 (conversation,),
             ).fetchall()
-            selected: list[sqlite3.Row] = []
-            selected_bytes = 0
             legacy_batch = bool(pending and pending[0]["legacy"])
-            for row in pending:
-                if bool(row["legacy"]) != legacy_batch:
-                    break
-                size = len(row["body"].encode("utf-8"))
-                if selected and (
-                    len(selected) >= max_events or selected_bytes + size > max_bytes
-                ):
-                    break
-                selected.append(row)
-                selected_bytes += size
-                if len(selected) >= max_events:
-                    break
+            candidates = [
+                row for row in pending if bool(row["legacy"]) == legacy_batch
+            ]
+            selected = _select_pending_rows(
+                candidates,
+                max_events=max_events,
+                max_bytes=max_bytes,
+            )
+            has_human_steer = any(
+                row["priority"] >= STEER_PRIORITY for row in candidates
+            )
+            if not legacy_batch and max_events > 1 and not has_human_steer:
+                ordinary = next(
+                    (row for row in candidates if row["priority"] == 0),
+                    None,
+                )
+                if ordinary is not None and ordinary not in selected:
+                    ordinary_size = len(ordinary["body"].encode("utf-8"))
+                    if ordinary_size > max_bytes:
+                        selected = [ordinary]
+                    else:
+                        selected = _select_pending_rows(
+                            [row for row in candidates if row is not ordinary],
+                            max_events=max_events - 1,
+                            max_bytes=max_bytes - ordinary_size,
+                            allow_oversized_first=False,
+                        )
+                        selected.append(ordinary)
             if not selected:
                 return None
 
@@ -1690,6 +1717,28 @@ def _require_event_payload(
         raise RuntimeError(
             f"event {event_key!r} was reused with a different payload"
         )
+
+
+def _select_pending_rows(
+    rows: Sequence[sqlite3.Row],
+    *,
+    max_events: int,
+    max_bytes: int,
+    allow_oversized_first: bool = True,
+) -> list[sqlite3.Row]:
+    selected: list[sqlite3.Row] = []
+    selected_bytes = 0
+    for row in rows:
+        size = len(row["body"].encode("utf-8"))
+        if not selected and size > max_bytes and not allow_oversized_first:
+            break
+        if selected and (
+            len(selected) >= max_events or selected_bytes + size > max_bytes
+        ):
+            break
+        selected.append(row)
+        selected_bytes += size
+    return selected
 
 
 def _message(row: sqlite3.Row) -> InboxMessage:

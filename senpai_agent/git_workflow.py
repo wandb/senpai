@@ -24,14 +24,14 @@ class PushResult:
     head_sha: str
 
 
-def require_clean_training_worktree(workspace: Path) -> None:
-    """Require every tracked and untracked assignment change to be committed."""
+def require_clean_job_worktree(workspace: Path) -> None:
+    """Require a student job to run against committed assignment state."""
 
     workspace = Path(workspace).resolve()
     _git(workspace, "rev-parse", "--is-inside-work-tree")
     if _git(workspace, "status", "--porcelain", "--untracked-files=all"):
         raise GitWorkflowPreconditionError(
-            "assignment worktree must be clean before training"
+            "student assignment worktree must be clean before run_job"
         )
 
 

@@ -39,10 +39,7 @@ from senpai_agent.program_context import PROGRAM_PATH_ENV
 from senpai_agent.PROMPTS import (
     AWAIT_AGENTS_SATISFIED_PROMPT,
     AWAIT_AGENTS_TIMEOUT_PROMPT,
-    DELEGATE_AGENT_DEPRECATION_PROMPT,
     DELEGATED_SEARCH_MODE_PROMPT,
-    DELEGATED_TASK_BACKGROUND_PROMPT,
-    DELEGATED_TASK_FINISHED_PROMPT,
     DELEGATED_TASK_PROMPT,
     DELEGATED_TASK_WITH_CONTEXT_PROMPT,
     render_prompt,
@@ -160,6 +157,9 @@ class DelegationConfig:
     role: str
     program_path: str
     launch_context: str
+    local_condenser_max_events: int = 0
+    local_condenser_max_tokens: int = 0
+    local_condenser_target_events: int = 0
     root_state_dir: Path | None = None
     tree_id: str | None = None
     depth: int = 0
@@ -376,6 +376,15 @@ class OpenHandsChildProcess:
                 "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": (
                     self._config.frontier_reasoning_effort
                 ),
+                "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS": str(
+                    self._config.local_condenser_max_events
+                ),
+                "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS": str(
+                    self._config.local_condenser_max_tokens
+                ),
+                "SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS": str(
+                    self._config.local_condenser_target_events
+                ),
                 "SENPAI_PARENT_CONVERSATION_HISTORY_DIR": str(
                     self._config.state_dir
                     / uuid.UUID(self._request.parent_conversation_id).hex
@@ -558,46 +567,6 @@ class OpenHandsChildProcess:
                 return result.strip()
             raise RuntimeError("subagent returned no successful terminal result")
         raise RuntimeError("subagent emitted no terminal result record")
-
-
-class DelegateAgentAction(Action):
-    """Legacy action schema retained so persisted conversations can resume."""
-
-    task: str = Field(min_length=1)
-    agent: AgentKind = "general-purpose"
-    model: ModelTier = "smart"
-    background: bool = False
-    include_context: bool = False
-    search_mode: SearchMode | None = None
-
-
-class DelegateAgentObservation(Observation):
-    """Legacy observation schema retained for durable event deserialization."""
-
-    task_id: str
-    status: Literal["finished", "dispatched"]
-    result: str | None = None
-
-    @property
-    def to_llm_content(self) -> Sequence[TextContent]:
-        if self.status == "finished":
-            return [
-                TextContent(
-                    text=render_prompt(
-                        DELEGATED_TASK_FINISHED_PROMPT,
-                        TASK_ID=self.task_id,
-                        RESULT=self.result or "",
-                    )
-                )
-            ]
-        return [
-            TextContent(
-                text=render_prompt(
-                    DELEGATED_TASK_BACKGROUND_PROMPT,
-                    TASK_ID=self.task_id,
-                )
-            )
-        ]
 
 
 def resolve_task_agent(agent: TaskAgentKind) -> tuple[AgentKind, SearchMode | None]:
@@ -1853,58 +1822,6 @@ class _CancelAgentsExecutor(ToolExecutor[CancelAgentsAction, CancelAgentsObserva
         return CancelAgentsObservation(
             tasks=self.manager.cancel(action.task_ids, conversation)
         )
-
-
-class _DeprecatedDelegateAgentExecutor(
-    ToolExecutor[DelegateAgentAction, DelegateAgentObservation]
-):
-    def __call__(
-        self,
-        action: DelegateAgentAction,  # noqa: ARG002
-        conversation: LocalConversation | None = None,  # noqa: ARG002
-    ) -> DelegateAgentObservation:
-        return DelegateAgentObservation(
-            task_id="deprecated",
-            status="finished",
-            result=DELEGATE_AGENT_DEPRECATION_PROMPT,
-        )
-
-
-class DelegateAgentTool(
-    ToolDefinition[DelegateAgentAction, DelegateAgentObservation]
-):
-    """Non-launching compatibility tool for pre-lifecycle conversations."""
-
-    name = "delegate_agent"
-
-    def declared_resources(self, action: Action) -> DeclaredResources:  # noqa: ARG002
-        return DeclaredResources(keys=(), declared=True)
-
-    @classmethod
-    def create(
-        cls,
-        conv_state: object | None = None,  # noqa: ARG003
-        *,
-        event_db_path: str | Path | None = None,  # noqa: ARG003
-    ) -> Sequence[Self]:
-        return [
-            cls(
-                description=(
-                    "Deprecated compatibility tool. It never launches an agent; "
-                    "use spawn_agents and await_agents instead."
-                ),
-                action_type=DelegateAgentAction,
-                observation_type=DelegateAgentObservation,
-                annotations=ToolAnnotations(
-                    title="Deprecated agent delegation",
-                    readOnlyHint=True,
-                    destructiveHint=False,
-                    idempotentHint=True,
-                    openWorldHint=False,
-                ),
-                executor=_DeprecatedDelegateAgentExecutor(),
-            )
-        ]
 
 
 class _DelegationTool(ToolDefinition):

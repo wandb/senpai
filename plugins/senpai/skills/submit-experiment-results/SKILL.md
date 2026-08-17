@@ -91,5 +91,7 @@ Do not run `git push`, edit labels, write result markers, or call `gh pr ready`
 yourself.
 
 If any run is still active or could change the conclusion, keep the assignment
-in progress and register it with `monitor_training`; do not submit a terminal
-result.
+in progress. Start long-running work with `run_job`; it registers terminal-state
+monitoring automatically. Use `monitor_job` only when an active W&B run also
+benefits from a metric threshold or staleness policy. Do not submit a terminal
+result until the evidence is terminal.

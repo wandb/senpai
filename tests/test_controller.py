@@ -6,11 +6,12 @@ from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
+from test_agent_markdown import HTML_HEADER
 
 import senpai_agent.controller as controller_module
 from senpai_agent.controller import (
-    ConversationRecoveryExhausted,
     Controller,
+    ConversationRecoveryExhausted,
     TurnResult,
     _activity_lease,
     _full_prompt,
@@ -25,9 +26,7 @@ from senpai_agent.program_context import ProgramSystemPrompt
 from senpai_agent.state import StartedConversationLedger, WorkspaceDivergenceLedger
 from senpai_agent.supervisor import ProgressLease, WorkerLease
 from senpai_agent.system_instructions import SenpaiSystemInstructions
-from senpai_agent.workspace import WorkspaceDivergence
-from test_agent_markdown import HTML_HEADER
-
+from senpai_agent.workspace import WorkspaceDivergence, WorkspaceJobRunning
 
 CONVERSATION_ID = UUID("00000000-0000-0000-0000-000000000001")
 
@@ -61,14 +60,20 @@ class Turns:
         inbox,
         inbox_turn_id,
     ):
+        turn = inbox.turn(inbox_turn_id)
         self.calls.append(
-            (prompt, conversation_id, event_keys, visible_event_keys)
+            (
+                prompt,
+                conversation_id,
+                event_keys,
+                visible_event_keys,
+                tuple(message.body for message in turn.events),
+            )
         )
         outcome = self.outcomes.pop(0) if self.outcomes else TurnResult(exit_code=0)
         if isinstance(outcome, Exception):
             raise outcome
         if outcome.exit_code == 0:
-            turn = inbox.turn(inbox_turn_id)
             for message in turn.messages:
                 inbox.record_delivered(message.delivery_id, message.body)
             inbox.record_processed(inbox_turn_id)
@@ -82,9 +87,9 @@ def controller(mailbox, turns, **overrides):
         turns=turns,
         conversation_id=overrides.pop("conversation_id", CONVERSATION_ID),
         full_prompt=overrides.pop("full_prompt", "programme"),
-        sleep=lambda _seconds: None,
-        poll_interval_seconds=600,
-        jitter_seconds=0,
+        sleep=overrides.pop("sleep", lambda _seconds: None),
+        poll_interval_seconds=overrides.pop("poll_interval_seconds", 600),
+        jitter_seconds=overrides.pop("jitter_seconds", 0),
         **overrides,
     )
 
@@ -95,6 +100,10 @@ def review_event(number=17):
         dedupe_key=f"review_ready:{number}:abc",
         payload={"number": number},
     )
+
+
+def delivered_text(call) -> str:
+    return "\n\n".join(call[4])
 
 
 def human_event(message_id=101):
@@ -216,6 +225,77 @@ def test_empty_mailbox_does_not_start_a_model_turn():
     controller(Mailbox([(), ()]), turns, role="student").run(max_cycles=2)
 
     assert turns.calls == []
+
+
+def test_active_job_monitor_shortens_the_controller_heartbeat():
+    sleeps = []
+
+    controller(
+        Mailbox([(), ()]),
+        Turns(),
+        sleep=sleeps.append,
+        next_monitor_poll_seconds=lambda: 45,
+    ).run(max_cycles=2)
+
+    assert sleeps == [45]
+
+
+def test_idle_job_monitor_keeps_the_controller_heartbeat():
+    sleeps = []
+
+    controller(
+        Mailbox([(), ()]),
+        Turns(),
+        sleep=sleeps.append,
+        next_monitor_poll_seconds=lambda: None,
+    ).run(max_cycles=2)
+
+    assert sleeps == [600]
+
+
+@pytest.mark.parametrize(
+    ("next_poll", "expected_phase"),
+    [
+        (lambda: float("nan"), "monitor-backoff"),
+        (
+            lambda: (_ for _ in ()).throw(RuntimeError("scheduler failed")),
+            "monitor-backoff",
+        ),
+    ],
+)
+def test_invalid_monitor_schedule_uses_bounded_nonzero_backoff(
+    next_poll,
+    expected_phase,
+):
+    sleeps = []
+    phases = []
+    instance = controller(
+        Mailbox([(), ()]),
+        Turns(),
+        sleep=sleeps.append,
+        next_monitor_poll_seconds=next_poll,
+        progress=SimpleNamespace(
+            update=lambda phase, *_args, **_kwargs: phases.append(phase)
+        ),
+    )
+
+    instance.run(max_cycles=2)
+
+    assert sleeps == [5]
+    assert expected_phase in phases
+
+
+def test_due_monitor_never_creates_a_zero_sleep_hot_loop():
+    sleeps = []
+
+    controller(
+        Mailbox([(), ()]),
+        Turns(),
+        sleep=sleeps.append,
+        next_monitor_poll_seconds=lambda: 0,
+    ).run(max_cycles=2)
+
+    assert sleeps == [1]
 
 
 def test_successful_turn_repolls_immediately_and_continues_without_full_brief():
@@ -520,36 +600,7 @@ def test_older_visible_event_does_not_lose_its_reminder_to_another_turn(
             self.calls += 1
             return (older,) if self.calls <= 2 else (older, newer)
 
-    class WatcherAwareTurns(Turns):
-        def run(
-            self,
-            prompt,
-            *,
-            conversation_id,
-            event_keys,
-            visible_event_keys=frozenset(),
-            inbox,
-            inbox_turn_id,
-        ):
-            result = super().run(
-                prompt,
-                conversation_id=conversation_id,
-                event_keys=event_keys,
-                visible_event_keys=visible_event_keys,
-                inbox=inbox,
-                inbox_turn_id=inbox_turn_id,
-            )
-            if (
-                event_keys == frozenset({newer.dedupe_key})
-                and older.dedupe_key not in visible_event_keys
-            ):
-                return TurnResult(
-                    exit_code=result.exit_code,
-                    delivered_event_keys=frozenset({older.dedupe_key}),
-                )
-            return result
-
-    turns = WatcherAwareTurns()
+    turns = Turns()
     Controller(
         role="advisor",
         mailbox=PersistentMailbox([]),
@@ -733,7 +784,8 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
         github_trusted_actor=None,
         state_dir=tmp_path,
         workspace=tmp_path,
-        training_max_timeout_seconds=1800,
+        job_max_timeout_seconds=1800,
+        command_secrets={"WANDB_API_KEY": "wandb-key"},
         conversation_id=CONVERSATION_ID,
         timeout_seconds=7200,
         harness_file=tmp_path / "harness.md",
@@ -755,7 +807,7 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
         lambda _args, _env: config,
     )
     monkeypatch.setattr(runner_module, "scrub_model_credentials", lambda *_: None)
-    monkeypatch.setattr(tools_module, "close_training_runtimes", lambda: None)
+    monkeypatch.setattr(tools_module, "close_job_runtimes", lambda: None)
     monkeypatch.setattr(weave_module, "finish_weave_monitoring", lambda: None)
     monkeypatch.setattr(
         controller_module,
@@ -779,6 +831,8 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
                 "SENPAI_ROLE": "advisor",
                 "ADVISOR_BRANCH": "main",
                 "SENPAI_POLL_INTERVAL_S": "30",
+                "WANDB_ENTITY": "acme",
+                "WANDB_PROJECT": "research",
             },
         )
         == 0
@@ -901,6 +955,7 @@ def test_preserved_workspace_divergence_is_delivered_to_the_existing_turn():
     assert turns.calls[0][2] == frozenset(
         {event.dedupe_key, conflict.event.dedupe_key}
     )
+    assert "do not reset or discard local work" in delivered_text(turns.calls[0])
 
 
 def student_assignment_event():
@@ -1121,12 +1176,7 @@ def test_feedback_polled_after_a_turn_is_processed_in_the_next_turn():
     )
     mailbox = Mailbox([(assignment,), (feedback,)])
     turns = Turns(
-        [
-            TurnResult(
-                exit_code=0,
-                delivered_event_keys=frozenset({feedback.dedupe_key}),
-            )
-        ]
+        [TurnResult(exit_code=0)]
     )
 
     controller(mailbox, turns, role="student").run(max_cycles=1)
@@ -1354,8 +1404,8 @@ def test_restart_continues_a_conversation_after_its_first_success(tmp_path: Path
             [
                 (
                     ControllerEvent(
-                        kind="training_monitor",
-                        dedupe_key="training:finished",
+                        kind="job_monitor",
+                        dedupe_key="job:finished",
                         payload={"conversation_id": str(conversation_id)},
                     ),
                 ),
@@ -1370,6 +1420,40 @@ def test_restart_continues_a_conversation_after_its_first_success(tmp_path: Path
 
     assert turns.calls[0][1] == conversation_id
     assert "programme" not in turns.calls[0][0]
+
+
+def test_workspace_lease_defers_only_checkout_events_in_a_mixed_batch():
+    assignment = ControllerEvent(
+        kind="student_assignment",
+        dedupe_key="assignment:leased",
+        payload={"assignment_id": "leased"},
+    )
+    monitor = ControllerEvent(
+        kind="job_monitor",
+        dedupe_key="job:regressed",
+        payload={
+            "conversation_id": str(CONVERSATION_ID),
+            "summary": "metric regressed",
+        },
+    )
+    mailbox = Mailbox([((assignment, monitor)), (assignment,)])
+    turns = Turns()
+
+    def reconcile(events):
+        if any(event.kind == "student_assignment" for event in events):
+            raise WorkspaceJobRunning(("job-17",))
+
+    controller(
+        mailbox,
+        turns,
+        role="student",
+        reconcile=reconcile,
+    ).run(max_cycles=1)
+
+    assert len(turns.calls) == 1
+    assert turns.calls[0][2] == frozenset({monitor.dedupe_key})
+    assert "metric regressed" in delivered_text(turns.calls[0])
+    assert mailbox.acknowledged == [(monitor.dedupe_key,)]
 
 
 def test_turn_lease_uses_the_configured_hard_deadline(tmp_path: Path):

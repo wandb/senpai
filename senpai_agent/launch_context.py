@@ -95,7 +95,11 @@ def load_operator_instructions(value: str) -> str:
     if not value:
         return ""
     path = Path(value)
-    text = read_agent_markdown(path) if path.exists() else strip_spdx_header(value)
+    try:
+        is_file = path.is_file()
+    except OSError:
+        is_file = False
+    text = read_agent_markdown(path) if is_file else strip_spdx_header(value)
     return text.strip()
 
 

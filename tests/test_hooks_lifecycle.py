@@ -5,14 +5,16 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from openhands.sdk.plugin import Plugin
 
 from senpai_agent.hooks import hook_main, queued_feedback_marker
+from senpai_agent.monitor import JobMonitorStore, JobMonitorSpec
 
 PLUGIN_DIR = Path(__file__).parents[1] / "plugins" / "senpai"
-TRAINING_ID = "b81440b1-b803-471e-9fe0-6dcabd756b83"
+JOB_ID = "b81440b1-b803-471e-9fe0-6dcabd756b83"
 
 
 def invoke_hook(
@@ -33,14 +35,18 @@ def assignment_workspace(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def write_running_training(state_dir: Path, *, monitored: bool) -> None:
-    training_dir = state_dir / "training"
-    training_dir.mkdir(parents=True)
-    (training_dir / f"{TRAINING_ID}.json").write_text('{"state":"running"}')
+def write_running_job(state_dir: Path, *, monitored: bool) -> None:
+    jobs_dir = state_dir / "jobs"
+    jobs_dir.mkdir(parents=True)
+    (jobs_dir / f"{JOB_ID}.json").write_text('{"state":"running"}')
     if monitored:
-        monitor_dir = training_dir / "monitors"
-        monitor_dir.mkdir()
-        (monitor_dir / f"{TRAINING_ID}.json").write_text("{}")
+        with JobMonitorStore(jobs_dir / "monitors.sqlite3") as store:
+            store.register(
+                JobMonitorSpec(
+                    job_id=JOB_ID,
+                    conversation_id=uuid4(),
+                )
+            )
 
 
 def test_pre_tool_hook_emits_a_native_denial(
@@ -84,16 +90,18 @@ def test_plugin_loads_terminal_safety_and_lifecycle_hooks():
     assert hooks["Stop"] and hooks["SessionEnd"]
 
 
+@pytest.mark.parametrize("role", ["student", "advisor"])
 @pytest.mark.parametrize("queued_feedback", (False, True))
-def test_student_stop_denies_unmonitored_training(
+def test_roles_stop_denies_unmonitored_job(
     assignment_workspace: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    role: str,
     queued_feedback: bool,
 ):
     state_dir = tmp_path / "state"
-    write_running_training(state_dir, monitored=False)
+    write_running_job(state_dir, monitored=False)
     if queued_feedback:
         queued_feedback_marker(state_dir).touch()
 
@@ -103,23 +111,23 @@ def test_student_stop_denies_unmonitored_training(
         monkeypatch,
         capsys,
         {
-            "SENPAI_ROLE": "student",
+            "SENPAI_ROLE": role,
             "SENPAI_OPENHANDS_STATE_DIR": str(state_dir),
         },
     )
 
     assert (exit_code, output["decision"]) == (2, "deny")
-    assert TRAINING_ID in str(output["reason"])
+    assert JOB_ID in str(output["reason"])
 
 
-def test_student_stop_allows_durable_monitored_training(
+def test_student_stop_allows_sqlite_registered_monitored_job(
     assignment_workspace: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ):
     state_dir = tmp_path / "state"
-    write_running_training(state_dir, monitored=True)
+    write_running_job(state_dir, monitored=True)
     monkeypatch.setattr(
         "senpai_agent.hooks.subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(stdout=""),
@@ -139,16 +147,16 @@ def test_student_stop_allows_durable_monitored_training(
     assert (exit_code, output["decision"]) == (0, "allow")
 
 
-def test_student_stop_ignores_non_training_json_sidecars(
+def test_student_stop_ignores_non_job_json_sidecars(
     assignment_workspace: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ):
     state_dir = tmp_path / "state"
-    training_dir = state_dir / "training"
-    training_dir.mkdir(parents=True)
-    (training_dir / f"{TRAINING_ID}.score.json").write_text(
+    jobs_dir = state_dir / "jobs"
+    jobs_dir.mkdir(parents=True)
+    (jobs_dir / f"{JOB_ID}.score.json").write_text(
         '{"metrics": {}, "passed": true, "score": 1.0}'
     )
     monkeypatch.setattr(

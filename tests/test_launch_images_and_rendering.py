@@ -35,6 +35,9 @@ def test_default_config_exposes_every_model_profile_and_effort():
         "fast_reasoning_effort": "high",
         "frontier_model": "openai/gpt-5.6-sol",
         "frontier_reasoning_effort": "max",
+        "local_condenser_max_events": 0,
+        "local_condenser_max_tokens": 0,
+        "local_condenser_target_events": 0,
     }.items() <= config.items()
     assert config["program_path"] == ""
     assert config["senpai_repo_url"] == "https://github.com/wandb/senpai.git"
@@ -140,6 +143,7 @@ def test_runner_repository_is_explicit_in_every_role_configmap(role):
 
 def test_launch_rejects_role_images_from_different_source_revisions():
     result = run_launch(
+        "--advisor",
         "--advisor_image",
         ADVISOR_IMAGE,
         "--student_image",
@@ -150,12 +154,28 @@ def test_launch_rejects_role_images_from_different_source_revisions():
     assert "same source revision" in result.stderr
 
 
+def test_launch_rejects_an_unsafe_local_condenser_event_cap():
+    result = run_launch(
+        "--advisor",
+        "--advisor_image",
+        ADVISOR_IMAGE,
+        "--student_image",
+        STUDENT_IMAGE,
+        "--local_condenser_max_events",
+        "11",
+    )
+
+    assert result.returncode != 0
+    assert "--local_condenser_max_events must be 0 or at least 12" in result.stderr
+
+
 @pytest.mark.parametrize("role", ["advisor", "student"])
 def test_launch_rejects_a_mutable_image_for_either_role(role):
     images = {"advisor": ADVISOR_IMAGE, "student": STUDENT_IMAGE}
     images[role] = f"ghcr.io/wandb/senpai-{role}:latest"
 
     result = run_launch(
+        "--advisor",
         "--advisor_image",
         images["advisor"],
         "--student_image",
@@ -164,6 +184,44 @@ def test_launch_rejects_a_mutable_image_for_either_role(role):
 
     assert result.returncode != 0
     assert f"--{role}_image must be an immutable digest" in result.stderr
+
+
+def test_student_only_launch_validates_only_the_student_image():
+    args = launch_args(advisor=False, advisor_image="")
+
+    launch.resolve_runner_revision(args, has_students=True)
+
+    assert args.senpai_repo_revision == REVISION
+
+
+def test_advisor_only_launch_validates_only_the_advisor_image():
+    args = launch_args(names="", n_students=0, student_image="")
+
+    launch.resolve_runner_revision(args, has_students=False)
+
+    assert args.senpai_repo_revision == REVISION
+
+
+def test_launch_help_keeps_descriptions_with_their_options():
+    result = run_launch("--help")
+    help_text = " ".join(result.stdout.split())
+
+    assert result.returncode == 0, result.stderr
+    for option_help in (
+        "--senpai_repo_url str public read-only runner source",
+        "--senpai_repo_revision str exact runner commit",
+        "--advisor_image str advisor source-SHA tag or image digest — REQUIRED",
+        "--student_image str student source-SHA tag or image digest — REQUIRED",
+        "--human_issues, --nohuman_issues bool allow human GitHub issue triage",
+        "--advisor, --noadvisor bool also deploy the advisor pod",
+        "--extra_instructions str shared operator instructions",
+        "--timeout_minutes float training run wall-clock limit",
+        "--max_epochs int maximum training epochs",
+        "--poll_interval_s int default advisor/student outer-loop sleep",
+        "--dry_run, --nodry_run bool render manifests only",
+        "--preflight_only, --nopreflight_only bool validate credentials/access only",
+    ):
+        assert option_help in help_text
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
@@ -245,8 +303,33 @@ def test_launch_secret_contains_each_credential_and_both_roles_reference_it():
             for item in container["env"]
         }
         assert references == {
-            key: "senpai-launch-secrets-test-track" for key in expected_values
+            key: "senpai-launch-secrets-test-track"
+            for key in (*expected_values, "hf-token")
         }
+        hf_reference = next(
+            item["valueFrom"]["secretKeyRef"]
+            for item in container["env"]
+            if item["name"] == "HF_TOKEN"
+        )
+        assert hf_reference["optional"] is True
+
+
+def test_launch_secret_includes_hugging_face_token_only_when_configured():
+    with_token = yaml.safe_load(
+        launch_helpers.render_launch_secret(
+            "track",
+            "github",
+            "exa",
+            "wandb",
+            hf_token="hugging-face",
+        )
+    )["data"]
+    without_token = yaml.safe_load(
+        launch_helpers.render_launch_secret("track", "github", "exa", "wandb")
+    )["data"]
+
+    assert base64.b64decode(with_token["hf-token"]).decode() == "hugging-face"
+    assert "hf-token" not in without_token
 
 
 def test_role_model_configuration_preserves_the_configured_efforts():
@@ -261,6 +344,9 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         fast_reasoning_effort="none",
         frontier_model="openai/gpt-5.6-sol",
         frontier_reasoning_effort="max",
+        local_condenser_max_events=180,
+        local_condenser_max_tokens=180_000,
+        local_condenser_target_events=40,
     )
 
     advisor_config, _deployment, _secret = render_role("advisor", args)
@@ -279,6 +365,9 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         assert config["SENPAI_OPENHANDS_FAST_REASONING_EFFORT"] == "none"
         assert config["SENPAI_OPENHANDS_FRONTIER_MODEL"] == args.frontier_model
         assert config["SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT"] == "max"
+        assert config["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"] == "180"
+        assert config["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS"] == "180000"
+        assert config["SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS"] == "40"
 
 
 def test_openai_ultra_launch_value_is_rejected():
@@ -360,6 +449,23 @@ def test_launch_rejects_unsupported_reasoning_effort(overrides, message):
         launch.validate_model_config(launch_args(**overrides))
 
 
+def test_launch_accepts_documented_anthropic_extended_efforts():
+    launch.validate_model_config(
+        launch_args(
+            advisor_model="anthropic/claude-opus-5",
+            advisor_reasoning_effort="xhigh",
+            student_model="anthropic/claude-opus-5",
+            student_reasoning_effort="xhigh",
+            smart_model="anthropic/claude-opus-5",
+            smart_reasoning_effort="xhigh",
+            fast_model="anthropic/claude-sonnet-5",
+            fast_reasoning_effort="high",
+            frontier_model="anthropic/claude-fable-5",
+            frontier_reasoning_effort="max",
+        )
+    )
+
+
 @pytest.mark.parametrize(
     ("model", "provider_env", "secret_key"),
     [
@@ -393,6 +499,7 @@ def test_roles_mount_only_the_provider_used_by_their_models(
         provider_env,
         "EXA_API_KEY",
         "WANDB_API_KEY",
+        "HF_TOKEN",
     }
 
 
@@ -414,7 +521,13 @@ def test_role_mounts_include_its_main_model_and_shared_profiles_only():
         ][0]["env"]
         mounted[role] = {item["name"] for item in environment}
 
-    common = {"GITHUB_TOKEN", "ANTHROPIC_API_KEY", "EXA_API_KEY", "WANDB_API_KEY"}
+    common = {
+        "GITHUB_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "EXA_API_KEY",
+        "WANDB_API_KEY",
+        "HF_TOKEN",
+    }
     assert mounted["advisor"] == common
     assert mounted["student"] == common | {"OPENAI_API_KEY"}
 

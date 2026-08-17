@@ -51,13 +51,24 @@ When the advisor assigns cleanup after a winning merge, simplify the training co
 
 Ensure that you log all relevant metrics and configs to wandb, especially when adding new metrics or configs particular to an experiment. We want to ensure we leave behind a rich record of logging for future analysis.
 
-## Train and monitor
+## Run and monitor long jobs
 
 Commit the exact implementation that will run and make the worktree clean before launching an expensive experiment. This makes each W&B result reproducible and lets the controller safely suspend the conversation while the process runs.
 
-Every optimization or GPU execution must use `run_training`, including debug runs and wrappers that train or evaluate a model. Pass an argv list, the exact repository working directory, and a timeout within the launch limit. Never launch training through the terminal.
+Every optimization or GPU execution must use `run_job`, including debug runs,
+inference benchmarks, evaluations, and wrappers that train a model. Pass an
+argv list, the exact target working directory, and a timeout within the launch
+limit. Never launch these long-running processes through the terminal.
 
-`run_training` registers terminal-state monitoring automatically. Use `monitor_training` only to add useful primary-metric gates or a stale-update timeout, `get_training_status` for one bounded check, and `cancel_training` for an early stop. Do not kill the process, stream logs, sleep, or create terminal polling loops; finish the turn and let the controller resume the conversation.
+`run_job` registers terminal-state monitoring automatically. Use `monitor_job`
+only to set or replace up to three useful W&B metric policies for an
+already-running job. Pass its exact associated `wandb_run_id` when known;
+omission is safe only when the job has exactly one associated W&B run. It never
+disables terminal wakes. Ordinary checks stay
+outside model context and actionable events wait for the next safe turn. Use
+`get_job_status` for one bounded check and `cancel_job` for an early stop. Do not
+kill the process, stream logs, sleep, or create terminal polling loops; finish
+the turn and let the controller resume the conversation.
 
 Every real experiment must log the artifacts required by `program.md` to W&B. Use groups only when the assignment calls for related arms, and run multiple variants only when the assignment requests them. After a run terminates, check for newer advisor or human feedback before spending another allocation.
 

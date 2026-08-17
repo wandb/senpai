@@ -85,8 +85,6 @@ WORKSPACE_DIVERGENCE_PROMPT = """The workspace cannot be reconciled automaticall
 
 TRUNCATED_FEEDBACK_PROMPT = """Open feedback_url to read the omitted text."""
 
-MONITOR_TRAINING_STARTED_PROMPT = """Training {{TRAINING_ID}} is durably monitored. You may finish this turn; the controller will resume this same conversation ({{CONVERSATION_ID}}) when action is needed."""
-
 AWAIT_AGENTS_SATISFIED_PROMPT = """Use the returned state now; unfinished sibling tasks keep running unless you cancel them explicitly."""
 
 AWAIT_AGENTS_TIMEOUT_PROMPT = """The tasks keep running. Continue useful parent work, inspect later with agent_status, or use join='change' for the next bounded wait; repeating the same long all-results wait will block on the same unfinished tasks."""

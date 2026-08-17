@@ -54,6 +54,15 @@ def test_monitoring_uses_the_senpai_wandb_project_and_student_identity(monkeypat
     assert calls[-1] == "finish"
 
 
+def test_advisor_identity_is_distinct_without_changing_the_default():
+    assert monitoring.weave_agent_name(
+        {"SENPAI_ROLE": "advisor", "ADVISOR_NAME": "aurora"}
+    ) == "advisor-aurora"
+    assert monitoring.weave_agent_name(
+        {"SENPAI_ROLE": "advisor", "ADVISOR_NAME": "advisor"}
+    ) == "advisor"
+
+
 @pytest.mark.parametrize(
     "env",
     [

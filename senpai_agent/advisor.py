@@ -3,7 +3,8 @@ import json
 import sqlite3
 import threading
 import uuid
-from collections.abc import Callable, Sequence, Set
+from collections.abc import Callable, Iterator, Sequence, Set
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
@@ -20,6 +21,7 @@ from senpai_agent.inbox import (
     DeliveryState,
     PersistentInbox,
     deliver_turn_messages,
+    event_priority,
 )
 from senpai_agent.PROMPTS import (
     ADVISOR_EVENT_PROMPT,
@@ -27,6 +29,14 @@ from senpai_agent.PROMPTS import (
     render_prompt,
 )
 
+_TERMINAL_DELIVERY_STATUSES = frozenset(
+    {
+        ConversationExecutionStatus.FINISHED,
+        ConversationExecutionStatus.ERROR,
+        ConversationExecutionStatus.STUCK,
+        ConversationExecutionStatus.DELETING,
+    }
+)
 _EVENT_STORE_SETUP_LOCK = threading.Lock()
 _STEERING_GRACE_SECONDS = 60.0
 _STEERING_INTERRUPTION_NOTICE = (
@@ -94,30 +104,78 @@ class AdvisorEventStore:
                     )
                     """
                 )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS advisor_event_acknowledgements (
+                    dedupe_key TEXT PRIMARY KEY
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO advisor_event_acknowledgements (dedupe_key)
+                SELECT dedupe_key FROM advisor_events WHERE acknowledged = 1
+                """
+            )
+            self._connection.commit()
+
+    @contextmanager
+    def _transaction(self) -> Iterator[None]:
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                self._connection.rollback()
+                raise
+            else:
                 self._connection.commit()
 
     def enqueue(self, event: AdvisorEvent) -> bool:
-        with self._lock:
-            row = self._connection.execute(
-                "SELECT event_json FROM advisor_events WHERE dedupe_key = ?",
+        with self._transaction():
+            acknowledged = self._connection.execute(
+                """
+                SELECT 1 FROM advisor_event_acknowledgements
+                WHERE dedupe_key = ?
+                """,
                 (event.dedupe_key,),
-            ).fetchone()
-            if row is not None:
-                existing = AdvisorEvent.model_validate_json(row[0])
-                if existing.kind != event.kind or existing.payload != event.payload:
-                    raise RuntimeError(
-                        f"event {event.dedupe_key!r} was reused with a different payload"
-                    )
-                return False
+            ).fetchone() is not None
             cursor = self._connection.execute(
                 """
-                INSERT INTO advisor_events (dedupe_key, event_json)
-                VALUES (?, ?)
+                INSERT INTO advisor_events (dedupe_key, event_json, acknowledged)
+                VALUES (?, ?, ?)
+                ON CONFLICT(dedupe_key) DO NOTHING
                 """,
-                (event.dedupe_key, event.model_dump_json()),
+                (
+                    event.dedupe_key,
+                    event.model_dump_json(),
+                    int(acknowledged),
+                ),
             )
-            self._connection.commit()
-            return cursor.rowcount == 1
+            row = self._connection.execute(
+                """
+                SELECT event_json, acknowledged
+                FROM advisor_events
+                WHERE dedupe_key = ?
+                """,
+                (event.dedupe_key,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"event {event.dedupe_key!r} disappeared")
+            existing = AdvisorEvent.model_validate_json(row[0])
+            if existing.kind != event.kind or existing.payload != event.payload:
+                raise RuntimeError(
+                    f"event {event.dedupe_key!r} was reused with a different payload"
+                )
+            if acknowledged and not row[1]:
+                self._connection.execute(
+                    """
+                    UPDATE advisor_events SET acknowledged = 1
+                    WHERE dedupe_key = ?
+                    """,
+                    (event.dedupe_key,),
+                )
+            return cursor.rowcount == 1 and not acknowledged
 
     def pending(self) -> list[AdvisorEvent]:
         with self._lock:
@@ -143,12 +201,18 @@ class AdvisorEventStore:
         return int(row[0])
 
     def acknowledge(self, dedupe_key: str) -> None:
-        with self._lock:
+        with self._transaction():
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO advisor_event_acknowledgements (dedupe_key)
+                VALUES (?)
+                """,
+                (dedupe_key,),
+            )
             self._connection.execute(
                 "UPDATE advisor_events SET acknowledged = 1 WHERE dedupe_key = ?",
                 (dedupe_key,),
             )
-            self._connection.commit()
 
     def acknowledged(self, dedupe_keys: Sequence[str]) -> set[str]:
         if not dedupe_keys:
@@ -158,9 +222,8 @@ class AdvisorEventStore:
             rows = self._connection.execute(
                 f"""
                 SELECT dedupe_key
-                FROM advisor_events
-                WHERE acknowledged = 1
-                  AND dedupe_key IN ({placeholders})
+                FROM advisor_event_acknowledgements
+                WHERE dedupe_key IN ({placeholders})
                 """,
                 tuple(dedupe_keys),
             ).fetchall()
@@ -331,6 +394,8 @@ class AdvisorEventPump:
                 parent_conversation_id=self._parent_conversation_id,
             )
         with state:
+            if state.execution_status in _TERMINAL_DELIVERY_STATUSES:
+                return 0
             if ConversationState.get_unmatched_actions(state.active_branch()):
                 return 0
             return _deliver_pending_events(
@@ -391,6 +456,7 @@ class AdvisorEventPump:
                     self._conversation_id,
                     event.dedupe_key,
                     event.to_inbox_message(),
+                    priority=event_priority(event.kind),
                 )
             self._store.acknowledge(event.dedupe_key)
             transferred += 1

@@ -1,6 +1,5 @@
 """Run one bounded Senpai OpenHands turn for the Python controller."""
 
-# ruff: noqa: E402
 # OpenHands imports intentionally follow Weave initialization below.
 
 from __future__ import annotations
@@ -33,6 +32,13 @@ from senpai_agent.delegation import (
     configure_delegation,
     record_delegated_task_result,
 )
+from senpai_agent.model_compatibility import (
+    REASONING_EFFORTS,
+    WANDB_GLM_52_MODEL,
+    WANDB_GLM_52_TOKENIZER,
+    register_litellm_model_compatibility,
+    supports_reasoning_effort,
+)
 from senpai_agent.inbox import (
     DeliveryState,
     InboxTurn,
@@ -55,9 +61,11 @@ from senpai_agent.weave_monitoring import (
 )
 
 WEAVE_PROJECT = initialize_weave_monitoring()
+register_litellm_model_compatibility()
 
 from openhands.sdk import LLM, Agent, AgentContext, LocalConversation, Tool
 from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
+from openhands.sdk.context.condenser import CondenserBase, LLMSummarizingCondenser
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
 from openhands.sdk.event import ActionEvent, MessageEvent, ObservationEvent
 from openhands.sdk.llm import TextContent
@@ -91,7 +99,15 @@ from senpai_agent.program_context import (
     PROGRAM_PATH_ENV,
     load_program_system_prompt,
 )
+from senpai_agent.persisted_conversation_migration import (
+    migrate_persisted_conversation,
+    migrate_persisted_job_state,
+)
 from senpai_agent.PROMPTS import RECOVERED_ACTION_PROMPT
+from senpai_agent.state import (
+    advisor_job_monitor_state_dir,
+    job_state_dir,
+)
 from senpai_agent.system_instructions import SenpaiSystemInstructions
 from senpai_agent.tools import register_senpai_tools
 
@@ -102,14 +118,6 @@ DEFAULT_REASONING_EFFORT = "xhigh"
 DEFAULT_FAST_REASONING_EFFORT = "high"
 DEFAULT_FRONTIER_REASONING_EFFORT = "max"
 WANDB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
-REASONING_EFFORTS = (
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-    "none",
-)
 SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore", "search")
 SENPAI_AGENT_DIR = Path(__file__).resolve().parents[1] / ".agents" / "agents"
 REPOSITORY_INSTRUCTION_FILENAMES = frozenset(
@@ -123,8 +131,18 @@ PROVIDER_API_KEY_ENVS = {
 COMMAND_SECRET_ENV_NAMES = (
     "WANDB_API_KEY",
     "EXA_API_KEY",
+    "MLXFAST_API_TOKEN",
+    "YUKON_API_TOKEN",
 )
 EVENT_TEXT_LIMIT = 20000
+DEFAULT_LOCAL_CONDENSER_MAX_EVENTS = 0
+GENERIC_LOCAL_CONDENSER_MAX_EVENTS = 80
+MIN_LOCAL_CONDENSER_MAX_EVENTS = 12
+DEFAULT_LOCAL_CONDENSER_MAX_TOKENS = 0
+DEFAULT_LOCAL_CONDENSER_TARGET_EVENTS = 0
+WANDB_GLM_52_MAX_EVENTS = 600
+WANDB_GLM_52_MAX_TOKENS = 180_000
+WANDB_GLM_52_TARGET_EVENTS = 40
 DEFAULT_INBOX_MAX_STALLED_ATTEMPTS = 3
 DEFAULT_INBOX_MAX_RECOVERY_GENERATIONS = 1
 
@@ -210,10 +228,13 @@ class RunnerConfig:
     student_name: str | None = None
     wandb_entity: str | None = None
     wandb_project: str | None = None
-    training_max_timeout_seconds: int = 1800
+    job_max_timeout_seconds: int = 1800
     timeout_seconds: float = 7200
     llm_timeout_seconds: int = 5400
     llm_num_retries: int = 1
+    local_condenser_max_events: int = DEFAULT_LOCAL_CONDENSER_MAX_EVENTS
+    local_condenser_max_tokens: int = DEFAULT_LOCAL_CONDENSER_MAX_TOKENS
+    local_condenser_target_events: int = DEFAULT_LOCAL_CONDENSER_TARGET_EVENTS
     inbox_max_stalled_attempts: int = DEFAULT_INBOX_MAX_STALLED_ATTEMPTS
     inbox_max_recovery_generations: int = DEFAULT_INBOX_MAX_RECOVERY_GENERATIONS
     child: bool = False
@@ -231,32 +252,16 @@ def parse_runner_args(argv: Sequence[str] | None = None) -> RunnerArgs:
 
 
 def openhands_reasoning_effort(reasoning_effort: str, model: str) -> str:
-    provider, _, model_name = model.lower().partition("/")
-    supports_openai_pro = provider == "openai" and (
-        model_name == "gpt-5.6" or model_name.startswith("gpt-5.6-")
-    )
     if reasoning_effort not in REASONING_EFFORTS:
         choices = ", ".join(REASONING_EFFORTS)
         raise ValueError(
             f"unsupported reasoning effort {reasoning_effort!r}; "
             f"choose one of: {choices}"
         )
-    if provider == "wandb" and model_name == "zai-org/glm-5.2":
-        if reasoning_effort not in {"high", "max"}:
-            raise ValueError(
-                f"reasoning effort {reasoning_effort!r} is unsupported for "
-                f"model {model!r}; use 'high' or 'max'"
-            )
-        return reasoning_effort
-    if (
-        reasoning_effort == "max"
-        and provider != "anthropic"
-        and not supports_openai_pro
-    ):
+    if not supports_reasoning_effort(model, reasoning_effort):
         raise ValueError(
             f"reasoning effort {reasoning_effort!r} is unsupported for model "
-            f"{model!r}; "
-            "use an anthropic model, an openai/gpt-5.6 model, or select a lower effort"
+            f"{model!r}; select a supported effort"
         )
     return reasoning_effort
 
@@ -544,8 +549,7 @@ def depth_aware_child_definition(
     """Expose recursive spawn only to the one child role that can use it."""
 
     if not child or (
-        definition.name == "general-purpose"
-        and 0 < depth < MAX_DELEGATION_DEPTH
+        definition.name == "general-purpose" and 0 < depth < MAX_DELEGATION_DEPTH
     ):
         return definition
     return definition.model_copy(
@@ -615,12 +619,12 @@ def resolve_config(
         launch=decode_launch_context(env.get(LAUNCH_CONTEXT_ENV, "")),
     )
     try:
-        training_max_timeout_seconds = round(
+        job_max_timeout_seconds = round(
             float(env.get("SENPAI_TIMEOUT_MINUTES", "30")) * 60
         )
     except ValueError as error:
         raise RuntimeError("SENPAI_TIMEOUT_MINUTES must be numeric") from error
-    if training_max_timeout_seconds <= 0:
+    if job_max_timeout_seconds <= 0:
         raise RuntimeError("SENPAI_TIMEOUT_MINUTES must be positive")
     try:
         timeout_seconds = float(env.get("SENPAI_OPENHANDS_TIMEOUT_SECONDS", "7200"))
@@ -635,8 +639,54 @@ def resolve_config(
         llm_num_retries = int(env.get("SENPAI_LLM_NUM_RETRIES", "1"))
     except ValueError as error:
         raise RuntimeError("Senpai LLM timeout settings must be numeric") from error
+    try:
+        local_condenser_max_events = int(
+            env.get(
+                "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS",
+                str(DEFAULT_LOCAL_CONDENSER_MAX_EVENTS),
+            )
+        )
+        local_condenser_max_tokens = int(
+            env.get(
+                "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS",
+                str(DEFAULT_LOCAL_CONDENSER_MAX_TOKENS),
+            )
+        )
+        local_condenser_target_events = int(
+            env.get(
+                "SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS",
+                str(DEFAULT_LOCAL_CONDENSER_TARGET_EVENTS),
+            )
+        )
+    except ValueError as error:
+        raise RuntimeError("local condenser limits must be integers") from error
     if llm_timeout_seconds <= 0 or llm_num_retries <= 0:
         raise RuntimeError("Senpai LLM timeout and attempts must be positive")
+    if (
+        local_condenser_max_events
+        and local_condenser_max_events < MIN_LOCAL_CONDENSER_MAX_EVENTS
+    ):
+        raise RuntimeError(
+            "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS must be 0 or at least "
+            f"{MIN_LOCAL_CONDENSER_MAX_EVENTS}"
+        )
+    if local_condenser_max_tokens < 0:
+        raise RuntimeError(
+            "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS must be non-negative"
+        )
+    if local_condenser_target_events < 0:
+        raise RuntimeError(
+            "SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS must be non-negative"
+        )
+    if (
+        local_condenser_max_events
+        and local_condenser_target_events
+        and local_condenser_target_events >= local_condenser_max_events
+    ):
+        raise RuntimeError(
+            "SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS must be less than "
+            "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"
+        )
     try:
         inbox_max_stalled_attempts = int(
             env.get(
@@ -674,9 +724,7 @@ def resolve_config(
         raise RuntimeError("SENPAI_DELEGATION_DEPTH must be between 0 and 2")
     deadline_value = env.get("SENPAI_DELEGATION_DEADLINE_EPOCH")
     try:
-        delegation_deadline_epoch = (
-            float(deadline_value) if deadline_value else None
-        )
+        delegation_deadline_epoch = float(deadline_value) if deadline_value else None
     except ValueError as error:
         raise RuntimeError(
             "SENPAI_DELEGATION_DEADLINE_EPOCH must be numeric"
@@ -695,12 +743,11 @@ def resolve_config(
         or DEFAULT_REASONING_EFFORT
     )
     reasoning_effort = openhands_reasoning_effort(reasoning_effort, model)
-    api_key_env = (
-        env_value(args.api_key_env, env, "SENPAI_OPENHANDS_API_KEY_ENV")
-        or infer_api_key_env(
-            model,
-            override_env="SENPAI_OPENHANDS_API_KEY_ENV",
-        )
+    api_key_env = env_value(
+        args.api_key_env, env, "SENPAI_OPENHANDS_API_KEY_ENV"
+    ) or infer_api_key_env(
+        model,
+        override_env="SENPAI_OPENHANDS_API_KEY_ENV",
     )
 
     smart_default_model = (
@@ -880,10 +927,13 @@ def resolve_config(
         student_name=env.get("STUDENT_NAME") or None,
         wandb_entity=wandb_entity,
         wandb_project=wandb_project,
-        training_max_timeout_seconds=training_max_timeout_seconds,
+        job_max_timeout_seconds=job_max_timeout_seconds,
         timeout_seconds=timeout_seconds,
         llm_timeout_seconds=llm_timeout_seconds,
         llm_num_retries=llm_num_retries,
+        local_condenser_max_events=local_condenser_max_events,
+        local_condenser_max_tokens=local_condenser_max_tokens,
+        local_condenser_target_events=local_condenser_target_events,
         inbox_max_stalled_attempts=inbox_max_stalled_attempts,
         inbox_max_recovery_generations=inbox_max_recovery_generations,
         child=args.child,
@@ -905,18 +955,32 @@ def find_named_agent(
     raise RuntimeError(f"OpenHands agent not found: {name}")
 
 
+def system_instructions_prompt(
+    instructions: SenpaiSystemInstructions,
+    runtime_invariant: str = "",
+) -> str:
+    prompt = instructions.prompt
+    if runtime_invariant:
+        prompt += (
+            f"\n# Live controller invariant\n\n{runtime_invariant.strip()}\n"
+        )
+    return prompt
+
+
 def with_system_instructions(
     agent: Agent,
     instructions: SenpaiSystemInstructions,
     project_skills: Sequence[Skill] = (),
+    runtime_invariant: str = "",
 ) -> Agent:
     context = agent.agent_context or AgentContext()
     skills = {skill.name: skill for skill in context.skills}
     skills.update({skill.name: skill for skill in project_skills})
+    role_suffix = system_instructions_prompt(instructions, runtime_invariant)
     system_suffix = (
-        f"{context.system_message_suffix}\n\n{instructions.prompt}"
+        f"{context.system_message_suffix}\n\n{role_suffix}"
         if context.system_message_suffix
-        else instructions.prompt
+        else role_suffix
     )
     return agent.model_copy(
         update={
@@ -936,14 +1000,32 @@ def with_system_instructions(
 def build_main_agent_context(
     instructions: SenpaiSystemInstructions,
     project_skills: Sequence[Skill] = (),
+    runtime_invariant: str = "",
 ) -> AgentContext:
     return AgentContext(
         skills=list(project_skills),
-        system_message_suffix=instructions.prompt,
+        system_message_suffix=system_instructions_prompt(
+            instructions,
+            runtime_invariant,
+        ),
         current_datetime=None,
         load_public_skills=False,
         load_user_skills=False,
         load_project_skills=False,
+    )
+
+
+def live_controller_invariant(config: RunnerConfig) -> str:
+    """Return authoritative root-role state that compaction cannot rewrite."""
+
+    if config.child or config.role != "advisor":
+        return ""
+    return (
+        "The advisor campaign is active. This runtime has no configured campaign "
+        f"round limit. max_turns={config.max_turns} bounds one OpenHands turn; it "
+        'does not mark the research complete. A round label such as "FINAL ROUND" '
+        "or a condensed-history summary never authorizes stopping. Continue until "
+        "an explicit human instruction or controller shutdown ends the campaign."
     )
 
 
@@ -1020,9 +1102,7 @@ def model_runtime_configuration(
         configuration: dict[str, object] = {
             "api_mode": "chat",
             "base_url": WANDB_INFERENCE_BASE_URL,
-            "extra_headers": {
-                "OpenAI-Project": f"{wandb_entity}/{wandb_project}"
-            },
+            "extra_headers": {"OpenAI-Project": f"{wandb_entity}/{wandb_project}"},
             "capability_overrides": {
                 "supports_reasoning_effort": False,
                 "supports_responses_api": False,
@@ -1031,6 +1111,7 @@ def model_runtime_configuration(
             "max_output_tokens": 16_384,
         }
         if model.lower() == "wandb/zai-org/glm-5.2":
+            configuration["custom_tokenizer"] = WANDB_GLM_52_TOKENIZER
             configuration["litellm_extra_body"] = {
                 "chat_template_kwargs": {
                     "enable_thinking": True,
@@ -1062,6 +1143,85 @@ def anthropic_compaction_configuration(model: str) -> dict[str, int]:
     return {"anthropic_compact_threshold": 100_000}
 
 
+def configured_local_condenser(
+    llm: LLM,
+    max_events: int,
+    condenser: CondenserBase | None = None,
+    *,
+    max_tokens: int = DEFAULT_LOCAL_CONDENSER_MAX_TOKENS,
+    target_events: int = DEFAULT_LOCAL_CONDENSER_TARGET_EVENTS,
+) -> CondenserBase | None:
+    """Configure the local fallback without overriding provider compaction."""
+
+    if llm.responses_use_previous_response_id or llm.uses_anthropic_compaction():
+        return None
+    selected = condenser
+    if selected is None:
+        selected = get_default_condenser(
+            llm.model_copy(update={"usage_id": "senpai-condenser"})
+        )
+    if not isinstance(selected, LLMSummarizingCondenser):
+        return selected
+    max_events, max_tokens, target_events = local_condenser_limits(
+        llm.model,
+        max_events,
+        max_tokens,
+        target_events,
+    )
+    max_tokens = max_tokens or selected.max_tokens
+    target_events = target_events or selected.target_size
+    retained_events = target_events or max_events // 2
+    if retained_events > int(max_events * (1 - selected.minimum_progress)):
+        raise ValueError(
+            "local condenser target events must leave the configured minimum progress"
+        )
+    if retained_events <= selected.keep_first + 1:
+        raise ValueError(
+            "local condenser target events must leave room after keep_first"
+        )
+    return selected.model_copy(
+        update={
+            "max_size": max_events,
+            "max_tokens": max_tokens or None,
+            "target_size": target_events or None,
+        }
+    )
+
+
+def local_condenser_limits(
+    model: str,
+    max_events: int,
+    max_tokens: int,
+    target_events: int,
+) -> tuple[int, int | None, int | None]:
+    """Resolve zero-valued knobs against the actual model profile."""
+
+    if model.lower() == WANDB_GLM_52_MODEL:
+        return (
+            max_events or WANDB_GLM_52_MAX_EVENTS,
+            max_tokens or WANDB_GLM_52_MAX_TOKENS,
+            target_events or WANDB_GLM_52_TARGET_EVENTS,
+        )
+    return (
+        max_events or GENERIC_LOCAL_CONDENSER_MAX_EVENTS,
+        max_tokens or None,
+        target_events or None,
+    )
+
+
+def require_exact_tokenizer(llm: LLM) -> None:
+    """Fail before a GLM turn if exact chat-template accounting is unavailable."""
+
+    if (
+        llm.model.lower() == WANDB_GLM_52_MODEL
+        and not llm.has_chat_template_tokenizer()
+    ):
+        raise RuntimeError(
+            f"{WANDB_GLM_52_MODEL} requires the exact "
+            f"{WANDB_GLM_52_TOKENIZER} chat-template tokenizer"
+        )
+
+
 def local_event_db_path(config: RunnerConfig) -> Path:
     return config.state_dir / f"{config.role}-events.sqlite3"
 
@@ -1080,7 +1240,7 @@ def scrub_model_credentials(
 
 
 def build_main_tools(config: RunnerConfig) -> list[Tool]:
-    """Keep native reasoning tools while replacing unsafe control boundaries."""
+    """Build Senpai's role-safe root tool surface."""
 
     if config.github_token is None:
         raise RuntimeError("main agents require GitHub credentials")
@@ -1091,7 +1251,7 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
             enable_browser=False,
             enable_sub_agents=False,
         )
-        if tool.name != "terminal"
+        if tool.name not in {"terminal", "think"}
     ]
     tools.extend(
         (
@@ -1113,8 +1273,6 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
         # the lightweight load_browser definition until the model opts in.
         tools.append(Tool(name="browser_tool_set"))
     delegation_params = {"event_db_path": str(local_event_db_path(config))}
-    if not config.child:
-        tools.append(Tool(name="delegate_agent", params=delegation_params))
     tools.extend(
         Tool(name=name, params=delegation_params)
         for name in (
@@ -1124,13 +1282,48 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
             "cancel_agents",
         )
     )
-    if config.role == "student" and not config.child:
-        training_params: dict[str, str | int] = {
-            "state_dir": str(config.state_dir / "training"),
-            "max_timeout_seconds": config.training_max_timeout_seconds,
+    if not config.child:
+        job_params: dict[str, str | int] = {
+            "state_dir": str(job_state_dir(config.state_dir)),
+            "max_timeout_seconds": config.job_max_timeout_seconds,
         }
-        tools.append(Tool(name="senpai_training", params=training_params))
+        if (
+            config.role == "student"
+            and config.wandb_entity
+            and config.wandb_project
+        ):
+            job_params.update(
+                wandb_entity=config.wandb_entity,
+                wandb_project=config.wandb_project,
+            )
+        tools.append(Tool(name="senpai_jobs", params=job_params))
+        if config.role == "advisor" and config.wandb_entity and config.wandb_project:
+            tools.append(
+                Tool(
+                    name="senpai_advisor_job_monitor",
+                    params={
+                        "state_dir": str(
+                            advisor_job_monitor_state_dir(config.state_dir)
+                        ),
+                        "wandb_entity": config.wandb_entity,
+                        "wandb_project": config.wandb_project,
+                    },
+                )
+            )
     return tools
+
+
+def without_legacy_think(agent: Agent) -> Agent:
+    """Remove OpenHands' legacy scratchpad from the actual runtime surface."""
+
+    return agent.model_copy(
+        update={
+            "tools": [tool for tool in agent.tools if tool.name != "think"],
+            "include_default_tools": [
+                name for name in agent.include_default_tools if name != "ThinkTool"
+            ],
+        }
+    )
 
 
 def delegation_config(
@@ -1162,6 +1355,9 @@ def delegation_config(
         enable_browser=config.enable_browser,
         command_secrets=config.command_secrets,
         role=config.role,
+        local_condenser_max_events=config.local_condenser_max_events,
+        local_condenser_max_tokens=config.local_condenser_max_tokens,
+        local_condenser_target_events=config.local_condenser_target_events,
         program_path=config.instructions.program.program_path,
         launch_context=config.instructions.launch,
         root_state_dir=config.delegation_root_state_dir,
@@ -1447,10 +1643,31 @@ def run_openhands(
     scrub_model_credentials(os.environ, config)
     register_default_tools(enable_browser=False)
     register_senpai_tools()
+    if not config.child:
+        job_migration = migrate_persisted_job_state(config.state_dir)
+        if job_migration.changed:
+            print(
+                "OPENHANDS_STATE_MIGRATION "
+                f"job_records={job_migration.records} "
+                "previous_job_state_preserved="
+                f"{str(job_migration.previous_state_preserved).lower()}",
+                file=sys.stderr,
+                flush=True,
+            )
     file_agents = sanitized_agent_definitions(config.workspace)
     available_agents = [definition.name for definition in file_agents]
     project_skills = sanitized_project_skills(config.workspace)
     os.environ["SENPAI_CONVERSATION_ID"] = config.conversation_id.hex
+    local_condenser = (
+        (None, None, None)
+        if model_provider(config.model) in {"openai", "anthropic"}
+        else local_condenser_limits(
+            config.model,
+            config.local_condenser_max_events,
+            config.local_condenser_max_tokens,
+            config.local_condenser_target_events,
+        )
+    )
 
     print(
         "OPENHANDS_RUN "
@@ -1483,6 +1700,9 @@ def run_openhands(
                     )
                     else "standard"
                 ),
+                "local_condenser_max_events": local_condenser[0],
+                "local_condenser_max_tokens": local_condenser[1],
+                "local_condenser_target_events": local_condenser[2],
                 "agent": config.agent_name,
                 "enable_browser": config.enable_browser,
                 "role_file": str(config.role_file) if config.role_file else None,
@@ -1530,6 +1750,7 @@ def run_openhands(
                 wandb_project=config.wandb_project,
             ),
         )
+        require_exact_tokenizer(llm)
         if config.agent_name:
             definition = depth_aware_child_definition(
                 find_named_agent(config.agent_name, file_agents),
@@ -1548,27 +1769,31 @@ def run_openhands(
                     ).model_copy(update={"skills": resolved_skills}),
                 }
             )
+            require_exact_tokenizer(agent.llm)
             agent = with_system_instructions(
                 agent,
                 config.instructions,
                 project_skills,
+                live_controller_invariant(config),
             )
             agent = with_tool_concurrency(agent, MAX_PARALLEL_AGENTS)
-            if (
-                agent.llm.responses_use_previous_response_id
-                or agent.llm.uses_anthropic_compaction()
-            ):
-                agent = agent.model_copy(update={"condenser": None})
+            agent = agent.model_copy(
+                update={
+                    "condenser": configured_local_condenser(
+                        agent.llm,
+                        config.local_condenser_max_events,
+                        agent.condenser,
+                        max_tokens=config.local_condenser_max_tokens,
+                        target_events=config.local_condenser_target_events,
+                    )
+                }
+            )
         else:
-            condenser = (
-                None
-                if (
-                    llm.responses_use_previous_response_id
-                    or llm.uses_anthropic_compaction()
-                )
-                else get_default_condenser(
-                    llm.model_copy(update={"usage_id": "senpai-condenser"})
-                )
+            condenser = configured_local_condenser(
+                llm,
+                config.local_condenser_max_events,
+                max_tokens=config.local_condenser_max_tokens,
+                target_events=config.local_condenser_target_events,
             )
             agent = Agent(
                 llm=llm,
@@ -1576,10 +1801,28 @@ def run_openhands(
                 agent_context=build_main_agent_context(
                     config.instructions,
                     project_skills,
+                    live_controller_invariant(config),
                 ),
                 system_prompt_kwargs={"cli_mode": True},
                 condenser=condenser,
                 tool_concurrency_limit=MAX_PARALLEL_AGENTS,
+            )
+        agent = without_legacy_think(agent)
+        conversation_migration = migrate_persisted_conversation(
+            config.state_dir,
+            config.conversation_id,
+        )
+        if conversation_migration.changed:
+            print(
+                "OPENHANDS_STATE_MIGRATION "
+                "base_state_rewritten="
+                f"{str(conversation_migration.base_state_rewritten).lower()} "
+                f"events_rewritten={conversation_migration.events_rewritten} "
+                "tool_definitions_removed="
+                f"{conversation_migration.tool_definitions_removed} "
+                f"conversation_id={config.conversation_id}",
+                file=sys.stderr,
+                flush=True,
             )
         last_activity = time.monotonic()
 
@@ -1799,7 +2042,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config = resolve_config(args)
             os.environ.pop(config.api_key_env, None)
             return run_openhands(prompt, config)
-        except BaseException as error:  # noqa: BLE001
+        except BaseException as error:
             if task_id := os.environ.get("SENPAI_DELEGATION_TASK_ID"):
                 record_delegated_task_result(
                     task_id,

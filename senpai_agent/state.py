@@ -12,6 +12,18 @@ from uuid import UUID
 from senpai_agent.mailbox import ControllerEvent
 
 
+def job_state_dir(state_dir: Path) -> Path:
+    """Return the canonical local supervised-job state directory."""
+
+    return Path(state_dir) / "jobs"
+
+
+def advisor_job_monitor_state_dir(state_dir: Path) -> Path:
+    """Return the canonical advisor-only external job-monitor directory."""
+
+    return Path(state_dir) / "advisor-job-monitors"
+
+
 def _replace_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
@@ -134,7 +146,7 @@ class StudentConversationSelector:
         )
 
     def _conversation_for(self, event: ControllerEvent) -> UUID:
-        if event.kind == "training_monitor":
+        if event.kind == "job_monitor":
             return UUID(str(event.payload["conversation_id"]))
         parent_id = event.payload.get("parent_conversation_id")
         if isinstance(parent_id, str):

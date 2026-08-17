@@ -98,6 +98,12 @@ spec:
             secretKeyRef:
               name: {{LAUNCH_SECRET_NAME}}
               key: exa-api-key
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{LAUNCH_SECRET_NAME}}
+              key: hf-token
+              optional: true
         resources:
           requests:
             cpu: "{{STUDENT_CPU}}"

@@ -407,6 +407,7 @@ LAUNCH_CREDENTIAL_ENV_NAMES = (
     "OPENAI_API_KEY",
     "EXA_API_KEY",
     "WANDB_API_KEY",
+    "HF_TOKEN",
 )
 
 
@@ -488,6 +489,13 @@ def resolve_wandb_api_key(dotenv_path: Path) -> str:
     return resolve_required_secret(dotenv_path, "WANDB_API_KEY", "W&B API key")
 
 
+def resolve_optional_secret(dotenv_path: Path, env_name: str) -> str:
+    """Resolve an optional secret from the shell environment, then .env."""
+    return os.environ.get(env_name, "").strip() or _dotenv_values(dotenv_path).get(
+        env_name, ""
+    ).strip()
+
+
 def render_launch_secret(
     tag: str,
     github_token: str,
@@ -496,6 +504,7 @@ def render_launch_secret(
     *,
     anthropic_api_key: str | None = None,
     openai_api_key: str | None = None,
+    hf_token: str = "",
 ) -> str:
     """Per-launch k8s Secret holding API credentials used by advisor/student pods."""
     credentials = {
@@ -507,6 +516,8 @@ def render_launch_secret(
         credentials["anthropic-api-key"] = anthropic_api_key
     if openai_api_key is not None:
         credentials["openai-api-key"] = openai_api_key
+    if hf_token:
+        credentials["hf-token"] = hf_token
     encoded = {
         name: base64.b64encode(value.encode()).decode()
         for name, value in credentials.items()

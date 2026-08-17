@@ -16,11 +16,14 @@ from senpai_agent.controller import (
     ConversationRecoveryExhausted,
     OpenHandsTurnRunner,
     _context_recovery_prompt,
+    _open_job_monitor_mailbox,
 )
 from senpai_agent.github.http import GitHubReadError
-from senpai_agent.github.mailbox import ActiveGitHubWatcher
+from senpai_agent.mailbox_watcher import ActiveMailboxWatcher
 from senpai_agent.inbox import DeliveryState, PersistentInbox, deliver_turn_messages
 from senpai_agent.mailbox import ControllerEvent
+from senpai_agent.monitor import JobMonitorSpec, JobMonitorStore
+from senpai_agent.jobs import JobState
 from senpai_agent.state import AssignmentConversationRegistry
 
 
@@ -30,6 +33,8 @@ class Config:
     state_dir: Path
     conversation_id: UUID
     timeout_seconds: float = 3600
+    wandb_entity: str | None = None
+    wandb_project: str | None = None
 
 
 class Mailbox:
@@ -72,6 +77,163 @@ def advisor_event(number=17):
     )
 
 
+def test_advisor_job_monitor_fires_in_background_without_preempting_active_turn(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    conversation_id = UUID("00000000-0000-0000-0000-000000000081")
+    job_id = "wandb.run.81"
+
+    class StatusSource:
+        def get_job_status(self, _job_id):
+            return SimpleNamespace(
+                state=JobState.FINISHED,
+                exit_code=None,
+                wandb_run_ids=(job_id,),
+            )
+
+    def monitor_factory():
+        return _open_job_monitor_mailbox(
+            state_dir / "advisor-job-monitors" / "monitors.sqlite3",
+            StatusSource(),
+            SimpleNamespace(latest=lambda *_values: None),
+        )
+
+    inbox = PersistentInbox(state_dir / "delivery-inbox.sqlite3")
+    inbox.enqueue(conversation_id, "active-event", "active event")
+    active = inbox.next_turn(conversation_id, "active prompt", max_events=1)
+    assert active is not None
+    inbox.enqueue(conversation_id, "ordinary-backlog", "ordinary backlog")
+
+    def run_openhands(_prompt, config, **options):
+        with JobMonitorStore(
+            state_dir / "advisor-job-monitors" / "monitors.sqlite3"
+        ) as tool_store:
+            tool_store.register(
+                JobMonitorSpec(
+                        job_id=job_id,
+                        conversation_id=conversation_id,
+                        poll_interval_seconds=5,
+                )
+            )
+
+        class Conversation:
+            def send_message(self, _message):
+                raise AssertionError("job event entered the active turn")
+
+        with AdvisorEventStore(
+            state_dir / "advisor-events.sqlite3"
+        ) as event_store, AdvisorEventPump(
+            event_store,
+            Conversation(),
+            poll_interval=0.001,
+            inbox=options["inbox"],
+            conversation_id=config.conversation_id,
+        ):
+            deadline = time.monotonic() + 1
+            while inbox.pending_count(conversation_id) < 2:
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+        return 0
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+
+    result = OpenHandsTurnRunner(
+        Config(
+            "advisor",
+            state_dir,
+            conversation_id,
+            wandb_entity="milieu",
+            wandb_project="nn_cfd",
+        ),
+        full_prompt="advisor initial controller context",
+        active_mailbox_factories=(monitor_factory,),
+        active_monitor_poll_interval_seconds=0.001,
+    ).run(
+        "active prompt",
+        conversation_id=conversation_id,
+        event_keys=frozenset({"active-event"}),
+        inbox=inbox,
+        inbox_turn_id=active.turn_id,
+    )
+
+    assert result.exit_code == 0
+    for message in active.messages:
+        inbox.record_delivered(message.delivery_id, message.body)
+    inbox.record_processed(active.turn_id)
+    inbox.acknowledge(active.turn_id)
+    next_turn = inbox.next_turn(conversation_id, "next prompt", max_events=1)
+    assert next_turn is not None
+    assert next_turn.event_keys == (f"{job_id}:status:finished",)
+
+
+def test_advisor_job_monitor_quiet_background_polls_create_no_events(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    conversation_id = UUID("00000000-0000-0000-0000-000000000082")
+    with JobMonitorStore(
+        state_dir / "advisor-job-monitors" / "monitors.sqlite3"
+    ) as store:
+        store.register(
+            JobMonitorSpec(
+                    job_id="wandb-run-82",
+                    conversation_id=conversation_id,
+                    poll_interval_seconds=5,
+            )
+        )
+
+    polls = []
+
+    class StatusSource:
+        def get_job_status(self, job_id):
+            polls.append(job_id)
+            return SimpleNamespace(
+                state=JobState.RUNNING,
+                exit_code=None,
+                wandb_run_ids=(job_id,),
+            )
+
+    def monitor_factory():
+        return _open_job_monitor_mailbox(
+            state_dir / "advisor-job-monitors" / "monitors.sqlite3",
+            StatusSource(),
+            SimpleNamespace(latest=lambda *_values: None),
+        )
+
+    def run_openhands(_prompt, _config):
+        deadline = time.monotonic() + 1
+        while not polls:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        return 0
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+
+    OpenHandsTurnRunner(
+        Config(
+            "advisor",
+            state_dir,
+            conversation_id,
+            wandb_entity="milieu",
+            wandb_project="nn_cfd",
+        ),
+        full_prompt="advisor initial controller context",
+        active_mailbox_factories=(monitor_factory,),
+        active_monitor_poll_interval_seconds=0.001,
+    ).run(
+        "continue unrelated work",
+        conversation_id=conversation_id,
+        event_keys=frozenset(),
+    )
+
+    assert polls == ["wandb-run-82"]
+    with AdvisorEventStore(state_dir / "advisor-events.sqlite3") as store:
+        assert store.pending() == []
+
+
 def test_context_recovery_prompt_does_not_repeat_an_embedded_research_brief():
     prompt = _context_recovery_prompt(
         "complete initial controller context",
@@ -96,7 +258,7 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
 
     def run_openhands(_prompt, config):
         class Conversation:
-            def send_message(self, message):
+            def send_message(self, message, sender=None):
                 messages.append(message)
 
         with AdvisorEventStore(
@@ -129,7 +291,6 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
     assert "Feedback for revision-2." in messages[0]
     assert "Feedback for revision-3." not in messages[0]
     assert str(conversation_id) in messages[0]
-    assert result.delivered_event_keys == frozenset({current.dedupe_key})
     with AdvisorEventStore(state_dir / "student-events.sqlite3") as store:
         assert store.pending() == []
 
@@ -169,7 +330,6 @@ def test_observed_student_input_routes_to_the_active_pump_until_it_is_delivered(
         event_keys=frozenset(),
     )
 
-    assert result.delivered_event_keys == frozenset()
     with AdvisorEventStore(store_path) as store:
         pending = store.pending()
         assert [event.dedupe_key for event in pending] == [incoming.dedupe_key]
@@ -205,7 +365,7 @@ def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
 
     def run_openhands(_prompt, config):
         class Conversation:
-            def send_message(self, message):
+            def send_message(self, message, sender=None):
                 messages.append(message)
 
         with AdvisorEventStore(store_path) as store, AdvisorEventPump(
@@ -231,7 +391,6 @@ def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
     )
 
     assert messages == []
-    assert result.delivered_event_keys == frozenset()
     with AdvisorEventStore(store_path) as store:
         assert store.pending() == []
 
@@ -249,7 +408,7 @@ def test_full_visible_set_suppresses_events_handled_in_an_earlier_turn(
 
     def run_openhands(_prompt, _config):
         class Conversation:
-            def send_message(self, message):
+            def send_message(self, message, sender=None):
                 messages.append(message)
 
         with AdvisorEventStore(store_path) as store, AdvisorEventPump(
@@ -277,7 +436,6 @@ def test_full_visible_set_suppresses_events_handled_in_an_earlier_turn(
     )
 
     assert messages == []
-    assert result.delivered_event_keys == frozenset()
     with AdvisorEventStore(store_path) as store:
         assert store.pending() == []
 
@@ -317,7 +475,6 @@ def test_acknowledged_store_rows_are_not_reported_as_this_turn_deliveries(
         event_keys=frozenset(),
     )
 
-    assert result.delivered_event_keys == frozenset()
 
 
 def test_active_watcher_retries_after_a_transient_github_read_error(
@@ -338,7 +495,7 @@ def test_active_watcher_retries_after_a_transient_github_read_error(
 
     mailbox = FlakyMailbox()
     store_path = tmp_path / "advisor-events.sqlite3"
-    with ActiveGitHubWatcher(
+    with ActiveMailboxWatcher(
         mailbox,
         store_path,
         known_keys=frozenset(),
@@ -358,7 +515,36 @@ def test_active_watcher_retries_after_a_transient_github_read_error(
         assert [pending.dedupe_key for pending in store.pending()] == [
             event.dedupe_key
         ]
-    assert "SENPAI_GITHUB_WATCHER_POLL_ERROR" in capsys.readouterr().err
+    assert "SENPAI_MAILBOX_WATCHER_POLL_ERROR" in capsys.readouterr().err
+
+
+def test_active_watcher_honors_github_retry_delay(tmp_path: Path):
+    event = advisor_event()
+
+    class RateLimitedMailbox:
+        def __init__(self):
+            self.calls: list[float] = []
+
+        def poll(self):
+            self.calls.append(time.monotonic())
+            if len(self.calls) == 1:
+                raise GitHubReadError("rate limited", retry_after_seconds=0.03)
+            return (event,)
+
+    mailbox = RateLimitedMailbox()
+    store_path = tmp_path / "advisor-events.sqlite3"
+    with ActiveMailboxWatcher(
+        mailbox,
+        store_path,
+        known_keys=frozenset(),
+        poll_interval_seconds=0.001,
+    ):
+        deadline = time.monotonic() + 1
+        while len(mailbox.calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+    assert len(mailbox.calls) >= 2
+    assert mailbox.calls[1] - mailbox.calls[0] >= 0.025
 
 
 def test_context_exhaustion_retries_once_on_a_fresh_branch_with_the_same_id(

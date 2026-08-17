@@ -111,6 +111,57 @@ def test_reader_errors_do_not_expose_token(monkeypatch):
     assert "/user" in str(raised.value)
 
 
+def test_reader_preserves_github_rate_limit_reset(monkeypatch):
+    monkeypatch.setattr(github_http.time, "time", lambda: 1_000)
+
+    def fail(github_request, timeout):
+        raise HTTPError(
+            github_request.full_url,
+            403,
+            "rate limited",
+            {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1120"},
+            None,
+        )
+
+    monkeypatch.setattr(github_http.request, "urlopen", fail)
+
+    with pytest.raises(GitHubReadError) as raised:
+        GitHubReader(SecretStr("github-secret")).get("/user")
+
+    assert raised.value.retry_after_seconds == 121
+    assert "github-secret" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        (None, None),
+        ({"Retry-After": "inf"}, None),
+        ({"Retry-After": "999999999"}, 3_600),
+    ],
+)
+def test_reader_bounds_invalid_or_unsafe_retry_headers(
+    monkeypatch,
+    headers,
+    expected,
+):
+    def fail(github_request, timeout):
+        raise HTTPError(
+            github_request.full_url,
+            403,
+            "rate limited",
+            headers,
+            None,
+        )
+
+    monkeypatch.setattr(github_http.request, "urlopen", fail)
+
+    with pytest.raises(GitHubReadError) as raised:
+        GitHubReader(SecretStr("github-secret")).get("/user")
+
+    assert raised.value.retry_after_seconds == expected
+
+
 def test_next_link_extracts_only_the_next_relation():
     assert (
         next_link(

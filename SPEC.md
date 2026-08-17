@@ -11,7 +11,7 @@ composing fragile tool calls:
 
 - GitHub polling, workflow operations, and verification;
 - assignment branch publication;
-- training process supervision and W&B metric monitoring;
+- generic long-running process supervision and optional W&B metric monitoring;
 - conversation selection and durable local events;
 - command policy and stop checks; and
 - cadence, retry, deadlines, and shutdown.
@@ -30,7 +30,7 @@ dependencies.
 5. GitHub mutations are typed, preconditioned, convergent on replay, and
    verified against remote state.
 6. The advisor uses one durable conversation UUID. A student uses one UUID per
-   assignment revision, and monitor wakes continue it.
+   assignment revision, and job-monitor wakes continue the owning conversation.
 7. Conversation and generated artifact state cannot fall back into the target
    checkout.
 8. Senpai does not prune conversation history.
@@ -107,28 +107,29 @@ Successful turns atomically acknowledge immutable feedback keys in a small JSON
 ledger. Oldest unacknowledged events are delivered in bounded count/byte
 batches; immediate post-turn polls drain later batches without dropping them.
 
-While an OpenHands turn is running, `ActiveGitHubWatcher` polls the same GitHub
-state. It enqueues all newly visible advisor events. For students, it maps
-authenticated human Issues and assignment-bound PR feedback into the active
-UUID. Authenticated humans are the interrupt tier: tools get up to 60 seconds
-to finish before Senpai interrupts and resumes the run, even when its inbox
-batch is full. Student assignments and trusted PR feedback share a FIFO queue
-tier; feedback waits for the next completed agent step without cancelling it.
-Ordinary events remain FIFO. Turn formation and non-human attachments are
-bounded to 16 events or 64 KiB; prioritized overflow remains pending to lead
-the next turn.
-Successfully injected student feedback is acknowledged in
-`github-feedback.json` only when the enclosing student turn succeeds.
+While an OpenHands turn is running, `ActiveMailboxWatcher` polls GitHub and job
+monitor mailboxes into the role's local event store. It enqueues all newly
+visible advisor events. For students, it maps authenticated human Issues,
+assignment-bound PR feedback, and job-monitor events into the active UUID.
+Authenticated humans are the interrupt tier: tools get up to 60 seconds to
+finish before Senpai interrupts and resumes the run, even when its inbox batch
+is full. Student assignments and trusted PR feedback share a FIFO queue tier;
+feedback and job-monitor events wait for the next safe sequential turn without
+cancelling it. Ordinary events remain FIFO. Turn formation and non-human
+attachments are bounded to 16 events or 64 KiB; prioritized overflow remains
+pending to lead the next turn. Events are acknowledged only after the enclosing
+turn succeeds; successful student feedback also advances `github-feedback.json`.
 
 Generic child results use a local SQLite WAL event store because parent and
 child run on the same advisor or student instance. That is not an inter-node
 protocol.
 
-The only SQLite databases are `advisor-events.sqlite3`, for unacknowledged
-advisor watcher/child events; `student-events.sqlite3`, for unacknowledged
-student feedback/child events; and `training/monitors.sqlite3`, for student
-monitor policy, samples, and deduplicated actionable signals. OpenHands
-conversation history is a separate file-backed per-UUID event log.
+Role-local SQLite state includes `advisor-events.sqlite3` for unacknowledged
+advisor watcher/child events, `student-events.sqlite3` for unacknowledged
+student feedback/child events, and `jobs/monitors.sqlite3` for supervised-job
+monitor policy, samples, and deduplicated actionable signals. The advisor's
+external W&B monitor policies use `advisor-job-monitors/monitors.sqlite3`.
+OpenHands conversation history is a separate file-backed per-UUID event log.
 
 A completed tool observation resets the three-attempt no-progress budget. A
 separate 36-inference-start backstop applies to each turn branch across worker
@@ -146,6 +147,12 @@ Advisor state:
 ├── controller-lease.json
 ├── advisor-events.sqlite3
 ├── started-conversations.json
+├── jobs/
+│   ├── <job-id>.json
+│   ├── <job-id>.log
+│   └── monitors.sqlite3
+├── advisor-job-monitors/
+│   └── monitors.sqlite3
 ├── github/
 └── conversations managed by OpenHands
 ```
@@ -162,16 +169,19 @@ Student state:
 ├── student-conversations.json
 ├── student-events.sqlite3
 ├── started-conversations.json
-├── training/
-│   ├── <training-id>.json
-│   ├── <training-id>.log
-│   ├── monitors.sqlite3
-│   └── monitors/<training-id>.json
+├── jobs/
+│   ├── <job-id>.json
+│   ├── <job-id>.log
+│   └── monitors.sqlite3
 ├── github/
 └── conversations managed by OpenHands
 ```
 
-`student-conversations.json` maps one `(assignment_id, revision_id)` to one UUID. `started-conversations.json` records the UUIDs that successfully received their initial controller context. A `training_monitor` event carries its original conversation UUID and therefore resumes, rather than replaces, the student conversation.
+`student-conversations.json` maps one `(assignment_id, revision_id)` to one
+UUID. `started-conversations.json` records the UUIDs that successfully received
+their initial controller context. A `job_monitor` event carries its original
+conversation UUID and therefore resumes, rather than replaces, the owning
+advisor or student conversation.
 
 `github-feedback.json` records every immutable PR feedback key's first-seen
 assignment revision, then marks it acknowledged only after its student turn
@@ -287,6 +297,12 @@ token trigger. OpenHands persists the returned typed compaction block in the
 normal event log and replays it first in each later request, including after a
 process restart. The local condenser is disabled for these conversations.
 Other providers retain the high-quality OpenHands condenser.
+
+Every advisor root turn appends one controller-derived liveness invariant to
+the system-message suffix, outside condensed history. It states that the
+campaign is active, that this runtime has no campaign round limit, and that
+`max_turns` limits one OpenHands turn rather than the research programme. Round
+labels, final-round claims, and summaries cannot authorize stopping.
 
 The complete durable transcript remains available as plain event JSON under
 `$SENPAI_OPENHANDS_STATE_DIR/$SENPAI_CONVERSATION_ID/events/`. The harness
@@ -542,84 +558,118 @@ Bash Runner have no delegation tools. A depth-one General Purpose child can use
 the lifecycle tools for depth-two leaf work, subject to the same tree budget
 and deadline. Children receive neither GitHub credentials nor GitHub
 read/write tools; the parent prepares any large PR Markdown artifact and owns
-every typed GitHub operation. They do not receive training tools.
+every typed GitHub operation. They do not receive job tools.
 
 When `review_ready` arrives during other advisor work, the advisor can spawn a
 smart, full-context General Purpose review and continue unrelated work. Every
 terminal record includes its root conversation identity, allowing the
 controller to resume the exact advisor or student conversation after its turn.
 
-### Training and monitoring
+### Long-running jobs and monitoring
 
-Students receive:
+Advisor and student root conversations receive:
 
 ```text
-run_training(spec: TrainingSpec) -> TrainingResult
-get_training_status(training_id: str) -> TrainingResult
-cancel_training(training_id: str) -> TrainingResult
-monitor_training(
-  training_id,
-  metric=None,
-  direction=None,
-  gates=(),
+run_job(spec: JobSpec) -> JobResult
+get_job_status(job_id: str) -> JobResult
+cancel_job(job_id: str) -> JobResult
+student monitor_job(
+  job_id,
+  wandb_run_id=None,
+  metrics=(
+    MetricMonitorSpec(metric, direction=None, gates=(), stale_after_seconds=600),
+    ...,
+  ),
   poll_interval_seconds=60,
-  stale_after_seconds=600,
-) -> MonitorTrainingObservation
+) -> MonitorJobObservation
+
+advisor monitor_job(
+  job_id,
+  metrics=(MetricMonitorSpec(...), ...),
+  poll_interval_seconds=60,
+) -> MonitorJobObservation
 ```
 
-`TrainingSupervisor` owns one process group, the configured timeout ceiling,
+The process supervisor owns one process group, the configured timeout ceiling,
 TERM/KILL cleanup, restart identity checks using PID/PGID/create-time, a bounded
 8 KiB error tail, streamed 64 KiB log parsing, persisted state, and discovered
-W&B run IDs. Run IDs are persisted while training is still running so metric
-monitoring can begin immediately.
+W&B run IDs. Run IDs are persisted while the job is still running so optional
+metric monitoring can begin immediately.
 
-The student commits the exact implementation and cleans the worktree before an
-expensive launch. Every successful `run_training` launch immediately registers
-a terminal-state monitor bound to the current conversation. `monitor_training`
-is an optional policy upgrade for useful metric gates or staleness detection;
-repeating it replaces the default or previous policy.
+The generic job supervisor confines `cwd` to the role workspace. Jobs declare
+`workspace_access` as `mutable` or `read_only`. A student mutable job requires a
+clean worktree at launch and holds an exclusive workspace lease, so assignment
+hydration, feedback checkout, and branch reconciliation wait until it reaches a
+terminal state. Advisor jobs and truly passive student watchers may be
+`read_only` and remain usable while notes are being edited. Jobs receive a
+scrubbed environment and may request only registered credentials explicitly;
+the current public grant is `WANDB_API_KEY`. Every successful `run_job` call
+immediately registers a terminal-state monitor bound to the current
+conversation. A student uses `monitor_job` with its local `run_job` ID and may
+bind metric policies to an exact associated `wandb_run_id`. Omission is allowed
+only when the job has exactly one associated W&B run. Registration validates
+the selected run in the configured project and persists that binding, so later
+log discovery cannot retarget metric evidence. An advisor instead uses a W&B
+run ID in the configured project as `job_id` without gaining process-status or
+cancellation authority over that external job. Each call sets or replaces zero
+to three independent metric policies; it never disables terminal wakes.
 
 The timeout is a total wall-clock ceiling, not merely the point at which
 shutdown begins. TERM is sent early enough that the configured grace period
 ends at the deadline, after which the complete process group is killed.
-`cancel_training` follows the same process-group cleanup path and does not
-return until the supervisor has persisted a terminal state. Target training
-code remains responsible for handling SIGTERM and flushing external services
+`cancel_job` follows the same process-group cleanup path and does not return
+until the supervisor has persisted a terminal state. Target job code remains
+responsible for handling SIGTERM and flushing external services
 such as W&B before the grace period expires.
 
-The controller polls only monitors that are due. It fetches one latest selected
-metric value from W&B, evaluates deterministic threshold/change/staleness and
-terminal-state rules, and persists deduplicated compact signals. Ordinary
-polls use no LLM tokens.
+The controller polls only monitors that are due. It fetches the latest value for
+up to three selected metrics from the monitor's persisted W&B run binding,
+evaluates deterministic threshold/change/staleness and terminal-state rules,
+and persists deduplicated compact signals. Polling continues in a background
+watcher while a model turn is active; quiet polls use no LLM tokens and add
+nothing to model context. A signal is prioritized for the next safe turn and
+never preempts the active conversation. The monitor store reports its earliest
+due poll to the controller, which shortens the ordinary heartbeat sleep
+accordingly; a minute-scale job therefore does not wait for the default
+ten-minute cadence.
 
-Metric samples reject NaN and infinities. A failure in one monitor's training
-status or W&B lookup advances that monitor's schedule and emits one
-deduplicated `monitor_error` hard signal; it cannot block other monitors,
+Metric samples reject NaN and infinities. Due monitors are ordered and processed
+in a capped batch with an overall time budget. A failure in one monitor's job
+status or W&B lookup advances that monitor's schedule and emits one deduplicated
+`monitor_error` hard signal. A slow external request can delay the current batch
+within its timeout and budget, but it cannot prevent later controller cycles,
 GitHub events, child results, or an already-pending hard-failure wake. A changed
-monitor policy resets its derived samples and signals to match the new marker.
+monitor policy resets its derived samples and signals to match the new persisted
+policy. The SQLite monitor store is the single source of truth for ownership,
+schedule, and active state; there is no second marker to reconcile.
 
-Every persisted actionable signal directly creates a compact
-`training_monitor` wake for the signal's original student conversation UUID.
-No intermediate LLM call gates these events: registering the monitor policy is
-the student's request to resume when one of its conditions emits a signal. The
-signal remains pending until that exact conversation successfully handles it.
+Every terminal job atomically records exactly one durable `job_status` signal,
+even when an active turn collects the result through `get_job_status` or
+`cancel_job` before the background watcher sees it. Every persisted actionable
+signal creates a compact `job_monitor` event for the original advisor or student
+conversation UUID. No intermediate LLM call gates these events: registering the
+monitor policy is the role's request to resume when one of its conditions emits
+a signal. The signal remains pending until that exact conversation successfully
+handles it. An already-active conversation is never duplicated; its event waits
+for the next safe sequential turn.
 
 Controller events are partitioned by their exact conversation UUID before a
 turn. Each partition is acknowledged only after its own successful turn, so a
-child result for one assignment cannot consume or permanently block a training
+child result for one assignment cannot consume or permanently block a job
 event for another.
 
-The Stop hook always verifies the automatic monitor marker and normally
-requires a clean worktree. While queued PR feedback waits for a safe boundary,
-a role-local marker waives only the clean-worktree check; the pump clears it
-before delivery and on entry and exit.
-The advisor and advisor children never receive training tools.
+The advisor and student Stop hooks verify that every live supervised job has an
+active SQLite monitor record. The student hook also verifies a clean worktree,
+allowing its turn to end while the controller supervises the process. While
+queued PR feedback waits for a safe boundary, a role-local marker waives only
+the clean-worktree check; the pump clears it before delivery and on entry and
+exit. Advisor and student children never receive job tools.
 
 ## Hooks, deadlines, and shutdown
 
 The native plugin declares OpenHands `PreToolUse`, `Stop`, and `SessionEnd`
 hooks. Its pre-tool hook covers both `senpai_terminal` and the raw `terminal`
-used by file-defined children, so delegation cannot bypass workflow or training
+used by file-defined children, so delegation cannot bypass workflow or job
 boundaries. Hooks give early model-visible feedback. `senpai_terminal` also
 evaluates the same pure policy in-process and fails closed if policy evaluation
 fails.
@@ -632,7 +682,7 @@ Every OpenHands turn has a controller-configured hard deadline. The deadline
 interrupts the conversation, produces a non-success result, and leaves durable
 events unacknowledged. The controller then retries with bounded exponential
 backoff. Controller termination interrupts and closes the current conversation,
-cancels active supervised training, closes local stores, and flushes Weave
+cancels active supervised jobs, closes local stores, and flushes Weave
 before the controller exits. Standalone and child runners flush Weave at runner
 exit.
 
@@ -725,11 +775,16 @@ Retained intentionally:
 
 - runtime skills and their model/effort metadata in the Senpai plugin;
 - human and developer guides under `.agents/skills`, outside pod context;
-- OpenHands Browser, task tracker, Think, and the high-quality default
+- OpenHands Browser, task tracker, and the high-quality default
   condenser for providers not using stored OpenAI Responses continuation or
   Anthropic native compaction;
 - the pinned `weave-openhands` agent, LLM, and tool tracing integration; and
 - only a small bootstrap shell path for clone, identity, and Git push guards.
+
+The task tracker is described as optional persisted coordination memory for parallel
+work, delegated agents, and long-running jobs; it does not impose a single
+`in_progress` item. The legacy model-visible `think` scratchpad is omitted from
+root and child tool surfaces while provider-native reasoning stays enabled.
 
 ## Acceptance
 

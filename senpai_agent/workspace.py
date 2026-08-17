@@ -7,7 +7,7 @@ import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,7 +16,6 @@ from pydantic import SecretStr
 from senpai_agent.git_workflow import git_process_env
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.PROMPTS import WORKSPACE_DIVERGENCE_PROMPT
-
 
 _HEAD_REF = "refs/senpai/assignment/head"
 _BASE_REF = "refs/senpai/assignment/base"
@@ -118,6 +117,17 @@ class WorkspaceDivergence(RuntimeError):
         )
 
 
+class WorkspaceJobRunning(RuntimeError):
+    """An assignment checkout is deferred while a mutable job holds the tree."""
+
+    def __init__(self, job_ids: Sequence[str]):
+        self.job_ids = tuple(job_ids)
+        super().__init__(
+            "assignment checkout deferred for mutable job(s): "
+            + ", ".join(self.job_ids)
+        )
+
+
 class StudentWorkspaceReconciler:
     """Hydrate an assignment and check it out without discarding local work."""
 
@@ -127,16 +137,16 @@ class StudentWorkspaceReconciler:
         *,
         repo: str | None = None,
         token: SecretStr | None = None,
+        active_mutable_job_ids: Callable[[], Sequence[str]] | None = None,
     ):
         if token is not None and repo is None:
             raise ValueError("authenticated reconciliation requires a GitHub repo")
-        if repo is not None and (
-            len(repo.split("/")) != 2 or not all(repo.split("/"))
-        ):
+        if repo is not None and (len(repo.split("/")) != 2 or not all(repo.split("/"))):
             raise ValueError("repo must use owner/name form")
         self.workspace = workspace
         self.token = token
         self.remote = f"https://github.com/{repo}.git" if repo else "origin"
+        self.active_mutable_job_ids = active_mutable_job_ids or (lambda: ())
 
     def __call__(self, events: Sequence[ControllerEvent]) -> None:
         assignment_event = next(
@@ -149,6 +159,9 @@ class StudentWorkspaceReconciler:
         )
         if assignment_event is None:
             return
+        active_jobs = tuple(self.active_mutable_job_ids())
+        if active_jobs:
+            raise WorkspaceJobRunning(active_jobs)
 
         assignment = _Assignment.from_event(assignment_event)
         fetched_head = self._hydrate(assignment)
@@ -166,13 +179,16 @@ class StudentWorkspaceReconciler:
             )
 
         local_ref = f"refs/heads/{assignment.head_ref}"
-        branch_exists = self._run(
-            "show-ref",
-            "--verify",
-            "--quiet",
-            local_ref,
-            check=False,
-        ).returncode == 0
+        branch_exists = (
+            self._run(
+                "show-ref",
+                "--verify",
+                "--quiet",
+                local_ref,
+                check=False,
+            ).returncode
+            == 0
+        )
         if not branch_exists:
             if fetched_head != assignment.head_sha:
                 raise WorkspaceDivergence(
@@ -288,12 +304,15 @@ class StudentWorkspaceReconciler:
             )
 
     def _commit_exists(self, sha: str) -> bool:
-        return self._run(
-            "cat-file",
-            "-e",
-            f"{sha}^{{commit}}",
-            check=False,
-        ).returncode == 0
+        return (
+            self._run(
+                "cat-file",
+                "-e",
+                f"{sha}^{{commit}}",
+                check=False,
+            ).returncode
+            == 0
+        )
 
     def _worktree_state(self) -> str:
         status = self._git(
@@ -320,9 +339,7 @@ class StudentWorkspaceReconciler:
             "-z",
         ).stdout
         paths = sorted(path for path in raw_paths.split("\0") if path)
-        state = [
-            f"paths={hashlib.sha256(raw_paths.encode()).hexdigest()}:{len(paths)}"
-        ]
+        state = [f"paths={hashlib.sha256(raw_paths.encode()).hexdigest()}:{len(paths)}"]
         budget = _UNTRACKED_CONTENT_BUDGET
         for relative in paths[:_UNTRACKED_FILE_LIMIT]:
             path = self.workspace / relative
@@ -333,9 +350,7 @@ class StudentWorkspaceReconciler:
                 continue
             digest = "metadata-only"
             if path.is_symlink():
-                digest = hashlib.sha256(
-                    path.readlink().as_posix().encode()
-                ).hexdigest()
+                digest = hashlib.sha256(path.readlink().as_posix().encode()).hexdigest()
             elif path.is_file() and metadata.st_size <= budget:
                 with path.open("rb") as file:
                     content = file.read(budget + 1)
@@ -385,9 +400,7 @@ class StudentWorkspaceReconciler:
         )
         if check and completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
-            raise RuntimeError(
-                f"git {' '.join(arguments[:2])} failed: {detail[:1000]}"
-            )
+            raise RuntimeError(f"git {' '.join(arguments[:2])} failed: {detail[:1000]}")
         return completed
 
     @staticmethod

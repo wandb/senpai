@@ -20,8 +20,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 EVENT_INDEX = re.compile(r"^event-(\d+)-")
-STATUS_TOOLS = frozenset({"get_training_status", "get_job_status"})
-LAUNCH_TOOLS = frozenset({"run_training", "run_job"})
+STATUS_TOOLS = frozenset({"get_job_status"})
+LAUNCH_TOOLS = frozenset({"run_job"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,7 +124,7 @@ def _explicit_role(base_state: dict[str, Any], event_dir: Path) -> str | None:
         params = tool.get("params") or {}
         if params.get("role") in {"advisor", "student"}:
             return str(params["role"])
-    if any(tool.get("name") == "senpai_training" for tool in tools):
+    if any(tool.get("name") == "senpai_jobs" for tool in tools):
         return "student"
 
     for part in reversed(event_dir.parts):

@@ -13,6 +13,7 @@ from senpai_agent.inbox import (
     MAX_EVENT_BYTES_PER_TURN,
     MAX_EVENTS_PER_TURN,
     MAX_INFERENCE_ATTEMPTS_PER_TURN,
+    JOB_PRIORITY,
     QUEUE_PRIORITY,
     STEER_PRIORITY,
     DeliveryState,
@@ -194,6 +195,113 @@ def test_fifo_drain_is_bounded_by_event_count_and_bytes(tmp_path: Path):
     oversized = inbox.next_turn(large_conversation, "large prompt")
     assert oversized is not None
     assert [event.event_key for event in oversized.events] == ["oversized"]
+
+
+def test_priority_applies_only_at_the_next_safe_turn(tmp_path: Path):
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(CONVERSATION_ID, "ordinary:active", "active ordinary event")
+    active = inbox.next_turn(CONVERSATION_ID, "active prompt")
+    assert active is not None
+
+    inbox.enqueue(
+        CONVERSATION_ID,
+        "ordinary:waiting",
+        "waiting ordinary event",
+    )
+    inbox.enqueue(
+        CONVERSATION_ID,
+        "job:waiting",
+        "waiting job event",
+        priority=JOB_PRIORITY,
+    )
+    inbox.enqueue(
+        CONVERSATION_ID,
+        "human:waiting",
+        "waiting human event",
+        priority=STEER_PRIORITY,
+    )
+
+    unchanged = inbox.next_turn(CONVERSATION_ID, "must not preempt")
+    assert unchanged is not None
+    assert unchanged.turn_id == active.turn_id
+    assert [event.event_key for event in unchanged.events] == ["ordinary:active"]
+
+    deliver_turn_messages(Conversation(), inbox, active.turn_id)
+    inbox.record_processed(active.turn_id)
+    inbox.acknowledge(active.turn_id)
+    resumed = inbox.next_turn(CONVERSATION_ID, "next safe turn")
+    assert resumed is not None
+    assert [event.event_key for event in resumed.events] == [
+        "human:waiting",
+        "job:waiting",
+        "ordinary:waiting",
+    ]
+
+
+def test_job_priority_cannot_starve_ordinary_results(tmp_path: Path):
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(CONVERSATION_ID, "ordinary", "student result")
+    for index in range(20):
+        inbox.enqueue(
+            CONVERSATION_ID,
+            f"job:{index}",
+            f"job monitor {index}",
+            priority=JOB_PRIORITY,
+        )
+
+    turn = inbox.next_turn(CONVERSATION_ID, "bounded priority prompt")
+    assert turn is not None
+    keys = [event.event_key for event in turn.events]
+    assert len(keys) == 16
+    assert keys[:15] == [f"job:{index}" for index in range(15)]
+    assert keys[-1] == "ordinary"
+
+
+def test_job_priority_reserves_ordinary_work_before_the_byte_cap(tmp_path: Path):
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(CONVERSATION_ID, "ordinary", "student result")
+    for index in range(20):
+        inbox.enqueue(
+            CONVERSATION_ID,
+            f"job:{index}",
+            "x" * 6_000,
+            priority=JOB_PRIORITY,
+        )
+
+    turn = inbox.next_turn(CONVERSATION_ID, "bounded priority prompt")
+    assert turn is not None
+    assert [event.event_key for event in turn.events][-1] == "ordinary"
+
+
+def test_priority_reservation_never_exceeds_the_byte_cap(tmp_path: Path):
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(CONVERSATION_ID, "ordinary", "o" * 63_000)
+    inbox.enqueue(
+        CONVERSATION_ID,
+        "job",
+        "j" * 6_000,
+        priority=JOB_PRIORITY,
+    )
+
+    turn = inbox.next_turn(CONVERSATION_ID, "bounded priority prompt")
+    assert turn is not None
+    assert [event.event_key for event in turn.events] == ["ordinary"]
+
+
+def test_oversized_ordinary_work_cannot_be_starved_by_priority(tmp_path: Path):
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(CONVERSATION_ID, "ordinary", "o" * 70_000)
+    for index in range(20):
+        inbox.enqueue(
+            CONVERSATION_ID,
+            f"job:{index}",
+            "j" * 6_000,
+            priority=JOB_PRIORITY,
+        )
+
+    turn = inbox.next_turn(CONVERSATION_ID, "bounded priority prompt")
+    assert turn is not None
+    assert [event.event_key for event in turn.events] == ["ordinary"]
 
 
 def test_priority_precedes_fifo_without_reordering_its_own_class(tmp_path: Path):
