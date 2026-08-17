@@ -212,6 +212,7 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
             "WANDB_API_KEY": "wandb-key",
             "EXA_API_KEY": "exa-key",
             "MLXFAST_API_TOKEN": "mlxfast-key",
+            "YUKON_API_TOKEN": "yukon-key",
             "SENPAI_TIMEOUT_MINUTES": "0.5",
         }
     )
@@ -227,6 +228,7 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
         "WANDB_API_KEY": "wandb-key",
         "EXA_API_KEY": "exa-key",
         "MLXFAST_API_TOKEN": "mlxfast-key",
+        "YUKON_API_TOKEN": "yukon-key",
     }
     assert "ANTHROPIC_API_KEY" not in config.command_secrets
     assert "OPENAI_API_KEY" not in config.command_secrets

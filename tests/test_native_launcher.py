@@ -2,6 +2,7 @@ import io
 import json
 import os
 import plistlib
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -95,6 +96,17 @@ class NativePlanTests(NativeTmuxTestCase):
         self.assertEqual(role.log_root.name, "logs")
         self.assertEqual(role.state_root.name, "state")
         self.assertTrue(role.lease.is_relative_to(role.state_root))
+
+    def test_plan_rejects_an_invalid_ownership_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "ownership_token"):
+                plan_native(
+                    args(
+                        Path(tmp) / "runs",
+                        native_ownership_token="not-a-token",
+                    ),
+                    [student()],
+                )
 
     def test_roles_get_distinct_tmux_socket_roots(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,7 +244,10 @@ class NativePlanTests(NativeTmuxTestCase):
 class NativeLaunchTests(NativeTmuxTestCase):
     def test_launch_writes_private_state_and_secret_free_persistent_plist(self):
         with tempfile.TemporaryDirectory() as tmp:
-            run_args = args(Path(tmp) / "runs")
+            run_args = args(
+                Path(tmp) / "runs",
+                native_ownership_token="a" * 32,
+            )
             spec = student()
             plan = plan_native(run_args, [spec])
             with (
@@ -275,6 +290,7 @@ class NativeLaunchTests(NativeTmuxTestCase):
             self.assertEqual(
                 descriptor["environment"]["TMUX_TMPDIR"], str(role.tmux_root)
             )
+            self.assertEqual(manifest["ownership_token"], "a" * 32)
             self.assertEqual(manifest["roles"][0]["tmux_root"], str(role.tmux_root))
             command_path = descriptor["environment"]["PATH"].split(os.pathsep)
             self.assertIn("/opt/homebrew/bin", command_path)
@@ -493,7 +509,60 @@ class NativeLaunchTests(NativeTmuxTestCase):
             )
 
 
+class NativeInventoryTests(unittest.TestCase):
+    def test_installed_role_keys_discovers_only_valid_campaign_roles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for role in ("advisor", "student-fern"):
+                (root / f"com.wandb.senpai.mlxfast-r1.{role}.plist").touch()
+            metadata = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0)
+
+            with (
+                patch.object(native_backend, "LAUNCH_DAEMON_ROOT", root),
+                patch.object(Path, "lstat", return_value=metadata),
+            ):
+                roles = native_backend._installed_role_keys("mlxfast-r1")
+
+        self.assertEqual(roles, {"advisor", "student-fern"})
+
+    def test_installed_role_keys_rejects_untrusted_inventory_entries(self):
+        cases = {
+            "symbolic link": SimpleNamespace(
+                st_mode=stat.S_IFLNK | 0o777,
+                st_uid=0,
+            ),
+            "non-root owner": SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o644,
+                st_uid=501,
+            ),
+            "group-writable file": SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o664,
+                st_uid=0,
+            ),
+        }
+        for name, metadata in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "com.wandb.senpai.mlxfast-r1.student-fern.plist").touch()
+                with (
+                    patch.object(native_backend, "LAUNCH_DAEMON_ROOT", root),
+                    patch.object(Path, "lstat", return_value=metadata),
+                    self.assertRaisesRegex(RuntimeError, "not root-controlled"),
+                ):
+                    native_backend._installed_role_keys("mlxfast-r1")
+
+
 class NativeLifecycleTests(NativeTmuxTestCase):
+    def setUp(self):
+        super().setUp()
+        self.installed_roles_patch = patch.object(
+            native_backend,
+            "_installed_role_keys",
+            return_value={"student-fern"},
+        )
+        self.installed_roles_patch.start()
+        self.addCleanup(self.installed_roles_patch.stop)
+
     def write_manifest(
         self,
         root: Path,
@@ -575,6 +644,28 @@ class NativeLifecycleTests(NativeTmuxTestCase):
             uninstall.assert_called_once_with("system", manifest["roles"][0])
             self.assertFalse(run_path.exists())
 
+    def test_terminate_rejects_a_mismatched_ownership_token_before_sudo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runs"
+            run_path, manifest = self.write_manifest(root)
+            manifest["ownership_token"] = "a" * 32
+            (run_path / "manifest.json").write_text(json.dumps(manifest))
+
+            with (
+                patch(
+                    "senpai.launch.native_backend._uninstall_recorded_role"
+                ) as uninstall,
+                self.assertRaisesRegex(RuntimeError, "ownership token"),
+            ):
+                terminate_native(
+                    "mlxfast-r1",
+                    str(root),
+                    ownership_token="b" * 32,
+                )
+
+            uninstall.assert_not_called()
+            self.assertTrue(run_path.exists())
+
     def test_terminate_removes_the_recorded_tmux_root_after_bootout(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "runs"
@@ -631,6 +722,110 @@ class NativeLifecycleTests(NativeTmuxTestCase):
 
             self.assertTrue(sibling.exists())
             self.assertTrue(run_path.exists())
+
+    def test_terminate_rejects_an_unrelated_launchdaemon_before_sudo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runs"
+            run_path, manifest = self.write_manifest(root)
+            manifest["roles"].append(
+                {
+                    "key": "student-tanjiro",
+                    "label": "com.vendor.security-agent",
+                    "plist": (
+                        "/Library/LaunchDaemons/com.vendor.security-agent.plist"
+                    ),
+                }
+            )
+            (run_path / "manifest.json").write_text(json.dumps(manifest))
+            completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch(
+                    "senpai.launch.native_backend._sudo_run",
+                    return_value=completed,
+                ) as sudo,
+                self.assertRaisesRegex(RuntimeError, "unexpected native role"),
+            ):
+                terminate_native("mlxfast-r1", str(root))
+
+            sudo.assert_not_called()
+            self.assertTrue(run_path.exists())
+
+    def test_terminate_rejects_a_manifest_that_omits_an_installed_role(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runs"
+            run_path, _manifest = self.write_manifest(root)
+
+            with (
+                patch.object(
+                    native_backend,
+                    "_installed_role_keys",
+                    return_value={"student-fern", "student-tanjiro"},
+                    create=True,
+                ),
+                patch.object(
+                    native_backend,
+                    "_uninstall_recorded_role",
+                ) as uninstall,
+                self.assertRaisesRegex(RuntimeError, "omits installed native role"),
+            ):
+                terminate_native("mlxfast-r1", str(root))
+
+            uninstall.assert_not_called()
+            self.assertTrue(run_path.exists())
+
+    def test_terminate_retry_boots_out_a_loaded_job_after_its_plist_was_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runs"
+            run_path, manifest = self.write_manifest(root)
+            failed = SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="temporary bootout failure",
+            )
+            completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch.object(
+                    native_backend,
+                    "_installed_role_keys",
+                    side_effect=(
+                        {"student-fern"},
+                        set(),
+                    ),
+                ),
+                patch.object(
+                    native_backend,
+                    "_job_state",
+                    return_value=("running", 42),
+                ),
+                patch.object(
+                    native_backend,
+                    "_sudo_run",
+                    side_effect=(failed, completed, completed, completed),
+                ) as sudo,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "temporary bootout failure"):
+                    terminate_native("mlxfast-r1", str(root))
+                self.assertTrue(run_path.exists())
+
+                terminate_native("mlxfast-r1", str(root))
+
+            bootouts = [
+                call.args[0]
+                for call in sudo.call_args_list
+                if call.args[0][1] == "bootout"
+            ]
+            self.assertEqual(len(bootouts), 2)
+            self.assertEqual(
+                bootouts[0],
+                [
+                    "/bin/launchctl",
+                    "bootout",
+                    f"system/{manifest['roles'][0]['label']}",
+                ],
+            )
+            self.assertFalse(run_path.exists())
 
     def test_uninstall_boots_out_then_removes_the_root_launchdaemon(self):
         completed = SimpleNamespace(returncode=0, stdout="", stderr="")

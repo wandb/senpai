@@ -16,6 +16,7 @@ import pwd
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -37,6 +38,7 @@ DEFAULT_NATIVE_TMUX_ROOT = "~/.senpai/t"
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHD_PREFIX = "com.wandb.senpai"
 LAUNCHD_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]+")
+OWNERSHIP_TOKEN = re.compile(r"[0-9a-f]{32}")
 LAUNCH_DAEMON_ROOT = Path("/Library/LaunchDaemons")
 LAUNCHCTL = "/bin/launchctl"
 CAFFEINATE = "/usr/bin/caffeinate"
@@ -92,6 +94,7 @@ class NativeLaunchPlan:
     user_name: str
     group_name: str
     roles: tuple[NativeRolePlan, ...]
+    ownership_token: str = ""
 
 
 def _path_beneath(root: Path, *parts: str) -> Path:
@@ -159,6 +162,9 @@ def plan_native(args, role_specs: list[RoleSpec]) -> NativeLaunchPlan:
     timeout = float(getattr(args, "native_ready_timeout_s", 600))
     if timeout <= 0:
         raise ValueError("native_ready_timeout_s must be greater than 0")
+    ownership_token = getattr(args, "native_ownership_token", "")
+    if ownership_token and not OWNERSHIP_TOKEN.fullmatch(ownership_token):
+        raise ValueError("native_ownership_token must be 32 lowercase hex characters")
 
     run_root = _run_root(args.tag, _configured_run_root(args))
     if run_root.is_relative_to(SOURCE_ROOT):
@@ -207,6 +213,7 @@ def plan_native(args, role_specs: list[RoleSpec]) -> NativeLaunchPlan:
         user_name=user_name,
         group_name=group_name,
         roles=tuple(roles),
+        ownership_token=ownership_token,
     )
 
 
@@ -474,6 +481,7 @@ def _write_manifest(plan: NativeLaunchPlan) -> None:
         plan.run_root / "manifest.json",
         {
             "domain": plan.domain,
+            "ownership_token": plan.ownership_token,
             "tag": plan.tag,
             "roles": [
                 {
@@ -558,6 +566,104 @@ def _uninstall_recorded_role(domain: str, role: dict) -> None:
             f"{recorded}"
         )
     _uninstall_service(domain, label, expected)
+
+
+def _validate_recorded_roles(tag: str, roles: object) -> None:
+    if not isinstance(roles, list) or not roles:
+        raise RuntimeError("Native manifest has no valid native roles")
+
+    keys: set[str] = set()
+    for role in roles:
+        if not isinstance(role, dict):
+            raise RuntimeError("Native manifest has an unexpected native role")
+        key = role.get("key")
+        if key == "advisor":
+            pass
+        elif isinstance(key, str) and key.startswith("student-"):
+            try:
+                validate_identifier("Native student name", key.removeprefix("student-"))
+            except ValueError as error:
+                raise RuntimeError(
+                    f"Native manifest has an unexpected native role {key!r}"
+                ) from error
+        else:
+            raise RuntimeError(
+                f"Native manifest has an unexpected native role {key!r}"
+            )
+        if key in keys:
+            raise RuntimeError(f"Native manifest repeats native role {key!r}")
+        keys.add(key)
+
+        expected_label = f"{LAUNCHD_PREFIX}.{tag}.{key}"
+        expected_plist = _launchd_plist_path(expected_label)
+        if (
+            role.get("label") != expected_label
+            or role.get("plist") != str(expected_plist)
+        ):
+            raise RuntimeError(
+                f"Native manifest has an unexpected native role {key!r}"
+            )
+
+
+def _installed_role_keys(tag: str) -> set[str]:
+    """Read the campaign inventory from root-owned LaunchDaemon plists."""
+
+    prefix = f"{LAUNCHD_PREFIX}.{tag}."
+    try:
+        candidates = tuple(LAUNCH_DAEMON_ROOT.glob(f"{prefix}*.plist"))
+    except OSError as error:
+        raise RuntimeError(
+            "Could not inspect the native LaunchDaemon inventory"
+        ) from error
+
+    keys: set[str] = set()
+    for path in candidates:
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise RuntimeError(
+                f"Could not inspect native LaunchDaemon {path}"
+            ) from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_mode & 0o022
+        ):
+            raise RuntimeError(
+                f"Native LaunchDaemon inventory entry is not root-controlled: {path}"
+            )
+        label = path.name.removesuffix(".plist")
+        key = label.removeprefix(prefix)
+        if key == "advisor":
+            pass
+        elif key.startswith("student-"):
+            try:
+                validate_identifier("Native student name", key.removeprefix("student-"))
+            except ValueError as error:
+                raise RuntimeError(
+                    f"Native LaunchDaemon inventory has an invalid role {key!r}"
+                ) from error
+        else:
+            raise RuntimeError(
+                f"Native LaunchDaemon inventory has an invalid role {key!r}"
+            )
+        if path != _launchd_plist_path(f"{prefix}{key}") or key in keys:
+            raise RuntimeError(
+                f"Native LaunchDaemon inventory has an invalid role {key!r}"
+            )
+        keys.add(key)
+    return keys
+
+
+def _validate_installed_role_inventory(tag: str, roles: list[dict]) -> set[str]:
+    recorded = {role["key"] for role in roles}
+    installed = _installed_role_keys(tag)
+    omitted = sorted(installed - recorded)
+    if omitted:
+        raise RuntimeError(
+            "Native manifest omits installed native role(s): " + ", ".join(omitted)
+        )
+    return installed
 
 
 def _remove_tmux_root(path: str | Path, expected: Path) -> None:
@@ -749,6 +855,7 @@ def _load_manifest(
         raise RuntimeError(f"Native run manifest tag does not match {tag!r}")
     if manifest.get("domain") != "system":
         raise RuntimeError("Native run manifest does not use the system launchd domain")
+    _validate_recorded_roles(tag, manifest.get("roles"))
     return path, manifest
 
 
@@ -800,9 +907,25 @@ def logs_native(
     subprocess.run([*command, *existing], check=True)
 
 
-def terminate_native(tag: str, run_root: str = DEFAULT_NATIVE_RUN_ROOT) -> None:
+def terminate_native(
+    tag: str,
+    run_root: str = DEFAULT_NATIVE_RUN_ROOT,
+    *,
+    ownership_token: str = "",
+) -> None:
     """Unload recorded services and remove their private workspaces and secrets."""
     path, manifest = _load_manifest(tag, run_root)
+    if ownership_token:
+        if not OWNERSHIP_TOKEN.fullmatch(ownership_token):
+            raise ValueError(
+                "native ownership token must be 32 lowercase hex characters"
+            )
+        if manifest.get("ownership_token") != ownership_token:
+            raise RuntimeError(
+                "Native run ownership token does not match; preserving services "
+                "and private state"
+            )
+    _validate_installed_role_inventory(tag, manifest["roles"])
     errors = []
     for role in reversed(manifest["roles"]):
         try:

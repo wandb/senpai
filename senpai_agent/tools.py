@@ -220,13 +220,19 @@ class JobSpec(SupervisedJobSpec):
         ),
     )
     secret_env: tuple[
-        Literal["WANDB_API_KEY", "MLXFAST_API_TOKEN"], ...
+        Literal[
+            "WANDB_API_KEY",
+            "MLXFAST_API_TOKEN",
+            "YUKON_API_TOKEN",
+        ],
+        ...,
     ] = Field(
         default=(),
         description=(
             "Registered credentials this process needs. Request WANDB_API_KEY "
-            "only for W&B communication and MLXFAST_API_TOKEN only for an "
-            "official MLXFast API operation."
+            "only for W&B communication, MLXFAST_API_TOKEN only for an "
+            "official MLXFast API operation, and YUKON_API_TOKEN only for an "
+            "official Yukon API operation."
         ),
     )
 

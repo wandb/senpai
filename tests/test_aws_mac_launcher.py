@@ -75,6 +75,9 @@ def args(state_root: Path, **overrides) -> SimpleNamespace:
         "native_ready_timeout_s": 37,
         "dry_run": False,
         "aws_mac_host_ids": "h-a1,h-b2",
+        "aws_mac_nodes_path": "",
+        "aws_mac_bootstrap_mode": "fresh",
+        "aws_mac_yukon_bundle": "",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -117,6 +120,30 @@ def host_description(
                 }
             ]
         },
+    }
+
+
+def adopted_instance(
+    *,
+    public_ip: str = "198.51.100.1",
+    security_group_ids: tuple[str, ...] = ("sg-a1",),
+) -> dict:
+    return {
+        "InstanceId": "i-a1",
+        "State": {"Name": "running"},
+        "InstanceType": "mac-m4pro.metal",
+        "Architecture": "arm64_mac",
+        "Placement": {
+            "HostId": "h-a1",
+            "AvailabilityZone": "us-east-1a",
+            "Tenancy": "host",
+        },
+        "SubnetId": "subnet-a1",
+        "SecurityGroups": [
+            {"GroupId": group_id} for group_id in security_group_ids
+        ],
+        "PublicIpAddress": public_ip,
+        "VpcId": "vpc-a1",
     }
 
 
@@ -199,10 +226,17 @@ class AwsMacInputTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "one host per student"):
             distribute_roles([student("fern")], hosts)
 
-    def test_ttl_zero_disables_shutdown_and_negative_values_are_rejected(self):
-        self.assertEqual(_user_data(0), "")
-        self.assertIn("/sbin/shutdown -h +150", _user_data(2.5))
+    def test_ttl_zero_disables_shutdown_but_still_publishes_ssh_host_keys(self):
+        no_ttl = _user_data(0)
+        self.assertNotIn("/sbin/shutdown", no_ttl)
+        self.assertIn("SENPAI_SSH_HOST_KEY", no_ttl)
+        self.assertIn("/etc/ssh/ssh_host_*_key.pub", no_ttl)
 
+        with_ttl = _user_data(2.5)
+        self.assertIn("/sbin/shutdown -h +150", with_ttl)
+        self.assertIn("SENPAI_SSH_HOST_KEY", with_ttl)
+
+    def test_negative_ttl_is_rejected(self):
         run_args = args(
             Path("/tmp/state"),
             aws_ttl_hours=-1,
@@ -255,6 +289,170 @@ class AwsMacInputTests(unittest.TestCase):
 
 
 class AwsMacInfrastructureValidationTests(unittest.TestCase):
+    def test_campaign_ssh_group_is_created_in_the_selected_vpc_with_run_tags(self):
+        host = mac_host("h-a1", "fern")
+        plan = AwsMacPlan(
+            context=AwsContext("us-east-1", "sandbox"),
+            account_id="770934259321",
+            ami_id="ami-mac",
+            root_device="/dev/sda1",
+            volume_gib=250,
+            security_group_id="sg-a1",
+            ssh_cidr="203.0.113.7/32",
+            hosts=(host,),
+            vpc_id="vpc-a1",
+        )
+        with patch.object(
+            aws_mac_backend,
+            "_aws_json",
+            return_value={"GroupId": "sg-b1"},
+        ) as aws_json:
+            group_id = aws_mac_backend._create_ssh_security_group(
+                plan,
+                name="senpai-mlxfast-r1-ssh-abcd1234",
+                tag="mlxfast-r1",
+            )
+
+        command = aws_json.call_args.args
+        self.assertEqual(group_id, "sg-b1")
+        self.assertEqual(command[1:3], ("ec2", "create-security-group"))
+        self.assertEqual(command[command.index("--vpc-id") + 1], "vpc-a1")
+        tags = json.loads(command[command.index("--tag-specifications") + 1])
+        self.assertIn(
+            {"Key": "senpai:run", "Value": "mlxfast-r1"},
+            tags[0]["Tags"],
+        )
+        self.assertIn(
+            {"Key": "SenpaiPurpose", "Value": "ssh"},
+            tags[0]["Tags"],
+        )
+
+    def test_campaign_ssh_group_removes_and_verifies_all_default_egress(self):
+        permissions = [
+            {
+                "IpProtocol": "-1",
+                "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                "Ipv6Ranges": [{"CidrIpv6": "::/0"}],
+            }
+        ]
+        with (
+            patch.object(
+                aws_mac_backend,
+                "_aws_json",
+                side_effect=(
+                    {
+                        "SecurityGroups": [
+                            {
+                                "GroupId": "sg-b1",
+                                "IpPermissionsEgress": permissions,
+                            }
+                        ]
+                    },
+                    {
+                        "SecurityGroups": [
+                            {
+                                "GroupId": "sg-b1",
+                                "IpPermissionsEgress": [],
+                            }
+                        ]
+                    },
+                ),
+            ),
+            patch.object(aws_mac_backend, "_aws_raw") as aws_raw,
+        ):
+            aws_mac_backend._harden_ssh_security_group(
+                AwsContext("us-east-1", "sandbox"),
+                "sg-b1",
+            )
+
+        self.assertEqual(
+            aws_raw.call_args.args[1:5],
+            ("ec2", "revoke-security-group-egress", "--group-id", "sg-b1"),
+        )
+        encoded = aws_raw.call_args.args[
+            aws_raw.call_args.args.index("--ip-permissions") + 1
+        ]
+        self.assertEqual(json.loads(encoded), permissions)
+
+    def test_campaign_ssh_group_tolerates_eventually_consistent_egress_reads(self):
+        permissions = [{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}]
+        with (
+            patch.object(
+                aws_mac_backend,
+                "_aws_json",
+                side_effect=(
+                    {
+                        "SecurityGroups": [
+                            {
+                                "GroupId": "sg-b1",
+                                "IpPermissionsEgress": permissions,
+                            }
+                        ]
+                    },
+                    {
+                        "SecurityGroups": [
+                            {
+                                "GroupId": "sg-b1",
+                                "IpPermissionsEgress": permissions,
+                            }
+                        ]
+                    },
+                    {
+                        "SecurityGroups": [
+                            {"GroupId": "sg-b1", "IpPermissionsEgress": []}
+                        ]
+                    },
+                ),
+            ) as aws_json,
+            patch.object(aws_mac_backend, "_aws_raw"),
+            patch.object(aws_mac_backend.time, "sleep") as sleep,
+        ):
+            aws_mac_backend._harden_ssh_security_group(
+                AwsContext("us-east-1", "sandbox"),
+                "sg-b1",
+            )
+
+        self.assertEqual(aws_json.call_count, 3)
+        sleep.assert_called_once_with(1)
+
+    def test_campaign_ssh_group_fails_closed_after_five_stale_egress_reads(self):
+        permissions = [{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}]
+        group = {
+            "SecurityGroups": [
+                {"GroupId": "sg-b1", "IpPermissionsEgress": permissions}
+            ]
+        }
+        with (
+            patch.object(
+                aws_mac_backend,
+                "_aws_json",
+                side_effect=[group] * 6,
+            ) as aws_json,
+            patch.object(aws_mac_backend, "_aws_raw"),
+            patch.object(aws_mac_backend.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "still permits egress"):
+                aws_mac_backend._harden_ssh_security_group(
+                    AwsContext("us-east-1", "sandbox"),
+                    "sg-b1",
+                )
+
+        self.assertEqual(aws_json.call_count, 6)
+        self.assertEqual(sleep.call_count, 4)
+
+    def test_ssh_requires_a_pre_authorized_host_key(self):
+        command = aws_mac_backend._ssh_base(
+            Path("/tmp/state"),
+            {"instance_id": "i-test", "public_ip": "198.51.100.1"},
+        )
+
+        self.assertEqual(command[:3], ["ssh", "-F", "/dev/null"])
+        self.assertIn("StrictHostKeyChecking=yes", command)
+        self.assertIn("GlobalKnownHostsFile=/dev/null", command)
+        self.assertIn("IdentityAgent=none", command)
+        self.assertIn("UpdateHostKeys=no", command)
+        self.assertNotIn("StrictHostKeyChecking=accept-new", command)
+
     def test_ssh_disconnects_stdin_when_no_payload_is_sent(self):
         node = {"instance_id": "i-test", "public_ip": "198.51.100.1"}
         completed = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
@@ -361,6 +559,22 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
 
         self.assertNotIn("AutoTokenizer.from_pretrained", script)
         self.assertNotIn("llm.has_chat_template_tokenizer()", script)
+
+    def test_remote_setup_installs_yukon_without_replacing_mlxfast(self):
+        script = _remote_setup_script(
+            SimpleNamespace(
+                senpai_repo_url="https://github.com/wandb/senpai.git",
+                senpai_repo_revision=REVISION,
+                aws_mac_yukon_bundle="/tmp/yukon.js",
+            )
+        ).decode()
+
+        self.assertIn("/usr/local/libexec/yukon.js", script)
+        self.assertIn("/usr/local/bin/yukon", script)
+        self.assertIn("YUKON_API_URL='https://api.yukon.org'", script)
+        self.assertIn("yukon version", script)
+        self.assertNotIn("/usr/local/libexec/mlxfast.js", script)
+        self.assertNotIn("/usr/local/bin/mlxfast", script)
 
     def test_remote_setup_imports_the_supplied_metal_toolchain(self):
         script = _remote_setup_script(
@@ -481,6 +695,44 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
         self.assertLess(execute, reconnect)
         self.assertNotIn("/bin/bash -s", commands)
 
+    def test_reused_node_receives_and_installs_the_yukon_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = root / "yukon.js"
+            bundle.write_bytes(b"#!/usr/bin/env bun\n")
+            run_args = args(
+                root / "state",
+                aws_mac_bootstrap_mode="reuse",
+                aws_mac_yukon_bundle=str(bundle),
+            )
+            node = {
+                "student": "fern",
+                "instance_id": "i-fern",
+                "public_ip": "198.51.100.1",
+                "runtime_ownership_token": "a" * 32,
+            }
+
+            with (
+                patch.object(aws_mac_backend, "_wait_ssh"),
+                patch.object(aws_mac_backend, "_ssh") as ssh,
+            ):
+                aws_mac_backend._prepare_node(run_args, root, node, None)
+
+        commands = [call.args[2] for call in ssh.call_args_list]
+        self.assertEqual(
+            commands.count("umask 077; cat > /tmp/senpai-yukon.js"),
+            1,
+        )
+        self.assertFalse(any("senpai-Xcode.zip" in command for command in commands))
+        setup = next(
+            call.kwargs["input_bytes"].decode()
+            for call in ssh.call_args_list
+            if call.kwargs.get("input_bytes", b"").startswith(b"#!/bin/bash")
+        )
+        self.assertIn("/usr/local/libexec/yukon.js", setup)
+        self.assertIn("/usr/local/bin/yukon", setup)
+        self.assertNotIn("/usr/local/libexec/mlxfast.js", setup)
+
     def test_instance_launch_is_pinned_to_the_mapped_dedicated_host(self):
         host = mac_host("h-a1", "fern")
         plan = AwsMacPlan(
@@ -504,12 +756,15 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
                 host,
                 "senpai-key",
                 "token-fern",
+                ssh_security_group_id="sg-b2",
             )
 
         command = aws_json.call_args.args
         self.assertEqual(command[1:3], ("ec2", "run-instances"))
         placement = json.loads(command[command.index("--placement") + 1])
         self.assertEqual(placement, {"HostId": "h-a1", "Tenancy": "host"})
+        network = json.loads(command[command.index("--network-interfaces") + 1])
+        self.assertEqual(network[0]["Groups"], ["sg-a1", "sg-b2"])
         self.assertEqual(command[command.index("--count") + 1], "1")
         self.assertEqual(
             command[command.index("--client-token") + 1],
@@ -520,8 +775,9 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
         self.assertEqual(node["client_token"], "token-fern")
         user_data = command[command.index("--user-data") + 1]
         self.assertIn("/sbin/shutdown -h +1440", user_data)
+        self.assertIn("SENPAI_SSH_HOST_KEY", user_data)
 
-    def test_zero_ttl_omits_scheduled_shutdown_from_instance_launch(self):
+    def test_zero_ttl_publishes_host_keys_without_scheduled_shutdown(self):
         host = mac_host("h-a1", "fern")
         plan = AwsMacPlan(
             context=AwsContext("us-east-1", "sandbox"),
@@ -544,14 +800,78 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
                 host,
                 "senpai-key",
                 "token-fern",
+                ssh_security_group_id="sg-b2",
             )
 
         command = aws_json.call_args.args
-        self.assertNotIn("--user-data", command)
+        user_data = command[command.index("--user-data") + 1]
+        self.assertNotIn("/sbin/shutdown", user_data)
+        self.assertIn("SENPAI_SSH_HOST_KEY", user_data)
+        self.assertIn("/etc/ssh/ssh_host_*_key.pub", user_data)
         self.assertEqual(
             command[command.index("--instance-initiated-shutdown-behavior") + 1],
             "stop",
         )
+
+    def test_recorded_instance_authenticates_host_after_persisting_public_ip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "state"
+            run_dir.mkdir()
+            host = mac_host("h-a1", "fern")
+            plan = AwsMacPlan(
+                context=AwsContext("us-east-1", "sandbox"),
+                account_id="770934259321",
+                ami_id="ami-mac",
+                root_device="/dev/sda1",
+                volume_gib=250,
+                security_group_id="sg-a1",
+                ssh_cidr="203.0.113.7/32",
+                hosts=(host,),
+                vpc_id="vpc-a1",
+            )
+            node = {
+                **asdict(host),
+                "client_token": "token-fern",
+                "instance_id": "i-fern",
+                "public_ip": "",
+            }
+            state = {"tag": "mlxfast-r1", "nodes": [node]}
+
+            def authorize(context, recorded_run_dir, recorded_node, *, timeout_s):
+                persisted = json.loads((run_dir / "state.json").read_text())
+                self.assertEqual(persisted["nodes"][0]["public_ip"], "198.51.100.1")
+                self.assertEqual(context, plan.context)
+                self.assertEqual(recorded_run_dir, run_dir)
+                self.assertIs(recorded_node, node)
+                self.assertEqual(timeout_s, 1_200)
+
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_wait_instance",
+                    return_value={"PublicIpAddress": "198.51.100.1"},
+                ),
+                patch.object(
+                    aws_mac_backend,
+                    "_authorize_ssh_host",
+                    side_effect=authorize,
+                    create=True,
+                ) as authorize_ssh_host,
+            ):
+                aws_mac_backend._wait_recorded_instance(
+                    args(run_dir.parent),
+                    plan,
+                    run_dir,
+                    state,
+                    node,
+                )
+
+            authorize_ssh_host.assert_called_once_with(
+                plan.context,
+                run_dir,
+                node,
+                timeout_s=1_200,
+            )
 
     def test_instance_readiness_polling_uses_health_status_without_stock_waiters(self):
         instance = {
@@ -669,6 +989,7 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
             payload["args"]["native_ready_timeout_s"],
             run_args.native_ready_timeout_s,
         )
+        self.assertEqual(payload["args"]["native_ownership_token"], "")
         self.assertNotIn("HF_HOME", payload["roles"][0]["env"])
         self.assertNotIn("HF_HUB_OFFLINE", payload["roles"][0]["env"])
         serialized = json.dumps(payload)
@@ -691,6 +1012,20 @@ class AwsMacInfrastructureValidationTests(unittest.TestCase):
 
 
 class AwsMacLaunchTests(unittest.TestCase):
+    def setUp(self):
+        self.termination_waiter_patch = patch.object(
+            aws_mac_backend,
+            "_wait_for_instances_terminated",
+        )
+        self.termination_waiter_patch.start()
+        self.addCleanup(self.termination_waiter_patch.stop)
+        self.ssh_group_hardening_patch = patch.object(
+            aws_mac_backend,
+            "_harden_ssh_security_group",
+        )
+        self.ssh_group_hardening_patch.start()
+        self.addCleanup(self.ssh_group_hardening_patch.stop)
+
     def test_key_pair_intent_is_recorded_before_the_aws_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -799,6 +1134,11 @@ class AwsMacLaunchTests(unittest.TestCase):
                 patch.object(aws_mac_backend, "_write_private_key", side_effect=write_key),
                 patch.object(
                     aws_mac_backend,
+                    "_create_ssh_security_group",
+                    return_value="sg-b1",
+                ),
+                patch.object(
+                    aws_mac_backend,
                     "_authorize_ssh",
                     side_effect=AwsCommandError("connection lost after authorize response"),
                 ),
@@ -809,6 +1149,62 @@ class AwsMacLaunchTests(unittest.TestCase):
                 launch_aws_mac(args(root / "state"), [student("fern")], plan)
 
         revoke_ssh.assert_called_once()
+
+    def test_ssh_group_hardening_failure_cleans_up_without_launching_an_instance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host = mac_host("h-a1", "fern")
+            plan = AwsMacPlan(
+                context=AwsContext("us-east-1", "sandbox"),
+                account_id="770934259321",
+                ami_id="ami-mac",
+                root_device="/dev/sda1",
+                volume_gib=250,
+                security_group_id="sg-a1",
+                ssh_cidr="203.0.113.7/32",
+                hosts=(host,),
+                vpc_id="vpc-a1",
+            )
+            operations: list[tuple[str, ...]] = []
+
+            def write_key(path, material):
+                path.write_text(material)
+                path.chmod(0o600)
+
+            def aws_raw(_context, _service, operation, *arguments):
+                operations.append((operation, *arguments))
+                return ""
+
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_aws_json",
+                    return_value={"KeyMaterial": "private-key"},
+                ),
+                patch.object(aws_mac_backend, "_key_name", return_value="senpai-key"),
+                patch.object(aws_mac_backend, "_write_private_key", side_effect=write_key),
+                patch.object(
+                    aws_mac_backend,
+                    "_create_ssh_security_group",
+                    return_value="sg-b1",
+                ),
+                patch.object(
+                    aws_mac_backend,
+                    "_harden_ssh_security_group",
+                    side_effect=RuntimeError("egress verification failed"),
+                ),
+                patch.object(aws_mac_backend, "_aws_raw", side_effect=aws_raw),
+                patch.object(aws_mac_backend, "_run_instance") as run_instance,
+                self.assertRaisesRegex(RuntimeError, "egress verification failed"),
+            ):
+                launch_aws_mac(args(root / "state"), [student("fern")], plan)
+
+            run_instance.assert_not_called()
+            self.assertIn(
+                ("delete-security-group", "--group-id", "sg-b1"),
+                operations,
+            )
+            self.assertFalse((root / "state" / "mlxfast-r1").exists())
 
     def test_launch_orders_remote_preflight_github_native_launch_and_gates(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -829,10 +1225,20 @@ class AwsMacLaunchTests(unittest.TestCase):
                 security_group_id="sg-a1",
                 ssh_cidr="203.0.113.7/32",
                 hosts=hosts,
+                vpc_id="vpc-a1",
             )
             events: list[str] = []
 
-            def run_instance(_args, _plan, host, _key_name, client_token):
+            def run_instance(
+                _args,
+                _plan,
+                host,
+                _key_name,
+                client_token,
+                *,
+                ssh_security_group_id,
+            ):
+                self.assertEqual(ssh_security_group_id, "sg-b1")
                 saved = json.loads(
                     (root / "state" / "mlxfast-r1" / "state.json").read_text()
                 )
@@ -858,6 +1264,11 @@ class AwsMacLaunchTests(unittest.TestCase):
                         f"198.51.100.{1 if student_name == 'fern' else 2}"
                     )
                 }
+
+            def authorize_host(context, _run_dir, node, *, timeout_s):
+                self.assertEqual(context, plan.context)
+                self.assertEqual(timeout_s, run_args.aws_ready_timeout_s)
+                events.append(f"authorize:{node['student']}")
 
             def sequential(label, actions):
                 events.append(label)
@@ -885,6 +1296,16 @@ class AwsMacLaunchTests(unittest.TestCase):
                 patch.object(aws_mac_backend, "_write_private_key", side_effect=write_key),
                 patch.object(
                     aws_mac_backend,
+                    "_create_ssh_security_group",
+                    return_value="sg-b1",
+                ),
+                patch.object(
+                    aws_mac_backend,
+                    "_harden_ssh_security_group",
+                    side_effect=lambda *_args: events.append("harden-ssh-group"),
+                ),
+                patch.object(
+                    aws_mac_backend,
                     "_authorize_ssh",
                     side_effect=AwsCommandError(
                         "An error occurred (InvalidPermission.Duplicate)"
@@ -895,6 +1316,11 @@ class AwsMacLaunchTests(unittest.TestCase):
                     aws_mac_backend,
                     "_wait_instance",
                     side_effect=wait_instance,
+                ),
+                patch.object(
+                    aws_mac_backend,
+                    "_authorize_ssh_host",
+                    side_effect=authorize_host,
                 ),
                 patch.object(
                     aws_mac_backend,
@@ -943,9 +1369,22 @@ class AwsMacLaunchTests(unittest.TestCase):
             ]
             github = events.index("github")
             self.assertLess(
+                events.index("harden-ssh-group"),
+                events.index("instance:fern"),
+            )
+            self.assertLess(
                 events.index("canary:fern"),
                 events.index("instance:tanjiro"),
             )
+            for student_name in ("fern", "tanjiro"):
+                self.assertLess(
+                    events.index(f"wait:{student_name}"),
+                    events.index(f"authorize:{student_name}"),
+                )
+                self.assertLess(
+                    events.index(f"authorize:{student_name}"),
+                    events.index(f"prepare:{student_name}"),
+                )
             self.assertEqual(len(preflights), 2)
             self.assertEqual(len(launches), 2)
             self.assertEqual(len(gates), 2)
@@ -959,8 +1398,11 @@ class AwsMacLaunchTests(unittest.TestCase):
             state = json.loads(
                 (root / "state" / "mlxfast-r1" / "state.json").read_text()
             )
+            self.assertEqual(state["backend"], "aws-mac")
+            self.assertEqual(state["state_version"], 3)
             self.assertEqual(state["phase"], "running")
-            self.assertFalse(state["ssh_authorized"])
+            self.assertTrue(state["ssh_authorized"])
+            self.assertEqual(state["ssh_security_group_id"], "sg-b1")
             self.assertEqual(len({node["client_token"] for node in state["nodes"]}), 2)
 
     def test_rollback_cleanup_terminates_instances_but_never_releases_hosts(self):
@@ -968,21 +1410,25 @@ class AwsMacLaunchTests(unittest.TestCase):
             run_dir = Path(tmp) / "state" / "mlxfast-r1"
             run_dir.mkdir(parents=True)
             state = {
+                "backend": "aws-mac",
+                "state_version": 3,
                 "tag": "mlxfast-r1",
                 "region": "us-east-1",
                 "profile": "sandbox",
                 "key_name": "senpai-key",
-                "ssh_authorized": True,
+                "ssh_authorized": False,
                 "ssh_cidr": "203.0.113.7/32",
                 "security_group_id": "sg-a1",
                 "nodes": [
                     {
                         "instance_id": "i-fern",
+                        "instance_ownership": "created",
                         "host_id": "h-a1",
                         "public_ip": "",
                     },
                     {
                         "instance_id": "i-tanjiro",
+                        "instance_ownership": "created",
                         "host_id": "h-b2",
                         "public_ip": "",
                     },
@@ -1001,13 +1447,517 @@ class AwsMacLaunchTests(unittest.TestCase):
                 errors = _cleanup(run_dir, state, AwsContext("us-east-1", "sandbox"))
 
         self.assertEqual(errors, [])
-        terminate = next(item for item in operations if item[0] == "terminate-instances")
+        terminate = [
+            item for item in operations if item[0] == "terminate-instances"
+        ]
         self.assertEqual(
             terminate,
-            ("terminate-instances", "--instance-ids", "i-fern", "i-tanjiro"),
+            [
+                ("terminate-instances", "--instance-ids", "i-fern"),
+                ("terminate-instances", "--instance-ids", "i-tanjiro"),
+            ],
         )
         self.assertFalse(any(item[0] == "release-hosts" for item in operations))
         self.assertFalse(any("h-a1" in item or "h-b2" in item for item in operations))
+
+    def test_cleanup_handles_a_missing_and_live_instance_independently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "state" / "mlxfast-r1"
+            run_dir.mkdir(parents=True)
+            state = {
+                "backend": "aws-mac",
+                "state_version": 3,
+                "tag": "mlxfast-r1",
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "",
+                "ssh_authorized": False,
+                "nodes": [
+                    {
+                        "instance_id": "i-missing",
+                        "instance_ownership": "created",
+                        "host_id": "h-a1",
+                        "public_ip": "",
+                    },
+                    {
+                        "instance_id": "i-live",
+                        "instance_ownership": "created",
+                        "host_id": "h-b2",
+                        "public_ip": "",
+                    },
+                ],
+            }
+            terminated: list[tuple[str, ...]] = []
+
+            def aws_raw(_context, _service, operation, *arguments):
+                if operation != "terminate-instances":
+                    return ""
+                terminated.append(arguments)
+                instance_id = arguments[-1]
+                if instance_id == "i-missing":
+                    raise AwsCommandError("InvalidInstanceID.NotFound")
+                return ""
+
+            with patch.object(aws_mac_backend, "_aws_raw", side_effect=aws_raw):
+                errors = _cleanup(run_dir, state, AwsContext("us-east-1", "sandbox"))
+
+            self.assertEqual(errors, [])
+            self.assertEqual(
+                terminated,
+                [
+                    ("--instance-ids", "i-missing"),
+                    ("--instance-ids", "i-live"),
+                ],
+            )
+            self.assertFalse(run_dir.exists())
+
+    def test_cleanup_persists_only_the_instance_that_failed_to_terminate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "state" / "mlxfast-r1"
+            run_dir.mkdir(parents=True)
+            state = {
+                "backend": "aws-mac",
+                "state_version": 3,
+                "tag": "mlxfast-r1",
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "",
+                "ssh_authorized": False,
+                "nodes": [
+                    {
+                        "instance_id": "i-terminated",
+                        "instance_ownership": "created",
+                        "host_id": "h-a1",
+                        "public_ip": "",
+                    },
+                    {
+                        "instance_id": "i-denied",
+                        "instance_ownership": "created",
+                        "host_id": "h-b2",
+                        "public_ip": "",
+                    },
+                ],
+            }
+
+            def aws_raw(_context, _service, operation, *arguments):
+                if operation == "terminate-instances" and arguments[-1] == "i-denied":
+                    raise AwsCommandError("UnauthorizedOperation")
+                return ""
+
+            with patch.object(aws_mac_backend, "_aws_raw", side_effect=aws_raw):
+                errors = _cleanup(run_dir, state, AwsContext("us-east-1", "sandbox"))
+
+            persisted = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(len(errors), 1)
+            self.assertIn("terminate instance i-denied", errors[0])
+            self.assertEqual(persisted["nodes"][0]["instance_id"], "")
+            self.assertEqual(persisted["nodes"][1]["instance_id"], "i-denied")
+            self.assertEqual(persisted["phase"], "cleanup-failed")
+
+    def test_same_cidr_campaigns_delete_only_their_owned_ssh_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_a = root / "campaign-a"
+            run_b = root / "campaign-b"
+            run_a.mkdir()
+            run_b.mkdir()
+            common = {
+                "backend": "aws-mac",
+                "state_version": 3,
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "",
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": True,
+                "ssh_authorized": True,
+                "ssh_cidr": "203.0.113.7/32",
+                "ssh_security_group_create_started": True,
+                "ssh_security_group_owned": True,
+                "vpc_id": "vpc-a1",
+                "nodes": [],
+            }
+            state_a = {
+                **common,
+                "tag": "campaign-a",
+                "ssh_security_group_id": "sg-b1",
+                "ssh_security_group_name": "senpai-campaign-a-ssh",
+            }
+            state_b = {
+                **common,
+                "tag": "campaign-b",
+                "ssh_security_group_id": "sg-b2",
+                "ssh_security_group_name": "senpai-campaign-b-ssh",
+            }
+            operations: list[tuple[str, ...]] = []
+
+            def aws_raw(_context, _service, operation, *arguments):
+                operations.append((operation, *arguments))
+                return ""
+
+            with patch.object(aws_mac_backend, "_aws_raw", side_effect=aws_raw):
+                errors = _cleanup(
+                    run_a,
+                    state_a,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+
+            self.assertEqual(errors, [])
+            self.assertFalse(run_a.exists())
+            self.assertTrue(run_b.exists())
+            serialized = json.dumps(operations)
+            self.assertIn("sg-b1", serialized)
+            self.assertNotIn("sg-a1", serialized)
+            self.assertNotIn("sg-b2", serialized)
+            self.assertIn("delete-security-group", serialized)
+
+    def test_cleanup_recovers_an_ambiguous_owned_ssh_group_create(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "campaign-a"
+            run_dir.mkdir()
+            state = {
+                "backend": "aws-mac",
+                "state_version": 2,
+                "tag": "campaign-a",
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "",
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": False,
+                "ssh_authorized": None,
+                "ssh_cidr": "203.0.113.7/32",
+                "ssh_security_group_create_started": True,
+                "ssh_security_group_id": "",
+                "ssh_security_group_name": "senpai-campaign-a-ssh",
+                "ssh_security_group_owned": None,
+                "vpc_id": "vpc-a1",
+                "nodes": [],
+            }
+            operations: list[tuple[str, ...]] = []
+
+            def aws_raw(_context, _service, operation, *arguments):
+                operations.append((operation, *arguments))
+                return ""
+
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_aws_json",
+                    return_value={"SecurityGroups": [{"GroupId": "sg-b1"}]},
+                ) as aws_json,
+                patch.object(aws_mac_backend, "_aws_raw", side_effect=aws_raw),
+            ):
+                errors = _cleanup(
+                    run_dir,
+                    state,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+
+            self.assertEqual(errors, [])
+            self.assertFalse(run_dir.exists())
+            self.assertIn("describe-security-groups", aws_json.call_args.args)
+            self.assertIn(
+                ("delete-security-group", "--group-id", "sg-b1"),
+                operations,
+            )
+
+    def test_cleanup_retries_an_owned_ssh_group_delete_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "campaign-a"
+            run_dir.mkdir()
+            state = {
+                "backend": "aws-mac",
+                "state_version": 2,
+                "tag": "campaign-a",
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "",
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": False,
+                "ssh_authorized": False,
+                "ssh_cidr": "203.0.113.7/32",
+                "ssh_security_group_create_started": True,
+                "ssh_security_group_id": "sg-b1",
+                "ssh_security_group_name": "senpai-campaign-a-ssh",
+                "ssh_security_group_owned": True,
+                "vpc_id": "vpc-a1",
+                "nodes": [],
+            }
+            attempts = 0
+
+            def aws_raw(_context, _service, operation, *_arguments):
+                nonlocal attempts
+                if operation == "delete-security-group":
+                    attempts += 1
+                    if attempts == 1:
+                        raise AwsCommandError("DependencyViolation")
+                return ""
+
+            with patch.object(aws_mac_backend, "_aws_raw", side_effect=aws_raw):
+                first_errors = _cleanup(
+                    run_dir,
+                    state,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+                persisted = json.loads((run_dir / "state.json").read_text())
+                retry_state = json.loads(json.dumps(persisted))
+                second_errors = _cleanup(
+                    run_dir,
+                    retry_state,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+
+            self.assertEqual(len(first_errors), 1)
+            self.assertIn("delete SSH security group", first_errors[0])
+            self.assertEqual(persisted["ssh_security_group_id"], "sg-b1")
+            self.assertEqual(second_errors, [])
+            self.assertEqual(attempts, 2)
+            self.assertFalse(run_dir.exists())
+
+    def test_cleanup_preserves_access_until_every_instance_is_terminated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "campaign-a"
+            run_dir.mkdir()
+            state = {
+                "backend": "aws-mac",
+                "state_version": 2,
+                "tag": "campaign-a",
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "senpai-key",
+                "key_create_started": True,
+                "key_owned": True,
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": True,
+                "ssh_authorized": True,
+                "ssh_cidr": "203.0.113.7/32",
+                "ssh_security_group_create_started": True,
+                "ssh_security_group_id": "sg-b1",
+                "ssh_security_group_name": "senpai-campaign-a-ssh",
+                "ssh_security_group_owned": True,
+                "vpc_id": "vpc-a1",
+                "nodes": [
+                    {
+                        "instance_id": "i-live",
+                        "instance_ownership": "created",
+                        "host_id": "h-a1",
+                        "public_ip": "",
+                    }
+                ],
+            }
+            operations: list[tuple[str, ...]] = []
+            terminate_attempts = 0
+
+            def aws_raw(_context, _service, operation, *arguments):
+                nonlocal terminate_attempts
+                operations.append((operation, *arguments))
+                if operation == "terminate-instances":
+                    terminate_attempts += 1
+                    if terminate_attempts == 1:
+                        raise AwsCommandError("UnauthorizedOperation")
+                return ""
+
+            with patch.object(aws_mac_backend, "_aws_raw", side_effect=aws_raw):
+                first_errors = _cleanup(
+                    run_dir,
+                    state,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+                persisted = json.loads((run_dir / "state.json").read_text())
+                first_operations = list(operations)
+                retry_state = json.loads(json.dumps(persisted))
+                second_errors = _cleanup(
+                    run_dir,
+                    retry_state,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+
+            self.assertEqual(len(first_errors), 1)
+            self.assertEqual(persisted["key_name"], "senpai-key")
+            self.assertEqual(persisted["ssh_security_group_id"], "sg-b1")
+            self.assertFalse(
+                any(
+                    operation
+                    in {
+                        "delete-key-pair",
+                        "revoke-security-group-ingress",
+                        "delete-security-group",
+                    }
+                    for operation, *_arguments in first_operations
+                )
+            )
+            self.assertEqual(second_errors, [])
+            self.assertFalse(run_dir.exists())
+            self.assertIn(
+                ("delete-key-pair", "--key-name", "senpai-key"),
+                operations,
+            )
+            self.assertIn(
+                ("delete-security-group", "--group-id", "sg-b1"),
+                operations,
+            )
+
+    def test_cleanup_preserves_access_when_the_termination_waiter_times_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "campaign-a"
+            run_dir.mkdir()
+            state = {
+                "backend": "aws-mac",
+                "state_version": 3,
+                "tag": "campaign-a",
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "senpai-key",
+                "key_create_started": True,
+                "key_owned": True,
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": True,
+                "ssh_authorized": True,
+                "ssh_cidr": "203.0.113.7/32",
+                "ssh_security_group_create_started": True,
+                "ssh_security_group_id": "sg-b1",
+                "ssh_security_group_name": "senpai-campaign-a-ssh",
+                "ssh_security_group_owned": True,
+                "vpc_id": "vpc-a1",
+                "nodes": [
+                    {
+                        "instance_id": "i-live",
+                        "instance_ownership": "created",
+                        "host_id": "h-a1",
+                        "public_ip": "",
+                    }
+                ],
+            }
+            operations: list[tuple[str, ...]] = []
+
+            def aws_raw(_context, _service, operation, *arguments):
+                operations.append((operation, *arguments))
+                return ""
+
+            with (
+                patch.object(aws_mac_backend, "_aws_raw", side_effect=aws_raw),
+                patch.object(
+                    aws_mac_backend,
+                    "_wait_for_instances_terminated",
+                    side_effect=AwsCommandError("Max attempts exceeded"),
+                ),
+            ):
+                errors = _cleanup(
+                    run_dir,
+                    state,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+
+            persisted = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(len(errors), 1)
+            self.assertIn("wait for instance i-live termination", errors[0])
+            self.assertEqual(persisted["nodes"][0]["instance_id"], "i-live")
+            self.assertEqual(persisted["key_name"], "senpai-key")
+            self.assertEqual(persisted["ssh_security_group_id"], "sg-b1")
+            self.assertFalse(
+                any(
+                    operation
+                    in {
+                        "delete-key-pair",
+                        "revoke-security-group-ingress",
+                        "delete-security-group",
+                    }
+                    for operation, *_arguments in operations
+                )
+            )
+
+    def test_legacy_cleanup_never_revokes_a_shared_ssh_rule(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "campaign-a"
+            run_dir.mkdir()
+            state = {
+                "backend": "aws-mac",
+                "state_version": 1,
+                "tag": "campaign-a",
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "",
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": True,
+                "ssh_authorized": True,
+                "ssh_cidr": "203.0.113.7/32",
+                "nodes": [],
+            }
+
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_aws_json",
+                    return_value={
+                        "SecurityGroups": [
+                            {
+                                "GroupId": "sg-a1",
+                                "IpPermissions": [
+                                    {
+                                        "IpProtocol": "tcp",
+                                        "FromPort": 22,
+                                        "ToPort": 22,
+                                        "IpRanges": [
+                                            {"CidrIp": "203.0.113.7/32"}
+                                        ],
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                ),
+                patch.object(aws_mac_backend, "_aws_raw") as aws_raw,
+            ):
+                errors = _cleanup(
+                    run_dir,
+                    state,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+
+            self.assertEqual(len(errors), 1)
+            self.assertIn("legacy shared SSH rule", errors[0])
+            self.assertIn("rerun terminate", errors[0])
+            self.assertTrue(run_dir.exists())
+            aws_raw.assert_not_called()
+
+    def test_legacy_cleanup_converges_after_the_shared_rule_is_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "campaign-a"
+            run_dir.mkdir()
+            state = {
+                "backend": "aws-mac",
+                "state_version": 1,
+                "tag": "campaign-a",
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "",
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": True,
+                "ssh_authorized": True,
+                "ssh_cidr": "203.0.113.7/32",
+                "nodes": [],
+            }
+
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_aws_json",
+                    return_value={
+                        "SecurityGroups": [
+                            {"GroupId": "sg-a1", "IpPermissions": []}
+                        ]
+                    },
+                ),
+                patch.object(aws_mac_backend, "_aws_raw") as aws_raw,
+            ):
+                errors = _cleanup(
+                    run_dir,
+                    state,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+
+            self.assertEqual(errors, [])
+            self.assertFalse(run_dir.exists())
+            aws_raw.assert_not_called()
 
     def test_cleanup_skips_native_termination_when_no_manifest_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1015,6 +1965,8 @@ class AwsMacLaunchTests(unittest.TestCase):
             run_dir.mkdir(parents=True)
             (run_dir / "id_ed25519").write_text("private")
             state = {
+                "backend": "aws-mac",
+                "state_version": 3,
                 "tag": "mlxfast-r1",
                 "region": "us-east-1",
                 "profile": "sandbox",
@@ -1023,6 +1975,7 @@ class AwsMacLaunchTests(unittest.TestCase):
                 "nodes": [
                     {
                         "instance_id": "i-fern",
+                        "instance_ownership": "created",
                         "host_id": "h-a1",
                         "public_ip": "198.51.100.1",
                     }
@@ -1038,11 +1991,93 @@ class AwsMacLaunchTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertIn("if test -f", ssh.call_args.args[2])
 
+    def test_successful_instance_termination_supersedes_native_stop_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "state" / "mlxfast-r1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "id_ed25519").write_text("private")
+            state = {
+                "backend": "aws-mac",
+                "state_version": 3,
+                "tag": "mlxfast-r1",
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "",
+                "ssh_authorized": False,
+                "nodes": [
+                    {
+                        "instance_id": "i-fern",
+                        "instance_ownership": "created",
+                        "host_id": "h-a1",
+                        "public_ip": "198.51.100.1",
+                    }
+                ],
+            }
+
+            with (
+                patch.object(aws_mac_backend, "_aws_raw", return_value=""),
+                patch.object(
+                    aws_mac_backend,
+                    "_ssh",
+                    side_effect=RuntimeError("host is already unavailable"),
+                ),
+            ):
+                errors = _cleanup(run_dir, state, AwsContext("us-east-1", "sandbox"))
+                run_exists = run_dir.exists()
+
+        self.assertEqual(errors, [])
+        self.assertFalse(run_exists)
+
+    def test_failed_instance_termination_preserves_cleanup_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "state" / "mlxfast-r1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "id_ed25519").write_text("private")
+            state = {
+                "backend": "aws-mac",
+                "state_version": 3,
+                "tag": "mlxfast-r1",
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "",
+                "ssh_authorized": False,
+                "nodes": [
+                    {
+                        "instance_id": "i-fern",
+                        "instance_ownership": "created",
+                        "host_id": "h-a1",
+                        "public_ip": "198.51.100.1",
+                    }
+                ],
+            }
+
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_aws_raw",
+                    side_effect=AwsCommandError("UnauthorizedOperation"),
+                ),
+                patch.object(
+                    aws_mac_backend,
+                    "_ssh",
+                    side_effect=RuntimeError("host is unavailable"),
+                ),
+            ):
+                errors = _cleanup(run_dir, state, AwsContext("us-east-1", "sandbox"))
+                run_exists = run_dir.exists()
+
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(any(error.startswith("native stop i-fern") for error in errors))
+        self.assertTrue(any(error.startswith("terminate instance") for error in errors))
+        self.assertTrue(run_exists)
+
     def test_cleanup_recovers_an_instance_from_its_persisted_client_token(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "state" / "mlxfast-r1"
             run_dir.mkdir(parents=True)
             state = {
+                "backend": "aws-mac",
+                "state_version": 3,
                 "tag": "mlxfast-r1",
                 "region": "us-east-1",
                 "profile": "sandbox",
@@ -1053,6 +2088,7 @@ class AwsMacLaunchTests(unittest.TestCase):
                         "student": "fern",
                         "client_token": "token-fern",
                         "instance_id": "",
+                        "instance_ownership": "created",
                         "host_id": "h-a1",
                         "public_ip": "",
                     }
@@ -1094,11 +2130,67 @@ class AwsMacLaunchTests(unittest.TestCase):
         self.assertIn("Name=client-token,Values=token-fern", aws_json.call_args.args)
         self.assertIn("Name=tag:senpai:run,Values=mlxfast-r1", aws_json.call_args.args)
 
+    def test_cleanup_converges_when_an_ambiguous_launch_already_terminated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "state" / "mlxfast-r1"
+            run_dir.mkdir(parents=True)
+            state = {
+                "backend": "aws-mac",
+                "state_version": 3,
+                "tag": "mlxfast-r1",
+                "region": "us-east-1",
+                "profile": "sandbox",
+                "key_name": "",
+                "ssh_authorized": False,
+                "nodes": [
+                    {
+                        "student": "fern",
+                        "client_token": "token-fern",
+                        "instance_id": "",
+                        "instance_ownership": "created",
+                        "host_id": "h-a1",
+                        "public_ip": "",
+                    }
+                ],
+            }
+
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_aws_json",
+                    return_value={
+                        "Reservations": [
+                            {
+                                "Instances": [
+                                    {
+                                        "InstanceId": "i-already-gone",
+                                        "Placement": {"HostId": "h-a1"},
+                                        "State": {"Name": "terminated"},
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                ),
+                patch.object(aws_mac_backend, "_aws_raw") as aws_raw,
+            ):
+                errors = _cleanup(
+                    run_dir,
+                    state,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+
+            self.assertEqual(errors, [])
+            self.assertFalse(run_dir.exists())
+            aws_raw.assert_not_called()
+
     def test_cleanup_treats_missing_aws_resources_as_already_removed(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "state" / "mlxfast-r1"
             run_dir.mkdir(parents=True)
             state = {
+                "backend": "aws-mac",
+                "state_version": 3,
                 "tag": "mlxfast-r1",
                 "region": "us-east-1",
                 "profile": "sandbox",
@@ -1109,9 +2201,14 @@ class AwsMacLaunchTests(unittest.TestCase):
                 "ssh_authorized": True,
                 "ssh_cidr": "203.0.113.7/32",
                 "security_group_id": "sg-a1",
+                "ssh_security_group_create_started": True,
+                "ssh_security_group_id": "sg-b1",
+                "ssh_security_group_name": "senpai-mlxfast-r1-ssh",
+                "ssh_security_group_owned": True,
                 "nodes": [
                     {
                         "instance_id": "i-fern",
+                        "instance_ownership": "created",
                         "host_id": "h-a1",
                         "public_ip": "",
                     }
@@ -1122,6 +2219,7 @@ class AwsMacLaunchTests(unittest.TestCase):
                 code = {
                     "terminate-instances": "InvalidInstanceID.NotFound",
                     "delete-key-pair": "InvalidKeyPair.NotFound",
+                    "delete-security-group": "InvalidGroup.NotFound",
                 }[operation]
                 raise AwsCommandError(code)
 
@@ -1139,6 +2237,599 @@ class AwsMacLaunchTests(unittest.TestCase):
         self.assertFalse(run_dir.exists())
 
 
+class AwsMacAdoptionTests(unittest.TestCase):
+    def test_adopted_instance_requires_the_aws_mac_architecture(self):
+        expected = {
+            "instance_id": "i-a1",
+            "host_id": "h-a1",
+            "availability_zone": "us-east-1a",
+            "subnet_id": "subnet-a1",
+            "security_group_ids": ["sg-a1"],
+        }
+        instance = {**adopted_instance(), "Architecture": "arm64"}
+
+        with self.assertRaisesRegex(RuntimeError, "arm64_mac"):
+            aws_mac_backend._validate_adopted_instance_snapshot(
+                expected,
+                instance,
+                "mac-m4pro.metal",
+            )
+
+    def test_schema_v1_manifest_is_exact_and_preserves_student_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            key = root / "id_ed25519"
+            known_hosts = root / "known_hosts"
+            key.write_text("private")
+            known_hosts.write_text("198.51.100.1 ssh-ed25519 trusted")
+            key.chmod(0o600)
+            known_hosts.chmod(0o644)
+            manifest = root / "nodes.yaml"
+            manifest.write_text(
+                aws_mac_backend.yaml.safe_dump(
+                    {
+                        "schema_version": 1,
+                        "access": {
+                            "private_key_path": str(key),
+                            "known_hosts_path": str(known_hosts),
+                            "ownership": "external",
+                        },
+                        "nodes": [
+                            {
+                                "student": name,
+                                "source": {"adopted_instance_id": instance_id},
+                                "expect": {
+                                    "host_id": host_id,
+                                    "availability_zone": "us-east-1a",
+                                    "subnet_id": "subnet-a1",
+                                    "security_group_ids": ["sg-a1"],
+                                },
+                                "prior_native_run": f"prior-{name}",
+                            }
+                            for name, instance_id, host_id in (
+                                ("tanjiro", "i-b2", "h-b2"),
+                                ("fern", "i-a1", "h-a1"),
+                            )
+                        ],
+                    }
+                )
+            )
+
+            adoption = aws_mac_backend._load_adoption_manifest(
+                str(manifest),
+                [student("fern"), student("tanjiro")],
+            )
+
+            self.assertEqual(
+                [host.student for host in adoption.hosts],
+                ["fern", "tanjiro"],
+            )
+            self.assertTrue(
+                all(host.instance_ownership == "adopted" for host in adoption.hosts)
+            )
+
+    def test_adopted_guest_preflight_uses_the_native_homebrew_path(self):
+        commands = []
+        manifest = json.dumps(
+            {
+                "tag": "prior-fern",
+                "domain": "system",
+                "roles": [
+                    {"label": "com.wandb.senpai.prior-fern.student-fern"}
+                ],
+            }
+        ).encode()
+
+        def run(command: str, *, check: bool = True):
+            commands.append(command)
+            if command.startswith("cat "):
+                return subprocess.CompletedProcess([], 0, manifest, b"")
+            if "launchctl print" in command:
+                return subprocess.CompletedProcess(
+                    [], 1, b"", b"Could not find service"
+                )
+            return subprocess.CompletedProcess([], 0, b"", b"")
+
+        aws_mac_backend._verify_adopted_guest(
+            {
+                "instance_id": "i-a1",
+                "prior_native_run": "prior-fern",
+            },
+            run,
+            "mlxfast-r1",
+        )
+
+        self.assertIn("export PATH=/opt/homebrew/bin:", commands[0])
+        self.assertIn("/opt/homebrew/opt/gettext/bin:", commands[0])
+
+    def test_reuse_launch_records_adopted_nodes_without_aws_mutations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            key = root / "external-key"
+            known_hosts = root / "external-known-hosts"
+            key.write_text("private")
+            known_hosts.write_text("198.51.100.1 ssh-ed25519 trusted")
+            key.chmod(0o600)
+            known_hosts.chmod(0o600)
+            run_args = args(
+                root / "state",
+                aws_mac_bootstrap_mode="reuse",
+                aws_mac_host_ids="",
+                aws_ttl_hours=0,
+            )
+            hosts = (
+                AwsMacHost(
+                    host_id="h-a1",
+                    availability_zone="us-east-1a",
+                    subnet_id="subnet-a1",
+                    student="fern",
+                    instance_id="i-a1",
+                    instance_ownership="adopted",
+                    public_ip="198.51.100.1",
+                    security_group_ids=("sg-a1",),
+                    prior_native_run="prior-fern",
+                ),
+            )
+            plan = AwsMacPlan(
+                context=AwsContext("us-east-1", "sandbox"),
+                account_id="770934259321",
+                ami_id="",
+                root_device="",
+                volume_gib=0,
+                security_group_id="sg-a1",
+                ssh_cidr="",
+                hosts=hosts,
+                vpc_id="vpc-a1",
+                bootstrap_mode="reuse",
+                private_key_path=key,
+                known_hosts_path=known_hosts,
+            )
+
+            def sequential(_label, actions):
+                for action in actions.values():
+                    action()
+
+            with (
+                patch.object(aws_mac_backend, "_create_fresh_access") as fresh,
+                patch.object(aws_mac_backend, "_launch_recorded_instance") as create,
+                patch.object(aws_mac_backend, "_aws_json") as aws_json,
+                patch.object(aws_mac_backend, "_aws_raw") as aws_raw,
+                patch.object(aws_mac_backend, "_wait_recorded_instance"),
+                patch.object(aws_mac_backend, "_prepare_node"),
+                patch.object(aws_mac_backend, "_native_action"),
+                patch.object(aws_mac_backend, "_launchd_canary"),
+                patch.object(aws_mac_backend, "_open_gate"),
+                patch.object(aws_mac_backend, "_run_parallel", side_effect=sequential),
+                redirect_stdout(io.StringIO()),
+            ):
+                launch_aws_mac(run_args, [student("fern"), advisor()], plan)
+
+            fresh.assert_not_called()
+            create.assert_not_called()
+            aws_json.assert_not_called()
+            aws_raw.assert_not_called()
+            run_dir = root / "state" / "mlxfast-r1"
+            state = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(state["bootstrap_mode"], "reuse")
+            self.assertEqual(state["nodes"][0]["instance_ownership"], "adopted")
+            ownership_token = state["runtime_ownership_token"]
+            self.assertRegex(ownership_token, r"^[0-9a-f]{32}$")
+            self.assertEqual(
+                state["nodes"][0]["runtime_ownership_token"],
+                ownership_token,
+            )
+            self.assertEqual((run_dir / "id_ed25519").read_text(), "private")
+
+    def test_adoption_preflight_rejects_existing_new_tag_namespaces(self):
+        for occupied in ("runner", "native"):
+            with self.subTest(occupied=occupied), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runner_root = root / "runners"
+                native_root = root / "native"
+                runner_root.mkdir()
+                native_root.mkdir()
+                if occupied == "runner":
+                    (runner_root / "mlxfast-r1").mkdir()
+                else:
+                    (native_root / "mlxfast-r1").mkdir()
+                node = {
+                    "instance_id": "i-a1",
+                    "prior_native_run": "prior-fern",
+                }
+                manifest = json.dumps(
+                    {
+                        "tag": "prior-fern",
+                        "domain": "system",
+                        "roles": [
+                            {
+                                "label": (
+                                    "com.wandb.senpai.prior-fern.student-fern"
+                                )
+                            }
+                        ],
+                    }
+                ).encode()
+
+                def run(command: str, *, check: bool = True):
+                    if command.startswith("cat "):
+                        return subprocess.CompletedProcess([], 0, manifest, b"")
+                    if "launchctl print" in command:
+                        return subprocess.CompletedProcess(
+                            [], 1, b"", b"Could not find service"
+                        )
+                    if command.startswith("set -eu; test ! -e"):
+                        result = subprocess.run(
+                            ["/bin/bash", "-c", command],
+                            capture_output=True,
+                            check=False,
+                        )
+                        if check and result.returncode:
+                            raise RuntimeError("new tag namespace already exists")
+                        return result
+                    return subprocess.CompletedProcess([], 0, b"", b"")
+
+                with (
+                    patch.object(
+                        aws_mac_backend,
+                        "REMOTE_RUNNER_ROOT",
+                        str(runner_root),
+                    ),
+                    patch.object(
+                        aws_mac_backend,
+                        "REMOTE_RUN_ROOT",
+                        str(native_root),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "already exists"),
+                ):
+                    aws_mac_backend._verify_adopted_guest(
+                        node,
+                        run,
+                        "mlxfast-r1",
+                    )
+
+    def test_adopted_instance_drift_stops_before_state_save_or_ssh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            node = {
+                "student": "fern",
+                "instance_id": "i-a1",
+                "instance_ownership": "adopted",
+                "host_id": "h-a1",
+                "availability_zone": "us-east-1a",
+                "subnet_id": "subnet-a1",
+                "security_group_ids": ("sg-a1",),
+                "public_ip": "198.51.100.1",
+                "prior_native_run": "prior-fern",
+            }
+            plan = AwsMacPlan(
+                context=AwsContext("us-east-1", "sandbox"),
+                account_id="770934259321",
+                ami_id="",
+                root_device="",
+                volume_gib=0,
+                security_group_id="sg-a1",
+                ssh_cidr="",
+                hosts=(),
+                vpc_id="vpc-a1",
+                bootstrap_mode="reuse",
+            )
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_wait_instance",
+                    return_value=adopted_instance(public_ip="198.51.100.2"),
+                ),
+                patch.object(aws_mac_backend, "_save_state") as save_state,
+                patch.object(aws_mac_backend, "_wait_ssh") as wait_ssh,
+                patch.object(
+                    aws_mac_backend,
+                    "_verify_adopted_guest",
+                ) as verify_guest,
+                self.assertRaisesRegex(RuntimeError, "public IP changed"),
+            ):
+                aws_mac_backend._wait_recorded_instance(
+                    args(root / "state"),
+                    plan,
+                    root,
+                    {},
+                    node,
+                )
+
+            self.assertEqual(node["public_ip"], "198.51.100.1")
+            save_state.assert_not_called()
+            wait_ssh.assert_not_called()
+            verify_guest.assert_not_called()
+
+    def test_cleanup_preserves_missing_ownership_without_any_side_effect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "mlxfast-r1"
+            run_dir.mkdir()
+            state = {
+                "backend": "aws-mac",
+                "state_version": 2,
+                "tag": "mlxfast-r1",
+                "region": "us-east-1",
+                "nodes": [{"student": "fern", "instance_id": "i-a1"}],
+            }
+            with (
+                patch.object(aws_mac_backend, "_aws_json") as aws_json,
+                patch.object(aws_mac_backend, "_aws_raw") as aws_raw,
+                patch.object(aws_mac_backend, "_ssh") as ssh,
+            ):
+                errors = _cleanup(run_dir, state)
+
+            self.assertIn("ownership", errors[0])
+            self.assertTrue(run_dir.is_dir())
+            aws_json.assert_not_called()
+            aws_raw.assert_not_called()
+            ssh.assert_not_called()
+
+    def test_adopted_cleanup_removes_only_the_new_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "mlxfast-r1"
+            run_dir.mkdir()
+            (run_dir / "id_ed25519").write_text("private")
+            (run_dir / "known_hosts").write_text("trusted")
+            state = {
+                "backend": "aws-mac",
+                "state_version": 3,
+                "bootstrap_mode": "reuse",
+                "tag": "mlxfast-r1",
+                "region": "us-east-1",
+                "instance_type": "mac-m4pro.metal",
+                "vpc_id": "vpc-a1",
+                "runtime_ownership_token": "a" * 32,
+                "key_name": "",
+                "key_owned": False,
+                "ssh_authorized": False,
+                "ssh_security_group_owned": False,
+                "nodes": [
+                    {
+                        "student": "fern",
+                        "instance_id": "i-a1",
+                        "instance_ownership": "adopted",
+                        "host_id": "h-a1",
+                        "availability_zone": "us-east-1a",
+                        "subnet_id": "subnet-a1",
+                        "security_group_ids": ["sg-a1"],
+                        "public_ip": "198.51.100.1",
+                        "runtime_ownership_token": "a" * 32,
+                    }
+                ],
+            }
+            completed = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_instance",
+                    return_value=adopted_instance(),
+                ),
+                patch.object(
+                    aws_mac_backend,
+                    "_ssh",
+                    return_value=completed,
+                ) as ssh,
+                patch.object(aws_mac_backend, "_aws_raw") as aws_raw,
+            ):
+                errors = _cleanup(
+                    run_dir,
+                    state,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+
+            self.assertEqual(errors, [])
+            self.assertFalse(run_dir.exists())
+            aws_raw.assert_not_called()
+            command = ssh.call_args.args[2]
+            self.assertIn("/.senpai/aws-mac-runners/mlxfast-r1/venv", command)
+            self.assertIn("/.senpai/aws-mac-runners/mlxfast-r1/.senpai-owner", command)
+            self.assertIn("--ownership-token", command)
+            self.assertIn("a" * 32, command)
+            self.assertIn("rm -rf", command)
+
+    def test_adopted_cleanup_preserves_runtime_with_mismatched_ownership(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "mlxfast-r1"
+            run_dir.mkdir()
+            (run_dir / "id_ed25519").write_text("private")
+            (run_dir / "known_hosts").write_text("trusted")
+            state = {
+                "backend": "aws-mac",
+                "state_version": 3,
+                "bootstrap_mode": "reuse",
+                "tag": "mlxfast-r1",
+                "region": "us-east-1",
+                "instance_type": "mac-m4pro.metal",
+                "vpc_id": "vpc-a1",
+                "runtime_ownership_token": "a" * 32,
+                "key_name": "",
+                "key_owned": False,
+                "ssh_authorized": False,
+                "ssh_security_group_owned": False,
+                "nodes": [
+                    {
+                        "student": "fern",
+                        "instance_id": "i-a1",
+                        "instance_ownership": "adopted",
+                        "host_id": "h-a1",
+                        "availability_zone": "us-east-1a",
+                        "subnet_id": "subnet-a1",
+                        "security_group_ids": ["sg-a1"],
+                        "public_ip": "198.51.100.1",
+                        "runtime_ownership_token": "b" * 32,
+                    }
+                ],
+            }
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_instance",
+                    return_value=adopted_instance(),
+                ),
+                patch.object(aws_mac_backend, "_ssh") as ssh,
+                patch.object(aws_mac_backend, "_aws_raw") as aws_raw,
+            ):
+                errors = _cleanup(
+                    run_dir,
+                    state,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+
+            self.assertRegex(errors[0], "ownership token")
+            self.assertTrue(run_dir.is_dir())
+            ssh.assert_not_called()
+            aws_raw.assert_not_called()
+
+    def test_adopted_cleanup_command_accepts_only_an_empty_unprepared_namespace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runner_root = root / "runner"
+            native_parent = root / "native"
+            native_root = native_parent / "mlxfast-r1"
+            state = {
+                "tag": "mlxfast-r1",
+                "runtime_ownership_token": "a" * 32,
+            }
+            node = {"runtime_ownership_token": "a" * 32}
+            with patch.object(
+                aws_mac_backend,
+                "REMOTE_RUN_ROOT",
+                str(native_parent),
+            ):
+                command = aws_mac_backend._adopted_runtime_cleanup_command(
+                    state,
+                    node,
+                    str(runner_root),
+                    str(runner_root / "source"),
+                    str(runner_root / "venv"),
+                )
+
+            result = subprocess.run(
+                ["/bin/sh", "-c", command],
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0)
+
+            runner_root.mkdir()
+            (runner_root / aws_mac_backend.REMOTE_RUNNER_OWNER).write_text("b" * 32)
+            result = subprocess.run(
+                ["/bin/sh", "-c", command],
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(runner_root.is_dir())
+
+            (runner_root / aws_mac_backend.REMOTE_RUNNER_OWNER).unlink()
+            runner_root.rmdir()
+            native_root.mkdir(parents=True)
+            result = subprocess.run(
+                ["/bin/sh", "-c", command],
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(native_root.is_dir())
+
+    def test_adopted_cleanup_retry_skips_runtime_already_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "mlxfast-r1"
+            run_dir.mkdir()
+            (run_dir / "id_ed25519").write_text("private")
+            (run_dir / "known_hosts").write_text("trusted")
+            state = {
+                "backend": "aws-mac",
+                "state_version": 3,
+                "bootstrap_mode": "reuse",
+                "tag": "mlxfast-r1",
+                "region": "us-east-1",
+                "instance_type": "mac-m4pro.metal",
+                "vpc_id": "vpc-a1",
+                "runtime_ownership_token": "a" * 32,
+                "key_name": "",
+                "key_owned": False,
+                "ssh_authorized": False,
+                "ssh_security_group_owned": False,
+                "nodes": [
+                    {
+                        "student": student,
+                        "instance_id": instance_id,
+                        "instance_ownership": "adopted",
+                        "host_id": "h-a1",
+                        "availability_zone": "us-east-1a",
+                        "subnet_id": "subnet-a1",
+                        "security_group_ids": ["sg-a1"],
+                        "public_ip": "198.51.100.1",
+                        "runtime_ownership_token": "a" * 32,
+                    }
+                    for student, instance_id in (
+                        ("fern", "i-a1"),
+                        ("frieren", "i-a2"),
+                    )
+                ],
+            }
+            completed = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+            first_attempt = [completed, RuntimeError("host unavailable")]
+
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_instance",
+                    side_effect=lambda _context, instance_id: {
+                        **adopted_instance(),
+                        "InstanceId": instance_id,
+                    },
+                ) as instance,
+                patch.object(
+                    aws_mac_backend,
+                    "_ssh",
+                    side_effect=first_attempt,
+                ) as ssh,
+                patch.object(aws_mac_backend, "_aws_raw") as aws_raw,
+            ):
+                errors = _cleanup(
+                    run_dir,
+                    state,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+
+            self.assertRegex(errors[0], "host unavailable")
+            self.assertTrue(run_dir.is_dir())
+            self.assertIs(state["nodes"][0]["runtime_cleanup_confirmed"], True)
+            self.assertNotIn("runtime_cleanup_confirmed", state["nodes"][1])
+            self.assertEqual(instance.call_count, 2)
+            self.assertEqual(ssh.call_count, 2)
+            aws_raw.assert_not_called()
+
+            with (
+                patch.object(
+                    aws_mac_backend,
+                    "_instance",
+                    return_value={**adopted_instance(), "InstanceId": "i-a2"},
+                ) as instance,
+                patch.object(
+                    aws_mac_backend,
+                    "_ssh",
+                    return_value=completed,
+                ) as ssh,
+                patch.object(aws_mac_backend, "_aws_raw") as aws_raw,
+            ):
+                errors = _cleanup(
+                    run_dir,
+                    state,
+                    AwsContext("us-east-1", "sandbox"),
+                )
+
+            self.assertEqual(errors, [])
+            self.assertFalse(run_dir.exists())
+            instance.assert_called_once()
+            self.assertEqual(instance.call_args.args[1], "i-a2")
+            ssh.assert_called_once()
+            self.assertEqual(ssh.call_args.args[1]["instance_id"], "i-a2")
+            aws_raw.assert_not_called()
+
+
 class AwsMacLifecycleTests(unittest.TestCase):
     @staticmethod
     def write_state(root: Path) -> None:
@@ -1148,9 +2839,15 @@ class AwsMacLifecycleTests(unittest.TestCase):
             json.dumps(
                 {
                     "account_id": "770934259321",
+                    "backend": "aws-mac",
                     "phase": "running",
                     "profile": "sandbox",
                     "region": "us-east-1",
+                    "instance_type": "mac-m4pro.metal",
+                    "security_group_id": "sg-a1",
+                    "ssh_authorize_started": False,
+                    "ssh_authorized": False,
+                    "state_version": 1,
                     "tag": "mlxfast-r1",
                     "nodes": [
                         {
@@ -1169,6 +2866,143 @@ class AwsMacLifecycleTests(unittest.TestCase):
                 }
             )
         )
+
+    def assert_lifecycle_state_rejected(
+        self,
+        state: object,
+        message: str,
+    ) -> None:
+        actions = {
+            "status": lambda state_root: status_aws_mac(
+                "mlxfast-r1", str(state_root)
+            ),
+            "logs": lambda state_root: logs_aws_mac(
+                "mlxfast-r1", str(state_root)
+            ),
+            "terminate": lambda state_root: aws_mac_backend.terminate_aws_mac(
+                "mlxfast-r1", str(state_root)
+            ),
+        }
+        for action_name, action in actions.items():
+            with self.subTest(action=action_name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    state_root = Path(tmp) / "aws"
+                    run_dir = state_root / "mlxfast-r1"
+                    run_dir.mkdir(parents=True)
+                    state_path = run_dir / "state.json"
+                    state_path.write_text(json.dumps(state))
+                    key_path = run_dir / "id_ed25519"
+                    key_path.write_text("private-key")
+
+                    with (
+                        patch.object(aws_mac_backend, "_check_account") as account,
+                        patch.object(aws_mac_backend, "_aws_json") as aws_json,
+                        patch.object(aws_mac_backend, "_aws_raw") as aws_raw,
+                        patch.object(aws_mac_backend, "_ssh") as ssh,
+                        self.assertRaisesRegex(RuntimeError, message),
+                    ):
+                        action(state_root)
+
+                    account.assert_not_called()
+                    aws_json.assert_not_called()
+                    aws_raw.assert_not_called()
+                    ssh.assert_not_called()
+                    self.assertEqual(json.loads(state_path.read_text()), state)
+                    self.assertEqual(key_path.read_text(), "private-key")
+
+    def test_lifecycle_rejects_non_object_state_before_aws_or_local_mutation(self):
+        self.assert_lifecycle_state_rejected(
+            ["not", "a", "state object"],
+            "JSON object",
+        )
+
+    def test_lifecycle_rejects_standard_aws_state_before_aws_or_local_mutation(self):
+        self.assert_lifecycle_state_rejected(
+            {
+                "account_id": "770934259321",
+                "availability_zone": "us-east-1a",
+                "instance_id": "i-standard-aws",
+                "instance_type": "g6.12xlarge",
+                "key_name": "senpai-standard-key",
+                "key_owned": True,
+                "phase": "running",
+                "profile": "sandbox",
+                "region": "us-east-1",
+                "roles": ["student-fern"],
+                "security_group_id": "sg-a1",
+                "subnet_id": "subnet-a1",
+                "tag": "mlxfast-r1",
+                "vpc_id": "vpc-a1",
+            },
+            "not compatible with AWS Mac lifecycle",
+        )
+
+    def test_lifecycle_rejects_explicit_non_mac_backend(self):
+        self.assert_lifecycle_state_rejected(
+            {
+                "account_id": "770934259321",
+                "backend": "aws",
+                "instance_type": "mac-m4pro.metal",
+                "nodes": [],
+                "profile": "sandbox",
+                "region": "us-east-1",
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": False,
+                "ssh_authorized": False,
+                "state_version": 1,
+                "tag": "mlxfast-r1",
+            },
+            "backend",
+        )
+
+    def test_lifecycle_rejects_unsupported_mac_state_version(self):
+        self.assert_lifecycle_state_rejected(
+            {
+                "account_id": "770934259321",
+                "backend": "aws-mac",
+                "instance_type": "mac-m4pro.metal",
+                "nodes": [],
+                "profile": "sandbox",
+                "region": "us-east-1",
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": False,
+                "ssh_authorized": False,
+                "state_version": 4,
+                "tag": "mlxfast-r1",
+            },
+            "state version",
+        )
+
+    def test_terminate_accepts_unambiguous_legacy_mac_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "aws"
+            run_dir = state_root / "mlxfast-r1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "account_id": "770934259321",
+                        "instance_type": "mac-m4pro.metal",
+                        "key_name": "",
+                        "nodes": [],
+                        "phase": "creating",
+                        "profile": "sandbox",
+                        "region": "us-east-1",
+                        "security_group_id": "sg-a1",
+                        "ssh_authorize_started": False,
+                        "ssh_authorized": False,
+                        "tag": "mlxfast-r1",
+                    }
+                )
+            )
+
+            with (
+                patch.object(aws_mac_backend, "_check_account"),
+                redirect_stdout(io.StringIO()),
+            ):
+                aws_mac_backend.terminate_aws_mac("mlxfast-r1", str(state_root))
+
+            self.assertFalse(run_dir.exists())
 
     def test_status_and_logs_map_roles_to_their_recorded_hosts(self):
         completed = subprocess.CompletedProcess(
@@ -1227,6 +3061,155 @@ class AwsMacLifecycleTests(unittest.TestCase):
         self.assertIn("--role advisor --tail 41", advisor_command)
         self.assertEqual(student_node["student"], "tanjiro")
         self.assertIn("--role student-tanjiro --tail 42", student_command)
+
+    def test_status_renders_mixed_confirmed_unresolved_and_live_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "aws"
+            run_dir = state_root / "mlxfast-r1"
+            run_dir.mkdir(parents=True)
+            state = {
+                "account_id": "770934259321",
+                "backend": "aws-mac",
+                "phase": "cleanup-failed",
+                "profile": "sandbox",
+                "region": "us-east-1",
+                "instance_type": "mac-m4pro.metal",
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": False,
+                "ssh_authorized": False,
+                "state_version": 2,
+                "tag": "mlxfast-r1",
+                "nodes": [
+                    {
+                        "student": "fern",
+                        "instance_id": "",
+                        "host_id": "h-a1",
+                        "public_ip": "",
+                        "termination_confirmed": True,
+                    },
+                    {
+                        "student": "tanjiro",
+                        "instance_id": "",
+                        "host_id": "h-b2",
+                        "public_ip": "",
+                    },
+                    {
+                        "student": "sprout",
+                        "instance_id": "i-live",
+                        "host_id": "h-c3",
+                        "public_ip": "",
+                    },
+                ],
+            }
+            (run_dir / "state.json").write_text(json.dumps(state))
+            output = io.StringIO()
+
+            with (
+                patch.object(aws_mac_backend, "_check_account"),
+                patch.object(
+                    aws_mac_backend,
+                    "_instance",
+                    return_value={"State": {"Name": "shutting-down"}},
+                ) as instance,
+                redirect_stdout(output),
+            ):
+                status_aws_mac("mlxfast-r1", str(state_root))
+
+            rendered = output.getvalue()
+            self.assertIn("student-fern: instance=- host=h-a1 state=terminated", rendered)
+            self.assertIn("student-tanjiro: instance=- host=h-b2 state=unresolved", rendered)
+            self.assertIn(
+                "student-sprout: instance=i-live host=h-c3 state=shutting-down",
+                rendered,
+            )
+            instance.assert_called_once()
+
+    def test_logs_rejects_non_live_nodes_before_ssh_and_allows_a_live_node(self):
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=b"live logs\n",
+            stderr=b"",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "aws"
+            run_dir = state_root / "mlxfast-r1"
+            run_dir.mkdir(parents=True)
+            state = {
+                "account_id": "770934259321",
+                "backend": "aws-mac",
+                "phase": "cleanup-failed",
+                "profile": "sandbox",
+                "region": "us-east-1",
+                "instance_type": "mac-m4pro.metal",
+                "security_group_id": "sg-a1",
+                "ssh_authorize_started": False,
+                "ssh_authorized": False,
+                "state_version": 2,
+                "tag": "mlxfast-r1",
+                "nodes": [
+                    {
+                        "student": "fern",
+                        "instance_id": "",
+                        "host_id": "h-a1",
+                        "public_ip": "",
+                        "termination_confirmed": True,
+                    },
+                    {
+                        "student": "tanjiro",
+                        "instance_id": "",
+                        "host_id": "h-b2",
+                        "public_ip": "",
+                    },
+                    {
+                        "student": "sprout",
+                        "instance_id": "i-live",
+                        "host_id": "h-c3",
+                        "public_ip": "198.51.100.3",
+                    },
+                ],
+            }
+            (run_dir / "state.json").write_text(json.dumps(state))
+
+            with (
+                patch.object(aws_mac_backend, "_check_account"),
+                patch.object(
+                    aws_mac_backend,
+                    "_ssh",
+                    return_value=completed,
+                ) as ssh,
+                self.assertRaisesRegex(RuntimeError, "terminated"),
+            ):
+                logs_aws_mac("mlxfast-r1", str(state_root), role_key="advisor")
+            ssh.assert_not_called()
+
+            with (
+                patch.object(aws_mac_backend, "_check_account"),
+                patch.object(aws_mac_backend, "_ssh") as ssh,
+                self.assertRaisesRegex(RuntimeError, "unresolved"),
+            ):
+                logs_aws_mac(
+                    "mlxfast-r1",
+                    str(state_root),
+                    role_key="student-tanjiro",
+                )
+            ssh.assert_not_called()
+
+            with (
+                patch.object(aws_mac_backend, "_check_account"),
+                patch.object(
+                    aws_mac_backend,
+                    "_ssh",
+                    return_value=completed,
+                ) as ssh,
+                redirect_stdout(io.StringIO()),
+            ):
+                logs_aws_mac(
+                    "mlxfast-r1",
+                    str(state_root),
+                    role_key="student-sprout",
+                )
+            self.assertEqual(ssh.call_args.args[1]["instance_id"], "i-live")
 
     def test_cli_parses_log_role_tail_profile_and_state_root(self):
         with (

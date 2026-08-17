@@ -6,10 +6,13 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import ipaddress
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -64,6 +67,12 @@ CAPACITY_ERROR_CODES = (
     "UnfulfillableCapacity",
 )
 AWS_TERMINATION_WAITER_ATTEMPTS = 2  # Two 10-minute AWS waiter windows.
+AWS_STATE_BACKEND = "aws"
+AWS_STATE_VERSION = 1
+SSH_HOST_KEY_MARKER = "SENPAI_SSH_HOST_KEY"
+_SSH_HOST_KEY_TYPE = re.compile(
+    r"(?:ssh-(?:ed25519|rsa)|ecdsa-sha2-nistp(?:256|384|521))"
+)
 
 
 @dataclass(frozen=True)
@@ -232,7 +241,67 @@ def _load_state(tag: str, state_root: str) -> tuple[Path, dict]:
     path = run_dir / "state.json"
     if not path.is_file():
         raise RuntimeError(f"No AWS Senpai state found for {tag!r} at {path}")
-    return run_dir, json.loads(path.read_text())
+    state = json.loads(path.read_text())
+    _validate_aws_state(state)
+    return run_dir, state
+
+
+def _validate_aws_state(state: object) -> None:
+    if not isinstance(state, dict):
+        raise RuntimeError("AWS lifecycle state must be a JSON object")
+    backend = state.get("backend")
+    version = state.get("state_version")
+    if "backend" in state or "state_version" in state:
+        if backend != AWS_STATE_BACKEND:
+            raise RuntimeError(
+                f"AWS lifecycle state belongs to backend {backend!r}, not 'aws'"
+            )
+        if type(version) is not int or version != AWS_STATE_VERSION:
+            raise RuntimeError(
+                f"AWS lifecycle state has unsupported version {version!r}"
+            )
+        return
+
+    if not _is_legacy_aws_state(state):
+        raise RuntimeError(
+            "AWS lifecycle state has no backend discriminator and is not an "
+            "unambiguous legacy standard-AWS run"
+        )
+
+
+def _is_legacy_aws_state(state: dict) -> bool:
+    string_fields = (
+        "account_id",
+        "ami_id",
+        "availability_zone",
+        "instance_type",
+        "phase",
+        "profile",
+        "region",
+        "root_device",
+        "ssh_cidr",
+        "subnet_id",
+        "tag",
+        "vpc_id",
+    )
+    if "nodes" in state or not all(
+        isinstance(state.get(name), str) and state[name]
+        for name in string_fields
+        if name != "profile"
+    ):
+        return False
+    if not isinstance(state.get("profile"), str):
+        return False
+    if state["instance_type"].startswith("mac"):
+        return False
+    if type(state.get("created_at")) is not int:
+        return False
+    if type(state.get("volume_gib")) is not int or state["volume_gib"] <= 0:
+        return False
+    roles = state.get("roles")
+    return isinstance(roles, list) and bool(roles) and all(
+        isinstance(role, str) and role for role in roles
+    )
 
 
 def _state_context(state: dict, profile: str = "") -> AwsContext:
@@ -694,6 +763,7 @@ def _user_data(args) -> str:
     return f"""#!/bin/bash
 set -euxo pipefail
 shutdown -h +{ttl_minutes} "Senpai AWS safety TTL reached"
+{_ssh_host_key_console_script()}
 if ! command -v docker >/dev/null; then
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
@@ -703,7 +773,107 @@ command -v nvidia-ctk
 nvidia-ctk runtime configure --runtime=docker
 systemctl restart docker
 usermod -aG docker ubuntu
+{_ssh_host_key_console_script()}
 """
+
+
+def _ssh_host_key_console_script() -> str:
+    return f"""set +x
+for host_key in /etc/ssh/ssh_host_*_key.pub; do
+    test -f "$host_key" || continue
+    read -r key_type key_data _ < "$host_key"
+    printf '{SSH_HOST_KEY_MARKER} %s %s\\n' "$key_type" "$key_data" > /dev/console
+done
+set -x"""
+
+
+def _console_host_keys(output: str, public_ip: str) -> tuple[str, ...]:
+    keys = set()
+    for line in output.splitlines():
+        marker = line.find(f"{SSH_HOST_KEY_MARKER} ")
+        if marker < 0:
+            continue
+        fields = line[marker:].split()
+        if len(fields) < 3:
+            continue
+        _marker, key_type, key_data = fields[:3]
+        if not _SSH_HOST_KEY_TYPE.fullmatch(key_type):
+            continue
+        try:
+            blob = base64.b64decode(key_data, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        if len(blob) < 4:
+            continue
+        type_length = int.from_bytes(blob[:4], "big")
+        encoded_type = blob[4 : 4 + type_length]
+        if len(encoded_type) != type_length:
+            continue
+        try:
+            embedded_type = encoded_type.decode("ascii")
+        except UnicodeDecodeError:
+            continue
+        if embedded_type != key_type:
+            continue
+        keys.add(f"{public_ip} {key_type} {key_data}")
+    return tuple(sorted(keys))
+
+
+def _write_known_host_keys(run_dir: Path, public_ip: str, keys: tuple[str, ...]) -> None:
+    path = run_dir / "known_hosts"
+    existing = path.read_text().splitlines() if path.is_file() else []
+    targets = {public_ip, f"[{public_ip}]:22"}
+    retained = []
+    for line in existing:
+        fields = line.split(maxsplit=1)
+        if not fields or fields[0] not in targets:
+            retained.append(line)
+    temporary = run_dir / "known_hosts.tmp"
+    temporary.write_text("\n".join([*retained, *keys]) + "\n")
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def _authorize_ssh_host(
+    context: AwsContext,
+    run_dir: Path,
+    state: dict,
+    *,
+    timeout_s: float,
+) -> None:
+    """Pin host keys obtained through AWS before the first SSH connection."""
+
+    deadline = time.monotonic() + timeout_s
+    instance_id = state["instance_id"]
+    public_ip = state["public_ip"]
+    last_error = "EC2 console output contained no valid Senpai SSH host key"
+    while True:
+        try:
+            output = _aws_raw(
+                context,
+                "ec2",
+                "get-console-output",
+                "--instance-id",
+                instance_id,
+                "--latest",
+                "--query",
+                "Output",
+                "--output",
+                "text",
+            )
+        except AwsCommandError as error:
+            last_error = str(error)
+        else:
+            keys = _console_host_keys(output, public_ip)
+            if keys:
+                _write_known_host_keys(run_dir, public_ip, keys)
+                return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"Timed out authenticating SSH host key for {instance_id}: {last_error}"
+            )
+        time.sleep(min(5, remaining))
 
 
 def _ssh_base(
@@ -723,7 +893,7 @@ def _ssh_base(
         "-o",
         "ConnectTimeout=10",
         "-o",
-        "StrictHostKeyChecking=accept-new",
+        "StrictHostKeyChecking=yes",
         "-o",
         f"UserKnownHostsFile={run_dir / 'known_hosts'}",
         f"ubuntu@{state['public_ip']}",
@@ -1192,6 +1362,15 @@ def _stream_directory(
 
 
 def _prepare_host(args, run_dir: Path, state: dict) -> None:
+    _authorize_ssh_host(
+        AwsContext(
+            state.get("region", args.aws_region),
+            state.get("profile", args.aws_profile),
+        ),
+        run_dir,
+        state,
+        timeout_s=args.aws_ready_timeout_s,
+    )
     _wait_for_ssh(run_dir, state, args.aws_ready_timeout_s)
     _ssh(
         run_dir,
@@ -2038,6 +2217,7 @@ def launch_aws(
     run_dir.chmod(0o700)
     state = {
         "account_id": plan.account_id,
+        "backend": AWS_STATE_BACKEND,
         "ami_id": plan.ami_id,
         "availability_zone": plan.availability_zone,
         "created_at": int(time.time()),
@@ -2048,6 +2228,7 @@ def launch_aws(
         "ssh_cidr": plan.ssh_cidr,
         "subnet_id": plan.subnet_id,
         "tag": args.tag,
+        "state_version": AWS_STATE_VERSION,
         "vpc_id": plan.vpc_id,
         "roles": [spec.key for spec in role_specs],
         "root_device": plan.root_device,
