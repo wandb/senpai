@@ -1,6 +1,7 @@
 import json
 import signal
 import threading
+import time
 from io import StringIO
 from types import SimpleNamespace
 
@@ -85,7 +86,7 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     assert captured["secrets"] == {"WANDB_API_KEY": "wandb-key"}
     assert captured["conversation_id_env"] == config.conversation_id.hex
     assert captured["delete_on_close"] is False
-    assert captured["llm_timeout"] == 900
+    assert captured["llm_timeout"] == 5400
     assert captured["llm_num_retries"] == 1
     assert captured["closed"] is True
 
@@ -477,7 +478,6 @@ def test_stalled_recovery_is_bounded_and_quarantined_with_the_full_brief(
     config = runtime_config(
         tmp_path,
         inbox_max_stalled_attempts=1,
-        inbox_max_turn_age_seconds=10_000,
         inbox_max_recovery_generations=1,
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
@@ -572,7 +572,6 @@ def test_model_visible_progress_renews_the_stalled_attempt_budget(
     config = runtime_config(
         tmp_path,
         inbox_max_stalled_attempts=1,
-        inbox_max_turn_age_seconds=10_000,
         inbox_max_recovery_generations=1,
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
@@ -653,7 +652,6 @@ def test_timeout_and_error_artifacts_do_not_renew_the_stalled_attempt_budget(
     config = runtime_config(
         tmp_path,
         inbox_max_stalled_attempts=2,
-        inbox_max_turn_age_seconds=10_000,
         inbox_max_recovery_generations=1,
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
@@ -1166,6 +1164,78 @@ def test_turn_deadline_requests_conversation_interrupt(tmp_path, monkeypatch):
     assert cancelled.is_set()
 
 
+def test_turn_activity_renews_the_inactivity_deadline():
+    interrupted = False
+    activity = [time.monotonic()]
+
+    class Conversation:
+        async def arun(self):
+            for _ in range(3):
+                await runner.asyncio.sleep(0.02)
+                activity[0] = time.monotonic()
+
+        def interrupt(self):
+            nonlocal interrupted
+            interrupted = True
+
+    runner.asyncio.run(
+        runner.arun_conversation(Conversation(), 0.03, lambda: activity[0])
+    )
+
+    assert not interrupted
+
+
+def test_startup_interrupt_is_a_normal_conversation_end():
+    class Conversation:
+        task = None
+
+        async def arun(self):
+            self.task = runner.asyncio.current_task()
+            await runner.asyncio.Event().wait()
+
+        def interrupt(self):
+            assert self.task is not None
+            self.task.cancel()
+
+    conversation = Conversation()
+
+    runner.asyncio.run(
+        runner.arun_conversation(
+            conversation,
+            1,
+            started=conversation.interrupt,
+        )
+    )
+
+    assert conversation.task.cancelled()
+
+
+def test_steering_resumes_the_same_conversation_object():
+    class Conversation:
+        def __init__(self):
+            self.id = "stable-advisor-id"
+            self.runs = 0
+
+        async def arun(self):
+            self.runs += 1
+
+        def interrupt(self):
+            raise AssertionError("a completed run does not need interruption")
+
+    resumes = iter((True, False))
+    pump = SimpleNamespace(
+        prepare_run=lambda: True,
+        run_started=lambda: None,
+        finish_run=lambda: next(resumes),
+    )
+    conversation = Conversation()
+
+    runner.run_steerable_conversation(conversation, pump, 1)
+
+    assert conversation.runs == 2
+    assert conversation.id == "stable-advisor-id"
+
+
 def test_signal_interrupts_the_conversation_and_restores_handlers(monkeypatch):
     calls = []
     installed = {}
@@ -1191,6 +1261,90 @@ def test_signal_interrupts_the_conversation_and_restores_handlers(monkeypatch):
         (signal.SIGTERM, previous[signal.SIGTERM]),
         (signal.SIGINT, previous[signal.SIGINT]),
     ]
+
+
+def test_signal_does_not_resume_a_steering_interruption(monkeypatch):
+    installed = {}
+    previous = {signal.SIGTERM: object(), signal.SIGINT: object()}
+
+    def fake_signal(signum, handler):
+        installed[signum] = handler
+        return previous[signum]
+
+    class Conversation:
+        def __init__(self):
+            self.runs = 0
+
+        async def arun(self):
+            self.runs += 1
+
+        def interrupt(self):
+            pass
+
+    class Pump:
+        prepare_run = staticmethod(lambda: True)
+        run_started = staticmethod(lambda: None)
+
+        @staticmethod
+        def finish_run():
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+            return True
+
+    conversation = Conversation()
+    monkeypatch.setattr(runner.signal, "signal", fake_signal)
+
+    with pytest.raises(SystemExit):
+        with graceful_interrupts(conversation) as stop_requested:
+            runner.run_steerable_conversation(
+                conversation,
+                Pump(),
+                1,
+                stop_requested=stop_requested,
+            )
+
+    assert conversation.runs == 1
+
+
+def test_signal_at_run_start_cancels_before_the_run_continues(monkeypatch):
+    installed = {}
+    previous = {signal.SIGTERM: object(), signal.SIGINT: object()}
+
+    def fake_signal(signum, handler):
+        installed[signum] = handler
+        return previous[signum]
+
+    class Conversation:
+        def __init__(self):
+            self.continued = False
+
+        async def arun(self):
+            await runner.asyncio.sleep(0)
+            self.continued = True
+
+        def interrupt(self):
+            pass
+
+    class Pump:
+        prepare_run = staticmethod(lambda: True)
+        finish_run = staticmethod(lambda: False)
+
+        @staticmethod
+        def run_started():
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+
+    conversation = Conversation()
+    monkeypatch.setattr(runner.signal, "signal", fake_signal)
+
+    with pytest.raises(SystemExit):
+        with graceful_interrupts(conversation) as stop_requested:
+            runner.run_steerable_conversation(
+                conversation,
+                Pump(),
+                1,
+                stop_requested=stop_requested,
+            )
+
+    assert not conversation.continued
 
 
 def test_recovered_actions_are_rejected_before_the_conversation_resumes(

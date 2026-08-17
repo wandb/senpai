@@ -64,6 +64,9 @@ deadline, and completed-turn counter. The supervisor resets bounded restart
 backoff only after a turn is successfully acknowledged; process uptime and
 idle sleep do not count as progress. The supervisor is independent of
 OpenHands and Kubernetes.
+OpenHands events renew the root turn's lease; its configured timeout measures
+inactivity rather than total elapsed time. Provider, tool, training, and child
+deadlines remain hard.
 Kubernetes liveness and Docker health checks inspect the same lease, while the
 supervisor provides the same recovery on a plain host.
 
@@ -105,12 +108,17 @@ ledger. Oldest unacknowledged events are delivered in bounded count/byte
 batches; immediate post-turn polls drain later batches without dropping them.
 
 While an OpenHands turn is running, `ActiveGitHubWatcher` polls the same GitHub
-state. It enqueues all newly visible advisor events, and only PR feedback bound
-to the currently running student UUID, in the role's local event store.
-OpenHands 1.40 supports concurrent `send_message`; `AdvisorEventPump` injects at
-its state lock boundary without cancelling unrelated work. Successfully
-injected student feedback is acknowledged in `github-feedback.json` only when
-the enclosing student turn succeeds.
+state. It enqueues all newly visible advisor events. For students, it maps
+authenticated human Issues and assignment-bound PR feedback into the active
+UUID. Authenticated humans are the interrupt tier: tools get up to 60 seconds
+to finish before Senpai interrupts and resumes the run, even when its inbox
+batch is full. Student assignments and trusted PR feedback share a FIFO queue
+tier; feedback waits for the next completed agent step without cancelling it.
+Ordinary events remain FIFO. Turn formation and non-human attachments are
+bounded to 16 events or 64 KiB; prioritized overflow remains pending to lead
+the next turn.
+Successfully injected student feedback is acknowledged in
+`github-feedback.json` only when the enclosing student turn succeeds.
 
 Generic child results use a local SQLite WAL event store because parent and
 child run on the same advisor or student instance. That is not an inter-node
@@ -121,6 +129,12 @@ advisor watcher/child events; `student-events.sqlite3`, for unacknowledged
 student feedback/child events; and `training/monitors.sqlite3`, for student
 monitor policy, samples, and deduplicated actionable signals. OpenHands
 conversation history is a separate file-backed per-UUID event log.
+
+A completed tool observation resets the three-attempt no-progress budget. A
+separate 36-inference-start backstop applies to each turn branch across worker
+restarts without limiting one productive run. Either exhausted budget enters
+bounded fresh-branch recovery and then quarantine. Only authenticated human
+steering can reopen quarantine; trusted PR feedback remains pending.
 
 ## State and conversations
 
@@ -483,11 +497,11 @@ at depth two. Explore, Search, Bash Runner, and every depth-two agent are leaves
 This makes chains such as Explore -> Explore impossible without constraining a
 later research phase to the first batch's lifetime budget.
 
-The tree inherits one absolute root-turn deadline. Each task also has a tier
-runtime cap: 600 seconds for `fast`, 1,800 for `smart`, and 3,600 for `frontier`.
-The effective deadline is the earlier of that cap and the inherited root
-deadline. Reaching it interrupts the complete process group and records a
-terminal timeout; no descendant survives the tree deadline.
+Each task has an absolute tier runtime cap: 1,200 seconds for `fast`, 3,600 for
+`smart`, and 7,200 for `frontier`. A descendant's effective deadline is the
+earlier of that cap and its inherited ancestor deadline. Reaching it interrupts
+the complete process group and records a terminal timeout; no descendant
+outlives an ancestor deadline.
 
 Each tier selects one explicit model-and-effort profile. `model=fast` defaults
 to `openai/gpt-5.6-luna` at `high` for mechanical search, command execution,
@@ -605,8 +619,10 @@ turn. Each partition is acknowledged only after its own successful turn, so a
 child result for one assignment cannot consume or permanently block a training
 event for another.
 
-The Stop hook verifies the automatic monitor marker and a clean worktree,
-allowing the student turn to end while the controller supervises the process.
+The Stop hook always verifies the automatic monitor marker and normally
+requires a clean worktree. While queued PR feedback waits for a safe boundary,
+a role-local marker waives only the clean-worktree check; the pump clears it
+before delivery and on entry and exit.
 The advisor and advisor children never receive training tools.
 
 ## Hooks, deadlines, and shutdown

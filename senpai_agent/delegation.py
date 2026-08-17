@@ -75,9 +75,9 @@ MAX_TREE_AGENTS = 8
 MAX_SPAWN_BATCH = 8
 MAX_AWAIT_SECONDS = 300
 MODEL_TIER_TIMEOUT_SECONDS: Mapping[ModelTier, float] = {
-    "fast": 600,
-    "smart": 1800,
-    "frontier": 3600,
+    "fast": 1200,
+    "smart": 3600,
+    "frontier": 7200,
 }
 TaskStatus = Literal[
     "queued",

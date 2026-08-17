@@ -52,6 +52,18 @@ def feedback_event(revision_id="revision-2"):
     )
 
 
+def human_issue_event():
+    return ControllerEvent(
+        kind="human_issue",
+        dedupe_key="human_issue:v2:23:702:abc",
+        payload={
+            "number": 23,
+            "human_message_id": 702,
+            "message": "Stop and inspect the active experiment.",
+        },
+    )
+
+
 def advisor_event(number=17):
     return ControllerEvent(
         kind="review_ready",
@@ -122,16 +134,17 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
         assert store.pending() == []
 
 
-def test_observed_feedback_is_not_reported_delivered_until_the_event_pump_sends_it(
+@pytest.mark.parametrize("incoming", [feedback_event(), human_issue_event()])
+def test_observed_student_input_routes_to_the_active_pump_until_it_is_delivered(
     tmp_path: Path,
     monkeypatch,
+    incoming: ControllerEvent,
 ):
     state_dir = tmp_path / "state"
     registry = AssignmentConversationRegistry(
         state_dir / "student-conversations.json"
     )
     conversation_id = registry.for_assignment("assignment-17", "revision-2")
-    feedback = feedback_event()
     store_path = state_dir / "student-events.sqlite3"
 
     def run_openhands(_prompt, _config):
@@ -148,7 +161,7 @@ def test_observed_feedback_is_not_reported_delivered_until_the_event_pump_sends_
     result = OpenHandsTurnRunner(
         Config("student", state_dir, conversation_id),
         full_prompt="student initial controller context",
-        github_mailbox=Mailbox((feedback,)),
+        github_mailbox=Mailbox((incoming,)),
         active_poll_interval_seconds=0.001,
     ).run(
         "student turn",
@@ -158,9 +171,12 @@ def test_observed_feedback_is_not_reported_delivered_until_the_event_pump_sends_
 
     assert result.delivered_event_keys == frozenset()
     with AdvisorEventStore(store_path) as store:
-        assert [event.dedupe_key for event in store.pending()] == [
-            feedback.dedupe_key
-        ]
+        pending = store.pending()
+        assert [event.dedupe_key for event in pending] == [incoming.dedupe_key]
+        assert pending[0].kind == incoming.kind
+        assert pending[0].payload["parent_conversation_id"] == str(
+            conversation_id
+        )
 
 
 def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
@@ -384,7 +400,7 @@ def test_context_exhaustion_retries_once_on_a_fresh_branch_with_the_same_id(
 
     assert result.exit_code == 0
     assert calls[0] == ("current actionable event", conversation_id, False, 100)
-    assert calls[1][1:] == (conversation_id, True, 75)
+    assert calls[1][1:] == (conversation_id, True, 100)
     assert "complete current controller context" in calls[1][0]
     assert "current actionable event" in calls[1][0]
     assert "raw trace and workspace are preserved" in calls[1][0]
@@ -490,40 +506,6 @@ def test_context_recovery_attempt_is_not_retried(
 
     assert [reset_context for _, _, reset_context in calls] == [False, True]
     assert raised.value.conversation_id == conversation_id
-    assert isinstance(raised.value.__cause__, ConversationRunError)
-
-
-def test_exhausted_turn_budget_defers_without_starting_a_doomed_recovery(
-    tmp_path: Path,
-    monkeypatch,
-):
-    conversation_id = UUID("00000000-0000-0000-0000-000000000094")
-    clock = [100.0]
-    calls = []
-
-    def run_openhands(prompt, config, *, reset_context=False):
-        calls.append((prompt, config.conversation_id, reset_context))
-        clock[0] += 100
-        raise ConversationRunError(
-            conversation_id,
-            LLMContextWindowExceedError("context length exceeded"),
-        )
-
-    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
-    monkeypatch.setattr("senpai_agent.controller.time.monotonic", lambda: clock[0])
-
-    with pytest.raises(ConversationRecoveryExhausted) as raised:
-        OpenHandsTurnRunner(
-            Config("advisor", tmp_path / "state", conversation_id, timeout_seconds=100),
-            full_prompt="complete current controller context",
-        ).run(
-            "current actionable event",
-            conversation_id=conversation_id,
-            event_keys=frozenset(),
-        )
-
-    assert len(calls) == 1
-    assert isinstance(raised.value.error, TimeoutError)
     assert isinstance(raised.value.__cause__, ConversationRunError)
 
 

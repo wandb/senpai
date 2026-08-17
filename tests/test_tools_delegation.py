@@ -36,9 +36,9 @@ from senpai_agent.delegation import (
 
 def test_model_tier_runtime_limits():
     assert MODEL_TIER_TIMEOUT_SECONDS == {
-        "fast": 600,
-        "smart": 1800,
-        "frontier": 3600,
+        "fast": 1200,
+        "smart": 3600,
+        "frontier": 7200,
     }
 
 
