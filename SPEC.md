@@ -86,9 +86,11 @@ GitHub state is level-triggered:
   label is a human message.
 
 Human Issue events use the exact latest human-authored body/comment ID as their
-dedupe key and `human_message_id`. An agent reply updates the Issue but does not
-create a new wake for its own comment. `respond_to_human_issue` verifies the exact
-human message before writing an idempotent response.
+dedupe key and `human_message_id`. Trusted messages may share the authenticated
+actor's GitHub identity; an authoritative Senpai protocol marker distinguishes
+agent output and prevents it from creating a new wake. `respond_to_human_issue`
+reapplies the same classification to the exact message before writing an
+idempotent response.
 Launches with human-Issue handling disabled skip that GitHub query entirely.
 
 Assigned-PR issue comments, submitted reviews, and inline comments each use

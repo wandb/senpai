@@ -104,3 +104,9 @@ def test_role_images_use_the_bootstrap_aware_health_wrapper():
     for name in ("entrypoint-advisor.sh", "entrypoint-student.sh"):
         entrypoint = (ROOT / "k8s" / name).read_text()
         assert entrypoint.index(".bootstrap-started") < entrypoint.index("git clone")
+
+
+def test_role_entrypoints_default_openhands_turns_to_sixteen_hours():
+    for name in ("entrypoint-advisor.sh", "entrypoint-student.sh"):
+        entrypoint = (ROOT / "k8s" / name).read_text()
+        assert 'SENPAI_OPENHANDS_TIMEOUT_SECONDS:-57600' in entrypoint

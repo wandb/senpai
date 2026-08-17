@@ -213,7 +213,7 @@ class RunnerConfig:
     wandb_entity: str | None = None
     wandb_project: str | None = None
     training_max_timeout_seconds: int = 1800
-    timeout_seconds: float = 3600
+    timeout_seconds: float = 57_600
     llm_timeout_seconds: int = 900
     llm_num_retries: int = 1
     inbox_max_stalled_attempts: int = DEFAULT_INBOX_MAX_STALLED_ATTEMPTS
@@ -626,7 +626,7 @@ def resolve_config(
     if training_max_timeout_seconds <= 0:
         raise RuntimeError("SENPAI_TIMEOUT_MINUTES must be positive")
     try:
-        timeout_seconds = float(env.get("SENPAI_OPENHANDS_TIMEOUT_SECONDS", "3600"))
+        timeout_seconds = float(env.get("SENPAI_OPENHANDS_TIMEOUT_SECONDS", "57600"))
     except ValueError as error:
         raise RuntimeError(
             "SENPAI_OPENHANDS_TIMEOUT_SECONDS must be numeric"

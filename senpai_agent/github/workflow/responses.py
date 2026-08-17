@@ -79,6 +79,14 @@ class IssueComment:
 
 
 @dataclass(frozen=True, slots=True)
+class HumanIssueMessage:
+    body: str
+    author: str
+    author_type: str
+    author_association: str
+
+
+@dataclass(frozen=True, slots=True)
 class ResultComment:
     comment: IssueComment
     result: ExperimentResult
@@ -180,6 +188,7 @@ class IssueCommentResponse(GitHubResponse):
 
 class IssueResponse(GitHubResponse):
     id: PositiveInteger
+    body: StrictStr | None
     state: StrictStr
     labels: tuple[GitHubLabel, ...]
     user: GitHubAuthor

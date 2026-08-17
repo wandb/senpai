@@ -113,6 +113,7 @@ def human_issue(
     author: str = "human-researcher",
     author_type: str = "User",
     association: str = "MEMBER",
+    body: str | None = "Please investigate the new result.",
     pull_request_url: str | None = None,
 ) -> dict[str, object]:
     issue: dict[str, object] = {
@@ -120,7 +121,7 @@ def human_issue(
         "number": 7,
         "html_url": f"https://github.com/{REPO}/issues/7",
         "state": state,
-        "body": "Please investigate the new result.",
+        "body": body,
         "labels": [
             {"name": label}
             for label in sorted(labels if labels is not None else {"human", "team"})
