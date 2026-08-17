@@ -5,12 +5,12 @@ from pathlib import Path
 
 import psutil
 
-from senpai_agent.training import (
-    TrainingResult,
-    TrainingState,
-    TrainingSupervisor,
+from senpai_agent.jobs import (
+    JobResult,
+    JobState,
+    JobSupervisor,
 )
-from training_test_support import (
+from job_test_support import (
     assert_process_stopped,
     make_supervisor,
     run_python,
@@ -26,7 +26,7 @@ TERM_IGNORING_SLEEP = (
 )
 
 
-def test_training_timeout_honors_the_requested_deadline(tmp_path: Path):
+def test_job_timeout_honors_the_requested_deadline(tmp_path: Path):
     workspace, supervisor = make_supervisor(
         tmp_path,
         terminate_grace_seconds=0.4,
@@ -40,10 +40,10 @@ def test_training_timeout_honors_the_requested_deadline(tmp_path: Path):
     )
     launch_elapsed = time.monotonic() - started
 
-    terminal = wait_for_terminal(supervisor, running.training_id)
+    terminal = wait_for_terminal(supervisor, running.job_id)
 
     assert launch_elapsed < 0.5
-    assert terminal.state is TrainingState.TIMED_OUT
+    assert terminal.state is JobState.TIMED_OUT
     assert terminal.elapsed_seconds < 1.25
     assert time.monotonic() - started < 1.25
 
@@ -68,13 +68,13 @@ def test_timeout_stops_term_ignoring_descendants(tmp_path: Path):
     )
 
     wait_for_path(child_pid_path)
-    terminal = wait_for_terminal(supervisor, running.training_id)
+    terminal = wait_for_terminal(supervisor, running.job_id)
 
-    assert terminal.state is TrainingState.TIMED_OUT
+    assert terminal.state is JobState.TIMED_OUT
     assert_process_stopped(int(child_pid_path.read_text()))
 
 
-def test_finished_training_stops_leftover_descendants(tmp_path: Path):
+def test_finished_job_stops_leftover_descendants(tmp_path: Path):
     workspace, supervisor = make_supervisor(
         tmp_path,
         terminate_grace_seconds=0.1,
@@ -87,13 +87,13 @@ def test_finished_training_stops_leftover_descendants(tmp_path: Path):
     )
     running = run_python(supervisor, workspace, parent_code)
 
-    terminal = wait_for_terminal(supervisor, running.training_id)
+    terminal = wait_for_terminal(supervisor, running.job_id)
 
-    assert terminal.state is TrainingState.FINISHED
+    assert terminal.state is JobState.FINISHED
     assert_process_stopped(int(child_pid_path.read_text()))
 
 
-def test_close_cannot_extend_the_training_deadline(tmp_path: Path):
+def test_close_cannot_extend_the_job_deadline(tmp_path: Path):
     workspace, supervisor = make_supervisor(
         tmp_path,
         terminate_grace_seconds=1.5,
@@ -116,9 +116,9 @@ def test_close_cannot_extend_the_training_deadline(tmp_path: Path):
         time.sleep(0.01)
 
     supervisor.close()
-    result = supervisor.get_training_status(running.training_id)
+    result = supervisor.get_job_status(running.job_id)
 
-    assert result.state in {TrainingState.CANCELLED, TrainingState.TIMED_OUT}
+    assert result.state in {JobState.CANCELLED, JobState.TIMED_OUT}
     assert result.elapsed_seconds < 2.1
     assert time.monotonic() - started < 2.1
 
@@ -140,9 +140,9 @@ def test_restart_stops_a_verified_orphaned_process_group(tmp_path: Path):
         start_new_session=True,
     )
     wait_for_path(child_pid_path)
-    orphan = TrainingResult(
-        training_id="d7d0d19f-9961-4dac-b2ff-7382dc463674",
-        state=TrainingState.RUNNING,
+    orphan = JobResult(
+        job_id="d7d0d19f-9961-4dac-b2ff-7382dc463674",
+        state=JobState.RUNNING,
         pid=process.pid,
         process_group_id=process.pid,
         process_start_time=process.create_time(),
@@ -150,19 +150,19 @@ def test_restart_stops_a_verified_orphaned_process_group(tmp_path: Path):
         elapsed_seconds=12,
         log_path=str(state_dir / "orphan.log"),
     )
-    (state_dir / f"{orphan.training_id}.json").write_text(orphan.model_dump_json())
-    sidecar = state_dir / f"{orphan.training_id}.score.json"
+    (state_dir / f"{orphan.job_id}.json").write_text(orphan.model_dump_json())
+    sidecar = state_dir / f"{orphan.job_id}.score.json"
     sidecar.write_text('{"metrics": {}, "passed": true, "score": 1.0}')
 
     try:
-        supervisor = TrainingSupervisor(
+        supervisor = JobSupervisor(
             workspace=workspace,
             state_dir=state_dir,
             terminate_grace_seconds=0.1,
         )
 
-        recovered = supervisor.get_training_status(orphan.training_id)
-        assert recovered.state is TrainingState.CANCELLED
+        recovered = supervisor.get_job_status(orphan.job_id)
+        assert recovered.state is JobState.CANCELLED
         assert "supervisor restarted" in recovered.error_tail
         assert sidecar.exists()
         assert process.wait(timeout=3) is not None
@@ -182,9 +182,9 @@ def test_restart_does_not_signal_a_reused_pid(tmp_path: Path):
         [sys.executable, "-c", "import time; time.sleep(60)"],
         start_new_session=True,
     )
-    orphan = TrainingResult(
-        training_id="26a7194a-3bea-45b1-a2e5-cd20d99e3a31",
-        state=TrainingState.RUNNING,
+    orphan = JobResult(
+        job_id="26a7194a-3bea-45b1-a2e5-cd20d99e3a31",
+        state=JobState.RUNNING,
         pid=unrelated.pid,
         process_group_id=unrelated.pid,
         process_start_time=unrelated.create_time() - 10,
@@ -192,13 +192,13 @@ def test_restart_does_not_signal_a_reused_pid(tmp_path: Path):
         elapsed_seconds=12,
         log_path=str(state_dir / "orphan.log"),
     )
-    (state_dir / f"{orphan.training_id}.json").write_text(orphan.model_dump_json())
+    (state_dir / f"{orphan.job_id}.json").write_text(orphan.model_dump_json())
 
     try:
-        supervisor = TrainingSupervisor(workspace=workspace, state_dir=state_dir)
+        supervisor = JobSupervisor(workspace=workspace, state_dir=state_dir)
 
-        recovered = supervisor.get_training_status(orphan.training_id)
-        assert recovered.state is TrainingState.CANCELLED
+        recovered = supervisor.get_job_status(orphan.job_id)
+        assert recovered.state is JobState.CANCELLED
         assert "no signal was sent" in recovered.error_tail
         assert unrelated.is_running()
     finally:

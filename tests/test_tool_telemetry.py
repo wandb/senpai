@@ -67,12 +67,12 @@ def observation(call_id: str, tool: str, at: datetime, *, error=False) -> dict:
 def telemetry_fixture(tmp_path: Path, now: datetime) -> Path:
     state = tmp_path / "state"
     root_events = [
-        action("launch", "run_training", now - timedelta(minutes=10), {"secret": "launch-secret"}),
-        observation("launch", "run_training", now - timedelta(minutes=9, seconds=55)),
-        action("status-1", "get_training_status", now - timedelta(minutes=8), {"training_id": "job-1"}),
-        observation("status-1", "get_training_status", now - timedelta(minutes=7, seconds=59)),
-        action("status-2", "get_training_status", now - timedelta(minutes=7, seconds=30), {"training_id": "job-1"}),
-        observation("status-2", "get_training_status", now - timedelta(minutes=7, seconds=29), error=True),
+        action("launch", "run_job", now - timedelta(minutes=10), {"secret": "launch-secret"}),
+        observation("launch", "run_job", now - timedelta(minutes=9, seconds=55)),
+        action("status-1", "get_job_status", now - timedelta(minutes=8), {"job_id": "job-1"}),
+        observation("status-1", "get_job_status", now - timedelta(minutes=7, seconds=59)),
+        action("status-2", "get_job_status", now - timedelta(minutes=7, seconds=30), {"job_id": "job-1"}),
+        observation("status-2", "get_job_status", now - timedelta(minutes=7, seconds=29), error=True),
         action("old", "terminal", now - timedelta(hours=13), {"command": "old-secret"}),
     ]
     write_conversation(
@@ -121,16 +121,16 @@ def test_recursive_report_counts_outcomes_latency_polling_and_repetition(tmp_pat
         (row["role"], row["model"], row["tool"]): row
         for row in report["by_source_scope_role_model_tool"]
     }
-    assert rows[("student", "openai/gpt-test", "get_training_status")][
+    assert rows[("student", "openai/gpt-test", "get_job_status")][
         "errors"
     ] == 1
-    assert rows[("student", "openai/gpt-test", "get_training_status")][
+    assert rows[("student", "openai/gpt-test", "get_job_status")][
         "latency"
     ]["p50_seconds"] == 1.0
     assert rows[("student", "openai/gpt-fast", "terminal")]["successes"] == 1
     assert {row["source"] for row in rows.values()} == {str(state.resolve())}
-    assert rows[("student", "openai/gpt-test", "run_training")]["scope"] == "root"
-    assert rows[("student", "openai/gpt-test", "run_training")]["depth"] == 0
+    assert rows[("student", "openai/gpt-test", "run_job")]["scope"] == "root"
+    assert rows[("student", "openai/gpt-test", "run_job")]["depth"] == 0
     assert rows[("student", "openai/gpt-fast", "terminal")]["scope"] == "child"
     assert rows[("student", "openai/gpt-fast", "terminal")]["depth"] == 1
 

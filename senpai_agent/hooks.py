@@ -11,7 +11,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from senpai_agent.training import training_result_paths
+from senpai_agent.jobs import job_result_paths
+from senpai_agent.state import job_state_dir
 
 
 @dataclass(frozen=True, slots=True)
@@ -715,12 +716,13 @@ def _stop_policy(
     if role not in {"advisor", "student"} or not (working_dir / ".git").exists():
         return PolicyDecision(True)
     if state_dir is not None:
+        jobs_dir = job_state_dir(state_dir)
         running = {
             path.stem
-            for path in training_result_paths(state_dir / "training")
+            for path in job_result_paths(jobs_dir)
             if json.loads(path.read_text()).get("state") == "running"
         }
-        monitored = _active_monitor_ids(state_dir / "training" / "monitors.sqlite3")
+        monitored = _active_monitor_ids(jobs_dir / "monitors.sqlite3")
         unmonitored = running - monitored
         if unmonitored:
             return PolicyDecision(
@@ -757,7 +759,7 @@ def _active_monitor_ids(database: Path) -> set[str]:
         return {
             str(row[0])
             for row in connection.execute(
-                "SELECT training_id FROM monitors WHERE active = 1"
+                "SELECT job_id FROM monitors WHERE active = 1"
             )
         }
     finally:

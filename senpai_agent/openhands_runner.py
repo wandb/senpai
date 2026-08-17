@@ -100,7 +100,15 @@ from senpai_agent.program_context import (
     PROGRAM_PATH_ENV,
     load_program_system_prompt,
 )
+from senpai_agent.persisted_conversation_migration import (
+    migrate_persisted_conversation,
+    migrate_persisted_job_state,
+)
 from senpai_agent.PROMPTS import RECOVERED_ACTION_PROMPT
+from senpai_agent.state import (
+    advisor_job_monitor_state_dir,
+    job_state_dir,
+)
 from senpai_agent.system_instructions import SenpaiSystemInstructions
 from senpai_agent.tools import register_senpai_tools
 
@@ -126,16 +134,6 @@ COMMAND_SECRET_ENV_NAMES = (
     "EXA_API_KEY",
     "MLXFAST_API_TOKEN",
 )
-_RETIRED_PERSISTED_TOOL_DEFINITION_KINDS = frozenset(
-    {
-        "DelegateAgentTool",
-        "RunTrainingTool",
-        "GetTrainingStatusTool",
-        "CancelTrainingTool",
-        "MonitorTrainingTool",
-    }
-)
-_DISABLED_PERSISTED_TOOL_NAMES = frozenset({"delegate_agent", "think"})
 EVENT_TEXT_LIMIT = 20000
 DEFAULT_LOCAL_CONDENSER_MAX_EVENTS = 0
 GENERIC_LOCAL_CONDENSER_MAX_EVENTS = 80
@@ -231,7 +229,7 @@ class RunnerConfig:
     student_name: str | None = None
     wandb_entity: str | None = None
     wandb_project: str | None = None
-    training_max_timeout_seconds: int = 1800
+    job_max_timeout_seconds: int = 1800
     timeout_seconds: float = 3600
     llm_timeout_seconds: int = 900
     llm_num_retries: int = 1
@@ -623,12 +621,12 @@ def resolve_config(
         launch=decode_launch_context(env.get(LAUNCH_CONTEXT_ENV, "")),
     )
     try:
-        training_max_timeout_seconds = round(
+        job_max_timeout_seconds = round(
             float(env.get("SENPAI_TIMEOUT_MINUTES", "30")) * 60
         )
     except ValueError as error:
         raise RuntimeError("SENPAI_TIMEOUT_MINUTES must be numeric") from error
-    if training_max_timeout_seconds <= 0:
+    if job_max_timeout_seconds <= 0:
         raise RuntimeError("SENPAI_TIMEOUT_MINUTES must be positive")
     try:
         timeout_seconds = float(env.get("SENPAI_OPENHANDS_TIMEOUT_SECONDS", "3600"))
@@ -942,7 +940,7 @@ def resolve_config(
         student_name=env.get("STUDENT_NAME") or None,
         wandb_entity=wandb_entity,
         wandb_project=wandb_project,
-        training_max_timeout_seconds=training_max_timeout_seconds,
+        job_max_timeout_seconds=job_max_timeout_seconds,
         timeout_seconds=timeout_seconds,
         llm_timeout_seconds=llm_timeout_seconds,
         llm_num_retries=llm_num_retries,
@@ -1300,10 +1298,23 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
     )
     if not config.child:
         job_params: dict[str, str | int] = {
-            "state_dir": str(config.state_dir / "training"),
-            "max_timeout_seconds": config.training_max_timeout_seconds,
+            "state_dir": str(job_state_dir(config.state_dir)),
+            "max_timeout_seconds": config.job_max_timeout_seconds,
         }
-        tools.append(Tool(name="senpai_training", params=job_params))
+        tools.append(Tool(name="senpai_jobs", params=job_params))
+        if config.role == "advisor" and config.wandb_entity and config.wandb_project:
+            tools.append(
+                Tool(
+                    name="senpai_advisor_job_monitor",
+                    params={
+                        "state_dir": str(
+                            advisor_job_monitor_state_dir(config.state_dir)
+                        ),
+                        "wandb_entity": config.wandb_entity,
+                        "wandb_project": config.wandb_project,
+                    },
+                )
+            )
     return tools
 
 
@@ -1318,118 +1329,6 @@ def without_legacy_think(agent: Agent) -> Agent:
             ],
         }
     )
-
-
-def _write_json_atomically(path: Path, payload: object) -> None:
-    mode = stat.S_IMODE(path.stat().st_mode)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            mode,
-        )
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            json.dump(payload, output, separators=(",", ":"))
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def migrate_persisted_retired_tool_definitions(
-    state_dir: Path,
-    conversation_id: uuid.UUID,
-) -> int:
-    """Remove only retired tool snapshots that the SDK can no longer decode."""
-
-    events_dir = Path(state_dir) / conversation_id.hex / "events"
-    removed = 0
-    for path in sorted(events_dir.glob("*.json")):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as error:
-            raise RuntimeError(
-                f"cannot migrate persisted conversation event at {path}: {error}"
-            ) from error
-        if not isinstance(payload, dict) or payload.get("kind") != "SystemPromptEvent":
-            continue
-        tools = payload.get("tools")
-        if not isinstance(tools, list):
-            continue
-        migrated_tools = [
-            tool
-            for tool in tools
-            if not (
-                isinstance(tool, dict)
-                and tool.get("kind") in _RETIRED_PERSISTED_TOOL_DEFINITION_KINDS
-            )
-        ]
-        removed_from_event = len(tools) - len(migrated_tools)
-        if not removed_from_event:
-            continue
-        payload["tools"] = migrated_tools
-        _write_json_atomically(path, payload)
-        removed += removed_from_event
-    return removed
-
-
-def migrate_persisted_disabled_tools(
-    state_dir: Path,
-    conversation_id: uuid.UUID,
-) -> frozenset[str]:
-    """Atomically remove disabled tools from one saved agent specification."""
-
-    path = Path(state_dir) / conversation_id.hex / "base_state.json"
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return frozenset()
-    except (json.JSONDecodeError, OSError) as error:
-        raise RuntimeError(
-            f"cannot migrate persisted agent state at {path}: {error}"
-        ) from error
-    if not isinstance(payload, dict) or not isinstance(payload.get("agent"), dict):
-        raise TypeError(f"persisted agent state at {path} has an unknown shape")
-    saved_agent = payload["agent"]
-    tools = saved_agent.get("tools")
-    defaults = saved_agent.get("include_default_tools")
-    if not isinstance(tools, list) or not all(
-        isinstance(tool, dict) and isinstance(tool.get("name"), str) for tool in tools
-    ):
-        raise RuntimeError(f"persisted agent tools at {path} have an unknown shape")
-    if defaults is not None and (
-        not isinstance(defaults, list)
-        or not all(isinstance(name, str) for name in defaults)
-    ):
-        raise RuntimeError(f"persisted default tools at {path} have an unknown shape")
-
-    removed = {
-        tool["name"] for tool in tools if tool["name"] in _DISABLED_PERSISTED_TOOL_NAMES
-    }
-    migrated_tools = [
-        tool for tool in tools if tool["name"] not in _DISABLED_PERSISTED_TOOL_NAMES
-    ]
-    if defaults is None or "ThinkTool" in defaults:
-        removed.add("think")
-    migrated_defaults = [
-        name
-        for name in (defaults if defaults is not None else ["FinishTool", "ThinkTool"])
-        if name != "ThinkTool"
-    ]
-    if migrated_tools == tools and migrated_defaults == defaults:
-        return frozenset()
-    saved_agent["tools"] = migrated_tools
-    saved_agent["include_default_tools"] = migrated_defaults
-
-    _write_json_atomically(path, payload)
-    return frozenset(removed)
 
 
 def delegation_config(
@@ -1668,6 +1567,17 @@ def run_openhands(
     scrub_model_credentials(os.environ, config)
     register_default_tools(enable_browser=False)
     register_senpai_tools()
+    if not config.child:
+        job_migration = migrate_persisted_job_state(config.state_dir)
+        if job_migration.changed:
+            print(
+                "OPENHANDS_STATE_MIGRATION "
+                f"job_records={job_migration.records} "
+                "previous_job_state_preserved="
+                f"{str(job_migration.previous_state_preserved).lower()}",
+                file=sys.stderr,
+                flush=True,
+            )
     file_agents = sanitized_agent_definitions(config.workspace)
     available_agents = [definition.name for definition in file_agents]
     project_skills = sanitized_project_skills(config.workspace)
@@ -1822,26 +1732,18 @@ def run_openhands(
                 tool_concurrency_limit=MAX_PARALLEL_AGENTS,
             )
         agent = without_legacy_think(agent)
-        retired_tool_definitions = migrate_persisted_retired_tool_definitions(
+        conversation_migration = migrate_persisted_conversation(
             config.state_dir,
             config.conversation_id,
         )
-        if retired_tool_definitions:
+        if conversation_migration.changed:
             print(
                 "OPENHANDS_STATE_MIGRATION "
-                f"removed_retired_tool_definitions={retired_tool_definitions} "
-                f"conversation_id={config.conversation_id}",
-                file=sys.stderr,
-                flush=True,
-            )
-        disabled_tools = migrate_persisted_disabled_tools(
-            config.state_dir,
-            config.conversation_id,
-        )
-        if disabled_tools:
-            print(
-                "OPENHANDS_STATE_MIGRATION "
-                f"removed_tools={','.join(sorted(disabled_tools))} "
+                "base_state_rewritten="
+                f"{str(conversation_migration.base_state_rewritten).lower()} "
+                f"events_rewritten={conversation_migration.events_rewritten} "
+                "tool_definitions_removed="
+                f"{conversation_migration.tool_definitions_removed} "
                 f"conversation_id={config.conversation_id}",
                 file=sys.stderr,
                 flush=True,

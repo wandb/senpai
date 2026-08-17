@@ -230,7 +230,7 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
     }
     assert "ANTHROPIC_API_KEY" not in config.command_secrets
     assert "OPENAI_API_KEY" not in config.command_secrets
-    assert config.training_max_timeout_seconds == 30
+    assert config.job_max_timeout_seconds == 30
     assert config.llm_timeout_seconds == 900
     assert config.llm_num_retries == 1
 

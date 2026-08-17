@@ -45,8 +45,8 @@ Do not copy raw event bodies into a report merely to recover arguments.
 
 Interpret the output carefully:
 
-- `get_training_status` and `get_job_status` counts are model-issued tool
-  calls. They do not include cheap controller-internal monitor polls.
+- `get_job_status` counts are model-issued tool calls. They do not include
+  cheap controller-internal monitor polls.
 - Latency is action-to-observation wall time when both timestamps survived.
 - Model attribution comes from each conversation's current
   `base_state.json`. If a conversation changed models in place, older calls

@@ -25,7 +25,7 @@ from openhands.tools.terminal import (
     TerminalObservation,
     TerminalTool,
 )
-from pydantic import Field, model_validator
+from pydantic import Field
 
 from senpai_agent.delegation import (
     AgentStatusTool,
@@ -36,24 +36,29 @@ from senpai_agent.delegation import (
 from senpai_agent.git_workflow import require_clean_job_worktree
 from senpai_agent.github.tools import GitHubWorkflowToolSet
 from senpai_agent.hooks import supervised_job_policy
-from senpai_agent.monitor import MetricGate, MonitorStore, TrainingMonitorSpec
-from senpai_agent.PROMPTS import MONITOR_TRAINING_STARTED_PROMPT, render_prompt
+from senpai_agent.monitor import (
+    JobMonitorSpec,
+    JobMonitorStore,
+    MetricMonitorSpec,
+    WandbJobStatusSource,
+)
 from senpai_agent.secrets import is_secret_environment_variable
-from senpai_agent.training import (
-    TrainingResult,
-    TrainingSpec,
-    TrainingState,
-    TrainingSupervisor,
+from senpai_agent.jobs import (
+    JobResult,
+    JobSpec as SupervisedJobSpec,
+    JobState,
+    JobSupervisor,
 )
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation import ConversationState, LocalConversation
 
 
-_TRAINING_RUNTIMES: dict[
+_JOB_RUNTIMES: dict[
     Path,
-    tuple[TrainingSupervisor, MonitorStore],
+    tuple[JobSupervisor, JobMonitorStore],
 ] = {}
+_ADVISOR_JOB_MONITOR_STORES: dict[Path, JobMonitorStore] = {}
 _BROWSER_ENABLED_STATE_KEY = "senpai.browser_enabled"
 _JOB_CONTROL_RESOURCE = "senpai-job-control"
 
@@ -156,168 +161,45 @@ class SenpaiTaskTrackerTool(TaskTrackerTool):
         ]
 
 
-def training_runtime(
+def job_runtime(
     workspace: Path,
     state_dir: Path,
     *,
     max_timeout_seconds: int | None = None,
-) -> tuple[TrainingSupervisor, MonitorStore]:
+) -> tuple[JobSupervisor, JobMonitorStore]:
     key = state_dir.resolve()
-    runtime = _TRAINING_RUNTIMES.get(key)
+    runtime = _JOB_RUNTIMES.get(key)
     if runtime is None:
         runtime = (
-            TrainingSupervisor(
+            JobSupervisor(
                 workspace=workspace,
                 state_dir=key,
                 max_timeout_seconds=max_timeout_seconds,
             ),
-            MonitorStore(key / "monitors.sqlite3"),
+            JobMonitorStore(key / "monitors.sqlite3"),
         )
-        _TRAINING_RUNTIMES[key] = runtime
+        _JOB_RUNTIMES[key] = runtime
     return runtime
 
 
-def close_training_runtimes() -> None:
-    for training, monitors in _TRAINING_RUNTIMES.values():
-        training.close()
+def close_job_runtimes() -> None:
+    for supervisor, monitors in _JOB_RUNTIMES.values():
+        supervisor.close()
         monitors.close()
-    _TRAINING_RUNTIMES.clear()
+    _JOB_RUNTIMES.clear()
+    for monitors in _ADVISOR_JOB_MONITOR_STORES.values():
+        monitors.close()
+    _ADVISOR_JOB_MONITOR_STORES.clear()
 
 
-class RunTrainingAction(Action):
-    """Persisted action type from the former model-visible tool surface."""
-
-    spec: TrainingSpec = Field(
-        description=(
-            "Structured process argv, assignment-workspace directory, and hard "
-            "timeout. Do not pass a shell command string."
-        )
-    )
+def advisor_job_monitor_store(state_dir: Path) -> JobMonitorStore:
+    key = state_dir.resolve()
+    if key not in _ADVISOR_JOB_MONITOR_STORES:
+        _ADVISOR_JOB_MONITOR_STORES[key] = JobMonitorStore(key / "monitors.sqlite3")
+    return _ADVISOR_JOB_MONITOR_STORES[key]
 
 
-class GetTrainingStatusAction(Action):
-    """Persisted action type from the former model-visible tool surface."""
-
-    training_id: str = Field(
-        min_length=1,
-        description="Training ID returned by run_training.",
-    )
-
-
-class CancelTrainingAction(Action):
-    """Persisted action type from the former model-visible tool surface."""
-
-    training_id: str = Field(
-        min_length=1,
-        description="Running training ID returned by run_training.",
-    )
-
-
-class MonitorTrainingAction(Action):
-    """Persisted action type from the former model-visible tool surface."""
-
-    training_id: str = Field(
-        min_length=1,
-        description="Training ID returned by run_training.",
-    )
-    metric: str | None = Field(
-        default=None,
-        description="W&B metric to monitor. Omit for terminal process state only.",
-    )
-    direction: Literal["min", "max"] | None = Field(
-        default=None,
-        description="Whether lower or higher values are better for change gates.",
-    )
-    gates: tuple[MetricGate, ...] = Field(
-        default=(),
-        description=(
-            "Metric thresholds or changes that should resume this conversation. "
-            "Ordinary polls are programmatic and do not consume model tokens."
-        ),
-    )
-    poll_interval_seconds: float = Field(
-        default=60,
-        ge=5,
-        allow_inf_nan=False,
-        description="Seconds between programmatic monitor polls.",
-    )
-    stale_after_seconds: float = Field(
-        default=600,
-        gt=0,
-        allow_inf_nan=False,
-        description="Notify when the selected metric has not updated this long.",
-    )
-
-    @model_validator(mode="before")
-    @classmethod
-    def discard_legacy_status_filter(cls, value: object) -> object:
-        """Resume conversations written before terminal wakes became mandatory."""
-
-        if isinstance(value, dict) and "notify_on_status" in value:
-            return {
-                key: item for key, item in value.items() if key != "notify_on_status"
-            }
-        return value
-
-
-class MonitorTrainingObservation(Observation):
-    """Persisted observation type from the former model-visible tool surface."""
-
-    training_id: str
-    conversation_id: str
-    status: Literal["monitoring"] = "monitoring"
-
-    @property
-    def to_llm_content(self) -> Sequence[TextContent]:
-        return [
-            TextContent(
-                text=render_prompt(
-                    MONITOR_TRAINING_STARTED_PROMPT,
-                    TRAINING_ID=self.training_id,
-                    CONVERSATION_ID=self.conversation_id,
-                )
-            )
-        ]
-
-
-class TrainingResultObservation(Observation):
-    """Persisted observation type from the former model-visible tool surface."""
-
-    training_id: str
-    state: TrainingState
-    pid: int | None = None
-    process_group_id: int | None = None
-    process_start_time: float | None = None
-    exit_code: int | None = None
-    elapsed_seconds: float
-    log_path: str
-    wandb_run_ids: tuple[str, ...] = ()
-    error_tail: str = ""
-
-    @classmethod
-    def from_result(cls, result: TrainingResult) -> Self:
-        values = result.model_dump()
-        values.pop("workspace_access", None)
-        return cls.model_validate(values)
-
-    @property
-    def to_llm_content(self) -> Sequence[TextContent]:
-        result = {
-            "training_id": self.training_id,
-            "state": self.state,
-            "pid": self.pid,
-            "exit_code": self.exit_code,
-            "elapsed_seconds": round(self.elapsed_seconds, 3),
-            "log_path": self.log_path,
-            "wandb_run_ids": self.wandb_run_ids,
-        }
-        if self.error_tail:
-            result["error_tail"] = self.error_tail
-        text = json.dumps(result, separators=(",", ":"), default=str)
-        return [TextContent(text=text)]
-
-
-class JobSpec(TrainingSpec):
+class JobSpec(SupervisedJobSpec):
     """One argv-based process supervised as a durable Senpai job."""
 
     argv: tuple[str, ...] = Field(
@@ -370,23 +252,20 @@ class CancelJobAction(Action):
 
 
 class MonitorJobAction(Action):
-    job_id: str = Field(min_length=1, description="Job ID returned by run_job.")
-    wandb_metric: str | None = Field(
-        default=None,
+    job_id: str = Field(
+        min_length=1,
+        pattern=r"^[^:;,#?/\"'\s]+$",
         description=(
-            "Optional W&B metric to monitor. Omit to keep terminal-state "
-            "monitoring only."
+            "Local job ID returned by run_job, or a configured-project W&B run "
+            "ID when the advisor monitors external work."
         ),
     )
-    direction: Literal["min", "max"] | None = Field(
-        default=None,
-        description="Whether lower or higher W&B metric values are better.",
-    )
-    gates: tuple[MetricGate, ...] = Field(
+    metrics: tuple[MetricMonitorSpec, ...] = Field(
         default=(),
+        max_length=3,
         description=(
-            "W&B metric thresholds or changes that should resume this "
-            "conversation. Ordinary polls do not consume model tokens."
+            "Up to three independent W&B metric policies. Omit to keep "
+            "terminal-state monitoring only."
         ),
     )
     poll_interval_seconds: float = Field(
@@ -394,12 +273,6 @@ class MonitorJobAction(Action):
         ge=5,
         allow_inf_nan=False,
         description="Seconds between programmatic monitor polls.",
-    )
-    stale_after_seconds: float = Field(
-        default=600,
-        gt=0,
-        allow_inf_nan=False,
-        description="Notify when the selected W&B metric has not updated this long.",
     )
 
 
@@ -423,7 +296,7 @@ class MonitorJobObservation(Observation):
 
 class JobResultObservation(Observation):
     job_id: str
-    state: TrainingState
+    state: JobState
     pid: int | None = None
     process_group_id: int | None = None
     process_start_time: float | None = None
@@ -436,12 +309,11 @@ class JobResultObservation(Observation):
     @classmethod
     def from_result(
         cls,
-        result: TrainingResult,
+        result: JobResult,
         *,
         mask: object | None = None,
     ) -> Self:
         values = result.model_dump()
-        values["job_id"] = values.pop("training_id")
         # workspace_access is supervisor metadata rather than model output.
         values.pop("workspace_access", None)
         if callable(mask):
@@ -469,8 +341,8 @@ class JobResultObservation(Observation):
 class _RunJobExecutor(ToolExecutor[RunJobAction, JobResultObservation]):
     def __init__(
         self,
-        supervisor: TrainingSupervisor,
-        monitor_store: MonitorStore,
+        supervisor: JobSupervisor,
+        monitor_store: JobMonitorStore,
         *,
         role: str,
     ):
@@ -499,31 +371,31 @@ class _RunJobExecutor(ToolExecutor[RunJobAction, JobResultObservation]):
             conversation,
             action.spec.secret_env,
         )
-        result = self.supervisor.run_training(
+        result = self.supervisor.run_job(
             action.spec,
             env=environment,
             redacted_values=redacted_values,
         )
         try:
             self.monitor_store.register(
-                TrainingMonitorSpec(
-                    training_id=result.training_id,
+                JobMonitorSpec(
+                    job_id=result.job_id,
                     conversation_id=conversation.id,
                 )
             )
         except BaseException as registration_error:
             try:
-                self.supervisor.cancel_training(result.training_id)
+                self.supervisor.cancel_job(result.job_id)
             except BaseException as cleanup_error:  # noqa: BLE001
                 registration_error.add_note(
                     "job cancellation during monitor-registration rollback failed: "
                     f"{type(cleanup_error).__name__}"
                 )
             try:
-                self.monitor_store.complete(result.training_id)
+                self.monitor_store.discard(result.job_id)
             except BaseException as cleanup_error:  # noqa: BLE001
                 registration_error.add_note(
-                    "monitor retirement during registration rollback failed: "
+                    "monitor discard during registration rollback failed: "
                     f"{type(cleanup_error).__name__}"
                 )
             raise
@@ -539,7 +411,7 @@ class _RunJobExecutor(ToolExecutor[RunJobAction, JobResultObservation]):
 
 
 class _GetJobStatusExecutor(ToolExecutor[GetJobStatusAction, JobResultObservation]):
-    def __init__(self, supervisor: TrainingSupervisor, store: MonitorStore):
+    def __init__(self, supervisor: JobSupervisor, store: JobMonitorStore):
         self.supervisor = supervisor
         self.store = store
 
@@ -550,22 +422,20 @@ class _GetJobStatusExecutor(ToolExecutor[GetJobStatusAction, JobResultObservatio
     ) -> JobResultObservation:
         if conversation is None:
             raise ValueError("get_job_status requires its parent conversation")
-        result = self.supervisor.get_training_status(action.job_id)
-        # The training runtime is already isolated to one role and workspace.
-        # Once a job is terminal, no process remains for another resumed root
-        # conversation to observe or control.
-        if result.state is TrainingState.RUNNING:
-            _require_owned_job(
-                self.store,
-                action.job_id,
-                conversation,
-                "get_job_status",
-            )
+        _require_owned_job(
+            self.store,
+            action.job_id,
+            conversation,
+            "get_job_status",
+        )
+        result = self.supervisor.get_job_status(action.job_id)
+        if result.state is not JobState.RUNNING:
+            self.store.record_terminal_and_complete(result)
         return _job_observation(result, conversation)
 
 
 class _CancelJobExecutor(ToolExecutor[CancelJobAction, JobResultObservation]):
-    def __init__(self, supervisor: TrainingSupervisor, store: MonitorStore):
+    def __init__(self, supervisor: JobSupervisor, store: JobMonitorStore):
         self.supervisor = supervisor
         self.store = store
 
@@ -575,18 +445,18 @@ class _CancelJobExecutor(ToolExecutor[CancelJobAction, JobResultObservation]):
         conversation: LocalConversation | None = None,
     ) -> JobResultObservation:
         _require_owned_job(self.store, action.job_id, conversation, "cancel_job")
-        result = self.supervisor.cancel_training(action.job_id)
-        if result.state is TrainingState.RUNNING:
+        result = self.supervisor.cancel_job(action.job_id)
+        if result.state is JobState.RUNNING:
             raise RuntimeError(
                 "cancel_job did not reach a terminal state; "
                 "the job monitor remains active"
             )
-        self.store.complete(action.job_id)
+        self.store.record_terminal_and_complete(result)
         return _job_observation(result, conversation)
 
 
 def _require_owned_job(
-    store: MonitorStore,
+    store: JobMonitorStore,
     job_id: str,
     conversation: LocalConversation | None,
     tool_name: str,
@@ -621,7 +491,7 @@ def _job_environment(
 
 
 def _job_observation(
-    result: TrainingResult,
+    result: JobResult,
     conversation: LocalConversation | None,
 ) -> JobResultObservation:
     registry = getattr(getattr(conversation, "state", None), "secret_registry", None)
@@ -636,8 +506,8 @@ class RunJobTool(ToolDefinition[RunJobAction, JobResultObservation]):
     @classmethod
     def create(
         cls,
-        supervisor: TrainingSupervisor,
-        monitor_store: MonitorStore,
+        supervisor: JobSupervisor,
+        monitor_store: JobMonitorStore,
         role: str = "advisor",
     ) -> Sequence[Self]:
         return [
@@ -674,8 +544,8 @@ class GetJobStatusTool(ToolDefinition[GetJobStatusAction, JobResultObservation])
     @classmethod
     def create(
         cls,
-        supervisor: TrainingSupervisor,
-        monitor_store: MonitorStore,
+        supervisor: JobSupervisor,
+        monitor_store: JobMonitorStore,
     ) -> Sequence[Self]:
         return [
             cls(
@@ -703,8 +573,8 @@ class CancelJobTool(ToolDefinition[CancelJobAction, JobResultObservation]):
     @classmethod
     def create(
         cls,
-        supervisor: TrainingSupervisor,
-        monitor_store: MonitorStore,
+        supervisor: JobSupervisor,
+        monitor_store: JobMonitorStore,
     ) -> Sequence[Self]:
         return [
             cls(
@@ -729,7 +599,7 @@ class CancelJobTool(ToolDefinition[CancelJobAction, JobResultObservation]):
 
 
 class _MonitorJobExecutor(ToolExecutor[MonitorJobAction, MonitorJobObservation]):
-    def __init__(self, supervisor: TrainingSupervisor, store: MonitorStore):
+    def __init__(self, supervisor: JobSupervisor, store: JobMonitorStore):
         self.supervisor = supervisor
         self.store = store
 
@@ -739,20 +609,17 @@ class _MonitorJobExecutor(ToolExecutor[MonitorJobAction, MonitorJobObservation])
         conversation: LocalConversation | None = None,
     ) -> MonitorJobObservation:
         _require_owned_job(self.store, action.job_id, conversation, "monitor_job")
-        self.supervisor.get_training_status(action.job_id)
+        self.supervisor.get_job_status(action.job_id)
         assert conversation is not None
-        spec = TrainingMonitorSpec(
-            training_id=action.job_id,
+        spec = JobMonitorSpec(
+            job_id=action.job_id,
             conversation_id=conversation.id,
-            metric=action.wandb_metric,
-            direction=action.direction,
-            gates=action.gates,
+            metrics=action.metrics,
             poll_interval_seconds=action.poll_interval_seconds,
-            stale_after_seconds=action.stale_after_seconds,
         )
         self.store.register(spec)
         return MonitorJobObservation(
-            job_id=spec.training_id,
+            job_id=spec.job_id,
             conversation_id=str(spec.conversation_id),
         )
 
@@ -767,8 +634,8 @@ class MonitorJobTool(ToolDefinition[MonitorJobAction, MonitorJobObservation]):
     @classmethod
     def create(
         cls,
-        supervisor: TrainingSupervisor,
-        monitor_store: MonitorStore,
+        supervisor: JobSupervisor,
+        monitor_store: JobMonitorStore,
     ) -> Sequence[Self]:
         return [
             cls(
@@ -793,6 +660,92 @@ class MonitorJobTool(ToolDefinition[MonitorJobAction, MonitorJobObservation]):
         ]
 
 
+class _AdvisorMonitorJobExecutor(
+    ToolExecutor[MonitorJobAction, MonitorJobObservation]
+):
+    def __init__(self, entity: str, project: str, store: JobMonitorStore):
+        self.entity = entity
+        self.project = project
+        self.store = store
+
+    def __call__(
+        self,
+        action: MonitorJobAction,
+        conversation: LocalConversation | None = None,
+    ) -> MonitorJobObservation:
+        if conversation is None:
+            raise ValueError("monitor_job requires its advisor conversation")
+        registry = getattr(getattr(conversation, "state", None), "secret_registry", None)
+        api_key = (
+            registry.get_secret_value("WANDB_API_KEY")
+            if registry is not None
+            else None
+        )
+        WandbJobStatusSource(
+            self.entity,
+            self.project,
+            api_key=api_key,
+        ).get_job_status(action.job_id)
+        spec = JobMonitorSpec(
+            job_id=action.job_id,
+            conversation_id=conversation.id,
+            metrics=action.metrics,
+            poll_interval_seconds=action.poll_interval_seconds,
+        )
+        self.store.register(spec)
+        return MonitorJobObservation(
+            job_id=spec.job_id,
+            conversation_id=str(spec.conversation_id),
+        )
+
+    def close(self) -> None:
+        return
+
+
+class AdvisorMonitorJobToolSet(
+    ToolDefinition[MonitorJobAction, MonitorJobObservation]
+):
+    """Expose configured-project W&B monitoring to the advisor."""
+
+    name = "monitor_job"
+
+    @classmethod
+    def create(
+        cls,
+        conv_state: object,  # noqa: ARG003
+        *,
+        state_dir: str | Path,
+        wandb_entity: str,
+        wandb_project: str,
+    ) -> Sequence[Self]:
+        store = advisor_job_monitor_store(Path(state_dir))
+        return [
+            cls(
+                description=(
+                    "Monitor one W&B job in the configured project. Terminal state "
+                    "is always monitored; optionally add up to three independent "
+                    "metric policies. Quiet checks run in the background without "
+                    "growing model context. Only a deduplicated actionable event is "
+                    "prioritized for this conversation's next safe turn."
+                ),
+                action_type=MonitorJobAction,
+                observation_type=MonitorJobObservation,
+                annotations=ToolAnnotations(
+                    title="Monitor job",
+                    readOnlyHint=False,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=True,
+                ),
+                executor=_AdvisorMonitorJobExecutor(
+                    wandb_entity,
+                    wandb_project,
+                    store,
+                ),
+            )
+        ]
+
+
 class JobToolSet(ToolDefinition[RunJobAction, JobResultObservation]):
     """Create generic job tools around one process supervisor."""
 
@@ -808,12 +761,12 @@ class JobToolSet(ToolDefinition[RunJobAction, JobResultObservation]):
         role = role or os.environ.get("SENPAI_ROLE")
         if role not in {"advisor", "student"}:
             raise ValueError("role must be advisor or student")
-        supervisor, monitor_store = training_runtime(
+        supervisor, monitor_store = job_runtime(
             Path(conv_state.workspace.working_dir),
             Path(state_dir),
             max_timeout_seconds=max_timeout_seconds,
         )
-        return (
+        tools: list[ToolDefinition] = [
             *RunJobTool.create(
                 supervisor=supervisor,
                 monitor_store=monitor_store,
@@ -827,11 +780,15 @@ class JobToolSet(ToolDefinition[RunJobAction, JobResultObservation]):
                 supervisor=supervisor,
                 monitor_store=monitor_store,
             ),
-            *MonitorJobTool.create(
-                supervisor=supervisor,
-                monitor_store=monitor_store,
-            ),
-        )
+        ]
+        if role == "student":
+            tools.extend(
+                MonitorJobTool.create(
+                    supervisor=supervisor,
+                    monitor_store=monitor_store,
+                )
+            )
+        return tools
 
 
 class SenpaiTerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
@@ -958,10 +915,8 @@ def register_senpai_tools() -> None:
     global _TOOLS_REGISTERED
     if _TOOLS_REGISTERED:
         return
-    # Keep the persisted factory identifier stable so existing OpenHands
-    # conversations can verify their saved agent specification. The concrete
-    # model-visible tools returned by this factory are job-oriented.
-    register_tool("senpai_training", JobToolSet)
+    register_tool("senpai_jobs", JobToolSet)
+    register_tool("senpai_advisor_job_monitor", AdvisorMonitorJobToolSet)
     register_tool("senpai_github", GitHubWorkflowToolSet)
     register_tool("spawn_agents", SpawnAgentsTool)
     register_tool("await_agents", AwaitAgentsTool)

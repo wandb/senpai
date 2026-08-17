@@ -61,8 +61,9 @@ argv list, the exact target working directory, and a timeout within the launch
 limit. Never launch these long-running processes through the terminal.
 
 `run_job` registers terminal-state monitoring automatically. Use `monitor_job`
-only to set or replace useful W&B primary-metric gates or a stale-update policy
-for an already-running job; it never disables terminal wakes. Use
+only to set or replace up to three useful W&B metric policies for an
+already-running job; it never disables terminal wakes. Ordinary checks stay
+outside model context and actionable events wait for the next safe turn. Use
 `get_job_status` for one bounded check and `cancel_job` for an early stop. Do not
 kill the process, stream logs, sleep, or create terminal polling loops; finish
 the turn and let the controller resume the conversation.

@@ -1,69 +1,79 @@
-"""Background delivery of newly observed GitHub mailbox events."""
+"""Persist mailbox events observed while an agent turn is running."""
 
 from __future__ import annotations
 
 import sys
 import threading
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from types import TracebackType
 from typing import Self
 
 from senpai_agent.advisor import AdvisorEvent, AdvisorEventStore
-from senpai_agent.github.http import GitHubReadError
-from senpai_agent.mailbox import ControllerEvent
-
-from .core import GitHubMailbox
+from senpai_agent.mailbox import ControllerEvent, Mailbox
 
 
-class ActiveGitHubWatcher:
-    """Feed new GitHub state into a running agent at SDK-safe boundaries."""
+MailboxFactory = Callable[[], AbstractContextManager[Mailbox]]
+
+
+class ActiveMailboxWatcher:
+    """Poll a mailbox quietly without injecting events into the active turn."""
 
     def __init__(
         self,
-        mailbox: GitHubMailbox,
+        mailbox: Mailbox | MailboxFactory,
         store_path: Path,
         *,
-        known_keys: frozenset[str],
+        known_keys: frozenset[str] = frozenset(),
         poll_interval_seconds: float = 30,
         map_event: Callable[[ControllerEvent], AdvisorEvent | None] | None = None,
+        shutdown_timeout_seconds: float = 1,
+        thread_name: str = "senpai-mailbox-watcher",
     ):
+        if poll_interval_seconds <= 0 or shutdown_timeout_seconds <= 0:
+            raise ValueError("watcher intervals must be positive")
         self.mailbox = mailbox
         self.store_path = store_path
         self.known_keys = set(known_keys)
         self.poll_interval_seconds = poll_interval_seconds
         self.map_event = map_event or _advisor_event
-        self.enqueued_keys: set[str] = set()
+        self.shutdown_timeout_seconds = shutdown_timeout_seconds
         self.stop = threading.Event()
         self.error: BaseException | None = None
         self.thread = threading.Thread(
             target=self._run,
-            name="senpai-github-watcher",
+            name=thread_name,
+            daemon=True,
         )
 
     def _run(self) -> None:
         try:
-            with AdvisorEventStore(self.store_path) as store:
+            mailbox_context = (
+                self.mailbox()
+                if callable(self.mailbox)
+                else nullcontext(self.mailbox)
+            )
+            with mailbox_context as mailbox, AdvisorEventStore(self.store_path) as store:
                 delay = self.poll_interval_seconds
                 while not self.stop.wait(delay):
                     try:
-                        events = self.mailbox.poll()
-                    except GitHubReadError as error:
-                        delay = max(
-                            self.poll_interval_seconds,
-                            error.retry_after_seconds
-                            if error.retry_after_seconds is not None
-                            else min(delay * 2, 600),
+                        events = mailbox.poll()
+                    except Exception as error:  # noqa: BLE001
+                        retry_after = getattr(error, "retry_after_seconds", None)
+                        delay = (
+                            max(self.poll_interval_seconds, retry_after)
+                            if retry_after is not None
+                            else min(max(delay * 2, self.poll_interval_seconds), 600)
                         )
                         print(
-                            "SENPAI_GITHUB_WATCHER_POLL_ERROR "
+                            "SENPAI_MAILBOX_WATCHER_POLL_ERROR "
                             f"{type(error).__name__}: {error}; "
                             f"retry_after_seconds={delay:g}",
                             file=sys.stderr,
                             flush=True,
                         )
                         continue
-                    delay = self.poll_interval_seconds
                     current = {event.dedupe_key for event in events}
                     for event in events:
                         if event.dedupe_key in self.known_keys:
@@ -71,12 +81,18 @@ class ActiveGitHubWatcher:
                         local_event = self.map_event(event)
                         if local_event is None:
                             continue
-                        if store.enqueue(local_event):
-                            self.enqueued_keys.add(local_event.dedupe_key)
+                        store.enqueue(local_event)
                     self.known_keys = current
+                    delay = self.poll_interval_seconds
         except BaseException as error:  # noqa: BLE001
             self.error = error
             self.stop.set()
+            print(
+                "SENPAI_MAILBOX_WATCHER_ERROR "
+                f"{type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def __enter__(self) -> Self:
         self.thread.start()
@@ -84,16 +100,16 @@ class ActiveGitHubWatcher:
 
     def __exit__(
         self,
-        exc_type: type[BaseException] | None,
+        _exc_type: type[BaseException] | None,
         _exc: BaseException | None,
         _traceback: TracebackType | None,
     ) -> None:
         self.stop.set()
-        self.thread.join()
-        if exc_type is None and self.error is not None:
+        self.thread.join(self.shutdown_timeout_seconds)
+        if self.thread.is_alive():
             print(
-                "SENPAI_GITHUB_WATCHER_ERROR "
-                f"{type(self.error).__name__}: {self.error}",
+                "SENPAI_MAILBOX_WATCHER_SHUTDOWN_TIMEOUT "
+                f"thread={self.thread.name}",
                 file=sys.stderr,
                 flush=True,
             )

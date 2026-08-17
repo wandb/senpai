@@ -23,6 +23,14 @@ MAX_EVENT_BYTES_PER_TURN = 64 * 1024
 _SENDER_PREFIX = "senpai-delivery:"
 
 
+def event_priority(kind: str) -> int:
+    if kind == "human_issue":
+        return 200
+    if kind == "job_monitor":
+        return 100
+    return 0
+
+
 class DeliveryState(StrEnum):
     PENDING = "pending"
     DELIVERED = "delivered"
@@ -37,6 +45,7 @@ class InboxMessage:
     state: DeliveryState
     event_key: str | None
     requires_ack: bool
+    priority: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +153,7 @@ class PersistentInbox:
                 ),
                 requires_ack INTEGER NOT NULL,
                 legacy INTEGER NOT NULL DEFAULT 0,
+                priority INTEGER NOT NULL DEFAULT 0,
                 turn_id TEXT,
                 position INTEGER,
                 FOREIGN KEY (turn_id) REFERENCES inbox_turns(turn_id)
@@ -229,6 +239,13 @@ class PersistentInbox:
                 ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0
                 """
             )
+        if "priority" not in message_columns:
+            self._connection.execute(
+                """
+                ALTER TABLE inbox_messages
+                ADD COLUMN priority INTEGER NOT NULL DEFAULT 0
+                """
+            )
         if legacy_path is not None and legacy_path.is_file():
             self._import_legacy_deliveries(legacy_path)
         self._connection.commit()
@@ -240,17 +257,20 @@ class PersistentInbox:
         body: str,
         *,
         requires_ack: bool = True,
+        priority: int = 0,
     ) -> bool:
         if not event_key:
             raise ValueError("event key must not be empty")
         if not body:
             raise ValueError("event body must not be empty")
+        if priority < 0:
+            raise ValueError("event priority must not be negative")
         conversation = str(conversation_id)
         with self._transaction() as database:
             _require_event_payload(database, conversation, event_key, body)
             existing = database.execute(
                 """
-                SELECT message.sequence, message.requires_ack
+                SELECT message.sequence, message.requires_ack, message.priority
                 FROM inbox_messages AS message
                 LEFT JOIN inbox_turns AS turn ON turn.turn_id = message.turn_id
                 WHERE message.conversation_id = ?
@@ -268,10 +288,21 @@ class PersistentInbox:
                 (conversation, event_key),
             ).fetchone()
             if existing is not None:
-                if requires_ack and not existing["requires_ack"]:
+                if (
+                    requires_ack and not existing["requires_ack"]
+                ) or priority > existing["priority"]:
                     database.execute(
-                        "UPDATE inbox_messages SET requires_ack = 1 WHERE sequence = ?",
-                        (existing["sequence"],),
+                        """
+                        UPDATE inbox_messages
+                        SET requires_ack = MAX(requires_ack, ?),
+                            priority = MAX(priority, ?)
+                        WHERE sequence = ?
+                        """,
+                        (
+                            int(requires_ack),
+                            priority,
+                            existing["sequence"],
+                        ),
                     )
                 return False
             legacy = database.execute(
@@ -298,8 +329,9 @@ class PersistentInbox:
                     sender,
                     state,
                     requires_ack,
-                    legacy
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    legacy,
+                    priority
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                 """,
                 (
                     conversation,
@@ -310,6 +342,7 @@ class PersistentInbox:
                     _sender(delivery_id),
                     int(requires_ack),
                     int(legacy is not None),
+                    priority,
                 ),
             )
             if legacy is not None:
@@ -405,30 +438,41 @@ class PersistentInbox:
 
             pending = database.execute(
                 """
-                SELECT sequence, body, delivery_id, legacy
+                SELECT sequence, body, delivery_id, legacy, priority
                 FROM inbox_messages
                 WHERE conversation_id = ?
                   AND state = 'pending'
                   AND turn_id IS NULL
-                ORDER BY legacy DESC, sequence
+                ORDER BY legacy DESC, priority DESC, sequence
                 """,
                 (conversation,),
             ).fetchall()
-            selected: list[sqlite3.Row] = []
-            selected_bytes = 0
             legacy_batch = bool(pending and pending[0]["legacy"])
-            for row in pending:
-                if bool(row["legacy"]) != legacy_batch:
-                    break
-                size = len(row["body"].encode("utf-8"))
-                if selected and (
-                    len(selected) >= max_events or selected_bytes + size > max_bytes
-                ):
-                    break
-                selected.append(row)
-                selected_bytes += size
-                if len(selected) >= max_events:
-                    break
+            candidates = [
+                row for row in pending if bool(row["legacy"]) == legacy_batch
+            ]
+            selected = _select_pending_rows(
+                candidates,
+                max_events=max_events,
+                max_bytes=max_bytes,
+            )
+            if not legacy_batch and max_events > 1:
+                ordinary = next(
+                    (row for row in candidates if row["priority"] == 0),
+                    None,
+                )
+                if ordinary is not None and ordinary not in selected:
+                    ordinary_size = len(ordinary["body"].encode("utf-8"))
+                    if ordinary_size > max_bytes:
+                        selected = [ordinary]
+                    else:
+                        selected = _select_pending_rows(
+                            [row for row in candidates if row is not ordinary],
+                            max_events=max_events - 1,
+                            max_bytes=max_bytes - ordinary_size,
+                            allow_oversized_first=False,
+                        )
+                        selected.append(ordinary)
             if not selected:
                 return None
 
@@ -992,9 +1036,10 @@ class PersistentInbox:
                         state,
                         requires_ack,
                         legacy,
+                        priority,
                         turn_id,
                         position
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
                     """,
                     (
                         original.conversation_id,
@@ -1005,6 +1050,7 @@ class PersistentInbox:
                         _sender(delivery_id),
                         int(message.requires_ack),
                         int(self._is_legacy_message(database, message.delivery_id)),
+                        message.priority,
                         recovery_id,
                         position,
                     ),
@@ -1047,7 +1093,10 @@ class PersistentInbox:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT conversation_id, MIN(sequence) AS first_sequence
+                SELECT
+                    conversation_id,
+                    MAX(priority) AS highest_priority,
+                    MIN(sequence) AS first_sequence
                 FROM inbox_messages
                 WHERE conversation_id NOT IN (
                         SELECT conversation_id
@@ -1066,7 +1115,7 @@ class PersistentInbox:
                       )
                   )
                 GROUP BY conversation_id
-                ORDER BY first_sequence
+                ORDER BY highest_priority DESC, first_sequence
                 """
             ).fetchall()
             return tuple(str(row[0]) for row in rows)
@@ -1521,6 +1570,28 @@ def _require_event_payload(
         )
 
 
+def _select_pending_rows(
+    rows: Sequence[sqlite3.Row],
+    *,
+    max_events: int,
+    max_bytes: int,
+    allow_oversized_first: bool = True,
+) -> list[sqlite3.Row]:
+    selected: list[sqlite3.Row] = []
+    selected_bytes = 0
+    for row in rows:
+        size = len(row["body"].encode("utf-8"))
+        if not selected and size > max_bytes and not allow_oversized_first:
+            break
+        if selected and (
+            len(selected) >= max_events or selected_bytes + size > max_bytes
+        ):
+            break
+        selected.append(row)
+        selected_bytes += size
+    return selected
+
+
 def _message(row: sqlite3.Row) -> InboxMessage:
     return InboxMessage(
         delivery_id=str(row["delivery_id"]),
@@ -1529,6 +1600,7 @@ def _message(row: sqlite3.Row) -> InboxMessage:
         state=DeliveryState(row["state"]),
         event_key=row["event_key"],
         requires_ack=bool(row["requires_ack"]),
+        priority=int(row["priority"]),
     )
 
 

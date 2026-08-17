@@ -102,25 +102,22 @@ Successful turns atomically acknowledge immutable feedback keys in a small JSON
 ledger. Oldest unacknowledged events are delivered in bounded count/byte
 batches; immediate post-turn polls drain later batches without dropping them.
 
-While an OpenHands turn is running, `ActiveGitHubWatcher` polls the same GitHub
-state. It enqueues all newly visible advisor events, and only PR feedback bound
-to the currently running student UUID, in the role's local event store.
-OpenHands 1.40 supports concurrent `send_message`; `AdvisorEventPump` injects at
-its state lock boundary without cancelling unrelated work. Successfully
-injected student feedback is acknowledged in `github-feedback.json` only when
-the enclosing student turn succeeds.
+While an OpenHands turn is running, `ActiveMailboxWatcher` polls GitHub and job
+monitor mailboxes into the role's local event store. It never injects messages
+into the active conversation. Newly visible advisor events, and student events
+bound to the running assignment UUID, remain pending for the next safe
+sequential turn and are acknowledged only after that turn succeeds.
 
 Generic child results use a local SQLite WAL event store because parent and
 child run on the same advisor or student instance. That is not an inter-node
 protocol.
 
-The only SQLite databases are `advisor-events.sqlite3`, for unacknowledged
-advisor watcher/child events; `student-events.sqlite3`, for unacknowledged
-student feedback/child events; and `training/monitors.sqlite3`, for role-local
-job-monitor policy, samples, and deduplicated actionable signals. The
-`training/` state-directory name is retained so live persisted conversations
-and supervised processes remain recoverable across this surface change. OpenHands
-conversation history is a separate file-backed per-UUID event log.
+Role-local SQLite state includes `advisor-events.sqlite3` for unacknowledged
+advisor watcher/child events, `student-events.sqlite3` for unacknowledged
+student feedback/child events, and `jobs/monitors.sqlite3` for supervised-job
+monitor policy, samples, and deduplicated actionable signals. The advisor's
+external W&B monitor policies use `advisor-job-monitors/monitors.sqlite3`.
+OpenHands conversation history is a separate file-backed per-UUID event log.
 
 ## State and conversations
 
@@ -132,11 +129,12 @@ Advisor state:
 ├── controller-lease.json
 ├── advisor-events.sqlite3
 ├── started-conversations.json
-├── training/
+├── jobs/
 │   ├── <job-id>.json
 │   ├── <job-id>.log
-│   ├── monitors.sqlite3
-│   └── monitors/<job-id>.json
+│   └── monitors.sqlite3
+├── advisor-job-monitors/
+│   └── monitors.sqlite3
 ├── github/
 └── conversations managed by OpenHands
 ```
@@ -153,11 +151,10 @@ Student state:
 ├── student-conversations.json
 ├── student-events.sqlite3
 ├── started-conversations.json
-├── training/
+├── jobs/
 │   ├── <job-id>.json
 │   ├── <job-id>.log
-│   ├── monitors.sqlite3
-│   └── monitors/<job-id>.json
+│   └── monitors.sqlite3
 ├── github/
 └── conversations managed by OpenHands
 ```
@@ -560,11 +557,11 @@ get_job_status(job_id: str) -> JobResult
 cancel_job(job_id: str) -> JobResult
 monitor_job(
   job_id,
-  wandb_metric=None,
-  direction=None,
-  gates=(),
+  metrics=(
+    MetricMonitorSpec(metric, direction=None, gates=(), stale_after_seconds=600),
+    ...,
+  ),
   poll_interval_seconds=60,
-  stale_after_seconds=600,
 ) -> MonitorJobObservation
 ```
 
@@ -583,9 +580,11 @@ terminal state. Advisor jobs and truly passive student watchers may be
 scrubbed environment and may request only registered credentials explicitly;
 the current public grant is `WANDB_API_KEY`. Every successful `run_job` call
 immediately registers a terminal-state monitor bound to the current
-conversation. `monitor_job` sets or replaces optional W&B metric gates and
-staleness detection for an already-running job; it never disables terminal
-wakes.
+conversation. A student uses `monitor_job` with its local `run_job` ID. An
+advisor may instead monitor a W&B run ID in the configured project without
+gaining process-status or cancellation authority over that external job. Each
+call sets or replaces zero to three independent metric policies; it never
+disables terminal wakes.
 
 The timeout is a total wall-clock ceiling, not merely the point at which
 shutdown begins. TERM is sent early enough that the configured grace period
@@ -595,12 +594,15 @@ until the supervisor has persisted a terminal state. Target job code remains
 responsible for handling SIGTERM and flushing external services
 such as W&B before the grace period expires.
 
-The controller polls only monitors that are due. It fetches one latest selected
-metric value from W&B, evaluates deterministic threshold/change/staleness and
-terminal-state rules, and persists deduplicated compact signals. Ordinary
-polls use no LLM tokens. The monitor store reports its earliest due poll to the
-controller, which shortens the ordinary heartbeat sleep accordingly; a
-minute-scale job therefore does not wait for the default ten-minute cadence.
+The controller polls only monitors that are due. It fetches the latest value for
+up to three selected metrics from W&B, evaluates deterministic
+threshold/change/staleness and terminal-state rules, and persists deduplicated
+compact signals. Polling continues in a background watcher while a model turn
+is active; quiet polls use no LLM tokens and add nothing to model context. A
+signal is prioritized for the next safe turn and never preempts the active
+conversation. The monitor store reports its earliest due poll to the controller,
+which shortens the ordinary heartbeat sleep accordingly; a minute-scale job
+therefore does not wait for the default ten-minute cadence.
 
 Metric samples reject NaN and infinities. Due monitors are ordered and processed
 in a capped batch with an overall time budget. A failure in one monitor's job
@@ -612,11 +614,15 @@ monitor policy resets its derived samples and signals to match the new persisted
 policy. The SQLite monitor store is the single source of truth for ownership,
 schedule, and active state; there is no second marker to reconcile.
 
-Every persisted actionable signal directly creates a compact `job_monitor`
-wake for the signal's original advisor or student conversation UUID. No
-intermediate LLM call gates these events: registering the monitor policy is the
-role's request to resume when one of its conditions emits a signal. The
-signal remains pending until that exact conversation successfully handles it.
+Every terminal job atomically records exactly one durable `job_status` signal,
+even when an active turn collects the result through `get_job_status` or
+`cancel_job` before the background watcher sees it. Every persisted actionable
+signal creates a compact `job_monitor` event for the original advisor or student
+conversation UUID. No intermediate LLM call gates these events: registering the
+monitor policy is the role's request to resume when one of its conditions emits
+a signal. The signal remains pending until that exact conversation successfully
+handles it. An already-active conversation is never duplicated; its event waits
+for the next safe sequential turn.
 
 Controller events are partitioned by their exact conversation UUID before a
 turn. Each partition is acknowledged only after its own successful turn, so a

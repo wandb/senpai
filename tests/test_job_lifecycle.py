@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from training_test_support import (
+from job_test_support import (
     assert_process_stopped,
     make_supervisor,
     run_python,
@@ -10,33 +10,33 @@ from training_test_support import (
     wait_for_terminal,
 )
 
-from senpai_agent.training import TrainingSpec, TrainingState, TrainingSupervisor
+from senpai_agent.jobs import JobSpec, JobState, JobSupervisor
 
 
-def test_finished_training_persists_its_result_and_log(tmp_path: Path):
+def test_finished_job_persists_its_result_and_log(tmp_path: Path):
     workspace, supervisor = make_supervisor(tmp_path)
     running = run_python(
         supervisor,
         workspace,
-        "print('https://wandb.ai/acme/cfd/runs/run-123', flush=True)",
+        "print('https://wandb.ai/acme/cfd/runs/run.123', flush=True)",
     )
 
-    terminal = wait_for_terminal(supervisor, running.training_id)
-    reopened = TrainingSupervisor(
+    terminal = wait_for_terminal(supervisor, running.job_id)
+    reopened = JobSupervisor(
         workspace=workspace,
         state_dir=tmp_path / "state",
-    ).get_training_status(running.training_id)
+    ).get_job_status(running.job_id)
 
-    assert running.state is TrainingState.RUNNING
+    assert running.state is JobState.RUNNING
     assert running.pid is not None
-    assert terminal.state is TrainingState.FINISHED
+    assert terminal.state is JobState.FINISHED
     assert terminal.exit_code == 0
-    assert terminal.wandb_run_ids == ("run-123",)
-    assert Path(terminal.log_path).read_text().strip().endswith("/runs/run-123")
+    assert terminal.wandb_run_ids == ("run.123",)
+    assert Path(terminal.log_path).read_text().strip().endswith("/runs/run.123")
     assert reopened == terminal
 
 
-def test_recovery_ignores_non_training_json_sidecars(tmp_path: Path):
+def test_recovery_ignores_non_job_json_sidecars(tmp_path: Path):
     workspace = tmp_path / "workspace"
     state_dir = tmp_path / "state"
     workspace.mkdir()
@@ -45,13 +45,13 @@ def test_recovery_ignores_non_training_json_sidecars(tmp_path: Path):
     contents = '{"metrics": {}, "passed": true, "score": 1.0}'
     sidecar.write_text(contents)
 
-    supervisor = TrainingSupervisor(workspace=workspace, state_dir=state_dir)
+    supervisor = JobSupervisor(workspace=workspace, state_dir=state_dir)
 
     assert sidecar.read_text() == contents
     supervisor.close()
 
 
-def test_recovery_rejects_a_corrupt_training_result(tmp_path: Path):
+def test_recovery_rejects_a_corrupt_job_result(tmp_path: Path):
     workspace = tmp_path / "workspace"
     state_dir = tmp_path / "state"
     workspace.mkdir()
@@ -60,10 +60,10 @@ def test_recovery_rejects_a_corrupt_training_result(tmp_path: Path):
     result.write_text('{"state": "running"}')
 
     with pytest.raises(ValueError):
-        TrainingSupervisor(workspace=workspace, state_dir=state_dir)
+        JobSupervisor(workspace=workspace, state_dir=state_dir)
 
 
-def test_training_passes_shell_metacharacters_as_a_literal_argument(tmp_path: Path):
+def test_job_passes_shell_metacharacters_as_a_literal_argument(tmp_path: Path):
     workspace, supervisor = make_supervisor(tmp_path)
     literal = "result; $(echo not-a-shell)"
     running = run_python(
@@ -73,13 +73,13 @@ def test_training_passes_shell_metacharacters_as_a_literal_argument(tmp_path: Pa
         literal,
     )
 
-    terminal = wait_for_terminal(supervisor, running.training_id)
+    terminal = wait_for_terminal(supervisor, running.job_id)
 
-    assert terminal.state is TrainingState.FINISHED
+    assert terminal.state is JobState.FINISHED
     assert Path(terminal.log_path).read_text().strip() == literal
 
 
-def test_training_rejects_a_working_directory_outside_the_workspace(tmp_path: Path):
+def test_job_rejects_a_working_directory_outside_the_workspace(tmp_path: Path):
     workspace, supervisor = make_supervisor(tmp_path)
 
     with pytest.raises(ValueError, match="inside"):
@@ -90,7 +90,7 @@ def test_training_rejects_a_working_directory_outside_the_workspace(tmp_path: Pa
         )
 
 
-def test_training_rejects_timeout_above_the_launch_ceiling(tmp_path: Path):
+def test_job_rejects_timeout_above_the_launch_ceiling(tmp_path: Path):
     workspace, supervisor = make_supervisor(tmp_path, max_timeout_seconds=30)
 
     with pytest.raises(ValueError, match="configured maximum"):
@@ -102,7 +102,7 @@ def test_training_rejects_timeout_above_the_launch_ceiling(tmp_path: Path):
         )
 
 
-def test_supervisor_close_cancels_active_training(tmp_path: Path):
+def test_supervisor_close_cancels_active_job(tmp_path: Path):
     workspace, supervisor = make_supervisor(
         tmp_path,
         terminate_grace_seconds=0.1,
@@ -116,8 +116,8 @@ def test_supervisor_close_cancels_active_training(tmp_path: Path):
 
     supervisor.close()
 
-    assert supervisor.get_training_status(running.training_id).state is (
-        TrainingState.CANCELLED
+    assert supervisor.get_job_status(running.job_id).state is (
+        JobState.CANCELLED
     )
 
 
@@ -138,10 +138,10 @@ def test_mutable_workspace_lease_is_exclusive_and_released_on_cancel(
     with pytest.raises(RuntimeError, match="mutable workspace job"):
         run_python(supervisor, workspace, "print('blocked')")
 
-    supervisor.cancel_training(running.training_id)
+    supervisor.cancel_job(running.job_id)
     replacement = run_python(supervisor, workspace, "print('released')")
-    assert wait_for_terminal(supervisor, replacement.training_id).state is (
-        TrainingState.FINISHED
+    assert wait_for_terminal(supervisor, replacement.job_id).state is (
+        JobState.FINISHED
     )
 
 
@@ -173,8 +173,8 @@ def test_internal_monitor_failure_stops_process_and_releases_workspace_lease(
 def test_failed_job_tail_redacts_secret_across_tail_boundary(tmp_path: Path):
     workspace, supervisor = make_supervisor(tmp_path)
     secret = "boundary-secret-value"
-    running = supervisor.run_training(
-        TrainingSpec(
+    running = supervisor.run_job(
+        JobSpec(
             argv=(
                 sys.executable,
                 "-c",
@@ -190,15 +190,15 @@ def test_failed_job_tail_redacts_secret_across_tail_boundary(tmp_path: Path):
         redacted_values=(secret,),
     )
 
-    terminal = wait_for_terminal(supervisor, running.training_id)
+    terminal = wait_for_terminal(supervisor, running.job_id)
 
-    assert terminal.state is TrainingState.FAILED
+    assert terminal.state is JobState.FAILED
     assert secret not in terminal.error_tail
     assert "boundary-secret" not in terminal.error_tail
     assert Path(terminal.log_path).stat().st_mode & 0o077 == 0
 
 
-def test_cancel_training_stops_one_run_and_is_idempotent(tmp_path: Path):
+def test_cancel_job_stops_one_run_and_is_idempotent(tmp_path: Path):
     workspace, supervisor = make_supervisor(
         tmp_path,
         terminate_grace_seconds=0.1,
@@ -210,13 +210,13 @@ def test_cancel_training_stops_one_run_and_is_idempotent(tmp_path: Path):
         timeout_seconds=60,
     )
 
-    cancelled = supervisor.cancel_training(running.training_id)
+    cancelled = supervisor.cancel_job(running.job_id)
 
-    assert cancelled.state is TrainingState.CANCELLED
-    assert supervisor.cancel_training(running.training_id) == cancelled
+    assert cancelled.state is JobState.CANCELLED
+    assert supervisor.cancel_job(running.job_id) == cancelled
 
 
-def test_cancel_training_stops_term_ignoring_descendants(tmp_path: Path):
+def test_cancel_job_stops_term_ignoring_descendants(tmp_path: Path):
     workspace, supervisor = make_supervisor(
         tmp_path,
         terminate_grace_seconds=0.1,
@@ -240,15 +240,15 @@ def test_cancel_training_stops_term_ignoring_descendants(tmp_path: Path):
     wait_for_path(descendant_path)
     descendant_pid = int(descendant_path.read_text())
 
-    cancelled = supervisor.cancel_training(running.training_id)
+    cancelled = supervisor.cancel_job(running.job_id)
 
-    assert cancelled.state is TrainingState.CANCELLED
+    assert cancelled.state is JobState.CANCELLED
     assert running.pid is not None
     assert_process_stopped(running.pid)
     assert_process_stopped(descendant_pid)
 
 
-def test_supervisor_drain_waits_for_training_to_finish(tmp_path: Path):
+def test_supervisor_drain_waits_for_job_to_finish(tmp_path: Path):
     workspace, supervisor = make_supervisor(tmp_path)
     running = run_python(
         supervisor,
@@ -258,6 +258,6 @@ def test_supervisor_drain_waits_for_training_to_finish(tmp_path: Path):
 
     supervisor.drain()
 
-    assert supervisor.get_training_status(running.training_id).state is (
-        TrainingState.FINISHED
+    assert supervisor.get_job_status(running.job_id).state is (
+        JobState.FINISHED
     )

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Monitor jobs"
+  short_description: "Wake on important job events without polling"
+  default_prompt: "Use $monitor-jobs to monitor this long-running job without manual polling."

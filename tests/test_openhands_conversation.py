@@ -13,10 +13,9 @@ from openhands.sdk.event import (
     InterruptEvent,
     MessageEvent,
     ObservationEvent,
-    SystemPromptEvent,
 )
 from openhands.sdk.llm import Message, TextContent
-from openhands.sdk.tool import FinishTool, resolve_tool
+from openhands.sdk.tool import resolve_tool
 from openhands.sdk.workspace import LocalWorkspace
 
 import senpai_agent.openhands_runner as runner
@@ -29,11 +28,12 @@ from senpai_agent.inbox import (
 from senpai_agent.openhands_runner import (
     graceful_interrupts,
     main,
-    migrate_persisted_disabled_tools,
-    migrate_persisted_retired_tool_definitions,
     reject_recovered_actions,
     run_openhands,
     without_legacy_think,
+)
+from senpai_agent.persisted_conversation_migration import (
+    migrate_persisted_conversation,
 )
 from openhands_support import (
     PLUGIN_DIR,
@@ -41,103 +41,6 @@ from openhands_support import (
     runtime_config,
 )
 from pydantic import SecretStr
-
-_RETIRED_TOOL_TYPES = (
-    (
-        "DelegateAgentTool",
-        "delegate_agent",
-        "DelegateAgentAction",
-        "DelegateAgentObservation",
-    ),
-    (
-        "RunTrainingTool",
-        "run_training",
-        "RunTrainingAction",
-        "TrainingResultObservation",
-    ),
-    (
-        "GetTrainingStatusTool",
-        "get_training_status",
-        "GetTrainingStatusAction",
-        "TrainingResultObservation",
-    ),
-    (
-        "CancelTrainingTool",
-        "cancel_training",
-        "CancelTrainingAction",
-        "TrainingResultObservation",
-    ),
-    (
-        "MonitorTrainingTool",
-        "monitor_training",
-        "MonitorTrainingAction",
-        "MonitorTrainingObservation",
-    ),
-)
-
-
-def _persisted_conversation_with_retired_tool_snapshots(tmp_path):
-    conversation_id = runner.uuid.uuid4()
-    persistence_root = tmp_path / "state"
-    persistence_dir = persistence_root / conversation_id.hex
-    workspace = LocalWorkspace(working_dir=tmp_path / "workspace")
-    llm = LLM(model="openai/gpt-4o-mini", api_key=SecretStr("test-key"))
-    persisted_agent = Agent(llm=llm, tools=[Tool(name="delegate_agent")])
-    agent = without_legacy_think(Agent(llm=llm, tools=[]))
-    state = ConversationState.create(
-        id=conversation_id,
-        agent=persisted_agent,
-        workspace=workspace,
-        persistence_dir=str(persistence_dir),
-    )
-    system_event = state.append_event(
-        SystemPromptEvent(
-            system_prompt=TextContent(text="preserve the historical system prompt"),
-            tools=[FinishTool.create()[0]],
-        )
-    )
-    message_event = state.append_event(
-        runner.MessageEvent(
-            source="user",
-            llm_message=Message(
-                role="user",
-                content=[TextContent(text="preserve this historical message")],
-            ),
-        )
-    )
-    system_path = next(
-        path
-        for path in (persistence_dir / "events").glob("*.json")
-        if json.loads(path.read_text(encoding="utf-8"))["kind"] == "SystemPromptEvent"
-    )
-    payload = json.loads(system_path.read_text(encoding="utf-8"))
-    payload["tools"] = [
-        {
-            "description": f"Historical {title} description.",
-            "action_type": action,
-            "observation_type": observation,
-            "annotations": None,
-            "kind": kind,
-            "title": title,
-        }
-        for kind, title, action, observation in _RETIRED_TOOL_TYPES
-    ] + payload["tools"]
-    system_path.write_text(json.dumps(payload), encoding="utf-8")
-    message_path = next(
-        path
-        for path in (persistence_dir / "events").glob("*.json")
-        if path != system_path
-    )
-    return SimpleNamespace(
-        conversation_id=conversation_id,
-        persistence_root=persistence_root,
-        workspace=workspace,
-        agent=agent,
-        event_ids=[system_event.id, message_event.id],
-        system_path=system_path,
-        message_path=message_path,
-    )
-
 
 def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     tmp_path,
@@ -204,7 +107,9 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     assert captured["closed"] is True
 
 
-def test_disabled_tool_migration_preserves_history_and_job_factory_resume(tmp_path):
+def test_conversation_migration_preserves_history_and_resumes_with_job_factory(
+    tmp_path,
+):
     conversation_id = runner.uuid.uuid4()
     persistence_root = tmp_path / "state"
     persistence_dir = persistence_root / conversation_id.hex
@@ -212,7 +117,7 @@ def test_disabled_tool_migration_preserves_history_and_job_factory_resume(tmp_pa
     llm = LLM(model="openai/gpt-4o-mini", api_key=SecretStr("test-key"))
     job_tool = Tool(
         name="senpai_training",
-        params={"state_dir": str(tmp_path / "jobs")},
+        params={"state_dir": str(persistence_root / "training")},
     )
     old_agent = Agent(
         llm=llm,
@@ -237,32 +142,29 @@ def test_disabled_tool_migration_preserves_history_and_job_factory_resume(tmp_pa
         (p, p.read_bytes()) for p in (persistence_dir / "events").iterdir()
     )
     before = json.loads((persistence_dir / "base_state.json").read_text())
+    original_base_state = (persistence_dir / "base_state.json").read_bytes()
 
-    assert migrate_persisted_disabled_tools(persistence_root, conversation_id) == {
-        "delegate_agent",
-        "think",
-    }
-    assert not migrate_persisted_disabled_tools(persistence_root, conversation_id)
-
-    persisted = json.loads((persistence_dir / "base_state.json").read_text())
-    assert [tool["name"] for tool in persisted["agent"]["tools"]] == ["senpai_training"]
-    assert persisted["agent"]["tools"][0] == job_tool.model_dump(mode="json")
-    assert "ThinkTool" not in persisted["agent"]["include_default_tools"]
-    assert {key: value for key, value in persisted.items() if key != "agent"} == {
-        key: value for key, value in before.items() if key != "agent"
-    }
-    assert {
-        key: value
-        for key, value in persisted["agent"].items()
-        if key not in {"tools", "include_default_tools"}
-    } == {
-        key: value
-        for key, value in before["agent"].items()
-        if key not in {"tools", "include_default_tools"}
-    }
-    assert all(path.read_bytes() == content for path, content in event_files)
-
-    current_agent = without_legacy_think(Agent(llm=llm, tools=[job_tool]))
+    migration = migrate_persisted_conversation(
+        persistence_root,
+        conversation_id,
+    )
+    assert migration.base_state_rewritten
+    assert not migration.events_rewritten
+    assert not migrate_persisted_conversation(
+        persistence_root,
+        conversation_id,
+    ).changed
+    current_agent = without_legacy_think(
+        Agent(
+            llm=llm,
+            tools=[
+                Tool(
+                    name="senpai_jobs",
+                    params={"state_dir": str(persistence_root / "jobs")},
+                )
+            ],
+        )
+    )
     conversation = runner.LocalConversation(
         agent=current_agent,
         workspace=workspace,
@@ -273,96 +175,25 @@ def test_disabled_tool_migration_preserves_history_and_job_factory_resume(tmp_pa
     try:
         assert [event.id for event in conversation.state.events] == [message.id]
         assert [tool.name for tool in conversation.state.agent.tools] == [
-            "senpai_training"
+            "senpai_jobs"
         ]
         assert conversation.state.agent.include_default_tools == ["FinishTool"]
     finally:
         conversation.close()
 
-
-def test_retired_tool_snapshots_are_removed_before_history_deserialization(tmp_path):
-    persisted = _persisted_conversation_with_retired_tool_snapshots(tmp_path)
-    original_system = json.loads(persisted.system_path.read_text(encoding="utf-8"))
-    original_message = persisted.message_path.read_bytes()
-
-    assert migrate_persisted_retired_tool_definitions(
-        persisted.persistence_root, persisted.conversation_id
-    ) == len(_RETIRED_TOOL_TYPES)
-    assert migrate_persisted_disabled_tools(
-        persisted.persistence_root, persisted.conversation_id
-    ) == {"delegate_agent", "think"}
     assert (
-        migrate_persisted_retired_tool_definitions(
-            persisted.persistence_root, persisted.conversation_id
-        )
-        == 0
+        persistence_dir / ".pre-job-api" / "base_state.json"
+    ).read_bytes() == original_base_state
+    assert all(path.read_bytes() == content for path, content in event_files)
+    persisted = json.loads((persistence_dir / "base_state.json").read_text())
+    assert [tool["name"] for tool in persisted["agent"]["tools"]] == ["senpai_jobs"]
+    assert persisted["agent"]["tools"][0]["params"]["state_dir"] == str(
+        persistence_root / "jobs"
     )
-
-    migrated_system = json.loads(persisted.system_path.read_text(encoding="utf-8"))
-    expected_system = original_system
-    expected_system["tools"] = [
-        tool
-        for tool in expected_system["tools"]
-        if tool["kind"] not in {item[0] for item in _RETIRED_TOOL_TYPES}
-    ]
-    assert migrated_system == expected_system
-    assert persisted.message_path.read_bytes() == original_message
-
-    conversation = runner.LocalConversation(
-        agent=persisted.agent,
-        workspace=persisted.workspace,
-        persistence_dir=persisted.persistence_root,
-        conversation_id=persisted.conversation_id,
-        visualizer=None,
-    )
-    try:
-        assert [event.id for event in conversation.state.events] == persisted.event_ids
-        assert conversation.state.events[0].system_prompt.text == (
-            "preserve the historical system prompt"
-        )
-        assert conversation.state.events[1].llm_message.content[0].text == (
-            "preserve this historical message"
-        )
-    finally:
-        conversation.close()
-
-
-def test_retired_tool_snapshot_migration_is_narrow_and_atomic(tmp_path, monkeypatch):
-    persisted = _persisted_conversation_with_retired_tool_snapshots(tmp_path)
-    payload = json.loads(persisted.system_path.read_text(encoding="utf-8"))
-    payload["tools"] = [
-        {
-            **payload["tools"][0],
-            "kind": "UnknownRetiredTool",
-            "meta": {"historical": "must remain visible"},
-        },
-        payload["tools"][1],
-    ]
-    persisted.system_path.write_text(json.dumps(payload), encoding="utf-8")
-    original = persisted.system_path.read_bytes()
-
-    def fail_replace(_source, _destination):
-        raise OSError("simulated atomic replacement failure")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(runner.os, "replace", fail_replace)
-        with pytest.raises(OSError, match="simulated atomic replacement failure"):
-            migrate_persisted_retired_tool_definitions(
-                persisted.persistence_root, persisted.conversation_id
-            )
-    assert persisted.system_path.read_bytes() == original
-    assert not tuple(
-        persisted.system_path.parent.glob(f".{persisted.system_path.name}.*.tmp")
-    )
-
-    assert (
-        migrate_persisted_retired_tool_definitions(
-            persisted.persistence_root, persisted.conversation_id
-        )
-        == 1
-    )
-    migrated = json.loads(persisted.system_path.read_text(encoding="utf-8"))
-    assert migrated["tools"] == [payload["tools"][0]]
+    assert "ThinkTool" not in persisted["agent"]["include_default_tools"]
+    assert {key: value for key, value in before.items() if key != "agent"} == {
+        key: value for key, value in persisted.items() if key != "agent"
+    }
 
 
 def test_context_reset_preserves_history_and_starts_a_fresh_active_branch(
