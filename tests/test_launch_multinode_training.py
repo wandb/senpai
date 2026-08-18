@@ -2,7 +2,13 @@ from pathlib import Path
 
 import yaml
 
-from launch_test_support import REVISION, launch, launch_args, launch_helpers
+from launch_test_support import (
+    REVISION,
+    launch,
+    launch_args,
+    launch_helpers,
+    render_role,
+)
 
 
 def render_student(**overrides):
@@ -44,7 +50,7 @@ def test_multinode_controller_is_cpu_only_with_a_credential_isolated_executor():
     student = containers["student"]
     executor = containers["kubernetes-executor"]
 
-    assert pod["nodeSelector"] == {"compute.coreweave.com/node-pool": "cpu"}
+    assert pod["nodeSelector"] == {}
     assert pod["tolerations"] == []
     assert pod["automountServiceAccountToken"] is False
     assert pod["serviceAccountName"] == service_account["metadata"]["name"]
@@ -121,7 +127,7 @@ def test_controller_image_has_only_the_validated_kubectl_socket_proxy():
     assert 'export PATH="$proxy_dir:$PATH"' in entrypoint
 
 
-def test_advisor_is_hard_pinned_to_the_cpu_pool():
+def test_advisor_placement_is_portable_by_default():
     template = (Path(__file__).parents[1] / "k8s" / "advisor-deployment.yaml").read_text()
     rendered = launch_helpers.render_template(
         template,
@@ -136,13 +142,32 @@ def test_advisor_is_hard_pinned_to_the_cpu_pool():
                 "PVC_MOUNT_PATH",
                 "LAUNCH_SECRET_NAME",
                 "POD_CONFIG_HASH",
+                "CONTROLLER_NODE_SELECTOR",
             )
         }
         | {
             "MODEL_PROVIDER_ENV": "        - name: MODEL_API_KEY",
             "CUSTOM_SECRET_ENV_REFS": "",
+            "CONTROLLER_NODE_SELECTOR": "{}",
         },
     )
     pod = yaml.safe_load(rendered)["spec"]["template"]["spec"]
 
-    assert pod["nodeSelector"] == {"compute.coreweave.com/node-pool": "cpu"}
+    assert pod["nodeSelector"] == {}
+
+
+def test_controller_node_selector_applies_to_cpu_only_roles():
+    selector = ["compute.coreweave.com/node-pool=cpu"]
+    *_, student = render_student(controller_node_selector=selector)
+    assert student["spec"]["template"]["spec"]["nodeSelector"] == {
+        "compute.coreweave.com/node-pool": "cpu"
+    }
+
+    _, advisor_yaml, _ = render_role(
+        "advisor",
+        launch_args(controller_node_selector=selector),
+    )
+    advisor = yaml.safe_load(advisor_yaml)
+    assert advisor["spec"]["template"]["spec"]["nodeSelector"] == {
+        "compute.coreweave.com/node-pool": "cpu"
+    }

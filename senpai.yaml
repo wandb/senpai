@@ -80,4 +80,7 @@ nodes_per_student: 1
 gpus_per_student_node: 1
 cpu_per_gpu: 15
 memory_gi_per_gpu: 120
+# Optional key=value selectors for the advisor and multi-node student controllers.
+# controller_node_selector: [compute.coreweave.com/node-pool=cpu]
+controller_node_selector: []
 preflight_only: false
