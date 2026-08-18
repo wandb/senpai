@@ -7,8 +7,10 @@ import sys
 import threading
 import time
 
+import psutil
 import pytest
 
+import senpai_agent.kubernetes_training as kubernetes_training
 from senpai_agent.kubernetes_training import KubernetesTrainingSupervisor
 from senpai_agent.training import (
     KubernetesResourceRef,
@@ -281,6 +283,388 @@ def test_supervisor_allows_only_one_active_run_and_cancellation_deletes_remote(
     assert result.state is TrainingState.CANCELLED
     assert len(client.deletions) == 1
     assert client.releases == [first.training_id]
+
+
+def test_close_detaches_and_restart_re_adopts_the_same_uid(tmp_path, monkeypatch):
+    client = FakeCluster(state=TrainingState.RUNNING)
+    runtime, workspace, _snapshot_root = supervisor(
+        tmp_path,
+        monkeypatch,
+        client,
+        max_timeout_seconds=60,
+        poll_seconds=30,
+    )
+    started = runtime.run_training(
+        TrainingSpec(
+            argv=(sys.executable, "-c", "pass"),
+            cwd=workspace,
+            timeout_seconds=30,
+        )
+    )
+    deadline = time.monotonic() + 1
+    while runtime.get_training_status(started.training_id).kubernetes_resource is None:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+    before = runtime.get_training_status(started.training_id)
+    assert before.kubernetes_resource is not None
+    closed_at = time.monotonic()
+    runtime.close()
+
+    detached = runtime.get_training_status(started.training_id)
+    assert time.monotonic() - closed_at < 1
+    assert detached.state is TrainingState.RUNNING
+    assert detached.kubernetes_released is False
+    assert client.deletions == []
+    assert client.releases == []
+    with pytest.raises(RuntimeError, match="supervisor is closed"):
+        runtime.cancel_training(started.training_id)
+    with pytest.raises(RuntimeError, match="supervisor is closed"):
+        runtime.run_training(
+            TrainingSpec(
+                argv=(sys.executable, "-c", "pass"),
+                cwd=workspace,
+                timeout_seconds=5,
+            )
+        )
+
+    client.state_value = TrainingState.FINISHED
+    recovered = KubernetesTrainingSupervisor(
+        workspace=workspace,
+        state_dir=tmp_path / "state",
+        nodes=2,
+        gpus_per_node=8,
+        max_timeout_seconds=60,
+        poll_seconds=0.01,
+        client=client,
+    )
+    recovered.drain()
+
+    assert client.adoptions == [before.kubernetes_resource]
+    assert client.deletions == []
+    assert client.releases == [started.training_id]
+    terminal = recovered.get_training_status(started.training_id)
+    assert terminal.state is TrainingState.FINISHED
+    assert terminal.kubernetes_resource == before.kubernetes_resource
+
+
+def test_close_terminates_only_the_local_launcher(tmp_path, monkeypatch):
+    client = FakeCluster(state=TrainingState.RUNNING)
+    runtime, workspace, _snapshot_root = supervisor(tmp_path, monkeypatch, client)
+    child_pid_path = workspace / "child.pid"
+    child_code = (
+        "import os,pathlib,signal,time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"pathlib.Path({str(child_pid_path)!r}).write_text(str(os.getpid())); "
+        "time.sleep(30)"
+    )
+    launcher_code = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable,'-c',{child_code!r}]); "
+        "time.sleep(30)"
+    )
+    started = runtime.run_training(
+        TrainingSpec(
+            argv=(sys.executable, "-c", launcher_code),
+            cwd=workspace,
+            timeout_seconds=5,
+        )
+    )
+    deadline = time.monotonic() + 1
+    while not child_pid_path.exists():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    child_pid = int(child_pid_path.read_text())
+
+    runtime.close()
+
+    detached = runtime.get_training_status(started.training_id)
+    assert not psutil.pid_exists(started.pid)
+    deadline = time.monotonic() + 1
+    while psutil.pid_exists(child_pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not psutil.pid_exists(child_pid)
+    assert detached.state is TrainingState.RUNNING
+    assert detached.kubernetes_released is False
+    assert client.deletions == []
+    assert client.releases == []
+
+
+def test_close_waits_for_an_inflight_launch_to_observe_shutdown(
+    tmp_path,
+    monkeypatch,
+):
+    client = FakeCluster(state=TrainingState.RUNNING)
+    runtime, workspace, _snapshot_root = supervisor(tmp_path, monkeypatch, client)
+    entered = threading.Event()
+    release = threading.Event()
+    original = kubernetes_training._materialize_source_snapshot
+
+    def blocked_snapshot(cwd):
+        entered.set()
+        assert release.wait(1)
+        return original(cwd)
+
+    monkeypatch.setattr(
+        kubernetes_training,
+        "_materialize_source_snapshot",
+        blocked_snapshot,
+    )
+    errors = []
+
+    def launch():
+        try:
+            runtime.run_training(
+                TrainingSpec(
+                    argv=(sys.executable, "-c", "pass"),
+                    cwd=workspace,
+                    timeout_seconds=5,
+                )
+            )
+        except Exception as error:
+            errors.append(error)
+
+    launch_thread = threading.Thread(target=launch)
+    launch_thread.start()
+    assert entered.wait(1)
+    close_thread = threading.Thread(target=runtime.close)
+    close_thread.start()
+    assert runtime._shutdown.wait(1)
+    assert close_thread.is_alive()
+
+    release.set()
+    launch_thread.join(1)
+    close_thread.join(1)
+
+    assert not launch_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert len(errors) == 1
+    assert str(errors[0]) == "Kubernetes training supervisor is closed"
+    assert client.reservations == []
+
+
+def test_close_persists_a_remote_terminal_result_that_wins_the_race(
+    tmp_path,
+    monkeypatch,
+):
+    class BlockingFinishedCluster(FakeCluster):
+        def __init__(self):
+            super().__init__(state=TrainingState.FINISHED)
+            self.state_started = threading.Event()
+            self.return_state = threading.Event()
+
+        def state(self, resource):
+            self.state_started.set()
+            assert self.return_state.wait(1)
+            return super().state(resource)
+
+    client = BlockingFinishedCluster()
+    runtime, workspace, _snapshot_root = supervisor(tmp_path, monkeypatch, client)
+    started = runtime.run_training(
+        TrainingSpec(
+            argv=(sys.executable, "-c", "pass"),
+            cwd=workspace,
+            timeout_seconds=5,
+        )
+    )
+    assert client.state_started.wait(1)
+    close_thread = threading.Thread(target=runtime.close)
+    close_thread.start()
+    assert runtime._shutdown.wait(1)
+
+    client.return_state.set()
+    close_thread.join(1)
+
+    assert not close_thread.is_alive()
+    result = runtime.get_training_status(started.training_id)
+    assert result.state is TrainingState.FINISHED
+    assert result.kubernetes_released is True
+    assert client.releases == [started.training_id]
+
+
+def test_close_cannot_split_running_publication_from_active_supervision(
+    tmp_path,
+    monkeypatch,
+):
+    client = FakeCluster(state=TrainingState.RUNNING)
+    runtime, workspace, _snapshot_root = supervisor(tmp_path, monkeypatch, client)
+    result_written = threading.Event()
+    finish_write = threading.Event()
+    original_write = runtime._write_result
+
+    def blocked_write(result):
+        original_write(result)
+        if result.state is TrainingState.RUNNING and not result_written.is_set():
+            result_written.set()
+            assert finish_write.wait(1)
+
+    monkeypatch.setattr(runtime, "_write_result", blocked_write)
+    errors = []
+
+    def launch():
+        try:
+            runtime.run_training(
+                TrainingSpec(
+                    argv=(sys.executable, "-c", "pass"),
+                    cwd=workspace,
+                    timeout_seconds=5,
+                )
+            )
+        except Exception as error:
+            errors.append(error)
+
+    launch_thread = threading.Thread(target=launch)
+    launch_thread.start()
+    assert result_written.wait(1)
+    close_thread = threading.Thread(target=runtime.close)
+    close_thread.start()
+    time.sleep(0.05)
+    assert close_thread.is_alive()
+
+    finish_write.set()
+    launch_thread.join(1)
+    close_thread.join(1)
+
+    assert errors == []
+    assert not launch_thread.is_alive()
+    assert not close_thread.is_alive()
+    result_path = next((tmp_path / "state").glob("*.json"))
+    persisted = TrainingResult.model_validate_json(result_path.read_text())
+    assert persisted.state is TrainingState.RUNNING
+    assert client.deletions == []
+    assert client.releases == []
+
+
+def test_close_does_not_override_a_selected_timeout(tmp_path, monkeypatch):
+    client = FakeCluster(state=TrainingState.RUNNING)
+    runtime, workspace, _snapshot_root = supervisor(
+        tmp_path,
+        monkeypatch,
+        client,
+        terminate_grace_seconds=0.2,
+    )
+    timeout_cleanup_started = threading.Event()
+    finish_timeout_cleanup = threading.Event()
+    original_terminate = kubernetes_training.terminate_process_group
+
+    def blocked_terminate(process, **kwargs):
+        if kwargs["grace_seconds"] == 0.2 and not timeout_cleanup_started.is_set():
+            timeout_cleanup_started.set()
+            assert finish_timeout_cleanup.wait(1)
+        return original_terminate(process, **kwargs)
+
+    monkeypatch.setattr(
+        kubernetes_training,
+        "terminate_process_group",
+        blocked_terminate,
+    )
+    started = runtime.run_training(
+        TrainingSpec(
+            argv=(sys.executable, "-c", "import time; time.sleep(30)"),
+            cwd=workspace,
+            timeout_seconds=1,
+        )
+    )
+    assert timeout_cleanup_started.wait(2)
+    close_thread = threading.Thread(target=runtime.close)
+    close_thread.start()
+    assert runtime._shutdown.wait(1)
+
+    finish_timeout_cleanup.set()
+    close_thread.join(2)
+
+    assert not close_thread.is_alive()
+    result = runtime.get_training_status(started.training_id)
+    assert result.state is TrainingState.TIMED_OUT
+    assert result.kubernetes_released is True
+    assert client.deletions[0].uid == "remote-uid"
+    assert client.releases == [started.training_id]
+
+
+def test_close_does_not_override_a_known_launcher_failure(tmp_path, monkeypatch):
+    client = FakeCluster(state=TrainingState.RUNNING)
+    runtime, workspace, _snapshot_root = supervisor(tmp_path, monkeypatch, client)
+    exit_observed = threading.Event()
+    finish_returncode = threading.Event()
+    real_popen = subprocess.Popen
+    launcher_argv = (sys.executable, "-c", "raise SystemExit(7)")
+
+    class BlockingReturncode:
+        def __init__(self, process):
+            self.process = process
+
+        def __getattr__(self, name):
+            return getattr(self.process, name)
+
+        @property
+        def returncode(self):
+            value = self.process.returncode
+            if value == 7 and not exit_observed.is_set():
+                exit_observed.set()
+                assert finish_returncode.wait(1)
+            return value
+
+    def blocking_popen(args, *popen_args, **popen_kwargs):
+        process = real_popen(args, *popen_args, **popen_kwargs)
+        if tuple(args) == launcher_argv:
+            return BlockingReturncode(process)
+        return process
+
+    monkeypatch.setattr(kubernetes_training.subprocess, "Popen", blocking_popen)
+    started = runtime.run_training(
+        TrainingSpec(
+            argv=launcher_argv,
+            cwd=workspace,
+            timeout_seconds=5,
+        )
+    )
+    assert exit_observed.wait(1)
+    close_thread = threading.Thread(target=runtime.close)
+    close_thread.start()
+    assert runtime._shutdown.wait(1)
+
+    finish_returncode.set()
+    close_thread.join(1)
+
+    assert not close_thread.is_alive()
+    result = runtime.get_training_status(started.training_id)
+    assert result.state is TrainingState.FAILED
+    assert result.exit_code == 7
+    assert result.kubernetes_released is True
+    assert client.deletions[0].uid == "remote-uid"
+    assert client.releases == [started.training_id]
+
+
+def test_close_defers_a_failed_terminal_release_to_restart(tmp_path, monkeypatch):
+    class FailingReleaseCluster(FakeCluster):
+        def __init__(self):
+            super().__init__(state=TrainingState.FINISHED)
+            self.release_started = threading.Event()
+
+        def release(self, training_id):
+            self.release_started.set()
+            raise RuntimeError(f"cannot release {training_id}")
+
+    client = FailingReleaseCluster()
+    runtime, workspace, _snapshot_root = supervisor(tmp_path, monkeypatch, client)
+    started = runtime.run_training(
+        TrainingSpec(
+            argv=(sys.executable, "-c", "pass"),
+            cwd=workspace,
+            timeout_seconds=5,
+        )
+    )
+    assert client.release_started.wait(1)
+
+    runtime.close()
+
+    result = runtime.get_training_status(started.training_id)
+    assert result.state is TrainingState.FINISHED
+    assert result.kubernetes_released is False
+    with runtime._lock:
+        thread = runtime._active[started.training_id].thread
+    assert thread is not None
+    assert not thread.is_alive()
 
 
 def test_supervisor_timeout_deletes_remote_workload(tmp_path, monkeypatch):

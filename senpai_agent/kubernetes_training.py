@@ -33,6 +33,7 @@ from senpai_agent.training import (
 _ERROR_TAIL_BYTES = 8192
 _POLL_SECONDS = 2.0
 _JOIN_SECONDS = 120.0
+_DETACH_GRACE_SECONDS = 0.1
 EXECUTOR_SOCKET_ENV = "SENPAI_KUBERNETES_EXECUTOR_SOCKET"
 
 
@@ -493,6 +494,9 @@ class KubernetesTrainingSupervisor:
         )
         self.client = client or KubernetesExecutorClient(socket_path)
         self._lock = threading.Lock()
+        self._shutdown = threading.Event()
+        self._launch_complete = threading.Event()
+        self._launch_complete.set()
         self._active: dict[str, _ActiveRemoteTraining] = {}
         self._launching = False
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -511,9 +515,12 @@ class KubernetesTrainingSupervisor:
         if cwd != self.workspace and not cwd.is_relative_to(self.workspace):
             raise ValueError("training cwd must be inside the assignment workspace")
         with self._lock:
+            if self._shutdown.is_set():
+                raise RuntimeError("Kubernetes training supervisor is closed")
             if self._active or self._launching:
                 raise RuntimeError("this student already has an active Kubernetes training run")
             self._launching = True
+            self._launch_complete.clear()
 
         training_id: str | None = None
         process: subprocess.Popen[bytes] | None = None
@@ -525,6 +532,8 @@ class KubernetesTrainingSupervisor:
             started_at = time.time()
             deadline_at = started_at + spec.timeout_seconds
             source_snapshot, source_commit = _materialize_source_snapshot(cwd)
+            if self._shutdown.is_set():
+                raise RuntimeError("Kubernetes training supervisor is closed")
             self.client.reserve(
                 training_id,
                 kubernetes_spec,
@@ -533,6 +542,8 @@ class KubernetesTrainingSupervisor:
                 source_commit,
             )
             reserved = True
+            if self._shutdown.is_set():
+                raise RuntimeError("Kubernetes training supervisor is closed")
             with log_path.open("wb") as log:
                 process = subprocess.Popen(
                     list(spec.argv),
@@ -584,10 +595,11 @@ class KubernetesTrainingSupervisor:
                 name=f"senpai-kubernetes-training-{training_id}",
             )
             active.thread = thread
-            self._write_result(result)
             with self._lock:
+                if self._shutdown.is_set():
+                    raise RuntimeError("Kubernetes training supervisor is closed")
+                self._write_result(result)
                 self._active[training_id] = active
-                self._launching = False
                 thread.start()
         except BaseException:
             if process is not None and process.poll() is None:
@@ -602,8 +614,11 @@ class KubernetesTrainingSupervisor:
             with self._lock:
                 if training_id is not None:
                     self._active.pop(training_id, None)
-                self._launching = False
             raise
+        finally:
+            with self._lock:
+                self._launching = False
+                self._launch_complete.set()
         return result
 
     def get_training_status(self, training_id: str) -> TrainingResult:
@@ -623,11 +638,16 @@ class KubernetesTrainingSupervisor:
         if result.state is not TrainingState.RUNNING:
             return result
         with self._lock:
+            if self._shutdown.is_set():
+                raise RuntimeError("Kubernetes training supervisor is closed")
             active = self._active.get(training_id)
-            if active is None:
-                return self.get_training_status(training_id)
-            active.cancelled = True
-            thread = active.thread
+            if active is not None:
+                active.cancelled = True
+                thread = active.thread
+            else:
+                thread = None
+        if active is None:
+            return self.get_training_status(training_id)
         if thread is not None:
             thread.join(_JOIN_SECONDS)
             if thread.is_alive():
@@ -635,13 +655,21 @@ class KubernetesTrainingSupervisor:
         return self.get_training_status(training_id)
 
     def close(self) -> None:
+        """Stop local supervision without changing the remote run."""
+
+        with self._lock:
+            self._shutdown.set()
+        if not self._launch_complete.wait(_JOIN_SECONDS):
+            raise TimeoutError("timed out waiting for Kubernetes training launch shutdown")
         with self._lock:
             active = tuple(self._active.values())
-            for training in active:
-                training.cancelled = True
         for training in active:
             if training.thread is not None:
                 training.thread.join(_JOIN_SECONDS)
+                if training.thread.is_alive():
+                    raise TimeoutError(
+                        "timed out waiting for Kubernetes training monitor shutdown"
+                    )
 
     def drain(self) -> None:
         with self._lock:
@@ -794,6 +822,20 @@ class KubernetesTrainingSupervisor:
     def _monitor(self, training_id: str) -> None:
         with self._lock:
             active = self._active[training_id]
+        if self._should_detach(active):
+            if active.process is None:
+                return
+            launcher_exit = active.process.poll()
+            if launcher_exit is None:
+                terminate_process_group(
+                    active.process,
+                    process_group_id=active.process_group_id,
+                    grace_seconds=_DETACH_GRACE_SECONDS,
+                    wait_full_grace=True,
+                )
+                return
+            if launcher_exit == 0:
+                return
         state = TrainingState.RUNNING
         exit_code = None
         detail = ""
@@ -809,8 +851,17 @@ class KubernetesTrainingSupervisor:
                             wait_full_grace=True,
                         )
                         break
-                    time.sleep(0.1)
+                    if self._shutdown.wait(0.1) and self._should_detach(active):
+                        terminate_process_group(
+                            active.process,
+                            process_group_id=active.process_group_id,
+                            grace_seconds=_DETACH_GRACE_SECONDS,
+                            wait_full_grace=True,
+                        )
+                        return
                 exit_code = active.process.returncode
+                if exit_code in {None, 0} and self._should_detach(active):
+                    return
                 if not active.cancelled and time.time() < active.deadline_at and exit_code == 0:
                     while active.resource is None:
                         try:
@@ -825,7 +876,11 @@ class KubernetesTrainingSupervisor:
                             break
                         if active.cancelled or time.time() >= active.deadline_at:
                             break
-                        time.sleep(self.poll_seconds)
+                        if (
+                            self._shutdown.wait(self.poll_seconds)
+                            and self._should_detach(active)
+                        ):
+                            return
                     if (
                         active.resource is None
                         and not active.cancelled
@@ -848,6 +903,8 @@ class KubernetesTrainingSupervisor:
             elif exit_code not in {None, 0}:
                 state = TrainingState.FAILED
                 detail = f"Kubernetes submission exited with code {exit_code}."
+            elif self._should_detach(active):
+                return
             elif active.resource is not None:
                 while True:
                     if active.cancelled:
@@ -862,7 +919,11 @@ class KubernetesTrainingSupervisor:
                         snapshot = self.client.state(active.resource)
                     except Exception as error:  # retry transient broker/API outages
                         detail = f"Waiting for Kubernetes status: {error}"
-                        time.sleep(self.poll_seconds)
+                        if (
+                            self._shutdown.wait(self.poll_seconds)
+                            and self._should_detach(active)
+                        ):
+                            return
                         continue
                     if snapshot is None:
                         state = TrainingState.FAILED
@@ -871,11 +932,18 @@ class KubernetesTrainingSupervisor:
                     state, detail = snapshot
                     if state is not TrainingState.RUNNING:
                         break
-                    time.sleep(self.poll_seconds)
+                    if (
+                        self._shutdown.wait(self.poll_seconds)
+                        and self._should_detach(active)
+                    ):
+                        return
         except Exception as error:  # noqa: BLE001
             state = TrainingState.FAILED
             detail = f"{type(error).__name__}: {error}"
             delete_required = True
+
+        if self._should_detach(active) and state is TrainingState.RUNNING:
+            return
 
         if active.resource is None:
             try:
@@ -940,11 +1008,21 @@ class KubernetesTrainingSupervisor:
                 self.client.release(training_id)
                 break
             except Exception:
-                time.sleep(self.poll_seconds)
+                if active.cancelled:
+                    time.sleep(self.poll_seconds)
+                elif self._shutdown.wait(self.poll_seconds):
+                    return
         result = self.get_training_status(training_id)
         self._write_result(result.model_copy(update={"kubernetes_released": True}))
         with self._lock:
             self._active.pop(training_id, None)
+
+    def _should_detach(self, active: _ActiveRemoteTraining) -> bool:
+        return (
+            self._shutdown.is_set()
+            and not active.cancelled
+            and time.time() < active.deadline_at
+        )
 
     def _publish_resource(
         self,

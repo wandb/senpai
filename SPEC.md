@@ -613,6 +613,14 @@ bundle mutation fails before training starts. Cancellation, timeout, and restart
 recovery remain UID-bound; uncertain deletion retains the broker reservation for
 deadline cleanup rather than releasing ownership early.
 
+Controller shutdown detaches from a running Kubernetes workload. It terminates
+the local launcher process. It leaves the remote workload running, keeps the
+durable result in the `RUNNING` state, and retains the workload UID and broker
+reservation. The next controller reserves the same training identity and
+re-adopts only that UID before it resumes monitoring. Explicit cancellation and
+timeout still delete the remote workload and persist a terminal result before
+releasing ownership.
+
 The student commits the exact implementation and cleans the worktree before an
 expensive launch. Every successful `run_training` launch immediately registers
 a terminal-state monitor bound to the current conversation. `monitor_training`
@@ -671,10 +679,11 @@ and `env` wrappers.
 Every OpenHands turn has a controller-configured hard deadline. The deadline
 interrupts the conversation, produces a non-success result, and leaves durable
 events unacknowledged. The controller then retries with bounded exponential
-backoff. Controller termination interrupts and closes the current conversation,
-cancels active supervised training, closes local stores, and flushes Weave
-before the controller exits. Standalone and child runners flush Weave at runner
-exit.
+backoff. Controller termination interrupts and closes the current conversation.
+It cancels active local training, but detaches from active Kubernetes training
+so the next controller can re-adopt the same remote UID. It then closes local
+stores and flushes Weave before it exits. Standalone and child runners flush
+Weave at runner exit.
 
 ## Secrets and Weave
 
