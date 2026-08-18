@@ -3,7 +3,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from senpai_agent.advisor import AdvisorEvent, AdvisorEventStore
+from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.mailbox_watcher import ActiveMailboxWatcher
 
@@ -37,12 +37,12 @@ def test_active_mailbox_watcher_recovers_after_one_poll_error(tmp_path: Path):
     ):
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
-            with AdvisorEventStore(store_path) as store:
+            with LocalEventStore(store_path) as store:
                 if store.pending_count() == 1:
                     break
             time.sleep(0.01)
 
-    with AdvisorEventStore(store_path) as store:
+    with LocalEventStore(store_path) as store:
         assert [event.dedupe_key for event in store.pending()] == [
             "job-1:status:failed"
         ]
@@ -51,7 +51,7 @@ def test_active_mailbox_watcher_recovers_after_one_poll_error(tmp_path: Path):
 
 def test_advisor_event_enqueue_is_atomic_across_connections(tmp_path: Path):
     path = tmp_path / "events.sqlite3"
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="job_monitor",
         dedupe_key="job-1:status:failed",
         payload={"job_id": "job-1", "state": "failed"},
@@ -62,7 +62,7 @@ def test_advisor_event_enqueue_is_atomic_across_connections(tmp_path: Path):
 
     def enqueue() -> None:
         try:
-            with AdvisorEventStore(path) as store:
+            with LocalEventStore(path) as store:
                 barrier.wait()
                 outcomes.append(store.enqueue(event))
         except BaseException as error:  # assertion captures the worker failure
@@ -82,15 +82,15 @@ def test_acknowledgement_before_late_watcher_enqueue_stays_acknowledged(
     tmp_path: Path,
 ):
     path = tmp_path / "events.sqlite3"
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="job_monitor",
         dedupe_key="job-1:status:failed",
         payload={"job_id": "job-1", "state": "failed"},
     )
 
-    with AdvisorEventStore(path) as store:
+    with LocalEventStore(path) as store:
         store.acknowledge(event.dedupe_key)
-    with AdvisorEventStore(path) as store:
+    with LocalEventStore(path) as store:
         assert not store.enqueue(event)
         assert store.pending() == []
         assert store.acknowledged((event.dedupe_key,)) == {event.dedupe_key}
@@ -112,10 +112,10 @@ def test_late_watcher_enqueue_cannot_shadow_a_synchronous_acknowledgement(
         def poll(self):
             return (event,)
 
-    def map_event(controller_event: ControllerEvent) -> AdvisorEvent:
+    def map_event(controller_event: ControllerEvent) -> LocalEvent:
         mapping.set()
         release.wait(5)
-        return AdvisorEvent(
+        return LocalEvent(
             kind=controller_event.kind,
             dedupe_key=controller_event.dedupe_key,
             payload=controller_event.payload,
@@ -130,14 +130,14 @@ def test_late_watcher_enqueue_cannot_shadow_a_synchronous_acknowledgement(
             map_event=map_event,
         ):
             assert mapping.wait(1)
-            with AdvisorEventStore(path) as store:
+            with LocalEventStore(path) as store:
                 store.acknowledge(event.dedupe_key)
     finally:
         release.set()
 
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
-        with AdvisorEventStore(path) as store:
+        with LocalEventStore(path) as store:
             if store.acknowledged((event.dedupe_key,)):
                 assert store.pending() == []
                 break

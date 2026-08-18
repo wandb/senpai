@@ -1,7 +1,15 @@
 from pathlib import Path
 from uuid import UUID
 
-from senpai_agent.mailbox import CompositeMailbox, ControllerEvent
+import pytest
+
+from senpai_agent.inbox import PersistentInbox
+from senpai_agent.local_events import LocalEvent, LocalEventStore
+from senpai_agent.mailbox import (
+    CompositeMailbox,
+    ControllerEvent,
+    StudentAssignmentAvailabilityMailbox,
+)
 from senpai_agent.monitor import (
     JobMonitorMailbox,
     JobMonitorSpec,
@@ -21,6 +29,14 @@ class StaticMailbox:
 
     def acknowledge(self, _dedupe_keys):
         return
+
+
+def availability_event(student: str = "Fern") -> ControllerEvent:
+    return ControllerEvent(
+        kind="student_available_for_assignment",
+        dedupe_key=f"student_available_for_assignment:{student}",
+        payload={"student": student},
+    )
 
 
 def test_composite_mailbox_preserves_healthy_events_when_a_peer_fails(capsys):
@@ -43,7 +59,118 @@ def test_composite_mailbox_preserves_healthy_events_when_a_peer_fails(capsys):
     assert "SENPAI_MAILBOX_ERROR RuntimeError" in capsys.readouterr().err
 
 
-def test_job_monitor_mailbox_routes_and_acknowledges_each_signal_independently(
+def test_reserved_assignment_retracts_unseen_availability_events(tmp_path: Path):
+    conversation_id = UUID(int=123)
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    store_path = tmp_path / "advisor-events.sqlite3"
+    event = availability_event()
+    inbox.enqueue(conversation_id, event.dedupe_key, event.to_prompt())
+    with LocalEventStore(store_path) as store:
+        store.enqueue(
+            LocalEvent(
+                kind=event.kind,
+                dedupe_key=event.dedupe_key,
+                payload=event.payload,
+            )
+        )
+        store.acknowledge(event.dedupe_key)
+
+    mailbox = StudentAssignmentAvailabilityMailbox(
+        StaticMailbox(()),
+        inbox=inbox,
+        conversation_id=conversation_id,
+        event_store_path=store_path,
+    )
+
+    assert mailbox.poll() == ()
+    assert inbox.pending_count(conversation_id) == 0
+    with LocalEventStore(store_path) as store:
+        assert store.enqueue(
+            LocalEvent(
+                kind=event.kind,
+                dedupe_key=event.dedupe_key,
+                payload=event.payload,
+            )
+        ) is True
+
+
+def test_available_student_preserves_its_queued_event(tmp_path: Path):
+    conversation_id = UUID(int=124)
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    event = availability_event()
+    inbox.enqueue(conversation_id, event.dedupe_key, event.to_prompt())
+    mailbox = StudentAssignmentAvailabilityMailbox(
+        StaticMailbox((event,)),
+        inbox=inbox,
+        conversation_id=conversation_id,
+        event_store_path=tmp_path / "advisor-events.sqlite3",
+    )
+
+    assert mailbox.poll() == (event,)
+    assert inbox.pending_count(conversation_id) == 1
+
+
+def test_snapshot_retracts_removed_student_availability(tmp_path: Path):
+    conversation_id = UUID(int=125)
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    store_path = tmp_path / "advisor-events.sqlite3"
+    stale = availability_event("Old-name")
+    current = availability_event("New-name")
+    inbox.enqueue(conversation_id, stale.dedupe_key, stale.to_prompt())
+    with LocalEventStore(store_path) as store:
+        store.enqueue(
+            LocalEvent(
+                kind=stale.kind,
+                dedupe_key=stale.dedupe_key,
+                payload=stale.payload,
+            )
+        )
+        store.acknowledge(stale.dedupe_key)
+
+    mailbox = StudentAssignmentAvailabilityMailbox(
+        StaticMailbox((current,)),
+        inbox=inbox,
+        conversation_id=conversation_id,
+        event_store_path=store_path,
+    )
+
+    assert mailbox.poll() == (current,)
+    assert inbox.pending_count(conversation_id) == 0
+    with LocalEventStore(store_path) as store:
+        assert store.enqueue(
+            LocalEvent(
+                kind=stale.kind,
+                dedupe_key=stale.dedupe_key,
+                payload=stale.payload,
+            )
+        ) is True
+
+
+def test_failed_github_poll_does_not_retract_queued_availability(tmp_path: Path):
+    class BrokenMailbox:
+        def poll(self):
+            raise RuntimeError("GitHub unavailable")
+
+        def acknowledge(self, _dedupe_keys):
+            return
+
+    conversation_id = UUID(int=125)
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    event = availability_event()
+    inbox.enqueue(conversation_id, event.dedupe_key, event.to_prompt())
+    mailbox = StudentAssignmentAvailabilityMailbox(
+        BrokenMailbox(),
+        inbox=inbox,
+        conversation_id=conversation_id,
+        event_store_path=tmp_path / "advisor-events.sqlite3",
+    )
+
+    with pytest.raises(RuntimeError, match="GitHub unavailable"):
+        mailbox.poll()
+    assert inbox.pending_count(conversation_id) == 1
+
+
+def test_monitor_mailbox_routes_and_acknowledges_each_signal_independently(
     tmp_path: Path,
 ):
     first_id = UUID("00000000-0000-0000-0000-000000000086")

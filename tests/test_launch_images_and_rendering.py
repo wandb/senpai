@@ -1,5 +1,6 @@
 import base64
 import re
+import sys
 
 import pytest
 import yaml
@@ -38,12 +39,33 @@ def test_default_config_exposes_every_model_profile_and_effort():
         "local_condenser_max_events": 0,
         "local_condenser_max_tokens": 0,
         "local_condenser_target_events": 0,
+        "compaction_trigger_tokens": 200_000,
     }.items() <= config.items()
     assert config["program_path"] == ""
+    assert "custom_secret_env_names" not in config
+    assert launch_args().custom_secret_env_names == []
     assert config["senpai_repo_url"] == "https://github.com/wandb/senpai.git"
     assert config["senpai_repo_revision"] == ""
     assert "repo_url" not in config
     assert "repo_revision" not in config
+
+
+def test_yaml_config_parses_custom_secret_names_as_a_list(monkeypatch, tmp_path):
+    config_path = tmp_path / "senpai.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "tag": "config-test",
+                "target_repo_url": "https://github.com/example/problem.git",
+                "custom_secret_env_names": ["PRIVATE_AUTH", "DATASET_LICENSE_KEY"],
+            }
+        )
+    )
+    monkeypatch.setattr(sys, "argv", ["launch.py"])
+
+    args = launch.sp.parse(launch.Args, config_path=str(config_path))
+
+    assert args.custom_secret_env_names == ["PRIVATE_AUTH", "DATASET_LICENSE_KEY"]
 
 
 @pytest.mark.parametrize(
@@ -297,18 +319,97 @@ def test_launch_secret_contains_each_credential_and_both_roles_reference_it():
             "containers"
         ][0]
         references = {
-            item["valueFrom"]["secretKeyRef"]["key"]: item["valueFrom"][
-                "secretKeyRef"
-            ]["name"]
+            item["name"]: item["valueFrom"]["secretKeyRef"]
             for item in container["env"]
         }
         assert references == {
-            key: "senpai-launch-secrets-test-track"
-            for key in (*expected_values, "hf-token")
+            "GITHUB_TOKEN": {
+                "name": "senpai-launch-secrets-test-track",
+                "key": "github-token",
+            },
+            "OPENAI_API_KEY": {
+                "name": "senpai-launch-secrets-test-track",
+                "key": "openai-api-key",
+            },
+            "EXA_API_KEY": {
+                "name": "senpai-launch-secrets-test-track",
+                "key": "exa-api-key",
+            },
+            "WANDB_API_KEY": {
+                "name": "senpai-launch-secrets-test-track",
+                "key": "wandb-api-key",
+            },
+            "HF_TOKEN": {
+                "name": "senpai-launch-secrets-test-track",
+                "key": "hf-token",
+                "optional": True,
+            },
+        }
+
+
+def test_secret_env_refs_preserve_environment_names_and_secret_keys():
+    fragment = launch.secret_env_refs(
+        [("OPENAI_API_KEY", "openai-api-key"), ("HF_TOKEN", "HF_TOKEN")],
+        "launch-secret",
+    )
+
+    assert yaml.safe_load("env:\n" + fragment) == {
+        "env": [
+            {
+                "name": "OPENAI_API_KEY",
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": "launch-secret",
+                        "key": "openai-api-key",
+                    }
+                },
+            },
+            {
+                "name": "HF_TOKEN",
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": "launch-secret",
+                        "key": "HF_TOKEN",
+                    }
+                },
+            },
+        ]
+    }
+    assert launch.secret_env_refs([], "launch-secret") == ""
+
+
+def test_custom_secrets_are_shared_by_both_roles_without_entering_configmaps():
+    names = ["PRIVATE_AUTH", "DATASET_LICENSE_KEY"]
+    args = launch_args(custom_secret_env_names=names)
+
+    for role in ("advisor", "student"):
+        configmap, deployment, secret = render_role(role, args)
+        config = yaml.safe_load(configmap)["data"]
+        secret_data = yaml.safe_load(secret)["data"]
+        environment = yaml.safe_load(deployment)["spec"]["template"]["spec"][
+            "containers"
+        ][0]["env"]
+        references = {
+            item["name"]: item["valueFrom"]["secretKeyRef"]
+            for item in environment
+            if item["name"] in names
+        }
+
+        assert config["SENPAI_CUSTOM_SECRET_ENV_NAMES"] == ",".join(names)
+        assert all(name not in config for name in names)
+        assert {
+            name: base64.b64decode(secret_data[name]).decode() for name in names
+        } == {name: f"{name.lower()}-secret" for name in names}
+        assert references == {
+            name: {
+                "name": "senpai-launch-secrets-test-track",
+                "key": name,
+            }
+            for name in names
         }
         hf_reference = next(
             item["valueFrom"]["secretKeyRef"]
-            for item in container["env"]
+            for item in environment
             if item["name"] == "HF_TOKEN"
         )
         assert hf_reference["optional"] is True
@@ -347,6 +448,7 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         local_condenser_max_events=180,
         local_condenser_max_tokens=180_000,
         local_condenser_target_events=40,
+        compaction_trigger_tokens=180_000,
     )
 
     advisor_config, _deployment, _secret = render_role("advisor", args)
@@ -368,6 +470,14 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         assert config["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"] == "180"
         assert config["SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_TOKENS"] == "180000"
         assert config["SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS"] == "40"
+        assert config["SENPAI_COMPACTION_TRIGGER_TOKENS"] == "180000"
+
+
+def test_launch_rejects_a_compaction_trigger_below_provider_minimum():
+    args = launch_args(compaction_trigger_tokens=49_999)
+
+    with pytest.raises(SystemExit, match="must be at least 50000"):
+        launch.validate_model_config(args)
 
 
 def test_openai_ultra_launch_value_is_rejected():
@@ -541,6 +651,7 @@ def test_pod_template_hash_covers_complete_config_and_secret_content():
         "wandb",
         anthropic_api_key="anthropic",
         openai_api_key="openai",
+        custom_secrets={},
     )
 
     first = launch_helpers.pod_template_hash(config, secret)

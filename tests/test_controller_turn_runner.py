@@ -11,7 +11,7 @@ from openhands.sdk.llm.exceptions import (
     LLMMalformedConversationHistoryError,
 )
 
-from senpai_agent.advisor import AdvisorEvent, AdvisorEventPump, AdvisorEventStore
+from senpai_agent.advisor import AdvisorEventPump
 from senpai_agent.controller import (
     ConversationRecoveryExhausted,
     OpenHandsTurnRunner,
@@ -21,6 +21,7 @@ from senpai_agent.controller import (
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.mailbox_watcher import ActiveMailboxWatcher
 from senpai_agent.inbox import DeliveryState, PersistentInbox, deliver_turn_messages
+from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.monitor import JobMonitorSpec, JobMonitorStore
 from senpai_agent.jobs import JobState
@@ -122,7 +123,7 @@ def test_advisor_job_monitor_fires_in_background_without_preempting_active_turn(
             def send_message(self, _message):
                 raise AssertionError("job event entered the active turn")
 
-        with AdvisorEventStore(
+        with LocalEventStore(
             state_dir / "advisor-events.sqlite3"
         ) as event_store, AdvisorEventPump(
             event_store,
@@ -230,7 +231,7 @@ def test_advisor_job_monitor_quiet_background_polls_create_no_events(
     )
 
     assert polls == ["wandb-run-82"]
-    with AdvisorEventStore(state_dir / "advisor-events.sqlite3") as store:
+    with LocalEventStore(state_dir / "advisor-events.sqlite3") as store:
         assert store.pending() == []
 
 
@@ -241,6 +242,36 @@ def test_context_recovery_prompt_does_not_repeat_an_embedded_research_brief():
     )
 
     assert prompt.count("complete initial controller context") == 1
+
+
+def test_turn_runner_passes_the_inference_state_out_of_band(
+    tmp_path: Path,
+    monkeypatch,
+):
+    conversation_id = UUID("00000000-0000-0000-0000-000000000094")
+    observed = []
+
+    def run_openhands(_prompt, _config, *, on_inference_state):
+        on_inference_state(1_755_000_000.0, 1_755_000_001.0)
+        return 0
+
+    def publish_state(started_at, heartbeat_at):
+        observed.append((started_at, heartbeat_at))
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+
+    result = OpenHandsTurnRunner(
+        Config("advisor", tmp_path / "state", conversation_id),
+        full_prompt="complete current controller context",
+        on_inference_state=publish_state,
+    ).run(
+        "current actionable event",
+        conversation_id=conversation_id,
+        event_keys=frozenset(),
+    )
+
+    assert result.exit_code == 0
+    assert observed == [(1_755_000_000.0, 1_755_000_001.0)]
 
 
 def test_running_student_receives_only_feedback_bound_to_its_conversation(
@@ -261,7 +292,7 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
             def send_message(self, message, sender=None):
                 messages.append(message)
 
-        with AdvisorEventStore(
+        with LocalEventStore(
             state_dir / "student-events.sqlite3"
         ) as store, AdvisorEventPump(
             store,
@@ -291,7 +322,8 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
     assert "Feedback for revision-2." in messages[0]
     assert "Feedback for revision-3." not in messages[0]
     assert str(conversation_id) in messages[0]
-    with AdvisorEventStore(state_dir / "student-events.sqlite3") as store:
+    assert result.delivered_event_keys == frozenset({current.dedupe_key})
+    with LocalEventStore(state_dir / "student-events.sqlite3") as store:
         assert store.pending() == []
 
 
@@ -311,7 +343,7 @@ def test_observed_student_input_routes_to_the_active_pump_until_it_is_delivered(
     def run_openhands(_prompt, _config):
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
-            with AdvisorEventStore(store_path) as store:
+            with LocalEventStore(store_path) as store:
                 if store.pending_count():
                     break
             time.sleep(0.001)
@@ -330,7 +362,8 @@ def test_observed_student_input_routes_to_the_active_pump_until_it_is_delivered(
         event_keys=frozenset(),
     )
 
-    with AdvisorEventStore(store_path) as store:
+    assert result.delivered_event_keys == frozenset()
+    with LocalEventStore(store_path) as store:
         pending = store.pending()
         assert [event.dedupe_key for event in pending] == [incoming.dedupe_key]
         assert pending[0].kind == incoming.kind
@@ -350,9 +383,9 @@ def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
     conversation_id = registry.for_assignment("assignment-17", "revision-2")
     feedback = feedback_event()
     store_path = state_dir / "student-events.sqlite3"
-    with AdvisorEventStore(store_path) as store:
+    with LocalEventStore(store_path) as store:
         store.enqueue(
-            AdvisorEvent(
+            LocalEvent(
                 kind=feedback.kind,
                 dedupe_key=feedback.dedupe_key,
                 payload={
@@ -368,7 +401,7 @@ def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
             def send_message(self, message, sender=None):
                 messages.append(message)
 
-        with AdvisorEventStore(store_path) as store, AdvisorEventPump(
+        with LocalEventStore(store_path) as store, AdvisorEventPump(
             store,
             Conversation(),
             poll_interval=0.001,
@@ -391,7 +424,8 @@ def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
     )
 
     assert messages == []
-    with AdvisorEventStore(store_path) as store:
+    assert result.delivered_event_keys == frozenset()
+    with LocalEventStore(store_path) as store:
         assert store.pending() == []
 
 
@@ -411,7 +445,7 @@ def test_full_visible_set_suppresses_events_handled_in_an_earlier_turn(
             def send_message(self, message, sender=None):
                 messages.append(message)
 
-        with AdvisorEventStore(store_path) as store, AdvisorEventPump(
+        with LocalEventStore(store_path) as store, AdvisorEventPump(
             store,
             Conversation(),
             poll_interval=0.001,
@@ -436,7 +470,8 @@ def test_full_visible_set_suppresses_events_handled_in_an_earlier_turn(
     )
 
     assert messages == []
-    with AdvisorEventStore(store_path) as store:
+    assert result.delivered_event_keys == frozenset()
+    with LocalEventStore(store_path) as store:
         assert store.pending() == []
 
 
@@ -448,9 +483,9 @@ def test_acknowledged_store_rows_are_not_reported_as_this_turn_deliveries(
     conversation_id = UUID("00000000-0000-0000-0000-000000000018")
     handled = advisor_event()
     store_path = state_dir / "advisor-events.sqlite3"
-    with AdvisorEventStore(store_path) as store:
+    with LocalEventStore(store_path) as store:
         store.enqueue(
-            AdvisorEvent(
+            LocalEvent(
                 kind=handled.kind,
                 dedupe_key=handled.dedupe_key,
                 payload=handled.payload,
@@ -503,7 +538,7 @@ def test_active_watcher_retries_after_a_transient_github_read_error(
     ) as watcher:
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
-            with AdvisorEventStore(store_path) as store:
+            with LocalEventStore(store_path) as store:
                 if store.pending_count():
                     break
             time.sleep(0.001)
@@ -511,7 +546,7 @@ def test_active_watcher_retries_after_a_transient_github_read_error(
 
     assert watcher.error is None
     assert mailbox.calls >= 2
-    with AdvisorEventStore(store_path) as store:
+    with LocalEventStore(store_path) as store:
         assert [pending.dedupe_key for pending in store.pending()] == [
             event.dedupe_key
         ]
@@ -545,6 +580,39 @@ def test_active_watcher_honors_github_retry_delay(tmp_path: Path):
 
     assert len(mailbox.calls) >= 2
     assert mailbox.calls[1] - mailbox.calls[0] >= 0.025
+
+
+def test_active_watcher_does_not_queue_student_availability(tmp_path: Path):
+    event = ControllerEvent(
+        kind="student_available_for_assignment",
+        dedupe_key="student_available_for_assignment:Fern",
+        payload={"student": "Fern"},
+    )
+
+    class Mailbox:
+        def __init__(self):
+            self.calls = 0
+
+        def poll(self):
+            self.calls += 1
+            return (event,)
+
+    mailbox = Mailbox()
+    store_path = tmp_path / "advisor-events.sqlite3"
+    with ActiveMailboxWatcher(
+        mailbox,
+        store_path,
+        known_keys=frozenset(),
+        poll_interval_seconds=0.001,
+    ) as watcher:
+        deadline = time.monotonic() + 1
+        while mailbox.calls < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+    assert mailbox.calls >= 2
+    assert watcher.enqueued_keys == set()
+    with LocalEventStore(store_path) as store:
+        assert store.pending() == []
 
 
 def test_context_exhaustion_retries_once_on_a_fresh_branch_with_the_same_id(

@@ -559,8 +559,12 @@ def test_event_guidance_lives_in_the_shared_harness():
     advisor = (prompt_dir / "ADVISOR.md").read_text(encoding="utf-8")
     harness = (prompt_dir / "SENPAI-HARNESS.md").read_text(encoding="utf-8")
 
-    assert "A `review_ready`, `job_monitor`, human-message" not in advisor
-    assert "A `review_ready`, `job_monitor`, human-message" in harness
+    event_guidance = (
+        "A `review_ready`, `job_monitor`, `human_issue`, "
+        "`student_available_for_assignment`"
+    )
+    assert event_guidance not in " ".join(advisor.split())
+    assert event_guidance in " ".join(harness.split())
 
 
 def test_shared_harness_omits_project_instructions_and_generic_reminders():

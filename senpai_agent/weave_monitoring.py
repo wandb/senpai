@@ -12,6 +12,7 @@ from weave_openhands import init as weave_init
 
 from senpai_agent.secrets import (
     GITHUB_TOKEN_ENV_NAMES,
+    configured_custom_secret_env_names,
     is_secret_environment_variable,
 )
 
@@ -89,6 +90,7 @@ class SecretRedactor:
 
 def secret_redactor(env: Mapping[str, str]) -> SecretRedactor:
     configured_model_key = env.get("SENPAI_OPENHANDS_API_KEY_ENV")
+    custom_secret_env_names = set(configured_custom_secret_env_names(env))
     return SecretRedactor(
         {
             value
@@ -96,6 +98,7 @@ def secret_redactor(env: Mapping[str, str]) -> SecretRedactor:
             if value
             and (
                 _is_secret_env(name)
+                or name in custom_secret_env_names
                 or (configured_model_key is not None and name == configured_model_key)
             )
         }

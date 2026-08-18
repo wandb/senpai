@@ -114,7 +114,7 @@ def test_create_assignment_rejects_another_wip_pull_for_the_student():
     assert fake.mutations == []
 
 
-def test_create_assignment_allows_a_review_ready_pull_for_the_student():
+def test_create_assignment_rejects_a_review_ready_pull_for_the_student():
     assignment = assignment_record(
         assignment_id="assignment-8",
         head_ref="student-one/new-candidate",
@@ -127,15 +127,14 @@ def test_create_assignment_allows_a_review_ready_pull_for_the_student():
         )
     )
 
-    result = workflow(fake).create_assignment(
-        assignment,
-        title="Try another candidate",
-        body="Run one bounded comparison.",
-    )
+    with pytest.raises(WorkflowPreconditionError, match="already has active"):
+        workflow(fake).create_assignment(
+            assignment,
+            title="Try another candidate",
+            body="Run one bounded comparison.",
+        )
 
-    assert result.changed is True
-    assert {"student:student-one", "status:wip"}.issubset(fake.pr["labels"])
-    assert "status:review" not in fake.pr["labels"]
+    assert fake.mutations == []
 
 
 def test_create_and_revision_transitions_cannot_overlap(monkeypatch):

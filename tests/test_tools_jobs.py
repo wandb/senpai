@@ -19,6 +19,7 @@ from senpai_agent.tools import (
     CancelJobTool,
     GetJobStatusAction,
     GetJobStatusTool,
+    JobResultObservation,
     JobSpec,
     MonitorJobAction,
     MonitorJobTool,
@@ -183,6 +184,57 @@ def test_run_job_registers_a_monitor_for_its_conversation(tmp_path: Path):
         assert monitor.metrics == ()
     finally:
         monitors.close()
+
+
+def test_job_error_tail_masks_registered_secrets(tmp_path: Path):
+    workspace = init_workspace(tmp_path)
+    secret = "private-job-token"
+    result = finished_result(tmp_path).model_copy(
+        update={"error_tail": f"authentication failed for {secret}"}
+    )
+    supervisor = StubJob(workspace, result)
+    monitors = JobMonitorStore(tmp_path / "monitors.sqlite3")
+    tool = RunJobTool.create(supervisor, monitors)[0]
+    registry = SecretRegistry()
+    registry.update_secrets({"PRIVATE_AUTH": secret})
+    conversation = SimpleNamespace(
+        id=uuid.uuid4(),
+        state=SimpleNamespace(secret_registry=registry),
+    )
+
+    try:
+        observation = tool.executor(
+            RunJobAction(
+                spec=JobSpec(
+                    argv=("python", "train.py"),
+                    cwd=workspace,
+                    timeout_seconds=20,
+                )
+            ),
+            conversation,
+        )
+
+        assert observation.error_tail == "authentication failed for <secret-hidden>"
+        assert secret not in observation.to_llm_content[0].text
+        assert result.error_tail.endswith(secret)
+    finally:
+        monitors.close()
+
+
+@pytest.mark.parametrize(
+    "conversation",
+    [None, SimpleNamespace(state=SimpleNamespace())],
+)
+def test_job_error_tail_requires_the_conversation_secret_registry(
+    tmp_path: Path,
+    conversation,
+):
+    result = finished_result(tmp_path).model_copy(
+        update={"error_tail": "unredacted job failure"}
+    )
+
+    with pytest.raises(RuntimeError, match="conversation secret registry"):
+        JobResultObservation.from_result(result, conversation)
 
 
 def test_run_job_allows_advisor_watchers_while_workspace_is_dirty(tmp_path: Path):

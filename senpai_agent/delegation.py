@@ -32,8 +32,8 @@ from openhands.sdk.tool import (
 )
 from pydantic import BaseModel, Field, model_validator
 
-from senpai_agent.advisor import AdvisorEvent, AdvisorEventStore
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV
+from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.processes import terminate_process_group
 from senpai_agent.program_context import PROGRAM_PATH_ENV
 from senpai_agent.PROMPTS import (
@@ -44,7 +44,12 @@ from senpai_agent.PROMPTS import (
     DELEGATED_TASK_WITH_CONTEXT_PROMPT,
     render_prompt,
 )
-from senpai_agent.secrets import scrub_github_credentials
+from senpai_agent.secrets import (
+    BUILTIN_CONVERSATION_SECRET_ENV_NAMES,
+    CUSTOM_SECRET_ENV_NAMES_ENV,
+    configured_custom_secret_env_names,
+    scrub_github_credentials,
+)
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation import LocalConversation
@@ -87,8 +92,8 @@ JoinMode = Literal["all", "first", "quorum", "change"]
 TERMINAL_TASK_STATUSES = frozenset({"finished", "failed", "cancelled"})
 
 
-class AdvisorEventSink(Protocol):
-    def enqueue(self, event: AdvisorEvent) -> bool: ...
+class LocalEventSink(Protocol):
+    def enqueue(self, event: LocalEvent) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -147,13 +152,14 @@ class DelegationConfig:
     frontier_reasoning_effort: str
     frontier_api_key_env: str
     frontier_api_key: str
+    compaction_trigger_tokens: int
     github_repo: str
     github_trusted_actor: str | None
     role_file: Path
     harness_file: Path
     plugin_dir: Path
     enable_browser: bool
-    command_secrets: Mapping[str, str]
+    conversation_secrets: Mapping[str, str]
     role: str
     program_path: str
     launch_context: str
@@ -337,6 +343,8 @@ class OpenHandsChildProcess:
     @property
     def environment(self) -> dict[str, str]:
         environment = dict(os.environ)
+        for name in configured_custom_secret_env_names(environment):
+            environment.pop(name, None)
         scrub_github_credentials(environment)
         for name in tuple(environment):
             if name.endswith("_API_KEY"):
@@ -346,7 +354,14 @@ class OpenHandsChildProcess:
             "SENPAI_OPENHANDS_CONVERSATION_ID",
         ):
             environment.pop(name, None)
-        environment.update(self._config.command_secrets)
+        custom_secret_names = tuple(
+            name
+            for name in self._config.conversation_secrets
+            if name not in BUILTIN_CONVERSATION_SECRET_ENV_NAMES
+        )
+        environment[CUSTOM_SECRET_ENV_NAMES_ENV] = ",".join(custom_secret_names)
+        configured_custom_secret_env_names(environment)
+        environment.update(self._config.conversation_secrets)
         profiles = self._config.profiles()
         environment.update(
             {profile.api_key_env: profile.api_key for profile in profiles}
@@ -358,9 +373,7 @@ class OpenHandsChildProcess:
                 "SENPAI_ROLE": self._config.role,
                 "SENPAI_OPENHANDS_API_KEY_ENV": selected.api_key_env,
                 "SENPAI_OPENHANDS_SMART_MODEL": self._config.smart_model,
-                "SENPAI_OPENHANDS_SMART_API_KEY_ENV": (
-                    self._config.smart_api_key_env
-                ),
+                "SENPAI_OPENHANDS_SMART_API_KEY_ENV": (self._config.smart_api_key_env),
                 "SENPAI_OPENHANDS_FAST_MODEL": self._config.fast_model,
                 "SENPAI_OPENHANDS_FAST_API_KEY_ENV": self._config.fast_api_key_env,
                 "SENPAI_OPENHANDS_FRONTIER_MODEL": self._config.frontier_model,
@@ -375,6 +388,9 @@ class OpenHandsChildProcess:
                 ),
                 "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": (
                     self._config.frontier_reasoning_effort
+                ),
+                "SENPAI_COMPACTION_TRIGGER_TOKENS": str(
+                    self._config.compaction_trigger_tokens
                 ),
                 "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS": str(
                     self._config.local_condenser_max_events
@@ -733,15 +749,15 @@ class DelegationRegistry:
                 CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_conversation_id);
                 """
             )
-            columns = {
-                row[1] for row in database.execute("PRAGMA table_info(tasks)")
-            }
+            columns = {row[1] for row in database.execute("PRAGMA table_info(tasks)")}
             if "parent_task_id" not in columns:
                 database.execute("ALTER TABLE tasks ADD COLUMN parent_task_id TEXT")
             if "collected_at" not in columns:
                 database.execute("ALTER TABLE tasks ADD COLUMN collected_at REAL")
             if "process_group_id" not in columns:
-                database.execute("ALTER TABLE tasks ADD COLUMN process_group_id INTEGER")
+                database.execute(
+                    "ALTER TABLE tasks ADD COLUMN process_group_id INTEGER"
+                )
             if "process_start_time" not in columns:
                 database.execute("ALTER TABLE tasks ADD COLUMN process_start_time REAL")
 
@@ -1145,7 +1161,7 @@ def _row_state(row: sqlite3.Row) -> AgentTaskState:
     )
 
 
-def _task_event(row: sqlite3.Row) -> AdvisorEvent:
+def _task_event(row: sqlite3.Row) -> LocalEvent:
     successful = row["status"] == "finished"
     payload = {
         "task_id": row["task_id"],
@@ -1157,7 +1173,7 @@ def _task_event(row: sqlite3.Row) -> AdvisorEvent:
             else {"error": row["error"] or f"subagent {row['status']}"}
         ),
     }
-    return AdvisorEvent(
+    return LocalEvent(
         kind="agent_result" if successful else "agent_error",
         dedupe_key=f"agent_result:{row['task_id']}",
         payload=payload,
@@ -1166,14 +1182,14 @@ def _task_event(row: sqlite3.Row) -> AdvisorEvent:
 
 def _enqueue_task_event(
     registry: DelegationRegistry,
-    event: AdvisorEvent,
-    event_sink: AdvisorEventSink | None,
+    event: LocalEvent,
+    event_sink: LocalEventSink | None,
     event_db_path: Path | None,
 ) -> None:
     if event_sink is not None:
         event_sink.enqueue(event)
     elif event_db_path is not None:
-        with AdvisorEventStore(event_db_path) as sink:
+        with LocalEventStore(event_db_path) as sink:
             sink.enqueue(event)
             task_id = str(event.payload["task_id"])
             if registry.rows([task_id])[0]["collected_at"] is not None:
@@ -1195,7 +1211,7 @@ def _signal_active_tasks(targets: Sequence[sqlite3.Row]) -> None:
 def _reconcile_active_tasks(
     registry: DelegationRegistry,
     rows: Sequence[sqlite3.Row],
-    event_sink: AdvisorEventSink | None,
+    event_sink: LocalEventSink | None,
     event_db_path: Path | None,
     *,
     allow_starting_grace: bool = True,
@@ -1259,12 +1275,8 @@ def record_delegated_task_result(
         changed = registry.finish(task_id, result=result, error=error)
         event_path = env.get("SENPAI_DELEGATION_EVENT_DB_PATH")
         row = registry.rows([task_id])[0]
-        if (
-            event_path
-            and row["depth"] == 1
-            and row["status"] in TERMINAL_TASK_STATUSES
-        ):
-            with AdvisorEventStore(Path(event_path)) as sink:
+        if event_path and row["depth"] == 1 and row["status"] in TERMINAL_TASK_STATUSES:
+            with LocalEventStore(Path(event_path)) as sink:
                 event = _task_event(row)
                 sink.enqueue(event)
                 if registry.rows([task_id])[0]["collected_at"] is not None:
@@ -1303,7 +1315,7 @@ class _DelegationManager:
         self,
         config: DelegationConfig,
         child_runner_factory: ChildAgentRunnerFactory,
-        event_sink: AdvisorEventSink | None,
+        event_sink: LocalEventSink | None,
         event_db_path: Path | None,
     ):
         root_state = config.root_state_dir or config.state_dir
@@ -1322,7 +1334,9 @@ class _DelegationManager:
             raise ValueError(f"maximum delegation depth is {MAX_DELEGATION_DEPTH}")
         if self.config.depth == 1:
             if self.config.current_task_id is None:
-                raise ValueError("nested delegation requires its current parent task ID")
+                raise ValueError(
+                    "nested delegation requires its current parent task ID"
+                )
             if self.config.agent_name != "general-purpose":
                 raise ValueError(
                     "explore, search, and bash-runner agents are delegation leaves"
@@ -1418,10 +1432,10 @@ class _DelegationManager:
                     error=f"{type(error).__name__}: {error}",
                 )
                 if changed and request.depth == 1:
-                    self._enqueue(
-                        _task_event(self.registry.rows([request.task_id])[0])
-                    )
-        return [_row_state(row) for row in self.registry.rows([r["task_id"] for r in rows])]
+                    self._enqueue(_task_event(self.registry.rows([request.task_id])[0]))
+        return [
+            _row_state(row) for row in self.registry.rows([r["task_id"] for r in rows])
+        ]
 
     def _complete(
         self,
@@ -1455,7 +1469,7 @@ class _DelegationManager:
         if request.depth == 1:
             self._enqueue(_task_event(self.registry.rows([request.task_id])[0]))
 
-    def _enqueue(self, event: AdvisorEvent) -> None:
+    def _enqueue(self, event: LocalEvent) -> None:
         _enqueue_task_event(
             self.registry,
             event,
@@ -1506,8 +1520,7 @@ class _DelegationManager:
         conversation: LocalConversation,
     ) -> list[AgentTaskState]:
         return [
-            _row_state(row)
-            for row in self._owned_rows_locked(task_ids, conversation)
+            _row_state(row) for row in self._owned_rows_locked(task_ids, conversation)
         ]
 
     def _owned_rows_locked(
@@ -1558,13 +1571,12 @@ class _DelegationManager:
             if row["depth"] == 1:
                 self._enqueue(_task_event(self.registry.rows([row["task_id"]])[0]))
         if self.event_db_path is not None:
-            with AdvisorEventStore(self.event_db_path) as store:
+            with LocalEventStore(self.event_db_path) as store:
                 for row in targets:
                     if row["depth"] == 1:
                         store.acknowledge(f"agent_result:{row['task_id']}")
-        return [
-            _row_state(row) for row in self.registry.rows(task_ids)
-        ]
+        return [_row_state(row) for row in self.registry.rows(task_ids)]
+
 
 class SpawnAgentsAction(Action):
     batch_key: str = Field(
@@ -1597,7 +1609,9 @@ class SpawnAgentsObservation(Observation):
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
-        return [TextContent(text=json.dumps(self.model_dump(mode="json"), sort_keys=True))]
+        return [
+            TextContent(text=json.dumps(self.model_dump(mode="json"), sort_keys=True))
+        ]
 
 
 class AwaitAgentsAction(Action):
@@ -1670,7 +1684,9 @@ class AgentStatusObservation(Observation):
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
-        return [TextContent(text=json.dumps(self.model_dump(mode="json"), sort_keys=True))]
+        return [
+            TextContent(text=json.dumps(self.model_dump(mode="json"), sort_keys=True))
+        ]
 
 
 class CancelAgentsAction(Action):
@@ -1691,7 +1707,9 @@ class CancelAgentsObservation(Observation):
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
-        return [TextContent(text=json.dumps(self.model_dump(mode="json"), sort_keys=True))]
+        return [
+            TextContent(text=json.dumps(self.model_dump(mode="json"), sort_keys=True))
+        ]
 
 
 def _require_unique_task_ids(task_ids: Sequence[str]) -> None:
@@ -1701,7 +1719,7 @@ def _require_unique_task_ids(task_ids: Sequence[str]) -> None:
 
 def _configured_manager(
     child_runner_factory: ChildAgentRunnerFactory | None,
-    event_sink: AdvisorEventSink | None,
+    event_sink: LocalEventSink | None,
     event_db_path: str | Path | None,
 ) -> _DelegationManager:
     if _DELEGATION_CONFIG is None:
@@ -1792,7 +1810,7 @@ class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservatio
         with self.manager.registry.lifecycle():
             self.manager.registry.mark_collected(terminal)
             if self.manager.event_db_path is not None:
-                with AdvisorEventStore(self.manager.event_db_path) as store:
+                with LocalEventStore(self.manager.event_db_path) as store:
                     for task_id in terminal:
                         store.acknowledge(f"agent_result:{task_id}")
 

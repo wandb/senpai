@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from uuid import UUID
 
-from senpai_agent.advisor import AdvisorEventStore
-from senpai_agent.inbox import event_priority
-from senpai_agent.PROMPTS import EVENT_PROMPT, render_prompt
+from senpai_agent.inbox import PersistentInbox, event_priority
+from senpai_agent.local_events import LocalEventStore
+from senpai_agent.PROMPTS import render_event_prompt
+
+_AVAILABILITY_EVENT_PREFIX = "student_available_for_assignment:"
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,11 +32,7 @@ class ControllerEvent:
             for key, value in self.payload.items()
             if key != "parent_conversation_id"
         }
-        return render_prompt(
-            EVENT_PROMPT,
-            KIND=self.kind,
-            PAYLOAD=json.dumps(payload, sort_keys=True, separators=(",", ":")),
-        )
+        return render_event_prompt(self.kind, payload)
 
 
 class Mailbox(Protocol):
@@ -70,6 +68,45 @@ class CompositeMailbox:
             mailbox.acknowledge(dedupe_keys)
 
 
+class StudentAssignmentAvailabilityMailbox:
+    """Reconcile student availability after each successful GitHub snapshot."""
+
+    def __init__(
+        self,
+        mailbox: Mailbox,
+        *,
+        inbox: PersistentInbox,
+        conversation_id: UUID | str,
+        event_store_path: Path,
+    ):
+        self.mailbox = mailbox
+        self.inbox = inbox
+        self.conversation_id = conversation_id
+        self.event_store_path = event_store_path
+
+    def poll(self) -> tuple[ControllerEvent, ...]:
+        events = tuple(self.mailbox.poll())
+        current = {
+            event.dedupe_key
+            for event in events
+            if event.kind == "student_available_for_assignment"
+        }
+        with LocalEventStore(self.event_store_path) as store:
+            store.discard_prefix(
+                _AVAILABILITY_EVENT_PREFIX,
+                retained_keys=tuple(current),
+            )
+        self.inbox.retract_pending_prefix(
+            self.conversation_id,
+            _AVAILABILITY_EVENT_PREFIX,
+            retained_keys=tuple(current),
+        )
+        return events
+
+    def acknowledge(self, dedupe_keys: Sequence[str]) -> None:
+        self.mailbox.acknowledge(dedupe_keys)
+
+
 class LocalAdvisorMailbox:
     """Deliver durable local child results directly to the advisor inbox."""
 
@@ -77,7 +114,7 @@ class LocalAdvisorMailbox:
         self.store_path = store_path
 
     def poll(self) -> tuple[ControllerEvent, ...]:
-        with AdvisorEventStore(self.store_path) as store:
+        with LocalEventStore(self.store_path) as store:
             pending = store.pending()
         return tuple(
             ControllerEvent(
@@ -89,7 +126,7 @@ class LocalAdvisorMailbox:
         )
 
     def acknowledge(self, dedupe_keys: Sequence[str]) -> None:
-        with AdvisorEventStore(self.store_path) as store:
+        with LocalEventStore(self.store_path) as store:
             for key in dedupe_keys:
                 store.acknowledge(key)
 
@@ -101,7 +138,7 @@ class LocalStudentMailbox:
         self.store_path = store_path
 
     def poll(self) -> tuple[ControllerEvent, ...]:
-        with AdvisorEventStore(self.store_path) as store:
+        with LocalEventStore(self.store_path) as store:
             pending = store.pending()
         for event in pending:
             if not isinstance(event.payload.get("parent_conversation_id"), str):
@@ -116,6 +153,6 @@ class LocalStudentMailbox:
         )
 
     def acknowledge(self, dedupe_keys: Sequence[str]) -> None:
-        with AdvisorEventStore(self.store_path) as store:
+        with LocalEventStore(self.store_path) as store:
             for key in dedupe_keys:
                 store.acknowledge(key)

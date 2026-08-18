@@ -19,7 +19,6 @@ from typing import Literal, Protocol
 from uuid import UUID
 
 from senpai_agent.agent_markdown import strip_spdx_header
-from senpai_agent.advisor import AdvisorEvent, AdvisorEventStore
 from senpai_agent.github.mailbox import GitHubMailbox
 from senpai_agent.inbox import (
     QUEUE_PRIORITY,
@@ -29,12 +28,14 @@ from senpai_agent.inbox import (
     InboxTurnQuarantined,
     PersistentInbox,
 )
+from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import (
     CompositeMailbox,
     ControllerEvent,
     LocalAdvisorMailbox,
     LocalStudentMailbox,
     Mailbox,
+    StudentAssignmentAvailabilityMailbox,
 )
 from senpai_agent.mailbox_watcher import ActiveMailboxWatcher, MailboxFactory
 from senpai_agent.monitor import (
@@ -46,6 +47,7 @@ from senpai_agent.monitor import (
     WandbJobStatusSource,
     WandbMetricSource,
 )
+from senpai_agent.persisted_conversation_migration import migrate_persisted_job_state
 from senpai_agent.PROMPTS import (
     CONTEXT_RECOVERY_PROMPT,
     CONTINUATION_CONTROLLER_PROMPT,
@@ -53,7 +55,6 @@ from senpai_agent.PROMPTS import (
     OPERATOR_INSTRUCTIONS_PROMPT,
     render_prompt,
 )
-from senpai_agent.persisted_conversation_migration import migrate_persisted_job_state
 from senpai_agent.state import (
     AssignmentConversationRegistry,
     ConversationBatch,
@@ -70,7 +71,6 @@ from senpai_agent.workspace import (
     WorkspaceJobRunning,
 )
 
-
 _EDGE_TRIGGERED_EVENT_KINDS = frozenset(
     {"research_base_changed", "student_assignment_comment"}
 )
@@ -80,6 +80,7 @@ _ACTIVITY_LEASE_RENEWAL_SECONDS = 30
 @dataclass(frozen=True, slots=True)
 class TurnResult:
     exit_code: int
+    delivered_event_keys: frozenset[str] = frozenset()
 
 
 class ConversationRecoveryExhausted(RuntimeError):
@@ -112,9 +113,7 @@ def _is_context_history_failure(error: Exception) -> bool:
     )
 
     cause = (
-        error.original_exception
-        if isinstance(error, ConversationRunError)
-        else error
+        error.original_exception if isinstance(error, ConversationRunError) else error
     )
     return isinstance(
         cause,
@@ -124,9 +123,7 @@ def _is_context_history_failure(error: Exception) -> bool:
 
 def _context_recovery_prompt(full_prompt: str, current_prompt: str) -> str:
     initial_context = (
-        ""
-        if not full_prompt or full_prompt in current_prompt
-        else f"{full_prompt}\n\n"
+        "" if not full_prompt or full_prompt in current_prompt else f"{full_prompt}\n\n"
     )
     return initial_context + render_prompt(
         CONTEXT_RECOVERY_PROMPT,
@@ -158,27 +155,45 @@ def _activity_lease(
     return renew
 
 
+def _inference_state_lease(
+    progress: ProgressLease,
+) -> Callable[[float | None, float | None], None]:
+    def publish(started_at: float | None, heartbeat_at: float | None) -> None:
+        try:
+            progress.update_llm_request(started_at, heartbeat_at)
+        except OSError as error:
+            print(
+                f"SENPAI_LEASE_UPDATE_ERROR {type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    return publish
+
+
 class OpenHandsTurnRunner:
     def __init__(
         self,
         config: object,
         *,
         full_prompt: str,
-        github_mailbox: GitHubMailbox | None = None,
+        github_mailbox: Mailbox | None = None,
         active_mailbox_factories: Sequence[MailboxFactory] = (),
         active_poll_interval_seconds: float = 30,
         active_monitor_poll_interval_seconds: float = 5,
         on_activity: Callable[[], None] | None = None,
+        on_inference_state: (
+            Callable[[float | None, float | None], None] | None
+        ) = None,
     ):
         self.config = config
         self.full_prompt = full_prompt.strip()
         self.github_mailbox = github_mailbox
         self.active_mailbox_factories = tuple(active_mailbox_factories)
         self.active_poll_interval_seconds = active_poll_interval_seconds
-        self.active_monitor_poll_interval_seconds = (
-            active_monitor_poll_interval_seconds
-        )
+        self.active_monitor_poll_interval_seconds = active_monitor_poll_interval_seconds
         self.on_activity = on_activity
+        self.on_inference_state = on_inference_state
 
     def run(
         self,
@@ -212,6 +227,8 @@ class OpenHandsTurnRunner:
                 )
             if self.on_activity is not None:
                 options["on_activity"] = self.on_activity
+            if self.on_inference_state is not None:
+                options["on_inference_state"] = self.on_inference_state
             return options
 
         def run_turn() -> int:
@@ -260,37 +277,48 @@ class OpenHandsTurnRunner:
         # A late watcher event may still be pending locally when the next
         # controller prompt carries that same GitHub event. The prompt is the
         # delivery path for this turn, so keep the event pump from repeating it.
-        with AdvisorEventStore(store_path) as store:
+        with LocalEventStore(store_path) as store:
             for event_key in event_keys:
                 store.acknowledge(event_key)
+        active_watchers: list[ActiveMailboxWatcher] = []
         with ExitStack() as watchers:
             if self.github_mailbox is not None:
-                watchers.enter_context(
-                    ActiveMailboxWatcher(
-                        self.github_mailbox,
-                        store_path,
-                        known_keys=visible_event_keys | event_keys,
-                        poll_interval_seconds=self.active_poll_interval_seconds,
-                        map_event=map_event,
+                active_watchers.append(
+                    watchers.enter_context(
+                        ActiveMailboxWatcher(
+                            self.github_mailbox,
+                            store_path,
+                            known_keys=visible_event_keys | event_keys,
+                            poll_interval_seconds=self.active_poll_interval_seconds,
+                            map_event=map_event,
+                        )
                     )
                 )
-            for index, mailbox_factory in enumerate(
-                self.active_mailbox_factories
-            ):
-                watchers.enter_context(
-                    ActiveMailboxWatcher(
-                        mailbox_factory,
-                        store_path,
-                        known_keys=visible_event_keys | event_keys,
-                        poll_interval_seconds=(
-                            self.active_monitor_poll_interval_seconds
-                        ),
-                        map_event=map_event,
-                        thread_name=f"senpai-job-monitor-{index}",
+            for index, mailbox_factory in enumerate(self.active_mailbox_factories):
+                active_watchers.append(
+                    watchers.enter_context(
+                        ActiveMailboxWatcher(
+                            mailbox_factory,
+                            store_path,
+                            known_keys=visible_event_keys | event_keys,
+                            poll_interval_seconds=(
+                                self.active_monitor_poll_interval_seconds
+                            ),
+                            map_event=map_event,
+                            thread_name=f"senpai-job-monitor-{index}",
+                        )
                     )
                 )
             exit_code = run_turn()
-        return TurnResult(exit_code=exit_code)
+        enqueued_keys = tuple(
+            key for watcher in active_watchers for key in watcher.enqueued_keys
+        )
+        with LocalEventStore(store_path) as store:
+            delivered = store.acknowledged(enqueued_keys)
+        return TurnResult(
+            exit_code=exit_code,
+            delivered_event_keys=frozenset(delivered),
+        )
 
 
 def _student_live_event(
@@ -298,7 +326,7 @@ def _student_live_event(
     *,
     conversation_id: UUID,
     registry: AssignmentConversationRegistry,
-) -> AdvisorEvent | None:
+) -> LocalEvent | None:
     if event.kind == "student_pr_feedback":
         target = registry.for_assignment(
             str(event.payload["assignment_id"]),
@@ -312,7 +340,7 @@ def _student_live_event(
             return None
     elif event.kind != "human_issue":
         return None
-    return AdvisorEvent(
+    return LocalEvent(
         kind=event.kind,
         dedupe_key=event.dedupe_key,
         payload={
@@ -599,9 +627,7 @@ class Controller:
                         "student_pr_feedback",
                     }
                     deferred_events = tuple(
-                        event
-                        for event in batch_events
-                        if event.kind in checkout_kinds
+                        event for event in batch_events if event.kind in checkout_kinds
                     )
                     batch_events = tuple(
                         event
@@ -950,16 +976,21 @@ def controller_main(
         or runner_config.state_dir,
         runner_config.state_dir / f"{role}-events.sqlite3",
     )
+    students = tuple(
+        student.strip()
+        for student in env.get("STUDENT_NAMES", "").split(",")
+        if student.strip()
+    )
+    inbox = PersistentInbox(
+        runner_config.state_dir / "delivery-inbox.sqlite3",
+        legacy_path=runner_config.state_dir / "pending-message-deliveries.json",
+    )
     github_mailbox = GitHubMailbox(
         repo=runner_config.github_repo,
         token=runner_config.github_token,
         role=role,
         advisor_branch=env["ADVISOR_BRANCH"],
-        students=tuple(
-            student.strip()
-            for student in env.get("STUDENT_NAMES", "").split(",")
-            if student.strip()
-        ),
+        students=students,
         student_name=env.get("STUDENT_NAME"),
         stale_wip_seconds=int(env.get("SENPAI_STALE_WIP_SECONDS", "7200")),
         trusted_actor=runner_config.github_trusted_actor,
@@ -971,6 +1002,7 @@ def controller_main(
         ),
     )
     mailbox: Mailbox = github_mailbox
+    active_github_mailbox: Mailbox = github_mailbox
     conversation_selector = None
     reconcile = None
     migrate_persisted_job_state(runner_config.state_dir)
@@ -979,7 +1011,7 @@ def controller_main(
         job_state_dir(runner_config.state_dir),
         max_timeout_seconds=runner_config.job_max_timeout_seconds,
     )
-    wandb_api_key = runner_config.command_secrets.get("WANDB_API_KEY")
+    wandb_api_key = runner_config.conversation_secrets.get("WANDB_API_KEY")
     wandb_metrics = WandbMetricSource(
         env["WANDB_ENTITY"],
         env["WANDB_PROJECT"],
@@ -1019,9 +1051,16 @@ def controller_main(
                 wandb_metrics,
             )
         )
-        mailbox = CompositeMailbox(
+        advisor_event_store = runner_config.state_dir / "advisor-events.sqlite3"
+        active_github_mailbox = StudentAssignmentAvailabilityMailbox(
             github_mailbox,
-            LocalAdvisorMailbox(runner_config.state_dir / "advisor-events.sqlite3"),
+            inbox=inbox,
+            conversation_id=runner_config.conversation_id,
+            event_store_path=advisor_event_store,
+        )
+        mailbox = CompositeMailbox(
+            active_github_mailbox,
+            LocalAdvisorMailbox(advisor_event_store),
             *monitor_mailboxes,
         )
     else:
@@ -1042,15 +1081,11 @@ def controller_main(
         )
 
     full_prompt = _full_prompt(env)
-    inbox = PersistentInbox(
-        runner_config.state_dir / "delivery-inbox.sqlite3",
-        legacy_path=runner_config.state_dir / "pending-message-deliveries.json",
-    )
     turn_lease_seconds = runner_config.timeout_seconds + 60
     turns = OpenHandsTurnRunner(
         runner_config,
         full_prompt=full_prompt,
-        github_mailbox=github_mailbox,
+        github_mailbox=active_github_mailbox,
         active_mailbox_factories=active_monitor_factories,
         active_poll_interval_seconds=float(
             env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "30")
@@ -1062,6 +1097,9 @@ def controller_main(
             _activity_lease(progress, turn_lease_seconds)
             if progress is not None
             else None
+        ),
+        on_inference_state=(
+            _inference_state_lease(progress) if progress is not None else None
         ),
     )
     controller = Controller(

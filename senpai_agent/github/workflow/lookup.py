@@ -86,7 +86,8 @@ class LookupMixin:
             issue.number
             for issue in issues
             if issue.pull_request is not None
-            and "status:wip" in {label.name for label in issue.labels}
+            and {"status:wip", "status:review"}
+            & {label.name for label in issue.labels}
         )
 
     def _human_issue(

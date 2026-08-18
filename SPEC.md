@@ -35,8 +35,8 @@ dependencies.
    checkout.
 8. Senpai does not prune conversation history.
 9. Only the student image carries CUDA, PyTorch, and the training stack.
-10. Secrets are passed at narrow executor boundaries and redacted before
-    monitored content is attached.
+10. Secret values are passed at narrow executor boundaries and redacted before
+    monitored content is attached. Custom secret names are explicit.
 11. Hivemind is disabled, not redesigned, in this change.
 
 ## Control loop and remote protocol
@@ -60,7 +60,10 @@ Python controller worker
 ```
 
 The worker publishes an atomic lease containing its PID, current phase, hard
-deadline, and completed-turn counter. The supervisor resets bounded restart
+deadline, completed-turn counter, and active LLM request timestamps. A
+non-model-visible heartbeat updates `llm_request_heartbeat_at` while preserving
+the request's original `llm_request_started_at`. It does not add conversation
+events or renew the hard deadline. The supervisor resets bounded restart
 backoff only after a turn is successfully acknowledged; process uptime and
 idle sleep do not count as progress. The supervisor is independent of
 OpenHands and Kubernetes.
@@ -79,6 +82,11 @@ GitHub state is level-triggered:
 - trusted human comments and reviews on one assigned open `status:wip` or
   `status:review` PR wake its exact student assignment conversation;
 - `status:review` is a durable advisor wake;
+- a configured student with no open assignment labeled `status:wip` or
+  `status:review` emits `student_available_for_assignment`. This event describes
+  assignment routing, not the student process or GPU state. A later successful
+  GitHub poll retracts the event while it is still queued and unclaimed if the
+  student now has an open assignment labeled `status:wip` or `status:review`;
 - when the configured research base changes from an active assignment's
   recorded base SHA, `research_base_changed` gives the advisor
   `required_base_sha`, `current_base_sha`, and a compare URL without cancelling
@@ -108,9 +116,11 @@ ledger. Oldest unacknowledged events are delivered in bounded count/byte
 batches; immediate post-turn polls drain later batches without dropping them.
 
 While an OpenHands turn is running, `ActiveMailboxWatcher` polls GitHub and job
-monitor mailboxes into the role's local event store. It enqueues all newly
-visible advisor events. For students, it maps authenticated human Issues,
-assignment-bound PR feedback, and job-monitor events into the active UUID.
+monitor mailboxes into the role's local event store. It enqueues newly visible
+advisor events except student-assignment availability, which the foreground
+poll reconciles before the next turn. For students, it maps authenticated human
+Issues, assignment-bound PR feedback, and job-monitor events into the active
+UUID.
 Authenticated humans are the interrupt tier: tools get up to 60 seconds to
 finish before Senpai interrupts and resumes the run, even when its inbox batch
 is full. Student assignments and trusted PR feedback share a FIFO queue tier;
@@ -228,6 +238,11 @@ explicit non-secret allowlist. A missing referenced value fails the launch;
 unrelated environment variables and credentials are never considered. The
 rendered role is persisted in role state and reused across worker restarts.
 
+The launcher renders `timeout_minutes` and `max_epochs` into the launch context
+as hard agent policy and exports them to the student role. The process
+supervisor enforces `timeout_minutes` as the maximum requested job timeout;
+target code remains responsible for respecting the epoch limit.
+
 At process startup, the runner loads the harness, rendered role, `program.md`,
 and authoritative launch context into one immutable
 `SenpaiSystemInstructions` value. Its prompt is the stable system suffix for
@@ -245,17 +260,17 @@ File-based subagents are discovered from `.agents/agents`. Live advisor and
 student skills come only from `plugins/senpai/skills`; `.agents/skills` is for
 human operators and Senpai developers and is not installed into pods. Target
 repositories may still supply their own project skills. Skill bodies are not
-concatenated into agent definitions. The OpenHands fork's `main` branch applies
+concatenated into agent definitions. The pinned OpenHands fork revision applies
 each agent definition's `reasoning_effort` override after resolving its
 inherited LLM or stored model profile.
 
 ## Prompt caching
 
-The SDK and tools track the `main` branch of
+The SDK and tools are pinned to commit
+`f69134273ee3a31a233d6201786570eb9c4c141b` of
 [`morganmcg1/software-agent-sdk`](https://github.com/morganmcg1/software-agent-sdk)
-and are based on OpenHands SDK 1.40.0. `uv.lock` records the exact `main` commit
-used for reproducible image builds, while runtime CI installs directly from
-`main` to verify the current fork head.
+and are based on OpenHands SDK 1.40.0. `pyproject.toml`, `uv.lock`, and runtime
+CI use the same exact revision for reproducible builds.
 
 `prompt_cache_configuration()` sets:
 
@@ -283,6 +298,7 @@ supported models can reuse server-side private reasoning and return the most
 detailed available summary. The default main effort is `xhigh`; GPT-5.6 also
 accepts `max`, which uses API `max` effort with Responses
 `reasoning.mode: pro`. Automatic OpenAI compaction starts at
+the `compaction_trigger_tokens` value from `senpai.yaml`, which defaults to
 200,000 rendered tokens. The OpenHands condenser is disabled for that provider
 chain, but its complete local event log remains durable and is used to recover
 the latest response ID after restart.
@@ -292,10 +308,15 @@ provider-native `output_config.effort: max` with adaptive thinking. Senpai
 never adds the OpenAI-only `reasoning.mode: pro` request body to Anthropic
 calls.
 
-Direct Anthropic models use native server-side compaction with a 200,000-input-
-token trigger. OpenHands persists the returned typed compaction block in the
-normal event log and replays it first in each later request, including after a
-process restart. The local condenser is disabled for these conversations.
+Direct Anthropic models use native server-side compaction with the same
+`compaction_trigger_tokens` input-token trigger. OpenHands persists the returned
+typed compaction block in the normal event log and replays it first in each
+later request, including after a process restart. Anthropic performs the token
+count after provider rendering; Senpai does not load a local tokenizer. This
+trigger is not a context-size cap. LiteLLM's normalized `prompt_tokens` can
+exceed it because that field sums the compaction and post-compaction sampling
+iterations; diagnose compaction from the raw iteration usage and returned
+compaction block. The local condenser is disabled for these conversations.
 Other providers retain the high-quality OpenHands condenser.
 
 Every advisor root turn appends one controller-derived liveness invariant to
@@ -502,6 +523,13 @@ turn while tasks remain active. A terminal child result or error is persisted
 and resumes the exact root conversation. A nested child must await or cancel
 all of its descendants before returning; it cannot detach background work.
 
+Children are told they can use approximately 1,500 tokens for conclusions and
+evidence pointers. If a report exceeds 15,000 tokens, Senpai stores the complete
+report under the role state, asks the same child conversation for one concise
+summary, and persists only that summary and the local artifact path. A failed
+summary returns an error with the artifact path; it never sends the oversized
+report to the parent conversation.
+
 One root spawn batch and all descendants form a delegation tree. The tree may
 admit at most eight tasks over its lifetime, a single spawn batch is limited to
 eight, and the role registry allows at most eight active tasks concurrently
@@ -560,10 +588,12 @@ and deadline. Children receive neither GitHub credentials nor GitHub
 read/write tools; the parent prepares any large PR Markdown artifact and owns
 every typed GitHub operation. They do not receive job tools.
 
-When `review_ready` arrives during other advisor work, the advisor can spawn a
-smart, full-context General Purpose review and continue unrelated work. Every
-terminal record includes its root conversation identity, allowing the
-controller to resume the exact advisor or student conversation after its turn.
+When `review_ready` arrives during other advisor work, the harness pauses the
+advisor at the next safe agent-step boundary and delivers the event into the
+same durable conversation without interrupting an active tool. The advisor can
+delegate or defer the review, then resume the displaced work. Every terminal
+record includes its root conversation identity, allowing the controller to
+resume the exact advisor or student conversation after its turn.
 
 ### Long-running jobs and monitoring
 
@@ -701,6 +731,23 @@ Generic child processes receive no GitHub token and no GitHub tools. Main-role
 GitHub operations remain typed and lease/state guarded. Terminal and hook
 policies are behavioral guardrails, not a credential-containment boundary.
 
+`custom_secret_env_names` is an explicit, shared list of additional
+environment-variable names. Names must be unique and match
+`[A-Za-z_][A-Za-z0-9_]*`. Built-in launch credential names and names beginning
+with `GH_`, `GITHUB_`, or `SENPAI_` are reserved. Launcher-owned and
+process-control environment-variable names are also reserved. The launcher
+resolves each value from the shell and then the repository-root `.env`. It
+reads `.env` values literally without variable interpolation. A missing listed
+value fails the launch. Kubernetes writes values to the per-launch Secret;
+Docker and AWS backends write them to their private role credential state. Each
+backend injects them into every advisor and student environment. The
+corresponding names, but not the values, are model-visible so agents can
+reference them during tool execution. OpenHands makes the values available at
+execution boundaries and propagates them to delegated children. Dry-run
+manifests validate names and contain deterministic placeholders instead of
+resolved values. Custom secrets receive no service-specific
+authentication preflight.
+
 Git operations use a temporary askpass helper rather than a persistent
 credential store. The runner repository cannot push, and a target pre-push hook
 enforces the exact role/branch matrix. Images run as an unprivileged user, and
@@ -708,13 +755,14 @@ the Kubernetes containers drop every Linux capability, disallow privilege
 escalation, and use the runtime-default seccomp profile.
 
 Weave content capture applies a longest-first transform over all configured
-API keys, tokens, passwords, secrets, credentials, and the selected custom
-model credential before content is sent. The pinned `weave-openhands`
-integration is initialized before OpenHands imports. Each conversation run is
-an agent trace with child LLM and tool spans, all carrying the durable
-OpenHands conversation ID. These OTLP records are stored in Weave Agent
-Observability and queried with `get_agent_spans()`, not the legacy Calls API;
-`OPENHANDS_RUN.weave_url` links directly to the conversation.
+API keys, tokens, passwords, secrets, credentials, custom secrets, and the
+selected custom model credential before content is sent. Custom secrets do not
+depend on naming conventions for redaction. The pinned
+`weave-openhands` integration is initialized before OpenHands imports. Each
+conversation run is an agent trace with child LLM and tool spans, all carrying
+the durable OpenHands conversation ID. These OTLP records are stored in Weave
+Agent Observability and queried with `get_agent_spans()`, not the legacy Calls
+API; `OPENHANDS_RUN.weave_url` links directly to the conversation.
 
 ## Images and launch acceptance
 
@@ -734,10 +782,12 @@ out that exact revision.
 Launch preflight verifies:
 
 - target-repository push and branch access;
-- the Anthropic key;
+- every model-provider credential referenced by the configured profiles;
 - the Exa key with one `type="instant"`, publication-category, one-result
-  search; and
-- the W&B key with a minimal viewer query.
+  search;
+- the W&B key with a minimal viewer query; and
+- the presence of every configured custom secret, without attempting
+  a service-specific authentication check.
 
 Exa is a progressive skill/script integration, not an always-connected MCP
 server.
@@ -796,7 +846,9 @@ The change is acceptable when:
 - browser smoke succeeds in both image builds;
 - no operational prompt advertises a missing tool or service;
 - no runtime role requires Claude Code semantics;
-- secrets do not appear in serialized tool specs or captured content;
+- secret values do not appear in serialized tool specs or captured content;
+- every configured custom secret reaches advisor, student, and child tool
+  execution with its output and trace content redacted;
 - monitor wakes resume the original student UUID;
 - cutoff arming completes after a bounded readiness window even when a pod
   never becomes Ready; and

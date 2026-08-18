@@ -90,18 +90,14 @@ spec:
             secretKeyRef:
               name: {{LAUNCH_SECRET_NAME}}
               key: github-token
-        {{MODEL_PROVIDER_ENV}}
+{{MODEL_PROVIDER_ENV}}
         - name: EXA_API_KEY
           valueFrom:
             secretKeyRef:
               name: {{LAUNCH_SECRET_NAME}}
               key: exa-api-key
-        - name: HF_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: {{LAUNCH_SECRET_NAME}}
-              key: hf-token
-              optional: true
+{{HF_TOKEN_ENV_REF}}
+{{CUSTOM_SECRET_ENV_REFS}}
         resources:
           requests:
             cpu: "4"

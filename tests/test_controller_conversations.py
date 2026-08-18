@@ -1,8 +1,8 @@
 from pathlib import Path
 from uuid import UUID
 
-from senpai_agent.advisor import AdvisorEvent, AdvisorEventStore
 from senpai_agent.controller import Controller, TurnResult
+from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import ControllerEvent, LocalStudentMailbox
 from senpai_agent.state import (
     AssignmentConversationRegistry,
@@ -88,16 +88,16 @@ def test_local_child_events_are_delivered_directly_to_each_parent(tmp_path: Path
     first_parent = UUID("00000000-0000-0000-0000-000000000011")
     second_parent = UUID("00000000-0000-0000-0000-000000000012")
     store_path = tmp_path / "student-events.sqlite3"
-    with AdvisorEventStore(store_path) as store:
+    with LocalEventStore(store_path) as store:
         store.enqueue(
-            AdvisorEvent(
+            LocalEvent(
                 kind="agent_result",
                 dedupe_key="agent_result:first",
                 payload={"parent_conversation_id": str(first_parent)},
             )
         )
         store.enqueue(
-            AdvisorEvent(
+            LocalEvent(
                 kind="agent_result",
                 dedupe_key="agent_result:second",
                 payload={"parent_conversation_id": str(second_parent)},

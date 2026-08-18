@@ -36,18 +36,23 @@ from senpai_agent.delegation import (
 from senpai_agent.git_workflow import require_clean_job_worktree
 from senpai_agent.github.tools import GitHubWorkflowToolSet
 from senpai_agent.hooks import supervised_job_policy
+from senpai_agent.jobs import (
+    JobResult,
+    JobState,
+    JobSupervisor,
+)
+from senpai_agent.jobs import (
+    JobSpec as SupervisedJobSpec,
+)
 from senpai_agent.monitor import (
     JobMonitorSpec,
     JobMonitorStore,
     MetricMonitorSpec,
     WandbJobStatusSource,
 )
-from senpai_agent.secrets import is_secret_environment_variable
-from senpai_agent.jobs import (
-    JobResult,
-    JobSpec as SupervisedJobSpec,
-    JobState,
-    JobSupervisor,
+from senpai_agent.secrets import (
+    configured_custom_secret_env_names,
+    is_secret_environment_variable,
 )
 
 if TYPE_CHECKING:
@@ -219,20 +224,11 @@ class JobSpec(SupervisedJobSpec):
             "do not modify workspace files."
         ),
     )
-    secret_env: tuple[
-        Literal[
-            "WANDB_API_KEY",
-            "MLXFAST_API_TOKEN",
-            "YUKON_API_TOKEN",
-        ],
-        ...,
-    ] = Field(
+    secret_env: tuple[str, ...] = Field(
         default=(),
         description=(
-            "Registered credentials this process needs. Request WANDB_API_KEY "
-            "only for W&B communication, MLXFAST_API_TOKEN only for an "
-            "official MLXFast API operation, and YUKON_API_TOKEN only for an "
-            "official Yukon API operation."
+            "Registered conversation credentials this process needs. Values are "
+            "resolved from the secret registry and redacted from failure output."
         ),
     )
 
@@ -319,9 +315,7 @@ class MonitorJobObservation(Observation):
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
         binding = (
-            f" W&B run: {self.wandb_run_id}."
-            if self.wandb_run_id is not None
-            else ""
+            f" W&B run: {self.wandb_run_id}." if self.wandb_run_id is not None else ""
         )
         return [
             TextContent(
@@ -350,14 +344,19 @@ class JobResultObservation(Observation):
     def from_result(
         cls,
         result: JobResult,
-        *,
-        mask: object | None = None,
+        conversation: LocalConversation | None,
     ) -> Self:
         values = result.model_dump()
         # workspace_access is supervisor metadata rather than model output.
         values.pop("workspace_access", None)
-        if callable(mask):
-            values["error_tail"] = mask(values["error_tail"])
+        if values["error_tail"]:
+            state = getattr(conversation, "state", None)
+            registry = getattr(state, "secret_registry", None)
+            if registry is None:
+                raise RuntimeError(
+                    "job result redaction requires a conversation secret registry"
+                )
+            values["error_tail"] = registry.mask_secrets_in_output(values["error_tail"])
         return cls.model_validate(values)
 
     @property
@@ -513,10 +512,11 @@ def _job_environment(
 ) -> tuple[dict[str, str], tuple[str, ...]]:
     """Build a scrubbed child environment and resolve only requested credentials."""
 
+    custom_secret_names = frozenset(configured_custom_secret_env_names(os.environ))
     environment = {
         name: value
         for name, value in os.environ.items()
-        if not is_secret_environment_variable(name)
+        if name not in custom_secret_names and not is_secret_environment_variable(name)
     }
 
     registry = getattr(getattr(conversation, "state", None), "secret_registry", None)
@@ -551,9 +551,7 @@ def _job_observation(
     result: JobResult,
     conversation: LocalConversation | None,
 ) -> JobResultObservation:
-    registry = getattr(getattr(conversation, "state", None), "secret_registry", None)
-    mask = registry.mask_secrets_in_output if registry is not None else None
-    return JobResultObservation.from_result(result, mask=mask)
+    return JobResultObservation.from_result(result, conversation)
 
 
 class RunJobTool(ToolDefinition[RunJobAction, JobResultObservation]):

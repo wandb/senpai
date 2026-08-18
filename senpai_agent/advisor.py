@@ -1,33 +1,24 @@
 import argparse
-import json
-import sqlite3
 import threading
 import uuid
-from collections.abc import Callable, Iterator, Sequence, Set
-from contextlib import contextmanager
-from datetime import UTC, datetime
+from collections.abc import Callable, Sequence, Set
 from pathlib import Path
 from types import TracebackType
 from typing import Protocol, Self
 
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
-from pydantic import BaseModel, ConfigDict, Field
 
 from senpai_agent.hooks import queued_feedback_marker
 from senpai_agent.inbox import (
+    ADVISOR_ACTIVE_STEERING_PRIORITIES,
     QUEUE_PRIORITY,
-    STEERING_PRIORITIES,
     STEER_PRIORITY,
     DeliveryState,
     PersistentInbox,
     deliver_turn_messages,
     event_priority,
 )
-from senpai_agent.PROMPTS import (
-    ADVISOR_EVENT_PROMPT,
-    EVENT_PROMPT,
-    render_prompt,
-)
+from senpai_agent.local_events import LocalEventStore
 
 _TERMINAL_DELIVERY_STATUSES = frozenset(
     {
@@ -37,212 +28,12 @@ _TERMINAL_DELIVERY_STATUSES = frozenset(
         ConversationExecutionStatus.DELETING,
     }
 )
-_EVENT_STORE_SETUP_LOCK = threading.Lock()
 _STEERING_GRACE_SECONDS = 60.0
 _STEERING_INTERRUPTION_NOTICE = (
     "Trusted human steering interrupted the active run. Active tools "
     "were given up to 60 seconds to finish; apply the next instruction before "
     "resuming displaced work."
 )
-
-
-class AdvisorEvent(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    kind: str
-    dedupe_key: str
-    payload: dict[str, object]
-    observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-
-    def to_user_message(self) -> str:
-        payload = json.dumps(self.payload, indent=2, sort_keys=True)
-        observed_at = self.observed_at.astimezone(UTC).isoformat()
-        return render_prompt(
-            ADVISOR_EVENT_PROMPT,
-            KIND=self.kind,
-            OBSERVED_AT=observed_at,
-            PAYLOAD=payload,
-        )
-
-    def to_inbox_message(self) -> str:
-        payload = {
-            key: value
-            for key, value in self.payload.items()
-            if key != "parent_conversation_id"
-        }
-        return render_prompt(
-            EVENT_PROMPT,
-            KIND=self.kind,
-            PAYLOAD=json.dumps(payload, sort_keys=True, separators=(",", ":")),
-        )
-
-
-class AdvisorEventStore:
-    def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
-        with _EVENT_STORE_SETUP_LOCK:
-            self._connection = sqlite3.connect(path, check_same_thread=False)
-            self._connection.execute("PRAGMA busy_timeout=5000")
-            journal_mode = self._connection.execute("PRAGMA journal_mode").fetchone()
-            if journal_mode != ("wal",):
-                self._connection.execute("PRAGMA journal_mode=WAL")
-            table_exists = self._connection.execute(
-                """
-                SELECT 1
-                FROM sqlite_schema
-                WHERE type = 'table' AND name = 'advisor_events'
-                """
-            ).fetchone()
-            if table_exists is None:
-                self._connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS advisor_events (
-                        dedupe_key TEXT PRIMARY KEY,
-                        event_json TEXT NOT NULL,
-                        acknowledged INTEGER NOT NULL DEFAULT 0
-                    )
-                    """
-                )
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS advisor_event_acknowledgements (
-                    dedupe_key TEXT PRIMARY KEY
-                )
-                """
-            )
-            self._connection.execute(
-                """
-                INSERT OR IGNORE INTO advisor_event_acknowledgements (dedupe_key)
-                SELECT dedupe_key FROM advisor_events WHERE acknowledged = 1
-                """
-            )
-            self._connection.commit()
-
-    @contextmanager
-    def _transaction(self) -> Iterator[None]:
-        with self._lock:
-            self._connection.execute("BEGIN IMMEDIATE")
-            try:
-                yield
-            except BaseException:
-                self._connection.rollback()
-                raise
-            else:
-                self._connection.commit()
-
-    def enqueue(self, event: AdvisorEvent) -> bool:
-        with self._transaction():
-            acknowledged = self._connection.execute(
-                """
-                SELECT 1 FROM advisor_event_acknowledgements
-                WHERE dedupe_key = ?
-                """,
-                (event.dedupe_key,),
-            ).fetchone() is not None
-            cursor = self._connection.execute(
-                """
-                INSERT INTO advisor_events (dedupe_key, event_json, acknowledged)
-                VALUES (?, ?, ?)
-                ON CONFLICT(dedupe_key) DO NOTHING
-                """,
-                (
-                    event.dedupe_key,
-                    event.model_dump_json(),
-                    int(acknowledged),
-                ),
-            )
-            row = self._connection.execute(
-                """
-                SELECT event_json, acknowledged
-                FROM advisor_events
-                WHERE dedupe_key = ?
-                """,
-                (event.dedupe_key,),
-            ).fetchone()
-            if row is None:
-                raise RuntimeError(f"event {event.dedupe_key!r} disappeared")
-            existing = AdvisorEvent.model_validate_json(row[0])
-            if existing.kind != event.kind or existing.payload != event.payload:
-                raise RuntimeError(
-                    f"event {event.dedupe_key!r} was reused with a different payload"
-                )
-            if acknowledged and not row[1]:
-                self._connection.execute(
-                    """
-                    UPDATE advisor_events SET acknowledged = 1
-                    WHERE dedupe_key = ?
-                    """,
-                    (event.dedupe_key,),
-                )
-            return cursor.rowcount == 1 and not acknowledged
-
-    def pending(self) -> list[AdvisorEvent]:
-        with self._lock:
-            rows = self._connection.execute(
-                """
-                SELECT event_json
-                FROM advisor_events
-                WHERE acknowledged = 0
-                ORDER BY rowid
-                """
-            ).fetchall()
-        return [AdvisorEvent.model_validate_json(row[0]) for row in rows]
-
-    def pending_count(self) -> int:
-        with self._lock:
-            row = self._connection.execute(
-                """
-                SELECT COUNT(*)
-                FROM advisor_events
-                WHERE acknowledged = 0
-                """
-            ).fetchone()
-        return int(row[0])
-
-    def acknowledge(self, dedupe_key: str) -> None:
-        with self._transaction():
-            self._connection.execute(
-                """
-                INSERT OR IGNORE INTO advisor_event_acknowledgements (dedupe_key)
-                VALUES (?)
-                """,
-                (dedupe_key,),
-            )
-            self._connection.execute(
-                "UPDATE advisor_events SET acknowledged = 1 WHERE dedupe_key = ?",
-                (dedupe_key,),
-            )
-
-    def acknowledged(self, dedupe_keys: Sequence[str]) -> set[str]:
-        if not dedupe_keys:
-            return set()
-        placeholders = ",".join("?" for _ in dedupe_keys)
-        with self._lock:
-            rows = self._connection.execute(
-                f"""
-                SELECT dedupe_key
-                FROM advisor_event_acknowledgements
-                WHERE dedupe_key IN ({placeholders})
-                """,
-                tuple(dedupe_keys),
-            ).fetchall()
-        return {str(row[0]) for row in rows}
-
-    def close(self) -> None:
-        with self._lock:
-            self._connection.close()
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(
-        self,
-        _exc_type: type[BaseException] | None,
-        _exc: BaseException | None,
-        _traceback: TracebackType | None,
-    ) -> None:
-        self.close()
 
 
 def advisor_conversation_id(
@@ -266,7 +57,7 @@ class MessageConversation(Protocol):
 
 
 def _deliver_pending_events(
-    store: AdvisorEventStore,
+    store: LocalEventStore,
     conversation: MessageConversation,
     *,
     record_delivery: Callable[[str], None],
@@ -279,8 +70,7 @@ def _deliver_pending_events(
         pending = [
             event
             for event in pending
-            if event.payload.get("parent_conversation_id")
-            == parent_conversation_id
+            if event.payload.get("parent_conversation_id") == parent_conversation_id
         ]
     for event in pending:
         if event.dedupe_key in already_delivered:
@@ -292,7 +82,7 @@ def _deliver_pending_events(
 
 
 def deliver_pending_events(
-    store: AdvisorEventStore,
+    store: LocalEventStore,
     conversation: MessageConversation,
     *,
     parent_conversation_id: str | None = None,
@@ -308,7 +98,7 @@ def deliver_pending_events(
 class AdvisorEventPump:
     def __init__(
         self,
-        store: AdvisorEventStore,
+        store: LocalEventStore,
         conversation: MessageConversation,
         *,
         poll_interval: float = 0.5,
@@ -371,9 +161,7 @@ class AdvisorEventPump:
             if first_failure:
                 self._error = error
             should_interrupt = (
-                first_failure
-                and self._run_armed
-                and self._run_started.is_set()
+                first_failure and self._run_armed and self._run_started.is_set()
             )
             self._steer_ready.set()
         self._stop.set()
@@ -420,7 +208,7 @@ class AdvisorEventPump:
         steer_generation = 0
         steer_active_run = False
         for event in pending:
-            mode = STEERING_PRIORITIES.get(event.kind)
+            mode = ADVISOR_ACTIVE_STEERING_PRIORITIES.get(event.kind)
             if mode is not None:
                 with self._steer_lock:
                     if not self._accept_steering:
@@ -595,9 +383,7 @@ class AdvisorEventPump:
     def _deliver_steer(self) -> bool:
         while True:
             if not self._steer_ready.wait(self._steering_grace_seconds + 1):
-                raise TimeoutError(
-                    "trusted input did not reach a steering boundary"
-                )
+                raise TimeoutError("trusted input did not reach a steering boundary")
             with self._steer_lock:
                 if self._error is not None:
                     raise self._error
@@ -625,9 +411,13 @@ class AdvisorEventPump:
         if interrupted and interrupt_notice:
             self._conversation.send_message(_STEERING_INTERRUPTION_NOTICE)
         deliver_turn_messages(self._conversation, self._inbox, turn_id)
-        return interrupt_requested or paused or (
-            state is None
-            or state.execution_status != ConversationExecutionStatus.PAUSED
+        return (
+            interrupt_requested
+            or paused
+            or (
+                state is None
+                or state.execution_status != ConversationExecutionStatus.PAUSED
+            )
         )
 
     def __enter__(self) -> Self:
@@ -674,7 +464,7 @@ def advisor_main(
     args = parser.parse_args(argv)
 
     if args.command == "pending-count":
-        with AdvisorEventStore(
+        with LocalEventStore(
             args.state_dir.expanduser().resolve() / "advisor-events.sqlite3"
         ) as store:
             print(store.pending_count())

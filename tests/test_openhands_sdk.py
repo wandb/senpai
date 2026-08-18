@@ -12,9 +12,9 @@ from pydantic import SecretStr
 
 from senpai_agent.openhands_runner import (
     EVENT_TEXT_LIMIT,
-    anthropic_compaction_configuration,
     apply_reasoning_profile,
     configured_local_condenser,
+    compaction_configuration,
     conversation_prompt_cache_key,
     event_summary,
     model_runtime_configuration,
@@ -31,13 +31,15 @@ from senpai_agent.model_compatibility import (
 from senpai_agent.inbox import DeliveryState, PersistentInbox, deliver_turn_messages
 from openhands_support import REPO_ROOT, runtime_config
 
+TEST_COMPACTION_TRIGGER_TOKENS = 180_000
 
-def test_openhands_fork_pin_is_consistent_across_install_paths():
+
+def test_openhands_fork_revision_is_consistent_across_install_paths():
     package_names = {"openhands-sdk", "openhands-tools"}
     fork_url = "git+https://github.com/morganmcg1/software-agent-sdk.git"
-    revision = "33608f0b8242ca0e1f6251efc8f535e249cd6101"
+    fork_revision = "f69134273ee3a31a233d6201786570eb9c4c141b"
     expected_requirements = {
-        f"{name} @ {fork_url}@{revision}#subdirectory={name}"
+        f"{name} @ {fork_url}@{fork_revision}#subdirectory={name}"
         for name in package_names
     }
 
@@ -82,12 +84,12 @@ def test_openhands_fork_pin_is_consistent_across_install_paths():
         assert source.path == "/morganmcg1/software-agent-sdk.git"
         assert parse_qs(source.query) == {
             "subdirectory": [name],
-            "rev": [revision],
+            "rev": [fork_revision],
         }
-        assert re.fullmatch(r"[0-9a-f]{40}", source.fragment)
+        assert source.fragment == fork_revision
         resolved_revisions.add(source.fragment)
 
-    assert resolved_revisions == {revision}
+    assert resolved_revisions == {fork_revision}
 
 
 @pytest.mark.parametrize(
@@ -205,13 +207,11 @@ def test_openai_response_configuration_is_accepted_by_the_pinned_sdk():
         "reasoning_context": "all_turns",
         "responses_store": True,
         "responses_use_previous_response_id": True,
-        "responses_compact_threshold": 200_000,
     }
     assert llm.uses_responses_api() is True
     assert llm.reasoning_effort == "max"
     assert llm.responses_store is True
     assert llm.responses_use_previous_response_id is True
-    assert llm.responses_compact_threshold == 200_000
     assert openai_responses_configuration("anthropic/claude-opus-4-8") == {}
 
 
@@ -316,6 +316,7 @@ def test_openai_max_uses_pro_mode_on_the_wire():
     configuration = model_runtime_configuration(
         "openai/gpt-5.6-sol",
         "max",
+        compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
     )
     llm = LLM(
         model="openai/gpt-5.6-sol",
@@ -343,6 +344,12 @@ def test_openai_max_uses_pro_mode_on_the_wire():
         "summary": "auto",
         "context": "all_turns",
     }
+    assert call_kwargs["context_management"] == [
+        {
+            "type": "compaction",
+            "compact_threshold": TEST_COMPACTION_TRIGGER_TOKENS,
+        }
+    ]
     assert call_kwargs["extra_body"] == {
         "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
         "reasoning": {
@@ -382,7 +389,11 @@ def test_file_agent_reasoning_override_replaces_the_parent_request_profile(
         model=model,
         api_key=SecretStr("test-key"),
         reasoning_effort=parent_effort,
-        **model_runtime_configuration(model, parent_effort),
+        **model_runtime_configuration(
+            model,
+            parent_effort,
+            compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
+        ),
     )
 
     configured = apply_reasoning_profile(
@@ -426,7 +437,11 @@ def test_anthropic_max_uses_provider_native_effort(model):
             model=model,
             api_key=SecretStr("test-key"),
             reasoning_effort="max",
-            **model_runtime_configuration(model, "max"),
+            **model_runtime_configuration(
+                model,
+                "max",
+                compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
+            ),
         )
     )
     _messages, _tools, _mocked, call_kwargs, _telemetry = (
@@ -448,6 +463,7 @@ def test_wandb_gateway_uses_chat_thinking_and_project_routing():
     configuration = model_runtime_configuration(
         "wandb/zai-org/GLM-5.2",
         "max",
+        compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
         wandb_entity="research-team",
         wandb_project="mlxfast",
     )
@@ -553,7 +569,11 @@ def test_glm_fails_clearly_without_an_exact_chat_template_tokenizer():
     ],
 )
 def test_pro_mode_is_only_enabled_by_openai_max(model, effort):
-    extra_body = model_runtime_configuration(model, effort).get(
+    extra_body = model_runtime_configuration(
+        model,
+        effort,
+        compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
+    ).get(
         "litellm_extra_body",
         {},
     )
@@ -561,19 +581,59 @@ def test_pro_mode_is_only_enabled_by_openai_max(model, effort):
     assert "reasoning" not in extra_body
 
 
-def test_anthropic_compaction_configuration_is_accepted_by_the_pinned_sdk():
-    configuration = anthropic_compaction_configuration(
-        "anthropic/claude-opus-4-8"
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        (
+            "openai/gpt-5.6",
+            {"responses_compact_threshold": TEST_COMPACTION_TRIGGER_TOKENS},
+        ),
+        (
+            "anthropic/claude-opus-4-8",
+            {"anthropic_compact_threshold": TEST_COMPACTION_TRIGGER_TOKENS},
+        ),
+        ("gemini/gemini-3-pro", {}),
+    ],
+)
+def test_compaction_configuration_translates_the_universal_trigger(
+    model,
+    expected,
+):
+    assert (
+        compaction_configuration(model, TEST_COMPACTION_TRIGGER_TOKENS)
+        == expected
+    )
+
+
+def test_universal_compaction_configuration_reaches_anthropic_sdk():
+    configuration = model_runtime_configuration(
+        "anthropic/claude-opus-4-8",
+        "max",
+        compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
     )
     llm = LLM(
         model="anthropic/claude-opus-4-8",
         api_key=SecretStr("test-key"),
         **configuration,
     )
+    _messages, _tools, _mocked, call_kwargs, _telemetry = (
+        llm._prepare_completion_params(
+            [Message(role="user", content=[TextContent(text="Investigate")])],
+            tools=None,
+            add_security_risk_prediction=False,
+            kwargs={},
+        )
+    )
 
-    assert configuration == {"anthropic_compact_threshold": 100_000}
+    assert (
+        configuration["anthropic_compact_threshold"]
+        == TEST_COMPACTION_TRIGGER_TOKENS
+    )
     assert llm.uses_anthropic_compaction() is True
-    assert anthropic_compaction_configuration("openai/gpt-5.6") == {}
+    assert call_kwargs["context_management"]["edits"][0]["trigger"] == {
+        "type": "input_tokens",
+        "value": TEST_COMPACTION_TRIGGER_TOKENS,
+    }
 
 
 def test_gpt56_marks_only_the_stable_system_cache_boundary():

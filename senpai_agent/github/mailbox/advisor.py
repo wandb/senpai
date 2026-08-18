@@ -43,7 +43,9 @@ def advisor_events(
 ) -> tuple[ControllerEvent, ...]:
     events: list[ControllerEvent] = []
     active_assignments: list[tuple[dict[str, object], AssignmentRecord]] = []
-    active_by_student: dict[str, list[int]] = {student: [] for student in mailbox.students}
+    reserved_by_student: dict[str, list[int]] = {
+        student: [] for student in mailbox.students
+    }
     now = datetime.now(UTC)
     for pull in pulls:
         labels = label_names(pull)
@@ -54,9 +56,9 @@ def advisor_events(
             for label in labels
             if label.startswith("student:")
         )
-        if "status:wip" in labels:
+        if {"status:wip", "status:review"} & labels:
             for student in students:
-                active_by_student.setdefault(student, []).append(number)
+                reserved_by_student.setdefault(student, []).append(number)
         reference = pull_reference(pull)
         assignment = None
         if {"status:wip", "status:review"} & labels:
@@ -112,12 +114,12 @@ def advisor_events(
                 )
             )
 
-    for student, numbers in active_by_student.items():
+    for student, numbers in reserved_by_student.items():
         if not numbers:
             events.append(
                 ControllerEvent(
-                    kind="idle_student",
-                    dedupe_key=f"idle_student:{student}",
+                    kind="student_available_for_assignment",
+                    dedupe_key=f"student_available_for_assignment:{student}",
                     payload={"student": student},
                 )
             )

@@ -10,6 +10,7 @@ import os
 import signal
 import stat
 import sys
+import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
@@ -21,7 +22,6 @@ os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
 
 from senpai_agent.advisor import (
     AdvisorEventPump,
-    AdvisorEventStore,
     advisor_conversation_id,
 )
 from senpai_agent.delegation import (
@@ -32,13 +32,6 @@ from senpai_agent.delegation import (
     configure_delegation,
     record_delegated_task_result,
 )
-from senpai_agent.model_compatibility import (
-    REASONING_EFFORTS,
-    WANDB_GLM_52_MODEL,
-    WANDB_GLM_52_TOKENIZER,
-    register_litellm_model_compatibility,
-    supports_reasoning_effort,
-)
 from senpai_agent.inbox import (
     DeliveryState,
     InboxTurn,
@@ -47,10 +40,19 @@ from senpai_agent.inbox import (
     events_after_turn_delivery,
     turn_has_finished_response,
 )
+from senpai_agent.model_compatibility import (
+    REASONING_EFFORTS,
+    WANDB_GLM_52_MODEL,
+    WANDB_GLM_52_TOKENIZER,
+    register_litellm_model_compatibility,
+    supports_reasoning_effort,
+)
 from senpai_agent.secrets import (
+    BUILTIN_CONVERSATION_SECRET_ENV_NAMES,
     GITHUB_TOKEN_ENV_NAMES,
     GITHUB_TOKEN_FD_ENV,
     GITHUB_TOKEN_FILE_ENV,
+    configured_custom_secret_env_names,
     scrub_github_credentials,
 )
 from senpai_agent.weave_monitoring import (
@@ -68,7 +70,7 @@ from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
 from openhands.sdk.context.condenser import CondenserBase, LLMSummarizingCondenser
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
 from openhands.sdk.event import ActionEvent, MessageEvent, ObservationEvent
-from openhands.sdk.llm import TextContent
+from openhands.sdk.llm import Message, TextContent
 from openhands.sdk.plugin import PluginSource
 from openhands.sdk.skills import (
     Skill,
@@ -94,16 +96,22 @@ from senpai_agent.github.tools import (
     clear_github_credentials,
     configure_github_credentials,
 )
+from senpai_agent.inference_heartbeat import InferenceHeartbeat
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV, decode_launch_context
-from senpai_agent.program_context import (
-    PROGRAM_PATH_ENV,
-    load_program_system_prompt,
-)
+from senpai_agent.local_events import LocalEventStore
 from senpai_agent.persisted_conversation_migration import (
     migrate_persisted_conversation,
     migrate_persisted_job_state,
 )
-from senpai_agent.PROMPTS import RECOVERED_ACTION_PROMPT
+from senpai_agent.program_context import (
+    PROGRAM_PATH_ENV,
+    load_program_system_prompt,
+)
+from senpai_agent.PROMPTS import (
+    DELEGATED_RESULT_SUMMARY_PROMPT,
+    RECOVERED_ACTION_PROMPT,
+    render_prompt,
+)
 from senpai_agent.state import (
     advisor_job_monitor_state_dir,
     job_state_dir,
@@ -117,24 +125,18 @@ DEFAULT_FRONTIER_MODEL = "openai/gpt-5.6-sol"
 DEFAULT_REASONING_EFFORT = "xhigh"
 DEFAULT_FAST_REASONING_EFFORT = "high"
 DEFAULT_FRONTIER_REASONING_EFFORT = "max"
+DEFAULT_COMPACTION_TRIGGER_TOKENS = 200_000
 WANDB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
 SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore", "search")
 SENPAI_AGENT_DIR = Path(__file__).resolve().parents[1] / ".agents" / "agents"
-REPOSITORY_INSTRUCTION_FILENAMES = frozenset(
-    {"agents.md", "agent.md", "claude.md"}
-)
+REPOSITORY_INSTRUCTION_FILENAMES = frozenset({"agents.md", "agent.md", "claude.md"})
 PROVIDER_API_KEY_ENVS = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
     "wandb": "WANDB_API_KEY",
 }
-COMMAND_SECRET_ENV_NAMES = (
-    "WANDB_API_KEY",
-    "EXA_API_KEY",
-    "MLXFAST_API_TOKEN",
-    "YUKON_API_TOKEN",
-)
 EVENT_TEXT_LIMIT = 20000
+MAX_INLINE_CHILD_RESULT_TOKENS = 15_000
 DEFAULT_LOCAL_CONDENSER_MAX_EVENTS = 0
 GENERIC_LOCAL_CONDENSER_MAX_EVENTS = 80
 MIN_LOCAL_CONDENSER_MAX_EVENTS = 12
@@ -175,6 +177,10 @@ class RunnerArgs:
         alias="--frontier-reasoning-effort",
         choices=REASONING_EFFORTS,
     )
+    compaction_trigger_tokens: int | None = field(
+        default=None,
+        alias="--compaction-trigger-tokens",
+    )
     workspace: str | None = field(default=None, alias="--workspace")
     state_dir: str | None = field(default=None, alias="--state-dir")
     conversation_id: str | None = field(default=None, alias="--conversation-id")
@@ -199,7 +205,7 @@ class RunnerConfig:
     github_repo: str
     github_token: SecretStr | None
     github_trusted_actor: str | None
-    command_secrets: Mapping[str, str]
+    conversation_secrets: Mapping[str, str]
     reasoning_effort: str
     smart_model: str
     smart_api_key_env: str
@@ -213,6 +219,7 @@ class RunnerConfig:
     frontier_api_key_env: str
     frontier_api_key: SecretStr
     frontier_reasoning_effort: str
+    compaction_trigger_tokens: int
     workspace: Path
     state_dir: Path
     conversation_id: uuid.UUID
@@ -361,10 +368,34 @@ def resolve_api_key(env: Mapping[str, str], key_env: str) -> SecretStr:
     return SecretStr(value)
 
 
-def command_secrets(env: Mapping[str, str]) -> dict[str, str]:
+def conversation_secrets(
+    env: Mapping[str, str],
+    *,
+    model_api_key_env_names: Sequence[str],
+) -> dict[str, str]:
+    custom_secret_env_names = configured_custom_secret_env_names(env)
+    model_credentials = set(model_api_key_env_names)
+    overlap = tuple(
+        name for name in custom_secret_env_names if name in model_credentials
+    )
+    if overlap:
+        raise RuntimeError(
+            "model credential environment variables cannot also be custom "
+            f"secrets: {', '.join(overlap)}"
+        )
+
+    custom_secrets = {}
+    for name in custom_secret_env_names:
+        value = env.get(name)
+        if value is None or not value.strip():
+            raise RuntimeError(f"configured custom secret {name} is required")
+        custom_secrets[name] = value
+
     return {
-        name: value for name in COMMAND_SECRET_ENV_NAMES if (value := env.get(name))
-    }
+        name: value
+        for name in BUILTIN_CONVERSATION_SECRET_ENV_NAMES
+        if (value := env.get(name))
+    } | custom_secrets
 
 
 def github_token(
@@ -526,8 +557,7 @@ def resolve_agent_skills(
     missing = [name for name in definition.skills if name not in available]
     if missing:
         raise ValueError(
-            f"Skills {', '.join(missing)} were not found for agent "
-            f"{definition.name}."
+            f"Skills {', '.join(missing)} were not found for agent {definition.name}."
         )
     return [available[name] for name in definition.skills]
 
@@ -687,6 +717,21 @@ def resolve_config(
             "SENPAI_OPENHANDS_LOCAL_CONDENSER_TARGET_EVENTS must be less than "
             "SENPAI_OPENHANDS_LOCAL_CONDENSER_MAX_EVENTS"
         )
+    try:
+        compaction_trigger_tokens = int(
+            args.compaction_trigger_tokens
+            if args.compaction_trigger_tokens is not None
+            else env.get(
+                "SENPAI_COMPACTION_TRIGGER_TOKENS",
+                str(DEFAULT_COMPACTION_TRIGGER_TOKENS),
+            )
+        )
+    except ValueError as error:
+        raise RuntimeError(
+            "SENPAI_COMPACTION_TRIGGER_TOKENS must be an integer"
+        ) from error
+    if compaction_trigger_tokens < 50_000:
+        raise RuntimeError("SENPAI_COMPACTION_TRIGGER_TOKENS must be at least 50000")
     try:
         inbox_max_stalled_attempts = int(
             env.get(
@@ -855,6 +900,15 @@ def resolve_config(
     smart_api_key = resolve_api_key(env, smart_api_key_env)
     fast_api_key = resolve_api_key(env, fast_api_key_env)
     frontier_api_key = resolve_api_key(env, frontier_api_key_env)
+    resolved_conversation_secrets = conversation_secrets(
+        env,
+        model_api_key_env_names=(
+            api_key_env,
+            smart_api_key_env,
+            fast_api_key_env,
+            frontier_api_key_env,
+        ),
+    )
     models = (model, smart_model, fast_model, frontier_model)
     if any(model_provider(profile) == "wandb" for profile in models) and not (
         wandb_entity and wandb_project
@@ -871,7 +925,7 @@ def resolve_config(
         github_repo=github_repo(env),
         github_token=github_token(env, required=not args.child),
         github_trusted_actor=env.get("SENPAI_GITHUB_ACTOR"),
-        command_secrets=command_secrets(env),
+        conversation_secrets=resolved_conversation_secrets,
         reasoning_effort=reasoning_effort,
         smart_model=smart_model,
         smart_api_key_env=smart_api_key_env,
@@ -885,6 +939,7 @@ def resolve_config(
         frontier_api_key_env=frontier_api_key_env,
         frontier_api_key=frontier_api_key,
         frontier_reasoning_effort=frontier_reasoning_effort,
+        compaction_trigger_tokens=compaction_trigger_tokens,
         workspace=workspace,
         state_dir=state_dir,
         conversation_id=(
@@ -961,9 +1016,7 @@ def system_instructions_prompt(
 ) -> str:
     prompt = instructions.prompt
     if runtime_invariant:
-        prompt += (
-            f"\n# Live controller invariant\n\n{runtime_invariant.strip()}\n"
-        )
+        prompt += f"\n# Live controller invariant\n\n{runtime_invariant.strip()}\n"
     return prompt
 
 
@@ -1077,7 +1130,6 @@ def openai_responses_configuration(
         "reasoning_context": "all_turns",
         "responses_store": True,
         "responses_use_previous_response_id": True,
-        "responses_compact_threshold": 200_000,
     }
     if reasoning := _openai_pro_reasoning(model, reasoning_effort):
         configuration["litellm_extra_body"] = {
@@ -1086,10 +1138,24 @@ def openai_responses_configuration(
     return configuration
 
 
+def compaction_configuration(
+    model: str,
+    trigger_tokens: int,
+) -> dict[str, int]:
+    """Translate the universal token trigger to the provider SDK field."""
+    provider = model_provider(model)
+    if provider == "openai":
+        return {"responses_compact_threshold": trigger_tokens}
+    if provider == "anthropic":
+        return {"anthropic_compact_threshold": trigger_tokens}
+    return {}
+
+
 def model_runtime_configuration(
     model: str,
     reasoning_effort: str,
     *,
+    compaction_trigger_tokens: int = DEFAULT_COMPACTION_TRIGGER_TOKENS,
     wandb_entity: str | None = None,
     wandb_project: str | None = None,
 ) -> dict[str, object]:
@@ -1125,7 +1191,7 @@ def model_runtime_configuration(
     for options in (
         prompt_cache_configuration(model),
         openai_responses_configuration(model, reasoning_effort),
-        anthropic_compaction_configuration(model),
+        compaction_configuration(model, compaction_trigger_tokens),
     ):
         for key, value in options.items():
             if key == "litellm_extra_body":
@@ -1135,12 +1201,6 @@ def model_runtime_configuration(
     if extra_body:
         configuration["litellm_extra_body"] = extra_body
     return configuration
-
-
-def anthropic_compaction_configuration(model: str) -> dict[str, int]:
-    if model.split("/", 1)[0].lower() != "anthropic":
-        return {}
-    return {"anthropic_compact_threshold": 100_000}
 
 
 def configured_local_condenser(
@@ -1287,11 +1347,7 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
             "state_dir": str(job_state_dir(config.state_dir)),
             "max_timeout_seconds": config.job_max_timeout_seconds,
         }
-        if (
-            config.role == "student"
-            and config.wandb_entity
-            and config.wandb_project
-        ):
+        if config.role == "student" and config.wandb_entity and config.wandb_project:
             job_params.update(
                 wandb_entity=config.wandb_entity,
                 wandb_project=config.wandb_project,
@@ -1347,13 +1403,14 @@ def delegation_config(
         frontier_reasoning_effort=config.frontier_reasoning_effort,
         frontier_api_key_env=config.frontier_api_key_env,
         frontier_api_key=config.frontier_api_key.get_secret_value(),
+        compaction_trigger_tokens=config.compaction_trigger_tokens,
         github_repo=config.github_repo,
         github_trusted_actor=config.github_trusted_actor,
         role_file=config.role_file,
         harness_file=config.harness_file,
         plugin_dir=config.plugin_dir,
         enable_browser=config.enable_browser,
-        command_secrets=config.command_secrets,
+        conversation_secrets=config.conversation_secrets,
         role=config.role,
         local_condenser_max_events=config.local_condenser_max_events,
         local_condenser_max_tokens=config.local_condenser_max_tokens,
@@ -1432,9 +1489,7 @@ async def arun_conversation(
             if task.done():
                 await task
                 return
-            renewed = (
-                activity() + timeout_seconds if activity is not None else deadline
-            )
+            renewed = activity() + timeout_seconds if activity is not None else deadline
             if renewed > time.monotonic():
                 deadline = renewed
                 continue
@@ -1560,8 +1615,14 @@ def reject_recovered_actions(conversation: object) -> int:
     return len(pending)
 
 
-def final_agent_result(conversation: object) -> str:
+def final_agent_result(
+    conversation: object,
+    *,
+    exclude_event_ids: frozenset[str] = frozenset(),
+) -> str:
     for event in reversed(conversation.state.view.events):
+        if str(event.id) in exclude_event_ids:
+            continue
         if isinstance(event, MessageEvent) and event.source == "agent":
             text = "".join(
                 content.text
@@ -1575,6 +1636,79 @@ def final_agent_result(conversation: object) -> str:
             if isinstance(message, str) and message.strip():
                 return message.strip()
     raise RuntimeError("child finished without a model-visible result")
+
+
+def _result_token_count(llm: LLM, result: str) -> int:
+    return llm.get_token_count(
+        [
+            Message(
+                role="assistant",
+                content=[TextContent(text=result)],
+            )
+        ]
+    )
+
+
+def _store_oversized_child_result(config: RunnerConfig, result: str) -> Path:
+    if config.delegation_root_state_dir is None or config.delegation_task_id is None:
+        raise RuntimeError(
+            "oversized child result requires delegated role-state storage"
+        )
+    directory = config.delegation_root_state_dir / "delegation" / "results"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory.chmod(0o700)
+    descriptor, temporary_name = tempfile.mkstemp(dir=directory)
+    temporary_path = Path(temporary_name)
+    path = directory / f"{config.delegation_task_id}.md"
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+            temporary.write(result)
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return path
+
+
+def compact_child_result(
+    conversation: object,
+    llm: LLM,
+    config: RunnerConfig,
+    result: str,
+    run_deadline: float,
+) -> str:
+    token_count = _result_token_count(llm, result)
+    if 0 < token_count <= MAX_INLINE_CHILD_RESULT_TOKENS:
+        return result
+
+    artifact = _store_oversized_child_result(config, result)
+    existing_event_ids = frozenset(
+        str(event.id) for event in conversation.state.view.events
+    )
+    try:
+        conversation.send_message(
+            render_prompt(
+                DELEGATED_RESULT_SUMMARY_PROMPT,
+                RESULT_PATH=str(artifact),
+            )
+        )
+        with graceful_interrupts(conversation):
+            run_conversation(conversation, run_deadline - time.time())
+        if conversation.state.execution_status != ConversationExecutionStatus.FINISHED:
+            raise RuntimeError("summary turn did not finish")
+        summary = final_agent_result(
+            conversation,
+            exclude_event_ids=existing_event_ids,
+        )
+        summary_tokens = _result_token_count(llm, summary)
+        if not 0 < summary_tokens <= MAX_INLINE_CHILD_RESULT_TOKENS:
+            raise RuntimeError(
+                "summary token count is unavailable or exceeds the child result limit"
+            )
+    except Exception as error:
+        raise RuntimeError(
+            f"oversized child report saved at {artifact}; summarization failed"
+        ) from error
+    return f"{summary}\n\nFull report: {artifact}"
 
 
 def _activate_inbox_turn(
@@ -1626,6 +1760,7 @@ def run_openhands(
     inbox_turn_id: str | None = None,
     recovery_prompt: str | None = None,
     on_activity: Callable[[], None] | None = None,
+    on_inference_state: (Callable[[float | None, float | None], None] | None) = None,
 ) -> int:
     if (inbox is None) != (inbox_turn_id is None):
         raise ValueError("inbox and inbox_turn_id must be provided together")
@@ -1684,6 +1819,7 @@ def run_openhands(
                 "fast_reasoning_effort": config.fast_reasoning_effort,
                 "frontier_model": config.frontier_model,
                 "frontier_reasoning_effort": config.frontier_reasoning_effort,
+                "compaction_trigger_tokens": config.compaction_trigger_tokens,
                 "prompt_cache": (
                     prompt_cache_configuration(config.model)
                     or {"provider_default": True}
@@ -1722,6 +1858,7 @@ def run_openhands(
     )
 
     if config.github_token is not None:
+        # The one-shot handoff is read after trace initialization.
         register_trace_secret(config.github_token.get_secret_value())
         configure_github_credentials(
             config.github_repo,
@@ -1731,9 +1868,15 @@ def run_openhands(
     configure_delegation(delegation_config(config, deadline_epoch=run_deadline))
     scrub_github_credentials(os.environ)
     conversation = None
+    inference_heartbeat = None
     cleanup_error: BaseException | None = None
     active_inbox_turn_id = inbox_turn_id
     try:
+        inference_heartbeat = (
+            InferenceHeartbeat(on_inference_state)
+            if on_inference_state is not None
+            else None
+        )
         llm = LLM(
             model=config.model,
             api_key=config.api_key,
@@ -1746,11 +1889,14 @@ def run_openhands(
             **model_runtime_configuration(
                 config.model,
                 config.reasoning_effort,
+                compaction_trigger_tokens=config.compaction_trigger_tokens,
                 wandb_entity=config.wandb_entity,
                 wandb_project=config.wandb_project,
             ),
         )
         require_exact_tokenizer(llm)
+        if inference_heartbeat is not None:
+            llm.set_request_scope(inference_heartbeat.request)
         if config.agent_name:
             definition = depth_aware_child_definition(
                 find_named_agent(config.agent_name, file_agents),
@@ -1764,9 +1910,9 @@ def run_openhands(
             agent = agent.model_copy(
                 update={
                     "llm": apply_reasoning_profile(agent.llm),
-                    "agent_context": (
-                        agent.agent_context or AgentContext()
-                    ).model_copy(update={"skills": resolved_skills}),
+                    "agent_context": (agent.agent_context or AgentContext()).model_copy(
+                        update={"skills": resolved_skills}
+                    ),
                 }
             )
             require_exact_tokenizer(agent.llm)
@@ -1842,7 +1988,7 @@ def run_openhands(
             callbacks=[] if config.child else [observe_event],
             max_iteration_per_run=config.max_turns,
             visualizer=None,
-            secrets=dict(config.command_secrets),
+            secrets=dict(config.conversation_secrets),
             tags={"runtime": "senpai-openhands"},
             delete_on_close=config.child,
             prompt_cache_key=conversation_prompt_cache_key(config),
@@ -1922,9 +2068,7 @@ def run_openhands(
                 inbox.record_inference_attempt(active_inbox_turn_id)
             with graceful_interrupts(conversation) as stop_requested:
                 if not config.child:
-                    with AdvisorEventStore(
-                        local_event_db_path(config)
-                    ) as event_store:
+                    with LocalEventStore(local_event_db_path(config)) as event_store:
                         event_pump = AdvisorEventPump(
                             event_store,
                             conversation,
@@ -1960,6 +2104,14 @@ def run_openhands(
             if config.child and status == ConversationExecutionStatus.FINISHED
             else None
         )
+        if child_result is not None:
+            child_result = compact_child_result(
+                conversation,
+                agent.llm,
+                config,
+                child_result,
+                run_deadline,
+            )
     finally:
         primary_exception = sys.exc_info()[1]
         primary_error = primary_exception is not None
@@ -1994,6 +2146,8 @@ def run_openhands(
                         cleanup_error = error
         clear_github_credentials()
         configure_delegation(None)
+        if inference_heartbeat is not None:
+            inference_heartbeat.close()
         if conversation is not None:
             conversation.close()
         if cleanup_error is not None and not primary_error:
@@ -2027,9 +2181,11 @@ def run_openhands(
         and active_inbox_turn_id is not None
         and inbox.latest_turn(active_inbox_turn_id).state is DeliveryState.PROCESSED
     )
-    return 0 if (
-        status == ConversationExecutionStatus.FINISHED or durable_turn_processed
-    ) else 1
+    return (
+        0
+        if (status == ConversationExecutionStatus.FINISHED or durable_turn_processed)
+        else 1
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

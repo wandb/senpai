@@ -21,6 +21,8 @@ def test_default_fleet_is_four_students_with_one_gpu_each():
     assert args.n_students == 4
     assert args.gpus_per_student == 1
     assert args.program_path == ""
+    assert args.timeout_minutes == 30
+    assert args.max_epochs == 50
 
 
 @pytest.mark.parametrize("backend", ["kubernetes", "docker", "aws"])
@@ -113,6 +115,12 @@ def test_each_role_receives_authoritative_launch_context(role):
         "Hard limits for each training run: `20` minutes wall-clock and `9` epochs"
         in context
     )
+    if role == "student":
+        assert data["SENPAI_TIMEOUT_MINUTES"] == "20"
+        assert data["SENPAI_MAX_EPOCHS"] == "9"
+    else:
+        assert "SENPAI_TIMEOUT_MINUTES" not in data
+        assert "SENPAI_MAX_EPOCHS" not in data
     assert "Prefer small, measurable experiments." not in context
     assert operator == "Prefer small, measurable experiments."
 

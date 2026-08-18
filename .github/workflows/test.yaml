@@ -36,8 +36,8 @@ jobs:
             "exa-py @ https://github.com/exa-labs/exa-py/archive/71f315b4be07d474df128c8fafc70cc7d0e47b56.tar.gz" \
             "weave>=0.53.1,<0.54" \
             "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@c1e9cda697e10ee92e5629b19c7d81cac8bcf54b" \
-            "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@33608f0b8242ca0e1f6251efc8f535e249cd6101#subdirectory=openhands-sdk" \
-            "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@33608f0b8242ca0e1f6251efc8f535e249cd6101#subdirectory=openhands-tools"
+            "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@f69134273ee3a31a233d6201786570eb9c4c141b#subdirectory=openhands-sdk" \
+            "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@f69134273ee3a31a233d6201786570eb9c4c141b#subdirectory=openhands-tools"
 
       - name: Test the complete control plane (no cluster)
         run: .venv/bin/python -m pytest

@@ -80,9 +80,24 @@ HF_TOKEN=
 | `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. |
 | `HF_TOKEN` | Optional access to private or gated Hugging Face models and datasets. It is omitted from launch secrets when unset. |
 
+To add another credential, put its value in `.env` and list its name in the
+launch configuration:
+
+```dotenv
+DATASET_LICENSE_KEY=abc123
+```
+
+```yaml
+custom_secret_env_names: [DATASET_LICENSE_KEY]
+```
+
+The credential is available to every advisor, student, and delegated child;
+its value is redacted from tool output and traces.
+
 `k8s/launch.py` reads shell environment variables first and then the
 repository-root `.env`; only the GitHub token also falls back to `gh auth
-token`.
+token`. Direct Docker or host execution that bypasses the launcher must export
+or pass credentials explicitly.
 
 Kubernetes stores runtime credentials in a per-launch Secret. Docker stores
 them in private local run state; AWS sends them over SSH into the same private
@@ -136,6 +151,8 @@ program_path: ""  # auto-discover, or set e.g. senpai/program.md
 wandb_entity: your-team
 wandb_project: your-project
 
+custom_secret_env_names: [DATASET_LICENSE_KEY]  # values come from .env
+
 advisor_model: openai/gpt-5.6-sol
 advisor_reasoning_effort: xhigh
 student_model: openai/gpt-5.6-sol
@@ -147,6 +164,7 @@ fast_model: openai/gpt-5.6-luna
 fast_reasoning_effort: high
 frontier_model: openai/gpt-5.6-sol
 frontier_reasoning_effort: max
+compaction_trigger_tokens: 200000
 local_condenser_max_events: 0
 local_condenser_max_tokens: 0
 local_condenser_target_events: 0
@@ -169,12 +187,15 @@ example, configure Claude Fable 5 as `anthropic/claude-fable-5`. Anthropic
 provider-native and is sent as `output_config.effort: max`; it does not enable
 OpenAI Pro mode.
 
+`compaction_trigger_tokens` sets the provider-native compaction trigger for
+OpenAI and Anthropic models. Providers without native compaction use Senpai's
+local summarizing condenser.
+
 W&B Inference uses LiteLLM's native `wandb/` provider. For example, set every
 model profile to `wandb/zai-org/GLM-5.2` with reasoning effort `max`. Senpai
 uses `WANDB_API_KEY`, routes requests through the W&B chat endpoint, explicitly
 enables GLM thinking, and sends
 `OpenAI-Project: <wandb_entity>/<wandb_project>` on every request.
-Providers without native compaction use Senpai's local summarizing condenser.
 Zero selects model-specific defaults for each of its three limits. Unknown
 local models retain the existing 80-event fallback with token and target limits
 disabled. W&B GLM-5.2 instead uses its exact `zai-org/GLM-5.2` chat-template
@@ -631,7 +652,7 @@ flowchart LR
 
 The structured result records its terminal status, exact result commit, W&B run IDs and URLs, bounded conclusion, and baseline/candidate metric comparison when available. Once published for an assignment revision and head, that evidence is immutable: exact duplicate publication is an idempotent replay, while changed evidence requires a new commit or revision. Non-revision feedback continues the same student conversation; a revision request intentionally creates a fresh revision identity and conversation.
 
-`status:wip` owns a student compute slot; `status:review` does not. The advisor can therefore review one result while that student starts another experiment. Sibling assignment mutations within one worker are serialized end to end, including advisor-base publication and student preflight, push, and result publication. Across advisor and student workers, exact assignment, revision, head, and branch-lease preconditions detect stale work; if a revision wins during result publication, SENPAI restores the current revision's WIP routing before returning the stale-result error.
+A student cannot receive another assignment while an open assignment has `status:wip` or `status:review`. The student becomes available after the advisor merges or closes the PR. Sibling assignment mutations within one worker are serialized end to end, including advisor-base publication and student preflight, push, and result publication. Across advisor and student workers, exact assignment, revision, head, and branch-lease preconditions detect stale work; if a revision wins during result publication, SENPAI restores the current revision's WIP routing before returning the stale-result error.
 
 Trusted collaborator comments, submitted reviews, and inline review comments are delivered automatically to the relevant student; feedback from untrusted authors and unrecognized bots is ignored. `get_prs` can still retrieve the complete discussion explicitly. If the configured research base changes while an experiment is running, SENPAI emits `research_base_changed` with the assignment's `required_base_sha` and the live `current_base_sha` without cancelling the assignment. When reviewing its terminal result, the advisor either requests a revision on the current base or records why that exact result remains valid with `accept_result_on_current_base`; `merge_experiment` still verifies the live SHA immediately before merging.
 
@@ -841,7 +862,7 @@ Useful launch controls:
 
 - `--names frieren,fern` selects stable students; otherwise use `--n_students` and `--student_prefix`.
 - `--gpus_per_student`, `--cpu_per_gpu`, and `--memory_gi_per_gpu` size each student.
-- `--timeout_minutes` and `--max_epochs` are hard per-training limits.
+- `--timeout_minutes` and `--max_epochs` are hard per-job limits and are also rendered into the agent-facing launch context.
 - `--poll_interval_s` and `--poll_jitter_s` control idle GitHub cadence without teaching the model to poll.
 - `--gh_history_scope branch` keeps normal advisor-branch memory, `fresh` creates a shallow ablation checkout, and `repo` exposes full repository history.
 - `--extra_instructions` accepts optional human operator guidance as a Markdown file or literal user context.
