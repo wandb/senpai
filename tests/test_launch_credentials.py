@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import subprocess
 import urllib.error
 import urllib.parse
 
@@ -32,6 +33,71 @@ def capture_request(monkeypatch, payload):
 
     monkeypatch.setattr(launch_helpers.urllib.request, "urlopen", urlopen)
     return captured
+
+
+def test_custom_secrets_resolve_only_the_explicit_allowlist(monkeypatch, tmp_path):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(
+        'SHELL_SECRET="dotenv-value"\n'
+        'DOTENV_SECRET="${MUST_STAY_LITERAL}"\n'
+        "UNLISTED_SECRET=dotenv-unlisted\n"
+    )
+    monkeypatch.setenv("SHELL_SECRET", "shell-value")
+    monkeypatch.setenv("UNLISTED_SECRET", "shell-unlisted")
+
+    resolved = launch_helpers.resolve_custom_secrets(
+        dotenv, ["SHELL_SECRET", "DOTENV_SECRET"]
+    )
+
+    assert resolved == {
+        "SHELL_SECRET": "shell-value",
+        "DOTENV_SECRET": "${MUST_STAY_LITERAL}",
+    }
+
+
+def test_custom_secrets_fall_back_from_blank_shell_values(monkeypatch, tmp_path):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("HF_TOKEN=dotenv-token\n")
+    monkeypatch.setenv("HF_TOKEN", " \t")
+
+    assert launch_helpers.resolve_custom_secrets(dotenv, ["HF_TOKEN"]) == {
+        "HF_TOKEN": "dotenv-token"
+    }
+
+
+def test_custom_secrets_report_every_missing_or_blank_name(monkeypatch, tmp_path):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("BLANK_SECRET=\n")
+    monkeypatch.delenv("MISSING_SECRET", raising=False)
+    monkeypatch.delenv("BLANK_SECRET", raising=False)
+
+    with pytest.raises(SystemExit) as raised:
+        launch_helpers.resolve_custom_secrets(
+            dotenv, ["MISSING_SECRET", "BLANK_SECRET"]
+        )
+
+    message = str(raised.value)
+    assert "MISSING_SECRET" in message
+    assert "BLANK_SECRET" in message
+
+
+def test_github_cli_fallback_does_not_inherit_custom_secrets(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("HF_TOKEN", "custom-secret")
+    monkeypatch.setenv("VISIBLE_SETTING", "safe")
+
+    def run(argv, **kwargs):
+        captured.update(argv=argv, kwargs=kwargs)
+        return subprocess.CompletedProcess(argv, 0, "github-token\n", "")
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+
+    token = launch_helpers.resolve_github_token(tmp_path / "missing.env", ["HF_TOKEN"])
+
+    assert token == "github-token"
+    assert "HF_TOKEN" not in captured["kwargs"]["env"]
+    assert captured["kwargs"]["env"]["VISIBLE_SETTING"] == "safe"
 
 
 def test_openai_preflight_authenticates_against_the_models_endpoint(monkeypatch):

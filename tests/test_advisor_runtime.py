@@ -11,9 +11,7 @@ from openhands.sdk.event import ActionEvent, ObservationEvent
 from openhands.sdk.llm import MessageToolCall
 
 from senpai_agent.advisor import (
-    AdvisorEvent,
     AdvisorEventPump,
-    AdvisorEventStore,
     advisor_conversation_id,
     advisor_main,
     deliver_pending_events,
@@ -21,6 +19,7 @@ from senpai_agent.advisor import (
 from senpai_agent.delegation import AgentStatusAction, AgentStatusObservation
 from senpai_agent.hooks import queued_feedback_marker
 from senpai_agent.inbox import PersistentInbox, deliver_turn_messages
+from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import ControllerEvent
 
 
@@ -153,20 +152,20 @@ def test_advisor_conversation_id_write_preserves_the_previous_value_on_crash(
 
 def test_event_store_deduplicates_and_survives_reopen(tmp_path: Path):
     database = tmp_path / "advisor-events.sqlite3"
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="review_ready",
         dedupe_key="review_ready:3467:abc123",
         payload={"pr": 3467, "head_sha": "abc123"},
     )
 
-    with AdvisorEventStore(database) as store:
+    with LocalEventStore(database) as store:
         assert store.enqueue(event) is True
         assert store.pending_count() == 1
         assert store.enqueue(event) is False
         with pytest.raises(RuntimeError, match="reused with a different payload"):
             store.enqueue(event.model_copy(update={"payload": {"pr": 999}}))
 
-    with AdvisorEventStore(database) as reopened:
+    with LocalEventStore(database) as reopened:
         pending = reopened.pending()
         assert pending == [event]
         reopened.acknowledge(event.dedupe_key)
@@ -174,8 +173,34 @@ def test_event_store_deduplicates_and_survives_reopen(tmp_path: Path):
         assert reopened.pending() == []
 
 
+def test_event_store_discards_absent_level_triggers(tmp_path: Path):
+    database = tmp_path / "advisor-events.sqlite3"
+    stale = LocalEvent(
+        kind="student_available_for_assignment",
+        dedupe_key="student_available_for_assignment:Fern",
+        payload={"student": "Fern"},
+    )
+    retained = stale.model_copy(
+        update={
+            "dedupe_key": "student_available_for_assignment:Frieren",
+            "payload": {"student": "Frieren"},
+        }
+    )
+
+    with LocalEventStore(database) as store:
+        assert store.enqueue(stale) is True
+        assert store.enqueue(retained) is True
+        store.acknowledge(stale.dedupe_key)
+        assert store.discard_prefix(
+            "student_available_for_assignment:",
+            retained_keys=(retained.dedupe_key,),
+        ) == 1
+        assert store.enqueue(stale) is True
+        assert store.enqueue(retained) is False
+
+
 def test_event_message_renders_observation_time_and_structured_payload():
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="review_ready",
         dedupe_key="review_ready:17:abc",
         payload={
@@ -198,12 +223,12 @@ def test_event_message_renders_observation_time_and_structured_payload():
 
 
 def test_deliver_pending_events_acknowledges_only_messages_sent(tmp_path: Path):
-    first = AdvisorEvent(
+    first = LocalEvent(
         kind="review_ready",
         dedupe_key="review_ready:11:ddd",
         payload={"pr": 11},
     )
-    second = AdvisorEvent(
+    second = LocalEvent(
         kind="agent_result",
         dedupe_key="agent_result:task-1",
         payload={"task_id": "task-1"},
@@ -219,7 +244,7 @@ def test_deliver_pending_events_acknowledges_only_messages_sent(tmp_path: Path):
                 raise RuntimeError("conversation unavailable")
             self.messages.append(message)
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         store.enqueue(first)
         store.enqueue(second)
         conversation = Conversation()
@@ -234,7 +259,7 @@ def test_deliver_pending_events_acknowledges_only_messages_sent(tmp_path: Path):
 def test_event_pump_keeps_events_queued_while_a_tool_action_is_unmatched(
     tmp_path: Path,
 ):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="agent_result",
         dedupe_key="agent_result:task-1",
         payload={"task_id": "task-1"},
@@ -248,7 +273,7 @@ def test_event_pump_keeps_events_queued_while_a_tool_action_is_unmatched(
         def send_message(self, message: str) -> None:
             self.messages.append(message)
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         store.enqueue(event)
         conversation = Conversation()
 
@@ -262,7 +287,7 @@ def test_event_pump_keeps_events_queued_while_a_tool_action_is_unmatched(
 def test_event_pump_delivers_queued_event_after_the_tool_boundary_is_safe(
     tmp_path: Path,
 ):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="agent_result",
         dedupe_key="agent_result:task-1",
         payload={"task_id": "task-1"},
@@ -279,7 +304,7 @@ def test_event_pump_delivers_queued_event_after_the_tool_boundary_is_safe(
             self.messages.append(message)
             self.received.set()
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         store.enqueue(event)
         conversation = Conversation()
         with AdvisorEventPump(store, conversation, poll_interval=0.01):
@@ -297,7 +322,7 @@ def test_event_pump_delivers_queued_event_after_the_tool_boundary_is_safe(
 def test_event_pump_injects_new_events_while_conversation_is_running(
     tmp_path: Path,
 ):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="review_ready",
         dedupe_key="review_ready:12:eee",
         payload={"pr": 12},
@@ -311,7 +336,7 @@ def test_event_pump_injects_new_events_while_conversation_is_running(
         def send_message(self, message: str) -> None:
             self.messages.append(message)
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         conversation = Conversation()
         with AdvisorEventPump(store, conversation, poll_interval=0.01):
             store.enqueue(event)
@@ -331,7 +356,7 @@ def test_event_pump_queues_into_the_controller_inbox_without_mid_turn_injection(
     Requirement: controller and event-pump messages use one durable inbox.
     Interface: AdvisorEventPump, PersistentInbox, and the active conversation.
     """
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="agent_result",
         dedupe_key="agent_result:task-1",
         payload={"task_id": "task-1"},
@@ -348,7 +373,7 @@ def test_event_pump_queues_into_the_controller_inbox_without_mid_turn_injection(
             self.messages.append(message)
             self.received.set()
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         store.enqueue(event)
         conversation = Conversation()
         inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
@@ -387,7 +412,7 @@ def test_event_pump_queues_into_the_controller_inbox_without_mid_turn_injection(
 
 def test_event_pump_accepts_an_in_memory_inbox(tmp_path: Path):
     with (
-        AdvisorEventStore(tmp_path / "events.sqlite3") as store,
+        LocalEventStore(tmp_path / "events.sqlite3") as store,
         PersistentInbox() as inbox,
     ):
         AdvisorEventPump(
@@ -399,7 +424,7 @@ def test_event_pump_accepts_an_in_memory_inbox(tmp_path: Path):
 
 
 def test_human_issue_steers_the_active_turn_after_the_tool_boundary(tmp_path: Path):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
         payload={"message": "Change direction."},
@@ -407,7 +432,7 @@ def test_human_issue_steers_the_active_turn_after_the_tool_boundary(tmp_path: Pa
     inbox, active, conversation = active_steering_turn(tmp_path)
     conversation.state.acquire()
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         pump = AdvisorEventPump(
             store,
             conversation,
@@ -434,7 +459,7 @@ def test_human_issue_steers_the_active_turn_after_the_tool_boundary(tmp_path: Pa
 def test_student_feedback_waits_for_the_step_and_marks_a_clean_unwind(
     tmp_path: Path,
 ):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="student_pr_feedback",
         dedupe_key="student_pr_feedback:1",
         payload={"message": "Try the narrower experiment next."},
@@ -443,7 +468,7 @@ def test_student_feedback_waits_for_the_step_and_marks_a_clean_unwind(
     marker = queued_feedback_marker(inbox.path.parent)
     conversation.state.acquire()
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         pump = AdvisorEventPump(
             store,
             conversation,
@@ -478,8 +503,50 @@ def test_student_feedback_waits_for_the_step_and_marks_a_clean_unwind(
     assert conversation.messages[-1] == event.to_inbox_message()
 
 
+def test_review_ready_waits_for_the_step_without_interrupting_current_work(
+    tmp_path: Path,
+):
+    event = LocalEvent(
+        kind="review_ready",
+        dedupe_key="review_ready:29:abc123",
+        payload={"pr": 29, "head_sha": "abc123"},
+    )
+    inbox, active, conversation = active_steering_turn(tmp_path)
+    conversation.state.acquire()
+
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
+        pump = AdvisorEventPump(
+            store,
+            conversation,
+            poll_interval=0.01,
+            inbox=inbox,
+            conversation_id=STEERING_CONVERSATION_ID,
+        )
+        assert pump.prepare_run()
+        pump.run_started()
+        with pump:
+            store.enqueue(event)
+            deadline = time.monotonic() + 1
+            while store.pending() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert store.pending() == []
+            assert not conversation.paused.wait(0.03)
+            assert conversation.interrupts == 0
+            conversation.state.release()
+            assert conversation.paused.wait(1)
+            assert pump.finish_run()
+
+    assert conversation.pauses == 1
+    assert conversation.interrupts == 0
+    assert inbox.turn(active.turn_id).event_keys == (
+        "controller:event",
+        event.dedupe_key,
+    )
+    assert conversation.messages[-1] == event.to_inbox_message()
+
+
 def test_student_feedback_waits_for_a_starting_run_to_leave_idle(tmp_path: Path):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="student_pr_feedback",
         dedupe_key="student_pr_feedback:1",
         payload={"message": "Try the narrower experiment next."},
@@ -487,7 +554,7 @@ def test_student_feedback_waits_for_a_starting_run_to_leave_idle(tmp_path: Path)
     inbox, _active, conversation = active_steering_turn(tmp_path)
     conversation.state.execution_status = ConversationExecutionStatus.IDLE
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         pump = AdvisorEventPump(
             store,
             conversation,
@@ -509,12 +576,12 @@ def test_student_feedback_waits_for_a_starting_run_to_leave_idle(tmp_path: Path)
 
 
 def test_human_issue_upgrades_queued_feedback_to_an_interrupt(tmp_path: Path):
-    feedback = AdvisorEvent(
+    feedback = LocalEvent(
         kind="student_pr_feedback",
         dedupe_key="student_pr_feedback:1",
         payload={"message": "Try the narrower experiment next."},
     )
-    instruction = AdvisorEvent(
+    instruction = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
         payload={"message": "Stop and inspect the latest frontier now."},
@@ -523,7 +590,7 @@ def test_human_issue_upgrades_queued_feedback_to_an_interrupt(tmp_path: Path):
     marker = queued_feedback_marker(inbox.path.parent)
     conversation.state.acquire()
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         pump = AdvisorEventPump(
             store,
             conversation,
@@ -555,17 +622,17 @@ def test_human_issue_upgrades_queued_feedback_to_an_interrupt(tmp_path: Path):
 
 
 def test_human_issue_interrupts_a_tool_after_the_steering_grace(tmp_path: Path):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
         payload={"message": "Change direction now."},
     )
-    paired = AdvisorEvent(
+    paired = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:paired",
         payload={"message": "Keep this paired instruction too."},
     )
-    followup = AdvisorEvent(
+    followup = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:2",
         payload={"message": "And preserve the current workspace."},
@@ -573,7 +640,7 @@ def test_human_issue_interrupts_a_tool_after_the_steering_grace(tmp_path: Path):
     inbox, _active, conversation = active_steering_turn(tmp_path)
     conversation.state.acquire()
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         pump = AdvisorEventPump(
             store,
             conversation,
@@ -608,14 +675,14 @@ def test_human_issue_interrupts_a_tool_after_the_steering_grace(tmp_path: Path):
 def test_human_issue_before_run_is_delivered_without_starting_then_cancelling(
     tmp_path: Path,
 ):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
         payload={"message": "Use this direction first."},
     )
     inbox, _active, conversation = active_steering_turn(tmp_path)
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         pump = AdvisorEventPump(
             store,
             conversation,
@@ -635,14 +702,14 @@ def test_human_issue_before_run_is_delivered_without_starting_then_cancelling(
 
 
 def test_student_feedback_does_not_resume_an_unrelated_pause(tmp_path: Path):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="student_pr_feedback",
         dedupe_key="student_pr_feedback:1",
         payload={"message": "Use this after restart."},
     )
     inbox, _active, conversation = active_steering_turn(tmp_path)
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         pump = AdvisorEventPump(
             store,
             conversation,
@@ -673,14 +740,14 @@ def test_human_issue_interrupts_a_run_with_stale_persisted_status(
     tmp_path: Path,
     status: ConversationExecutionStatus,
 ):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
         payload={"message": "Stop the newly starting run."},
     )
     inbox, _active, conversation = active_steering_turn(tmp_path)
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         pump = AdvisorEventPump(
             store,
             conversation,
@@ -715,14 +782,14 @@ def test_human_issue_does_not_claim_a_cleanly_ended_run_was_interrupted(
     tmp_path: Path,
     status: ConversationExecutionStatus,
 ):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
         payload={"message": "Apply this next."},
     )
     inbox, _active, conversation = active_steering_turn(tmp_path)
     conversation.state.execution_status = status
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         pump = AdvisorEventPump(
             store,
             conversation,
@@ -744,7 +811,7 @@ def test_human_issue_does_not_claim_a_cleanly_ended_run_was_interrupted(
 
 
 def test_human_issue_joins_a_failed_turn_for_its_retry(tmp_path: Path):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
         payload={"message": "Recover with this direction."},
@@ -767,7 +834,7 @@ def test_human_issue_joins_a_failed_turn_for_its_retry(tmp_path: Path):
     assert active is not None
     conversation = Conversation()
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         store.enqueue(event)
         with AdvisorEventPump(
             store,
@@ -791,7 +858,7 @@ def test_human_issue_joins_a_failed_turn_for_its_retry(tmp_path: Path):
 def test_non_finished_turn_leaves_delivered_child_result_pending(
     tmp_path: Path,
 ):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="agent_result",
         dedupe_key="agent_result:task-1",
         payload={"task_id": "task-1"},
@@ -809,7 +876,7 @@ def test_non_finished_turn_leaves_delivered_child_result_pending(
             self.messages.append(message)
             self.received.set()
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         store.enqueue(event)
         conversation = Conversation()
 
@@ -825,12 +892,12 @@ def test_event_pump_routes_child_results_to_their_parent_conversation(
 ):
     first_parent = "00000000-0000-0000-0000-000000000001"
     second_parent = "00000000-0000-0000-0000-000000000002"
-    first = AdvisorEvent(
+    first = LocalEvent(
         kind="agent_result",
         dedupe_key="agent_result:first",
         payload={"parent_conversation_id": first_parent},
     )
-    second = AdvisorEvent(
+    second = LocalEvent(
         kind="agent_result",
         dedupe_key="agent_result:second",
         payload={"parent_conversation_id": second_parent},
@@ -844,7 +911,7 @@ def test_event_pump_routes_child_results_to_their_parent_conversation(
         def send_message(self, message: str) -> None:
             self.messages.append(message)
 
-    with AdvisorEventStore(tmp_path / "student-events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "student-events.sqlite3") as store:
         store.enqueue(first)
         store.enqueue(second)
         conversation = Conversation()
@@ -865,7 +932,7 @@ def test_event_pump_routes_child_results_to_their_parent_conversation(
 def test_event_pump_surfaces_delivery_failure_and_leaves_event_pending(
     tmp_path: Path,
 ):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="review_ready",
         dedupe_key="review_ready:13:fff",
         payload={"pr": 13},
@@ -878,7 +945,7 @@ def test_event_pump_surfaces_delivery_failure_and_leaves_event_pending(
         def send_message(self, _message: str) -> None:
             raise RuntimeError("conversation rejected event")
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         store.enqueue(event)
         with (
             pytest.raises(RuntimeError, match="conversation rejected event"),
@@ -896,7 +963,7 @@ def test_event_pump_failure_after_arming_interrupts_again_when_the_run_starts(
     tmp_path: Path,
 ):
     conversation = SteeringConversation()
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         pump = AdvisorEventPump(store, conversation)
         assert pump.prepare_run()
         pump._fail(RuntimeError("pump failed before run startup"))
@@ -911,14 +978,14 @@ def test_event_pump_surfaces_a_mid_batch_failure_without_boundary_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
         payload={"message": "Change direction."},
     )
     inbox, _active, conversation = active_steering_turn(tmp_path)
 
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         def fail_acknowledgement(_dedupe_key: str) -> None:
             raise RuntimeError("inbox acknowledgement failed")
 
@@ -946,7 +1013,7 @@ def test_event_pump_surfaces_a_mid_batch_failure_without_boundary_timeout(
 def test_event_pump_surfaces_a_queue_boundary_failure_and_unwinds_the_run(
     tmp_path: Path,
 ):
-    event = AdvisorEvent(
+    event = LocalEvent(
         kind="student_pr_feedback",
         dedupe_key="student_pr_feedback:1",
         payload={"message": "Apply this next."},
@@ -957,7 +1024,7 @@ def test_event_pump_surfaces_a_queue_boundary_failure_and_unwinds_the_run(
         raise RuntimeError("conversation pause failed")
 
     conversation.pause = fail_pause
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
         pump = AdvisorEventPump(
             store,
             conversation,
@@ -980,9 +1047,9 @@ def test_advisor_cli_reports_the_pending_event_count(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ):
-    with AdvisorEventStore(tmp_path / "advisor-events.sqlite3") as store:
+    with LocalEventStore(tmp_path / "advisor-events.sqlite3") as store:
         store.enqueue(
-            AdvisorEvent(
+            LocalEvent(
                 kind="review_ready",
                 dedupe_key="review_ready:1:a",
                 payload={"pr": 1},
@@ -1010,10 +1077,25 @@ def test_inbox_rendering_excludes_transport_only_parent_conversation_id():
         dedupe_key="feedback:17",
         payload=payload,
     )
-    watcher_event = AdvisorEvent(
+    watcher_event = LocalEvent(
         kind=controller_event.kind,
         dedupe_key=controller_event.dedupe_key,
         payload={**payload, "parent_conversation_id": "conversation-17"},
+    )
+
+    assert watcher_event.to_inbox_message() == controller_event.to_prompt()
+
+
+def test_student_availability_rendering_matches_controller_and_watcher_paths():
+    controller_event = ControllerEvent(
+        kind="student_available_for_assignment",
+        dedupe_key="student_available_for_assignment:qwen-edward",
+        payload={"student": "qwen-edward"},
+    )
+    watcher_event = LocalEvent(
+        kind=controller_event.kind,
+        dedupe_key=controller_event.dedupe_key,
+        payload=controller_event.payload,
     )
 
     assert watcher_event.to_inbox_message() == controller_event.to_prompt()

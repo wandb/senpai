@@ -12,6 +12,7 @@ from pydantic import SecretStr
 
 import senpai_agent.supervisor as supervisor_module
 from senpai_agent.supervisor import (
+    ProgressLease,
     SupervisorConfig,
     WorkerLease,
     WorkerSupervisor,
@@ -51,6 +52,52 @@ def test_supervisor_default_termination_grace_is_sixty_seconds():
 
 def test_supervisor_caps_repeated_restart_backoff_at_five_minutes():
     assert SupervisorConfig().max_backoff_seconds == 300
+
+
+def test_inference_heartbeat_is_observational_controller_state(tmp_path: Path):
+    lease_path = tmp_path / "controller-lease.json"
+    progress = ProgressLease(lease_path)
+    progress.update("openhands-turn", 300)
+    initial = WorkerLease.read(lease_path)
+
+    progress.update_llm_request(1_755_000_000.0, 1_755_000_001.0)
+    active = WorkerLease.read(lease_path)
+
+    assert active.phase == initial.phase
+    assert active.deadline == initial.deadline
+    assert active.completed_turns == initial.completed_turns
+    assert active.llm_request_started_at == 1_755_000_000.0
+    assert active.llm_request_heartbeat_at == 1_755_000_001.0
+
+    progress.update_llm_request(1_755_000_000.0, 1_755_000_030.0)
+    pulsed = WorkerLease.read(lease_path)
+    assert pulsed.deadline == initial.deadline
+    assert pulsed.llm_request_started_at == active.llm_request_started_at
+    assert pulsed.llm_request_heartbeat_at == 1_755_000_030.0
+
+    progress.update_llm_request(None, None)
+    idle = WorkerLease.read(lease_path)
+    assert idle.deadline == initial.deadline
+    assert idle.llm_request_started_at is None
+    assert idle.llm_request_heartbeat_at is None
+
+
+def test_worker_lease_reads_legacy_state_without_inference_fields(tmp_path: Path):
+    lease_path = tmp_path / "controller-lease.json"
+    lease_path.write_text(
+        json.dumps(
+            {
+                "pid": 123,
+                "phase": "poll",
+                "deadline": 456.0,
+            }
+        )
+    )
+
+    lease = WorkerLease.read(lease_path)
+
+    assert lease.llm_request_started_at is None
+    assert lease.llm_request_heartbeat_at is None
 
 
 def test_supervisor_snapshots_program_and_rendered_role_before_starting_workers(

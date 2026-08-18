@@ -59,6 +59,10 @@ def render_role(role: str, args: launch.Args | None = None) -> tuple[str, str, s
         "wandb",
         anthropic_api_key="anthropic" if "anthropic" in providers else None,
         openai_api_key="openai" if "openai" in providers else None,
+        custom_secrets={
+            name: f"{name.lower()}-secret"
+            for name in args.custom_secret_env_names
+        },
     )
     template = (ROOT / "k8s" / f"{role}-deployment.yaml").read_text()
     if role == "student":

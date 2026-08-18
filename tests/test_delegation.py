@@ -11,7 +11,6 @@ import pytest
 import psutil
 from openhands.sdk.llm import Message, TextContent
 
-from senpai_agent.advisor import AdvisorEventStore
 from senpai_agent.delegation import (
     AgentTask,
     DelegationConfig,
@@ -27,8 +26,10 @@ from senpai_agent.launch_context import (
     LAUNCH_CONTEXT_ENV,
     PLACEHOLDER,
 )
+from senpai_agent.local_events import LocalEventStore
 from senpai_agent.openhands_runner import delegation_config as runner_delegation_config
 from senpai_agent.program_context import PROGRAM_PATH_ENV
+from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV
 from senpai_agent.supervisor import prepare_system_context_environment
 from openhands_support import runtime_config
 
@@ -81,13 +82,14 @@ def delegation_config(tmp_path: Path, **updates) -> DelegationConfig:
         "frontier_reasoning_effort": "max",
         "frontier_api_key_env": "OPENAI_API_KEY",
         "frontier_api_key": "openai-secret",
+        "compaction_trigger_tokens": 200_000,
         "github_repo": "acme/widgets",
         "github_trusted_actor": None,
         "role_file": tmp_path / "ADVISOR.md",
         "harness_file": tmp_path / "SENPAI-HARNESS.md",
         "plugin_dir": tmp_path / "plugin",
         "enable_browser": True,
-        "command_secrets": {"EXA_API_KEY": "exa-secret"},
+        "conversation_secrets": {"EXA_API_KEY": "exa-secret"},
         "role": "advisor",
         "program_path": "program.md",
         "launch_context": "# Authoritative launch context\n\nSystem policy.",
@@ -223,6 +225,7 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
     assert fast.environment["SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT"] == (
         config.frontier_reasoning_effort
     )
+    assert fast.environment["SENPAI_COMPACTION_TRIGGER_TOKENS"] == "200000"
 
 
 def test_child_environment_carries_the_resolved_program_path(tmp_path: Path):
@@ -304,6 +307,34 @@ def test_child_environment_replaces_ambient_model_credentials(
     assert environment["ANTHROPIC_API_KEY"] == "anthropic-secret"
     assert environment["OPENAI_API_KEY"] == "openai-secret"
     assert "GEMINI_API_KEY" not in environment
+
+
+def test_child_environment_carries_only_configured_custom_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv(CUSTOM_SECRET_ENV_NAMES_ENV, "STALE_AUTH")
+    monkeypatch.setenv("STALE_AUTH", "stale-secret")
+    config = delegation_config(
+        tmp_path,
+        conversation_secrets={
+            "EXA_API_KEY": "exa-secret",
+            "PRIVATE_AUTH": "private-secret",
+            "REGISTRY_API_KEY": "registry-secret",
+        },
+    )
+
+    environment = OpenHandsChildProcess(
+        config,
+        delegation_request(model="fast", agent="general-purpose"),
+    ).environment
+
+    assert environment[CUSTOM_SECRET_ENV_NAMES_ENV] == (
+        "PRIVATE_AUTH,REGISTRY_API_KEY"
+    )
+    assert environment["PRIVATE_AUTH"] == "private-secret"
+    assert environment["REGISTRY_API_KEY"] == "registry-secret"
+    assert "STALE_AUTH" not in environment
 
 
 def test_child_process_never_receives_the_github_write_token(
@@ -389,7 +420,7 @@ def test_late_result_event_is_acknowledged_when_await_collected_first(tmp_path: 
         },
     )
 
-    with AdvisorEventStore(event_path) as events:
+    with LocalEventStore(event_path) as events:
         assert events.pending() == []
 
 

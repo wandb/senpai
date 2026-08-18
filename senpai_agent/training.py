@@ -124,14 +124,10 @@ class TrainingSupervisor:
         workspace: Path,
         state_dir: Path,
         terminate_grace_seconds: float = 10,
-        max_timeout_seconds: int | None = None,
     ):
         self.workspace = workspace.resolve()
         self.state_dir = state_dir.resolve()
         self.terminate_grace_seconds = terminate_grace_seconds
-        if max_timeout_seconds is not None and max_timeout_seconds <= 0:
-            raise ValueError("max_timeout_seconds must be positive")
-        self.max_timeout_seconds = max_timeout_seconds
         self._lock = threading.Lock()
         self._active: dict[str, _ActiveTraining] = {}
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -163,15 +159,6 @@ class TrainingSupervisor:
     def run_training(self, spec: TrainingSpec) -> TrainingResult:
         if isinstance(spec.argv, str) or not spec.argv:
             raise ValueError("argv must be a non-empty sequence, not a shell string")
-        if (
-            self.max_timeout_seconds is not None
-            and spec.timeout_seconds > self.max_timeout_seconds
-        ):
-            raise ValueError(
-                "training timeout exceeds the configured maximum of "
-                f"{self.max_timeout_seconds} seconds"
-            )
-
         cwd = Path(spec.cwd).resolve()
         if cwd != self.workspace and not cwd.is_relative_to(self.workspace):
             raise ValueError("training cwd must be inside the assignment workspace")

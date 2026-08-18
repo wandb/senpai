@@ -195,7 +195,6 @@ def training_runtime(
             supervisor = TrainingSupervisor(
                 workspace=workspace,
                 state_dir=key,
-                max_timeout_seconds=max_timeout_seconds,
             )
         runtime = (supervisor, MonitorStore(key / "monitors.sqlite3"))
         _TRAINING_RUNTIMES[key] = runtime
@@ -311,8 +310,28 @@ class TrainingResultObservation(Observation):
     source_commit: str | None = None
 
     @classmethod
-    def from_result(cls, result: TrainingResult) -> Self:
-        return cls.model_validate(result.model_dump())
+    def from_result(
+        cls,
+        result: TrainingResult,
+        conversation: LocalConversation | None,
+    ) -> Self:
+        observation = cls.model_validate(result.model_dump())
+        if not observation.error_tail:
+            return observation
+
+        state = getattr(conversation, "state", None)
+        secret_registry = getattr(state, "secret_registry", None)
+        if secret_registry is None:
+            raise RuntimeError(
+                "training result redaction requires a conversation secret registry"
+            )
+        return observation.model_copy(
+            update={
+                "error_tail": secret_registry.mask_secrets_in_output(
+                    observation.error_tail
+                )
+            }
+        )
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
@@ -366,7 +385,7 @@ class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObserva
                     conversation_id=conversation.id,
                 )
             )
-            return TrainingResultObservation.from_result(result)
+            return TrainingResultObservation.from_result(result, conversation)
         finally:
             with self._lock:
                 self._in_flight.discard(result.training_id)
@@ -394,7 +413,8 @@ class _GetTrainingStatusExecutor(
         conversation: LocalConversation | None = None,
     ) -> TrainingResultObservation:
         return TrainingResultObservation.from_result(
-            self.training.get_training_status(action.training_id)
+            self.training.get_training_status(action.training_id),
+            conversation,
         )
 
 
@@ -424,7 +444,7 @@ class _CancelTrainingExecutor(
                 "the training monitor remains active"
             )
         self.store.complete(action.training_id)
-        return TrainingResultObservation.from_result(result)
+        return TrainingResultObservation.from_result(result, conversation)
 
 
 class RunTrainingTool(ToolDefinition[RunTrainingAction, TrainingResultObservation]):
@@ -594,12 +614,10 @@ class TrainingToolSet(ToolDefinition[RunTrainingAction, TrainingResultObservatio
         conv_state: object,
         *,
         state_dir: str | Path,
-        max_timeout_seconds: int | None = None,
     ) -> Sequence[ToolDefinition]:
         training, monitor_store = training_runtime(
             Path(conv_state.workspace.working_dir),
             Path(state_dir),
-            max_timeout_seconds=max_timeout_seconds,
         )
         return (
             *RunTrainingTool.create(

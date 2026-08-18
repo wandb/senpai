@@ -18,6 +18,7 @@ from senpai_agent.openhands_runner import (
     without_eager_skill_discovery,
 )
 from senpai_agent.program_context import ProgramSystemPrompt
+from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV
 from senpai_agent.system_instructions import SenpaiSystemInstructions
 from openhands_support import TEST_LAUNCH_CONTEXT, runtime_config, runtime_env
 from test_agent_markdown import HTML_HEADER, PLAIN_HEADER
@@ -180,7 +181,7 @@ def test_developer_only_project_skills_are_not_exposed_to_senpai(tmp_path: Path)
     }
 
 
-def test_resolved_config_separates_runtime_credentials_from_command_secrets(
+def test_resolved_config_separates_runtime_credentials_from_conversation_secrets(
     tmp_path: Path,
 ):
     env = runtime_env(tmp_path)
@@ -189,7 +190,8 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
             "GH_TOKEN": "secondary-github-key",
             "WANDB_API_KEY": "wandb-key",
             "EXA_API_KEY": "exa-key",
-            "SENPAI_TIMEOUT_MINUTES": "0.5",
+            CUSTOM_SECRET_ENV_NAMES_ENV: "PRIVATE_AUTH",
+            "PRIVATE_AUTH": "private-key",
         }
     )
 
@@ -200,21 +202,41 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
     assert config.fast_api_key.get_secret_value() == "openai-key"
     assert config.frontier_api_key.get_secret_value() == "openai-key"
     assert config.github_token.get_secret_value() == "github-key"
-    assert config.command_secrets == {
+    assert config.conversation_secrets == {
         "WANDB_API_KEY": "wandb-key",
         "EXA_API_KEY": "exa-key",
+        "PRIVATE_AUTH": "private-key",
     }
-    assert "ANTHROPIC_API_KEY" not in config.command_secrets
-    assert "OPENAI_API_KEY" not in config.command_secrets
-    assert config.training_max_timeout_seconds == 30
+    assert "ANTHROPIC_API_KEY" not in config.conversation_secrets
+    assert "OPENAI_API_KEY" not in config.conversation_secrets
     assert config.timeout_seconds == 7200
     assert config.llm_timeout_seconds == 5400
     assert config.llm_num_retries == 1
+    assert config.compaction_trigger_tokens == 200_000
 
     delegated = runner.delegation_config(config)
     assert delegated.smart_api_key == "openai-key"
     assert delegated.fast_api_key == "openai-key"
     assert delegated.frontier_api_key == "openai-key"
+
+
+def test_training_limits_are_not_read_from_environment(tmp_path: Path):
+    env = runtime_env(tmp_path)
+    env["SENPAI_TIMEOUT_MINUTES"] = "not-a-number"
+    env["SENPAI_MAX_EPOCHS"] = "not-an-integer"
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert not hasattr(config, "training_max_timeout_seconds")
+
+
+def test_configured_custom_secret_requires_a_nonblank_value(tmp_path: Path):
+    env = runtime_env(tmp_path)
+    env[CUSTOM_SECRET_ENV_NAMES_ENV] = "PRIVATE_AUTH"
+    env["PRIVATE_AUTH"] = "  "
+
+    with pytest.raises(RuntimeError, match="custom secret PRIVATE_AUTH is required"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
 def test_resolved_config_discovers_one_level_program_from_target_workspace(
@@ -310,6 +332,38 @@ def test_inbox_recovery_budget_is_explicit_and_configurable(tmp_path):
     assert default.inbox_max_recovery_generations == 1
     assert configured.inbox_max_stalled_attempts == 4
     assert configured.inbox_max_recovery_generations == 2
+
+
+def test_compaction_trigger_tokens_are_explicit_and_configurable(tmp_path):
+    default = resolve_config(
+        parse_runner_args(["--max-turns", "1"]),
+        runtime_env(tmp_path),
+    )
+    configured = resolve_config(
+        parse_runner_args(
+            ["--max-turns", "1", "--compaction-trigger-tokens", "180000"]
+        ),
+        runtime_env(tmp_path),
+    )
+
+    assert default.compaction_trigger_tokens == 200_000
+    assert configured.compaction_trigger_tokens == 180_000
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [("not-a-number", "must be an integer"), ("49999", "at least 50000")],
+)
+def test_compaction_trigger_tokens_reject_invalid_environment_values(
+    tmp_path,
+    value,
+    message,
+):
+    env = runtime_env(tmp_path)
+    env["SENPAI_COMPACTION_TRIGGER_TOKENS"] = value
+
+    with pytest.raises(RuntimeError, match=message):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
 @pytest.mark.parametrize(
@@ -555,6 +609,23 @@ def test_explicit_api_key_env_preserves_custom_provider_support(tmp_path: Path):
     assert config.api_key.get_secret_value() == "custom-key"
     assert config.smart_api_key.get_secret_value() == "custom-key"
     assert config.fast_api_key.get_secret_value() == "custom-key"
+
+
+def test_custom_model_credential_cannot_also_be_a_custom_secret(tmp_path: Path):
+    env = runtime_env(tmp_path)
+    env.update(
+        {
+            "PRIVATE_AUTH": "custom-key",
+            CUSTOM_SECRET_ENV_NAMES_ENV: "PRIVATE_AUTH",
+            "SENPAI_OPENHANDS_MODEL": "custom/main",
+            "SENPAI_OPENHANDS_API_KEY_ENV": "PRIVATE_AUTH",
+            "SENPAI_OPENHANDS_SMART_MODEL": "custom/smart",
+            "SENPAI_OPENHANDS_FAST_MODEL": "custom/fast",
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="cannot also be custom secrets"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
 def test_custom_main_provider_requires_the_existing_api_key_env_override(

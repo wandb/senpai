@@ -297,7 +297,7 @@ def test_edited_student_comment_fails_closed(monkeypatch, capsys):
     assert "edited assignment comment rejected" in capsys.readouterr().err
 
 
-def test_review_label_wakes_the_advisor_and_releases_the_student_slot(monkeypatch):
+def test_review_label_wakes_the_advisor_and_keeps_the_student_assigned(monkeypatch):
     advisor = mailbox(
         monkeypatch,
         [
@@ -312,12 +312,47 @@ def test_review_label_wakes_the_advisor_and_releases_the_student_slot(monkeypatc
 
     assert [event.kind for event in events] == [
         "review_ready",
-        "idle_student",
-        "idle_student",
+        "student_available_for_assignment",
     ]
     assert events[0].payload["number"] == 17
-    assert events[1].payload == {"student": "student-1"}
-    assert events[2].payload == {"student": "student-2"}
+    assert (
+        events[1].dedupe_key
+        == "student_available_for_assignment:student-2"
+    )
+    assert events[1].payload == {"student": "student-2"}
+    assert events[1].to_prompt().startswith(
+        "## Student available for assignment: `student-2`"
+    )
+
+
+@pytest.mark.parametrize("status", ["status:wip", "status:review"])
+@pytest.mark.parametrize(
+    "blocker",
+    ["status:hold", "status:blocked", "status:needs-rebase"],
+)
+def test_assignment_action_labels_do_not_make_the_student_available(
+    monkeypatch,
+    status,
+    blocker,
+):
+    advisor = mailbox(
+        monkeypatch,
+        [
+            pull(
+                labels=(
+                    "research",
+                    "student:student-1",
+                    status,
+                    blocker,
+                )
+            )
+        ],
+        students=("student-1",),
+    )
+
+    assert "student_available_for_assignment" not in {
+        event.kind for event in advisor.poll()
+    }
 
 
 def test_new_review_revision_at_the_same_head_wakes_the_advisor(monkeypatch):
@@ -478,7 +513,7 @@ def test_duplicate_assignments_report_every_pr_for_the_student(monkeypatch):
         monkeypatch,
         [
             pull(labels=("student:student-1", "status:wip"), number=17),
-            pull(labels=("student:student-1", "status:wip"), number=18),
+            pull(labels=("student:student-1", "status:review"), number=18),
         ],
         students=("student-1",),
     )
@@ -1002,5 +1037,14 @@ def test_research_base_ref_failure_does_not_suppress_other_advisor_events(
 
     events = advisor.poll()
 
-    assert {event.kind for event in events} == {"review_ready", "idle_student"}
+    assert {event.kind for event in events} == {
+        "review_ready",
+        "student_available_for_assignment",
+    }
+    available = next(
+        event
+        for event in events
+        if event.kind == "student_available_for_assignment"
+    )
+    assert available.payload == {"student": "student-2"}
     assert "SENPAI_RESEARCH_BASE_WATCH_ERROR" in capsys.readouterr().err

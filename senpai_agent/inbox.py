@@ -28,6 +28,10 @@ STEERING_PRIORITIES = {
     "human_issue": STEER_PRIORITY,
     "student_pr_feedback": QUEUE_PRIORITY,
 }
+ADVISOR_ACTIVE_STEERING_PRIORITIES = {
+    **STEERING_PRIORITIES,
+    "review_ready": QUEUE_PRIORITY,
+}
 _SENDER_PREFIX = "senpai-delivery:"
 
 
@@ -456,6 +460,41 @@ class PersistentInbox:
                 str(conversation_id),
                 event_key,
                 body,
+            )
+
+    def retract_pending_prefix(
+        self,
+        conversation_id: UUID | str,
+        event_key_prefix: str,
+        *,
+        retained_keys: Sequence[str] = (),
+    ) -> None:
+        """Remove matching events not attached to a model turn."""
+
+        if not event_key_prefix:
+            raise ValueError("event key prefix must not be empty")
+        retained = tuple(dict.fromkeys(retained_keys))
+        retention_clause = ""
+        if retained:
+            placeholders = ",".join("?" for _ in retained)
+            retention_clause = f"AND event_key NOT IN ({placeholders})"
+        parameters = (
+            str(conversation_id),
+            len(event_key_prefix),
+            event_key_prefix,
+            *retained,
+        )
+        with self._transaction() as database:
+            database.execute(
+                f"""
+                DELETE FROM inbox_messages
+                WHERE conversation_id = ?
+                  AND substr(event_key, 1, ?) = ?
+                  {retention_clause}
+                  AND state = 'pending'
+                  AND turn_id IS NULL
+                """,
+                parameters,
             )
 
     def next_turn(

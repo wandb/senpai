@@ -15,6 +15,7 @@ from senpai_agent.tools import (
     MonitorTrainingTool,
     RunTrainingAction,
     RunTrainingTool,
+    TrainingResultObservation,
     close_training_runtimes,
     register_senpai_tools,
 )
@@ -91,6 +92,60 @@ def test_run_training_registers_a_monitor_for_its_conversation(tmp_path: Path):
         assert monitor.gates == ()
     finally:
         monitors.close()
+
+
+def test_training_error_tail_masks_registered_secrets(tmp_path: Path):
+    workspace = init_workspace(tmp_path)
+    secret = "private-training-token"
+    result = finished_result(tmp_path).model_copy(
+        update={"error_tail": f"authentication failed for {secret}"}
+    )
+    training = StubTraining(workspace, result)
+    monitors = MonitorStore(tmp_path / "monitors.sqlite3")
+    tool = RunTrainingTool.create(training, monitors)[0]
+
+    class SecretRegistry:
+        def mask_secrets_in_output(self, text: str) -> str:
+            return text.replace(secret, "<secret-hidden>")
+
+    conversation = SimpleNamespace(
+        id=uuid.uuid4(),
+        state=SimpleNamespace(secret_registry=SecretRegistry()),
+    )
+
+    try:
+        observation = tool.executor(
+            RunTrainingAction(
+                spec=TrainingSpec(
+                    argv=("python", "train.py"),
+                    cwd=workspace,
+                    timeout_seconds=20,
+                )
+            ),
+            conversation,
+        )
+
+        assert observation.error_tail == "authentication failed for <secret-hidden>"
+        assert secret not in observation.to_llm_content[0].text
+        assert result.error_tail.endswith(secret)
+    finally:
+        monitors.close()
+
+
+@pytest.mark.parametrize(
+    "conversation",
+    [None, SimpleNamespace(state=SimpleNamespace())],
+)
+def test_training_error_tail_requires_the_conversation_secret_registry(
+    tmp_path: Path,
+    conversation,
+):
+    result = finished_result(tmp_path).model_copy(
+        update={"error_tail": "unredacted training failure"}
+    )
+
+    with pytest.raises(RuntimeError, match="conversation secret registry"):
+        TrainingResultObservation.from_result(result, conversation)
 
 
 def test_run_training_requires_a_clean_worktree_before_starting(tmp_path: Path):

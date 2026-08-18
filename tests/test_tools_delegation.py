@@ -11,7 +11,6 @@ from openhands.sdk.context.view import View
 from openhands.sdk.event import MessageEvent
 from openhands.sdk.llm import Message, TextContent
 
-from senpai_agent.advisor import AdvisorEventStore
 from senpai_agent.delegation import (
     AgentStatusAction,
     AgentStatusTool,
@@ -26,12 +25,14 @@ from senpai_agent.delegation import (
     LeafAgentTask,
     LeafSpawnAgentsAction,
     MODEL_TIER_TIMEOUT_SECONDS,
+    OpenHandsChildProcess,
     SpawnAgentsAction,
     SpawnAgentsTool,
     cancel_pending_descendants,
     configure_delegation,
     reconcile_delegated_tasks,
 )
+from senpai_agent.local_events import LocalEventStore
 
 
 def test_model_tier_runtime_limits():
@@ -252,13 +253,14 @@ def config(tmp_path: Path, **updates) -> DelegationConfig:
         "frontier_reasoning_effort": "max",
         "frontier_api_key_env": "OPENAI_API_KEY",
         "frontier_api_key": "secret",
+        "compaction_trigger_tokens": 200_000,
         "github_repo": "acme/widgets",
         "github_trusted_actor": None,
         "role_file": tmp_path / "role.md",
         "harness_file": tmp_path / "harness.md",
         "plugin_dir": tmp_path / "plugin",
         "enable_browser": False,
-        "command_secrets": {},
+        "conversation_secrets": {},
         "role": "advisor",
         "program_path": "program.md",
         "launch_context": "# Authoritative launch context\n\nSystem policy.",
@@ -326,6 +328,71 @@ def test_spawn_is_nonblocking_and_await_first_collects_the_first_result(tmp_path
         "running"
     ) == 1
     releases[0].set()
+
+
+def test_compacted_result_is_the_only_parent_visible_task_value(tmp_path):
+    raw_report = "RAW_REPORT_MUST_NOT_REACH_THE_PARENT"
+    artifact = tmp_path / "state" / "delegation" / "results" / "task.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(raw_report, encoding="utf-8")
+    public_result = f"Concise conclusion.\n\nFull report: {artifact}"
+    release = threading.Event()
+    release.set()
+    sink = EventSink()
+    requests = []
+
+    def factory(request):
+        requests.append(request)
+        return FakeChild(release, result=public_result)
+
+    spawn, await_tool, status, _cancel = tools(
+        tmp_path,
+        factory,
+        sink=sink,
+    )
+    parent = parent_conversation()
+    task = spawn(
+        SpawnAgentsAction(
+            batch_key="compacted-result",
+            tasks=[AgentTask(task="Return a bounded report")],
+        ),
+        parent,
+    ).tasks[0]
+    assert sink.received.wait(1)
+
+    registry_path = tmp_path / "state" / "delegation" / "tasks.sqlite3"
+    child_environment = OpenHandsChildProcess(
+        config(tmp_path),
+        requests[0],
+    ).environment
+    assert child_environment["SENPAI_DELEGATION_REGISTRY_PATH"] == str(
+        registry_path
+    )
+    assert child_environment["SENPAI_DELEGATION_ROOT_STATE_DIR"] == str(
+        tmp_path / "state"
+    )
+    assert child_environment["SENPAI_DELEGATION_TASK_ID"] == task.task_id
+
+    registry = DelegationRegistry(registry_path)
+    stored_result = registry.rows([task.task_id])[0]["result"]
+    status_observation = status(AgentStatusAction(task_ids=[task.task_id]), parent)
+    await_observation = await_tool(
+        AwaitAgentsAction(task_ids=[task.task_id], timeout_seconds=1), parent
+    )
+    status_result = status_observation.tasks[0].result
+    await_result = await_observation.tasks[0].result
+    event_result = sink.events[0].payload["result"]
+
+    assert (stored_result, status_result, await_result, event_result) == (
+        public_result,
+    ) * 4
+    parent_messages = [
+        status_observation.to_llm_content[0].text,
+        await_observation.to_llm_content[0].text,
+        sink.events[0].to_inbox_message(),
+    ]
+    assert all(str(artifact) in message for message in parent_messages)
+    assert all(raw_report not in message for message in parent_messages)
 
 
 def test_search_task_form_is_resolved_in_registry_and_child_request(tmp_path):
@@ -630,7 +697,7 @@ def test_dead_replayed_task_becomes_failed_and_is_never_respawned(tmp_path):
     assert replay.tasks[0].status == "failed"
     assert "no longer running" in replay.tasks[0].error
     assert len(requests) == 1
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as events:
+    with LocalEventStore(tmp_path / "events.sqlite3") as events:
         assert [event.payload["task_id"] for event in events.pending()] == [
             first.tasks[0].task_id
         ]
@@ -662,7 +729,7 @@ def test_controller_startup_reconciles_a_dead_background_task_and_enqueues_its_w
     failed = registry.rows([task_id])[0]
     assert failed["status"] == "failed"
     assert "no longer running" in failed["error"]
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as events:
+    with LocalEventStore(tmp_path / "events.sqlite3") as events:
         pending = events.pending()
     assert [event.payload["task_id"] for event in pending] == [task_id]
 
@@ -688,7 +755,7 @@ def test_controller_startup_immediately_fails_a_preexisting_queued_task(tmp_path
     failed = registry.rows([task_id])[0]
     assert failed["status"] == "failed"
     assert "startup did not complete" in failed["error"]
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as events:
+    with LocalEventStore(tmp_path / "events.sqlite3") as events:
         pending = events.pending()
     assert [event.payload["task_id"] for event in pending] == [task_id]
 
@@ -742,7 +809,7 @@ def test_cancelling_an_already_finished_task_acknowledges_its_event(tmp_path):
         parent,
     ).tasks[0]
     while True:
-        with AdvisorEventStore(tmp_path / "events.sqlite3") as events:
+        with LocalEventStore(tmp_path / "events.sqlite3") as events:
             if events.pending():
                 break
         time.sleep(0.01)
@@ -750,7 +817,7 @@ def test_cancelling_an_already_finished_task_acknowledges_its_event(tmp_path):
     cancelled = cancel(CancelAgentsAction(task_ids=[task.task_id]), parent)
 
     assert cancelled.tasks[0].status == "finished"
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as events:
+    with LocalEventStore(tmp_path / "events.sqlite3") as events:
         assert events.pending() == []
 
 

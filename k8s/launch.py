@@ -12,7 +12,7 @@ import posixpath
 import shlex
 import sys
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import simple_parsing as sp
@@ -28,6 +28,7 @@ from senpai_agent.launch_context import (
     render_launch_context,
 )
 from senpai_agent.program_context import PROGRAM_PATH_ENV, normalize_program_path
+from senpai_agent.secrets import validate_custom_secret_env_names
 
 from launch_helpers import (
     ensure_advisor_branch,
@@ -51,6 +52,7 @@ from launch_helpers import (
     render_launch_secret,
     render_template,
     resolve_anthropic_api_key,
+    resolve_custom_secrets,
     resolve_exa_api_key,
     resolve_github_token,
     resolve_openai_api_key,
@@ -105,6 +107,7 @@ class Args:
     fast_reasoning_effort: str = "high"
     frontier_model: str = "openai/gpt-5.6-sol"
     frontier_reasoning_effort: str = "max"
+    compaction_trigger_tokens: int = 200_000
     human_issues: bool = (
         True  # allow human GitHub issue triage; disable for isolated launches
     )
@@ -118,10 +121,11 @@ class Args:
     extra_instructions: str = (
         ""  # shared operator instructions: a .md file path or literal text
     )
-    timeout_minutes: float = (
-        30.0  # training run wall-clock limit (SENPAI_TIMEOUT_MINUTES)
-    )
-    max_epochs: int = 50  # maximum training epochs (SENPAI_MAX_EPOCHS)
+    timeout_minutes: float = 30.0  # wall-clock policy in the launch context
+    max_epochs: int = 50  # epoch policy in the launch context
+    custom_secret_env_names: list[str] = field(
+        default_factory=list
+    )  # additional shell/.env credentials mounted into every role
     poll_interval_s: int = (
         600  # default advisor/student outer-loop sleep between GitHub polls
     )
@@ -194,6 +198,8 @@ def _supports_openai_pro(model: str) -> bool:
 
 
 def validate_model_config(args: Args) -> None:
+    if args.compaction_trigger_tokens < 50_000:
+        sys.exit("ERROR: --compaction_trigger_tokens must be at least 50000")
     profiles = {
         "student": (args.student_model, args.student_reasoning_effort),
         "smart": (args.smart_model, args.smart_reasoning_effort),
@@ -244,17 +250,18 @@ def role_model_config(args: Args, role: str) -> dict[str, str]:
         "SENPAI_OPENHANDS_FAST_REASONING_EFFORT": args.fast_reasoning_effort,
         "SENPAI_OPENHANDS_FRONTIER_MODEL": args.frontier_model,
         "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": args.frontier_reasoning_effort,
+        "SENPAI_COMPACTION_TRIGGER_TOKENS": str(args.compaction_trigger_tokens),
     }
 
 
-def model_provider_env(args: Args, role: str, secret_name: str) -> str:
+def secret_env_refs(
+    references: list[tuple[str, str]], secret_name: str
+) -> str:
     lines = []
-    providers = sorted(configured_model_providers(args, role) - {"wandb"})
-    for index, provider in enumerate(providers):
-        env_name, secret_key = MODEL_PROVIDERS[provider]
+    for environment_name, secret_key in references:
         lines.extend(
             (
-                f"{'- name' if index == 0 else '        - name'}: {env_name}",
+                f"        - name: {environment_name}",
                 "          valueFrom:",
                 "            secretKeyRef:",
                 f"              name: {secret_name}",
@@ -264,19 +271,22 @@ def model_provider_env(args: Args, role: str, secret_name: str) -> str:
     return "\n".join(lines)
 
 
+def model_secret_env_refs(args: Args, role: str) -> list[tuple[str, str]]:
+    providers = sorted(configured_model_providers(args, role) - {"wandb"})
+    return [MODEL_PROVIDERS[provider] for provider in providers]
+
+
 def validate_timing_args(args: Args) -> None:
     if args.timeout_minutes <= 0:
         sys.exit("ERROR: --timeout_minutes must be positive")
     if args.max_epochs < 1:
         sys.exit("ERROR: --max_epochs must be at least 1")
-    positive = ["poll_interval_s"]
+    if args.poll_interval_s < 1:
+        sys.exit("ERROR: --poll_interval_s must be at least 1")
     non_negative = [
         "poll_jitter_s",
         "stale_wip_seconds",
     ]
-    for name in positive:
-        if getattr(args, name) < 1:
-            sys.exit(f"ERROR: --{name} must be at least 1")
     for name in non_negative:
         if getattr(args, name) < 0:
             sys.exit(f"ERROR: --{name} must be non-negative")
@@ -573,10 +583,11 @@ def render_student(
             "ADVISOR_BRANCH": args.advisor_branch,
             "GH_HISTORY_SCOPE": args.gh_history_scope,
             "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
-            "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
-            "SENPAI_MAX_EPOCHS": str(args.max_epochs),
             "SENPAI_POLL_INTERVAL_S": str(args.poll_interval_s),
             "SENPAI_POLL_JITTER_S": str(args.poll_jitter_s),
+            "SENPAI_CUSTOM_SECRET_ENV_NAMES": ",".join(
+                args.custom_secret_env_names
+            ),
             LAUNCH_CONTEXT_ENV: encoded_launch_context(
                 args,
                 tag,
@@ -649,7 +660,12 @@ def render_student(
             ),
             "KUBERNETES_EXECUTOR_VOLUMES": _executor_volumes(args),
             "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
-            "MODEL_PROVIDER_ENV": model_provider_env(args, "student", secret_name),
+            "MODEL_PROVIDER_ENV": secret_env_refs(
+                model_secret_env_refs(args, "student"), secret_name
+            ),
+            "CUSTOM_SECRET_ENV_REFS": secret_env_refs(
+                [(name, name) for name in args.custom_secret_env_names], secret_name
+            ),
         },
     )
     documents = [configmap]
@@ -690,6 +706,7 @@ def render_advisor(
         "SENPAI_POLL_INTERVAL_S": str(args.poll_interval_s),
         "SENPAI_POLL_JITTER_S": str(args.poll_jitter_s),
         "SENPAI_STALE_WIP_SECONDS": str(args.stale_wip_seconds),
+        "SENPAI_CUSTOM_SECRET_ENV_NAMES": ",".join(args.custom_secret_env_names),
         "PROBLEM_DIR": args.problem_dir,
         "PVC_MOUNT_PATH": args.pvc_mount_path,
         "SENPAI_START_GATE_PATH": args.start_gate_path,
@@ -717,7 +734,12 @@ def render_advisor(
             "PVC_MOUNT_PATH": args.pvc_mount_path,
             "LAUNCH_SECRET_NAME": secret_name,
             "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
-            "MODEL_PROVIDER_ENV": model_provider_env(args, "advisor", secret_name),
+            "MODEL_PROVIDER_ENV": secret_env_refs(
+                model_secret_env_refs(args, "advisor"), secret_name
+            ),
+            "CUSTOM_SECRET_ENV_REFS": secret_env_refs(
+                [(name, name) for name in args.custom_secret_env_names], secret_name
+            ),
         },
     )
     return configmap + "\n---\n" + deployment
@@ -738,6 +760,10 @@ def main():
     validate_timing_args(args)
     validate_program_path(args)
     validate_model_config(args)
+    try:
+        validate_custom_secret_env_names(args.custom_secret_env_names)
+    except ValueError as error:
+        sys.exit(f"ERROR: {error}")
     if not args.preflight_only:
         role_images = [
             ("advisor", args.advisor_image),
@@ -786,8 +812,12 @@ def main():
     model_providers = deployed_model_providers(args)
     github_token = exa_api_key = wandb_api_key = ""
     provider_api_keys: dict[str, str] = {}
+    custom_secrets: dict[str, str] = {}
     if not args.dry_run or args.preflight_only:
-        github_token = resolve_github_token(DOTENV_PATH)
+        custom_secrets = resolve_custom_secrets(
+            DOTENV_PATH, args.custom_secret_env_names
+        )
+        github_token = resolve_github_token(DOTENV_PATH, args.custom_secret_env_names)
         if "anthropic" in model_providers:
             provider_api_keys["anthropic"] = resolve_anthropic_api_key(DOTENV_PATH)
         if "openai" in model_providers:
@@ -843,6 +873,9 @@ def main():
             provider: f"<REDACTED_{MODEL_PROVIDERS[provider][0]}>"
             for provider in model_providers
         }
+        custom_secrets = {
+            name: f"<REDACTED_{name}>" for name in args.custom_secret_env_names
+        }
     launch_secret = render_launch_secret(
         args.tag,
         github_token if not args.dry_run else "<REDACTED_GITHUB_TOKEN>",
@@ -850,6 +883,7 @@ def main():
         wandb_api_key if not args.dry_run else "<REDACTED_WANDB_API_KEY>",
         anthropic_api_key=provider_api_keys.get("anthropic"),
         openai_api_key=provider_api_keys.get("openai"),
+        custom_secrets=custom_secrets,
     )
 
     # --- Apply per-launch secret first (pods reference it on startup) ---

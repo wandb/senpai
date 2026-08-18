@@ -62,6 +62,8 @@ class WorkerLease:
     phase: str
     deadline: float
     completed_turns: int = 0
+    llm_request_started_at: float | None = None
+    llm_request_heartbeat_at: float | None = None
 
     @classmethod
     def read(cls, path: Path) -> WorkerLease:
@@ -71,8 +73,24 @@ class WorkerLease:
             phase=str(value["phase"]),
             deadline=float(value["deadline"]),
             completed_turns=int(value.get("completed_turns", 0)),
+            llm_request_started_at=(
+                float(value["llm_request_started_at"])
+                if value.get("llm_request_started_at") is not None
+                else None
+            ),
+            llm_request_heartbeat_at=(
+                float(value["llm_request_heartbeat_at"])
+                if value.get("llm_request_heartbeat_at") is not None
+                else None
+            ),
         )
-        if lease.pid <= 0 or not lease.phase or lease.completed_turns < 0:
+        if (
+            lease.pid <= 0
+            or not lease.phase
+            or lease.completed_turns < 0
+            or (lease.llm_request_started_at is None)
+            != (lease.llm_request_heartbeat_at is None)
+        ):
             raise ValueError("invalid controller lease")
         return lease
 
@@ -83,6 +101,11 @@ class ProgressLease:
     def __init__(self, path: Path):
         self.path = path.resolve()
         self.completed_turns = 0
+        self._lock = threading.Lock()
+        self._phase: str | None = None
+        self._deadline: float | None = None
+        self._llm_request_started_at: float | None = None
+        self._llm_request_heartbeat_at: float | None = None
 
     def update(
         self,
@@ -93,17 +116,41 @@ class ProgressLease:
     ) -> None:
         if not phase or timeout_seconds <= 0:
             raise ValueError("progress phase and timeout must be positive")
-        if completed_turn:
-            self.completed_turns += 1
+        with self._lock:
+            if completed_turn:
+                self.completed_turns += 1
+            self._phase = phase
+            self._deadline = time.monotonic() + timeout_seconds
+            self._write_locked()
+
+    def update_llm_request(
+        self,
+        started_at: float | None,
+        heartbeat_at: float | None,
+    ) -> None:
+        if (started_at is None) != (heartbeat_at is None):
+            raise ValueError("LLM request timestamps must be set or cleared together")
+        with self._lock:
+            if self._phase is None or self._deadline is None:
+                raise RuntimeError("progress lease must be initialized")
+            self._llm_request_started_at = started_at
+            self._llm_request_heartbeat_at = heartbeat_at
+            self._write_locked()
+
+    def _write_locked(self) -> None:
+        assert self._phase is not None
+        assert self._deadline is not None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(
             json.dumps(
                 {
                     "pid": os.getpid(),
-                    "phase": phase,
-                    "deadline": time.monotonic() + timeout_seconds,
+                    "phase": self._phase,
+                    "deadline": self._deadline,
                     "completed_turns": self.completed_turns,
+                    "llm_request_started_at": self._llm_request_started_at,
+                    "llm_request_heartbeat_at": self._llm_request_heartbeat_at,
                 },
                 sort_keys=True,
             ),

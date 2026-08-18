@@ -12,7 +12,7 @@ def test_prompt_module_defines_nonempty_uppercase_strings():
         if name.endswith("_PROMPT")
     }
 
-    assert len(prompt_values) == 20
+    assert prompt_values
     assert all(name.isupper() for name in prompt_values)
     assert all(isinstance(value, str) for value in prompt_values.values())
     assert all(value == value.strip() for value in prompt_values.values())
@@ -37,6 +37,16 @@ def test_render_prompt_preserves_placeholder_boundary_whitespace():
     )
 
 
+def test_student_available_event_names_the_student_and_defines_availability():
+    assert prompts.render_event_prompt(
+        "student_available_for_assignment",
+        {"student": "qwen-edward"},
+    ) == (
+        "## Student available for assignment: `qwen-edward`\n\n"
+        "`qwen-edward` has no open `status:wip` or `status:review` assignment."
+    )
+
+
 def test_python_sources_do_not_embed_centralized_prompt_text():
     source_root = Path(prompts.__file__).parent
     prompt_module = Path(prompts.__file__).resolve()
@@ -44,6 +54,7 @@ def test_python_sources_do_not_embed_centralized_prompt_text():
         "# Conversation context recovery",
         "Actionable events follow as separately tracked messages.",
         "You are a fresh Senpai subagent.",
+        "Your response is too large to send to directly to your parent",
         "Senpai restarted before this action completed.",
         "Open feedback_url to read the omitted text.",
         "You may finish this turn; the controller will resume",

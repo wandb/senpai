@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import Mapping
 
 
 CONTEXT_RECOVERY_PROMPT = """# Conversation context recovery
@@ -67,9 +69,27 @@ The JSON below is the complete model-visible parent context at delegation time. 
 
 {{ASSIGNMENT}}"""
 
+DELEGATED_RESULT_SUMMARY_PROMPT = """Your response is too large to send to directly to your parent that requested this and risks blowing-up its context window. Instead SENPAI stored your complete response at:
+
+{{RESULT_PATH}}
+
+This file is visible to your parent and it can read some or all of it as needed. Your task now is to generate a fresh, shorter, summary response of your findings / suggestions etc to the parent. Use only the response you just produced to generate your summary. Do not perform more research, edit files, or call tools. Return approxinately 1,500 tokens of plain-language, high-signal, actionable text.
+
+Response guidelines:
+
+- Lead with the conclusion or recommendation.
+- Include only the strongest evidence and precise paths or identifiers.
+- State any suggested next actions.
+- State any material risks and unresolved questions (if any).
+- Refer to sections of the main response file to support your statements, as needed.
+- Use clear, structured markdown formatting
+- Include a link to the full response file.
+
+Do not reproduce long excerpts or the full-response path."""
+
 RECOVERED_ACTION_PROMPT = """Senpai restarted before this action completed. Inspect the preserved workspace and rerun it explicitly only if it is still needed."""
 
-ADVISOR_EVENT_PROMPT = """# Senpai event: {{KIND}}
+LOCAL_EVENT_PROMPT = """# Senpai event: {{KIND}}
 
 Observed at (UTC): {{OBSERVED_AT}}
 
@@ -80,6 +100,10 @@ Observed at (UTC): {{OBSERVED_AT}}
 EVENT_PROMPT = """## {{KIND}}
 
 {{PAYLOAD}}"""
+
+STUDENT_AVAILABLE_FOR_ASSIGNMENT_PROMPT = """## Student available for assignment: `{{STUDENT}}`
+
+`{{STUDENT}}` has no open `status:wip` or `status:review` assignment."""
 
 WORKSPACE_DIVERGENCE_PROMPT = """The workspace cannot be reconciled automatically because local assignment history diverged or dirty work belongs to another checkout. Senpai preserved every local commit and dirty file without changing the checkout. Inspect and reconcile it explicitly; do not reset or discard local work."""
 
@@ -117,3 +141,18 @@ def render_prompt(template: str, /, **values: str) -> str:
             details.append(f"unexpected: {', '.join(unexpected)}")
         raise ValueError(f"invalid prompt values: {'; '.join(details)}")
     return _PLACEHOLDER.sub(lambda match: values[match.group(1)], template)
+
+
+def render_event_prompt(kind: str, payload: Mapping[str, object]) -> str:
+    """Render a controller event for the model."""
+
+    if kind == "student_available_for_assignment":
+        return render_prompt(
+            STUDENT_AVAILABLE_FOR_ASSIGNMENT_PROMPT,
+            STUDENT=str(payload["student"]),
+        )
+    return render_prompt(
+        EVENT_PROMPT,
+        KIND=kind,
+        PAYLOAD=json.dumps(payload, sort_keys=True, separators=(",", ":")),
+    )

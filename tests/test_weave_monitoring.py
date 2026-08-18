@@ -10,6 +10,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 from weave_openhands import TracingConfig, instrument, is_instrumented, uninstrument
 
 import senpai_agent.weave_monitoring as monitoring
+from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV
 
 
 @pytest.fixture(scope="module")
@@ -125,6 +126,17 @@ def test_secret_redactor_replaces_overlapping_values_longest_first():
         "openai-secret service-secret database-secret client-secret "
         "custom-model-secret"
     ) == " ".join(["<secret-hidden>"] * 10)
+
+
+def test_secret_redactor_includes_explicit_custom_secret_names():
+    redact = monitoring.secret_redactor(
+        {
+            CUSTOM_SECRET_ENV_NAMES_ENV: "PRIVATE_AUTH",
+            "PRIVATE_AUTH": "private-value",
+        }
+    )
+
+    assert redact("credential=private-value") == "credential=<secret-hidden>"
 
 
 def test_weave_openhands_traces_a_real_openhands_turn(

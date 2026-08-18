@@ -70,6 +70,20 @@ WANDB_API_KEY=
 | `EXA_API_KEY` | General-web and research-publication search. |
 | `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. |
 
+To add a credential, put its value in `.env` and list its name in the launch
+configuration:
+
+```dotenv
+HF_TOKEN=abc123
+```
+
+```yaml
+custom_secret_env_names: [HF_TOKEN]
+```
+
+The credential is available to every advisor, student, and delegated child;
+its value is redacted from tool output and traces.
+
 `k8s/launch.py` reads shell environment variables first and then the repository-root `.env`; only the GitHub token also falls back to `gh auth token`. Direct Docker or host execution must export or pass credentials explicitly.
 
 The launcher places credentials in a per-launch Kubernetes Secret. During bootstrap, the GitHub write token is removed from the process environment and handed to the controller through a one-use channel; it is not exposed to the model or subagents.
@@ -108,6 +122,8 @@ program_path: ""  # auto-discover, or set e.g. senpai/program.md
 wandb_entity: your-team
 wandb_project: your-project
 
+custom_secret_env_names: [HF_TOKEN]  # values come from .env
+
 advisor_model: openai/gpt-5.6-sol
 advisor_reasoning_effort: xhigh
 student_model: openai/gpt-5.6-sol
@@ -119,6 +135,7 @@ fast_model: openai/gpt-5.6-luna
 fast_reasoning_effort: high
 frontier_model: openai/gpt-5.6-sol
 frontier_reasoning_effort: max
+compaction_trigger_tokens: 200000
 
 pvc_claim_name: your-existing-pvc
 pvc_mount_path: /mnt/data
@@ -138,6 +155,9 @@ example, configure Claude Fable 5 as `anthropic/claude-fable-5`. Anthropic
 `reasoning_effort: max` on Claude Fable 5, Opus 5, and Sonnet 5 stays
 provider-native and is sent as `output_config.effort: max`; it does not enable
 OpenAI Pro mode.
+
+`compaction_trigger_tokens` sets the compaction limit. OpenAI and Anthropic
+apply it for their models; OpenHands handles compaction for other providers.
 
 If using W&B Inference use `wandb/` provider as the provider. For example `wandb/zai-org/GLM-5.2`, SENPAI
 uses `WANDB_API_KEY` for auth.
@@ -245,7 +265,7 @@ flowchart LR
 
 The structured result records its terminal status, exact result commit, W&B run IDs and URLs, bounded conclusion, and baseline/candidate metric comparison when available. Once published for an assignment revision and head, that evidence is immutable: exact duplicate publication is an idempotent replay, while changed evidence requires a new commit or revision. Non-revision feedback continues the same student conversation; a revision request intentionally creates a fresh revision identity and conversation.
 
-`status:wip` owns a student compute slot; `status:review` does not. The advisor can therefore review one result while that student starts another experiment. Sibling assignment mutations within one worker are serialized end to end, including advisor-base publication and student preflight, push, and result publication. Across advisor and student workers, exact assignment, revision, head, and branch-lease preconditions detect stale work; if a revision wins during result publication, SENPAI restores the current revision's WIP routing before returning the stale-result error.
+A student cannot receive another assignment while an open assignment has `status:wip` or `status:review`. The student becomes available after the advisor merges or closes the PR. Sibling assignment mutations within one worker are serialized end to end, including advisor-base publication and student preflight, push, and result publication. Across advisor and student workers, exact assignment, revision, head, and branch-lease preconditions detect stale work; if a revision wins during result publication, SENPAI restores the current revision's WIP routing before returning the stale-result error.
 
 Trusted collaborator comments, submitted reviews, and inline review comments are delivered automatically to the relevant student; feedback from untrusted authors and unrecognized bots is ignored. `get_prs` can still retrieve the complete discussion explicitly. If the configured research base changes while an experiment is running, SENPAI emits `research_base_changed` with the assignment's `required_base_sha` and the live `current_base_sha` without cancelling the assignment. When reviewing its terminal result, the advisor either requests a revision on the current base or records why that exact result remains valid with `accept_result_on_current_base`; `merge_experiment` still verifies the live SHA immediately before merging.
 
@@ -424,7 +444,7 @@ Useful launch controls:
 
 - `--names frieren,fern` selects stable students; otherwise use `--n_students` and `--student_prefix`.
 - `--nodes_per_student` and `--gpus_per_student_node` set the supervised worker topology; `--cpu_per_gpu` and `--memory_gi_per_gpu` bind its worker resources.
-- `--timeout_minutes` and `--max_epochs` are hard per-training limits.
+- `--timeout_minutes` sets the hard supervised-training ceiling and `--max_epochs` sets the agent-facing epoch policy; target training receives neither as a dedicated `SENPAI_*` variable.
 - `--poll_interval_s` and `--poll_jitter_s` control idle GitHub cadence without teaching the model to poll.
 - `--gh_history_scope branch` keeps normal advisor-branch memory, `fresh` creates a shallow ablation checkout, and `repo` exposes full repository history.
 - `--extra_instructions` accepts optional human operator guidance as a Markdown file or literal user context.

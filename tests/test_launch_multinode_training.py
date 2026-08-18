@@ -21,6 +21,7 @@ def render_student(**overrides):
         "exa",
         "wandb",
         openai_api_key="openai",
+        custom_secrets={},
     )
     return list(
         yaml.safe_load_all(
@@ -85,6 +86,7 @@ def test_single_node_student_keeps_local_gpu_resources_without_executor_rbac():
         "exa",
         "wandb",
         openai_api_key="openai",
+        custom_secrets={},
     )
     documents = list(
         yaml.safe_load_all(
@@ -136,7 +138,10 @@ def test_advisor_is_hard_pinned_to_the_cpu_pool():
                 "POD_CONFIG_HASH",
             )
         }
-        | {"MODEL_PROVIDER_ENV": "- name: MODEL_API_KEY"},
+        | {
+            "MODEL_PROVIDER_ENV": "        - name: MODEL_API_KEY",
+            "CUSTOM_SECRET_ENV_REFS": "",
+        },
     )
     pod = yaml.safe_load(rendered)["spec"]["template"]["spec"]
 

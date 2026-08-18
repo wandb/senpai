@@ -134,6 +134,49 @@ def test_event_identity_cannot_hide_a_changed_payload(tmp_path: Path):
         inbox.enqueue(CONVERSATION_ID, "event:1", "changed after acknowledgement")
 
 
+def test_retract_pending_removes_only_unclaimed_events(tmp_path: Path):
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    availability_key = "student_available_for_assignment:Fern"
+    other_key = "review_ready:17:abc"
+    inbox.enqueue(CONVERSATION_ID, availability_key, "student available")
+    inbox.enqueue(CONVERSATION_ID, other_key, "review ready")
+
+    inbox.retract_pending_prefix(
+        CONVERSATION_ID,
+        "student_available_for_assignment:",
+    )
+    inbox.retract_pending_prefix(
+        CONVERSATION_ID,
+        "student_available_for_assignment:",
+    )
+    assert inbox.pending_count(CONVERSATION_ID) == 1
+    assert inbox.enqueue(
+        CONVERSATION_ID,
+        availability_key,
+        "student available",
+    ) is True
+
+    turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
+    assert turn is not None
+    assert turn.event_keys == (other_key, availability_key)
+
+
+def test_retract_pending_preserves_a_claimed_turn(tmp_path: Path):
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    availability_key = "student_available_for_assignment:Fern"
+    inbox.enqueue(CONVERSATION_ID, availability_key, "student available")
+    turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
+    assert turn is not None
+
+    inbox.retract_pending_prefix(
+        CONVERSATION_ID,
+        "student_available_for_assignment:",
+    )
+    assert PersistentInbox(inbox.path).turn(turn.turn_id).event_keys == (
+        availability_key,
+    )
+
+
 def test_crash_before_append_reuses_turn_and_appends_each_message_once(tmp_path: Path):
     """
     Requirement: a crash before append retries the same durable delivery normally.
@@ -980,7 +1023,7 @@ def test_restart_after_preparing_visible_persisted_prompt_keeps_one_copy(
 def test_reset_preserves_legacy_provenance_for_a_later_compact_reminder(
     tmp_path: Path,
 ):
-    event_key = "idle_student:Fern"
+    event_key = "review_ready:17:abc"
     compact_body = "compact event"
     legacy_id = str(UUID(int=119))
     legacy_path = tmp_path / "pending-message-deliveries.json"
