@@ -1,3 +1,4 @@
+import asyncio
 import json
 import signal
 import threading
@@ -6,6 +7,7 @@ from io import StringIO
 from types import SimpleNamespace
 
 import pytest
+from openhands.sdk import LLM
 from openhands.sdk.conversation import ConversationExecutionStatus
 from openhands.sdk.event import (
     AgentErrorEvent,
@@ -24,6 +26,10 @@ from senpai_agent.inbox import (
     InboxTurnQuarantined,
     PersistentInbox,
 )
+import senpai_agent.openhands.agents as openhands_agents
+import senpai_agent.openhands.conversation as openhands_conversation
+import senpai_agent.openhands.runtime as openhands_runtime
+from senpai_agent.openhands.child_results import MAX_INLINE_CHILD_RESULT_TOKENS
 from senpai_agent.openhands_runner import (
     graceful_interrupts,
     main,
@@ -72,9 +78,13 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
         def close(self):
             captured["closed"] = True
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
-    monkeypatch.setattr(runner, "register_trace_secret", registered_secrets.append)
-    isolate_agent_discovery(monkeypatch, runner)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(
+        openhands_runtime,
+        "register_trace_secret",
+        registered_secrets.append,
+    )
+    isolate_agent_discovery(monkeypatch, openhands_agents)
     config = runtime_config(
         tmp_path,
         conversation_secrets={
@@ -101,7 +111,7 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     assert captured["delete_on_close"] is False
     assert captured["llm_timeout"] == 5400
     assert captured["llm_num_retries"] == 1
-    assert captured["llm_type"] is runner.LLM
+    assert captured["llm_type"] is LLM
     assert captured["closed"] is True
 
 
@@ -139,13 +149,13 @@ def test_context_reset_preserves_history_and_starts_a_fresh_active_branch(
         def close(self):
             calls.append(("close", None))
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
     monkeypatch.setattr(
-        runner.ConversationState,
+        openhands_conversation.ConversationState,
         "get_unmatched_actions",
         lambda _events: [object()],
     )
-    isolate_agent_discovery(monkeypatch, runner)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
     config = runtime_config(tmp_path)
 
     assert run_openhands("fresh recovery prompt", config, reset_context=True) == 0
@@ -198,13 +208,13 @@ def test_provider_timeout_resumes_inference_without_resending_the_turn(
         def close(self):
             pass
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
     monkeypatch.setattr(
-        runner.ConversationState,
+        openhands_conversation.ConversationState,
         "get_unmatched_actions",
         lambda _events: [],
     )
-    isolate_agent_discovery(monkeypatch, runner)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
     config = runtime_config(tmp_path)
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
     inbox.enqueue(config.conversation_id, "event:1", "first event")
@@ -259,13 +269,13 @@ def test_processed_turn_recovers_without_append_or_inference(tmp_path, monkeypat
         def close(self):
             calls.append("close")
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
     monkeypatch.setattr(
-        runner.ConversationState,
+        openhands_conversation.ConversationState,
         "get_unmatched_actions",
         lambda _events: [],
     )
-    isolate_agent_discovery(monkeypatch, runner)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
     config = runtime_config(tmp_path)
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
     inbox.enqueue(config.conversation_id, "event:1", "first event")
@@ -324,13 +334,13 @@ def test_finished_branch_repairs_processing_receipt_without_inference(
         def close(self):
             calls.append("close")
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
     monkeypatch.setattr(
-        runner.ConversationState,
+        openhands_conversation.ConversationState,
         "get_unmatched_actions",
         lambda _events: [],
     )
-    isolate_agent_discovery(monkeypatch, runner)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
 
     assert run_openhands(
         "unused",
@@ -389,13 +399,13 @@ def test_terminal_budget_reconciles_a_finished_response_before_recovery(
         def close(self):
             calls.append("close")
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
     monkeypatch.setattr(
-        runner.ConversationState,
+        openhands_conversation.ConversationState,
         "get_unmatched_actions",
         lambda _events: [],
     )
-    isolate_agent_discovery(monkeypatch, runner)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
 
     result = OpenHandsTurnRunner(
         config,
@@ -460,13 +470,13 @@ def test_paused_persisted_final_response_reconciles_without_inference(
         def close(self):
             calls.append("close")
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
     monkeypatch.setattr(
-        runner.ConversationState,
+        openhands_conversation.ConversationState,
         "get_unmatched_actions",
         lambda _events: [],
     )
-    isolate_agent_discovery(monkeypatch, runner)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
 
     assert run_openhands(
         turn.prompt.body,
@@ -525,13 +535,13 @@ def test_stalled_recovery_is_bounded_and_quarantined_with_the_full_brief(
         def close(self):
             calls.append(("close", None))
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
     monkeypatch.setattr(
-        runner.ConversationState,
+        openhands_conversation.ConversationState,
         "get_unmatched_actions",
         lambda _events: [],
     )
-    isolate_agent_discovery(monkeypatch, runner)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
     turns = OpenHandsTurnRunner(
         config, full_prompt="complete initial controller context"
     )
@@ -623,13 +633,13 @@ def test_model_visible_progress_renews_the_stalled_attempt_budget(
         def close(self):
             pass
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
     monkeypatch.setattr(
-        runner.ConversationState,
+        openhands_conversation.ConversationState,
         "get_unmatched_actions",
         lambda _events: [],
     )
-    isolate_agent_discovery(monkeypatch, runner)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
     turns = OpenHandsTurnRunner(
         config, full_prompt="complete initial controller context"
     )
@@ -700,13 +710,13 @@ def test_timeout_and_error_artifacts_do_not_renew_the_stalled_attempt_budget(
         def close(self):
             pass
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
     monkeypatch.setattr(
-        runner.ConversationState,
+        openhands_conversation.ConversationState,
         "get_unmatched_actions",
         lambda _events: [],
     )
-    isolate_agent_discovery(monkeypatch, runner)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
     turns = OpenHandsTurnRunner(
         config, full_prompt="complete initial controller context"
     )
@@ -775,13 +785,13 @@ def test_context_reset_preserves_old_branch_and_requeues_once(tmp_path, monkeypa
         def close(self):
             calls.append(("close", None))
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
     monkeypatch.setattr(
-        runner.ConversationState,
+        openhands_conversation.ConversationState,
         "get_unmatched_actions",
         lambda _events: [],
     )
-    isolate_agent_discovery(monkeypatch, runner)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
 
     run_openhands(
         "fresh recovery prompt",
@@ -849,13 +859,13 @@ def test_restart_after_recovery_commit_resets_before_delivering(tmp_path, monkey
         def close(self):
             calls.append(("close", None))
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
     monkeypatch.setattr(
-        runner.ConversationState,
+        openhands_conversation.ConversationState,
         "get_unmatched_actions",
         lambda _events: [],
     )
-    isolate_agent_discovery(monkeypatch, runner)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
 
     assert run_openhands(
         "unused normal-restart prompt",
@@ -893,7 +903,7 @@ def _child_result_conversation(reports, captured, *, rebuild_before_second=False
                 self.state.view.events = []
             if report is not None:
                 self.state.view.events.append(
-                    runner.MessageEvent(
+                    MessageEvent(
                         source="agent",
                         llm_message=Message(
                             role="assistant",
@@ -926,17 +936,17 @@ def test_child_result_at_emergency_limit_is_returned_unchanged(
 ):
     captured = {}
     monkeypatch.setattr(
-        runner,
+        openhands_conversation,
         "LocalConversation",
         _child_result_conversation(["bounded child report"], captured),
     )
     monkeypatch.setattr(
-        runner.LLM,
+        LLM,
         "get_token_count",
-        lambda *_args, **_kwargs: runner.MAX_INLINE_CHILD_RESULT_TOKENS,
+        lambda *_args, **_kwargs: MAX_INLINE_CHILD_RESULT_TOKENS,
     )
-    isolate_agent_discovery(monkeypatch, runner)
-    monkeypatch.setattr(runner, "WEAVE_PROJECT", "wandb-applied-ai-team/senpai-v1")
+    isolate_agent_discovery(monkeypatch, openhands_agents)
+    monkeypatch.setattr(openhands_runtime, "WEAVE_PROJECT", "wandb-applied-ai-team/senpai-v1")
     config = runtime_config(tmp_path, child=True)
 
     assert run_openhands("child task", config) == 0
@@ -973,10 +983,10 @@ def test_oversized_child_result_is_spilled_then_replaced_by_one_summary(
     role_state = tmp_path / "role-state"
     captured = {}
     token_counts = iter(
-        [initial_token_count, runner.MAX_INLINE_CHILD_RESULT_TOKENS]
+        [initial_token_count, MAX_INLINE_CHILD_RESULT_TOKENS]
     )
     monkeypatch.setattr(
-        runner,
+        openhands_conversation,
         "LocalConversation",
         _child_result_conversation(
             [raw_report, summary],
@@ -985,11 +995,11 @@ def test_oversized_child_result_is_spilled_then_replaced_by_one_summary(
         ),
     )
     monkeypatch.setattr(
-        runner.LLM,
+        LLM,
         "get_token_count",
         lambda *_args, **_kwargs: next(token_counts),
     )
-    isolate_agent_discovery(monkeypatch, runner)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
 
     config = runtime_config(
         tmp_path,
@@ -1021,7 +1031,7 @@ def test_oversized_child_result_is_spilled_then_replaced_by_one_summary(
     parent_config = runtime_config(tmp_path, workspace=target_checkout)
     file_editor_spec = next(
         tool
-        for tool in runner.build_main_tools(parent_config)
+        for tool in openhands_agents.build_main_tools(parent_config)
         if tool.name == "file_editor"
     )
     file_editor = resolve_tool(file_editor_spec, parent_state)[0]
@@ -1040,7 +1050,7 @@ def test_oversized_child_result_is_spilled_then_replaced_by_one_summary(
     [
         (None, 200),
         ("UNKNOWN_COUNT", 0),
-        ("STILL_TOO_LARGE", runner.MAX_INLINE_CHILD_RESULT_TOKENS + 1),
+        ("STILL_TOO_LARGE", MAX_INLINE_CHILD_RESULT_TOKENS + 1),
     ],
 )
 def test_oversized_child_result_fails_closed_when_compression_fails(
@@ -1056,16 +1066,16 @@ def test_oversized_child_result_fails_closed_when_compression_fails(
     captured = {}
     token_counts = iter([15_001, summary_token_count])
     monkeypatch.setattr(
-        runner,
+        openhands_conversation,
         "LocalConversation",
         _child_result_conversation([raw_report, summary], captured),
     )
     monkeypatch.setattr(
-        runner.LLM,
+        LLM,
         "get_token_count",
         lambda *_args, **_kwargs: next(token_counts),
     )
-    isolate_agent_discovery(monkeypatch, runner)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
     config = runtime_config(
         tmp_path,
         child=True,
@@ -1111,9 +1121,9 @@ def test_student_requests_persistent_storage_for_monitor_wake(
         def close(self):
             pass
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
-    isolate_agent_discovery(monkeypatch, runner)
-    monkeypatch.setattr(runner, "configure_delegation", delegation.append)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
+    monkeypatch.setattr(openhands_runtime, "configure_delegation", delegation.append)
 
     assert run_openhands("student task", runtime_config(tmp_path, role="student")) == 0
     assert captured == {
@@ -1147,8 +1157,8 @@ def test_github_tokens_never_reach_the_agent_environment(
             pass
 
     monkeypatch.setenv("GITHUB_TOKEN", "stale-env-secret")
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
-    isolate_agent_discovery(monkeypatch, runner)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
 
     assert run_openhands("task", runtime_config(tmp_path, role="student")) == 0
     assert observed == [None, None]
@@ -1179,8 +1189,8 @@ def test_nonfinished_conversation_returns_failure(tmp_path, monkeypatch, status)
         def close(self):
             pass
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
-    isolate_agent_discovery(monkeypatch, runner)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
 
     assert run_openhands("task", runtime_config(tmp_path)) == 1
 
@@ -1210,10 +1220,10 @@ def test_conversation_and_credentials_are_cleaned_up_after_failures(
         def close(self):
             closed.append(True)
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
-    isolate_agent_discovery(monkeypatch, runner)
-    monkeypatch.setattr(runner, "clear_github_credentials", lambda: cleared.append(True))
-    monkeypatch.setattr(runner, "configure_delegation", delegation.append)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
+    monkeypatch.setattr(openhands_runtime, "clear_github_credentials", lambda: cleared.append(True))
+    monkeypatch.setattr(openhands_runtime, "configure_delegation", delegation.append)
 
     with pytest.raises(RuntimeError, match="failed"):
         run_openhands("task", runtime_config(tmp_path))
@@ -1259,8 +1269,8 @@ def test_runtime_credentials_remain_configured_through_lazy_tool_initialization(
         def close(self):
             pass
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
-    isolate_agent_discovery(monkeypatch, runner)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
 
     config = runtime_config(
         tmp_path,
@@ -1303,7 +1313,7 @@ def test_turn_deadline_requests_conversation_interrupt(tmp_path, monkeypatch):
 
         async def arun(self):
             try:
-                await runner.asyncio.Event().wait()
+                await asyncio.Event().wait()
             finally:
                 cancelled.set()
 
@@ -1313,8 +1323,8 @@ def test_turn_deadline_requests_conversation_interrupt(tmp_path, monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
-    isolate_agent_discovery(monkeypatch, runner)
+    monkeypatch.setattr(openhands_conversation, "LocalConversation", FakeConversation)
+    isolate_agent_discovery(monkeypatch, openhands_agents)
 
     assert (
             run_openhands(
@@ -1334,15 +1344,15 @@ def test_turn_activity_renews_the_inactivity_deadline():
     class Conversation:
         async def arun(self):
             for _ in range(3):
-                await runner.asyncio.sleep(0.02)
+                await asyncio.sleep(0.02)
                 activity[0] = time.monotonic()
 
         def interrupt(self):
             nonlocal interrupted
             interrupted = True
 
-    runner.asyncio.run(
-        runner.arun_conversation(Conversation(), 0.03, lambda: activity[0])
+    asyncio.run(
+        openhands_conversation.arun_conversation(Conversation(), 0.03, lambda: activity[0])
     )
 
     assert not interrupted
@@ -1353,8 +1363,8 @@ def test_startup_interrupt_is_a_normal_conversation_end():
         task = None
 
         async def arun(self):
-            self.task = runner.asyncio.current_task()
-            await runner.asyncio.Event().wait()
+            self.task = asyncio.current_task()
+            await asyncio.Event().wait()
 
         def interrupt(self):
             assert self.task is not None
@@ -1362,8 +1372,8 @@ def test_startup_interrupt_is_a_normal_conversation_end():
 
     conversation = Conversation()
 
-    runner.asyncio.run(
-        runner.arun_conversation(
+    asyncio.run(
+        openhands_conversation.arun_conversation(
             conversation,
             1,
             started=conversation.interrupt,
@@ -1393,7 +1403,7 @@ def test_steering_resumes_the_same_conversation_object():
     )
     conversation = Conversation()
 
-    runner.run_steerable_conversation(conversation, pump, 1)
+    openhands_conversation.run_steerable_conversation(conversation, pump, 1)
 
     assert conversation.runs == 2
     assert conversation.id == "stable-advisor-id"
@@ -1410,7 +1420,7 @@ def test_signal_interrupts_the_conversation_and_restores_handlers(monkeypatch):
         return previous[signum]
 
     conversation = SimpleNamespace(interrupt=lambda: calls.append("interrupt"))
-    monkeypatch.setattr(runner.signal, "signal", fake_signal)
+    monkeypatch.setattr(openhands_conversation.signal, "signal", fake_signal)
 
     with pytest.raises(SystemExit) as raised:
         with graceful_interrupts(conversation):
@@ -1454,11 +1464,11 @@ def test_signal_does_not_resume_a_steering_interruption(monkeypatch):
             return True
 
     conversation = Conversation()
-    monkeypatch.setattr(runner.signal, "signal", fake_signal)
+    monkeypatch.setattr(openhands_conversation.signal, "signal", fake_signal)
 
     with pytest.raises(SystemExit):
         with graceful_interrupts(conversation) as stop_requested:
-            runner.run_steerable_conversation(
+            openhands_conversation.run_steerable_conversation(
                 conversation,
                 Pump(),
                 1,
@@ -1481,7 +1491,7 @@ def test_signal_at_run_start_cancels_before_the_run_continues(monkeypatch):
             self.continued = False
 
         async def arun(self):
-            await runner.asyncio.sleep(0)
+            await asyncio.sleep(0)
             self.continued = True
 
         def interrupt(self):
@@ -1496,11 +1506,11 @@ def test_signal_at_run_start_cancels_before_the_run_continues(monkeypatch):
             installed[signal.SIGTERM](signal.SIGTERM, None)
 
     conversation = Conversation()
-    monkeypatch.setattr(runner.signal, "signal", fake_signal)
+    monkeypatch.setattr(openhands_conversation.signal, "signal", fake_signal)
 
     with pytest.raises(SystemExit):
         with graceful_interrupts(conversation) as stop_requested:
-            runner.run_steerable_conversation(
+            openhands_conversation.run_steerable_conversation(
                 conversation,
                 Pump(),
                 1,
@@ -1519,7 +1529,7 @@ def test_recovered_actions_are_rejected_before_the_conversation_resumes(
         reject_pending_actions=lambda reason: rejected.append(reason),
     )
     monkeypatch.setattr(
-        runner.ConversationState,
+        openhands_conversation.ConversationState,
         "get_unmatched_actions",
         lambda _events: [object()],
     )
