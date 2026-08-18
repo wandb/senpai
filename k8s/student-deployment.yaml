@@ -33,7 +33,8 @@ spec:
         student: {{STUDENT_NAME}}
         research-tag: {{RESEARCH_TAG}}
     spec:
-      terminationGracePeriodSeconds: 90
+{{STUDENT_AFFINITY}}{{STUDENT_NODE_SELECTOR}}      terminationGracePeriodSeconds: 90
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -42,7 +43,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
-      containers:
+{{HIVEMIND_SIDECAR}}      containers:
       - name: student
         image: {{STUDENT_IMAGE}}
         securityContext:
@@ -143,6 +144,7 @@ spec:
           claimName: {{PVC_CLAIM_NAME}}
       - name: state
         emptyDir: {}
+{{HIVEMIND_STATE_VOLUME}}
       tolerations:
       - key: "nvidia.com/gpu"
         operator: "Exists"

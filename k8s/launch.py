@@ -7,7 +7,9 @@
 """Launch senpai advisor and student agents as K8s resources."""
 
 import base64
+import json
 import posixpath
+import re
 import shlex
 import sys
 from dataclasses import dataclass
@@ -37,6 +39,7 @@ from launch_helpers import (
     pod_template_hash,
     preflight_check_anthropic_api_key,
     preflight_check_exa_api_key,
+    preflight_check_hivemind_token,
     preflight_check_openai_api_key,
     preflight_check_student_name_availability,
     preflight_check_target_repo_access,
@@ -49,6 +52,7 @@ from launch_helpers import (
     resolve_anthropic_api_key,
     resolve_exa_api_key,
     resolve_github_token,
+    resolve_hivemind_token,
     resolve_openai_api_key,
     resolve_wandb_api_key,
     routing_labels,
@@ -60,6 +64,16 @@ STUDENT_TEMPLATE = Path(__file__).parent / "student-deployment.yaml"
 ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-deployment.yaml"
 SENPAI_CONFIG = Path(__file__).parent.parent / "senpai.yaml"
 DOTENV_PATH = Path(__file__).parent.parent / ".env"
+AGENTSTREAM_REVISION = "fdb6b22a7ba45a0645ff1b535e62d98fc974f593"
+DEFAULT_HIVEMIND_DAEMON_SOURCE = (
+    "wandb-hivemind @ git+https://github.com/wandb/agentstream.git@"
+    f"{AGENTSTREAM_REVISION}#subdirectory=daemon"
+)
+DEFAULT_HIVEMIND_AGENTSTREAM_SOURCE = (
+    "wandb-agentstream @ git+https://github.com/wandb/agentstream.git@"
+    f"{AGENTSTREAM_REVISION}"
+)
+KUBERNETES_DNS_LABEL = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 
 
 @dataclass
@@ -89,6 +103,9 @@ class Args:
     namespace: str = "default"  # Kubernetes namespace for all launch resources
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
     wandb_project: str = "senpai-v1"  # W&B project name
+    hivemind_enabled: bool = False  # record OpenHands conversations in Hivemind
+    hivemind_daemon_source: str = DEFAULT_HIVEMIND_DAEMON_SOURCE
+    hivemind_agentstream_source: str = DEFAULT_HIVEMIND_AGENTSTREAM_SOURCE
     advisor_model: str = "openai/gpt-5.6-sol"
     advisor_reasoning_effort: str = "xhigh"
     student_model: str = "openai/gpt-5.6-sol"
@@ -99,6 +116,7 @@ class Args:
     fast_reasoning_effort: str = "high"
     frontier_model: str = "openai/gpt-5.6-sol"
     frontier_reasoning_effort: str = "max"
+    max_parallel_agents: int = 8  # active subagent limit; supported range is 1-8
     human_issues: bool = (
         True  # allow human GitHub issue triage; disable for isolated launches
     )
@@ -125,6 +143,10 @@ class Args:
     dry_run: bool = (
         False  # render manifests only: do not apply them or validate credentials
     )
+    colocate_students: bool = (
+        False  # require students from this launch to share one Kubernetes node
+    )
+    student_node_name: str = ""  # exact kubernetes.io/hostname label for students
     preflight_only: bool = (
         False  # validate credentials/access only: do not render or apply manifests
     )
@@ -258,6 +280,92 @@ def model_provider_env(args: Args, role: str, secret_name: str) -> str:
     return "\n".join(lines)
 
 
+def hivemind_config(args: Args) -> dict[str, str]:
+    return {
+        "SENPAI_HIVEMIND_ENABLED": str(args.hivemind_enabled).lower(),
+    }
+
+
+def hivemind_sidecar(
+    args: Args,
+    *,
+    role: str,
+    image: str,
+    secret_name: str,
+    tag: str,
+) -> str:
+    if not args.hivemind_enabled:
+        return ""
+    if role == "student":
+        openhands_state_dir = "/watch/openhands_state"
+        hivemind_state_dir = "/var/lib/hivemind/student"
+    else:
+        openhands_state_dir = f"/watch/{tag}/advisor/openhands_state"
+        hivemind_state_dir = "/var/lib/hivemind/advisor"
+    daemon_source = json.dumps(args.hivemind_daemon_source)
+    agentstream_source = json.dumps(args.hivemind_agentstream_source)
+    default_repo = json.dumps(args.target_repo_url)
+    return f"""      initContainers:
+      - name: hivemind
+        image: {image}
+        restartPolicy: Always
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -e
+          mkdir -p "$SENPAI_HIVEMIND_STATE_DIR"
+          exec uvx \\
+            --from "$SENPAI_HIVEMIND_DAEMON_SOURCE" \\
+            --with "$SENPAI_HIVEMIND_AGENTSTREAM_SOURCE" \\
+            hivemind run --state-dir "$SENPAI_HIVEMIND_STATE_DIR"
+        env:
+        - name: SENPAI_HIVEMIND_DAEMON_SOURCE
+          value: {daemon_source}
+        - name: SENPAI_HIVEMIND_AGENTSTREAM_SOURCE
+          value: {agentstream_source}
+        - name: SENPAI_OPENHANDS_STATE_DIR
+          value: {openhands_state_dir}
+        - name: HIVEMIND_WATCH_PATHS
+          value: {openhands_state_dir}
+        - name: SENPAI_HIVEMIND_STATE_DIR
+          value: {hivemind_state_dir}
+        - name: HIVEMIND_DEFAULT_REPO
+          value: {default_repo}
+        - name: HIVEMIND_UPGRADE_WATCHER_DISABLED
+          value: "1"
+        - name: HIVEMIND_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {secret_name}
+              key: hivemind-token
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+        volumeMounts:
+        - name: state
+          mountPath: /watch
+          readOnly: true
+        - name: hivemind-state
+          mountPath: /var/lib/hivemind
+"""
+
+
+def hivemind_state_volume(args: Args) -> str:
+    if not args.hivemind_enabled:
+        return ""
+    return """      - name: hivemind-state
+        emptyDir: {}
+"""
+
+
 def validate_timing_args(args: Args) -> None:
     if args.timeout_minutes <= 0:
         sys.exit("ERROR: --timeout_minutes must be positive")
@@ -288,6 +396,26 @@ def validate_timing_args(args: Args) -> None:
                 "ERROR: --start_gate_path must be an absolute normalized file "
                 "path beneath the shared PVC --pvc_mount_path"
             )
+
+
+def validate_delegation_args(args: Args) -> None:
+    if not 1 <= args.max_parallel_agents <= 8:
+        sys.exit("ERROR: --max_parallel_agents must be between 1 and 8")
+
+
+def validate_student_node_name(node_name: str) -> None:
+    if node_name and KUBERNETES_DNS_LABEL.fullmatch(node_name) is None:
+        raise ValueError(
+            "must be a Kubernetes DNS label: at most 63 lowercase alphanumeric "
+            "or '-' characters, starting and ending with an alphanumeric character"
+        )
+
+
+def validate_student_scheduling_args(args: Args) -> None:
+    try:
+        validate_student_node_name(args.student_node_name)
+    except ValueError as error:
+        sys.exit(f"ERROR: --student_node_name {error}")
 
 
 def validate_program_path(args: Args) -> None:
@@ -339,6 +467,28 @@ def encoded_operator_instructions(args: Args) -> str:
     ).decode()
 
 
+def student_affinity(tag: str) -> str:
+    return f"""      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: senpai
+                role: student
+                research-tag: {tag}
+            topologyKey: kubernetes.io/hostname
+"""
+
+
+def student_node_selector(node_name: str) -> str:
+    validate_student_node_name(node_name)
+    if not node_name:
+        return ""
+    return f"""      nodeSelector:
+        kubernetes.io/hostname: {node_name}
+"""
+
+
 def render_student(
     template: str,
     student_name: str,
@@ -356,6 +506,7 @@ def render_student(
         labels={"app": "senpai", "role": "student", "research-tag": tag},
         data={
             **role_model_config(args, "student"),
+            **hivemind_config(args),
             "SENPAI_REPO_URL": args.senpai_repo_url,
             "SENPAI_REPO_REVISION": args.senpai_repo_revision,
             "TARGET_REPO_URL": args.target_repo_url,
@@ -373,6 +524,7 @@ def render_student(
             "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
             "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
             "SENPAI_MAX_EPOCHS": str(args.max_epochs),
+            "SENPAI_MAX_PARALLEL_AGENTS": str(args.max_parallel_agents),
             "SENPAI_POLL_INTERVAL_S": str(args.poll_interval_s),
             "SENPAI_POLL_JITTER_S": str(args.poll_jitter_s),
             LAUNCH_CONTEXT_ENV: encoded_launch_context(
@@ -402,8 +554,20 @@ def render_student(
             "STUDENT_CPU": str(student_cpu),
             "STUDENT_MEMORY": f"{student_memory_gi}Gi",
             "GPUS_PER_STUDENT": str(args.gpus_per_student),
+            "STUDENT_AFFINITY": (
+                student_affinity(tag) if args.colocate_students else ""
+            ),
+            "STUDENT_NODE_SELECTOR": student_node_selector(args.student_node_name),
             "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
             "MODEL_PROVIDER_ENV": model_provider_env(args, "student", secret_name),
+            "HIVEMIND_SIDECAR": hivemind_sidecar(
+                args,
+                role="student",
+                image=args.student_image,
+                secret_name=secret_name,
+                tag=tag,
+            ),
+            "HIVEMIND_STATE_VOLUME": hivemind_state_volume(args),
         },
     )
     return configmap + "\n---\n" + deployment
@@ -421,6 +585,7 @@ def render_advisor(
     advisor_deployment_name = f"senpai-advisor-{tag}"
     data = {
         **role_model_config(args, "advisor"),
+        **hivemind_config(args),
         "SENPAI_REPO_URL": args.senpai_repo_url,
         "SENPAI_REPO_REVISION": args.senpai_repo_revision,
         "TARGET_REPO_URL": args.target_repo_url,
@@ -436,6 +601,7 @@ def render_advisor(
         "ADVISOR_BRANCH": args.advisor_branch,
         "GH_HISTORY_SCOPE": args.gh_history_scope,
         "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
+        "SENPAI_MAX_PARALLEL_AGENTS": str(args.max_parallel_agents),
         "SENPAI_POLL_INTERVAL_S": str(args.poll_interval_s),
         "SENPAI_POLL_JITTER_S": str(args.poll_jitter_s),
         "SENPAI_STALE_WIP_SECONDS": str(args.stale_wip_seconds),
@@ -467,6 +633,14 @@ def render_advisor(
             "LAUNCH_SECRET_NAME": secret_name,
             "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
             "MODEL_PROVIDER_ENV": model_provider_env(args, "advisor", secret_name),
+            "HIVEMIND_SIDECAR": hivemind_sidecar(
+                args,
+                role="advisor",
+                image=args.advisor_image,
+                secret_name=secret_name,
+                tag=tag,
+            ),
+            "HIVEMIND_STATE_VOLUME": hivemind_state_volume(args),
         },
     )
     return configmap + "\n---\n" + deployment
@@ -479,6 +653,8 @@ def main():
             "ERROR: --gpus_per_student, --cpu_per_gpu, and --memory_gi_per_gpu must all be at least 1"
         )
     validate_timing_args(args)
+    validate_delegation_args(args)
+    validate_student_scheduling_args(args)
     validate_program_path(args)
     validate_model_config(args)
     if not args.preflight_only:
@@ -525,7 +701,7 @@ def main():
         student_list = [f"{args.student_prefix}-{name}" for name in student_list]
 
     model_providers = deployed_model_providers(args)
-    github_token = exa_api_key = wandb_api_key = ""
+    github_token = exa_api_key = hivemind_token = wandb_api_key = ""
     provider_api_keys: dict[str, str] = {}
     if not args.dry_run or args.preflight_only:
         github_token = resolve_github_token(DOTENV_PATH)
@@ -534,6 +710,8 @@ def main():
         if "openai" in model_providers:
             provider_api_keys["openai"] = resolve_openai_api_key(DOTENV_PATH)
         exa_api_key = resolve_exa_api_key(DOTENV_PATH)
+        if args.hivemind_enabled:
+            hivemind_token = resolve_hivemind_token(DOTENV_PATH)
         wandb_api_key = resolve_wandb_api_key(DOTENV_PATH)
         preflight_check_target_repo_access(args.target_repo_url, github_token)
         args.target_repo_branch = preflight_check_target_repo_branch(
@@ -559,6 +737,8 @@ def main():
             )
         preflight_check_exa_api_key(exa_api_key)
         preflight_check_wandb_api_key(wandb_api_key)
+        if hivemind_token:
+            preflight_check_hivemind_token(hivemind_token)
         if args.preflight_only:
             print("Preflight OK — credentials and target repo access verified.")
             return
@@ -590,6 +770,13 @@ def main():
         exa_api_key if not args.dry_run else "<REDACTED_EXA_API_KEY>",
         wandb_api_key if not args.dry_run else "<REDACTED_WANDB_API_KEY>",
         anthropic_api_key=provider_api_keys.get("anthropic"),
+        hivemind_token=(
+            hivemind_token
+            if not args.dry_run
+            else "<REDACTED_HIVEMIND_TOKEN>"
+        )
+        if args.hivemind_enabled
+        else None,
         openai_api_key=provider_api_keys.get("openai"),
     )
 

@@ -39,8 +39,102 @@ def test_default_config_exposes_every_model_profile_and_effort():
     assert config["program_path"] == ""
     assert config["senpai_repo_url"] == "https://github.com/wandb/senpai.git"
     assert config["senpai_repo_revision"] == ""
+    assert config["max_parallel_agents"] == 8
+    assert config["colocate_students"] is False
+    assert config["hivemind_enabled"] is False
+    assert config["hivemind_daemon_source"] == (
+        "wandb-hivemind @ git+https://github.com/wandb/agentstream.git@"
+        "fdb6b22a7ba45a0645ff1b535e62d98fc974f593#subdirectory=daemon"
+    )
+    assert config["hivemind_agentstream_source"] == (
+        "wandb-agentstream @ git+https://github.com/wandb/agentstream.git@"
+        "fdb6b22a7ba45a0645ff1b535e62d98fc974f593"
+    )
+    assert config["student_node_name"] == ""
     assert "repo_url" not in config
     assert "repo_revision" not in config
+
+
+@pytest.mark.parametrize("limit", [0, 9])
+def test_launch_rejects_a_parallel_agent_limit_outside_the_supported_range(limit):
+    with pytest.raises(SystemExit, match="between 1 and 8"):
+        launch.validate_delegation_args(launch_args(max_parallel_agents=limit))
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_parallel_agent_limit_is_rendered_for_every_role(role):
+    configmap, _deployment, _secret = render_role(
+        role,
+        launch_args(max_parallel_agents=4),
+    )
+
+    assert yaml.safe_load(configmap)["data"]["SENPAI_MAX_PARALLEL_AGENTS"] == "4"
+
+
+def test_student_colocation_is_opt_in():
+    _configmap, default_deployment, _secret = render_role("student")
+    _configmap, colocated_deployment, _secret = render_role(
+        "student",
+        launch_args(colocate_students=True),
+    )
+
+    default_spec = yaml.safe_load(default_deployment)["spec"]["template"]["spec"]
+    colocated_spec = yaml.safe_load(colocated_deployment)["spec"]["template"]["spec"]
+
+    assert "affinity" not in default_spec
+    assert "nodeSelector" not in default_spec
+    assert colocated_spec["affinity"] == {
+        "podAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": [
+                {
+                    "labelSelector": {
+                        "matchLabels": {
+                            "app": "senpai",
+                            "role": "student",
+                            "research-tag": "test-track",
+                        }
+                    },
+                    "topologyKey": "kubernetes.io/hostname",
+                }
+            ]
+        }
+    }
+
+
+def test_exact_student_node_selector_can_be_combined_with_colocation():
+    _configmap, deployment, _secret = render_role(
+        "student",
+        launch_args(
+            colocate_students=True,
+            student_node_name="gpu-node-08",
+        ),
+    )
+
+    spec = yaml.safe_load(deployment)["spec"]["template"]["spec"]
+
+    assert "affinity" in spec
+    assert spec["nodeSelector"] == {
+        "kubernetes.io/hostname": "gpu-node-08",
+    }
+
+
+@pytest.mark.parametrize(
+    "node_name",
+    ["GPU-node", "gpu.node", "-gpu", "gpu-", "gpu/node", "gpu\nnode", "a" * 64],
+)
+def test_launch_rejects_an_invalid_student_node_name(node_name):
+    with pytest.raises(SystemExit, match="Kubernetes DNS label"):
+        launch.validate_student_scheduling_args(
+            launch_args(student_node_name=node_name)
+        )
+
+
+def test_student_renderer_rejects_node_name_manifest_injection():
+    with pytest.raises(ValueError, match="Kubernetes DNS label"):
+        render_role(
+            "student",
+            launch_args(student_node_name="node\n      hostNetwork: true"),
+        )
 
 
 @pytest.mark.parametrize(
@@ -247,6 +341,81 @@ def test_launch_secret_contains_each_credential_and_both_roles_reference_it():
         assert references == {
             key: "senpai-launch-secrets-test-track" for key in expected_values
         }
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_hivemind_sidecar_is_opt_in_and_owns_the_only_token_reference(role):
+    default_configmap, default_deployment, default_secret = render_role(role)
+    default_pod = yaml.safe_load(default_deployment)["spec"]["template"]["spec"]
+
+    assert [container["name"] for container in default_pod["containers"]] == [role]
+    assert "initContainers" not in default_pod
+    assert "hivemind-token" not in yaml.safe_load(default_secret)["data"]
+    assert yaml.safe_load(default_configmap)["data"]["SENPAI_HIVEMIND_ENABLED"] == (
+        "false"
+    )
+
+    configmap, deployment, secret = render_role(
+        role,
+        launch_args(hivemind_enabled=True),
+    )
+    config = yaml.safe_load(configmap)["data"]
+    pod = yaml.safe_load(deployment)["spec"]["template"]["spec"]
+    [main_container] = pod["containers"]
+    [sidecar] = pod["initContainers"]
+    secret_values = {
+        key: base64.b64decode(value).decode()
+        for key, value in yaml.safe_load(secret)["data"].items()
+    }
+
+    assert config["SENPAI_HIVEMIND_ENABLED"] == "true"
+    assert {key for key in config if "HIVEMIND" in key} == {
+        "SENPAI_HIVEMIND_ENABLED"
+    }
+    assert secret_values["hivemind-token"] == "sa_hivemind"
+    assert sidecar["name"] == "hivemind"
+    assert sidecar["restartPolicy"] == "Always"
+    assert pod["automountServiceAccountToken"] is False
+    assert sidecar["image"] == (
+        ADVISOR_IMAGE if role == "advisor" else STUDENT_IMAGE
+    )
+    assert "envFrom" not in sidecar
+    assert "HIVEMIND_TOKEN" not in str(main_container)
+    assert deployment.count("key: hivemind-token") == 1
+
+    sidecar_env = {item["name"]: item for item in sidecar["env"]}
+    assert sidecar_env["HIVEMIND_TOKEN"]["valueFrom"]["secretKeyRef"] == {
+        "name": "senpai-launch-secrets-test-track",
+        "key": "hivemind-token",
+    }
+    assert sidecar_env["SENPAI_HIVEMIND_DAEMON_SOURCE"]["value"] == (
+        launch.DEFAULT_HIVEMIND_DAEMON_SOURCE
+    )
+    assert sidecar_env["SENPAI_HIVEMIND_AGENTSTREAM_SOURCE"]["value"] == (
+        launch.DEFAULT_HIVEMIND_AGENTSTREAM_SOURCE
+    )
+    assert sidecar_env["HIVEMIND_DEFAULT_REPO"]["value"] == (
+        "https://github.com/example/problem.git"
+    )
+    assert sidecar_env["HIVEMIND_UPGRADE_WATCHER_DISABLED"]["value"] == "1"
+    assert sidecar_env["HIVEMIND_WATCH_PATHS"]["value"] == sidecar_env[
+        "SENPAI_OPENHANDS_STATE_DIR"
+    ]["value"]
+    assert sidecar_env["HIVEMIND_WATCH_PATHS"]["value"].startswith("/watch/")
+    assert sidecar_env["SENPAI_HIVEMIND_STATE_DIR"]["value"].startswith(
+        "/var/lib/hivemind/"
+    )
+    assert sidecar["args"][0].lstrip().startswith("set -e\n")
+    assert "exec uvx" in sidecar["args"][0]
+    assert "hivemind run --state-dir" in sidecar["args"][0]
+    assert sidecar["volumeMounts"] == [
+        {"name": "state", "mountPath": "/watch", "readOnly": True},
+        {"name": "hivemind-state", "mountPath": "/var/lib/hivemind"},
+    ]
+    assert {volume["name"] for volume in pod["volumes"]} >= {
+        "state",
+        "hivemind-state",
+    }
 
 
 def test_role_model_configuration_preserves_the_configured_efforts():

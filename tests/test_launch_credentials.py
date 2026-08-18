@@ -3,10 +3,59 @@ import io
 import json
 import urllib.error
 import urllib.parse
+from pathlib import Path
 
 import pytest
 
 from launch_test_support import launch_helpers
+
+
+def test_hivemind_token_prefers_shell_over_dotenv(tmp_path: Path, monkeypatch):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("HIVEMIND_TOKEN=sa_dotenv\n", encoding="utf-8")
+    monkeypatch.setenv("HIVEMIND_TOKEN", "sa_shell")
+
+    assert launch_helpers.resolve_hivemind_token(dotenv) == "sa_shell"
+
+
+def test_hivemind_token_uses_dotenv_without_a_login_fallback(
+    tmp_path: Path,
+    monkeypatch,
+):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("HIVEMIND_TOKEN=sa_dotenv\n", encoding="utf-8")
+    monkeypatch.delenv("HIVEMIND_TOKEN", raising=False)
+
+    assert launch_helpers.resolve_hivemind_token(dotenv) == "sa_dotenv"
+
+
+def test_hivemind_requires_static_token_form(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HIVEMIND_TOKEN", "personal-token")
+
+    with pytest.raises(SystemExit) as raised:
+        launch_helpers.resolve_hivemind_token(tmp_path / ".env")
+
+    message = str(raised.value)
+    assert "sa_" in message
+    assert "Personal Access Token" in message
+    assert "personal-token" not in message
+
+
+def test_hivemind_enabled_launch_fails_clearly_without_a_token(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.delenv("HIVEMIND_TOKEN", raising=False)
+
+    with pytest.raises(SystemExit) as raised:
+        launch_helpers.resolve_hivemind_token(tmp_path / ".env")
+
+    message = str(raised.value)
+    assert "no Hivemind token" in message
+    assert "HIVEMIND_TOKEN" in message
 
 
 class JSONResponse:
@@ -21,6 +70,126 @@ class JSONResponse:
 
     def read(self):
         return self.body
+
+
+class EmptyResponse:
+    status = 204
+
+    def __init__(self, url=launch_helpers.HIVEMIND_HEARTBEAT_URL):
+        self.url = url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def geturl(self):
+        return self.url
+
+    def read(self):
+        return b""
+
+
+def test_hivemind_preflight_authenticates_write_access(monkeypatch, capsys):
+    captured = {}
+
+    def urlopen(request, timeout):
+        captured.update(request=request, timeout=timeout)
+        return EmptyResponse()
+
+    monkeypatch.setattr(launch_helpers, "_open_without_redirects", urlopen)
+
+    launch_helpers.preflight_check_hivemind_token("sa_hivemind-secret")
+
+    request = captured["request"]
+    assert request.full_url == launch_helpers.HIVEMIND_HEARTBEAT_URL
+    assert request.method == "POST"
+    assert request.data == b""
+    assert request.headers["Authorization"] == "Bearer sa_hivemind-secret"
+    assert captured["timeout"] == 10
+    output = capsys.readouterr().out
+    assert "write access" in output
+    assert "sa_hivemind-secret" not in output
+
+
+def test_hivemind_preflight_rejects_and_redacts_auth_errors(monkeypatch):
+    def urlopen(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(
+                b'{"error":{"code":"insufficient_scope",'
+                b'"message":"sa_hivemind-secret lacks write"}}'
+            ),
+        )
+
+    monkeypatch.setattr(launch_helpers, "_open_without_redirects", urlopen)
+
+    with pytest.raises(SystemExit) as raised:
+        launch_helpers.preflight_check_hivemind_token("sa_hivemind-secret")
+
+    message = str(raised.value)
+    assert "HTTP 403" in message
+    assert "insufficient_scope" in message
+    assert "sa_hivemind-secret" not in message
+    assert "<redacted>" in message
+
+
+def test_hivemind_preflight_rejects_unexpected_status(monkeypatch):
+    response = EmptyResponse()
+    response.status = 200
+    monkeypatch.setattr(
+        launch_helpers,
+        "_open_without_redirects",
+        lambda _request, timeout: response,
+    )
+
+    with pytest.raises(SystemExit, match="unexpected response"):
+        launch_helpers.preflight_check_hivemind_token("sa_hivemind-secret")
+
+
+def test_hivemind_preflight_never_forwards_authorization_on_redirect():
+    request = urllib.request.Request(
+        launch_helpers.HIVEMIND_HEARTBEAT_URL,
+        headers={"Authorization": "Bearer sa_hivemind-secret"},
+    )
+
+    redirected = launch_helpers._NoRedirectHandler().redirect_request(
+        request,
+        None,
+        302,
+        "Found",
+        {"Location": "https://attacker.example/collect"},
+        "https://attacker.example/collect",
+    )
+
+    assert redirected is None
+
+
+def test_hivemind_preflight_opener_installs_the_no_redirect_handler(monkeypatch):
+    captured = {}
+
+    class Opener:
+        def open(self, request, *, timeout):
+            captured.update(request=request, timeout=timeout)
+            return EmptyResponse()
+
+    def build_opener(*handlers):
+        captured["handlers"] = handlers
+        return Opener()
+
+    monkeypatch.setattr(launch_helpers.urllib.request, "build_opener", build_opener)
+    request = urllib.request.Request(launch_helpers.HIVEMIND_HEARTBEAT_URL)
+
+    launch_helpers._open_without_redirects(request, timeout=10)
+
+    assert len(captured["handlers"]) == 1
+    assert isinstance(captured["handlers"][0], launch_helpers._NoRedirectHandler)
+    assert captured["request"] is request
+    assert captured["timeout"] == 10
 
 
 def capture_request(monkeypatch, payload):

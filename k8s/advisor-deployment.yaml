@@ -32,6 +32,7 @@ spec:
         research-tag: {{RESEARCH_TAG}}
     spec:
       terminationGracePeriodSeconds: 90
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -40,7 +41,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
-      containers:
+{{HIVEMIND_SIDECAR}}      containers:
       - name: advisor
         image: {{ADVISOR_IMAGE}}
         securityContext:
@@ -133,3 +134,4 @@ spec:
           claimName: {{PVC_CLAIM_NAME}}
       - name: state
         emptyDir: {}
+{{HIVEMIND_STATE_VOLUME}}

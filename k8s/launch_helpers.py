@@ -104,6 +104,21 @@ LABEL_COLOR_STATUS_REVIEW = "0e8a16"
 LABEL_COLOR_STUDENT = "f9d0c4"
 FULL_SHA_IMAGE = re.compile(r"[^\s]+:sha-([0-9a-f]{40})")
 DIGEST_IMAGE = re.compile(r"[^\s]+@sha256:[0-9a-f]{64}")
+HIVEMIND_HEARTBEAT_URL = "https://hivemind.wandb.tools/v1/daemon/heartbeat"
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep bearer credentials on the configured Hivemind origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _open_without_redirects(req: urllib.request.Request, timeout: int):
+    return urllib.request.build_opener(_NoRedirectHandler()).open(
+        req,
+        timeout=timeout,
+    )
 
 
 def expand_student_names(n: int, names: list[str] = STUDENT_NAMES) -> list[str]:
@@ -406,6 +421,7 @@ LAUNCH_CREDENTIAL_ENV_NAMES = (
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "EXA_API_KEY",
+    "HIVEMIND_TOKEN",
     "WANDB_API_KEY",
 )
 
@@ -488,6 +504,17 @@ def resolve_wandb_api_key(dotenv_path: Path) -> str:
     return resolve_required_secret(dotenv_path, "WANDB_API_KEY", "W&B API key")
 
 
+def resolve_hivemind_token(dotenv_path: Path) -> str:
+    """Resolve the Hivemind token: $HIVEMIND_TOKEN → .env → hard error."""
+    token = resolve_required_secret(dotenv_path, "HIVEMIND_TOKEN", "Hivemind token")
+    if not token.startswith("sa_"):
+        sys.exit(
+            "ERROR: HIVEMIND_TOKEN must use Hivemind's sa_ static-token form. "
+            "Create a write-scoped Personal Access Token or service-account token."
+        )
+    return token
+
+
 def render_launch_secret(
     tag: str,
     github_token: str,
@@ -495,6 +522,7 @@ def render_launch_secret(
     wandb_api_key: str,
     *,
     anthropic_api_key: str | None = None,
+    hivemind_token: str | None = None,
     openai_api_key: str | None = None,
 ) -> str:
     """Per-launch k8s Secret holding API credentials used by advisor/student pods."""
@@ -505,6 +533,8 @@ def render_launch_secret(
     }
     if anthropic_api_key is not None:
         credentials["anthropic-api-key"] = anthropic_api_key
+    if hivemind_token is not None:
+        credentials["hivemind-token"] = hivemind_token
     if openai_api_key is not None:
         credentials["openai-api-key"] = openai_api_key
     encoded = {
@@ -542,7 +572,11 @@ def _api_error_summary(error: urllib.error.HTTPError, *secrets: str) -> str:
     else:
         err = payload.get("error", payload)
         if isinstance(err, dict):
-            parts = [str(err[k]) for k in ("type", "tag", "message") if err.get(k)]
+            parts = [
+                str(err[k])
+                for k in ("type", "tag", "code", "message")
+                if err.get(k)
+            ]
             summary = ": ".join(parts) if parts else json.dumps(err, sort_keys=True)
         else:
             summary = str(err)
@@ -596,6 +630,38 @@ def preflight_check_openai_api_key(api_key: str) -> None:
         },
     )
     _preflight_http("OpenAI API key", req, api_key, timeout=10)
+
+
+def preflight_check_hivemind_token(token: str) -> None:
+    """Verify that a static Hivemind token has effective write access."""
+    req = urllib.request.Request(
+        HIVEMIND_HEARTBEAT_URL,
+        data=b"",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "senpai-launch-preflight",
+        },
+        method="POST",
+    )
+    print("Preflight: checking Hivemind write access", flush=True)
+    try:
+        with _open_without_redirects(req, timeout=10) as response:
+            status = response.status
+            response.read()
+    except urllib.error.HTTPError as error:
+        sys.exit(
+            "ERROR: Hivemind token failed: "
+            f"HTTP {error.code}: {_api_error_summary(error, token)}"
+        )
+    except urllib.error.URLError as error:
+        reason = _redact_secrets(str(error.reason), token)
+        sys.exit(f"ERROR: Hivemind token failed: {reason}")
+    if status != 204:
+        sys.exit(
+            "ERROR: Hivemind token check returned an unexpected response: "
+            f"HTTP {status}"
+        )
+    print("  OK — Hivemind token has write access")
 
 
 def preflight_check_exa_api_key(api_key: str) -> None:

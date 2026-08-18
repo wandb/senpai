@@ -37,7 +37,8 @@ dependencies.
 9. Only the student image carries CUDA, PyTorch, and the training stack.
 10. Secrets are passed at narrow executor boundaries and redacted before
     monitored content is attached.
-11. Hivemind is disabled, not redesigned, in this change.
+11. Hivemind is opt-in. Its static token is available only to an isolated
+    sidecar, never to the advisor, student, model, or delegated child.
 
 ## Control loop and remote protocol
 
@@ -487,15 +488,17 @@ and resumes the exact root conversation. A nested child must await or cancel
 all of its descendants before returning; it cannot detach background work.
 
 One root spawn batch and all descendants form a delegation tree. The tree may
-admit at most eight tasks over its lifetime, a single spawn batch is limited to
-eight, and the role registry allows at most eight active tasks concurrently
-across all trees. Root tasks consume that lifetime budget, so callers must
-leave capacity when a General Purpose child needs helpers. A later sequential
-root batch forms a new tree. The root is depth zero. It may spawn any registered
-agent at depth one, and a depth-one General Purpose agent may spawn leaf helpers
-at depth two. Explore, Search, Bash Runner, and every depth-two agent are leaves.
-This makes chains such as Explore -> Explore impossible without constraining a
-later research phase to the first batch's lifetime budget.
+admit at most eight tasks over its lifetime, and a single spawn batch is limited
+to eight. `max_parallel_agents` sets the role registry's active-task limit
+across all trees and OpenHands tool concurrency. It defaults to eight and
+accepts values from one to eight. Root tasks consume the tree lifetime budget,
+so callers must leave capacity when a General Purpose child needs helpers. A
+later sequential root batch forms a new tree. The root is depth zero. It may
+spawn any registered agent at depth one, and a depth-one General Purpose agent
+may spawn leaf helpers at depth two. Explore, Search, Bash Runner, and every
+depth-two agent are leaves. This makes chains such as Explore -> Explore
+impossible without constraining a later research phase to the first batch's
+lifetime budget.
 
 Each task has an absolute tier runtime cap: 1,200 seconds for `fast`, 3,600 for
 `smart`, and 7,200 for `frontier`. A descendant's effective deadline is the
@@ -647,6 +650,27 @@ the worker reads and closes that pipe before tool initialization. No raw token
 is written to conversation/dataset storage. The long-lived PID 1 environment,
 model-facing tool schemas, and agent terminal contain no GitHub token.
 
+When `hivemind_enabled` is true, the launcher also requires an `sa_...`
+`HIVEMIND_TOKEN`. It resolves that token only from the shell or repository-root
+`.env`; GitHub login is not a fallback. The launcher calls the daemon heartbeat
+to verify effective write access. The token may be a user-owned Personal Access
+Token or a service-account token. Its Secret reference exists only on an
+isolated Hivemind sidecar. The main role container receives only
+`SENPAI_HIVEMIND_ENABLED`, which causes every root and child
+`LocalConversation` to set
+`runtime=senpai-openhands` and retain child stores for import. The runner
+also removes any stale `HIVEMIND_TOKEN` before model execution as a
+defense-in-depth boundary.
+
+The Kubernetes native sidecar mounts role OpenHands state read-only and stores
+daemon state in a separate writable `emptyDir` that the main container cannot
+access. It disables auto-upgrade and execs the foreground daemon. Kubernetes
+stops the sidecar after the main container during the pod's 90-second
+termination grace period. The daemon and `wandb-agentstream` adapter library
+use the same reviewed AgentStream commit. OpenHands adapter discovery supplies
+`source_format=openhands`; the backend keeps that source format for
+normalization and exposes `SENPAI` as the visible harness.
+
 Generic child processes receive no GitHub token and no GitHub tools. Main-role
 GitHub operations remain typed and lease/state guarded. Terminal and hook
 policies are behavioral guardrails, not a credential-containment boundary.
@@ -694,10 +718,24 @@ server.
 
 The Kubernetes launcher creates one Secret, ConfigMaps, and Deployments. It
 creates no Service or RBAC. Docker and local hosts need no shared network for
-Senpai communication.
+Senpai communication. By default, the scheduler places student pods
+independently. The opt-in `colocate_students` launch setting adds required pod
+affinity on `kubernetes.io/hostname` for student pods with the same research
+tag, without naming a cluster or node. The optional `student_node_name` setting
+adds an exact hostname node selector after validating the value as one
+Kubernetes DNS label. Both settings are empty or disabled by default and may be
+combined.
 
-Hivemind startup remains commented with a clear note. The Python controller
-waits for the optional cluster start gate while continuously refreshing a
+Hivemind remains disabled by default. Enabling it adds one sidecar per role pod
+and one token key to the launch Secret; disabled manifests contain neither.
+The sidecar watches the role-local OpenHands directory recursively, including
+retained child conversations, and uses the target repository as the fallback
+repository attribution. Its exact daemon and adapter sources are configurable
+but default to AgentStream commit
+`fdb6b22a7ba45a0645ff1b535e62d98fc974f593`.
+
+The Python controller waits for the optional cluster start gate while
+continuously refreshing a
 `start-gate` lease; readiness therefore cannot deadlock gated launch. Cluster
 launch and cutoff CLIs accept a gate only when it is an absolute normalized
 file path beneath their shared PVC mount. Cluster cutoff arms as soon as all

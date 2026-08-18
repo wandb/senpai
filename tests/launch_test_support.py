@@ -58,6 +58,7 @@ def render_role(role: str, args: launch.Args | None = None) -> tuple[str, str, s
         "exa",
         "wandb",
         anthropic_api_key="anthropic" if "anthropic" in providers else None,
+        hivemind_token="sa_hivemind" if args.hivemind_enabled else None,
         openai_api_key="openai" if "openai" in providers else None,
     )
     template = (ROOT / "k8s" / f"{role}-deployment.yaml").read_text()

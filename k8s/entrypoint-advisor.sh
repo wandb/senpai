@@ -131,10 +131,6 @@ ls \
     "$HOME/.agents/agents/search.md" \
     "$SENPAI_PLUGIN/skills/wandb-primary/SKILL.md"
 
-# --- Hivemind is intentionally disabled pending its OpenHands rewrite. ---
-# source "$WORKDIR/k8s/start-hivemind.sh"
-# start_hivemind
-
 export IS_SANDBOX=1
 export SENPAI_OPENHANDS_WORKSPACE="$TARGET_WORKDIR"
 export SENPAI_OPENHANDS_HARNESS_FILE="$WORKDIR/system_instructions/SENPAI-HARNESS.md"

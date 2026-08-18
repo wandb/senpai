@@ -210,11 +210,57 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
     assert config.timeout_seconds == 7200
     assert config.llm_timeout_seconds == 5400
     assert config.llm_num_retries == 1
+    assert config.max_parallel_agents == 8
+    assert config.hivemind_enabled is False
 
     delegated = runner.delegation_config(config)
     assert delegated.smart_api_key == "openai-key"
     assert delegated.fast_api_key == "openai-key"
     assert delegated.frontier_api_key == "openai-key"
+    assert delegated.max_parallel_agents == 8
+
+
+def test_resolved_config_honors_the_parallel_agent_limit(tmp_path: Path):
+    env = runtime_env(tmp_path)
+    env["SENPAI_MAX_PARALLEL_AGENTS"] = "4"
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert config.max_parallel_agents == 4
+    assert runner.delegation_config(config).max_parallel_agents == 4
+
+
+def test_resolved_config_enables_hivemind_store_retention(tmp_path: Path):
+    env = runtime_env(tmp_path)
+    env["SENPAI_HIVEMIND_ENABLED"] = "true"
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert config.hivemind_enabled is True
+
+
+@pytest.mark.parametrize("setting", ["1", "yes", "enabled"])
+def test_resolved_config_rejects_an_invalid_hivemind_setting(
+    tmp_path: Path,
+    setting: str,
+):
+    env = runtime_env(tmp_path)
+    env["SENPAI_HIVEMIND_ENABLED"] = setting
+
+    with pytest.raises(RuntimeError, match="SENPAI_HIVEMIND_ENABLED"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+
+@pytest.mark.parametrize("limit", ["not-an-integer", "0", "9"])
+def test_resolved_config_rejects_an_invalid_parallel_agent_limit(
+    tmp_path: Path,
+    limit: str,
+):
+    env = runtime_env(tmp_path)
+    env["SENPAI_MAX_PARALLEL_AGENTS"] = limit
+
+    with pytest.raises(RuntimeError, match="SENPAI_MAX_PARALLEL_AGENTS"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
 def test_resolved_config_discovers_one_level_program_from_target_workspace(
@@ -594,6 +640,7 @@ def test_model_credentials_are_removed_from_the_agent_environment(tmp_path: Path
         "ANTHROPIC_API_KEY": "anthropic-key",
         "OPENAI_API_KEY": "openai-key",
         "WANDB_API_KEY": "wandb-key",
+        "HIVEMIND_TOKEN": "sa_stale-token",
     }
 
     scrub_model_credentials(environment, runtime_config(tmp_path))

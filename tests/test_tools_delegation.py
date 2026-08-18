@@ -956,6 +956,27 @@ def test_registry_active_cap_spans_trees_and_frees_after_completion(tmp_path):
         release.set()
 
 
+def test_configured_active_cap_rejects_a_larger_spawn_batch(tmp_path):
+    requests = []
+
+    def factory(request):
+        requests.append(request)
+        return FakeChild(threading.Event())
+
+    spawn, *_ = tools(tmp_path, factory, max_parallel_agents=2)
+
+    with pytest.raises(RuntimeError, match=r"capacity is full \(2 active\)"):
+        spawn(
+            SpawnAgentsAction(
+                batch_key="configured-cap",
+                tasks=[AgentTask(key=str(i), task=f"Task {i}") for i in range(3)],
+            ),
+            parent_conversation(),
+        )
+
+    assert requests == []
+
+
 def test_cancelling_a_root_task_cancels_descendants_deepest_first(tmp_path):
     root_release = threading.Event()
     leaf_release = threading.Event()

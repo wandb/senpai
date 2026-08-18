@@ -88,6 +88,7 @@ def bypass_external_preflight(monkeypatch):
         ("resolve_anthropic_api_key", "anthropic"),
         ("resolve_openai_api_key", "openai"),
         ("resolve_exa_api_key", "exa"),
+        ("resolve_hivemind_token", "sa_hivemind"),
         ("resolve_wandb_api_key", "wandb"),
     ):
         monkeypatch.setattr(launch, name, lambda _path, value=value: value)
@@ -97,6 +98,7 @@ def bypass_external_preflight(monkeypatch):
         "preflight_check_anthropic_api_key",
         "preflight_check_openai_api_key",
         "preflight_check_exa_api_key",
+        "preflight_check_hivemind_token",
         "preflight_check_wandb_api_key",
         "preflight_check_wandb_inference",
         "ensure_advisor_branch",

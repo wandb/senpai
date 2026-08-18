@@ -60,6 +60,7 @@ ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
 EXA_API_KEY=
 WANDB_API_KEY=
+HIVEMIND_TOKEN=
 ```
 
 | Credential | Required access |
@@ -69,10 +70,11 @@ WANDB_API_KEY=
 | `OPENAI_API_KEY` | Required when an `openai/...` model is configured. Every default profile uses GPT-5.6. |
 | `EXA_API_KEY` | General-web and research-publication search. |
 | `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. |
+| `HIVEMIND_TOKEN` | Required only when `hivemind_enabled` is true. Create a write-scoped Personal Access Token in Hivemind Settings > Access, or use a service-account token. Both use the `sa_...` static-token form; read scope is not required. |
 
 `k8s/launch.py` reads shell environment variables first and then the repository-root `.env`; only the GitHub token also falls back to `gh auth token`. Direct Docker or host execution must export or pass credentials explicitly.
 
-The launcher places credentials in a per-launch Kubernetes Secret. During bootstrap, the GitHub write token is removed from the process environment and handed to the controller through a one-use channel; it is not exposed to the model or subagents.
+The launcher places credentials in a per-launch Kubernetes Secret. During bootstrap, the GitHub write token is removed from the process environment and handed to the controller through a one-use channel; it is not exposed to the model or subagents. The Hivemind token has no GitHub-login fallback and is mounted only into the isolated Hivemind sidecar, never the advisor or student container.
 
 ### 4. Prepare the target repository
 
@@ -108,6 +110,10 @@ program_path: ""  # auto-discover, or set e.g. senpai/program.md
 wandb_entity: your-team
 wandb_project: your-project
 
+hivemind_enabled: false
+hivemind_daemon_source: "wandb-hivemind @ git+https://github.com/wandb/agentstream.git@fdb6b22a7ba45a0645ff1b535e62d98fc974f593#subdirectory=daemon"
+hivemind_agentstream_source: "wandb-agentstream @ git+https://github.com/wandb/agentstream.git@fdb6b22a7ba45a0645ff1b535e62d98fc974f593"
+
 advisor_model: openai/gpt-5.6-sol
 advisor_reasoning_effort: xhigh
 student_model: openai/gpt-5.6-sol
@@ -120,6 +126,8 @@ fast_reasoning_effort: high
 frontier_model: openai/gpt-5.6-sol
 frontier_reasoning_effort: max
 
+max_parallel_agents: 8
+
 pvc_claim_name: your-existing-pvc
 pvc_mount_path: /mnt/data
 
@@ -127,6 +135,8 @@ n_students: 1
 gpus_per_student: 1
 cpu_per_gpu: 8
 memory_gi_per_gpu: 64
+colocate_students: false
+student_node_name: ""
 
 timeout_minutes: 30
 max_epochs: 50
@@ -143,6 +153,24 @@ uses `WANDB_API_KEY` for auth.
 
 The defaults in `senpai.yaml` describe W&B's deployment and should not be copied unchanged into another environment. Every setting can also be overridden on the command line. `--tag` and `--target_repo_url` are required unless your chosen config file supplies them.
 
+`max_parallel_agents` sets the active delegated-subagent limit and OpenHands
+tool concurrency for every advisor and student. It accepts values from 1 to 8.
+Set `colocate_students: true` to require all student pods with the same research
+tag to run on one Kubernetes node. The scheduler leaves students pending when
+no node can satisfy their combined resource requests. Set `student_node_name`
+to a verified Kubernetes hostname label to target one exact node. This setting
+adds a node selector and can be combined with `colocate_students`.
+
+Hivemind recording is disabled by default. When enabled, each pod gets a
+least-privilege Kubernetes native sidecar that watches the role's OpenHands
+state directory and runs the daemon and OpenHands adapter from the same
+reviewed AgentStream commit. Root and delegated conversations carry
+`runtime=senpai-openhands`, which AgentStream displays as the `SENPAI` harness
+while retaining OpenHands as the source format. The `delete_on_close` setting
+keeps child stores available for catch-up until pod replacement. Its daemon
+state is pod-local and disappears when Kubernetes replaces or reschedules the
+pod.
+
 Deployments require matching advisor and student image digests, or `sha-<40-character-commit>` tags built from the same SENPAI revision. Digest-pinned images also require the full matching `senpai_repo_revision`. The source commit must be fetchable from `senpai_repo_url`; its public default is read-only and needs no PR permission. Override it only when using images built from another SENPAI repository. `target_repo_url` is the separate, required repository where agents create commits and PRs.
 
 ### 6. Run preflight
@@ -158,7 +186,11 @@ uv run python k8s/launch.py \
 Preflight authenticates GitHub, Exa, W&B, and every model provider referenced by
 the configured model profiles. It also verifies GitHub Contents write access,
 resolves the target branch, and rejects student labels already carrying active
-assignments. It deliberately skips image validation and makes no cluster
+assignments. When Hivemind is enabled, preflight also requires an `sa_...`
+static token from the shell or `.env` and calls the daemon heartbeat to verify
+effective write access. A Personal Access Token attributes uploads to its human
+owner; the recorded coding harness remains independent of that identity.
+Preflight deliberately skips image validation and makes no cluster
 changes. A real launch additionally verifies immutable image syntax and that
 both role images identify the same source revision.
 
@@ -389,6 +421,12 @@ The controller owns cadence, durable events, conversation selection, verified Gi
 The command policy blocks raw GitHub mutations, direct training, `git push`, polling loops, and log streams. Operation-specific typed tools enforce repository, branch, assignment, revision, head-SHA, label, and replay preconditions. This policy keeps routine operations deterministic while leaving high-entropy research work to the agent.
 
 When `WANDB_ENTITY` and `WANDB_PROJECT` are configured, [`weave-openhands`](https://github.com/morganmcg1/weave-openhands) traces advisor, student, and child conversations. Each `OPENHANDS_RUN` record includes a direct Weave Agent Observability URL.
+
+Optional Hivemind recording runs as a restartable native sidecar init container.
+Only the sidecar receives `HIVEMIND_TOKEN`. It mounts OpenHands state read-only,
+uses a separate writable `emptyDir` for daemon state, disables auto-upgrade, and
+executes the commit-pinned foreground daemon. Kubernetes stops the sidecar after
+the main container, which preserves final OpenHands writes for synchronization.
 
 ## Operations
 

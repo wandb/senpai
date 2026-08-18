@@ -223,6 +223,7 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
     assert fast.environment["SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT"] == (
         config.frontier_reasoning_effort
     )
+    assert fast.environment["SENPAI_MAX_PARALLEL_AGENTS"] == "8"
 
 
 def test_child_environment_carries_the_resolved_program_path(tmp_path: Path):
@@ -239,6 +240,15 @@ def test_child_environment_carries_the_resolved_program_path(tmp_path: Path):
         b64decode(child.environment[LAUNCH_CONTEXT_ENV], validate=True).decode()
         == "# Authoritative launch context\n\nSystem policy."
     )
+
+
+def test_child_environment_carries_hivemind_retention_explicitly(tmp_path: Path):
+    child = OpenHandsChildProcess(
+        delegation_config(tmp_path, hivemind_enabled=True),
+        delegation_request(),
+    )
+
+    assert child.environment["SENPAI_HIVEMIND_ENABLED"] == "true"
 
 
 def test_child_reuses_the_supervisor_rendered_role_prompt(tmp_path: Path):
@@ -306,19 +316,21 @@ def test_child_environment_replaces_ambient_model_credentials(
     assert "GEMINI_API_KEY" not in environment
 
 
-def test_child_process_never_receives_the_github_write_token(
+def test_child_process_never_receives_control_plane_tokens(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     request = delegation_request()
     config = delegation_config(tmp_path)
     monkeypatch.setenv("GITHUB_TOKEN", "ambient-write-token")
+    monkeypatch.setenv("HIVEMIND_TOKEN", "sa_ambient-hivemind-token")
 
     environment = OpenHandsChildProcess(config, request).environment
 
     assert "GITHUB_TOKEN" not in environment
     assert "GH_TOKEN" not in environment
     assert "SENPAI_GITHUB_TOKEN_FILE" not in environment
+    assert "HIVEMIND_TOKEN" not in environment
     assert "ambient-write-token" not in repr(environment)
     assert not list(config.state_dir.rglob(".github-token-*"))
 

@@ -205,6 +205,8 @@ class RunnerConfig:
     role_file: Path
     plugin_dir: Path
     instructions: SenpaiSystemInstructions
+    max_parallel_agents: int = MAX_PARALLEL_AGENTS
+    hivemind_enabled: bool = False
     advisor_branch: str | None = None
     student_names: tuple[str, ...] | None = None
     student_name: str | None = None
@@ -638,6 +640,20 @@ def resolve_config(
     if llm_timeout_seconds <= 0 or llm_num_retries <= 0:
         raise RuntimeError("Senpai LLM timeout and attempts must be positive")
     try:
+        max_parallel_agents = int(
+            env.get("SENPAI_MAX_PARALLEL_AGENTS", str(MAX_PARALLEL_AGENTS))
+        )
+    except ValueError as error:
+        raise RuntimeError("SENPAI_MAX_PARALLEL_AGENTS must be an integer") from error
+    if not 1 <= max_parallel_agents <= MAX_PARALLEL_AGENTS:
+        raise RuntimeError(
+            f"SENPAI_MAX_PARALLEL_AGENTS must be between 1 and {MAX_PARALLEL_AGENTS}"
+        )
+    hivemind_setting = env.get("SENPAI_HIVEMIND_ENABLED", "false").strip().lower()
+    if hivemind_setting not in {"true", "false"}:
+        raise RuntimeError("SENPAI_HIVEMIND_ENABLED must be true or false")
+    hivemind_enabled = hivemind_setting == "true"
+    try:
         inbox_max_stalled_attempts = int(
             env.get(
                 "SENPAI_INBOX_MAX_STALLED_ATTEMPTS",
@@ -871,6 +887,8 @@ def resolve_config(
             env_value(args.plugin_dir, env, "SENPAI_PLUGIN"),
         ),
         instructions=instructions,
+        max_parallel_agents=max_parallel_agents,
+        hivemind_enabled=hivemind_enabled,
         advisor_branch=env.get("ADVISOR_BRANCH") or None,
         student_names=tuple(
             name.strip()
@@ -1077,6 +1095,7 @@ def scrub_model_credentials(
         config.frontier_api_key_env,
     }:
         environment.pop(key_env, None)
+    environment.pop("HIVEMIND_TOKEN", None)
 
 
 def build_main_tools(config: RunnerConfig) -> list[Tool]:
@@ -1164,6 +1183,8 @@ def delegation_config(
         role=config.role,
         program_path=config.instructions.program.program_path,
         launch_context=config.instructions.launch,
+        max_parallel_agents=config.max_parallel_agents,
+        hivemind_enabled=config.hivemind_enabled,
         root_state_dir=config.delegation_root_state_dir,
         tree_id=config.delegation_tree_id,
         depth=config.delegation_depth,
@@ -1488,6 +1509,7 @@ def run_openhands(
                 "role_file": str(config.role_file) if config.role_file else None,
                 "plugin_dir": str(config.plugin_dir),
                 "available_agents": available_agents,
+                "max_parallel_agents": config.max_parallel_agents,
                 "weave_project": WEAVE_PROJECT,
                 "weave_url": weave_conversation_url(
                     WEAVE_PROJECT,
@@ -1553,7 +1575,7 @@ def run_openhands(
                 config.instructions,
                 project_skills,
             )
-            agent = with_tool_concurrency(agent, MAX_PARALLEL_AGENTS)
+            agent = with_tool_concurrency(agent, config.max_parallel_agents)
             if (
                 agent.llm.responses_use_previous_response_id
                 or agent.llm.uses_anthropic_compaction()
@@ -1579,7 +1601,7 @@ def run_openhands(
                 ),
                 system_prompt_kwargs={"cli_mode": True},
                 condenser=condenser,
-                tool_concurrency_limit=MAX_PARALLEL_AGENTS,
+                tool_concurrency_limit=config.max_parallel_agents,
             )
         last_activity = time.monotonic()
 
@@ -1601,7 +1623,7 @@ def run_openhands(
             visualizer=None,
             secrets=dict(config.command_secrets),
             tags={"runtime": "senpai-openhands"},
-            delete_on_close=config.child,
+            delete_on_close=config.child and not config.hivemind_enabled,
             prompt_cache_key=conversation_prompt_cache_key(config),
         )
         reject_recovered_actions(conversation)

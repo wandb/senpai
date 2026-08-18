@@ -21,6 +21,13 @@ def load_kubernetes_template(name: str) -> dict:
     """Render Go-template tokens before asking PyYAML to parse the manifest."""
     template = (ROOT / "k8s" / name).read_text(encoding="utf-8")
     template = template.replace("{{MODEL_PROVIDER_ENV}}", "- name: MODEL_API_KEY")
+    for placeholder in (
+        "{{HIVEMIND_SIDECAR}}",
+        "{{HIVEMIND_STATE_VOLUME}}",
+        "{{STUDENT_AFFINITY}}",
+        "{{STUDENT_NODE_SELECTOR}}",
+    ):
+        template = template.replace(placeholder, "")
     return yaml.safe_load(TEMPLATE_TOKEN.sub("fixture", template))
 
 
@@ -208,6 +215,8 @@ def test_entrypoints_delegate_runtime_lifecycle_to_the_python_supervisor(
         in entrypoint
     )
     assert f"exec python -m senpai_agent.supervisor {role}" in entrypoint
+    assert "HIVEMIND_TOKEN" not in entrypoint
+    assert "start_hivemind" not in entrypoint
     assert "wait_for_senpai_start_gate" not in entrypoint
     trust_runner = 'git config --global safe.directory "$WORKDIR"'
     assert entrypoint.index(trust_runner) < entrypoint.index(
@@ -266,6 +275,7 @@ def test_role_pods_enforce_non_root_process_isolation():
         pod = deployment["spec"]["template"]["spec"]
         container = container_for(deployment)
 
+        assert pod["automountServiceAccountToken"] is False
         assert pod["securityContext"] == {
             "runAsNonRoot": True,
             "runAsUser": 10001,

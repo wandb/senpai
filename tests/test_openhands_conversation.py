@@ -50,6 +50,7 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
             self.id = kwargs["conversation_id"]
             captured["secrets"] = kwargs["secrets"]
             captured["delete_on_close"] = kwargs["delete_on_close"]
+            captured["tags"] = kwargs["tags"]
             captured["llm_timeout"] = agent.llm.timeout
             captured["llm_num_retries"] = agent.llm.num_retries
             self.state = SimpleNamespace(
@@ -86,6 +87,7 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     assert captured["secrets"] == {"WANDB_API_KEY": "wandb-key"}
     assert captured["conversation_id_env"] == config.conversation_id.hex
     assert captured["delete_on_close"] is False
+    assert captured["tags"] == {"runtime": "senpai-openhands"}
     assert captured["llm_timeout"] == 5400
     assert captured["llm_num_retries"] == 1
     assert captured["closed"] is True
@@ -857,10 +859,16 @@ def test_restart_after_recovery_commit_resets_before_delivering(tmp_path, monkey
     ]
 
 
-def test_child_requests_ephemeral_storage_and_emits_its_terminal_report(
+@pytest.mark.parametrize(
+    ("hivemind_enabled", "delete_on_close"),
+    [(False, True), (True, False)],
+)
+def test_child_storage_lifetime_supports_hivemind_catch_up_and_terminal_report(
     tmp_path,
     monkeypatch,
     capsys,
+    hivemind_enabled,
+    delete_on_close,
 ):
     captured = {}
 
@@ -868,6 +876,7 @@ def test_child_requests_ephemeral_storage_and_emits_its_terminal_report(
         def __init__(self, **kwargs):
             self.id = kwargs["conversation_id"]
             captured["delete_on_close"] = kwargs["delete_on_close"]
+            captured["tags"] = kwargs["tags"]
             self.state = SimpleNamespace(
                 execution_status=ConversationExecutionStatus.IDLE,
                 view=SimpleNamespace(events=[]),
@@ -894,7 +903,11 @@ def test_child_requests_ephemeral_storage_and_emits_its_terminal_report(
     monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
     isolate_agent_discovery(monkeypatch, runner)
     monkeypatch.setattr(runner, "WEAVE_PROJECT", "wandb-applied-ai-team/senpai-v1")
-    config = runtime_config(tmp_path, child=True)
+    config = runtime_config(
+        tmp_path,
+        child=True,
+        hivemind_enabled=hivemind_enabled,
+    )
 
     assert run_openhands("child task", config) == 0
 
@@ -913,7 +926,11 @@ def test_child_requests_ephemeral_storage_and_emits_its_terminal_report(
             if line.startswith("OPENHANDS_RUN ")
         )
     )
-    assert captured == {"delete_on_close": True, "closed": True}
+    assert captured == {
+        "delete_on_close": delete_on_close,
+        "tags": {"runtime": "senpai-openhands"},
+        "closed": True,
+    }
     assert result["result"] == "bounded child report"
     assert run["weave_url"] == (
         "https://wandb.ai/wandb-applied-ai-team/senpai-v1/"
@@ -921,7 +938,7 @@ def test_child_requests_ephemeral_storage_and_emits_its_terminal_report(
     )
 
 
-def test_student_requests_persistent_storage_for_monitor_wake(
+def test_student_requests_persistent_storage_and_configured_tool_concurrency(
     tmp_path,
     monkeypatch,
 ):
@@ -952,16 +969,26 @@ def test_student_requests_persistent_storage_for_monitor_wake(
     isolate_agent_discovery(monkeypatch, runner)
     monkeypatch.setattr(runner, "configure_delegation", delegation.append)
 
-    assert run_openhands("student task", runtime_config(tmp_path, role="student")) == 0
+    assert (
+        run_openhands(
+            "student task",
+            runtime_config(
+                tmp_path,
+                role="student",
+                max_parallel_agents=4,
+            ),
+        )
+        == 0
+    )
     assert captured == {
         "delete_on_close": False,
-        "tool_concurrency_limit": 8,
+        "tool_concurrency_limit": 4,
     }
     assert delegation[0].role == "student"
     assert delegation[-1] is None
 
 
-def test_github_tokens_never_reach_the_agent_environment(
+def test_control_plane_tokens_never_reach_the_agent_environment(
     tmp_path,
     monkeypatch,
 ):
@@ -975,21 +1002,33 @@ def test_github_tokens_never_reach_the_agent_environment(
             )
 
         def send_message(self, _prompt):
-            observed.append(runner.os.environ.get("GITHUB_TOKEN"))
+            observed.append(
+                (
+                    runner.os.environ.get("GITHUB_TOKEN"),
+                    runner.os.environ.get("HIVEMIND_TOKEN"),
+                )
+            )
 
         async def arun(self):
-            observed.append(runner.os.environ.get("GITHUB_TOKEN"))
+            observed.append(
+                (
+                    runner.os.environ.get("GITHUB_TOKEN"),
+                    runner.os.environ.get("HIVEMIND_TOKEN"),
+                )
+            )
 
         def close(self):
             pass
 
     monkeypatch.setenv("GITHUB_TOKEN", "stale-env-secret")
+    monkeypatch.setenv("HIVEMIND_TOKEN", "sa_stale-env-secret")
     monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
     isolate_agent_discovery(monkeypatch, runner)
 
     assert run_openhands("task", runtime_config(tmp_path, role="student")) == 0
-    assert observed == [None, None]
+    assert observed == [(None, None), (None, None)]
     assert "GITHUB_TOKEN" not in runner.os.environ
+    assert "HIVEMIND_TOKEN" not in runner.os.environ
 
 
 @pytest.mark.parametrize(

@@ -160,6 +160,8 @@ class DelegationConfig:
     role: str
     program_path: str
     launch_context: str
+    max_parallel_agents: int = MAX_PARALLEL_AGENTS
+    hivemind_enabled: bool = False
     root_state_dir: Path | None = None
     tree_id: str | None = None
     depth: int = 0
@@ -342,6 +344,7 @@ class OpenHandsChildProcess:
             if name.endswith("_API_KEY"):
                 environment.pop(name)
         for name in (
+            "HIVEMIND_TOKEN",
             "SENPAI_OPENHANDS_AGENT",
             "SENPAI_OPENHANDS_CONVERSATION_ID",
         ):
@@ -376,6 +379,10 @@ class OpenHandsChildProcess:
                 "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": (
                     self._config.frontier_reasoning_effort
                 ),
+                "SENPAI_MAX_PARALLEL_AGENTS": str(self._config.max_parallel_agents),
+                "SENPAI_HIVEMIND_ENABLED": str(
+                    self._config.hivemind_enabled
+                ).lower(),
                 "SENPAI_PARENT_CONVERSATION_HISTORY_DIR": str(
                     self._config.state_dir
                     / uuid.UUID(self._request.parent_conversation_id).hex
@@ -803,6 +810,7 @@ class DelegationRegistry:
         depth: int,
         specs: Sequence[AgentTaskBase],
         deadlines: Sequence[float],
+        max_parallel_agents: int = MAX_PARALLEL_AGENTS,
     ) -> tuple[list[sqlite3.Row], bool]:
         specs_json = _task_specs_json(specs)
         keys = [spec.key or str(index) for index, spec in enumerate(specs)]
@@ -865,9 +873,9 @@ class DelegationRegistry:
                 raise RuntimeError(
                     f"delegation tree capacity is {MAX_TREE_AGENTS} total tasks"
                 )
-            if active_count + len(specs) > MAX_PARALLEL_AGENTS:
+            if active_count + len(specs) > max_parallel_agents:
                 raise RuntimeError(
-                    f"subagent capacity is full ({MAX_PARALLEL_AGENTS} active)"
+                    f"subagent capacity is full ({max_parallel_agents} active)"
                 )
 
             database.execute(
@@ -1397,6 +1405,7 @@ class _DelegationManager:
             depth=self.config.depth + 1,
             specs=action.tasks,
             deadlines=deadlines,
+            max_parallel_agents=self.config.max_parallel_agents,
         )
         self._reconcile(rows)
         rows = self.registry.rows([row["task_id"] for row in rows])
