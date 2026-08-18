@@ -15,7 +15,7 @@ from senpai_agent.kubernetes_executor import (
     _UnixServer,
     checkout_source_bundle,
 )
-from senpai_agent.kubernetes_training import KubernetesApiClient
+from senpai_agent.kubernetes_training import KubernetesApiClient, KubernetesApiError
 from senpai_agent.training import KubernetesResourceRef, TrainingState
 
 
@@ -157,6 +157,7 @@ def manifest(commit: str = "a" * 40) -> dict:
     worker = {
         "name": "train",
         "image": "training:immutable",
+        "volumeMounts": [{"name": "dataset", "mountPath": "/mnt/amf1-pvc"}],
         "env": [
             {"name": "WANDB_API_KEY", "value": "must-be-replaced"},
             {"name": "NN_CFD_WANDB_RUN_ID", "value": "wandb-one"},
@@ -345,6 +346,64 @@ def test_executor_rejects_an_explicitly_read_only_dataset_pvc(tmp_path):
     with pytest.raises(
         ValueError,
         match="dataset PVC must be read-write for status and checkpoints",
+    ):
+        apply(broker, document)
+
+
+def test_executor_rejects_a_gpu_container_without_the_dataset_pvc_mount(tmp_path):
+    broker = executor(tmp_path)
+    reserve(broker)
+    document = manifest()
+    worker = document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]["spec"]
+    worker["containers"][0]["volumeMounts"] = []
+
+    with pytest.raises(
+        ValueError,
+        match="every GPU training container must mount the dataset PVC",
+    ):
+        apply(broker, document)
+
+
+def test_executor_rejects_a_read_only_gpu_dataset_mount(tmp_path):
+    broker = executor(tmp_path)
+    reserve(broker)
+    document = manifest()
+    worker = document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]["spec"]
+    worker["containers"][0]["volumeMounts"][0]["readOnly"] = True
+
+    with pytest.raises(
+        ValueError,
+        match="GPU training containers must mount the dataset PVC read-write",
+    ):
+        apply(broker, document)
+
+
+def test_executor_allows_a_read_only_alias_with_a_writable_dataset_mount(tmp_path):
+    broker = executor(tmp_path)
+    reserve(broker)
+    document = manifest()
+    worker = document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]["spec"]
+    worker["containers"][0]["volumeMounts"].append(
+        {
+            "name": "dataset",
+            "mountPath": "/mnt/dataset-read-only",
+            "readOnly": True,
+        }
+    )
+
+    assert "created" in apply(broker, document)
+
+
+def test_executor_rejects_a_dataset_mount_replaced_by_the_workspace(tmp_path):
+    broker = executor(tmp_path)
+    reserve(broker)
+    document = manifest()
+    worker = document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]["spec"]
+    worker["containers"][0]["volumeMounts"][0]["mountPath"] = "/workspace"
+
+    with pytest.raises(
+        ValueError,
+        match="every GPU training container must mount the dataset PVC",
     ):
         apply(broker, document)
 
@@ -698,6 +757,119 @@ def test_executor_recovers_a_create_response_failure_before_release(tmp_path):
     assert persisted["released"] is False
 
 
+@pytest.mark.parametrize("status_code", [408, 422, 425, 429])
+def test_executor_releases_a_direct_create_rejection(tmp_path, status_code):
+    class RejectedCreate(FakeApi):
+        def create(self, _manifest, _namespace):
+            raise KubernetesApiError(
+                "POST",
+                "/apis/kubeflow.org/v2beta1/mpijobs",
+                status_code,
+            )
+
+    broker = executor(tmp_path, RejectedCreate())
+    reserve(broker)
+
+    with pytest.raises(KubernetesApiError, match=f"HTTP {status_code}"):
+        apply(broker, manifest())
+
+    persisted = json.loads((tmp_path / "reservation.json").read_text())
+    assert persisted["create_attempted"] is True
+    assert persisted["released"] is True
+    assert persisted["manifest"] is None
+
+    reserve(broker, "b" * 40)
+    replacement = json.loads((tmp_path / "reservation.json").read_text())
+    assert replacement["source_commit"] == "b" * 40
+    assert replacement["released"] is False
+
+
+@pytest.mark.parametrize("retry_operation", ["reconcile", "apply"])
+def test_executor_retains_a_rejected_retry_after_an_ambiguous_create(
+    tmp_path,
+    retry_operation,
+):
+    class RejectedRetry(FakeApi):
+        def __init__(self):
+            super().__init__()
+            self.pending: dict | None = None
+
+        def create(self, manifest, _namespace):
+            self.creates += 1
+            if self.creates == 1:
+                self.pending = deepcopy(manifest)
+                raise TimeoutError("create response was lost")
+            raise KubernetesApiError("POST", "/apis/kubeflow.org/v2beta1/mpijobs", 422)
+
+        def complete_initial_create(self):
+            assert self.pending is not None
+            self.document_value = self.pending
+            self.document_value["metadata"]["uid"] = "late-initial-uid"
+
+    api = RejectedRetry()
+    broker = executor(tmp_path, api)
+    reserve(broker)
+
+    with pytest.raises(TimeoutError, match="response was lost"):
+        apply(broker, manifest())
+    assert json.loads((tmp_path / "reservation.json").read_text())["released"] is False
+
+    if retry_operation == "reconcile":
+        broker.reconcile()
+    else:
+        with pytest.raises(KubernetesApiError, match="HTTP 422"):
+            apply(broker, manifest())
+
+    persisted = json.loads((tmp_path / "reservation.json").read_text())
+    assert persisted["create_attempted"] is True
+    assert persisted["released"] is False
+    assert persisted["manifest"] is not None
+
+    api.complete_initial_create()
+    broker._reservation["deadline_at"] = time.time() - 1
+    broker._write_state()
+    broker.reconcile()
+
+    assert api.deleted == [
+        KubernetesResourceRef(
+            kind="MPIJob",
+            name="senpai-fred-fern-123",
+            namespace="research",
+            uid="late-initial-uid",
+            nodes=2,
+            gpus_per_node=8,
+        )
+    ]
+    assert json.loads((tmp_path / "reservation.json").read_text())["released"] is True
+
+
+@pytest.mark.parametrize(
+    "status_code",
+    [409, 499, 503],
+    ids=["conflict-may-be-an-existing-create", "client-closed", "server-error"],
+)
+def test_executor_retains_an_ambiguous_http_create_response(
+    tmp_path,
+    status_code,
+):
+    class UnavailableApi(FakeApi):
+        def create(self, _manifest, _namespace):
+            raise KubernetesApiError(
+                "POST", "/apis/kubeflow.org/v2beta1/mpijobs", status_code
+            )
+
+    broker = executor(tmp_path, UnavailableApi())
+    reserve(broker)
+
+    with pytest.raises(KubernetesApiError, match=f"HTTP {status_code}"):
+        apply(broker, manifest())
+
+    persisted = json.loads((tmp_path / "reservation.json").read_text())
+    assert persisted["create_attempted"] is True
+    assert persisted["released"] is False
+    assert persisted["manifest"] is not None
+
+
 def test_executor_retains_an_unresolved_create_until_it_becomes_visible(tmp_path):
     class DelayedCreate(FakeApi):
         def __init__(self):
@@ -715,6 +887,10 @@ def test_executor_retains_an_unresolved_create_until_it_becomes_visible(tmp_path
 
     with pytest.raises(TimeoutError, match="response was lost"):
         apply(broker, manifest())
+    persisted = json.loads((tmp_path / "reservation.json").read_text())
+    assert persisted["create_attempted"] is True
+    assert persisted["released"] is False
+    assert persisted["manifest"] is not None
     with pytest.raises(RuntimeError, match="unresolved Kubernetes create"):
         broker.handle({"operation": "release", "training_id": "training-one"})
 
@@ -814,6 +990,25 @@ def test_late_initial_create_stays_suspended_after_retry_release(tmp_path):
 
     assert api.document_value["spec"]["runPolicy"]["suspend"] is True
     assert api.activated == []
+
+
+def test_api_error_preserves_the_http_status(tmp_path, monkeypatch):
+    token = tmp_path / "token"
+    token.write_text("rotated-token")
+    client = object.__new__(KubernetesApiClient)
+    client.api_server = "https://kubernetes.example"
+    client.token_path = token
+    client.ssl_context = None
+
+    def reject(request, **_kwargs):
+        raise urllib.error.HTTPError(request.full_url, 422, "invalid", {}, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", reject)
+
+    with pytest.raises(KubernetesApiError) as error:
+        client.create({"kind": "Job"}, "research")
+
+    assert error.value.status_code == 422
 
 
 def test_api_delete_uses_a_uid_precondition_and_foreground_propagation(
