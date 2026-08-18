@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 import senpai_agent.git_workflow as git_workflow
 from senpai_agent.git_workflow import (
@@ -52,6 +53,26 @@ def test_create_assignment_branch_is_empty_idempotent_and_worktree_safe(
         "rev-parse",
         f"{base_sha}^{{tree}}",
     )
+
+
+def test_credentialed_assignment_creation_uses_an_isolated_repository(tmp_path: Path):
+    workspace, remote, base_sha = advisor_repository(tmp_path)
+    attacker_remote = tmp_path / "attacker.git"
+    git(tmp_path, "init", "--bare", str(attacker_remote))
+    git(workspace, "remote", "set-url", "--push", "origin", str(attacker_remote))
+
+    created = create_assignment_branch(
+        workspace,
+        branch="student-one/lower-lr",
+        base_branch="schmidhuber",
+        expected_base_sha=base_sha,
+        assignment_id="assignment-7",
+        authenticated_remote=remote.resolve().as_uri(),
+        token=SecretStr("typed-write-token"),
+    )
+
+    assert git(remote, "rev-parse", f"refs/heads/{created.branch}") == created.head_sha
+    assert git(attacker_remote, "branch", "--list", created.branch) == ""
 
 
 def test_create_assignment_branch_rejects_foreign_existing_history(

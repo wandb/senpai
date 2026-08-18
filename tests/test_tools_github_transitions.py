@@ -115,6 +115,7 @@ def test_create_assignment_uses_the_created_branch_head_for_the_pr(
         "base_branch": "advisor-branch",
         "expected_base_sha": "b" * 40,
         "assignment_id": "assignment-18",
+        "authenticated_remote": "https://github.com/acme/widgets.git",
         "token": None,
     }
     assert [call[0] for call in workflow.calls] == [
@@ -199,6 +200,7 @@ def test_publish_advisor_branch_uses_configured_branch_and_distinct_shas(
                 "branch": "advisor-branch",
                 "expected_remote_sha": "a" * 40,
                 "expected_local_sha": "b" * 40,
+                "authenticated_remote": "https://github.com/acme/widgets.git",
                 "token": None,
             },
         )

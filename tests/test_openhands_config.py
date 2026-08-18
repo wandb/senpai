@@ -5,6 +5,7 @@ import pytest
 from pydantic import SecretStr
 
 import senpai_agent.openhands_runner as runner
+from senpai_agent.openhands_security import disable_ambient_plugin_discovery
 from senpai_agent.openhands_runner import (
     build_main_agent_context,
     find_role_file,
@@ -23,6 +24,24 @@ from openhands_support import TEST_LAUNCH_CONTEXT, runtime_config, runtime_env
 from test_agent_markdown import HTML_HEADER, PLAIN_HEADER
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_ambient_openhands_plugins_are_disabled(monkeypatch: pytest.MonkeyPatch):
+    from openhands.sdk.conversation.impl import local_conversation
+
+    monkeypatch.setattr(
+        local_conversation,
+        "load_available_plugins",
+        lambda *_args, **_kwargs: {"attacker": object()},
+    )
+
+    disable_ambient_plugin_discovery()
+
+    assert local_conversation.load_available_plugins(
+        work_dir="/untrusted-target",
+        include_user=True,
+        include_project=True,
+    ) == {}
 
 
 def test_browser_is_enabled_by_default_and_can_be_disabled():

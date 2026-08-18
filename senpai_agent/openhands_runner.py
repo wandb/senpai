@@ -88,6 +88,7 @@ from senpai_agent.github.tools import (
     configure_github_credentials,
 )
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV, decode_launch_context
+from senpai_agent.openhands_security import disable_ambient_plugin_discovery
 from senpai_agent.program_context import (
     PROGRAM_PATH_ENV,
     load_program_system_prompt,
@@ -1375,6 +1376,7 @@ def run_openhands(
     if run_timeout <= 0:
         raise TimeoutError("the inherited OpenHands deadline has expired")
     scrub_model_credentials(os.environ, config)
+    disable_ambient_plugin_discovery()
     register_default_tools(enable_browser=False)
     register_senpai_tools()
     file_agents = sanitized_agent_definitions(config.workspace)
