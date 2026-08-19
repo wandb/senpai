@@ -2,9 +2,9 @@
 # Arm a cluster-side Senpai cutoff job.
 #
 # The job waits inside Kubernetes until all expected Senpai pods are Ready,
-# records that timestamp on the PVC, sleeps for the requested budget, then
-# deletes the tagged Senpai deployments/configmaps/secrets. This keeps the hard
-# cutoff independent of the operator laptop staying awake.
+# records its state on the PVC, then deletes the tagged Senpai resources at the
+# configured deadline. This keeps the hard cutoff independent of the operator
+# laptop staying awake.
 
 set -euo pipefail
 
@@ -18,6 +18,7 @@ EXPECTED_PODS="90"
 EXPECTED_DEPLOYMENTS="90"
 READINESS_TIMEOUT_MINUTES="30"
 BUDGET_HOURS="48"
+DEADLINE_EPOCH=""
 PVC_CLAIM_NAME="new-pvc"
 PVC_MOUNT_PATH="/mnt/new-pvc"
 PVC_LOG_ROOT="/mnt/new-pvc/senpai-conversation-logs"
@@ -38,6 +39,7 @@ Options:
   --readiness-timeout-minutes M
                               Arm even if not all pods are Ready after M minutes (default: 30)
   --budget-hours H            Fleet runtime after readiness or timeout arming (default: 48)
+  --deadline-epoch E          Absolute Unix deadline; overrides readiness-based budget timing
   --pvc-claim NAME            PVC claim mounted into cutoff job (default: new-pvc)
   --pvc-mount-path PATH       Mount path inside cutoff job (default: /mnt/new-pvc)
   --pvc-log-root PATH         PVC cutoff-state root (default: /mnt/new-pvc/senpai-conversation-logs)
@@ -56,6 +58,7 @@ while [ "$#" -gt 0 ]; do
     --expected-deployments) EXPECTED_DEPLOYMENTS="$2"; shift 2 ;;
     --readiness-timeout-minutes) READINESS_TIMEOUT_MINUTES="$2"; shift 2 ;;
     --budget-hours) BUDGET_HOURS="$2"; shift 2 ;;
+    --deadline-epoch) DEADLINE_EPOCH="$2"; shift 2 ;;
     --pvc-claim) PVC_CLAIM_NAME="$2"; shift 2 ;;
     --pvc-mount-path) PVC_MOUNT_PATH="$2"; shift 2 ;;
     --pvc-log-root) PVC_LOG_ROOT="$2"; shift 2 ;;
@@ -140,6 +143,10 @@ if not math.isfinite(minutes) or minutes < 0:
 print(int(minutes * 60))
 PY
 )"
+if [ -n "$DEADLINE_EPOCH" ] && ! [[ "$DEADLINE_EPOCH" =~ ^[0-9]+$ ]]; then
+  echo "--deadline-epoch must be a non-negative Unix timestamp" >&2
+  exit 2
+fi
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -157,11 +164,14 @@ EXPECTED_PODS="${EXPECTED_PODS:?}"
 EXPECTED_DEPLOYMENTS="${EXPECTED_DEPLOYMENTS:?}"
 READINESS_TIMEOUT_SECONDS="${READINESS_TIMEOUT_SECONDS:?}"
 BUDGET_SECONDS="${BUDGET_SECONDS:?}"
+ABSOLUTE_DEADLINE_EPOCH="${DEADLINE_EPOCH:-}"
 REQUESTED_ARM_ID="${ARM_ID:?}"
 PVC_LOG_ROOT="${PVC_LOG_ROOT:?}"
 START_GATE_PATH="${START_GATE_PATH:-}"
 NAMESPACE="${NAMESPACE:-default}"
 SELECTOR="research-tag in (${TAGS_CSV})"
+TARGET_DELETE_TIMEOUT_SECONDS=120
+POD_TERMINATION_GRACE_SECONDS=1
 
 RUN_DIR="${PVC_LOG_ROOT}/${RUN_SLUG}"
 STATE_FILE="${RUN_DIR}/cutoff_state.env"
@@ -201,7 +211,11 @@ deployment_count() {
 write_state() {
   local reason="$1" now kill_at kill_at_utc tmp
   now="$(date -u '+%s')"
-  kill_at=$((now + BUDGET_SECONDS))
+  if [ -n "$ABSOLUTE_DEADLINE_EPOCH" ]; then
+    kill_at="$ABSOLUTE_DEADLINE_EPOCH"
+  else
+    kill_at=$((now + BUDGET_SECONDS))
+  fi
   kill_at_utc="$(utc_from_epoch "$kill_at")"
   tmp="${STATE_FILE}.tmp"
   {
@@ -248,7 +262,7 @@ wait_for_ready_gate() {
       # shellcheck source=/dev/null
       source "$STATE_FILE"
       log "Loaded existing cutoff state: KILL_AT_UTC=${KILL_AT_UTC}"
-      open_start_gate
+      [ "${ARM_REASON:-}" = "total_deadline" ] || open_start_gate
       return 0
     fi
     log "Discarding cutoff state from an earlier arm of this run slug"
@@ -257,11 +271,26 @@ wait_for_ready_gate() {
   fi
 
   deadline=$(($(date -u '+%s') + READINESS_TIMEOUT_SECONDS))
+  if [ -n "$ABSOLUTE_DEADLINE_EPOCH" ] && [ "$ABSOLUTE_DEADLINE_EPOCH" -lt "$deadline" ]; then
+    deadline="$ABSOLUTE_DEADLINE_EPOCH"
+  fi
   log "Waiting for ready gate: expected pods=${EXPECTED_PODS}, deployments=${EXPECTED_DEPLOYMENTS}, timeout=${READINESS_TIMEOUT_SECONDS}s, selector=${SELECTOR}"
   while true; do
+    now="$(date -u '+%s')"
+    if [ -n "$ABSOLUTE_DEADLINE_EPOCH" ] && [ "$now" -ge "$ABSOLUTE_DEADLINE_EPOCH" ]; then
+      log "Total eval deadline reached before the ready gate"
+      write_state "total_deadline"
+      return 0
+    fi
     read -r total ready < <(pod_counts)
     deploys="$(deployment_count)"
     log "Ready gate poll: ready=${ready}/${EXPECTED_PODS}, pods=${total}/${EXPECTED_PODS}, deployments=${deploys}/${EXPECTED_DEPLOYMENTS}"
+    now="$(date -u '+%s')"
+    if [ -n "$ABSOLUTE_DEADLINE_EPOCH" ] && [ "$now" -ge "$ABSOLUTE_DEADLINE_EPOCH" ]; then
+      log "Total eval deadline reached before the ready gate"
+      write_state "total_deadline"
+      return 0
+    fi
     if [ "$total" = "$EXPECTED_PODS" ] && [ "$ready" = "$EXPECTED_PODS" ] && [ "$deploys" = "$EXPECTED_DEPLOYMENTS" ]; then
       write_state "all_ready"
       # shellcheck source=/dev/null
@@ -270,7 +299,6 @@ wait_for_ready_gate() {
       open_start_gate
       return 0
     fi
-    now="$(date -u '+%s')"
     if [ "$now" -ge "$deadline" ]; then
       log "Readiness deadline reached; arming cutoff anyway"
       write_state "readiness_timeout"
@@ -302,22 +330,62 @@ sleep_until() {
 }
 
 delete_targets() {
-  local deploys
-  deploys="$(deployment_count)"
-  if [ "$deploys" = "0" ]; then
-    log "No target deployments remain; deleting any residual launch resources"
+  local deadline total ready deploys now remaining delay
+  deadline=$(($(date -u '+%s') + TARGET_DELETE_TIMEOUT_SECONDS))
+
+  log "Stopping target deployments with selector: ${SELECTOR}"
+  kubectl -n "$NAMESPACE" delete deployments -l "$SELECTOR" \
+    --ignore-not-found=true --cascade=foreground --wait=false
+
+  while true; do
+    read -r total ready < <(pod_counts)
+    deploys="$(deployment_count)"
+    log "Delete poll: pods=${total}, ready=${ready}, deployments=${deploys}"
+    if [ "$total" = "0" ] && [ "$deploys" = "0" ]; then
+      break
+    fi
+
+    now="$(date -u '+%s')"
+    remaining=$((deadline - now))
+    if [ "$remaining" -le 0 ]; then
+      log "Target deletion timed out with pods=${total}, deployments=${deploys}"
+      return 1
+    fi
+    if [ "$total" != "0" ]; then
+      log "Terminating ${total} selected target pod(s)"
+      kubectl -n "$NAMESPACE" delete pods -l "$SELECTOR" \
+        --ignore-not-found=true \
+        --grace-period="$POD_TERMINATION_GRACE_SECONDS" \
+        --wait=true --timeout="${remaining}s"
+      continue
+    fi
+    delay="$remaining"
+    [ "$delay" -gt 2 ] && delay=2
+    sleep "$delay"
+  done
+
+  now="$(date -u '+%s')"
+  remaining=$((deadline - now))
+  if [ "$remaining" -le 0 ]; then
+    log "Target deletion timed out before residual resources were removed"
+    return 1
   fi
-  log "Deleting deployments/configmaps/secrets with selector: ${SELECTOR}"
-  kubectl -n "$NAMESPACE" delete deployments,configmaps,secrets -l "$SELECTOR" --ignore-not-found=true
+  log "Deleting target configmaps/secrets with selector: ${SELECTOR}"
+  kubectl -n "$NAMESPACE" delete configmaps,secrets -l "$SELECTOR" \
+    --ignore-not-found=true --wait=true --timeout="${remaining}s"
   date -u '+%Y-%m-%dT%H:%M:%SZ' > "${RUN_DIR}/delete_done_utc.txt"
-  log "Delete command completed"
+  log "Target pods and launch resources are gone"
 }
 
 main() {
   log "Cluster cutoff job starting: ${RUN_SLUG}"
+  pod_counts >/dev/null
+  deployment_count >/dev/null
+  touch /tmp/senpai-cutoff-ready
   wait_for_ready_gate
   # shellcheck source=/dev/null
   source "$STATE_FILE"
+  log "Cutoff armed: ARM_REASON=${ARM_REASON} KILL_AT_UTC=${KILL_AT_UTC}"
   sleep_until "$KILL_AT_EPOCH" "hard cutoff delete"
   delete_targets
   log "Cluster cutoff job done: ${RUN_SLUG}"
@@ -343,7 +411,7 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["pods"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["get", "list", "watch", "delete"]
 - apiGroups: [""]
   resources: ["configmaps", "secrets"]
   verbs: ["get", "list", "watch", "delete"]
@@ -366,7 +434,11 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 EOF_RBAC
 
-"$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" create configmap "$CONFIGMAP_NAME" \
+KUBECTL_RENDER_SCOPE=(--context "$CONTEXT")
+if [ "$DRY_RUN" = "true" ]; then
+  KUBECTL_RENDER_SCOPE=(--kubeconfig /dev/null)
+fi
+"$KUBECTL" "${KUBECTL_RENDER_SCOPE[@]}" -n "$NAMESPACE" create configmap "$CONFIGMAP_NAME" \
   --from-file=cutoff-job.sh="$CUTOFF_SCRIPT" \
   --dry-run=client -o yaml > "${TMP_DIR}/configmap.yaml"
 
@@ -407,6 +479,8 @@ spec:
           value: "${READINESS_TIMEOUT_SECONDS}"
         - name: BUDGET_SECONDS
           value: "${BUDGET_SECONDS}"
+        - name: DEADLINE_EPOCH
+          value: "${DEADLINE_EPOCH}"
         - name: ARM_ID
           value: "${ARM_ID}"
         - name: PVC_LOG_ROOT
@@ -415,6 +489,12 @@ spec:
           value: "${START_GATE_PATH}"
         - name: NAMESPACE
           value: "${NAMESPACE}"
+        readinessProbe:
+          exec:
+            command: ["/bin/sh", "-c", "test -f /tmp/senpai-cutoff-ready"]
+          periodSeconds: 2
+          timeoutSeconds: 1
+          failureThreshold: 150
         volumeMounts:
         - name: cutoff-script
           mountPath: /opt/senpai-cutoff

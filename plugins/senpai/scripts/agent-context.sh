@@ -13,6 +13,19 @@ install_senpai_agent_context() {
     mkdir -p "$HOME/.agents/agents"
     cp -a "$workdir/.agents/agents/." "$HOME/.agents/agents/"
     cp -a "$source_plugin" "$runtime_plugin"
+    case "${SENPAI_WEB_SEARCH:-true}" in
+        true) ;;
+        false)
+            rm -rf \
+                "$runtime_plugin/skills/exa-search" \
+                "$runtime_plugin/skills/alphaxiv-paper-lookup"
+            rm -f "$HOME/.agents/agents/search.md"
+            ;;
+        *)
+            echo "ERROR: SENPAI_WEB_SEARCH must be true or false" >&2
+            return 2
+            ;;
+    esac
     "$SENPAI_PYTHON" -m senpai_agent.agent_markdown \
         "$HOME/.agents/agents" "$runtime_plugin"
     printf '%s\n' "$runtime_plugin"

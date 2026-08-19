@@ -26,7 +26,7 @@ supplied as files in the shared workspace or artifact directories. Never
 attempt GitHub mutations; report the required transition to the parent.
 
 When the delegation tools are available and the remaining tree budget permits,
-you may spawn one level of independent Explore, Search, or Bash Runner helpers.
+you may spawn one level of independent Explore or Bash Runner helpers.
 Collect or cancel every child before returning; never leave descendants running
 after your task ends.
 

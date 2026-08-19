@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import signal
 import stat
@@ -121,6 +122,7 @@ REASONING_EFFORTS = (
 )
 SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore", "search")
 SENPAI_AGENT_DIR = Path(__file__).resolve().parents[1] / ".agents" / "agents"
+WEB_SEARCH_SKILL_NAMES = frozenset({"exa-search", "alphaxiv-paper-lookup"})
 REPOSITORY_INSTRUCTION_FILENAMES = frozenset(
     {"agents.md", "agent.md", "claude.md"}
 )
@@ -216,11 +218,13 @@ class RunnerConfig:
     role_file: Path
     plugin_dir: Path
     instructions: SenpaiSystemInstructions
+    web_search: bool = True
     advisor_branch: str | None = None
     student_names: tuple[str, ...] | None = None
     student_name: str | None = None
     wandb_entity: str | None = None
     wandb_project: str | None = None
+    training_max_timeout_seconds: int = 1800
     timeout_seconds: float = 7200
     llm_timeout_seconds: int = 5400
     llm_num_retries: int = 1
@@ -370,6 +374,7 @@ def conversation_secrets(
     env: Mapping[str, str],
     *,
     model_api_key_env_names: Sequence[str],
+    include_web_search: bool,
 ) -> dict[str, str]:
     custom_secret_env_names = configured_custom_secret_env_names(env)
     model_credentials = set(model_api_key_env_names)
@@ -392,6 +397,7 @@ def conversation_secrets(
     return {
         name: value
         for name in BUILTIN_CONVERSATION_SECRET_ENV_NAMES
+        if include_web_search or name != "EXA_API_KEY"
         if (value := env.get(name))
     } | custom_secrets
 
@@ -497,7 +503,11 @@ def is_exposed_skill(skill: Skill, root: Path | None = None) -> bool:
     )
 
 
-def sanitized_project_skills(workspace: Path) -> list[Skill]:
+def sanitized_project_skills(
+    workspace: Path,
+    *,
+    web_search: bool = True,
+) -> list[Skill]:
     """Load explicit project skills without repository instruction files."""
 
     skills: list[Skill] = []
@@ -518,10 +528,15 @@ def sanitized_project_skills(workspace: Path) -> list[Skill]:
     return [
         skill.model_copy(update={"content": strip_spdx_header(skill.content)})
         for skill in skills
+        if web_search or skill.name not in WEB_SEARCH_SKILL_NAMES
     ]
 
 
-def sanitized_agent_definitions(workspace: Path) -> list[AgentDefinition]:
+def sanitized_agent_definitions(
+    workspace: Path,
+    *,
+    web_search: bool = True,
+) -> list[AgentDefinition]:
     """Load Senpai agents first, then unshadowed target and user agents."""
 
     reserved = {
@@ -540,6 +555,7 @@ def sanitized_agent_definitions(workspace: Path) -> list[AgentDefinition]:
                 if candidate.name not in reserved
             ),
         )
+        if web_search or definition.name != "search"
     ]
 
 
@@ -632,6 +648,10 @@ def resolve_config(
     role = env.get("SENPAI_ROLE", "")
     if role not in {"advisor", "student"}:
         raise RuntimeError("SENPAI_ROLE must be advisor or student")
+    web_search_value = env.get("SENPAI_WEB_SEARCH", "true").lower()
+    if web_search_value not in {"true", "false"}:
+        raise RuntimeError("SENPAI_WEB_SEARCH must be true or false")
+    web_search = web_search_value == "true"
     harness_file = find_harness_file(
         env_value(
             args.harness_file,
@@ -648,6 +668,17 @@ def resolve_config(
         program=program,
         launch=decode_launch_context(env.get(LAUNCH_CONTEXT_ENV, "")),
     )
+    try:
+        training_timeout_minutes = float(
+            env.get("SENPAI_TIMEOUT_MINUTES", "30")
+        )
+    except ValueError as error:
+        raise RuntimeError("SENPAI_TIMEOUT_MINUTES must be numeric") from error
+    if not math.isfinite(training_timeout_minutes) or training_timeout_minutes <= 0:
+        raise RuntimeError("SENPAI_TIMEOUT_MINUTES must be positive and finite")
+    training_max_timeout_seconds = round(training_timeout_minutes * 60)
+    if training_max_timeout_seconds < 1:
+        raise RuntimeError("SENPAI_TIMEOUT_MINUTES must be at least one second")
     try:
         timeout_seconds = float(env.get("SENPAI_OPENHANDS_TIMEOUT_SECONDS", "7200"))
     except ValueError as error:
@@ -859,6 +890,7 @@ def resolve_config(
             fast_api_key_env,
             frontier_api_key_env,
         ),
+        include_web_search=web_search,
     )
     models = (model, smart_model, fast_model, frontier_model)
     if any(model_provider(profile) == "wandb" for profile in models) and not (
@@ -916,7 +948,7 @@ def resolve_config(
             )
         ),
         role=role,
-        enable_browser=args.enable_browser,
+        enable_browser=args.enable_browser and web_search,
         agent_name=env_value(args.agent, env, "SENPAI_OPENHANDS_AGENT"),
         harness_file=harness_file,
         role_file=role_file,
@@ -924,6 +956,7 @@ def resolve_config(
             env_value(args.plugin_dir, env, "SENPAI_PLUGIN"),
         ),
         instructions=instructions,
+        web_search=web_search,
         advisor_branch=env.get("ADVISOR_BRANCH") or None,
         student_names=tuple(
             name.strip()
@@ -933,6 +966,7 @@ def resolve_config(
         student_name=env.get("STUDENT_NAME") or None,
         wandb_entity=wandb_entity,
         wandb_project=wandb_project,
+        training_max_timeout_seconds=training_max_timeout_seconds,
         timeout_seconds=timeout_seconds,
         llm_timeout_seconds=llm_timeout_seconds,
         llm_num_retries=llm_num_retries,
@@ -1172,7 +1206,7 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
         # the lightweight load_browser definition until the model opts in.
         tools.append(Tool(name="browser_tool_set"))
     delegation_params = {"event_db_path": str(local_event_db_path(config))}
-    if not config.child:
+    if not config.child and config.web_search:
         tools.append(Tool(name="delegate_agent", params=delegation_params))
     tools.extend(
         Tool(name=name, params=delegation_params)
@@ -1184,7 +1218,10 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
         )
     )
     if config.role == "student" and not config.child:
-        training_params = {"state_dir": str(config.state_dir / "training")}
+        training_params: dict[str, str | int] = {
+            "state_dir": str(config.state_dir / "training"),
+            "max_timeout_seconds": config.training_max_timeout_seconds,
+        }
         tools.append(Tool(name="senpai_training", params=training_params))
     return tools
 
@@ -1221,6 +1258,7 @@ def delegation_config(
         role=config.role,
         program_path=config.instructions.program.program_path,
         launch_context=config.instructions.launch,
+        web_search=config.web_search,
         root_state_dir=config.delegation_root_state_dir,
         tree_id=config.delegation_tree_id,
         depth=config.delegation_depth,
@@ -1587,11 +1625,19 @@ def run_openhands(
     if run_deadline is not None and run_deadline <= started_at:
         raise TimeoutError("the inherited OpenHands deadline has expired")
     scrub_model_credentials(os.environ, config)
+    if not config.web_search:
+        os.environ.pop("EXA_API_KEY", None)
     register_default_tools(enable_browser=False)
     register_senpai_tools()
-    file_agents = sanitized_agent_definitions(config.workspace)
+    file_agents = sanitized_agent_definitions(
+        config.workspace,
+        web_search=config.web_search,
+    )
+    project_skills = sanitized_project_skills(
+        config.workspace,
+        web_search=config.web_search,
+    )
     available_agents = [definition.name for definition in file_agents]
-    project_skills = sanitized_project_skills(config.workspace)
     os.environ["SENPAI_CONVERSATION_ID"] = config.conversation_id.hex
 
     print(

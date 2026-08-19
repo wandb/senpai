@@ -407,7 +407,13 @@ def test_registered_training_tools_share_one_runtime(tmp_path: Path):
     register_senpai_tools()
 
     tools = resolve_tool(
-        Tool(name="senpai_training", params={"state_dir": str(tmp_path / "state")}),
+        Tool(
+            name="senpai_training",
+            params={
+                "state_dir": str(tmp_path / "state"),
+                "max_timeout_seconds": 1200,
+            },
+        ),
         state,
     )
     by_name = {tool.name: tool for tool in tools}
@@ -435,5 +441,6 @@ def test_registered_training_tools_share_one_runtime(tmp_path: Path):
             by_name["run_training"].executor.monitor_store
             is by_name["monitor_training"].executor.store
         )
+        assert by_name["run_training"].executor.training.max_timeout_seconds == 1200
     finally:
         close_training_runtimes()

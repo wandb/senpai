@@ -7,6 +7,7 @@
 """Launch senpai advisor and student agents as K8s resources."""
 
 import base64
+import math
 import posixpath
 import shlex
 import sys
@@ -71,6 +72,7 @@ class Args:
     tag: str  # research tag (e.g. mar13)
     target_repo_url: str  # problem-package repo (entrypoint clones this into $PROBLEM_DIR; agent commits/PRs land here) — REQUIRED, no default
     target_repo_branch: str = ""  # target repo branch used as the base when creating advisor_branch; empty = target repo default branch
+    target_repo_revision: str = ""  # optional exact commit required at the target base/advisor branch
     problem_dir: str = "target/"  # active problem directory — entrypoint clones target_repo_url here (from senpai.yaml)
     program_path: str = ""  # target-repo-relative program.md; blank requires exactly one root/one-level match
     names: str = ""  # comma-separated student names (e.g. "frieren,fern")
@@ -91,6 +93,7 @@ class Args:
     namespace: str = "default"  # Kubernetes namespace for all launch resources
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
     wandb_project: str = "senpai-v1"  # W&B project name
+    wandb_run_group: str = ""  # optional W&B group shared by this launch
     advisor_model: str = "openai/gpt-5.6-sol"
     advisor_reasoning_effort: str = "xhigh"
     student_model: str = "openai/gpt-5.6-sol"
@@ -105,6 +108,7 @@ class Args:
     human_issues: bool = (
         True  # allow human GitHub issue triage; disable for isolated launches
     )
+    web_search: bool = True  # expose Senpai browser and external-search facilities
     advisor_branch: str = "schmidhuber"  # branch the advisor works on inside the problem-package repo (students PR into it; created from target_repo_branch if missing)
     gh_history_scope: str = "branch"  # branch=normal track memory, fresh=clean ablation, repo=whole-repo memory
     pvc_claim_name: str = "new-pvc"  # PVC name mounted into pods
@@ -115,7 +119,9 @@ class Args:
     extra_instructions: str = (
         ""  # shared operator instructions: a .md file path or literal text
     )
-    timeout_minutes: float = 30.0  # wall-clock policy in the launch context
+    timeout_minutes: float = 30.0  # hard wall-clock limit for each training run
+    trial_index: int | None = None  # optional zero-based eval replication index
+    trial_seed: int | None = None  # optional deterministic eval replication seed
     max_epochs: int = 50  # epoch policy in the launch context
     custom_secret_env_names: list[str] = field(
         default_factory=list
@@ -271,8 +277,10 @@ def model_secret_env_refs(args: Args, role: str) -> list[tuple[str, str]]:
 
 
 def validate_timing_args(args: Args) -> None:
-    if args.timeout_minutes <= 0:
-        sys.exit("ERROR: --timeout_minutes must be positive")
+    if not math.isfinite(args.timeout_minutes) or args.timeout_minutes <= 0:
+        sys.exit("ERROR: --timeout_minutes must be a positive finite number")
+    if round(args.timeout_minutes * 60) < 1:
+        sys.exit("ERROR: --timeout_minutes must be at least one second")
     if args.max_epochs < 1:
         sys.exit("ERROR: --max_epochs must be at least 1")
     if args.poll_interval_s < 1:
@@ -298,6 +306,13 @@ def validate_timing_args(args: Args) -> None:
                 "ERROR: --start_gate_path must be an absolute normalized file "
                 "path beneath the shared PVC --pvc_mount_path"
             )
+
+
+def validate_trial_args(args: Args) -> None:
+    if (args.trial_index is None) != (args.trial_seed is None):
+        sys.exit("ERROR: --trial_index and --trial_seed must be set together")
+    if args.trial_index is not None and min(args.trial_index, args.trial_seed) < 0:
+        sys.exit("ERROR: --trial_index and --trial_seed must be non-negative")
 
 
 def validate_program_path(args: Args) -> None:
@@ -370,6 +385,7 @@ def render_student(
             "SENPAI_REPO_REVISION": args.senpai_repo_revision,
             "TARGET_REPO_URL": args.target_repo_url,
             "TARGET_REPO_BRANCH": args.target_repo_branch,
+            "TARGET_REPO_REVISION": args.target_repo_revision,
             PROGRAM_PATH_ENV: args.program_path,
             "GH_REPO": target_repo_slug(args.target_repo_url),
             "STUDENT_NAME": student_name,
@@ -378,9 +394,24 @@ def render_student(
             "WANDB_ENTITY": args.wandb_entity,
             "WANDB_PROJECT": args.wandb_project,
             "WANDB_MODE": "online",
+            **(
+                {"WANDB_RUN_GROUP": args.wandb_run_group}
+                if args.wandb_run_group
+                else {}
+            ),
             "ADVISOR_BRANCH": args.advisor_branch,
             "GH_HISTORY_SCOPE": args.gh_history_scope,
             "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
+            "SENPAI_WEB_SEARCH": "true" if args.web_search else "false",
+            "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
+            **(
+                {
+                    "SENPAI_TRIAL_INDEX": str(args.trial_index),
+                    "SENPAI_TRIAL_SEED": str(args.trial_seed),
+                }
+                if args.trial_index is not None
+                else {}
+            ),
             "SENPAI_POLL_INTERVAL_S": str(args.poll_interval_s),
             "SENPAI_POLL_JITTER_S": str(args.poll_jitter_s),
             "SENPAI_CUSTOM_SECRET_ENV_NAMES": ",".join(
@@ -417,6 +448,10 @@ def render_student(
             "MODEL_PROVIDER_ENV": secret_env_refs(
                 model_secret_env_refs(args, "student"), secret_name
             ),
+            "EXA_SECRET_ENV_REF": secret_env_refs(
+                [("EXA_API_KEY", "exa-api-key")] if args.web_search else [],
+                secret_name,
+            ),
             "CUSTOM_SECRET_ENV_REFS": secret_env_refs(
                 [(name, name) for name in args.custom_secret_env_names], secret_name
             ),
@@ -441,6 +476,7 @@ def render_advisor(
         "SENPAI_REPO_REVISION": args.senpai_repo_revision,
         "TARGET_REPO_URL": args.target_repo_url,
         "TARGET_REPO_BRANCH": args.target_repo_branch,
+        "TARGET_REPO_REVISION": args.target_repo_revision,
         PROGRAM_PATH_ENV: args.program_path,
         "GH_REPO": target_repo_slug(args.target_repo_url),
         "RESEARCH_TAG": tag,
@@ -449,9 +485,24 @@ def render_advisor(
         "WANDB_ENTITY": args.wandb_entity,
         "WANDB_PROJECT": args.wandb_project,
         "WANDB_MODE": "online",
+        **(
+            {"WANDB_RUN_GROUP": args.wandb_run_group}
+            if args.wandb_run_group
+            else {}
+        ),
         "ADVISOR_BRANCH": args.advisor_branch,
         "GH_HISTORY_SCOPE": args.gh_history_scope,
         "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
+        "SENPAI_WEB_SEARCH": "true" if args.web_search else "false",
+        "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
+        **(
+            {
+                "SENPAI_TRIAL_INDEX": str(args.trial_index),
+                "SENPAI_TRIAL_SEED": str(args.trial_seed),
+            }
+            if args.trial_index is not None
+            else {}
+        ),
         "SENPAI_POLL_INTERVAL_S": str(args.poll_interval_s),
         "SENPAI_POLL_JITTER_S": str(args.poll_jitter_s),
         "SENPAI_STALE_WIP_SECONDS": str(args.stale_wip_seconds),
@@ -486,6 +537,10 @@ def render_advisor(
             "MODEL_PROVIDER_ENV": secret_env_refs(
                 model_secret_env_refs(args, "advisor"), secret_name
             ),
+            "EXA_SECRET_ENV_REF": secret_env_refs(
+                [("EXA_API_KEY", "exa-api-key")] if args.web_search else [],
+                secret_name,
+            ),
             "CUSTOM_SECRET_ENV_REFS": secret_env_refs(
                 [(name, name) for name in args.custom_secret_env_names], secret_name
             ),
@@ -501,6 +556,7 @@ def main():
             "ERROR: --gpus_per_student, --cpu_per_gpu, and --memory_gi_per_gpu must all be at least 1"
         )
     validate_timing_args(args)
+    validate_trial_args(args)
     validate_program_path(args)
     validate_model_config(args)
     try:
@@ -551,10 +607,20 @@ def main():
         student_list = [f"{args.student_prefix}-{name}" for name in student_list]
 
     model_providers = deployed_model_providers(args)
-    github_token = exa_api_key = wandb_api_key = ""
-    provider_api_keys: dict[str, str] = {}
-    custom_secrets: dict[str, str] = {}
-    if not args.dry_run or args.preflight_only:
+    if args.dry_run and not args.preflight_only:
+        github_token = "<REDACTED_GITHUB_TOKEN>"
+        wandb_api_key = "<REDACTED_WANDB_API_KEY>"
+        exa_api_key = "<REDACTED_EXA_API_KEY>" if args.web_search else None
+        provider_api_keys = {
+            provider: f"<REDACTED_{MODEL_PROVIDERS[provider][0]}>"
+            for provider in model_providers
+        }
+        custom_secrets = {
+            name: f"<REDACTED_{name}>" for name in args.custom_secret_env_names
+        }
+    else:
+        provider_api_keys = {}
+        exa_api_key = None
         custom_secrets = resolve_custom_secrets(
             DOTENV_PATH, args.custom_secret_env_names
         )
@@ -563,13 +629,15 @@ def main():
             provider_api_keys["anthropic"] = resolve_anthropic_api_key(DOTENV_PATH)
         if "openai" in model_providers:
             provider_api_keys["openai"] = resolve_openai_api_key(DOTENV_PATH)
-        exa_api_key = resolve_exa_api_key(DOTENV_PATH)
+        if args.web_search:
+            exa_api_key = resolve_exa_api_key(DOTENV_PATH)
         wandb_api_key = resolve_wandb_api_key(DOTENV_PATH)
         preflight_check_target_repo_access(args.target_repo_url, github_token)
         args.target_repo_branch = preflight_check_target_repo_branch(
             args.target_repo_url,
             github_token,
             args.target_repo_branch,
+            args.target_repo_revision,
         )
         preflight_check_student_name_availability(
             args.target_repo_url,
@@ -587,7 +655,8 @@ def main():
                 args.wandb_entity,
                 args.wandb_project,
             )
-        preflight_check_exa_api_key(exa_api_key)
+        if exa_api_key is not None:
+            preflight_check_exa_api_key(exa_api_key)
         preflight_check_wandb_api_key(wandb_api_key)
         if args.preflight_only:
             print("Preflight OK — credentials and target repo access verified.")
@@ -599,6 +668,7 @@ def main():
             github_token,
             args.target_repo_branch,
             args.advisor_branch,
+            args.target_repo_revision,
         )
         ensure_target_repo_labels(
             args.target_repo_url,
@@ -609,19 +679,11 @@ def main():
     student_template = STUDENT_TEMPLATE.read_text()
     advisor_template = ADVISOR_TEMPLATE.read_text()
     secret_name = f"senpai-launch-secrets-{args.tag}"
-    if args.dry_run:
-        provider_api_keys = {
-            provider: f"<REDACTED_{MODEL_PROVIDERS[provider][0]}>"
-            for provider in model_providers
-        }
-        custom_secrets = {
-            name: f"<REDACTED_{name}>" for name in args.custom_secret_env_names
-        }
     launch_secret = render_launch_secret(
         args.tag,
-        github_token if not args.dry_run else "<REDACTED_GITHUB_TOKEN>",
-        exa_api_key if not args.dry_run else "<REDACTED_EXA_API_KEY>",
-        wandb_api_key if not args.dry_run else "<REDACTED_WANDB_API_KEY>",
+        github_token,
+        exa_api_key,
+        wandb_api_key,
         anthropic_api_key=provider_api_keys.get("anthropic"),
         openai_api_key=provider_api_keys.get("openai"),
         custom_secrets=custom_secrets,

@@ -146,12 +146,88 @@ def test_cutoff_dry_run_keeps_readiness_and_delete_without_archive_rbac(tmp_path
     rendered = result.stdout
     job_script = captured_script.read_text(encoding="utf-8")
     assert "Waiting for ready gate" in job_script
+    assert "ABSOLUTE_DEADLINE_EPOCH" in job_script
     assert 'sleep_until "$KILL_AT_EPOCH" "hard cutoff delete"' in job_script
-    assert "delete deployments,configmaps,secrets" in job_script
+    deployment_delete = job_script.index("delete deployments -l")
+    pod_delete = job_script.index("delete pods -l")
+    residual_delete = job_script.index("delete configmaps,secrets -l")
+    assert deployment_delete < pod_delete < residual_delete
+    assert '--grace-period="$POD_TERMINATION_GRACE_SECONDS"' in job_script
+    assert '--wait=true --timeout="${remaining}s"' in job_script
     assert "harvest" not in job_script.lower()
     assert "kubectl exec" not in job_script
     assert 'resources: ["pods/log"]' not in rendered
     assert 'resources: ["pods/exec"]' not in rendered
+    assert 'verbs: ["get", "list", "watch", "delete"]' in rendered
+    assert "test -f /tmp/senpai-cutoff-ready" in rendered
+
+
+def test_absolute_deadline_deletes_without_opening_a_late_start_gate(tmp_path):
+    generated, captured_script = render_cutoff(
+        tmp_path,
+        "--run-slug",
+        "past-deadline",
+        "--tags-csv",
+        "track-a",
+        "--expected-pods",
+        "1",
+        "--expected-deployments",
+        "1",
+        "--deadline-epoch",
+        "1",
+    )
+    assert generated.returncode == 0, generated.stderr
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    delete_log = tmp_path / "delete.log"
+    runtime_kubectl = bin_dir / "kubectl"
+    runtime_kubectl.write_text(
+        """#!/bin/sh
+case "$*" in
+  *"get pods"*) printf '%s\n' '{"items":[]}' ;;
+  *"get deployments"*) exit 0 ;;
+  *"delete deployments "*) printf '%s\n' "$*" >> "$DELETE_LOG" ;;
+  *"delete configmaps,secrets "*) printf '%s\n' "$*" >> "$DELETE_LOG" ;;
+  *) exit 2 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    runtime_kubectl.chmod(0o755)
+    state_root = tmp_path / "state"
+    gate = tmp_path / "start-gate"
+
+    result = subprocess.run(
+        ["bash", str(captured_script)],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "DELETE_LOG": str(delete_log),
+            "RUN_SLUG": "past-deadline",
+            "TAGS_CSV": "track-a",
+            "EXPECTED_PODS": "1",
+            "EXPECTED_DEPLOYMENTS": "1",
+            "READINESS_TIMEOUT_SECONDS": "1800",
+            "BUDGET_SECONDS": "21600",
+            "DEADLINE_EPOCH": "1",
+            "ARM_ID": "past-deadline-arm",
+            "PVC_LOG_ROOT": str(state_root),
+            "START_GATE_PATH": str(gate),
+            "NAMESPACE": "test-ns",
+        },
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Total eval deadline reached before the ready gate" in result.stdout
+    assert "ARM_REASON=total_deadline" in result.stdout
+    assert not gate.exists()
+    assert delete_log.is_file()
+    state = (state_root / "past-deadline" / "cutoff_state.env").read_text()
+    assert "KILL_AT_EPOCH=1" in state
 
 
 def test_generated_cutoff_waits_for_readiness_then_deletes_selected_resources(tmp_path):
@@ -173,18 +249,32 @@ def test_generated_cutoff_waits_for_readiness_then_deletes_selected_resources(tm
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     delete_log = tmp_path / "delete.log"
+    deployments_deleted = tmp_path / "deployments-deleted"
+    pods_deleted = tmp_path / "pods-deleted"
     runtime_kubectl = bin_dir / "kubectl"
     runtime_kubectl.write_text(
         """#!/bin/sh
 case "$*" in
   *"get pods"*)
-    printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"ready":true}]}}]}'
+    if [ -f "$PODS_DELETED" ]; then
+      printf '%s\n' '{"items":[]}'
+    else
+      printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"ready":true}]}}]}'
+    fi
     ;;
   *"get deployments"*)
-    printf '%s\n' 'senpai-track-a'
+    [ -f "$DEPLOYMENTS_DELETED" ] || printf '%s\n' 'senpai-track-a'
     ;;
-  *"delete deployments,configmaps,secrets"*)
-    printf '%s\n' "$*" > "$DELETE_LOG"
+  *"delete deployments "*)
+    touch "$DEPLOYMENTS_DELETED"
+    printf '%s\n' "$*" >> "$DELETE_LOG"
+    ;;
+  *"delete pods "*)
+    touch "$PODS_DELETED"
+    printf '%s\n' "$*" >> "$DELETE_LOG"
+    ;;
+  *"delete configmaps,secrets "*)
+    printf '%s\n' "$*" >> "$DELETE_LOG"
     ;;
   *)
     printf 'unexpected kubectl call: %s\n' "$*" >&2
@@ -205,6 +295,8 @@ esac
             **os.environ,
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "DELETE_LOG": str(delete_log),
+            "DEPLOYMENTS_DELETED": str(deployments_deleted),
+            "PODS_DELETED": str(pods_deleted),
             "RUN_SLUG": "acceptance",
             "TAGS_CSV": "track-a",
             "EXPECTED_PODS": "1",
@@ -221,9 +313,14 @@ esac
 
     assert result.returncode == 0, result.stderr
     assert gate.is_file()
-    deleted = delete_log.read_text(encoding="utf-8")
-    assert "delete deployments,configmaps,secrets" in deleted
-    assert "research-tag in (track-a)" in deleted
+    deleted = delete_log.read_text(encoding="utf-8").splitlines()
+    assert "delete deployments " in deleted[0]
+    assert "--cascade=foreground --wait=false" in deleted[0]
+    assert "delete pods " in deleted[1]
+    assert "--grace-period=1 --wait=true --timeout=" in deleted[1]
+    assert "delete configmaps,secrets " in deleted[2]
+    assert all("research-tag in (track-a)" in command for command in deleted)
+    assert "Target pods and launch resources are gone" in result.stdout
 
 
 def test_generated_cutoff_arms_after_readiness_deadline_when_a_pod_never_readies(
@@ -249,18 +346,32 @@ def test_generated_cutoff_arms_after_readiness_deadline_when_a_pod_never_readies
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     delete_log = tmp_path / "delete.log"
+    deployments_deleted = tmp_path / "deployments-deleted"
+    pods_deleted = tmp_path / "pods-deleted"
     runtime_kubectl = bin_dir / "kubectl"
     runtime_kubectl.write_text(
         """#!/bin/sh
 case "$*" in
   *"get pods"*)
-    printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"ready":false}]}}]}'
+    if [ -f "$PODS_DELETED" ]; then
+      printf '%s\n' '{"items":[]}'
+    else
+      printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"ready":false}]}}]}'
+    fi
     ;;
   *"get deployments"*)
-    printf '%s\n' 'senpai-track-a'
+    [ -f "$DEPLOYMENTS_DELETED" ] || printf '%s\n' 'senpai-track-a'
     ;;
-  *"delete deployments,configmaps,secrets"*)
-    printf '%s\n' "$*" > "$DELETE_LOG"
+  *"delete deployments "*)
+    touch "$DEPLOYMENTS_DELETED"
+    printf '%s\n' "$*" >> "$DELETE_LOG"
+    ;;
+  *"delete pods "*)
+    touch "$PODS_DELETED"
+    printf '%s\n' "$*" >> "$DELETE_LOG"
+    ;;
+  *"delete configmaps,secrets "*)
+    printf '%s\n' "$*" >> "$DELETE_LOG"
     ;;
   *)
     printf 'unexpected kubectl call: %s\n' "$*" >&2
@@ -282,6 +393,8 @@ esac
             **os.environ,
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "DELETE_LOG": str(delete_log),
+            "DEPLOYMENTS_DELETED": str(deployments_deleted),
+            "PODS_DELETED": str(pods_deleted),
             "RUN_SLUG": "never-ready",
             "TAGS_CSV": "track-a",
             "EXPECTED_PODS": "1",
@@ -320,15 +433,25 @@ def test_rearming_a_used_slug_replaces_its_expired_cutoff_state(tmp_path):
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+    deployments_deleted = tmp_path / "deployments-deleted"
+    pods_deleted = tmp_path / "pods-deleted"
     runtime_kubectl = bin_dir / "kubectl"
     runtime_kubectl.write_text(
         """#!/bin/sh
 case "$*" in
   *"get pods"*)
-    printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"ready":true}]}}]}'
+    if [ -f "$PODS_DELETED" ]; then
+      printf '%s\n' '{"items":[]}'
+    else
+      printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"ready":true}]}}]}'
+    fi
     ;;
-  *"get deployments"*) printf '%s\n' 'senpai-track-a' ;;
-  *"delete deployments,configmaps,secrets"*) exit 0 ;;
+  *"get deployments"*)
+    [ -f "$DEPLOYMENTS_DELETED" ] || printf '%s\n' 'senpai-track-a'
+    ;;
+  *"delete deployments "*) touch "$DEPLOYMENTS_DELETED" ;;
+  *"delete pods "*) touch "$PODS_DELETED" ;;
+  *"delete configmaps,secrets "*) exit 0 ;;
   *) exit 2 ;;
 esac
 """,
@@ -360,6 +483,8 @@ esac
         env={
             **os.environ,
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "DEPLOYMENTS_DELETED": str(deployments_deleted),
+            "PODS_DELETED": str(pods_deleted),
             "RUN_SLUG": "reused",
             "TAGS_CSV": "track-a",
             "EXPECTED_PODS": "1",

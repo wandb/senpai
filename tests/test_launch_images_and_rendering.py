@@ -37,6 +37,8 @@ def test_default_config_exposes_every_model_profile_and_effort():
         "frontier_model": "openai/gpt-5.6-sol",
         "frontier_reasoning_effort": "max",
         "compaction_trigger_tokens": 200_000,
+        "web_search": True,
+        "wandb_run_group": "",
     }.items() <= config.items()
     assert config["program_path"] == ""
     assert "custom_secret_env_names" not in config
@@ -229,6 +231,11 @@ def test_start_gate_is_rendered_when_it_is_beneath_the_shared_pvc():
     )
 
 
+def test_training_timeout_must_round_to_at_least_one_second():
+    with pytest.raises(SystemExit, match="at least one second"):
+        launch.validate_timing_args(launch_args(timeout_minutes=0.001))
+
+
 @pytest.mark.parametrize(
     "path",
     ["/program.md", "../program.md", "senpai/../program.md", "policy.md"],
@@ -282,6 +289,52 @@ def test_launch_secret_contains_each_credential_and_both_roles_reference_it():
                 "key": "wandb-api-key",
             },
         }
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_disabled_web_search_omits_exa_and_disables_runtime_facilities(role):
+    configmap, deployment, secret = render_role(
+        role,
+        launch_args(web_search=False),
+    )
+    config = yaml.safe_load(configmap)["data"]
+    secret_keys = set(yaml.safe_load(secret)["data"])
+    environment = yaml.safe_load(deployment)["spec"]["template"]["spec"][
+        "containers"
+    ][0]["env"]
+
+    assert config["SENPAI_WEB_SEARCH"] == "false"
+    assert "exa-api-key" not in secret_keys
+    assert "EXA_API_KEY" not in {item["name"] for item in environment}
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_wandb_run_group_is_exported_only_when_configured(role):
+    grouped, _deployment, _secret = render_role(
+        role,
+        launch_args(wandb_run_group="eval-2026-08-19"),
+    )
+    ungrouped, _deployment, _secret = render_role(role)
+
+    assert yaml.safe_load(grouped)["data"]["WANDB_RUN_GROUP"] == (
+        "eval-2026-08-19"
+    )
+    assert "WANDB_RUN_GROUP" not in yaml.safe_load(ungrouped)["data"]
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_eval_trial_provenance_is_exported_when_configured(role):
+    configured, _deployment, _secret = render_role(
+        role,
+        launch_args(trial_index=2, trial_seed=1729),
+    )
+    ordinary, _deployment, _secret = render_role(role)
+
+    data = yaml.safe_load(configured)["data"]
+    assert data["SENPAI_TRIAL_INDEX"] == "2"
+    assert data["SENPAI_TRIAL_SEED"] == "1729"
+    assert "SENPAI_TRIAL_INDEX" not in yaml.safe_load(ordinary)["data"]
+    assert "SENPAI_TRIAL_SEED" not in yaml.safe_load(ordinary)["data"]
 
 
 def test_secret_env_refs_preserve_environment_names_and_secret_keys():

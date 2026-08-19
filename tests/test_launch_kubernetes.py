@@ -1,5 +1,6 @@
 import base64
 import subprocess
+import urllib.error
 
 import pytest
 
@@ -83,6 +84,66 @@ def test_kubectl_default_scope_omits_an_empty_context():
     ]
 
 
+def test_target_branch_preflight_rejects_revision_drift(monkeypatch):
+    expected = "a" * 40
+    actual = "b" * 40
+    monkeypatch.setattr(
+        launch_helpers,
+        "_github_api",
+        lambda *_args, **_kwargs: {"commit": {"sha": actual}},
+    )
+
+    with pytest.raises(SystemExit, match=f"is at {actual}, expected {expected}"):
+        launch_helpers.preflight_check_target_repo_branch(
+            "https://github.com/example/problem.git",
+            "token",
+            "main",
+            expected,
+        )
+
+
+def test_existing_advisor_branch_must_match_the_pinned_target_revision(monkeypatch):
+    expected = "a" * 40
+    actual = "b" * 40
+
+    def github_api(path, *_args, **_kwargs):
+        revision = actual if path.endswith("branches/eval") else expected
+        return {"commit": {"sha": revision}}
+
+    monkeypatch.setattr(launch_helpers, "_github_api", github_api)
+
+    with pytest.raises(SystemExit, match="existing advisor branch.*expected"):
+        launch_helpers.ensure_advisor_branch(
+            "https://github.com/example/problem.git",
+            "token",
+            "main",
+            "eval",
+            expected,
+        )
+
+
+def test_parallel_launch_accepts_a_routing_label_created_concurrently(monkeypatch):
+    calls = []
+
+    def github_api(path, _token, **kwargs):
+        calls.append((path, kwargs.get("method", "GET")))
+        if len(calls) == 1:
+            raise urllib.error.HTTPError(path, 404, "missing", None, None)
+        if len(calls) == 2:
+            raise urllib.error.HTTPError(path, 422, "exists", None, None)
+        return {"name": "status:wip"}
+
+    monkeypatch.setattr(launch_helpers, "_github_api", github_api)
+
+    launch_helpers.ensure_target_repo_labels(
+        "https://github.com/example/problem.git",
+        "token",
+        {"status:wip": ("fbca04", "Work in progress")},
+    )
+
+    assert [method for _path, method in calls] == ["GET", "POST", "GET"]
+
+
 def bypass_external_preflight(monkeypatch):
     monkeypatch.setattr(
         launch,
@@ -134,6 +195,24 @@ def test_preflight_resolves_custom_secrets(monkeypatch):
     assert resolved == [
         (launch.DOTENV_PATH, ["HF_TOKEN", "DATASET_LICENSE_KEY"])
     ]
+
+
+def test_disabled_web_search_skips_exa_resolution_and_preflight(monkeypatch):
+    args = launch_args(preflight_only=True, web_search=False)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "resolve_exa_api_key",
+        lambda *_args: pytest.fail("disabled web search must not resolve Exa"),
+    )
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_exa_api_key",
+        lambda *_args: pytest.fail("disabled web search must not preflight Exa"),
+    )
+
+    launch.main()
 
 
 def test_launch_reports_invalid_custom_secret_names_without_a_traceback(monkeypatch):

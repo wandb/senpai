@@ -192,6 +192,7 @@ def test_main_tools_replace_unsafe_defaults_with_role_scoped_boundaries(
     if role == "student":
         assert by_name["senpai_training"].params == {
             "state_dir": str(config.state_dir / "training"),
+            "max_timeout_seconds": 1800,
         }
 
 
@@ -265,6 +266,24 @@ def test_target_agents_cannot_shadow_senpai_delegation_agents(tmp_path):
         "cancel_agents",
     }
     assert "Shadowed instructions" not in definition.system_prompt
+
+
+def test_disabled_web_search_removes_the_search_agent_definition(tmp_path):
+    names = {
+        definition.name
+        for definition in sanitized_agent_definitions(tmp_path, web_search=False)
+    }
+
+    assert names == {"bash-runner", "general-purpose", "explore"}
+
+
+def test_disabled_web_search_removes_legacy_search_delegation_schema(tmp_path):
+    names = {
+        tool.name
+        for tool in build_main_tools(runtime_config(tmp_path, web_search=False))
+    }
+
+    assert "delegate_agent" not in names
 
 
 def test_child_definition_exposes_spawn_only_to_depth_one_generalist():
@@ -625,14 +644,14 @@ def test_delegation_guidance_lives_in_the_plugin_skill():
         "`await_agents`",
         "`agent_status`",
         "`cancel_agents`",
-        "`search_general_web`",
-        "`search_research_publications`",
         '`model="frontier"`',
         '`agent="general-purpose"`',
         "ask for research, critique, ideas, or a plan rather than edits",
         "timeout of at most 300 seconds",
     ):
         assert required in normalized_skill
+    assert "search_general_web" not in normalized_skill
+    assert "search_research_publications" not in normalized_skill
 
 
 def test_advisor_prompt_uses_general_research_domains_and_typed_assignment_body():
@@ -655,7 +674,7 @@ def test_harness_states_bounded_delegation_tree_contract():
     for required in (
         "at most eight children in total",
         "depth-one general-purpose child",
-        "Explore, Search, Bash Runner, and every depth-two child are leaves",
+        "Explore, Bash Runner, and every depth-two child are leaves",
         "descendants inherit the earlier ancestor deadline",
         "twenty minutes for `fast`",
         "one hour for `smart`",

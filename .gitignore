@@ -50,6 +50,7 @@ results.tsv
 experiment_log/
 advisor_logs/
 student_logs/
+eval/results/
 
 # Claude worktrees
 .claude/worktrees/

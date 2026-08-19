@@ -72,6 +72,8 @@ LeafTaskAgentKind = Literal[
     "search_research_publications",
     "bash-runner",
 ]
+LocalTaskAgentKind = Literal["general-purpose", "explore", "bash-runner"]
+LocalLeafTaskAgentKind = Literal["explore", "bash-runner"]
 ModelTier = Literal["smart", "fast", "frontier"]
 SearchMode = Literal["general-web", "research-publications"]
 MAX_PARALLEL_AGENTS = 8
@@ -166,6 +168,7 @@ class DelegationConfig:
     role: str
     program_path: str
     launch_context: str
+    web_search: bool = True
     root_state_dir: Path | None = None
     tree_id: str | None = None
     depth: int = 0
@@ -371,6 +374,9 @@ class OpenHandsChildProcess:
             {
                 "OPENHANDS_SUPPRESS_BANNER": "1",
                 "SENPAI_ROLE": self._config.role,
+                "SENPAI_WEB_SEARCH": (
+                    "true" if self._config.web_search else "false"
+                ),
                 "SENPAI_OPENHANDS_API_KEY_ENV": selected.api_key_env,
                 "SENPAI_OPENHANDS_SMART_MODEL": self._config.smart_model,
                 "SENPAI_OPENHANDS_SMART_API_KEY_ENV": (
@@ -681,6 +687,27 @@ class LeafAgentTask(AgentTaskBase):
             "Choose a leaf specialization: explore, bash-runner, "
             "search_general_web, or search_research_publications."
         ),
+    )
+
+
+class LocalAgentTask(AgentTaskBase):
+    """Delegation task exposed when external search is unavailable."""
+
+    agent: LocalTaskAgentKind = Field(
+        default="general-purpose",
+        description=(
+            "Use general-purpose for mixed work, or explore or bash-runner "
+            "for local leaf work."
+        ),
+    )
+
+
+class LocalLeafAgentTask(AgentTaskBase):
+    """Leaf delegation task exposed when external search is unavailable."""
+
+    agent: LocalLeafTaskAgentKind = Field(
+        default="explore",
+        description="Choose a local leaf specialization: explore or bash-runner.",
     )
 
 
@@ -1367,6 +1394,10 @@ class _DelegationManager:
     def _validate_spawn(self, tasks: Sequence[AgentTaskBase]) -> None:
         if not tasks or len(tasks) > MAX_SPAWN_BATCH:
             raise ValueError(f"spawn_agents requires 1 to {MAX_SPAWN_BATCH} tasks")
+        if not self.config.web_search and any(
+            task.resolved_agent()[0] == "search" for task in tasks
+        ):
+            raise ValueError("external search agents are disabled for this launch")
         if self.config.depth >= MAX_DELEGATION_DEPTH:
             raise ValueError(f"maximum delegation depth is {MAX_DELEGATION_DEPTH}")
         if self.config.depth == 1:
@@ -1638,6 +1669,32 @@ class LeafSpawnAgentsAction(Action):
         min_length=1,
         max_length=MAX_SPAWN_BATCH,
         description="One to eight leaf tasks started without waiting for results.",
+    )
+
+
+class LocalSpawnAgentsAction(Action):
+    batch_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="Stable identifier used to make an exact batch retry idempotent.",
+    )
+    tasks: list[LocalAgentTask] = Field(
+        min_length=1,
+        max_length=MAX_SPAWN_BATCH,
+        description="Independent local-only tasks to start concurrently.",
+    )
+
+
+class LocalLeafSpawnAgentsAction(Action):
+    batch_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="Stable identifier used to make an exact batch retry idempotent.",
+    )
+    tasks: list[LocalLeafAgentTask] = Field(
+        min_length=1,
+        max_length=MAX_SPAWN_BATCH,
+        description="Independent local-only leaf tasks to start concurrently.",
     )
 
 
@@ -1952,12 +2009,14 @@ class SpawnAgentsTool(_DelegationTool[SpawnAgentsAction, SpawnAgentsObservation]
         event_db_path=None,
     ) -> Sequence[Self]:
         manager = cls._manager(child_runner_factory, event_sink, event_db_path)
-        action_type = (
-            LeafSpawnAgentsAction
-            if manager.config.depth == 1
+        leaf = (
+            manager.config.depth == 1
             and manager.config.agent_name == "general-purpose"
-            else SpawnAgentsAction
         )
+        if manager.config.web_search:
+            action_type = LeafSpawnAgentsAction if leaf else SpawnAgentsAction
+        else:
+            action_type = LocalLeafSpawnAgentsAction if leaf else LocalSpawnAgentsAction
         return [
             cls(
                 description="Start one bounded batch of subagents and return task IDs immediately.",

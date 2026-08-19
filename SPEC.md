@@ -228,10 +228,32 @@ explicit non-secret allowlist. A missing referenced value fails the launch;
 unrelated environment variables and credentials are never considered. The
 rendered role is persisted in role state and reused across worker restarts.
 
-The launcher renders `timeout_minutes` and `max_epochs` into the launch context
-as agent policy. It does not export dedicated timeout or epoch environment
-variables, and the training supervisor has no launch-wide timeout default or
-ceiling. Each training run supplies its own positive `timeout_seconds` value.
+The launcher renders `timeout_minutes` and `max_epochs` into the launch context.
+It also exports `timeout_minutes` as `SENPAI_TIMEOUT_MINUTES`. The runner parses
+that value once and configures the training supervisor with the corresponding
+launch-wide ceiling in seconds. Each training run supplies a positive
+`timeout_seconds` value at or below that ceiling. `max_epochs` remains agent
+policy and has no dedicated environment variable.
+
+The launcher exports one `SENPAI_WEB_SEARCH` boolean. When false, it does not
+resolve, preflight, store, or mount the Exa credential. The runner disables the
+browser and rejects the two external-search delegation kinds. Bootstrap removes
+the search agent plus the Exa and AlphaXiv lookup skills from the copied runtime
+plugin. It also scrubs an ambient Exa credential before creating the agent
+terminal. Local code exploration, Bash Runner, and General Purpose agents remain
+available. Generic network access through the terminal is outside this switch's
+contract. Revoking the capability on a durable local conversation requires fresh
+role state because OpenHands does not resume a persisted agent after tools are
+removed; Kubernetes role state is ephemeral across recreated pods.
+
+When `wandb_run_group` is nonempty, the launcher exports it through the
+standard `WANDB_RUN_GROUP` environment variable to both roles.
+
+When `target_repo_revision` is nonempty, launch preflight requires the resolved
+target base branch to point to that exact full commit SHA. Launch creates a new
+advisor branch from that commit, or rejects a pre-existing advisor branch at a
+different revision. This closes the check/use gap for pinned evaluation
+targets.
 
 At process startup, the runner loads the harness, rendered role, `program.md`,
 and authoritative launch context into one immutable
@@ -597,11 +619,12 @@ monitor_training(
 ) -> MonitorTrainingObservation
 ```
 
-`TrainingSupervisor` owns one process group, each run's requested timeout,
-TERM/KILL cleanup, restart identity checks using PID/PGID/create-time, a bounded
-8 KiB error tail, streamed 64 KiB log parsing, persisted state, and discovered
-W&B run IDs. Run IDs are persisted while training is still running so metric
-monitoring can begin immediately.
+`TrainingSupervisor` owns one process group, the launch-wide timeout ceiling,
+each accepted run's requested timeout, TERM/KILL cleanup, restart identity
+checks using PID/PGID/create-time, a bounded 8 KiB error tail, streamed 64 KiB
+log parsing, persisted state, and discovered W&B run IDs. It rejects a requested
+timeout above the ceiling. Run IDs are persisted while training is still
+running so metric monitoring can begin immediately.
 
 The student commits the exact implementation and cleans the worktree before an
 expensive launch. Every successful `run_training` launch immediately registers
@@ -731,15 +754,17 @@ out that exact revision.
 Launch preflight verifies:
 
 - target-repository push and branch access;
+- optional exact target revision;
 - every model-provider credential referenced by the configured profiles;
-- the Exa key with one `type="instant"`, publication-category, one-result
-  search;
+- when web search is enabled, the Exa key with one `type="instant"`,
+  publication-category, one-result search;
 - the W&B key with a minimal viewer query; and
 - the presence of every configured custom secret, without attempting
   a service-specific authentication check.
 
 Exa is a progressive skill/script integration, not an always-connected MCP
-server.
+server. A web-search-disabled deployment exposes neither Exa nor AlphaXiv
+lookup skills.
 
 The Kubernetes launcher creates one Secret, ConfigMaps, and Deployments. It
 creates no Service or RBAC. Docker and local hosts need no shared network for
@@ -754,7 +779,11 @@ expected resources are Ready or when its bounded readiness window expires,
 whichever comes first, and opens the optional start gate in either case. One
 missing or crash-looping pod therefore cannot prevent the runtime budget from
 starting. At the persisted deadline it deletes launch resources; all
-conversation harvest/archive code is removed.
+conversation harvest/archive code is removed. A cutoff job may instead receive
+an absolute Unix deadline. In that mode, readiness consumes the fixed budget,
+reaching the total deadline never opens a late start gate, and deletion begins
+immediately. Its readiness probe succeeds only after the cutoff process reaches
+Kubernetes and writes to the shared PVC.
 
 ## Removed code
 
