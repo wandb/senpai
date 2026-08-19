@@ -39,11 +39,7 @@ def human_pr_comment_events(
 ) -> list[ControllerEvent]:
     """Return trusted human comments from every open advisor-branch PR."""
 
-    try:
-        actor = mailbox._github.actor()
-    except GitHubReadError as error:
-        _report_read_error(f"actor {type(error).__name__}: {error}")
-        return []
+    actor = mailbox._github.actor()
 
     candidates: list[_HumanComment] = []
     for pull in pulls:
@@ -51,7 +47,9 @@ def human_pr_comment_events(
             number = int(pull["number"])
             pr_url = str(pull["html_url"])
             comments = mailbox._pull_comments(number)
-        except (GitHubReadError, KeyError, TypeError, ValueError) as error:
+        except GitHubReadError:
+            raise
+        except (KeyError, TypeError, ValueError) as error:
             _report_read_error(
                 f"pr={pull.get('number')!r} {type(error).__name__}: {error}"
             )

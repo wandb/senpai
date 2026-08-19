@@ -121,9 +121,9 @@ class Args:
         default_factory=list
     )  # additional shell/.env credentials mounted into every role
     poll_interval_s: int = (
-        600  # default advisor/student outer-loop sleep between GitHub polls
+        300  # controller-lifetime GitHub snapshot cadence for every role state
     )
-    poll_jitter_s: int = 120  # max random jitter added to outer-loop sleeps
+    poll_jitter_s: int = 120  # max jitter on reconciliation sleeps, not GitHub polls
     stale_wip_seconds: int = 7200  # advisor-action threshold for stale WIP PRs
     start_gate_path: str = ""  # optional shared file path that must exist before advisor/student loops begin
     dry_run: bool = (

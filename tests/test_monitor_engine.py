@@ -8,6 +8,7 @@ import pytest
 
 from senpai_agent.monitor import (
     MetricSample,
+    MonitorEvaluation,
     MonitorStore,
     TrainingMonitorEngine,
     TrainingMonitorSpec,
@@ -177,6 +178,153 @@ def test_terminal_failure_wins_over_metric_and_sample_failures(
         assert produced[0].hard_failure is True
         assert store.pending_signals() == list(produced)
         assert store.active() == []
+
+
+def test_terminal_hint_bypasses_future_deadline_without_fetching_metrics(
+    tmp_path: Path,
+):
+    spec = monitor(metric="val/loss")
+
+    class Training:
+        def __init__(self):
+            self.calls = []
+
+        def get_training_status(self, training_id):
+            self.calls.append(training_id)
+            return result(tmp_path, training_id, TrainingState.FINISHED)
+
+    class Metrics:
+        def __init__(self):
+            self.calls = []
+
+        def latest(self, run_id, metric):
+            self.calls.append((run_id, metric))
+            raise AssertionError("terminal hints must not fetch metrics")
+
+    training = Training()
+    metrics = Metrics()
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(spec)
+        store.record_poll(spec, MonitorEvaluation(), None, now=NOW)
+        assert store.due(NOW + timedelta(seconds=1)) == []
+
+        polled = TrainingMonitorEngine(store, training, metrics).poll_terminal(
+            (spec.training_id,),
+            now=NOW + timedelta(seconds=1),
+        )
+        produced = polled.items
+
+        assert [signal.kind for signal in produced] == ["training_status"]
+        assert polled.resolved_training_ids == frozenset({spec.training_id})
+        assert produced[0].state is TrainingState.FINISHED
+        assert training.calls == [spec.training_id]
+        assert metrics.calls == []
+        assert store.active() == []
+
+
+def test_running_unknown_and_inactive_terminal_hints_are_no_ops(tmp_path: Path):
+    running = monitor("train-running", metric="val/loss")
+    inactive = monitor("train-inactive")
+
+    class Training:
+        def __init__(self):
+            self.calls = []
+
+        def get_training_status(self, training_id):
+            self.calls.append(training_id)
+            if training_id != running.training_id:
+                raise AssertionError("inactive and unknown hints must not be queried")
+            return result(tmp_path, training_id, TrainingState.RUNNING)
+
+    class Metrics:
+        def latest(self, _run_id, _metric):
+            raise AssertionError("a terminal hint for a running job must not fetch metrics")
+
+    training = Training()
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(running)
+        store.record_poll(running, MonitorEvaluation(), None, now=NOW)
+        store.register(inactive)
+        store.complete(inactive.training_id)
+
+        polled = TrainingMonitorEngine(store, training, Metrics()).poll_terminal(
+            ("train-unknown", inactive.training_id, running.training_id),
+            now=NOW + timedelta(seconds=1),
+        )
+        produced = polled.items
+
+        assert produced == ()
+        assert polled.resolved_training_ids == frozenset(
+            {"train-unknown", inactive.training_id, running.training_id}
+        )
+        assert training.calls == [running.training_id]
+        assert store.active() == [running]
+        assert store.due(NOW + timedelta(seconds=59)) == []
+        assert store.due(NOW + timedelta(seconds=60)) == [running]
+
+
+def test_terminal_hints_are_deduplicated_before_status_lookup(tmp_path: Path):
+    spec = monitor("train-deduplicated")
+
+    class Training:
+        def __init__(self):
+            self.calls = []
+
+        def get_training_status(self, training_id):
+            self.calls.append(training_id)
+            return result(tmp_path, training_id, TrainingState.FINISHED)
+
+    training = Training()
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(spec)
+
+        polled = TrainingMonitorEngine(
+            store,
+            training,
+            SimpleNamespace(),
+        ).poll_terminal(
+            (spec.training_id, spec.training_id, spec.training_id),
+            now=NOW,
+        )
+        produced = polled.items
+
+        assert training.calls == [spec.training_id]
+        assert [signal.dedupe_key for signal in produced] == [
+            f"{spec.training_id}:status:finished"
+        ]
+        assert store.pending_signals() == list(produced)
+
+
+def test_terminal_status_read_failure_remains_unresolved_until_retry(
+    tmp_path: Path,
+):
+    spec = monitor("train-retry")
+
+    class Training:
+        def __init__(self):
+            self.calls = 0
+
+        def get_training_status(self, training_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("status backend unavailable")
+            return result(tmp_path, training_id, TrainingState.FINISHED)
+
+    training = Training()
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(spec)
+        engine = TrainingMonitorEngine(store, training, SimpleNamespace())
+
+        failed = engine.poll_terminal((spec.training_id,), now=NOW)
+        recovered = engine.poll_terminal(
+            (spec.training_id,),
+            now=NOW + timedelta(seconds=60),
+        )
+
+        assert failed.resolved_training_ids == frozenset()
+        assert recovered.resolved_training_ids == frozenset({spec.training_id})
+        assert [signal.kind for signal in failed.items] == ["monitor_error"]
+        assert [signal.kind for signal in recovered.items] == ["training_status"]
 
 
 def test_wandb_source_returns_latest_value_and_timestamp(monkeypatch):

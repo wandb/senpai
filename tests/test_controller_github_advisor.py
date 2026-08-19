@@ -57,6 +57,11 @@ def mailbox(monkeypatch, pulls, *, students=()):
     monkeypatch.setattr(value, "_pulls", lambda: list(pulls))
     monkeypatch.setattr(value, "_issues", list)
     monkeypatch.setattr(value._github, "objects", lambda _url: [])
+    monkeypatch.setattr(
+        value._github,
+        "get",
+        lambda _path: {"object": {"sha": "b" * 40}},
+    )
     return value
 
 
@@ -432,15 +437,43 @@ def test_student_and_human_parsers_share_a_failed_comment_read(monkeypatch):
         lambda _path: {"object": {"sha": "b" * 40}},
     )
 
-    events = advisor.poll()
-
-    assert not any(
-        event.kind in {"human_pr_comment", "student_assignment_comment"}
-        for event in events
-    )
+    with pytest.raises(
+        GitHubReadError,
+        match="temporary issue-comment failure",
+    ):
+        advisor.poll()
     assert reads.count(
         "/repos/acme/widgets/issues/17/comments?per_page=100"
     ) == 1
+
+
+def test_human_comment_actor_failure_invalidates_the_snapshot(monkeypatch):
+    malformed = pull(labels=("research",), body="No assignment marker.")
+    advisor = mailbox(monkeypatch, [malformed])
+    monkeypatch.setattr(
+        advisor._github,
+        "actor",
+        lambda: (_ for _ in ()).throw(GitHubReadError("actor unavailable")),
+    )
+
+    with pytest.raises(GitHubReadError, match="actor unavailable"):
+        advisor.poll()
+
+
+def test_unassigned_pr_comment_failure_invalidates_the_snapshot(monkeypatch):
+    malformed = pull(labels=("research",), body="No assignment marker.")
+    advisor = mailbox(monkeypatch, [malformed])
+    monkeypatch.setattr(advisor._github, "actor", lambda: "senpai-bot")
+    monkeypatch.setattr(
+        advisor._github,
+        "objects",
+        lambda _url: (_ for _ in ()).throw(
+            GitHubReadError("unassigned comments unavailable")
+        ),
+    )
+
+    with pytest.raises(GitHubReadError, match="unassigned comments unavailable"):
+        advisor.poll()
 
 
 def test_advisor_receives_trusted_human_comment_without_a_valid_assignment(
@@ -1297,10 +1330,7 @@ def test_each_assignment_watches_its_own_research_base_ref(monkeypatch):
     ]
 
 
-def test_research_base_ref_failure_does_not_suppress_other_advisor_events(
-    monkeypatch,
-    capsys,
-):
+def test_research_base_transport_failure_rejects_the_partial_snapshot(monkeypatch):
     advisor = mailbox(
         monkeypatch,
         [
@@ -1313,21 +1343,34 @@ def test_research_base_ref_failure_does_not_suppress_other_advisor_events(
         students=("student-1", "student-2"),
     )
 
-    def invalid_ref(_path):
-        raise TypeError("invalid ref response")
+    def unavailable_ref(_path):
+        raise GitHubReadError("GitHub ref endpoint unavailable")
 
-    monkeypatch.setattr(advisor._github, "get", invalid_ref)
+    monkeypatch.setattr(advisor._github, "get", unavailable_ref)
 
-    events = advisor.poll()
+    with pytest.raises(GitHubReadError, match="ref endpoint unavailable"):
+        advisor.poll()
 
-    assert {event.kind for event in events} == {
-        "review_ready",
-        "student_available_for_assignment",
-    }
-    available = next(
-        event
-        for event in events
-        if event.kind == "student_available_for_assignment"
+
+def test_student_comment_transport_failure_rejects_the_partial_snapshot(monkeypatch):
+    assigned = pull(
+        labels=("research", "student:student-1", "status:wip"),
+        body=render_assignment_marker(assignment()),
     )
-    assert available.payload == {"student": "student-2"}
-    assert "SENPAI_RESEARCH_BASE_WATCH_ERROR" in capsys.readouterr().err
+    advisor = mailbox(monkeypatch, [assigned], students=("student-1",))
+    monkeypatch.setattr(advisor._github, "actor", lambda: "senpai-bot")
+    monkeypatch.setattr(
+        advisor,
+        "_pull_comments",
+        lambda _number: (_ for _ in ()).throw(
+            GitHubReadError("GitHub comments endpoint unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        advisor._github,
+        "get",
+        lambda _path: {"object": {"sha": "b" * 40}},
+    )
+
+    with pytest.raises(GitHubReadError, match="comments endpoint unavailable"):
+        advisor.poll()

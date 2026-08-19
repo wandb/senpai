@@ -2,10 +2,11 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -89,10 +90,12 @@ class TrainingSupervisor:
         workspace: Path,
         state_dir: Path,
         terminate_grace_seconds: float = 10,
+        on_terminal: Callable[[str], None] | None = None,
     ):
         self.workspace = workspace.resolve()
         self.state_dir = state_dir.resolve()
         self.terminate_grace_seconds = terminate_grace_seconds
+        self.on_terminal = on_terminal
         self._lock = threading.Lock()
         self._active: dict[str, _ActiveTraining] = {}
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -119,7 +122,7 @@ class TrainingSupervisor:
                         ),
                     }
                 )
-                self._write_result(recovered)
+                self._commit_terminal(recovered)
 
     def run_training(self, spec: TrainingSpec) -> TrainingResult:
         if isinstance(spec.argv, str) or not spec.argv:
@@ -313,7 +316,7 @@ class TrainingSupervisor:
                 else ""
             ),
         )
-        self._write_result(result)
+        self._commit_terminal(result)
         with self._lock:
             self._active.pop(training_id, None)
 
@@ -405,3 +408,20 @@ class TrainingSupervisor:
         temporary = path.with_suffix(".tmp")
         temporary.write_text(result.model_dump_json(indent=2))
         temporary.replace(path)
+
+    def _commit_terminal(self, result: TrainingResult) -> None:
+        if result.state is TrainingState.RUNNING:
+            raise ValueError("terminal result must not be running")
+        self._write_result(result)
+        if self.on_terminal is None:
+            return
+        try:
+            self.on_terminal(result.training_id)
+        except Exception as error:  # noqa: BLE001
+            print(
+                "SENPAI_TRAINING_NOTIFY_ERROR "
+                f"training_id={result.training_id} "
+                f"error={type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )

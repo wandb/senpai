@@ -15,9 +15,10 @@ from senpai_agent.monitor import (
     MonitorMailbox,
     MonitorSignal,
     MonitorStore,
+    TrainingMonitorEngine,
     TrainingMonitorSpec,
 )
-from senpai_agent.training import TrainingState
+from senpai_agent.training import TrainingResult, TrainingState
 
 
 class StaticMailbox:
@@ -214,3 +215,58 @@ def test_monitor_mailbox_routes_and_acknowledges_each_signal_independently(
         }
         mailbox.acknowledge((first.dedupe_key,))
         assert [event.dedupe_key for event in mailbox.poll()] == [second.dedupe_key]
+
+
+def test_monitor_mailbox_routes_only_the_hinted_terminal_training(
+    tmp_path: Path,
+):
+    first_conversation = UUID("00000000-0000-0000-0000-000000000086")
+    second_conversation = UUID("00000000-0000-0000-0000-000000000087")
+    first = TrainingMonitorSpec(
+        training_id="training-first",
+        conversation_id=first_conversation,
+    )
+    second = TrainingMonitorSpec(
+        training_id="training-second",
+        conversation_id=second_conversation,
+    )
+
+    class Training:
+        def __init__(self):
+            self.calls = []
+
+        def get_training_status(self, training_id):
+            self.calls.append(training_id)
+            return TrainingResult(
+                training_id=training_id,
+                state=TrainingState.FINISHED,
+                exit_code=0,
+                elapsed_seconds=1,
+                log_path=str(tmp_path / f"{training_id}.log"),
+            )
+
+    class Metrics:
+        def latest(self, _run_id, _metric):
+            raise AssertionError("terminal mailbox routing must not fetch metrics")
+
+    training = Training()
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(first)
+        store.register(second)
+        mailbox = MonitorMailbox(
+            TrainingMonitorEngine(store, training, Metrics()),
+            store,
+        )
+
+        polled = mailbox.poll_terminal((second.training_id, second.training_id))
+        events = polled.items
+
+        assert training.calls == [second.training_id]
+        assert polled.resolved_training_ids == frozenset({second.training_id})
+        assert len(events) == 1
+        assert events[0].kind == "training_monitor"
+        assert events[0].dedupe_key == "training-second:status:finished"
+        assert events[0].payload["conversation_id"] == str(second_conversation)
+        assert events[0].payload["training_id"] == second.training_id
+        assert events[0].payload["signal"]["state"] == "finished"
+        assert store.active() == [first]

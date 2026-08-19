@@ -52,11 +52,16 @@ Python supervisor
   TERM/KILL a worker whose current phase lease expires
 
 Python controller worker
-  poll GitHub + local durable monitor/event state
+  read one controller-lifetime GitHub snapshot + local durable event state
   reconcile the target checkout
   start one bounded OpenHands turn
   verify durable state
-  sleep/backoff/jitter
+  wait for a snapshot, terminal training result, deadline, or backoff
+
+controller-lifetime GitHub watcher
+  poll GitHub immediately and every configured interval
+  publish only complete successful snapshots
+  wake the controller when the snapshot changes
 ```
 
 The worker publishes an atomic lease containing its PID, current phase, hard
@@ -116,17 +121,27 @@ Every accepted event carries its first-seen assignment and revision identity,
 so monitor and feedback events resume one student UUID.
 Successful turns atomically acknowledge immutable feedback keys in a small JSON
 ledger. Oldest unacknowledged events are delivered in bounded count/byte
-batches; immediate post-turn polls drain later batches without dropping them.
+batches. After each successful turn, the controller requests a non-blocking
+refresh. If that refresh publishes a later feedback batch, its snapshot wake
+starts the next reconciliation cycle.
 
-While an OpenHands turn is running, `ActiveGitHubWatcher` polls the same GitHub
-state. It enqueues newly visible GitHub events except student-assignment
-availability, which the foreground poll reconciles before the next turn. For
+One `GitHubMailboxWatcher` owns GitHub polling for the controller's complete
+lifetime. It publishes one complete cached snapshot to both foreground
+reconciliation and active-turn delivery. It uses conditional HTTP requests and
+retains the last successful snapshot after a read error. GitHub rate limits set
+the next eligible poll time and cannot create a retry loop. A completed turn
+requests a refresh without waiting for its network response.
+
+A changed snapshot wakes a sleeping controller. While an OpenHands turn is
+running, the watcher enqueues newly visible GitHub events except
+student-assignment availability, which foreground reconciliation owns. For
 students, it maps authenticated human Issues and assignment-bound PR feedback
-into the active UUID. Authenticated humans are the interrupt tier: tools get up
-to 60 seconds to finish before Senpai interrupts and resumes the run, even when
-its inbox batch is full. Student assignments and trusted PR feedback share a
-FIFO queue tier; feedback waits for the next completed agent step without
-cancelling it.
+into the active UUID. A wake does not select delivery behavior. The existing
+event pump persists the event first, then applies the established priorities.
+Authenticated humans are the interrupt tier: tools get up to 60 seconds to
+finish before Senpai interrupts and resumes the run, even when its inbox batch
+is full. Student assignments and trusted PR feedback share a FIFO queue tier;
+feedback waits for the next completed agent step without cancelling it.
 Ordinary events remain FIFO. Turn formation and non-human attachments are
 bounded to 16 events or 64 KiB; prioritized overflow remains pending to lead
 the next turn.
@@ -624,6 +639,19 @@ The controller polls only monitors that are due. It fetches one latest selected
 metric value from W&B, evaluates deterministic threshold/change/staleness and
 terminal-state rules, and persists deduplicated compact signals. Ordinary
 polls use no LLM tokens.
+
+The training supervisor atomically commits every terminal result before it
+notifies the controller. This process-local notification only wakes foreground
+monitor reconciliation; it never enters the active-turn event pump. The
+controller checks the named terminal monitor immediately without fetching W&B
+or advancing a running monitor's schedule. A completion during an active turn
+waits for that turn to finish, then enters the ordinary FIFO tier. Startup also
+checks every active monitor, so a controller-process restart repairs a result
+that was committed before its notification.
+
+The controller also waits on the earliest active monitor deadline. Metric and
+staleness policies therefore keep their declared cadence even when the GitHub
+and reconciliation interval is longer.
 
 Metric samples reject NaN and infinities. A failure in one monitor's training
 status or W&B lookup advances that monitor's schedule and emits one

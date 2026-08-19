@@ -80,6 +80,9 @@ class GitHubMailbox:
         """Mark persisted feedback delivered after a successful controller turn."""
         acknowledge_feedback(self, dedupe_keys)
 
+    def cancel_poll(self) -> None:
+        self._github.cancel()
+
     def _issue_comments(
         self,
         issue: Mapping[str, object],
