@@ -120,6 +120,8 @@ class Args:
         ""  # shared operator instructions: a .md file path or literal text
     )
     timeout_minutes: float = 30.0  # hard wall-clock limit for each training run
+    trial_index: int | None = None  # optional zero-based eval replication index
+    trial_seed: int | None = None  # optional deterministic eval replication seed
     max_epochs: int = 50  # epoch policy in the launch context
     custom_secret_env_names: list[str] = field(
         default_factory=list
@@ -306,6 +308,13 @@ def validate_timing_args(args: Args) -> None:
             )
 
 
+def validate_trial_args(args: Args) -> None:
+    if (args.trial_index is None) != (args.trial_seed is None):
+        sys.exit("ERROR: --trial_index and --trial_seed must be set together")
+    if args.trial_index is not None and min(args.trial_index, args.trial_seed) < 0:
+        sys.exit("ERROR: --trial_index and --trial_seed must be non-negative")
+
+
 def validate_program_path(args: Args) -> None:
     try:
         normalize_program_path(args.program_path)
@@ -395,6 +404,14 @@ def render_student(
             "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
             "SENPAI_WEB_SEARCH": "true" if args.web_search else "false",
             "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
+            **(
+                {
+                    "SENPAI_TRIAL_INDEX": str(args.trial_index),
+                    "SENPAI_TRIAL_SEED": str(args.trial_seed),
+                }
+                if args.trial_index is not None
+                else {}
+            ),
             "SENPAI_POLL_INTERVAL_S": str(args.poll_interval_s),
             "SENPAI_POLL_JITTER_S": str(args.poll_jitter_s),
             "SENPAI_CUSTOM_SECRET_ENV_NAMES": ",".join(
@@ -478,6 +495,14 @@ def render_advisor(
         "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
         "SENPAI_WEB_SEARCH": "true" if args.web_search else "false",
         "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
+        **(
+            {
+                "SENPAI_TRIAL_INDEX": str(args.trial_index),
+                "SENPAI_TRIAL_SEED": str(args.trial_seed),
+            }
+            if args.trial_index is not None
+            else {}
+        ),
         "SENPAI_POLL_INTERVAL_S": str(args.poll_interval_s),
         "SENPAI_POLL_JITTER_S": str(args.poll_jitter_s),
         "SENPAI_STALE_WIP_SECONDS": str(args.stale_wip_seconds),
@@ -531,6 +556,7 @@ def main():
             "ERROR: --gpus_per_student, --cpu_per_gpu, and --memory_gi_per_gpu must all be at least 1"
         )
     validate_timing_args(args)
+    validate_trial_args(args)
     validate_program_path(args)
     validate_model_config(args)
     try:
@@ -581,11 +607,20 @@ def main():
         student_list = [f"{args.student_prefix}-{name}" for name in student_list]
 
     model_providers = deployed_model_providers(args)
-    github_token = wandb_api_key = ""
-    exa_api_key: str | None = None
-    provider_api_keys: dict[str, str] = {}
-    custom_secrets: dict[str, str] = {}
-    if not args.dry_run or args.preflight_only:
+    if args.dry_run and not args.preflight_only:
+        github_token = "<REDACTED_GITHUB_TOKEN>"
+        wandb_api_key = "<REDACTED_WANDB_API_KEY>"
+        exa_api_key = "<REDACTED_EXA_API_KEY>" if args.web_search else None
+        provider_api_keys = {
+            provider: f"<REDACTED_{MODEL_PROVIDERS[provider][0]}>"
+            for provider in model_providers
+        }
+        custom_secrets = {
+            name: f"<REDACTED_{name}>" for name in args.custom_secret_env_names
+        }
+    else:
+        provider_api_keys = {}
+        exa_api_key = None
         custom_secrets = resolve_custom_secrets(
             DOTENV_PATH, args.custom_secret_env_names
         )
@@ -644,23 +679,11 @@ def main():
     student_template = STUDENT_TEMPLATE.read_text()
     advisor_template = ADVISOR_TEMPLATE.read_text()
     secret_name = f"senpai-launch-secrets-{args.tag}"
-    if args.dry_run:
-        provider_api_keys = {
-            provider: f"<REDACTED_{MODEL_PROVIDERS[provider][0]}>"
-            for provider in model_providers
-        }
-        custom_secrets = {
-            name: f"<REDACTED_{name}>" for name in args.custom_secret_env_names
-        }
     launch_secret = render_launch_secret(
         args.tag,
-        github_token if not args.dry_run else "<REDACTED_GITHUB_TOKEN>",
-        (
-            exa_api_key
-            if not args.dry_run
-            else ("<REDACTED_EXA_API_KEY>" if args.web_search else None)
-        ),
-        wandb_api_key if not args.dry_run else "<REDACTED_WANDB_API_KEY>",
+        github_token,
+        exa_api_key,
+        wandb_api_key,
         anthropic_api_key=provider_api_keys.get("anthropic"),
         openai_api_key=provider_api_keys.get("openai"),
         custom_secrets=custom_secrets,

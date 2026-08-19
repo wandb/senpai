@@ -122,6 +122,7 @@ REASONING_EFFORTS = (
 )
 SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore", "search")
 SENPAI_AGENT_DIR = Path(__file__).resolve().parents[1] / ".agents" / "agents"
+WEB_SEARCH_SKILL_NAMES = frozenset({"exa-search", "alphaxiv-paper-lookup"})
 REPOSITORY_INSTRUCTION_FILENAMES = frozenset(
     {"agents.md", "agent.md", "claude.md"}
 )
@@ -502,7 +503,11 @@ def is_exposed_skill(skill: Skill, root: Path | None = None) -> bool:
     )
 
 
-def sanitized_project_skills(workspace: Path) -> list[Skill]:
+def sanitized_project_skills(
+    workspace: Path,
+    *,
+    web_search: bool = True,
+) -> list[Skill]:
     """Load explicit project skills without repository instruction files."""
 
     skills: list[Skill] = []
@@ -523,10 +528,15 @@ def sanitized_project_skills(workspace: Path) -> list[Skill]:
     return [
         skill.model_copy(update={"content": strip_spdx_header(skill.content)})
         for skill in skills
+        if web_search or skill.name not in WEB_SEARCH_SKILL_NAMES
     ]
 
 
-def sanitized_agent_definitions(workspace: Path) -> list[AgentDefinition]:
+def sanitized_agent_definitions(
+    workspace: Path,
+    *,
+    web_search: bool = True,
+) -> list[AgentDefinition]:
     """Load Senpai agents first, then unshadowed target and user agents."""
 
     reserved = {
@@ -545,6 +555,7 @@ def sanitized_agent_definitions(workspace: Path) -> list[AgentDefinition]:
                 if candidate.name not in reserved
             ),
         )
+        if web_search or definition.name != "search"
     ]
 
 
@@ -1195,7 +1206,7 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
         # the lightweight load_browser definition until the model opts in.
         tools.append(Tool(name="browser_tool_set"))
     delegation_params = {"event_db_path": str(local_event_db_path(config))}
-    if not config.child:
+    if not config.child and config.web_search:
         tools.append(Tool(name="delegate_agent", params=delegation_params))
     tools.extend(
         Tool(name=name, params=delegation_params)
@@ -1618,9 +1629,15 @@ def run_openhands(
         os.environ.pop("EXA_API_KEY", None)
     register_default_tools(enable_browser=False)
     register_senpai_tools()
-    file_agents = sanitized_agent_definitions(config.workspace)
+    file_agents = sanitized_agent_definitions(
+        config.workspace,
+        web_search=config.web_search,
+    )
+    project_skills = sanitized_project_skills(
+        config.workspace,
+        web_search=config.web_search,
+    )
     available_agents = [definition.name for definition in file_agents]
-    project_skills = sanitized_project_skills(config.workspace)
     os.environ["SENPAI_CONVERSATION_ID"] = config.conversation_id.hex
 
     print(

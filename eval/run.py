@@ -22,17 +22,28 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from statistics import fmean, median, pstdev, pvariance
 from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import wandb
 import yaml
 from dotenv import load_dotenv
+from pydantic import SecretStr
 
+from eval.adjudication import GitHubReads, adjudicate_trial, freeze_advisor_head
+from k8s.launch_helpers import resolve_github_token
+from senpai_agent.github.http import GitHubReader
 
-ROOT = Path(__file__).resolve().parents[1]
+EVALUATOR_PATH = Path(__file__).resolve()
+ADJUDICATOR_PATH = ROOT / "eval" / "adjudication.py"
 LAUNCH_SCRIPT = ROOT / "k8s" / "launch.py"
 CUTOFF_SCRIPT = ROOT / "scripts" / "arm_senpai_cluster_cutoff.sh"
 DEFAULT_RESULTS_DIR = ROOT / "eval" / "results"
@@ -42,6 +53,9 @@ MODEL = "openai/gpt-5.6-luna"
 REASONING_EFFORT = "high"
 DEFAULT_TRAINING_TIMEOUT_MINUTES = 20.0
 DEFAULT_TOTAL_TIMEOUT_HOURS = 6.0
+DEFAULT_N_TRIALS = 3
+DEFAULT_WANDB_ENTITY = "wandb-applied-ai-team"
+DEFAULT_WANDB_PROJECT = "senpai_eval"
 READINESS_TIMEOUT_MINUTES = 30.0
 CUTOFF_START_TIMEOUT_SECONDS = 300
 POLL_INTERVAL_SECONDS = 30
@@ -52,17 +66,61 @@ MAX_RUN_ID_LENGTH = 27
 NANOGPT_TARGET_LOSS = 3.28
 NANOGPT_SIGNIFICANCE_DELTA = 0.004
 NANOGPT_BENCHMARK = "modded-nanogpt-track-3-optimization"
+NANOGPT_VAL_TOKENS = 10_485_760
+NANOGPT_SHARD_TOKENS = 100_000_000
+NANOGPT_SHARD_BYTES = 1_024 + 2 * NANOGPT_SHARD_TOKENS
+NANOGPT_TRAIN_SHARDS = [
+    f"fineweb_train_{index:06d}.bin" for index in range(1, 21)
+]
+NANOGPT_VAL_SHARDS = ["fineweb_val_000000.bin"]
+NANOGPT_DATA_CONTRACT = {
+    "train_shards": NANOGPT_TRAIN_SHARDS,
+    "val_shards": NANOGPT_VAL_SHARDS,
+    "tokens_per_shard": NANOGPT_SHARD_TOKENS,
+    "bytes_per_shard": NANOGPT_SHARD_BYTES,
+    "val_tokens": NANOGPT_VAL_TOKENS,
+}
+NANOGPT_METRIC_CONTRACT = {
+    "primary": "speedrun/final_first_step_to_target",
+    "validation": "val/loss",
+    "direction": "minimize",
+    "target": NANOGPT_TARGET_LOSS,
+    "significance_rule": (
+        "(target - mean_loss) * sqrt(num_trials) >= stat_sig_delta"
+    ),
+}
 TANDEM_SPLITS = (
     "test_single_in_dist",
     "test_geom_camber_rc",
     "test_geom_camber_cruise",
     "test_re_rand",
 )
+TANDEM_VAL_SPLITS = tuple(split.replace("test_", "val_", 1) for split in TANDEM_SPLITS)
+TANDEM_METRIC_CONTRACT = {
+    "primary": "test_avg/mae_surf_p",
+    "selection": "val_avg/mae_surf_p",
+    "direction": "minimize",
+    "test_splits": list(TANDEM_SPLITS),
+}
+TANDEM_PROTECTED_HASHES = {
+    "split_manifest_sha256": (
+        "5b9bf301f0a7f0f415133333fa9be4e6a321ca8ee0d01a6ae06443dffc5261de"
+    ),
+    "scoring_source_sha256": (
+        "81ebbc4f72c58121826a157446817428bc8b10716bef55cb142e353154df8871"
+    ),
+    "loader_source_sha256": (
+        "7640dc3c7b7c914e11d9e94f6e2ea8026274ffd8acf9f71bb8c1178dc01973f0"
+    ),
+}
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 
 
 @dataclass(frozen=True)
 class Target:
     name: str
+    branch_slug: str
     label: str
     repo_url: str
     base_branch: str
@@ -74,19 +132,21 @@ class Target:
 TARGETS = (
     Target(
         name="nanogpt",
+        branch_slug="nano",
         label="Modded NanoGPT",
         repo_url="https://github.com/morganmcg1/modded-nanogpt-senpai",
-        base_branch="master",
-        base_revision="0ba525c8d6dbdbdf7a69b4ddb129658527f9212b",
+        base_branch="codex/eval-wandb-contract",
+        base_revision="1f487927967e0c9973822117f2131280e2e40d04",
         primary_metric="speedrun/final_first_step_to_target",
         metric_unit="steps",
     ),
     Target(
         name="tandemfoil",
+        branch_slug="foil",
         label="TandemFoilSet Balanced",
         repo_url="https://github.com/morganmcg1/TandemFoilSet-Balanced",
         base_branch="codex/eval-wandb-group",
-        base_revision="58161c30627bb67d204020fd4281f0098ecde6fc",
+        base_revision="21afbf128e8ca267d0d0e72efc91856dcf2c2cbf",
         primary_metric="test_avg/mae_surf_p",
         metric_unit="MAE",
     ),
@@ -119,6 +179,12 @@ def positive_number(value: float, name: str) -> float:
     return value
 
 
+def positive_integer(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 def git_revision() -> str:
     return subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -127,6 +193,37 @@ def git_revision() -> str:
         text=True,
         check=True,
     ).stdout.strip()
+
+
+def git_dirty() -> bool:
+    return bool(
+        subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    )
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def verify_report_sources(manifest: Mapping[str, Any]) -> None:
+    mismatches = [
+        name
+        for name, path in (
+            ("evaluator_sha256", EVALUATOR_PATH),
+            ("adjudicator_sha256", ADJUDICATOR_PATH),
+        )
+        if manifest.get(name) != file_sha256(path)
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "report source hash mismatch: " + ", ".join(mismatches)
+        )
 
 
 def resolve_senpai_revision(config: Mapping[str, Any]) -> str:
@@ -181,12 +278,11 @@ def build_manifest(
     dry_run: bool,
     training_timeout_minutes: float = DEFAULT_TRAINING_TIMEOUT_MINUTES,
     total_timeout_hours: float = DEFAULT_TOTAL_TIMEOUT_HOURS,
+    n_trials: int = DEFAULT_N_TRIALS,
     cutoff_image: str | None = None,
 ) -> dict[str, Any]:
     require_config(
         config,
-        "wandb_entity",
-        "wandb_project",
         "pvc_claim_name",
         "pvc_mount_path",
         "advisor_image",
@@ -198,6 +294,7 @@ def build_manifest(
     if round(training_timeout_minutes * 60) < 1:
         raise ValueError("training timeout must be at least one second")
     total_timeout_hours = positive_number(total_timeout_hours, "total timeout")
+    n_trials = positive_integer(n_trials, "n_trials")
     senpai_revision = resolve_senpai_revision(config)
     evaluator_revision = git_revision()
     cutoff_image = cutoff_image or (
@@ -209,19 +306,48 @@ def build_manifest(
     gate = f"{mount}/senpai-evals/{run_id}/start-gate"
     suffix = run_id[-12:]
     targets = []
-    for target in TARGETS:
-        tag = f"{run_id}-{target.name}"
+    seed_base = int(hashlib.sha256(run_id.encode()).hexdigest()[:8], 16)
+    for target_ordinal, target in enumerate(TARGETS):
+        trials = []
+        for trial_index in range(n_trials):
+            trial_name = f"trial-{trial_index + 1:02d}"
+            seed_offset = target_ordinal * n_trials + trial_index
+            trial_seed = (seed_base + seed_offset) % (2**31 - 1)
+            advisor_branch = (
+                f"senpai-eval/{run_id}/{target.branch_slug}-t{trial_index + 1:02d}"
+            )
+            if len(advisor_branch) > 50:
+                raise ValueError(
+                    "n_trials makes advisor routing labels exceed 50 characters"
+                )
+            trials.append(
+                {
+                    "trial_index": trial_index,
+                    "trial_name": trial_name,
+                    "trial_seed": trial_seed,
+                    "research_tag": (
+                        f"{run_id}-{target.branch_slug}-t{trial_index + 1:02d}"
+                    ),
+                    "wandb_group": f"{run_id}/{target.name}/{trial_name}",
+                    "advisor_branch": advisor_branch,
+                    "student_name": (
+                        f"eval-{suffix}-{target.branch_slug}-t{trial_index + 1:02d}"
+                    ),
+                    "adjudication": {
+                        "status": "pending",
+                        "selected_run_id": None,
+                        "evidence": {},
+                    },
+                }
+            )
         targets.append(
             {
                 **asdict(target),
-                "research_tag": tag,
-                "wandb_group": f"{run_id}/{target.name}",
-                "advisor_branch": f"senpai-eval/{run_id}/{target.name}",
-                "student_name": f"eval-{suffix}-{target.name}",
+                "trials": trials,
             }
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": run_id,
         "status": "starting",
         "created_at": datetime.fromtimestamp(started_at_epoch, UTC).isoformat(),
@@ -234,22 +360,26 @@ def build_manifest(
         "web_search": web_search,
         "training_timeout_minutes": training_timeout_minutes,
         "total_timeout_hours": total_timeout_hours,
+        "n_trials": n_trials,
         "readiness_timeout_minutes": READINESS_TIMEOUT_MINUTES,
         "senpai_repo_url": config.get(
             "senpai_repo_url", "https://github.com/wandb/senpai.git"
         ),
         "senpai_repo_revision": senpai_revision,
         "evaluator_revision": evaluator_revision,
-        "evaluator_sha256": hashlib.sha256(
-            Path(__file__).read_bytes()
-        ).hexdigest(),
+        "evaluator_dirty": git_dirty(),
+        "evaluator_sha256": file_sha256(EVALUATOR_PATH),
+        "adjudicator_sha256": file_sha256(ADJUDICATOR_PATH),
         "advisor_image": config["advisor_image"],
         "student_image": config["student_image"],
         "cutoff_image": cutoff_image,
-        "wandb_entity": config["wandb_entity"],
-        "wandb_project": config["wandb_project"],
+        "wandb_entity": DEFAULT_WANDB_ENTITY,
+        "wandb_project": DEFAULT_WANDB_PROJECT,
         "kube_context": config.get("kube_context", ""),
         "namespace": config.get("namespace", "default"),
+        "custom_secret_env_names": list(
+            config.get("custom_secret_env_names", [])
+        ),
         "pvc_claim_name": config["pvc_claim_name"],
         "pvc_mount_path": config["pvc_mount_path"],
         "start_gate_path": gate,
@@ -258,53 +388,31 @@ def build_manifest(
     }
 
 
-def target_instructions(
-    target: Mapping[str, Any], training_timeout_minutes: float
-) -> str:
-    common = f"""This is a bounded Senpai agent evaluation.
-
-Optimize the target repository's declared primary metric and publish normal,
-reproducible experiment evidence. Every training invocation has a hard
-{training_timeout_minutes:g}-minute wall-clock ceiling. Budget setup,
-validation, test evaluation, and W&B synchronization inside that ceiling.
-Use run_training for every GPU execution.
-
-Every W&B training run must use the exact group from $WANDB_RUN_GROUP. Do not
-run debug or reduced-data evaluations. Prefer one decisive experiment at a
-time, and preserve the target's metric and data-split contract.
-"""
-    if target["name"] == "nanogpt":
-        return common + """
-Use records/track_3_optimization/train_gpt_simple.py with --num_trials 1 and
---wandb_group "$WANDB_RUN_GROUP". The scored metric is the nonnegative
-speedrun/final_first_step_to_target, and the final validation loss must pass
-the repository's statistical-significance gate. A best intermediate loss is
-not a substitute for the final loss.
-"""
-    return common + """
-Run train.py with --wandb_group "$WANDB_RUN_GROUP". Leave --debug and
---skip_test disabled. A scored run must finish all four held-out test splits;
-best_val_avg/mae_surf_p is diagnostic and cannot replace
-test_avg/mae_surf_p.
-"""
+def iter_trial_specs(
+    manifest: Mapping[str, Any],
+) -> Iterable[tuple[Mapping[str, Any], Mapping[str, Any]]]:
+    for target in manifest["targets"]:
+        for trial in target["trials"]:
+            yield target, trial
 
 
 def target_launch_config(
     base: Mapping[str, Any],
     manifest: Mapping[str, Any],
     target: Mapping[str, Any],
+    trial: Mapping[str, Any],
 ) -> dict[str, Any]:
     config = dict(base)
     config.update(
         {
-            "tag": target["research_tag"],
+            "tag": trial["research_tag"],
             "target_repo_url": target["repo_url"],
             "target_repo_branch": target["base_branch"],
             "target_repo_revision": target["base_revision"],
-            "advisor_branch": target["advisor_branch"],
+            "advisor_branch": trial["advisor_branch"],
             "program_path": "",
             "advisor": True,
-            "names": target["student_name"],
+            "names": trial["student_name"],
             "n_students": 1,
             "student_prefix": "",
             "advisor_model": MODEL,
@@ -319,16 +427,18 @@ def target_launch_config(
             "frontier_reasoning_effort": REASONING_EFFORT,
             "human_issues": False,
             "web_search": manifest["web_search"],
-            "wandb_run_group": target["wandb_group"],
+            "wandb_entity": manifest["wandb_entity"],
+            "wandb_project": manifest["wandb_project"],
+            "wandb_run_group": trial["wandb_group"],
+            "trial_index": trial["trial_index"],
+            "trial_seed": trial["trial_seed"],
             "timeout_minutes": manifest["training_timeout_minutes"],
             "poll_interval_s": POLL_INTERVAL_SECONDS,
             "poll_jitter_s": POLL_JITTER_SECONDS,
             "stale_wip_seconds": STALE_WIP_SECONDS,
             "gh_history_scope": "fresh",
             "start_gate_path": manifest["start_gate_path"],
-            "extra_instructions": target_instructions(
-                target, manifest["training_timeout_minutes"]
-            ),
+            "extra_instructions": "",
             "dry_run": manifest["dry_run"],
             "preflight_only": False,
         }
@@ -378,8 +488,9 @@ def arm_cutoff(
     manifest: Mapping[str, Any],
 ) -> None:
     target_tags = ",".join(
-        target["research_tag"] for target in manifest["targets"]
+        trial["research_tag"] for _target, trial in iter_trial_specs(manifest)
     )
+    launch_count = sum(1 for _target, _trial in iter_trial_specs(manifest))
     argv = [
         str(CUTOFF_SCRIPT),
         "--run-slug",
@@ -387,9 +498,9 @@ def arm_cutoff(
         "--tags-csv",
         target_tags,
         "--expected-pods",
-        str(2 * len(manifest["targets"])),
+        str(2 * launch_count),
         "--expected-deployments",
-        str(2 * len(manifest["targets"])),
+        str(2 * launch_count),
         "--readiness-timeout-minutes",
         str(manifest["readiness_timeout_minutes"]),
         "--budget-hours",
@@ -440,7 +551,9 @@ def run_best_effort(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
 
 
 def cleanup_eval_resources(manifest: Mapping[str, Any]) -> bool:
-    tags = ",".join(target["research_tag"] for target in manifest["targets"])
+    tags = ",".join(
+        trial["research_tag"] for _target, trial in iter_trial_specs(manifest)
+    )
     selector = f"app=senpai,research-tag in ({tags})"
     target_commands = (
         kubectl_command(
@@ -507,6 +620,19 @@ def manifest_path(results_dir: Path, run_id: str) -> Path:
     return results_dir / f"{run_id}.json"
 
 
+def run_parallel(commands: Sequence[Sequence[str]]) -> None:
+    failures = []
+    with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+        futures = [executor.submit(run_checked, command) for command in commands]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as error:
+                failures.append(error)
+    if failures:
+        raise failures[0]
+
+
 def launch_eval(
     config_path: Path,
     results_dir: Path,
@@ -517,6 +643,7 @@ def launch_eval(
     dry_run: bool,
     training_timeout_minutes: float = DEFAULT_TRAINING_TIMEOUT_MINUTES,
     total_timeout_hours: float = DEFAULT_TOTAL_TIMEOUT_HOURS,
+    n_trials: int = DEFAULT_N_TRIALS,
 ) -> dict[str, Any]:
     config = load_yaml(config_path)
     manifest = build_manifest(
@@ -526,6 +653,7 @@ def launch_eval(
         dry_run=dry_run,
         training_timeout_minutes=training_timeout_minutes,
         total_timeout_hours=total_timeout_hours,
+        n_trials=n_trials,
         cutoff_image=cutoff_image,
     )
     path = manifest_path(results_dir, run_id)
@@ -535,18 +663,15 @@ def launch_eval(
     resources_started = False
     try:
         with tempfile.TemporaryDirectory(prefix="senpai-eval-") as directory:
-            temporary_root = Path(directory)
             launch_paths = []
-            for target in manifest["targets"]:
-                launch_config = target_launch_config(config, manifest, target)
-                instructions_path = (
-                    temporary_root / f"{target['name']}.instructions.md"
+            for target, trial in iter_trial_specs(manifest):
+                launch_config = target_launch_config(
+                    config, manifest, target, trial
                 )
-                instructions_path.write_text(
-                    launch_config["extra_instructions"], encoding="utf-8"
+                target_config_path = (
+                    Path(directory)
+                    / f"{target['name']}-{trial['trial_name']}.yaml"
                 )
-                launch_config["extra_instructions"] = str(instructions_path)
-                target_config_path = temporary_root / f"{target['name']}.yaml"
                 target_config_path.write_text(
                     yaml.safe_dump(launch_config, sort_keys=False),
                     encoding="utf-8",
@@ -587,17 +712,22 @@ def launch_eval(
                 manifest["status"] = "launching"
                 write_json(path, manifest)
 
-            for target_config_path in launch_paths:
-                if not dry_run and time.time() >= manifest["deadline_epoch"]:
-                    raise TimeoutError("total eval deadline elapsed during launch")
-                run_checked(
-                    [
-                        sys.executable,
-                        str(LAUNCH_SCRIPT),
-                        "--config_path",
-                        str(target_config_path),
-                    ]
-                )
+            if not dry_run and time.time() >= manifest["deadline_epoch"]:
+                raise TimeoutError("total eval deadline elapsed during launch")
+            launch_commands = [
+                [
+                    sys.executable,
+                    str(LAUNCH_SCRIPT),
+                    "--config_path",
+                    str(target_config_path),
+                ]
+                for target_config_path in launch_paths
+            ]
+            if dry_run:
+                for command in launch_commands:
+                    run_checked(command)
+            else:
+                run_parallel(launch_commands)
             if not dry_run and time.time() >= manifest["deadline_epoch"]:
                 raise TimeoutError("total eval deadline elapsed during launch")
     except BaseException as error:
@@ -765,12 +895,174 @@ def run_summary(run: object) -> dict[str, Any]:
 
 
 def run_identity(run: object) -> dict[str, Any]:
-    return {
+    identity = {
         "run_id": str(getattr(run, "id", "unknown")),
         "name": str(getattr(run, "name", "")),
         "url": str(getattr(run, "url", "")),
         "state": str(getattr(run, "state", "unknown")),
     }
+    for attribute in ("group", "job_type", "commit", "created_at"):
+        if value := getattr(run, attribute, None):
+            identity[attribute] = str(value)
+    if tags := getattr(run, "tags", None):
+        identity["tags"] = list(tags)
+    return identity
+
+
+def nonempty_mapping(value: object) -> bool:
+    return isinstance(value, Mapping) and bool(value)
+
+
+def nonempty_sequence(value: object) -> bool:
+    return (
+        isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes))
+        and bool(value)
+    )
+
+
+def config_contract_error(
+    run: object,
+    manifest: Mapping[str, Any],
+    target: Mapping[str, Any],
+    trial: Mapping[str, Any],
+) -> str | None:
+    """Return why a W&B run cannot represent one full eval trial."""
+
+    if str(getattr(run, "state", "unknown")) != "finished":
+        return "W&B run did not finish"
+    if str(getattr(run, "group", "")) != trial["wandb_group"]:
+        return "W&B run object has the wrong group"
+    config = dict(getattr(run, "config", {}) or {})
+    expected = {
+        "wandb_entity": manifest["wandb_entity"],
+        "wandb_project": manifest["wandb_project"],
+        "wandb_group": trial["wandb_group"],
+        "wandb_run_group": trial["wandb_group"],
+        "senpai_trial_index": trial["trial_index"],
+        "senpai_trial_seed": trial["trial_seed"],
+        "senpai_timeout_minutes": manifest["training_timeout_minutes"],
+        "git_dirty": False,
+    }
+    for key, value in expected.items():
+        if config.get(key) != value:
+            return f"config {key} does not match the eval contract"
+    if COMMIT_RE.fullmatch(str(config.get("git_commit", ""))) is None:
+        return "config git_commit is not a full commit SHA"
+
+    if target["name"] == "nanogpt":
+        return nanogpt_config_contract_error(config, run_summary(run))
+    return tandem_config_contract_error(config, run_summary(run))
+
+
+def shard_manifest_valid(
+    value: object,
+    *,
+    expected_names: Sequence[str],
+) -> bool:
+    if not nonempty_sequence(value):
+        return False
+    names = [str(item.get("name", "")) for item in value if isinstance(item, Mapping)]
+    return names == list(expected_names) and all(
+        isinstance(item, Mapping)
+        and item.get("bytes") == NANOGPT_SHARD_BYTES
+        for item in value
+    )
+
+
+def nanogpt_config_contract_error(
+    config: Mapping[str, Any],
+    summary: Mapping[str, Any],
+) -> str | None:
+    expected = {
+        "benchmark": NANOGPT_BENCHMARK,
+        "run_kind": "full-training",
+        "num_trials": 1,
+        "val_tokens": NANOGPT_VAL_TOKENS,
+        "target_val_loss": NANOGPT_TARGET_LOSS,
+        "stat_sig_delta": NANOGPT_SIGNIFICANCE_DELTA,
+        "data_contract": NANOGPT_DATA_CONTRACT,
+        "metric_contract": NANOGPT_METRIC_CONTRACT,
+    }
+    for key, value in expected.items():
+        if config.get(key) != value:
+            return f"config {key} does not match the NanoGPT contract"
+    if SHA256_RE.fullmatch(str(config.get("source_sha256", ""))) is None:
+        return "config source_sha256 is missing"
+    if config.get("seed") != config.get("senpai_trial_seed"):
+        return "config seed does not match the eval seed"
+    if not nonempty_mapping(config.get("model_config")):
+        return "config model_config is missing"
+    if not nonempty_sequence(config.get("optimizer_groups")):
+        return "config optimizer_groups is missing"
+    train_shards = config.get("train_shards")
+    val_shards = config.get("val_shards")
+    if not shard_manifest_valid(
+        train_shards,
+        expected_names=NANOGPT_TRAIN_SHARDS,
+    ):
+        return "config train_shards does not match the full data contract"
+    if not shard_manifest_valid(
+        val_shards,
+        expected_names=NANOGPT_VAL_SHARDS,
+    ):
+        return "config val_shards does not match the full data contract"
+    expected_summary = {
+        "eval/completed": True,
+        "eval/data_contract_satisfied": True,
+        "eval/all_trials_reached_target": True,
+        "eval/ranking_eligible": True,
+        "eval/train_shard_count": len(train_shards),
+        "eval/val_shard_count": len(val_shards),
+        "eval/primary_metric_name": NANOGPT_METRIC_CONTRACT["primary"],
+        "eval/primary_metric_direction": "minimize",
+        "speedrun/statistically_valid": True,
+    }
+    for key, value in expected_summary.items():
+        if summary.get(key) != value:
+            return f"summary {key} does not match the NanoGPT contract"
+    return None
+
+
+def tandem_config_contract_error(
+    config: Mapping[str, Any],
+    summary: Mapping[str, Any],
+) -> str | None:
+    expected = {
+        "debug": False,
+        "skip_test": False,
+        "splits_dir": "/mnt/new-pvc/datasets/tandemfoil/splits_v2",
+        "metric_contract": TANDEM_METRIC_CONTRACT,
+        "train_samples": 1499,
+        "val_samples": {split: 100 for split in TANDEM_VAL_SPLITS},
+        "materialized_split_manifest_sha256": TANDEM_PROTECTED_HASHES[
+            "split_manifest_sha256"
+        ],
+        "data_contract_satisfied": True,
+        **TANDEM_PROTECTED_HASHES,
+    }
+    for key, value in expected.items():
+        if config.get(key) != value:
+            return f"config {key} does not match the TandemFoil contract"
+    if config.get("seed") != config.get("senpai_trial_seed"):
+        return "config seed does not match the eval seed"
+    if SHA256_RE.fullmatch(str(config.get("training_source_sha256", ""))) is None:
+        return "config training_source_sha256 is missing"
+    for key in ("model_config", "optimizer_config", "scheduler_config"):
+        if not nonempty_mapping(config.get(key)):
+            return f"config {key} is missing"
+    expected_summary = {
+        "eval/completed": True,
+        "eval/ranking_eligible": True,
+        "eval/data_contract_satisfied": True,
+        "eval/full_test_splits": len(TANDEM_SPLITS),
+        "eval/primary_metric_name": TANDEM_METRIC_CONTRACT["primary"],
+        "eval/primary_metric_direction": "minimize",
+    }
+    for key, value in expected_summary.items():
+        if summary.get(key) != value:
+            return f"summary {key} does not match the TandemFoil contract"
+    return None
 
 
 def trial_zero(row: Mapping[str, Any]) -> bool:
@@ -923,8 +1215,50 @@ def score_tandem_run(
     )
 
 
-def score_target_runs(
+def resolve_adjudication(
+    trial: Mapping[str, Any],
+    valid_runs: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], Mapping[str, Any] | None]:
+    value = trial.get("adjudication", {})
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{trial['trial_name']} adjudication must be a mapping")
+    status = value.get("status", "pending")
+    if status not in {"pending", "accepted", "rejected"}:
+        raise ValueError(
+            f"{trial['trial_name']} has unknown adjudication status: {status}"
+        )
+    evidence = value.get("evidence", {})
+    if not isinstance(evidence, Mapping):
+        raise ValueError(
+            f"{trial['trial_name']} adjudication evidence must be a mapping"
+        )
+    selected_run_id = value.get("selected_run_id")
+    selected = next(
+        (run for run in valid_runs if run["run_id"] == selected_run_id),
+        None,
+    )
+    if status == "accepted" and selected is None:
+        raise ValueError(
+            f"{trial['trial_name']} accepted adjudication must select an eligible run"
+        )
+    if status != "accepted" and selected_run_id is not None:
+        raise ValueError(
+            f"{trial['trial_name']} {status} adjudication cannot select a run"
+        )
+    return (
+        {
+            "status": status,
+            "selected_run_id": selected_run_id,
+            "evidence": dict(evidence),
+        },
+        selected,
+    )
+
+
+def score_trial_runs(
+    manifest: Mapping[str, Any],
     target: Mapping[str, Any],
+    trial: Mapping[str, Any],
     runs: Iterable[object],
 ) -> dict[str, Any]:
     scorer = score_nanogpt_run if target["name"] == "nanogpt" else score_tandem_run
@@ -934,24 +1268,111 @@ def score_target_runs(
     for run in runs:
         identity = run_identity(run)
         states[identity["state"]] += 1
-        score, reason = scorer(run)
+        reason = config_contract_error(run, manifest, target, trial)
+        score = None
+        if reason is None:
+            score, reason = scorer(run)
         if score is not None:
+            score["commit_sha"] = str(
+                dict(getattr(run, "config", {}) or {})["git_commit"]
+            )
             valid.append(score)
         else:
             rejected.append({**identity, "reason": reason or "unscored"})
     valid.sort(key=lambda item: item["score"])
+    adjudication, final_result = resolve_adjudication(trial, valid)
     return {
-        "name": target["name"],
-        "label": target["label"],
-        "group": target["wandb_group"],
-        "primary_metric": target["primary_metric"],
-        "direction": "minimize",
+        "trial_index": trial["trial_index"],
+        "trial_name": trial["trial_name"],
+        "trial_seed": trial["trial_seed"],
+        "research_tag": trial["research_tag"],
+        "wandb_group": trial["wandb_group"],
+        "advisor_branch": trial["advisor_branch"],
+        "student_name": trial["student_name"],
         "total_runs": sum(states.values()),
         "eligible_runs": len(valid),
         "states": dict(sorted(states.items())),
-        "best": valid[0] if valid else None,
-        "valid_runs": valid,
+        "raw_candidate": valid[0] if valid else None,
+        "adjudication_status": adjudication["status"],
+        "adjudication_evidence": adjudication["evidence"],
+        "selected": final_result,
+        "candidate_runs": valid,
         "rejected_runs": rejected,
+    }
+
+
+def score_distribution(final_results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    scores = [float(result["score"]) for result in final_results]
+    if not scores:
+        return {
+            "count": 0,
+            "scores": [],
+            "mean": None,
+            "median": None,
+            "minimum": None,
+            "maximum": None,
+            "population_variance": None,
+            "population_stddev": None,
+            "coefficient_of_variation": None,
+        }
+    mean_score = fmean(scores)
+    standard_deviation = pstdev(scores)
+    return {
+        "count": len(scores),
+        "scores": scores,
+        "mean": mean_score,
+        "median": median(scores),
+        "minimum": min(scores),
+        "maximum": max(scores),
+        "population_variance": pvariance(scores),
+        "population_stddev": standard_deviation,
+        "coefficient_of_variation": (
+            standard_deviation / mean_score if mean_score else None
+        ),
+    }
+
+
+def aggregate_target_trials(
+    target: Mapping[str, Any],
+    trial_results: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    statuses = Counter(trial["adjudication_status"] for trial in trial_results)
+    adjudicated_trials = statuses["accepted"] + statuses["rejected"]
+    states: Counter[str] = Counter()
+    for trial in trial_results:
+        states.update(trial["states"])
+    final_results = [
+        {
+            "trial_index": trial["trial_index"],
+            "trial_name": trial["trial_name"],
+            "trial_seed": trial["trial_seed"],
+            "research_tag": trial["research_tag"],
+            "wandb_group": trial["wandb_group"],
+            "advisor_branch": trial["advisor_branch"],
+            "student_name": trial["student_name"],
+            **trial["selected"],
+        }
+        for trial in trial_results
+        if trial["selected"] is not None
+    ]
+    return {
+        "name": target["name"],
+        "label": target["label"],
+        "primary_metric": target["primary_metric"],
+        "metric_unit": target["metric_unit"],
+        "direction": "minimize",
+        "trial_count": len(trial_results),
+        "accepted_trials": len(final_results),
+        "adjudicated_trials": adjudicated_trials,
+        "adjudication_statuses": dict(sorted(statuses.items())),
+        "run_states": dict(sorted(states.items())),
+        "total_runs": sum(trial["total_runs"] for trial in trial_results),
+        "eligible_runs": sum(
+            trial["eligible_runs"] for trial in trial_results
+        ),
+        "final_results": final_results,
+        "distribution": score_distribution(final_results),
+        "trials": list(trial_results),
     }
 
 
@@ -972,47 +1393,73 @@ def render_markdown(
         f"- Built-in web search: `{'on' if manifest['web_search'] else 'off'}`",
         f"- Per-training hard timeout: `{manifest['training_timeout_minutes']:g} minutes`",
         f"- Total eval timeout: `{manifest['total_timeout_hours']:g} hours`",
+        f"- Independent trials per target: `{manifest['n_trials']}`",
         f"- Cutoff: `{manifest.get('cutoff_status', 'unknown')}` "
         f"(`{manifest.get('cutoff_arm_reason', 'unknown')}`)",
         f"- W&B project: `{manifest['wandb_entity']}/{manifest['wandb_project']}`",
         "",
-        "| Target | Eligible / total | Primary metric | Best | W&B run | State |",
-        "|---|---:|---|---:|---|---|",
+        "| Target | Accepted / adjudicated / trials | Eligible / total runs | "
+        "Primary metric | Mean | Stddev | Range |",
+        "|---|---:|---:|---|---:|---:|---:|",
     ]
     for result in target_results:
-        best = result["best"]
-        if best:
-            run_link = (
-                f"[{best['run_id']}]({best['url']})"
-                if best["url"]
-                else best["run_id"]
-            )
-            score = format_score(best["score"])
-            state = best["state"]
-        else:
-            run_link = score = state = "—"
+        distribution = result["distribution"]
+        score_range = (
+            f"{format_score(distribution['minimum'])}–"
+            f"{format_score(distribution['maximum'])}"
+            if distribution["count"]
+            else "—"
+        )
         lines.append(
-            f"| {result['label']} | {result['eligible_runs']} / "
+            f"| {result['label']} | {result['accepted_trials']} / "
+            f"{result['adjudicated_trials']} / {result['trial_count']} | "
+            f"{result['eligible_runs']} / "
             f"{result['total_runs']} | `{result['primary_metric']}` | "
-            f"{score} | {run_link} | {state} |"
+            f"{format_score(distribution['mean'])} | "
+            f"{format_score(distribution['population_stddev'])} | "
+            f"{score_range} |"
         )
 
     for result in target_results:
         lines.extend(("", f"## {result['label']}", ""))
-        if best := result["best"]:
-            lines.append("Best-run diagnostics:")
-            lines.append("")
-            for key, value in best["diagnostics"].items():
-                lines.append(f"- `{key}`: {format_score(value)}")
-        else:
-            lines.append("No run satisfied the target's scoring contract.")
-        if result["rejected_runs"]:
-            lines.extend(("", "Unscored runs:", ""))
-            for rejected in result["rejected_runs"]:
-                lines.append(
-                    f"- `{rejected['run_id']}` ({rejected['state']}): "
-                    f"{rejected['reason']}"
+        lines.extend(
+            (
+                "| Trial | Adjudication | Eligible / total | Raw candidate | Final result |",
+                "|---|---|---:|---:|---:|",
+            )
+        )
+        for trial in result["trials"]:
+            raw = trial["raw_candidate"]
+            final = trial["selected"]
+            lines.append(
+                f"| {trial['trial_name']} | "
+                f"{trial['adjudication_status']} | "
+                f"{trial['eligible_runs']} / {trial['total_runs']} | "
+                f"{format_score(raw['score'] if raw else None)} | "
+                f"{format_score(final['score'] if final else None)} |"
+            )
+        if not result["final_results"]:
+            lines.extend(
+                (
+                    "",
+                    "No trial has an accepted final result. Raw metric minima "
+                    "remain candidates only.",
                 )
+            )
+        for trial in result["trials"]:
+            lines.extend(("", f"### {trial['trial_name']}", ""))
+            lines.append(f"- W&B group: `{trial['wandb_group']}`")
+            lines.append(f"- Advisor branch: `{trial['advisor_branch']}`")
+            lines.append(f"- Seed: `{trial['trial_seed']}`")
+            if evidence := trial["adjudication_evidence"]:
+                lines.append(f"- Evidence: `{json.dumps(evidence, sort_keys=True)}`")
+            if trial["rejected_runs"]:
+                lines.append("- Unscored runs:")
+                for rejected in trial["rejected_runs"]:
+                    lines.append(
+                        f"  - `{rejected['run_id']}` ({rejected['state']}): "
+                        f"{rejected['reason']}"
+                    )
     return "\n".join(lines) + "\n"
 
 
@@ -1036,12 +1483,15 @@ def log_report_to_wandb(
             "model": manifest["model"],
             "reasoning_effort": manifest["reasoning_effort"],
             "web_search": manifest["web_search"],
+            "n_trials": manifest["n_trials"],
             "training_timeout_minutes": manifest["training_timeout_minutes"],
             "total_timeout_hours": manifest["total_timeout_hours"],
             "senpai_repo_url": manifest["senpai_repo_url"],
             "senpai_repo_revision": manifest["senpai_repo_revision"],
             "evaluator_revision": manifest["evaluator_revision"],
+            "evaluator_dirty": manifest["evaluator_dirty"],
             "evaluator_sha256": manifest["evaluator_sha256"],
+            "adjudicator_sha256": manifest["adjudicator_sha256"],
             "advisor_image": manifest["advisor_image"],
             "student_image": manifest["student_image"],
             "cutoff_image": manifest["cutoff_image"],
@@ -1060,42 +1510,254 @@ def log_report_to_wandb(
                     "repo_url": target["repo_url"],
                     "base_branch": target["base_branch"],
                     "base_revision": target["base_revision"],
-                    "wandb_group": target["wandb_group"],
+                    "trials": [
+                        {
+                            "trial_index": trial["trial_index"],
+                            "trial_name": trial["trial_name"],
+                            "trial_seed": trial["trial_seed"],
+                            "research_tag": trial["research_tag"],
+                            "wandb_group": trial["wandb_group"],
+                            "advisor_branch": trial["advisor_branch"],
+                            "student_name": trial["student_name"],
+                            "adjudication": trial["adjudication"],
+                        }
+                        for trial in target["trials"]
+                    ],
                 }
                 for target in manifest["targets"]
             ],
         },
     )
-    metrics: dict[str, int | float] = {}
+    logged: dict[str, Any] = {}
     for result in target_results:
         prefix = f"eval/{result['name']}"
-        metrics[f"{prefix}/total_runs"] = result["total_runs"]
-        metrics[f"{prefix}/eligible_runs"] = result["eligible_runs"]
-        if result["best"]:
-            metrics[f"{prefix}/primary"] = result["best"]["score"]
-            for key, value in result["best"]["diagnostics"].items():
-                if (number := finite_number(value)) is not None:
-                    metrics[f"{prefix}/diagnostic/{key}"] = number
-    metrics["eval/scored_targets"] = sum(
-        result["best"] is not None for result in target_results
+        distribution = result["distribution"]
+        logged[f"{prefix}/trials_total"] = result["trial_count"]
+        logged[f"{prefix}/trials_accepted"] = result["accepted_trials"]
+        logged[f"{prefix}/trials_accepted_fraction"] = (
+            result["accepted_trials"] / result["trial_count"]
+        )
+        logged[f"{prefix}/trials_adjudicated"] = result["adjudicated_trials"]
+        logged[f"{prefix}/trials_adjudicated_fraction"] = (
+            result["adjudicated_trials"] / result["trial_count"]
+        )
+        logged[f"{prefix}/total_runs"] = result["total_runs"]
+        logged[f"{prefix}/eligible_runs"] = result["eligible_runs"]
+        logged[f"{prefix}/eligible_run_fraction"] = (
+            result["eligible_runs"] / result["total_runs"]
+            if result["total_runs"]
+            else 0.0
+        )
+        for status, count in result["adjudication_statuses"].items():
+            logged[f"{prefix}/adjudication/{status}"] = count
+        for state, count in result["run_states"].items():
+            logged[f"{prefix}/run_state/{state}"] = count
+        for name, value in distribution.items():
+            if name == "scores" or value is None:
+                continue
+            logged[f"{prefix}/distribution/{name}"] = value
+
+        rows = []
+        scatter_rows = []
+        for trial in result["trials"]:
+            final = trial["selected"]
+            raw = trial["raw_candidate"]
+            rows.append(
+                [
+                    trial["trial_index"],
+                    trial["trial_name"],
+                    trial["trial_seed"],
+                    trial["adjudication_status"],
+                    trial["wandb_group"],
+                    trial["advisor_branch"],
+                    trial["eligible_runs"],
+                    trial["total_runs"],
+                    raw["score"] if raw else None,
+                    final["score"] if final else None,
+                    final["run_id"] if final else None,
+                    final["url"] if final else None,
+                    json.dumps(
+                        trial["adjudication_evidence"], sort_keys=True
+                    ),
+                ]
+            )
+            if final:
+                logged[
+                    f"{prefix}/trial/{trial['trial_index']}/final_primary"
+                ] = final["score"]
+                scatter_rows.append(
+                    [trial["trial_index"], final["score"], final["run_id"]]
+                )
+        table = wandb.Table(
+            columns=[
+                "trial_index",
+                "trial_name",
+                "trial_seed",
+                "adjudication_status",
+                "wandb_group",
+                "advisor_branch",
+                "eligible_runs",
+                "total_runs",
+                "raw_candidate_score",
+                "final_score",
+                "selected_run_id",
+                "selected_run_url",
+                "adjudication_evidence",
+            ],
+            data=rows,
+        )
+        logged[f"{prefix}/trial_results"] = table
+        if scatter_rows:
+            scatter_table = wandb.Table(
+                columns=["trial_index", "score", "selected_run_id"],
+                data=scatter_rows,
+            )
+            logged[f"{prefix}/score_scatter"] = wandb.plot.scatter(
+                scatter_table,
+                "trial_index",
+                "score",
+                title=f"{result['label']} accepted final scores",
+            )
+    logged["eval/targets_with_accepted_results"] = sum(
+        result["accepted_trials"] > 0 for result in target_results
     )
-    metrics["eval/total_targets"] = len(target_results)
-    run.log(metrics)
+    logged["eval/targets_fully_adjudicated"] = sum(
+        result["adjudicated_trials"] == result["trial_count"]
+        for result in target_results
+    )
+    logged["eval/total_targets"] = len(target_results)
+    logged["eval/trials_total"] = sum(
+        result["trial_count"] for result in target_results
+    )
+    logged["eval/trials_accepted"] = sum(
+        result["accepted_trials"] for result in target_results
+    )
+    logged["eval/trials_adjudicated"] = sum(
+        result["adjudicated_trials"] for result in target_results
+    )
+    run.log(logged)
     run.summary["report_markdown"] = markdown
     url = run.url
     run.finish()
     return url
 
 
+def eval_github_reader(manifest: Mapping[str, Any]) -> GitHubReader:
+    token = resolve_github_token(
+        ROOT / ".env",
+        tuple(manifest.get("custom_secret_env_names", [])),
+    )
+    return GitHubReader(SecretStr(token))
+
+
+def persist_frozen_advisor_heads(
+    manifest: dict[str, Any],
+    results_dir: Path,
+    github: GitHubReads,
+) -> None:
+    path = manifest_path(results_dir, manifest["run_id"])
+    for target, trial in iter_trial_specs(manifest):
+        frozen_head = trial.get("adjudication_frozen_head_sha")
+        if frozen_head is not None:
+            if not isinstance(frozen_head, str) or not frozen_head:
+                raise ValueError(
+                    f"{trial['trial_name']} frozen advisor head must be non-empty"
+                )
+            continue
+        trial["adjudication_frozen_head_sha"] = freeze_advisor_head(
+            target, trial, github
+        )
+        write_json(path, manifest)
+
+
+DECISION_FIELDS = (
+    "status",
+    "selected_run_id",
+    "reason",
+    "pr_number",
+    "result_commit_sha",
+    "merge_commit_sha",
+    "result_digest",
+    "score",
+)
+
+
+def semantic_decision(decision: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: decision.get(key) for key in DECISION_FIELDS}
+
+
+def record_adjudication(
+    trial: dict[str, Any],
+    trial_result: dict[str, Any],
+    decision: Mapping[str, Any],
+) -> None:
+    evidence = dict(decision["evidence"])
+    frozen_head = str(evidence["frozen_advisor_head"])
+    previous_head = trial.get("adjudication_frozen_head_sha")
+    if previous_head is not None and previous_head != frozen_head:
+        raise ValueError(
+            f"{trial['trial_name']} adjudication changed its frozen advisor head"
+        )
+    current_semantics = semantic_decision(decision)
+    previous_adjudication = trial.get("adjudication")
+    previous_evidence = (
+        previous_adjudication.get("evidence")
+        if isinstance(previous_adjudication, Mapping)
+        else None
+    )
+    previous_semantics = (
+        previous_evidence.get("decision")
+        if isinstance(previous_evidence, Mapping)
+        else None
+    )
+    if previous_semantics is not None:
+        if not isinstance(previous_semantics, Mapping):
+            raise ValueError(
+                f"{trial['trial_name']} persisted decision must be a mapping"
+            )
+        persisted = dict(previous_semantics)
+        if (
+            persisted.get("status") != previous_adjudication.get("status")
+            or persisted.get("selected_run_id")
+            != previous_adjudication.get("selected_run_id")
+        ):
+            raise ValueError(
+                f"{trial['trial_name']} persisted adjudication is inconsistent"
+            )
+        if persisted != current_semantics:
+            raise RuntimeError(
+                f"{trial['trial_name']} adjudication changed after it was persisted"
+            )
+        return
+
+    evidence["decision"] = current_semantics
+    trial["adjudication_frozen_head_sha"] = frozen_head
+    trial["adjudication"] = {
+        "status": decision["status"],
+        "selected_run_id": decision["selected_run_id"],
+        "evidence": evidence,
+    }
+    adjudication, selected = resolve_adjudication(
+        trial, trial_result["candidate_runs"]
+    )
+    trial_result["adjudication_status"] = adjudication["status"]
+    trial_result["adjudication_evidence"] = adjudication["evidence"]
+    trial_result["selected"] = selected
+
+
 def report_eval(
-    manifest: Mapping[str, Any],
+    manifest: dict[str, Any],
     results_dir: Path,
     *,
     log_wandb: bool,
     api: object | None = None,
+    github: GitHubReads | None = None,
 ) -> tuple[dict[str, Any], str]:
+    completed = manifest.get("status") == "completed"
+    if completed:
+        verify_report_sources(manifest)
     if log_wandb:
-        if manifest.get("status") != "completed":
+        if not completed:
             raise RuntimeError(
                 "refusing to publish an aggregate W&B report before the cutoff "
                 "job completes"
@@ -1108,23 +1770,43 @@ def report_eval(
             raise RuntimeError(
                 "refusing to publish without a recorded cutoff arm reason"
             )
+    if completed:
+        github = github or eval_github_reader(manifest)
+        persist_frozen_advisor_heads(manifest, results_dir, github)
     api = api or wandb.Api()
     project = f"{manifest['wandb_entity']}/{manifest['wandb_project']}"
     target_results = []
     for target in manifest["targets"]:
-        runs = api.runs(project, filters={"group": target["wandb_group"]})
-        target_results.append(score_target_runs(target, runs))
+        trial_results = []
+        for trial in target["trials"]:
+            runs = api.runs(project, filters={"group": trial["wandb_group"]})
+            trial_result = score_trial_runs(manifest, target, trial, runs)
+            if completed:
+                decision = adjudicate_trial(
+                    target,
+                    trial,
+                    github,
+                    trial_result["candidate_runs"],
+                    frozen_head_sha=trial["adjudication_frozen_head_sha"],
+                )
+                record_adjudication(trial, trial_result, decision)
+                write_json(manifest_path(results_dir, manifest["run_id"]), manifest)
+            trial_results.append(trial_result)
+        target_results.append(aggregate_target_trials(target, trial_results))
     markdown = render_markdown(manifest, target_results)
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": manifest["run_id"],
+        "n_trials": manifest["n_trials"],
         "generated_at": utc_now(),
         "eval_status": manifest.get("status", "unknown"),
         "provenance": {
             "senpai_repo_url": manifest["senpai_repo_url"],
             "senpai_repo_revision": manifest["senpai_repo_revision"],
             "evaluator_revision": manifest["evaluator_revision"],
+            "evaluator_dirty": manifest["evaluator_dirty"],
             "evaluator_sha256": manifest["evaluator_sha256"],
+            "adjudicator_sha256": manifest["adjudicator_sha256"],
             "advisor_image": manifest["advisor_image"],
             "student_image": manifest["student_image"],
             "cutoff_image": manifest["cutoff_image"],
@@ -1141,6 +1823,19 @@ def report_eval(
                 target["name"]: target["base_revision"]
                 for target in manifest["targets"]
             },
+            "trials": [
+                {
+                    "target": target["name"],
+                    "trial_index": trial["trial_index"],
+                    "trial_name": trial["trial_name"],
+                    "trial_seed": trial["trial_seed"],
+                    "research_tag": trial["research_tag"],
+                    "wandb_group": trial["wandb_group"],
+                    "advisor_branch": trial["advisor_branch"],
+                    "student_name": trial["student_name"],
+                }
+                for target, trial in iter_trial_specs(manifest)
+            ],
         },
         "targets": target_results,
     }
@@ -1189,6 +1884,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="absolute launch-to-cleanup deadline (default: 6)",
     )
     launch.add_argument(
+        "--n-trials",
+        type=int,
+        default=DEFAULT_N_TRIALS,
+        help="independent Senpai replications per target (default: 3)",
+    )
+    launch.add_argument(
         "--wait",
         action="store_true",
         help="wait for the cutoff, then write and log the report",
@@ -1224,6 +1925,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             dry_run=args.dry_run,
             training_timeout_minutes=args.training_timeout_minutes,
             total_timeout_hours=args.total_timeout_hours,
+            n_trials=args.n_trials,
         )
         print(f"Eval {run_id} {manifest['status']}.", flush=True)
         print(

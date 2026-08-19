@@ -779,13 +779,19 @@ def ensure_target_repo_labels(
                         "description": description,
                     }
                 ).encode()
-                _github_api(
-                    f"/repos/{slug}/labels",
-                    token,
-                    method="POST",
-                    data=payload,
-                )
-                print(f"  created label {name}")
+                try:
+                    _github_api(
+                        f"/repos/{slug}/labels",
+                        token,
+                        method="POST",
+                        data=payload,
+                    )
+                    print(f"  created label {name}")
+                except urllib.error.HTTPError as create_error:
+                    if create_error.code != 422:
+                        raise
+                    _github_api(f"/repos/{slug}/labels/{encoded}", token)
+                    print(f"  label {name} was created concurrently")
                 continue
 
             print(f"GitHub label check failed for {name!r}", file=sys.stderr)

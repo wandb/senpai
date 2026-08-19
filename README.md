@@ -220,9 +220,10 @@ Use `--kube_context` and `--namespace` when the desired cluster is not your curr
 
 [`eval/README.md`](eval/README.md) defines a bounded two-target regression eval
 for Senpai development. It runs every model profile on GPT-5.6 Luna, defaults
-to a hard 20-minute ceiling per training process and a six-hour absolute fleet
-deadline, supports a no-web-search variant, and publishes deterministic W&B
-metrics plus a provenance-rich aggregate report.
+to three parallel replications per target, a hard 20-minute ceiling per
+training process, and one six-hour absolute fleet deadline. It supports a
+no-web-search variant and publishes adjudicated W&B distributions plus a
+provenance-rich aggregate report.
 
 ## Experiment workflow
 
@@ -445,7 +446,7 @@ Useful launch controls:
 - `--wandb_run_group` exports `WANDB_RUN_GROUP` when nonempty so related runs can be queried together.
 - `--web_search false` disables Senpai's browser and external-search facilities without blocking generic terminal network access.
 - `--poll_interval_s` and `--poll_jitter_s` control idle GitHub cadence without teaching the model to poll.
-- `--gh_history_scope branch` keeps normal advisor-branch memory, `fresh` creates a shallow ablation checkout, and `repo` exposes full repository history.
+- `--gh_history_scope branch` keeps normal advisor-branch memory; `fresh` clones only the selected branch at depth one with tags disabled for a clean-history ablation; and `repo` exposes full repository history. `fresh` limits the local Git graph, not GitHub or W&B access.
 - `--extra_instructions` accepts optional human operator guidance as a Markdown file or literal user context.
 - `human_issues: false` disables GitHub Issue polling for isolated launches.
 

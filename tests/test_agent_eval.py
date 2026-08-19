@@ -4,6 +4,7 @@
 
 import json
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,10 @@ import yaml
 
 import eval.run as agent_eval
 from eval.run import (
+    DEFAULT_N_TRIALS,
     DEFAULT_TRAINING_TIMEOUT_MINUTES,
+    DEFAULT_WANDB_ENTITY,
+    DEFAULT_WANDB_PROJECT,
     MODEL,
     NANOGPT_BENCHMARK,
     REASONING_EFFORT,
@@ -35,11 +39,14 @@ class FakeRun:
         validation=(),
         markers=(),
         state="finished",
+        run_id="run-123",
+        group="",
     ):
-        self.id = "run-123"
+        self.id = run_id
         self.name = "candidate"
-        self.url = "https://wandb.ai/acme/evals/runs/run-123"
+        self.url = f"https://wandb.ai/acme/evals/runs/{run_id}"
         self.state = state
+        self.group = group
         self.config = config or {}
         self.summary = summary or {}
         self.validation = list(validation)
@@ -49,6 +56,19 @@ class FakeRun:
         if "val/loss" in keys:
             return iter(self.validation)
         return iter(self.markers)
+
+
+def test_eval_script_runs_directly_from_the_documented_entrypoint():
+    result = subprocess.run(
+        [agent_eval.sys.executable, str(agent_eval.EVALUATOR_PATH), "--help"],
+        cwd=agent_eval.ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "{launch,report}" in result.stdout
 
 
 def local_config():
@@ -71,11 +91,12 @@ def test_eval_launch_config_is_bounded_isolated_and_all_luna():
         dry_run=False,
     )
     target = manifest["targets"][0]
+    trial = target["trials"][0]
 
-    config = target_launch_config(base, manifest, target)
+    config = target_launch_config(base, manifest, target, trial)
 
     assert config["target_repo_url"].endswith("modded-nanogpt-senpai")
-    assert config["target_repo_branch"] == "master"
+    assert config["target_repo_branch"] == target["base_branch"]
     assert len(target["base_revision"]) == 40
     assert config["advisor"] is True
     assert config["n_students"] == 1
@@ -83,7 +104,11 @@ def test_eval_launch_config_is_bounded_isolated_and_all_luna():
     assert config["web_search"] is False
     assert config["human_issues"] is False
     assert config["gh_history_scope"] == "fresh"
-    assert config["wandb_run_group"] == target["wandb_group"]
+    assert config["wandb_run_group"] == trial["wandb_group"]
+    assert config["wandb_entity"] == DEFAULT_WANDB_ENTITY
+    assert config["wandb_project"] == DEFAULT_WANDB_PROJECT
+    assert config["trial_index"] == 0
+    assert config["trial_seed"] == trial["trial_seed"]
     assert config["start_gate_path"] == manifest["start_gate_path"]
     assert {
         config["advisor_model"],
@@ -100,6 +125,42 @@ def test_eval_launch_config_is_bounded_isolated_and_all_luna():
         config["frontier_reasoning_effort"],
     } == {REASONING_EFFORT}
     assert config["target_repo_revision"] == target["base_revision"]
+    assert config["extra_instructions"] == ""
+
+
+def test_eval_defaults_to_three_isolated_trials_and_standard_wandb_project():
+    base = local_config()
+
+    manifest = build_manifest(
+        base,
+        "eval-defaults",
+        web_search=False,
+        dry_run=False,
+    )
+    trials = [
+        (target, trial)
+        for target in manifest["targets"]
+        for trial in target["trials"]
+    ]
+
+    assert manifest["n_trials"] == DEFAULT_N_TRIALS == 3
+    assert manifest["wandb_entity"] == DEFAULT_WANDB_ENTITY
+    assert manifest["wandb_project"] == DEFAULT_WANDB_PROJECT
+    assert len(trials) == 6
+    for key in (
+        "research_tag",
+        "wandb_group",
+        "advisor_branch",
+        "student_name",
+        "trial_seed",
+    ):
+        assert len({trial[key] for _target, trial in trials}) == 6
+    assert all(len(trial["advisor_branch"]) <= 50 for _target, trial in trials)
+    assert all(
+        trial["adjudication"]
+        == {"status": "pending", "selected_run_id": None, "evidence": {}}
+        for _target, trial in trials
+    )
 
 
 def valid_nanogpt_run(final_loss=3.275, first_step=3350):
@@ -216,6 +277,112 @@ def valid_tandem_summary():
     return summary
 
 
+def tandem_run(score, run_id):
+    summary = {
+        f"test/{split}/mae_surf_p": score for split in TANDEM_SPLITS
+    }
+    summary["test_avg/mae_surf_p"] = score
+    return FakeRun(summary=summary, run_id=run_id)
+
+
+def eval_contract_run(run, manifest, target, trial):
+    run.group = trial["wandb_group"]
+    run.config.update(
+        {
+            "wandb_entity": manifest["wandb_entity"],
+            "wandb_project": manifest["wandb_project"],
+            "wandb_group": trial["wandb_group"],
+            "wandb_run_group": trial["wandb_group"],
+            "senpai_trial_index": trial["trial_index"],
+            "senpai_trial_seed": trial["trial_seed"],
+            "senpai_timeout_minutes": manifest["training_timeout_minutes"],
+            "git_commit": "c" * 40,
+            "git_dirty": False,
+        }
+    )
+    if target["name"] == "nanogpt":
+        run.config.update(
+            {
+                "benchmark": agent_eval.NANOGPT_BENCHMARK,
+                "run_kind": "full-training",
+                "num_trials": 1,
+                "val_tokens": agent_eval.NANOGPT_VAL_TOKENS,
+                "target_val_loss": agent_eval.NANOGPT_TARGET_LOSS,
+                "stat_sig_delta": agent_eval.NANOGPT_SIGNIFICANCE_DELTA,
+                "data_contract": agent_eval.NANOGPT_DATA_CONTRACT,
+                "metric_contract": agent_eval.NANOGPT_METRIC_CONTRACT,
+                "source_sha256": "d" * 64,
+                "seed": trial["trial_seed"],
+                "model_config": {"layers": 12},
+                "optimizer_groups": [{"optimizer": "AdamW"}],
+                "train_shards": [
+                    {
+                        "name": f"fineweb_train_{index:06d}.bin",
+                        "bytes": agent_eval.NANOGPT_SHARD_BYTES,
+                    }
+                    for index in range(1, 21)
+                ],
+                "val_shards": [
+                    {
+                        "name": "fineweb_val_000000.bin",
+                        "bytes": agent_eval.NANOGPT_SHARD_BYTES,
+                    }
+                ],
+            }
+        )
+        run.summary.update(
+            {
+                "eval/completed": True,
+                "eval/data_contract_satisfied": True,
+                "eval/all_trials_reached_target": True,
+                "eval/ranking_eligible": True,
+                "eval/train_shard_count": 20,
+                "eval/val_shard_count": 1,
+                "eval/primary_metric_name": (
+                    "speedrun/final_first_step_to_target"
+                ),
+                "eval/primary_metric_direction": "minimize",
+                "speedrun/statistically_valid": True,
+            }
+        )
+    else:
+        run.config.update(
+            {
+                "debug": False,
+                "skip_test": False,
+                "splits_dir": "/mnt/new-pvc/datasets/tandemfoil/splits_v2",
+                "seed": trial["trial_seed"],
+                "metric_contract": agent_eval.TANDEM_METRIC_CONTRACT,
+                "train_samples": 1499,
+                "val_samples": {
+                    split: 100 for split in agent_eval.TANDEM_VAL_SPLITS
+                },
+                "training_source_sha256": "e" * 64,
+                "materialized_split_manifest_sha256": (
+                    agent_eval.TANDEM_PROTECTED_HASHES[
+                        "split_manifest_sha256"
+                    ]
+                ),
+                "data_contract_satisfied": True,
+                **agent_eval.TANDEM_PROTECTED_HASHES,
+                "model_config": {"layers": 5},
+                "optimizer_config": {"name": "AdamW"},
+                "scheduler_config": {"name": "CosineAnnealingLR"},
+            }
+        )
+        run.summary.update(
+            {
+                "eval/completed": True,
+                "eval/ranking_eligible": True,
+                "eval/data_contract_satisfied": True,
+                "eval/full_test_splits": 4,
+                "eval/primary_metric_name": "test_avg/mae_surf_p",
+                "eval/primary_metric_direction": "minimize",
+            }
+        )
+    return run
+
+
 def test_tandem_scores_recomputed_complete_test_average_even_if_run_crashed():
     run = FakeRun(
         config={"debug": False, "skip_test": False},
@@ -284,9 +451,12 @@ def test_eval_timeouts_are_configurable_and_share_one_absolute_deadline():
     assert manifest["training_timeout_minutes"] == 12.5
     assert manifest["total_timeout_hours"] == 1.25
     assert manifest["deadline_epoch"] - manifest["started_at_epoch"] == 4500
-    config = target_launch_config(local_config(), manifest, manifest["targets"][0])
+    target = manifest["targets"][0]
+    config = target_launch_config(
+        local_config(), manifest, target, target["trials"][0]
+    )
     assert config["timeout_minutes"] == 12.5
-    assert "12.5-minute wall-clock ceiling" in config["extra_instructions"]
+    assert config["extra_instructions"] == ""
 
     args = agent_eval.parse_args(
         [
@@ -295,10 +465,13 @@ def test_eval_timeouts_are_configurable_and_share_one_absolute_deadline():
             "12.5",
             "--total-timeout-hours",
             "1.25",
+            "--n-trials",
+            "5",
         ]
     )
     assert args.training_timeout_minutes == 12.5
     assert args.total_timeout_hours == 1.25
+    assert args.n_trials == 5
     with pytest.raises(ValueError, match="total timeout must be a positive"):
         build_manifest(
             local_config(),
@@ -315,6 +488,14 @@ def test_eval_timeouts_are_configurable_and_share_one_absolute_deadline():
             dry_run=False,
             training_timeout_minutes=0.001,
         )
+    with pytest.raises(ValueError, match="n_trials must be a positive integer"):
+        build_manifest(
+            local_config(),
+            "eval-zero-trials",
+            web_search=False,
+            dry_run=False,
+            n_trials=0,
+        )
 
 
 def test_eval_run_id_keeps_every_github_routing_label_within_50_characters():
@@ -323,7 +504,11 @@ def test_eval_run_id_keeps_every_github_routing_label_within_50_characters():
         local_config(), run_id, web_search=False, dry_run=False
     )
 
-    assert all(len(target["advisor_branch"]) <= 50 for target in manifest["targets"])
+    assert all(
+        len(trial["advisor_branch"]) <= 50
+        for target in manifest["targets"]
+        for trial in target["trials"]
+    )
     with pytest.raises(ValueError, match="at most 27"):
         validate_run_id("a" * 28)
 
@@ -338,12 +523,17 @@ def test_launch_preflights_both_targets_then_arms_and_rolls_back_on_failure(
     config_path = tmp_path / "senpai.yaml"
     config_path.write_text(yaml.safe_dump(local_config()))
     events = []
+    launch_barrier = threading.Barrier(4)
+    settled = []
 
     def run(argv, *, env=None):
         config = yaml.safe_load(Path(argv[-1]).read_text(encoding="utf-8"))
         kind = "preflight" if config["preflight_only"] else "launch"
         events.append((kind, config["tag"]))
-        if kind == "launch" and config["tag"].endswith("tandemfoil"):
+        if kind == "launch":
+            launch_barrier.wait(timeout=2)
+            settled.append(config["tag"])
+        if kind == "launch" and config["tag"].endswith("foil-t02"):
             raise subprocess.CalledProcessError(1, argv)
 
     monkeypatch.setattr(agent_eval, "run_checked", run)
@@ -360,7 +550,7 @@ def test_launch_preflights_both_targets_then_arms_and_rolls_back_on_failure(
     monkeypatch.setattr(
         agent_eval,
         "cleanup_eval_resources",
-        lambda _manifest: events.append(("cleanup", "all")) or True,
+        lambda _manifest: events.append(("cleanup", str(len(settled)))) or True,
     )
 
     with pytest.raises(subprocess.CalledProcessError):
@@ -371,17 +561,26 @@ def test_launch_preflights_both_targets_then_arms_and_rolls_back_on_failure(
             web_search=False,
             cutoff_image=None,
             dry_run=False,
+            n_trials=2,
         )
 
-    assert events == [
-        ("preflight", "eval-rollback-nanogpt"),
-        ("preflight", "eval-rollback-tandemfoil"),
+    assert events[:6] == [
+        ("preflight", "eval-rollback-nano-t01"),
+        ("preflight", "eval-rollback-nano-t02"),
+        ("preflight", "eval-rollback-foil-t01"),
+        ("preflight", "eval-rollback-foil-t02"),
         ("arm", "cutoff"),
         ("ready", "cutoff"),
-        ("launch", "eval-rollback-nanogpt"),
-        ("launch", "eval-rollback-tandemfoil"),
-        ("cleanup", "all"),
     ]
+    assert {
+        tag for kind, tag in events[6:-1] if kind == "launch"
+    } == {
+        "eval-rollback-nano-t01",
+        "eval-rollback-nano-t02",
+        "eval-rollback-foil-t01",
+        "eval-rollback-foil-t02",
+    }
+    assert events[-1] == ("cleanup", "4")
     saved = json.loads((tmp_path / "eval-rollback.json").read_text())
     assert saved["status"] == "launch_failed"
     assert saved["cleanup_status"] == "complete"
@@ -403,10 +602,12 @@ def test_cleanup_deletes_tagged_resources_before_the_cutoff(monkeypatch):
     assert commands[0][commands[0].index("delete") + 1] == (
         "deployments,configmaps,secrets"
     )
-    assert (
-        "app=senpai,research-tag in "
-        "(eval-cleanup-nanogpt,eval-cleanup-tandemfoil)"
-    ) in commands[0]
+    tags = ",".join(
+        trial["research_tag"]
+        for target in manifest["targets"]
+        for trial in target["trials"]
+    )
+    assert f"app=senpai,research-tag in ({tags})" in commands[0]
     assert commands[1][commands[1].index("delete") + 1] == "pods"
     assert commands[2][commands[2].index("delete") + 1] == "job"
     assert commands[3][commands[3].index("delete") + 1] == "configmap"
@@ -446,6 +647,32 @@ def test_cutoff_worker_must_exist_and_be_ready_before_launch(monkeypatch):
         "app=senpai-cutoff,run-slug=eval-cutoff-ready" in command
         for command in commands
     )
+
+
+def test_one_cutoff_accounts_for_every_target_trial(monkeypatch):
+    manifest = build_manifest(
+        local_config(),
+        "eval-cutoff-size",
+        web_search=False,
+        dry_run=True,
+        n_trials=4,
+    )
+    commands = []
+    monkeypatch.setattr(
+        agent_eval,
+        "run_checked",
+        lambda argv, *, env=None: commands.append(argv),
+    )
+
+    agent_eval.arm_cutoff(local_config(), manifest)
+
+    command = commands[0]
+    assert command[command.index("--expected-pods") + 1] == "16"
+    assert command[command.index("--expected-deployments") + 1] == "16"
+    assert command[command.index("--deadline-epoch") + 1] == str(
+        manifest["deadline_epoch"]
+    )
+    assert command.count("--deadline-epoch") == 1
 
 
 def test_cutoff_status_collects_logs_from_every_job_retry_pod(monkeypatch):
@@ -532,6 +759,16 @@ class EmptyApi:
         return []
 
 
+class RunsApi(EmptyApi):
+    def __init__(self, runs_by_group):
+        super().__init__()
+        self.runs_by_group = runs_by_group
+
+    def runs(self, _project, *, filters):
+        self.filters.append(filters)
+        return self.runs_by_group.get(filters["group"], [])
+
+
 def test_report_keeps_provenance_and_queries_only_exact_groups(tmp_path):
     manifest = build_manifest(
         local_config(), "eval-report", web_search=False, dry_run=False
@@ -542,13 +779,334 @@ def test_report_keeps_provenance_and_queries_only_exact_groups(tmp_path):
     report, _ = report_eval(manifest, tmp_path, log_wandb=False, api=api)
 
     assert api.filters == [
-        {"group": "eval-report/nanogpt"},
-        {"group": "eval-report/tandemfoil"},
+        {"group": f"eval-report/{target}/{trial}"}
+        for target in ("nanogpt", "tandemfoil")
+        for trial in ("trial-01", "trial-02", "trial-03")
     ]
     assert report["provenance"]["senpai_repo_revision"] == "a" * 40
     assert report["provenance"]["target_revisions"] == {
         target["name"]: target["base_revision"] for target in manifest["targets"]
     }
+    assert len(report["provenance"]["trials"]) == 6
+
+
+def test_trial_candidates_require_finished_full_contract_runs():
+    manifest = build_manifest(
+        local_config(), "eval-contract", web_search=False, dry_run=False
+    )
+    target = manifest["targets"][0]
+    trial = target["trials"][0]
+    valid = eval_contract_run(valid_nanogpt_run(), manifest, target, trial)
+    wrong_group = eval_contract_run(
+        valid_nanogpt_run(), manifest, target, trial
+    )
+    wrong_group.id = "wrong-group"
+    wrong_group.group = "manual-test-group"
+    incomplete = eval_contract_run(
+        valid_nanogpt_run(), manifest, target, trial
+    )
+    incomplete.id = "incomplete"
+    incomplete.state = "crashed"
+
+    result = agent_eval.score_trial_runs(
+        manifest, target, trial, [valid, wrong_group, incomplete]
+    )
+
+    assert [run["run_id"] for run in result["candidate_runs"]] == ["run-123"]
+    assert {run["reason"] for run in result["rejected_runs"]} == {
+        "W&B run object has the wrong group",
+        "W&B run did not finish",
+    }
+
+
+def test_nanogpt_candidate_requires_exact_full_shard_manifest():
+    manifest = build_manifest(
+        local_config(), "eval-nanogpt-data", web_search=False, dry_run=False
+    )
+    target = manifest["targets"][0]
+    trial = target["trials"][0]
+    run = eval_contract_run(
+        valid_nanogpt_run(), manifest, target, trial
+    )
+    run.config["train_shards"][0]["bytes"] -= 2
+
+    result = agent_eval.score_trial_runs(manifest, target, trial, [run])
+
+    assert result["candidate_runs"] == []
+    assert result["rejected_runs"][0]["reason"] == (
+        "config train_shards does not match the full data contract"
+    )
+
+
+def test_tandem_candidate_requires_protected_data_and_scorer_hashes():
+    manifest = build_manifest(
+        local_config(), "eval-data-contract", web_search=False, dry_run=False
+    )
+    target = manifest["targets"][1]
+    trial = target["trials"][0]
+    run = eval_contract_run(
+        tandem_run(12.0, "tampered-data"), manifest, target, trial
+    )
+    run.config["split_manifest_sha256"] = "0" * 64
+
+    result = agent_eval.score_trial_runs(manifest, target, trial, [run])
+
+    assert result["candidate_runs"] == []
+    assert result["rejected_runs"][0]["reason"] == (
+        "config split_manifest_sha256 does not match the TandemFoil contract"
+    )
+
+
+def test_tandem_candidate_requires_materialized_data_manifest_binding():
+    manifest = build_manifest(
+        local_config(), "eval-materialized-data", web_search=False, dry_run=False
+    )
+    target = manifest["targets"][1]
+    trial = target["trials"][0]
+    run = eval_contract_run(
+        tandem_run(12.0, "stale-data"), manifest, target, trial
+    )
+    run.config["materialized_split_manifest_sha256"] = "0" * 64
+
+    result = agent_eval.score_trial_runs(manifest, target, trial, [run])
+
+    assert result["candidate_runs"] == []
+    assert result["rejected_runs"][0]["reason"] == (
+        "config materialized_split_manifest_sha256 does not match the "
+        "TandemFoil contract"
+    )
+
+
+def test_report_aggregates_only_explicitly_adjudicated_trial_results(tmp_path):
+    manifest = build_manifest(
+        local_config(), "eval-adjudicated", web_search=False, dry_run=False
+    )
+    tandem = manifest["targets"][1]
+    first, second, pending = tandem["trials"]
+    first["adjudication"] = {
+        "status": "accepted",
+        "selected_run_id": "selected-14",
+        "evidence": {"kind": "senpai-result", "pr": 14},
+    }
+    second["adjudication"] = {
+        "status": "accepted",
+        "selected_run_id": "selected-12",
+        "evidence": {"kind": "senpai-result", "pr": 12},
+    }
+    api = RunsApi(
+        {
+            first["wandb_group"]: [
+                eval_contract_run(
+                    tandem_run(10.0, "raw-minimum"), manifest, tandem, first
+                ),
+                eval_contract_run(
+                    tandem_run(14.0, "selected-14"), manifest, tandem, first
+                ),
+            ],
+            second["wandb_group"]: [
+                eval_contract_run(
+                    tandem_run(12.0, "selected-12"), manifest, tandem, second
+                )
+            ],
+            pending["wandb_group"]: [
+                eval_contract_run(
+                    tandem_run(1.0, "pending-minimum"), manifest, tandem, pending
+                )
+            ],
+        }
+    )
+
+    report, markdown = report_eval(
+        manifest, tmp_path, log_wandb=False, api=api
+    )
+
+    result = next(
+        target for target in report["targets"] if target["name"] == "tandemfoil"
+    )
+    assert [row["run_id"] for row in result["final_results"]] == [
+        "selected-14",
+        "selected-12",
+    ]
+    assert result["trials"][0]["raw_candidate"]["run_id"] == "raw-minimum"
+    assert result["trials"][2]["selected"] is None
+    assert result["accepted_trials"] == 2
+    assert result["adjudicated_trials"] == 2
+    assert result["distribution"] == {
+        "count": 2,
+        "scores": [14.0, 12.0],
+        "mean": 13.0,
+        "median": 13.0,
+        "minimum": 12.0,
+        "maximum": 14.0,
+        "population_variance": 1.0,
+        "population_stddev": 1.0,
+        "coefficient_of_variation": 1.0 / 13.0,
+    }
+    assert "Accepted / adjudicated / trials" in markdown
+    assert "| TandemFoilSet Balanced | 2 / 2 / 3 |" in markdown
+    assert "Raw metric minima remain candidates only" in markdown
+
+
+def test_report_rejects_an_adjudication_that_selects_an_ineligible_run(tmp_path):
+    manifest = build_manifest(
+        local_config(), "eval-bad-selection", web_search=False, dry_run=False
+    )
+    manifest["targets"][0]["trials"][0]["adjudication"] = {
+        "status": "accepted",
+        "selected_run_id": "not-eligible",
+        "evidence": {},
+    }
+
+    with pytest.raises(ValueError, match="must select an eligible run"):
+        report_eval(manifest, tmp_path, log_wandb=False, api=EmptyApi())
+
+
+@pytest.mark.parametrize("field", ["evaluator_sha256", "adjudicator_sha256"])
+def test_completed_report_rejects_source_drift_before_external_reads(
+    monkeypatch, tmp_path, field
+):
+    manifest = build_manifest(
+        local_config(), "eval-source-drift", web_search=False, dry_run=False
+    )
+    manifest["status"] = "completed"
+    manifest[field] = "0" * 64
+    monkeypatch.setattr(
+        agent_eval.wandb,
+        "Api",
+        lambda: pytest.fail("W&B client created before source verification"),
+    )
+    monkeypatch.setattr(
+        agent_eval,
+        "eval_github_reader",
+        lambda _manifest: pytest.fail(
+            "GitHub client created before source verification"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=field):
+        report_eval(manifest, tmp_path, log_wandb=False)
+
+    assert not (tmp_path / "eval-source-drift.report.json").exists()
+    assert not (tmp_path / "eval-source-drift.report.md").exists()
+
+
+def test_completed_report_uses_and_persists_github_adjudication(monkeypatch, tmp_path):
+    manifest = build_manifest(
+        local_config(), "eval-github-ledger", web_search=False, dry_run=False
+    )
+    manifest["status"] = "completed"
+    target = manifest["targets"][0]
+    winning_trial = target["trials"][0]
+    winner = eval_contract_run(
+        valid_nanogpt_run(), manifest, target, winning_trial
+    )
+    calls = []
+    freeze_calls = []
+
+    def freeze(target, trial, github):
+        freeze_calls.append((target["name"], trial["trial_index"], github))
+        ordinal = (
+            (0 if target["name"] == "nanogpt" else 3)
+            + trial["trial_index"]
+            + 1
+        )
+        return f"{ordinal:040x}"
+
+    def adjudicate(target, trial, github, candidates, *, frozen_head_sha):
+        calls.append((target["name"], trial["trial_index"], frozen_head_sha, github))
+        saved = json.loads((tmp_path / "eval-github-ledger.json").read_text())
+        saved_trial = next(
+            candidate
+            for saved_target in saved["targets"]
+            if saved_target["name"] == target["name"]
+            for candidate in saved_target["trials"]
+            if candidate["trial_index"] == trial["trial_index"]
+        )
+        assert saved_trial["adjudication_frozen_head_sha"] == frozen_head_sha
+        selected = candidates[0]["run_id"] if candidates else None
+        return {
+            "status": "accepted" if selected else "rejected",
+            "reason": "test ledger decision",
+            "selected_run_id": selected,
+            "score": candidates[0]["score"] if candidates else None,
+            "evidence": {"frozen_advisor_head": frozen_head_sha},
+        }
+
+    monkeypatch.setattr(agent_eval, "freeze_advisor_head", freeze)
+    monkeypatch.setattr(agent_eval, "adjudicate_trial", adjudicate)
+    api = RunsApi({winning_trial["wandb_group"]: [winner]})
+
+    report, _ = report_eval(
+        manifest,
+        tmp_path,
+        log_wandb=False,
+        api=api,
+        github=object(),
+    )
+
+    nano = next(result for result in report["targets"] if result["name"] == "nanogpt")
+    assert nano["final_results"][0]["run_id"] == "run-123"
+    assert len(calls) == 6
+    assert len(freeze_calls) == 6
+    assert all(frozen is not None for _target, _trial, frozen, _github in calls)
+    saved = json.loads((tmp_path / "eval-github-ledger.json").read_text())
+    assert all(
+        trial["adjudication"]["status"] in {"accepted", "rejected"}
+        and len(trial["adjudication_frozen_head_sha"]) == 40
+        for target in saved["targets"]
+        for trial in target["trials"]
+    )
+
+    calls.clear()
+    report_eval(
+        manifest,
+        tmp_path,
+        log_wandb=False,
+        api=api,
+        github=object(),
+    )
+
+    assert len(freeze_calls) == 6
+    assert len(calls) == 6
+    assert all(frozen is not None for _target, _trial, frozen, _github in calls)
+
+
+def test_persisted_adjudication_rejects_semantic_replay_drift():
+    manifest = build_manifest(
+        local_config(), "eval-decision-drift", web_search=False, dry_run=False
+    )
+    trial = manifest["targets"][0]["trials"][0]
+    head = "f" * 40
+    trial["adjudication_frozen_head_sha"] = head
+    trial_result = {
+        "candidate_runs": [
+            {"run_id": "first", "score": 10},
+            {"run_id": "second", "score": 9},
+        ]
+    }
+    first = {
+        "status": "accepted",
+        "reason": "first decision",
+        "selected_run_id": "first",
+        "score": 10,
+        "pr_number": 1,
+        "result_digest": "a" * 64,
+        "evidence": {"frozen_advisor_head": head},
+    }
+    agent_eval.record_adjudication(trial, trial_result, first)
+    persisted = json.loads(json.dumps(trial))
+    changed = {
+        **first,
+        "selected_run_id": "second",
+        "score": 9,
+        "pr_number": 2,
+        "result_digest": "b" * 64,
+    }
+
+    with pytest.raises(RuntimeError, match="changed after it was persisted"):
+        agent_eval.record_adjudication(trial, trial_result, changed)
+
+    assert trial == persisted
 
 
 def test_report_refuses_to_publish_before_cutoff_completion(tmp_path):
@@ -561,7 +1119,7 @@ def test_report_refuses_to_publish_before_cutoff_completion(tmp_path):
         report_eval(manifest, tmp_path, log_wandb=True, api=EmptyApi())
 
 
-def test_wandb_aggregate_records_provenance_primary_and_diagnostics(monkeypatch):
+def test_wandb_aggregate_logs_provenance_distribution_table_and_scatter(monkeypatch):
     manifest = build_manifest(
         local_config(), "eval-aggregate", web_search=False, dry_run=False
     )
@@ -582,30 +1140,77 @@ def test_wandb_aggregate_records_provenance_primary_and_diagnostics(monkeypatch)
 
     aggregate = AggregateRun()
     captured = {}
+    tables = []
+    scatters = []
 
     def init(**kwargs):
         captured.update(kwargs)
         return aggregate
 
+    def table(**kwargs):
+        tables.append(kwargs)
+        return kwargs
+
+    def scatter(table_value, x, y, *, title):
+        value = {"table": table_value, "x": x, "y": y, "title": title}
+        scatters.append(value)
+        return value
+
     monkeypatch.setattr(agent_eval.wandb, "init", init)
-    target_results = [
-        {
-            "name": "nanogpt",
-            "total_runs": 1,
-            "eligible_runs": 1,
-            "best": {
-                "score": 3350,
-                "diagnostics": {"final_val_loss": 3.275},
-            },
-        }
+    monkeypatch.setattr(agent_eval.wandb, "Table", table)
+    monkeypatch.setattr(agent_eval.wandb.plot, "scatter", scatter)
+    target = manifest["targets"][0]
+    target["trials"][0]["adjudication"] = {
+        "status": "accepted",
+        "selected_run_id": "run-123",
+        "evidence": {"kind": "senpai-result", "pr": 7},
+    }
+    target["trials"][1]["adjudication"] = {
+        "status": "rejected",
+        "selected_run_id": None,
+        "evidence": {"kind": "senpai-result", "reason": "no winner"},
+    }
+    trial_results = [
+        agent_eval.score_trial_runs(
+            manifest,
+            target,
+            trial,
+            [eval_contract_run(valid_nanogpt_run(), manifest, target, trial)]
+            if trial["trial_index"] == 0
+            else [],
+        )
+        for trial in target["trials"]
     ]
+    target_results = [agent_eval.aggregate_target_trials(target, trial_results)]
 
     url = agent_eval.log_report_to_wandb(manifest, target_results, "# Report\n")
 
     assert url == aggregate.url
+    assert captured["entity"] == DEFAULT_WANDB_ENTITY
+    assert captured["project"] == DEFAULT_WANDB_PROJECT
     assert captured["config"]["senpai_repo_revision"] == "a" * 40
+    assert captured["config"]["n_trials"] == 3
     assert captured["config"]["targets"][0]["base_revision"] == (
         manifest["targets"][0]["base_revision"]
     )
-    assert aggregate.logged["eval/nanogpt/primary"] == 3350
-    assert aggregate.logged["eval/nanogpt/diagnostic/final_val_loss"] == 3.275
+    assert aggregate.logged["eval/nanogpt/trials_accepted"] == 1
+    assert aggregate.logged["eval/nanogpt/trials_accepted_fraction"] == pytest.approx(
+        1 / 3
+    )
+    assert aggregate.logged["eval/nanogpt/trials_adjudicated"] == 2
+    assert aggregate.logged[
+        "eval/nanogpt/trials_adjudicated_fraction"
+    ] == pytest.approx(2 / 3)
+    assert aggregate.logged["eval/nanogpt/distribution/mean"] == 3350
+    assert aggregate.logged["eval/nanogpt/distribution/population_variance"] == 0
+    assert aggregate.logged["eval/nanogpt/trial/0/final_primary"] == 3350
+    assert "eval/nanogpt/trial_results" in aggregate.logged
+    assert "eval/nanogpt/score_scatter" in aggregate.logged
+    assert aggregate.logged["eval/targets_with_accepted_results"] == 1
+    assert aggregate.logged["eval/targets_fully_adjudicated"] == 0
+    assert aggregate.logged["eval/trials_accepted"] == 1
+    assert aggregate.logged["eval/trials_adjudicated"] == 2
+    assert "eval/adjudicated_targets" not in aggregate.logged
+    assert scatters[0]["title"] == "Modded NanoGPT accepted final scores"
+    assert len(tables) == 2
+    assert len(scatters) == 1

@@ -322,6 +322,21 @@ def test_wandb_run_group_is_exported_only_when_configured(role):
     assert "WANDB_RUN_GROUP" not in yaml.safe_load(ungrouped)["data"]
 
 
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_eval_trial_provenance_is_exported_when_configured(role):
+    configured, _deployment, _secret = render_role(
+        role,
+        launch_args(trial_index=2, trial_seed=1729),
+    )
+    ordinary, _deployment, _secret = render_role(role)
+
+    data = yaml.safe_load(configured)["data"]
+    assert data["SENPAI_TRIAL_INDEX"] == "2"
+    assert data["SENPAI_TRIAL_SEED"] == "1729"
+    assert "SENPAI_TRIAL_INDEX" not in yaml.safe_load(ordinary)["data"]
+    assert "SENPAI_TRIAL_SEED" not in yaml.safe_load(ordinary)["data"]
+
+
 def test_secret_env_refs_preserve_environment_names_and_secret_keys():
     fragment = launch.secret_env_refs(
         [("OPENAI_API_KEY", "openai-api-key"), ("HF_TOKEN", "HF_TOKEN")],

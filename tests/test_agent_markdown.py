@@ -146,12 +146,11 @@ def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
     agent_names = {agent.name for agent in agents}
     assert "bash-runner" in agent_names
     assert ("search" in agent_names) is search_agent
-    if not search_agent:
-        delegation_guide = next(
-            skill for skill in plugin.skills if skill.name == "delegate-subagents"
-        ).content
-        assert "search_general_web" not in delegation_guide
-        assert "search_research_publications" not in delegation_guide
+    delegation_guide = next(
+        skill for skill in plugin.skills if skill.name == "delegate-subagents"
+    ).content
+    assert "search_general_web" not in delegation_guide
+    assert "search_research_publications" not in delegation_guide
     assert not (home / ".agents/skills").exists()
     assert all(
         strip_spdx_header(text) == text

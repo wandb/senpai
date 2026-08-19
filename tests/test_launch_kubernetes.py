@@ -1,5 +1,6 @@
 import base64
 import subprocess
+import urllib.error
 
 import pytest
 
@@ -119,6 +120,28 @@ def test_existing_advisor_branch_must_match_the_pinned_target_revision(monkeypat
             "eval",
             expected,
         )
+
+
+def test_parallel_launch_accepts_a_routing_label_created_concurrently(monkeypatch):
+    calls = []
+
+    def github_api(path, _token, **kwargs):
+        calls.append((path, kwargs.get("method", "GET")))
+        if len(calls) == 1:
+            raise urllib.error.HTTPError(path, 404, "missing", None, None)
+        if len(calls) == 2:
+            raise urllib.error.HTTPError(path, 422, "exists", None, None)
+        return {"name": "status:wip"}
+
+    monkeypatch.setattr(launch_helpers, "_github_api", github_api)
+
+    launch_helpers.ensure_target_repo_labels(
+        "https://github.com/example/problem.git",
+        "token",
+        {"status:wip": ("fbca04", "Work in progress")},
+    )
+
+    assert [method for _path, method in calls] == ["GET", "POST", "GET"]
 
 
 def bypass_external_preflight(monkeypatch):

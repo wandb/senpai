@@ -74,12 +74,14 @@ if [ "$GH_HISTORY_SCOPE" != "repo" ]; then
 fi
 
 echo "=== Agent config installed ==="
-ls \
-    "$HOME/.agents/agents/bash-runner.md" \
-    "$HOME/.agents/agents/general-purpose.md" \
-    "$HOME/.agents/agents/explore.md" \
-    "$HOME/.agents/agents/search.md" \
+agent_context=(
+    "$HOME/.agents/agents/bash-runner.md"
+    "$HOME/.agents/agents/general-purpose.md"
+    "$HOME/.agents/agents/explore.md"
     "$SENPAI_PLUGIN/skills/wandb-primary/SKILL.md"
+)
+[ "$SENPAI_WEB_SEARCH" = "true" ] && agent_context+=("$HOME/.agents/agents/search.md")
+ls "${agent_context[@]}"
 
 # --- Hivemind is intentionally disabled pending its OpenHands rewrite. ---
 # source "$WORKDIR/k8s/start-hivemind.sh"

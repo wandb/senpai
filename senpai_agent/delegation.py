@@ -72,6 +72,8 @@ LeafTaskAgentKind = Literal[
     "search_research_publications",
     "bash-runner",
 ]
+LocalTaskAgentKind = Literal["general-purpose", "explore", "bash-runner"]
+LocalLeafTaskAgentKind = Literal["explore", "bash-runner"]
 ModelTier = Literal["smart", "fast", "frontier"]
 SearchMode = Literal["general-web", "research-publications"]
 MAX_PARALLEL_AGENTS = 8
@@ -685,6 +687,27 @@ class LeafAgentTask(AgentTaskBase):
             "Choose a leaf specialization: explore, bash-runner, "
             "search_general_web, or search_research_publications."
         ),
+    )
+
+
+class LocalAgentTask(AgentTaskBase):
+    """Delegation task exposed when external search is unavailable."""
+
+    agent: LocalTaskAgentKind = Field(
+        default="general-purpose",
+        description=(
+            "Use general-purpose for mixed work, or explore or bash-runner "
+            "for local leaf work."
+        ),
+    )
+
+
+class LocalLeafAgentTask(AgentTaskBase):
+    """Leaf delegation task exposed when external search is unavailable."""
+
+    agent: LocalLeafTaskAgentKind = Field(
+        default="explore",
+        description="Choose a local leaf specialization: explore or bash-runner.",
     )
 
 
@@ -1649,6 +1672,32 @@ class LeafSpawnAgentsAction(Action):
     )
 
 
+class LocalSpawnAgentsAction(Action):
+    batch_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="Stable identifier used to make an exact batch retry idempotent.",
+    )
+    tasks: list[LocalAgentTask] = Field(
+        min_length=1,
+        max_length=MAX_SPAWN_BATCH,
+        description="Independent local-only tasks to start concurrently.",
+    )
+
+
+class LocalLeafSpawnAgentsAction(Action):
+    batch_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="Stable identifier used to make an exact batch retry idempotent.",
+    )
+    tasks: list[LocalLeafAgentTask] = Field(
+        min_length=1,
+        max_length=MAX_SPAWN_BATCH,
+        description="Independent local-only leaf tasks to start concurrently.",
+    )
+
+
 class SpawnAgentsObservation(Observation):
     tasks: list[AgentTaskState]
 
@@ -1960,12 +2009,14 @@ class SpawnAgentsTool(_DelegationTool[SpawnAgentsAction, SpawnAgentsObservation]
         event_db_path=None,
     ) -> Sequence[Self]:
         manager = cls._manager(child_runner_factory, event_sink, event_db_path)
-        action_type = (
-            LeafSpawnAgentsAction
-            if manager.config.depth == 1
+        leaf = (
+            manager.config.depth == 1
             and manager.config.agent_name == "general-purpose"
-            else SpawnAgentsAction
         )
+        if manager.config.web_search:
+            action_type = LeafSpawnAgentsAction if leaf else SpawnAgentsAction
+        else:
+            action_type = LocalLeafSpawnAgentsAction if leaf else LocalSpawnAgentsAction
         return [
             cls(
                 description="Start one bounded batch of subagents and return task IDs immediately.",

@@ -99,5 +99,13 @@ def runtime_env(
 
 def isolate_agent_discovery(monkeypatch, runner) -> None:
     monkeypatch.setattr(runner, "discover_agents", lambda _: [])
-    monkeypatch.setattr(runner, "sanitized_agent_definitions", lambda _: [])
-    monkeypatch.setattr(runner, "sanitized_project_skills", lambda _: [])
+    monkeypatch.setattr(
+        runner,
+        "sanitized_agent_definitions",
+        lambda _workspace, **_options: [],
+    )
+    monkeypatch.setattr(
+        runner,
+        "sanitized_project_skills",
+        lambda _workspace, **_options: [],
+    )

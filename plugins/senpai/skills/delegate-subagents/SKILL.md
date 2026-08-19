@@ -17,11 +17,9 @@ Batch independent tasks in one `spawn_agents` call with a stable `batch_key`. Gi
 Choose:
 
 - `explore` for local code, data, artifacts, or history;
-- `search_general_web` for current public sources;
-- `search_research_publications` for scholarly literature and primary papers;
 - `bash-runner` with `model=fast` for tests, builds, and bounded commands; and
 - `general-purpose` for mixed analysis, planning, review, or implementation.
 
-Use `fast` for mechanical work, `smart` for subtle synthesis, and `frontier` for the hardest judgment. For a fresh independent perspective, use `model="frontier"`, `agent="general-purpose"`, and `include_context=false`; ask for research, critique, ideas, or a plan rather than edits. The search agent and its search skills own source selection and search mechanics.
+Use `fast` for mechanical work, `smart` for subtle synthesis, and `frontier` for the hardest judgment. For a fresh independent perspective, use `model="frontier"`, `agent="general-purpose"`, and `include_context=false`; ask for research, critique, ideas, or a plan rather than edits.
 
 `spawn_agents` returns task IDs immediately. Continue useful work, then use bounded `await_agents` calls with `all`, `first`, `quorum`, or `change` and a timeout of at most 300 seconds. Use `agent_status` for one non-blocking snapshot and `cancel_agents` when work is no longer useful; do not poll.

@@ -24,6 +24,8 @@ from senpai_agent.delegation import (
     DelegationRequest,
     LeafAgentTask,
     LeafSpawnAgentsAction,
+    LocalLeafSpawnAgentsAction,
+    LocalSpawnAgentsAction,
     MODEL_TIER_TIMEOUT_SECONDS,
     OpenHandsChildProcess,
     SpawnAgentsAction,
@@ -169,6 +171,35 @@ def test_depth_one_generalist_schema_cannot_request_generalist_child(tmp_path):
                 "tasks": [{"task": "Recurse", "agent": "general-purpose"}],
             }
         )
+
+
+def test_disabled_web_search_removes_search_from_every_spawn_schema(tmp_path):
+    configure_delegation(config(tmp_path, depth=0, web_search=False))
+    root = SpawnAgentsTool.create(child_runner_factory=lambda _: None)[0]
+    assert root.action_type is LocalSpawnAgentsAction
+
+    root_agents = (
+        LocalSpawnAgentsAction.model_json_schema()["$defs"]["LocalAgentTask"]
+        ["properties"]["agent"]["enum"]
+    )
+    assert root_agents == ["general-purpose", "explore", "bash-runner"]
+
+    configure_delegation(
+        config(
+            tmp_path,
+            depth=1,
+            agent_name="general-purpose",
+            web_search=False,
+        )
+    )
+    nested = SpawnAgentsTool.create(child_runner_factory=lambda _: None)[0]
+    assert nested.action_type is LocalLeafSpawnAgentsAction
+    leaf_agents = (
+        LocalLeafSpawnAgentsAction.model_json_schema()["$defs"][
+            "LocalLeafAgentTask"
+        ]["properties"]["agent"]["enum"]
+    )
+    assert leaf_agents == ["explore", "bash-runner"]
 
 
 class EventSink:
