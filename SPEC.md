@@ -761,14 +761,30 @@ Launch preflight verifies:
 Exa is a progressive skill/script integration, not an always-connected MCP
 server.
 
-The Kubernetes launcher creates one Secret, ConfigMaps, and Deployments. For
-multi-node students it also creates a namespaced ServiceAccount, Role, and
-RoleBinding limited to creating/getting/deleting Jobs or MPIJobs and reading
-their pod logs. The controller is CPU-pinned and tokenless. A separate executor
-sidecar alone mounts a projected token and validates the exact node/GPU and
-CPU/memory allocation, deadline, source/W&B evidence, volumes, pod security,
-and workload ownership across a Unix socket. Docker and local hosts need no
-shared network for Senpai communication.
+The Kubernetes launcher creates one Secret, ConfigMaps, and Deployments. A
+student launch first scans every requested name for an existing Deployment,
+controller Pod, or nonterminal labeled Job. It scans MPIJobs only when the API
+exists and requires that API for multi-node students. After all scans pass, it
+creates the per-tag Secret as an atomic, durable, immutable reservation before
+any GitHub write. An advisor-only apply cannot change the Secret data after a
+student launch wins the reservation race. It then creates each student resource
+separately, with the Deployment last. Student resources are new-only; the
+launcher never applies over them. A concurrent launch or an orphan from a
+failed launch therefore fails closed and requires explicit operator cleanup
+before retry.
+
+For multi-node students the launcher also creates a namespaced ServiceAccount,
+Role, and RoleBinding limited to creating, getting, patching, and deleting Jobs
+or MPIJobs and reading their pod logs. The launcher's operator identity needs
+get access to Deployments, list access to Pods and Jobs, API discovery, and
+create access to the rendered resources. When the MPIJob API is installed,
+every launch needs list access to MPIJobs so it can reject orphaned workloads;
+multi-node preflight also requires the API to exist. The controller is
+CPU-pinned and tokenless. A separate executor sidecar alone mounts a projected
+token and validates the exact node/GPU and CPU/memory allocation, deadline,
+source/W&B evidence, volumes, pod security, and workload ownership across a
+Unix socket. Docker and local hosts need no shared network for Senpai
+communication.
 
 Hivemind startup remains commented with a clear note. The Python controller
 waits for the optional cluster start gate while continuously refreshing a

@@ -32,6 +32,7 @@ from senpai_agent.secrets import validate_custom_secret_env_names
 
 from launch_helpers import (
     ensure_advisor_branch,
+    ensure_new_student_slot,
     ensure_target_repo_labels,
     existing_student_names,
     expand_student_names,
@@ -39,6 +40,7 @@ from launch_helpers import (
     is_immutable_image_reference,
     kubectl_apply,
     kubectl_command,
+    kubectl_create,
     pod_template_hash,
     preflight_check_anthropic_api_key,
     preflight_check_exa_api_key,
@@ -763,6 +765,40 @@ def render_advisor(
     return configmap + "\n---\n" + deployment
 
 
+def validated_student_resources(manifest: str, student_name: str) -> list[dict]:
+    """Parse one student manifest and return its Deployment last."""
+    try:
+        documents = list(yaml.safe_load_all(manifest))
+    except yaml.YAMLError as error:
+        raise RuntimeError(
+            f"student {student_name} manifest contains invalid YAML"
+        ) from error
+
+    for index, document in enumerate(documents, start=1):
+        if (
+            not isinstance(document, dict)
+            or not isinstance(document.get("kind"), str)
+            or not isinstance(document.get("metadata"), dict)
+            or not isinstance(document["metadata"].get("name"), str)
+        ):
+            raise RuntimeError(
+                f"student {student_name} manifest document {index} must have "
+                "string kind and metadata.name fields"
+            )
+
+    deployments = [
+        document for document in documents if document["kind"] == "Deployment"
+    ]
+    if len(deployments) != 1:
+        raise RuntimeError(
+            f"student {student_name} manifest must contain exactly one Deployment; "
+            f"found {len(deployments)}"
+        )
+    return [
+        document for document in documents if document["kind"] != "Deployment"
+    ] + deployments
+
+
 def main():
     args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
     if min(
@@ -874,19 +910,6 @@ def main():
             print("Preflight OK — credentials and target repo access verified.")
             return
 
-    if not args.dry_run:
-        ensure_advisor_branch(
-            args.target_repo_url,
-            github_token,
-            args.target_repo_branch,
-            args.advisor_branch,
-        )
-        ensure_target_repo_labels(
-            args.target_repo_url,
-            github_token,
-            routing_labels(args.advisor_branch, student_list),
-        )
-
     student_template = STUDENT_TEMPLATE.read_text()
     advisor_template = ADVISOR_TEMPLATE.read_text()
     secret_name = f"senpai-launch-secrets-{args.tag}"
@@ -906,22 +929,10 @@ def main():
         anthropic_api_key=provider_api_keys.get("anthropic"),
         openai_api_key=provider_api_keys.get("openai"),
         custom_secrets=custom_secrets,
+        immutable=bool(student_list),
     )
 
-    # --- Apply per-launch secret first (pods reference it on startup) ---
-    if args.dry_run:
-        print(f"--- Secret: {secret_name} ---")
-        print(launch_secret)
-        print()
-    else:
-        kubectl_apply(
-            launch_secret,
-            f"secret {secret_name}",
-            kube_context=args.kube_context,
-            namespace=args.namespace,
-        )
-
-    # --- Deploy students ---
+    student_manifests = []
     for name in student_list:
         manifest = render_student(
             student_template,
@@ -931,17 +942,87 @@ def main():
             launch_secret,
             args,
         )
+        student_manifests.append(
+            (name, manifest, validated_student_resources(manifest, name))
+        )
+
+    if not args.dry_run and student_list:
+        for name in student_list:
+            ensure_new_student_slot(
+                f"senpai-{args.tag}-{name}",
+                tag=args.tag,
+                student_name=name,
+                require_mpijob=args.nodes_per_student > 1,
+                kube_context=args.kube_context,
+                namespace=args.namespace,
+            )
+        try:
+            kubectl_create(
+                launch_secret,
+                f"secret {secret_name}",
+                kube_context=args.kube_context,
+                namespace=args.namespace,
+            )
+        except RuntimeError as error:
+            kubectl = shlex.join(
+                kubectl_command(
+                    kube_context=args.kube_context,
+                    namespace=args.namespace,
+                )
+            )
+            raise RuntimeError(
+                f"{error}\nNo GitHub or controller writes were attempted. If this "
+                f"is a stale reservation, inspect the tag before retrying, then "
+                f"delete the reservation with: {kubectl} delete secret {secret_name}"
+            ) from error
+
+    if not args.dry_run:
+        ensure_advisor_branch(
+            args.target_repo_url,
+            github_token,
+            args.target_repo_branch,
+            args.advisor_branch,
+        )
+        ensure_target_repo_labels(
+            args.target_repo_url,
+            github_token,
+            routing_labels(args.advisor_branch, student_list),
+        )
+
+    if args.dry_run:
+        print(f"--- Secret: {secret_name} ---")
+        print(launch_secret)
+        print()
+    elif not student_list:
+        kubectl_apply(
+            launch_secret,
+            f"secret {secret_name}",
+            kube_context=args.kube_context,
+            namespace=args.namespace,
+        )
+
+    # --- Deploy students ---
+    for name, manifest, documents in student_manifests:
         if args.dry_run:
             print(f"--- Student: {name} ---")
             print(manifest)
             print()
         else:
-            kubectl_apply(
-                manifest,
-                f"student {name}",
-                kube_context=args.kube_context,
-                namespace=args.namespace,
-            )
+            try:
+                for document in documents:
+                    kind = document["kind"]
+                    resource_name = document["metadata"]["name"]
+                    kubectl_create(
+                        yaml.safe_dump(document, sort_keys=False),
+                        f"student {name} {kind} {resource_name}",
+                        kube_context=args.kube_context,
+                        namespace=args.namespace,
+                    )
+            except RuntimeError as error:
+                raise RuntimeError(
+                    f"{error}\nLaunch tag {args.tag} remains reserved. Inspect and "
+                    "remove every stale resource for this tag before retrying."
+                ) from error
 
     advisor_student_list = student_list
     if args.advisor and not args.dry_run:
@@ -1000,7 +1081,8 @@ def main():
             )
         print("\nStop:")
         print(f"  {kubectl} delete deployments -l research-tag={args.tag}")
-        print(f"  {kubectl} delete jobs,mpijobs -l research-tag={args.tag}")
+        workloads = "jobs,mpijobs" if args.nodes_per_student > 1 else "jobs"
+        print(f"  {kubectl} delete {workloads} -l research-tag={args.tag}")
         print(
             f"  {kubectl} delete configmaps,secrets,serviceaccounts,roles,rolebindings "
             f"-l research-tag={args.tag}"

@@ -228,15 +228,44 @@ model-facing student has no Kubernetes token or real `kubectl`; its
 
 The launcher creates routing labels, one launch Secret, role ConfigMaps, and Deployments. Multi-node students also receive one namespaced ServiceAccount, Role, and RoleBinding. It does not create the namespace, PVC, Service, or cluster-wide RBAC.
 
+Student launches are create-only. Before the first write, the launcher rejects
+an existing student Deployment, any matching controller Pod, or any matching
+nonterminal Job. It checks MPIJobs only when the cluster provides that API;
+multi-node students require it. The launcher then creates the per-tag Secret as
+an atomic, durable, immutable reservation before it changes GitHub labels or
+branches. An advisor-only apply cannot change the Secret data after a student
+launch wins the reservation race. It creates each student resource separately
+and creates the Deployment last. It never applies changes over an existing
+student resource.
+
+A launch that contains students requires an unused tag and per-tag Secret. A
+concurrent launch, a tag already used by an advisor-only launch, or an orphaned
+resource fails closed. If a launch fails after it reserves the tag, inspect
+every resource with that `research-tag` before cleanup. Remove the stale
+resources, including `secret/senpai-launch-secrets-<tag>`, only when no
+controller or training workload from that launch is still active. Then use a
+fresh tag or retry the fully cleaned tag. Dry runs do not query or reserve the
+cluster.
+
+The operator's Kubernetes identity must be able to get Deployments; list Pods
+and Jobs; discover namespaced APIs; and create Secrets, ConfigMaps, and
+Deployments. When the MPIJob API is installed, the identity must also list
+MPIJobs so every launch can reject an orphaned workload. Multi-node launches
+require that API and create permission for the rendered ServiceAccount, Role,
+and RoleBinding. Advisor launch and reconciliation retain their existing apply
+permissions until an immutable student reservation owns the tag.
+
 Inspect and stop the launch:
 
 ```bash
 kubectl get deployments,pods -l research-tag=first-run
 kubectl logs -f deployment/senpai-first-run-frieren -c student
 kubectl delete deployments -l research-tag=first-run
-kubectl delete jobs,mpijobs -l research-tag=first-run
+kubectl delete jobs -l research-tag=first-run
 kubectl delete configmaps,secrets,serviceaccounts,roles,rolebindings -l research-tag=first-run
 ```
+
+For a multi-node launch, delete `jobs,mpijobs` instead of only `jobs`.
 
 Use `--kube_context` and `--namespace` when the desired cluster is not your current default. Use `--dry_run` to render redacted manifests without checking credentials or writing to the cluster.
 
