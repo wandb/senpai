@@ -228,6 +228,22 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
     assert fast.environment["SENPAI_COMPACTION_TRIGGER_TOKENS"] == "200000"
 
 
+def test_disabled_web_search_is_explicit_in_the_child_runtime(tmp_path: Path):
+    child = OpenHandsChildProcess(
+        delegation_config(
+            tmp_path,
+            enable_browser=False,
+            web_search=False,
+            conversation_secrets={},
+        ),
+        delegation_request(agent="explore"),
+    )
+
+    assert "--no-browser" in child.command
+    assert child.environment["SENPAI_WEB_SEARCH"] == "false"
+    assert "EXA_API_KEY" not in child.environment
+
+
 def test_child_environment_carries_the_resolved_program_path(tmp_path: Path):
     child = OpenHandsChildProcess(
         delegation_config(

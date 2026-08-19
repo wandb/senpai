@@ -284,21 +284,34 @@ def resolve_target_repo_branch(
 
 
 def preflight_check_target_repo_branch(
-    target_repo_url: str, token: str, target_repo_branch: str
+    target_repo_url: str,
+    token: str,
+    target_repo_branch: str,
+    target_repo_revision: str = "",
 ) -> str:
-    """Verify the base branch exists and return the resolved branch name."""
+    """Verify the base branch and optional exact revision."""
     slug = target_repo_slug(target_repo_url)
     branch = resolve_target_repo_branch(target_repo_url, token, target_repo_branch)
     if not branch:
         sys.exit(f"ERROR: could not resolve default branch for {slug}")
+    if target_repo_revision and not re.fullmatch(
+        r"[0-9a-f]{40}", target_repo_revision
+    ):
+        sys.exit("ERROR: --target_repo_revision must be a full lowercase commit SHA")
 
     print(f"Preflight: checking target repo base branch {slug}@{branch}")
     try:
-        _github_api(_branch_api_path(slug, branch), token)
+        branch_info = _github_api(_branch_api_path(slug, branch), token)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             sys.exit(f"ERROR: target repo branch {slug}@{branch} does not exist")
         raise
+    actual_revision = branch_info["commit"]["sha"]
+    if target_repo_revision and actual_revision != target_repo_revision:
+        sys.exit(
+            f"ERROR: target repo branch {slug}@{branch} is at {actual_revision}, "
+            f"expected {target_repo_revision}"
+        )
     print(f"  OK — target repo branch {branch} exists")
     return branch
 
@@ -369,11 +382,15 @@ def ensure_advisor_branch(
     token: str,
     target_repo_branch: str,
     advisor_branch: str,
+    target_repo_revision: str = "",
 ) -> None:
-    """Create advisor_branch from target_repo_branch when it does not exist."""
+    """Create or verify the advisor branch at the requested target revision."""
     slug = target_repo_slug(target_repo_url)
     base_branch = preflight_check_target_repo_branch(
-        target_repo_url, token, target_repo_branch
+        target_repo_url,
+        token,
+        target_repo_branch,
+        target_repo_revision,
     )
 
     if advisor_branch == base_branch:
@@ -384,7 +401,13 @@ def ensure_advisor_branch(
 
     print(f"Preflight: ensuring advisor branch {slug}@{advisor_branch} exists")
     try:
-        _github_api(_branch_api_path(slug, advisor_branch), token)
+        advisor_info = _github_api(_branch_api_path(slug, advisor_branch), token)
+        advisor_revision = advisor_info["commit"]["sha"]
+        if target_repo_revision and advisor_revision != target_repo_revision:
+            sys.exit(
+                f"ERROR: existing advisor branch {slug}@{advisor_branch} is at "
+                f"{advisor_revision}, expected {target_repo_revision}"
+            )
         print(f"  OK — advisor branch {advisor_branch} already exists")
         return
     except urllib.error.HTTPError as e:
@@ -393,6 +416,11 @@ def ensure_advisor_branch(
 
     base_info = _github_api(_branch_api_path(slug, base_branch), token)
     base_sha = base_info["commit"]["sha"]
+    if target_repo_revision and base_sha != target_repo_revision:
+        sys.exit(
+            f"ERROR: target repo branch {slug}@{base_branch} moved to "
+            f"{base_sha}; expected {target_repo_revision}"
+        )
     payload = json.dumps(
         {
             "ref": f"refs/heads/{advisor_branch}",
@@ -512,7 +540,7 @@ def resolve_wandb_api_key(dotenv_path: Path) -> str:
 def render_launch_secret(
     tag: str,
     github_token: str,
-    exa_api_key: str,
+    exa_api_key: str | None,
     wandb_api_key: str,
     *,
     anthropic_api_key: str | None = None,
@@ -522,9 +550,10 @@ def render_launch_secret(
     """Per-launch k8s Secret holding API credentials used by advisor/student pods."""
     credentials = {
         "github-token": github_token,
-        "exa-api-key": exa_api_key,
         "wandb-api-key": wandb_api_key,
     }
+    if exa_api_key is not None:
+        credentials["exa-api-key"] = exa_api_key
     if anthropic_api_key is not None:
         credentials["anthropic-api-key"] = anthropic_api_key
     if openai_api_key is not None:

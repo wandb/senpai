@@ -80,8 +80,18 @@ def test_human_issue_skill_keeps_the_single_intent_response_contract():
     assert "STUDENT $0" not in content
 
 
+@pytest.mark.parametrize(
+    ("web_search", "excluded_skills", "search_agent"),
+    [
+        ("true", set(), True),
+        ("false", {"alphaxiv-paper-lookup", "exa-search"}, False),
+    ],
+)
 def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
     tmp_path: Path,
+    web_search: str,
+    excluded_skills: set[str],
+    search_agent: bool,
 ):
     home = tmp_path / "home"
     runtime_root = tmp_path / "runtime"
@@ -110,7 +120,12 @@ def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
         check=True,
         capture_output=True,
         text=True,
-        env={**os.environ, "HOME": str(home), "SENPAI_PYTHON": sys.executable},
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "SENPAI_PYTHON": sys.executable,
+            "SENPAI_WEB_SEARCH": web_search,
+        },
     )
     runtime_plugin = Path(completed.stdout.strip())
 
@@ -127,8 +142,16 @@ def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
         "senpai-status-check",
         "submit-experiment-results",
         "wandb-primary",
-    }
-    assert "bash-runner" in {agent.name for agent in agents}
+    } - excluded_skills
+    agent_names = {agent.name for agent in agents}
+    assert "bash-runner" in agent_names
+    assert ("search" in agent_names) is search_agent
+    if not search_agent:
+        delegation_guide = next(
+            skill for skill in plugin.skills if skill.name == "delegate-subagents"
+        ).content
+        assert "search_general_web" not in delegation_guide
+        assert "search_research_publications" not in delegation_guide
     assert not (home / ".agents/skills").exists()
     assert all(
         strip_spdx_header(text) == text

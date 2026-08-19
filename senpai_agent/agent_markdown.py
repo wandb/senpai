@@ -7,6 +7,13 @@ from collections.abc import Iterable
 from pathlib import Path
 
 
+_WEB_SEARCH_GUIDANCE = (
+    "- `search_general_web` for current public sources;\n",
+    "- `search_research_publications` for scholarly literature and primary papers;\n",
+    " The search agent and its search skills own source selection and search mechanics.",
+)
+
+
 def _is_spdx_line(line: str) -> bool:
     return line.strip().removeprefix("#").strip().startswith("SPDX-")
 
@@ -83,12 +90,27 @@ def sanitize_markdown(paths: Iterable[Path]) -> None:
             path.write_text(cleaned, encoding="utf-8")
 
 
+def remove_web_search_guidance(plugin: Path) -> None:
+    """Remove unavailable search task advice from one runtime plugin copy."""
+
+    guide = plugin / "skills" / "delegate-subagents" / "SKILL.md"
+    content = guide.read_text(encoding="utf-8")
+    for guidance in _WEB_SEARCH_GUIDANCE:
+        if guidance not in content:
+            raise RuntimeError(f"web-search guidance is missing from {guide}")
+        content = content.replace(guidance, "", 1)
+    guide.write_text(content, encoding="utf-8")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Strip SPDX boilerplate from agent-facing Markdown copies."
     )
+    parser.add_argument("--without-web-search", type=Path)
     parser.add_argument("paths", nargs="+", type=Path)
     args = parser.parse_args(argv)
+    if args.without_web_search:
+        remove_web_search_guidance(args.without_web_search)
     sanitize_markdown(args.paths)
 
 

@@ -33,11 +33,13 @@ _RESERVED_CUSTOM_SECRET_ENV_NAMES = frozenset(
         "STUDENT_NAME",
         "STUDENT_NAMES",
         "TARGET_REPO_BRANCH",
+        "TARGET_REPO_REVISION",
         "TARGET_REPO_URL",
         "TARGET_WORKDIR",
         "WANDB_ENTITY",
         "WANDB_MODE",
         "WANDB_PROJECT",
+        "WANDB_RUN_GROUP",
         # Custom credentials must not change process startup or executable routing.
         "BASH_ENV",
         "ENV",

@@ -21,6 +21,9 @@ senpai_repo_revision: ""
 # The launcher creates advisor_branch from target_repo_branch when needed, then
 # the entrypoint clones it into $PROBLEM_DIR.
 target_repo_branch: ""
+# Optional full commit SHA. When set, launch fails unless the base branch and a
+# pre-existing advisor branch point to this exact revision.
+target_repo_revision: ""
 
 # docker images
 # Required: use digests or matching sha-<full-commit> tags.
@@ -38,6 +41,8 @@ pvc_mount_path: /mnt/new-pvc
 # W&B
 wandb_entity: wandb-applied-ai-team
 wandb_project: senpai-v1
+# Optional group applied to every W&B run created by this launch.
+wandb_run_group: ""
 
 # Put additional credentials in .env, then list their names here to inject them
 # into every advisor and student environment. For example:
@@ -71,6 +76,7 @@ poll_interval_s: 600
 poll_jitter_s: 120
 stale_wip_seconds: 7200
 human_issues: true
+web_search: true
 
 # students
 n_students: 4

@@ -163,6 +163,8 @@ class SenpaiTaskTrackerTool(TaskTrackerTool):
 def training_runtime(
     workspace: Path,
     state_dir: Path,
+    *,
+    max_timeout_seconds: int | None = None,
 ) -> tuple[TrainingSupervisor, MonitorStore]:
     key = state_dir.resolve()
     runtime = _TRAINING_RUNTIMES.get(key)
@@ -171,6 +173,7 @@ def training_runtime(
             TrainingSupervisor(
                 workspace=workspace,
                 state_dir=key,
+                max_timeout_seconds=max_timeout_seconds,
             ),
             MonitorStore(key / "monitors.sqlite3"),
         )
@@ -580,10 +583,12 @@ class TrainingToolSet(ToolDefinition[RunTrainingAction, TrainingResultObservatio
         conv_state: object,
         *,
         state_dir: str | Path,
+        max_timeout_seconds: int | None = None,
     ) -> Sequence[ToolDefinition]:
         training, monitor_store = training_runtime(
             Path(conv_state.workspace.working_dir),
             Path(state_dir),
+            max_timeout_seconds=max_timeout_seconds,
         )
         return (
             *RunTrainingTool.create(

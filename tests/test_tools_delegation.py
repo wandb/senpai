@@ -432,6 +432,44 @@ def test_search_task_form_is_resolved_in_registry_and_child_request(tmp_path):
     )
 
 
+def test_disabled_web_search_rejects_search_tasks_but_keeps_local_agents(tmp_path):
+    release = threading.Event()
+    release.set()
+    requests = []
+
+    def factory(request):
+        requests.append(request)
+        return FakeChild(release)
+
+    spawn, *_ = tools(tmp_path, factory, web_search=False)
+    parent = parent_conversation()
+
+    with pytest.raises(ValueError, match="external search agents are disabled"):
+        spawn(
+            SpawnAgentsAction(
+                batch_key="disabled-search",
+                tasks=[
+                    AgentTask(
+                        task="Search the web",
+                        agent="search_general_web",
+                    )
+                ],
+            ),
+            parent,
+        )
+
+    spawned = spawn(
+        SpawnAgentsAction(
+            batch_key="local-exploration",
+            tasks=[AgentTask(task="Inspect the code", agent="explore")],
+        ),
+        parent,
+    )
+
+    assert spawned.tasks[0].agent == "explore"
+    assert requests[0].agent == "explore"
+
+
 def test_await_quorum_and_timeout_leave_unfinished_tasks_running(tmp_path):
     releases = [threading.Event() for _ in range(3)]
     children = []

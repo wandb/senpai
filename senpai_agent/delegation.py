@@ -166,6 +166,7 @@ class DelegationConfig:
     role: str
     program_path: str
     launch_context: str
+    web_search: bool = True
     root_state_dir: Path | None = None
     tree_id: str | None = None
     depth: int = 0
@@ -371,6 +372,9 @@ class OpenHandsChildProcess:
             {
                 "OPENHANDS_SUPPRESS_BANNER": "1",
                 "SENPAI_ROLE": self._config.role,
+                "SENPAI_WEB_SEARCH": (
+                    "true" if self._config.web_search else "false"
+                ),
                 "SENPAI_OPENHANDS_API_KEY_ENV": selected.api_key_env,
                 "SENPAI_OPENHANDS_SMART_MODEL": self._config.smart_model,
                 "SENPAI_OPENHANDS_SMART_API_KEY_ENV": (
@@ -1367,6 +1371,10 @@ class _DelegationManager:
     def _validate_spawn(self, tasks: Sequence[AgentTaskBase]) -> None:
         if not tasks or len(tasks) > MAX_SPAWN_BATCH:
             raise ValueError(f"spawn_agents requires 1 to {MAX_SPAWN_BATCH} tasks")
+        if not self.config.web_search and any(
+            task.resolved_agent()[0] == "search" for task in tasks
+        ):
+            raise ValueError("external search agents are disabled for this launch")
         if self.config.depth >= MAX_DELEGATION_DEPTH:
             raise ValueError(f"maximum delegation depth is {MAX_DELEGATION_DEPTH}")
         if self.config.depth == 1:

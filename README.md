@@ -25,7 +25,7 @@ Kubernetes is currently the turnkey deployment path. The GitHub-based coordinati
 ### 1. Prerequisites
 
 - Python 3.13, [uv](https://docs.astral.sh/uv/), Git, and `kubectl`.
-- A Kubernetes context and existing namespace with outbound access to GitHub, Anthropic, Exa, and W&B. Your identity must be able to get, list, create, update, patch, and delete Deployments, ConfigMaps, and Secrets there.
+- A Kubernetes context and existing namespace with outbound access to GitHub, W&B, every configured model provider, and Exa when web search is enabled. Your identity must be able to get, list, create, update, patch, and delete Deployments, ConfigMaps, and Secrets there.
 - An existing PVC with enough space for the dataset, plus concurrent mounts from every scheduled node—normally `ReadWriteMany`, unless your storage driver explicitly supports another multi-node topology. The launcher mounts this claim but does not create it; role state stays on each pod's node-local `emptyDir` volume.
 - NVIDIA GPU nodes, the Kubernetes NVIDIA device plugin, and a host driver compatible with CUDA 13 and the shipped student image.
 - A target GitHub repository that Senpai can clone and modify.
@@ -67,7 +67,7 @@ WANDB_API_KEY=
 | `GITHUB_TOKEN` | Target-repository Contents, Pull requests, and Issues read/write. A classic token with `repo` scope also works. GitHub CLI authentication is the fallback when this value is absent. |
 | `ANTHROPIC_API_KEY` | Required when an `anthropic/...` model is configured. |
 | `OPENAI_API_KEY` | Required when an `openai/...` model is configured. Every default profile uses GPT-5.6. |
-| `EXA_API_KEY` | General-web and research-publication search. |
+| `EXA_API_KEY` | General-web and research-publication search. Required only when `web_search: true`. |
 | `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. |
 
 To add a credential, put its value in `.env` and list its name in the launch
@@ -116,11 +116,13 @@ The most important settings are:
 
 ```yaml
 target_repo_branch: main
+target_repo_revision: ""  # optional exact 40-character base commit
 advisor_branch: senpai-research
 program_path: ""  # auto-discover, or set e.g. senpai/program.md
 
 wandb_entity: your-team
 wandb_project: your-project
+wandb_run_group: ""  # optional shared W&B group for this launch
 
 custom_secret_env_names: [HF_TOKEN]  # values come from .env
 
@@ -147,6 +149,7 @@ memory_gi_per_gpu: 64
 
 timeout_minutes: 30
 max_epochs: 50
+web_search: true
 ```
 
 OpenHands uses LiteLLM, so LLM provider names are required as prefixes. For
@@ -175,12 +178,14 @@ uv run python k8s/launch.py \
   --preflight_only
 ```
 
-Preflight authenticates GitHub, Exa, W&B, and every model provider referenced by
-the configured model profiles. It also verifies GitHub Contents write access,
+Preflight authenticates GitHub, W&B, every configured model provider, and Exa
+when web search is enabled. It also verifies GitHub Contents write access,
 resolves the target branch, and rejects student labels already carrying active
 assignments. It deliberately skips image validation and makes no cluster
 changes. A real launch additionally verifies immutable image syntax and that
-both role images identify the same source revision.
+both role images identify the same Senpai revision. When
+`target_repo_revision` is set, preflight and launch require the target base—and
+any pre-existing advisor branch—to point to that exact commit.
 
 ### 7. Launch
 
@@ -210,6 +215,14 @@ kubectl delete deployments,configmaps,secrets -l research-tag=first-run
 ```
 
 Use `--kube_context` and `--namespace` when the desired cluster is not your current default. Use `--dry_run` to render redacted manifests without checking credentials or writing to the cluster.
+
+### Fast agent eval
+
+[`eval/README.md`](eval/README.md) defines a bounded two-target regression eval
+for Senpai development. It runs every model profile on GPT-5.6 Luna, defaults
+to a hard 20-minute ceiling per training process and a six-hour absolute fleet
+deadline, supports a no-web-search variant, and publishes deterministic W&B
+metrics plus a provenance-rich aggregate report.
 
 ## Experiment workflow
 
@@ -268,11 +281,21 @@ After launch, the student can finish its turn. The deterministic controller poll
 
 Worker and container restarts preserve completed OpenHands events. Recovered live training is terminated safely rather than being adopted under an unverifiable process identity; the original student conversation receives the persisted terminal outcome.
 
+`timeout_minutes` is the launch-wide maximum for every `run_training` call.
+The supervisor rejects a larger requested timeout and enforces accepted
+timeouts with the existing process-group TERM/KILL boundary.
+
 Interactive browser operations are progressively disclosed. A fresh root
 conversation initially sees only `load_browser`; invoking it adds the fourteen
 OpenHands browser operations and records the choice in conversation state so a
 resumed conversation restores them. `--no-browser` exposes neither the loader
-nor the browser family.
+nor the browser family. Setting `web_search: false` also omits the Exa
+credential, rejects external-search subagent tasks, disables the browser, and
+removes the search agent plus the Exa and AlphaXiv lookup skills from the
+deployed runtime plugin. Local code exploration and general-purpose subagents
+remain available. Apply a capability change with fresh role state; OpenHands
+does not resume a durable conversation after its tool set shrinks. Kubernetes
+role state uses `emptyDir`, so a recreated pod starts fresh automatically.
 
 ## Subagents
 
@@ -331,7 +354,8 @@ Children share the parent workspace, so their process and conversation are isola
 Live advisors and students load Senpai-owned skills only from
 `plugins/senpai/skills`; target repositories may also supply project skills.
 Guides under `.agents/skills` are for human users and Senpai developers and
-are not installed into autoresearch pods.
+are not installed into autoresearch pods. Launches with `web_search: false`
+exclude the Exa and AlphaXiv guides listed below.
 
 ### Live autoresearch
 
@@ -416,7 +440,10 @@ Useful launch controls:
 
 - `--names frieren,fern` selects stable students; otherwise use `--n_students` and `--student_prefix`.
 - `--gpus_per_student`, `--cpu_per_gpu`, and `--memory_gi_per_gpu` size each student.
-- `--timeout_minutes` and `--max_epochs` set agent-facing launch-context limits; target training receives neither as a dedicated `SENPAI_*` variable.
+- `--target_repo_revision` pins the target base and initial advisor branch to one exact commit.
+- `--timeout_minutes` sets the hard supervisor ceiling for each `run_training` call and remains visible as `SENPAI_TIMEOUT_MINUTES`; `--max_epochs` is an agent-facing launch-context limit.
+- `--wandb_run_group` exports `WANDB_RUN_GROUP` when nonempty so related runs can be queried together.
+- `--web_search false` disables Senpai's browser and external-search facilities without blocking generic terminal network access.
 - `--poll_interval_s` and `--poll_jitter_s` control idle GitHub cadence without teaching the model to poll.
 - `--gh_history_scope branch` keeps normal advisor-branch memory, `fresh` creates a shallow ablation checkout, and `repo` exposes full repository history.
 - `--extra_instructions` accepts optional human operator guidance as a Markdown file or literal user context.

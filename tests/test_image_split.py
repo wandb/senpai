@@ -23,6 +23,7 @@ def load_kubernetes_template(name: str) -> dict:
     template = template.replace(
         "{{MODEL_PROVIDER_ENV}}", "        - name: MODEL_API_KEY"
     )
+    template = template.replace("{{EXA_SECRET_ENV_REF}}", "")
     template = template.replace("{{CUSTOM_SECRET_ENV_REFS}}", "")
     return yaml.safe_load(TEMPLATE_TOKEN.sub("fixture", template))
 

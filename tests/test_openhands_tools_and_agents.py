@@ -192,6 +192,7 @@ def test_main_tools_replace_unsafe_defaults_with_role_scoped_boundaries(
     if role == "student":
         assert by_name["senpai_training"].params == {
             "state_dir": str(config.state_dir / "training"),
+            "max_timeout_seconds": 1800,
         }
 
 

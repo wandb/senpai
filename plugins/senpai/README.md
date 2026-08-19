@@ -12,7 +12,8 @@ message. It natively loads:
 GitHub mutations and training supervision are native typed Senpai tools, not
 skill shell commands. Exa is also a skill/script integration rather than an MCP
 server; launch preflight makes one `instant` publication search with one result
-to validate the key.
+to validate the key. A launch with `web_search: false` removes the search agent
+and the Exa and AlphaXiv lookup skills from its copied runtime plugin.
 
 The Python runtime registers the GitHub tools and exposes only those valid for
 the current role:

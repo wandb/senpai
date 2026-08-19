@@ -55,7 +55,7 @@ def render_role(role: str, args: launch.Args | None = None) -> tuple[str, str, s
     secret = launch_helpers.render_launch_secret(
         args.tag,
         "github",
-        "exa",
+        "exa" if args.web_search else None,
         "wandb",
         anthropic_api_key="anthropic" if "anthropic" in providers else None,
         openai_api_key="openai" if "openai" in providers else None,

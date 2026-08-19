@@ -891,6 +891,7 @@ def controller_main(
         training, monitor_store = training_runtime(
             runner_config.workspace,
             runner_config.state_dir / "training",
+            max_timeout_seconds=runner_config.training_max_timeout_seconds,
         )
         metrics = WandbMetricSource(
             env["WANDB_ENTITY"],

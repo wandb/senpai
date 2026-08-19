@@ -209,6 +209,8 @@ def test_resolved_config_separates_runtime_credentials_from_conversation_secrets
     }
     assert "ANTHROPIC_API_KEY" not in config.conversation_secrets
     assert "OPENAI_API_KEY" not in config.conversation_secrets
+    assert config.training_max_timeout_seconds == 1800
+    assert config.web_search is True
     assert config.timeout_seconds == 7200
     assert config.llm_timeout_seconds == 5400
     assert config.llm_num_retries == 1
@@ -220,14 +222,62 @@ def test_resolved_config_separates_runtime_credentials_from_conversation_secrets
     assert delegated.frontier_api_key == "openai-key"
 
 
-def test_training_limits_are_not_read_from_environment(tmp_path: Path):
+def test_training_timeout_is_read_from_environment(tmp_path: Path):
     env = runtime_env(tmp_path)
-    env["SENPAI_TIMEOUT_MINUTES"] = "not-a-number"
-    env["SENPAI_MAX_EPOCHS"] = "not-an-integer"
+    env["SENPAI_TIMEOUT_MINUTES"] = "0.5"
 
     config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
-    assert not hasattr(config, "training_max_timeout_seconds")
+    assert config.training_max_timeout_seconds == 30
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("not-a-number", "numeric"),
+        ("nan", "finite"),
+        ("inf", "finite"),
+        ("0", "positive"),
+        ("-1", "positive"),
+        ("0.001", "at least one second"),
+    ],
+)
+def test_training_timeout_must_be_positive_numeric(
+    tmp_path: Path,
+    value: str,
+    message: str,
+):
+    env = runtime_env(tmp_path)
+    env["SENPAI_TIMEOUT_MINUTES"] = value
+
+    with pytest.raises(RuntimeError, match=message):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+
+def test_disabled_web_search_removes_exa_and_overrides_browser_flag(tmp_path: Path):
+    env = runtime_env(tmp_path)
+    env.update(
+        {
+            "SENPAI_WEB_SEARCH": "false",
+            "EXA_API_KEY": "ambient-exa-key",
+            "WANDB_API_KEY": "wandb-key",
+        }
+    )
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert config.web_search is False
+    assert config.enable_browser is False
+    assert config.conversation_secrets == {"WANDB_API_KEY": "wandb-key"}
+    assert runner.delegation_config(config).web_search is False
+
+
+def test_web_search_environment_must_be_boolean(tmp_path: Path):
+    env = runtime_env(tmp_path)
+    env["SENPAI_WEB_SEARCH"] = "disabled"
+
+    with pytest.raises(RuntimeError, match="SENPAI_WEB_SEARCH must be true or false"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
 def test_configured_custom_secret_requires_a_nonblank_value(tmp_path: Path):

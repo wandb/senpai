@@ -104,7 +104,7 @@ def test_each_role_receives_authoritative_launch_context(role):
         "Hard limits for each training run: `20` minutes wall-clock and `9` epochs"
         in context
     )
-    assert "SENPAI_TIMEOUT_MINUTES" not in data
+    assert data["SENPAI_TIMEOUT_MINUTES"] == "20"
     assert "SENPAI_MAX_EPOCHS" not in data
     assert "Prefer small, measurable experiments." not in context
     assert operator == "Prefer small, measurable experiments."
@@ -128,6 +128,17 @@ def test_each_role_receives_the_configured_program_path(role):
     assert yaml.safe_load(configmap)["data"]["SENPAI_PROGRAM_PATH"] == (
         "senpai/program.md"
     )
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_each_role_records_the_pinned_target_revision(role):
+    revision = "b" * 40
+    configmap, _deployment, _secret = render_role(
+        role,
+        launch_args(target_repo_revision=revision),
+    )
+
+    assert yaml.safe_load(configmap)["data"]["TARGET_REPO_REVISION"] == revision
 
 
 @pytest.mark.parametrize(

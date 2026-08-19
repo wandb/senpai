@@ -1124,7 +1124,7 @@ def test_student_requests_persistent_storage_for_monitor_wake(
     assert delegation[-1] is None
 
 
-def test_github_tokens_never_reach_the_agent_environment(
+def test_disabled_credentials_never_reach_the_agent_environment(
     tmp_path,
     monkeypatch,
 ):
@@ -1138,21 +1138,35 @@ def test_github_tokens_never_reach_the_agent_environment(
             )
 
         def send_message(self, _prompt):
-            observed.append(runner.os.environ.get("GITHUB_TOKEN"))
+            observed.append(
+                (
+                    runner.os.environ.get("GITHUB_TOKEN"),
+                    runner.os.environ.get("EXA_API_KEY"),
+                )
+            )
 
         async def arun(self):
-            observed.append(runner.os.environ.get("GITHUB_TOKEN"))
+            observed.append(
+                (
+                    runner.os.environ.get("GITHUB_TOKEN"),
+                    runner.os.environ.get("EXA_API_KEY"),
+                )
+            )
 
         def close(self):
             pass
 
     monkeypatch.setenv("GITHUB_TOKEN", "stale-env-secret")
+    monkeypatch.setenv("EXA_API_KEY", "ambient-exa-key")
     monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
     isolate_agent_discovery(monkeypatch, runner)
 
-    assert run_openhands("task", runtime_config(tmp_path, role="student")) == 0
-    assert observed == [None, None]
+    assert run_openhands(
+        "task", runtime_config(tmp_path, role="student", web_search=False)
+    ) == 0
+    assert observed == [(None, None), (None, None)]
     assert "GITHUB_TOKEN" not in runner.os.environ
+    assert "EXA_API_KEY" not in runner.os.environ
 
 
 @pytest.mark.parametrize(
