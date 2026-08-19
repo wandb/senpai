@@ -105,58 +105,8 @@ def yes_no(value: object) -> str:
     return "Yes" if bool(value) else "No"
 
 
-def task_table(tasks: Sequence[Mapping[str, object]]) -> str:
-    """Render ordered agent task state without allowing table injection."""
-
-    if not tasks:
-        return "No delegated tasks."
-
-    def cell(value: object) -> str:
-        return inline_code(" ".join(str(value).split())).replace("|", r"\|")
-
-    rows = [
-        "| Task ID | Key | Agent | Model | Status |",
-        "|---|---|---|---|---|",
-    ]
-    for task in tasks:
-        key = task.get("key")
-        rows.append(
-            "| "
-            + " | ".join(
-                (
-                    cell(task["task_id"]),
-                    cell(key) if key is not None else "—",
-                    cell(task["agent"]),
-                    cell(task["model"]),
-                    cell(task["status"]),
-                )
-            )
-            + " |"
-        )
-    return "\n".join(rows)
-
-
-def task_details(tasks: Sequence[Mapping[str, object]]) -> str:
-    sections: list[str] = []
-    for task in tasks:
-        task_id = inline_code(task["task_id"])
-        if task.get("result") is not None:
-            sections.append(
-                f"### Agent Response: {task_id}\n\n"
-                f"{tagged_block('agent-response', task['result'])}"
-            )
-        if task.get("error") is not None:
-            sections.append(
-                f"### Agent Error: {task_id}\n\n"
-                f"{tagged_block('agent-error', task['error'])}"
-            )
-    return "\n\n".join(sections)
-
-
 def _section(lines: list[str], title: str, body: Sequence[str] | str) -> None:
     content = [body] if isinstance(body, str) else list(body)
-    if not content:
-        return
     lines.extend(["", f"### {title}", "", *content])
 
 
@@ -165,387 +115,281 @@ def _field(label: str, value: object, *, code: bool = True) -> str:
     return f"- {label}: {rendered}"
 
 
-def _pull_request(payload: Mapping[str, object]) -> str | None:
-    number = payload.get("number")
-    url = payload.get("pr_url", payload.get("url"))
-    if number is None:
-        return None
-    if url is not None:
-        return f"- Pull request: {markdown_link(f'#{number}', url)}"
-    return f"- Pull request: #{number}"
-
-
-def _additional_data(
-    lines: list[str],
-    payload: Mapping[str, object],
-    consumed: set[str],
-) -> None:
-    additional = {
-        key: value
-        for key, value in payload.items()
-        if key not in consumed and key not in _ROUTING_FIELDS
-    }
-    if additional:
-        _section(lines, "Additional Data", json_block(additional))
+def _pull_request(payload: Mapping[str, object]) -> str:
+    url = payload["pr_url"] if "pr_url" in payload else payload["url"]
+    number = payload["number"]
+    return f"- Pull request: {markdown_link(f'#{number}', url)}"
 
 
 def _student_assignment(payload: Mapping[str, object]) -> str:
-    consumed = {
-        "assignment_id",
-        "base_ref",
-        "base_sha",
-        "blockers",
-        "head_ref",
-        "head_sha",
-        "number",
-        "revision_id",
-        "url",
-    }
     lines = ["## Student Assignment", "", "This assignment revision is active."]
-    identity = []
-    for key, label in (("assignment_id", "Assignment"), ("revision_id", "Revision")):
-        if key in payload:
-            identity.append(_field(label, payload[key]))
-    if pull := _pull_request(payload):
-        identity.append(pull)
-    _section(lines, "Identity", identity)
-
-    repository = []
-    for key, label in (
-        ("base_ref", "Base"),
-        ("base_sha", "Base commit"),
-        ("head_ref", "Assignment branch"),
-        ("head_sha", "Remote head"),
-    ):
-        if key in payload:
-            repository.append(_field(label, payload[key]))
-    _section(lines, "Repository State", repository)
-
-    if "blockers" in payload:
-        blockers = list(payload["blockers"])  # type: ignore[arg-type]
-        _section(
-            lines,
-            "Blockers",
-            [f"- {inline_code(blocker)}" for blocker in blockers] or ["None."],
-        )
-    _additional_data(lines, payload, consumed)
+    _section(
+        lines,
+        "Identity",
+        [
+            _field("Assignment", payload["assignment_id"]),
+            _field("Revision", payload["revision_id"]),
+            _pull_request(payload),
+        ],
+    )
+    _section(
+        lines,
+        "Repository State",
+        [
+            _field("Base", payload["base_ref"]),
+            _field("Base commit", payload["base_sha"]),
+            _field("Assignment branch", payload["head_ref"]),
+            _field("Remote head", payload["head_sha"]),
+        ],
+    )
+    blockers = list(payload["blockers"])  # type: ignore[arg-type]
+    _section(
+        lines,
+        "Blockers",
+        [f"- {inline_code(blocker)}" for blocker in blockers] or ["None."],
+    )
     return "\n".join(lines)
 
 
 def _malformed_assignment(payload: Mapping[str, object]) -> str:
-    consumed = {"error", "head_ref", "head_sha", "number", "url"}
     lines = ["## Malformed Student Assignment"]
-    details = []
-    if pull := _pull_request(payload):
-        details.append(pull)
-    for key, label in (("head_ref", "Branch"), ("head_sha", "Head")):
-        if key in payload:
-            details.append(_field(label, payload[key]))
-    _section(lines, "Repository State", details)
-    if "error" in payload:
-        _section(
-            lines,
-            "Assignment Error:",
-            tagged_block("assignment-error", payload["error"]),
-        )
-    _additional_data(lines, payload, consumed)
+    _section(
+        lines,
+        "Repository State",
+        [
+            _pull_request(payload),
+            _field("Branch", payload["head_ref"]),
+            _field("Head", payload["head_sha"]),
+        ],
+    )
+    _section(
+        lines,
+        "Assignment Error:",
+        tagged_block("assignment-error", payload["error"]),
+    )
     return "\n".join(lines)
 
 
 def _student_pr_feedback(payload: Mapping[str, object]) -> str:
-    consumed = {
-        "assignment_id",
-        "author",
-        "author_association",
-        "base_ref",
-        "base_sha",
-        "created_at",
-        "feedback_id",
-        "feedback_type",
-        "feedback_url",
-        "full_message_instruction",
-        "head_ref",
-        "head_sha",
-        "line",
-        "message",
-        "message_truncated",
-        "number",
-        "path",
-        "pr_url",
-        "revision_id",
-        "state",
-    }
-    lines = ["## PR Feedback"]
-    if "message" in payload:
-        lines.extend(["", tagged_block("pr-feedback", payload["message"])])
+    lines = [
+        "## PR Feedback",
+        "",
+        tagged_block("pr-feedback", payload["message"]),
+    ]
 
-    if "path" in payload:
+    feedback_type = payload["feedback_type"]
+    if feedback_type == "inline_comment":
         location = _field("File", payload["path"])
         if "line" in payload:
             location += f" at line {inline_code(payload['line'])}"
         _section(lines, "Location", location)
-    if "state" in payload:
+    elif feedback_type == "review":
         _section(lines, "Review State", inline_code(payload["state"]))
 
-    assignment = []
-    for key, label in (("assignment_id", "Assignment"), ("revision_id", "Revision")):
-        if key in payload:
-            assignment.append(_field(label, payload[key]))
-    if pull := _pull_request(payload):
-        assignment.append(pull)
-    _section(lines, "Assignment", assignment)
-
-    repository = []
-    for key, label in (
-        ("base_ref", "Base"),
-        ("base_sha", "Base commit"),
-        ("head_ref", "Assignment branch"),
-        ("head_sha", "Remote head"),
-    ):
-        if key in payload:
-            repository.append(_field(label, payload[key]))
-    _section(lines, "Repository State", repository)
-
-    source = []
-    for key, label in (
-        ("feedback_type", "Type"),
-        ("feedback_id", "Feedback ID"),
-        ("author", "Author"),
-        ("author_association", "Author association"),
-        ("created_at", "Created"),
-    ):
-        if key in payload:
-            source.append(_field(label, payload[key]))
-    if "feedback_url" in payload:
-        source.append(
+    _section(
+        lines,
+        "Assignment",
+        [
+            _field("Assignment", payload["assignment_id"]),
+            _field("Revision", payload["revision_id"]),
+            _pull_request(payload),
+        ],
+    )
+    _section(
+        lines,
+        "Repository State",
+        [
+            _field("Base", payload["base_ref"]),
+            _field("Base commit", payload["base_sha"]),
+            _field("Assignment branch", payload["head_ref"]),
+            _field("Remote head", payload["head_sha"]),
+        ],
+    )
+    _section(
+        lines,
+        "Source",
+        [
+            _field("Type", feedback_type),
+            _field("Feedback ID", payload["feedback_id"]),
+            _field("Author", payload["author"]),
+            _field("Author association", payload["author_association"]),
+            _field("Created", payload["created_at"]),
             "- Feedback URL (`feedback_url`): "
-            f"{markdown_link('Open feedback', payload['feedback_url'])}"
-        )
-    _section(lines, "Source", source)
-    if payload.get("message_truncated") and "full_message_instruction" in payload:
+            f"{markdown_link('Open feedback', payload['feedback_url'])}",
+        ],
+    )
+    if payload.get("message_truncated"):
         _section(
             lines,
             "Full Feedback",
             markdown_text(payload["full_message_instruction"]),
         )
-    _additional_data(lines, payload, consumed)
     return "\n".join(lines)
 
 
 def _human_issue(payload: Mapping[str, object]) -> str:
-    consumed = {
-        "author",
-        "created_at",
-        "human_message_id",
-        "message",
-        "number",
-        "title",
-        "url",
-    }
     lines = ["## Human Issue"]
-    if "message" in payload:
-        _section(
-            lines,
-            "Human Message:",
-            tagged_block("human-message", payload["message"]),
-        )
-    source = []
-    if "number" in payload:
-        number = payload["number"]
-        if "url" in payload:
-            source.append(
-                f"- Issue: {markdown_link(f'#{number}', payload['url'])}"
-            )
-        else:
-            source.append(f"- Issue: #{number}")
-    for key, label in (
-        ("title", "Title"),
-        ("human_message_id", "Message ID"),
-        ("author", "Author"),
-        ("created_at", "Created"),
-    ):
-        if key in payload:
-            source.append(_field(label, payload[key], code=key != "title"))
-    _section(lines, "Source", source)
-    _additional_data(lines, payload, consumed)
+    _section(
+        lines,
+        "Human Message:",
+        tagged_block("human-message", payload["message"]),
+    )
+    number = payload["number"]
+    _section(
+        lines,
+        "Source",
+        [
+            f"- Issue: {markdown_link(f'#{number}', payload['url'])}",
+            _field("Title", payload["title"], code=False),
+            _field("Message ID", payload["human_message_id"]),
+            _field("Author", payload["author"]),
+            _field("Created", payload["created_at"]),
+        ],
+    )
     return "\n".join(lines)
 
 
 def _student_assignment_comment(payload: Mapping[str, object]) -> str:
-    consumed = {
-        "assignment_id",
-        "comment_id",
-        "content_digest",
-        "message",
-        "number",
-        "pr_url",
-        "revision_id",
-        "student",
-    }
     lines = ["## Student Progress Comment"]
-    if "message" in payload:
-        _section(
-            lines,
-            "Student Message:",
-            tagged_block("student-message", payload["message"]),
-        )
-    assignment = []
-    for key, label in (
-        ("student", "Student"),
-        ("assignment_id", "Assignment"),
-        ("revision_id", "Revision"),
-        ("comment_id", "Comment ID"),
-    ):
-        if key in payload:
-            assignment.append(_field(label, payload[key]))
-    if pull := _pull_request(payload):
-        assignment.append(pull)
-    _section(lines, "Assignment", assignment)
-    _additional_data(lines, payload, consumed)
+    _section(
+        lines,
+        "Student Message:",
+        tagged_block("student-message", payload["message"]),
+    )
+    _section(
+        lines,
+        "Assignment",
+        [
+            _field("Student", payload["student"]),
+            _field("Assignment", payload["assignment_id"]),
+            _field("Revision", payload["revision_id"]),
+            _field("Comment ID", payload["comment_id"]),
+            _pull_request(payload),
+        ],
+    )
     return "\n".join(lines)
 
 
 def _review_ready(payload: Mapping[str, object]) -> str:
-    consumed = {"assignment_id", "head_ref", "head_sha", "number", "revision_id", "url"}
     title = (
         "## Experiment Ready for Review"
         if "assignment_id" in payload
         else "## Pull Request Ready for Review"
     )
     lines = [title]
-    details = []
-    if pull := _pull_request(payload):
-        details.append(pull)
-    for key, label in (
-        ("assignment_id", "Assignment"),
-        ("revision_id", "Revision"),
-        ("head_ref", "Branch"),
-        ("head_sha", "Result head"),
-    ):
-        if key in payload:
-            details.append(_field(label, payload[key]))
+    details = [_pull_request(payload)]
+    if "assignment_id" in payload:
+        details.extend(
+            [
+                _field("Assignment", payload["assignment_id"]),
+                _field("Revision", payload["revision_id"]),
+            ]
+        )
+    details.extend(
+        [
+            _field("Branch", payload["head_ref"]),
+            _field("Result head", payload["head_sha"]),
+        ]
+    )
     _section(lines, "Review Target", details)
-    _additional_data(lines, payload, consumed)
     return "\n".join(lines)
 
 
 def _advisor_action(payload: Mapping[str, object]) -> str:
-    consumed = {"head_ref", "head_sha", "number", "reasons", "url"}
     lines = ["## Advisor Action Required"]
-    details = []
-    if pull := _pull_request(payload):
-        details.append(pull)
-    for key, label in (("head_ref", "Branch"), ("head_sha", "Head")):
-        if key in payload:
-            details.append(_field(label, payload[key]))
-    _section(lines, "Pull Request", details)
-    if "reasons" in payload:
-        reasons = list(payload["reasons"])  # type: ignore[arg-type]
-        _section(
-            lines,
-            "Reasons",
-            [f"- {inline_code(reason)}" for reason in reasons] or ["None."],
-        )
-    _additional_data(lines, payload, consumed)
+    _section(
+        lines,
+        "Pull Request",
+        [
+            _pull_request(payload),
+            _field("Branch", payload["head_ref"]),
+            _field("Head", payload["head_sha"]),
+        ],
+    )
+    reasons = list(payload["reasons"])  # type: ignore[arg-type]
+    _section(
+        lines,
+        "Reasons",
+        [f"- {inline_code(reason)}" for reason in reasons],
+    )
     return "\n".join(lines)
 
 
 def _student_available(payload: Mapping[str, object]) -> str:
-    lines = [
-        f"## Student available for assignment: {inline_code(payload['student'])}",
-        "",
-        f"{inline_code(payload['student'])} has no open "
-        f"{inline_code('status:wip')} or {inline_code('status:review')} assignment.",
-    ]
-    _additional_data(lines, payload, {"student"})
-    return "\n".join(lines)
+    return "\n".join(
+        [
+            f"## Student available for assignment: {inline_code(payload['student'])}",
+            "",
+            f"{inline_code(payload['student'])} has no open "
+            f"{inline_code('status:wip')} or "
+            f"{inline_code('status:review')} assignment.",
+        ]
+    )
 
 
 def _duplicate_assignment(payload: Mapping[str, object]) -> str:
-    lines = ["## Student Has Multiple Active Assignments"]
-    if "student" in payload:
-        lines.extend(["", f"Student: {inline_code(payload['student'])}"])
-    if "pull_requests" in payload:
-        pull_requests = list(payload["pull_requests"])  # type: ignore[arg-type]
-        _section(
-            lines,
-            "Pull Requests",
-            [f"- PR #{number}" for number in pull_requests] or ["None."],
-        )
-    _additional_data(lines, payload, {"student", "pull_requests"})
+    lines = [
+        "## Student Has Multiple Active Assignments",
+        "",
+        f"Student: {inline_code(payload['student'])}",
+    ]
+    pull_requests = list(payload["pull_requests"])  # type: ignore[arg-type]
+    _section(
+        lines,
+        "Pull Requests",
+        [f"- PR #{number}" for number in pull_requests],
+    )
     return "\n".join(lines)
 
 
 def _research_base_changed(payload: Mapping[str, object]) -> str:
-    consumed = {
-        "assignment_id",
-        "base_ref",
-        "compare_url",
-        "current_base_sha",
-        "head_ref",
-        "head_sha",
-        "number",
-        "required_base_sha",
-        "revision_id",
-        "student",
-        "url",
-    }
     lines = ["## Research Base Changed"]
-    assignment = []
-    for key, label in (
-        ("assignment_id", "Assignment"),
-        ("revision_id", "Revision"),
-        ("student", "Student"),
-        ("base_ref", "Base branch"),
-        ("head_ref", "Assignment branch"),
-        ("head_sha", "Pull request head"),
-    ):
-        if key in payload:
-            assignment.append(_field(label, payload[key]))
-    if pull := _pull_request(payload):
-        assignment.append(pull)
-    _section(lines, "Assignment", assignment)
-
-    base_state = []
-    for key, label in (
-        ("required_base_sha", "Assignment-required base"),
-        ("current_base_sha", "Current base"),
-    ):
-        if key in payload:
-            base_state.append(_field(label, payload[key]))
-    _section(lines, "Base State", base_state)
-    if "compare_url" in payload:
-        lines.extend(
-            ["", markdown_link("Compare the base commits", payload["compare_url"])]
-        )
-    _additional_data(lines, payload, consumed)
+    _section(
+        lines,
+        "Assignment",
+        [
+            _field("Assignment", payload["assignment_id"]),
+            _field("Revision", payload["revision_id"]),
+            _field("Student", payload["student"]),
+            _field("Base branch", payload["base_ref"]),
+            _field("Assignment branch", payload["head_ref"]),
+            _field("Pull request head", payload["head_sha"]),
+            _pull_request(payload),
+        ],
+    )
+    _section(
+        lines,
+        "Base State",
+        [
+            _field("Assignment-required base", payload["required_base_sha"]),
+            _field("Current base", payload["current_base_sha"]),
+        ],
+    )
+    lines.extend(
+        ["", markdown_link("Compare the base commits", payload["compare_url"])]
+    )
     return "\n".join(lines)
 
 
 def _training_monitor(payload: Mapping[str, object]) -> str:
-    consumed = {"conversation_id", "reason", "signal", "summary", "training_id"}
-    signal = payload.get("signal")
-    signal_value = signal if isinstance(signal, Mapping) else {}
-    signal_kind = signal_value.get("kind")
+    signal_value = payload["signal"]
+    if not isinstance(signal_value, Mapping):
+        raise TypeError("training monitor signal must be an object")
+    signal_kind = signal_value["kind"]
     title = {
         "metric_gate": "## Training Metric Gate",
         "metric_stale": "## Training Metric Is Stale",
         "monitor_error": "## Training Monitor Error",
         "training_status": "## Training Status",
-    }.get(signal_kind, "## Training Monitor Signal")
+    }[signal_kind]
     lines = [title]
-    status = []
-    training_id = payload.get("training_id", signal_value.get("training_id"))
-    if training_id is not None:
-        status.append(_field("Training ID", training_id))
+    status = [_field("Training ID", payload["training_id"])]
     for key, label in (
         ("metric", "Metric"),
         ("value", "Value"),
         ("state", "State"),
         ("hard_failure", "Hard failure"),
     ):
-        if key not in signal_value:
-            continue
         value = signal_value[key]
         if key == "hard_failure":
             status.append(_field(label, yes_no(value), code=False))
@@ -554,51 +398,16 @@ def _training_monitor(payload: Mapping[str, object]) -> str:
         else:
             status.append(_field(label, value))
     _section(lines, "Status", status)
-    detail = signal_value.get("detail", payload.get("summary"))
-    if detail is not None:
-        _section(lines, "Signal", tagged_block("monitor-signal", detail))
-    if "reason" in payload:
-        _section(lines, "Reason", markdown_text(payload["reason"]))
-    signal_additional = {
-        key: value
-        for key, value in signal_value.items()
-        if key
-        not in {
-            "dedupe_key",
-            "detail",
-            "hard_failure",
-            "kind",
-            "metric",
-            "state",
-            "training_id",
-            "value",
-        }
-    }
-    additional_payload = {
-        key: value
-        for key, value in payload.items()
-        if key not in consumed and key not in _ROUTING_FIELDS
-    }
-    if signal_additional or additional_payload:
-        _section(
-            lines,
-            "Additional Data",
-            json_block({**additional_payload, **signal_additional}),
-        )
+    _section(
+        lines,
+        "Signal",
+        tagged_block("monitor-signal", signal_value["detail"]),
+    )
+    _section(lines, "Reason", markdown_text(payload["reason"]))
     return "\n".join(lines)
 
 
 def _workspace_diverged(payload: Mapping[str, object]) -> str:
-    consumed = {
-        "base_ref",
-        "base_sha",
-        "current_branch",
-        "expected_remote_head",
-        "head_ref",
-        "instructions",
-        "preserved_local_head",
-        "worktree_fingerprint",
-    }
     lines = [
         "## Workspace Requires Manual Reconciliation",
         "",
@@ -607,33 +416,31 @@ def _workspace_diverged(payload: Mapping[str, object]) -> str:
             "discarding anything."
         ),
     ]
-    state = []
-    for key, label in (
-        ("head_ref", "Expected branch"),
-        ("current_branch", "Current branch"),
-        ("expected_remote_head", "Expected remote head"),
-        ("preserved_local_head", "Preserved local head"),
-        ("base_ref", "Base"),
-        ("base_sha", "Base commit"),
-    ):
-        value = payload.get(key)
+    state = [_field("Expected branch", payload["head_ref"])]
+    current_branch = payload["current_branch"]
+    if current_branch is not None:
+        state.append(_field("Current branch", current_branch))
+    state.extend(
+        [
+            _field("Expected remote head", payload["expected_remote_head"]),
+            _field("Preserved local head", payload["preserved_local_head"]),
+        ]
+    )
+    for key, label in (("base_ref", "Base"), ("base_sha", "Base commit")):
+        value = payload[key]
         if value is not None:
             state.append(_field(label, value))
     _section(lines, "Preserved State", state)
-    if "instructions" in payload:
-        _section(lines, "Required Action", markdown_text(payload["instructions"]))
-    _additional_data(lines, payload, consumed)
+    _section(lines, "Required Action", markdown_text(payload["instructions"]))
     return "\n".join(lines)
 
 
 def _agent_response(payload: Mapping[str, object], *, failed: bool) -> str:
-    consumed = {"error", "result", "task", "task_id"}
     lines = ["## Delegated Task Failed" if failed else "## Delegated Task Completed"]
-    if "task_id" in payload:
-        lines.extend(["", _field("Task ID", payload["task_id"])])
+    lines.extend(["", _field("Task ID", payload["task_id"])])
     if failed:
         _section(lines, "Agent Error:", tagged_block("agent-error", payload["error"]))
-    elif "result" in payload:
+    else:
         _section(
             lines,
             "Agent Response:",
@@ -645,7 +452,6 @@ def _agent_response(payload: Mapping[str, object], *, failed: bool) -> str:
             "Assigned Task (Provenance Only):",
             tagged_block("delegated-task", payload["task"]),
         )
-    _additional_data(lines, payload, consumed)
     return "\n".join(lines)
 
 
@@ -691,7 +497,10 @@ def render_event_prompt(kind: str, payload: Mapping[str, object]) -> str:
     return renderer(visible)
 
 
-def render_legacy_event_prompt(kind: str, payload: Mapping[str, object]) -> str:
+def render_pre_markdown_event_prompt(
+    kind: str,
+    payload: Mapping[str, object],
+) -> str:
     """Reproduce the pre-Markdown-v2 body for durable inbox compatibility."""
 
     visible = visible_event_payload(payload)

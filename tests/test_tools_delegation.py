@@ -39,6 +39,7 @@ from senpai_agent.delegation import (
     reconcile_delegated_tasks,
 )
 from senpai_agent.local_events import LocalEventStore
+from senpai_agent.model_markdown import render_event_prompt
 
 
 def test_model_tier_runtime_limits():
@@ -121,14 +122,12 @@ def test_legacy_completed_delegation_uses_the_agent_response_boundary():
         result="## Result\n\nDone.",
     )
 
-    assert observation.to_llm_content[0].text == (
-        "## Delegated Task Completed\n\n"
-        "- Task ID: `legacy-17`\n\n"
-        "### Agent Response:\n\n"
-        "<agent-response>\n\n"
-        "## Result\n\n"
-        "Done.\n\n"
-        "</agent-response>"
+    assert observation.to_llm_content[0].text == render_event_prompt(
+        "agent_result",
+        {
+            "task_id": "legacy-17",
+            "result": "## Result\n\nDone.",
+        },
     )
 
 

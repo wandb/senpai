@@ -240,7 +240,11 @@ def test_v2_assignment_queues_behind_an_unresolved_v1_delivery(
         payload=legacy_payload,
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(UUID(int=17), legacy.dedupe_key, legacy.to_prompt())
+    inbox.enqueue(
+        UUID(int=17),
+        legacy.dedupe_key,
+        legacy.to_pre_markdown_prompt(),
+    )
     active = inbox.next_turn(UUID(int=17), "legacy prompt")
     assert active is not None
 

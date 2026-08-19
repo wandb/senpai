@@ -36,9 +36,8 @@ from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.model_markdown import (
     inline_code,
+    render_event_prompt,
     tagged_block,
-    task_details,
-    task_table,
     yes_no,
 )
 from senpai_agent.processes import terminate_process_group
@@ -49,7 +48,6 @@ from senpai_agent.PROMPTS import (
     DELEGATE_AGENT_DEPRECATION_PROMPT,
     DELEGATED_SEARCH_MODE_PROMPT,
     DELEGATED_TASK_BACKGROUND_PROMPT,
-    DELEGATED_TASK_FINISHED_PROMPT,
     DELEGATED_TASK_PROMPT,
     DELEGATED_TASK_WITH_CONTEXT_PROMPT,
     render_prompt,
@@ -608,13 +606,9 @@ class DelegateAgentObservation(Observation):
         if self.status == "finished":
             return [
                 TextContent(
-                    text=render_prompt(
-                        DELEGATED_TASK_FINISHED_PROMPT,
-                        TASK_ID=self.task_id,
-                        AGENT_RESPONSE=tagged_block(
-                            "agent-response",
-                            self.result or "",
-                        ),
+                    text=render_event_prompt(
+                        "agent_result",
+                        {"task_id": self.task_id, "result": self.result or ""},
                     )
                 )
             ]
@@ -1798,13 +1792,56 @@ def _task_states_markdown(
     *,
     summary: Sequence[str] = (),
 ) -> str:
-    values = [task.model_dump(mode="json") for task in tasks]
     sections = [f"## {title}"]
     if summary:
         sections.extend(["", *summary])
-    sections.extend(["", task_table(values)])
-    if details := task_details(values):
-        sections.extend(["", details])
+    if not tasks:
+        sections.extend(["", "No delegated tasks."])
+        return "\n".join(sections)
+
+    def cell(value: object) -> str:
+        text = " ".join(str(value).split())
+        return inline_code(text).replace("|", r"\|")
+
+    rows = [
+        "| Task ID | Key | Agent | Model | Status |",
+        "|---|---|---|---|---|",
+    ]
+    for task in tasks:
+        rows.append(
+            "| "
+            + " | ".join(
+                (
+                    cell(task.task_id),
+                    cell(task.key) if task.key is not None else "—",
+                    cell(task.agent),
+                    cell(task.model),
+                    cell(task.status),
+                )
+            )
+            + " |"
+        )
+    sections.extend(["", *rows])
+    for task in tasks:
+        task_id = inline_code(task.task_id)
+        if task.result is not None:
+            sections.extend(
+                [
+                    "",
+                    f"### Agent Response: {task_id}",
+                    "",
+                    tagged_block("agent-response", task.result),
+                ]
+            )
+        if task.error is not None:
+            sections.extend(
+                [
+                    "",
+                    f"### Agent Error: {task_id}",
+                    "",
+                    tagged_block("agent-error", task.error),
+                ]
+            )
     return "\n".join(sections)
 
 

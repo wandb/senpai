@@ -21,6 +21,7 @@ from senpai_agent.hooks import queued_feedback_marker
 from senpai_agent.inbox import PersistentInbox, deliver_turn_messages
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import ControllerEvent
+from event_payloads import event_payload
 
 
 class ConversationStateStub:
@@ -155,7 +156,12 @@ def test_event_store_deduplicates_and_survives_reopen(tmp_path: Path):
     event = LocalEvent(
         kind="review_ready",
         dedupe_key="review_ready:3467:abc123",
-        payload={"pr": 3467, "head_sha": "abc123"},
+        payload=event_payload(
+            "review_ready",
+            number=3467,
+            url="https://github.test/pull/3467",
+            head_sha="abc123",
+        ),
     )
 
     with LocalEventStore(database) as store:
@@ -206,6 +212,7 @@ def test_event_message_uses_the_same_model_view_as_the_durable_inbox():
         payload={
             "number": 17,
             "url": "https://github.test/pull/17",
+            "head_ref": "student/experiment",
             "head_sha": "abc",
         },
         observed_at=datetime(2026, 7, 31, 12, 30, tzinfo=UTC),
@@ -215,6 +222,7 @@ def test_event_message_uses_the_same_model_view_as_the_durable_inbox():
         "## Pull Request Ready for Review\n\n"
         "### Review Target\n\n"
         "- Pull request: [#17](<https://github.test/pull/17>)\n"
+        "- Branch: `student/experiment`\n"
         "- Result head: `abc`"
     )
     assert event.to_user_message() == event.to_inbox_message()
@@ -225,12 +233,12 @@ def test_deliver_pending_events_acknowledges_only_messages_sent(tmp_path: Path):
     first = LocalEvent(
         kind="review_ready",
         dedupe_key="review_ready:11:ddd",
-        payload={"pr": 11},
+        payload=event_payload("review_ready", number=11),
     )
     second = LocalEvent(
         kind="agent_result",
         dedupe_key="agent_result:task-1",
-        payload={"task_id": "task-1"},
+        payload=event_payload("agent_result", task_id="task-1"),
     )
 
     class Conversation:
@@ -261,7 +269,7 @@ def test_event_pump_keeps_events_queued_while_a_tool_action_is_unmatched(
     event = LocalEvent(
         kind="agent_result",
         dedupe_key="agent_result:task-1",
-        payload={"task_id": "task-1"},
+        payload=event_payload("agent_result", task_id="task-1"),
     )
 
     class Conversation:
@@ -289,7 +297,7 @@ def test_event_pump_delivers_queued_event_after_the_tool_boundary_is_safe(
     event = LocalEvent(
         kind="agent_result",
         dedupe_key="agent_result:task-1",
-        payload={"task_id": "task-1"},
+        payload=event_payload("agent_result", task_id="task-1"),
     )
     action = pending_tool_action()
 
@@ -324,7 +332,7 @@ def test_event_pump_injects_new_events_while_conversation_is_running(
     event = LocalEvent(
         kind="review_ready",
         dedupe_key="review_ready:12:eee",
-        payload={"pr": 12},
+        payload=event_payload("review_ready", number=12),
     )
 
     class Conversation:
@@ -358,7 +366,7 @@ def test_event_pump_queues_into_the_controller_inbox_without_mid_turn_injection(
     event = LocalEvent(
         kind="agent_result",
         dedupe_key="agent_result:task-1",
-        payload={"task_id": "task-1"},
+        payload=event_payload("agent_result", task_id="task-1"),
     )
     conversation_id = "00000000-0000-0000-0000-000000000017"
 
@@ -426,7 +434,7 @@ def test_human_issue_steers_the_active_turn_after_the_tool_boundary(tmp_path: Pa
     event = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
-        payload={"message": "Change direction."},
+        payload=event_payload("human_issue", message="Change direction."),
     )
     inbox, active, conversation = active_steering_turn(tmp_path)
     conversation.state.acquire()
@@ -461,7 +469,10 @@ def test_student_feedback_waits_for_the_step_and_marks_a_clean_unwind(
     event = LocalEvent(
         kind="student_pr_feedback",
         dedupe_key="student_pr_feedback:1",
-        payload={"message": "Try the narrower experiment next."},
+        payload=event_payload(
+            "student_pr_feedback",
+            message="Try the narrower experiment next.",
+        ),
     )
     inbox, active, conversation = active_steering_turn(tmp_path)
     marker = queued_feedback_marker(inbox.path.parent)
@@ -508,7 +519,11 @@ def test_review_ready_waits_for_the_step_without_interrupting_current_work(
     event = LocalEvent(
         kind="review_ready",
         dedupe_key="review_ready:29:abc123",
-        payload={"pr": 29, "head_sha": "abc123"},
+        payload=event_payload(
+            "review_ready",
+            number=29,
+            head_sha="abc123",
+        ),
     )
     inbox, active, conversation = active_steering_turn(tmp_path)
     conversation.state.acquire()
@@ -548,7 +563,10 @@ def test_student_feedback_waits_for_a_starting_run_to_leave_idle(tmp_path: Path)
     event = LocalEvent(
         kind="student_pr_feedback",
         dedupe_key="student_pr_feedback:1",
-        payload={"message": "Try the narrower experiment next."},
+        payload=event_payload(
+            "student_pr_feedback",
+            message="Try the narrower experiment next.",
+        ),
     )
     inbox, _active, conversation = active_steering_turn(tmp_path)
     conversation.state.execution_status = ConversationExecutionStatus.IDLE
@@ -578,12 +596,18 @@ def test_human_issue_upgrades_queued_feedback_to_an_interrupt(tmp_path: Path):
     feedback = LocalEvent(
         kind="student_pr_feedback",
         dedupe_key="student_pr_feedback:1",
-        payload={"message": "Try the narrower experiment next."},
+        payload=event_payload(
+            "student_pr_feedback",
+            message="Try the narrower experiment next.",
+        ),
     )
     instruction = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
-        payload={"message": "Stop and inspect the latest frontier now."},
+        payload=event_payload(
+            "human_issue",
+            message="Stop and inspect the latest frontier now.",
+        ),
     )
     inbox, _active, conversation = active_steering_turn(tmp_path)
     marker = queued_feedback_marker(inbox.path.parent)
@@ -624,17 +648,25 @@ def test_human_issue_interrupts_a_tool_after_the_steering_grace(tmp_path: Path):
     event = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
-        payload={"message": "Change direction now."},
+        payload=event_payload("human_issue", message="Change direction now."),
     )
     paired = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:paired",
-        payload={"message": "Keep this paired instruction too."},
+        payload=event_payload(
+            "human_issue",
+            human_message_id=703,
+            message="Keep this paired instruction too.",
+        ),
     )
     followup = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:2",
-        payload={"message": "And preserve the current workspace."},
+        payload=event_payload(
+            "human_issue",
+            human_message_id=704,
+            message="And preserve the current workspace.",
+        ),
     )
     inbox, _active, conversation = active_steering_turn(tmp_path)
     conversation.state.acquire()
@@ -677,7 +709,7 @@ def test_human_issue_before_run_is_delivered_without_starting_then_cancelling(
     event = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
-        payload={"message": "Use this direction first."},
+        payload=event_payload("human_issue", message="Use this direction first."),
     )
     inbox, _active, conversation = active_steering_turn(tmp_path)
 
@@ -704,7 +736,10 @@ def test_student_feedback_does_not_resume_an_unrelated_pause(tmp_path: Path):
     event = LocalEvent(
         kind="student_pr_feedback",
         dedupe_key="student_pr_feedback:1",
-        payload={"message": "Use this after restart."},
+        payload=event_payload(
+            "student_pr_feedback",
+            message="Use this after restart.",
+        ),
     )
     inbox, _active, conversation = active_steering_turn(tmp_path)
 
@@ -742,7 +777,10 @@ def test_human_issue_interrupts_a_run_with_stale_persisted_status(
     event = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
-        payload={"message": "Stop the newly starting run."},
+        payload=event_payload(
+            "human_issue",
+            message="Stop the newly starting run.",
+        ),
     )
     inbox, _active, conversation = active_steering_turn(tmp_path)
 
@@ -784,7 +822,7 @@ def test_human_issue_does_not_claim_a_cleanly_ended_run_was_interrupted(
     event = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
-        payload={"message": "Apply this next."},
+        payload=event_payload("human_issue", message="Apply this next."),
     )
     inbox, _active, conversation = active_steering_turn(tmp_path)
     conversation.state.execution_status = status
@@ -813,7 +851,10 @@ def test_human_issue_joins_a_failed_turn_for_its_retry(tmp_path: Path):
     event = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
-        payload={"message": "Recover with this direction."},
+        payload=event_payload(
+            "human_issue",
+            message="Recover with this direction.",
+        ),
     )
     conversation_id = "00000000-0000-0000-0000-000000000017"
 
@@ -860,7 +901,7 @@ def test_non_finished_turn_leaves_delivered_child_result_pending(
     event = LocalEvent(
         kind="agent_result",
         dedupe_key="agent_result:task-1",
-        payload={"task_id": "task-1"},
+        payload=event_payload("agent_result", task_id="task-1"),
     )
 
     class Conversation:
@@ -894,12 +935,20 @@ def test_event_pump_routes_child_results_to_their_parent_conversation(
     first = LocalEvent(
         kind="agent_result",
         dedupe_key="agent_result:first",
-        payload={"parent_conversation_id": first_parent},
+        payload=event_payload(
+            "agent_result",
+            task_id="first",
+            parent_conversation_id=first_parent,
+        ),
     )
     second = LocalEvent(
         kind="agent_result",
         dedupe_key="agent_result:second",
-        payload={"parent_conversation_id": second_parent},
+        payload=event_payload(
+            "agent_result",
+            task_id="second",
+            parent_conversation_id=second_parent,
+        ),
     )
 
     class Conversation:
@@ -934,7 +983,7 @@ def test_event_pump_surfaces_delivery_failure_and_leaves_event_pending(
     event = LocalEvent(
         kind="review_ready",
         dedupe_key="review_ready:13:fff",
-        payload={"pr": 13},
+        payload=event_payload("review_ready", number=13),
     )
 
     class Conversation:
@@ -980,7 +1029,7 @@ def test_event_pump_surfaces_a_mid_batch_failure_without_boundary_timeout(
     event = LocalEvent(
         kind="human_issue",
         dedupe_key="human_issue:1",
-        payload={"message": "Change direction."},
+        payload=event_payload("human_issue", message="Change direction."),
     )
     inbox, _active, conversation = active_steering_turn(tmp_path)
 
@@ -1015,7 +1064,10 @@ def test_event_pump_surfaces_a_queue_boundary_failure_and_unwinds_the_run(
     event = LocalEvent(
         kind="student_pr_feedback",
         dedupe_key="student_pr_feedback:1",
-        payload={"message": "Apply this next."},
+        payload=event_payload(
+            "student_pr_feedback",
+            message="Apply this next.",
+        ),
     )
     inbox, _active, conversation = active_steering_turn(tmp_path)
 
@@ -1051,7 +1103,7 @@ def test_advisor_cli_reports_the_pending_event_count(
             LocalEvent(
                 kind="review_ready",
                 dedupe_key="review_ready:1:a",
-                payload={"pr": 1},
+                payload=event_payload("review_ready", number=1),
             )
         )
 
@@ -1071,20 +1123,23 @@ def test_advisor_cli_reports_the_pending_event_count(
 @pytest.mark.parametrize(
     ("kind", "payload"),
     [
-        ("student_assignment", {"blockers": []}),
-        ("malformed_assignment", {"error": "invalid marker"}),
-        ("student_pr_feedback", {"message": "Review this."}),
-        ("human_issue", {"message": "Please inspect this."}),
-        ("student_assignment_comment", {"message": "Run started."}),
-        ("review_ready", {}),
-        ("advisor_action", {"reasons": []}),
-        ("student_available_for_assignment", {"student": "Fern"}),
-        ("duplicate_assignment", {"pull_requests": []}),
-        ("research_base_changed", {}),
-        ("training_monitor", {"signal": {"kind": "training_status"}}),
-        ("workspace_diverged", {}),
-        ("agent_result", {"result": "Done."}),
-        ("agent_error", {"error": "Failed."}),
+        (kind, event_payload(kind))
+        for kind in (
+            "student_assignment",
+            "malformed_assignment",
+            "student_pr_feedback",
+            "human_issue",
+            "student_assignment_comment",
+            "review_ready",
+            "advisor_action",
+            "student_available_for_assignment",
+            "duplicate_assignment",
+            "research_base_changed",
+            "training_monitor",
+            "workspace_diverged",
+            "agent_result",
+            "agent_error",
+        )
     ],
 )
 def test_inbox_rendering_matches_for_every_controller_and_watcher_event(
@@ -1104,5 +1159,5 @@ def test_inbox_rendering_matches_for_every_controller_and_watcher_event(
     )
 
     assert watcher_event.to_inbox_message() == controller_event.to_prompt()
-    assert watcher_event.payload_identity() == controller_event.payload_identity()
+    assert watcher_event.event_identity() == controller_event.event_identity()
     assert "transport-only" not in watcher_event.to_inbox_message()

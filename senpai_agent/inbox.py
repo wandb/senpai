@@ -50,7 +50,7 @@ class InboxMessage:
     event_key: str | None
     requires_ack: bool
     priority: int
-    payload_identity_sha256: str | None = None
+    event_identity_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,7 +152,7 @@ class PersistentInbox:
                 event_key TEXT,
                 body TEXT NOT NULL,
                 body_sha256 TEXT NOT NULL,
-                payload_identity_sha256 TEXT,
+                event_identity_sha256 TEXT,
                 delivery_id TEXT NOT NULL UNIQUE,
                 sender TEXT NOT NULL UNIQUE,
                 state TEXT NOT NULL CHECK (
@@ -260,10 +260,16 @@ class PersistentInbox:
                 ADD COLUMN priority INTEGER NOT NULL DEFAULT 0
                 """
             )
-        if "payload_identity_sha256" not in message_columns:
-            self._connection.execute(
-                "ALTER TABLE inbox_messages ADD COLUMN payload_identity_sha256 TEXT"
-            )
+        if "event_identity_sha256" not in message_columns:
+            if "payload_identity_sha256" in message_columns:
+                self._connection.execute(
+                    "ALTER TABLE inbox_messages RENAME COLUMN "
+                    "payload_identity_sha256 TO event_identity_sha256"
+                )
+            else:
+                self._connection.execute(
+                    "ALTER TABLE inbox_messages ADD COLUMN event_identity_sha256 TEXT"
+                )
         if legacy_path is not None and legacy_path.is_file():
             self._import_legacy_deliveries(legacy_path)
         self._connection.commit()
@@ -274,8 +280,8 @@ class PersistentInbox:
         event_key: str,
         body: str,
         *,
-        accepted_historical_bodies: Sequence[str] = (),
-        payload_identity: str | None = None,
+        pre_markdown_body: str | None = None,
+        event_identity: str | None = None,
         requires_ack: bool = True,
         priority: int = 0,
     ) -> bool:
@@ -286,8 +292,8 @@ class PersistentInbox:
                 conversation,
                 event_key,
                 body,
-                accepted_historical_bodies=accepted_historical_bodies,
-                payload_identity=payload_identity,
+                pre_markdown_body=pre_markdown_body,
+                event_identity=event_identity,
                 requires_ack=requires_ack,
                 priority=priority,
             )
@@ -300,8 +306,8 @@ class PersistentInbox:
         event_key: str,
         body: str,
         *,
-        accepted_historical_bodies: Sequence[str],
-        payload_identity: str | None,
+        pre_markdown_body: str | None,
+        event_identity: str | None,
         requires_ack: bool,
         priority: int,
     ) -> tuple[int, str | None, DeliveryState, bool]:
@@ -309,18 +315,13 @@ class PersistentInbox:
             raise ValueError("event key must not be empty")
         if not body:
             raise ValueError("event body must not be empty")
-        if accepted_historical_bodies and payload_identity is None:
-            raise ValueError(
-                "historical event bodies require a canonical payload identity"
-            )
-        identity = payload_identity if payload_identity is not None else body
-        _require_event_payload(
+        identity_sha256 = _require_event_identity(
             database,
             conversation,
             event_key,
             body,
-            accepted_historical_bodies=accepted_historical_bodies,
-            payload_identity=identity,
+            pre_markdown_body=pre_markdown_body,
+            event_identity=event_identity,
         )
         existing = self._live_event_message(database, conversation, event_key)
         if existing is not None:
@@ -360,7 +361,7 @@ class PersistentInbox:
                 event_key,
                 body,
                 body_sha256,
-                payload_identity_sha256,
+                event_identity_sha256,
                 delivery_id,
                 sender,
                 state,
@@ -374,7 +375,7 @@ class PersistentInbox:
                 event_key,
                 body,
                 _digest(body),
-                _digest(identity),
+                identity_sha256,
                 delivery_id,
                 _sender(delivery_id),
                 int(requires_ack),
@@ -399,8 +400,8 @@ class PersistentInbox:
         event_key: str,
         body: str,
         *,
-        accepted_historical_bodies: Sequence[str] = (),
-        payload_identity: str | None = None,
+        pre_markdown_body: str | None = None,
+        event_identity: str | None = None,
         priority: int = QUEUE_PRIORITY,
     ) -> tuple[str, DeliveryState] | None:
         """Prioritize one event and attach it to the active turn when possible."""
@@ -414,8 +415,8 @@ class PersistentInbox:
                 conversation,
                 event_key,
                 body,
-                accepted_historical_bodies=accepted_historical_bodies,
-                payload_identity=payload_identity,
+                pre_markdown_body=pre_markdown_body,
+                event_identity=event_identity,
                 requires_ack=True,
                 priority=priority,
             )
@@ -474,33 +475,27 @@ class PersistentInbox:
             )
         return turn_id, state
 
-    def require_event_payload(
+    def require_event_identity(
         self,
         conversation_id: UUID | str,
         event_key: str,
         body: str,
         *,
-        accepted_historical_bodies: Sequence[str] = (),
-        payload_identity: str | None = None,
+        pre_markdown_body: str | None = None,
+        event_identity: str | None = None,
     ) -> None:
         """Reject a polled identity that conflicts with durable inbox history."""
 
         if not event_key or not body:
             raise ValueError("event key and body must not be empty")
-        if accepted_historical_bodies and payload_identity is None:
-            raise ValueError(
-                "historical event bodies require a canonical payload identity"
-            )
         with self._transaction() as database:
-            _require_event_payload(
+            _require_event_identity(
                 database,
                 str(conversation_id),
                 event_key,
                 body,
-                accepted_historical_bodies=accepted_historical_bodies,
-                payload_identity=(
-                    payload_identity if payload_identity is not None else body
-                ),
+                pre_markdown_body=pre_markdown_body,
+                event_identity=event_identity,
             )
 
     def retract_pending_prefix(
@@ -1144,7 +1139,7 @@ class PersistentInbox:
                         event_key,
                         body,
                         body_sha256,
-                        payload_identity_sha256,
+                        event_identity_sha256,
                         delivery_id,
                         sender,
                         state,
@@ -1160,7 +1155,7 @@ class PersistentInbox:
                         message.event_key,
                         message.body,
                         _digest(message.body),
-                        message.payload_identity_sha256,
+                        message.event_identity_sha256,
                         delivery_id,
                         _sender(delivery_id),
                         int(message.requires_ack),
@@ -1750,29 +1745,36 @@ def _event_call_ids(event: object) -> set[str]:
     }
 
 
-def _require_event_payload(
+def _require_event_identity(
     database: sqlite3.Connection,
     conversation_id: str,
     event_key: str,
     body: str,
     *,
-    accepted_historical_bodies: Sequence[str] = (),
-    payload_identity: str,
-) -> None:
-    if not payload_identity:
-        raise ValueError("event payload identity must not be empty")
-    accepted = tuple(dict.fromkeys((body, *accepted_historical_bodies)))
-    if any(not value for value in accepted):
-        raise ValueError("accepted event bodies must not be empty")
-    identity_sha256 = _digest(payload_identity)
+    pre_markdown_body: str | None,
+    event_identity: str | None,
+) -> str:
+    if pre_markdown_body is not None and event_identity is None:
+        raise ValueError("a pre-Markdown body requires a canonical event identity")
+    identity = body if event_identity is None else event_identity
+    if not identity:
+        raise ValueError("event identity must not be empty")
+    if pre_markdown_body == "":
+        raise ValueError("pre-Markdown event body must not be empty")
+    accepted_bodies = (
+        (body,)
+        if pre_markdown_body is None or pre_markdown_body == body
+        else (body, pre_markdown_body)
+    )
+    identity_sha256 = _digest(identity)
     conflict = database.execute(
         """
         SELECT 1
         FROM inbox_messages
         WHERE conversation_id = ?
           AND event_key = ?
-          AND payload_identity_sha256 IS NOT NULL
-          AND payload_identity_sha256 != ?
+          AND event_identity_sha256 IS NOT NULL
+          AND event_identity_sha256 != ?
         LIMIT 1
         """,
         (conversation_id, event_key, identity_sha256),
@@ -1782,7 +1784,7 @@ def _require_event_payload(
             f"event {event_key!r} was reused with a different payload"
         )
 
-    placeholders = ",".join("?" for _ in accepted)
+    placeholders = ",".join("?" for _ in accepted_bodies)
     conflict = database.execute(
         f"""
         SELECT 1
@@ -1790,11 +1792,11 @@ def _require_event_payload(
         WHERE conversation_id = ?
           AND event_key = ?
           AND legacy = 0
-          AND payload_identity_sha256 IS NULL
+          AND event_identity_sha256 IS NULL
           AND body NOT IN ({placeholders})
         LIMIT 1
         """,
-        (conversation_id, event_key, *accepted),
+        (conversation_id, event_key, *accepted_bodies),
     ).fetchone()
     if conflict is not None:
         raise RuntimeError(
@@ -1803,15 +1805,16 @@ def _require_event_payload(
     database.execute(
         f"""
         UPDATE inbox_messages
-        SET payload_identity_sha256 = ?
+        SET event_identity_sha256 = ?
         WHERE conversation_id = ?
           AND event_key = ?
           AND legacy = 0
-          AND payload_identity_sha256 IS NULL
+          AND event_identity_sha256 IS NULL
           AND body IN ({placeholders})
         """,
-        (identity_sha256, conversation_id, event_key, *accepted),
+        (identity_sha256, conversation_id, event_key, *accepted_bodies),
     )
+    return identity_sha256
 
 
 def _message(row: sqlite3.Row) -> InboxMessage:
@@ -1823,7 +1826,7 @@ def _message(row: sqlite3.Row) -> InboxMessage:
         event_key=row["event_key"],
         requires_ack=bool(row["requires_ack"]),
         priority=int(row["priority"]),
-        payload_identity_sha256=row["payload_identity_sha256"],
+        event_identity_sha256=row["event_identity_sha256"],
     )
 
 

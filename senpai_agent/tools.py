@@ -324,10 +324,12 @@ class TrainingResultObservation(Observation):
                 "",
             ]
         )
-        lines.extend(
-            [f"- {inline_code(run_id)}" for run_id in self.wandb_run_ids]
-            or ["None."]
-        )
+        if self.wandb_run_ids:
+            lines.extend(
+                f"- {inline_code(run_id)}" for run_id in self.wandb_run_ids
+            )
+        else:
+            lines.append("None.")
         if self.error_tail:
             lines.extend(
                 [

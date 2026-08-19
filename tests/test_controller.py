@@ -31,6 +31,7 @@ from senpai_agent.supervisor import ProgressLease, WorkerLease
 from senpai_agent.system_instructions import SenpaiSystemInstructions
 from senpai_agent.workspace import WorkspaceDivergence
 from test_agent_markdown import HTML_HEADER
+from event_payloads import event_payload
 
 
 CONVERSATION_ID = UUID("00000000-0000-0000-0000-000000000001")
@@ -97,7 +98,7 @@ def review_event(number=17):
     return ControllerEvent(
         kind="review_ready",
         dedupe_key=f"review_ready:{number}:abc",
-        payload={"number": number},
+        payload=event_payload("review_ready", number=number),
     )
 
 
@@ -105,7 +106,11 @@ def human_event(message_id=101):
     return ControllerEvent(
         kind="human_issue",
         dedupe_key=f"human_issue:1:{message_id}",
-        payload={"number": 1, "human_message_id": message_id},
+        payload=event_payload(
+            "human_issue",
+            number=1,
+            human_message_id=message_id,
+        ),
     )
 
 
@@ -150,11 +155,11 @@ def research_base_event(current_sha="def"):
     return ControllerEvent(
         kind="research_base_changed",
         dedupe_key=f"research_base_changed:17:abc:{current_sha}",
-        payload={
-            "number": 17,
-            "required_base_sha": "abc",
-            "current_base_sha": current_sha,
-        },
+        payload=event_payload(
+            "research_base_changed",
+            required_base_sha="abc",
+            current_base_sha=current_sha,
+        ),
     )
 
 
@@ -650,7 +655,10 @@ def test_fast_poll_defaults_to_ten_minute_level_trigger_reminders(monkeypatch):
             ControllerEvent(
                 kind="student_assignment_comment",
                 dedupe_key="student_assignment_comment:v2:message-1",
-                payload={"comment_id": "message-1"},
+                payload=event_payload(
+                    "student_assignment_comment",
+                    comment_id="message-1",
+                ),
             ),
             id="student-comment",
         ),
@@ -690,7 +698,11 @@ def test_student_assignment_comment_is_not_replayed_after_restart(tmp_path: Path
     event = ControllerEvent(
         kind="student_assignment_comment",
         dedupe_key="student_assignment_comment:v2:message-1",
-        payload={"comment_id": "message-1", "message": "STUDENT: Running."},
+        payload=event_payload(
+            "student_assignment_comment",
+            comment_id="message-1",
+            message="STUDENT: Running.",
+        ),
     )
     inbox_path = tmp_path / "inbox.sqlite3"
 
@@ -714,12 +726,20 @@ def test_visible_event_identity_cannot_change_payload_between_polls(tmp_path: Pa
     first = ControllerEvent(
         kind="student_assignment_comment",
         dedupe_key="student_assignment_comment:v2:message-1",
-        payload={"comment_id": "message-1", "message": "STUDENT: Running."},
+        payload=event_payload(
+            "student_assignment_comment",
+            comment_id="message-1",
+            message="STUDENT: Running.",
+        ),
     )
     edited = ControllerEvent(
         kind=first.kind,
         dedupe_key=first.dedupe_key,
-        payload={"comment_id": "message-1", "message": "STUDENT: Changed."},
+        payload=event_payload(
+            "student_assignment_comment",
+            comment_id="message-1",
+            message="STUDENT: Changed.",
+        ),
     )
 
     with pytest.raises(RuntimeError, match="reused with a different payload"):
@@ -951,10 +971,10 @@ def student_assignment_event():
     return ControllerEvent(
         kind="student_assignment",
         dedupe_key="student_assignment:assignment-17:revision-2:base:head",
-        payload={
-            "assignment_id": "assignment-17",
-            "revision_id": "revision-2",
-        },
+        payload=event_payload(
+            "student_assignment",
+            revision_id="revision-2",
+        ),
     )
 
 
@@ -1059,7 +1079,11 @@ def test_new_feedback_passes_through_an_unchanged_workspace_divergence():
     feedback = ControllerEvent(
         kind="student_pr_feedback",
         dedupe_key="student_pr_feedback:issue_comment:17:101",
-        payload={"message": "Use the accepted base."},
+        payload=event_payload(
+            "student_pr_feedback",
+            revision_id="revision-2",
+            message="Use the accepted base.",
+        ),
     )
     conflict = WorkspaceDivergence(
         head_ref="student/candidate",
@@ -1150,18 +1174,18 @@ def test_feedback_polled_after_a_turn_is_processed_in_the_next_turn():
     assignment = ControllerEvent(
         kind="student_assignment",
         dedupe_key="student_assignment:assignment-17:revision-2",
-        payload={
-            "assignment_id": "assignment-17",
-            "revision_id": "revision-2",
-        },
+        payload=event_payload(
+            "student_assignment",
+            revision_id="revision-2",
+        ),
     )
     feedback = ControllerEvent(
         kind="student_pr_feedback",
         dedupe_key="student_pr_feedback:issue_comment:17:101",
-        payload={
-            "assignment_id": "assignment-17",
-            "revision_id": "revision-2",
-        },
+        payload=event_payload(
+            "student_pr_feedback",
+            revision_id="revision-2",
+        ),
     )
     mailbox = Mailbox([(assignment,), (feedback,)])
     turns = Turns(
@@ -1190,16 +1214,19 @@ def test_initial_assignment_precedes_feedback_when_the_batch_splits():
     assignment = ControllerEvent(
         kind=base_assignment.kind,
         dedupe_key=base_assignment.dedupe_key,
-        payload={**base_assignment.payload, "brief": "x" * (70 * 1024)},
+        payload={
+            **base_assignment.payload,
+            "blockers": ["x" * (70 * 1024)],
+        },
     )
     feedback = ControllerEvent(
         kind="student_pr_feedback",
         dedupe_key="student_pr_feedback:issue_comment:17:101",
-        payload={
-            "assignment_id": "assignment-17",
-            "revision_id": "revision-2",
-            "message": "Apply this after reading the assignment.",
-        },
+        payload=event_payload(
+            "student_pr_feedback",
+            revision_id="revision-2",
+            message="Apply this after reading the assignment.",
+        ),
     )
     turns = Turns()
 
@@ -1291,11 +1318,11 @@ def test_new_feedback_waits_behind_a_quarantined_student():
     feedback = ControllerEvent(
         kind="student_pr_feedback",
         dedupe_key="student_pr_feedback:issue_comment:17:101",
-        payload={
-            "assignment_id": "assignment-17",
-            "revision_id": "revision-2",
-            "message": "Try the narrower experiment next.",
-        },
+        payload=event_payload(
+            "student_pr_feedback",
+            revision_id="revision-2",
+            message="Try the narrower experiment next.",
+        ),
     )
     mailbox = Mailbox(((feedback,), ()))
     turns = Turns()
@@ -1400,7 +1427,10 @@ def test_restart_continues_a_conversation_after_its_first_success(tmp_path: Path
                     ControllerEvent(
                         kind="training_monitor",
                         dedupe_key="training:finished",
-                        payload={"conversation_id": str(conversation_id)},
+                        payload=event_payload(
+                            "training_monitor",
+                            conversation_id=str(conversation_id),
+                        ),
                     ),
                 ),
                 (),

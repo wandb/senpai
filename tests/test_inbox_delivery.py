@@ -22,6 +22,7 @@ from senpai_agent.inbox import (
     turn_has_finished_response,
 )
 from senpai_agent.mailbox import ControllerEvent
+from event_payloads import event_payload
 
 
 CONVERSATION_ID = UUID("00000000-0000-0000-0000-000000000017")
@@ -135,7 +136,7 @@ def test_event_identity_cannot_hide_a_changed_payload(tmp_path: Path):
         inbox.enqueue(CONVERSATION_ID, "event:1", "changed after acknowledgement")
 
 
-def test_event_renderer_cutover_accepts_only_the_equivalent_legacy_body(
+def test_event_renderer_cutover_accepts_only_the_equivalent_pre_markdown_body(
     tmp_path: Path,
 ):
     """A restart keeps an attached v1 message and uses v2 for later reminders."""
@@ -150,33 +151,36 @@ def test_event_renderer_cutover_accepts_only_the_equivalent_legacy_body(
             "head_sha": "abc",
         },
     )
-    legacy_body = event.to_legacy_prompt()
+    pre_markdown_body = event.to_pre_markdown_prompt()
     markdown_body = event.to_prompt()
-    assert legacy_body != markdown_body
+    assert pre_markdown_body != markdown_body
 
-    assert inbox.enqueue(CONVERSATION_ID, event.dedupe_key, legacy_body) is True
+    assert (
+        inbox.enqueue(CONVERSATION_ID, event.dedupe_key, pre_markdown_body)
+        is True
+    )
     turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert turn is not None
     inbox.close()
     with sqlite3.connect(inbox.path) as database:
         database.execute(
-            "ALTER TABLE inbox_messages DROP COLUMN payload_identity_sha256"
+            "ALTER TABLE inbox_messages DROP COLUMN event_identity_sha256"
         )
     inbox = PersistentInbox(inbox.path)
 
-    inbox.require_event_payload(
+    inbox.require_event_identity(
         CONVERSATION_ID,
         event.dedupe_key,
         markdown_body,
-        accepted_historical_bodies=(legacy_body,),
-        payload_identity=event.payload_identity(),
+        pre_markdown_body=pre_markdown_body,
+        event_identity=event.event_identity(),
     )
     with sqlite3.connect(inbox.path) as database:
         identity_sha256 = database.execute(
-            "SELECT payload_identity_sha256 FROM inbox_messages"
+            "SELECT event_identity_sha256 FROM inbox_messages"
         ).fetchone()[0]
     assert identity_sha256 == hashlib.sha256(
-        event.payload_identity().encode()
+        event.event_identity().encode()
     ).hexdigest()
 
     assert (
@@ -184,12 +188,12 @@ def test_event_renderer_cutover_accepts_only_the_equivalent_legacy_body(
             CONVERSATION_ID,
             event.dedupe_key,
             markdown_body,
-            accepted_historical_bodies=(legacy_body,),
-            payload_identity=event.payload_identity(),
+            pre_markdown_body=pre_markdown_body,
+            event_identity=event.event_identity(),
         )
         is False
     )
-    assert inbox.turn(turn.turn_id).events[0].body == legacy_body
+    assert inbox.turn(turn.turn_id).events[0].body == pre_markdown_body
 
     changed = ControllerEvent(
         kind=event.kind,
@@ -201,8 +205,8 @@ def test_event_renderer_cutover_accepts_only_the_equivalent_legacy_body(
             CONVERSATION_ID,
             changed.dedupe_key,
             changed.to_prompt(),
-            accepted_historical_bodies=(changed.to_legacy_prompt(),),
-            payload_identity=changed.payload_identity(),
+            pre_markdown_body=changed.to_pre_markdown_prompt(),
+            event_identity=changed.event_identity(),
         )
 
     deliver_turn_messages(Conversation(), inbox, turn.turn_id)
@@ -214,8 +218,8 @@ def test_event_renderer_cutover_accepts_only_the_equivalent_legacy_body(
             CONVERSATION_ID,
             event.dedupe_key,
             markdown_body,
-            accepted_historical_bodies=(legacy_body,),
-            payload_identity=event.payload_identity(),
+            pre_markdown_body=pre_markdown_body,
+            event_identity=event.event_identity(),
         )
         is True
     )
@@ -231,16 +235,10 @@ def test_event_identity_includes_fields_hidden_from_the_markdown_view(
     original = ControllerEvent(
         kind="workspace_diverged",
         dedupe_key="workspace_diverged:stable-key",
-        payload={
-            "head_ref": "student/experiment",
-            "expected_remote_head": "abc",
-            "preserved_local_head": "def",
-            "base_ref": "main",
-            "base_sha": "123",
-            "current_branch": "student/experiment",
-            "worktree_fingerprint": "fingerprint-one",
-            "instructions": "Reconcile the workspace.",
-        },
+        payload=event_payload(
+            "workspace_diverged",
+            worktree_fingerprint="fingerprint-one",
+        ),
     )
     changed = ControllerEvent(
         kind=original.kind,
@@ -249,13 +247,13 @@ def test_event_identity_includes_fields_hidden_from_the_markdown_view(
     )
     assert original.to_prompt() == changed.to_prompt()
 
-    legacy_body = original.to_legacy_prompt()
+    pre_markdown_body = original.to_pre_markdown_prompt()
     assert inbox.enqueue(
         CONVERSATION_ID,
         original.dedupe_key,
         original.to_prompt(),
-        accepted_historical_bodies=(legacy_body,),
-        payload_identity=original.payload_identity(),
+        pre_markdown_body=pre_markdown_body,
+        event_identity=original.event_identity(),
     )
 
     with pytest.raises(RuntimeError, match="reused with a different payload"):
@@ -263,12 +261,63 @@ def test_event_identity_includes_fields_hidden_from_the_markdown_view(
             CONVERSATION_ID,
             changed.dedupe_key,
             changed.to_prompt(),
-            accepted_historical_bodies=(changed.to_legacy_prompt(),),
-            payload_identity=changed.payload_identity(),
+            pre_markdown_body=changed.to_pre_markdown_prompt(),
+            event_identity=changed.event_identity(),
         )
 
 
-def test_event_identity_is_independent_of_the_legacy_renderer(tmp_path: Path):
+def test_event_identity_migrates_the_intermediate_column_name(tmp_path: Path):
+    path = tmp_path / "inbox.sqlite3"
+    original = ControllerEvent(
+        kind="workspace_diverged",
+        dedupe_key="workspace_diverged:stable-key",
+        payload=event_payload(
+            "workspace_diverged",
+            worktree_fingerprint="fingerprint-one",
+        ),
+    )
+    inbox = PersistentInbox(path)
+    inbox.enqueue(
+        CONVERSATION_ID,
+        original.dedupe_key,
+        original.to_prompt(),
+        pre_markdown_body=original.to_pre_markdown_prompt(),
+        event_identity=original.event_identity(),
+    )
+    inbox.close()
+    with sqlite3.connect(path) as database:
+        database.execute(
+            "ALTER TABLE inbox_messages RENAME COLUMN "
+            "event_identity_sha256 TO payload_identity_sha256"
+        )
+
+    reopened = PersistentInbox(path)
+    changed = ControllerEvent(
+        kind=original.kind,
+        dedupe_key=original.dedupe_key,
+        payload={**original.payload, "worktree_fingerprint": "fingerprint-two"},
+    )
+    assert original.to_prompt() == changed.to_prompt()
+    with pytest.raises(RuntimeError, match="reused with a different payload"):
+        reopened.enqueue(
+            CONVERSATION_ID,
+            changed.dedupe_key,
+            changed.to_prompt(),
+            pre_markdown_body=changed.to_pre_markdown_prompt(),
+            event_identity=changed.event_identity(),
+        )
+
+    with sqlite3.connect(path) as database:
+        columns = {
+            row[1] for row in database.execute("PRAGMA table_info(inbox_messages)")
+        }
+    assert "event_identity_sha256" in columns
+    assert "payload_identity_sha256" not in columns
+
+
+def test_event_identity_is_independent_of_the_pre_markdown_renderer(
+    tmp_path: Path,
+):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
     original = ControllerEvent(
         kind="student_available_for_assignment",
@@ -280,14 +329,14 @@ def test_event_identity_is_independent_of_the_legacy_renderer(tmp_path: Path):
         dedupe_key=original.dedupe_key,
         payload={"student": "Fern", "generation": 2},
     )
-    assert original.to_legacy_prompt() == changed.to_legacy_prompt()
+    assert original.to_pre_markdown_prompt() == changed.to_pre_markdown_prompt()
 
     assert inbox.enqueue(
         CONVERSATION_ID,
         original.dedupe_key,
         original.to_prompt(),
-        accepted_historical_bodies=(original.to_legacy_prompt(),),
-        payload_identity=original.payload_identity(),
+        pre_markdown_body=original.to_pre_markdown_prompt(),
+        event_identity=original.event_identity(),
     )
 
     with pytest.raises(RuntimeError, match="reused with a different payload"):
@@ -295,8 +344,8 @@ def test_event_identity_is_independent_of_the_legacy_renderer(tmp_path: Path):
             CONVERSATION_ID,
             changed.dedupe_key,
             changed.to_prompt(),
-            accepted_historical_bodies=(changed.to_legacy_prompt(),),
-            payload_identity=changed.payload_identity(),
+            pre_markdown_body=changed.to_pre_markdown_prompt(),
+            event_identity=changed.event_identity(),
         )
 
 

@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from senpai_agent.model_markdown import (
     canonical_event_identity,
     render_event_prompt,
-    render_legacy_event_prompt,
+    render_pre_markdown_event_prompt,
 )
 
 
@@ -36,10 +36,10 @@ class LocalEvent(BaseModel):
     def to_inbox_message(self) -> str:
         return render_event_prompt(self.kind, self.payload)
 
-    def to_legacy_inbox_message(self) -> str:
-        return render_legacy_event_prompt(self.kind, self.payload)
+    def to_pre_markdown_inbox_message(self) -> str:
+        return render_pre_markdown_event_prompt(self.kind, self.payload)
 
-    def payload_identity(self) -> str:
+    def event_identity(self) -> str:
         return canonical_event_identity(self.kind, self.payload)
 
 

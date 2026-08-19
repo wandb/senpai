@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 import senpai_agent.PROMPTS as prompts
+from event_payloads import event_payload
 
 
 def test_prompt_module_defines_nonempty_uppercase_strings():
@@ -52,18 +53,13 @@ def test_pr_feedback_preserves_the_message_inside_a_named_boundary():
 
     rendered = prompts.render_event_prompt(
         "student_pr_feedback",
-        {
-            "number": 4629,
-            "pr_url": "https://github.com/acme/repo/pull/4629",
-            "message": message,
-            "assignment_id": "assignment-17",
-            "revision_id": "initial",
-            "feedback_type": "issue_comment",
-            "feedback_id": 5344,
-            "author": "morgan",
-            "author_association": "OWNER",
-            "created_at": "2026-08-19T15:49:43Z",
-        },
+        event_payload(
+            "student_pr_feedback",
+            number=4629,
+            pr_url="https://github.com/acme/repo/pull/4629",
+            message=message,
+            author="morgan",
+        ),
     )
 
     assert rendered == (
@@ -75,12 +71,19 @@ def test_pr_feedback_preserves_the_message_inside_a_named_boundary():
         "- Assignment: `assignment-17`\n"
         "- Revision: `initial`\n"
         "- Pull request: [#4629](<https://github.com/acme/repo/pull/4629>)\n\n"
+        "### Repository State\n\n"
+        "- Base: `research/main`\n"
+        "- Base commit: `base-sha`\n"
+        "- Assignment branch: `student/experiment`\n"
+        "- Remote head: `abc`\n\n"
         "### Source\n\n"
         "- Type: `issue_comment`\n"
         "- Feedback ID: `5344`\n"
         "- Author: `morgan`\n"
         "- Author association: `OWNER`\n"
-        "- Created: `2026-08-19T15:49:43Z`"
+        "- Created: `2026-08-19T15:49:43Z`\n"
+        "- Feedback URL (`feedback_url`): "
+        "[Open feedback](<https://github.test/pull/17#issuecomment-5344>)"
     )
     assert "Required Action" not in rendered
     assert "Constraints" not in rendered
@@ -95,21 +98,27 @@ def test_pr_feedback_preserves_the_message_inside_a_named_boundary():
             "PR Feedback",
             None,
             "pr-feedback",
-            {"message": "Review this exact result."},
+            event_payload(
+                "student_pr_feedback",
+                message="Review this exact result.",
+            ),
         ),
         (
             "human_issue",
             "Human Issue",
             "Human Message:",
             "human-message",
-            {"message": "Please inspect the run."},
+            event_payload("human_issue", message="Please inspect the run."),
         ),
         (
             "student_assignment_comment",
             "Student Progress Comment",
             "Student Message:",
             "student-message",
-            {"message": "The run has started."},
+            event_payload(
+                "student_assignment_comment",
+                message="The run has started.",
+            ),
         ),
     ],
 )
@@ -203,14 +212,19 @@ def test_unknown_event_extends_its_json_fence_for_embedded_backticks():
     assert rendered.endswith("\n````")
 
 
+def test_known_event_requires_its_complete_producer_payload():
+    with pytest.raises(KeyError, match="assignment_id"):
+        prompts.render_event_prompt("student_assignment", {"blockers": []})
+
+
 def test_event_links_encode_markdown_delimiters_in_urls():
     rendered = prompts.render_event_prompt(
         "student_pr_feedback",
-        {
-            "number": 17,
-            "pr_url": "https://good.test/)[Injected](https://evil.test)",
-            "message": "Review this.",
-        },
+        event_payload(
+            "student_pr_feedback",
+            pr_url="https://good.test/)[Injected](https://evil.test)",
+            message="Review this.",
+        ),
     )
 
     assert (
@@ -224,44 +238,72 @@ def test_event_links_encode_markdown_delimiters_in_urls():
 @pytest.mark.parametrize(
     ("kind", "payload", "heading"),
     [
-        ("student_assignment", {"blockers": []}, "## Student Assignment"),
+        (
+            "student_assignment",
+            event_payload("student_assignment"),
+            "## Student Assignment",
+        ),
         (
             "malformed_assignment",
-            {"error": "invalid marker"},
+            event_payload("malformed_assignment"),
             "## Malformed Student Assignment",
         ),
-        ("student_pr_feedback", {"message": "Review."}, "## PR Feedback"),
-        ("human_issue", {"message": "Inspect."}, "## Human Issue"),
+        (
+            "student_pr_feedback",
+            event_payload("student_pr_feedback"),
+            "## PR Feedback",
+        ),
+        ("human_issue", event_payload("human_issue"), "## Human Issue"),
         (
             "student_assignment_comment",
-            {"message": "Run started."},
+            event_payload("student_assignment_comment"),
             "## Student Progress Comment",
         ),
-        ("review_ready", {}, "## Pull Request Ready for Review"),
-        ("advisor_action", {"reasons": []}, "## Advisor Action Required"),
+        (
+            "review_ready",
+            event_payload("review_ready"),
+            "## Pull Request Ready for Review",
+        ),
+        (
+            "advisor_action",
+            event_payload("advisor_action"),
+            "## Advisor Action Required",
+        ),
         (
             "student_available_for_assignment",
-            {"student": "Fern"},
+            event_payload("student_available_for_assignment"),
             "## Student available for assignment: `Fern`",
         ),
         (
             "duplicate_assignment",
-            {"pull_requests": []},
+            event_payload("duplicate_assignment"),
             "## Student Has Multiple Active Assignments",
         ),
-        ("research_base_changed", {}, "## Research Base Changed"),
+        (
+            "research_base_changed",
+            event_payload("research_base_changed"),
+            "## Research Base Changed",
+        ),
         (
             "training_monitor",
-            {"signal": {"kind": "metric_gate"}},
+            event_payload("training_monitor"),
             "## Training Metric Gate",
         ),
         (
             "workspace_diverged",
-            {},
+            event_payload("workspace_diverged"),
             "## Workspace Requires Manual Reconciliation",
         ),
-        ("agent_result", {"result": "Done."}, "## Delegated Task Completed"),
-        ("agent_error", {"error": "Failed."}, "## Delegated Task Failed"),
+        (
+            "agent_result",
+            event_payload("agent_result"),
+            "## Delegated Task Completed",
+        ),
+        (
+            "agent_error",
+            event_payload("agent_error"),
+            "## Delegated Task Failed",
+        ),
     ],
 )
 def test_every_production_event_has_a_named_markdown_renderer(

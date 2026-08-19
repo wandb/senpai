@@ -23,6 +23,7 @@ from senpai_agent.inbox import DeliveryState, PersistentInbox, deliver_turn_mess
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.state import AssignmentConversationRegistry
+from event_payloads import event_payload
 
 
 @dataclass(frozen=True)
@@ -45,11 +46,11 @@ def feedback_event(revision_id="revision-2"):
     return ControllerEvent(
         kind="student_pr_feedback",
         dedupe_key=f"student_pr_feedback:issue_comment:17:{revision_id}",
-        payload={
-            "assignment_id": "assignment-17",
-            "revision_id": revision_id,
-            "message": f"Feedback for {revision_id}.",
-        },
+        payload=event_payload(
+            "student_pr_feedback",
+            revision_id=revision_id,
+            message=f"Feedback for {revision_id}.",
+        ),
     )
 
 
@@ -57,11 +58,10 @@ def human_issue_event():
     return ControllerEvent(
         kind="human_issue",
         dedupe_key="human_issue:v2:23:702:abc",
-        payload={
-            "number": 23,
-            "human_message_id": 702,
-            "message": "Stop and inspect the active experiment.",
-        },
+        payload=event_payload(
+            "human_issue",
+            message="Stop and inspect the active experiment.",
+        ),
     )
 
 
@@ -69,7 +69,7 @@ def advisor_event(number=17):
     return ControllerEvent(
         kind="review_ready",
         dedupe_key=f"review_ready:{number}:abc",
-        payload={"number": number},
+        payload=event_payload("review_ready", number=number),
     )
 
 

@@ -99,14 +99,6 @@ AWAIT_AGENTS_SATISFIED_PROMPT = """Use the returned state now; unfinished siblin
 
 AWAIT_AGENTS_TIMEOUT_PROMPT = """The tasks keep running. Continue useful parent work, inspect later with agent_status, or use join='change' for the next bounded wait; repeating the same long all-results wait will block on the same unfinished tasks."""
 
-DELEGATED_TASK_FINISHED_PROMPT = """## Delegated Task Completed
-
-- Task ID: `{{TASK_ID}}`
-
-### Agent Response:
-
-{{AGENT_RESPONSE}}"""
-
 DELEGATED_TASK_BACKGROUND_PROMPT = """Subagent task {{TASK_ID}} is running in the background. Its result or error will arrive as a durable local event."""
 
 DELEGATE_AGENT_DEPRECATION_PROMPT = """delegate_agent is deprecated and cannot launch an agent. Use spawn_agents with a stable batch_key, then pass its task IDs to await_agents."""

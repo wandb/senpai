@@ -8,6 +8,7 @@ from senpai_agent.state import (
     AssignmentConversationRegistry,
     StudentConversationSelector,
 )
+from event_payloads import event_payload
 
 
 class Mailbox:
@@ -87,14 +88,22 @@ def test_local_child_events_are_delivered_directly_to_each_parent(tmp_path: Path
             LocalEvent(
                 kind="agent_result",
                 dedupe_key="agent_result:first",
-                payload={"parent_conversation_id": str(first_parent)},
+                payload=event_payload(
+                    "agent_result",
+                    task_id="first",
+                    parent_conversation_id=str(first_parent),
+                ),
             )
         )
         store.enqueue(
             LocalEvent(
                 kind="agent_result",
                 dedupe_key="agent_result:second",
-                payload={"parent_conversation_id": str(second_parent)},
+                payload=event_payload(
+                    "agent_result",
+                    task_id="second",
+                    parent_conversation_id=str(second_parent),
+                ),
             )
         )
 
@@ -129,23 +138,26 @@ def test_assignment_feedback_and_monitor_wake_share_the_assignment_uuid(
         ControllerEvent(
             kind="student_assignment",
             dedupe_key="student_assignment:assignment-17:revision-2",
-            payload={
-                "assignment_id": "assignment-17",
-                "revision_id": "revision-2",
-            },
+            payload=event_payload(
+                "student_assignment",
+                revision_id="revision-2",
+            ),
         ),
         ControllerEvent(
             kind="student_pr_feedback",
             dedupe_key="student_pr_feedback:issue_comment:17:101",
-            payload={
-                "assignment_id": "assignment-17",
-                "revision_id": "revision-2",
-            },
+            payload=event_payload(
+                "student_pr_feedback",
+                revision_id="revision-2",
+            ),
         ),
         ControllerEvent(
             kind="training_monitor",
             dedupe_key="training_monitor:run-1:finished",
-            payload={"conversation_id": str(conversation_id)},
+            payload=event_payload(
+                "training_monitor",
+                conversation_id=str(conversation_id),
+            ),
         ),
     )
 
@@ -164,15 +176,20 @@ def test_controller_partitions_and_acknowledges_events_by_conversation(
     first_event = ControllerEvent(
         kind="training_monitor",
         dedupe_key="monitor:first",
-        payload={"conversation_id": str(first), "summary": "first only"},
+        payload=event_payload(
+            "training_monitor",
+            conversation_id=str(first),
+            summary="first only",
+        ),
     )
     second_event = ControllerEvent(
         kind="agent_result",
         dedupe_key="child:second",
-        payload={
-            "parent_conversation_id": str(second),
-            "summary": "second only",
-        },
+        payload=event_payload(
+            "agent_result",
+            task_id="second",
+            parent_conversation_id=str(second),
+        ),
     )
     mailbox = Mailbox((first_event, second_event))
     turns = Turns()
@@ -196,12 +213,12 @@ def test_failed_conversation_does_not_ack_or_starve_another(tmp_path: Path):
     first_event = ControllerEvent(
         kind="training_monitor",
         dedupe_key="monitor:first",
-        payload={"conversation_id": str(first)},
+        payload=event_payload("training_monitor", conversation_id=str(first)),
     )
     second_event = ControllerEvent(
         kind="training_monitor",
         dedupe_key="monitor:second",
-        payload={"conversation_id": str(second)},
+        payload=event_payload("training_monitor", conversation_id=str(second)),
     )
     mailbox = Mailbox((first_event, second_event))
     turns = Turns((1, 0))
@@ -219,14 +236,23 @@ def test_bounded_backlog_yields_to_another_ready_conversation(tmp_path: Path):
         ControllerEvent(
             kind="agent_result",
             dedupe_key=f"first:{index}",
-            payload={"parent_conversation_id": str(first), "index": index},
+            payload=event_payload(
+                "agent_result",
+                task_id=f"first-{index}",
+                parent_conversation_id=str(first),
+                index=index,
+            ),
         )
         for index in range(20)
     )
     other = ControllerEvent(
         kind="agent_result",
         dedupe_key="second:0",
-        payload={"parent_conversation_id": str(second)},
+        payload=event_payload(
+            "agent_result",
+            task_id="second",
+            parent_conversation_id=str(second),
+        ),
     )
     turns = Turns()
 
