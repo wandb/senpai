@@ -36,6 +36,16 @@ _JOIN_SECONDS = 120.0
 EXECUTOR_SOCKET_ENV = "SENPAI_KUBERNETES_EXECUTOR_SOCKET"
 
 
+class KubernetesApiError(RuntimeError):
+    """Kubernetes API response failure with its HTTP status preserved."""
+
+    def __init__(self, method: str, path: str, status_code: int):
+        super().__init__(
+            f"Kubernetes API {method} {path.split('?')[0]} failed: HTTP {status_code}"
+        )
+        self.status_code = status_code
+
+
 class TrainingClusterClient(Protocol):
     def reserve(
         self,
@@ -422,9 +432,7 @@ class KubernetesApiClient:
         except urllib.error.HTTPError as error:
             if allow_not_found and error.code == 404:
                 return ""
-            raise RuntimeError(
-                f"Kubernetes API {method} {path.split('?')[0]} failed: HTTP {error.code}"
-            ) from error
+            raise KubernetesApiError(method, path, error.code) from error
 
 
 def _workload_shape(document: dict) -> tuple[int, int]:

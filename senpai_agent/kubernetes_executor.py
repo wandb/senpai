@@ -20,6 +20,7 @@ import yaml
 
 from senpai_agent.kubernetes_training import (
     EXECUTOR_SOCKET_ENV,
+    KubernetesApiError,
     KubernetesApiClient,
     KubernetesExecutorClient,
     _workload_shape,
@@ -35,6 +36,7 @@ _TRAINING_RESOURCE_NAMES = {"cpu", "memory", "nvidia.com/gpu"}
 _SOURCE_BUNDLE_MOUNT = "/var/lib/senpai-source/source.bundle"
 _WORKSPACE_MOUNT = "/workspace"
 _WORKSPACE_VOLUME = "senpai-workspace"
+_AMBIGUOUS_CREATE_STATUS_CODES = {409, 499}
 
 
 class KubernetesExecutor:
@@ -135,8 +137,8 @@ class KubernetesExecutor:
                 resource = self._current_resource()
             if resource is None and self._reservation.get("create_attempted"):
                 try:
-                    resource = self._record_created(
-                        self.client.create(self._reservation["manifest"], self.namespace)
+                    resource = self._create_reserved_workload(
+                        release_on_rejection=False
                     )
                 except Exception:
                     resource = self._current_resource()
@@ -250,15 +252,35 @@ class KubernetesExecutor:
             raise ValueError("training manifest annotations do not match reserved evidence")
 
         self._secure_manifest(manifest, reservation)
+        release_on_rejection = not reservation["create_attempted"]
         reservation["create_attempted"] = True
         reservation["manifest"] = manifest
         self._write_state()
-        created = self.client.create(manifest, self.namespace)
-        resource = self._record_created(created)
+        resource = self._create_reserved_workload(
+            release_on_rejection=release_on_rejection
+        )
         reservation["activation_authorized"] = True
         self._write_state()
         self._activate(resource)
         return f"{resource.kind.lower()}/{resource.name} created\n"
+
+    def _create_reserved_workload(
+        self,
+        *,
+        release_on_rejection: bool,
+    ) -> KubernetesResourceRef:
+        reservation = self._require_reservation(active=True)
+        try:
+            created = self.client.create(reservation["manifest"], self.namespace)
+        except KubernetesApiError as error:
+            if release_on_rejection and 400 <= error.status_code < 500 and (
+                error.status_code not in _AMBIGUOUS_CREATE_STATUS_CODES
+            ):
+                reservation["manifest"] = None
+                reservation["released"] = True
+                self._write_state()
+            raise
+        return self._record_created(created)
 
     def _activate(self, resource: KubernetesResourceRef) -> None:
         reservation = self._require_reservation()
@@ -575,9 +597,26 @@ class KubernetesExecutor:
             ]
             if nested_workspace_mounts:
                 raise ValueError("training containers may not shadow the Senpai workspace")
-            container["volumeMounts"] = [
+            mounts = [
                 mount for mount in mounts if mount.get("mountPath") != _WORKSPACE_MOUNT
             ] + [{"name": _WORKSPACE_VOLUME, "mountPath": _WORKSPACE_MOUNT}]
+            container["volumeMounts"] = mounts
+            if _container_gpu(container, "requests") or _container_gpu(
+                container, "limits"
+            ):
+                dataset_mounts = [
+                    mount
+                    for mount in mounts
+                    if mount.get("name") == dataset_volume["name"]
+                ]
+                if not dataset_mounts:
+                    raise ValueError(
+                        "every GPU training container must mount the dataset PVC"
+                    )
+                if all(mount.get("readOnly") is True for mount in dataset_mounts):
+                    raise ValueError(
+                        "GPU training containers must mount the dataset PVC read-write"
+                    )
 
         pod_spec["initContainers"] = [
             {
