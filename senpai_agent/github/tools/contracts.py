@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from typing import Literal, Self
 
@@ -11,6 +10,7 @@ from openhands.sdk.tool import Action, Observation
 from pydantic import BaseModel, ConfigDict, Field
 
 from senpai_agent.github.workflow import MutationResult
+from senpai_agent.model_markdown import inline_code, markdown_url, yes_no
 from senpai_agent.models import ExperimentResult
 
 
@@ -279,12 +279,13 @@ class GitHubMutationObservation(Observation):
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
-        return [
-            TextContent(
-                text=json.dumps(
-                    self.model_dump(mode="json"),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
+        lines = [
+            "## GitHub Update",
+            "",
+            f"- State: {inline_code(self.state)}",
+            f"- Changed: {yes_no(self.changed)}",
+            f"- Resource: <{markdown_url(self.resource_url)}>",
         ]
+        if self.version is not None:
+            lines.append(f"- Version: {inline_code(self.version)}")
+        return [TextContent(text="\n".join(lines))]

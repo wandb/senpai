@@ -11,7 +11,11 @@ from uuid import UUID
 
 from senpai_agent.inbox import PersistentInbox
 from senpai_agent.local_events import LocalEventStore
-from senpai_agent.PROMPTS import render_event_prompt
+from senpai_agent.model_markdown import (
+    canonical_event_identity,
+    render_event_prompt,
+    render_legacy_event_prompt,
+)
 
 
 _AVAILABILITY_EVENT_PREFIX = "student_available_for_assignment:"
@@ -24,12 +28,13 @@ class ControllerEvent:
     payload: dict[str, object]
 
     def to_prompt(self) -> str:
-        payload = {
-            key: value
-            for key, value in self.payload.items()
-            if key != "parent_conversation_id"
-        }
-        return render_event_prompt(self.kind, payload)
+        return render_event_prompt(self.kind, self.payload)
+
+    def to_legacy_prompt(self) -> str:
+        return render_legacy_event_prompt(self.kind, self.payload)
+
+    def payload_identity(self) -> str:
+        return canonical_event_identity(self.kind, self.payload)
 
 
 class Mailbox(Protocol):

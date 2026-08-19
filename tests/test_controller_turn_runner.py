@@ -159,7 +159,7 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
     assert len(messages) == 1
     assert "Feedback for revision-2." in messages[0]
     assert "Feedback for revision-3." not in messages[0]
-    assert str(conversation_id) in messages[0]
+    assert str(conversation_id) not in messages[0]
     assert result.delivered_event_keys == frozenset({current.dedupe_key})
     with LocalEventStore(state_dir / "student-events.sqlite3") as store:
         assert store.pending() == []

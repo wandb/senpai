@@ -34,6 +34,13 @@ from pydantic import BaseModel, Field, model_validator
 
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV
 from senpai_agent.local_events import LocalEvent, LocalEventStore
+from senpai_agent.model_markdown import (
+    inline_code,
+    tagged_block,
+    task_details,
+    task_table,
+    yes_no,
+)
 from senpai_agent.processes import terminate_process_group
 from senpai_agent.program_context import PROGRAM_PATH_ENV
 from senpai_agent.PROMPTS import (
@@ -604,7 +611,10 @@ class DelegateAgentObservation(Observation):
                     text=render_prompt(
                         DELEGATED_TASK_FINISHED_PROMPT,
                         TASK_ID=self.task_id,
-                        RESULT=self.result or "",
+                        AGENT_RESPONSE=tagged_block(
+                            "agent-response",
+                            self.result or "",
+                        ),
                     )
                 )
             ]
@@ -1646,7 +1656,14 @@ class SpawnAgentsObservation(Observation):
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
-        return [TextContent(text=json.dumps(self.model_dump(mode="json"), sort_keys=True))]
+        return [
+            TextContent(
+                text=_task_states_markdown(
+                    "Delegated Agent Tasks",
+                    self.tasks,
+                )
+            )
+        ]
 
 
 class AwaitAgentsAction(Action):
@@ -1696,8 +1713,26 @@ class AwaitAgentsObservation(Observation):
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
-        payload = self.model_dump(mode="json")
-        return [TextContent(text=json.dumps(payload, sort_keys=True))]
+        changed = (
+            ", ".join(inline_code(task_id) for task_id in self.changed_task_ids)
+            if self.changed_task_ids
+            else "None"
+        )
+        summary = [
+            f"- Join: {inline_code(self.join)}",
+            f"- Satisfied: {yes_no(self.satisfied)}",
+            f"- Timed out: {yes_no(self.timed_out)}",
+            f"- Waited: {self.waited_seconds:g} seconds",
+            f"- Changed tasks: {changed}",
+        ]
+        text = _task_states_markdown(
+            "Delegated Agent Wait",
+            self.tasks,
+            summary=summary,
+        )
+        if self.guidance:
+            text += f"\n\n### Guidance\n\n{self.guidance}"
+        return [TextContent(text=text)]
 
 
 class AgentStatusAction(Action):
@@ -1719,7 +1754,14 @@ class AgentStatusObservation(Observation):
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
-        return [TextContent(text=json.dumps(self.model_dump(mode="json"), sort_keys=True))]
+        return [
+            TextContent(
+                text=_task_states_markdown(
+                    "Delegated Agent Status",
+                    self.tasks,
+                )
+            )
+        ]
 
 
 class CancelAgentsAction(Action):
@@ -1740,7 +1782,30 @@ class CancelAgentsObservation(Observation):
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
-        return [TextContent(text=json.dumps(self.model_dump(mode="json"), sort_keys=True))]
+        return [
+            TextContent(
+                text=_task_states_markdown(
+                    "Delegated Agent Cancellation",
+                    self.tasks,
+                )
+            )
+        ]
+
+
+def _task_states_markdown(
+    title: str,
+    tasks: Sequence[AgentTaskState],
+    *,
+    summary: Sequence[str] = (),
+) -> str:
+    values = [task.model_dump(mode="json") for task in tasks]
+    sections = [f"## {title}"]
+    if summary:
+        sections.extend(["", *summary])
+    sections.extend(["", task_table(values)])
+    if details := task_details(values):
+        sections.extend(["", details])
+    return "\n".join(sections)
 
 
 def _require_unique_task_ids(task_ids: Sequence[str]) -> None:

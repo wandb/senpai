@@ -728,3 +728,9 @@ def test_long_feedback_keeps_actionable_head_tail_and_source_link(monkeypatch):
     assert event.payload["full_message_instruction"] == (
         "Open feedback_url to read the omitted text."
     )
+    rendered = event.to_prompt()
+    assert (
+        "### Full Feedback\n\n" + r"Open feedback\_url to read"
+        in rendered
+    )
+    assert "- Feedback URL (`feedback_url`): [Open feedback]" in rendered

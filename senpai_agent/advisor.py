@@ -200,6 +200,7 @@ class AdvisorEventPump:
         steer_generation = 0
         steer_active_run = False
         for event in pending:
+            legacy_message = event.to_legacy_inbox_message()
             mode = ADVISOR_ACTIVE_STEERING_PRIORITIES.get(event.kind)
             if mode is not None:
                 with self._steer_lock:
@@ -209,6 +210,8 @@ class AdvisorEventPump:
                         self._conversation_id,
                         event.dedupe_key,
                         event.to_inbox_message(),
+                        accepted_historical_bodies=(legacy_message,),
+                        payload_identity=event.payload_identity(),
                         priority=mode,
                     )
                     if steering is not None:
@@ -236,6 +239,8 @@ class AdvisorEventPump:
                     self._conversation_id,
                     event.dedupe_key,
                     event.to_inbox_message(),
+                    accepted_historical_bodies=(legacy_message,),
+                    payload_identity=event.payload_identity(),
                 )
             self._store.acknowledge(event.dedupe_key)
             transferred += 1

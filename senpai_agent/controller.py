@@ -525,10 +525,13 @@ class Controller:
             return
         for event in polled:
             if event.kind == "student_assignment_comment":
+                legacy_prompt = event.to_legacy_prompt()
                 self.inbox.require_event_payload(
                     self.conversation_id,
                     event.dedupe_key,
                     event.to_prompt(),
+                    accepted_historical_bodies=(legacy_prompt,),
+                    payload_identity=event.payload_identity(),
                 )
         events = self._new_events(
             polled,
@@ -576,11 +579,14 @@ class Controller:
                         self._clear_workspace_divergence(conversation_id)
             for event in batch_events:
                 steering_priority = STEERING_PRIORITIES.get(event.kind)
+                legacy_prompt = event.to_legacy_prompt()
                 if steering_priority is not None:
                     self.inbox.steer(
                         conversation_id,
                         event.dedupe_key,
                         event.to_prompt(),
+                        accepted_historical_bodies=(legacy_prompt,),
+                        payload_identity=event.payload_identity(),
                         priority=steering_priority,
                     )
                 else:
@@ -588,6 +594,8 @@ class Controller:
                         conversation_id,
                         event.dedupe_key,
                         event.to_prompt(),
+                        accepted_historical_bodies=(legacy_prompt,),
+                        payload_identity=event.payload_identity(),
                         priority=(
                             QUEUE_PRIORITY
                             if event.kind == "student_assignment"

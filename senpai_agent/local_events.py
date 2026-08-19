@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 import threading
 from collections.abc import Sequence
@@ -13,10 +12,10 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from senpai_agent.PROMPTS import (
-    LOCAL_EVENT_PROMPT,
+from senpai_agent.model_markdown import (
+    canonical_event_identity,
     render_event_prompt,
-    render_prompt,
+    render_legacy_event_prompt,
 )
 
 
@@ -32,22 +31,16 @@ class LocalEvent(BaseModel):
     observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     def to_user_message(self) -> str:
-        payload = json.dumps(self.payload, indent=2, sort_keys=True)
-        observed_at = self.observed_at.astimezone(UTC).isoformat()
-        return render_prompt(
-            LOCAL_EVENT_PROMPT,
-            KIND=self.kind,
-            OBSERVED_AT=observed_at,
-            PAYLOAD=payload,
-        )
+        return self.to_inbox_message()
 
     def to_inbox_message(self) -> str:
-        payload = {
-            key: value
-            for key, value in self.payload.items()
-            if key != "parent_conversation_id"
-        }
-        return render_event_prompt(self.kind, payload)
+        return render_event_prompt(self.kind, self.payload)
+
+    def to_legacy_inbox_message(self) -> str:
+        return render_legacy_event_prompt(self.kind, self.payload)
+
+    def payload_identity(self) -> str:
+        return canonical_event_identity(self.kind, self.payload)
 
 
 class LocalEventStore:

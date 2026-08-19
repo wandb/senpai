@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 from collections.abc import Sequence
@@ -38,6 +37,7 @@ from senpai_agent.delegation import (
 from senpai_agent.git_workflow import require_clean_training_worktree
 from senpai_agent.github.tools import GitHubWorkflowToolSet
 from senpai_agent.monitor import MetricGate, MonitorStore, TrainingMonitorSpec
+from senpai_agent.model_markdown import inline_code, tagged_block
 from senpai_agent.PROMPTS import MONITOR_TRAINING_STARTED_PROMPT, render_prompt
 from senpai_agent.training import (
     TrainingResult,
@@ -305,19 +305,41 @@ class TrainingResultObservation(Observation):
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
-        result = {
-            "training_id": self.training_id,
-            "state": self.state,
-            "pid": self.pid,
-            "exit_code": self.exit_code,
-            "elapsed_seconds": round(self.elapsed_seconds, 3),
-            "log_path": self.log_path,
-            "wandb_run_ids": self.wandb_run_ids,
-        }
+        lines = [
+            "## Training Status",
+            "",
+            f"- Training ID: {inline_code(self.training_id)}",
+            f"- State: {inline_code(self.state)}",
+        ]
+        if self.pid is not None:
+            lines.append(f"- Process ID: {inline_code(self.pid)}")
+        if self.exit_code is not None:
+            lines.append(f"- Exit code: {inline_code(self.exit_code)}")
+        lines.extend(
+            [
+                f"- Elapsed: {round(self.elapsed_seconds, 3)} seconds",
+                f"- Log: {inline_code(self.log_path)}",
+                "",
+                "### W&B Run IDs",
+                "",
+            ]
+        )
+        lines.extend(
+            [f"- {inline_code(run_id)}" for run_id in self.wandb_run_ids]
+            or ["None."]
+        )
         if self.error_tail:
-            result["error_tail"] = self.error_tail
-        text = json.dumps(result, separators=(",", ":"), default=str)
-        return [TextContent(text=text)]
+            lines.extend(
+                [
+                    "",
+                    "### Error Tail:",
+                    "",
+                    tagged_block("training-error", self.error_tail),
+                ]
+            )
+        else:
+            lines.extend(["", "No error output was reported."])
+        return [TextContent(text="\n".join(lines))]
 
 
 class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObservation]):

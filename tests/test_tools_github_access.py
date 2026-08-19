@@ -12,6 +12,7 @@ from senpai_agent.github import PRManifestEntry, PRRetrievalResult
 from senpai_agent.github.tools import (
     GetPRsAction,
     GetPRsTool,
+    GitHubMutationObservation,
     GitHubToolRuntime,
     GitHubWorkflowToolSet,
     RespondToHumanIssueAction,
@@ -55,6 +56,46 @@ def test_github_tools_package_preserves_public_contract_types():
 
     assert expected <= set(github_tools_module.__all__)
     assert expected <= set(dir(github_tools_module))
+
+
+@pytest.mark.parametrize(
+    ("version", "expected_suffix"),
+    [
+        ("a" * 40, f"\n- Version: `{'a' * 40}`"),
+        (None, ""),
+    ],
+)
+def test_github_mutation_result_renders_as_markdown(version, expected_suffix):
+    observation = GitHubMutationObservation(
+        changed=False,
+        resource_url="https://github.test/pull/17",
+        state="post_assignment_comment",
+        version=version,
+    )
+
+    assert observation.to_llm_content[0].text == (
+        "## GitHub Update\n\n"
+        "- State: `post_assignment_comment`\n"
+        "- Changed: No\n"
+        "- Resource: <https://github.test/pull/17>"
+        f"{expected_suffix}"
+    )
+
+
+def test_github_mutation_resource_cannot_inject_markdown():
+    observation = GitHubMutationObservation(
+        changed=True,
+        resource_url="https://good.test/)[Injected](https://evil.test)",
+        state="updated",
+    )
+
+    assert observation.to_llm_content[0].text == (
+        "## GitHub Update\n\n"
+        "- State: `updated`\n"
+        "- Changed: Yes\n"
+        "- Resource: "
+        "<https://good.test/%29%5BInjected%5D%28https://evil.test%29>"
+    )
 
 
 @pytest.mark.parametrize(

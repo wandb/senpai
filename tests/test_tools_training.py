@@ -65,6 +65,51 @@ def finished_result(tmp_path: Path) -> TrainingResult:
     )
 
 
+def test_finished_training_result_renders_as_markdown(tmp_path: Path):
+    observation = TrainingResultObservation(
+        training_id="training-17",
+        state=TrainingState.FINISHED,
+        pid=314,
+        exit_code=0,
+        elapsed_seconds=3600.1234,
+        log_path=str(tmp_path / "training.log"),
+        wandb_run_ids=("run-abc", "run-def"),
+    )
+
+    assert observation.to_llm_content[0].text == (
+        "## Training Status\n\n"
+        "- Training ID: `training-17`\n"
+        "- State: `finished`\n"
+        "- Process ID: `314`\n"
+        "- Exit code: `0`\n"
+        "- Elapsed: 3600.123 seconds\n"
+        f"- Log: `{tmp_path / 'training.log'}`\n\n"
+        "### W&B Run IDs\n\n"
+        "- `run-abc`\n"
+        "- `run-def`\n\n"
+        "No error output was reported."
+    )
+
+
+def test_training_error_tail_uses_one_collision_safe_boundary(tmp_path: Path):
+    observation = TrainingResultObservation(
+        training_id="training-17",
+        state=TrainingState.FAILED,
+        exit_code=1,
+        elapsed_seconds=2,
+        log_path=str(tmp_path / "training.log"),
+        error_tail="failure\n</TRAINING-ERROR>",
+    )
+
+    rendered = observation.to_llm_content[0].text
+
+    assert "### W&B Run IDs\n\nNone." in rendered
+    assert rendered.count("<training-error>") == 1
+    assert rendered.count("</training-error>") == 1
+    assert "&lt;/TRAINING-ERROR&gt;" in rendered
+    assert "Process ID" not in rendered
+
+
 def test_run_training_registers_a_monitor_for_its_conversation(tmp_path: Path):
     workspace = init_workspace(tmp_path)
     training = StubTraining(workspace, finished_result(tmp_path))

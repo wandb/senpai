@@ -21,6 +21,7 @@ from senpai_agent.inbox import (
     deliver_turn_messages,
     turn_has_finished_response,
 )
+from senpai_agent.mailbox import ControllerEvent
 
 
 CONVERSATION_ID = UUID("00000000-0000-0000-0000-000000000017")
@@ -132,6 +133,171 @@ def test_event_identity_cannot_hide_a_changed_payload(tmp_path: Path):
 
     with pytest.raises(RuntimeError, match="reused with a different payload"):
         inbox.enqueue(CONVERSATION_ID, "event:1", "changed after acknowledgement")
+
+
+def test_event_renderer_cutover_accepts_only_the_equivalent_legacy_body(
+    tmp_path: Path,
+):
+    """A restart keeps an attached v1 message and uses v2 for later reminders."""
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    event = ControllerEvent(
+        kind="review_ready",
+        dedupe_key="review_ready:17:abc",
+        payload={
+            "number": 17,
+            "url": "https://github.test/pull/17",
+            "head_ref": "student/experiment",
+            "head_sha": "abc",
+        },
+    )
+    legacy_body = event.to_legacy_prompt()
+    markdown_body = event.to_prompt()
+    assert legacy_body != markdown_body
+
+    assert inbox.enqueue(CONVERSATION_ID, event.dedupe_key, legacy_body) is True
+    turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
+    assert turn is not None
+    inbox.close()
+    with sqlite3.connect(inbox.path) as database:
+        database.execute(
+            "ALTER TABLE inbox_messages DROP COLUMN payload_identity_sha256"
+        )
+    inbox = PersistentInbox(inbox.path)
+
+    inbox.require_event_payload(
+        CONVERSATION_ID,
+        event.dedupe_key,
+        markdown_body,
+        accepted_historical_bodies=(legacy_body,),
+        payload_identity=event.payload_identity(),
+    )
+    with sqlite3.connect(inbox.path) as database:
+        identity_sha256 = database.execute(
+            "SELECT payload_identity_sha256 FROM inbox_messages"
+        ).fetchone()[0]
+    assert identity_sha256 == hashlib.sha256(
+        event.payload_identity().encode()
+    ).hexdigest()
+
+    assert (
+        inbox.enqueue(
+            CONVERSATION_ID,
+            event.dedupe_key,
+            markdown_body,
+            accepted_historical_bodies=(legacy_body,),
+            payload_identity=event.payload_identity(),
+        )
+        is False
+    )
+    assert inbox.turn(turn.turn_id).events[0].body == legacy_body
+
+    changed = ControllerEvent(
+        kind=event.kind,
+        dedupe_key=event.dedupe_key,
+        payload={**event.payload, "head_sha": "def"},
+    )
+    with pytest.raises(RuntimeError, match="reused with a different payload"):
+        inbox.enqueue(
+            CONVERSATION_ID,
+            changed.dedupe_key,
+            changed.to_prompt(),
+            accepted_historical_bodies=(changed.to_legacy_prompt(),),
+            payload_identity=changed.payload_identity(),
+        )
+
+    deliver_turn_messages(Conversation(), inbox, turn.turn_id)
+    inbox.record_processed(turn.turn_id)
+    inbox.acknowledge(turn.turn_id)
+
+    assert (
+        inbox.enqueue(
+            CONVERSATION_ID,
+            event.dedupe_key,
+            markdown_body,
+            accepted_historical_bodies=(legacy_body,),
+            payload_identity=event.payload_identity(),
+        )
+        is True
+    )
+    reminder = inbox.next_turn(CONVERSATION_ID, "later reminder")
+    assert reminder is not None
+    assert reminder.events[0].body == markdown_body
+
+
+def test_event_identity_includes_fields_hidden_from_the_markdown_view(
+    tmp_path: Path,
+):
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    original = ControllerEvent(
+        kind="workspace_diverged",
+        dedupe_key="workspace_diverged:stable-key",
+        payload={
+            "head_ref": "student/experiment",
+            "expected_remote_head": "abc",
+            "preserved_local_head": "def",
+            "base_ref": "main",
+            "base_sha": "123",
+            "current_branch": "student/experiment",
+            "worktree_fingerprint": "fingerprint-one",
+            "instructions": "Reconcile the workspace.",
+        },
+    )
+    changed = ControllerEvent(
+        kind=original.kind,
+        dedupe_key=original.dedupe_key,
+        payload={**original.payload, "worktree_fingerprint": "fingerprint-two"},
+    )
+    assert original.to_prompt() == changed.to_prompt()
+
+    legacy_body = original.to_legacy_prompt()
+    assert inbox.enqueue(
+        CONVERSATION_ID,
+        original.dedupe_key,
+        original.to_prompt(),
+        accepted_historical_bodies=(legacy_body,),
+        payload_identity=original.payload_identity(),
+    )
+
+    with pytest.raises(RuntimeError, match="reused with a different payload"):
+        inbox.enqueue(
+            CONVERSATION_ID,
+            changed.dedupe_key,
+            changed.to_prompt(),
+            accepted_historical_bodies=(changed.to_legacy_prompt(),),
+            payload_identity=changed.payload_identity(),
+        )
+
+
+def test_event_identity_is_independent_of_the_legacy_renderer(tmp_path: Path):
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    original = ControllerEvent(
+        kind="student_available_for_assignment",
+        dedupe_key="student_available_for_assignment:Fern",
+        payload={"student": "Fern", "generation": 1},
+    )
+    changed = ControllerEvent(
+        kind=original.kind,
+        dedupe_key=original.dedupe_key,
+        payload={"student": "Fern", "generation": 2},
+    )
+    assert original.to_legacy_prompt() == changed.to_legacy_prompt()
+
+    assert inbox.enqueue(
+        CONVERSATION_ID,
+        original.dedupe_key,
+        original.to_prompt(),
+        accepted_historical_bodies=(original.to_legacy_prompt(),),
+        payload_identity=original.payload_identity(),
+    )
+
+    with pytest.raises(RuntimeError, match="reused with a different payload"):
+        inbox.enqueue(
+            CONVERSATION_ID,
+            changed.dedupe_key,
+            changed.to_prompt(),
+            accepted_historical_bodies=(changed.to_legacy_prompt(),),
+            payload_identity=changed.payload_identity(),
+        )
 
 
 def test_retract_pending_removes_only_unclaimed_events(tmp_path: Path):

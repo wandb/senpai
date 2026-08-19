@@ -199,27 +199,26 @@ def test_event_store_discards_absent_level_triggers(tmp_path: Path):
         assert store.enqueue(retained) is False
 
 
-def test_event_message_renders_observation_time_and_structured_payload():
+def test_event_message_uses_the_same_model_view_as_the_durable_inbox():
     event = LocalEvent(
         kind="review_ready",
         dedupe_key="review_ready:17:abc",
         payload={
-            "pr": 17,
+            "number": 17,
+            "url": "https://github.test/pull/17",
             "head_sha": "abc",
         },
         observed_at=datetime(2026, 7, 31, 12, 30, tzinfo=UTC),
     )
 
     assert event.to_user_message() == (
-        "# Senpai event: review_ready\n\n"
-        "Observed at (UTC): 2026-07-31T12:30:00+00:00\n\n"
-        "```json\n"
-        "{\n"
-        '  "head_sha": "abc",\n'
-        '  "pr": 17\n'
-        "}\n"
-        "```"
+        "## Pull Request Ready for Review\n\n"
+        "### Review Target\n\n"
+        "- Pull request: [#17](<https://github.test/pull/17>)\n"
+        "- Result head: `abc`"
     )
+    assert event.to_user_message() == event.to_inbox_message()
+    assert "Observed at" not in event.to_user_message()
 
 
 def test_deliver_pending_events_acknowledges_only_messages_sent(tmp_path: Path):
@@ -1069,33 +1068,41 @@ def test_advisor_cli_reports_the_pending_event_count(
     assert capsys.readouterr().out.strip() == "1"
 
 
-def test_inbox_rendering_excludes_transport_only_parent_conversation_id():
+@pytest.mark.parametrize(
+    ("kind", "payload"),
+    [
+        ("student_assignment", {"blockers": []}),
+        ("malformed_assignment", {"error": "invalid marker"}),
+        ("student_pr_feedback", {"message": "Review this."}),
+        ("human_issue", {"message": "Please inspect this."}),
+        ("student_assignment_comment", {"message": "Run started."}),
+        ("review_ready", {}),
+        ("advisor_action", {"reasons": []}),
+        ("student_available_for_assignment", {"student": "Fern"}),
+        ("duplicate_assignment", {"pull_requests": []}),
+        ("research_base_changed", {}),
+        ("training_monitor", {"signal": {"kind": "training_status"}}),
+        ("workspace_diverged", {}),
+        ("agent_result", {"result": "Done."}),
+        ("agent_error", {"error": "Failed."}),
+    ],
+)
+def test_inbox_rendering_matches_for_every_controller_and_watcher_event(
+    kind,
+    payload,
+):
     """Watcher and controller paths must render one payload for one event key."""
-    payload = {"assignment_id": "a-17", "revision_id": "r-2"}
     controller_event = ControllerEvent(
-        kind="student_pr_feedback",
-        dedupe_key="feedback:17",
+        kind=kind,
+        dedupe_key=f"{kind}:17",
         payload=payload,
     )
     watcher_event = LocalEvent(
         kind=controller_event.kind,
         dedupe_key=controller_event.dedupe_key,
-        payload={**payload, "parent_conversation_id": "conversation-17"},
+        payload={**payload, "parent_conversation_id": "transport-only"},
     )
 
     assert watcher_event.to_inbox_message() == controller_event.to_prompt()
-
-
-def test_student_availability_rendering_matches_controller_and_watcher_paths():
-    controller_event = ControllerEvent(
-        kind="student_available_for_assignment",
-        dedupe_key="student_available_for_assignment:qwen-edward",
-        payload={"student": "qwen-edward"},
-    )
-    watcher_event = LocalEvent(
-        kind=controller_event.kind,
-        dedupe_key=controller_event.dedupe_key,
-        payload=controller_event.payload,
-    )
-
-    assert watcher_event.to_inbox_message() == controller_event.to_prompt()
+    assert watcher_event.payload_identity() == controller_event.payload_identity()
+    assert "transport-only" not in watcher_event.to_inbox_message()

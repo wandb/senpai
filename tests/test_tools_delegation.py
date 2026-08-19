@@ -13,12 +13,17 @@ from openhands.sdk.llm import Message, TextContent
 
 from senpai_agent.delegation import (
     AgentStatusAction,
+    AgentStatusObservation,
     AgentStatusTool,
     AgentTask,
+    AgentTaskState,
     AwaitAgentsAction,
+    AwaitAgentsObservation,
     AwaitAgentsTool,
     CancelAgentsAction,
+    CancelAgentsObservation,
     CancelAgentsTool,
+    DelegateAgentObservation,
     DelegationConfig,
     DelegationRegistry,
     DelegationRequest,
@@ -27,6 +32,7 @@ from senpai_agent.delegation import (
     MODEL_TIER_TIMEOUT_SECONDS,
     OpenHandsChildProcess,
     SpawnAgentsAction,
+    SpawnAgentsObservation,
     SpawnAgentsTool,
     cancel_pending_descendants,
     configure_delegation,
@@ -41,6 +47,89 @@ def test_model_tier_runtime_limits():
         "smart": 3600,
         "frontier": 7200,
     }
+
+
+def test_delegation_observations_render_task_state_and_markdown_responses():
+    task = AgentTaskState(
+        task_id="task-17",
+        key="inspect|code",
+        status="finished",
+        agent="explore",
+        model="smart",
+        result="## Finding\n\nThe path is correct.",
+    )
+
+    rendered = SpawnAgentsObservation(tasks=[task]).to_llm_content[0].text
+
+    assert rendered == (
+        "## Delegated Agent Tasks\n\n"
+        "| Task ID | Key | Agent | Model | Status |\n"
+        "|---|---|---|---|---|\n"
+        "| `task-17` | `inspect\\|code` | `explore` | `smart` | `finished` |\n\n"
+        "### Agent Response: `task-17`\n\n"
+        "<agent-response>\n\n"
+        "## Finding\n\n"
+        "The path is correct.\n\n"
+        "</agent-response>"
+    )
+
+
+def test_await_agents_renders_wait_metadata_and_guidance():
+    rendered = AwaitAgentsObservation(
+        join="quorum",
+        satisfied=False,
+        timed_out=True,
+        tasks=[],
+        changed_task_ids=[],
+        waited_seconds=12.5,
+        guidance="Continue useful parent work.",
+    ).to_llm_content[0].text
+
+    assert rendered == (
+        "## Delegated Agent Wait\n\n"
+        "- Join: `quorum`\n"
+        "- Satisfied: No\n"
+        "- Timed out: Yes\n"
+        "- Waited: 12.5 seconds\n"
+        "- Changed tasks: None\n\n"
+        "No delegated tasks.\n\n"
+        "### Guidance\n\n"
+        "Continue useful parent work."
+    )
+
+
+@pytest.mark.parametrize(
+    ("observation", "title"),
+    [
+        (AgentStatusObservation(tasks=[]), "Delegated Agent Status"),
+        (CancelAgentsObservation(tasks=[]), "Delegated Agent Cancellation"),
+    ],
+)
+def test_empty_delegation_observations_do_not_emit_an_empty_table(
+    observation,
+    title,
+):
+    assert observation.to_llm_content[0].text == (
+        f"## {title}\n\nNo delegated tasks."
+    )
+
+
+def test_legacy_completed_delegation_uses_the_agent_response_boundary():
+    observation = DelegateAgentObservation(
+        task_id="legacy-17",
+        status="finished",
+        result="## Result\n\nDone.",
+    )
+
+    assert observation.to_llm_content[0].text == (
+        "## Delegated Task Completed\n\n"
+        "- Task ID: `legacy-17`\n\n"
+        "### Agent Response:\n\n"
+        "<agent-response>\n\n"
+        "## Result\n\n"
+        "Done.\n\n"
+        "</agent-response>"
+    )
 
 
 def test_explicit_search_task_forms_resolve_to_internal_search_modes():
@@ -1355,16 +1444,12 @@ def test_start_failure_returns_visible_failed_state_without_hiding_siblings(tmp_
 
     assert [task.status for task in result.tasks] == ["running", "failed"]
     assert "could not launch" in result.tasks[1].error
-    model_payload = json.loads(result.to_llm_content[0].text)
-    assert model_payload["tasks"][1] == {
-        "task_id": result.tasks[1].task_id,
-        "key": "failed",
-        "status": "failed",
-        "agent": "general-purpose",
-        "model": "smart",
-        "result": None,
-        "error": "RuntimeError: could not launch",
-    }
+    rendered = result.to_llm_content[0].text
+    assert f"### Agent Error: `{result.tasks[1].task_id}`" in rendered
+    assert (
+        "<agent-error>\n\nRuntimeError: could not launch\n\n</agent-error>"
+        in rendered
+    )
     release.set()
 
 
