@@ -145,6 +145,7 @@ nodes_per_student: 1
 gpus_per_student_node: 1
 cpu_per_gpu: 8
 memory_gi_per_gpu: 64
+controller_node_selector: []  # e.g. [compute.coreweave.com/node-pool=cpu]
 
 timeout_minutes: 30
 max_epochs: 50
@@ -444,6 +445,7 @@ Useful launch controls:
 
 - `--names frieren,fern` selects stable students; otherwise use `--n_students` and `--student_prefix`.
 - `--nodes_per_student` and `--gpus_per_student_node` set the supervised worker topology; `--cpu_per_gpu` and `--memory_gi_per_gpu` bind its worker resources.
+- `--controller_node_selector key=value` optionally constrains advisor and multi-node controller placement; the portable default leaves placement unconstrained.
 - `--timeout_minutes` sets the hard supervised-training ceiling and `--max_epochs` sets the agent-facing epoch policy; target training receives neither as a dedicated `SENPAI_*` variable.
 - `--poll_interval_s` and `--poll_jitter_s` control idle GitHub cadence without teaching the model to poll.
 - `--gh_history_scope branch` keeps normal advisor-branch memory, `fresh` creates a shallow ablation checkout, and `repo` exposes full repository history.

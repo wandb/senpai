@@ -84,6 +84,9 @@ class Args:
     gpus_per_student_node: int = 1  # GPUs on each remote training worker
     cpu_per_gpu: int = 15  # CPU requested per student GPU
     memory_gi_per_gpu: int = 120  # memory Gi requested per student GPU
+    controller_node_selector: list[str] = field(
+        default_factory=list
+    )  # optional key=value placement selectors for advisor and multi-node controllers
     senpai_repo_url: str = (
         "https://github.com/wandb/senpai.git"  # public read-only runner source
     )
@@ -179,6 +182,18 @@ def configured_models(args: Args, role: str | None = None) -> tuple[str, ...]:
     if role is not None:
         return (main_models[role], *models)
     return (*main_models.values(), *models)
+
+
+def controller_node_selector(values: list[str]) -> dict[str, str]:
+    selector: dict[str, str] = {}
+    for item in values:
+        key, separator, value = item.partition("=")
+        if not separator or not key or not value:
+            raise ValueError("controller node selectors must use key=value")
+        if key in selector:
+            raise ValueError(f"duplicate controller node selector: {key}")
+        selector[key] = value
+    return selector
 
 
 def configured_model_providers(args: Args, role: str | None = None) -> set[str]:
@@ -637,7 +652,7 @@ def render_student(
             ),
             "STUDENT_RESOURCES": _student_resources(args),
             "STUDENT_NODE_SELECTOR": json.dumps(
-                {"compute.coreweave.com/node-pool": "cpu"}
+                controller_node_selector(args.controller_node_selector)
                 if args.nodes_per_student > 1
                 else {}
             ),
@@ -740,6 +755,9 @@ def render_advisor(
             "CUSTOM_SECRET_ENV_REFS": secret_env_refs(
                 [(name, name) for name in args.custom_secret_env_names], secret_name
             ),
+            "CONTROLLER_NODE_SELECTOR": json.dumps(
+                controller_node_selector(args.controller_node_selector)
+            ),
         },
     )
     return configmap + "\n---\n" + deployment
@@ -760,6 +778,10 @@ def main():
     validate_timing_args(args)
     validate_program_path(args)
     validate_model_config(args)
+    try:
+        controller_node_selector(args.controller_node_selector)
+    except ValueError as error:
+        sys.exit(f"ERROR: {error}")
     try:
         validate_custom_secret_env_names(args.custom_secret_env_names)
     except ValueError as error:
