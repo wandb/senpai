@@ -91,6 +91,31 @@ def test_image_reference_rejects_mutable_or_incomplete_pins(image):
     assert not launch_helpers.is_immutable_image_reference(image)
 
 
+def test_digest_image_reference_rejects_source_sha_tags():
+    assert launch_helpers.is_digest_image_reference(
+        f"ghcr.io/wandb/senpai@sha256:{'b' * 64}"
+    )
+    assert not launch_helpers.is_digest_image_reference(
+        f"ghcr.io/wandb/senpai:sha-{REVISION}"
+    )
+
+
+def test_multinode_executor_requires_a_registry_digest():
+    result = run_launch(
+        "--advisor_image",
+        ADVISOR_IMAGE,
+        "--student_image",
+        STUDENT_IMAGE,
+        "--nodes_per_student",
+        "2",
+        "--executor_image",
+        f"ghcr.io/wandb/senpai-executor:sha-{REVISION}",
+    )
+
+    assert result.returncode != 0
+    assert "--executor_image must use an immutable @sha256 digest" in result.stderr
+
+
 def test_source_revision_is_derived_from_a_full_sha_tag():
     image = f"ghcr.io/wandb/senpai:sha-{REVISION}"
 

@@ -122,6 +122,7 @@ def test_cutoff_has_a_minimal_commit_built_image():
     assert set(workflow["jobs"]["build"]["strategy"]["matrix"]["role"]) == {
         "advisor",
         "student",
+        "executor",
         "cutoff",
     }
 

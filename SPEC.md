@@ -606,6 +606,24 @@ TERM/KILL cleanup, restart identity checks using PID/PGID/create-time, a bounded
 W&B run IDs. Run IDs are persisted while training is still running so metric
 monitoring can begin immediately.
 
+When a student has more than one configured node, `KubernetesTrainingSupervisor`
+keeps the same tool contract while supervising one remote MPIJob. It creates an
+atomic Git bundle for the clean `HEAD` on the shared PVC, generates the workload
+and W&B identities, launches the target submitter through the local process
+path, then persists and polls the broker-created UID. The broker replaces
+target-provided init logic with a fixed local-copy and exact-commit checkout, so
+bundle mutation fails before training starts. Cancellation, timeout, and restart
+recovery remain UID-bound; uncertain deletion retains the broker reservation for
+deadline cleanup rather than releasing ownership early.
+
+Controller shutdown detaches from a running Kubernetes workload. It terminates
+the local launcher process. It leaves the remote workload running, keeps the
+durable result in the `RUNNING` state, and retains the workload UID and broker
+reservation. The next controller reserves the same training identity and
+re-adopts only that UID before it resumes monitoring. Explicit cancellation and
+timeout still delete the remote workload and persist a terminal result before
+releasing ownership.
+
 The student commits the exact implementation and cleans the worktree before an
 expensive launch. Every successful `run_training` launch immediately registers
 a terminal-state monitor bound to the current conversation. `monitor_training`
@@ -664,10 +682,11 @@ and `env` wrappers.
 Every OpenHands turn has a controller-configured hard deadline. The deadline
 interrupts the conversation, produces a non-success result, and leaves durable
 events unacknowledged. The controller then retries with bounded exponential
-backoff. Controller termination interrupts and closes the current conversation,
-cancels active supervised training, closes local stores, and flushes Weave
-before the controller exits. Standalone and child runners flush Weave at runner
-exit.
+backoff. Controller termination interrupts and closes the current conversation.
+It cancels active local training, but detaches from active Kubernetes training
+so the next controller can re-adopt the same remote UID. It then closes local
+stores and flushes Weave before it exits. Standalone and child runners flush
+Weave at runner exit.
 
 ## Secrets and Weave
 
@@ -718,11 +737,12 @@ API; `OPENHANDS_RUN.weave_url` links directly to the conversation.
 
 ## Images and launch acceptance
 
-Three images are built from the same exact source commit:
+Four images are built from the same exact source commit:
 
 - advisor: Python/OpenHands, GitHub CLI, and Chromium; no PyTorch, CUDA, or
   Kubernetes tooling;
 - student: the CUDA/PyTorch stack plus the same OpenHands and Chromium runtime;
+- executor: a minimal Python broker with no model runtime or `kubectl`;
 - cutoff: a minimal shell/Python runtime with one checksum-verified, pinned
   `kubectl`.
 
@@ -744,9 +764,30 @@ Launch preflight verifies:
 Exa is a progressive skill/script integration, not an always-connected MCP
 server.
 
-The Kubernetes launcher creates one Secret, ConfigMaps, and Deployments. It
-creates no Service or RBAC. Docker and local hosts need no shared network for
-Senpai communication.
+The Kubernetes launcher creates one Secret, ConfigMaps, and Deployments. A
+student launch first scans every requested name for an existing Deployment,
+controller Pod, or nonterminal labeled Job. It scans MPIJobs only when the API
+exists and requires that API for multi-node students. After all scans pass, it
+creates the per-tag Secret as an atomic, durable, immutable reservation before
+any GitHub write. An advisor-only apply cannot change the Secret data after a
+student launch wins the reservation race. It then creates each student resource
+separately, with the Deployment last. Student resources are new-only; the
+launcher never applies over them. A concurrent launch or an orphan from a
+failed launch therefore fails closed and requires explicit operator cleanup
+before retry.
+
+For multi-node students the launcher also creates a namespaced ServiceAccount,
+Role, and RoleBinding limited to creating, getting, patching, and deleting Jobs
+or MPIJobs and reading their pod logs. The launcher's operator identity needs
+get access to Deployments, list access to Pods and Jobs, API discovery, and
+create access to the rendered resources. When the MPIJob API is installed,
+every launch needs list access to MPIJobs so it can reject orphaned workloads;
+multi-node preflight also requires the API to exist. The controller is
+CPU-pinned and tokenless. A separate executor sidecar alone mounts a projected
+token and validates the exact node/GPU and CPU/memory allocation, deadline,
+source/W&B evidence, volumes, pod security, and workload ownership across a
+Unix socket. Docker and local hosts need no shared network for Senpai
+communication.
 
 Hivemind startup remains commented with a clear note. The Python controller
 waits for the optional cluster start gate while continuously refreshing a
@@ -789,7 +830,8 @@ The change is acceptable when:
 
 - unit and local integration tests pass;
 - shell scripts pass `bash -n`;
-- manifests render matching immutable source revisions without Service/RBAC;
+- manifests render matching immutable source revisions and scoped multi-node RBAC;
+- remote workloads remain suspended until their exact created UID is confirmed;
 - browser smoke succeeds in both image builds;
 - no operational prompt advertises a missing tool or service;
 - no runtime role requires Claude Code semantics;

@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 import psutil
 from pydantic import BaseModel, ConfigDict, Field
@@ -35,6 +36,33 @@ class TrainingState(StrEnum):
     CANCELLED = "cancelled"
 
 
+class KubernetesTrainingSpec(BaseModel):
+    """Identity of the Kubernetes workload created by ``argv``."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["Job", "MPIJob"]
+    name: str = Field(pattern=r"^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$")
+    namespace: str = Field(
+        default="default",
+        pattern=r"^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$",
+    )
+    wandb_run_id: str = Field(min_length=1)
+
+
+class KubernetesResourceRef(BaseModel):
+    """Durable identity and verified shape of one remote training workload."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["Job", "MPIJob"]
+    name: str
+    namespace: str
+    uid: str
+    nodes: int = Field(gt=0)
+    gpus_per_node: int = Field(gt=0)
+
+
 class TrainingSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -56,6 +84,13 @@ class TrainingResult(BaseModel):
     log_path: str
     wandb_run_ids: tuple[str, ...] = ()
     error_tail: str = ""
+    started_at: float | None = Field(default=None, gt=0)
+    deadline_at: float | None = Field(default=None, gt=0)
+    kubernetes_spec: KubernetesTrainingSpec | None = None
+    kubernetes_resource: KubernetesResourceRef | None = None
+    kubernetes_released: bool | None = None
+    source_snapshot: str | None = None
+    source_commit: str | None = None
 
 
 def training_result_paths(state_dir: Path) -> Iterator[Path]:

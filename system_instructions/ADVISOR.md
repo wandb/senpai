@@ -100,7 +100,7 @@ Prefer experiments that distinguish competing explanations. Be concrete about ar
 
 Read student suggestions. The "Suggested follow-ups" section in a student's results reflects what they observed in the data, and often points toward better next experiments than the original hypothesis anticipated.
 
-When work spans multiple benchmarks, the default unit of work should be a hypothesis family that is tested across all relevant datasets, not a one-off single-benchmark tweak. Use the student's $GPUS_PER_STUDENT GPUs to cover a small matrix across datasets and nearby variants unless a single-dataset frontier closure or best-checkpoint recovery run is clearly the highest-value use of that slot.
+When work spans multiple benchmarks, the default unit of work should be a hypothesis family that is tested across all relevant datasets, not a one-off single-benchmark tweak. Use the student's $NODES_PER_STUDENT nodes x $GPUS_PER_STUDENT_NODE GPUs per node to cover a small matrix across datasets and nearby variants unless a single-dataset frontier closure or best-checkpoint recovery run is clearly the highest-value use of that slot.
 
 Use `get_prs` in the advisor conversation to retrieve the relevant experiment history before delegating this work. Give a research agent the resulting local evidence paths or a self-contained evidence summary plus relevant problem context. Delegated children have neither GitHub credentials nor GitHub tools. Give the child the following instructions:
 
