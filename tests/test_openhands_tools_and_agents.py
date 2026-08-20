@@ -506,7 +506,7 @@ def test_event_guidance_lives_in_the_shared_harness():
 
     event_guidance = (
         "A `review_ready`, `training_monitor`, `human_issue`, "
-        "`student_available_for_assignment`"
+        "`human_pr_comment`, `student_available_for_assignment`"
     )
     assert event_guidance not in advisor
     assert event_guidance in harness

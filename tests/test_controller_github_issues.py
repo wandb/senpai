@@ -219,6 +219,29 @@ def test_editing_a_human_issue_title_creates_a_new_event_version(monkeypatch):
     assert edited.payload["title"] == "Clarify the direction"
 
 
+def test_editing_the_latest_human_comment_creates_a_new_event_version(monkeypatch):
+    advisor = mailbox()
+    comments = [
+        {
+            "id": 702,
+            "body": "Also compare memory.",
+            "created_at": "2026-07-29T18:10:00Z",
+            "user": {"login": "ada", "type": "User"},
+            "author_association": "COLLABORATOR",
+        }
+    ]
+    monkeypatch.setattr(advisor, "_pulls", list)
+    monkeypatch.setattr(advisor, "_issues", lambda: [issue()])
+    monkeypatch.setattr(advisor, "_issue_comments", lambda _issue: comments)
+    first = advisor.poll()[0]
+
+    comments[0]["body"] = "Also compare memory and latency."
+    edited = advisor.poll()[0]
+
+    assert edited.dedupe_key != first.dedupe_key
+    assert edited.payload["human_message_id"] == first.payload["human_message_id"]
+
+
 def test_editing_the_omitted_prefix_of_a_long_human_message_versions_it(
     monkeypatch,
 ):

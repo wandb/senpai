@@ -211,7 +211,7 @@ def test_resolved_config_separates_runtime_credentials_from_conversation_secrets
     assert "OPENAI_API_KEY" not in config.conversation_secrets
     assert config.timeout_seconds == 7200
     assert config.llm_timeout_seconds == 5400
-    assert config.llm_num_retries == 1
+    assert config.llm_num_retries == 5
     assert config.compaction_trigger_tokens == 200_000
 
     delegated = runner.delegation_config(config)

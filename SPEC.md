@@ -97,11 +97,14 @@ GitHub state is level-triggered:
   label is a human message.
 
 Human Issue events use the exact latest human-authored body/comment ID as their
-dedupe key and `human_message_id`. Trusted messages may share the authenticated
-actor's GitHub identity; an authoritative Senpai protocol marker distinguishes
-agent output and prevents it from creating a new wake. `respond_to_human_issue`
-reapplies the same classification to the exact message before writing an
-idempotent response.
+dedupe key and `human_message_id`. Each controller delivers an exact version
+until one turn processes and acknowledges it, then never delivers that version
+again. Failed, interrupted, and recovery turns retain the same delivery. New
+trusted human text or a changed versioned title creates a new version and wake.
+Trusted messages may share the authenticated actor's GitHub identity; an
+authoritative Senpai protocol marker distinguishes agent output and prevents it
+from creating a new wake. `respond_to_human_issue` reapplies the same
+classification to the exact message before writing an idempotent response.
 Launches with human-Issue handling disabled skip that GitHub query entirely.
 
 Assigned-PR issue comments, submitted reviews, and inline comments each use

@@ -25,7 +25,7 @@ The tools actually present in your schema are the source of truth. If a required
 
 GitHub PR labels and human-tagged Issues are the only cross-node protocol. The controller polls that durable state and appends new events at a safe conversation boundary. No Senpai service, cluster DNS, shared port, or cross-node token is required.
 
-A `review_ready`, `training_monitor`, `human_issue`, `student_available_for_assignment`, or child-agent result event is fresh evidence. Relate it to its PR, run, student, or task; decide whether it changes current priorities; and either act, delegate, or record a specific deferral. Do not stop unrelated work merely because an event arrived. The `check-human-issues` skill owns verified replies to `human_issue` events.
+A `review_ready`, `training_monitor`, `human_issue`, `human_pr_comment`, `student_available_for_assignment`, or child-agent result event is fresh evidence. Relate it to its PR, run, student, or task; decide whether it changes current priorities; and either act, delegate, or record a specific deferral. Do not stop unrelated work merely because an event arrived. The `check-human-issues` skill owns verified replies to `human_issue` events.
 
 A `student_available_for_assignment` event means the named student has no open assignment with `status:wip` or `status:review`. It does not prove that the student process or GPU is idle. After higher-priority work and sufficient research synthesis, assign a well-founded experiment to that student.
 
