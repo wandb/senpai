@@ -4,11 +4,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
+import httpx
 import pytest
+from litellm.exceptions import PermissionDeniedError
 from openhands.sdk.conversation.exceptions import ConversationRunError
 from openhands.sdk.llm.exceptions import (
+    LLMAuthenticationError,
+    LLMBadRequestError,
     LLMContextWindowExceedError,
     LLMMalformedConversationHistoryError,
+    LLMRateLimitError,
+    LLMServiceUnavailableError,
+    LLMTimeoutError,
 )
 
 from senpai_agent.advisor import AdvisorEventPump
@@ -17,6 +24,7 @@ from senpai_agent.controller import (
     OpenHandsTurnRunner,
     _context_recovery_prompt,
     _open_job_monitor_mailbox,
+    _provider_failure,
 )
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.mailbox_watcher import ActiveMailboxWatcher
@@ -242,6 +250,60 @@ def test_context_recovery_prompt_does_not_repeat_an_embedded_research_brief():
     )
 
     assert prompt.count("complete initial controller context") == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "retryable"),
+    [
+        (LLMRateLimitError("rate limit"), True),
+        (LLMTimeoutError("provider timeout"), True),
+        (LLMServiceUnavailableError("provider unavailable"), True),
+        (LLMAuthenticationError("invalid key"), False),
+        (LLMBadRequestError("malformed request"), False),
+    ],
+)
+def test_provider_failure_classification(error, retryable):
+    wrapped = ConversationRunError(
+        UUID("00000000-0000-0000-0000-000000000090"), error
+    )
+
+    assert _provider_failure(wrapped, 1_700_000_000).retryable is retryable
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        LLMContextWindowExceedError("context length exceeded"),
+        LLMMalformedConversationHistoryError("invalid tool history"),
+        TimeoutError("local mailbox timeout"),
+        ConnectionError("connection error talking to GitHub"),
+    ],
+)
+def test_non_provider_failures_bypass_provider_cooldown(error):
+    assert _provider_failure(error, 1_700_000_000) is None
+
+
+def test_provider_permission_failure_is_permanent():
+    error = PermissionDeniedError(
+        "permission denied",
+        "anthropic",
+        "claude",
+        httpx.Response(403, request=httpx.Request("POST", "https://anthropic.com")),
+    )
+
+    assert _provider_failure(error, 1_700_000_000).retryable is False
+
+
+def test_provider_failure_honors_retry_after_from_the_exhausted_response():
+    raw = RuntimeError("provider overloaded")
+    raw.litellm_response_headers = {"retry-after": "90"}
+    mapped = LLMServiceUnavailableError("provider overloaded")
+    mapped.__cause__ = raw
+
+    failure = _provider_failure(mapped, 1_700_000_000)
+
+    assert failure is not None
+    assert failure.retry_after == 90
 
 
 def test_turn_runner_passes_the_inference_state_out_of_band(

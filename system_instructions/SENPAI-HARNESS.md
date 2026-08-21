@@ -50,7 +50,7 @@ The tools actually present in your schema are the source of truth. If a required
 
 GitHub PR labels and human-tagged Issues are the only cross-node protocol. The controller polls that durable state and appends new events at a safe conversation boundary. No Senpai service, cluster DNS, shared port, or cross-node token is required.
 
-A `review_ready`, `job_monitor`, `human_issue`,
+A `review_ready`, `job_monitor`, `human_issue`, `human_pr_comment`,
 `student_available_for_assignment`, or child-agent result event is fresh
 evidence. Relate it to its PR, run, student, or task; decide whether it changes
 current priorities; and either act, delegate, or record a specific deferral. Do
@@ -61,6 +61,10 @@ A `student_available_for_assignment` event means the named student has no open
 assignment with `status:wip` or `status:review`. It does not prove that the
 student process or GPU is idle. After higher-priority work and sufficient
 research synthesis, assign a well-founded experiment to that student.
+
+A `student_assignment_comment` event is interim feedback and may refer to an earlier assignment revision when polling races with a revision request. Refresh the complete PR, interpret the message against the current assignment, and respond on the current revision. Treat a clarification, question, hold, or nudge differently from a request to revise the experiment.
+
+A `research_base_changed` event means an experiment's original comparison point moved. Do not cancel in-flight work solely because the base changed. Before deciding a terminal result, reassess whether the conclusion still holds against the current base and record that decision through the provided review workflow.
 
 Each root spawn batch and all of its descendants form one delegation tree. A tree can create at most eight children in total, every spawn batch is limited to eight, and the role can run at most eight active tasks concurrently across all trees. The root batch counts toward its tree's total, so leave capacity when a general-purpose child will need helpers. The root may spawn general-purpose or leaf agents. A depth-one general-purpose child may spawn leaf helpers at depth two; Explore, Search, Bash Runner, and every depth-two child are leaves. Each delegated task has an absolute tier deadline, and descendants inherit the earlier ancestor deadline. Nested children must collect or cancel their helpers before returning, so no descendant can become detached background work. The root advisor or student may leave useful tasks running; their durable terminal events resume that root conversation.
 

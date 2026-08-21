@@ -123,12 +123,23 @@ def test_student_charter_requires_typed_tools_for_every_long_job():
     assert "`cancel_job`" in instructions
 
 
-def test_advisor_charter_explains_student_comment_events():
+def test_advisor_charter_explains_student_feedback_without_tool_protocol():
     instructions = (ROOT / "system_instructions" / "ADVISOR.md").read_text()
 
-    assert "`student_assignment_comment` event" in instructions
-    assert "retain an earlier revision" in instructions
-    assert "reply on the current revision with `send_assignment_feedback`" in instructions
+    assert "Treat student questions and interim feedback as current evidence" in instructions
+    assert "refresh the complete experiment context" in instructions
+    assert "distinguish a clarification or hold from a revised experiment" in instructions
+    for operational_detail in (
+        "student_assignment_comment",
+        "get_prs",
+        "send_assignment_feedback",
+    ):
+        assert operational_detail not in instructions
+
+    harness = (ROOT / "system_instructions" / "SENPAI-HARNESS.md").read_text()
+    assert "A `student_assignment_comment` event is interim feedback" in harness
+    assert "may refer to an earlier assignment revision" in harness
+    assert "respond on the current revision" in harness
 
 
 def test_project_instruction_files_are_not_loaded_but_explicit_skills_are(
@@ -239,7 +250,7 @@ def test_resolved_config_separates_runtime_credentials_from_conversation_secrets
     assert config.job_max_timeout_seconds == 30
     assert config.timeout_seconds == 7200
     assert config.llm_timeout_seconds == 5400
-    assert config.llm_num_retries == 1
+    assert config.llm_num_retries == 5
     assert config.compaction_trigger_tokens == 200_000
 
     delegated = runner.delegation_config(config)

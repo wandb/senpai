@@ -9,10 +9,11 @@ import signal
 import sys
 import time
 from base64 import b64decode
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from functools import partial
 from pathlib import Path
 from typing import Literal, Protocol
@@ -21,6 +22,7 @@ from uuid import UUID
 from senpai_agent.agent_markdown import strip_spdx_header
 from senpai_agent.github.mailbox import GitHubMailbox
 from senpai_agent.inbox import (
+    EXACT_ONCE_EVENT_KINDS,
     QUEUE_PRIORITY,
     STEERING_PRIORITIES,
     DeliveryState,
@@ -71,16 +73,24 @@ from senpai_agent.workspace import (
     WorkspaceJobRunning,
 )
 
-_EDGE_TRIGGERED_EVENT_KINDS = frozenset(
-    {"research_base_changed", "student_assignment_comment"}
-)
+_EDGE_TRIGGERED_EVENT_KINDS = EXACT_ONCE_EVENT_KINDS | {
+    "research_base_changed",
+    "student_assignment_comment",
+}
 _ACTIVITY_LEASE_RENEWAL_SECONDS = 30
+_LLM_PROVIDER_COOLDOWN_SECONDS = (30.0, 60.0, 120.0, 240.0, 300.0)
 
 
 @dataclass(frozen=True, slots=True)
 class TurnResult:
     exit_code: int
     delivered_event_keys: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderFailure:
+    retryable: bool
+    retry_after: float = 0
 
 
 class ConversationRecoveryExhausted(RuntimeError):
@@ -119,6 +129,76 @@ def _is_context_history_failure(error: Exception) -> bool:
         cause,
         (LLMContextWindowExceedError, LLMMalformedConversationHistoryError),
     )
+
+
+def _exception_chain(error: BaseException) -> Iterator[BaseException]:
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        yield current
+        pending.extend(getattr(current, "_senpai_retried_provider_errors", ()))
+        linked = getattr(current, "original_exception", None) or current.__cause__
+        if isinstance(linked, BaseException):
+            pending.append(linked)
+
+
+def _retry_after_seconds(error: BaseException, now: float) -> float:
+    value = getattr(error, "retry_after", None)
+    if value is None:
+        value = next(
+            (
+                header
+                for headers in (
+                    getattr(error, "litellm_response_headers", None),
+                    getattr(error, "headers", None),
+                    getattr(getattr(error, "response", None), "headers", None),
+                )
+                if headers
+                for name, header in headers.items()
+                if str(name).casefold() == "retry-after"
+            ),
+            None,
+        )
+    if value is None:
+        return 0
+    try:
+        return max(0, float(value))
+    except (TypeError, ValueError):
+        try:
+            return max(0, parsedate_to_datetime(str(value)).timestamp() - now)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+
+def _provider_failure(error: Exception, now: float) -> ProviderFailure | None:
+    from openai import OpenAIError
+    from openhands.sdk.event.error_classification import FailureKind, classify_error
+    from openhands.sdk.llm.exceptions import LLMError
+
+    chain = tuple(_exception_chain(error))
+    if not any(isinstance(current, (LLMError, OpenAIError)) for current in chain):
+        return None
+    kinds = {
+        classify_error(type(current).__name__, str(current)).kind
+        for current in chain
+    }
+    if kinds & {FailureKind.AUTH, FailureKind.QUOTA, FailureKind.CONFIG}:
+        return ProviderFailure(retryable=False)
+    if kinds & {FailureKind.AGENT_ACTION, FailureKind.INTERNAL}:
+        return None
+    if kinds & {FailureKind.RATE_LIMIT, FailureKind.TRANSIENT}:
+        return ProviderFailure(
+            retryable=True,
+            retry_after=max(_retry_after_seconds(current, now) for current in chain),
+        )
+    return ProviderFailure(retryable=False)
+
+
+def _provider_retry_delay(failures: int, retry_after: float) -> float:
+    base = _LLM_PROVIDER_COOLDOWN_SECONDS[
+        min(failures, len(_LLM_PROVIDER_COOLDOWN_SECONDS) - 1)
+    ]
+    return max(base, retry_after) + random.uniform(0, base * 0.2)
 
 
 def _context_recovery_prompt(full_prompt: str, current_prompt: str) -> str:
@@ -179,7 +259,7 @@ class OpenHandsTurnRunner:
         full_prompt: str,
         github_mailbox: Mailbox | None = None,
         active_mailbox_factories: Sequence[MailboxFactory] = (),
-        active_poll_interval_seconds: float = 30,
+        active_poll_interval_seconds: float = 75,
         active_monitor_poll_interval_seconds: float = 5,
         on_activity: Callable[[], None] | None = None,
         on_inference_state: (
@@ -529,6 +609,31 @@ class Controller:
                     )
                     continue
                 except Exception as error:  # noqa: BLE001
+                    now = time.time()
+                    provider_failure = _provider_failure(error, now)
+                    if provider_failure is not None and provider_failure.retryable:
+                        current = self.inbox.provider_cooldown()
+                        delay = _provider_retry_delay(
+                            0 if current is None else current.failure_count,
+                            provider_failure.retry_after,
+                        )
+                        cooldown = self.inbox.defer_provider_retry(
+                            turn.turn_id,
+                            now + delay,
+                        )
+                        print(
+                            "SENPAI_PROVIDER_COOLDOWN "
+                            f"conversation_id={turn.conversation_id} "
+                            f"turn_id={turn.turn_id} "
+                            f"failure_count={cooldown.failure_count} "
+                            f"retry_after_seconds={delay:g} "
+                            f"error={type(error).__name__}: {error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
+                    if provider_failure is not None:
+                        raise
                     failures = turn_failures.get(conversation_id, 0) + 1
                     turn_failures[conversation_id] = failures
                     print(
@@ -564,6 +669,7 @@ class Controller:
                     continue
 
                 self._assert_processed(turn.turn_id)
+                self.inbox.clear_provider_cooldown()
                 self._acknowledge_processed_turns()
                 turn_failures.pop(conversation_id, None)
                 served_conversations.add(conversation_id)
@@ -584,6 +690,13 @@ class Controller:
                 continue
             phase, delay = self._idle_delay()
             self._sleep(phase, delay)
+
+    def _provider_cooldown_remaining(self) -> float | None:
+        cooldown = self.inbox.provider_cooldown()
+        if cooldown is None:
+            return None
+        remaining = cooldown.retry_at - time.time()
+        return remaining if remaining > 0 else None
 
     def _poll_into_inbox(self, *, allow_reminders: bool = True) -> None:
         self._publish_progress("poll")
@@ -685,6 +798,7 @@ class Controller:
                         event.dedupe_key,
                         event.to_prompt(),
                         priority=steering_priority,
+                        once=event.kind in EXACT_ONCE_EVENT_KINDS,
                     )
                 else:
                     self.inbox.enqueue(
@@ -696,12 +810,15 @@ class Controller:
                             if event.kind == "student_assignment"
                             else event.priority
                         ),
+                        once=event.kind in EXACT_ONCE_EVENT_KINDS,
                     )
 
     def _next_ready_turn(
         self,
         excluded: set[UUID] | frozenset[UUID] = frozenset(),
     ) -> InboxTurn | None:
+        if self._provider_cooldown_remaining() is not None:
+            return None
         now = time.monotonic()
         self._deferred_conversations = {
             conversation_id: retry_at
@@ -800,8 +917,14 @@ class Controller:
             1.0,
             self.poll_interval_seconds + random.uniform(0, self.jitter_seconds),
         )
+        provider_delay = self._provider_cooldown_remaining()
+        if provider_delay is not None:
+            heartbeat = min(heartbeat, provider_delay)
+            heartbeat_phase = "provider-cooldown"
+        else:
+            heartbeat_phase = "sleep"
         if self.next_monitor_poll_seconds is None:
-            return "sleep", heartbeat
+            return heartbeat_phase, heartbeat
         try:
             monitor_delay = self.next_monitor_poll_seconds()
         except Exception as error:  # noqa: BLE001
@@ -812,7 +935,7 @@ class Controller:
             )
             return "monitor-backoff", min(heartbeat, 5.0)
         if monitor_delay is None:
-            return "sleep", heartbeat
+            return heartbeat_phase, heartbeat
         if not math.isfinite(monitor_delay) or monitor_delay < 0:
             print(
                 f"SENPAI_MONITOR_SCHEDULE_INVALID delay={monitor_delay!r}",
@@ -820,7 +943,10 @@ class Controller:
                 flush=True,
             )
             return "monitor-backoff", min(heartbeat, 5.0)
-        return "monitor-sleep", max(1.0, min(heartbeat, monitor_delay))
+        monitor_delay = max(1.0, monitor_delay)
+        if monitor_delay < heartbeat:
+            return "monitor-sleep", monitor_delay
+        return heartbeat_phase, heartbeat
 
     def _has_started(self, conversation_id: UUID) -> bool:
         return conversation_id in self._started or (
@@ -1088,7 +1214,7 @@ def controller_main(
         github_mailbox=active_github_mailbox,
         active_mailbox_factories=active_monitor_factories,
         active_poll_interval_seconds=float(
-            env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "30")
+            env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "75")
         ),
         active_monitor_poll_interval_seconds=float(
             env.get("SENPAI_ACTIVE_MONITOR_POLL_INTERVAL_S", "5")

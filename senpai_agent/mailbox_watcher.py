@@ -25,7 +25,7 @@ class ActiveMailboxWatcher:
         store_path: Path,
         *,
         known_keys: frozenset[str] = frozenset(),
-        poll_interval_seconds: float = 30,
+        poll_interval_seconds: float = 75,
         map_event: Callable[[ControllerEvent], LocalEvent | None] | None = None,
         shutdown_timeout_seconds: float = 1,
         thread_name: str = "senpai-mailbox-watcher",

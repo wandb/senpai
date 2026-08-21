@@ -8,6 +8,14 @@ SPDX-PackageName: senpai
 
 These values were resolved by the Senpai launcher and describe the actual runtime. They override conflicting compute or run-limit claims in `program.md` and other repository instructions, as well as conflicting isolation claims.
 
+## Runtime identity
+
+- Role: `{{ROLE}}`.
+- GitHub repository: `{{GH_REPO}}`.
+- Advisor branch: `{{ADVISOR_BRANCH}}`.
+- W&B project: `{{WANDB_ENTITY}}/{{WANDB_PROJECT}}`.
+- Students in scope: `{{STUDENTS}}`.
+
 ## Runtime
 
 - Compute backend: `{{BACKEND}}`.

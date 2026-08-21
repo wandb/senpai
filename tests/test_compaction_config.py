@@ -63,6 +63,9 @@ def test_main_yaml_token_trigger_reaches_the_provider_request(tmp_path, model):
         trigger = call_kwargs["context_management"]["edits"][0]["trigger"][
             "value"
         ]
+        assert "instructions" not in call_kwargs["context_management"][
+            "edits"
+        ][0]
 
     assert config.compaction_trigger_tokens == 200_000
     assert trigger == 200_000

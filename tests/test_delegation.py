@@ -269,6 +269,7 @@ def test_child_reuses_the_supervisor_rendered_role_prompt(tmp_path: Path):
             "WANDB_ENTITY": "acme",
             "WANDB_PROJECT": "cfd",
             "STUDENT_NAMES": "fern,frieren",
+            "GPUS_PER_STUDENT": "2",
             "GITHUB_TOKEN": "github-secret-sentinel",
             "WANDB_API_KEY": "wandb-secret-sentinel",
         },
@@ -294,8 +295,8 @@ def test_child_reuses_the_supervisor_rendered_role_prompt(tmp_path: Path):
         == parent.instructions.program.program_path
     )
     role_prompt = role_file.read_text()
-    assert "Role: `advisor`" in role_prompt
-    assert "Students: `fern,frieren`" in role_prompt
+    assert "## Runtime identity" not in role_prompt
+    assert "Use the `2` GPUs available to each student" in role_prompt
     assert PLACEHOLDER.search(role_prompt) is None
     assert "github-secret-sentinel" not in role_prompt
     assert "wandb-secret-sentinel" not in role_prompt
@@ -413,7 +414,7 @@ def test_late_result_event_is_acknowledged_when_await_collected_first(tmp_path: 
         parent_conversation_id="conversation",
         parent_task_id=None,
         depth=1,
-        specs=[AgentTask(key="task", task="Inspect")],
+        specs=[AgentTask(key="task", task="Inspect", model="smart")],
         deadlines=[time.time() + 60],
     )
     reserved_id = rows[0]["task_id"]

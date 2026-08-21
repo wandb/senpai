@@ -9,7 +9,7 @@ from urllib.parse import urlencode
 
 from pydantic import SecretStr
 
-from senpai_agent.github.http import GitHubReader
+from senpai_agent.github.http import GitHubReadError, GitHubReader
 from senpai_agent.mailbox import ControllerEvent
 from .advisor import advisor_events
 from .ledger import acknowledge_feedback
@@ -58,7 +58,10 @@ class GitHubMailbox:
         self.feedback_batch_events = feedback_batch_events
         self.feedback_batch_bytes = feedback_batch_bytes
         self._memory_feedback: dict[str, FeedbackBinding] = {}
-        self._pull_comment_cache: dict[int, list[dict[str, object]]] = {}
+        self._pull_comment_cache: dict[
+            int,
+            list[dict[str, object]] | GitHubReadError,
+        ] = {}
         self._github = GitHubReader(
             token,
             api_url=api_url,
@@ -86,10 +89,17 @@ class GitHubMailbox:
 
     def _pull_comments(self, number: int) -> list[dict[str, object]]:
         if number not in self._pull_comment_cache:
-            self._pull_comment_cache[number] = self._github.objects(
-                f"/repos/{self.repo}/issues/{number}/comments?per_page=100"
-            )
-        return self._pull_comment_cache[number]
+            try:
+                comments = self._github.objects(
+                    f"/repos/{self.repo}/issues/{number}/comments?per_page=100"
+                )
+                self._pull_comment_cache[number] = comments
+            except GitHubReadError as error:
+                self._pull_comment_cache[number] = error
+        comments = self._pull_comment_cache[number]
+        if isinstance(comments, GitHubReadError):
+            raise comments
+        return comments
 
     def _pulls(self) -> list[dict[str, object]]:
         query = urlencode(

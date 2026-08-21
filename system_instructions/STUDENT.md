@@ -10,14 +10,6 @@ You implement one assigned experiment, run it safely, and report complete, repro
 
 Read the `program.md` identified in your system prompt, plus the assigned PR body and every PR comment and review before editing. Together they define the hypothesis, allowed files, metric contract, run limits, and any requested revision.
 
-## Runtime identity
-
-- Role: `{{ROLE}}`
-- GitHub repository: `{{GH_REPO}}`
-- Advisor branch: `{{ADVISOR_BRANCH}}`
-- W&B project: `{{WANDB_ENTITY}}/{{WANDB_PROJECT}}`
-- Student: `{{STUDENT_NAME}}`
-
 ## Boundaries
 
 - Work only on the assigned PR and branch. Do not invent another assignment, branch, or PR.

@@ -9,6 +9,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 from senpai_agent.launch_context import (
     LAUNCH_CONTEXT_ENV,
@@ -109,18 +110,39 @@ def target_repo_slug(url: str) -> str:
     return url.split("github.com", 1)[-1].lstrip(":/").removesuffix(".git")
 
 
-def _encoded_launch_context(args, tag: str, student_names: list[str]) -> str:
+def build_launch_context(
+    args,
+    tag: str,
+    student_names: list[str],
+    *,
+    role: Literal["advisor", "student"],
+    backend: str | None = None,
+) -> str:
+    return render_launch_context(
+        role=role,
+        github_repo=target_repo_slug(args.target_repo_url),
+        wandb_entity=args.wandb_entity,
+        wandb_project=args.wandb_project,
+        backend=backend or args.backend,
+        gpus_per_student=args.gpus_per_student,
+        timeout_minutes=args.timeout_minutes,
+        max_epochs=args.max_epochs,
+        tag=tag,
+        advisor_branch=args.advisor_branch,
+        target_base=args.target_repo_branch,
+        students=student_names,
+    )
+
+
+def _encoded_launch_context(
+    args,
+    tag: str,
+    student_names: list[str],
+    *,
+    role: Literal["advisor", "student"],
+) -> str:
     return base64.b64encode(
-        render_launch_context(
-            backend=args.backend,
-            gpus_per_student=args.gpus_per_student,
-            timeout_minutes=args.timeout_minutes,
-            max_epochs=args.max_epochs,
-            tag=tag,
-            advisor_branch=args.advisor_branch,
-            target_base=args.target_repo_branch,
-            students=student_names,
-        ).encode()
+        build_launch_context(args, tag, student_names, role=role).encode()
     ).decode()
 
 
@@ -199,7 +221,7 @@ def build_student_spec(
             "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
             "SENPAI_MAX_EPOCHS": str(args.max_epochs),
             LAUNCH_CONTEXT_ENV: _encoded_launch_context(
-                args, tag, [student_name]
+                args, tag, [student_name], role="student"
             ),
             "EXTRA_INSTRUCTIONS_B64": _encoded_operator_instructions(args),
         }
@@ -221,7 +243,7 @@ def build_advisor_spec(
             "STUDENT_NAMES": ",".join(student_names),
             "SENPAI_STALE_WIP_SECONDS": str(args.stale_wip_seconds),
             LAUNCH_CONTEXT_ENV: _encoded_launch_context(
-                args, tag, student_names
+                args, tag, student_names, role="advisor"
             ),
             "EXTRA_INSTRUCTIONS_B64": _encoded_operator_instructions(args),
         }

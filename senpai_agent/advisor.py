@@ -11,6 +11,7 @@ from openhands.sdk.conversation import ConversationExecutionStatus, Conversation
 from senpai_agent.hooks import queued_feedback_marker
 from senpai_agent.inbox import (
     ADVISOR_ACTIVE_STEERING_PRIORITIES,
+    EXACT_ONCE_EVENT_KINDS,
     QUEUE_PRIORITY,
     STEER_PRIORITY,
     DeliveryState,
@@ -218,6 +219,7 @@ class AdvisorEventPump:
                         event.dedupe_key,
                         event.to_inbox_message(),
                         priority=mode,
+                        once=event.kind in EXACT_ONCE_EVENT_KINDS,
                     )
                     if steering is not None:
                         turn_id, state = steering
@@ -245,6 +247,7 @@ class AdvisorEventPump:
                     event.dedupe_key,
                     event.to_inbox_message(),
                     priority=event_priority(event.kind),
+                    once=event.kind in EXACT_ONCE_EVENT_KINDS,
                 )
             self._store.acknowledge(event.dedupe_key)
             transferred += 1

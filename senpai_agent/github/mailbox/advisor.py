@@ -21,6 +21,9 @@ from senpai_agent.models import (
     parse_result_markers,
 )
 
+from .advisor_comments import human_pr_comment_events
+from .issues import human_issue_events
+from .student_comments import student_assignment_comment_events
 from .values import (
     github_datetime,
     label_names,
@@ -29,8 +32,6 @@ from .values import (
     result_matches_assignment,
     versioned_event,
 )
-from .issues import human_issue_events
-from .student_comments import student_assignment_comment_events
 
 if TYPE_CHECKING:
     from .core import GitHubMailbox
@@ -140,6 +141,7 @@ def advisor_events(
 
     events.extend(_research_base_events(mailbox, active_assignments))
     events.extend(student_assignment_comment_events(mailbox, active_assignments))
+    events.extend(human_pr_comment_events(mailbox, pulls))
     events.extend(human_issue_events(mailbox, issues))
     return tuple(events)
 

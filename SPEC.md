@@ -97,11 +97,14 @@ GitHub state is level-triggered:
   label is a human message.
 
 Human Issue events use the exact latest human-authored body/comment ID as their
-dedupe key and `human_message_id`. Trusted messages may share the authenticated
-actor's GitHub identity; an authoritative Senpai protocol marker distinguishes
-agent output and prevents it from creating a new wake. `respond_to_human_issue`
-reapplies the same classification to the exact message before writing an
-idempotent response.
+dedupe key and `human_message_id`. Each controller delivers an exact version
+until one turn processes and acknowledges it, then never delivers that version
+again. Failed, interrupted, and recovery turns retain the same delivery. New
+trusted human text or a changed versioned title creates a new version and wake.
+Trusted messages may share the authenticated actor's GitHub identity; an
+authoritative Senpai protocol marker distinguishes agent output and prevents it
+from creating a new wake. `respond_to_human_issue` reapplies the same
+classification to the exact message before writing an idempotent response.
 Launches with human-Issue handling disabled skip that GitHub query entirely.
 
 Assigned-PR issue comments, submitted reviews, and inline comments each use
@@ -220,12 +223,12 @@ The model receives:
 1. OpenHands' native base system prompt and tool schemas.
 2. One stable system suffix assembled from:
    - `system_instructions/SENPAI-HARNESS.md`; and
-   - the rendered advisor or student role charter, including its non-secret
-     runtime identity; and
+   - the rendered advisor or student role charter; and
    - the selected target-repository `program.md` under
      `# program.md - <path>`; and
    - the rendered `system_instructions/SENPAI-LAUNCH-CONTEXT.md`, containing
-     authoritative runtime and isolation rules after `program.md`. A blank
+     authoritative runtime identity, limits, and isolation rules after
+     `program.md`. A blank
      `program_path` searches root
      `program.md` and one-level `*/program.md` paths and requires exactly one
      total match.
@@ -316,7 +319,9 @@ count after provider rendering; Senpai does not load a local tokenizer. This
 trigger is not a context-size cap. LiteLLM's normalized `prompt_tokens` can
 exceed it because that field sums the compaction and post-compaction sampling
 iterations; diagnose compaction from the raw iteration usage and returned
-compaction block. The local condenser is disabled for these conversations.
+compaction block. Senpai leaves Anthropic's compaction instructions unset so
+the provider uses its model-specific native prompt. The local condenser is
+disabled for these conversations.
 Other providers retain the high-quality OpenHands condenser.
 
 Every advisor root turn appends one controller-derived liveness invariant to
@@ -469,7 +474,7 @@ spawn_agents(
     task: str,
     agent: general-purpose | explore | search_general_web |
            search_research_publications | bash-runner = general-purpose,
-    model: fast | smart | frontier = smart,
+    model: fast | smart | frontier,
     include_context: bool = false,
   }],
 ) -> {tasks: [{task_id, key, status, agent, model, result?, error?}]}
@@ -501,6 +506,9 @@ conversation. A task `key` is optional; when omitted, its stable list index is
 used. Replaying the same batch and specification returns the same task records;
 it never launches duplicate children. Reusing a batch key with a different
 task specification fails clearly.
+
+Every task must select `fast`, `smart`, or `frontier` explicitly. There is no
+implicit model tier.
 
 `await_agents` is the only blocking delegation operation. `all` waits for every
 selected task to reach a terminal state, `first` waits for any one, `quorum`

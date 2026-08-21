@@ -96,6 +96,17 @@ class LocalEventSink(Protocol):
     def enqueue(self, event: LocalEvent) -> bool: ...
 
 
+class DelegateAgentAction(Action):
+    """Legacy schema retained while persisted state migrates to lifecycle tools."""
+
+    task: str = Field(min_length=1)
+    agent: AgentKind = "general-purpose"
+    model: ModelTier = "smart"
+    background: bool = False
+    include_context: bool = False
+    search_mode: SearchMode | None = None
+
+
 @dataclass(frozen=True)
 class DelegationRequest:
     task_id: str
@@ -606,8 +617,7 @@ class AgentTaskBase(BaseModel):
         description="Self-contained assignment and requested evidence-linked report.",
     )
     model: ModelTier = Field(
-        default="smart",
-        description="Fast for mechanical work, smart for synthesis, frontier for the hardest work.",
+        description="Select fast, smart, or frontier according to the delegation policy.",
     )
     include_context: bool = Field(
         default=False,

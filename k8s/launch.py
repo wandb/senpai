@@ -61,6 +61,7 @@ from senpai.launch.docker_backend import (  # noqa: E402
 )
 from senpai.launch.specs import (  # noqa: E402
     build_advisor_spec,
+    build_launch_context,
     build_student_spec,
     target_repo_slug,
 )
