@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+from senpai_agent.event_kinds import EventKind
 
-def event_payload(kind: str, /, **overrides: object) -> dict[str, object]:
+
+def event_payload(
+    kind: str | EventKind,
+    /,
+    **overrides: object,
+) -> dict[str, object]:
     parent_conversation_id = "00000000-0000-0000-0000-000000000017"
     pull = {
         "number": 17,
@@ -11,25 +17,25 @@ def event_payload(kind: str, /, **overrides: object) -> dict[str, object]:
         "head_ref": "student/experiment",
         "head_sha": "abc",
     }
-    payloads: dict[str, dict[str, object]] = {
-        "advisor_action": {**pull, "reasons": ["blocked"]},
-        "agent_error": {
+    payloads: dict[EventKind, dict[str, object]] = {
+        EventKind.ADVISOR_ACTION: {**pull, "reasons": ["blocked"]},
+        EventKind.AGENT_ERROR: {
             "task_id": "task-17",
             "parent_conversation_id": parent_conversation_id,
             "task": "Inspect the experiment.",
             "error": "Inspection failed.",
         },
-        "agent_result": {
+        EventKind.AGENT_RESULT: {
             "task_id": "task-17",
             "parent_conversation_id": parent_conversation_id,
             "task": "Inspect the experiment.",
             "result": "Inspection complete.",
         },
-        "duplicate_assignment": {
+        EventKind.DUPLICATE_ASSIGNMENT: {
             "student": "Fern",
             "pull_requests": [17, 18],
         },
-        "human_issue": {
+        EventKind.HUMAN_ISSUE: {
             "number": 23,
             "title": "Experiment direction",
             "url": "https://github.test/issues/23",
@@ -38,8 +44,11 @@ def event_payload(kind: str, /, **overrides: object) -> dict[str, object]:
             "message": "Inspect the current experiment.",
             "created_at": "2026-08-19T15:49:43Z",
         },
-        "malformed_assignment": {**pull, "error": "Invalid assignment marker."},
-        "research_base_changed": {
+        EventKind.MALFORMED_ASSIGNMENT: {
+            **pull,
+            "error": "Invalid assignment marker.",
+        },
+        EventKind.RESEARCH_BASE_CHANGED: {
             **pull,
             "assignment_id": "assignment-17",
             "revision_id": "initial",
@@ -49,8 +58,8 @@ def event_payload(kind: str, /, **overrides: object) -> dict[str, object]:
             "current_base_sha": "base-new",
             "compare_url": "https://github.test/compare/base-old...base-new",
         },
-        "review_ready": pull,
-        "student_assignment": {
+        EventKind.REVIEW_READY: pull,
+        EventKind.STUDENT_ASSIGNMENT: {
             **pull,
             "assignment_id": "assignment-17",
             "revision_id": "initial",
@@ -58,7 +67,7 @@ def event_payload(kind: str, /, **overrides: object) -> dict[str, object]:
             "base_sha": "base-sha",
             "blockers": [],
         },
-        "student_assignment_comment": {
+        EventKind.STUDENT_ASSIGNMENT_COMMENT: {
             "number": 17,
             "pr_url": "https://github.test/pull/17",
             "comment_id": "comment-17",
@@ -68,8 +77,8 @@ def event_payload(kind: str, /, **overrides: object) -> dict[str, object]:
             "message": "The run has started.",
             "content_digest": "digest-17",
         },
-        "student_available_for_assignment": {"student": "Fern"},
-        "student_pr_feedback": {
+        EventKind.STUDENT_AVAILABLE_FOR_ASSIGNMENT: {"student": "Fern"},
+        EventKind.STUDENT_PR_FEEDBACK: {
             "number": 17,
             "pr_url": "https://github.test/pull/17",
             "feedback_url": "https://github.test/pull/17#issuecomment-5344",
@@ -86,7 +95,7 @@ def event_payload(kind: str, /, **overrides: object) -> dict[str, object]:
             "message": "Review the current result.",
             "created_at": "2026-08-19T15:49:43Z",
         },
-        "training_monitor": {
+        EventKind.TRAINING_MONITOR: {
             "conversation_id": parent_conversation_id,
             "training_id": "training-17",
             "summary": "The metric crossed its gate.",
@@ -102,7 +111,7 @@ def event_payload(kind: str, /, **overrides: object) -> dict[str, object]:
                 "hard_failure": False,
             },
         },
-        "workspace_diverged": {
+        EventKind.WORKSPACE_DIVERGED: {
             "head_ref": "student/experiment",
             "expected_remote_head": "abc",
             "preserved_local_head": "def",
@@ -113,4 +122,6 @@ def event_payload(kind: str, /, **overrides: object) -> dict[str, object]:
             "instructions": "Reconcile the workspace.",
         },
     }
-    return {**payloads[kind], **overrides}
+    if frozenset(payloads) != frozenset(EventKind):
+        raise RuntimeError("event payload fixtures do not match EventKind")
+    return {**payloads[EventKind(kind)], **overrides}

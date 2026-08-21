@@ -14,6 +14,7 @@ from uuid import UUID
 
 from pydantic import Field
 
+from senpai_agent.event_kinds import EventKind
 from senpai_agent.models import Contract
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.training import TrainingResult, TrainingState
@@ -655,7 +656,7 @@ class MonitorMailbox:
         self.engine.poll()
         return tuple(
             ControllerEvent(
-                kind="training_monitor",
+                kind=EventKind.TRAINING_MONITOR,
                 dedupe_key=signal.dedupe_key,
                 payload={
                     "conversation_id": str(

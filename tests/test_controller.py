@@ -114,6 +114,186 @@ def human_event(message_id=101):
     )
 
 
+def test_malformed_event_is_deferred_without_blocking_or_relogging_siblings(
+    tmp_path: Path,
+    capsys,
+):
+    malformed = ControllerEvent(
+        kind="student_assignment",
+        dedupe_key="student_assignment:malformed",
+        payload={"blockers": []},
+    )
+    ready = review_event()
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    runtime = controller(
+        Mailbox(((malformed, ready), (malformed,))),
+        Turns(),
+        inbox=inbox,
+    )
+
+    runtime._poll_into_inbox()
+    runtime._poll_into_inbox()
+
+    assert inbox.pending_count(CONVERSATION_ID) == 1
+    turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
+    assert turn is not None
+    assert turn.event_keys == (ready.dedupe_key,)
+    errors = capsys.readouterr().err
+    assert errors.count("SENPAI_EVENT_RENDER_ERROR") == 1
+    assert "disposition=deferred" in errors
+
+
+def test_corrected_edge_event_retries_after_the_defer_deadline(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+):
+    clock = [100.0]
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+    payload = event_payload("student_assignment_comment")
+    payload.pop("message")
+    malformed = ControllerEvent(
+        kind="student_assignment_comment",
+        dedupe_key="student_assignment_comment:stable",
+        payload=payload,
+    )
+    corrected = ControllerEvent(
+        kind=malformed.kind,
+        dedupe_key=malformed.dedupe_key,
+        payload=event_payload("student_assignment_comment"),
+    )
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    runtime = controller(
+        Mailbox(((malformed,), (corrected,), (corrected,))),
+        Turns(),
+        inbox=inbox,
+        event_reminder_seconds=10,
+    )
+
+    runtime._poll_into_inbox()
+    clock[0] = 105
+    runtime._poll_into_inbox()
+    assert inbox.pending_count(CONVERSATION_ID) == 0
+
+    clock[0] = 111
+    runtime._poll_into_inbox()
+
+    assert inbox.pending_count(CONVERSATION_ID) == 1
+    assert capsys.readouterr().err.count("SENPAI_EVENT_RENDER_ERROR") == 1
+
+
+def test_cyclic_event_payload_does_not_block_a_valid_sibling(
+    tmp_path: Path,
+    capsys,
+):
+    cyclic_payload: dict[str, object] = {}
+    cyclic_payload["self"] = cyclic_payload
+    cyclic = ControllerEvent(
+        kind="future_event",
+        dedupe_key="future_event:cyclic",
+        payload=cyclic_payload,
+    )
+    ready = review_event()
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    runtime = controller(
+        Mailbox(((cyclic, ready),)),
+        Turns(),
+        inbox=inbox,
+    )
+
+    runtime._poll_into_inbox()
+
+    turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
+    assert turn is not None
+    assert turn.event_keys == (ready.dedupe_key,)
+    error = capsys.readouterr().err
+    assert error.count("SENPAI_EVENT_RENDER_ERROR") == 1
+    assert "Circular reference detected" in error
+
+
+def test_non_utf8_event_key_does_not_block_a_valid_sibling(
+    tmp_path: Path,
+    capsys,
+):
+    invalid_key = review_event(18)
+    invalid_key = ControllerEvent(
+        kind=invalid_key.kind,
+        dedupe_key="review_ready:\ud800",
+        payload=invalid_key.payload,
+    )
+    ready = review_event()
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    runtime = controller(
+        Mailbox(((invalid_key, ready),)),
+        Turns(),
+        inbox=inbox,
+    )
+
+    runtime._poll_into_inbox()
+
+    turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
+    assert turn is not None
+    assert turn.event_keys == (ready.dedupe_key,)
+    error = capsys.readouterr().err
+    assert error.count("SENPAI_EVENT_RENDER_ERROR") == 1
+    assert "event key must be valid UTF-8" in error
+
+
+def test_nonfinite_assignment_comment_identity_is_deferred_once(
+    tmp_path: Path,
+    capsys,
+):
+    malformed = ControllerEvent(
+        kind="student_assignment_comment",
+        dedupe_key="student_assignment_comment:malformed",
+        payload=event_payload(
+            "student_assignment_comment",
+            invalid_value=float("nan"),
+        ),
+    )
+    runtime = controller(
+        Mailbox(((malformed,), (malformed,))),
+        Turns(),
+        inbox=PersistentInbox(tmp_path / "inbox.sqlite3"),
+    )
+
+    runtime._poll_into_inbox()
+    runtime._poll_into_inbox()
+
+    assert capsys.readouterr().err.count("SENPAI_EVENT_RENDER_ERROR") == 1
+
+
+def test_oversized_assignment_comment_is_deferred_without_blocking_siblings(
+    tmp_path: Path,
+    capsys,
+):
+    oversized = ControllerEvent(
+        kind="student_assignment_comment",
+        dedupe_key="student_assignment_comment:oversized",
+        payload=event_payload(
+            "student_assignment_comment",
+            message="x" * (70 * 1024),
+        ),
+    )
+    ready = review_event()
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    runtime = controller(
+        Mailbox(((oversized, ready), (oversized,))),
+        Turns(),
+        inbox=inbox,
+    )
+
+    runtime._poll_into_inbox()
+    runtime._poll_into_inbox()
+
+    turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
+    assert turn is not None
+    assert turn.event_keys == (ready.dedupe_key,)
+    error = capsys.readouterr().err
+    assert error.count("SENPAI_EVENT_RENDER_ERROR") == 1
+    assert "event identity exceeds 65536 UTF-8 bytes" in error
+
+
 class MultiGenerationRecoveryTurns:
     def run(
         self,
@@ -272,6 +452,7 @@ def test_post_turn_snapshot_retracts_availability_queued_during_active_turn(
                 CONVERSATION_ID,
                 availability.dedupe_key,
                 availability.to_prompt(),
+                event_identity=availability.event_identity(),
             )
             return result
 
@@ -1216,7 +1397,7 @@ def test_initial_assignment_precedes_feedback_when_the_batch_splits():
         dedupe_key=base_assignment.dedupe_key,
         payload={
             **base_assignment.payload,
-            "blockers": ["x" * (70 * 1024)],
+            "blockers": ["x" * (40 * 1024)],
         },
     )
     feedback = ControllerEvent(
@@ -1225,7 +1406,7 @@ def test_initial_assignment_precedes_feedback_when_the_batch_splits():
         payload=event_payload(
             "student_pr_feedback",
             revision_id="revision-2",
-            message="Apply this after reading the assignment.",
+            message="y" * (40 * 1024),
         ),
     )
     turns = Turns()

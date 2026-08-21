@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import re
 from enum import StrEnum
-from hashlib import sha256
 from typing import Annotated, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from senpai_agent.json_values import canonical_json, canonical_json_digest
 
 
 class Contract(BaseModel):
@@ -254,12 +255,7 @@ _RESEARCH_BASE_ACCEPTANCE_MARKER = re.compile(
 
 
 def _marker_payload(value: Contract) -> str:
-    return json.dumps(
-        value.model_dump(mode="json"),
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).replace(">", r"\u003e")
+    return canonical_json(value.model_dump(mode="json")).replace(">", r"\u003e")
 
 
 def experiment_result_digest(result: ExperimentResult) -> str:
@@ -267,13 +263,7 @@ def experiment_result_digest(result: ExperimentResult) -> str:
 
     if not isinstance(result, ExperimentResult):
         raise TypeError("result must be an ExperimentResult")
-    payload = json.dumps(
-        result.model_dump(mode="json"),
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode()
-    return sha256(payload).hexdigest()
+    return canonical_json_digest(result.model_dump(mode="json"))
 
 
 def render_assignment_marker(assignment: AssignmentRecord) -> str:

@@ -10,7 +10,7 @@ from openhands.sdk.tool import Action, Observation
 from pydantic import BaseModel, ConfigDict, Field
 
 from senpai_agent.github.workflow import MutationResult
-from senpai_agent.model_markdown import inline_code, markdown_url, yes_no
+from senpai_agent.model_markdown import inline_code, markdown_url
 from senpai_agent.models import ExperimentResult
 
 
@@ -283,7 +283,7 @@ class GitHubMutationObservation(Observation):
             "## GitHub Update",
             "",
             f"- State: {inline_code(self.state)}",
-            f"- Changed: {yes_no(self.changed)}",
+            f"- Changed: `{str(self.changed).lower()}`",
             f"- Resource: <{markdown_url(self.resource_url)}>",
         ]
         if self.version is not None:

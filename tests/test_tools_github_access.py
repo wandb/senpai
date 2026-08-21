@@ -76,7 +76,7 @@ def test_github_mutation_result_renders_as_markdown(version, expected_suffix):
     assert observation.to_llm_content[0].text == (
         "## GitHub Update\n\n"
         "- State: `post_assignment_comment`\n"
-        "- Changed: No\n"
+        "- Changed: `false`\n"
         "- Resource: <https://github.test/pull/17>"
         f"{expected_suffix}"
     )
@@ -92,7 +92,7 @@ def test_github_mutation_resource_cannot_inject_markdown():
     assert observation.to_llm_content[0].text == (
         "## GitHub Update\n\n"
         "- State: `updated`\n"
-        "- Changed: Yes\n"
+        "- Changed: `true`\n"
         "- Resource: "
         "<https://good.test/%29%5BInjected%5D%28https://evil.test%29>"
     )

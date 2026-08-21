@@ -9,16 +9,16 @@ from pathlib import Path
 from typing import Protocol
 from uuid import UUID
 
+from senpai_agent.event_kinds import EventKind
 from senpai_agent.inbox import PersistentInbox
 from senpai_agent.local_events import LocalEventStore
 from senpai_agent.model_markdown import (
     canonical_event_identity,
     render_event_prompt,
-    render_pre_markdown_event_prompt,
 )
 
 
-_AVAILABILITY_EVENT_PREFIX = "student_available_for_assignment:"
+_AVAILABILITY_EVENT_PREFIX = f"{EventKind.STUDENT_AVAILABLE_FOR_ASSIGNMENT}:"
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,11 +30,25 @@ class ControllerEvent:
     def to_prompt(self) -> str:
         return render_event_prompt(self.kind, self.payload)
 
-    def to_pre_markdown_prompt(self) -> str:
-        return render_pre_markdown_event_prompt(self.kind, self.payload)
-
     def event_identity(self) -> str:
         return canonical_event_identity(self.kind, self.payload)
+
+
+def report_event_render_error(
+    kind: str,
+    event_key: str,
+    error: Exception,
+    *,
+    disposition: str,
+) -> None:
+    print(
+        "SENPAI_EVENT_RENDER_ERROR "
+        f"kind={ascii(kind)} event_key={ascii(event_key)} "
+        f"error={type(error).__name__}:{ascii(error)} "
+        f"disposition={disposition}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 class Mailbox(Protocol):
@@ -91,7 +105,7 @@ class StudentAssignmentAvailabilityMailbox:
         current = {
             event.dedupe_key
             for event in events
-            if event.kind == "student_available_for_assignment"
+            if event.kind == EventKind.STUDENT_AVAILABLE_FOR_ASSIGNMENT
         }
         with LocalEventStore(self.event_store_path) as store:
             store.discard_prefix(

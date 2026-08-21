@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from senpai_agent.json_values import canonical_json_digest
 
 if TYPE_CHECKING:
     from senpai_agent.github.pull_requests import PRManifestEntry
@@ -87,7 +87,5 @@ def _artifact_name(
         "search": search,
         "heads": [(entry.number, entry.head_sha) for entry in manifest],
     }
-    digest = hashlib.sha256(
-        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()[:20]
+    digest = canonical_json_digest(identity)[:20]
     return f"pull-requests-{digest}.md"

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from senpai_agent.event_kinds import EventKind
 from senpai_agent.github.human_messages import is_trusted_human_message
 from senpai_agent.mailbox import ControllerEvent
 
@@ -83,7 +84,7 @@ def human_issue_events(
         }
         events.append(
             versioned_event(
-                "human_issue",
+                EventKind.HUMAN_ISSUE,
                 number,
                 latest["id"],
                 payload_digest({"message": full_message}),

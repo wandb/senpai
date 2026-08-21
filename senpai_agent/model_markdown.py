@@ -9,7 +9,12 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
+from html import escape
 from urllib.parse import quote
+
+from senpai_agent.event_kinds import EVENT_KINDS, EventKind
+from senpai_agent.json_values import canonical_json
+from senpai_agent.text_values import utf8_text
 
 
 EventRenderer = Callable[[Mapping[str, object]], str]
@@ -29,12 +34,17 @@ _BOUNDARY_TAGS = frozenset(
     }
 )
 _BOUNDARY_PATTERN = re.compile(
-    rf"</?(?:{'|'.join(sorted(_BOUNDARY_TAGS))})(?:\s[^>]*)?\s*/?>",
+    rf"<(?:(?:\s*/\s*)|\s*)(?:{'|'.join(sorted(_BOUNDARY_TAGS))})"
+    r"(?=[\s/>]|$)(?:[^<>]*>)?",
     re.IGNORECASE,
 )
+_BACKTICK_RUN = re.compile(r"`+")
+_TILDE_RUN = re.compile(r"~+")
+_MAX_MARKDOWN_FENCE = 32
 _MARKDOWN_ESCAPES = str.maketrans(
     {
         "\\": "\\\\",
+        "`": "\\`",
         "*": "\\*",
         "_": "\\_",
         "[": "\\[",
@@ -47,11 +57,29 @@ _MARKDOWN_ESCAPES = str.maketrans(
 )
 
 
-def inline_code(value: object) -> str:
-    """Render an opaque value without letting backticks break its boundary."""
+def _single_line(value: object) -> str:
+    return " ".join(utf8_text(value).split())
 
-    text = str(value)
-    longest_run = max((len(run) for run in re.findall(r"`+", text)), default=0)
+
+def _escape_boundary_tags(value: str) -> str:
+    return _BOUNDARY_PATTERN.sub(
+        lambda match: match.group().replace("<", "&lt;").replace(">", "&gt;"),
+        value,
+    )
+
+
+def inline_code(value: object) -> str:
+    """Render one opaque value inside a single-line code boundary."""
+
+    text = _escape_boundary_tags(_single_line(value))
+    if not text:
+        return "—"
+    longest_run = max(
+        (len(match.group()) for match in _BACKTICK_RUN.finditer(text)),
+        default=0,
+    )
+    if longest_run >= _MAX_MARKDOWN_FENCE:
+        return f"<code>{escape(text, quote=False)}</code>"
     fence = "`" * (longest_run + 1)
     padding = " " if text.startswith("`") or text.endswith("`") else ""
     return f"{fence}{padding}{text}{padding}{fence}"
@@ -60,21 +88,21 @@ def inline_code(value: object) -> str:
 def markdown_text(value: object) -> str:
     """Render one untrusted value as plain, single-line Markdown text."""
 
-    return " ".join(str(value).split()).translate(_MARKDOWN_ESCAPES)
+    return _escape_boundary_tags(_single_line(value)).translate(_MARKDOWN_ESCAPES)
 
 
 def markdown_url(value: object) -> str:
     """Percent-encode control characters while retaining normal URL syntax."""
 
     return quote(
-        str(value).strip(),
+        utf8_text(value).strip(),
         safe="/:?#@$&'+,;=%",
     )
 
 
 def markdown_link(label: str, url: object) -> str:
     safe_label = (
-        " ".join(label.split())
+        _single_line(label)
         .replace("\\", "\\\\")
         .replace("[", r"\[")
         .replace("]", r"\]")
@@ -87,22 +115,39 @@ def tagged_block(tag: str, value: object) -> str:
 
     if tag not in _BOUNDARY_TAGS:
         raise ValueError(f"invalid model-facing tag {tag!r}")
-    content = _BOUNDARY_PATTERN.sub(
-        lambda match: match.group().replace("<", "&lt;").replace(">", "&gt;"),
-        str(value),
-    )
+    content = _escape_boundary_tags(utf8_text(value))
     return f"<{tag}>\n\n{content}\n\n</{tag}>"
 
 
 def json_block(value: object) -> str:
-    payload = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False)
-    longest_run = max((len(run) for run in re.findall(r"`+", payload)), default=0)
-    fence = "`" * max(3, longest_run + 1)
+    payload = utf8_text(
+        json.dumps(
+            value,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    )
+    backtick_run = max(
+        (len(match.group()) for match in _BACKTICK_RUN.finditer(payload)),
+        default=0,
+    )
+    tilde_run = max(
+        (len(match.group()) for match in _TILDE_RUN.finditer(payload)),
+        default=0,
+    )
+    if backtick_run < _MAX_MARKDOWN_FENCE:
+        fence = "`" * max(3, backtick_run + 1)
+    elif tilde_run < _MAX_MARKDOWN_FENCE:
+        fence = "~" * max(3, tilde_run + 1)
+    else:
+        return (
+            '<pre><code class="language-json">\n'
+            f"{escape(payload, quote=False)}\n"
+            "</code></pre>"
+        )
     return f"{fence}json\n{payload}\n{fence}"
-
-
-def yes_no(value: object) -> str:
-    return "Yes" if bool(value) else "No"
 
 
 def _section(lines: list[str], title: str, body: Sequence[str] | str) -> None:
@@ -121,6 +166,15 @@ def _pull_request(payload: Mapping[str, object]) -> str:
     return f"- Pull request: {markdown_link(f'#{number}', url)}"
 
 
+def _repository_state(payload: Mapping[str, object]) -> list[str]:
+    return [
+        _field("Base", payload["base_ref"]),
+        _field("Base commit", payload["base_sha"]),
+        _field("Assignment branch", payload["head_ref"]),
+        _field("Remote head", payload["head_sha"]),
+    ]
+
+
 def _student_assignment(payload: Mapping[str, object]) -> str:
     lines = ["## Student Assignment", "", "This assignment revision is active."]
     _section(
@@ -135,12 +189,7 @@ def _student_assignment(payload: Mapping[str, object]) -> str:
     _section(
         lines,
         "Repository State",
-        [
-            _field("Base", payload["base_ref"]),
-            _field("Base commit", payload["base_sha"]),
-            _field("Assignment branch", payload["head_ref"]),
-            _field("Remote head", payload["head_sha"]),
-        ],
+        _repository_state(payload),
     )
     blockers = list(payload["blockers"])  # type: ignore[arg-type]
     _section(
@@ -198,12 +247,7 @@ def _student_pr_feedback(payload: Mapping[str, object]) -> str:
     _section(
         lines,
         "Repository State",
-        [
-            _field("Base", payload["base_ref"]),
-            _field("Base commit", payload["base_sha"]),
-            _field("Assignment branch", payload["head_ref"]),
-            _field("Remote head", payload["head_sha"]),
-        ],
+        _repository_state(payload),
     )
     _section(
         lines,
@@ -361,8 +405,14 @@ def _research_base_changed(payload: Mapping[str, object]) -> str:
         lines,
         "Base State",
         [
-            _field("Assignment-required base", payload["required_base_sha"]),
-            _field("Current base", payload["current_base_sha"]),
+            _field(
+                "Live base to run against (`current_base_sha`)",
+                payload["current_base_sha"],
+            ),
+            _field(
+                "Assignment's original base (`required_base_sha`)",
+                payload["required_base_sha"],
+            ),
         ],
     )
     lines.extend(
@@ -381,7 +431,12 @@ def _training_monitor(payload: Mapping[str, object]) -> str:
         "metric_stale": "## Training Metric Is Stale",
         "monitor_error": "## Training Monitor Error",
         "training_status": "## Training Status",
-    }[signal_kind]
+    }.get(signal_kind)
+    if title is None:
+        return (
+            f"## Training Monitor Signal: {inline_code(signal_kind)}\n\n"
+            f"{json_block(signal_value)}"
+        )
     lines = [title]
     status = [_field("Training ID", payload["training_id"])]
     for key, label in (
@@ -392,7 +447,7 @@ def _training_monitor(payload: Mapping[str, object]) -> str:
     ):
         value = signal_value[key]
         if key == "hard_failure":
-            status.append(_field(label, yes_no(value), code=False))
+            status.append(_field(label, str(value).lower()))
         elif value is None:
             status.append(_field(label, "Unavailable", code=False))
         else:
@@ -464,21 +519,23 @@ def _agent_error(payload: Mapping[str, object]) -> str:
 
 
 _EVENT_RENDERERS: dict[str, EventRenderer] = {
-    "advisor_action": _advisor_action,
-    "agent_error": _agent_error,
-    "agent_result": _agent_result,
-    "duplicate_assignment": _duplicate_assignment,
-    "human_issue": _human_issue,
-    "malformed_assignment": _malformed_assignment,
-    "research_base_changed": _research_base_changed,
-    "review_ready": _review_ready,
-    "student_assignment": _student_assignment,
-    "student_assignment_comment": _student_assignment_comment,
-    "student_available_for_assignment": _student_available,
-    "student_pr_feedback": _student_pr_feedback,
-    "training_monitor": _training_monitor,
-    "workspace_diverged": _workspace_diverged,
+    EventKind.ADVISOR_ACTION: _advisor_action,
+    EventKind.AGENT_ERROR: _agent_error,
+    EventKind.AGENT_RESULT: _agent_result,
+    EventKind.DUPLICATE_ASSIGNMENT: _duplicate_assignment,
+    EventKind.HUMAN_ISSUE: _human_issue,
+    EventKind.MALFORMED_ASSIGNMENT: _malformed_assignment,
+    EventKind.RESEARCH_BASE_CHANGED: _research_base_changed,
+    EventKind.REVIEW_READY: _review_ready,
+    EventKind.STUDENT_ASSIGNMENT: _student_assignment,
+    EventKind.STUDENT_ASSIGNMENT_COMMENT: _student_assignment_comment,
+    EventKind.STUDENT_AVAILABLE_FOR_ASSIGNMENT: _student_available,
+    EventKind.STUDENT_PR_FEEDBACK: _student_pr_feedback,
+    EventKind.TRAINING_MONITOR: _training_monitor,
+    EventKind.WORKSPACE_DIVERGED: _workspace_diverged,
 }
+if frozenset(_EVENT_RENDERERS) != EVENT_KINDS:
+    raise RuntimeError("specialized event renderers do not match EventKind")
 
 
 def visible_event_payload(payload: Mapping[str, object]) -> dict[str, object]:
@@ -497,28 +554,9 @@ def render_event_prompt(kind: str, payload: Mapping[str, object]) -> str:
     return renderer(visible)
 
 
-def render_pre_markdown_event_prompt(
-    kind: str,
-    payload: Mapping[str, object],
-) -> str:
-    """Reproduce the pre-Markdown-v2 body for durable inbox compatibility."""
-
-    visible = visible_event_payload(payload)
-    if kind == "student_available_for_assignment":
-        student = str(visible["student"])
-        return (
-            f"## Student available for assignment: `{student}`\n\n"
-            f"`{student}` has no open `status:wip` or `status:review` assignment."
-        )
-    encoded = json.dumps(visible, sort_keys=True, separators=(",", ":"))
-    return f"## {kind}\n\n{encoded}"
-
-
 def canonical_event_identity(kind: str, payload: Mapping[str, object]) -> str:
     """Encode the complete model-relevant event independently of its display."""
 
-    return json.dumps(
-        {"kind": kind, "payload": visible_event_payload(payload)},
-        sort_keys=True,
-        separators=(",", ":"),
+    return canonical_json(
+        {"kind": kind, "payload": visible_event_payload(payload)}
     )

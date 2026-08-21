@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from collections.abc import Sequence
@@ -12,10 +13,10 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from senpai_agent.json_values import canonical_json
 from senpai_agent.model_markdown import (
     canonical_event_identity,
     render_event_prompt,
-    render_pre_markdown_event_prompt,
 )
 
 
@@ -35,9 +36,6 @@ class LocalEvent(BaseModel):
 
     def to_inbox_message(self) -> str:
         return render_event_prompt(self.kind, self.payload)
-
-    def to_pre_markdown_inbox_message(self) -> str:
-        return render_pre_markdown_event_prompt(self.kind, self.payload)
 
     def event_identity(self) -> str:
         return canonical_event_identity(self.kind, self.payload)
@@ -73,13 +71,20 @@ class LocalEventStore:
                 self._connection.commit()
 
     def enqueue(self, event: LocalEvent) -> bool:
+        if not event.dedupe_key:
+            raise ValueError("event key must not be empty")
+        try:
+            event.dedupe_key.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError("event key must be valid UTF-8") from error
+        canonical_json(event.payload)
         with self._lock:
             row = self._connection.execute(
                 "SELECT event_json FROM advisor_events WHERE dedupe_key = ?",
                 (event.dedupe_key,),
             ).fetchone()
             if row is not None:
-                existing = LocalEvent.model_validate_json(row[0])
+                existing = LocalEvent.model_validate(json.loads(row[0]))
                 if existing.kind != event.kind or existing.payload != event.payload:
                     raise RuntimeError(
                         f"event {event.dedupe_key!r} was reused with a different payload"
@@ -90,7 +95,10 @@ class LocalEventStore:
                 INSERT INTO advisor_events (dedupe_key, event_json)
                 VALUES (?, ?)
                 """,
-                (event.dedupe_key, event.model_dump_json()),
+                (
+                    event.dedupe_key,
+                    canonical_json(event.model_dump(mode="json")),
+                ),
             )
             self._connection.commit()
             return cursor.rowcount == 1
@@ -105,7 +113,7 @@ class LocalEventStore:
                 ORDER BY rowid
                 """
             ).fetchall()
-        return [LocalEvent.model_validate_json(row[0]) for row in rows]
+        return [LocalEvent.model_validate(json.loads(row[0])) for row in rows]
 
     def pending_count(self) -> int:
         with self._lock:

@@ -207,7 +207,7 @@ def test_provider_timeout_resumes_inference_without_resending_the_turn(
     isolate_agent_discovery(monkeypatch, runner)
     config = runtime_config(tmp_path)
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(config.conversation_id, "event:1", "first event")
+    inbox.enqueue(config.conversation_id, "event:1", "first event", event_identity="first event")
     turn = inbox.next_turn(config.conversation_id, "controller prompt")
     assert turn is not None
 
@@ -268,7 +268,7 @@ def test_processed_turn_recovers_without_append_or_inference(tmp_path, monkeypat
     isolate_agent_discovery(monkeypatch, runner)
     config = runtime_config(tmp_path)
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(config.conversation_id, "event:1", "first event")
+    inbox.enqueue(config.conversation_id, "event:1", "first event", event_identity="first event")
     turn = inbox.next_turn(config.conversation_id, "controller prompt")
     assert turn is not None
     for message in turn.messages:
@@ -295,7 +295,7 @@ def test_finished_branch_repairs_processing_receipt_without_inference(
     calls = []
     config = runtime_config(tmp_path)
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(config.conversation_id, "event:1", "first event")
+    inbox.enqueue(config.conversation_id, "event:1", "first event", event_identity="first event")
     turn = inbox.next_turn(config.conversation_id, "controller prompt")
     assert turn is not None
     for message in turn.messages:
@@ -355,7 +355,7 @@ def test_terminal_budget_reconciles_a_finished_response_before_recovery(
     calls = []
     config = runtime_config(tmp_path)
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(config.conversation_id, "event:1", "first event")
+    inbox.enqueue(config.conversation_id, "event:1", "first event", event_identity="first event")
     turn = inbox.next_turn(config.conversation_id, "controller prompt")
     assert turn is not None
     for message in turn.messages:
@@ -425,7 +425,7 @@ def test_paused_persisted_final_response_reconciles_without_inference(
     calls = []
     config = runtime_config(tmp_path)
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(config.conversation_id, "event:1", "first event")
+    inbox.enqueue(config.conversation_id, "event:1", "first event", event_identity="first event")
     turn = inbox.next_turn(config.conversation_id, "controller prompt")
     assert turn is not None
     branch = [
@@ -495,7 +495,7 @@ def test_stalled_recovery_is_bounded_and_quarantined_with_the_full_brief(
         inbox_max_recovery_generations=1,
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(config.conversation_id, "event:1", "canonical event")
+    inbox.enqueue(config.conversation_id, "event:1", "canonical event", event_identity="canonical event")
     turn = inbox.next_turn(config.conversation_id, "ordinary continuation")
     assert turn is not None
 
@@ -589,7 +589,7 @@ def test_model_visible_progress_renews_the_stalled_attempt_budget(
         inbox_max_recovery_generations=1,
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(config.conversation_id, "event:1", "canonical event")
+    inbox.enqueue(config.conversation_id, "event:1", "canonical event", event_identity="canonical event")
     turn = inbox.next_turn(config.conversation_id, "ordinary continuation")
     assert turn is not None
 
@@ -669,7 +669,7 @@ def test_timeout_and_error_artifacts_do_not_renew_the_stalled_attempt_budget(
         inbox_max_recovery_generations=1,
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(config.conversation_id, "event:1", "canonical event")
+    inbox.enqueue(config.conversation_id, "event:1", "canonical event", event_identity="canonical event")
     turn = inbox.next_turn(config.conversation_id, "ordinary continuation")
     assert turn is not None
 
@@ -731,7 +731,7 @@ def test_context_reset_preserves_old_branch_and_requeues_once(tmp_path, monkeypa
     """
     config = runtime_config(tmp_path)
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(config.conversation_id, "event:1", "first event")
+    inbox.enqueue(config.conversation_id, "event:1", "first event", event_identity="first event")
     old_turn = inbox.next_turn(config.conversation_id, "old controller prompt")
     assert old_turn is not None
     old_branch = [
@@ -808,7 +808,7 @@ def test_restart_after_recovery_commit_resets_before_delivering(tmp_path, monkey
     """A crash after reset persistence cannot deliver onto the polluted branch."""
     config = runtime_config(tmp_path)
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(config.conversation_id, "event:1", "canonical event")
+    inbox.enqueue(config.conversation_id, "event:1", "canonical event", event_identity="canonical event")
     old = inbox.next_turn(config.conversation_id, "old prompt")
     assert old is not None
     old_branch = [

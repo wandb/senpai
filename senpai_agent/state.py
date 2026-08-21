@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
+from senpai_agent.event_kinds import EventKind
 from senpai_agent.mailbox import ControllerEvent
 
 
@@ -134,17 +135,20 @@ class StudentConversationSelector:
         )
 
     def _conversation_for(self, event: ControllerEvent) -> UUID:
-        if event.kind == "training_monitor":
+        if event.kind == EventKind.TRAINING_MONITOR:
             return UUID(str(event.payload["conversation_id"]))
         parent_id = event.payload.get("parent_conversation_id")
         if isinstance(parent_id, str):
             return UUID(parent_id)
-        if event.kind in {"student_assignment", "student_pr_feedback"}:
+        if event.kind in {
+            EventKind.STUDENT_ASSIGNMENT,
+            EventKind.STUDENT_PR_FEEDBACK,
+        }:
             return self.registry.for_assignment(
                 str(event.payload["assignment_id"]),
                 str(event.payload["revision_id"]),
             )
-        if event.kind == "human_issue":
+        if event.kind == EventKind.HUMAN_ISSUE:
             return self.registry.for_assignment(
                 f"human-issue-{event.payload['number']}",
                 "thread",

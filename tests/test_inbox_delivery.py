@@ -1,7 +1,9 @@
 import hashlib
 import json
 import sqlite3
+import threading
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -9,6 +11,7 @@ from uuid import UUID
 import pytest
 from openhands.sdk.event import ActionEvent, ObservationEvent
 
+import senpai_agent.inbox as inbox_module
 from senpai_agent.inbox import (
     MAX_EVENT_BYTES_PER_TURN,
     MAX_EVENTS_PER_TURN,
@@ -21,6 +24,7 @@ from senpai_agent.inbox import (
     deliver_turn_messages,
     turn_has_finished_response,
 )
+from senpai_agent.json_values import canonical_json
 from senpai_agent.mailbox import ControllerEvent
 from event_payloads import event_payload
 
@@ -44,6 +48,58 @@ def event_message(index: int, size: int = 0) -> str:
     return f"event-{index}:" + ("x" * size)
 
 
+def pre_markdown_event_body(event: ControllerEvent) -> str:
+    payload = {
+        key: value
+        for key, value in event.payload.items()
+        if key != "parent_conversation_id"
+    }
+    if event.kind == "student_available_for_assignment":
+        student = payload["student"]
+        return (
+            f"## Student available for assignment: `{student}`\n\n"
+            f"`{student}` has no open `status:wip` or "
+            "`status:review` assignment."
+        )
+    return f"## {event.kind}\n\n{canonical_json(payload)}"
+
+
+def enqueue_event(
+    inbox: PersistentInbox,
+    conversation_id: UUID,
+    event_key: str,
+    body: str,
+    *,
+    event_identity: str | None = None,
+    **options,
+):
+    return inbox.enqueue(
+        conversation_id,
+        event_key,
+        body,
+        event_identity=body if event_identity is None else event_identity,
+        **options,
+    )
+
+
+def steer_event(
+    inbox: PersistentInbox,
+    conversation_id: UUID,
+    event_key: str,
+    body: str,
+    *,
+    event_identity: str | None = None,
+    **options,
+):
+    return inbox.steer(
+        conversation_id,
+        event_key,
+        body,
+        event_identity=body if event_identity is None else event_identity,
+        **options,
+    )
+
+
 def delivery_sender(delivery_id: str) -> str:
     return "senpai-delivery:" + hashlib.sha256(delivery_id.encode()).hexdigest()
 
@@ -55,7 +111,7 @@ def test_delivery_state_is_durable_and_monotonic_across_restarts(tmp_path: Path)
     """
     path = tmp_path / "inbox.sqlite3"
     inbox = PersistentInbox(path)
-    assert inbox.enqueue(CONVERSATION_ID, "event:1", "first event") is True
+    assert enqueue_event(inbox, CONVERSATION_ID, "event:1", "first event") is True
     turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert turn is not None
     assert [message.state for message in turn.messages] == [
@@ -92,7 +148,7 @@ def test_stable_sender_verifies_payload_after_crash_between_append_and_receipt(
     Interface: the sender and body visible on the active OpenHands branch.
     """
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    enqueue_event(inbox, CONVERSATION_ID, "event:1", "canonical event")
     turn = inbox.next_turn(CONVERSATION_ID, "canonical prompt")
     assert turn is not None
 
@@ -121,10 +177,10 @@ def test_event_identity_cannot_hide_a_changed_payload(tmp_path: Path):
     Interface: repeated enqueue calls against the persistent inbox.
     """
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    enqueue_event(inbox, CONVERSATION_ID, "event:1", "canonical event")
 
     with pytest.raises(RuntimeError, match="reused with a different payload"):
-        inbox.enqueue(CONVERSATION_ID, "event:1", "changed event")
+        enqueue_event(inbox, CONVERSATION_ID, "event:1", "changed event")
 
     turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert turn is not None
@@ -133,10 +189,10 @@ def test_event_identity_cannot_hide_a_changed_payload(tmp_path: Path):
     inbox.acknowledge(turn.turn_id)
 
     with pytest.raises(RuntimeError, match="reused with a different payload"):
-        inbox.enqueue(CONVERSATION_ID, "event:1", "changed after acknowledgement")
+        enqueue_event(inbox, CONVERSATION_ID, "event:1", "changed after acknowledgement")
 
 
-def test_event_renderer_cutover_accepts_only_the_equivalent_pre_markdown_body(
+def test_pre_markdown_event_identity_is_backfilled_once_at_open(
     tmp_path: Path,
 ):
     """A restart keeps an attached v1 message and uses v2 for later reminders."""
@@ -151,12 +207,18 @@ def test_event_renderer_cutover_accepts_only_the_equivalent_pre_markdown_body(
             "head_sha": "abc",
         },
     )
-    pre_markdown_body = event.to_pre_markdown_prompt()
+    pre_markdown_body = pre_markdown_event_body(event)
     markdown_body = event.to_prompt()
     assert pre_markdown_body != markdown_body
 
     assert (
-        inbox.enqueue(CONVERSATION_ID, event.dedupe_key, pre_markdown_body)
+        enqueue_event(
+            inbox,
+            CONVERSATION_ID,
+            event.dedupe_key,
+            pre_markdown_body,
+            event_identity=event.event_identity(),
+        )
         is True
     )
     turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
@@ -171,8 +233,6 @@ def test_event_renderer_cutover_accepts_only_the_equivalent_pre_markdown_body(
     inbox.require_event_identity(
         CONVERSATION_ID,
         event.dedupe_key,
-        markdown_body,
-        pre_markdown_body=pre_markdown_body,
         event_identity=event.event_identity(),
     )
     with sqlite3.connect(inbox.path) as database:
@@ -184,11 +244,11 @@ def test_event_renderer_cutover_accepts_only_the_equivalent_pre_markdown_body(
     ).hexdigest()
 
     assert (
-        inbox.enqueue(
+        enqueue_event(
+            inbox,
             CONVERSATION_ID,
             event.dedupe_key,
             markdown_body,
-            pre_markdown_body=pre_markdown_body,
             event_identity=event.event_identity(),
         )
         is False
@@ -201,11 +261,11 @@ def test_event_renderer_cutover_accepts_only_the_equivalent_pre_markdown_body(
         payload={**event.payload, "head_sha": "def"},
     )
     with pytest.raises(RuntimeError, match="reused with a different payload"):
-        inbox.enqueue(
+        enqueue_event(
+            inbox,
             CONVERSATION_ID,
             changed.dedupe_key,
             changed.to_prompt(),
-            pre_markdown_body=changed.to_pre_markdown_prompt(),
             event_identity=changed.event_identity(),
         )
 
@@ -214,11 +274,11 @@ def test_event_renderer_cutover_accepts_only_the_equivalent_pre_markdown_body(
     inbox.acknowledge(turn.turn_id)
 
     assert (
-        inbox.enqueue(
+        enqueue_event(
+            inbox,
             CONVERSATION_ID,
             event.dedupe_key,
             markdown_body,
-            pre_markdown_body=pre_markdown_body,
             event_identity=event.event_identity(),
         )
         is True
@@ -226,6 +286,100 @@ def test_event_renderer_cutover_accepts_only_the_equivalent_pre_markdown_body(
     reminder = inbox.next_turn(CONVERSATION_ID, "later reminder")
     assert reminder is not None
     assert reminder.events[0].body == markdown_body
+
+
+def test_existing_identity_column_backfills_pre_markdown_null_rows(
+    tmp_path: Path,
+):
+    path = tmp_path / "inbox.sqlite3"
+    event = ControllerEvent(
+        kind="review_ready",
+        dedupe_key="review_ready:17:abc",
+        payload=event_payload("review_ready"),
+    )
+    inbox = PersistentInbox(path)
+    enqueue_event(
+        inbox,
+        CONVERSATION_ID,
+        event.dedupe_key,
+        pre_markdown_event_body(event),
+        event_identity=event.event_identity(),
+    )
+    inbox.close()
+    with sqlite3.connect(path) as database:
+        database.execute(
+            "UPDATE inbox_messages SET event_identity_sha256 = NULL"
+        )
+
+    reopened = PersistentInbox(path)
+
+    reopened.require_event_identity(
+        CONVERSATION_ID,
+        event.dedupe_key,
+        event_identity=event.event_identity(),
+    )
+    with sqlite3.connect(path) as database:
+        stored = database.execute(
+            "SELECT event_identity_sha256 FROM inbox_messages"
+        ).fetchone()[0]
+    assert stored == hashlib.sha256(event.event_identity().encode()).hexdigest()
+
+
+def test_concurrent_openers_serialize_the_identity_migration(
+    tmp_path: Path,
+    monkeypatch,
+):
+    path = tmp_path / "inbox.sqlite3"
+    event = ControllerEvent(
+        kind="review_ready",
+        dedupe_key="review_ready:17:abc",
+        payload=event_payload("review_ready"),
+    )
+    inbox = PersistentInbox(path)
+    enqueue_event(
+        inbox,
+        CONVERSATION_ID,
+        event.dedupe_key,
+        pre_markdown_event_body(event),
+        event_identity=event.event_identity(),
+    )
+    inbox.close()
+    with sqlite3.connect(path) as database:
+        database.execute(
+            "ALTER TABLE inbox_messages DROP COLUMN event_identity_sha256"
+        )
+
+    barrier = threading.Barrier(2)
+    real_connect = sqlite3.connect
+
+    class SynchronizedConnection(sqlite3.Connection):
+        def execute(self, statement, parameters=(), /):
+            if statement == "BEGIN IMMEDIATE":
+                barrier.wait(timeout=5)
+            return super().execute(statement, parameters)
+
+    def synchronized_connect(*args, **kwargs):
+        return real_connect(*args, factory=SynchronizedConnection, **kwargs)
+
+    monkeypatch.setattr(inbox_module.sqlite3, "connect", synchronized_connect)
+
+    def reopen(_index: int) -> None:
+        PersistentInbox(path).close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        tuple(pool.map(reopen, range(2)))
+
+    with real_connect(path) as database:
+        columns = {
+            str(row[1])
+            for row in database.execute("PRAGMA table_info(inbox_messages)")
+        }
+        missing = database.execute(
+            "SELECT COUNT(*) FROM inbox_messages "
+            "WHERE event_identity_sha256 IS NULL"
+        ).fetchone()[0]
+    assert "event_identity_sha256" in columns
+    assert missing == 0
 
 
 def test_event_identity_includes_fields_hidden_from_the_markdown_view(
@@ -247,105 +401,143 @@ def test_event_identity_includes_fields_hidden_from_the_markdown_view(
     )
     assert original.to_prompt() == changed.to_prompt()
 
-    pre_markdown_body = original.to_pre_markdown_prompt()
-    assert inbox.enqueue(
+    assert enqueue_event(
+        inbox,
         CONVERSATION_ID,
         original.dedupe_key,
         original.to_prompt(),
-        pre_markdown_body=pre_markdown_body,
         event_identity=original.event_identity(),
     )
 
     with pytest.raises(RuntimeError, match="reused with a different payload"):
-        inbox.enqueue(
+        enqueue_event(
+            inbox,
             CONVERSATION_ID,
             changed.dedupe_key,
             changed.to_prompt(),
-            pre_markdown_body=changed.to_pre_markdown_prompt(),
             event_identity=changed.event_identity(),
         )
 
 
-def test_event_identity_migrates_the_intermediate_column_name(tmp_path: Path):
+def test_pre_markdown_availability_backfill_uses_historical_payload(
+    tmp_path: Path,
+):
     path = tmp_path / "inbox.sqlite3"
     original = ControllerEvent(
-        kind="workspace_diverged",
-        dedupe_key="workspace_diverged:stable-key",
-        payload=event_payload(
-            "workspace_diverged",
-            worktree_fingerprint="fingerprint-one",
-        ),
+        kind="student_available_for_assignment",
+        dedupe_key="student_available_for_assignment:Fern",
+        payload={"student": "Fern"},
     )
     inbox = PersistentInbox(path)
-    inbox.enqueue(
+    enqueue_event(
+        inbox,
         CONVERSATION_ID,
         original.dedupe_key,
-        original.to_prompt(),
-        pre_markdown_body=original.to_pre_markdown_prompt(),
+        pre_markdown_event_body(original),
         event_identity=original.event_identity(),
     )
     inbox.close()
     with sqlite3.connect(path) as database:
         database.execute(
-            "ALTER TABLE inbox_messages RENAME COLUMN "
-            "event_identity_sha256 TO payload_identity_sha256"
+            "ALTER TABLE inbox_messages DROP COLUMN event_identity_sha256"
         )
 
     reopened = PersistentInbox(path)
     changed = ControllerEvent(
         kind=original.kind,
         dedupe_key=original.dedupe_key,
-        payload={**original.payload, "worktree_fingerprint": "fingerprint-two"},
+        payload={"student": "Fern", "generation": 2},
     )
     assert original.to_prompt() == changed.to_prompt()
     with pytest.raises(RuntimeError, match="reused with a different payload"):
-        reopened.enqueue(
+        enqueue_event(
+            reopened,
             CONVERSATION_ID,
             changed.dedupe_key,
             changed.to_prompt(),
-            pre_markdown_body=changed.to_pre_markdown_prompt(),
             event_identity=changed.event_identity(),
         )
 
+
+def test_pre_markdown_backfill_rejects_an_unparseable_native_event(tmp_path: Path):
+    path = tmp_path / "inbox.sqlite3"
+    inbox = PersistentInbox(path)
+    enqueue_event(inbox, CONVERSATION_ID, "event:1", "not a v1 event")
+    inbox.close()
+    with sqlite3.connect(path) as database:
+        database.execute(
+            "ALTER TABLE inbox_messages DROP COLUMN event_identity_sha256"
+        )
+
+    with pytest.raises(RuntimeError, match="cannot migrate event 'event:1'"):
+        PersistentInbox(path)
+
     with sqlite3.connect(path) as database:
         columns = {
-            row[1] for row in database.execute("PRAGMA table_info(inbox_messages)")
+            str(row[1])
+            for row in database.execute("PRAGMA table_info(inbox_messages)")
         }
-    assert "event_identity_sha256" in columns
-    assert "payload_identity_sha256" not in columns
+    assert "event_identity_sha256" not in columns
 
 
-def test_event_identity_is_independent_of_the_pre_markdown_renderer(
-    tmp_path: Path,
-):
+def test_pre_markdown_backfill_preserves_oversized_processed_history(tmp_path: Path):
+    path = tmp_path / "inbox.sqlite3"
+    inbox = PersistentInbox(path)
+    enqueue_event(inbox, CONVERSATION_ID, "future:1", "placeholder")
+    turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
+    assert turn is not None
+    deliver_turn_messages(Conversation(), inbox, turn.turn_id)
+    inbox.record_processed(turn.turn_id)
+    inbox.acknowledge(turn.turn_id)
+    inbox.close()
+    oversized = "## future_event\n\n" + canonical_json(
+        {"message": "x" * (70 * 1024)}
+    )
+    with sqlite3.connect(path) as database:
+        database.execute(
+            "ALTER TABLE inbox_messages DROP COLUMN event_identity_sha256"
+        )
+        database.execute(
+            "UPDATE inbox_messages SET body = ?, body_sha256 = ?",
+            (oversized, hashlib.sha256(oversized.encode()).hexdigest()),
+        )
+
+    reopened = PersistentInbox(path)
+
+    with sqlite3.connect(path) as database:
+        identity = database.execute(
+            "SELECT event_identity_sha256 FROM inbox_messages "
+            "WHERE event_key = 'future:1'"
+        ).fetchone()[0]
+    assert identity is not None
+    assert reopened.turn(turn.turn_id).events[0].body == oversized
+
+
+def test_event_identity_is_required_and_never_derived_from_the_body(tmp_path: Path):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    original = ControllerEvent(
-        kind="student_available_for_assignment",
-        dedupe_key="student_available_for_assignment:Fern",
-        payload={"student": "Fern", "generation": 1},
-    )
-    changed = ControllerEvent(
-        kind=original.kind,
-        dedupe_key=original.dedupe_key,
-        payload={"student": "Fern", "generation": 2},
-    )
-    assert original.to_pre_markdown_prompt() == changed.to_pre_markdown_prompt()
-
-    assert inbox.enqueue(
-        CONVERSATION_ID,
-        original.dedupe_key,
-        original.to_prompt(),
-        pre_markdown_body=original.to_pre_markdown_prompt(),
-        event_identity=original.event_identity(),
-    )
-
-    with pytest.raises(RuntimeError, match="reused with a different payload"):
+    with pytest.raises(TypeError, match="event_identity"):
+        inbox.enqueue(CONVERSATION_ID, "event:1", "body")
+    with pytest.raises(ValueError, match="event identity must not be empty"):
         inbox.enqueue(
             CONVERSATION_ID,
-            changed.dedupe_key,
-            changed.to_prompt(),
-            pre_markdown_body=changed.to_pre_markdown_prompt(),
-            event_identity=changed.event_identity(),
+            "event:1",
+            "body",
+            event_identity="",
+        )
+
+
+def test_event_identity_preflight_stays_read_only(tmp_path: Path):
+    path = tmp_path / "inbox.sqlite3"
+    inbox = PersistentInbox(path)
+    enqueue_event(inbox, CONVERSATION_ID, "event:1", "body")
+
+    with sqlite3.connect(path) as writer:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("BEGIN IMMEDIATE")
+        inbox.require_event_identity(
+            CONVERSATION_ID,
+            "event:1",
+            event_identity="body",
         )
 
 
@@ -353,8 +545,8 @@ def test_retract_pending_removes_only_unclaimed_events(tmp_path: Path):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
     availability_key = "student_available_for_assignment:Fern"
     other_key = "review_ready:17:abc"
-    inbox.enqueue(CONVERSATION_ID, availability_key, "student available")
-    inbox.enqueue(CONVERSATION_ID, other_key, "review ready")
+    enqueue_event(inbox, CONVERSATION_ID, availability_key, "student available")
+    enqueue_event(inbox, CONVERSATION_ID, other_key, "review ready")
 
     inbox.retract_pending_prefix(
         CONVERSATION_ID,
@@ -365,11 +557,15 @@ def test_retract_pending_removes_only_unclaimed_events(tmp_path: Path):
         "student_available_for_assignment:",
     )
     assert inbox.pending_count(CONVERSATION_ID) == 1
-    assert inbox.enqueue(
-        CONVERSATION_ID,
-        availability_key,
-        "student available",
-    ) is True
+    assert (
+        enqueue_event(
+            inbox,
+            CONVERSATION_ID,
+            availability_key,
+            "student available",
+        )
+        is True
+    )
 
     turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert turn is not None
@@ -379,7 +575,7 @@ def test_retract_pending_removes_only_unclaimed_events(tmp_path: Path):
 def test_retract_pending_preserves_a_claimed_turn(tmp_path: Path):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
     availability_key = "student_available_for_assignment:Fern"
-    inbox.enqueue(CONVERSATION_ID, availability_key, "student available")
+    enqueue_event(inbox, CONVERSATION_ID, availability_key, "student available")
     turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert turn is not None
 
@@ -399,7 +595,7 @@ def test_crash_before_append_reuses_turn_and_appends_each_message_once(tmp_path:
     """
     path = tmp_path / "inbox.sqlite3"
     inbox = PersistentInbox(path)
-    inbox.enqueue(CONVERSATION_ID, "event:1", "first event")
+    enqueue_event(inbox, CONVERSATION_ID, "event:1", "first event")
     before_crash = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert before_crash is not None
 
@@ -429,7 +625,7 @@ def test_fifo_drain_is_bounded_by_event_count_and_bytes(tmp_path: Path):
     """
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
     for index in range(20):
-        inbox.enqueue(CONVERSATION_ID, f"event:{index}", event_message(index))
+        enqueue_event(inbox, CONVERSATION_ID, f"event:{index}", event_message(index))
 
     first = inbox.next_turn(CONVERSATION_ID, "first prompt")
     assert first is not None
@@ -447,35 +643,44 @@ def test_fifo_drain_is_bounded_by_event_count_and_bytes(tmp_path: Path):
     ]
 
     large_conversation = UUID("00000000-0000-0000-0000-000000000064")
-    inbox.enqueue(large_conversation, "oversized", event_message(0, 70 * 1024))
-    inbox.enqueue(large_conversation, "next", "small")
-    oversized = inbox.next_turn(large_conversation, "large prompt")
-    assert oversized is not None
-    assert [event.event_key for event in oversized.events] == ["oversized"]
+    with pytest.raises(ValueError, match="event body exceeds 65536 UTF-8 bytes"):
+        enqueue_event(
+            inbox,
+            large_conversation,
+            "oversized",
+            event_message(0, 70 * 1024),
+        )
+    enqueue_event(inbox, large_conversation, "next", "small")
+    bounded = inbox.next_turn(large_conversation, "large prompt")
+    assert bounded is not None
+    assert [event.event_key for event in bounded.events] == ["next"]
 
 
 def test_priority_precedes_fifo_without_reordering_its_own_class(tmp_path: Path):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(CONVERSATION_ID, "event:ordinary-1", "ordinary 1")
-    inbox.enqueue(
+    enqueue_event(inbox, CONVERSATION_ID, "event:ordinary-1", "ordinary 1")
+    enqueue_event(
+        inbox,
         CONVERSATION_ID,
         "event:queue-1",
         "queue 1",
         priority=QUEUE_PRIORITY,
     )
-    inbox.enqueue(
+    enqueue_event(
+        inbox,
         CONVERSATION_ID,
         "event:queue-2",
         "queue 2",
         priority=QUEUE_PRIORITY,
     )
-    inbox.enqueue(
+    enqueue_event(
+        inbox,
         CONVERSATION_ID,
         "event:steer",
         "steer",
         priority=STEER_PRIORITY,
     )
-    inbox.enqueue(CONVERSATION_ID, "event:ordinary-2", "ordinary 2")
+    enqueue_event(inbox, CONVERSATION_ID, "event:ordinary-2", "ordinary 2")
 
     turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
 
@@ -497,13 +702,15 @@ def test_priority_migrates_and_steer_leads_ready_conversations(tmp_path: Path):
 
     inbox = PersistentInbox(path)
     other = UUID("00000000-0000-0000-0000-000000000018")
-    inbox.enqueue(
+    enqueue_event(
+        inbox,
         CONVERSATION_ID,
         "event:assignment",
         "assignment",
         priority=QUEUE_PRIORITY,
     )
-    inbox.enqueue(
+    enqueue_event(
+        inbox,
         other,
         "event:steer",
         "steer",
@@ -519,12 +726,12 @@ def test_new_events_wait_behind_an_unresolved_delivery(tmp_path: Path):
     Interface: next_turn while a delivered turn has not been processed.
     """
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(CONVERSATION_ID, "event:first", "first")
+    enqueue_event(inbox, CONVERSATION_ID, "event:first", "first")
     first = inbox.next_turn(CONVERSATION_ID, "first prompt")
     assert first is not None
     deliver_turn_messages(Conversation(), inbox, first.turn_id)
 
-    inbox.enqueue(CONVERSATION_ID, "event:later", "later")
+    enqueue_event(inbox, CONVERSATION_ID, "event:later", "later")
     retry = inbox.next_turn(CONVERSATION_ID, "retry prompt")
     assert retry is not None
     assert retry.turn_id == first.turn_id
@@ -534,7 +741,7 @@ def test_new_events_wait_behind_an_unresolved_delivery(tmp_path: Path):
 
 def test_human_steering_joins_the_active_turn_and_resets_its_budget(tmp_path: Path):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(CONVERSATION_ID, "event:first", "first")
+    enqueue_event(inbox, CONVERSATION_ID, "event:first", "first")
     active = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert active is not None
     conversation = Conversation()
@@ -543,13 +750,15 @@ def test_human_steering_joins_the_active_turn_and_resets_its_budget(tmp_path: Pa
         inbox.record_inference_attempt(active.turn_id)
     assert inbox.terminal_recovery_due(active.turn_id, max_attempts=3)
 
-    steered = inbox.steer(
+    steered = steer_event(
+        inbox,
         CONVERSATION_ID,
         "human:1",
         "change direction",
         priority=STEER_PRIORITY,
     )
-    repeated = inbox.steer(
+    repeated = steer_event(
+        inbox,
         CONVERSATION_ID,
         "human:1",
         "change direction",
@@ -572,7 +781,7 @@ def test_human_steering_joins_the_active_turn_and_resets_its_budget(tmp_path: Pa
 def test_steer_enqueue_and_attachment_roll_back_together(tmp_path: Path):
     path = tmp_path / "inbox.sqlite3"
     inbox = PersistentInbox(path)
-    inbox.enqueue(CONVERSATION_ID, "event:first", "first")
+    enqueue_event(inbox, CONVERSATION_ID, "event:first", "first")
     active = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert active is not None
     with sqlite3.connect(path) as database:
@@ -588,7 +797,8 @@ def test_steer_enqueue_and_attachment_roll_back_together(tmp_path: Path):
         )
 
     with pytest.raises(sqlite3.IntegrityError, match="attachment failed"):
-        inbox.steer(
+        steer_event(
+            inbox,
             CONVERSATION_ID,
             "human:1",
             "change direction",
@@ -603,20 +813,21 @@ def test_only_a_new_human_steer_reopens_the_same_quarantined_turn(
     capsys,
 ):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(CONVERSATION_ID, "event:first", "first")
+    enqueue_event(inbox, CONVERSATION_ID, "event:first", "first")
     active = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert active is not None
     deliver_turn_messages(Conversation(), inbox, active.turn_id)
     inbox.record_inference_attempt(active.turn_id)
     inbox.quarantine(active.turn_id, "recovery budget exhausted")
 
-    duplicate = inbox.steer(CONVERSATION_ID, "event:first", "first")
+    duplicate = steer_event(inbox, CONVERSATION_ID, "event:first", "first")
 
     assert duplicate is None
     assert inbox.turn(active.turn_id).quarantine_reason == "recovery budget exhausted"
     assert inbox.ready_conversation_ids() == ()
 
-    queued = inbox.steer(
+    queued = steer_event(
+        inbox,
         CONVERSATION_ID,
         "feedback:1",
         "try again",
@@ -627,7 +838,8 @@ def test_only_a_new_human_steer_reopens_the_same_quarantined_turn(
     assert inbox.turn(active.turn_id).quarantine_reason == "recovery budget exhausted"
     assert inbox.pending_count(CONVERSATION_ID) == 1
 
-    reopened = inbox.steer(
+    reopened = steer_event(
+        inbox,
         CONVERSATION_ID,
         "human:1",
         "change direction",
@@ -652,13 +864,14 @@ def test_only_a_new_human_steer_reopens_the_same_quarantined_turn(
 
 def test_queued_feedback_does_not_refill_an_active_turn_budget(tmp_path: Path):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(CONVERSATION_ID, "event:first", "first")
+    enqueue_event(inbox, CONVERSATION_ID, "event:first", "first")
     active = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert active is not None
     deliver_turn_messages(Conversation(), inbox, active.turn_id)
     inbox.record_inference_attempt(active.turn_id)
 
-    attached = inbox.steer(
+    attached = steer_event(
+        inbox,
         CONVERSATION_ID,
         "feedback:1",
         "try again",
@@ -673,23 +886,31 @@ def test_steer_overflow_waits_for_the_next_turn_and_recovery_stays_bounded(
     tmp_path: Path,
 ):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(CONVERSATION_ID, "event:0", "initial")
+    enqueue_event(inbox, CONVERSATION_ID, "event:0", "initial")
     active = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert active is not None
 
     for index in range(1, MAX_EVENTS_PER_TURN):
-        assert inbox.steer(
+        assert (
+            steer_event(
+                inbox,
+                CONVERSATION_ID,
+                f"feedback:{index}",
+                f"feedback {index}",
+                priority=QUEUE_PRIORITY,
+            )
+            is not None
+        )
+    assert (
+        steer_event(
+            inbox,
             CONVERSATION_ID,
-            f"feedback:{index}",
-            f"feedback {index}",
+            "feedback:overflow",
+            "overflow",
             priority=QUEUE_PRIORITY,
-        ) is not None
-    assert inbox.steer(
-        CONVERSATION_ID,
-        "feedback:overflow",
-        "overflow",
-        priority=QUEUE_PRIORITY,
-    ) is None
+        )
+        is None
+    )
 
     bounded = inbox.turn(active.turn_id)
     assert len(bounded.events) == MAX_EVENTS_PER_TURN
@@ -711,16 +932,20 @@ def test_steer_overflow_waits_for_the_next_turn_and_recovery_stays_bounded(
 def test_steer_overflow_respects_the_turn_byte_limit(tmp_path: Path):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
     initial = "x" * (MAX_EVENT_BYTES_PER_TURN - 4)
-    inbox.enqueue(CONVERSATION_ID, "event:initial", initial)
+    enqueue_event(inbox, CONVERSATION_ID, "event:initial", initial)
     active = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert active is not None
 
-    assert inbox.steer(
-        CONVERSATION_ID,
-        "feedback:overflow",
-        "12345",
-        priority=QUEUE_PRIORITY,
-    ) is None
+    assert (
+        steer_event(
+            inbox,
+            CONVERSATION_ID,
+            "feedback:overflow",
+            "12345",
+            priority=QUEUE_PRIORITY,
+        )
+        is None
+    )
 
     assert active.event_keys == ("event:initial",)
     assert inbox.pending_count(CONVERSATION_ID) == 1
@@ -728,18 +953,23 @@ def test_steer_overflow_respects_the_turn_byte_limit(tmp_path: Path):
 
 def test_human_steering_can_join_and_reopen_a_full_turn(tmp_path: Path):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(CONVERSATION_ID, "event:0", "initial")
+    enqueue_event(inbox, CONVERSATION_ID, "event:0", "initial")
     active = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert active is not None
     for index in range(1, MAX_EVENTS_PER_TURN):
-        assert inbox.steer(
-            CONVERSATION_ID,
-            f"feedback:{index}",
-            f"feedback {index}",
-            priority=QUEUE_PRIORITY,
-        ) is not None
+        assert (
+            steer_event(
+                inbox,
+                CONVERSATION_ID,
+                f"feedback:{index}",
+                f"feedback {index}",
+                priority=QUEUE_PRIORITY,
+            )
+            is not None
+        )
 
-    attached = inbox.steer(
+    attached = steer_event(
+        inbox,
         CONVERSATION_ID,
         "human:active",
         "interrupt the full turn",
@@ -748,7 +978,8 @@ def test_human_steering_can_join_and_reopen_a_full_turn(tmp_path: Path):
     assert attached == (active.turn_id, DeliveryState.PENDING)
 
     inbox.quarantine(active.turn_id, "recovery budget exhausted")
-    reopened = inbox.steer(
+    reopened = steer_event(
+        inbox,
         CONVERSATION_ID,
         "human:quarantined",
         "reopen the full turn",
@@ -768,7 +999,8 @@ def test_context_reset_preserves_old_turn_and_requeues_one_canonical_copy(
     Interface: reset_turn plus the active and historical persistent turns.
     """
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(
+    enqueue_event(
+        inbox,
         CONVERSATION_ID,
         "event:1",
         "canonical event",
@@ -794,7 +1026,7 @@ def test_context_reset_preserves_old_turn_and_requeues_one_canonical_copy(
     assert inbox.turn(old.turn_id).state is DeliveryState.DELIVERED
 
     queued = UUID("00000000-0000-0000-0000-000000000018")
-    inbox.enqueue(queued, "event:queued", "queued", priority=QUEUE_PRIORITY)
+    enqueue_event(inbox, queued, "event:queued", "queued", priority=QUEUE_PRIORITY)
     assert inbox.ready_conversation_ids()[:2] == (str(CONVERSATION_ID), str(queued))
 
     next_generation = inbox.reset_turn(
@@ -815,7 +1047,7 @@ def test_terminal_recovery_policy_survives_restart_and_bounds_attempts(
     """
     path = tmp_path / "inbox.sqlite3"
     inbox = PersistentInbox(path)
-    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    enqueue_event(inbox, CONVERSATION_ID, "event:1", "canonical event")
     turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert turn is not None
     deliver_turn_messages(Conversation(), inbox, turn.turn_id)
@@ -837,7 +1069,7 @@ def test_terminal_recovery_policy_survives_restart_and_bounds_attempts(
 def test_progressing_retries_have_a_durable_attempt_backstop(tmp_path: Path):
     path = tmp_path / "inbox.sqlite3"
     inbox = PersistentInbox(path)
-    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    enqueue_event(inbox, CONVERSATION_ID, "event:1", "canonical event")
     turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert turn is not None
     deliver_turn_messages(Conversation(), inbox, turn.turn_id)
@@ -874,7 +1106,7 @@ def test_progressing_retries_have_a_durable_attempt_backstop(tmp_path: Path):
 
 def test_one_productive_inference_run_has_no_activity_cap(tmp_path: Path):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    enqueue_event(inbox, CONVERSATION_ID, "event:1", "canonical event")
     turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert turn is not None
     deliver_turn_messages(Conversation(), inbox, turn.turn_id)
@@ -893,7 +1125,7 @@ def test_inference_attempt_backstop_migrates_existing_inboxes(tmp_path: Path):
         database.execute("ALTER TABLE inbox_turns DROP COLUMN inference_attempts")
 
     inbox = PersistentInbox(path)
-    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    enqueue_event(inbox, CONVERSATION_ID, "event:1", "canonical event")
     turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert turn is not None
     deliver_turn_messages(Conversation(), inbox, turn.turn_id)
@@ -904,7 +1136,7 @@ def test_inference_attempt_backstop_migrates_existing_inboxes(tmp_path: Path):
 
 def test_ordinary_tool_action_is_not_a_finished_response(tmp_path: Path):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    enqueue_event(inbox, CONVERSATION_ID, "event:1", "canonical event")
     turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert turn is not None
     conversation = Conversation()
@@ -923,7 +1155,7 @@ def test_ordinary_tool_action_is_not_a_finished_response(tmp_path: Path):
 
 def test_matched_finish_observation_is_a_finished_response(tmp_path: Path):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    enqueue_event(inbox, CONVERSATION_ID, "event:1", "canonical event")
     turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert turn is not None
     conversation = Conversation()
@@ -951,7 +1183,7 @@ def test_matched_finish_observation_is_a_finished_response(tmp_path: Path):
 
 def test_feedback_after_a_finished_response_reopens_the_turn(tmp_path: Path):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    enqueue_event(inbox, CONVERSATION_ID, "event:1", "canonical event")
     turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert turn is not None
     conversation = Conversation()
@@ -972,14 +1204,14 @@ def test_deliberate_reminder_gets_a_fresh_delivery_identity(tmp_path: Path):
     Interface: enqueueing the same event after processing and acknowledgement.
     """
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(CONVERSATION_ID, "event:1", "still actionable")
+    enqueue_event(inbox, CONVERSATION_ID, "event:1", "still actionable")
     first = inbox.next_turn(CONVERSATION_ID, "first prompt")
     assert first is not None
     deliver_turn_messages(Conversation(), inbox, first.turn_id)
     inbox.record_processed(first.turn_id)
     inbox.acknowledge(first.turn_id)
 
-    assert inbox.enqueue(CONVERSATION_ID, "event:1", "still actionable") is True
+    assert enqueue_event(inbox, CONVERSATION_ID, "event:1", "still actionable") is True
     reminder = inbox.next_turn(CONVERSATION_ID, "reminder prompt")
     assert reminder is not None
     assert reminder.events[0].delivery_id != first.events[0].delivery_id
@@ -996,7 +1228,7 @@ def test_108_events_and_four_failed_resumes_leave_one_visible_copy_per_event(
     path = tmp_path / "inbox.sqlite3"
     inbox = PersistentInbox(path)
     for index in range(108):
-        inbox.enqueue(CONVERSATION_ID, f"event:{index}", event_message(index))
+        enqueue_event(inbox, CONVERSATION_ID, f"event:{index}", event_message(index))
 
     conversation = Conversation()
     first = inbox.next_turn(CONVERSATION_ID, "prompt-0")
@@ -1049,7 +1281,7 @@ def test_legacy_pr3472_delivery_is_adopted_without_replay(
         tmp_path / "inbox.sqlite3",
         legacy_path=legacy_path,
     )
-    inbox.enqueue(CONVERSATION_ID, event_key, event_body)
+    enqueue_event(inbox, CONVERSATION_ID, event_key, event_body)
     turn = inbox.next_turn(
         CONVERSATION_ID,
         "new controller prompt",
@@ -1085,7 +1317,7 @@ def test_legacy_pr3472_delivery_is_adopted_without_replay(
     inbox.record_processed(turn.turn_id)
     inbox.acknowledge(turn.turn_id)
 
-    assert inbox.enqueue(CONVERSATION_ID, event_key, event_body) is True
+    assert enqueue_event(inbox, CONVERSATION_ID, event_key, event_body) is True
     reminder = inbox.next_turn(CONVERSATION_ID, "later reminder")
     assert reminder is not None
     assert reminder.events[0].delivery_id != legacy_event_id
@@ -1105,7 +1337,7 @@ def test_visible_persisted_prompt_keeps_its_identity_during_legacy_adoption(
         encoding="utf-8",
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3", legacy_path=legacy_path)
-    inbox.enqueue(CONVERSATION_ID, event_key, "compact event")
+    enqueue_event(inbox, CONVERSATION_ID, event_key, "compact event")
     turn = inbox.next_turn(CONVERSATION_ID, "persisted prompt")
     assert turn is not None
     if prompt_already_delivered:
@@ -1155,7 +1387,7 @@ def test_visible_persisted_prompt_rejects_a_changed_body_without_mutation(
         encoding="utf-8",
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3", legacy_path=legacy_path)
-    inbox.enqueue(CONVERSATION_ID, "review_ready:17:abc", "compact event")
+    enqueue_event(inbox, CONVERSATION_ID, "review_ready:17:abc", "compact event")
     turn = inbox.next_turn(CONVERSATION_ID, "persisted prompt")
     assert turn is not None
     if prompt_already_delivered:
@@ -1199,7 +1431,7 @@ def test_restart_after_preparing_visible_persisted_prompt_keeps_one_copy(
         encoding="utf-8",
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3", legacy_path=legacy_path)
-    inbox.enqueue(CONVERSATION_ID, "review_ready:17:abc", "compact event")
+    enqueue_event(inbox, CONVERSATION_ID, "review_ready:17:abc", "compact event")
     turn = inbox.next_turn(CONVERSATION_ID, "persisted prompt")
     assert turn is not None
     conversation = Conversation(
@@ -1247,7 +1479,7 @@ def test_reset_preserves_legacy_provenance_for_a_later_compact_reminder(
         encoding="utf-8",
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3", legacy_path=legacy_path)
-    inbox.enqueue(CONVERSATION_ID, event_key, compact_body)
+    enqueue_event(inbox, CONVERSATION_ID, event_key, compact_body)
     original = inbox.next_turn(CONVERSATION_ID, "new prompt")
     assert original is not None
     branch = [
@@ -1268,7 +1500,7 @@ def test_reset_preserves_legacy_provenance_for_a_later_compact_reminder(
     inbox.record_processed(recovery.turn_id)
     inbox.acknowledge(recovery.turn_id)
 
-    assert inbox.enqueue(CONVERSATION_ID, event_key, compact_body) is True
+    assert enqueue_event(inbox, CONVERSATION_ID, event_key, compact_body) is True
 
 
 def test_adopted_legacy_prompt_is_stable_when_migration_reenters(tmp_path: Path):
@@ -1285,7 +1517,7 @@ def test_adopted_legacy_prompt_is_stable_when_migration_reenters(tmp_path: Path)
         inbox_path,
         legacy_path=legacy_path,
     )
-    inbox.enqueue(CONVERSATION_ID, event_key, "new compact event")
+    enqueue_event(inbox, CONVERSATION_ID, event_key, "new compact event")
     turn = inbox.next_turn(
         CONVERSATION_ID,
         "new controller prompt",
@@ -1374,7 +1606,7 @@ def test_unappended_legacy_backlog_obeys_normal_count_and_byte_limits(
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3", legacy_path=legacy_path)
     for index in range(20):
-        inbox.enqueue(CONVERSATION_ID, f"event:{index}", event_message(index))
+        enqueue_event(inbox, CONVERSATION_ID, f"event:{index}", event_message(index))
 
     turn = inbox.next_turn(CONVERSATION_ID, "bounded migration prompt")
     assert turn is not None
@@ -1402,15 +1634,17 @@ def test_unappended_legacy_backlog_obeys_normal_count_and_byte_limits(
         tmp_path / "byte-inbox.sqlite3",
         legacy_path=byte_ledger,
     )
-    byte_inbox.enqueue(
-        byte_conversation,
-        "large",
-        event_message(0, 70 * 1024),
-    )
-    byte_inbox.enqueue(byte_conversation, "next", "small")
-    oversized = byte_inbox.next_turn(byte_conversation, "byte limit")
-    assert oversized is not None
-    assert [event.event_key for event in oversized.events] == ["large"]
+    with pytest.raises(ValueError, match="event body exceeds 65536 UTF-8 bytes"):
+        enqueue_event(
+            byte_inbox,
+            byte_conversation,
+            "large",
+            event_message(0, 70 * 1024),
+        )
+    enqueue_event(byte_inbox, byte_conversation, "next", "small")
+    bounded = byte_inbox.next_turn(byte_conversation, "byte limit")
+    assert bounded is not None
+    assert [event.event_key for event in bounded.events] == ["next"]
 
 
 def test_already_visible_legacy_batch_is_absorbed_without_replay(tmp_path: Path):
@@ -1425,7 +1659,7 @@ def test_already_visible_legacy_batch_is_absorbed_without_replay(tmp_path: Path)
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3", legacy_path=legacy_path)
     for index in range(20):
-        inbox.enqueue(CONVERSATION_ID, f"event:{index}", event_message(index))
+        enqueue_event(inbox, CONVERSATION_ID, f"event:{index}", event_message(index))
     selected = inbox.next_turn(CONVERSATION_ID, "new bounded prompt")
     assert selected is not None
     assert len(selected.events) == 16

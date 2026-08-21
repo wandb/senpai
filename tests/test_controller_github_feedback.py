@@ -6,7 +6,9 @@ from pydantic import SecretStr
 
 from senpai_agent.controller import Controller, TurnResult
 from senpai_agent.github.mailbox import GitHubMailbox
+from senpai_agent.github.mailbox.values import bounded_text
 from senpai_agent.inbox import PersistentInbox
+from senpai_agent.json_values import canonical_json
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.models import (
     AssignmentCommentRecord,
@@ -60,6 +62,13 @@ def feedback_responses(*, issue_comments=(), reviews=(), inline_comments=()):
             "?per_page=100"
         ): list(inline_comments),
     }
+
+
+def test_bounded_github_text_normalizes_lone_unicode_surrogates():
+    rendered = bounded_text("before\ud800after", limit=100)
+
+    assert rendered == r"before\ud800after"
+    assert rendered.encode("utf-8")
 
 
 def student_mailbox(
@@ -189,7 +198,15 @@ def test_repolling_one_assignment_after_mutable_pr_metadata_changes_is_idempoten
     first = mailbox.poll()[0]
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
 
-    assert inbox.enqueue(UUID(int=17), first.dedupe_key, first.to_prompt()) is True
+    assert (
+        inbox.enqueue(
+            UUID(int=17),
+            first.dedupe_key,
+            first.to_prompt(),
+            event_identity=first.event_identity(),
+        )
+        is True
+    )
 
     pull = mailbox._pulls()[0]
     pull["title"] = "Clarify the bounded change"
@@ -200,7 +217,12 @@ def test_repolling_one_assignment_after_mutable_pr_metadata_changes_is_idempoten
     assert repeated.dedupe_key == first.dedupe_key
     assert repeated.to_prompt() == first.to_prompt()
     assert (
-        inbox.enqueue(UUID(int=17), repeated.dedupe_key, repeated.to_prompt())
+        inbox.enqueue(
+            UUID(int=17),
+            repeated.dedupe_key,
+            repeated.to_prompt(),
+            event_identity=repeated.event_identity(),
+        )
         is False
     )
 
@@ -243,12 +265,21 @@ def test_v2_assignment_queues_behind_an_unresolved_v1_delivery(
     inbox.enqueue(
         UUID(int=17),
         legacy.dedupe_key,
-        legacy.to_pre_markdown_prompt(),
+        f"## {legacy.kind}\n\n{canonical_json(legacy.payload)}",
+        event_identity=legacy.event_identity(),
     )
     active = inbox.next_turn(UUID(int=17), "legacy prompt")
     assert active is not None
 
-    assert inbox.enqueue(UUID(int=17), current.dedupe_key, current.to_prompt()) is True
+    assert (
+        inbox.enqueue(
+            UUID(int=17),
+            current.dedupe_key,
+            current.to_prompt(),
+            event_identity=current.event_identity(),
+        )
+        is True
+    )
     resumed = inbox.next_turn(UUID(int=17), "new prompt")
 
     assert resumed is not None

@@ -32,16 +32,18 @@ from openhands.sdk.tool import (
 )
 from pydantic import BaseModel, Field, model_validator
 
+from senpai_agent.event_kinds import EventKind
+from senpai_agent.json_values import canonical_json
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.model_markdown import (
     inline_code,
     render_event_prompt,
     tagged_block,
-    yes_no,
 )
 from senpai_agent.processes import terminate_process_group
 from senpai_agent.program_context import PROGRAM_PATH_ENV
+from senpai_agent.text_values import utf8_text
 from senpai_agent.PROMPTS import (
     AWAIT_AGENTS_SATISFIED_PROMPT,
     AWAIT_AGENTS_TIMEOUT_PROMPT,
@@ -607,7 +609,7 @@ class DelegateAgentObservation(Observation):
             return [
                 TextContent(
                     text=render_event_prompt(
-                        "agent_result",
+                        EventKind.AGENT_RESULT,
                         {"task_id": self.task_id, "result": self.result or ""},
                     )
                 )
@@ -692,11 +694,7 @@ _PERSISTED_TASK_SPEC_FIELDS = frozenset(AgentTask.model_fields) | {"search_mode"
 
 
 def _task_specs_json(specs: Sequence[AgentTaskBase]) -> str:
-    return json.dumps(
-        [spec.model_dump(mode="json") for spec in specs],
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    return canonical_json([spec.model_dump(mode="json") for spec in specs])
 
 
 def _canonical_persisted_task_specs(encoded: str) -> str:
@@ -1211,8 +1209,8 @@ def _task_event(row: sqlite3.Row) -> LocalEvent:
         ),
     }
     return LocalEvent(
-        kind="agent_result" if successful else "agent_error",
-        dedupe_key=f"agent_result:{row['task_id']}",
+        kind=EventKind.AGENT_RESULT if successful else EventKind.AGENT_ERROR,
+        dedupe_key=f"{EventKind.AGENT_RESULT}:{row['task_id']}",
         payload=payload,
     )
 
@@ -1614,7 +1612,9 @@ class _DelegationManager:
             with LocalEventStore(self.event_db_path) as store:
                 for row in targets:
                     if row["depth"] == 1:
-                        store.acknowledge(f"agent_result:{row['task_id']}")
+                        store.acknowledge(
+                            f"{EventKind.AGENT_RESULT}:{row['task_id']}"
+                        )
         return [
             _row_state(row) for row in self.registry.rows(task_ids)
         ]
@@ -1714,9 +1714,9 @@ class AwaitAgentsObservation(Observation):
         )
         summary = [
             f"- Join: {inline_code(self.join)}",
-            f"- Satisfied: {yes_no(self.satisfied)}",
-            f"- Timed out: {yes_no(self.timed_out)}",
-            f"- Waited: {self.waited_seconds:g} seconds",
+            f"- Satisfied: `{str(self.satisfied).lower()}`",
+            f"- Timed out: `{str(self.timed_out).lower()}`",
+            f"- Waited: {round(self.waited_seconds, 3)} seconds",
             f"- Changed tasks: {changed}",
         ]
         text = _task_states_markdown(
@@ -1725,7 +1725,7 @@ class AwaitAgentsObservation(Observation):
             summary=summary,
         )
         if self.guidance:
-            text += f"\n\n### Guidance\n\n{self.guidance}"
+            text += f"\n\n### Guidance\n\n{utf8_text(self.guidance)}"
         return [TextContent(text=text)]
 
 
@@ -1800,8 +1800,7 @@ def _task_states_markdown(
         return "\n".join(sections)
 
     def cell(value: object) -> str:
-        text = " ".join(str(value).split())
-        return inline_code(text).replace("|", r"\|")
+        return inline_code(value).replace("|", r"\|")
 
     rows = [
         "| Task ID | Key | Agent | Model | Status |",
@@ -1945,7 +1944,7 @@ class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservatio
             if self.manager.event_db_path is not None:
                 with LocalEventStore(self.manager.event_db_path) as store:
                     for task_id in terminal:
-                        store.acknowledge(f"agent_result:{task_id}")
+                        store.acknowledge(f"{EventKind.AGENT_RESULT}:{task_id}")
 
     def interrupt(self) -> None:
         self._interrupted.set()

@@ -11,6 +11,7 @@ from openhands.sdk.conversation import ConversationExecutionStatus, Conversation
 from senpai_agent.hooks import queued_feedback_marker
 from senpai_agent.inbox import (
     ADVISOR_ACTIVE_STEERING_PRIORITIES,
+    MAX_EVENT_BYTES_PER_TURN,
     QUEUE_PRIORITY,
     STEER_PRIORITY,
     DeliveryState,
@@ -18,6 +19,7 @@ from senpai_agent.inbox import (
     deliver_turn_messages,
 )
 from senpai_agent.local_events import LocalEventStore
+from senpai_agent.mailbox import report_event_render_error
 
 _STEERING_GRACE_SECONDS = 60.0
 _STEERING_INTERRUPTION_NOTICE = (
@@ -67,7 +69,27 @@ def _deliver_pending_events(
     for event in pending:
         if event.dedupe_key in already_delivered:
             continue
-        conversation.send_message(event.to_user_message())
+        try:
+            event_identity = event.event_identity()
+            if len(event_identity.encode("utf-8")) > MAX_EVENT_BYTES_PER_TURN:
+                raise ValueError(
+                    f"event identity exceeds {MAX_EVENT_BYTES_PER_TURN} UTF-8 bytes"
+                )
+            message = event.to_user_message()
+            if len(message.encode("utf-8")) > MAX_EVENT_BYTES_PER_TURN:
+                raise ValueError(
+                    f"event body exceeds {MAX_EVENT_BYTES_PER_TURN} UTF-8 bytes"
+                )
+        except Exception as error:  # noqa: BLE001
+            report_event_render_error(
+                event.kind,
+                event.dedupe_key,
+                error,
+                disposition="acknowledged_dropped",
+            )
+            store.acknowledge(event.dedupe_key)
+            continue
+        conversation.send_message(message)
         record_delivery(event.dedupe_key)
         delivered += 1
     return delivered
@@ -200,7 +222,27 @@ class AdvisorEventPump:
         steer_generation = 0
         steer_active_run = False
         for event in pending:
-            pre_markdown_message = event.to_pre_markdown_inbox_message()
+            try:
+                event_identity = event.event_identity()
+                if len(event_identity.encode("utf-8")) > MAX_EVENT_BYTES_PER_TURN:
+                    raise ValueError(
+                        "event identity exceeds "
+                        f"{MAX_EVENT_BYTES_PER_TURN} UTF-8 bytes"
+                    )
+                message = event.to_inbox_message()
+                if len(message.encode("utf-8")) > MAX_EVENT_BYTES_PER_TURN:
+                    raise ValueError(
+                        f"event body exceeds {MAX_EVENT_BYTES_PER_TURN} UTF-8 bytes"
+                    )
+            except Exception as error:  # noqa: BLE001
+                report_event_render_error(
+                    event.kind,
+                    event.dedupe_key,
+                    error,
+                    disposition="acknowledged_dropped",
+                )
+                self._store.acknowledge(event.dedupe_key)
+                continue
             mode = ADVISOR_ACTIVE_STEERING_PRIORITIES.get(event.kind)
             if mode is not None:
                 with self._steer_lock:
@@ -209,9 +251,8 @@ class AdvisorEventPump:
                     steering = self._inbox.steer(
                         self._conversation_id,
                         event.dedupe_key,
-                        event.to_inbox_message(),
-                        pre_markdown_body=pre_markdown_message,
-                        event_identity=event.event_identity(),
+                        message,
+                        event_identity=event_identity,
                         priority=mode,
                     )
                     if steering is not None:
@@ -238,9 +279,8 @@ class AdvisorEventPump:
                 self._inbox.enqueue(
                     self._conversation_id,
                     event.dedupe_key,
-                    event.to_inbox_message(),
-                    pre_markdown_body=pre_markdown_message,
-                    event_identity=event.event_identity(),
+                    message,
+                    event_identity=event_identity,
                 )
             self._store.acknowledge(event.dedupe_key)
             transferred += 1

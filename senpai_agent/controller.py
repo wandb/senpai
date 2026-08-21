@@ -17,8 +17,10 @@ from typing import Literal, Protocol
 from uuid import UUID
 
 from senpai_agent.agent_markdown import strip_spdx_header
+from senpai_agent.event_kinds import EventKind
 from senpai_agent.github.mailbox import ActiveGitHubWatcher, GitHubMailbox
 from senpai_agent.inbox import (
+    MAX_EVENT_BYTES_PER_TURN,
     QUEUE_PRIORITY,
     STEERING_PRIORITIES,
     DeliveryState,
@@ -34,6 +36,7 @@ from senpai_agent.mailbox import (
     LocalStudentMailbox,
     Mailbox,
     StudentAssignmentAvailabilityMailbox,
+    report_event_render_error,
 )
 from senpai_agent.monitor import (
     MonitorMailbox,
@@ -59,9 +62,22 @@ from senpai_agent.workspace import StudentWorkspaceReconciler, WorkspaceDivergen
 
 
 _EDGE_TRIGGERED_EVENT_KINDS = frozenset(
-    {"research_base_changed", "student_assignment_comment"}
+    {EventKind.RESEARCH_BASE_CHANGED, EventKind.STUDENT_ASSIGNMENT_COMMENT}
 )
 _ACTIVITY_LEASE_RENEWAL_SECONDS = 30
+
+
+def _validate_event_key(event_key: str) -> None:
+    if not event_key:
+        raise ValueError("event key must not be empty")
+    try:
+        encoded = event_key.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("event key must be valid UTF-8") from error
+    if len(encoded) > MAX_EVENT_BYTES_PER_TURN:
+        raise ValueError(
+            f"event key exceeds {MAX_EVENT_BYTES_PER_TURN} UTF-8 bytes"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,14 +305,14 @@ def _student_live_event(
     conversation_id: UUID,
     registry: AssignmentConversationRegistry,
 ) -> LocalEvent | None:
-    if event.kind == "student_pr_feedback":
+    if event.kind == EventKind.STUDENT_PR_FEEDBACK:
         target = registry.for_assignment(
             str(event.payload["assignment_id"]),
             str(event.payload["revision_id"]),
         )
         if target != conversation_id:
             return None
-    elif event.kind != "human_issue":
+    elif event.kind != EventKind.HUMAN_ISSUE:
         return None
     return LocalEvent(
         kind=event.kind,
@@ -523,23 +539,79 @@ class Controller:
                 flush=True,
             )
             return
+        rendered: dict[str, tuple[str, str]] = {}
         for event in polled:
-            if event.kind == "student_assignment_comment":
-                pre_markdown_prompt = event.to_pre_markdown_prompt()
+            if event.kind == EventKind.STUDENT_ASSIGNMENT_COMMENT:
+                retry_at = self._deferred_until.get(event.dedupe_key)
+                if retry_at is not None and time.monotonic() < retry_at:
+                    continue
+                try:
+                    _validate_event_key(event.dedupe_key)
+                    event_identity = event.event_identity()
+                    if (
+                        len(event_identity.encode("utf-8"))
+                        > MAX_EVENT_BYTES_PER_TURN
+                    ):
+                        raise ValueError(
+                            "event identity exceeds "
+                            f"{MAX_EVENT_BYTES_PER_TURN} UTF-8 bytes"
+                        )
+                except Exception as error:  # noqa: BLE001
+                    self._defer_event(event, error)
+                    continue
                 self.inbox.require_event_identity(
                     self.conversation_id,
                     event.dedupe_key,
-                    event.to_prompt(),
-                    pre_markdown_body=pre_markdown_prompt,
-                    event_identity=event.event_identity(),
+                    event_identity=event_identity,
                 )
-        events = self._new_events(
+        candidates = self._new_events(
             polled,
             allow_reminders=allow_reminders,
         )
-        self._enqueue_events(events)
+        renderable: list[ControllerEvent] = []
+        for event in candidates:
+            content = self._render_event(event)
+            if content is None:
+                continue
+            rendered[event.dedupe_key] = content
+            renderable.append(event)
+        self._enqueue_events(renderable, rendered)
 
-    def _enqueue_events(self, events: Sequence[ControllerEvent]) -> None:
+    def _render_event(self, event: ControllerEvent) -> tuple[str, str] | None:
+        try:
+            _validate_event_key(event.dedupe_key)
+            event_identity = event.event_identity()
+            if len(event_identity.encode("utf-8")) > MAX_EVENT_BYTES_PER_TURN:
+                raise ValueError(
+                    f"event identity exceeds {MAX_EVENT_BYTES_PER_TURN} UTF-8 bytes"
+                )
+            body = event.to_prompt()
+            if len(body.encode("utf-8")) > MAX_EVENT_BYTES_PER_TURN:
+                raise ValueError(
+                    f"event body exceeds {MAX_EVENT_BYTES_PER_TURN} UTF-8 bytes"
+                )
+            return body, event_identity
+        except Exception as error:  # noqa: BLE001
+            self._defer_event(event, error)
+            return None
+
+    def _defer_event(self, event: ControllerEvent, error: Exception) -> None:
+        self._visible.pop(event.dedupe_key, None)
+        self._deferred_until[event.dedupe_key] = (
+            time.monotonic() + self.event_reminder_seconds
+        )
+        report_event_render_error(
+            event.kind,
+            event.dedupe_key,
+            error,
+            disposition="deferred",
+        )
+
+    def _enqueue_events(
+        self,
+        events: Sequence[ControllerEvent],
+        rendered: Mapping[str, tuple[str, str]],
+    ) -> None:
         for batch in self._event_batches(events):
             batch_events = batch.events
             conversation_id = batch.conversation_id
@@ -560,7 +632,7 @@ class Controller:
                         batch_events = tuple(
                             event
                             for event in batch_events
-                            if event.kind != "student_assignment"
+                            if event.kind != EventKind.STUDENT_ASSIGNMENT
                         )
                         if not batch_events:
                             print(
@@ -574,31 +646,35 @@ class Controller:
                     batch_events = (*batch_events, conflict.event)
                 else:
                     if any(
-                        event.kind == "student_assignment" for event in batch_events
+                        event.kind == EventKind.STUDENT_ASSIGNMENT
+                        for event in batch_events
                     ):
                         self._clear_workspace_divergence(conversation_id)
             for event in batch_events:
+                content = rendered.get(event.dedupe_key)
+                if content is None:
+                    content = self._render_event(event)
+                if content is None:
+                    continue
+                body, event_identity = content
                 steering_priority = STEERING_PRIORITIES.get(event.kind)
-                pre_markdown_prompt = event.to_pre_markdown_prompt()
                 if steering_priority is not None:
                     self.inbox.steer(
                         conversation_id,
                         event.dedupe_key,
-                        event.to_prompt(),
-                        pre_markdown_body=pre_markdown_prompt,
-                        event_identity=event.event_identity(),
+                        body,
+                        event_identity=event_identity,
                         priority=steering_priority,
                     )
                 else:
                     self.inbox.enqueue(
                         conversation_id,
                         event.dedupe_key,
-                        event.to_prompt(),
-                        pre_markdown_body=pre_markdown_prompt,
-                        event_identity=event.event_identity(),
+                        body,
+                        event_identity=event_identity,
                         priority=(
                             QUEUE_PRIORITY
-                            if event.kind == "student_assignment"
+                            if event.kind == EventKind.STUDENT_ASSIGNMENT
                             else 0
                         ),
                     )
@@ -652,7 +728,7 @@ class Controller:
                 (
                     key
                     for key in turn.event_keys
-                    if key.startswith("workspace_diverged:")
+                    if key.startswith(f"{EventKind.WORKSPACE_DIVERGED}:")
                 ),
                 None,
             )
@@ -667,9 +743,26 @@ class Controller:
         self,
         events: Sequence[ControllerEvent],
     ) -> tuple[ConversationBatch, ...]:
-        if self.conversation_for_events is not None:
-            return tuple(self.conversation_for_events(events))
-        return (ConversationBatch(self.conversation_id, tuple(events)),)
+        if self.conversation_for_events is None:
+            return (ConversationBatch(self.conversation_id, tuple(events)),)
+
+        grouped: dict[UUID, list[ControllerEvent]] = {}
+        for event in events:
+            try:
+                routed = tuple(self.conversation_for_events((event,)))
+                if len(routed) != 1 or routed[0].events != (event,):
+                    raise RuntimeError(
+                        "conversation selector must route each event exactly once"
+                    )
+                conversation_id = UUID(str(routed[0].conversation_id))
+            except Exception as error:  # noqa: BLE001
+                self._defer_event(event, error)
+                continue
+            grouped.setdefault(conversation_id, []).append(event)
+        return tuple(
+            ConversationBatch(conversation_id, tuple(batch_events))
+            for conversation_id, batch_events in grouped.items()
+        )
 
     def _wait_for_start_gates(self) -> None:
         while any(not path.is_file() for path in self.start_gate_paths):

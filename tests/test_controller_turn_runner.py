@@ -392,6 +392,41 @@ def test_active_watcher_retries_after_a_transient_github_read_error(
     assert "SENPAI_GITHUB_WATCHER_POLL_ERROR" in capsys.readouterr().err
 
 
+def test_active_watcher_isolates_a_malformed_event_from_valid_siblings(
+    tmp_path: Path,
+    capsys,
+):
+    malformed = ControllerEvent(
+        kind="future_event",
+        dedupe_key="future_event:malformed",
+        payload={"value": float("nan")},
+    )
+    valid = human_issue_event()
+    mailbox = Mailbox((malformed, valid))
+    store_path = tmp_path / "advisor-events.sqlite3"
+
+    with ActiveGitHubWatcher(
+        mailbox,
+        store_path,
+        known_keys=frozenset(),
+        poll_interval_seconds=0.001,
+    ) as watcher:
+        deadline = time.monotonic() + 1
+        while valid.dedupe_key not in watcher.enqueued_keys:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+
+    assert watcher.error is None
+    assert watcher.enqueued_keys == {valid.dedupe_key}
+    with LocalEventStore(store_path) as store:
+        assert [event.dedupe_key for event in store.pending()] == [
+            valid.dedupe_key
+        ]
+    error = capsys.readouterr().err
+    assert error.count("SENPAI_EVENT_RENDER_ERROR") == 1
+    assert "disposition=deferred" in error
+
+
 def test_active_watcher_does_not_queue_student_availability(tmp_path: Path):
     event = ControllerEvent(
         kind="student_available_for_assignment",
@@ -480,7 +515,12 @@ def test_terminal_turn_recovery_preserves_history_and_excludes_new_events(
     """
     conversation_id = UUID("00000000-0000-0000-0000-000000000095")
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(conversation_id, "event:old", "old canonical event")
+    inbox.enqueue(
+        conversation_id,
+        "event:old",
+        "old canonical event",
+        event_identity="old canonical event",
+    )
     original = inbox.next_turn(conversation_id, "unchanged controller prompt")
     assert original is not None
 
@@ -498,7 +538,12 @@ def test_terminal_turn_recovery_preserves_history_and_excludes_new_events(
     for _attempt in range(3):
         inbox.record_inference_attempt(original.turn_id)
 
-    inbox.enqueue(conversation_id, "event:new", "new event stays queued")
+    inbox.enqueue(
+        conversation_id,
+        "event:new",
+        "new event stays queued",
+        event_identity="new event stays queued",
+    )
     calls = []
 
     def run_openhands(prompt, _config, **kwargs):

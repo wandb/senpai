@@ -17,6 +17,9 @@ from types import TracebackType
 from typing import Self
 from uuid import UUID
 
+from senpai_agent.event_kinds import EventKind
+from senpai_agent.json_values import canonical_json
+
 
 MAX_EVENTS_PER_TURN = 16
 MAX_EVENT_BYTES_PER_TURN = 64 * 1024
@@ -25,12 +28,12 @@ MAX_INFERENCE_ATTEMPTS_PER_TURN = 36
 QUEUE_PRIORITY = 1
 STEER_PRIORITY = 2
 STEERING_PRIORITIES = {
-    "human_issue": STEER_PRIORITY,
-    "student_pr_feedback": QUEUE_PRIORITY,
+    EventKind.HUMAN_ISSUE: STEER_PRIORITY,
+    EventKind.STUDENT_PR_FEEDBACK: QUEUE_PRIORITY,
 }
 ADVISOR_ACTIVE_STEERING_PRIORITIES = {
     **STEERING_PRIORITIES,
-    "review_ready": QUEUE_PRIORITY,
+    EventKind.REVIEW_READY: QUEUE_PRIORITY,
 }
 _SENDER_PREFIX = "senpai-delivery:"
 
@@ -260,16 +263,36 @@ class PersistentInbox:
                 ADD COLUMN priority INTEGER NOT NULL DEFAULT 0
                 """
             )
-        if "event_identity_sha256" not in message_columns:
-            if "payload_identity_sha256" in message_columns:
-                self._connection.execute(
-                    "ALTER TABLE inbox_messages RENAME COLUMN "
-                    "payload_identity_sha256 TO event_identity_sha256"
-                )
-            else:
-                self._connection.execute(
-                    "ALTER TABLE inbox_messages ADD COLUMN event_identity_sha256 TEXT"
-                )
+        if "payload_identity_sha256" in message_columns:
+            raise RuntimeError(
+                "unsupported development inbox column payload_identity_sha256"
+            )
+        identity_migration_needed = (
+            "event_identity_sha256" not in message_columns
+            or _native_event_identities_missing(self._connection)
+        )
+        if identity_migration_needed:
+            self._connection.commit()
+            with self._connection:
+                self._connection.execute("BEGIN IMMEDIATE")
+                locked_columns = {
+                    str(row[1])
+                    for row in self._connection.execute(
+                        "PRAGMA table_info(inbox_messages)"
+                    )
+                }
+                if "payload_identity_sha256" in locked_columns:
+                    raise RuntimeError(
+                        "unsupported development inbox column "
+                        "payload_identity_sha256"
+                    )
+                if "event_identity_sha256" not in locked_columns:
+                    self._connection.execute(
+                        "ALTER TABLE inbox_messages "
+                        "ADD COLUMN event_identity_sha256 TEXT"
+                    )
+                if _native_event_identities_missing(self._connection):
+                    _backfill_pre_markdown_event_identities(self._connection)
         if legacy_path is not None and legacy_path.is_file():
             self._import_legacy_deliveries(legacy_path)
         self._connection.commit()
@@ -280,8 +303,7 @@ class PersistentInbox:
         event_key: str,
         body: str,
         *,
-        pre_markdown_body: str | None = None,
-        event_identity: str | None = None,
+        event_identity: str,
         requires_ack: bool = True,
         priority: int = 0,
     ) -> bool:
@@ -292,7 +314,6 @@ class PersistentInbox:
                 conversation,
                 event_key,
                 body,
-                pre_markdown_body=pre_markdown_body,
                 event_identity=event_identity,
                 requires_ack=requires_ack,
                 priority=priority,
@@ -306,8 +327,7 @@ class PersistentInbox:
         event_key: str,
         body: str,
         *,
-        pre_markdown_body: str | None,
-        event_identity: str | None,
+        event_identity: str,
         requires_ack: bool,
         priority: int,
     ) -> tuple[int, str | None, DeliveryState, bool]:
@@ -315,12 +335,14 @@ class PersistentInbox:
             raise ValueError("event key must not be empty")
         if not body:
             raise ValueError("event body must not be empty")
+        if len(body.encode("utf-8")) > MAX_EVENT_BYTES_PER_TURN:
+            raise ValueError(
+                f"event body exceeds {MAX_EVENT_BYTES_PER_TURN} UTF-8 bytes"
+            )
         identity_sha256 = _require_event_identity(
             database,
             conversation,
             event_key,
-            body,
-            pre_markdown_body=pre_markdown_body,
             event_identity=event_identity,
         )
         existing = self._live_event_message(database, conversation, event_key)
@@ -400,8 +422,7 @@ class PersistentInbox:
         event_key: str,
         body: str,
         *,
-        pre_markdown_body: str | None = None,
-        event_identity: str | None = None,
+        event_identity: str,
         priority: int = QUEUE_PRIORITY,
     ) -> tuple[str, DeliveryState] | None:
         """Prioritize one event and attach it to the active turn when possible."""
@@ -415,7 +436,6 @@ class PersistentInbox:
                 conversation,
                 event_key,
                 body,
-                pre_markdown_body=pre_markdown_body,
                 event_identity=event_identity,
                 requires_ack=True,
                 priority=priority,
@@ -479,22 +499,18 @@ class PersistentInbox:
         self,
         conversation_id: UUID | str,
         event_key: str,
-        body: str,
         *,
-        pre_markdown_body: str | None = None,
-        event_identity: str | None = None,
+        event_identity: str,
     ) -> None:
         """Reject a polled identity that conflicts with durable inbox history."""
 
-        if not event_key or not body:
-            raise ValueError("event key and body must not be empty")
-        with self._transaction() as database:
+        if not event_key:
+            raise ValueError("event key must not be empty")
+        with self._lock:
             _require_event_identity(
-                database,
+                self._connection,
                 str(conversation_id),
                 event_key,
-                body,
-                pre_markdown_body=pre_markdown_body,
                 event_identity=event_identity,
             )
 
@@ -1749,32 +1765,26 @@ def _require_event_identity(
     database: sqlite3.Connection,
     conversation_id: str,
     event_key: str,
-    body: str,
     *,
-    pre_markdown_body: str | None,
-    event_identity: str | None,
+    event_identity: str,
 ) -> str:
-    if pre_markdown_body is not None and event_identity is None:
-        raise ValueError("a pre-Markdown body requires a canonical event identity")
-    identity = body if event_identity is None else event_identity
-    if not identity:
+    if not event_identity:
         raise ValueError("event identity must not be empty")
-    if pre_markdown_body == "":
-        raise ValueError("pre-Markdown event body must not be empty")
-    accepted_bodies = (
-        (body,)
-        if pre_markdown_body is None or pre_markdown_body == body
-        else (body, pre_markdown_body)
-    )
-    identity_sha256 = _digest(identity)
+    if len(event_identity.encode("utf-8")) > MAX_EVENT_BYTES_PER_TURN:
+        raise ValueError(
+            f"event identity exceeds {MAX_EVENT_BYTES_PER_TURN} UTF-8 bytes"
+        )
+    identity_sha256 = _digest(event_identity)
     conflict = database.execute(
         """
         SELECT 1
         FROM inbox_messages
         WHERE conversation_id = ?
           AND event_key = ?
-          AND event_identity_sha256 IS NOT NULL
-          AND event_identity_sha256 != ?
+          AND (
+              (event_identity_sha256 IS NULL AND legacy = 0)
+              OR event_identity_sha256 != ?
+          )
         LIMIT 1
         """,
         (conversation_id, event_key, identity_sha256),
@@ -1783,38 +1793,124 @@ def _require_event_identity(
         raise RuntimeError(
             f"event {event_key!r} was reused with a different payload"
         )
+    return identity_sha256
 
-    placeholders = ",".join("?" for _ in accepted_bodies)
-    conflict = database.execute(
-        f"""
-        SELECT 1
+
+def _backfill_pre_markdown_event_identities(
+    database: sqlite3.Connection,
+) -> None:
+    rows = database.execute(
+        """
+        SELECT sequence, event_key, body, body_sha256
         FROM inbox_messages
-        WHERE conversation_id = ?
-          AND event_key = ?
+        WHERE event_key IS NOT NULL
           AND legacy = 0
           AND event_identity_sha256 IS NULL
-          AND body NOT IN ({placeholders})
-        LIMIT 1
-        """,
-        (conversation_id, event_key, *accepted_bodies),
-    ).fetchone()
-    if conflict is not None:
-        raise RuntimeError(
-            f"event {event_key!r} was reused with a different payload"
-        )
-    database.execute(
-        f"""
+        """
+    ).fetchall()
+    updates: list[tuple[str, int]] = []
+    for row in rows:
+        sequence = int(row["sequence"])
+        event_key = str(row["event_key"])
+        body = str(row["body"])
+        if row["body_sha256"] != _digest(body):
+            raise RuntimeError(
+                f"cannot migrate event {event_key!r} at sequence {sequence}: "
+                "body digest mismatch"
+            )
+        try:
+            event_identity = _pre_markdown_event_identity(event_key, body)
+            identity_sha256 = _digest(event_identity)
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise RuntimeError(
+                f"cannot migrate event {event_key!r} at sequence {sequence}"
+            ) from error
+        updates.append((identity_sha256, sequence))
+    database.executemany(
+        """
         UPDATE inbox_messages
         SET event_identity_sha256 = ?
-        WHERE conversation_id = ?
-          AND event_key = ?
+        WHERE sequence = ?
+        """,
+        updates,
+    )
+    missing = database.execute(
+        """
+        SELECT 1
+        FROM inbox_messages
+        WHERE event_key IS NOT NULL
           AND legacy = 0
           AND event_identity_sha256 IS NULL
-          AND body IN ({placeholders})
-        """,
-        (identity_sha256, conversation_id, event_key, *accepted_bodies),
+        LIMIT 1
+        """
+    ).fetchone()
+    if missing is not None:
+        raise RuntimeError("pre-Markdown event identity migration was incomplete")
+    conflict = database.execute(
+        """
+        SELECT 1
+        FROM inbox_messages
+        WHERE event_key IS NOT NULL AND legacy = 0
+        GROUP BY conversation_id, event_key
+        HAVING COUNT(DISTINCT event_identity_sha256) > 1
+        LIMIT 1
+        """
+    ).fetchone()
+    if conflict is not None:
+        raise RuntimeError("cannot migrate conflicting pre-Markdown event identities")
+
+
+def _native_event_identities_missing(database: sqlite3.Connection) -> bool:
+    return (
+        database.execute(
+            """
+            SELECT 1
+            FROM inbox_messages
+            WHERE event_key IS NOT NULL
+              AND legacy = 0
+              AND event_identity_sha256 IS NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        is not None
     )
-    return identity_sha256
+
+
+def _pre_markdown_event_identity(event_key: str, body: str) -> str:
+    availability_prefix = "## Student available for assignment: `"
+    if body.startswith(availability_prefix):
+        event_prefix = f"{EventKind.STUDENT_AVAILABLE_FOR_ASSIGNMENT}:"
+        if not event_key.startswith(event_prefix):
+            raise RuntimeError("availability event key does not identify a student")
+        student = event_key.removeprefix(event_prefix)
+        expected = (
+            f"{availability_prefix}{student}`\n\n"
+            f"`{student}` has no open `status:wip` or "
+            "`status:review` assignment."
+        )
+        if body != expected:
+            raise RuntimeError("cannot migrate malformed pre-Markdown event body")
+        return canonical_json(
+            {
+                "kind": EventKind.STUDENT_AVAILABLE_FOR_ASSIGNMENT,
+                "payload": {"student": student},
+            }
+        )
+
+    heading, separator, encoded_payload = body.partition("\n\n")
+    if not separator or not heading.startswith("## "):
+        raise RuntimeError("cannot migrate malformed pre-Markdown event body")
+    try:
+        payload = json.loads(encoded_payload)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("cannot migrate malformed pre-Markdown event body") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("cannot migrate malformed pre-Markdown event body")
+    if encoded_payload != canonical_json(payload):
+        raise RuntimeError("cannot migrate non-canonical pre-Markdown event body")
+    return canonical_json(
+        {"kind": heading.removeprefix("## "), "payload": payload}
+    )
 
 
 def _message(row: sqlite3.Row) -> InboxMessage:

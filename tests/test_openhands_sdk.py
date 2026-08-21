@@ -520,7 +520,12 @@ def test_local_conversation_exposes_the_configured_prompt_cache_key(tmp_path):
 def test_local_conversation_persists_delivery_sender_and_payload(tmp_path):
     conversation_id = UUID("00000000-0000-0000-0000-000000000117")
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(conversation_id, "event:1", "durable event")
+    inbox.enqueue(
+        conversation_id,
+        "event:1",
+        "durable event",
+        event_identity="durable event",
+    )
     turn = inbox.next_turn(conversation_id, "durable prompt")
     assert turn is not None
 

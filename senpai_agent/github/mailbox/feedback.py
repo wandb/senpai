@@ -6,6 +6,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from senpai_agent.event_kinds import EventKind
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.models import AssignmentRecord
 from senpai_agent.PROMPTS import TRUNCATED_FEEDBACK_PROMPT
@@ -145,7 +146,8 @@ def student_pr_feedback_events(
             candidates.append(
                 _FeedbackCandidate(
                     source_key=(
-                        f"student_pr_feedback:{surface}:{number}:{feedback_id}"
+                        f"{EventKind.STUDENT_PR_FEEDBACK}:"
+                        f"{surface}:{number}:{feedback_id}"
                     ),
                     content_digest=payload_digest(content),
                     payload=payload,
@@ -171,7 +173,8 @@ def _pending_feedback(
     bound_events: list[ControllerEvent] = []
     for candidate in candidates:
         event_key = (
-            f"student_pr_feedback:v2:{candidate.source_key.removeprefix(FEEDBACK_KEY_PREFIX)}:"
+            f"{EventKind.STUDENT_PR_FEEDBACK}:v2:"
+            f"{candidate.source_key.removeprefix(FEEDBACK_KEY_PREFIX)}:"
             f"{candidate.content_digest}"
         )
         binding = ledger.get(event_key)
@@ -229,7 +232,7 @@ def _pending_feedback(
             )
         bound_events.append(
             ControllerEvent(
-                kind="student_pr_feedback",
+                kind=EventKind.STUDENT_PR_FEEDBACK,
                 dedupe_key=event_key,
                 payload=binding.payload,
             )

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
+from senpai_agent.event_kinds import EventKind
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.models import (
@@ -85,7 +86,11 @@ def advisor_events(
                     "revision_id": assignment.revision_id,
                 }
             events.append(
-                versioned_event("review_ready", *review_identity, payload=review_payload)
+                versioned_event(
+                    EventKind.REVIEW_READY,
+                    *review_identity,
+                    payload=review_payload,
+                )
             )
         reasons: list[str] = []
         if "status:blocked" in labels:
@@ -106,7 +111,7 @@ def advisor_events(
             action_payload = {**reference, "reasons": reasons}
             events.append(
                 versioned_event(
-                    "advisor_action",
+                    EventKind.ADVISOR_ACTION,
                     number,
                     head_sha,
                     ",".join(reasons),
@@ -118,17 +123,19 @@ def advisor_events(
         if not numbers:
             events.append(
                 ControllerEvent(
-                    kind="student_available_for_assignment",
-                    dedupe_key=f"student_available_for_assignment:{student}",
+                    kind=EventKind.STUDENT_AVAILABLE_FOR_ASSIGNMENT,
+                    dedupe_key=(
+                        f"{EventKind.STUDENT_AVAILABLE_FOR_ASSIGNMENT}:{student}"
+                    ),
                     payload={"student": student},
                 )
             )
         elif len(numbers) > 1:
             events.append(
                 ControllerEvent(
-                    kind="duplicate_assignment",
+                    kind=EventKind.DUPLICATE_ASSIGNMENT,
                     dedupe_key=(
-                        f"duplicate_assignment:{student}:"
+                        f"{EventKind.DUPLICATE_ASSIGNMENT}:{student}:"
                         f"{','.join(map(str, sorted(numbers)))}"
                     ),
                     payload={
@@ -200,7 +207,7 @@ def _research_base_events(
         }
         events.append(
             versioned_event(
-                "research_base_changed",
+                EventKind.RESEARCH_BASE_CHANGED,
                 number,
                 assignment.assignment_id,
                 assignment.revision_id,

@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from senpai_agent.event_kinds import EventKind
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.models import (
@@ -155,9 +156,9 @@ def _comment_candidate(
     }
     return _CommentCandidate(
         event=ControllerEvent(
-            kind="student_assignment_comment",
+            kind=EventKind.STUDENT_ASSIGNMENT_COMMENT,
             dedupe_key=(
-                "student_assignment_comment:v2:"
+                f"{EventKind.STUDENT_ASSIGNMENT_COMMENT}:v2:"
                 + payload_digest(record.model_dump(mode="json"))
             ),
             payload=payload,

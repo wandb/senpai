@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 import threading
 from collections.abc import Callable
@@ -9,9 +10,14 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
+from senpai_agent.event_kinds import EventKind
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.local_events import LocalEvent, LocalEventStore
-from senpai_agent.mailbox import ControllerEvent, Mailbox
+from senpai_agent.mailbox import (
+    ControllerEvent,
+    Mailbox,
+    report_event_render_error,
+)
 
 
 class ActiveGitHubWatcher:
@@ -57,15 +63,25 @@ class ActiveGitHubWatcher:
                     for event in events:
                         # The foreground poll reconciles availability before the
                         # next turn; staging it here would preserve stale state.
-                        if event.kind == "student_available_for_assignment":
+                        if event.kind == EventKind.STUDENT_AVAILABLE_FOR_ASSIGNMENT:
                             continue
                         if event.dedupe_key in self.known_keys:
                             continue
-                        local_event = self.map_event(event)
-                        if local_event is None:
-                            continue
-                        if store.enqueue(local_event):
-                            self.enqueued_keys.add(local_event.dedupe_key)
+                        try:
+                            local_event = self.map_event(event)
+                            if local_event is None:
+                                continue
+                            if store.enqueue(local_event):
+                                self.enqueued_keys.add(local_event.dedupe_key)
+                        except sqlite3.Error:
+                            raise
+                        except Exception as error:  # noqa: BLE001
+                            report_event_render_error(
+                                event.kind,
+                                event.dedupe_key,
+                                error,
+                                disposition="deferred",
+                            )
                     self.known_keys = current
         except BaseException as error:  # noqa: BLE001
             self.error = error

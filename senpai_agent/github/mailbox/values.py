@@ -2,21 +2,22 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from hashlib import sha256
 
+from senpai_agent.event_kinds import EventKind
 from senpai_agent.github.human_messages import is_trusted_human_author
+from senpai_agent.json_values import canonical_json_digest
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.models import (
     AssignmentRecord,
     ExperimentResult,
     parse_assignment_feedback_markers,
 )
+from senpai_agent.text_values import utf8_text
 
-FEEDBACK_KEY_PREFIX = "student_pr_feedback:"
+FEEDBACK_KEY_PREFIX = f"{EventKind.STUDENT_PR_FEEDBACK}:"
 FEEDBACK_EXCERPT_BYTES = 4_000
 DEFAULT_FEEDBACK_BATCH_EVENTS = 8
 DEFAULT_FEEDBACK_BATCH_BYTES = 32_000
@@ -43,17 +44,11 @@ def pull_reference(pull: Mapping[str, object]) -> dict[str, object]:
 
 
 def payload_digest(payload: Mapping[str, object]) -> str:
-    encoded = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode()
-    return sha256(encoded).hexdigest()
+    return canonical_json_digest(payload)
 
 
 def versioned_event(
-    kind: str,
+    kind: EventKind,
     *identity: object,
     payload: dict[str, object],
 ) -> ControllerEvent:
@@ -126,6 +121,7 @@ def _middle_excerpt(
     limit: int,
     marker: str,
 ) -> tuple[str, bool]:
+    value = utf8_text(value)
     encoded = value.encode()
     if len(encoded) <= limit:
         return value, False

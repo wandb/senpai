@@ -13,6 +13,7 @@ from pathlib import Path
 
 from pydantic import SecretStr
 
+from senpai_agent.event_kinds import EventKind
 from senpai_agent.git_workflow import git_process_env
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.PROMPTS import WORKSPACE_DIVERGENCE_PROMPT
@@ -97,8 +98,8 @@ class WorkspaceDivergence(RuntimeError):
             ).encode()
         ).hexdigest()
         self.event = ControllerEvent(
-            kind="workspace_diverged",
-            dedupe_key=f"workspace_diverged:{fingerprint}",
+            kind=EventKind.WORKSPACE_DIVERGED,
+            dedupe_key=f"{EventKind.WORKSPACE_DIVERGED}:{fingerprint}",
             payload={
                 "head_ref": head_ref,
                 "expected_remote_head": expected_head,
@@ -143,7 +144,8 @@ class StudentWorkspaceReconciler:
             (
                 event
                 for event in events
-                if event.kind in {"student_assignment", "student_pr_feedback"}
+                if event.kind
+                in {EventKind.STUDENT_ASSIGNMENT, EventKind.STUDENT_PR_FEEDBACK}
             ),
             None,
         )

@@ -89,14 +89,26 @@ def test_await_agents_renders_wait_metadata_and_guidance():
     assert rendered == (
         "## Delegated Agent Wait\n\n"
         "- Join: `quorum`\n"
-        "- Satisfied: No\n"
-        "- Timed out: Yes\n"
+        "- Satisfied: `false`\n"
+        "- Timed out: `true`\n"
         "- Waited: 12.5 seconds\n"
         "- Changed tasks: None\n\n"
         "No delegated tasks.\n\n"
         "### Guidance\n\n"
         "Continue useful parent work."
     )
+
+
+def test_await_agents_preserves_millisecond_precision_for_long_waits():
+    observation = AwaitAgentsObservation(
+        join="all",
+        satisfied=True,
+        timed_out=False,
+        tasks=[],
+        waited_seconds=3600.1234,
+    )
+
+    assert "- Waited: 3600.123 seconds" in observation.to_llm_content[0].text
 
 
 @pytest.mark.parametrize(

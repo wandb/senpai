@@ -1,7 +1,9 @@
 from pathlib import Path
 from uuid import UUID
 
+import senpai_agent.controller as controller_module
 from senpai_agent.controller import Controller, TurnResult
+from senpai_agent.inbox import PersistentInbox
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import ControllerEvent, LocalStudentMailbox
 from senpai_agent.state import (
@@ -205,6 +207,116 @@ def test_controller_partitions_and_acknowledges_events_by_conversation(
         (first_event.dedupe_key,),
         (second_event.dedupe_key,),
     ]
+
+
+def test_invalid_event_routes_do_not_block_a_valid_sibling(
+    tmp_path: Path,
+    capsys,
+):
+    missing_route = event_payload("training_monitor")
+    missing_route.pop("conversation_id")
+    malformed_events = (
+        ControllerEvent(
+            kind="training_monitor",
+            dedupe_key="monitor:missing-route",
+            payload=missing_route,
+        ),
+        ControllerEvent(
+            kind="agent_result",
+            dedupe_key="agent_result:invalid-route",
+            payload=event_payload(
+                "agent_result",
+                parent_conversation_id="not-a-uuid",
+            ),
+        ),
+    )
+    valid_conversation = UUID("00000000-0000-0000-0000-000000000085")
+    valid = ControllerEvent(
+        kind="training_monitor",
+        dedupe_key="monitor:valid",
+        payload=event_payload(
+            "training_monitor",
+            conversation_id=str(valid_conversation),
+        ),
+    )
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    controller = Controller(
+        role="student",
+        mailbox=Mailbox((*malformed_events, valid)),
+        turns=Turns(),
+        conversation_id=UUID("00000000-0000-0000-0000-000000000001"),
+        full_prompt="programme",
+        conversation_for_events=StudentConversationSelector(
+            AssignmentConversationRegistry(tmp_path / "students.json")
+        ),
+        inbox=inbox,
+        sleep=lambda _seconds: None,
+        poll_interval_seconds=600,
+        jitter_seconds=0,
+    )
+
+    controller._poll_into_inbox()
+
+    assert inbox.pending_count(valid_conversation) == 1
+    error = capsys.readouterr().err
+    assert error.count("SENPAI_EVENT_RENDER_ERROR") == 2
+    assert "disposition=deferred" in error
+
+
+def test_corrected_route_retries_after_the_defer_deadline(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+):
+    clock = [100.0]
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+    conversation_id = UUID("00000000-0000-0000-0000-000000000086")
+    malformed = ControllerEvent(
+        kind="agent_result",
+        dedupe_key="agent_result:stable",
+        payload=event_payload(
+            "agent_result",
+            parent_conversation_id="not-a-uuid",
+        ),
+    )
+    corrected = ControllerEvent(
+        kind=malformed.kind,
+        dedupe_key=malformed.dedupe_key,
+        payload=event_payload(
+            "agent_result",
+            parent_conversation_id=str(conversation_id),
+        ),
+    )
+    mailbox = Mailbox((malformed,))
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    controller = Controller(
+        role="student",
+        mailbox=mailbox,
+        turns=Turns(),
+        conversation_id=UUID("00000000-0000-0000-0000-000000000001"),
+        full_prompt="programme",
+        conversation_for_events=StudentConversationSelector(
+            AssignmentConversationRegistry(tmp_path / "students.json")
+        ),
+        inbox=inbox,
+        event_reminder_seconds=10,
+        sleep=lambda _seconds: None,
+        poll_interval_seconds=600,
+        jitter_seconds=0,
+    )
+
+    controller._poll_into_inbox()
+    mailbox.events = (corrected,)
+    clock[0] = 105
+    controller._poll_into_inbox()
+    assert inbox.pending_count(conversation_id) == 0
+
+    mailbox.events = (corrected,)
+    clock[0] = 111
+    controller._poll_into_inbox()
+
+    assert inbox.pending_count(conversation_id) == 1
+    assert capsys.readouterr().err.count("SENPAI_EVENT_RENDER_ERROR") == 1
 
 
 def test_failed_conversation_does_not_ack_or_starve_another(tmp_path: Path):

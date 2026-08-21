@@ -64,7 +64,12 @@ def test_reserved_assignment_retracts_unseen_availability_events(tmp_path: Path)
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
     store_path = tmp_path / "advisor-events.sqlite3"
     event = availability_event()
-    inbox.enqueue(conversation_id, event.dedupe_key, event.to_prompt())
+    inbox.enqueue(
+        conversation_id,
+        event.dedupe_key,
+        event.to_prompt(),
+        event_identity=event.event_identity(),
+    )
     with LocalEventStore(store_path) as store:
         store.enqueue(
             LocalEvent(
@@ -98,7 +103,12 @@ def test_available_student_preserves_its_queued_event(tmp_path: Path):
     conversation_id = UUID(int=124)
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
     event = availability_event()
-    inbox.enqueue(conversation_id, event.dedupe_key, event.to_prompt())
+    inbox.enqueue(
+        conversation_id,
+        event.dedupe_key,
+        event.to_prompt(),
+        event_identity=event.event_identity(),
+    )
     mailbox = StudentAssignmentAvailabilityMailbox(
         StaticMailbox((event,)),
         inbox=inbox,
@@ -116,7 +126,12 @@ def test_snapshot_retracts_removed_student_availability(tmp_path: Path):
     store_path = tmp_path / "advisor-events.sqlite3"
     stale = availability_event("Old-name")
     current = availability_event("New-name")
-    inbox.enqueue(conversation_id, stale.dedupe_key, stale.to_prompt())
+    inbox.enqueue(
+        conversation_id,
+        stale.dedupe_key,
+        stale.to_prompt(),
+        event_identity=stale.event_identity(),
+    )
     with LocalEventStore(store_path) as store:
         store.enqueue(
             LocalEvent(
@@ -157,7 +172,12 @@ def test_failed_github_poll_does_not_retract_queued_availability(tmp_path: Path)
     conversation_id = UUID(int=125)
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
     event = availability_event()
-    inbox.enqueue(conversation_id, event.dedupe_key, event.to_prompt())
+    inbox.enqueue(
+        conversation_id,
+        event.dedupe_key,
+        event.to_prompt(),
+        event_identity=event.event_identity(),
+    )
     mailbox = StudentAssignmentAvailabilityMailbox(
         BrokenMailbox(),
         inbox=inbox,

@@ -6,6 +6,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
+from senpai_agent.event_kinds import EventKind
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.models import AssignmentRecord, parse_assignment_markers
 
@@ -74,9 +75,9 @@ def student_events(
         numbers = sorted(int(pull["number"]) for pull in wip)
         events.append(
             ControllerEvent(
-                kind="duplicate_assignment",
+                kind=EventKind.DUPLICATE_ASSIGNMENT,
                 dedupe_key=(
-                    f"duplicate_assignment:{mailbox.student_name}:"
+                    f"{EventKind.DUPLICATE_ASSIGNMENT}:{mailbox.student_name}:"
                     f"{','.join(map(str, numbers))}"
                 ),
                 payload={
@@ -122,7 +123,10 @@ def student_events(
             }
             events.append(
                 versioned_event(
-                    "malformed_assignment", number, head_sha, payload=payload
+                    EventKind.MALFORMED_ASSIGNMENT,
+                    number,
+                    head_sha,
+                    payload=payload,
                 )
             )
             continue
@@ -160,7 +164,7 @@ def student_events(
             }
             events.append(
                 versioned_event(
-                    "student_assignment",
+                    EventKind.STUDENT_ASSIGNMENT,
                     number,
                     assignment.assignment_id,
                     assignment.revision_id,

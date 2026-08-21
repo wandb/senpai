@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 from openhands.sdk.conversation import ConversationExecutionStatus
+
+from senpai_agent.event_kinds import EVENT_KINDS
 from openhands.sdk.event import ActionEvent, ObservationEvent
 from openhands.sdk.llm import MessageToolCall
 
@@ -116,7 +118,12 @@ class SteeringConversation:
 
 def active_steering_turn(tmp_path: Path):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(STEERING_CONVERSATION_ID, "controller:event", "controller event")
+    inbox.enqueue(
+        STEERING_CONVERSATION_ID,
+        "controller:event",
+        "controller event",
+        event_identity="controller event",
+    )
     turn = inbox.next_turn(STEERING_CONVERSATION_ID, "controller prompt")
     assert turn is not None
     conversation = SteeringConversation()
@@ -177,6 +184,61 @@ def test_event_store_deduplicates_and_survives_reopen(tmp_path: Path):
         reopened.acknowledge(event.dedupe_key)
         assert reopened.pending_count() == 0
         assert reopened.pending() == []
+
+
+def test_event_store_and_model_view_accept_lone_unicode_surrogates(tmp_path: Path):
+    event = LocalEvent(
+        kind="future_event",
+        dedupe_key="future_event:unicode",
+        payload={"message": "before\ud800after", "emoji": "🧪"},
+    )
+
+    with LocalEventStore(tmp_path / "advisor-events.sqlite3") as store:
+        assert store.enqueue(event) is True
+        restored = store.pending()[0]
+
+    assert restored == event
+    assert restored.to_inbox_message().encode("utf-8")
+    assert "\\ud800" in restored.to_inbox_message()
+    assert "🧪" in restored.to_inbox_message()
+
+
+def test_event_store_rejects_a_non_utf8_key_without_writing_a_row(tmp_path: Path):
+    event = LocalEvent(
+        kind="future_event",
+        dedupe_key="future_event:\ud800",
+        payload={"message": "valid"},
+    )
+
+    with LocalEventStore(tmp_path / "advisor-events.sqlite3") as store:
+        with pytest.raises(ValueError, match="event key must be valid UTF-8"):
+            store.enqueue(event)
+        assert store.pending_count() == 0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"value": float("nan")},
+        {"value": float("inf")},
+        {"value": float("-inf")},
+        {"parent_conversation_id": float("nan")},
+    ],
+)
+def test_event_store_rejects_nonfinite_payloads_without_writing_a_row(
+    tmp_path: Path,
+    payload: dict[str, object],
+):
+    event = LocalEvent(
+        kind="future_event",
+        dedupe_key="future_event:nonfinite",
+        payload=payload,
+    )
+
+    with LocalEventStore(tmp_path / "advisor-events.sqlite3") as store:
+        with pytest.raises(ValueError, match="Out of range float values"):
+            store.enqueue(event)
+        assert store.pending_count() == 0
 
 
 def test_event_store_discards_absent_level_triggers(tmp_path: Path):
@@ -261,6 +323,42 @@ def test_deliver_pending_events_acknowledges_only_messages_sent(tmp_path: Path):
 
         assert conversation.messages == [first.to_user_message()]
         assert store.pending() == [second]
+
+
+def test_malformed_local_event_is_dropped_without_blocking_a_valid_sibling(
+    tmp_path: Path,
+    capsys,
+):
+    malformed = LocalEvent(
+        kind="student_assignment",
+        dedupe_key="student_assignment:malformed",
+        payload={"blockers": []},
+    )
+    valid = LocalEvent(
+        kind="review_ready",
+        dedupe_key="review_ready:17:abc",
+        payload=event_payload("review_ready"),
+    )
+
+    class Conversation:
+        def __init__(self):
+            self.messages: list[str] = []
+
+        def send_message(self, message: str) -> None:
+            self.messages.append(message)
+
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
+        store.enqueue(malformed)
+        store.enqueue(valid)
+        conversation = Conversation()
+
+        assert deliver_pending_events(store, conversation) == 1
+        assert conversation.messages == [valid.to_user_message()]
+        assert store.pending() == []
+
+    error = capsys.readouterr().err
+    assert "SENPAI_EVENT_RENDER_ERROR" in error
+    assert "disposition=acknowledged_dropped" in error
 
 
 def test_event_pump_keeps_events_queued_while_a_tool_action_is_unmatched(
@@ -384,7 +482,12 @@ def test_event_pump_queues_into_the_controller_inbox_without_mid_turn_injection(
         store.enqueue(event)
         conversation = Conversation()
         inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-        inbox.enqueue(conversation_id, "controller:event", "controller event")
+        inbox.enqueue(
+            conversation_id,
+            "controller:event",
+            "controller event",
+            event_identity="controller event",
+        )
         active = inbox.next_turn(conversation_id, "controller prompt")
         assert active is not None
         for message in active.messages:
@@ -869,7 +972,12 @@ def test_human_issue_joins_a_failed_turn_for_its_retry(tmp_path: Path):
             self.messages.append(message)
 
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
-    inbox.enqueue(conversation_id, "controller:event", "controller event")
+    inbox.enqueue(
+        conversation_id,
+        "controller:event",
+        "controller event",
+        event_identity="controller event",
+    )
     active = inbox.next_turn(conversation_id, "controller prompt")
     assert active is not None
     conversation = Conversation()
@@ -1122,25 +1230,7 @@ def test_advisor_cli_reports_the_pending_event_count(
 
 @pytest.mark.parametrize(
     ("kind", "payload"),
-    [
-        (kind, event_payload(kind))
-        for kind in (
-            "student_assignment",
-            "malformed_assignment",
-            "student_pr_feedback",
-            "human_issue",
-            "student_assignment_comment",
-            "review_ready",
-            "advisor_action",
-            "student_available_for_assignment",
-            "duplicate_assignment",
-            "research_base_changed",
-            "training_monitor",
-            "workspace_diverged",
-            "agent_result",
-            "agent_error",
-        )
-    ],
+    [(kind, event_payload(kind)) for kind in sorted(EVENT_KINDS)],
 )
 def test_inbox_rendering_matches_for_every_controller_and_watcher_event(
     kind,
