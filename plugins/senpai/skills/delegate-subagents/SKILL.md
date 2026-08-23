@@ -39,6 +39,28 @@ Agent specialization and model tier are independent. For first-principles synthe
 
 Normally set `include_context=false` and provide a self-contained task with exact evidence paths. This gives the child a fresh perspective while preserving access to the merged system prompt and searchable parent history. Set `include_context=true` only when the complete model-visible conversation is necessary and cannot be summarized reliably. For research judgment, ask for research, critique, diagnosis, ideas, or a plan rather than edits.
 
+## Keep bulk output in the child
+
+Delegate before running a command or broad read that may return substantial
+output. A child can summarize output it produced; it cannot remove output that
+already entered the parent context.
+
+- Use `agent="bash-runner", model="fast"` for verbose tests, builds, bounded
+  logs, Git inspection, and deterministic command output.
+- Use `agent="explore", model="fast"` for broad file, history, or PR-artifact
+  searches and extraction into cited facts.
+- Use `agent="general-purpose", model="fast"` for exact mechanical edits with
+  explicit file targets and focused acceptance checks.
+- Use `model="smart"` for ordinary implementation, review, synthesis, and
+  failure diagnosis.
+- Use `model="frontier"` for causal scientific interpretation, disputed
+  evidence, direction changes, and expensive experiment portfolios.
+
+For a potentially large GitHub review, have the root call
+`get_prs(max_inline_prs=0)`, pass the returned artifact path to an Explore
+child, inspect the child's cited decisive evidence, and perform any typed
+GitHub transition in the root.
+
 ## Collect results
 
 `spawn_agents` returns task IDs immediately. Continue useful work, then use bounded `await_agents` calls with `all`, `first`, `quorum`, or `change` and a timeout of at most 300 seconds. Use `agent_status` for one non-blocking snapshot and `cancel_agents` when work is no longer useful; do not poll.
