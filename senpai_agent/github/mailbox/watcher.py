@@ -23,7 +23,7 @@ class ActiveGitHubWatcher:
         store_path: Path,
         *,
         known_keys: frozenset[str],
-        poll_interval_seconds: float = 30,
+        poll_interval_seconds: float = 75,
         map_event: Callable[[ControllerEvent], LocalEvent | None] | None = None,
     ):
         self.mailbox = mailbox

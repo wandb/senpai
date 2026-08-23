@@ -15,10 +15,11 @@ from openhands.sdk.event import (
     ObservationEvent,
 )
 from openhands.sdk.llm import Message, TextContent
+from openhands.sdk.llm.exceptions import LLMServiceUnavailableError
 from openhands.sdk.tool import resolve_tool
 
 import senpai_agent.openhands_runner as runner
-from senpai_agent.controller import OpenHandsTurnRunner
+from senpai_agent.controller import OpenHandsTurnRunner, _provider_failure
 from senpai_agent.inbox import (
     DeliveryState,
     InboxTurnQuarantined,
@@ -52,7 +53,13 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
             captured["secrets"] = kwargs["secrets"]
             captured["delete_on_close"] = kwargs["delete_on_close"]
             captured["llm_timeout"] = agent.llm.timeout
-            captured["llm_num_retries"] = agent.llm.num_retries
+            captured["llm_retries"] = (
+                agent.llm.num_retries,
+                agent.llm.retry_multiplier,
+                agent.llm.retry_min_wait,
+                agent.llm.retry_max_wait,
+            )
+            captured["llm"] = agent.llm
             captured["llm_type"] = type(agent.llm)
             self.state = SimpleNamespace(
                 execution_status=ConversationExecutionStatus.FINISHED
@@ -100,9 +107,19 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     assert captured["conversation_id_env"] == config.conversation_id.hex
     assert captured["delete_on_close"] is False
     assert captured["llm_timeout"] == 5400
-    assert captured["llm_num_retries"] == 1
+    assert captured["llm_retries"] == (5, 8, 8, 64)
     assert captured["llm_type"] is runner.LLM
     assert captured["closed"] is True
+
+    retried = RuntimeError("provider requested a longer pause")
+    retried.headers = {"retry-after": "300"}
+    exhausted = LLMServiceUnavailableError("provider unavailable")
+    with pytest.raises(LLMServiceUnavailableError):
+        with captured["llm"]._request_scope():
+            with captured["llm"]._request_scope():
+                captured["llm"].retry_listener(1, 5, retried)
+                raise exhausted
+    assert _provider_failure(exhausted, 1_700_000_000).retry_after == 300
 
 
 def test_context_reset_preserves_history_and_starts_a_fresh_active_branch(

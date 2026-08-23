@@ -14,6 +14,7 @@ import sys
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import simple_parsing as sp
 import yaml
@@ -336,8 +337,13 @@ def build_launch_context(
     student_list: list[str],
     *,
     backend: str,
+    role: Literal["advisor", "student"],
 ) -> str:
     return render_launch_context(
+        role=role,
+        github_repo=target_repo_slug(args.target_repo_url),
+        wandb_entity=args.wandb_entity,
+        wandb_project=args.wandb_project,
         backend=backend,
         nodes_per_student=args.nodes_per_student,
         gpus_per_student_node=args.gpus_per_student_node,
@@ -356,6 +362,7 @@ def encoded_launch_context(
     student_list: list[str],
     *,
     backend: str,
+    role: Literal["advisor", "student"],
 ) -> str:
     return base64.b64encode(
         build_launch_context(
@@ -363,6 +370,7 @@ def encoded_launch_context(
             tag,
             student_list,
             backend=backend,
+            role=role,
         ).encode()
     ).decode()
 
@@ -610,6 +618,7 @@ def render_student(
                 tag,
                 [student_name],
                 backend="kubernetes",
+                role="student",
             ),
             "EXTRA_INSTRUCTIONS_B64": encoded_operator_instructions(args),
             "PROBLEM_DIR": args.problem_dir,
@@ -733,6 +742,7 @@ def render_advisor(
         tag,
         student_list,
         backend="kubernetes",
+        role="advisor",
     )
     data["EXTRA_INSTRUCTIONS_B64"] = encoded_operator_instructions(args)
     configmap = render_configmap(

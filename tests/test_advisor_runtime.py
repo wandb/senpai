@@ -423,10 +423,18 @@ def test_event_pump_accepts_an_in_memory_inbox(tmp_path: Path):
         )
 
 
-def test_human_issue_steers_the_active_turn_after_the_tool_boundary(tmp_path: Path):
+@pytest.mark.parametrize(
+    "kind",
+    ["human_issue", "human_pr_comment"],
+    ids=["human-issue", "human-pr-comment"],
+)
+def test_human_instruction_steers_the_active_turn_after_the_tool_boundary(
+    tmp_path: Path,
+    kind: str,
+):
     event = LocalEvent(
-        kind="human_issue",
-        dedupe_key="human_issue:1",
+        kind=kind,
+        dedupe_key=f"{kind}:1",
         payload={"message": "Change direction."},
     )
     inbox, active, conversation = active_steering_turn(tmp_path)
@@ -454,6 +462,46 @@ def test_human_issue_steers_the_active_turn_after_the_tool_boundary(tmp_path: Pa
     steered = inbox.turn(active.turn_id)
     assert steered.event_keys == ("controller:event", event.dedupe_key)
     assert conversation.messages[-1] == event.to_inbox_message()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["human_issue", "human_pr_comment"],
+    ids=["human-issue", "human-pr-comment"],
+)
+def test_event_pump_drops_an_acknowledged_human_instruction(
+    tmp_path: Path,
+    kind: str,
+):
+    event = LocalEvent(
+        kind=kind,
+        dedupe_key=f"{kind}:1",
+        payload={"message": "Change direction."},
+    )
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    conversation = SteeringConversation()
+
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
+        pump = AdvisorEventPump(
+            store,
+            conversation,
+            inbox=inbox,
+            conversation_id=STEERING_CONVERSATION_ID,
+        )
+        assert store.enqueue(event)
+        assert pump._transfer_to_inbox() == 1
+        first = inbox.next_turn(STEERING_CONVERSATION_ID, "controller prompt")
+        assert first is not None
+        deliver_turn_messages(conversation, inbox, first.turn_id)
+        inbox.record_processed(first.turn_id)
+        inbox.acknowledge(first.turn_id)
+
+        store.discard_prefix(event.dedupe_key)
+        assert store.enqueue(event)
+        assert pump._transfer_to_inbox() == 1
+
+        assert store.pending() == []
+        assert inbox.next_turn(STEERING_CONVERSATION_ID, "controller prompt") is None
 
 
 def test_student_feedback_waits_for_the_step_and_marks_a_clean_unwind(

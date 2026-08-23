@@ -396,7 +396,10 @@ def test_pro_mode_is_only_enabled_by_openai_max(model, effort):
         ),
         (
             "anthropic/claude-opus-4-8",
-            {"anthropic_compact_threshold": TEST_COMPACTION_TRIGGER_TOKENS},
+            {
+                "anthropic_compact_threshold": TEST_COMPACTION_TRIGGER_TOKENS,
+                "anthropic_compaction_instructions": None,
+            },
         ),
         ("gemini/gemini-3-pro", {}),
     ],
@@ -435,10 +438,18 @@ def test_universal_compaction_configuration_reaches_anthropic_sdk():
         configuration["anthropic_compact_threshold"]
         == TEST_COMPACTION_TRIGGER_TOKENS
     )
+    assert configuration["anthropic_compaction_instructions"] is None
     assert llm.uses_anthropic_compaction() is True
-    assert call_kwargs["context_management"]["edits"][0]["trigger"] == {
-        "type": "input_tokens",
-        "value": TEST_COMPACTION_TRIGGER_TOKENS,
+    assert call_kwargs["context_management"] == {
+        "edits": [
+            {
+                "type": "compact_20260112",
+                "trigger": {
+                    "type": "input_tokens",
+                    "value": TEST_COMPACTION_TRIGGER_TOKENS,
+                },
+            }
+        ]
     }
 
 

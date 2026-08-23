@@ -639,8 +639,7 @@ class AgentTaskBase(BaseModel):
         description="Self-contained assignment and requested evidence-linked report.",
     )
     model: ModelTier = Field(
-        default="smart",
-        description="Fast for mechanical work, smart for synthesis, frontier for the hardest work.",
+        description="Select fast, smart, or frontier according to the delegation policy.",
     )
     include_context: bool = Field(
         default=False,

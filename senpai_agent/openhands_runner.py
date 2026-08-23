@@ -15,7 +15,8 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -223,7 +224,7 @@ class RunnerConfig:
     wandb_project: str | None = None
     timeout_seconds: float = 7200
     llm_timeout_seconds: int = 5400
-    llm_num_retries: int = 1
+    llm_num_retries: int = 5
     inbox_max_stalled_attempts: int = DEFAULT_INBOX_MAX_STALLED_ATTEMPTS
     inbox_max_recovery_generations: int = DEFAULT_INBOX_MAX_RECOVERY_GENERATIONS
     child: bool = False
@@ -658,7 +659,7 @@ def resolve_config(
         raise RuntimeError("SENPAI_OPENHANDS_TIMEOUT_SECONDS must be positive")
     try:
         llm_timeout_seconds = int(env.get("SENPAI_LLM_TIMEOUT_SECONDS", "5400"))
-        llm_num_retries = int(env.get("SENPAI_LLM_NUM_RETRIES", "1"))
+        llm_num_retries = int(env.get("SENPAI_LLM_NUM_RETRIES", "5"))
     except ValueError as error:
         raise RuntimeError("Senpai LLM timeout settings must be numeric") from error
     if llm_timeout_seconds <= 0 or llm_num_retries <= 0:
@@ -1058,13 +1059,16 @@ def openai_responses_configuration(
 def compaction_configuration(
     model: str,
     trigger_tokens: int,
-) -> dict[str, int]:
+) -> dict[str, int | None]:
     """Translate the universal token trigger to the provider SDK field."""
     provider = model_provider(model)
     if provider == "openai":
         return {"responses_compact_threshold": trigger_tokens}
     if provider == "anthropic":
-        return {"anthropic_compact_threshold": trigger_tokens}
+        return {
+            "anthropic_compact_threshold": trigger_tokens,
+            "anthropic_compaction_instructions": None,
+        }
     return {}
 
 
@@ -1659,11 +1663,46 @@ def run_openhands(
     cleanup_error: BaseException | None = None
     active_inbox_turn_id = inbox_turn_id
     try:
+        retried_provider_errors: ContextVar[tuple[BaseException, ...]] = ContextVar(
+            "retried_provider_errors",
+            default=(),
+        )
+
+        def record_retry(
+            _attempt: int,
+            _total: int,
+            error: BaseException | None,
+        ) -> None:
+            if error is not None:
+                retried_provider_errors.set((*retried_provider_errors.get(), error))
+
         inference_heartbeat = (
             InferenceHeartbeat(on_inference_state)
             if on_inference_state is not None
             else None
         )
+
+        @contextmanager
+        def model_request() -> Iterator[None]:
+            token = retried_provider_errors.set(())
+            try:
+                with (
+                    inference_heartbeat.request()
+                    if inference_heartbeat is not None
+                    else nullcontext()
+                ):
+                    yield
+            except Exception as error:
+                retried = (
+                    *getattr(error, "_senpai_retried_provider_errors", ()),
+                    *retried_provider_errors.get(),
+                )
+                if retried:
+                    setattr(error, "_senpai_retried_provider_errors", retried)
+                raise
+            finally:
+                retried_provider_errors.reset(token)
+
         llm = LLM(
             model=config.model,
             api_key=config.api_key,
@@ -1673,6 +1712,7 @@ def run_openhands(
                 config.reasoning_effort, config.model
             ),
             usage_id="senpai",
+            retry_listener=record_retry,
             **model_runtime_configuration(
                 config.model,
                 config.reasoning_effort,
@@ -1681,8 +1721,7 @@ def run_openhands(
                 wandb_project=config.wandb_project,
             ),
         )
-        if inference_heartbeat is not None:
-            llm.set_request_scope(inference_heartbeat.request)
+        llm.set_request_scope(model_request)
         if config.agent_name:
             definition = depth_aware_child_definition(
                 find_named_agent(config.agent_name, file_agents),

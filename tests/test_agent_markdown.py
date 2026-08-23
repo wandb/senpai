@@ -123,6 +123,7 @@ def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
         "check-human-issues",
         "delegate-subagents",
         "exa-search",
+        "maintain-research-state",
         "review-experiment",
         "senpai-status-check",
         "submit-experiment-results",
@@ -139,3 +140,16 @@ def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
     assert {
         path: path.read_text(encoding="utf-8") for path in originals
     } == originals
+
+
+def test_delegate_subagents_skill_advertises_frontier_research_judgment():
+    skill = (
+        PLUGIN_DIR / "skills" / "delegate-subagents" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    frontmatter = " ".join(skill.split("---", 2)[1].split())
+
+    assert "every task requires an" in frontmatter
+    assert "explicit model tier" in frontmatter
+    assert "delegation-capable subagents" in frontmatter
+    assert "research ideation" in frontmatter
+    assert "expensive experiment portfolios" in frontmatter

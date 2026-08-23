@@ -24,6 +24,8 @@ ROLE_TEMPLATE_VALUES = {
         "WANDB_ENTITY",
         "WANDB_PROJECT",
         "STUDENT_NAMES",
+        "NODES_PER_STUDENT",
+        "GPUS_PER_STUDENT_NODE",
     ),
     "student": (
         "GH_REPO",
@@ -63,6 +65,10 @@ def render_role_prompt(
 
 def render_launch_context(
     *,
+    role: Literal["advisor", "student"],
+    github_repo: str,
+    wandb_entity: str,
+    wandb_project: str,
     backend: str,
     nodes_per_student: int,
     gpus_per_student_node: int,
@@ -78,6 +84,10 @@ def render_launch_context(
     return _render(
         LAUNCH_CONTEXT_TEMPLATE,
         {
+            "ROLE": role,
+            "GH_REPO": github_repo,
+            "WANDB_ENTITY": wandb_entity,
+            "WANDB_PROJECT": wandb_project,
             "BACKEND": backend,
             "NODES_PER_STUDENT": str(nodes_per_student),
             "GPUS_PER_STUDENT_NODE": str(gpus_per_student_node),

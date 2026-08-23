@@ -208,6 +208,7 @@ def test_native_senpai_plugin_loads_its_runtime_skills():
         "check-human-issues",
         "delegate-subagents",
         "exa-search",
+        "maintain-research-state",
         "review-experiment",
         "senpai-status-check",
         "submit-experiment-results",
@@ -369,15 +370,17 @@ def test_markdown_agents_register_and_construct_with_the_native_loader(tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_search_agent_receives_skills_from_the_runtime_plugin(
+@pytest.mark.parametrize("agent_file", ["search.md", "general-purpose.md"])
+def test_subagents_receive_skills_from_the_runtime_plugin(
     monkeypatch,
     tmp_path,
+    agent_file,
 ):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("SENPAI_ROLE", "advisor")
     register_default_tools(enable_browser=False)
     register_senpai_tools()
-    definition = AgentDefinition.load(AGENT_DIR / "search.md")
+    definition = AgentDefinition.load(AGENT_DIR / agent_file)
     agent = agent_definition_to_factory(definition, work_dir=tmp_path)(
         LLM(
             model="anthropic/claude-opus-4-8",
@@ -397,6 +400,7 @@ def test_search_agent_receives_skills_from_the_runtime_plugin(
     conversation._ensure_plugins_loaded()
     try:
         assert {skill.name for skill in conversation.agent.agent_context.skills} >= {
+            "delegate-subagents",
             "exa-search",
             "alphaxiv-paper-lookup",
         }
@@ -506,10 +510,15 @@ def test_event_guidance_lives_in_the_shared_harness():
 
     event_guidance = (
         "A `review_ready`, `training_monitor`, `human_issue`, "
-        "`student_available_for_assignment`"
+        "`human_pr_comment`, `student_available_for_assignment`"
     )
     assert event_guidance not in advisor
     assert event_guidance in harness
+    assert "A `student_assignment_comment` event is interim feedback" in harness
+    assert "may refer to an earlier assignment revision" in harness
+    assert "respond on the current revision" in harness
+    assert "A `research_base_changed` event means" in harness
+    assert "Do not cancel in-flight work solely because the base changed" in harness
 
 
 def test_shared_harness_omits_project_instructions_and_generic_reminders():
@@ -614,11 +623,43 @@ def test_delegation_guidance_lives_in_the_plugin_skill():
         / "SKILL.md"
     ).read_text(encoding="utf-8")
     normalized_harness = " ".join(harness.split())
+    normalized_advisor = " ".join(advisor.split())
     normalized_skill = " ".join(skill.split())
 
     assert "`delegate-subagents` skill" in normalized_harness
     assert "`spawn_agents`" not in advisor
     assert "`spawn_agents`" not in student
+
+    for trigger in (
+        "fresh research ideation",
+        "planning a new research round",
+        "changing direction after a plateau",
+        "reviewing a large body of research or experiment evidence",
+        "difficult debugging or optimization of code that is already highly optimized",
+        "disagreement between local and external evaluation",
+        "substantial GPU time or external-evaluation budget",
+    ):
+        assert trigger in normalized_advisor
+
+    assert "Instruct the researcher-agent to think creatively" in advisor
+    assert "Schmidhuber" in advisor
+
+    for implementation_detail in (
+        "researcher-agent-instructions",
+        "agent specialization",
+        "model tier",
+        '`model="frontier"`',
+        '`agent="general-purpose"`',
+        "`fast`",
+        "`smart`",
+        "`frontier`",
+        "`general-purpose`",
+        "`bash-runner`",
+        "include_context",
+        "search_research_publications",
+        "search_general_web",
+    ):
+        assert implementation_detail not in advisor
 
     for required in (
         "`spawn_agents`",
@@ -629,13 +670,31 @@ def test_delegation_guidance_lives_in_the_plugin_skill():
         "`search_research_publications`",
         '`model="frontier"`',
         '`agent="general-purpose"`',
-        "ask for research, critique, ideas, or a plan rather than edits",
+        "Every task must explicitly set `model`",
+        "fresh research ideation",
+        "planning a new research round",
+        "changing direction after a plateau",
+        "reviewing a large research or experiment history",
+        "difficult debugging or optimization of code that is already highly optimized",
+        "disagreement between local and external evaluation",
+        "substantial GPU time or external-evaluation budget",
+        "ask for research, critique, diagnosis, ideas, or a plan rather than edits",
         "timeout of at most 300 seconds",
     ):
         assert required in normalized_skill
 
+    assert "complete relevant experiment history" not in normalized_skill
 
-def test_advisor_prompt_uses_general_research_domains_and_typed_assignment_body():
+    spec = (REPO_ROOT / "SPEC.md").read_text(encoding="utf-8")
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "model: fast | smart | frontier," in spec
+    assert "model: fast | smart | frontier = smart," not in spec
+    assert "Every task must set `model` explicitly" in readme
+    assert "the hardest generalist work" not in readme
+    assert "high-leverage research and technical judgment" in readme
+
+
+def test_advisor_prompt_uses_general_research_domains_and_an_actionable_brief():
     advisor = " ".join(
         (REPO_ROOT / "system_instructions" / "ADVISOR.md")
         .read_text(encoding="utf-8")
@@ -643,7 +702,82 @@ def test_advisor_prompt_uses_general_research_domains_and_typed_assignment_body(
     )
 
     assert "adjacent research fields such as physics, chemistry or biology" in advisor
-    assert "Pass the complete actionable experiment brief in `body`" in advisor
+    assert "deliver a complete, actionable experiment brief safely" in advisor
+    for operational_detail in ("create_assignment", "assign-experiment", "`body`"):
+        assert operational_detail not in advisor
+
+
+def test_advisor_prompt_keeps_policy_and_moves_operational_details():
+    advisor = (
+        REPO_ROOT / "system_instructions" / "ADVISOR.md"
+    ).read_text(encoding="utf-8")
+
+    for retained in (
+        "Do not run training or evaluation",
+        "Use the operation-specific typed GitHub tools",
+        "W&B Report",
+        "{{NODES_PER_STUDENT}}",
+        "{{GPUS_PER_STUDENT_NODE}}",
+        "Use subagents when an independent perspective",
+        "Schmidhuber",
+        "## Writing style",
+        "ASD-STE100",
+    ):
+        assert retained in advisor
+
+    for moved_or_removed in (
+        "## Runtime identity",
+        "board message",
+        "one durable conversation",
+        "$GPUS_PER_STUDENT",
+        "$NODES_PER_STUDENT",
+        "$GPUS_PER_STUDENT_NODE",
+        "get_prs",
+        "review-experiment",
+        "research_base_changed",
+        "accept_result_on_current_base",
+        "current_base_sha",
+        "request_assignment_revision",
+        "required_base_sha",
+        "student_assignment_comment",
+        "send_assignment_feedback",
+        "create_assignment",
+        "assign-experiment",
+        "publish_advisor_branch",
+        "research/RESEARCH_IDEAS_",
+        "research/CURRENT_RESEARCH_STATE.md",
+        "research/DATASET_ANALYSIS.md",
+        "Epoch and wall-clock limits",
+        "injected launch-runtime context",
+    ):
+        assert moved_or_removed not in advisor
+
+
+def test_research_state_skill_owns_artifacts_and_publication():
+    advisor = (
+        REPO_ROOT / "system_instructions" / "ADVISOR.md"
+    ).read_text(encoding="utf-8")
+    skill = (
+        PLUGIN_DIR / "skills" / "maintain-research-state" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    frontmatter = " ".join(skill.split("---", 2)[1].split())
+
+    for trigger in (
+        "research focus or direction",
+        "durable research ideas",
+        "dataset understanding",
+    ):
+        assert trigger in frontmatter
+
+    for owned_detail in (
+        "research/CURRENT_RESEARCH_STATE.md",
+        "research/RESEARCH_IDEAS_<YYYY-MM-DD_HH:MM>.md",
+        "research/DATASET_ANALYSIS.md",
+        "publish_advisor_branch",
+        "living, pruned view",
+    ):
+        assert owned_detail in skill
+        assert owned_detail not in advisor
 
 
 def test_harness_states_bounded_delegation_tree_contract():
