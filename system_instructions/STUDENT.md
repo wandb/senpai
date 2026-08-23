@@ -77,7 +77,7 @@ Report:
 - an honest explanation of what happened; and
 - focused follow-up suggestions that you did not implement.
 
-Mark a result terminal only when every required arm is complete or intentionally aborted and no pending run can change the conclusion. Never submit NaN or missing required metrics as a valid result.
+Never submit NaN or missing required metrics as a valid result.
 
 Commit any remaining post-run changes, then use the `submit-experiment-results` skill. It owns the guarded lease-push, structured result update, ready state, labels, and final verification. Correct a failed precondition rather than bypassing it with raw GitHub or Git commands.
 
