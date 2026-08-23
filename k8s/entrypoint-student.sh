@@ -101,11 +101,13 @@ rm -f "$GIT_ASKPASS_FILE"
 if [ "${NODES_PER_STUDENT:-1}" -gt 1 ]; then
     proxy_dir="$LOGDIR/bin"
     mkdir -p "$proxy_dir"
+    kubectl_wrapper="$(mktemp "$proxy_dir/.kubectl.XXXXXX")"
     printf '%s\n' \
         '#!/bin/sh' \
         'exec python -m senpai_agent.kubernetes_executor kubectl "$@"' \
-        > "$proxy_dir/kubectl"
-    chmod 500 "$proxy_dir/kubectl"
+        > "$kubectl_wrapper"
+    chmod 500 "$kubectl_wrapper"
+    mv -f "$kubectl_wrapper" "$proxy_dir/kubectl"
     export PATH="$proxy_dir:$PATH"
     for _ in $(seq 1 180); do
         [ -S "$SENPAI_KUBERNETES_EXECUTOR_SOCKET" ] && break
