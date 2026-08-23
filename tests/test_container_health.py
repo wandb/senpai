@@ -109,4 +109,4 @@ def test_role_images_use_the_bootstrap_aware_health_wrapper():
 def test_role_entrypoints_default_openhands_turns_to_two_hours_of_inactivity():
     for name in ("entrypoint-advisor.sh", "entrypoint-student.sh"):
         entrypoint = (ROOT / "k8s" / name).read_text()
-        assert 'SENPAI_OPENHANDS_TIMEOUT_SECONDS:-7200' in entrypoint
+        assert 'SENPAI_OPENHANDS_TIMEOUT_SECONDS:-57600' in entrypoint
