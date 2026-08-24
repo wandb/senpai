@@ -1,10 +1,13 @@
 import base64
+import os
 import re
+import subprocess
 import sys
 
 import pytest
 import yaml
 
+from git_workflow_support import commit_file, git, repository
 from launch_test_support import (
     ADVISOR_IMAGE,
     REVISION,
@@ -260,6 +263,59 @@ def test_role_bootstrap_verifies_both_checkout_and_image_source_revision(role):
     assert (
         'test "$SENPAI_IMAGE_REVISION" = "$SENPAI_REPO_REVISION"' in command
     )
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_role_bootstrap_reuses_runner_checkout_without_touching_target(role, tmp_path):
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source, _remote, revision = repository(source_root)
+
+    _configmap, deployment, _secret = render_role(role)
+    command = yaml.safe_load(deployment)["spec"]["template"]["spec"]["containers"][
+        0
+    ]["args"][0]
+    workspace_root = tmp_path / "workspace"
+    runner = workspace_root / "senpai"
+    bootstrap = "set -e\numask 022\n" + command[
+        command.index("askpass=") : command.index("exec bash")
+    ]
+    bootstrap = bootstrap.replace("/tmp/senpai-git-askpass", str(tmp_path / "askpass"))
+    token_handoff = tmp_path / "github-token"
+    bootstrap = bootstrap.replace(
+        "/tmp/senpai-supervisor-github-token", str(token_handoff)
+    )
+    bootstrap = bootstrap.replace("/workspace", str(workspace_root))
+    umask_output = tmp_path / "umask"
+    bootstrap += '\numask > "$UMASK_OUTPUT"\n'
+    env = os.environ | {
+        "GITHUB_TOKEN": "unused",
+        "SENPAI_IMAGE_REVISION": revision,
+        "SENPAI_REPO_REVISION": revision,
+        "SENPAI_REPO_URL": str(source),
+        "UMASK_OUTPUT": str(umask_output),
+    }
+
+    subprocess.run(["bash", "-c", bootstrap], check=True, env=env)
+    target = runner / "target"
+    target.mkdir()
+    git(target, "init", "--quiet")
+    git(target, "config", "user.name", "Student")
+    git(target, "config", "user.email", "student@example.com")
+    target_revision = commit_file(target, "state.txt", "committed\n", "state")
+    (target / "state.txt").write_text("in progress\n")
+    target_status = git(target, "status", "--short")
+    git(runner, "remote", "set-url", "origin", str(tmp_path / "stale.git"))
+
+    subprocess.run(["bash", "-c", bootstrap], check=True, env=env)
+
+    assert git(target, "rev-parse", "HEAD") == target_revision
+    assert git(target, "status", "--short") == target_status
+    assert (target / "state.txt").read_text() == "in progress\n"
+    assert git(runner, "remote", "get-url", "origin") == str(source)
+    assert git(runner, "rev-parse", "HEAD") == revision
+    assert token_handoff.stat().st_mode & 0o777 == 0o600
+    assert int(umask_output.read_text().strip(), 8) == 0o22
 
 
 @pytest.mark.parametrize(
