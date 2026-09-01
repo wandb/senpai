@@ -1023,7 +1023,7 @@ def test_oversized_child_result_is_spilled_then_replaced_by_one_summary(
     result = _output_record(output, "OPENHANDS_RESULT ")
     assert captured["runs"] == [raw_report, summary]
     assert len(captured["prompts"]) == 2
-    assert "approxinately 1,500 tokens" in captured["prompts"][1]
+    assert "approximately 1,500 tokens" in captured["prompts"][1]
     assert str(artifact) in captured["prompts"][1]
     assert artifact.read_text(encoding="utf-8") == raw_report
     assert not artifact.is_relative_to(target_checkout)

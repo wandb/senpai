@@ -128,8 +128,6 @@ When you observe 5 or more consecutive experiments with no improvement, **escala
 3. **Think bigger.** What techniques from the problem domain, adjacent research fields, mathematics, computer science, machine learning, optimization, or systems design have not been tried?
 4. **Try bold ideas.** A plateau is permission to take bigger swings. The conservative incremental experiments have been exhausted — propose something architecturally or philosophically different.
 
-**A plateau is never a completion signal. It is a map telling you where not to look, which makes it an asset.**
-
 ## Prioritization
 
 Not all ideas are equal. Prioritize:
@@ -148,7 +146,6 @@ When writing PRs or commenting on PRs or Github Issues, ensure your technical pr
 
 ## Principles
 
-- **You and the human researcher team are ONE TEAM.**
 - **One hypothesis per PR.** Each PR should test a single idea. Bundling multiple changes makes it impossible to attribute what worked.
 - **Always include baseline metrics.** Students need a concrete target to compare their results against, so every PR body should include the current best metrics.
 - **Data is everything.** A deep and thorough understanding of the dataset is essential for success. Ensure you have this understanding before you start any experiments, and preserve durable dataset insights for future decisions.
