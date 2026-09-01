@@ -8,29 +8,34 @@ import signal
 import sys
 import time
 from base64 import b64decode
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from functools import partial
 from pathlib import Path
 from typing import Literal, Protocol
 from uuid import UUID
 
 from senpai_agent.agent_markdown import strip_spdx_header
-from senpai_agent.advisor import AdvisorEvent, AdvisorEventStore
 from senpai_agent.github.mailbox import ActiveGitHubWatcher, GitHubMailbox
 from senpai_agent.inbox import (
+    EXACT_ONCE_EVENT_KINDS,
+    QUEUE_PRIORITY,
+    STEERING_PRIORITIES,
     DeliveryState,
     InboxTurn,
     InboxTurnQuarantined,
     PersistentInbox,
 )
+from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import (
     CompositeMailbox,
     ControllerEvent,
     LocalAdvisorMailbox,
     LocalStudentMailbox,
     Mailbox,
+    StudentAssignmentAvailabilityMailbox,
 )
 from senpai_agent.monitor import (
     MonitorMailbox,
@@ -55,13 +60,24 @@ from senpai_agent.supervisor import LEASE_ENV, ProgressLease
 from senpai_agent.workspace import StudentWorkspaceReconciler, WorkspaceDivergence
 
 
-_EDGE_TRIGGERED_EVENT_KINDS = frozenset({"research_base_changed"})
+_EDGE_TRIGGERED_EVENT_KINDS = EXACT_ONCE_EVENT_KINDS | {
+    "research_base_changed",
+    "student_assignment_comment",
+}
+_ACTIVITY_LEASE_RENEWAL_SECONDS = 30
+_LLM_PROVIDER_COOLDOWN_SECONDS = (30.0, 60.0, 120.0, 240.0, 300.0)
 
 
 @dataclass(frozen=True, slots=True)
 class TurnResult:
     exit_code: int
     delivered_event_keys: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderFailure:
+    retryable: bool
+    retry_after: float = 0
 
 
 class ConversationRecoveryExhausted(RuntimeError):
@@ -104,6 +120,76 @@ def _is_context_history_failure(error: Exception) -> bool:
     )
 
 
+def _exception_chain(error: BaseException) -> Iterator[BaseException]:
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        yield current
+        pending.extend(getattr(current, "_senpai_retried_provider_errors", ()))
+        linked = getattr(current, "original_exception", None) or current.__cause__
+        if isinstance(linked, BaseException):
+            pending.append(linked)
+
+
+def _retry_after_seconds(error: BaseException, now: float) -> float:
+    value = getattr(error, "retry_after", None)
+    if value is None:
+        value = next(
+            (
+                header
+                for headers in (
+                    getattr(error, "litellm_response_headers", None),
+                    getattr(error, "headers", None),
+                    getattr(getattr(error, "response", None), "headers", None),
+                )
+                if headers
+                for name, header in headers.items()
+                if str(name).casefold() == "retry-after"
+            ),
+            None,
+        )
+    if value is None:
+        return 0
+    try:
+        return max(0, float(value))
+    except (TypeError, ValueError):
+        try:
+            return max(0, parsedate_to_datetime(str(value)).timestamp() - now)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+
+def _provider_failure(error: Exception, now: float) -> ProviderFailure | None:
+    from openai import OpenAIError
+    from openhands.sdk.event.error_classification import FailureKind, classify_error
+    from openhands.sdk.llm.exceptions import LLMError
+
+    chain = tuple(_exception_chain(error))
+    if not any(isinstance(current, (LLMError, OpenAIError)) for current in chain):
+        return None
+    kinds = {
+        classify_error(type(current).__name__, str(current)).kind
+        for current in chain
+    }
+    if kinds & {FailureKind.AUTH, FailureKind.QUOTA, FailureKind.CONFIG}:
+        return ProviderFailure(retryable=False)
+    if kinds & {FailureKind.AGENT_ACTION, FailureKind.INTERNAL}:
+        return None
+    if kinds & {FailureKind.RATE_LIMIT, FailureKind.TRANSIENT}:
+        return ProviderFailure(
+            retryable=True,
+            retry_after=max(_retry_after_seconds(current, now) for current in chain),
+        )
+    return ProviderFailure(retryable=False)
+
+
+def _provider_retry_delay(failures: int, retry_after: float) -> float:
+    base = _LLM_PROVIDER_COOLDOWN_SECONDS[
+        min(failures, len(_LLM_PROVIDER_COOLDOWN_SECONDS) - 1)
+    ]
+    return max(base, retry_after) + random.uniform(0, base * 0.2)
+
+
 def _context_recovery_prompt(full_prompt: str, current_prompt: str) -> str:
     initial_context = (
         ""
@@ -116,19 +202,65 @@ def _context_recovery_prompt(full_prompt: str, current_prompt: str) -> str:
     )
 
 
+def _activity_lease(
+    progress: ProgressLease,
+    timeout_seconds: float,
+) -> Callable[[], None]:
+    last_attempt = float("-inf")
+
+    def renew() -> None:
+        nonlocal last_attempt
+        now = time.monotonic()
+        if now - last_attempt < _ACTIVITY_LEASE_RENEWAL_SECONDS:
+            return
+        last_attempt = now
+        try:
+            progress.update("openhands-turn", timeout_seconds)
+        except OSError as error:
+            print(
+                f"SENPAI_LEASE_UPDATE_ERROR {type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    return renew
+
+
+def _inference_state_lease(
+    progress: ProgressLease,
+) -> Callable[[float | None, float | None], None]:
+    def publish(started_at: float | None, heartbeat_at: float | None) -> None:
+        try:
+            progress.update_llm_request(started_at, heartbeat_at)
+        except OSError as error:
+            print(
+                f"SENPAI_LEASE_UPDATE_ERROR {type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    return publish
+
+
 class OpenHandsTurnRunner:
     def __init__(
         self,
         config: object,
         *,
         full_prompt: str,
-        github_mailbox: GitHubMailbox | None = None,
-        active_poll_interval_seconds: float = 30,
+        github_mailbox: Mailbox | None = None,
+        active_poll_interval_seconds: float = 75,
+        on_activity: Callable[[], None] | None = None,
+        on_inference_state: (
+            Callable[[float | None, float | None], None] | None
+        ) = None,
     ):
         self.config = config
         self.full_prompt = full_prompt.strip()
         self.github_mailbox = github_mailbox
         self.active_poll_interval_seconds = active_poll_interval_seconds
+        self.on_activity = on_activity
+        self.on_inference_state = on_inference_state
 
     def run(
         self,
@@ -146,25 +278,29 @@ class OpenHandsTurnRunner:
             self.config,
             conversation_id=conversation_id,
         )
-        turn_deadline = time.monotonic() + config.timeout_seconds
         if (inbox is None) != (inbox_turn_id is None):
             raise ValueError("inbox and inbox turn ID must be provided together")
 
-        def inbox_options() -> dict[str, object]:
-            if inbox is None or inbox_turn_id is None:
-                return {}
-            return {
-                "inbox": inbox,
-                "inbox_turn_id": inbox_turn_id,
-                "recovery_prompt": _context_recovery_prompt(
-                    self.full_prompt,
-                    prompt,
-                ),
-            }
+        def run_options() -> dict[str, object]:
+            options: dict[str, object] = {}
+            if inbox is not None and inbox_turn_id is not None:
+                options.update(
+                    inbox=inbox,
+                    inbox_turn_id=inbox_turn_id,
+                    recovery_prompt=_context_recovery_prompt(
+                        self.full_prompt,
+                        prompt,
+                    ),
+                )
+            if self.on_activity is not None:
+                options["on_activity"] = self.on_activity
+            if self.on_inference_state is not None:
+                options["on_inference_state"] = self.on_inference_state
+            return options
 
         def run_turn() -> int:
             try:
-                return run_openhands(prompt, config, **inbox_options())
+                return run_openhands(prompt, config, **run_options())
             except Exception as error:
                 if not _is_context_history_failure(error):
                     raise
@@ -175,25 +311,12 @@ class OpenHandsTurnRunner:
                     file=sys.stderr,
                     flush=True,
                 )
-                remaining = turn_deadline - time.monotonic()
-                if remaining <= 0:
-                    timeout = TimeoutError(
-                        "no turn time remains for context recovery"
-                    )
-                    raise ConversationRecoveryExhausted(
-                        conversation_id,
-                        timeout,
-                    ) from error
-                recovery_config = replace(
-                    config,
-                    timeout_seconds=remaining,
-                )
                 try:
                     return run_openhands(
                         _context_recovery_prompt(self.full_prompt, prompt),
-                        recovery_config,
+                        config,
                         reset_context=True,
-                        **inbox_options(),
+                        **run_options(),
                     )
                 except Exception as recovery_error:
                     if _is_context_history_failure(recovery_error):
@@ -213,7 +336,7 @@ class OpenHandsTurnRunner:
                 config.state_dir / "student-conversations.json"
             )
             map_event = partial(
-                _student_feedback_event,
+                _student_live_event,
                 conversation_id=conversation_id,
                 registry=registry,
             )
@@ -221,7 +344,7 @@ class OpenHandsTurnRunner:
         # A late watcher event may still be pending locally when the next
         # controller prompt carries that same GitHub event. The prompt is the
         # delivery path for this turn, so keep the event pump from repeating it.
-        with AdvisorEventStore(store_path) as store:
+        with LocalEventStore(store_path) as store:
             for event_key in event_keys:
                 store.acknowledge(event_key)
         with ActiveGitHubWatcher(
@@ -232,7 +355,7 @@ class OpenHandsTurnRunner:
             map_event=map_event,
         ) as watcher:
             exit_code = run_turn()
-        with AdvisorEventStore(store_path) as store:
+        with LocalEventStore(store_path) as store:
             delivered = store.acknowledged(tuple(watcher.enqueued_keys))
         return TurnResult(
             exit_code=exit_code,
@@ -240,21 +363,22 @@ class OpenHandsTurnRunner:
         )
 
 
-def _student_feedback_event(
+def _student_live_event(
     event: ControllerEvent,
     *,
     conversation_id: UUID,
     registry: AssignmentConversationRegistry,
-) -> AdvisorEvent | None:
-    if event.kind != "student_pr_feedback":
+) -> LocalEvent | None:
+    if event.kind == "student_pr_feedback":
+        target = registry.for_assignment(
+            str(event.payload["assignment_id"]),
+            str(event.payload["revision_id"]),
+        )
+        if target != conversation_id:
+            return None
+    elif event.kind != "human_issue":
         return None
-    target = registry.for_assignment(
-        str(event.payload["assignment_id"]),
-        str(event.payload["revision_id"]),
-    )
-    if target != conversation_id:
-        return None
-    return AdvisorEvent(
+    return LocalEvent(
         kind=event.kind,
         dedupe_key=event.dedupe_key,
         payload={
@@ -284,7 +408,7 @@ class Controller:
         reconcile: Callable[[Sequence[ControllerEvent]], None] | None = None,
         progress: ProgressLease | None = None,
         operation_timeout_seconds: float = 300,
-        turn_timeout_seconds: float = 3660,
+        turn_timeout_seconds: float = 7260,
         max_consecutive_turn_failures: int = 2,
         event_reminder_seconds: float | None = None,
         start_gate_path: Path | None = None,
@@ -408,6 +532,31 @@ class Controller:
                     )
                     continue
                 except Exception as error:  # noqa: BLE001
+                    now = time.time()
+                    provider_failure = _provider_failure(error, now)
+                    if provider_failure is not None and provider_failure.retryable:
+                        current = self.inbox.provider_cooldown()
+                        delay = _provider_retry_delay(
+                            0 if current is None else current.failure_count,
+                            provider_failure.retry_after,
+                        )
+                        cooldown = self.inbox.defer_provider_retry(
+                            turn.turn_id,
+                            now + delay,
+                        )
+                        print(
+                            "SENPAI_PROVIDER_COOLDOWN "
+                            f"conversation_id={turn.conversation_id} "
+                            f"turn_id={turn.turn_id} "
+                            f"failure_count={cooldown.failure_count} "
+                            f"retry_after_seconds={delay:g} "
+                            f"error={type(error).__name__}: {error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
+                    if provider_failure is not None:
+                        raise
                     failures = turn_failures.get(conversation_id, 0) + 1
                     turn_failures[conversation_id] = failures
                     print(
@@ -443,6 +592,7 @@ class Controller:
                     continue
 
                 self._assert_processed(turn.turn_id)
+                self.inbox.clear_provider_cooldown()
                 self._acknowledge_processed_turns()
                 turn_failures.pop(conversation_id, None)
                 served_conversations.add(conversation_id)
@@ -461,10 +611,24 @@ class Controller:
                 )
                 self._sleep("turn-backoff", delay)
                 continue
-            self._sleep(
-                "sleep",
-                self.poll_interval_seconds + random.uniform(0, self.jitter_seconds),
+            normal_delay = self.poll_interval_seconds + random.uniform(
+                0,
+                self.jitter_seconds,
             )
+            provider_delay = self._provider_cooldown_remaining()
+            if provider_delay is not None and (
+                normal_delay <= 0 or provider_delay < normal_delay
+            ):
+                self._sleep("provider-cooldown", provider_delay)
+            else:
+                self._sleep("sleep", normal_delay)
+
+    def _provider_cooldown_remaining(self) -> float | None:
+        cooldown = self.inbox.provider_cooldown()
+        if cooldown is None:
+            return None
+        remaining = cooldown.retry_at - time.time()
+        return remaining if remaining > 0 else None
 
     def _poll_into_inbox(self, *, allow_reminders: bool = True) -> None:
         self._publish_progress("poll")
@@ -479,6 +643,13 @@ class Controller:
                 flush=True,
             )
             return
+        for event in polled:
+            if event.kind == "student_assignment_comment":
+                self.inbox.require_event_payload(
+                    self.conversation_id,
+                    event.dedupe_key,
+                    event.to_prompt(),
+                )
         events = self._new_events(
             polled,
             allow_reminders=allow_reminders,
@@ -524,16 +695,34 @@ class Controller:
                     ):
                         self._clear_workspace_divergence(conversation_id)
             for event in batch_events:
-                self.inbox.enqueue(
-                    conversation_id,
-                    event.dedupe_key,
-                    event.to_prompt(),
-                )
+                steering_priority = STEERING_PRIORITIES.get(event.kind)
+                if steering_priority is not None:
+                    self.inbox.steer(
+                        conversation_id,
+                        event.dedupe_key,
+                        event.to_prompt(),
+                        priority=steering_priority,
+                        once=event.kind in EXACT_ONCE_EVENT_KINDS,
+                    )
+                else:
+                    self.inbox.enqueue(
+                        conversation_id,
+                        event.dedupe_key,
+                        event.to_prompt(),
+                        priority=(
+                            QUEUE_PRIORITY
+                            if event.kind == "student_assignment"
+                            else 0
+                        ),
+                        once=event.kind in EXACT_ONCE_EVENT_KINDS,
+                    )
 
     def _next_ready_turn(
         self,
         excluded: set[UUID] | frozenset[UUID] = frozenset(),
     ) -> InboxTurn | None:
+        if self._provider_cooldown_remaining() is not None:
+            return None
         now = time.monotonic()
         self._deferred_conversations = {
             conversation_id: retry_at
@@ -780,16 +969,21 @@ def controller_main(
         or runner_config.state_dir,
         runner_config.state_dir / f"{role}-events.sqlite3",
     )
+    students = tuple(
+        student.strip()
+        for student in env.get("STUDENT_NAMES", "").split(",")
+        if student.strip()
+    )
+    inbox = PersistentInbox(
+        runner_config.state_dir / "delivery-inbox.sqlite3",
+        legacy_path=runner_config.state_dir / "pending-message-deliveries.json",
+    )
     github_mailbox = GitHubMailbox(
         repo=runner_config.github_repo,
         token=runner_config.github_token,
         role=role,
         advisor_branch=env["ADVISOR_BRANCH"],
-        students=tuple(
-            student.strip()
-            for student in env.get("STUDENT_NAMES", "").split(",")
-            if student.strip()
-        ),
+        students=students,
         student_name=env.get("STUDENT_NAME"),
         stale_wip_seconds=int(env.get("SENPAI_STALE_WIP_SECONDS", "7200")),
         trusted_actor=runner_config.github_trusted_actor,
@@ -801,19 +995,26 @@ def controller_main(
         ),
     )
     mailbox: Mailbox = github_mailbox
+    active_github_mailbox: Mailbox = github_mailbox
     conversation_selector = None
     reconcile = None
 
     if role == "advisor":
-        mailbox = CompositeMailbox(
+        advisor_event_store = runner_config.state_dir / "advisor-events.sqlite3"
+        active_github_mailbox = StudentAssignmentAvailabilityMailbox(
             github_mailbox,
-            LocalAdvisorMailbox(runner_config.state_dir / "advisor-events.sqlite3"),
+            inbox=inbox,
+            conversation_id=runner_config.conversation_id,
+            event_store_path=advisor_event_store,
+        )
+        mailbox = CompositeMailbox(
+            active_github_mailbox,
+            LocalAdvisorMailbox(advisor_event_store),
         )
     else:
         training, monitor_store = training_runtime(
             runner_config.workspace,
             runner_config.state_dir / "training",
-            max_timeout_seconds=runner_config.training_max_timeout_seconds,
         )
         metrics = WandbMetricSource(
             env["WANDB_ENTITY"],
@@ -838,16 +1039,21 @@ def controller_main(
         )
 
     full_prompt = _full_prompt(env)
-    inbox = PersistentInbox(
-        runner_config.state_dir / "delivery-inbox.sqlite3",
-        legacy_path=runner_config.state_dir / "pending-message-deliveries.json",
-    )
+    turn_lease_seconds = runner_config.timeout_seconds + 60
     turns = OpenHandsTurnRunner(
         runner_config,
         full_prompt=full_prompt,
-        github_mailbox=github_mailbox,
+        github_mailbox=active_github_mailbox,
         active_poll_interval_seconds=float(
-            env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "30")
+            env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "75")
+        ),
+        on_activity=(
+            _activity_lease(progress, turn_lease_seconds)
+            if progress is not None
+            else None
+        ),
+        on_inference_state=(
+            _inference_state_lease(progress) if progress is not None else None
         ),
     )
     controller = Controller(
@@ -872,7 +1078,7 @@ def controller_main(
         operation_timeout_seconds=float(
             env.get("SENPAI_CONTROLLER_OPERATION_TIMEOUT_SECONDS", "300")
         ),
-        turn_timeout_seconds=runner_config.timeout_seconds + 60,
+        turn_timeout_seconds=turn_lease_seconds,
         max_consecutive_turn_failures=int(
             env.get("SENPAI_CONTROLLER_MAX_CONSECUTIVE_TURN_FAILURES", "2")
         ),

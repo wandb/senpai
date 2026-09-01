@@ -89,18 +89,6 @@ def test_training_rejects_a_working_directory_outside_the_workspace(tmp_path: Pa
         )
 
 
-def test_training_rejects_timeout_above_the_launch_ceiling(tmp_path: Path):
-    workspace, supervisor = make_supervisor(tmp_path, max_timeout_seconds=30)
-
-    with pytest.raises(ValueError, match="configured maximum"):
-        run_python(
-            supervisor,
-            workspace,
-            "print('never launched')",
-            timeout_seconds=31,
-        )
-
-
 def test_supervisor_close_cancels_active_training(tmp_path: Path):
     workspace, supervisor = make_supervisor(
         tmp_path,

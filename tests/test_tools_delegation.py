@@ -11,7 +11,6 @@ from openhands.sdk.context.view import View
 from openhands.sdk.event import MessageEvent
 from openhands.sdk.llm import Message, TextContent
 
-from senpai_agent.advisor import AdvisorEventStore
 from senpai_agent.delegation import (
     AgentStatusAction,
     AgentStatusTool,
@@ -20,33 +19,67 @@ from senpai_agent.delegation import (
     AwaitAgentsTool,
     CancelAgentsAction,
     CancelAgentsTool,
+    DelegateAgentAction,
     DelegationConfig,
     DelegationRegistry,
     DelegationRequest,
     LeafAgentTask,
     LeafSpawnAgentsAction,
     MODEL_TIER_TIMEOUT_SECONDS,
+    OpenHandsChildProcess,
     SpawnAgentsAction,
     SpawnAgentsTool,
     cancel_pending_descendants,
     configure_delegation,
     reconcile_delegated_tasks,
 )
+from senpai_agent.local_events import LocalEventStore
 
 
 def test_model_tier_runtime_limits():
     assert MODEL_TIER_TIMEOUT_SECONDS == {
-        "fast": 600,
-        "smart": 1800,
-        "frontier": 3600,
+        "fast": 1200,
+        "smart": 3600,
+        "frontier": 7200,
     }
 
 
+def test_legacy_delegate_action_keeps_its_smart_default():
+    assert DelegateAgentAction(task="Inspect persisted work").model == "smart"
+
+
+def test_task_schema_requires_an_explicit_model_tier():
+    for task_type in (AgentTask, LeafAgentTask):
+        schema = task_type.model_json_schema()
+
+        assert "model" in schema["required"]
+        assert "default" not in schema["properties"]["model"]
+        assert schema["properties"]["model"]["description"] == (
+            "Select fast, smart, or frontier according to the delegation policy."
+        )
+
+
+@pytest.mark.parametrize("action_type", [SpawnAgentsAction, LeafSpawnAgentsAction])
+def test_spawn_rejects_a_task_without_a_model_tier(action_type):
+    with pytest.raises(ValueError, match=r"tasks\.0\.model\s+Field required"):
+        action_type.model_validate(
+            {
+                "batch_key": "missing-model",
+                "tasks": [{"task": "Inspect", "agent": "explore"}],
+            }
+        )
+
+
 def test_explicit_search_task_forms_resolve_to_internal_search_modes():
-    web = AgentTask(task="Find current documentation", agent="search_general_web")
+    web = AgentTask(
+        task="Find current documentation",
+        agent="search_general_web",
+        model="smart",
+    )
     papers = LeafAgentTask(
         task="Find primary papers",
         agent="search_research_publications",
+        model="smart",
     )
 
     assert web.resolved_agent() == ("search", "general-web")
@@ -59,6 +92,7 @@ def test_persisted_search_task_restores_without_exposing_the_old_schema():
         {
             "task": "Find primary papers",
             "agent": "search",
+            "model": "smart",
             "search_mode": "research-publications",
         }
     )
@@ -73,7 +107,12 @@ def test_persisted_search_task_restores_without_exposing_the_old_schema():
     ("current", "legacy"),
     [
         (
-            AgentTask(key="inspect", task="Inspect the code", agent="explore"),
+            AgentTask(
+                key="inspect",
+                task="Inspect the code",
+                agent="explore",
+                model="smart",
+            ),
             {
                 "key": "inspect",
                 "task": "Inspect the code",
@@ -88,6 +127,7 @@ def test_persisted_search_task_restores_without_exposing_the_old_schema():
                 key="papers",
                 task="Find primary papers",
                 agent="search_research_publications",
+                model="smart",
             ),
             {
                 "key": "papers",
@@ -165,7 +205,13 @@ def test_depth_one_generalist_schema_cannot_request_generalist_child(tmp_path):
         LeafSpawnAgentsAction.model_validate(
             {
                 "batch_key": "invalid-generalist-chain",
-                "tasks": [{"task": "Recurse", "agent": "general-purpose"}],
+                "tasks": [
+                    {
+                        "task": "Recurse",
+                        "agent": "general-purpose",
+                        "model": "smart",
+                    }
+                ],
             }
         )
 
@@ -252,13 +298,14 @@ def config(tmp_path: Path, **updates) -> DelegationConfig:
         "frontier_reasoning_effort": "max",
         "frontier_api_key_env": "OPENAI_API_KEY",
         "frontier_api_key": "secret",
+        "compaction_trigger_tokens": 200_000,
         "github_repo": "acme/widgets",
         "github_trusted_actor": None,
         "role_file": tmp_path / "role.md",
         "harness_file": tmp_path / "harness.md",
         "plugin_dir": tmp_path / "plugin",
         "enable_browser": False,
-        "command_secrets": {},
+        "conversation_secrets": {},
         "role": "advisor",
         "program_path": "program.md",
         "launch_context": "# Authoritative launch context\n\nSystem policy.",
@@ -298,8 +345,12 @@ def test_spawn_is_nonblocking_and_await_first_collects_the_first_result(tmp_path
         SpawnAgentsAction(
             batch_key="compare-kernels",
             tasks=[
-                AgentTask(key="a", task="Inspect A", agent="explore"),
-                AgentTask(key="b", task="Inspect B", agent="explore"),
+                AgentTask(
+                    key="a", task="Inspect A", agent="explore", model="smart"
+                ),
+                AgentTask(
+                    key="b", task="Inspect B", agent="explore", model="smart"
+                ),
             ],
         ),
         parent,
@@ -328,6 +379,71 @@ def test_spawn_is_nonblocking_and_await_first_collects_the_first_result(tmp_path
     releases[0].set()
 
 
+def test_compacted_result_is_the_only_parent_visible_task_value(tmp_path):
+    raw_report = "RAW_REPORT_MUST_NOT_REACH_THE_PARENT"
+    artifact = tmp_path / "state" / "delegation" / "results" / "task.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(raw_report, encoding="utf-8")
+    public_result = f"Concise conclusion.\n\nFull report: {artifact}"
+    release = threading.Event()
+    release.set()
+    sink = EventSink()
+    requests = []
+
+    def factory(request):
+        requests.append(request)
+        return FakeChild(release, result=public_result)
+
+    spawn, await_tool, status, _cancel = tools(
+        tmp_path,
+        factory,
+        sink=sink,
+    )
+    parent = parent_conversation()
+    task = spawn(
+        SpawnAgentsAction(
+            batch_key="compacted-result",
+            tasks=[AgentTask(task="Return a bounded report", model="smart")],
+        ),
+        parent,
+    ).tasks[0]
+    assert sink.received.wait(1)
+
+    registry_path = tmp_path / "state" / "delegation" / "tasks.sqlite3"
+    child_environment = OpenHandsChildProcess(
+        config(tmp_path),
+        requests[0],
+    ).environment
+    assert child_environment["SENPAI_DELEGATION_REGISTRY_PATH"] == str(
+        registry_path
+    )
+    assert child_environment["SENPAI_DELEGATION_ROOT_STATE_DIR"] == str(
+        tmp_path / "state"
+    )
+    assert child_environment["SENPAI_DELEGATION_TASK_ID"] == task.task_id
+
+    registry = DelegationRegistry(registry_path)
+    stored_result = registry.rows([task.task_id])[0]["result"]
+    status_observation = status(AgentStatusAction(task_ids=[task.task_id]), parent)
+    await_observation = await_tool(
+        AwaitAgentsAction(task_ids=[task.task_id], timeout_seconds=1), parent
+    )
+    status_result = status_observation.tasks[0].result
+    await_result = await_observation.tasks[0].result
+    event_result = sink.events[0].payload["result"]
+
+    assert (stored_result, status_result, await_result, event_result) == (
+        public_result,
+    ) * 4
+    parent_messages = [
+        status_observation.to_llm_content[0].text,
+        await_observation.to_llm_content[0].text,
+        sink.events[0].to_inbox_message(),
+    ]
+    assert all(str(artifact) in message for message in parent_messages)
+    assert all(raw_report not in message for message in parent_messages)
+
+
 def test_search_task_form_is_resolved_in_registry_and_child_request(tmp_path):
     release = threading.Event()
     release.set()
@@ -346,6 +462,7 @@ def test_search_task_form_is_resolved_in_registry_and_child_request(tmp_path):
                 AgentTask(
                     task="Find primary sources",
                     agent="search_research_publications",
+                    model="smart",
                 )
             ],
         ),
@@ -379,7 +496,10 @@ def test_await_quorum_and_timeout_leave_unfinished_tasks_running(tmp_path):
     spawned = spawn(
         SpawnAgentsAction(
             batch_key="quorum",
-            tasks=[AgentTask(key=str(i), task=f"Task {i}") for i in range(3)],
+            tasks=[
+                AgentTask(key=str(i), task=f"Task {i}", model="smart")
+                for i in range(3)
+            ],
         ),
         parent,
     )
@@ -425,7 +545,13 @@ def test_await_change_returns_on_the_next_task_transition(tmp_path):
     task = spawn(
         SpawnAgentsAction(
             batch_key="next-state-change",
-            tasks=[AgentTask(task="Finish after the signal", agent="explore")],
+            tasks=[
+                AgentTask(
+                    task="Finish after the signal",
+                    agent="explore",
+                    model="smart",
+                )
+            ],
         ),
         parent,
     ).tasks[0]
@@ -460,7 +586,10 @@ def test_repeated_await_change_ignores_a_collected_terminal_sibling(tmp_path):
     spawned = spawn(
         SpawnAgentsAction(
             batch_key="successive-change",
-            tasks=[AgentTask(task="First"), AgentTask(task="Second")],
+            tasks=[
+                AgentTask(task="First", model="smart"),
+                AgentTask(task="Second", model="smart"),
+            ],
         ),
         parent,
     )
@@ -511,7 +640,10 @@ def test_timed_out_await_collects_results_it_already_returned(tmp_path):
     spawned = spawn(
         SpawnAgentsAction(
             batch_key="partial-timeout",
-            tasks=[AgentTask(task="First"), AgentTask(task="Second")],
+            tasks=[
+                AgentTask(task="First", model="smart"),
+                AgentTask(task="Second", model="smart"),
+            ],
         ),
         parent,
     )
@@ -551,7 +683,11 @@ def test_replayed_batch_reuses_task_ids_and_changed_specs_fail(tmp_path):
     parent = parent_conversation()
     action = SpawnAgentsAction(
         batch_key="stable-operation",
-        tasks=[AgentTask(key="review", task="Review the implementation")],
+        tasks=[
+            AgentTask(
+                key="review", task="Review the implementation", model="smart"
+            )
+        ],
     )
 
     first = spawn(action, parent)
@@ -565,7 +701,11 @@ def test_replayed_batch_reuses_task_ids_and_changed_specs_fail(tmp_path):
         spawn(
             SpawnAgentsAction(
                 batch_key="stable-operation",
-                tasks=[AgentTask(key="review", task="Implement it instead")],
+                tasks=[
+                    AgentTask(
+                        key="review", task="Implement it instead", model="smart"
+                    )
+                ],
             ),
             parent,
         )
@@ -581,7 +721,7 @@ def test_replay_of_pre_reserved_queued_work_never_launches_it(tmp_path):
     parent = parent_conversation()
     action = SpawnAgentsAction(
         batch_key="reserved-before-crash",
-        tasks=[AgentTask(key="one", task="Do not duplicate")],
+        tasks=[AgentTask(key="one", task="Do not duplicate", model="smart")],
     )
     registry = DelegationRegistry(tmp_path / "state" / "delegation" / "tasks.sqlite3")
     reserved, created = registry.reserve(
@@ -619,7 +759,7 @@ def test_dead_replayed_task_becomes_failed_and_is_never_respawned(tmp_path):
     parent = parent_conversation()
     action = SpawnAgentsAction(
         batch_key="dead-child",
-        tasks=[AgentTask(task="Inspect failure")],
+        tasks=[AgentTask(task="Inspect failure", model="smart")],
     )
     first = spawn(action, parent)
     registry = DelegationRegistry(tmp_path / "state" / "delegation" / "tasks.sqlite3")
@@ -630,7 +770,7 @@ def test_dead_replayed_task_becomes_failed_and_is_never_respawned(tmp_path):
     assert replay.tasks[0].status == "failed"
     assert "no longer running" in replay.tasks[0].error
     assert len(requests) == 1
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as events:
+    with LocalEventStore(tmp_path / "events.sqlite3") as events:
         assert [event.payload["task_id"] for event in events.pending()] == [
             first.tasks[0].task_id
         ]
@@ -648,7 +788,11 @@ def test_controller_startup_reconciles_a_dead_background_task_and_enqueues_its_w
         parent_conversation_id=str(parent.id),
         parent_task_id=None,
         depth=1,
-        specs=[AgentTask(key="orphan", task="Recover after restart")],
+        specs=[
+            AgentTask(
+                key="orphan", task="Recover after restart", model="smart"
+            )
+        ],
         deadlines=[time.time() + 60],
     )
     task_id = rows[0]["task_id"]
@@ -662,7 +806,7 @@ def test_controller_startup_reconciles_a_dead_background_task_and_enqueues_its_w
     failed = registry.rows([task_id])[0]
     assert failed["status"] == "failed"
     assert "no longer running" in failed["error"]
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as events:
+    with LocalEventStore(tmp_path / "events.sqlite3") as events:
         pending = events.pending()
     assert [event.payload["task_id"] for event in pending] == [task_id]
 
@@ -675,7 +819,7 @@ def test_controller_startup_immediately_fails_a_preexisting_queued_task(tmp_path
         parent_conversation_id="conversation",
         parent_task_id=None,
         depth=1,
-        specs=[AgentTask(key="queued", task="Never launched")],
+        specs=[AgentTask(key="queued", task="Never launched", model="smart")],
         deadlines=[time.time() + 60],
     )
     task_id = rows[0]["task_id"]
@@ -688,7 +832,7 @@ def test_controller_startup_immediately_fails_a_preexisting_queued_task(tmp_path
     failed = registry.rows([task_id])[0]
     assert failed["status"] == "failed"
     assert "startup did not complete" in failed["error"]
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as events:
+    with LocalEventStore(tmp_path / "events.sqlite3") as events:
         pending = events.pending()
     assert [event.payload["task_id"] for event in pending] == [task_id]
 
@@ -707,7 +851,10 @@ def test_cancel_is_targeted_and_releases_the_child(tmp_path):
     spawned = spawn(
         SpawnAgentsAction(
             batch_key="cancel-one",
-            tasks=[AgentTask(task="A"), AgentTask(task="B")],
+            tasks=[
+                AgentTask(task="A", model="smart"),
+                AgentTask(task="B", model="smart"),
+            ],
         ),
         parent,
     )
@@ -737,12 +884,12 @@ def test_cancelling_an_already_finished_task_acknowledges_its_event(tmp_path):
     task = spawn(
         SpawnAgentsAction(
             batch_key="terminal-cancel",
-            tasks=[AgentTask(key="task", task="Finish")],
+            tasks=[AgentTask(key="task", task="Finish", model="smart")],
         ),
         parent,
     ).tasks[0]
     while True:
-        with AdvisorEventStore(tmp_path / "events.sqlite3") as events:
+        with LocalEventStore(tmp_path / "events.sqlite3") as events:
             if events.pending():
                 break
         time.sleep(0.01)
@@ -750,7 +897,7 @@ def test_cancelling_an_already_finished_task_acknowledges_its_event(tmp_path):
     cancelled = cancel(CancelAgentsAction(task_ids=[task.task_id]), parent)
 
     assert cancelled.tasks[0].status == "finished"
-    with AdvisorEventStore(tmp_path / "events.sqlite3") as events:
+    with LocalEventStore(tmp_path / "events.sqlite3") as events:
         assert events.pending() == []
 
 
@@ -780,8 +927,8 @@ def test_cancel_waits_for_batch_admission_and_catches_every_claimed_child(tmp_pa
     action = SpawnAgentsAction(
         batch_key="spawn-cancel-race",
         tasks=[
-            AgentTask(key="first", task="First"),
-            AgentTask(key="second", task="Second"),
+            AgentTask(key="first", task="First", model="smart"),
+            AgentTask(key="second", task="Second", model="smart"),
         ],
     )
     spawned = []
@@ -828,7 +975,12 @@ def test_tree_and_depth_guards_apply_before_any_child_starts(tmp_path):
         SpawnAgentsAction(
             batch_key="bounded-tree",
             tasks=[
-                AgentTask(key=str(i), task=f"Root task {i}", agent="general-purpose")
+                AgentTask(
+                    key=str(i),
+                    task=f"Root task {i}",
+                    agent="general-purpose",
+                    model="smart",
+                )
                 for i in range(5)
             ],
         ),
@@ -850,7 +1002,12 @@ def test_tree_and_depth_guards_apply_before_any_child_starts(tmp_path):
             SpawnAgentsAction(
                 batch_key="too-many-descendants",
                 tasks=[
-                    AgentTask(key=str(i), task=f"Leaf {i}", agent="explore")
+                    AgentTask(
+                        key=str(i),
+                        task=f"Leaf {i}",
+                        agent="explore",
+                        model="smart",
+                    )
                     for i in range(4)
                 ],
             ),
@@ -870,7 +1027,9 @@ def test_tree_and_depth_guards_apply_before_any_child_starts(tmp_path):
         leaf_spawn(
             SpawnAgentsAction(
                 batch_key="illegal-recursion",
-                tasks=[AgentTask(task="Nested", agent="explore")],
+                tasks=[
+                    AgentTask(task="Nested", agent="explore", model="smart")
+                ],
             ),
             parent_conversation(),
         )
@@ -879,7 +1038,13 @@ def test_tree_and_depth_guards_apply_before_any_child_starts(tmp_path):
         nested_spawn(
             SpawnAgentsAction(
                 batch_key="general-purpose-chain",
-                tasks=[AgentTask(task="Another GP", agent="general-purpose")],
+                tasks=[
+                    AgentTask(
+                        task="Another GP",
+                        agent="general-purpose",
+                        model="smart",
+                    )
+                ],
             ),
             nested_parent,
         )
@@ -896,7 +1061,9 @@ def test_tree_and_depth_guards_apply_before_any_child_starts(tmp_path):
         depth_two_spawn(
             SpawnAgentsAction(
                 batch_key="cedar-depth-four",
-                tasks=[AgentTask(task="Too deep", agent="explore")],
+                tasks=[
+                    AgentTask(task="Too deep", agent="explore", model="smart")
+                ],
             ),
             parent_conversation(),
         )
@@ -919,7 +1086,10 @@ def test_registry_active_cap_spans_trees_and_frees_after_completion(tmp_path):
     first = spawn(
         SpawnAgentsAction(
             batch_key="first-tree",
-            tasks=[AgentTask(key=str(i), task=f"First {i}") for i in range(5)],
+            tasks=[
+                AgentTask(key=str(i), task=f"First {i}", model="smart")
+                for i in range(5)
+            ],
         ),
         parent,
     )
@@ -928,7 +1098,10 @@ def test_registry_active_cap_spans_trees_and_frees_after_completion(tmp_path):
         spawn(
             SpawnAgentsAction(
                 batch_key="second-tree",
-                tasks=[AgentTask(key=str(i), task=f"Second {i}") for i in range(4)],
+                tasks=[
+                    AgentTask(key=str(i), task=f"Second {i}", model="smart")
+                    for i in range(4)
+                ],
             ),
             parent,
         )
@@ -945,7 +1118,10 @@ def test_registry_active_cap_spans_trees_and_frees_after_completion(tmp_path):
     second = spawn(
         SpawnAgentsAction(
             batch_key="second-tree",
-            tasks=[AgentTask(key=str(i), task=f"Second {i}") for i in range(4)],
+            tasks=[
+                AgentTask(key=str(i), task=f"Second {i}", model="smart")
+                for i in range(4)
+            ],
         ),
         parent,
     )
@@ -982,7 +1158,14 @@ def test_cancelling_a_root_task_cancels_descendants_deepest_first(tmp_path):
     root = root_spawn(
         SpawnAgentsAction(
             batch_key="root-tree",
-            tasks=[AgentTask(key="gp", task="Research", agent="general-purpose")],
+            tasks=[
+                AgentTask(
+                    key="gp",
+                    task="Research",
+                    agent="general-purpose",
+                    model="smart",
+                )
+            ],
         ),
         parent,
     )
@@ -1004,7 +1187,11 @@ def test_cancelling_a_root_task_cancels_descendants_deepest_first(tmp_path):
     nested_spawn(
         SpawnAgentsAction(
             batch_key="leaf-batch",
-            tasks=[AgentTask(key="leaf", task="Inspect", agent="explore")],
+            tasks=[
+                AgentTask(
+                    key="leaf", task="Inspect", agent="explore", model="smart"
+                )
+            ],
         ),
         parent_conversation(),
     )
@@ -1041,7 +1228,14 @@ def test_expired_parent_deadline_fails_root_and_cancels_descendants(tmp_path):
     root = root_spawn(
         SpawnAgentsAction(
             batch_key="deadline-tree",
-            tasks=[AgentTask(key="gp", task="Parent", agent="general-purpose")],
+            tasks=[
+                AgentTask(
+                    key="gp",
+                    task="Parent",
+                    agent="general-purpose",
+                    model="smart",
+                )
+            ],
         ),
         parent,
     ).tasks[0]
@@ -1063,7 +1257,11 @@ def test_expired_parent_deadline_fails_root_and_cancels_descendants(tmp_path):
     leaf = nested_spawn(
         SpawnAgentsAction(
             batch_key="deadline-leaf",
-            tasks=[AgentTask(key="leaf", task="Leaf", agent="explore")],
+            tasks=[
+                AgentTask(
+                    key="leaf", task="Leaf", agent="explore", model="smart"
+                )
+            ],
         ),
         parent_conversation(),
     ).tasks[0]
@@ -1094,7 +1292,14 @@ def test_depth_two_completion_is_collected_by_parent_not_root_event_stream(tmp_p
     root = root_spawn(
         SpawnAgentsAction(
             batch_key="root",
-            tasks=[AgentTask(key="gp", task="Parent", agent="general-purpose")],
+            tasks=[
+                AgentTask(
+                    key="gp",
+                    task="Parent",
+                    agent="general-purpose",
+                    model="smart",
+                )
+            ],
         ),
         root_parent,
     ).tasks[0]
@@ -1114,7 +1319,11 @@ def test_depth_two_completion_is_collected_by_parent_not_root_event_stream(tmp_p
     task = spawn(
         SpawnAgentsAction(
             batch_key="nested",
-            tasks=[AgentTask(key="leaf", task="Inspect", agent="explore")],
+            tasks=[
+                AgentTask(
+                    key="leaf", task="Inspect", agent="explore", model="smart"
+                )
+            ],
         ),
         parent,
     ).tasks[0]
@@ -1138,7 +1347,14 @@ def test_finished_leaf_must_be_awaited_not_only_status_checked(tmp_path):
     root = root_spawn(
         SpawnAgentsAction(
             batch_key="root-for-collection",
-            tasks=[AgentTask(key="gp", task="Parent", agent="general-purpose")],
+            tasks=[
+                AgentTask(
+                    key="gp",
+                    task="Parent",
+                    agent="general-purpose",
+                    model="smart",
+                )
+            ],
         ),
         parent_conversation(),
     ).tasks[0]
@@ -1156,7 +1372,11 @@ def test_finished_leaf_must_be_awaited_not_only_status_checked(tmp_path):
     first = nested_spawn(
         SpawnAgentsAction(
             batch_key="status-only",
-            tasks=[AgentTask(key="leaf", task="Inspect", agent="explore")],
+            tasks=[
+                AgentTask(
+                    key="leaf", task="Inspect", agent="explore", model="smart"
+                )
+            ],
         ),
         nested_parent,
     ).tasks[0]
@@ -1173,7 +1393,14 @@ def test_finished_leaf_must_be_awaited_not_only_status_checked(tmp_path):
     second = nested_spawn(
         SpawnAgentsAction(
             batch_key="awaited",
-            tasks=[AgentTask(key="leaf", task="Inspect again", agent="explore")],
+            tasks=[
+                AgentTask(
+                    key="leaf",
+                    task="Inspect again",
+                    agent="explore",
+                    model="smart",
+                )
+            ],
         ),
         nested_parent,
     ).tasks[0]
@@ -1196,7 +1423,7 @@ def test_explicit_task_ids_are_private_to_the_spawning_parent(tmp_path):
     task = spawn(
         SpawnAgentsAction(
             batch_key="owned",
-            tasks=[AgentTask(key="task", task="Private task")],
+            tasks=[AgentTask(key="task", task="Private task", model="smart")],
         ),
         owner,
     ).tasks[0]
@@ -1241,7 +1468,7 @@ def test_tool_close_leaves_spawned_background_work_alive(tmp_path):
     task = spawn(
         SpawnAgentsAction(
             batch_key="survives-close",
-            tasks=[AgentTask(key="task", task="Keep working")],
+            tasks=[AgentTask(key="task", task="Keep working", model="smart")],
         ),
         parent,
     ).tasks[0]
@@ -1279,8 +1506,8 @@ def test_start_failure_returns_visible_failed_state_without_hiding_siblings(tmp_
         SpawnAgentsAction(
             batch_key="partial-start",
             tasks=[
-                AgentTask(key="running", task="Runs"),
-                AgentTask(key="failed", task="Fails"),
+                AgentTask(key="running", task="Runs", model="smart"),
+                AgentTask(key="failed", task="Fails", model="smart"),
             ],
         ),
         parent_conversation(),
@@ -1312,7 +1539,7 @@ def test_status_without_ids_includes_uncollected_terminal_tasks(tmp_path):
     task = spawn(
         SpawnAgentsAction(
             batch_key="uncollected-status",
-            tasks=[AgentTask(key="done", task="Finish")],
+            tasks=[AgentTask(key="done", task="Finish", model="smart")],
         ),
         parent,
     ).tasks[0]
@@ -1335,7 +1562,7 @@ def test_internal_starting_claim_is_reported_publicly_as_queued(tmp_path):
     parent = parent_conversation()
     action = SpawnAgentsAction(
         batch_key="starting-claim",
-        tasks=[AgentTask(key="one", task="Claimed")],
+        tasks=[AgentTask(key="one", task="Claimed", model="smart")],
     )
     registry = DelegationRegistry(tmp_path / "state" / "delegation" / "tasks.sqlite3")
     rows, _created = registry.reserve(
@@ -1408,8 +1635,13 @@ def test_context_is_copied_only_for_tasks_that_request_it(tmp_path):
         SpawnAgentsAction(
             batch_key="context",
             tasks=[
-                AgentTask(key="with", task="With", include_context=True),
-                AgentTask(key="without", task="Without"),
+                AgentTask(
+                    key="with",
+                    task="With",
+                    model="smart",
+                    include_context=True,
+                ),
+                AgentTask(key="without", task="Without", model="smart"),
             ],
         ),
         parent_conversation(),

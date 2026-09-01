@@ -1,5 +1,9 @@
 """Workflow invariants shared by GitHub operations."""
 
+from senpai_agent.github.human_messages import (
+    is_trusted_human_author,
+    is_trusted_human_message,
+)
 from senpai_agent.github.workflow.errors import (
     PullHeadMismatchError,
     ReconciliationError,
@@ -19,9 +23,6 @@ from senpai_agent.models import (
 )
 
 
-_TRUSTED_HUMAN_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
-
-
 def positive_number(number: int) -> int:
     if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
         raise ValueError("pull request number must be a positive integer")
@@ -38,17 +39,34 @@ def positive_message_id(message_id: int) -> int:
     return message_id
 
 
-def require_trusted_human_author(
+def require_trusted_human_message(
     *,
-    login: str,
+    author: str,
     author_type: str,
     association: str,
+    body: str,
+    actor: str,
 ) -> None:
-    if author_type != "User" or association not in _TRUSTED_HUMAN_ASSOCIATIONS:
+    if is_trusted_human_message(
+        author=author,
+        author_type=author_type,
+        association=association,
+        body=body,
+        actor=actor,
+    ):
+        return
+    if not is_trusted_human_author(
+        author_type=author_type,
+        association=association,
+    ):
         raise WorkflowPreconditionError(
-            f"human message author {login!r} must be an OWNER, MEMBER, or "
+            f"human message author {author!r} must be an OWNER, MEMBER, or "
             "COLLABORATOR User"
         )
+    raise WorkflowPreconditionError(
+        "human message must not be a Senpai protocol comment from the "
+        "authenticated actor"
+    )
 
 
 def distinct_results(
@@ -246,6 +264,8 @@ def require_current_revision(
 def require_active_assignment_routing(
     snapshot: PullRequestSnapshot,
     assignment: AssignmentRecord,
+    *,
+    allowed_statuses: frozenset[str] = frozenset({"status:wip"}),
 ) -> None:
     labels = set(snapshot.labels)
     student_labels = {label for label in labels if label.startswith("student:")}
@@ -253,9 +273,12 @@ def require_active_assignment_routing(
         raise WorkflowPreconditionError(
             "pull request must retain exactly its assigned student label"
         )
-    if "status:wip" not in labels or "status:review" in labels:
+    active_statuses = labels & {"status:wip", "status:review"}
+    if len(active_statuses) != 1 or not active_statuses <= allowed_statuses:
+        allowed = " or ".join(sorted(allowed_statuses))
         raise WorkflowPreconditionError(
-            "pull request must have status:wip as its only active assignment status"
+            f"pull request must have exactly one of {allowed} as its active "
+            "assignment status"
         )
 
 

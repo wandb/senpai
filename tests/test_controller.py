@@ -6,20 +6,31 @@ from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
+from openhands.sdk.conversation.exceptions import ConversationRunError
+from openhands.sdk.llm.exceptions import (
+    LLMAuthenticationError,
+    LLMServiceUnavailableError,
+)
 
 import senpai_agent.controller as controller_module
 from senpai_agent.controller import (
     ConversationRecoveryExhausted,
     Controller,
     TurnResult,
+    _activity_lease,
     _full_prompt,
+    _inference_state_lease,
+    _provider_retry_delay,
 )
 from senpai_agent.inbox import (
     InboxTurnQuarantined,
     PersistentInbox,
     deliver_turn_messages,
 )
-from senpai_agent.mailbox import ControllerEvent
+from senpai_agent.mailbox import (
+    ControllerEvent,
+    StudentAssignmentAvailabilityMailbox,
+)
 from senpai_agent.program_context import ProgramSystemPrompt
 from senpai_agent.state import StartedConversationLedger, WorkspaceDivergenceLedger
 from senpai_agent.supervisor import ProgressLease, WorkerLease
@@ -74,6 +85,36 @@ class Turns:
         return outcome
 
 
+class ProviderTurns(Turns):
+    def __init__(self, outcomes):
+        super().__init__(outcomes)
+        self.turn_ids = []
+
+    def run(self, *args, inbox, inbox_turn_id, **kwargs):
+        self.turn_ids.append(inbox_turn_id)
+        if isinstance(self.outcomes[0], Exception):
+            mark_turn_delivered(inbox, inbox_turn_id)
+            inbox.record_inference_attempt(inbox_turn_id)
+        return super().run(
+            *args,
+            inbox=inbox,
+            inbox_turn_id=inbox_turn_id,
+            **kwargs,
+        )
+
+
+def provider_error() -> ConversationRunError:
+    return ConversationRunError(
+        CONVERSATION_ID,
+        LLMServiceUnavailableError("anthropic overloaded"),
+    )
+
+
+def mark_turn_delivered(inbox: PersistentInbox, turn_id: str) -> None:
+    for message in inbox.turn(turn_id).messages:
+        inbox.record_delivered(message.delivery_id, message.body)
+
+
 def controller(mailbox, turns, **overrides):
     return Controller(
         role=overrides.pop("role", "advisor"),
@@ -93,6 +134,24 @@ def review_event(number=17):
         kind="review_ready",
         dedupe_key=f"review_ready:{number}:abc",
         payload={"number": number},
+    )
+
+
+def human_event(message_id=101):
+    return ControllerEvent(
+        kind="human_issue",
+        dedupe_key=f"human_issue:1:{message_id}",
+        payload={"number": 1, "human_message_id": message_id},
+    )
+
+
+def human_pr_comment_event(comment_id=601):
+    return ControllerEvent(
+        kind="human_pr_comment",
+        dedupe_key=(
+            f"human_pr_comment:v2:issue_comment:17:{comment_id}:abc"
+        ),
+        payload={"number": 17, "feedback_id": comment_id},
     )
 
 
@@ -211,8 +270,8 @@ def test_empty_mailbox_does_not_start_a_model_turn():
 
 def test_successful_turn_repolls_immediately_and_continues_without_full_brief():
     first = ControllerEvent(
-        kind="idle_student",
-        dedupe_key="idle_student:student-1",
+        kind="student_available_for_assignment",
+        dedupe_key="student_available_for_assignment:student-1",
         payload={"student": "student-1"},
     )
     second = review_event()
@@ -228,6 +287,41 @@ def test_successful_turn_repolls_immediately_and_continues_without_full_brief():
     assert "programme" in turns.calls[0][0]
     assert "programme" not in turns.calls[1][0]
     assert mailbox.calls == 3
+
+
+def test_post_turn_snapshot_retracts_availability_queued_during_active_turn(
+    tmp_path: Path,
+):
+    availability = ControllerEvent(
+        kind="student_available_for_assignment",
+        dedupe_key="student_available_for_assignment:student-1",
+        payload={"student": "student-1"},
+    )
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    source = Mailbox([(review_event(),), ()])
+    mailbox = StudentAssignmentAvailabilityMailbox(
+        source,
+        inbox=inbox,
+        conversation_id=CONVERSATION_ID,
+        event_store_path=tmp_path / "advisor-events.sqlite3",
+    )
+
+    class QueuingTurns(Turns):
+        def run(self, *args, **kwargs):
+            result = super().run(*args, **kwargs)
+            inbox.enqueue(
+                CONVERSATION_ID,
+                availability.dedupe_key,
+                availability.to_prompt(),
+            )
+            return result
+
+    turns = QueuingTurns()
+    controller(mailbox, turns, inbox=inbox).run(max_cycles=1)
+
+    assert len(turns.calls) == 1
+    assert inbox.pending_count(CONVERSATION_ID) == 0
+    assert source.calls == 2
 
 
 def test_post_turn_poll_at_reminder_boundary_only_delivers_new_state(
@@ -594,10 +688,26 @@ def test_fast_poll_defaults_to_ten_minute_level_trigger_reminders(monkeypatch):
     ]
 
 
-def test_unchanged_research_base_change_does_not_repeat_on_reminder_cadence(
+@pytest.mark.parametrize(
+    "event",
+    [
+        pytest.param(research_base_event(), id="research-base"),
+        pytest.param(human_event(), id="human-issue"),
+        pytest.param(
+            ControllerEvent(
+                kind="student_assignment_comment",
+                dedupe_key="student_assignment_comment:v2:message-1",
+                payload={"comment_id": "message-1"},
+            ),
+            id="student-comment",
+        ),
+        pytest.param(human_pr_comment_event(), id="human-pr-comment"),
+    ],
+)
+def test_edge_triggered_event_does_not_repeat_on_reminder_cadence(
     monkeypatch,
+    event,
 ):
-    event = research_base_event()
     clock = [0.0]
     monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
 
@@ -622,6 +732,123 @@ def test_unchanged_research_base_change_does_not_repeat_on_reminder_cadence(
     assert [call[2] for call in turns.calls] == [
         frozenset({event.dedupe_key}),
     ]
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        pytest.param(human_event(), id="human-issue"),
+        pytest.param(
+            ControllerEvent(
+                kind="student_assignment_comment",
+                dedupe_key="student_assignment_comment:v2:message-1",
+                payload={
+                    "comment_id": "message-1",
+                    "message": "STUDENT: Running.",
+                },
+            ),
+            id="student-comment",
+        ),
+        pytest.param(human_pr_comment_event(), id="human-pr-comment"),
+    ],
+)
+def test_edge_triggered_event_is_not_replayed_after_restart(
+    tmp_path: Path,
+    monkeypatch,
+    event: ControllerEvent,
+):
+    inbox_path = tmp_path / "inbox.sqlite3"
+    clock = [0.0]
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+
+    controller(
+        Mailbox([(event,), (event,)]),
+        Turns(),
+        inbox=PersistentInbox(inbox_path),
+    ).run(max_cycles=1)
+    restarted_turns = Turns()
+
+    Controller(
+        role="advisor",
+        mailbox=Mailbox([(event,), (event,)]),
+        turns=restarted_turns,
+        conversation_id=CONVERSATION_ID,
+        full_prompt="programme",
+        inbox=PersistentInbox(inbox_path),
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        poll_interval_seconds=1,
+        jitter_seconds=0,
+        event_reminder_seconds=1,
+    ).run(max_cycles=2)
+
+    assert restarted_turns.calls == []
+
+
+def test_new_human_message_wakes_after_previous_message_is_acknowledged():
+    first = human_event(101)
+    follow_up = human_event(102)
+
+    class HumanMailbox(Mailbox):
+        def poll(self):
+            self.calls += 1
+            return (first,) if self.calls <= 2 else (follow_up,)
+
+    turns = Turns()
+    controller(HumanMailbox([]), turns).run(max_cycles=2)
+
+    assert [call[2] for call in turns.calls] == [
+        frozenset({first.dedupe_key}),
+        frozenset({follow_up.dedupe_key}),
+    ]
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        pytest.param(human_event(), id="human-issue"),
+        pytest.param(human_pr_comment_event(), id="human-pr-comment"),
+    ],
+)
+def test_acknowledged_human_instruction_does_not_replay_after_a_poll_gap(
+    tmp_path: Path,
+    event: ControllerEvent,
+):
+    inbox_path = tmp_path / "inbox.sqlite3"
+
+    controller(
+        Mailbox([(event,), (event,)]),
+        Turns(),
+        inbox=PersistentInbox(inbox_path),
+    ).run(max_cycles=1)
+    restarted_turns = Turns()
+
+    controller(
+        Mailbox([(), (event,), (event,)]),
+        restarted_turns,
+        inbox=PersistentInbox(inbox_path),
+    ).run(max_cycles=2)
+
+    assert restarted_turns.calls == []
+
+
+def test_visible_event_identity_cannot_change_payload_between_polls(tmp_path: Path):
+    first = ControllerEvent(
+        kind="student_assignment_comment",
+        dedupe_key="student_assignment_comment:v2:message-1",
+        payload={"comment_id": "message-1", "message": "STUDENT: Running."},
+    )
+    edited = ControllerEvent(
+        kind=first.kind,
+        dedupe_key=first.dedupe_key,
+        payload={"comment_id": "message-1", "message": "STUDENT: Changed."},
+    )
+
+    with pytest.raises(RuntimeError, match="reused with a different payload"):
+        controller(
+            Mailbox([(first,), (edited,)]),
+            Turns(),
+            inbox=PersistentInbox(tmp_path / "inbox.sqlite3"),
+        ).run(max_cycles=1)
 
 
 def test_changed_research_base_sha_wakes_immediately():
@@ -661,14 +888,14 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
     import senpai_agent.weave_monitoring as weave_module
 
     config = SimpleNamespace(
+        model="anthropic/claude-opus-4-8",
         github_token="token",
         github_repo="acme/widgets",
         github_trusted_actor=None,
         state_dir=tmp_path,
         workspace=tmp_path,
-        training_max_timeout_seconds=1800,
         conversation_id=CONVERSATION_ID,
-        timeout_seconds=3600,
+        timeout_seconds=7200,
         harness_file=tmp_path / "harness.md",
         role_file=tmp_path / "role.md",
         instructions=SenpaiSystemInstructions(
@@ -720,6 +947,13 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
     assert created[0].event_reminder_seconds == 600
     assert created[0].full_prompt == "programme"
     assert created[0].turns.full_prompt == "programme"
+    assert created[0].turns.active_poll_interval_seconds == 75
+    assert isinstance(
+        created[0].mailbox.mailboxes[0],
+        StudentAssignmentAvailabilityMailbox,
+    )
+    assert created[0].turns.github_mailbox is created[0].mailbox.mailboxes[0]
+    assert created[0].turn_timeout_seconds == 7260
 
 
 def test_repeated_turn_failures_exit_to_the_supervisor_for_a_clean_restart():
@@ -776,6 +1010,96 @@ def test_exhausted_context_recovery_defers_then_retries_without_failure_streak(
     log = capsys.readouterr().err
     assert "SENPAI_TURN_DEFERRED" in log
     assert "retry_after_seconds=600" in log
+
+
+def test_transient_provider_failure_defers_and_retries_the_same_turn(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    path = tmp_path / "inbox.sqlite3"
+    event = review_event(17)
+    clock = [1_700_000_000.0]
+    monkeypatch.setattr(controller_module.random, "uniform", lambda _low, _high: 0)
+    monkeypatch.setattr(controller_module.time, "time", lambda: clock[0])
+    failed_turn = ProviderTurns([provider_error()])
+    inbox = PersistentInbox(path)
+    Controller(
+        role="advisor",
+        mailbox=Mailbox([(event,)]),
+        turns=failed_turn,
+        conversation_id=CONVERSATION_ID,
+        full_prompt="programme",
+        inbox=inbox,
+        max_consecutive_turn_failures=1,
+    ).run(max_cycles=1)
+
+    turn_id = failed_turn.turn_ids[0]
+    preserved = inbox.latest_turn(turn_id)
+    assert preserved.recovery_generation == 0
+    assert preserved.quarantine_reason is None
+    assert not inbox.terminal_recovery_due(turn_id, max_attempts=1)
+    inbox.close()
+
+    waiting_turn = ProviderTurns([TurnResult(exit_code=0)])
+    Controller(
+        role="advisor",
+        mailbox=Mailbox([()]),
+        turns=waiting_turn,
+        conversation_id=CONVERSATION_ID,
+        full_prompt="programme",
+        inbox=PersistentInbox(path),
+    ).run(max_cycles=1)
+    assert waiting_turn.calls == []
+
+    clock[0] += 30
+    resumed_turn = ProviderTurns([TurnResult(exit_code=0)])
+    mailbox = Mailbox([()])
+    restarted_inbox = PersistentInbox(path)
+    Controller(
+        role="advisor",
+        mailbox=mailbox,
+        turns=resumed_turn,
+        conversation_id=CONVERSATION_ID,
+        full_prompt="programme",
+        inbox=restarted_inbox,
+    ).run(max_cycles=1)
+
+    assert resumed_turn.turn_ids == [turn_id]
+    assert restarted_inbox.provider_cooldown() is None
+    assert mailbox.acknowledged == [(event.dedupe_key,)]
+    assert "SENPAI_PROVIDER_COOLDOWN" in capsys.readouterr().err
+
+
+def test_permanent_provider_failure_exits_without_a_controller_retry():
+    error = ConversationRunError(
+        CONVERSATION_ID,
+        LLMAuthenticationError("invalid provider key"),
+    )
+    turns = ProviderTurns([error])
+
+    with pytest.raises(ConversationRunError):
+        controller(
+            Mailbox([(review_event(),)]),
+            turns,
+            max_consecutive_turn_failures=2,
+        ).run(max_cycles=2)
+
+    assert len(turns.calls) == 1
+
+
+def test_provider_cooldown_schedule_honors_retry_after_and_adds_jitter(monkeypatch):
+    monkeypatch.setattr(controller_module.random, "uniform", lambda _low, high: high)
+
+    assert [_provider_retry_delay(failure, 0) for failure in range(6)] == [
+        36,
+        72,
+        144,
+        288,
+        360,
+        360,
+    ]
+    assert _provider_retry_delay(0, 90) == 96
 
 
 def test_context_retry_deadline_survives_a_transiently_absent_event(
@@ -1073,6 +1397,36 @@ def test_feedback_polled_after_a_turn_is_processed_in_the_next_turn():
     ]
 
 
+def test_initial_assignment_precedes_feedback_when_the_batch_splits():
+    base_assignment = student_assignment_event()
+    assignment = ControllerEvent(
+        kind=base_assignment.kind,
+        dedupe_key=base_assignment.dedupe_key,
+        payload={**base_assignment.payload, "brief": "x" * (70 * 1024)},
+    )
+    feedback = ControllerEvent(
+        kind="student_pr_feedback",
+        dedupe_key="student_pr_feedback:issue_comment:17:101",
+        payload={
+            "assignment_id": "assignment-17",
+            "revision_id": "revision-2",
+            "message": "Apply this after reading the assignment.",
+        },
+    )
+    turns = Turns()
+
+    controller(
+        Mailbox(((assignment, feedback), ())),
+        turns,
+        role="student",
+    ).run(max_cycles=1)
+
+    assert [call[2] for call in turns.calls] == [
+        frozenset({assignment.dedupe_key}),
+        frozenset({feedback.dedupe_key}),
+    ]
+
+
 def test_controller_follows_the_complete_recovery_chain_before_acknowledging():
     """
     Requirement: any bounded number of recovery generations completes one logical turn.
@@ -1104,6 +1458,81 @@ def test_controller_quarantines_an_exhausted_turn_without_restarting(capsys):
     assert mailbox.acknowledged == []
     assert runtime.inbox.ready_conversation_ids() == ()
     assert "SENPAI_TURN_QUARANTINED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        pytest.param(human_event(), id="human-issue"),
+        pytest.param(human_pr_comment_event(), id="human-pr-comment"),
+    ],
+)
+def test_new_human_instruction_reopens_the_same_quarantined_advisor(
+    instruction,
+):
+    runtime = controller(
+        Mailbox(((review_event(),), ())),
+        QuarantiningTurns(),
+        max_consecutive_turn_failures=1,
+    )
+    runtime.run(max_cycles=1)
+    quarantined = runtime.inbox.quarantined_turns()[0]
+    mailbox = Mailbox(((instruction,), ()))
+    turns = Turns()
+
+    controller(
+        mailbox,
+        turns,
+        inbox=runtime.inbox,
+    ).run(max_cycles=1)
+
+    assert len(turns.calls) == 1
+    assert turns.calls[0][1] == CONVERSATION_ID
+    assert turns.calls[0][2] == frozenset(
+        {review_event().dedupe_key, instruction.dedupe_key}
+    )
+    assert "programme" in turns.calls[0][0]
+    assert runtime.inbox.turn(quarantined.turn_id).quarantine_reason is None
+    assert mailbox.acknowledged == [
+        (review_event().dedupe_key, instruction.dedupe_key)
+    ]
+
+
+def test_new_feedback_waits_behind_a_quarantined_student():
+    assignment = student_assignment_event()
+    runtime = controller(
+        Mailbox(((assignment,), ())),
+        QuarantiningTurns(),
+        role="student",
+        max_consecutive_turn_failures=1,
+    )
+    runtime.run(max_cycles=1)
+    quarantined = runtime.inbox.quarantined_turns()[0]
+    feedback = ControllerEvent(
+        kind="student_pr_feedback",
+        dedupe_key="student_pr_feedback:issue_comment:17:101",
+        payload={
+            "assignment_id": "assignment-17",
+            "revision_id": "revision-2",
+            "message": "Try the narrower experiment next.",
+        },
+    )
+    mailbox = Mailbox(((feedback,), ()))
+    turns = Turns()
+
+    controller(
+        mailbox,
+        turns,
+        role="student",
+        inbox=runtime.inbox,
+    ).run(max_cycles=1)
+
+    assert turns.calls == []
+    assert runtime.inbox.turn(quarantined.turn_id).quarantine_reason == (
+        "recovery budget exhausted"
+    )
+    assert runtime.inbox.pending_count(CONVERSATION_ID) == 1
+    assert mailbox.acknowledged == []
 
 
 def test_start_gate_wait_publishes_a_live_lease_before_polling(tmp_path: Path):
@@ -1228,6 +1657,69 @@ def test_turn_lease_uses_the_configured_hard_deadline(tmp_path: Path):
 
     assert observed[0].phase == "openhands-turn"
     assert before + 456 <= observed[0].deadline <= after + 456
+
+
+def test_activity_lease_is_renewed_at_most_every_thirty_seconds(monkeypatch):
+    clock = [100.0]
+    updates = []
+    progress = SimpleNamespace(
+        update=lambda phase, timeout: updates.append((phase, timeout, clock[0]))
+    )
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+    renew = _activity_lease(progress, 3660)
+
+    renew()
+    clock[0] = 129.9
+    renew()
+    clock[0] = 130.0
+    renew()
+
+    assert updates == [
+        ("openhands-turn", 3660, 100.0),
+        ("openhands-turn", 3660, 130.0),
+    ]
+
+
+def test_activity_lease_write_failure_does_not_escape_the_event_path(
+    monkeypatch,
+    capsys,
+):
+    clock = [100.0]
+    attempts = []
+
+    def update(_phase, _timeout):
+        attempts.append(clock[0])
+        if len(attempts) == 1:
+            raise OSError("lease volume unavailable")
+
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+    renew = _activity_lease(SimpleNamespace(update=update), 3660)
+
+    renew()
+    clock[0] = 101.0
+    renew()
+    clock[0] = 130.0
+    renew()
+
+    assert attempts == [100.0, 130.0]
+    assert "SENPAI_LEASE_UPDATE_ERROR OSError: lease volume unavailable" in (
+        capsys.readouterr().err
+    )
+
+
+def test_inference_state_lease_write_failure_does_not_mask_the_model_result(capsys):
+    def update_llm_request(_started_at, _heartbeat_at):
+        raise OSError("lease volume unavailable")
+
+    publish = _inference_state_lease(
+        SimpleNamespace(update_llm_request=update_llm_request)
+    )
+
+    publish(1_755_000_000.0, 1_755_000_001.0)
+
+    assert "SENPAI_LEASE_UPDATE_ERROR OSError: lease volume unavailable" in (
+        capsys.readouterr().err
+    )
 
 
 def test_only_an_acknowledged_turn_advances_supervisor_progress(tmp_path: Path):

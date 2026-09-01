@@ -35,8 +35,8 @@ dependencies.
    checkout.
 8. Senpai does not prune conversation history.
 9. Only the student image carries CUDA, PyTorch, and the training stack.
-10. Secrets are passed at narrow executor boundaries and redacted before
-    monitored content is attached.
+10. Secret values are passed at narrow executor boundaries and redacted before
+    monitored content is attached. Custom secret names are explicit.
 11. Hivemind is disabled, not redesigned, in this change.
 
 ## Control loop and remote protocol
@@ -60,10 +60,16 @@ Python controller worker
 ```
 
 The worker publishes an atomic lease containing its PID, current phase, hard
-deadline, and completed-turn counter. The supervisor resets bounded restart
+deadline, completed-turn counter, and active LLM request timestamps. A
+non-model-visible heartbeat updates `llm_request_heartbeat_at` while preserving
+the request's original `llm_request_started_at`. It does not add conversation
+events or renew the hard deadline. The supervisor resets bounded restart
 backoff only after a turn is successfully acknowledged; process uptime and
 idle sleep do not count as progress. The supervisor is independent of
 OpenHands and Kubernetes.
+OpenHands events renew the root turn's lease; its configured timeout measures
+inactivity rather than total elapsed time. Provider, tool, training, and child
+deadlines remain hard.
 Kubernetes liveness and Docker health checks inspect the same lease, while the
 supervisor provides the same recovery on a plain host.
 
@@ -76,6 +82,11 @@ GitHub state is level-triggered:
 - trusted human comments and reviews on one assigned open `status:wip` or
   `status:review` PR wake its exact student assignment conversation;
 - `status:review` is a durable advisor wake;
+- a configured student with no open assignment labeled `status:wip` or
+  `status:review` emits `student_available_for_assignment`. This event describes
+  assignment routing, not the student process or GPU state. A later successful
+  GitHub poll retracts the event while it is still queued and unclaimed if the
+  student now has an open assignment labeled `status:wip` or `status:review`;
 - when the configured research base changes from an active assignment's
   recorded base SHA, `research_base_changed` gives the advisor
   `required_base_sha`, `current_base_sha`, and a compare URL without cancelling
@@ -86,9 +97,14 @@ GitHub state is level-triggered:
   label is a human message.
 
 Human Issue events use the exact latest human-authored body/comment ID as their
-dedupe key and `human_message_id`. An agent reply updates the Issue but does not
-create a new wake for its own comment. `respond_to_human_issue` verifies the exact
-human message before writing an idempotent response.
+dedupe key and `human_message_id`. Each controller delivers an exact version
+until one turn processes and acknowledges it, then never delivers that version
+again. Failed, interrupted, and recovery turns retain the same delivery. New
+trusted human text or a changed versioned title creates a new version and wake.
+Trusted messages may share the authenticated actor's GitHub identity; an
+authoritative Senpai protocol marker distinguishes agent output and prevents it
+from creating a new wake. `respond_to_human_issue` reapplies the same
+classification to the exact message before writing an idempotent response.
 Launches with human-Issue handling disabled skip that GitHub query entirely.
 
 Assigned-PR issue comments, submitted reviews, and inline comments each use
@@ -103,12 +119,19 @@ ledger. Oldest unacknowledged events are delivered in bounded count/byte
 batches; immediate post-turn polls drain later batches without dropping them.
 
 While an OpenHands turn is running, `ActiveGitHubWatcher` polls the same GitHub
-state. It enqueues all newly visible advisor events, and only PR feedback bound
-to the currently running student UUID, in the role's local event store.
-OpenHands 1.40 supports concurrent `send_message`; `AdvisorEventPump` injects at
-its state lock boundary without cancelling unrelated work. Successfully
-injected student feedback is acknowledged in `github-feedback.json` only when
-the enclosing student turn succeeds.
+state. It enqueues newly visible GitHub events except student-assignment
+availability, which the foreground poll reconciles before the next turn. For
+students, it maps authenticated human Issues and assignment-bound PR feedback
+into the active UUID. Authenticated humans are the interrupt tier: tools get up
+to 60 seconds to finish before Senpai interrupts and resumes the run, even when
+its inbox batch is full. Student assignments and trusted PR feedback share a
+FIFO queue tier; feedback waits for the next completed agent step without
+cancelling it.
+Ordinary events remain FIFO. Turn formation and non-human attachments are
+bounded to 16 events or 64 KiB; prioritized overflow remains pending to lead
+the next turn.
+Successfully injected student feedback is acknowledged in
+`github-feedback.json` only when the enclosing student turn succeeds.
 
 Generic child results use a local SQLite WAL event store because parent and
 child run on the same advisor or student instance. That is not an inter-node
@@ -119,6 +142,12 @@ advisor watcher/child events; `student-events.sqlite3`, for unacknowledged
 student feedback/child events; and `training/monitors.sqlite3`, for student
 monitor policy, samples, and deduplicated actionable signals. OpenHands
 conversation history is a separate file-backed per-UUID event log.
+
+A completed tool observation resets the three-attempt no-progress budget. A
+separate 36-inference-start backstop applies to each turn branch across worker
+restarts without limiting one productive run. Either exhausted budget enters
+bounded fresh-branch recovery and then quarantine. Only authenticated human
+steering can reopen quarantine; trusted PR feedback remains pending.
 
 ## State and conversations
 
@@ -184,12 +213,12 @@ The model receives:
 1. OpenHands' native base system prompt and tool schemas.
 2. One stable system suffix assembled from:
    - `system_instructions/SENPAI-HARNESS.md`; and
-   - the rendered advisor or student role charter, including its non-secret
-     runtime identity; and
+   - the rendered advisor or student role charter; and
    - the selected target-repository `program.md` under
      `# program.md - <path>`; and
    - the rendered `system_instructions/SENPAI-LAUNCH-CONTEXT.md`, containing
-     authoritative runtime and isolation rules after `program.md`. A blank
+     authoritative runtime identity, limits, and isolation rules after
+     `program.md`. A blank
      `program_path` searches root
      `program.md` and one-level `*/program.md` paths and requires exactly one
      total match.
@@ -201,6 +230,11 @@ program path and renders the role's `{{VARIABLE}}` placeholders once from an
 explicit non-secret allowlist. A missing referenced value fails the launch;
 unrelated environment variables and credentials are never considered. The
 rendered role is persisted in role state and reused across worker restarts.
+
+The launcher renders `timeout_minutes` and `max_epochs` into the launch context
+as agent policy. It does not export dedicated timeout or epoch environment
+variables, and the training supervisor has no launch-wide timeout default or
+ceiling. Each training run supplies its own positive `timeout_seconds` value.
 
 At process startup, the runner loads the harness, rendered role, `program.md`,
 and authoritative launch context into one immutable
@@ -257,14 +291,27 @@ supported models can reuse server-side private reasoning and return the most
 detailed available summary. The default main effort is `xhigh`; GPT-5.6 also
 accepts `max`, which uses API `max` effort with Responses
 `reasoning.mode: pro`. Automatic OpenAI compaction starts at
+the `compaction_trigger_tokens` value from `senpai.yaml`, which defaults to
 200,000 rendered tokens. The OpenHands condenser is disabled for that provider
 chain, but its complete local event log remains durable and is used to recover
 the latest response ID after restart.
 
-Direct Anthropic models use native server-side compaction with a 200,000-input-
-token trigger. OpenHands persists the returned typed compaction block in the
-normal event log and replays it first in each later request, including after a
-process restart. The local condenser is disabled for these conversations.
+Claude Fable 5, Opus 5, and Sonnet 5 profiles pass `max` through as
+provider-native `output_config.effort: max` with adaptive thinking. Senpai
+never adds the OpenAI-only `reasoning.mode: pro` request body to Anthropic
+calls.
+
+Direct Anthropic models use native server-side compaction with the same
+`compaction_trigger_tokens` input-token trigger. OpenHands persists the returned
+typed compaction block in the normal event log and replays it first in each
+later request, including after a process restart. Anthropic performs the token
+count after provider rendering; Senpai does not load a local tokenizer. This
+trigger is not a context-size cap. LiteLLM's normalized `prompt_tokens` can
+exceed it because that field sums the compaction and post-compaction sampling
+iterations; diagnose compaction from the raw iteration usage and returned
+compaction block. Senpai leaves Anthropic's compaction instructions unset so
+the provider uses its model-specific native prompt. The local condenser is
+disabled for these conversations.
 Other providers retain the high-quality OpenHands condenser.
 
 The complete durable transcript remains available as plain event JSON under
@@ -300,7 +347,7 @@ the model-facing schema. It also canonicalizes every Senpai-authored comment to
 an `ADVISOR:` or `STUDENT:` prefix from that trusted role; models supply plain
 comment text and cannot impersonate the other role through a payload.
 
-Advisor operations that act on an assignment share this object:
+Assignment-scoped advisor and student operations share this object:
 
 ```json
 {
@@ -317,6 +364,7 @@ Advisor operations that act on an assignment share this object:
 | `publish_advisor_branch` | advisor | `remote_branch_sha_before_push`, `local_commit_sha` |
 | `repair_assignment_routing` | advisor | `working_state` (`wip` or `review`) and a `blockers` list containing only `blocked`, `hold`, or `needs-rebase` |
 | `send_assignment_feedback` | advisor | `feedback_id`, `comment` |
+| `post_assignment_comment` | student | `comment_id`, `comment` |
 | `request_assignment_revision` | advisor | `new_revision_id`, `required_base_sha`, `comment` |
 | `accept_result_on_current_base` | advisor | `expected_current_base_sha`, `reason` |
 | `merge_experiment` | advisor | `expected_current_base_sha`, `merge_method` |
@@ -324,7 +372,16 @@ Advisor operations that act on an assignment share this object:
 | `respond_to_human_issue` | advisor or student | `issue_number`, `human_message_id`, `response` |
 | `submit_experiment_result` | student | `branch`, `remote_branch_sha_before_push`, `result` |
 
-Student publication happens only inside `submit_experiment_result`, which
+Interim student communication happens through `post_assignment_comment`. The
+runtime binds the configured student identity and validates the exact open WIP
+or review assignment, revision, and PR head before posting an immutable typed
+comment. Exact replay is a no-op; changed text uses a new `comment_id`. The
+operation does not push or change the PR head, draft state, or labels, and its
+trusted marker wakes the advisor without entering the student's own feedback
+inbox. A comment that races with a revision request retains its original
+revision identity and is still delivered.
+
+Terminal student publication happens only inside `submit_experiment_result`, which
 derives the PR and proposed local head from the structured result, then validates
 repository, assignment, revision, student, and current remote head before it can
 push. Marker comments are trusted only when authored by the authenticated token
@@ -401,7 +458,7 @@ spawn_agents(
     task: str,
     agent: general-purpose | explore | search_general_web |
            search_research_publications | bash-runner = general-purpose,
-    model: fast | smart | frontier = smart,
+    model: fast | smart | frontier,
     include_context: bool = false,
   }],
 ) -> {tasks: [{task_id, key, status, agent, model, result?, error?}]}
@@ -434,6 +491,9 @@ used. Replaying the same batch and specification returns the same task records;
 it never launches duplicate children. Reusing a batch key with a different
 task specification fails clearly.
 
+Every task must select `fast`, `smart`, or `frontier` explicitly. There is no
+implicit model tier.
+
 `await_agents` is the only blocking delegation operation. `all` waits for every
 selected task to reach a terminal state, `first` waits for any one, `quorum`
 waits for the requested number, and `change` returns when any selected task
@@ -455,6 +515,13 @@ turn while tasks remain active. A terminal child result or error is persisted
 and resumes the exact root conversation. A nested child must await or cancel
 all of its descendants before returning; it cannot detach background work.
 
+Children are told they can use approximately 1,500 tokens for conclusions and
+evidence pointers. If a report exceeds 15,000 tokens, Senpai stores the complete
+report under the role state, asks the same child conversation for one concise
+summary, and persists only that summary and the local artifact path. A failed
+summary returns an error with the artifact path; it never sends the oversized
+report to the parent conversation.
+
 One root spawn batch and all descendants form a delegation tree. The tree may
 admit at most eight tasks over its lifetime, a single spawn batch is limited to
 eight, and the role registry allows at most eight active tasks concurrently
@@ -466,11 +533,11 @@ at depth two. Explore, Search, Bash Runner, and every depth-two agent are leaves
 This makes chains such as Explore -> Explore impossible without constraining a
 later research phase to the first batch's lifetime budget.
 
-The tree inherits one absolute root-turn deadline. Each task also has a tier
-runtime cap: 600 seconds for `fast`, 1,800 for `smart`, and 3,600 for `frontier`.
-The effective deadline is the earlier of that cap and the inherited root
-deadline. Reaching it interrupts the complete process group and records a
-terminal timeout; no descendant survives the tree deadline.
+Each task has an absolute tier runtime cap: 1,200 seconds for `fast`, 3,600 for
+`smart`, and 7,200 for `frontier`. A descendant's effective deadline is the
+earlier of that cap and its inherited ancestor deadline. Reaching it interrupts
+the complete process group and records a terminal timeout; no descendant
+outlives an ancestor deadline.
 
 Each tier selects one explicit model-and-effort profile. `model=fast` defaults
 to `openai/gpt-5.6-luna` at `high` for mechanical search, command execution,
@@ -513,10 +580,12 @@ and deadline. Children receive neither GitHub credentials nor GitHub
 read/write tools; the parent prepares any large PR Markdown artifact and owns
 every typed GitHub operation. They do not receive training tools.
 
-When `review_ready` arrives during other advisor work, the advisor can spawn a
-smart, full-context General Purpose review and continue unrelated work. Every
-terminal record includes its root conversation identity, allowing the
-controller to resume the exact advisor or student conversation after its turn.
+When `review_ready` arrives during other advisor work, the harness pauses the
+advisor at the next safe agent-step boundary and delivers the event into the
+same durable conversation without interrupting an active tool. The advisor can
+delegate or defer the review, then resume the displaced work. Every terminal
+record includes its root conversation identity, allowing the controller to
+resume the exact advisor or student conversation after its turn.
 
 ### Training and monitoring
 
@@ -536,7 +605,7 @@ monitor_training(
 ) -> MonitorTrainingObservation
 ```
 
-`TrainingSupervisor` owns one process group, the configured timeout ceiling,
+`TrainingSupervisor` owns one process group, each run's requested timeout,
 TERM/KILL cleanup, restart identity checks using PID/PGID/create-time, a bounded
 8 KiB error tail, streamed 64 KiB log parsing, persisted state, and discovered
 W&B run IDs. Run IDs are persisted while training is still running so metric
@@ -548,9 +617,9 @@ a terminal-state monitor bound to the current conversation. `monitor_training`
 is an optional policy upgrade for useful metric gates or staleness detection;
 repeating it replaces the default or previous policy.
 
-The timeout is a total wall-clock ceiling, not merely the point at which
-shutdown begins. TERM is sent early enough that the configured grace period
-ends at the deadline, after which the complete process group is killed.
+Each run's requested timeout is a total wall-clock ceiling, not merely the
+point at which shutdown begins. TERM is sent early enough that the configured
+grace period ends at the deadline, after which the complete process group is killed.
 `cancel_training` follows the same process-group cleanup path and does not
 return until the supervisor has persisted a terminal state. Target training
 code remains responsible for handling SIGTERM and flushing external services
@@ -578,8 +647,10 @@ turn. Each partition is acknowledged only after its own successful turn, so a
 child result for one assignment cannot consume or permanently block a training
 event for another.
 
-The Stop hook verifies the automatic monitor marker and a clean worktree,
-allowing the student turn to end while the controller supervises the process.
+The Stop hook always verifies the automatic monitor marker and normally
+requires a clean worktree. While queued PR feedback waits for a safe boundary,
+a role-local marker waives only the clean-worktree check; the pump clears it
+before delivery and on entry and exit.
 The advisor and advisor children never receive training tools.
 
 ## Hooks, deadlines, and shutdown
@@ -618,6 +689,22 @@ Generic child processes receive no GitHub token and no GitHub tools. Main-role
 GitHub operations remain typed and lease/state guarded. Terminal and hook
 policies are behavioral guardrails, not a credential-containment boundary.
 
+`custom_secret_env_names` is an explicit, shared list of additional
+environment-variable names. Names must be unique and match
+`[A-Za-z_][A-Za-z0-9_]*`. Built-in launch credential names and names beginning
+with `GH_`, `GITHUB_`, or `SENPAI_` are reserved. Launcher-owned and
+process-control environment-variable names are also reserved. The launcher
+resolves each value from the shell and then the repository-root `.env`. It
+reads `.env` values literally without variable interpolation. A missing listed
+value fails the launch. It writes values only to the per-launch Kubernetes
+Secret and injects them into every advisor and student environment. The
+corresponding names, but not the values, are model-visible so agents can
+reference them during tool execution. OpenHands makes the values available at
+execution boundaries and propagates them to delegated children. Dry-run
+manifests validate names and contain deterministic placeholders instead of
+resolved values. Custom secrets receive no service-specific
+authentication preflight.
+
 Git operations use a temporary askpass helper rather than a persistent
 credential store. The runner repository cannot push, and a target pre-push hook
 enforces the exact role/branch matrix. Images run as an unprivileged user, and
@@ -625,13 +712,14 @@ the Kubernetes containers drop every Linux capability, disallow privilege
 escalation, and use the runtime-default seccomp profile.
 
 Weave content capture applies a longest-first transform over all configured
-API keys, tokens, passwords, secrets, credentials, and the selected custom
-model credential before content is sent. The pinned `weave-openhands`
-integration is initialized before OpenHands imports. Each conversation run is
-an agent trace with child LLM and tool spans, all carrying the durable
-OpenHands conversation ID. These OTLP records are stored in Weave Agent
-Observability and queried with `get_agent_spans()`, not the legacy Calls API;
-`OPENHANDS_RUN.weave_url` links directly to the conversation.
+API keys, tokens, passwords, secrets, credentials, custom secrets, and the
+selected custom model credential before content is sent. Custom secrets do not
+depend on naming conventions for redaction. The pinned
+`weave-openhands` integration is initialized before OpenHands imports. Each
+conversation run is an agent trace with child LLM and tool spans, all carrying
+the durable OpenHands conversation ID. These OTLP records are stored in Weave
+Agent Observability and queried with `get_agent_spans()`, not the legacy Calls
+API; `OPENHANDS_RUN.weave_url` links directly to the conversation.
 
 ## Images and launch acceptance
 
@@ -651,10 +739,12 @@ out that exact revision.
 Launch preflight verifies:
 
 - target-repository push and branch access;
-- the Anthropic key;
+- every model-provider credential referenced by the configured profiles;
 - the Exa key with one `type="instant"`, publication-category, one-result
-  search; and
-- the W&B key with a minimal viewer query.
+  search;
+- the W&B key with a minimal viewer query; and
+- the presence of every configured custom secret, without attempting
+  a service-specific authentication check.
 
 Exa is a progressive skill/script integration, not an always-connected MCP
 server.
@@ -708,7 +798,9 @@ The change is acceptable when:
 - browser smoke succeeds in both image builds;
 - no operational prompt advertises a missing tool or service;
 - no runtime role requires Claude Code semantics;
-- secrets do not appear in serialized tool specs or captured content;
+- secret values do not appear in serialized tool specs or captured content;
+- every configured custom secret reaches advisor, student, and child tool
+  execution with its output and trace content redacted;
 - monitor wakes resume the original student UUID;
 - cutoff arming completes after a bounded readiness window even when a pod
   never becomes Ready; and

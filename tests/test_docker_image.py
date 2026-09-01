@@ -232,6 +232,7 @@ def test_openhands_plugin_loads_workflow_skills_without_exa_mcp(test_pod):
         "plugin = Plugin.load('/workspaces/senpai/plugins/senpai')\n"
         "skills = {skill.name for skill in plugin.skills}\n"
         "assert 'assign-experiment' in skills\n"
+        "assert 'maintain-research-state' in skills\n"
         "assert {'poll-for-work', 'survey-prs'}.isdisjoint(skills)\n"
         "assert not plugin.mcp_config\n"
         "assert not __import__('pathlib').Path("

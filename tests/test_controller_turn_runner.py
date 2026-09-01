@@ -4,22 +4,31 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
+import httpx
 import pytest
+from litellm.exceptions import PermissionDeniedError
 from openhands.sdk.conversation.exceptions import ConversationRunError
 from openhands.sdk.llm.exceptions import (
+    LLMAuthenticationError,
+    LLMBadRequestError,
     LLMContextWindowExceedError,
     LLMMalformedConversationHistoryError,
+    LLMRateLimitError,
+    LLMServiceUnavailableError,
+    LLMTimeoutError,
 )
 
-from senpai_agent.advisor import AdvisorEvent, AdvisorEventPump, AdvisorEventStore
+from senpai_agent.advisor import AdvisorEventPump
 from senpai_agent.controller import (
     ConversationRecoveryExhausted,
     OpenHandsTurnRunner,
     _context_recovery_prompt,
+    _provider_failure,
 )
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.github.mailbox import ActiveGitHubWatcher
 from senpai_agent.inbox import DeliveryState, PersistentInbox, deliver_turn_messages
+from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.state import AssignmentConversationRegistry
 
@@ -52,6 +61,18 @@ def feedback_event(revision_id="revision-2"):
     )
 
 
+def human_issue_event():
+    return ControllerEvent(
+        kind="human_issue",
+        dedupe_key="human_issue:v2:23:702:abc",
+        payload={
+            "number": 23,
+            "human_message_id": 702,
+            "message": "Stop and inspect the active experiment.",
+        },
+    )
+
+
 def advisor_event(number=17):
     return ControllerEvent(
         kind="review_ready",
@@ -67,6 +88,90 @@ def test_context_recovery_prompt_does_not_repeat_an_embedded_research_brief():
     )
 
     assert prompt.count("complete initial controller context") == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "retryable"),
+    [
+        (LLMRateLimitError("rate limit"), True),
+        (LLMTimeoutError("provider timeout"), True),
+        (LLMServiceUnavailableError("provider unavailable"), True),
+        (LLMAuthenticationError("invalid key"), False),
+        (LLMBadRequestError("malformed request"), False),
+    ],
+)
+def test_provider_failure_classification(error, retryable):
+    wrapped = ConversationRunError(
+        UUID("00000000-0000-0000-0000-000000000090"), error
+    )
+
+    assert _provider_failure(wrapped, 1_700_000_000).retryable is retryable
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        LLMContextWindowExceedError("context length exceeded"),
+        LLMMalformedConversationHistoryError("invalid tool history"),
+        TimeoutError("local mailbox timeout"),
+        ConnectionError("connection error talking to GitHub"),
+    ],
+)
+def test_non_provider_failures_bypass_provider_cooldown(error):
+    assert _provider_failure(error, 1_700_000_000) is None
+
+
+def test_provider_permission_failure_is_permanent():
+    error = PermissionDeniedError(
+        "permission denied",
+        "anthropic",
+        "claude",
+        httpx.Response(403, request=httpx.Request("POST", "https://anthropic.com")),
+    )
+
+    assert _provider_failure(error, 1_700_000_000).retryable is False
+
+
+def test_provider_failure_honors_retry_after_from_the_exhausted_response():
+    raw = RuntimeError("provider overloaded")
+    raw.litellm_response_headers = {"retry-after": "90"}
+    mapped = LLMServiceUnavailableError("provider overloaded")
+    mapped.__cause__ = raw
+
+    failure = _provider_failure(mapped, 1_700_000_000)
+
+    assert failure is not None
+    assert failure.retry_after == 90
+
+
+def test_turn_runner_passes_the_inference_state_out_of_band(
+    tmp_path: Path,
+    monkeypatch,
+):
+    conversation_id = UUID("00000000-0000-0000-0000-000000000094")
+    observed = []
+
+    def run_openhands(_prompt, _config, *, on_inference_state):
+        on_inference_state(1_755_000_000.0, 1_755_000_001.0)
+        return 0
+
+    def publish_state(started_at, heartbeat_at):
+        observed.append((started_at, heartbeat_at))
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+
+    result = OpenHandsTurnRunner(
+        Config("advisor", tmp_path / "state", conversation_id),
+        full_prompt="complete current controller context",
+        on_inference_state=publish_state,
+    ).run(
+        "current actionable event",
+        conversation_id=conversation_id,
+        event_keys=frozenset(),
+    )
+
+    assert result.exit_code == 0
+    assert observed == [(1_755_000_000.0, 1_755_000_001.0)]
 
 
 def test_running_student_receives_only_feedback_bound_to_its_conversation(
@@ -87,7 +192,7 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
             def send_message(self, message):
                 messages.append(message)
 
-        with AdvisorEventStore(
+        with LocalEventStore(
             state_dir / "student-events.sqlite3"
         ) as store, AdvisorEventPump(
             store,
@@ -118,26 +223,27 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
     assert "Feedback for revision-3." not in messages[0]
     assert str(conversation_id) in messages[0]
     assert result.delivered_event_keys == frozenset({current.dedupe_key})
-    with AdvisorEventStore(state_dir / "student-events.sqlite3") as store:
+    with LocalEventStore(state_dir / "student-events.sqlite3") as store:
         assert store.pending() == []
 
 
-def test_observed_feedback_is_not_reported_delivered_until_the_event_pump_sends_it(
+@pytest.mark.parametrize("incoming", [feedback_event(), human_issue_event()])
+def test_observed_student_input_routes_to_the_active_pump_until_it_is_delivered(
     tmp_path: Path,
     monkeypatch,
+    incoming: ControllerEvent,
 ):
     state_dir = tmp_path / "state"
     registry = AssignmentConversationRegistry(
         state_dir / "student-conversations.json"
     )
     conversation_id = registry.for_assignment("assignment-17", "revision-2")
-    feedback = feedback_event()
     store_path = state_dir / "student-events.sqlite3"
 
     def run_openhands(_prompt, _config):
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
-            with AdvisorEventStore(store_path) as store:
+            with LocalEventStore(store_path) as store:
                 if store.pending_count():
                     break
             time.sleep(0.001)
@@ -148,7 +254,7 @@ def test_observed_feedback_is_not_reported_delivered_until_the_event_pump_sends_
     result = OpenHandsTurnRunner(
         Config("student", state_dir, conversation_id),
         full_prompt="student initial controller context",
-        github_mailbox=Mailbox((feedback,)),
+        github_mailbox=Mailbox((incoming,)),
         active_poll_interval_seconds=0.001,
     ).run(
         "student turn",
@@ -157,10 +263,13 @@ def test_observed_feedback_is_not_reported_delivered_until_the_event_pump_sends_
     )
 
     assert result.delivered_event_keys == frozenset()
-    with AdvisorEventStore(store_path) as store:
-        assert [event.dedupe_key for event in store.pending()] == [
-            feedback.dedupe_key
-        ]
+    with LocalEventStore(store_path) as store:
+        pending = store.pending()
+        assert [event.dedupe_key for event in pending] == [incoming.dedupe_key]
+        assert pending[0].kind == incoming.kind
+        assert pending[0].payload["parent_conversation_id"] == str(
+            conversation_id
+        )
 
 
 def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
@@ -174,9 +283,9 @@ def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
     conversation_id = registry.for_assignment("assignment-17", "revision-2")
     feedback = feedback_event()
     store_path = state_dir / "student-events.sqlite3"
-    with AdvisorEventStore(store_path) as store:
+    with LocalEventStore(store_path) as store:
         store.enqueue(
-            AdvisorEvent(
+            LocalEvent(
                 kind=feedback.kind,
                 dedupe_key=feedback.dedupe_key,
                 payload={
@@ -192,7 +301,7 @@ def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
             def send_message(self, message):
                 messages.append(message)
 
-        with AdvisorEventStore(store_path) as store, AdvisorEventPump(
+        with LocalEventStore(store_path) as store, AdvisorEventPump(
             store,
             Conversation(),
             poll_interval=0.001,
@@ -216,7 +325,7 @@ def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
 
     assert messages == []
     assert result.delivered_event_keys == frozenset()
-    with AdvisorEventStore(store_path) as store:
+    with LocalEventStore(store_path) as store:
         assert store.pending() == []
 
 
@@ -236,7 +345,7 @@ def test_full_visible_set_suppresses_events_handled_in_an_earlier_turn(
             def send_message(self, message):
                 messages.append(message)
 
-        with AdvisorEventStore(store_path) as store, AdvisorEventPump(
+        with LocalEventStore(store_path) as store, AdvisorEventPump(
             store,
             Conversation(),
             poll_interval=0.001,
@@ -262,7 +371,7 @@ def test_full_visible_set_suppresses_events_handled_in_an_earlier_turn(
 
     assert messages == []
     assert result.delivered_event_keys == frozenset()
-    with AdvisorEventStore(store_path) as store:
+    with LocalEventStore(store_path) as store:
         assert store.pending() == []
 
 
@@ -274,9 +383,9 @@ def test_acknowledged_store_rows_are_not_reported_as_this_turn_deliveries(
     conversation_id = UUID("00000000-0000-0000-0000-000000000018")
     handled = advisor_event()
     store_path = state_dir / "advisor-events.sqlite3"
-    with AdvisorEventStore(store_path) as store:
+    with LocalEventStore(store_path) as store:
         store.enqueue(
-            AdvisorEvent(
+            LocalEvent(
                 kind=handled.kind,
                 dedupe_key=handled.dedupe_key,
                 payload=handled.payload,
@@ -330,7 +439,7 @@ def test_active_watcher_retries_after_a_transient_github_read_error(
     ) as watcher:
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
-            with AdvisorEventStore(store_path) as store:
+            with LocalEventStore(store_path) as store:
                 if store.pending_count():
                     break
             time.sleep(0.001)
@@ -338,11 +447,44 @@ def test_active_watcher_retries_after_a_transient_github_read_error(
 
     assert watcher.error is None
     assert mailbox.calls >= 2
-    with AdvisorEventStore(store_path) as store:
+    with LocalEventStore(store_path) as store:
         assert [pending.dedupe_key for pending in store.pending()] == [
             event.dedupe_key
         ]
     assert "SENPAI_GITHUB_WATCHER_POLL_ERROR" in capsys.readouterr().err
+
+
+def test_active_watcher_does_not_queue_student_availability(tmp_path: Path):
+    event = ControllerEvent(
+        kind="student_available_for_assignment",
+        dedupe_key="student_available_for_assignment:Fern",
+        payload={"student": "Fern"},
+    )
+
+    class Mailbox:
+        def __init__(self):
+            self.calls = 0
+
+        def poll(self):
+            self.calls += 1
+            return (event,)
+
+    mailbox = Mailbox()
+    store_path = tmp_path / "advisor-events.sqlite3"
+    with ActiveGitHubWatcher(
+        mailbox,
+        store_path,
+        known_keys=frozenset(),
+        poll_interval_seconds=0.001,
+    ) as watcher:
+        deadline = time.monotonic() + 1
+        while mailbox.calls < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+    assert mailbox.calls >= 2
+    assert watcher.enqueued_keys == set()
+    with LocalEventStore(store_path) as store:
+        assert store.pending() == []
 
 
 def test_context_exhaustion_retries_once_on_a_fresh_branch_with_the_same_id(
@@ -384,7 +526,7 @@ def test_context_exhaustion_retries_once_on_a_fresh_branch_with_the_same_id(
 
     assert result.exit_code == 0
     assert calls[0] == ("current actionable event", conversation_id, False, 100)
-    assert calls[1][1:] == (conversation_id, True, 75)
+    assert calls[1][1:] == (conversation_id, True, 100)
     assert "complete current controller context" in calls[1][0]
     assert "current actionable event" in calls[1][0]
     assert "raw trace and workspace are preserved" in calls[1][0]
@@ -490,40 +632,6 @@ def test_context_recovery_attempt_is_not_retried(
 
     assert [reset_context for _, _, reset_context in calls] == [False, True]
     assert raised.value.conversation_id == conversation_id
-    assert isinstance(raised.value.__cause__, ConversationRunError)
-
-
-def test_exhausted_turn_budget_defers_without_starting_a_doomed_recovery(
-    tmp_path: Path,
-    monkeypatch,
-):
-    conversation_id = UUID("00000000-0000-0000-0000-000000000094")
-    clock = [100.0]
-    calls = []
-
-    def run_openhands(prompt, config, *, reset_context=False):
-        calls.append((prompt, config.conversation_id, reset_context))
-        clock[0] += 100
-        raise ConversationRunError(
-            conversation_id,
-            LLMContextWindowExceedError("context length exceeded"),
-        )
-
-    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
-    monkeypatch.setattr("senpai_agent.controller.time.monotonic", lambda: clock[0])
-
-    with pytest.raises(ConversationRecoveryExhausted) as raised:
-        OpenHandsTurnRunner(
-            Config("advisor", tmp_path / "state", conversation_id, timeout_seconds=100),
-            full_prompt="complete current controller context",
-        ).run(
-            "current actionable event",
-            conversation_id=conversation_id,
-            event_keys=frozenset(),
-        )
-
-    assert len(calls) == 1
-    assert isinstance(raised.value.error, TimeoutError)
     assert isinstance(raised.value.__cause__, ConversationRunError)
 
 

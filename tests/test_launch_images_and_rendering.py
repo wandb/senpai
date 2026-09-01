@@ -1,9 +1,13 @@
 import base64
+import os
 import re
+import subprocess
+import sys
 
 import pytest
 import yaml
 
+from git_workflow_support import commit_file, git, repository
 from launch_test_support import (
     ADVISOR_IMAGE,
     REVISION,
@@ -35,12 +39,33 @@ def test_default_config_exposes_every_model_profile_and_effort():
         "fast_reasoning_effort": "high",
         "frontier_model": "openai/gpt-5.6-sol",
         "frontier_reasoning_effort": "max",
+        "compaction_trigger_tokens": 200_000,
     }.items() <= config.items()
     assert config["program_path"] == ""
+    assert "custom_secret_env_names" not in config
+    assert launch_args().custom_secret_env_names == []
     assert config["senpai_repo_url"] == "https://github.com/wandb/senpai.git"
     assert config["senpai_repo_revision"] == ""
     assert "repo_url" not in config
     assert "repo_revision" not in config
+
+
+def test_yaml_config_parses_custom_secret_names_as_a_list(monkeypatch, tmp_path):
+    config_path = tmp_path / "senpai.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "tag": "config-test",
+                "target_repo_url": "https://github.com/example/problem.git",
+                "custom_secret_env_names": ["HF_TOKEN", "DATASET_LICENSE_KEY"],
+            }
+        )
+    )
+    monkeypatch.setattr(sys, "argv", ["launch.py"])
+
+    args = launch.sp.parse(launch.Args, config_path=str(config_path))
+
+    assert args.custom_secret_env_names == ["HF_TOKEN", "DATASET_LICENSE_KEY"]
 
 
 @pytest.mark.parametrize(
@@ -182,6 +207,59 @@ def test_role_bootstrap_verifies_both_checkout_and_image_source_revision(role):
     )
 
 
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_role_bootstrap_reuses_runner_checkout_without_touching_target(role, tmp_path):
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source, _remote, revision = repository(source_root)
+
+    _configmap, deployment, _secret = render_role(role)
+    command = yaml.safe_load(deployment)["spec"]["template"]["spec"]["containers"][
+        0
+    ]["args"][0]
+    workspace_root = tmp_path / "workspace"
+    runner = workspace_root / "senpai"
+    bootstrap = "set -e\numask 022\n" + command[
+        command.index("askpass=") : command.index("exec bash")
+    ]
+    bootstrap = bootstrap.replace("/tmp/senpai-git-askpass", str(tmp_path / "askpass"))
+    token_handoff = tmp_path / "github-token"
+    bootstrap = bootstrap.replace(
+        "/tmp/senpai-supervisor-github-token", str(token_handoff)
+    )
+    bootstrap = bootstrap.replace("/workspace", str(workspace_root))
+    umask_output = tmp_path / "umask"
+    bootstrap += '\numask > "$UMASK_OUTPUT"\n'
+    env = os.environ | {
+        "GITHUB_TOKEN": "unused",
+        "SENPAI_IMAGE_REVISION": revision,
+        "SENPAI_REPO_REVISION": revision,
+        "SENPAI_REPO_URL": str(source),
+        "UMASK_OUTPUT": str(umask_output),
+    }
+
+    subprocess.run(["bash", "-c", bootstrap], check=True, env=env)
+    target = runner / "target"
+    target.mkdir()
+    git(target, "init", "--quiet")
+    git(target, "config", "user.name", "Student")
+    git(target, "config", "user.email", "student@example.com")
+    target_revision = commit_file(target, "state.txt", "committed\n", "state")
+    (target / "state.txt").write_text("in progress\n")
+    target_status = git(target, "status", "--short")
+    git(runner, "remote", "set-url", "origin", str(tmp_path / "stale.git"))
+
+    subprocess.run(["bash", "-c", bootstrap], check=True, env=env)
+
+    assert git(target, "rev-parse", "HEAD") == target_revision
+    assert git(target, "status", "--short") == target_status
+    assert (target / "state.txt").read_text() == "in progress\n"
+    assert git(runner, "remote", "get-url", "origin") == str(source)
+    assert git(runner, "rev-parse", "HEAD") == revision
+    assert token_handoff.stat().st_mode & 0o777 == 0o600
+    assert int(umask_output.read_text().strip(), 8) == 0o22
+
+
 @pytest.mark.parametrize(
     "gate",
     ["relative/start-gate", "/tmp/start-gate", "/mnt/shared/../escape"],
@@ -239,13 +317,88 @@ def test_launch_secret_contains_each_credential_and_both_roles_reference_it():
             "containers"
         ][0]
         references = {
-            item["valueFrom"]["secretKeyRef"]["key"]: item["valueFrom"][
-                "secretKeyRef"
-            ]["name"]
+            item["name"]: item["valueFrom"]["secretKeyRef"]
             for item in container["env"]
         }
         assert references == {
-            key: "senpai-launch-secrets-test-track" for key in expected_values
+            "GITHUB_TOKEN": {
+                "name": "senpai-launch-secrets-test-track",
+                "key": "github-token",
+            },
+            "OPENAI_API_KEY": {
+                "name": "senpai-launch-secrets-test-track",
+                "key": "openai-api-key",
+            },
+            "EXA_API_KEY": {
+                "name": "senpai-launch-secrets-test-track",
+                "key": "exa-api-key",
+            },
+            "WANDB_API_KEY": {
+                "name": "senpai-launch-secrets-test-track",
+                "key": "wandb-api-key",
+            },
+        }
+
+
+def test_secret_env_refs_preserve_environment_names_and_secret_keys():
+    fragment = launch.secret_env_refs(
+        [("OPENAI_API_KEY", "openai-api-key"), ("HF_TOKEN", "HF_TOKEN")],
+        "launch-secret",
+    )
+
+    assert yaml.safe_load("env:\n" + fragment) == {
+        "env": [
+            {
+                "name": "OPENAI_API_KEY",
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": "launch-secret",
+                        "key": "openai-api-key",
+                    }
+                },
+            },
+            {
+                "name": "HF_TOKEN",
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": "launch-secret",
+                        "key": "HF_TOKEN",
+                    }
+                },
+            },
+        ]
+    }
+    assert launch.secret_env_refs([], "launch-secret") == ""
+
+
+def test_custom_secrets_are_shared_by_both_roles_without_entering_configmaps():
+    names = ["HF_TOKEN", "DATASET_LICENSE_KEY"]
+    args = launch_args(custom_secret_env_names=names)
+
+    for role in ("advisor", "student"):
+        configmap, deployment, secret = render_role(role, args)
+        config = yaml.safe_load(configmap)["data"]
+        secret_data = yaml.safe_load(secret)["data"]
+        environment = yaml.safe_load(deployment)["spec"]["template"]["spec"][
+            "containers"
+        ][0]["env"]
+        references = {
+            item["name"]: item["valueFrom"]["secretKeyRef"]
+            for item in environment
+            if item["name"] in names
+        }
+
+        assert config["SENPAI_CUSTOM_SECRET_ENV_NAMES"] == ",".join(names)
+        assert all(name not in config for name in names)
+        assert {
+            name: base64.b64decode(secret_data[name]).decode() for name in names
+        } == {name: f"{name.lower()}-secret" for name in names}
+        assert references == {
+            name: {
+                "name": "senpai-launch-secrets-test-track",
+                "key": name,
+            }
+            for name in names
         }
 
 
@@ -261,6 +414,7 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         fast_reasoning_effort="none",
         frontier_model="openai/gpt-5.6-sol",
         frontier_reasoning_effort="max",
+        compaction_trigger_tokens=180_000,
     )
 
     advisor_config, _deployment, _secret = render_role("advisor", args)
@@ -279,6 +433,14 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         assert config["SENPAI_OPENHANDS_FAST_REASONING_EFFORT"] == "none"
         assert config["SENPAI_OPENHANDS_FRONTIER_MODEL"] == args.frontier_model
         assert config["SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT"] == "max"
+        assert config["SENPAI_COMPACTION_TRIGGER_TOKENS"] == "180000"
+
+
+def test_launch_rejects_a_compaction_trigger_below_provider_minimum():
+    args = launch_args(compaction_trigger_tokens=49_999)
+
+    with pytest.raises(SystemExit, match="must be at least 50000"):
+        launch.validate_model_config(args)
 
 
 def test_openai_ultra_launch_value_is_rejected():
@@ -289,6 +451,23 @@ def test_openai_ultra_launch_value_is_rejected():
 
     with pytest.raises(SystemExit, match="must be one of"):
         launch.validate_model_config(args)
+
+
+def test_launch_accepts_anthropic_max_for_every_model_profile():
+    args = launch_args(
+        advisor_model="anthropic/claude-fable-5",
+        advisor_reasoning_effort="max",
+        student_model="anthropic/claude-opus-5",
+        student_reasoning_effort="max",
+        smart_model="anthropic/claude-opus-5",
+        smart_reasoning_effort="max",
+        fast_model="anthropic/claude-sonnet-5",
+        fast_reasoning_effort="max",
+        frontier_model="anthropic/claude-fable-5",
+        frontier_reasoning_effort="max",
+    )
+
+    launch.validate_model_config(args)
 
 
 def test_wandb_gateway_is_rendered_for_every_role():
@@ -411,6 +590,7 @@ def test_pod_template_hash_covers_complete_config_and_secret_content():
         "wandb",
         anthropic_api_key="anthropic",
         openai_api_key="openai",
+        custom_secrets={},
     )
 
     first = launch_helpers.pod_template_hash(config, secret)

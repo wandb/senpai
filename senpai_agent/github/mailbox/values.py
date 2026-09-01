@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 
+from senpai_agent.github.human_messages import is_trusted_human_author
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.models import (
     AssignmentRecord,
@@ -15,8 +16,6 @@ from senpai_agent.models import (
     parse_assignment_feedback_markers,
 )
 
-
-TRUSTED_HUMAN_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 FEEDBACK_KEY_PREFIX = "student_pr_feedback:"
 FEEDBACK_EXCERPT_BYTES = 4_000
 DEFAULT_FEEDBACK_BATCH_EVENTS = 8
@@ -158,9 +157,9 @@ def trusted_feedback(
         revision_id=assignment.revision_id,
     )
     same_actor = str(user.get("login") or "").casefold() == actor.casefold()
-    trusted_human = (
-        user.get("type") == "User"
-        and item.get("author_association") in TRUSTED_HUMAN_ASSOCIATIONS
+    trusted_human = is_trusted_human_author(
+        author_type=str(user.get("type") or ""),
+        association=str(item.get("author_association") or ""),
     )
     if not same_actor:
         return (current, body) if trusted_human else None

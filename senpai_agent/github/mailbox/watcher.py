@@ -9,11 +9,9 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
-from senpai_agent.advisor import AdvisorEvent, AdvisorEventStore
 from senpai_agent.github.http import GitHubReadError
-from senpai_agent.mailbox import ControllerEvent
-
-from .core import GitHubMailbox
+from senpai_agent.local_events import LocalEvent, LocalEventStore
+from senpai_agent.mailbox import ControllerEvent, Mailbox
 
 
 class ActiveGitHubWatcher:
@@ -21,18 +19,18 @@ class ActiveGitHubWatcher:
 
     def __init__(
         self,
-        mailbox: GitHubMailbox,
+        mailbox: Mailbox,
         store_path: Path,
         *,
         known_keys: frozenset[str],
-        poll_interval_seconds: float = 30,
-        map_event: Callable[[ControllerEvent], AdvisorEvent | None] | None = None,
+        poll_interval_seconds: float = 75,
+        map_event: Callable[[ControllerEvent], LocalEvent | None] | None = None,
     ):
         self.mailbox = mailbox
         self.store_path = store_path
         self.known_keys = set(known_keys)
         self.poll_interval_seconds = poll_interval_seconds
-        self.map_event = map_event or _advisor_event
+        self.map_event = map_event or _local_event
         self.enqueued_keys: set[str] = set()
         self.stop = threading.Event()
         self.error: BaseException | None = None
@@ -43,7 +41,7 @@ class ActiveGitHubWatcher:
 
     def _run(self) -> None:
         try:
-            with AdvisorEventStore(self.store_path) as store:
+            with LocalEventStore(self.store_path) as store:
                 while not self.stop.wait(self.poll_interval_seconds):
                     try:
                         events = self.mailbox.poll()
@@ -57,6 +55,10 @@ class ActiveGitHubWatcher:
                         continue
                     current = {event.dedupe_key for event in events}
                     for event in events:
+                        # The foreground poll reconciles availability before the
+                        # next turn; staging it here would preserve stale state.
+                        if event.kind == "student_available_for_assignment":
+                            continue
                         if event.dedupe_key in self.known_keys:
                             continue
                         local_event = self.map_event(event)
@@ -90,8 +92,8 @@ class ActiveGitHubWatcher:
             )
 
 
-def _advisor_event(event: ControllerEvent) -> AdvisorEvent:
-    return AdvisorEvent(
+def _local_event(event: ControllerEvent) -> LocalEvent:
+    return LocalEvent(
         kind=event.kind,
         dedupe_key=event.dedupe_key,
         payload=event.payload,

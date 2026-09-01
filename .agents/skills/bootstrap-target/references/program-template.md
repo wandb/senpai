@@ -90,9 +90,9 @@ cd "$PROBLEM_DIR" && <train command> \
   --wandb_group "<hypothesis-or-pr>"
 ```
 
-Explain debug, screening, and confirmation run lengths. Resource ceilings such
-as `SENPAI_TIMEOUT_MINUTES`, `SENPAI_MAX_EPOCHS`, and GPU counts are hard
-limits, not instructions to run until exhaustion.
+Explain debug, screening, and confirmation run lengths. Resource ceilings in
+this contract, such as GPU counts, memory limits, or target-specific time and
+step budgets, are hard limits, not instructions to run until exhaustion.
 
 ## W&B Metrics And Telemetry
 

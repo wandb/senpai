@@ -7,7 +7,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NoReturn
 
 from openhands.sdk.conversation import ConversationExecutionStatus
 from openhands.sdk.tool import ToolAnnotations, ToolExecutor
@@ -22,7 +22,11 @@ from senpai_agent.github.workflow import (
 )
 from senpai_agent.models import ExperimentResult
 
-from .contracts import GitHubMutationObservation, SubmitExperimentResultAction
+from .contracts import (
+    GitHubMutationObservation,
+    PostAssignmentCommentAction,
+    SubmitExperimentResultAction,
+)
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation import LocalConversation
@@ -113,31 +117,33 @@ class GitHubToolRuntime:
     def require_current_student(self, student: str) -> None:
         """Bind a submitted result to this student runtime."""
 
-        if self.role != "student" or not self.student_name:
-            raise RuntimeError("submit_experiment_result requires a student name")
-        if student != self.student_name:
+        current = self.current_student()
+        if student != current:
             raise PermissionError(
                 f"result student {student!r} does not match this runtime's "
-                f"student {self.student_name!r}"
+                f"student {current!r}"
             )
+
+    def current_student(self) -> str:
+        """Return the configured identity for a student-owned mutation."""
+
+        if self.role != "student" or not self.student_name:
+            raise RuntimeError("student GitHub tools require a student name")
+        return self.student_name
 
     def human_issue_audience(self) -> set[str]:
         """Return the only Issue audience labels this role may answer."""
 
         if self.role == "advisor":
             return {"team", self.assignment_base_branch()}
-        if not self.student_name:
-            raise RuntimeError("student GitHub tools require a student name")
-        return {"team", f"student:{self.student_name}"}
+        return {"team", f"student:{self.current_student()}"}
 
     def human_issue_responder(self) -> str:
         """Return the role or pod identity used to key one Issue reply."""
 
         if self.role == "advisor":
             return "advisor"
-        if not self.student_name:
-            raise RuntimeError("student GitHub tools require a student name")
-        return self.student_name
+        return self.current_student()
 
 
 class SubmitExperimentResultExecutor(
@@ -182,14 +188,7 @@ class SubmitExperimentResultExecutor(
                 )
                 result = self._submit_after_push(number, action.result)
             except StaleAssignmentRevisionError as error:
-                if conversation is not None:
-                    conversation.state.execution_status = (
-                        ConversationExecutionStatus.FINISHED
-                    )
-                raise ValueError(
-                    f"{error} Ending this stale turn so the controller can resume "
-                    "the current assignment revision."
-                ) from error
+                _finish_stale_assignment_turn(error, conversation)
             return GitHubMutationObservation.from_result(result)
 
     def _submit_after_push(
@@ -211,6 +210,47 @@ class SubmitExperimentResultExecutor(
             expected_head_sha=result.commit_sha,
             result=result,
         )
+
+
+class PostAssignmentCommentExecutor(
+    ToolExecutor[PostAssignmentCommentAction, GitHubMutationObservation]
+):
+    """Post one durable interim message to the student's current assignment."""
+
+    def __init__(self, runtime: GitHubToolRuntime):
+        self.runtime = runtime
+
+    def __call__(
+        self,
+        action: PostAssignmentCommentAction,
+        conversation: LocalConversation | None = None,
+    ) -> GitHubMutationObservation:
+        version = action.assignment
+        try:
+            result = self.runtime.workflow.post_assignment_comment(
+                version.pr_number,
+                assignment_id=version.assignment_id,
+                revision_id=version.revision_id,
+                expected_head_sha=version.expected_pr_head_sha,
+                student=self.runtime.current_student(),
+                comment_id=action.comment_id,
+                comment=action.comment,
+            )
+        except StaleAssignmentRevisionError as error:
+            _finish_stale_assignment_turn(error, conversation)
+        return GitHubMutationObservation.from_result(result)
+
+
+def _finish_stale_assignment_turn(
+    error: StaleAssignmentRevisionError,
+    conversation: LocalConversation | None,
+) -> NoReturn:
+    if conversation is not None:
+        conversation.state.execution_status = ConversationExecutionStatus.FINISHED
+    raise ValueError(
+        f"{error} Ending this stale turn so the controller can resume "
+        "the current assignment revision."
+    ) from error
 
 
 def configured_student_names(value: Sequence[str] | str | None) -> frozenset[str]:

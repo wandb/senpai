@@ -10,7 +10,6 @@ from senpai_agent.github.workflow.responses import MutationResult
 from senpai_agent.github.workflow.text import (
     marker_body,
     replace_assignment_marker,
-    role_prefixed_comment,
 )
 from senpai_agent.github.workflow.validation import (
     require_active_assignment_routing,
@@ -207,14 +206,12 @@ class RevisionMixin:
         feedback_id: str,
         comment: str,
     ) -> MutationResult:
-        before, assignment = self._assigned_pull_at_head(
+        _before, assignment = self._routed_assignment_at_head(
             number,
             assignment_id=assignment_id,
+            revision_id=revision_id,
             expected_head_sha=expected_head_sha,
         )
-        require_open(before)
-        require_current_revision(assignment, revision_id)
-        require_active_assignment_routing(before, assignment)
         feedback_id = feedback_id.strip()
         body = comment.strip()
         if not feedback_id or not body:
@@ -230,30 +227,21 @@ class RevisionMixin:
             )
         )
         rendered_comment = marker_body(marker, body)
-        existing = self._marker_comments(number, marker)
-        if len(existing) > 1:
-            raise ReconciliationError(
-                f"GitHub contains multiple comments for marker {marker!r}"
-            )
-        desired_body = role_prefixed_comment(rendered_comment, self._role)
-        if existing and role_prefixed_comment(existing[0].body, self._role) != desired_body:
-            raise WorkflowPreconditionError(
-                "feedback_id already identifies different guidance; "
-                "use a new feedback_id"
-            )
         changed, verified = self._upsert_marker_comment(
             number,
             marker=marker,
             body=rendered_comment,
+            conflict_message=(
+                "feedback_id already identifies different guidance; "
+                "use a new feedback_id"
+            ),
         )
-        after, current_assignment = self._assigned_pull_at_head(
+        after, _current_assignment = self._routed_assignment_at_head(
             number,
             assignment_id=assignment_id,
+            revision_id=revision_id,
             expected_head_sha=expected_head_sha,
         )
-        require_open(after)
-        require_current_revision(current_assignment, revision_id)
-        require_active_assignment_routing(after, current_assignment)
         return MutationResult(
             changed=changed,
             resource_url=verified.url,

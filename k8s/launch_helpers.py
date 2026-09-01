@@ -18,8 +18,10 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Sequence
 from pathlib import Path
 
+from dotenv import dotenv_values
 STUDENT_NAMES = [
     "frieren",
     "fern",
@@ -408,32 +410,49 @@ LAUNCH_CREDENTIAL_ENV_NAMES = (
     "EXA_API_KEY",
     "WANDB_API_KEY",
 )
-
-
-def _dotenv_values(path: Path) -> dict[str, str]:
-    """Read KEY=VAL lines from path."""
-    values = {}
+def _dotenv_values(path: Path) -> dict[str, str | None]:
+    """Read literal values from a dotenv file without mutating the environment."""
     if not path.exists():
-        return values
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        v = v.strip().strip('"').strip("'")
-        values[k.strip()] = v
-    return values
+        return {}
+    return dict(dotenv_values(path, interpolate=False))
 
 
-def _subprocess_env_without_launch_credentials() -> dict[str, str]:
-    return {k: v for k, v in os.environ.items() if k not in LAUNCH_CREDENTIAL_ENV_NAMES}
+def resolve_custom_secrets(
+    dotenv_path: Path, names: Sequence[str]
+) -> dict[str, str]:
+    """Resolve explicitly allowlisted secrets from the shell, then .env."""
+    dotenv = _dotenv_values(dotenv_path)
+    resolved = {}
+    missing = []
+    for name in names:
+        value = os.environ.get(name)
+        if value is None or not value.strip():
+            value = dotenv.get(name)
+        if value is None or not value.strip():
+            missing.append(name)
+        else:
+            resolved[name] = value
+    if missing:
+        joined = ", ".join(missing)
+        sys.exit(
+            "ERROR: missing or blank custom secrets: "
+            f"{joined}. Set them in your shell or repository-root .env."
+        )
+    return resolved
+
+
+def _subprocess_env_without_launch_credentials(
+    custom_secret_env_names: Sequence[str],
+) -> dict[str, str]:
+    excluded = {*LAUNCH_CREDENTIAL_ENV_NAMES, *custom_secret_env_names}
+    return {k: v for k, v in os.environ.items() if k not in excluded}
 
 
 def resolve_required_secret(dotenv_path: Path, env_name: str, label: str) -> str:
     """Resolve a required secret from the shell env, then .env."""
     value = os.environ.get(env_name, "").strip()
     if not value:
-        value = _dotenv_values(dotenv_path).get(env_name, "").strip()
+        value = (_dotenv_values(dotenv_path).get(env_name) or "").strip()
     if value:
         return value
     sys.exit(
@@ -441,11 +460,13 @@ def resolve_required_secret(dotenv_path: Path, env_name: str, label: str) -> str
     )
 
 
-def resolve_github_token(dotenv_path: Path) -> str:
+def resolve_github_token(
+    dotenv_path: Path, custom_secret_env_names: Sequence[str]
+) -> str:
     """Resolve the GitHub token: $GITHUB_TOKEN → .env → `gh auth token` → hard error."""
     tok = os.environ.get("GITHUB_TOKEN", "").strip()
     if not tok:
-        tok = _dotenv_values(dotenv_path).get("GITHUB_TOKEN", "").strip()
+        tok = (_dotenv_values(dotenv_path).get("GITHUB_TOKEN") or "").strip()
     if tok:
         return tok
     try:
@@ -453,7 +474,7 @@ def resolve_github_token(dotenv_path: Path) -> str:
             ["gh", "auth", "token"],
             capture_output=True,
             text=True,
-            env=_subprocess_env_without_launch_credentials(),
+            env=_subprocess_env_without_launch_credentials(custom_secret_env_names),
             check=False,
         )
         if res.returncode == 0 and res.stdout.strip():
@@ -496,6 +517,7 @@ def render_launch_secret(
     *,
     anthropic_api_key: str | None = None,
     openai_api_key: str | None = None,
+    custom_secrets: dict[str, str],
 ) -> str:
     """Per-launch k8s Secret holding API credentials used by advisor/student pods."""
     credentials = {
@@ -507,6 +529,7 @@ def render_launch_secret(
         credentials["anthropic-api-key"] = anthropic_api_key
     if openai_api_key is not None:
         credentials["openai-api-key"] = openai_api_key
+    credentials.update(custom_secrets)
     encoded = {
         name: base64.b64encode(value.encode()).decode()
         for name, value in credentials.items()

@@ -19,6 +19,7 @@ from senpai_agent.openhands_runner import (
     without_eager_skill_discovery,
 )
 from senpai_agent.program_context import ProgramSystemPrompt
+from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV
 from senpai_agent.system_instructions import SenpaiSystemInstructions
 from openhands_support import TEST_LAUNCH_CONTEXT, runtime_config, runtime_env
 from test_agent_markdown import HTML_HEADER, PLAIN_HEADER
@@ -96,15 +97,46 @@ def test_main_agent_context_appends_program_after_harness_and_role():
 
 def test_student_charter_requires_typed_workflow_and_training_tools():
     instructions = (ROOT / "system_instructions" / "STUDENT.md").read_text()
+    submission_skill = (
+        ROOT
+        / "plugins"
+        / "senpai"
+        / "skills"
+        / "submit-experiment-results"
+        / "SKILL.md"
+    ).read_text()
 
-    assert "When `post_assignment_comment` is present" in instructions
+    assert "Use `post_assignment_comment`" in instructions
+    assert "When `post_assignment_comment` is present" not in instructions
     assert "ask the advisor a meaningful interim question" in instructions
+    assert "fresh `comment_id`" not in instructions
+    assert "fresh `comment_id`" in submission_skill
+    assert "Keep the PR concise" in submission_skill
     assert "Use `submit_experiment_result` for the terminal result" in instructions
     assert "must use `run_training`" in instructions
     assert "Never launch training through the terminal" in instructions
     assert "`monitor_training`" in instructions
     assert "`get_training_status`" in instructions
     assert "`cancel_training`" in instructions
+
+
+def test_advisor_charter_explains_student_feedback_without_tool_protocol():
+    instructions = (ROOT / "system_instructions" / "ADVISOR.md").read_text()
+
+    assert "Treat student questions and interim feedback as current evidence" in instructions
+    assert "refresh the complete experiment context" in instructions
+    assert "distinguish a clarification or hold from a revised experiment" in instructions
+    for operational_detail in (
+        "student_assignment_comment",
+        "get_prs",
+        "send_assignment_feedback",
+    ):
+        assert operational_detail not in instructions
+
+    harness = (ROOT / "system_instructions" / "SENPAI-HARNESS.md").read_text()
+    assert "A `student_assignment_comment` event is interim feedback" in harness
+    assert "may refer to an earlier assignment revision" in harness
+    assert "respond on the current revision" in harness
 
 
 def test_project_instruction_files_are_not_loaded_but_explicit_skills_are(
@@ -179,7 +211,7 @@ def test_developer_only_project_skills_are_not_exposed_to_senpai(tmp_path: Path)
     }
 
 
-def test_resolved_config_separates_runtime_credentials_from_command_secrets(
+def test_resolved_config_separates_runtime_credentials_from_conversation_secrets(
     tmp_path: Path,
 ):
     env = runtime_env(tmp_path)
@@ -188,7 +220,8 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
             "GH_TOKEN": "secondary-github-key",
             "WANDB_API_KEY": "wandb-key",
             "EXA_API_KEY": "exa-key",
-            "SENPAI_TIMEOUT_MINUTES": "0.5",
+            CUSTOM_SECRET_ENV_NAMES_ENV: "PRIVATE_AUTH",
+            "PRIVATE_AUTH": "private-key",
         }
     )
 
@@ -199,20 +232,41 @@ def test_resolved_config_separates_runtime_credentials_from_command_secrets(
     assert config.fast_api_key.get_secret_value() == "openai-key"
     assert config.frontier_api_key.get_secret_value() == "openai-key"
     assert config.github_token.get_secret_value() == "github-key"
-    assert config.command_secrets == {
+    assert config.conversation_secrets == {
         "WANDB_API_KEY": "wandb-key",
         "EXA_API_KEY": "exa-key",
+        "PRIVATE_AUTH": "private-key",
     }
-    assert "ANTHROPIC_API_KEY" not in config.command_secrets
-    assert "OPENAI_API_KEY" not in config.command_secrets
-    assert config.training_max_timeout_seconds == 30
-    assert config.llm_timeout_seconds == 900
-    assert config.llm_num_retries == 1
+    assert "ANTHROPIC_API_KEY" not in config.conversation_secrets
+    assert "OPENAI_API_KEY" not in config.conversation_secrets
+    assert config.timeout_seconds == 7200
+    assert config.llm_timeout_seconds == 5400
+    assert config.llm_num_retries == 5
+    assert config.compaction_trigger_tokens == 200_000
 
     delegated = runner.delegation_config(config)
     assert delegated.smart_api_key == "openai-key"
     assert delegated.fast_api_key == "openai-key"
     assert delegated.frontier_api_key == "openai-key"
+
+
+def test_training_limits_are_not_read_from_environment(tmp_path: Path):
+    env = runtime_env(tmp_path)
+    env["SENPAI_TIMEOUT_MINUTES"] = "not-a-number"
+    env["SENPAI_MAX_EPOCHS"] = "not-an-integer"
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert not hasattr(config, "training_max_timeout_seconds")
+
+
+def test_configured_custom_secret_requires_a_nonblank_value(tmp_path: Path):
+    env = runtime_env(tmp_path)
+    env[CUSTOM_SECRET_ENV_NAMES_ENV] = "PRIVATE_AUTH"
+    env["PRIVATE_AUTH"] = "  "
+
+    with pytest.raises(RuntimeError, match="custom secret PRIVATE_AUTH is required"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
 def test_resolved_config_discovers_one_level_program_from_target_workspace(
@@ -298,7 +352,6 @@ def test_inbox_recovery_budget_is_explicit_and_configurable(tmp_path):
     env.update(
         {
             "SENPAI_INBOX_MAX_STALLED_ATTEMPTS": "4",
-            "SENPAI_INBOX_MAX_TURN_AGE_SECONDS": "7200",
             "SENPAI_INBOX_MAX_RECOVERY_GENERATIONS": "2",
         }
     )
@@ -306,19 +359,47 @@ def test_inbox_recovery_budget_is_explicit_and_configurable(tmp_path):
     configured = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
     assert default.inbox_max_stalled_attempts == 3
-    assert default.inbox_max_turn_age_seconds == 10_800
     assert default.inbox_max_recovery_generations == 1
     assert configured.inbox_max_stalled_attempts == 4
-    assert configured.inbox_max_turn_age_seconds == 7200
     assert configured.inbox_max_recovery_generations == 2
+
+
+def test_compaction_trigger_tokens_are_explicit_and_configurable(tmp_path):
+    default = resolve_config(
+        parse_runner_args(["--max-turns", "1"]),
+        runtime_env(tmp_path),
+    )
+    configured = resolve_config(
+        parse_runner_args(
+            ["--max-turns", "1", "--compaction-trigger-tokens", "180000"]
+        ),
+        runtime_env(tmp_path),
+    )
+
+    assert default.compaction_trigger_tokens == 200_000
+    assert configured.compaction_trigger_tokens == 180_000
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [("not-a-number", "must be an integer"), ("49999", "at least 50000")],
+)
+def test_compaction_trigger_tokens_reject_invalid_environment_values(
+    tmp_path,
+    value,
+    message,
+):
+    env = runtime_env(tmp_path)
+    env["SENPAI_COMPACTION_TRIGGER_TOKENS"] = value
+
+    with pytest.raises(RuntimeError, match=message):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
 @pytest.mark.parametrize(
     ("key", "value"),
     [
         ("SENPAI_INBOX_MAX_STALLED_ATTEMPTS", "0"),
-        ("SENPAI_INBOX_MAX_TURN_AGE_SECONDS", "never"),
-        ("SENPAI_INBOX_MAX_TURN_AGE_SECONDS", "nan"),
         ("SENPAI_INBOX_MAX_RECOVERY_GENERATIONS", "-1"),
     ],
 )
@@ -478,6 +559,41 @@ def test_all_model_profiles_accept_independent_cli_model_and_effort_settings(
     )
 
 
+def test_anthropic_max_is_accepted_across_model_profiles(tmp_path: Path):
+    env = runtime_env(tmp_path)
+    env.update(
+        {
+            "SENPAI_OPENHANDS_MODEL": "anthropic/claude-fable-5",
+            "SENPAI_OPENHANDS_REASONING_EFFORT": "max",
+            "SENPAI_OPENHANDS_SMART_MODEL": "anthropic/claude-opus-5",
+            "SENPAI_OPENHANDS_SMART_REASONING_EFFORT": "max",
+            "SENPAI_OPENHANDS_FAST_MODEL": "anthropic/claude-sonnet-5",
+            "SENPAI_OPENHANDS_FAST_REASONING_EFFORT": "max",
+            "SENPAI_OPENHANDS_FRONTIER_MODEL": "anthropic/claude-fable-5",
+            "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": "max",
+        }
+    )
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert (config.model, config.reasoning_effort) == (
+        "anthropic/claude-fable-5",
+        "max",
+    )
+    assert (config.smart_model, config.smart_reasoning_effort) == (
+        "anthropic/claude-opus-5",
+        "max",
+    )
+    assert (config.fast_model, config.fast_reasoning_effort) == (
+        "anthropic/claude-sonnet-5",
+        "max",
+    )
+    assert (config.frontier_model, config.frontier_reasoning_effort) == (
+        "anthropic/claude-fable-5",
+        "max",
+    )
+
+
 @pytest.mark.parametrize(
     ("updates", "message"),
     [
@@ -488,10 +604,6 @@ def test_all_model_profiles_accept_independent_cli_model_and_effort_settings(
                 "SENPAI_OPENHANDS_REASONING_EFFORT": "ultra",
             },
             "unsupported",
-        ),
-        (
-            {"SENPAI_OPENHANDS_FRONTIER_MODEL": "anthropic/claude-opus-4-8"},
-            "unsupported for",
         ),
     ],
 )
@@ -527,6 +639,23 @@ def test_explicit_api_key_env_preserves_custom_provider_support(tmp_path: Path):
     assert config.api_key.get_secret_value() == "custom-key"
     assert config.smart_api_key.get_secret_value() == "custom-key"
     assert config.fast_api_key.get_secret_value() == "custom-key"
+
+
+def test_custom_model_credential_cannot_also_be_a_custom_secret(tmp_path: Path):
+    env = runtime_env(tmp_path)
+    env.update(
+        {
+            "PRIVATE_AUTH": "custom-key",
+            CUSTOM_SECRET_ENV_NAMES_ENV: "PRIVATE_AUTH",
+            "SENPAI_OPENHANDS_MODEL": "custom/main",
+            "SENPAI_OPENHANDS_API_KEY_ENV": "PRIVATE_AUTH",
+            "SENPAI_OPENHANDS_SMART_MODEL": "custom/smart",
+            "SENPAI_OPENHANDS_FAST_MODEL": "custom/fast",
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="cannot also be custom secrets"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
 def test_custom_main_provider_requires_the_existing_api_key_env_override(

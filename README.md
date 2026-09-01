@@ -70,6 +70,20 @@ WANDB_API_KEY=
 | `EXA_API_KEY` | General-web and research-publication search. |
 | `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. |
 
+To add a credential, put its value in `.env` and list its name in the launch
+configuration:
+
+```dotenv
+HF_TOKEN=abc123
+```
+
+```yaml
+custom_secret_env_names: [HF_TOKEN]
+```
+
+The credential is available to every advisor, student, and delegated child;
+its value is redacted from tool output and traces.
+
 `k8s/launch.py` reads shell environment variables first and then the repository-root `.env`; only the GitHub token also falls back to `gh auth token`. Direct Docker or host execution must export or pass credentials explicitly.
 
 The launcher places credentials in a per-launch Kubernetes Secret. During bootstrap, the GitHub write token is removed from the process environment and handed to the controller through a one-use channel; it is not exposed to the model or subagents.
@@ -108,6 +122,8 @@ program_path: ""  # auto-discover, or set e.g. senpai/program.md
 wandb_entity: your-team
 wandb_project: your-project
 
+custom_secret_env_names: [HF_TOKEN]  # values come from .env
+
 advisor_model: openai/gpt-5.6-sol
 advisor_reasoning_effort: xhigh
 student_model: openai/gpt-5.6-sol
@@ -119,6 +135,7 @@ fast_model: openai/gpt-5.6-luna
 fast_reasoning_effort: high
 frontier_model: openai/gpt-5.6-sol
 frontier_reasoning_effort: max
+compaction_trigger_tokens: 200000
 
 pvc_claim_name: your-existing-pvc
 pvc_mount_path: /mnt/data
@@ -132,7 +149,14 @@ timeout_minutes: 30
 max_epochs: 50
 ```
 
-OpenHands uses LiteLLM, so LLM provider names are required as prefixes. 
+OpenHands uses LiteLLM, so LLM provider names are required as prefixes. For
+example, configure Claude Fable 5 as `anthropic/claude-fable-5`. Anthropic
+`reasoning_effort: max` on Claude Fable 5, Opus 5, and Sonnet 5 stays
+provider-native and is sent as `output_config.effort: max`; it does not enable
+OpenAI Pro mode.
+
+`compaction_trigger_tokens` sets the compaction limit. OpenAI and Anthropic
+apply it for their models; OpenHands handles compaction for other providers.
 
 If using W&B Inference use `wandb/` provider as the provider. For example `wandb/zai-org/GLM-5.2`, SENPAI
 uses `WANDB_API_KEY` for auth.
@@ -206,16 +230,16 @@ flowchart LR
 
 1. The advisor creates a falsifiable assignment with the exact required research-base SHA, baseline metrics, expected mechanism, implementation scope, and stopping rules.
 2. `create_assignment` creates the student branch and draft PR, embeds a typed assignment record, and applies the routing labels.
-3. The assigned student receives one OpenHands conversation for that assignment revision. New PR comments and reviews are queued durably even while a turn is active, then delivered in the next bounded turn.
-4. The student commits the exact implementation, launches supervised training, and records every referenced run in W&B.
+3. The assigned student receives one OpenHands conversation for that assignment revision. New PR comments and reviews steer it after the current agent step.
+4. The student commits the exact implementation, launches supervised training, records every referenced run in W&B, and uses `post_assignment_comment` for material progress, questions, blockers, or replies. Each typed comment wakes the advisor without changing the PR head, draft state, or labels.
 5. The student calls `submit_experiment_result`; the tool validates and publishes the branch before changing the PR to `status:review`.
 6. The advisor compares the evidence, then uses the corresponding operation-specific tool to merge a reproducible winner, close a useful negative result, request a new revision, or send non-revision feedback.
 
 The structured result records its terminal status, exact result commit, W&B run IDs and URLs, bounded conclusion, and baseline/candidate metric comparison when available. Once published for an assignment revision and head, that evidence is immutable: exact duplicate publication is an idempotent replay, while changed evidence requires a new commit or revision. Non-revision feedback continues the same student conversation; a revision request intentionally creates a fresh revision identity and conversation.
 
-`status:wip` owns a student compute slot; `status:review` does not. The advisor can therefore review one result while that student starts another experiment. Sibling assignment mutations within one worker are serialized end to end, including advisor-base publication and student preflight, push, and result publication. Across advisor and student workers, exact assignment, revision, head, and branch-lease preconditions detect stale work; if a revision wins during result publication, SENPAI restores the current revision's WIP routing before returning the stale-result error.
+A student cannot receive another assignment while an open assignment has `status:wip` or `status:review`. The student becomes available after the advisor merges or closes the PR. Sibling assignment mutations within one worker are serialized end to end, including advisor-base publication and student preflight, push, and result publication. Across advisor and student workers, exact assignment, revision, head, and branch-lease preconditions detect stale work; if a revision wins during result publication, SENPAI restores the current revision's WIP routing before returning the stale-result error.
 
-Trusted collaborator comments, submitted reviews, and inline review comments are delivered automatically to the relevant student; feedback from untrusted authors and unrecognized bots is ignored. `get_prs` can still retrieve the complete discussion explicitly. If the configured research base changes while an experiment is running, SENPAI emits `research_base_changed` with the assignment's `required_base_sha` and the live `current_base_sha` without cancelling the assignment. When reviewing its terminal result, the advisor either requests a revision on the current base or records why that exact result remains valid with `accept_result_on_current_base`; `merge_experiment` still verifies the live SHA immediately before merging.
+PR comments from verified GitHub owners, members, and collaborators steer the advisor and reach the student. Submitted reviews and inline comments also reach the student. The system ignores untrusted authors, unrecognized bots, and advisor protocol comments. `get_prs` can still retrieve the complete discussion explicitly. If the configured research base changes while an experiment is running, SENPAI emits `research_base_changed` with the assignment's `required_base_sha` and the live `current_base_sha` without cancelling the assignment. When reviewing its terminal result, the advisor either requests a revision on the current base or records why that exact result remains valid with `accept_result_on_current_base`; `merge_experiment` still verifies the live SHA immediately before merging.
 
 Before each assignment or PR-feedback turn, the student controller authenticates
 and hydrates the exact assignment head and recorded baseline into
@@ -259,9 +283,13 @@ immediately. A timed-out wait returns current state and suggests non-blocking
 next steps; it does not cancel the children. Every child runs in a fresh
 OpenHands conversation and separate process group.
 
+Every task must set `model` explicitly to `fast`, `smart`, or `frontier`; there
+is no implicit model tier. Read the `delegate-subagents` skill before choosing
+the tier, agent specialization, and context policy.
+
 | Agent | Best for | Recommended tier |
 |---|---|---|
-| [General Purpose](.agents/agents/general-purpose.md) | Bounded work combining terminal investigation, code editing, task tracking, tests, and one controlled level of leaf delegation. | `smart` for ordinary implementation or review; `frontier` for the hardest generalist work. |
+| [General Purpose](.agents/agents/general-purpose.md) | Bounded work combining terminal investigation, code editing, task tracking, tests, and one controlled level of leaf delegation. | `smart` for ordinary implementation or review; `frontier` for the high-leverage research and technical judgment defined by the delegation skill. |
 | [Explore](.agents/agents/explore.md) | Read-only search across code, data, experiment artifacts, papers, or durable conversation history. It returns conclusions with paths and line numbers rather than dumping source. | `fast` for mechanical exploration; `smart` when relationships are subtle. |
 | [Search](.agents/agents/search.md) | External research through Exa via the explicit `search_general_web` or `search_research_publications` task form, with primary-source links. | `smart`. |
 | [Bash Runner](.agents/agents/bash-runner.md) | Tests, builds, linters, dependency commands, Git inspection, and noisy CLI work. It returns counts and actionable failures rather than raw logs. | `fast`. |
@@ -270,8 +298,8 @@ The model tier is independent of the agent specialization. With the default
 `agent=general-purpose`, `model=frontier` launches GPT-5.6 Sol at `max`, sent
 to the Responses API with `reasoning.mode: pro`
 with the general-purpose terminal and code-editing toolset. Pair `frontier`
-with `search_general_web` or `search_research_publications` when the hard task
-is external research.
+with `search_general_web` or `search_research_publications` when the
+high-leverage task is external research.
 
 A root spawn batch and its descendants form one delegation tree, which may
 create at most eight children total. A role runs at most eight active tasks
@@ -279,10 +307,11 @@ concurrently across all trees. Root tasks count toward the tree total, so leave
 slots when a General Purpose child needs helpers. Recursion is limited to two
 child edges: the root may spawn any agent, and a depth-one General Purpose
 child may spawn leaf helpers; Explore, Search, Bash Runner, and all depth-two
-children cannot delegate. The tree shares one absolute root-turn deadline, and
-a nested child must await or cancel all of its helpers before returning.
-Individual tasks are capped at ten minutes for `fast`, thirty for `smart`, and
-one hour for `frontier`, shortened when the root deadline is nearer.
+children cannot delegate. Each delegated task has an absolute tier deadline,
+and descendants inherit the earlier ancestor deadline. A nested child must
+await or cancel all of its helpers before returning.
+Individual tasks are capped at twenty minutes for `fast`, one hour for `smart`,
+and two hours for `frontier`, shortened when an ancestor deadline is nearer.
 
 An await call is capped at five minutes and does not cancel unfinished work.
 `agent_status` provides a non-blocking snapshot; with no task IDs, it returns
@@ -314,6 +343,7 @@ are not installed into autoresearch pods.
 |---|---|
 | [Assign an experiment](plugins/senpai/skills/assign-experiment/SKILL.md) | Turn a hypothesis into a typed student branch and draft PR. |
 | [Delegate subagents](plugins/senpai/skills/delegate-subagents/SKILL.md) | Launch and coordinate bounded parallel research, review, and implementation help. |
+| [Maintain research state](plugins/senpai/skills/maintain-research-state/SKILL.md) | Keep advisor-owned research direction, ideas, and dataset knowledge current and publish them safely. |
 | [Submit experiment results](plugins/senpai/skills/submit-experiment-results/SKILL.md) | Commit the tested implementation and publish a structured, evidence-backed result. |
 | [Review an experiment](plugins/senpai/skills/review-experiment/SKILL.md) | Merge a reproducible winner, close a useful negative, or request the missing evidence. |
 | [Handle human Issues](plugins/senpai/skills/check-human-issues/SKILL.md) | Respond to authenticated human-to-agent messages delivered through GitHub Issues. |
@@ -369,13 +399,13 @@ controller
 
 The controller owns cadence, durable events, conversation selection, verified GitHub operations, process supervision, and monitoring. OpenHands owns research judgment, code changes, and evidence interpretation.
 
-- The advisor keeps one conversation UUID under the pod-local `/var/lib/senpai/<tag>/advisor/openhands_state`; it survives controller and container restarts within that pod.
+- The advisor keeps one conversation UUID across restarts, recovery, and quarantine.
 - A student uses one UUID per assignment revision; feedback, monitor events, and child-task results resume that exact conversation.
-- Still-actionable GitHub state is re-delivered on the configured reminder cadence, which defaults to at least ten minutes even when GitHub is polled more frequently. Immediate post-turn polls deliver changed state but not timed reminders, so a successful research-only turn cannot enter a no-sleep reminder loop. `research_base_changed` is keyed by assignment, revision, PR head, and the exact required/current base pair; each identity or base movement requires a new decision. Merge repeats the live-base check immediately before its mutation, while external base writers still require strict up-to-date branch protection or a merge queue for an atomic guarantee.
-- Each model request gets one bounded 15-minute attempt. Foreground terminal calls return control within ten minutes for explicit continuation, the whole turn retains its one-hour hard lease, and two consecutive failed turns exit to the supervisor for a clean worker restart. Restart backoff grows across failed workers to a five-minute ceiling; only a successfully acknowledged turn resets that streak, not process uptime or idle sleep.
-- Every controller prompt, GitHub event, monitor signal, and child result follows one durable `pending -> delivered -> processed` inbox. A provider failure resumes the already-delivered turn without resending it, and a crash after inference performs mailbox acknowledgement without another model call. New events wait behind an unresolved turn in the same conversation; normal drains are FIFO and bounded to 16 events or 64 KiB, while ready conversations take fair turns.
-- A newly completed tool observation renews the consecutive retry budget; timeout, error, interruption, state, and delivery events do not. A persisted final response is reconciled even if cancellation left the SDK status paused. After three no-progress attempts or three total hours, Senpai preserves the raw trace and retries one canonical copy on a fresh branch with the complete initial controller context. If that recovery exhausts the same budget, the turn is durably quarantined, reported as `SENPAI_TURN_QUARANTINED` on every controller start, and excluded from scheduling rather than entering a restart loop. `SENPAI_INBOX_MAX_STALLED_ATTEMPTS`, `SENPAI_INBOX_MAX_TURN_AGE_SECONDS`, and `SENPAI_INBOX_MAX_RECOVERY_GENERATIONS` configure these positive attempt/age limits and the non-negative number of fresh branches.
-- A typed context-window or malformed-history failure uses the same bounded fresh-branch recovery. The reset and its canonical recovery copy are durable across crashes; transient failures remain unacknowledged and retry after at least ten minutes.
+- Still-actionable GitHub state is re-delivered on the configured reminder cadence, which defaults to at least ten minutes even when GitHub is polled more frequently. Human Issue and PR comment versions are retained across failed or interrupted turns and are never delivered again after successful acknowledgement. New trusted text creates a new version; a changed Human Issue title also creates a new version. `research_base_changed` and student assignment comments are also delivered once per exact event version. Immediate post-turn polls deliver changed state but not timed reminders, so a successful research-only turn cannot enter a no-sleep reminder loop. `research_base_changed` is keyed by assignment, revision, PR head, and the exact required/current base pair; each identity or base movement requires a new decision. Merge repeats the live-base check immediately before its mutation, while external base writers still require strict up-to-date branch protection or a merge queue for an atomic guarantee.
+- Each model request has a hard 90-minute ceiling. OpenHands uses five attempts with 8/16/32/64-second waits (`SENPAI_LLM_NUM_RETRIES`). Foreground terminal calls return within ten minutes, delegated children retain hard 20/60/120-minute tier limits, and root turns use a two-hour inactivity lease renewed by OpenHands events. Two consecutive failed turns exit to the supervisor for a clean worker restart. Restart backoff grows across failed workers to a five-minute ceiling; only a successfully acknowledged turn resets that streak, not process uptime or idle sleep.
+- Every input follows one durable `pending -> delivered -> processed` inbox. Authenticated human Issues and PR comments are the interrupt tier: tools get up to 60 seconds to finish before the active run is interrupted and resumed, even when its inbox batch is full. Student assignments and trusted PR feedback share a FIFO queue tier; feedback waits for the next completed agent step without cancelling it. Ordinary events remain FIFO. Turn formation and non-human attachments are bounded to 16 events or 64 KiB; prioritized overflow leads the next turn.
+- A completed tool observation renews the three-attempt no-progress budget; timeout, error, interruption, state, and delivery events do not. Thirty-six inference starts on one branch are a separate restart backstop and do not limit one productive run. Either exhausted budget triggers bounded canonical fresh-branch recovery; exhausting recovery quarantines the turn and reports it on every controller start. Only an authenticated human instruction reopens quarantine and resets both budgets; trusted PR feedback stays pending. A persisted final response is reconciled even if cancellation left the SDK status paused. `SENPAI_INBOX_MAX_STALLED_ATTEMPTS` and `SENPAI_INBOX_MAX_RECOVERY_GENERATIONS` configure recovery.
+- Typed context/history failures use durable bounded fresh-branch recovery. Exhausted transient provider failures preserve the turn and its budgets behind durable 30/60/120/240/300-second cooldowns with jitter and `Retry-After` while mailbox polling continues; permanent provider errors fail immediately.
 - On restart, an incomplete persisted tool action is rejected rather than replayed implicitly. A checked-out assignment branch that was deliberately rebased or extended locally is preserved and surfaced to its existing student conversation for explicit reconciliation.
 - The complete OpenHands event log remains locally searchable. Senpai does not prune conversation directories; operators own retention.
 - Student state may be ephemeral because the branch, PR, typed result, W&B runs, and Weave trace are the durable handoff.
@@ -391,7 +421,7 @@ Useful launch controls:
 
 - `--names frieren,fern` selects stable students; otherwise use `--n_students` and `--student_prefix`.
 - `--gpus_per_student`, `--cpu_per_gpu`, and `--memory_gi_per_gpu` size each student.
-- `--timeout_minutes` and `--max_epochs` are hard per-training limits.
+- `--timeout_minutes` and `--max_epochs` set agent-facing launch-context limits; target training receives neither as a dedicated `SENPAI_*` variable.
 - `--poll_interval_s` and `--poll_jitter_s` control idle GitHub cadence without teaching the model to poll.
 - `--gh_history_scope branch` keeps normal advisor-branch memory, `fresh` creates a shallow ablation checkout, and `repo` exposes full repository history.
 - `--extra_instructions` accepts optional human operator guidance as a Markdown file or literal user context.
@@ -407,7 +437,7 @@ Pod startup and liveness probes read the supervisor lease. Container restarts re
 
 GitHub coordination works across Docker, cloud VMs, or local hosts without private networking. The current repository does not yet provide a Compose or direct-host launcher: the Kubernetes manifests perform the source clone, environment assembly, skill installation, token handoff, mounts, and entrypoint selection.
 
-To build another launcher, reproduce [entrypoint-advisor.sh](k8s/entrypoint-advisor.sh) or [entrypoint-student.sh](k8s/entrypoint-student.sh), render `SENPAI-LAUNCH-CONTEXT.md` with `render_launch_context`, and provide it as base64 in `SENPAI_LAUNCH_CONTEXT_B64`. Pass the built-in role template and its explicit identity values to the Python supervisor, which renders the non-secret identity once and persists that role snapshot. Keep optional operator guidance in `EXTRA_INSTRUCTIONS_B64`. Persist `/var/lib/senpai/<tag>/advisor` for the advisor and use the container healthcheck with a restart policy. Student execution requires Linux, an NVIDIA runtime, and compatible CUDA hardware; Docker Desktop on macOS cannot run the GPU student image.
+To build another launcher, reproduce [entrypoint-advisor.sh](k8s/entrypoint-advisor.sh) or [entrypoint-student.sh](k8s/entrypoint-student.sh), render `SENPAI-LAUNCH-CONTEXT.md` with runtime identity, limits, and isolation through `render_launch_context`, and provide it as base64 in `SENPAI_LAUNCH_CONTEXT_B64`. Pass the built-in role template and its required non-secret values to the Python supervisor, which renders and persists that role snapshot. Keep optional operator guidance in `EXTRA_INSTRUCTIONS_B64`. Persist `/var/lib/senpai/<tag>/advisor` for the advisor and use the container healthcheck with a restart policy. Student execution requires Linux, an NVIDIA runtime, and compatible CUDA hardware; Docker Desktop on macOS cannot run the GPU student image.
 
 ## Development and reference
 

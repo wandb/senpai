@@ -1,3 +1,4 @@
+import base64
 import subprocess
 
 import pytest
@@ -83,8 +84,12 @@ def test_kubectl_default_scope_omits_an_empty_context():
 
 
 def bypass_external_preflight(monkeypatch):
+    monkeypatch.setattr(
+        launch,
+        "resolve_github_token",
+        lambda _path, _custom_secret_env_names: "github",
+    )
     for name, value in (
-        ("resolve_github_token", "github"),
         ("resolve_anthropic_api_key", "anthropic"),
         ("resolve_openai_api_key", "openai"),
         ("resolve_exa_api_key", "exa"),
@@ -108,6 +113,51 @@ def bypass_external_preflight(monkeypatch):
         "preflight_check_target_repo_branch",
         lambda *_args: "main",
     )
+
+
+def test_preflight_resolves_custom_secrets(monkeypatch):
+    args = launch_args(
+        preflight_only=True,
+        custom_secret_env_names=["HF_TOKEN", "DATASET_LICENSE_KEY"],
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    resolved = []
+    monkeypatch.setattr(
+        launch,
+        "resolve_custom_secrets",
+        lambda path, names: resolved.append((path, names)) or {},
+    )
+
+    launch.main()
+
+    assert resolved == [
+        (launch.DOTENV_PATH, ["HF_TOKEN", "DATASET_LICENSE_KEY"])
+    ]
+
+
+def test_launch_reports_invalid_custom_secret_names_without_a_traceback(monkeypatch):
+    args = launch_args(custom_secret_env_names=["NOT-VALID"])
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+
+    with pytest.raises(SystemExit, match="^ERROR: invalid custom secret"):
+        launch.main()
+
+
+def test_dry_run_never_reads_custom_secret_values(monkeypatch, capsys):
+    args = launch_args(dry_run=True, custom_secret_env_names=["HF_TOKEN"])
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    monkeypatch.setattr(
+        launch,
+        "resolve_custom_secrets",
+        lambda *_args: pytest.fail("dry-run must not resolve custom secrets"),
+    )
+
+    launch.main()
+
+    output = capsys.readouterr().out
+    encoded_placeholder = base64.b64encode(b"<REDACTED_HF_TOKEN>").decode()
+    assert f"HF_TOKEN: {encoded_placeholder}" in output
 
 
 def test_wandb_gateway_uses_the_wandb_key_for_openai_compatible_inference(

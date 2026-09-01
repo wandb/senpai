@@ -127,6 +127,30 @@ class SendAssignmentFeedbackAction(Action):
     )
 
 
+class PostAssignmentCommentAction(Action):
+    """Post one interim student message to the current assignment PR."""
+
+    assignment: AssignmentVersion = Field(
+        description="Current student assignment revision and PR-head precondition.",
+    )
+    comment_id: str = Field(
+        min_length=1,
+        max_length=256,
+        description=(
+            "Stable ID for this message. Exact replay is a no-op; a new message "
+            "must use a new ID."
+        ),
+    )
+    comment: str = Field(
+        min_length=1,
+        max_length=50_000,
+        description=(
+            "Interim progress, question, blocker, evidence, or response to post on "
+            "the assigned pull request."
+        ),
+    )
+
+
 class RequestAssignmentRevisionAction(Action):
     """Start a new revision of an existing assignment on an exact research base."""
 

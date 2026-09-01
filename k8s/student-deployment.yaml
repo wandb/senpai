@@ -64,16 +64,19 @@ spec:
           chmod 700 "$askpass"
           mkdir -p /workspace
           git init /workspace/senpai
+          if git -C /workspace/senpai remote get-url origin >/dev/null 2>&1; then
+            git -C /workspace/senpai remote set-url origin "$SENPAI_REPO_URL"
+          else
+            git -C /workspace/senpai remote add origin "$SENPAI_REPO_URL"
+          fi
           GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
             git -C /workspace/senpai fetch --depth 1 "$SENPAI_REPO_URL" "$SENPAI_REPO_REVISION"
           git -C /workspace/senpai checkout --detach FETCH_HEAD
           cd /workspace/senpai
-          git remote add origin "$SENPAI_REPO_URL"
           test "$(git rev-parse HEAD)" = "$SENPAI_REPO_REVISION"
           test "$SENPAI_IMAGE_REVISION" = "$SENPAI_REPO_REVISION"
           token_handoff=/tmp/senpai-supervisor-github-token
-          umask 077
-          printf '%s' "$GITHUB_TOKEN" > "$token_handoff"
+          (umask 077; printf '%s' "$GITHUB_TOKEN" > "$token_handoff")
           export SENPAI_GITHUB_TOKEN_FILE="$token_handoff"
           unset GITHUB_TOKEN GH_TOKEN
           rm -f "$askpass"
@@ -92,12 +95,13 @@ spec:
             secretKeyRef:
               name: {{LAUNCH_SECRET_NAME}}
               key: github-token
-        {{MODEL_PROVIDER_ENV}}
+{{MODEL_PROVIDER_ENV}}
         - name: EXA_API_KEY
           valueFrom:
             secretKeyRef:
               name: {{LAUNCH_SECRET_NAME}}
               key: exa-api-key
+{{CUSTOM_SECRET_ENV_REFS}}
         resources:
           requests:
             cpu: "{{STUDENT_CPU}}"

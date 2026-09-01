@@ -8,13 +8,13 @@ from senpai_agent.github.workflow.errors import (
 )
 from senpai_agent.github.workflow.responses import (
     GitHubUser,
+    HumanIssueMessage,
     IssueResponse,
     IssueSearchResponse,
     NumberedResponse,
     PullRequestSnapshot,
     validated_response,
 )
-from senpai_agent.github.workflow.validation import require_trusted_human_author
 from senpai_agent.models import AssignmentRecord
 
 
@@ -86,7 +86,8 @@ class LookupMixin:
             issue.number
             for issue in issues
             if issue.pull_request is not None
-            and "status:wip" in {label.name for label in issue.labels}
+            and {"status:wip", "status:review"}
+            & {label.name for label in issue.labels}
         )
 
     def _human_issue(
@@ -116,20 +117,20 @@ class LookupMixin:
             )
         return issue
 
-    def _human_message_author(
+    def _human_message(
         self,
         number: int,
         *,
         issue: IssueResponse,
         human_message_id: int,
-    ) -> str:
+    ) -> HumanIssueMessage:
         if issue.id == human_message_id:
-            require_trusted_human_author(
-                login=issue.user.login,
+            return HumanIssueMessage(
+                body=issue.body or "",
+                author=issue.user.login,
                 author_type=issue.user.type,
-                association=issue.author_association,
+                author_association=issue.author_association,
             )
-            return issue.user.login
         match = next(
             (
                 comment
@@ -142,12 +143,12 @@ class LookupMixin:
             raise WorkflowPreconditionError(
                 f"human message ID {human_message_id} is not present on issue #{number}"
             )
-        require_trusted_human_author(
-            login=match.author,
+        return HumanIssueMessage(
+            body=match.body,
+            author=match.author,
             author_type=match.author_type,
-            association=match.author_association,
+            author_association=match.author_association,
         )
-        return match.author
 
     def _actor(self) -> str:
         if self._trusted_actor is None:

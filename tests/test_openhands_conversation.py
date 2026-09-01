@@ -1,6 +1,7 @@
 import json
 import signal
 import threading
+import time
 from io import StringIO
 from types import SimpleNamespace
 
@@ -14,10 +15,11 @@ from openhands.sdk.event import (
     ObservationEvent,
 )
 from openhands.sdk.llm import Message, TextContent
+from openhands.sdk.llm.exceptions import LLMServiceUnavailableError
 from openhands.sdk.tool import resolve_tool
 
 import senpai_agent.openhands_runner as runner
-from senpai_agent.controller import OpenHandsTurnRunner
+from senpai_agent.controller import OpenHandsTurnRunner, _provider_failure
 from senpai_agent.inbox import (
     DeliveryState,
     InboxTurnQuarantined,
@@ -41,6 +43,7 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     monkeypatch,
 ):
     captured = {}
+    registered_secrets = []
 
     class FakeConversation:
         def __init__(self, agent, **kwargs):
@@ -50,7 +53,14 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
             captured["secrets"] = kwargs["secrets"]
             captured["delete_on_close"] = kwargs["delete_on_close"]
             captured["llm_timeout"] = agent.llm.timeout
-            captured["llm_num_retries"] = agent.llm.num_retries
+            captured["llm_retries"] = (
+                agent.llm.num_retries,
+                agent.llm.retry_multiplier,
+                agent.llm.retry_min_wait,
+                agent.llm.retry_max_wait,
+            )
+            captured["llm"] = agent.llm
+            captured["llm_type"] = type(agent.llm)
             self.state = SimpleNamespace(
                 execution_status=ConversationExecutionStatus.FINISHED
             )
@@ -70,8 +80,15 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
             captured["closed"] = True
 
     monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(runner, "register_trace_secret", registered_secrets.append)
     isolate_agent_discovery(monkeypatch, runner)
-    config = runtime_config(tmp_path)
+    config = runtime_config(
+        tmp_path,
+        conversation_secrets={
+            "WANDB_API_KEY": "wandb-key",
+            "PRIVATE_AUTH": "private-key",
+        },
+    )
 
     assert run_openhands("first task", config) == 0
     assert captured["prompt"] == "first task"
@@ -82,12 +99,27 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
         "# Authoritative launch context\n\nTest launch policy.\n"
     )
     assert captured["plugin"] == str(PLUGIN_DIR)
-    assert captured["secrets"] == {"WANDB_API_KEY": "wandb-key"}
+    assert captured["secrets"] == {
+        "WANDB_API_KEY": "wandb-key",
+        "PRIVATE_AUTH": "private-key",
+    }
+    assert registered_secrets == ["github-key"]
     assert captured["conversation_id_env"] == config.conversation_id.hex
     assert captured["delete_on_close"] is False
-    assert captured["llm_timeout"] == 900
-    assert captured["llm_num_retries"] == 1
+    assert captured["llm_timeout"] == 5400
+    assert captured["llm_retries"] == (5, 8, 8, 64)
+    assert captured["llm_type"] is runner.LLM
     assert captured["closed"] is True
+
+    retried = RuntimeError("provider requested a longer pause")
+    retried.headers = {"retry-after": "300"}
+    exhausted = LLMServiceUnavailableError("provider unavailable")
+    with pytest.raises(LLMServiceUnavailableError):
+        with captured["llm"]._request_scope():
+            with captured["llm"]._request_scope():
+                captured["llm"].retry_listener(1, 5, retried)
+                raise exhausted
+    assert _provider_failure(exhausted, 1_700_000_000).retry_after == 300
 
 
 def test_context_reset_preserves_history_and_starts_a_fresh_active_branch(
@@ -477,7 +509,6 @@ def test_stalled_recovery_is_bounded_and_quarantined_with_the_full_brief(
     config = runtime_config(
         tmp_path,
         inbox_max_stalled_attempts=1,
-        inbox_max_turn_age_seconds=10_000,
         inbox_max_recovery_generations=1,
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
@@ -572,7 +603,6 @@ def test_model_visible_progress_renews_the_stalled_attempt_budget(
     config = runtime_config(
         tmp_path,
         inbox_max_stalled_attempts=1,
-        inbox_max_turn_age_seconds=10_000,
         inbox_max_recovery_generations=1,
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
@@ -653,7 +683,6 @@ def test_timeout_and_error_artifacts_do_not_renew_the_stalled_attempt_budget(
     config = runtime_config(
         tmp_path,
         inbox_max_stalled_attempts=2,
-        inbox_max_turn_age_seconds=10_000,
         inbox_max_recovery_generations=1,
     )
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
@@ -859,13 +888,7 @@ def test_restart_after_recovery_commit_resets_before_delivering(tmp_path, monkey
     ]
 
 
-def test_child_requests_ephemeral_storage_and_emits_its_terminal_report(
-    tmp_path,
-    monkeypatch,
-    capsys,
-):
-    captured = {}
-
+def _child_result_conversation(reports, captured, *, rebuild_before_second=False):
     class FakeConversation:
         def __init__(self, **kwargs):
             self.id = kwargs["conversation_id"]
@@ -875,52 +898,207 @@ def test_child_requests_ephemeral_storage_and_emits_its_terminal_report(
                 view=SimpleNamespace(events=[]),
             )
 
-        def send_message(self, _prompt):
-            pass
+        def send_message(self, prompt):
+            captured.setdefault("prompts", []).append(prompt)
+            if self.state.execution_status == ConversationExecutionStatus.FINISHED:
+                self.state.execution_status = ConversationExecutionStatus.IDLE
 
         async def arun(self):
-            self.state.view.events.append(
-                runner.MessageEvent(
-                    source="agent",
-                    llm_message=Message(
-                        role="assistant",
-                        content=[TextContent(text="bounded child report")],
-                    ),
+            report = reports[len(captured.setdefault("runs", []))]
+            captured["runs"].append(report)
+            if rebuild_before_second and len(captured["runs"]) == 2:
+                self.state.view.events = []
+            if report is not None:
+                self.state.view.events.append(
+                    runner.MessageEvent(
+                        source="agent",
+                        llm_message=Message(
+                            role="assistant",
+                            content=[TextContent(text=report)],
+                        ),
+                    )
                 )
-            )
             self.state.execution_status = ConversationExecutionStatus.FINISHED
 
         def close(self):
             captured["closed"] = True
 
-    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    return FakeConversation
+
+
+def _output_record(output, prefix):
+    return json.loads(
+        next(
+            line.removeprefix(prefix)
+            for line in output.splitlines()
+            if line.startswith(prefix)
+        )
+    )
+
+
+def test_child_result_at_emergency_limit_is_returned_unchanged(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    captured = {}
+    monkeypatch.setattr(
+        runner,
+        "LocalConversation",
+        _child_result_conversation(["bounded child report"], captured),
+    )
+    monkeypatch.setattr(
+        runner.LLM,
+        "get_token_count",
+        lambda *_args, **_kwargs: runner.MAX_INLINE_CHILD_RESULT_TOKENS,
+    )
     isolate_agent_discovery(monkeypatch, runner)
     monkeypatch.setattr(runner, "WEAVE_PROJECT", "wandb-applied-ai-team/senpai-v1")
     config = runtime_config(tmp_path, child=True)
 
     assert run_openhands("child task", config) == 0
 
-    records = capsys.readouterr().out.splitlines()
-    result = json.loads(
-        next(
-            line.removeprefix("OPENHANDS_RESULT ")
-            for line in records
-            if line.startswith("OPENHANDS_RESULT ")
-        )
-    )
-    run = json.loads(
-        next(
-            line.removeprefix("OPENHANDS_RUN ")
-            for line in records
-            if line.startswith("OPENHANDS_RUN ")
-        )
-    )
-    assert captured == {"delete_on_close": True, "closed": True}
+    output = capsys.readouterr().out
+    result = _output_record(output, "OPENHANDS_RESULT ")
+    run = _output_record(output, "OPENHANDS_RUN ")
+    assert captured["delete_on_close"] is True
+    assert captured["runs"] == ["bounded child report"]
+    assert captured["closed"] is True
     assert result["result"] == "bounded child report"
     assert run["weave_url"] == (
         "https://wandb.ai/wandb-applied-ai-team/senpai-v1/"
         f"weave/agents/conversations/{config.conversation_id}"
     )
+
+
+@pytest.mark.parametrize(
+    ("initial_token_count", "rebuild_view"),
+    [(0, False), (15_001, True)],
+)
+def test_oversized_child_result_is_spilled_then_replaced_by_one_summary(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    initial_token_count,
+    rebuild_view,
+):
+    raw_report = "RAW_REPORT_MUST_NOT_REACH_THE_PARENT"
+    summary = "The strongest evidence points to the scheduler boundary."
+    task_id = "task-1"
+    target_checkout = tmp_path / "target"
+    target_checkout.mkdir()
+    role_state = tmp_path / "role-state"
+    captured = {}
+    token_counts = iter(
+        [initial_token_count, runner.MAX_INLINE_CHILD_RESULT_TOKENS]
+    )
+    monkeypatch.setattr(
+        runner,
+        "LocalConversation",
+        _child_result_conversation(
+            [raw_report, summary],
+            captured,
+            rebuild_before_second=rebuild_view,
+        ),
+    )
+    monkeypatch.setattr(
+        runner.LLM,
+        "get_token_count",
+        lambda *_args, **_kwargs: next(token_counts),
+    )
+    isolate_agent_discovery(monkeypatch, runner)
+
+    config = runtime_config(
+        tmp_path,
+        child=True,
+        workspace=target_checkout,
+        delegation_root_state_dir=role_state,
+        delegation_task_id=task_id,
+    )
+
+    assert run_openhands("child task", config) == 0
+
+    artifact = role_state / "delegation" / "results" / f"{task_id}.md"
+    output = capsys.readouterr().out
+    result = _output_record(output, "OPENHANDS_RESULT ")
+    assert captured["runs"] == [raw_report, summary]
+    assert len(captured["prompts"]) == 2
+    assert "approxinately 1,500 tokens" in captured["prompts"][1]
+    assert str(artifact) in captured["prompts"][1]
+    assert artifact.read_text(encoding="utf-8") == raw_report
+    assert not artifact.is_relative_to(target_checkout)
+    assert artifact.parent.stat().st_mode & 0o777 == 0o700
+    assert artifact.stat().st_mode & 0o777 == 0o600
+    parent_state = SimpleNamespace(
+        workspace=SimpleNamespace(working_dir=str(target_checkout)),
+        agent=SimpleNamespace(
+            llm=SimpleNamespace(vision_is_active=lambda: False),
+        ),
+    )
+    parent_config = runtime_config(tmp_path, workspace=target_checkout)
+    file_editor_spec = next(
+        tool
+        for tool in runner.build_main_tools(parent_config)
+        if tool.name == "file_editor"
+    )
+    file_editor = resolve_tool(file_editor_spec, parent_state)[0]
+    parent_read = file_editor(
+        file_editor.action_type(command="view", path=str(artifact))
+    )
+    assert parent_read.is_error is False
+    assert raw_report in parent_read.text
+    assert result["result"] == f"{summary}\n\nFull report: {artifact}"
+    assert raw_report not in result["result"]
+    assert raw_report not in output
+
+
+@pytest.mark.parametrize(
+    ("summary", "summary_token_count"),
+    [
+        (None, 200),
+        ("UNKNOWN_COUNT", 0),
+        ("STILL_TOO_LARGE", runner.MAX_INLINE_CHILD_RESULT_TOKENS + 1),
+    ],
+)
+def test_oversized_child_result_fails_closed_when_compression_fails(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    summary,
+    summary_token_count,
+):
+    raw_report = "RAW_REPORT_MUST_NOT_REACH_THE_PARENT"
+    task_id = "task-1"
+    role_state = tmp_path / "role-state"
+    captured = {}
+    token_counts = iter([15_001, summary_token_count])
+    monkeypatch.setattr(
+        runner,
+        "LocalConversation",
+        _child_result_conversation([raw_report, summary], captured),
+    )
+    monkeypatch.setattr(
+        runner.LLM,
+        "get_token_count",
+        lambda *_args, **_kwargs: next(token_counts),
+    )
+    isolate_agent_discovery(monkeypatch, runner)
+    config = runtime_config(
+        tmp_path,
+        child=True,
+        delegation_root_state_dir=role_state,
+        delegation_task_id=task_id,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        run_openhands("child task", config)
+
+    artifact = role_state / "delegation" / "results" / f"{task_id}.md"
+    output = capsys.readouterr().out
+    assert str(artifact) in str(raised.value)
+    assert raw_report not in str(raised.value)
+    assert artifact.read_text(encoding="utf-8") == raw_report
+    assert raw_report not in output
 
 
 def test_student_requests_persistent_storage_for_monitor_wake(
@@ -1111,6 +1289,7 @@ def test_runtime_credentials_remain_configured_through_lazy_tool_initialization(
     assert captured["resolved"] == {
         "senpai_github": {
             "get_prs",
+            "post_assignment_comment",
             "respond_to_human_issue",
             "submit_experiment_result",
         },
@@ -1165,6 +1344,78 @@ def test_turn_deadline_requests_conversation_interrupt(tmp_path, monkeypatch):
     assert cancelled.is_set()
 
 
+def test_turn_activity_renews_the_inactivity_deadline():
+    interrupted = False
+    activity = [time.monotonic()]
+
+    class Conversation:
+        async def arun(self):
+            for _ in range(3):
+                await runner.asyncio.sleep(0.02)
+                activity[0] = time.monotonic()
+
+        def interrupt(self):
+            nonlocal interrupted
+            interrupted = True
+
+    runner.asyncio.run(
+        runner.arun_conversation(Conversation(), 0.03, lambda: activity[0])
+    )
+
+    assert not interrupted
+
+
+def test_startup_interrupt_is_a_normal_conversation_end():
+    class Conversation:
+        task = None
+
+        async def arun(self):
+            self.task = runner.asyncio.current_task()
+            await runner.asyncio.Event().wait()
+
+        def interrupt(self):
+            assert self.task is not None
+            self.task.cancel()
+
+    conversation = Conversation()
+
+    runner.asyncio.run(
+        runner.arun_conversation(
+            conversation,
+            1,
+            started=conversation.interrupt,
+        )
+    )
+
+    assert conversation.task.cancelled()
+
+
+def test_steering_resumes_the_same_conversation_object():
+    class Conversation:
+        def __init__(self):
+            self.id = "stable-advisor-id"
+            self.runs = 0
+
+        async def arun(self):
+            self.runs += 1
+
+        def interrupt(self):
+            raise AssertionError("a completed run does not need interruption")
+
+    resumes = iter((True, False))
+    pump = SimpleNamespace(
+        prepare_run=lambda: True,
+        run_started=lambda: None,
+        finish_run=lambda: next(resumes),
+    )
+    conversation = Conversation()
+
+    runner.run_steerable_conversation(conversation, pump, 1)
+
+    assert conversation.runs == 2
+    assert conversation.id == "stable-advisor-id"
+
+
 def test_signal_interrupts_the_conversation_and_restores_handlers(monkeypatch):
     calls = []
     installed = {}
@@ -1190,6 +1441,90 @@ def test_signal_interrupts_the_conversation_and_restores_handlers(monkeypatch):
         (signal.SIGTERM, previous[signal.SIGTERM]),
         (signal.SIGINT, previous[signal.SIGINT]),
     ]
+
+
+def test_signal_does_not_resume_a_steering_interruption(monkeypatch):
+    installed = {}
+    previous = {signal.SIGTERM: object(), signal.SIGINT: object()}
+
+    def fake_signal(signum, handler):
+        installed[signum] = handler
+        return previous[signum]
+
+    class Conversation:
+        def __init__(self):
+            self.runs = 0
+
+        async def arun(self):
+            self.runs += 1
+
+        def interrupt(self):
+            pass
+
+    class Pump:
+        prepare_run = staticmethod(lambda: True)
+        run_started = staticmethod(lambda: None)
+
+        @staticmethod
+        def finish_run():
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+            return True
+
+    conversation = Conversation()
+    monkeypatch.setattr(runner.signal, "signal", fake_signal)
+
+    with pytest.raises(SystemExit):
+        with graceful_interrupts(conversation) as stop_requested:
+            runner.run_steerable_conversation(
+                conversation,
+                Pump(),
+                1,
+                stop_requested=stop_requested,
+            )
+
+    assert conversation.runs == 1
+
+
+def test_signal_at_run_start_cancels_before_the_run_continues(monkeypatch):
+    installed = {}
+    previous = {signal.SIGTERM: object(), signal.SIGINT: object()}
+
+    def fake_signal(signum, handler):
+        installed[signum] = handler
+        return previous[signum]
+
+    class Conversation:
+        def __init__(self):
+            self.continued = False
+
+        async def arun(self):
+            await runner.asyncio.sleep(0)
+            self.continued = True
+
+        def interrupt(self):
+            pass
+
+    class Pump:
+        prepare_run = staticmethod(lambda: True)
+        finish_run = staticmethod(lambda: False)
+
+        @staticmethod
+        def run_started():
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+
+    conversation = Conversation()
+    monkeypatch.setattr(runner.signal, "signal", fake_signal)
+
+    with pytest.raises(SystemExit):
+        with graceful_interrupts(conversation) as stop_requested:
+            runner.run_steerable_conversation(
+                conversation,
+                Pump(),
+                1,
+                stop_requested=stop_requested,
+            )
+
+    assert not conversation.continued
 
 
 def test_recovered_actions_are_rejected_before_the_conversation_resumes(

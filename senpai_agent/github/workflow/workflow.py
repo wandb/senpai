@@ -9,9 +9,11 @@ from senpai_agent.github.workflow.merge import MergeMixin
 from senpai_agent.github.workflow.results import ResultMixin
 from senpai_agent.github.workflow.review import ReviewMixin
 from senpai_agent.github.workflow.revisions import RevisionMixin
+from senpai_agent.github.workflow.student_comments import StudentCommentMixin
 
 
 class GitHubWorkflow(
+    StudentCommentMixin,
     HumanIssueMixin,
     MergeMixin,
     ReviewMixin,

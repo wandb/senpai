@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from openhands.sdk.plugin import Plugin
 
-from senpai_agent.hooks import hook_main
+from senpai_agent.hooks import hook_main, queued_feedback_marker
 
 PLUGIN_DIR = Path(__file__).parents[1] / "plugins" / "senpai"
 TRAINING_ID = "b81440b1-b803-471e-9fe0-6dcabd756b83"
@@ -84,14 +84,18 @@ def test_plugin_loads_terminal_safety_and_lifecycle_hooks():
     assert hooks["Stop"] and hooks["SessionEnd"]
 
 
+@pytest.mark.parametrize("queued_feedback", (False, True))
 def test_student_stop_denies_unmonitored_training(
     assignment_workspace: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    queued_feedback: bool,
 ):
     state_dir = tmp_path / "state"
     write_running_training(state_dir, monitored=False)
+    if queued_feedback:
+        queued_feedback_marker(state_dir).touch()
 
     exit_code, output = invoke_hook(
         "stop",
@@ -185,6 +189,34 @@ def test_student_stop_denies_a_dirty_assignment_workspace(
     )
 
     assert (exit_code, output["decision"]) == (2, "deny")
+
+
+def test_queued_feedback_temporarily_allows_a_clean_unwind(
+    assignment_workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    queued_feedback_marker(state_dir).touch()
+    monkeypatch.setattr(
+        "senpai_agent.hooks.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=" M model.py\n"),
+    )
+
+    exit_code, output = invoke_hook(
+        "stop",
+        {"working_dir": str(assignment_workspace)},
+        monkeypatch,
+        capsys,
+        {
+            "SENPAI_ROLE": "student",
+            "SENPAI_OPENHANDS_STATE_DIR": str(state_dir),
+        },
+    )
+
+    assert (exit_code, output["decision"]) == (0, "allow")
 
 
 def test_session_end_allows_shutdown(

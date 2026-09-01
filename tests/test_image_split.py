@@ -20,7 +20,10 @@ BINARY_ONLY_RUNTIME_PACKAGES = (
 def load_kubernetes_template(name: str) -> dict:
     """Render Go-template tokens before asking PyYAML to parse the manifest."""
     template = (ROOT / "k8s" / name).read_text(encoding="utf-8")
-    template = template.replace("{{MODEL_PROVIDER_ENV}}", "- name: MODEL_API_KEY")
+    template = template.replace(
+        "{{MODEL_PROVIDER_ENV}}", "        - name: MODEL_API_KEY"
+    )
+    template = template.replace("{{CUSTOM_SECRET_ENV_REFS}}", "")
     return yaml.safe_load(TEMPLATE_TOKEN.sub("fixture", template))
 
 

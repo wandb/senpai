@@ -1,7 +1,9 @@
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from openhands.sdk.conversation import ConversationExecutionStatus
 
 from senpai_agent.git_workflow import PushResult
 from senpai_agent.github.tools import (
@@ -15,6 +17,8 @@ from senpai_agent.github.tools import (
     GitHubToolRuntime,
     MergeExperimentAction,
     MergeExperimentTool,
+    PostAssignmentCommentAction,
+    PostAssignmentCommentTool,
     PublishAdvisorBranchAction,
     PublishAdvisorBranchTool,
     RepairAssignmentRoutingAction,
@@ -24,7 +28,7 @@ from senpai_agent.github.tools import (
     SendAssignmentFeedbackAction,
     SendAssignmentFeedbackTool,
 )
-from senpai_agent.github.workflow import MutationResult
+from senpai_agent.github.workflow import MutationResult, StaleAssignmentRevisionError
 from senpai_agent.models import DispositionRecord, render_disposition_marker
 
 
@@ -67,6 +71,23 @@ def runtime(workflow: RecordingWorkflow, workspace: Path) -> GitHubToolRuntime:
     )
 
 
+def student_runtime(
+    workflow: RecordingWorkflow,
+    workspace: Path,
+    *,
+    student_name: str | None = "student-one",
+) -> GitHubToolRuntime:
+    return GitHubToolRuntime(
+        workflow=workflow,
+        workspace=workspace,
+        git_token=None,
+        role="student",
+        advisor_branch=None,
+        student_names=frozenset(),
+        student_name=student_name,
+    )
+
+
 def assignment() -> AssignmentVersion:
     return AssignmentVersion(
         pr_number=17,
@@ -74,6 +95,81 @@ def assignment() -> AssignmentVersion:
         revision_id="revision-1",
         expected_pr_head_sha="a" * 40,
     )
+
+
+def test_student_comment_binds_runtime_student_and_exact_assignment(tmp_path: Path):
+    workflow = RecordingWorkflow()
+    tool = PostAssignmentCommentTool.create(student_runtime(workflow, tmp_path))[0]
+
+    observation = tool(
+        PostAssignmentCommentAction(
+            assignment=assignment(),
+            comment_id="paired-run-started",
+            comment="The paired run has started.",
+        )
+    )
+
+    assert observation.state == "post_assignment_comment"
+    assert workflow.calls == [
+        (
+            "post_assignment_comment",
+            17,
+            {
+                "assignment_id": "assignment-17",
+                "revision_id": "revision-1",
+                "expected_head_sha": "a" * 40,
+                "student": "student-one",
+                "comment_id": "paired-run-started",
+                "comment": "The paired run has started.",
+            },
+        )
+    ]
+
+
+def test_student_comment_requires_configured_student_before_mutation(tmp_path: Path):
+    workflow = RecordingWorkflow()
+    tool = PostAssignmentCommentTool.create(
+        student_runtime(workflow, tmp_path, student_name=None)
+    )[0]
+
+    with pytest.raises(RuntimeError, match="student name"):
+        tool(
+            PostAssignmentCommentAction(
+                assignment=assignment(),
+                comment_id="blocked",
+                comment="The experiment is blocked.",
+            )
+        )
+
+    assert workflow.calls == []
+
+
+def test_stale_student_comment_finishes_the_obsolete_conversation(tmp_path: Path):
+    class StaleWorkflow(RecordingWorkflow):
+        def post_assignment_comment(self, number, **kwargs):
+            self.calls.append(("post_assignment_comment", number, kwargs))
+            raise StaleAssignmentRevisionError(
+                "assignment revision is 'revision-2', expected 'revision-1'"
+            )
+
+    workflow = StaleWorkflow()
+    tool = PostAssignmentCommentTool.create(student_runtime(workflow, tmp_path))[0]
+    conversation = SimpleNamespace(
+        state=SimpleNamespace(execution_status=ConversationExecutionStatus.RUNNING)
+    )
+
+    with pytest.raises(ValueError, match="controller can resume"):
+        tool(
+            PostAssignmentCommentAction(
+                assignment=assignment(),
+                comment_id="stale-progress",
+                comment="This turn is obsolete.",
+            ),
+            conversation,
+        )
+
+    assert conversation.state.execution_status is ConversationExecutionStatus.FINISHED
+    assert [call[0] for call in workflow.calls] == ["post_assignment_comment"]
 
 
 def test_create_assignment_uses_the_created_branch_head_for_the_pr(

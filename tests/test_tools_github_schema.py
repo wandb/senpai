@@ -11,6 +11,8 @@ from senpai_agent.github.tools import (
     GitHubToolRuntime,
     MergeExperimentTool,
     PublishAdvisorBranchTool,
+    PostAssignmentCommentAction,
+    PostAssignmentCommentTool,
     RepairAssignmentRoutingTool,
     RequestAssignmentRevisionTool,
     RespondToHumanIssueTool,
@@ -35,6 +37,7 @@ EXPECTED_FIELDS = {
         "remote_branch_sha_before_push",
         "local_commit_sha",
     },
+    "post_assignment_comment": {"assignment", "comment_id", "comment"},
     "repair_assignment_routing": {"assignment", "working_state", "blockers"},
     "send_assignment_feedback": {"assignment", "feedback_id", "comment"},
     "request_assignment_revision": {
@@ -81,6 +84,7 @@ def github_tools(tmp_path: Path):
     tool_types = (
         CreateAssignmentTool,
         PublishAdvisorBranchTool,
+        PostAssignmentCommentTool,
         RepairAssignmentRoutingTool,
         SendAssignmentFeedbackTool,
         RequestAssignmentRevisionTool,
@@ -150,6 +154,28 @@ def test_operation_specific_actions_reject_fields_from_other_tools():
                 "remote_branch_sha_before_push": "a" * 40,
                 "result": {},
                 "accepted_base_sha": "b" * 40,
+            }
+        )
+
+
+def test_student_comment_contract_rejects_empty_and_foreign_fields():
+    assignment = {
+        "pr_number": 17,
+        "assignment_id": "assignment-17",
+        "revision_id": "revision-1",
+        "expected_pr_head_sha": "a" * 40,
+    }
+    with pytest.raises(ValidationError, match="comment_id"):
+        PostAssignmentCommentAction.model_validate(
+            {"assignment": assignment, "comment_id": "", "comment": "Progress."}
+        )
+    with pytest.raises(ValidationError, match="student"):
+        PostAssignmentCommentAction.model_validate(
+            {
+                "assignment": assignment,
+                "comment_id": "progress-1",
+                "comment": "Progress.",
+                "student": "student-one",
             }
         )
 

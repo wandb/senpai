@@ -7,15 +7,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import signal
 import stat
 import sys
+import tempfile
 import time
 import uuid
-from collections.abc import Iterator, Mapping, MutableMapping, Sequence
-from contextlib import contextmanager, suppress
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
+from contextlib import contextmanager, nullcontext, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,7 +24,6 @@ os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
 
 from senpai_agent.advisor import (
     AdvisorEventPump,
-    AdvisorEventStore,
     advisor_conversation_id,
 )
 from senpai_agent.delegation import (
@@ -43,9 +43,11 @@ from senpai_agent.inbox import (
     turn_has_finished_response,
 )
 from senpai_agent.secrets import (
+    BUILTIN_CONVERSATION_SECRET_ENV_NAMES,
     GITHUB_TOKEN_ENV_NAMES,
     GITHUB_TOKEN_FD_ENV,
     GITHUB_TOKEN_FILE_ENV,
+    configured_custom_secret_env_names,
     scrub_github_credentials,
 )
 from senpai_agent.weave_monitoring import (
@@ -61,7 +63,7 @@ from openhands.sdk import LLM, Agent, AgentContext, LocalConversation, Tool
 from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
 from openhands.sdk.event import ActionEvent, MessageEvent, ObservationEvent
-from openhands.sdk.llm import TextContent
+from openhands.sdk.llm import Message, TextContent
 from openhands.sdk.plugin import PluginSource
 from openhands.sdk.skills import (
     Skill,
@@ -87,13 +89,19 @@ from senpai_agent.github.tools import (
     clear_github_credentials,
     configure_github_credentials,
 )
+from senpai_agent.inference_heartbeat import InferenceHeartbeat
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV, decode_launch_context
+from senpai_agent.local_events import LocalEventStore
 from senpai_agent.openhands_security import disable_ambient_plugin_discovery
 from senpai_agent.program_context import (
     PROGRAM_PATH_ENV,
     load_program_system_prompt,
 )
-from senpai_agent.PROMPTS import RECOVERED_ACTION_PROMPT
+from senpai_agent.PROMPTS import (
+    DELEGATED_RESULT_SUMMARY_PROMPT,
+    RECOVERED_ACTION_PROMPT,
+    render_prompt,
+)
 from senpai_agent.system_instructions import SenpaiSystemInstructions
 from senpai_agent.tools import register_senpai_tools
 
@@ -103,6 +111,7 @@ DEFAULT_FRONTIER_MODEL = "openai/gpt-5.6-sol"
 DEFAULT_REASONING_EFFORT = "xhigh"
 DEFAULT_FAST_REASONING_EFFORT = "high"
 DEFAULT_FRONTIER_REASONING_EFFORT = "max"
+DEFAULT_COMPACTION_TRIGGER_TOKENS = 200_000
 WANDB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
 REASONING_EFFORTS = (
     "low",
@@ -122,13 +131,9 @@ PROVIDER_API_KEY_ENVS = {
     "openai": "OPENAI_API_KEY",
     "wandb": "WANDB_API_KEY",
 }
-COMMAND_SECRET_ENV_NAMES = (
-    "WANDB_API_KEY",
-    "EXA_API_KEY",
-)
 EVENT_TEXT_LIMIT = 20000
+MAX_INLINE_CHILD_RESULT_TOKENS = 15_000
 DEFAULT_INBOX_MAX_STALLED_ATTEMPTS = 3
-DEFAULT_INBOX_MAX_TURN_AGE_SECONDS = 3 * 60 * 60
 DEFAULT_INBOX_MAX_RECOVERY_GENERATIONS = 1
 
 
@@ -160,6 +165,10 @@ class RunnerArgs:
         alias="--frontier-reasoning-effort",
         choices=REASONING_EFFORTS,
     )
+    compaction_trigger_tokens: int | None = field(
+        default=None,
+        alias="--compaction-trigger-tokens",
+    )
     workspace: str | None = field(default=None, alias="--workspace")
     state_dir: str | None = field(default=None, alias="--state-dir")
     conversation_id: str | None = field(default=None, alias="--conversation-id")
@@ -184,7 +193,7 @@ class RunnerConfig:
     github_repo: str
     github_token: SecretStr | None
     github_trusted_actor: str | None
-    command_secrets: Mapping[str, str]
+    conversation_secrets: Mapping[str, str]
     reasoning_effort: str
     smart_model: str
     smart_api_key_env: str
@@ -198,6 +207,7 @@ class RunnerConfig:
     frontier_api_key_env: str
     frontier_api_key: SecretStr
     frontier_reasoning_effort: str
+    compaction_trigger_tokens: int
     workspace: Path
     state_dir: Path
     conversation_id: uuid.UUID
@@ -213,12 +223,10 @@ class RunnerConfig:
     student_name: str | None = None
     wandb_entity: str | None = None
     wandb_project: str | None = None
-    training_max_timeout_seconds: int = 1800
-    timeout_seconds: float = 3600
-    llm_timeout_seconds: int = 900
-    llm_num_retries: int = 1
+    timeout_seconds: float = 7200
+    llm_timeout_seconds: int = 5400
+    llm_num_retries: int = 5
     inbox_max_stalled_attempts: int = DEFAULT_INBOX_MAX_STALLED_ATTEMPTS
-    inbox_max_turn_age_seconds: float = DEFAULT_INBOX_MAX_TURN_AGE_SECONDS
     inbox_max_recovery_generations: int = DEFAULT_INBOX_MAX_RECOVERY_GENERATIONS
     child: bool = False
     delegation_root_state_dir: Path | None = None
@@ -252,11 +260,15 @@ def openhands_reasoning_effort(reasoning_effort: str, model: str) -> str:
                 f"model {model!r}; use 'high' or 'max'"
             )
         return reasoning_effort
-    if reasoning_effort == "max" and not supports_openai_pro:
+    if (
+        reasoning_effort == "max"
+        and provider != "anthropic"
+        and not supports_openai_pro
+    ):
         raise ValueError(
             f"reasoning effort {reasoning_effort!r} is unsupported for model "
             f"{model!r}; "
-            "use an openai/gpt-5.6 model or select a lower effort"
+            "use an anthropic model, an openai/gpt-5.6 model, or select a lower effort"
         )
     return reasoning_effort
 
@@ -356,10 +368,34 @@ def resolve_api_key(env: Mapping[str, str], key_env: str) -> SecretStr:
     return SecretStr(value)
 
 
-def command_secrets(env: Mapping[str, str]) -> dict[str, str]:
+def conversation_secrets(
+    env: Mapping[str, str],
+    *,
+    model_api_key_env_names: Sequence[str],
+) -> dict[str, str]:
+    custom_secret_env_names = configured_custom_secret_env_names(env)
+    model_credentials = set(model_api_key_env_names)
+    overlap = tuple(
+        name for name in custom_secret_env_names if name in model_credentials
+    )
+    if overlap:
+        raise RuntimeError(
+            "model credential environment variables cannot also be custom "
+            f"secrets: {', '.join(overlap)}"
+        )
+
+    custom_secrets = {}
+    for name in custom_secret_env_names:
+        value = env.get(name)
+        if value is None or not value.strip():
+            raise RuntimeError(f"configured custom secret {name} is required")
+        custom_secrets[name] = value
+
     return {
-        name: value for name in COMMAND_SECRET_ENV_NAMES if (value := env.get(name))
-    }
+        name: value
+        for name in BUILTIN_CONVERSATION_SECRET_ENV_NAMES
+        if (value := env.get(name))
+    } | custom_secrets
 
 
 def github_token(
@@ -615,15 +651,7 @@ def resolve_config(
         launch=decode_launch_context(env.get(LAUNCH_CONTEXT_ENV, "")),
     )
     try:
-        training_max_timeout_seconds = round(
-            float(env.get("SENPAI_TIMEOUT_MINUTES", "30")) * 60
-        )
-    except ValueError as error:
-        raise RuntimeError("SENPAI_TIMEOUT_MINUTES must be numeric") from error
-    if training_max_timeout_seconds <= 0:
-        raise RuntimeError("SENPAI_TIMEOUT_MINUTES must be positive")
-    try:
-        timeout_seconds = float(env.get("SENPAI_OPENHANDS_TIMEOUT_SECONDS", "3600"))
+        timeout_seconds = float(env.get("SENPAI_OPENHANDS_TIMEOUT_SECONDS", "7200"))
     except ValueError as error:
         raise RuntimeError(
             "SENPAI_OPENHANDS_TIMEOUT_SECONDS must be numeric"
@@ -631,23 +659,34 @@ def resolve_config(
     if timeout_seconds <= 0:
         raise RuntimeError("SENPAI_OPENHANDS_TIMEOUT_SECONDS must be positive")
     try:
-        llm_timeout_seconds = int(env.get("SENPAI_LLM_TIMEOUT_SECONDS", "900"))
-        llm_num_retries = int(env.get("SENPAI_LLM_NUM_RETRIES", "1"))
+        llm_timeout_seconds = int(env.get("SENPAI_LLM_TIMEOUT_SECONDS", "5400"))
+        llm_num_retries = int(env.get("SENPAI_LLM_NUM_RETRIES", "5"))
     except ValueError as error:
         raise RuntimeError("Senpai LLM timeout settings must be numeric") from error
     if llm_timeout_seconds <= 0 or llm_num_retries <= 0:
         raise RuntimeError("Senpai LLM timeout and attempts must be positive")
     try:
+        compaction_trigger_tokens = int(
+            args.compaction_trigger_tokens
+            if args.compaction_trigger_tokens is not None
+            else env.get(
+                "SENPAI_COMPACTION_TRIGGER_TOKENS",
+                str(DEFAULT_COMPACTION_TRIGGER_TOKENS),
+            )
+        )
+    except ValueError as error:
+        raise RuntimeError(
+            "SENPAI_COMPACTION_TRIGGER_TOKENS must be an integer"
+        ) from error
+    if compaction_trigger_tokens < 50_000:
+        raise RuntimeError(
+            "SENPAI_COMPACTION_TRIGGER_TOKENS must be at least 50000"
+        )
+    try:
         inbox_max_stalled_attempts = int(
             env.get(
                 "SENPAI_INBOX_MAX_STALLED_ATTEMPTS",
                 str(DEFAULT_INBOX_MAX_STALLED_ATTEMPTS),
-            )
-        )
-        inbox_max_turn_age_seconds = float(
-            env.get(
-                "SENPAI_INBOX_MAX_TURN_AGE_SECONDS",
-                str(DEFAULT_INBOX_MAX_TURN_AGE_SECONDS),
             )
         )
         inbox_max_recovery_generations = int(
@@ -658,14 +697,9 @@ def resolve_config(
         )
     except ValueError as error:
         raise RuntimeError("inbox recovery budget must be numeric") from error
-    if (
-        inbox_max_stalled_attempts <= 0
-        or not math.isfinite(inbox_max_turn_age_seconds)
-        or inbox_max_turn_age_seconds <= 0
-        or inbox_max_recovery_generations < 0
-    ):
+    if inbox_max_stalled_attempts <= 0 or inbox_max_recovery_generations < 0:
         raise RuntimeError(
-            "inbox recovery budget requires positive attempt/age limits and a "
+            "inbox recovery budget requires a positive attempt limit and a "
             "non-negative recovery-generation limit"
         )
     wandb_entity = env.get("WANDB_ENTITY", "").strip() or None
@@ -819,6 +853,15 @@ def resolve_config(
     smart_api_key = resolve_api_key(env, smart_api_key_env)
     fast_api_key = resolve_api_key(env, fast_api_key_env)
     frontier_api_key = resolve_api_key(env, frontier_api_key_env)
+    resolved_conversation_secrets = conversation_secrets(
+        env,
+        model_api_key_env_names=(
+            api_key_env,
+            smart_api_key_env,
+            fast_api_key_env,
+            frontier_api_key_env,
+        ),
+    )
     models = (model, smart_model, fast_model, frontier_model)
     if any(model_provider(profile) == "wandb" for profile in models) and not (
         wandb_entity and wandb_project
@@ -835,7 +878,7 @@ def resolve_config(
         github_repo=github_repo(env),
         github_token=github_token(env, required=not args.child),
         github_trusted_actor=env.get("SENPAI_GITHUB_ACTOR"),
-        command_secrets=command_secrets(env),
+        conversation_secrets=resolved_conversation_secrets,
         reasoning_effort=reasoning_effort,
         smart_model=smart_model,
         smart_api_key_env=smart_api_key_env,
@@ -849,6 +892,7 @@ def resolve_config(
         frontier_api_key_env=frontier_api_key_env,
         frontier_api_key=frontier_api_key,
         frontier_reasoning_effort=frontier_reasoning_effort,
+        compaction_trigger_tokens=compaction_trigger_tokens,
         workspace=workspace,
         state_dir=state_dir,
         conversation_id=(
@@ -891,12 +935,10 @@ def resolve_config(
         student_name=env.get("STUDENT_NAME") or None,
         wandb_entity=wandb_entity,
         wandb_project=wandb_project,
-        training_max_timeout_seconds=training_max_timeout_seconds,
         timeout_seconds=timeout_seconds,
         llm_timeout_seconds=llm_timeout_seconds,
         llm_num_retries=llm_num_retries,
         inbox_max_stalled_attempts=inbox_max_stalled_attempts,
-        inbox_max_turn_age_seconds=inbox_max_turn_age_seconds,
         inbox_max_recovery_generations=inbox_max_recovery_generations,
         child=args.child,
         delegation_root_state_dir=delegation_root_state_dir,
@@ -1007,7 +1049,6 @@ def openai_responses_configuration(
         "reasoning_context": "all_turns",
         "responses_store": True,
         "responses_use_previous_response_id": True,
-        "responses_compact_threshold": 200_000,
     }
     if reasoning := _openai_pro_reasoning(model, reasoning_effort):
         configuration["litellm_extra_body"] = {
@@ -1016,10 +1057,27 @@ def openai_responses_configuration(
     return configuration
 
 
+def compaction_configuration(
+    model: str,
+    trigger_tokens: int,
+) -> dict[str, int | None]:
+    """Translate the universal token trigger to the provider SDK field."""
+    provider = model_provider(model)
+    if provider == "openai":
+        return {"responses_compact_threshold": trigger_tokens}
+    if provider == "anthropic":
+        return {
+            "anthropic_compact_threshold": trigger_tokens,
+            "anthropic_compaction_instructions": None,
+        }
+    return {}
+
+
 def model_runtime_configuration(
     model: str,
     reasoning_effort: str,
     *,
+    compaction_trigger_tokens: int,
     wandb_entity: str | None = None,
     wandb_project: str | None = None,
 ) -> dict[str, object]:
@@ -1056,7 +1114,7 @@ def model_runtime_configuration(
     for options in (
         prompt_cache_configuration(model),
         openai_responses_configuration(model, reasoning_effort),
-        anthropic_compaction_configuration(model),
+        compaction_configuration(model, compaction_trigger_tokens),
     ):
         for key, value in options.items():
             if key == "litellm_extra_body":
@@ -1066,12 +1124,6 @@ def model_runtime_configuration(
     if extra_body:
         configuration["litellm_extra_body"] = extra_body
     return configuration
-
-
-def anthropic_compaction_configuration(model: str) -> dict[str, int]:
-    if model.split("/", 1)[0].lower() != "anthropic":
-        return {}
-    return {"anthropic_compact_threshold": 100_000}
 
 
 def local_event_db_path(config: RunnerConfig) -> Path:
@@ -1137,10 +1189,7 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
         )
     )
     if config.role == "student" and not config.child:
-        training_params: dict[str, str | int] = {
-            "state_dir": str(config.state_dir / "training"),
-            "max_timeout_seconds": config.training_max_timeout_seconds,
-        }
+        training_params = {"state_dir": str(config.state_dir / "training")}
         tools.append(Tool(name="senpai_training", params=training_params))
     return tools
 
@@ -1166,13 +1215,14 @@ def delegation_config(
         frontier_reasoning_effort=config.frontier_reasoning_effort,
         frontier_api_key_env=config.frontier_api_key_env,
         frontier_api_key=config.frontier_api_key.get_secret_value(),
+        compaction_trigger_tokens=config.compaction_trigger_tokens,
         github_repo=config.github_repo,
         github_trusted_actor=config.github_trusted_actor,
         role_file=config.role_file,
         harness_file=config.harness_file,
         plugin_dir=config.plugin_dir,
         enable_browser=config.enable_browser,
-        command_secrets=config.command_secrets,
+        conversation_secrets=config.conversation_secrets,
         role=config.role,
         program_path=config.instructions.program.program_path,
         launch_context=config.instructions.launch,
@@ -1186,7 +1236,7 @@ def delegation_config(
 
 
 @contextmanager
-def graceful_interrupts(conversation: object) -> Iterator[None]:
+def graceful_interrupts(conversation: object) -> Iterator[Callable[[], bool]]:
     interrupted_by: list[int] = []
 
     def interrupt(signum: int, _frame: object) -> None:
@@ -1200,7 +1250,7 @@ def graceful_interrupts(conversation: object) -> Iterator[None]:
         for signum in (signal.SIGTERM, signal.SIGINT)
     }
     try:
-        yield
+        yield lambda: bool(interrupted_by)
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
@@ -1211,26 +1261,62 @@ def graceful_interrupts(conversation: object) -> Iterator[None]:
 async def arun_conversation(
     conversation: object,
     timeout_seconds: float,
+    activity: Callable[[], float] | None = None,
+    *,
+    started: Callable[[], None] | None = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> None:
-    """Run the async OpenHands path so timeout cancellation reaches tools."""
+    """Run until completion or one full timeout passes without activity."""
 
     task = asyncio.create_task(conversation.arun())
-    try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
-    except TimeoutError:
-        print(
-            f"OPENHANDS_TIMEOUT seconds={timeout_seconds:g}",
-            file=sys.stderr,
-            flush=True,
-        )
+
+    async def cancel_run() -> None:
         conversation.interrupt()
-        if not task.done():
-            task.cancel()
+        task.cancel()
         with suppress(asyncio.CancelledError):
             await task
 
+    await asyncio.sleep(0)
+    if started is not None:
+        started()
+    if stop_requested is not None and stop_requested():
+        await cancel_run()
+        return
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=max(0, deadline - time.monotonic()),
+            )
+            return
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise
+            return
+        except TimeoutError:
+            if task.done():
+                await task
+                return
+            renewed = (
+                activity() + timeout_seconds if activity is not None else deadline
+            )
+            if renewed > time.monotonic():
+                deadline = renewed
+                continue
+            print(
+                f"OPENHANDS_TIMEOUT seconds={timeout_seconds:g}",
+                file=sys.stderr,
+                flush=True,
+            )
+            await cancel_run()
+            return
 
-def run_conversation(conversation: object, timeout_seconds: float) -> None:
+
+def run_conversation(
+    conversation: object,
+    timeout_seconds: float,
+) -> None:
     if timeout_seconds <= 0:
         print(
             f"OPENHANDS_TIMEOUT seconds={max(timeout_seconds, 0):g}",
@@ -1240,6 +1326,47 @@ def run_conversation(conversation: object, timeout_seconds: float) -> None:
         conversation.interrupt()
         return
     asyncio.run(arun_conversation(conversation, timeout_seconds))
+
+
+async def arun_steerable_conversation(
+    conversation: object,
+    pump: AdvisorEventPump,
+    timeout_seconds: float,
+    activity: Callable[[], float] | None = None,
+    stop_requested: Callable[[], bool] | None = None,
+) -> None:
+    while stop_requested is None or not stop_requested():
+        if not pump.prepare_run():
+            continue
+        if stop_requested is not None and stop_requested():
+            return
+        await arun_conversation(
+            conversation,
+            timeout_seconds,
+            activity,
+            started=pump.run_started,
+            stop_requested=stop_requested,
+        )
+        if not pump.finish_run():
+            return
+
+
+def run_steerable_conversation(
+    conversation: object,
+    pump: AdvisorEventPump,
+    timeout_seconds: float,
+    activity: Callable[[], float] | None = None,
+    stop_requested: Callable[[], bool] | None = None,
+) -> None:
+    asyncio.run(
+        arun_steerable_conversation(
+            conversation,
+            pump,
+            timeout_seconds,
+            activity,
+            stop_requested,
+        )
+    )
 
 
 def event_summary(event: object) -> dict[str, object]:
@@ -1299,8 +1426,14 @@ def reject_recovered_actions(conversation: object) -> int:
     return len(pending)
 
 
-def final_agent_result(conversation: object) -> str:
+def final_agent_result(
+    conversation: object,
+    *,
+    exclude_event_ids: frozenset[str] = frozenset(),
+) -> str:
     for event in reversed(conversation.state.view.events):
+        if str(event.id) in exclude_event_ids:
+            continue
         if isinstance(event, MessageEvent) and event.source == "agent":
             text = "".join(
                 content.text
@@ -1314,6 +1447,82 @@ def final_agent_result(conversation: object) -> str:
             if isinstance(message, str) and message.strip():
                 return message.strip()
     raise RuntimeError("child finished without a model-visible result")
+
+
+def _result_token_count(llm: LLM, result: str) -> int:
+    return llm.get_token_count(
+        [
+            Message(
+                role="assistant",
+                content=[TextContent(text=result)],
+            )
+        ]
+    )
+
+
+def _store_oversized_child_result(config: RunnerConfig, result: str) -> Path:
+    if config.delegation_root_state_dir is None or config.delegation_task_id is None:
+        raise RuntimeError(
+            "oversized child result requires delegated role-state storage"
+        )
+    directory = config.delegation_root_state_dir / "delegation" / "results"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory.chmod(0o700)
+    descriptor, temporary_name = tempfile.mkstemp(dir=directory)
+    temporary_path = Path(temporary_name)
+    path = directory / f"{config.delegation_task_id}.md"
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+            temporary.write(result)
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return path
+
+
+def compact_child_result(
+    conversation: object,
+    llm: LLM,
+    config: RunnerConfig,
+    result: str,
+    run_deadline: float,
+) -> str:
+    token_count = _result_token_count(llm, result)
+    if 0 < token_count <= MAX_INLINE_CHILD_RESULT_TOKENS:
+        return result
+
+    artifact = _store_oversized_child_result(config, result)
+    existing_event_ids = frozenset(
+        str(event.id) for event in conversation.state.view.events
+    )
+    try:
+        conversation.send_message(
+            render_prompt(
+                DELEGATED_RESULT_SUMMARY_PROMPT,
+                RESULT_PATH=str(artifact),
+            )
+        )
+        with graceful_interrupts(conversation):
+            run_conversation(conversation, run_deadline - time.time())
+        if (
+            conversation.state.execution_status
+            != ConversationExecutionStatus.FINISHED
+        ):
+            raise RuntimeError("summary turn did not finish")
+        summary = final_agent_result(
+            conversation,
+            exclude_event_ids=existing_event_ids,
+        )
+        summary_tokens = _result_token_count(llm, summary)
+        if not 0 < summary_tokens <= MAX_INLINE_CHILD_RESULT_TOKENS:
+            raise RuntimeError(
+                "summary token count is unavailable or exceeds the child result limit"
+            )
+    except Exception as error:
+        raise RuntimeError(
+            f"oversized child report saved at {artifact}; summarization failed"
+        ) from error
+    return f"{summary}\n\nFull report: {artifact}"
 
 
 def _activate_inbox_turn(
@@ -1364,16 +1573,23 @@ def run_openhands(
     inbox: PersistentInbox | None = None,
     inbox_turn_id: str | None = None,
     recovery_prompt: str | None = None,
+    on_activity: Callable[[], None] | None = None,
+    on_inference_state: (
+        Callable[[float | None, float | None], None] | None
+    ) = None,
 ) -> int:
     if (inbox is None) != (inbox_turn_id is None):
         raise ValueError("inbox and inbox_turn_id must be provided together")
     started_at = time.time()
-    run_deadline = min(
-        started_at + config.timeout_seconds,
-        config.delegation_deadline_epoch or float("inf"),
+    run_deadline = (
+        min(
+            started_at + config.timeout_seconds,
+            config.delegation_deadline_epoch or float("inf"),
+        )
+        if config.child
+        else None
     )
-    run_timeout = run_deadline - started_at
-    if run_timeout <= 0:
+    if run_deadline is not None and run_deadline <= started_at:
         raise TimeoutError("the inherited OpenHands deadline has expired")
     scrub_model_credentials(os.environ, config)
     disable_ambient_plugin_discovery()
@@ -1399,6 +1615,7 @@ def run_openhands(
                 "fast_reasoning_effort": config.fast_reasoning_effort,
                 "frontier_model": config.frontier_model,
                 "frontier_reasoning_effort": config.frontier_reasoning_effort,
+                "compaction_trigger_tokens": config.compaction_trigger_tokens,
                 "prompt_cache": (
                     prompt_cache_configuration(config.model)
                     or {"provider_default": True}
@@ -1434,6 +1651,7 @@ def run_openhands(
     )
 
     if config.github_token is not None:
+        # The one-shot handoff is read after trace initialization.
         register_trace_secret(config.github_token.get_secret_value())
         configure_github_credentials(
             config.github_repo,
@@ -1443,9 +1661,50 @@ def run_openhands(
     configure_delegation(delegation_config(config, deadline_epoch=run_deadline))
     scrub_github_credentials(os.environ)
     conversation = None
+    inference_heartbeat = None
     cleanup_error: BaseException | None = None
     active_inbox_turn_id = inbox_turn_id
     try:
+        retried_provider_errors: ContextVar[tuple[BaseException, ...]] = ContextVar(
+            "retried_provider_errors",
+            default=(),
+        )
+
+        def record_retry(
+            _attempt: int,
+            _total: int,
+            error: BaseException | None,
+        ) -> None:
+            if error is not None:
+                retried_provider_errors.set((*retried_provider_errors.get(), error))
+
+        inference_heartbeat = (
+            InferenceHeartbeat(on_inference_state)
+            if on_inference_state is not None
+            else None
+        )
+
+        @contextmanager
+        def model_request() -> Iterator[None]:
+            token = retried_provider_errors.set(())
+            try:
+                with (
+                    inference_heartbeat.request()
+                    if inference_heartbeat is not None
+                    else nullcontext()
+                ):
+                    yield
+            except Exception as error:
+                retried = (
+                    *getattr(error, "_senpai_retried_provider_errors", ()),
+                    *retried_provider_errors.get(),
+                )
+                if retried:
+                    setattr(error, "_senpai_retried_provider_errors", retried)
+                raise
+            finally:
+                retried_provider_errors.reset(token)
+
         llm = LLM(
             model=config.model,
             api_key=config.api_key,
@@ -1455,13 +1714,16 @@ def run_openhands(
                 config.reasoning_effort, config.model
             ),
             usage_id="senpai",
+            retry_listener=record_retry,
             **model_runtime_configuration(
                 config.model,
                 config.reasoning_effort,
+                compaction_trigger_tokens=config.compaction_trigger_tokens,
                 wandb_entity=config.wandb_entity,
                 wandb_project=config.wandb_project,
             ),
         )
+        llm.set_request_scope(model_request)
         if config.agent_name:
             definition = depth_aware_child_definition(
                 find_named_agent(config.agent_name, file_agents),
@@ -1513,16 +1775,25 @@ def run_openhands(
                 condenser=condenser,
                 tool_concurrency_limit=MAX_PARALLEL_AGENTS,
             )
+        last_activity = time.monotonic()
+
+        def observe_event(event: object) -> None:
+            nonlocal last_activity
+            last_activity = time.monotonic()
+            if on_activity is not None:
+                on_activity()
+            print_event(event)
+
         conversation = LocalConversation(
             agent=agent,
             workspace=config.workspace,
             plugins=[PluginSource(source=str(config.plugin_dir))],
             persistence_dir=config.state_dir,
             conversation_id=config.conversation_id,
-            callbacks=[] if config.child else [print_event],
+            callbacks=[] if config.child else [observe_event],
             max_iteration_per_run=config.max_turns,
             visualizer=None,
-            secrets=dict(config.command_secrets),
+            secrets=dict(config.conversation_secrets),
             tags={"runtime": "senpai-openhands"},
             delete_on_close=config.child,
             prompt_cache_key=conversation_prompt_cache_key(config),
@@ -1571,7 +1842,6 @@ def run_openhands(
                 if inbox.terminal_recovery_due(
                     active_inbox_turn_id,
                     max_attempts=config.inbox_max_stalled_attempts,
-                    max_age_seconds=config.inbox_max_turn_age_seconds,
                 ):
                     stalled_turn_id = active_inbox_turn_id
                     recovery = inbox.recover_turn(
@@ -1601,11 +1871,12 @@ def run_openhands(
                         ),
                     )
                 inbox.record_inference_attempt(active_inbox_turn_id)
-            with graceful_interrupts(conversation):
+            with graceful_interrupts(conversation) as stop_requested:
                 if not config.child:
-                    with (
-                        AdvisorEventStore(local_event_db_path(config)) as event_store,
-                        AdvisorEventPump(
+                    with LocalEventStore(
+                        local_event_db_path(config)
+                    ) as event_store:
+                        event_pump = AdvisorEventPump(
                             event_store,
                             conversation,
                             parent_conversation_id=(
@@ -1615,10 +1886,17 @@ def run_openhands(
                             ),
                             inbox=inbox,
                             conversation_id=config.conversation_id,
-                        ),
-                    ):
-                        run_conversation(conversation, run_deadline - time.time())
+                        )
+                        with event_pump:
+                            run_steerable_conversation(
+                                conversation,
+                                event_pump,
+                                config.timeout_seconds,
+                                lambda: last_activity,
+                                stop_requested,
+                            )
                 else:
+                    assert run_deadline is not None
                     run_conversation(conversation, run_deadline - time.time())
         status = conversation.state.execution_status
         if (
@@ -1633,6 +1911,14 @@ def run_openhands(
             if config.child and status == ConversationExecutionStatus.FINISHED
             else None
         )
+        if child_result is not None:
+            child_result = compact_child_result(
+                conversation,
+                agent.llm,
+                config,
+                child_result,
+                run_deadline,
+            )
     finally:
         primary_exception = sys.exc_info()[1]
         primary_error = primary_exception is not None
@@ -1667,6 +1953,8 @@ def run_openhands(
                         cleanup_error = error
         clear_github_credentials()
         configure_delegation(None)
+        if inference_heartbeat is not None:
+            inference_heartbeat.close()
         if conversation is not None:
             conversation.close()
         if cleanup_error is not None and not primary_error:
