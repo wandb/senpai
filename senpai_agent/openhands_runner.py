@@ -62,6 +62,7 @@ WEAVE_PROJECT = initialize_weave_monitoring()
 from openhands.sdk import LLM, Agent, AgentContext, LocalConversation, Tool
 from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
+from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.event import ActionEvent, MessageEvent, ObservationEvent
 from openhands.sdk.llm import Message, TextContent
 from openhands.sdk.plugin import PluginSource
@@ -91,6 +92,7 @@ from senpai_agent.github.tools import (
 )
 from senpai_agent.inference_heartbeat import InferenceHeartbeat
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV, decode_launch_context
+from senpai_agent.anthropic_safety import enforce_anthropic_safety
 from senpai_agent.local_events import LocalEventStore
 from senpai_agent.program_context import (
     PROGRAM_PATH_ENV,
@@ -1721,6 +1723,7 @@ def run_openhands(
                 wandb_project=config.wandb_project,
             ),
         )
+        llm = enforce_anthropic_safety(llm)
         llm.set_request_scope(model_request)
         if config.agent_name:
             definition = depth_aware_child_definition(
@@ -1732,9 +1735,19 @@ def run_openhands(
             agent = agent_definition_to_factory(
                 without_eager_skill_discovery(definition),
             )(llm)
+            agent_llm = apply_reasoning_profile(
+                enforce_anthropic_safety(agent.llm)
+            )
+            agent_llm.set_request_scope(model_request)
+            condenser = agent.condenser
+            if isinstance(condenser, LLMSummarizingCondenser):
+                condenser_llm = enforce_anthropic_safety(condenser.llm)
+                condenser_llm.set_request_scope(model_request)
+                condenser = condenser.model_copy(update={"llm": condenser_llm})
             agent = agent.model_copy(
                 update={
-                    "llm": apply_reasoning_profile(agent.llm),
+                    "llm": agent_llm,
+                    "condenser": condenser,
                     "agent_context": (
                         agent.agent_context or AgentContext()
                     ).model_copy(update={"skills": resolved_skills}),

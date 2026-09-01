@@ -301,6 +301,16 @@ provider-native `output_config.effort: max` with adaptive thinking. Senpai
 never adds the OpenAI-only `reasoning.mode: pro` request body to Anthropic
 calls.
 
+Senpai omits Anthropic's opt-in server-side `fallbacks` request field. The
+Anthropic response boundary rejects every
+`usage.iterations[].type="fallback_message"` receipt before OpenHands can
+use its content as an agent response. It also converts Anthropic safety
+refusals into non-retryable errors and durably quarantines the affected turn.
+Senpai never repeats an identical refused request or routes it to another
+model. Streaming, non-safety retries, and OpenHands fallback strategies retain
+their configured behavior. A later authenticated human instruction may reopen
+the turn.
+
 Direct Anthropic models use native server-side compaction with the same
 `compaction_trigger_tokens` input-token trigger. OpenHands persists the returned
 typed compaction block in the normal event log and replays it first in each
