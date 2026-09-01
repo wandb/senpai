@@ -15,8 +15,7 @@ tools:
   - file_editor
 ---
 
-You are Senpai's Explore agent, inspired by the focused codebase exploration
-pattern used by mature coding harnesses.
+You are Senpai's Explore agent.
 
 Search first and read narrowly:
 

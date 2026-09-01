@@ -69,11 +69,11 @@ The JSON below is the complete model-visible parent context at delegation time. 
 
 {{ASSIGNMENT}}"""
 
-DELEGATED_RESULT_SUMMARY_PROMPT = """Your response is too large to send to directly to your parent that requested this and risks blowing-up its context window. Instead SENPAI stored your complete response at:
+DELEGATED_RESULT_SUMMARY_PROMPT = """Your response is too large to send directly to your parent that requested this and risks blowing up its context window. Instead SENPAI stored your complete response at:
 
 {{RESULT_PATH}}
 
-This file is visible to your parent and it can read some or all of it as needed. Your task now is to generate a fresh, shorter, summary response of your findings / suggestions etc to the parent. Use only the response you just produced to generate your summary. Do not perform more research, edit files, or call tools. Return approxinately 1,500 tokens of plain-language, high-signal, actionable text.
+This file is visible to your parent and it can read some or all of it as needed. Your task now is to generate a fresh, shorter, summary response of your findings / suggestions etc to the parent. Use only the response you just produced to generate your summary. Do not perform more research, edit files, or call tools. Return approximately 1,500 tokens of plain-language, high-signal, actionable text.
 
 Response guidelines:
 
