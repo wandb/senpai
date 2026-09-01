@@ -210,6 +210,43 @@ def test_push_publishes_only_head_when_the_worktree_is_dirty(tmp_path: Path):
     assert (workspace / "model.py").read_text() == "uncommitted = True\n"
 
 
+@pytest.mark.parametrize("change", ["add", "modify", "delete"])
+def test_typed_push_rejects_program_policy_changes(tmp_path: Path, change: str):
+    workspace, remote, remote_sha = repository(tmp_path)
+    if change != "add":
+        remote_sha = commit_file(
+            workspace,
+            "program.md",
+            "Operator-reviewed policy.\n",
+            "add program policy",
+        )
+        git(workspace, "push", "origin", "experiment-7")
+
+    if change == "add":
+        policy = workspace / "policy" / "program.md"
+        policy.parent.mkdir()
+        policy.write_text("Agent-authored policy.\n")
+        git(workspace, "add", str(policy.relative_to(workspace)))
+    elif change == "modify":
+        (workspace / "program.md").write_text("Agent-authored policy.\n")
+        git(workspace, "add", "program.md")
+    else:
+        git(workspace, "rm", "program.md")
+    git(workspace, "commit", "-m", f"{change} program policy")
+
+    with pytest.raises(
+        GitWorkflowPreconditionError,
+        match="explicit operator publication",
+    ):
+        push_assignment_branch(
+            workspace,
+            branch="experiment-7",
+            expected_remote_sha=remote_sha,
+        )
+
+    assert git(remote, "rev-parse", "refs/heads/experiment-7") == remote_sha
+
+
 @pytest.mark.parametrize(
     ("lease", "error"),
     [

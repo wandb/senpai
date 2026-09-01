@@ -8,7 +8,7 @@ import signal
 import sys
 import time
 from base64 import b64decode
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -49,6 +49,7 @@ from senpai_agent.PROMPTS import (
     OPERATOR_INSTRUCTIONS_PROMPT,
     render_prompt,
 )
+from senpai_agent.secrets import PRIVATE_CREDENTIAL_FD_ENVS, set_process_nondumpable
 from senpai_agent.state import (
     AssignmentConversationRegistry,
     ConversationBatch,
@@ -922,17 +923,44 @@ def _role_interval(
     return float(env.get(role_key, env.get(shared_key, str(default))))
 
 
+def _consume_private_credential_fds(env: MutableMapping[str, str]) -> None:
+    for credential_name, fd_env in PRIVATE_CREDENTIAL_FD_ENVS.items():
+        descriptor_value = env.pop(fd_env, None)
+        if descriptor_value is None:
+            continue
+        try:
+            descriptor = int(descriptor_value)
+        except ValueError as error:
+            raise RuntimeError(f"{fd_env} must be an integer") from error
+        with os.fdopen(descriptor, encoding="utf-8") as stream:
+            value = stream.read().strip()
+        if not value:
+            raise RuntimeError(f"{fd_env} is empty")
+        env[credential_name] = value
+
+
 def controller_main(
     argv: Sequence[str] | None = None,
     env: Mapping[str, str] = os.environ,
 ) -> int:
     import argparse
 
+    env = os.environ if env is os.environ else dict(env)
+    set_process_nondumpable()
+    _consume_private_credential_fds(env)
+
     progress = ProgressLease(Path(env[LEASE_ENV])) if env.get(LEASE_ENV) else None
     if progress is not None:
         progress.update("startup", 300)
 
     from senpai_agent.delegation import reconcile_delegated_tasks
+    from senpai_agent.weave_monitoring import (
+        finish_weave_monitoring,
+        initialize_weave_monitoring,
+    )
+
+    initialize_weave_monitoring(env)
+
     from senpai_agent.openhands_runner import (
         parse_runner_args,
         resolve_config,
@@ -940,10 +968,9 @@ def controller_main(
     )
     from senpai_agent.tools import (
         close_training_runtimes,
+        configure_training_credentials,
         training_runtime,
     )
-    from senpai_agent.weave_monitoring import finish_weave_monitoring
-
     parser = argparse.ArgumentParser(
         description="Run the portable Senpai GitHub/OpenHands controller."
     )
@@ -964,6 +991,7 @@ def controller_main(
     if runner_config.github_token is None:
         raise RuntimeError("controller worker requires GitHub credentials")
     scrub_model_credentials(os.environ, runner_config)
+    configure_training_credentials(runner_config.training_wandb_api_key)
     reconcile_delegated_tasks(
         getattr(runner_config, "delegation_root_state_dir", None)
         or runner_config.state_dir,
@@ -1019,6 +1047,7 @@ def controller_main(
         metrics = WandbMetricSource(
             env["WANDB_ENTITY"],
             env["WANDB_PROJECT"],
+            runner_config.wandb_api_key,
         )
         mailbox = CompositeMailbox(
             github_mailbox,
@@ -1129,6 +1158,7 @@ def controller_main(
             signal.signal(signum, handler)
         inbox.close()
         close_training_runtimes()
+        configure_training_credentials(None)
         finish_weave_monitoring()
     return 0
 

@@ -18,10 +18,17 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from dotenv import dotenv_values
+
+_KUBERNETES_DNS_PART = r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?"
+_KUBERNETES_DNS_SUBDOMAIN = re.compile(
+    rf"{_KUBERNETES_DNS_PART}(?:[.]{_KUBERNETES_DNS_PART})*"
+)
+_KUBERNETES_NAME_LIMIT = 63
+
 STUDENT_NAMES = [
     "frieren",
     "fern",
@@ -124,6 +131,29 @@ def expand_student_names(n: int, names: list[str] = STUDENT_NAMES) -> list[str]:
     return out
 
 
+def validate_kubernetes_label(value: str, option: str) -> None:
+    """Require one value that is safe in Kubernetes names and labels."""
+
+    if (
+        len(value) > _KUBERNETES_NAME_LIMIT
+        or _KUBERNETES_DNS_SUBDOMAIN.fullmatch(value) is None
+    ):
+        raise ValueError(
+            f"{option} must be a lowercase Kubernetes DNS name of at most "
+            f"{_KUBERNETES_NAME_LIMIT} characters"
+        )
+
+
+def kubernetes_resource_name(value: str) -> str:
+    """Keep a readable name and hash only an overlong constructed tail."""
+
+    if len(value) <= _KUBERNETES_NAME_LIMIT:
+        return value
+    digest = hashlib.sha256(value.encode()).hexdigest()[:16]
+    prefix = value[: _KUBERNETES_NAME_LIMIT - len(digest) - 1].rstrip("-.")
+    return f"{prefix}-{digest}"
+
+
 def routing_labels(
     advisor_branch: str, student_names: list[str]
 ) -> dict[str, tuple[str, str]]:
@@ -210,6 +240,294 @@ def existing_student_names(
     return [line for line in result.stdout.splitlines() if line]
 
 
+def _role_annotation_values(
+    tag: str,
+    annotation: str,
+    description: str,
+    *,
+    students_only: bool = False,
+    base64_encoded: bool = False,
+    allow_empty: bool = False,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> dict[str, set[str]]:
+    """Read one binding from desired Deployments and every live Pod."""
+
+    result = subprocess.run(
+        kubectl_command(
+            "get",
+            "deployments,pods",
+            "-l",
+            f"app=senpai,research-tag={tag}",
+            "-o",
+            "json",
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    bindings: dict[str, set[str]] = {}
+    for resource in json.loads(result.stdout).get("items", []):
+        metadata = resource.get("metadata", {})
+        labels = metadata.get("labels", {})
+        role = labels.get("role")
+        student = labels.get("student")
+        if students_only and role != "student":
+            continue
+        if role == "advisor":
+            identity = "advisor"
+        elif role == "student" and isinstance(student, str) and student:
+            identity = f"student/{student}"
+        else:
+            sys.exit(
+                "ERROR: an existing Senpai role resource lacks a valid role "
+                "identity; use a new launch tag"
+            )
+        annotations = metadata.get("annotations", {})
+        if resource.get("kind") == "Deployment":
+            annotations = (
+                resource.get("spec", {})
+                .get("template", {})
+                .get("metadata", {})
+                .get("annotations", {})
+            )
+        value = annotations.get(annotation)
+        try:
+            if base64_encoded:
+                value = base64.b64decode(value, validate=True).decode()
+            elif not isinstance(value, str):
+                raise TypeError
+        except (TypeError, ValueError, UnicodeDecodeError):
+            sys.exit(
+                f"ERROR: existing {identity.replace('/', ' ')} lacks a valid "
+                f"{description} binding; use a new launch tag"
+            )
+        if not value and not allow_empty:
+            sys.exit(
+                f"ERROR: existing {identity.replace('/', ' ')} lacks a valid "
+                f"{description} binding; use a new launch tag"
+            )
+        bindings.setdefault(identity, set()).add(value)
+    return bindings
+
+
+def existing_student_wandb_viewers(
+    tag: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> dict[str, set[str]]:
+    """Return every active or desired W&B writer identity by student."""
+
+    bindings = _role_annotation_values(
+        tag,
+        "senpai.wandb.com/wandb-viewer",
+        "W&B writer viewer",
+        students_only=True,
+        base64_encoded=True,
+        kube_context=kube_context,
+        namespace=namespace,
+    )
+    return {
+        identity.removeprefix("student/"): viewers
+        for identity, viewers in bindings.items()
+    }
+
+
+def existing_controller_wandb_viewers(
+    tag: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> dict[str, set[str]]:
+    """Return every active or desired controller W&B identity by role."""
+
+    return _role_annotation_values(
+        tag,
+        "senpai.wandb.com/controller-wandb-viewer",
+        "controller W&B viewer",
+        base64_encoded=True,
+        kube_context=kube_context,
+        namespace=namespace,
+    )
+
+
+def existing_inference_wandb_viewers(
+    tag: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> dict[str, set[str]]:
+    """Return every active or desired W&B Inference identity by role."""
+
+    return _role_annotation_values(
+        tag,
+        "senpai.wandb.com/inference-wandb-viewer",
+        "W&B Inference viewer",
+        base64_encoded=True,
+        allow_empty=True,
+        kube_context=kube_context,
+        namespace=namespace,
+    )
+
+
+def existing_wandb_viewer_owners(
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> dict[str, set[str]]:
+    """Return every desired or live W&B viewer owner in the namespace."""
+
+    result = subprocess.run(
+        kubectl_command(
+            "get",
+            "deployments,pods",
+            "-l",
+            "app=senpai",
+            "-o",
+            "json",
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    owners: dict[str, set[str]] = {}
+    for resource in json.loads(result.stdout).get("items", []):
+        metadata = resource.get("metadata", {})
+        labels = metadata.get("labels", {})
+        tag = labels.get("research-tag")
+        role = labels.get("role")
+        student = labels.get("student")
+        if not isinstance(tag, str) or not tag:
+            sys.exit(
+                "ERROR: an existing Senpai role resource lacks a research-tag; "
+                "remove or upgrade every active legacy role before launching"
+            )
+        if role == "advisor":
+            identity = "advisor"
+        elif role == "student" and isinstance(student, str) and student:
+            identity = f"student {student!r}"
+        else:
+            sys.exit(
+                "ERROR: an existing Senpai role resource lacks a valid role "
+                "identity; remove or upgrade every active legacy role before "
+                "launching"
+            )
+        annotations = metadata.get("annotations", {})
+        if resource.get("kind") == "Deployment":
+            annotations = (
+                resource.get("spec", {})
+                .get("template", {})
+                .get("metadata", {})
+                .get("annotations", {})
+            )
+        bindings = [
+            (
+                f"tag {tag!r} controller",
+                "senpai.wandb.com/controller-wandb-viewer",
+                False,
+            ),
+            (
+                f"tag {tag!r} W&B Inference",
+                "senpai.wandb.com/inference-wandb-viewer",
+                True,
+            ),
+        ]
+        if role == "student":
+            bindings.append(
+                (
+                    f"tag {tag!r} {identity}",
+                    "senpai.wandb.com/wandb-viewer",
+                    False,
+                )
+            )
+        for owner, annotation, allow_empty in bindings:
+            try:
+                viewer = base64.b64decode(
+                    annotations.get(annotation), validate=True
+                ).decode()
+            except (TypeError, ValueError, UnicodeDecodeError):
+                sys.exit(
+                    f"ERROR: existing {identity} in tag {tag!r} lacks a valid "
+                    "W&B viewer binding; remove or upgrade every active legacy "
+                    "role before launching"
+                )
+            if not viewer:
+                if allow_empty:
+                    continue
+                sys.exit(
+                    f"ERROR: existing {identity} in tag {tag!r} lacks a valid "
+                    "W&B viewer binding; remove or upgrade every active legacy "
+                    "role before launching"
+                )
+            owners.setdefault(owner, set()).add(viewer)
+    return owners
+
+
+def existing_program_context_secret(
+    tag: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> str | None:
+    """Return the one immutable program snapshot bound to a live launch tag."""
+
+    bindings = _role_annotation_values(
+        tag,
+        "senpai.program.com/context-secret",
+        "program context",
+        kube_context=kube_context,
+        namespace=namespace,
+    )
+    names = {name for values in bindings.values() for name in values}
+    if len(names) > 1:
+        sys.exit(
+            "ERROR: existing roles use different program snapshots; use a new "
+            "launch tag"
+        )
+    return next(iter(names), None)
+
+
+def read_program_context_secret(
+    name: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> str:
+    """Read the encoded program snapshot from a launch-owned Secret."""
+
+    result = subprocess.run(
+        kubectl_command(
+            "get",
+            "secret",
+            name,
+            "-o",
+            "json",
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(result.stdout)
+    labels = payload.get("metadata", {}).get("labels", {})
+    value = payload.get("data", {}).get("program-context")
+    if labels.get("senpai.wandb.com/secret-role") != "program-context":
+        sys.exit("ERROR: the bound program context Secret has an invalid role")
+    try:
+        encoded = base64.b64decode(value, validate=True).decode()
+    except (TypeError, ValueError, UnicodeDecodeError):
+        sys.exit("ERROR: the bound program context Secret is invalid")
+    if not encoded:
+        sys.exit("ERROR: the bound program context Secret is empty")
+    return encoded
+
+
 def render_template(template: str, replacements: dict[str, str]) -> str:
     """Replace {{PLACEHOLDER}} tokens in a K8s manifest template."""
     out = template
@@ -235,9 +553,9 @@ def render_configmap(name: str, labels: dict[str, str], data: dict[str, str]) ->
     return "\n".join(lines)
 
 
-def pod_template_hash(configmap: str, launch_secret: str) -> str:
+def pod_template_hash(*resources: str) -> str:
     """Hash the complete pod configuration that must trigger a rollout."""
-    return hashlib.sha256(f"{configmap}\0{launch_secret}".encode()).hexdigest()
+    return hashlib.sha256("\0".join(resources).encode()).hexdigest()
 
 
 def target_repo_slug(url: str) -> str:
@@ -369,24 +687,25 @@ def ensure_advisor_branch(
     token: str,
     target_repo_branch: str,
     advisor_branch: str,
-) -> None:
-    """Create advisor_branch from target_repo_branch when it does not exist."""
+) -> str:
+    """Ensure the advisor branch exists and return its exact head commit."""
     slug = target_repo_slug(target_repo_url)
     base_branch = preflight_check_target_repo_branch(
         target_repo_url, token, target_repo_branch
     )
 
     if advisor_branch == base_branch:
+        branch = _github_api(_branch_api_path(slug, advisor_branch), token)
         print(
             f"Preflight: advisor branch is target base branch {slug}@{advisor_branch}"
         )
-        return
+        return str(branch["commit"]["sha"])
 
     print(f"Preflight: ensuring advisor branch {slug}@{advisor_branch} exists")
     try:
-        _github_api(_branch_api_path(slug, advisor_branch), token)
+        branch = _github_api(_branch_api_path(slug, advisor_branch), token)
         print(f"  OK — advisor branch {advisor_branch} already exists")
-        return
+        return str(branch["commit"]["sha"])
     except urllib.error.HTTPError as e:
         if e.code != 404:
             raise
@@ -401,6 +720,7 @@ def ensure_advisor_branch(
     ).encode()
     _github_api(f"/repos/{slug}/git/refs", token, method="POST", data=payload)
     print(f"  created {advisor_branch} from {base_branch} at {base_sha[:7]}")
+    return str(base_sha)
 
 
 LAUNCH_CREDENTIAL_ENV_NAMES = (
@@ -509,6 +829,51 @@ def resolve_wandb_api_key(dotenv_path: Path) -> str:
     return resolve_required_secret(dotenv_path, "WANDB_API_KEY", "W&B API key")
 
 
+def resolve_wandb_inference_api_key(dotenv_path: Path) -> str:
+    """Resolve the dedicated W&B Inference model credential."""
+
+    return resolve_required_secret(
+        dotenv_path,
+        "WANDB_INFERENCE_API_KEY",
+        "W&B Inference API key",
+    )
+
+
+def student_wandb_api_key_env(student_name: str) -> str:
+    suffix = re.sub(r"[^A-Za-z0-9]", "_", student_name).upper()
+    return f"WANDB_API_KEY_{suffix}"
+
+
+def resolve_student_wandb_api_keys(
+    dotenv_path: Path,
+    student_names: Sequence[str],
+) -> dict[str, str]:
+    """Resolve one distinct W&B writer key for each student pod."""
+
+    env_names: dict[str, str] = {}
+    for name in student_names:
+        env_name = student_wandb_api_key_env(name)
+        if env_name in env_names:
+            other = env_names[env_name]
+            sys.exit(
+                f"ERROR: student names {other!r} and {name!r} both map to "
+                f"{env_name}; choose names with distinct credential suffixes"
+            )
+        env_names[env_name] = name
+
+    resolved = {
+        name: resolve_required_secret(
+            dotenv_path,
+            student_wandb_api_key_env(name),
+            f"W&B training API key for student {name}",
+        )
+        for name in student_names
+    }
+    if len(set(resolved.values())) != len(resolved):
+        sys.exit("ERROR: every student requires a distinct W&B training API key")
+    return resolved
+
+
 def render_launch_secret(
     tag: str,
     github_token: str,
@@ -517,9 +882,10 @@ def render_launch_secret(
     *,
     anthropic_api_key: str | None = None,
     openai_api_key: str | None = None,
+    wandb_inference_api_key: str | None = None,
     custom_secrets: dict[str, str],
-) -> str:
-    """Per-launch k8s Secret holding API credentials used by advisor/student pods."""
+) -> tuple[str, str]:
+    """Render content-addressed shared credentials for one launch update."""
     credentials = {
         "github-token": github_token,
         "exa-api-key": exa_api_key,
@@ -529,24 +895,96 @@ def render_launch_secret(
         credentials["anthropic-api-key"] = anthropic_api_key
     if openai_api_key is not None:
         credentials["openai-api-key"] = openai_api_key
+    if wandb_inference_api_key is not None:
+        credentials["wandb-inference-api-key"] = wandb_inference_api_key
     credentials.update(custom_secrets)
     encoded = {
         name: base64.b64encode(value.encode()).decode()
         for name, value in credentials.items()
     }
+    digest = hashlib.sha256(
+        json.dumps(credentials, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()[:16]
+    name = kubernetes_resource_name(f"senpai-launch-secrets-{tag}-{digest}")
     lines = [
         "apiVersion: v1",
         "kind: Secret",
         "metadata:",
-        f"  name: senpai-launch-secrets-{tag}",
+        f"  name: {name}",
         "  labels:",
         "    app: senpai",
         f"    research-tag: {tag}",
         "type: Opaque",
+        "immutable: true",
         "data:",
     ]
     lines.extend(f"  {name}: {value}" for name, value in encoded.items())
-    return "\n".join(lines) + "\n"
+    return name, "\n".join(lines) + "\n"
+
+
+def render_program_context_secret(
+    tag: str,
+    program_context: str,
+) -> tuple[str, str]:
+    """Render an immutable, content-addressed program snapshot Secret."""
+
+    digest = hashlib.sha256(program_context.encode()).hexdigest()[:16]
+    name = kubernetes_resource_name(f"senpai-program-context-{tag}-{digest}")
+    encoded = base64.b64encode(program_context.encode()).decode()
+    manifest = "\n".join(
+        [
+            "apiVersion: v1",
+            "kind: Secret",
+            "metadata:",
+            f"  name: {name}",
+            "  labels:",
+            "    app: senpai",
+            f"    research-tag: {tag}",
+            "    senpai.wandb.com/secret-role: program-context",
+            "type: Opaque",
+            "immutable: true",
+            "data:",
+            f"  program-context: {encoded}",
+        ]
+    )
+    return name, manifest + "\n"
+
+
+def render_student_wandb_secret(
+    tag: str,
+    student_name: str,
+    api_key: str,
+    viewer_id: str,
+) -> tuple[str, str]:
+    """Render one student's isolated W&B writer credential."""
+
+    digest = hashlib.sha256(api_key.encode()).hexdigest()[:16]
+    name = kubernetes_resource_name(
+        f"senpai-wandb-student-{tag}-{student_name}-{digest}"
+    )
+    encoded = base64.b64encode(api_key.encode()).decode()
+    viewer = base64.b64encode(viewer_id.encode()).decode()
+    manifest = "\n".join(
+        [
+            "apiVersion: v1",
+            "kind: Secret",
+            "metadata:",
+            f"  name: {name}",
+            "  labels:",
+            "    app: senpai",
+            "    role: student",
+            f"    student: {student_name}",
+            f"    research-tag: {tag}",
+            "    senpai.wandb.com/secret-role: training-writer",
+            "  annotations:",
+            f"    senpai.wandb.com/wandb-viewer: {viewer}",
+            "type: Opaque",
+            "immutable: true",
+            "data:",
+            f"  wandb-api-key: {encoded}",
+        ]
+    )
+    return name, manifest + "\n"
 
 
 def _redact_secrets(text: str, *secrets: str) -> str:
@@ -646,8 +1084,8 @@ def preflight_check_exa_api_key(api_key: str) -> None:
         sys.exit("ERROR: Exa API key check returned an invalid search response")
 
 
-def preflight_check_wandb_api_key(api_key: str) -> None:
-    """Verify the supplied W&B API key with the smallest viewer query."""
+def preflight_check_wandb_api_key(api_key: str) -> str:
+    """Verify the supplied W&B API key and return its viewer identity."""
     basic_auth = base64.b64encode(f"api:{api_key}".encode()).decode()
     req = urllib.request.Request(
         "https://api.wandb.ai/graphql",
@@ -674,11 +1112,65 @@ def preflight_check_wandb_api_key(api_key: str) -> None:
         )
     except urllib.error.URLError as error:
         sys.exit(f"ERROR: W&B API key failed: {error.reason}")
-    if not payload.get("data", {}).get("viewer"):
-        errors = json.dumps(payload.get("errors", []), sort_keys=True)
+    viewer = (
+        payload.get("data", {}).get("viewer")
+        if isinstance(payload, dict)
+        else None
+    )
+    viewer_id = viewer.get("id") if isinstance(viewer, dict) else None
+    if not isinstance(viewer_id, str) or not viewer_id.strip():
+        errors = json.dumps(
+            payload.get("errors", []) if isinstance(payload, dict) else [],
+            sort_keys=True,
+        )
         errors = _redact_secrets(errors, api_key, basic_auth)
         sys.exit(f"ERROR: W&B API key failed to resolve a viewer: {errors[:1000]}")
     print("  OK — W&B API key authenticated")
+    return viewer_id.strip()
+
+
+def require_distinct_wandb_viewers(
+    controller_viewer: str,
+    student_viewers: Mapping[str, str],
+    *,
+    inference_viewers: Sequence[str] = (),
+    active_controller_viewers: Sequence[str] = (),
+    active_inference_viewers: Sequence[str] = (),
+    active_student_viewers: Mapping[str, Sequence[str]] | None = None,
+    active_viewer_owners: Mapping[str, Sequence[str]] | None = None,
+    owner_scope: str = "",
+) -> None:
+    """Reject viewer reuse across controller, inference, and writer owners."""
+
+    owners: dict[str, str] = {}
+
+    def bind(viewer: str, owner: str) -> None:
+        if not viewer:
+            return
+        if previous := owners.get(viewer):
+            if previous != owner:
+                sys.exit(
+                    "ERROR: W&B API keys for "
+                    f"{previous} and {owner} authenticate as the same viewer"
+                )
+            return
+        owners[viewer] = owner
+
+    def owner(name: str) -> str:
+        return f"{owner_scope} {name}".strip()
+
+    for active_owner, viewers in (active_viewer_owners or {}).items():
+        for viewer in viewers:
+            bind(viewer, active_owner)
+    for viewer in (*active_controller_viewers, controller_viewer):
+        bind(viewer, owner("controller"))
+    for viewer in (*active_inference_viewers, *inference_viewers):
+        bind(viewer, owner("W&B Inference"))
+    for student, viewers in (active_student_viewers or {}).items():
+        for viewer in viewers:
+            bind(viewer, owner(f"student {student!r}"))
+    for student, viewer in student_viewers.items():
+        bind(viewer, owner(f"student {student!r}"))
 
 
 def preflight_check_wandb_inference(

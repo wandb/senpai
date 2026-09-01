@@ -132,6 +132,12 @@ def initialize_weave_monitoring(
     return project_name
 
 
+def current_weave_project() -> str | None:
+    """Return the active project without starting a tracing session."""
+
+    return _project_name
+
+
 def finish_weave_monitoring() -> None:
     global _content_redactor, _initialized, _project_name
     if not _initialized:

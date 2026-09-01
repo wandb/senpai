@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from pydantic import SecretStr
 
@@ -186,6 +186,7 @@ def _push_validated_commit(
         raise GitWorkflowPreconditionError(
             f"local head {local_sha} does not fast-forward remote head {remote_sha}"
         ) from error
+    _require_program_policy_unchanged(repository, remote_sha, local_sha)
 
     _git(
         repository,
@@ -198,6 +199,33 @@ def _push_validated_commit(
     if _remote_head(repository, remote, branch, token=token) != local_sha:
         raise RuntimeError("remote branch did not reach the pushed commit")
     return PushResult(True, branch, local_sha)
+
+
+def _require_program_policy_unchanged(
+    repository: Path,
+    base_sha: str,
+    head_sha: str,
+) -> None:
+    changed_paths = _git(
+        repository,
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+        "-z",
+        base_sha,
+        head_sha,
+        "--",
+    ).removesuffix("\0")
+    if any(
+        PurePosixPath(path).name == "program.md"
+        for path in changed_paths.split("\0")
+        if path
+    ):
+        raise GitWorkflowPreconditionError(
+            "program.md changes require explicit operator publication"
+        )
 
 
 def _create_assignment_commit(

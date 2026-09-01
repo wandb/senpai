@@ -81,6 +81,41 @@ def test_custom_secrets_report_every_missing_or_blank_name(monkeypatch, tmp_path
     assert "BLANK_SECRET" in message
 
 
+def test_student_wandb_keys_are_derived_and_must_be_distinct(monkeypatch, tmp_path):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(
+        "WANDB_API_KEY_FERN=fern-key\n"
+        "WANDB_API_KEY_TEAM_FRIEREN=frieren-key\n"
+    )
+    for name in ("WANDB_API_KEY_FERN", "WANDB_API_KEY_TEAM_FRIEREN"):
+        monkeypatch.delenv(name, raising=False)
+
+    assert launch_helpers.resolve_student_wandb_api_keys(
+        dotenv, ["fern", "team-frieren"]
+    ) == {"fern": "fern-key", "team-frieren": "frieren-key"}
+
+    dotenv.write_text(
+        "WANDB_API_KEY_FERN=shared-key\n"
+        "WANDB_API_KEY_FRIEREN=shared-key\n"
+    )
+    with pytest.raises(SystemExit, match="distinct W&B training API key"):
+        launch_helpers.resolve_student_wandb_api_keys(
+            dotenv, ["fern", "frieren"]
+        )
+
+
+def test_student_wandb_key_names_must_not_normalize_to_the_same_env_name(tmp_path):
+    with pytest.raises(SystemExit) as raised:
+        launch_helpers.resolve_student_wandb_api_keys(
+            tmp_path / ".env", ["team-fern", "team_fern"]
+        )
+
+    message = str(raised.value)
+    assert "team-fern" in message
+    assert "team_fern" in message
+    assert "WANDB_API_KEY_TEAM_FERN" in message
+
+
 def test_github_cli_fallback_does_not_inherit_custom_secrets(monkeypatch, tmp_path):
     captured = {}
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
@@ -142,7 +177,7 @@ def test_wandb_preflight_authenticates_with_the_minimal_viewer_query(monkeypatch
         {"data": {"viewer": {"id": "user"}}},
     )
 
-    launch_helpers.preflight_check_wandb_api_key("wandb-secret")
+    assert launch_helpers.preflight_check_wandb_api_key("wandb-secret") == "user"
 
     request = captured["request"]
     assert request.full_url == "https://api.wandb.ai/graphql"
@@ -172,6 +207,86 @@ def test_wandb_preflight_redacts_credentials_from_graphql_errors(monkeypatch):
     assert "wandb-secret" not in message
     assert basic_auth not in message
     assert "<redacted>" in message
+
+
+@pytest.mark.parametrize(
+    "viewer",
+    [{}, {"id": ""}, {"id": 123}, None],
+)
+def test_wandb_preflight_requires_a_viewer_identity(monkeypatch, viewer):
+    capture_request(monkeypatch, {"data": {"viewer": viewer}})
+
+    with pytest.raises(SystemExit, match="failed to resolve a viewer"):
+        launch_helpers.preflight_check_wandb_api_key("wandb-secret")
+
+
+def test_wandb_viewers_must_be_distinct_across_controller_and_students():
+    launch_helpers.require_distinct_wandb_viewers(
+        "controller-viewer",
+        {"fern": "fern-viewer", "frieren": "frieren-viewer"},
+        inference_viewers=("inference-viewer",),
+        active_controller_viewers=("old-controller-viewer",),
+        active_inference_viewers=("old-inference-viewer",),
+        active_student_viewers={"fern": ("old-fern-viewer",)},
+    )
+
+    with pytest.raises(SystemExit, match="controller and W&B Inference"):
+        launch_helpers.require_distinct_wandb_viewers(
+            "shared-viewer",
+            {},
+            inference_viewers=("shared-viewer",),
+        )
+
+    with pytest.raises(SystemExit, match="W&B Inference.*student 'fern'"):
+        launch_helpers.require_distinct_wandb_viewers(
+            "controller-viewer",
+            {"fern": "shared-viewer"},
+            inference_viewers=("shared-viewer",),
+        )
+
+    with pytest.raises(SystemExit, match="controller.*student 'fern'.*same viewer"):
+        launch_helpers.require_distinct_wandb_viewers(
+            "shared-viewer",
+            {"fern": "shared-viewer"},
+        )
+
+    with pytest.raises(SystemExit, match="student 'fern'.*student 'frieren'.*same viewer"):
+        launch_helpers.require_distinct_wandb_viewers(
+            "controller-viewer",
+            {"fern": "shared-viewer", "frieren": "shared-viewer"},
+        )
+
+    with pytest.raises(SystemExit, match="W&B Inference.*student 'fern'"):
+        launch_helpers.require_distinct_wandb_viewers(
+            "controller-viewer",
+            {"fern": "old-inference-viewer"},
+            active_inference_viewers=("old-inference-viewer",),
+        )
+
+    with pytest.raises(SystemExit, match="controller.*student 'fern'"):
+        launch_helpers.require_distinct_wandb_viewers(
+            "new-controller-viewer",
+            {"fern": "old-controller-viewer"},
+            active_controller_viewers=("old-controller-viewer",),
+        )
+
+    launch_helpers.require_distinct_wandb_viewers(
+        "controller-viewer",
+        {"fern": "fern-viewer"},
+        active_controller_viewers=("controller-viewer", "old-controller-viewer"),
+        active_inference_viewers=("inference-viewer", "old-inference-viewer"),
+        active_student_viewers={"fern": ("fern-viewer", "old-fern-viewer")},
+    )
+
+    with pytest.raises(SystemExit, match="older-track.*current-track.*same viewer"):
+        launch_helpers.require_distinct_wandb_viewers(
+            "controller-viewer",
+            {"fern": "shared-viewer"},
+            active_viewer_owners={
+                "tag 'older-track' student 'frieren'": ("shared-viewer",)
+            },
+            owner_scope="tag 'current-track'",
+        )
 
 
 def test_wandb_inference_preflight_routes_to_the_requested_project(monkeypatch):
@@ -216,6 +331,29 @@ def test_repo_access_uses_an_impossible_ref_write_probe(monkeypatch):
         "ref": "refs/heads/senpai-write-preflight",
         "sha": "0" * 40,
     }
+
+
+def test_existing_advisor_branch_head_becomes_the_program_source_commit(
+    monkeypatch,
+):
+    source_commit = "c" * 40
+    monkeypatch.setattr(
+        launch_helpers,
+        "preflight_check_target_repo_branch",
+        lambda *_args: "main",
+    )
+    monkeypatch.setattr(
+        launch_helpers,
+        "_github_api",
+        lambda *_args, **_kwargs: {"commit": {"sha": source_commit}},
+    )
+
+    assert launch_helpers.ensure_advisor_branch(
+        "https://github.com/example/problem.git",
+        "github-secret",
+        "main",
+        "research",
+    ) == source_commit
 
 
 def test_repo_access_rejects_and_redacts_a_non_validation_error(monkeypatch):

@@ -8,7 +8,7 @@ SPDX-PackageName: senpai
 
 You implement one assigned experiment, run it safely, and report complete, reproducible evidence to the advisor.
 
-Read the `program.md` identified in your system prompt, plus the assigned PR body and every PR comment and review before editing. Together they define the hypothesis, allowed files, metric contract, run limits, and any requested revision.
+Use the immutable target-policy snapshot identified in your system prompt, plus the assigned PR body and every PR comment and review before editing. Together they define the hypothesis, allowed files, metric contract, run limits, and any requested revision. Do not replace the snapshot with a live workspace copy or modify any `program.md`.
 
 ## Boundaries
 

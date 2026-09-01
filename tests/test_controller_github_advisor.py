@@ -25,6 +25,8 @@ def pull(
     number=17,
     body="",
     head_sha=None,
+    head_repo="acme/widgets",
+    author="maintainer",
     comments_url=None,
     updated_at="2099-07-29T18:00:00Z",
 ):
@@ -34,9 +36,11 @@ def pull(
         "html_url": f"https://github.test/acme/widgets/pull/{number}",
         "updated_at": updated_at,
         "body": body,
+        "user": {"login": author},
         "head": {
             "ref": f"student/candidate-{number}",
             "sha": head_sha or str(number % 10) * 40,
+            "repo": {"full_name": head_repo},
         },
         "labels": [{"name": label} for label in labels],
     }
@@ -56,8 +60,96 @@ def mailbox(monkeypatch, pulls, *, students=()):
     )
     monkeypatch.setattr(value, "_pulls", lambda: list(pulls))
     monkeypatch.setattr(value, "_issues", list)
+    monkeypatch.setattr(value, "_has_write_permission", lambda _login: True)
     monkeypatch.setattr(value._github, "objects", lambda _url: [])
     return value
+
+
+@pytest.mark.parametrize(
+    ("permission", "expected"),
+    [
+        ("admin", True),
+        ("maintain", True),
+        ("write", True),
+        ("triage", False),
+        ("read", False),
+        ("none", False),
+    ],
+)
+def test_advisor_write_authorization_uses_current_collaborator_permission(
+    monkeypatch,
+    permission,
+    expected,
+):
+    advisor = GitHubMailbox(
+        repo="acme/widgets",
+        token=SecretStr("github-token"),
+        role="advisor",
+        advisor_branch="research",
+    )
+    requests = []
+
+    def get(path):
+        requests.append(path)
+        return {"permission": permission}
+
+    monkeypatch.setattr(advisor._github, "get", get)
+
+    assert advisor._has_write_permission("maintainer") is expected
+    assert requests == [
+        "/repos/acme/widgets/collaborators/maintainer/permission"
+    ]
+
+
+def test_advisor_rejects_a_fork_head_before_checking_author_permission(monkeypatch):
+    fork = pull(
+        labels=("research", "student:student-1", "status:review"),
+        head_repo="outsider/widgets",
+    )
+    advisor = mailbox(monkeypatch, [fork])
+    permission_checks = []
+    monkeypatch.setattr(
+        advisor,
+        "_has_write_permission",
+        lambda login: permission_checks.append(login) or True,
+    )
+
+    assert advisor.poll() == ()
+    assert permission_checks == []
+
+
+def test_advisor_rejects_a_same_repo_pull_without_current_write_permission(
+    monkeypatch,
+):
+    untrusted = pull(
+        labels=("research", "student:student-1", "status:review"),
+        author="former-maintainer",
+    )
+    advisor = mailbox(monkeypatch, [untrusted])
+    permission_checks = []
+    monkeypatch.setattr(
+        advisor,
+        "_has_write_permission",
+        lambda login: permission_checks.append(login) or False,
+    )
+
+    assert advisor.poll() == ()
+    assert permission_checks == ["former-maintainer"]
+
+
+def test_advisor_permission_read_failure_rejects_the_pull(monkeypatch, capsys):
+    candidate = pull(
+        labels=("research", "student:student-1", "status:review"),
+    )
+    advisor = mailbox(monkeypatch, [candidate])
+
+    def fail(_login):
+        raise GitHubReadError("permission unavailable")
+
+    monkeypatch.setattr(advisor, "_has_write_permission", fail)
+
+    assert advisor.poll() == ()
+    assert "SENPAI_ADVISOR_PULL_AUTHORIZATION_ERROR pr=17" in capsys.readouterr().err
 
 
 def assignment(

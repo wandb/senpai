@@ -42,6 +42,7 @@ def advisor_events(
     pulls: Sequence[dict[str, object]],
     issues: Sequence[dict[str, object]],
 ) -> tuple[ControllerEvent, ...]:
+    pulls = _authorized_control_pulls(mailbox, pulls)
     events: list[ControllerEvent] = []
     active_assignments: list[tuple[dict[str, object], AssignmentRecord]] = []
     reserved_by_student: dict[str, list[int]] = {
@@ -144,6 +145,38 @@ def advisor_events(
     events.extend(human_pr_comment_events(mailbox, pulls))
     events.extend(human_issue_events(mailbox, issues))
     return tuple(events)
+
+
+def _authorized_control_pulls(
+    mailbox: GitHubMailbox,
+    pulls: Sequence[dict[str, object]],
+) -> tuple[dict[str, object], ...]:
+    """Return same-repository PRs whose authors currently have write access."""
+
+    permissions: dict[str, bool] = {}
+    authorized: list[dict[str, object]] = []
+    for pull in pulls:
+        try:
+            head = object_value(pull["head"])
+            head_repo = object_value(head["repo"])["full_name"]
+            author = object_value(pull["user"])["login"]
+            if not isinstance(head_repo, str) or not isinstance(author, str):
+                raise TypeError("GitHub pull request has invalid trust metadata")
+            if head_repo.casefold() != mailbox.repo.casefold():
+                continue
+            login = author.casefold()
+            if login not in permissions:
+                permissions[login] = mailbox._has_write_permission(author)
+            if permissions[login]:
+                authorized.append(pull)
+        except (GitHubReadError, KeyError, TypeError) as error:
+            print(
+                "SENPAI_ADVISOR_PULL_AUTHORIZATION_ERROR "
+                f"pr={pull.get('number')!r} {type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+    return tuple(authorized)
 
 
 def _research_base_events(

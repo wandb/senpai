@@ -82,6 +82,18 @@ def test_plugin_loads_terminal_safety_and_lifecycle_hooks():
         "terminal",
     }
     assert hooks["Stop"] and hooks["SessionEnd"]
+    commands = [
+        hook["command"]
+        for group in hooks.values()
+        for registration in group
+        for hook in registration["hooks"]
+        if hook["type"] == "command"
+    ]
+    assert commands
+    assert all(
+        command.startswith("/opt/senpai-venv/bin/python -P -m senpai_agent.hooks ")
+        for command in commands
+    )
 
 
 @pytest.mark.parametrize("queued_feedback", (False, True))
