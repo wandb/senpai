@@ -1,11 +1,10 @@
-import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 from openhands.sdk.plugin import Plugin
-from openhands.sdk.subagent import discover_agents
 
 from senpai_agent.agent_markdown import sanitize_markdown, strip_spdx_header
 
@@ -80,43 +79,21 @@ def test_human_issue_skill_keeps_the_single_intent_response_contract():
     assert "STUDENT $0" not in content
 
 
-def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
-    tmp_path: Path,
-):
-    home = tmp_path / "home"
-    runtime_root = tmp_path / "runtime"
-    home.mkdir()
-    runtime_root.mkdir()
+def test_plugin_sanitizer_builds_a_loadable_runtime_copy(tmp_path: Path):
+    runtime_plugin = tmp_path / "plugin"
+    shutil.copytree(PLUGIN_DIR, runtime_plugin)
     source_skill = PLUGIN_DIR / "skills" / "review-experiment" / "SKILL.md"
-    operator_skill = ROOT / ".agents" / "skills" / "experiment-report" / "SKILL.md"
-    source_agent = ROOT / ".agents" / "agents" / "bash-runner.md"
-    originals = {
-        source_skill: source_skill.read_text(encoding="utf-8"),
-        operator_skill: operator_skill.read_text(encoding="utf-8"),
-        source_agent: source_agent.read_text(encoding="utf-8"),
-    }
+    original = source_skill.read_text(encoding="utf-8")
 
-    completed = subprocess.run(
-        [
-            "bash",
-            "-c",
-            'source "$1"; install_senpai_agent_context "$2" "$3" "$4"',
-            "bash",
-            str(PLUGIN_DIR / "scripts" / "agent-context.sh"),
-            str(ROOT),
-            str(PLUGIN_DIR),
-            str(runtime_root),
-        ],
+    subprocess.run(
+        [sys.executable, "-m", "senpai_agent.agent_markdown", str(runtime_plugin)],
         check=True,
         capture_output=True,
         text=True,
-        env={**os.environ, "HOME": str(home), "SENPAI_PYTHON": sys.executable},
+        cwd=ROOT,
     )
-    runtime_plugin = Path(completed.stdout.strip())
 
     plugin = Plugin.load(runtime_plugin)
-    agents = discover_agents(home, include_project=True, include_user=False)
-
     assert {skill.name for skill in plugin.skills} == {
         "alphaxiv-paper-lookup",
         "assign-experiment",
@@ -129,17 +106,12 @@ def test_agent_context_installer_builds_loadable_sanitized_runtime_copies(
         "submit-experiment-results",
         "wandb-primary",
     }
-    assert "bash-runner" in {agent.name for agent in agents}
-    assert not (home / ".agents/skills").exists()
     assert all(
         strip_spdx_header(text) == text
-        for root in (runtime_plugin, home / ".agents")
-        for path in root.rglob("*.md")
+        for path in runtime_plugin.rglob("*.md")
         if (text := path.read_text(encoding="utf-8"))
     )
-    assert {
-        path: path.read_text(encoding="utf-8") for path in originals
-    } == originals
+    assert source_skill.read_text(encoding="utf-8") == original
 
 
 def test_delegate_subagents_skill_advertises_frontier_research_judgment():

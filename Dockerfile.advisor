@@ -7,6 +7,7 @@ LABEL org.opencontainers.image.revision="${SENPAI_SOURCE_REVISION}"
 ENV PATH="/opt/senpai-venv/bin:/home/senpai/.local/bin:${PATH}" \
     PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
     SENPAI_AGENT_DIR=/opt/senpai-agent-definitions \
+    SENPAI_PLUGIN=/opt/senpai-plugin \
     SENPAI_IMAGE_REVISION="${SENPAI_SOURCE_REVISION}" \
     SENPAI_PYTHON=/opt/senpai-venv/bin/python \
     UV_PYTHON=/opt/senpai-venv/bin/python \
@@ -36,6 +37,7 @@ RUN python -m pip install --no-cache-dir "uv==0.10.9" && \
 COPY pyproject.toml uv.lock /tmp/senpai/
 COPY senpai_agent /tmp/senpai/senpai_agent
 COPY .agents/agents /opt/senpai-agent-definitions
+COPY plugins/senpai /opt/senpai-plugin
 RUN cd /tmp/senpai && \
     uv export --locked --python 3.13 --no-dev --no-emit-project \
       --format requirements.txt \
@@ -56,8 +58,9 @@ RUN cd /tmp/senpai && \
       -r requirements.txt && \
     uv pip install --python "$SENPAI_PYTHON" --no-deps /tmp/senpai && \
     python -c 'import importlib.metadata, importlib.util, openhands.sdk, senpai_agent, sys; assert sys.version_info[:2] == (3, 13); assert importlib.util.find_spec("torch") is None; assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
-    chown -R root:root /opt/senpai-venv "$SENPAI_AGENT_DIR" && \
-    chmod -R a-w /opt/senpai-venv "$SENPAI_AGENT_DIR" && \
+    python -m senpai_agent.agent_markdown "$SENPAI_PLUGIN" && \
+    chown -R root:root /opt/senpai-venv "$SENPAI_AGENT_DIR" "$SENPAI_PLUGIN" && \
+    chmod -R a-w /opt/senpai-venv "$SENPAI_AGENT_DIR" "$SENPAI_PLUGIN" && \
     rm -rf /root/.cache/uv /tmp/senpai
 
 COPY scripts/senpai-browser-smoke-test.py /usr/local/bin/senpai-browser-smoke-test

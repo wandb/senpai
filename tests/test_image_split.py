@@ -119,6 +119,10 @@ def test_both_images_root_own_the_reserved_agent_definitions():
         assert "chown -R root:root" in root_setup
         assert "chmod -R a-w" in root_setup
         assert root_setup.count('"$SENPAI_AGENT_DIR"') == 2
+        assert "SENPAI_PLUGIN=/opt/senpai-plugin" in dockerfile
+        assert "COPY plugins/senpai /opt/senpai-plugin" in dockerfile
+        assert 'python -m senpai_agent.agent_markdown "$SENPAI_PLUGIN"' in root_setup
+        assert root_setup.count('"$SENPAI_PLUGIN"') == 3
 
 
 def test_target_uv_projects_cannot_reuse_the_controller_environment():
@@ -376,6 +380,8 @@ def test_runtime_git_auth_uses_ephemeral_askpass_not_a_credential_store():
         )
         assert 'GIT_ASKPASS_FILE="/tmp/senpai-git-askpass"' in entrypoint
         assert "mktemp -d /tmp/senpai-supervisor.XXXXXX" in entrypoint
+        assert 'source "$SENPAI_PLUGIN/scripts/git-guard.sh"' in entrypoint
+        assert "agent-context" not in entrypoint
         assert (
             'SENPAI_GITHUB_TOKEN_FILE="$CREDENTIAL_HANDOFF_DIR/github-token"'
             in entrypoint
