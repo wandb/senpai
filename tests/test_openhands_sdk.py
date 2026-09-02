@@ -91,7 +91,7 @@ def test_openhands_fork_revision_is_consistent_across_install_paths():
         ("max", "openai/gpt-5.6-sol", "max"),
         ("high", "openai/gpt-5.6", "high"),
         ("xhigh", "anthropic/claude-opus-4-8", "xhigh"),
-        ("max", "anthropic/claude-fable-5", "max"),
+        ("max", "anthropic/claude-fable-5-1", "max"),
         ("max", "anthropic/claude-opus-5", "max"),
         ("max", "anthropic/claude-sonnet-5", "max"),
         ("high", "wandb/zai-org/GLM-5.2", "high"),
@@ -279,7 +279,7 @@ def test_file_agent_reasoning_override_replaces_the_parent_request_profile(
 @pytest.mark.parametrize(
     "model",
     [
-        "anthropic/claude-fable-5",
+        "anthropic/claude-fable-5-1",
         "anthropic/claude-opus-5",
         "anthropic/claude-sonnet-5",
     ],
@@ -371,7 +371,7 @@ def test_wandb_gateway_uses_chat_thinking_and_project_routing():
     ("model", "effort"),
     [
         ("openai/gpt-5.6-sol", "xhigh"),
-        ("anthropic/claude-fable-5", "max"),
+        ("anthropic/claude-fable-5-1", "max"),
     ],
 )
 def test_pro_mode_is_only_enabled_by_openai_max(model, effort):

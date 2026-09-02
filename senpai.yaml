@@ -45,15 +45,15 @@ wandb_project: senpai-v1
 #   - HF_TOKEN  # Set HF_TOKEN=abc123 in .env
 
 # OpenHands models
-advisor_model: openai/gpt-5.6-sol
-advisor_reasoning_effort: xhigh
-student_model: openai/gpt-5.6-sol
-student_reasoning_effort: xhigh
-smart_model: openai/gpt-5.6-sol
-smart_reasoning_effort: xhigh
-fast_model: openai/gpt-5.6-luna
-fast_reasoning_effort: high
-frontier_model: openai/gpt-5.6-sol
+advisor_model: anthropic/claude-fable-5-1
+advisor_reasoning_effort: high
+student_model: anthropic/claude-fable-5-1
+student_reasoning_effort: medium
+smart_model: anthropic/claude-fable-5-1
+smart_reasoning_effort: high
+fast_model: anthropic/claude-sonnet-5
+fast_reasoning_effort: medium
+frontier_model: anthropic/claude-fable-5-1
 frontier_reasoning_effort: max
 # Provider-native rendered/input-token trigger for supported compaction APIs.
 compaction_trigger_tokens: 200000

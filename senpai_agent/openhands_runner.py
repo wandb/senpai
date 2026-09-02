@@ -104,11 +104,13 @@ from senpai_agent.PROMPTS import (
 from senpai_agent.system_instructions import SenpaiSystemInstructions
 from senpai_agent.tools import register_senpai_tools
 
-DEFAULT_MODEL = "openai/gpt-5.6-sol"
-DEFAULT_FAST_MODEL = "openai/gpt-5.6-luna"
-DEFAULT_FRONTIER_MODEL = "openai/gpt-5.6-sol"
-DEFAULT_REASONING_EFFORT = "xhigh"
-DEFAULT_FAST_REASONING_EFFORT = "high"
+DEFAULT_MODEL = "anthropic/claude-fable-5-1"
+DEFAULT_FAST_MODEL = "anthropic/claude-sonnet-5"
+DEFAULT_FRONTIER_MODEL = "anthropic/claude-fable-5-1"
+DEFAULT_ADVISOR_REASONING_EFFORT = "high"
+DEFAULT_STUDENT_REASONING_EFFORT = "medium"
+DEFAULT_SMART_REASONING_EFFORT = "high"
+DEFAULT_FAST_REASONING_EFFORT = "medium"
 DEFAULT_FRONTIER_REASONING_EFFORT = "max"
 DEFAULT_COMPACTION_TRIGGER_TOKENS = 200_000
 WANDB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
@@ -729,14 +731,19 @@ def resolve_config(
     model = env_value(args.model, env, "SENPAI_OPENHANDS_MODEL", DEFAULT_MODEL)
     if not model:
         model = DEFAULT_MODEL
+    default_reasoning_effort = (
+        DEFAULT_ADVISOR_REASONING_EFFORT
+        if role == "advisor"
+        else DEFAULT_STUDENT_REASONING_EFFORT
+    )
     reasoning_effort = (
         env_value(
             args.reasoning_effort,
             env,
             "SENPAI_OPENHANDS_REASONING_EFFORT",
-            DEFAULT_REASONING_EFFORT,
+            default_reasoning_effort,
         )
-        or DEFAULT_REASONING_EFFORT
+        or default_reasoning_effort
     )
     reasoning_effort = openhands_reasoning_effort(reasoning_effort, model)
     api_key_env = (
@@ -760,8 +767,10 @@ def resolve_config(
         or smart_default_model
     )
     smart_default_effort = (
-        env.get("SENPAI_OPENHANDS_REASONING_EFFORT") if args.child else reasoning_effort
-    ) or DEFAULT_REASONING_EFFORT
+        env.get("SENPAI_OPENHANDS_REASONING_EFFORT")
+        if args.child
+        else DEFAULT_SMART_REASONING_EFFORT
+    ) or DEFAULT_SMART_REASONING_EFFORT
     smart_reasoning_effort = (
         env_value(
             args.smart_reasoning_effort,
@@ -790,14 +799,19 @@ def resolve_config(
         )
         or fast_default_model
     )
+    fast_default_effort = (
+        DEFAULT_FAST_REASONING_EFFORT
+        if fast_model == DEFAULT_FAST_MODEL
+        else smart_reasoning_effort
+    )
     fast_reasoning_effort = (
         env_value(
             args.fast_reasoning_effort,
             env,
             "SENPAI_OPENHANDS_FAST_REASONING_EFFORT",
-            DEFAULT_FAST_REASONING_EFFORT,
+            fast_default_effort,
         )
-        or DEFAULT_FAST_REASONING_EFFORT
+        or fast_default_effort
     )
     fast_reasoning_effort = openhands_reasoning_effort(
         fast_reasoning_effort,

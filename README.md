@@ -65,8 +65,8 @@ WANDB_API_KEY=
 | Credential | Required access |
 |---|---|
 | `GITHUB_TOKEN` | Target-repository Contents, Pull requests, and Issues read/write. A classic token with `repo` scope also works. GitHub CLI authentication is the fallback when this value is absent. |
-| `ANTHROPIC_API_KEY` | Required when an `anthropic/...` model is configured. |
-| `OPENAI_API_KEY` | Required when an `openai/...` model is configured. Every default profile uses GPT-5.6. |
+| `ANTHROPIC_API_KEY` | Required when an `anthropic/...` model is configured. Every default profile uses Anthropic. |
+| `OPENAI_API_KEY` | Required when an `openai/...` model is configured. |
 | `EXA_API_KEY` | General-web and research-publication search. |
 | `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. |
 
@@ -124,16 +124,16 @@ wandb_project: your-project
 
 custom_secret_env_names: [HF_TOKEN]  # values come from .env
 
-advisor_model: openai/gpt-5.6-sol
-advisor_reasoning_effort: xhigh
-student_model: openai/gpt-5.6-sol
-student_reasoning_effort: xhigh
+advisor_model: anthropic/claude-fable-5-1
+advisor_reasoning_effort: high
+student_model: anthropic/claude-fable-5-1
+student_reasoning_effort: medium
 
-smart_model: openai/gpt-5.6-sol
-smart_reasoning_effort: xhigh
-fast_model: openai/gpt-5.6-luna
-fast_reasoning_effort: high
-frontier_model: openai/gpt-5.6-sol
+smart_model: anthropic/claude-fable-5-1
+smart_reasoning_effort: high
+fast_model: anthropic/claude-sonnet-5
+fast_reasoning_effort: medium
+frontier_model: anthropic/claude-fable-5-1
 frontier_reasoning_effort: max
 compaction_trigger_tokens: 200000
 
@@ -150,8 +150,8 @@ max_epochs: 50
 ```
 
 OpenHands uses LiteLLM, so LLM provider names are required as prefixes. For
-example, configure Claude Fable 5 as `anthropic/claude-fable-5`. Anthropic
-`reasoning_effort: max` on Claude Fable 5, Opus 5, and Sonnet 5 stays
+example, configure Claude Fable 5.1 as `anthropic/claude-fable-5-1`. Anthropic
+`reasoning_effort: max` on Claude Fable 5.1, Fable 5, Opus 5, and Sonnet 5 stays
 provider-native and is sent as `output_config.effort: max`; it does not enable
 OpenAI Pro mode.
 
@@ -295,8 +295,7 @@ the tier, agent specialization, and context policy.
 | [Bash Runner](.agents/agents/bash-runner.md) | Tests, builds, linters, dependency commands, Git inspection, and noisy CLI work. It returns counts and actionable failures rather than raw logs. | `fast`. |
 
 The model tier is independent of the agent specialization. With the default
-`agent=general-purpose`, `model=frontier` launches GPT-5.6 Sol at `max`, sent
-to the Responses API with `reasoning.mode: pro`
+`agent=general-purpose`, `model=frontier` launches Claude Fable 5.1 at `max`
 with the general-purpose terminal and code-editing toolset. Pair `frontier`
 with `search_general_web` or `search_research_publications` when the
 high-leverage task is external research.

@@ -208,10 +208,10 @@ def test_resolved_config_separates_runtime_credentials_from_conversation_secrets
 
     config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
-    assert config.api_key.get_secret_value() == "openai-key"
-    assert config.smart_api_key.get_secret_value() == "openai-key"
-    assert config.fast_api_key.get_secret_value() == "openai-key"
-    assert config.frontier_api_key.get_secret_value() == "openai-key"
+    assert config.api_key.get_secret_value() == "anthropic-key"
+    assert config.smart_api_key.get_secret_value() == "anthropic-key"
+    assert config.fast_api_key.get_secret_value() == "anthropic-key"
+    assert config.frontier_api_key.get_secret_value() == "anthropic-key"
     assert config.github_token.get_secret_value() == "github-key"
     assert config.conversation_secrets == {
         "WANDB_API_KEY": "wandb-key",
@@ -226,9 +226,9 @@ def test_resolved_config_separates_runtime_credentials_from_conversation_secrets
     assert config.compaction_trigger_tokens == 200_000
 
     delegated = runner.delegation_config(config)
-    assert delegated.smart_api_key == "openai-key"
-    assert delegated.fast_api_key == "openai-key"
-    assert delegated.frontier_api_key == "openai-key"
+    assert delegated.smart_api_key == "anthropic-key"
+    assert delegated.fast_api_key == "anthropic-key"
+    assert delegated.frontier_api_key == "anthropic-key"
 
 
 def test_training_limits_are_not_read_from_environment(tmp_path: Path):
@@ -392,34 +392,44 @@ def test_inbox_recovery_budget_rejects_invalid_values(tmp_path, key, value):
         resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
+@pytest.mark.parametrize(
+    ("role", "main_reasoning_effort"),
+    [("advisor", "high"), ("student", "medium")],
+)
 def test_default_model_profiles_are_explicit_and_provider_credentials_are_inferred(
     tmp_path: Path,
+    role: str,
+    main_reasoning_effort: str,
 ):
     config = resolve_config(
         parse_runner_args(["--max-turns", "1"]),
-        runtime_env(tmp_path),
+        runtime_env(tmp_path, role=role),
     )
 
     assert (
         config.model,
         config.api_key_env,
         config.reasoning_effort,
-    ) == ("openai/gpt-5.6-sol", "OPENAI_API_KEY", "xhigh")
+    ) == (
+        "anthropic/claude-fable-5-1",
+        "ANTHROPIC_API_KEY",
+        main_reasoning_effort,
+    )
     assert (
         config.smart_model,
         config.smart_api_key_env,
         config.smart_reasoning_effort,
-    ) == ("openai/gpt-5.6-sol", "OPENAI_API_KEY", "xhigh")
+    ) == ("anthropic/claude-fable-5-1", "ANTHROPIC_API_KEY", "high")
     assert (
         config.fast_model,
         config.fast_api_key_env,
         config.fast_reasoning_effort,
-    ) == ("openai/gpt-5.6-luna", "OPENAI_API_KEY", "high")
+    ) == ("anthropic/claude-sonnet-5", "ANTHROPIC_API_KEY", "medium")
     assert (
         config.frontier_model,
         config.frontier_api_key_env,
         config.frontier_reasoning_effort,
-    ) == ("openai/gpt-5.6-sol", "OPENAI_API_KEY", "max")
+    ) == ("anthropic/claude-fable-5-1", "ANTHROPIC_API_KEY", "max")
 
 
 def test_ultra_environment_value_is_rejected(tmp_path: Path):
@@ -464,7 +474,7 @@ def test_wandb_gateway_configuration_is_explicit_and_uses_max_glm_reasoning(
     assert config.frontier_reasoning_effort == "max"
 
 
-def test_fast_model_uses_luna_for_an_openai_main_profile(tmp_path: Path):
+def test_fast_model_inherits_an_openai_main_profile(tmp_path: Path):
     env = runtime_env(tmp_path)
     env.update(
         {
@@ -475,13 +485,14 @@ def test_fast_model_uses_luna_for_an_openai_main_profile(tmp_path: Path):
     config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
     assert config.smart_model == "openai/gpt-5.6"
-    assert config.fast_model == "openai/gpt-5.6-luna"
+    assert config.fast_model == "openai/gpt-5.6"
+    assert config.fast_reasoning_effort == "high"
     assert config.api_key_env == "OPENAI_API_KEY"
     assert config.smart_api_key_env == "OPENAI_API_KEY"
     assert config.fast_api_key_env == "OPENAI_API_KEY"
 
 
-def test_fast_model_inherits_a_non_openai_main_profile(tmp_path: Path):
+def test_fast_model_uses_sonnet_for_an_anthropic_main_profile(tmp_path: Path):
     env = runtime_env(tmp_path)
     env.update(
         {
@@ -492,9 +503,36 @@ def test_fast_model_inherits_a_non_openai_main_profile(tmp_path: Path):
     config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
     assert config.smart_model == "anthropic/claude-opus-4-8"
-    assert config.fast_model == "anthropic/claude-opus-4-8"
+    assert config.fast_model == "anthropic/claude-sonnet-5"
+    assert config.fast_reasoning_effort == "medium"
     assert config.smart_api_key_env == "ANTHROPIC_API_KEY"
     assert config.fast_api_key_env == "ANTHROPIC_API_KEY"
+
+
+def test_fast_profile_inherits_smart_effort_for_a_wandb_main_override(
+    tmp_path: Path,
+):
+    env = runtime_env(tmp_path)
+    env.update(
+        {
+            "WANDB_API_KEY": "wandb-key",
+            "WANDB_ENTITY": "research-team",
+            "WANDB_PROJECT": "mlxfast",
+            "SENPAI_OPENHANDS_MODEL": "wandb/zai-org/GLM-5.2",
+            "SENPAI_OPENHANDS_REASONING_EFFORT": "max",
+        }
+    )
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert (config.smart_model, config.smart_reasoning_effort) == (
+        "wandb/zai-org/GLM-5.2",
+        "high",
+    )
+    assert (config.fast_model, config.fast_reasoning_effort) == (
+        "wandb/zai-org/GLM-5.2",
+        "high",
+    )
 
 
 def test_all_model_profiles_accept_independent_cli_model_and_effort_settings(
@@ -544,13 +582,13 @@ def test_anthropic_max_is_accepted_across_model_profiles(tmp_path: Path):
     env = runtime_env(tmp_path)
     env.update(
         {
-            "SENPAI_OPENHANDS_MODEL": "anthropic/claude-fable-5",
+            "SENPAI_OPENHANDS_MODEL": "anthropic/claude-fable-5-1",
             "SENPAI_OPENHANDS_REASONING_EFFORT": "max",
             "SENPAI_OPENHANDS_SMART_MODEL": "anthropic/claude-opus-5",
             "SENPAI_OPENHANDS_SMART_REASONING_EFFORT": "max",
             "SENPAI_OPENHANDS_FAST_MODEL": "anthropic/claude-sonnet-5",
             "SENPAI_OPENHANDS_FAST_REASONING_EFFORT": "max",
-            "SENPAI_OPENHANDS_FRONTIER_MODEL": "anthropic/claude-fable-5",
+            "SENPAI_OPENHANDS_FRONTIER_MODEL": "anthropic/claude-fable-5-1",
             "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": "max",
         }
     )
@@ -558,7 +596,7 @@ def test_anthropic_max_is_accepted_across_model_profiles(tmp_path: Path):
     config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
     assert (config.model, config.reasoning_effort) == (
-        "anthropic/claude-fable-5",
+        "anthropic/claude-fable-5-1",
         "max",
     )
     assert (config.smart_model, config.smart_reasoning_effort) == (
@@ -570,7 +608,7 @@ def test_anthropic_max_is_accepted_across_model_profiles(tmp_path: Path):
         "max",
     )
     assert (config.frontier_model, config.frontier_reasoning_effort) == (
-        "anthropic/claude-fable-5",
+        "anthropic/claude-fable-5-1",
         "max",
     )
 
