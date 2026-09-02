@@ -45,6 +45,7 @@ from senpai_agent.training import (
     TrainingSpec,
     TrainingState,
     TrainingSupervisor,
+    target_python_environment,
 )
 
 if TYPE_CHECKING:
@@ -56,7 +57,6 @@ _TRAINING_RUNTIMES: dict[
     tuple[TrainingSupervisor, MonitorStore],
 ] = {}
 _BROWSER_ENABLED_STATE_KEY = "senpai.browser_enabled"
-_TARGET_PYTHON_ENV = "SENPAI_TARGET_PYTHON_ENV"
 _training_wandb_api_key: SecretStr | None = None
 
 
@@ -713,7 +713,7 @@ class SenpaiTerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
         native = TerminalTool.create(
             conv_state,
             no_change_timeout_seconds=no_change_timeout,
-            env=_target_python_environment(),
+            env=target_python_environment() or None,
         )[0]
         if native.executor is None:
             raise RuntimeError("native terminal tool has no executor")
@@ -727,18 +727,6 @@ class SenpaiTerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
                 )
             )
         ]
-
-
-def _target_python_environment() -> dict[str, str] | None:
-    target_env = os.environ.get(_TARGET_PYTHON_ENV, "").strip()
-    if not target_env:
-        return None
-    python = f"{target_env}/bin/python"
-    return {
-        "PATH": f"{target_env}/bin:{os.environ['PATH']}",
-        "UV_PYTHON": python,
-        "VIRTUAL_ENV": target_env,
-    }
 
 
 _TOOLS_REGISTERED = False

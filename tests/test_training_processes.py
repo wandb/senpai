@@ -76,6 +76,7 @@ def test_training_preserves_normal_project_python_imports(
         "from project_module import VALUE\n"
         f"Path({str(output)!r}).write_text(json.dumps({{"
         "'value': VALUE, 'uv_python': os.environ['UV_PYTHON'], "
+        "'uv_project_environment': os.environ['UV_PROJECT_ENVIRONMENT'], "
         "'virtual_env': os.environ['VIRTUAL_ENV']}))\n"
     )
 
@@ -92,6 +93,7 @@ def test_training_preserves_normal_project_python_imports(
     assert json.loads(output.read_text()) == {
         "value": "project-import",
         "uv_python": str(target_env / "bin" / "python"),
+        "uv_project_environment": str(target_env),
         "virtual_env": str(target_env),
     }
 

@@ -143,6 +143,7 @@ def test_terminal_tool_bounds_silent_commands(monkeypatch, tmp_path):
     assert captured["no_change_timeout_seconds"] == 600
     assert captured["env"] == {
         "PATH": "/home/senpai/.venvs/target/bin:/usr/bin:/bin",
+        "UV_PROJECT_ENVIRONMENT": "/home/senpai/.venvs/target",
         "UV_PYTHON": "/home/senpai/.venvs/target/bin/python",
         "VIRTUAL_ENV": "/home/senpai/.venvs/target",
     }
