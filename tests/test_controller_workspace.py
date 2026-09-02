@@ -396,8 +396,6 @@ def test_reconciliation_isolates_typed_auth_from_hostile_git_configuration(
                 for index in range(int(env["GIT_CONFIG_COUNT"]))
             }
             assert configuration["credential.helper"] == ""
-            assert configuration["http.proxy"] == ""
-            assert configuration["http.https://github.com/.proxy"] == ""
             assert configuration["http.sslVerify"] == "true"
             assert configuration["http.https://github.com/.sslVerify"] == "true"
             assert configuration["http.followRedirects"] == "false"

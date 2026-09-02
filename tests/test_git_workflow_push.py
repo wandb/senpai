@@ -11,6 +11,7 @@ from senpai_agent.git_workflow import (
     GitWorkflowPreconditionError,
     git_process_env,
     push_assignment_branch,
+    require_clean_training_worktree,
     require_commit_contains_base,
 )
 
@@ -321,7 +322,7 @@ def test_typed_push_auth_is_confined_to_network_git_processes(
         }
         assert configuration["core.hooksPath"] == os.devnull
         assert configuration["credential.helper"] == ""
-        assert configuration["http.proxy"] == ""
+        assert configuration["core.fsmonitor"] == "false"
         assert configuration["http.sslVerify"] == "true"
         assert configuration["http.followRedirects"] == "false"
         authorization = next(
@@ -459,3 +460,55 @@ def test_credentialed_push_does_not_run_checkout_status_helpers(tmp_path: Path):
     assert pushed.head_sha == candidate_sha
     assert not fsmonitor_marker.exists()
     assert not filter_marker.exists()
+
+
+def test_push_from_a_shallow_checkout_keeps_the_history_boundary(tmp_path: Path):
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    git(tmp_path, "init", "--bare", str(origin))
+    git(tmp_path, "init", str(seed))
+    git(seed, "config", "user.name", "Student")
+    git(seed, "config", "user.email", "student@example.com")
+    commit_file(seed, "model.py", "baseline = 0\n", "root")
+    previous_sha = commit_file(seed, "model.py", "baseline = 1\n", "baseline")
+    git(seed, "branch", "-M", "experiment-7")
+    git(seed, "push", str(origin), "experiment-7")
+    workspace = tmp_path / "workspace"
+    git(
+        tmp_path,
+        "clone",
+        "--depth",
+        "1",
+        "--branch",
+        "experiment-7",
+        origin.resolve().as_uri(),
+        str(workspace),
+    )
+    git(workspace, "config", "user.name", "Student")
+    git(workspace, "config", "user.email", "student@example.com")
+    candidate_sha = commit_file(workspace, "model.py", "baseline = 2\n", "candidate")
+    assert (workspace / ".git" / "shallow").is_file()
+
+    pushed = push_assignment_branch(
+        workspace,
+        branch="experiment-7",
+        expected_remote_sha=previous_sha,
+        authenticated_remote=origin.resolve().as_uri(),
+        token=SecretStr("typed-write-token"),
+    )
+
+    assert pushed.head_sha == candidate_sha
+    assert git(origin, "rev-parse", "refs/heads/experiment-7") == candidate_sha
+
+
+def test_clean_worktree_check_ignores_a_lying_fsmonitor_hook(tmp_path: Path):
+    workspace, _remote, _sha = repository(tmp_path)
+    fsmonitor = tmp_path / "fsmonitor.sh"
+    fsmonitor.write_text("#!/bin/sh\nprintf 'token\\0'\n", encoding="utf-8")
+    fsmonitor.chmod(0o755)
+    git(workspace, "config", "core.fsmonitor", str(fsmonitor))
+    git(workspace, "status", "--porcelain")
+    (workspace / "model.py").write_text("baseline = 2\n")
+
+    with pytest.raises(GitWorkflowPreconditionError, match="clean before training"):
+        require_clean_training_worktree(workspace)

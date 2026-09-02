@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from collections.abc import Iterator
@@ -18,7 +19,7 @@ from senpai_agent.secrets import scrub_github_credentials
 
 GIT_EXECUTABLE = "/usr/bin/git"
 _GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
-_PROXY_ENVIRONMENT = (
+PROXY_ENVIRONMENT = (
     "ALL_PROXY",
     "HTTPS_PROXY",
     "HTTP_PROXY",
@@ -74,9 +75,22 @@ def staged_commit(workspace: Path, commit_sha: str) -> Iterator[Path]:
     ).resolve()
     if not object_directory.is_dir() or "\n" in str(object_directory):
         raise GitWorkflowPreconditionError("workspace Git object directory is invalid")
+    shallow = Path(
+        run_git(
+            workspace,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "shallow",
+        )
+    )
     with isolated_bare_repository() as repository:
         alternates = repository / "objects" / "info" / "alternates"
         alternates.write_text(f"{object_directory}\n", encoding="utf-8")
+        # Shallow grafts travel with the objects; without them history walks
+        # fail at the clone boundary. Grafts only remove parent edges.
+        if shallow.is_file():
+            shutil.copyfile(shallow, repository / "shallow")
         run_git(repository, "update-ref", "refs/senpai/local", commit_sha)
         staged_sha = run_git(repository, "rev-parse", "refs/senpai/local^{commit}")
         if staged_sha != commit_sha:
@@ -114,15 +128,20 @@ def run_git(
     environment = git_process_env(token)
     if extra_env:
         environment.update(extra_env)
-    completed = subprocess.run(
-        [GIT_EXECUTABLE, *arguments],
-        cwd=workspace,
-        text=True,
-        input=input_text,
-        capture_output=True,
-        env=environment,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [GIT_EXECUTABLE, *arguments],
+            cwd=workspace,
+            text=True,
+            input=input_text,
+            capture_output=True,
+            env=environment,
+            check=False,
+        )
+    except FileNotFoundError as error:
+        raise GitWorkflowPreconditionError(
+            f"git is not installed at {GIT_EXECUTABLE}"
+        ) from error
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise GitWorkflowPreconditionError(
@@ -138,7 +157,7 @@ def git_process_env(token: SecretStr | None) -> dict[str, str]:
     environment = dict(os.environ)
     scrub_github_credentials(environment)
     for name in tuple(environment):
-        if name.startswith("GIT_") or name in _PROXY_ENVIRONMENT:
+        if name.startswith("GIT_") or name in PROXY_ENVIRONMENT:
             environment.pop(name)
     for name in _GIT_TRANSPORT_ENVIRONMENT:
         environment.pop(name, None)
@@ -157,9 +176,8 @@ def git_process_env(token: SecretStr | None) -> dict[str, str]:
     configuration.extend(
         (
             ("credential.helper", ""),
+            ("core.fsmonitor", "false"),
             ("core.hooksPath", os.devnull),
-            ("http.proxy", ""),
-            ("http.https://github.com/.proxy", ""),
             ("http.sslVerify", "true"),
             ("http.https://github.com/.sslVerify", "true"),
             ("http.followRedirects", "false"),
