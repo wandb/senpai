@@ -3,8 +3,9 @@ import yaml
 from openhands.sdk import LLM
 from openhands.sdk.llm import Message, TextContent
 
-from launch_test_support import launch, launch_args, render_role
+from launch_test_support import REVISION, launch, launch_args, render_role
 from openhands_support import runtime_env
+from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV, decode_launch_context
 from senpai_agent.openhands_runner import (
     model_runtime_configuration,
     parse_runner_args,
@@ -23,19 +24,25 @@ def test_main_yaml_token_trigger_reaches_the_provider_request(tmp_path, model):
         compaction_trigger_tokens=project["compaction_trigger_tokens"],
     )
     configmap, _deployment, _secret = render_role("student", args)
-    environment = runtime_env(tmp_path, role="student")
-    environment.update(yaml.safe_load(configmap)["data"])
-    config = resolve_config(
+    config = yaml.safe_load(configmap)["data"]
+    environment = runtime_env(
+        tmp_path,
+        role="student",
+        program_source_commit=REVISION,
+        launch_context=decode_launch_context(config[LAUNCH_CONTEXT_ENV]),
+    )
+    environment.update(config)
+    runtime = resolve_config(
         parse_runner_args(["--max-turns", "1"]),
         environment,
     )
     llm = LLM(
-        model=config.model,
-        api_key=config.api_key,
+        model=runtime.model,
+        api_key=runtime.api_key,
         **model_runtime_configuration(
-            config.model,
-            config.reasoning_effort,
-            compaction_trigger_tokens=config.compaction_trigger_tokens,
+            runtime.model,
+            runtime.reasoning_effort,
+            compaction_trigger_tokens=runtime.compaction_trigger_tokens,
         ),
     )
     message = Message(role="user", content=[TextContent(text="Investigate")])
@@ -67,5 +74,5 @@ def test_main_yaml_token_trigger_reaches_the_provider_request(tmp_path, model):
             "edits"
         ][0]
 
-    assert config.compaction_trigger_tokens == 200_000
+    assert runtime.compaction_trigger_tokens == 200_000
     assert trigger == 200_000

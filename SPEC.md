@@ -48,8 +48,11 @@ entrypoint
 
 Python supervisor
   start one controller worker process group
-  restart crashes with bounded exponential backoff
-  TERM/KILL a worker whose current phase lease expires
+  TERM/KILL the controller and descendants when its lease expires
+  exit after that one controller stops
+
+container runtime or external process manager
+  restart the complete container
 
 Python controller worker
   poll GitHub + local durable monitor/event state
@@ -63,15 +66,19 @@ The worker publishes an atomic lease containing its PID, current phase, hard
 deadline, completed-turn counter, and active LLM request timestamps. A
 non-model-visible heartbeat updates `llm_request_heartbeat_at` while preserving
 the request's original `llm_request_started_at`. It does not add conversation
-events or renew the hard deadline. The supervisor resets bounded restart
-backoff only after a turn is successfully acknowledged; process uptime and
-idle sleep do not count as progress. The supervisor is independent of
-OpenHands and Kubernetes.
+events or renew the hard deadline. The supervisor starts exactly one controller
+because the credential handoff is one use. It terminates remaining descendants
+and exits when that controller stops or exceeds its lease. The supervisor is
+independent of OpenHands and Kubernetes. Kubernetes or another external process
+manager must restart the complete container and repeat bootstrap.
 OpenHands events renew the root turn's lease; its configured timeout measures
 inactivity rather than total elapsed time. Provider, tool, training, and child
 deadlines remain hard.
-Kubernetes liveness and Docker health checks inspect the same lease, while the
-supervisor provides the same recovery on a plain host.
+The supervisor exposes that lease through `/healthz`. Kubernetes startup and
+liveness probes use `httpGet`, so a probe does not create another process with
+the container's original environment. A plain-host deployment needs an
+external process manager that probes the same endpoint and restarts the whole
+container or bootstrap process.
 
 The core controller imports no Kubernetes API and needs no Service, port, DNS
 record, ServiceAccount, RBAC, cross-node token, or tailnet.
@@ -199,8 +206,8 @@ The controller marks a conversation's initial controller context delivered only 
 
 Role state uses pod-local storage and survives controller or container restarts
 within the same pod. Replacing or rescheduling a pod starts fresh local state;
-the PR, branch, typed result, W&B runs, and Weave trace remain the durable
-handoff.
+the PR, branch, typed result, W&B runs, and main-role Weave trace remain the
+durable handoff.
 
 No default path may be relative to the current workspace. Senpai removes only
 its generated PR Markdown artifacts after 24 hours. It does not delete
@@ -214,8 +221,8 @@ The model receives:
 2. One stable system suffix assembled from:
    - `system_instructions/SENPAI-HARNESS.md`; and
    - the rendered advisor or student role charter; and
-   - the selected target-repository `program.md` under
-     `# program.md - <path>`; and
+   - one committed, content-addressed snapshot of the selected target-repository
+     `program.md`, labeled as target-provided research policy; and
    - the rendered `system_instructions/SENPAI-LAUNCH-CONTEXT.md`, containing
      authoritative runtime identity, limits, and isolation rules after
      `program.md`. A blank
@@ -225,45 +232,77 @@ The model receives:
 3. Explicit project and Senpai skills through OpenHands skill context. Agent Skills bodies are loaded only when invoked. Repository `AGENTS.md`, `AGENT.md`, and `CLAUDE.md` instruction files are not loaded as project context.
 4. User turns containing optional human operator instructions, current state, and current UTC time.
 
-Before constructing a model worker, the supervisor resolves the configured
-program path and renders the role's `{{VARIABLE}}` placeholders once from an
-explicit non-secret allowlist. A missing referenced value fails the launch;
-unrelated environment variables and credentials are never considered. The
-rendered role is persisted in role state and reused across worker restarts.
+At launch, the launcher resolves the advisor branch to one exact commit. It
+clones that advertised branch into an isolated bare repository, then resolves
+the configured program path from the pinned commit. It rejects files larger than
+64 KiB and independently recomputes the Git object IDs for the commit, each
+traversed tree, and the selected blob. Unrelated and dangling objects do not
+enter the check. The launcher places the content, commit, path, and SHA-256
+digest in one encoded snapshot inside a separate immutable, content-addressed
+Secret. The Secret name includes the encoded snapshot digest. Pods project only
+that key into a read-only file. A container restart therefore does not depend on GitHub
+continuing to advertise or serve the pinned object. Before
+it constructs a model worker, the supervisor decodes and verifies that launch
+snapshot. It combines the harness, rendered role, program, and launch context
+into another content-addressed file. It passes only the file path and expected
+digest to workers. Every new worker and delegated child verifies that complete
+snapshot instead of reading trusted content from the live checkout. Senpai's
+typed Git publication and `merge_experiment` both reject every `program.md`
+addition, modification, deletion, or rename; an operator must publish policy
+updates outside Senpai and start a new launch. The supervisor also renders the
+role's `{{VARIABLE}}` placeholders once from an explicit non-secret allowlist.
+A missing referenced value fails the launch. The renderer ignores unrelated
+environment variables and credentials. The rendered role is persisted in role
+state. The supervisor rejects it if it does not match a fresh controller
+rendering. Workers reject any prompt component that does not match the
+controller-held complete-snapshot digest.
+
+Each launch invocation writes immutable, content-addressed shared credentials.
+Every student has a separate immutable, content-addressed W&B writer Secret, so
+adding a student does not rewrite an existing student's key. Reapplying the
+same active tag reuses its exact original program snapshot when the normalized
+path and content are unchanged. A changed path or content requires a new tag.
+A changed credential set creates a new Secret. Only roles rendered in that
+invocation move to the new credential references; other roles retain their
+existing credential Secrets until explicitly relaunched.
 
 The launcher renders `timeout_minutes` and `max_epochs` into the launch context
 as agent policy. It does not export dedicated timeout or epoch environment
 variables, and the training supervisor has no launch-wide timeout default or
 ceiling. Each training run supplies its own positive `timeout_seconds` value.
 
-At process startup, the runner loads the harness, rendered role, `program.md`,
-and authoritative launch context into one immutable
-`SenpaiSystemInstructions` value. Its prompt is the stable system suffix for
-that process and is never reread, monitored, or refreshed during the agent
-session. Delegated children inherit the rendered role snapshot, resolved
-repository-relative program path, and exact launch context, then build their
-own immutable value. Runtime identity and `program.md` are not duplicated in
+At process startup, the runner verifies the complete snapshot file against its
+controller-held digest, verifies the separate source files and launch metadata
+against that snapshot, and loads one immutable `SenpaiSystemInstructions` value.
+Its prompt is the stable system suffix for that process and is never refreshed
+during the agent session. Delegated children write and verify their own
+content-addressed snapshot file from the exact inherited value.
+Runtime identity and `program.md` are not duplicated in
 ordinary user messages. Optional operator instructions remain user context;
 use GitHub Issues for live human direction. OpenHands includes the system
 suffix on every inference, and current time is rendered for every controller
-wake. Operators must start fresh role state to apply a changed identity,
-program, or role charter.
+wake. Operators must adopt a changed identity, program, harness, launch context,
+or role charter only while the role is stopped. For state created before the
+content-addressed prompt boundary, they remove only
+`$SENPAI_OPENHANDS_STATE_DIR/system-instructions`, or start with fresh role
+state. The next supervisor recreates the trusted snapshots from launch-owned
+inputs. The remaining OpenHands conversation state can stay in place.
 
 File-based subagents are discovered from `.agents/agents`. Live advisor and
 student skills come only from `plugins/senpai/skills`; `.agents/skills` is for
 human operators and Senpai developers and is not installed into pods. Target
 repositories may still supply their own project skills. Skill bodies are not
-concatenated into agent definitions. The OpenHands fork's `main` branch applies
+concatenated into agent definitions. The pinned OpenHands fork revision applies
 each agent definition's `reasoning_effort` override after resolving its
 inherited LLM or stored model profile.
 
 ## Prompt caching
 
-The SDK and tools track the `main` branch of
-[`morganmcg1/software-agent-sdk`](https://github.com/morganmcg1/software-agent-sdk)
-and are based on OpenHands SDK 1.40.0. `uv.lock` records the exact `main` commit
-used for reproducible image builds, while runtime CI installs directly from
-`main` to verify the current fork head.
+The SDK and tools use OpenHands SDK 1.40.0 from commit
+[`f69134273ee3a31a233d6201786570eb9c4c141b`](https://github.com/morganmcg1/software-agent-sdk/tree/f69134273ee3a31a233d6201786570eb9c4c141b).
+Both `pyproject.toml` and `uv.lock` pin that exact source revision. CI also names
+the exact Git revision, although its dependency-install step does not reproduce
+the complete lock and remains a hardening opportunity.
 
 `prompt_cache_configuration()` sets:
 
@@ -427,7 +466,10 @@ Immediately before a first merge mutation, `merge_experiment` reads the live
 Git ref for the assignment's base branch and compares it with
 `expected_current_base_sha`. The merge proceeds only when the result's required
 base equals that live SHA or an exact matching acceptance exists. Replay of an
-already verified merge returns before this ref lookup.
+already verified merge returns before this ref lookup. The same mutation
+boundary reads every changed-file page and rejects `program.md` as either the
+current or previous path, which covers additions, modifications, deletions, and
+renames.
 
 All assignment mutations issued by one workflow instance, plus that worker's
 advisor-branch publication and the student's complete preflight/push/result
@@ -671,19 +713,42 @@ interrupts the conversation, produces a non-success result, and leaves durable
 events unacknowledged. The controller then retries with bounded exponential
 backoff. Controller termination interrupts and closes the current conversation,
 cancels active supervised training, closes local stores, and flushes Weave
-before the controller exits. Standalone and child runners flush Weave at runner
-exit.
+before the controller exits. The supervisor then terminates remaining
+descendants and exits; an external process manager restarts the complete
+container. Standalone runners flush Weave at runner exit. Delegated children
+have no controller W&B credential and do not initialize an independent Weave
+run. A child using a `wandb/...` model receives the separate W&B Inference
+credential as its model-provider key. The controller passes delegated model
+credentials through a bounded, one-use inherited descriptor rather than the
+child environment. The child disables process dumping before it reads and
+closes that descriptor.
 
 ## Secrets and Weave
 
-The entrypoint uses the GitHub write token only for bootstrap, writes it to a
-private mode-0600 file under the pod-local `/tmp`, removes the askpass helper,
-clears all raw token environment variables, and execs the supervisor. The
-supervisor consumes and unlinks that bootstrap file into typed in-process
-memory. Before each controller restart it creates a one-shot inherited pipe;
-the worker reads and closes that pipe before tool initialization. No raw token
-is written to conversation/dataset storage. The long-lived PID 1 environment,
-model-facing tool schemas, and agent terminal contain no GitHub token.
+The Kubernetes launcher stores each set of shared controller and custom
+credentials in an immutable, content-addressed Secret. It stores each student's
+W&B writer key in a separate immutable, content-addressed Secret. The
+app-container bootstrap writes the GitHub, Exa, controller
+W&B, and role-specific student W&B credentials to private mode-0600 files under
+pod-local `/tmp`. It then clears the raw credential environment and execs the
+entrypoint and supervisor. The supervisor consumes and unlinks those files into
+typed in-process memory. It creates one-shot inherited pipes for one controller;
+the controller reads and closes those pipes before tool initialization. When
+the controller exits or wedges, the supervisor kills its descendants and exits
+so Kubernetes restarts the complete container and repeats bootstrap. The
+supervisor serves `/healthz` in-process, and Kubernetes uses HTTP probes rather
+than spawning credential-bearing probe processes. No raw token is written to
+conversation/dataset storage. The long-lived PID 1 environment, model-facing
+tool schemas, and agent terminal contain no GitHub token.
+
+The controller necessarily holds its W&B and Exa credentials in memory. A
+student's supervised training process intentionally receives that student's
+W&B writer key. Non-dumpable credential holders and environment scrubbing
+reduce same-UID exposure but do not establish complete same-UID secrecy or W&B
+result integrity. In particular, a same-UID attacker can race a delegated
+child's inherited credential descriptor before the Python child disables
+dumping. A separate UID or process boundary is required to remove that startup
+race.
 
 Generic child processes receive no GitHub token and no GitHub tools. Main-role
 GitHub operations remain typed and lease/state guarded. Terminal and hook
@@ -692,12 +757,14 @@ policies are behavioral guardrails, not a credential-containment boundary.
 `custom_secret_env_names` is an explicit, shared list of additional
 environment-variable names. Names must be unique and match
 `[A-Za-z_][A-Za-z0-9_]*`. Built-in launch credential names and names beginning
-with `GH_`, `GITHUB_`, or `SENPAI_` are reserved. Launcher-owned and
-process-control environment-variable names are also reserved. The launcher
+with `GH_`, `GITHUB_`, `SENPAI_`, or `WANDB_API_KEY_` are reserved.
+Launcher-owned and process-control environment-variable names are also
+reserved. The launcher
 resolves each value from the shell and then the repository-root `.env`. It
 reads `.env` values literally without variable interpolation. A missing listed
-value fails the launch. It writes values only to the per-launch Kubernetes
-Secret and injects them into every advisor and student environment. The
+value fails the launch. It writes values only to the content-addressed
+credential Secret for that invocation and injects them into every advisor and
+student environment. The
 corresponding names, but not the values, are model-visible so agents can
 reference them during tool execution. OpenHands makes the values available at
 execution boundaries and propagates them to delegated children. Dry-run
@@ -715,11 +782,15 @@ Weave content capture applies a longest-first transform over all configured
 API keys, tokens, passwords, secrets, credentials, custom secrets, and the
 selected custom model credential before content is sent. Custom secrets do not
 depend on naming conventions for redaction. The pinned
-`weave-openhands` integration is initialized before OpenHands imports. Each
+`weave-openhands` integration is initialized by the credential-bearing
+controller before it imports OpenHands. Each main advisor or student
 conversation run is an agent trace with child LLM and tool spans, all carrying
-the durable OpenHands conversation ID. These OTLP records are stored in Weave
-Agent Observability and queried with `get_agent_spans()`, not the legacy Calls
-API; `OPENHANDS_RUN.weave_url` links directly to the conversation.
+the durable OpenHands conversation ID. Delegated children receive no controller
+W&B credential and do not create independent Weave traces. Children that use a
+`wandb/...` model receive the separate inference credential. The main-role OTLP
+records are stored in Weave Agent Observability and queried with
+`get_agent_spans()`, not the legacy Calls API; `OPENHANDS_RUN.weave_url` links
+directly to the conversation.
 
 ## Images and launch acceptance
 
@@ -742,16 +813,35 @@ Launch preflight verifies:
 - every model-provider credential referenced by the configured profiles;
 - the Exa key with one `type="instant"`, publication-category, one-result
   search;
-- the W&B key with a minimal viewer query; and
+- each W&B key with a minimal viewer query, with distinct viewer identities for
+  the controller, W&B Inference, and every student writer. Desired Deployments
+  and live Pods retain those viewer bindings. The launcher scans every Senpai
+  role in the namespace, so concurrent launch tags and incremental rollouts
+  reject cross-owner reuse; and
 - the presence of every configured custom secret, without attempting
   a service-specific authentication check.
+
+The operator must configure each student viewer with only the target-project
+write access its assignment requires. The launcher cannot verify W&B project
+membership or role, assignment binding, or that a reported run is merge
+evidence.
 
 Exa is a progressive skill/script integration, not an always-connected MCP
 server.
 
-The Kubernetes launcher creates one Secret, ConfigMaps, and Deployments. It
-creates no Service or RBAC. Docker and local hosts need no shared network for
-Senpai communication.
+The Kubernetes launcher creates one content-addressed launch-credential Secret
+per rendered credential set, one immutable content-addressed program-context
+Secret, one immutable content-addressed W&B writer Secret per student,
+ConfigMaps, and Deployments. It creates no Service or RBAC. Docker and local
+hosts need no shared network for Senpai communication.
+
+Every desired Deployment and live Pod must carry its W&B owner bindings, and
+every role under one tag must carry its program binding. Missing legacy W&B
+bindings anywhere in the namespace fail closed until those roles are removed
+or upgraded; the first hardened launch also requires a new tag.
+If the target branch advances without changing the normalized `program.md` path
+or content, the launcher reuses the tag's exact original encoded snapshot. A
+policy path or content change requires a new tag.
 
 Hivemind startup remains commented with a clear note. The Python controller
 waits for the optional cluster start gate while continuously refreshing a
@@ -761,8 +851,9 @@ file path beneath their shared PVC mount. Cluster cutoff arms as soon as all
 expected resources are Ready or when its bounded readiness window expires,
 whichever comes first, and opens the optional start gate in either case. One
 missing or crash-looping pod therefore cannot prevent the runtime budget from
-starting. At the persisted deadline it deletes launch resources; all
-conversation harvest/archive code is removed.
+starting. At the persisted deadline it deletes matching Deployments; all
+conversation harvest/archive code is removed. ConfigMaps, Secrets, PVC data,
+and other launch-labeled resources remain for explicit operator cleanup.
 
 ## Removed code
 

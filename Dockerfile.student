@@ -7,6 +7,7 @@ LABEL org.opencontainers.image.revision="${SENPAI_SOURCE_REVISION}"
 
 ENV PATH="/opt/senpai-venv/bin:/home/senpai/.local/bin:${PATH}" \
     PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+    SENPAI_AGENT_DIR=/opt/senpai-agent-definitions \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python \
     SENPAI_IMAGE_REVISION="${SENPAI_SOURCE_REVISION}" \
     BROWSER_USE_DISABLE_EXTENSIONS=1
@@ -35,11 +36,12 @@ RUN python3 -m pip install --no-cache-dir "uv==0.10.9" && \
     python --version
 
 ENV SENPAI_PYTHON=/opt/senpai-venv/bin/python \
-    UV_PROJECT_ENVIRONMENT=/opt/senpai-venv \
     UV_PYTHON=/opt/senpai-venv/bin/python \
     UV_PYTHON_DOWNLOADS=never
 
 COPY pyproject.toml uv.lock /tmp/senpai/
+COPY senpai_agent /tmp/senpai/senpai_agent
+COPY .agents/agents /opt/senpai-agent-definitions
 RUN cd /tmp/senpai && \
     uv export --locked --python 3.13 --no-dev --no-emit-project \
       --format requirements.txt > requirements.txt && \
@@ -51,12 +53,15 @@ RUN cd /tmp/senpai && \
       --only-binary pydantic-core \
       --only-binary rpds-py \
       -r requirements.txt && \
-    python -c 'import importlib.metadata, openhands.sdk, sys, torch; assert sys.version_info[:2] == (3, 13); assert torch.__version__.startswith("2.13."); assert torch.version.cuda and torch.version.cuda.startswith("13."); assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
-    chown -R 10001:10001 /opt/senpai-venv "$UV_PYTHON_INSTALL_DIR" && \
-    rm -rf /root/.cache/uv
+    uv pip install --python "$SENPAI_PYTHON" --no-deps /tmp/senpai && \
+    python -c 'import importlib.metadata, openhands.sdk, senpai_agent, sys, torch; assert sys.version_info[:2] == (3, 13); assert torch.__version__.startswith("2.13."); assert torch.version.cuda and torch.version.cuda.startswith("13."); assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
+    chown -R root:root \
+      /opt/senpai-venv "$UV_PYTHON_INSTALL_DIR" "$SENPAI_AGENT_DIR" && \
+    chmod -R a-w \
+      /opt/senpai-venv "$UV_PYTHON_INSTALL_DIR" "$SENPAI_AGENT_DIR" && \
+    rm -rf /root/.cache/uv /tmp/senpai
 
 COPY scripts/senpai-browser-smoke-test.py /usr/local/bin/senpai-browser-smoke-test
-COPY scripts/senpai-container-health.sh /usr/local/bin/senpai-container-health
 
 # Expose the pinned browser on PATH because launchers give roles a persistent HOME.
 RUN uvx --from "playwright==${PLAYWRIGHT_VERSION}" \
@@ -65,8 +70,7 @@ RUN uvx --from "playwright==${PLAYWRIGHT_VERSION}" \
       -type f -path '*/chrome-linux*/chrome' -print -quit) && \
     test -x "$chromium_path" && \
     ln -s "$chromium_path" /usr/local/bin/chromium && \
-    chmod +x /usr/local/bin/senpai-browser-smoke-test \
-      /usr/local/bin/senpai-container-health && \
+    chmod +x /usr/local/bin/senpai-browser-smoke-test && \
     mkdir -p /workspace /workspaces /var/lib/senpai && \
     chown -R 10001:10001 \
       /home/senpai /workspace /workspaces /var/lib/senpai && \
@@ -84,10 +88,6 @@ RUN chmod +x /usr/local/bin/senpai-gpu-smoke-test && \
     python -c 'from torch.utils.cpp_extension import _get_cuda_arch_flags; assert _get_cuda_arch_flags()'
 
 ENV HOME=/home/senpai
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10m --retries=5 \
-    CMD senpai-container-health \
-      "/var/lib/senpai/openhands_state/controller-lease.json"
 
 WORKDIR /workspaces
 USER 10001:10001

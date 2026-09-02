@@ -51,6 +51,9 @@ class CreateAssignmentExecutor(
                 base_branch=base_branch,
                 expected_base_sha=action.expected_base_sha,
                 assignment_id=action.assignment_id,
+                authenticated_remote=git_workflow.github_repository_url(
+                    self.runtime.workflow.repo
+                ),
                 token=self.runtime.git_token,
             )
             result = self.runtime.workflow.create_assignment(
@@ -89,6 +92,9 @@ class PublishAdvisorBranchExecutor(
                 branch=self.runtime.advisor_branch,
                 expected_remote_sha=action.remote_branch_sha_before_push,
                 expected_local_sha=action.local_commit_sha,
+                authenticated_remote=git_workflow.github_repository_url(
+                    self.runtime.workflow.repo
+                ),
                 token=self.runtime.git_token,
             )
         return GitHubMutationObservation(

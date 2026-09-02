@@ -1,12 +1,15 @@
+import json
 import signal
 import sys
 import time
 from pathlib import Path
 
 import psutil
+from pydantic import SecretStr
 
 from senpai_agent.training import (
     TrainingResult,
+    TrainingSpec,
     TrainingState,
     TrainingSupervisor,
 )
@@ -24,6 +27,73 @@ TERM_IGNORING_SLEEP = (
     "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
     "time.sleep(60)"
 )
+
+
+def test_training_receives_only_its_per_student_wandb_key(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("WANDB_API_KEY", "controller-key")
+    monkeypatch.setenv("EXA_API_KEY", "exa-key")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-key")
+    workspace, supervisor = make_supervisor(
+        tmp_path,
+        wandb_api_key=SecretStr("student-training-key"),
+    )
+    output = workspace / "environment.json"
+    code = (
+        "import json,os,pathlib;"
+        "keys=('WANDB_API_KEY','EXA_API_KEY','GITHUB_TOKEN');"
+        f"pathlib.Path({str(output)!r}).write_text(json.dumps(dict("
+        "(name,os.environ.get(name)) for name in keys)))"
+    )
+
+    result = run_python(supervisor, workspace, code)
+    terminal = wait_for_terminal(supervisor, result.training_id)
+    assert terminal.state is TrainingState.FINISHED
+    assert json.loads(output.read_text()) == {
+        "WANDB_API_KEY": "student-training-key",
+        "EXA_API_KEY": None,
+        "GITHUB_TOKEN": None,
+    }
+
+
+def test_training_preserves_normal_project_python_imports(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    workspace, supervisor = make_supervisor(tmp_path)
+    target_env = tmp_path / "target-env"
+    (target_env / "bin").mkdir(parents=True)
+    monkeypatch.setenv("SENPAI_TARGET_PYTHON_ENV", str(target_env))
+    (workspace / "project_module.py").write_text("VALUE = 'project-import'\n")
+    output = workspace / "import-result.txt"
+    script = workspace / "train.py"
+    script.write_text(
+        "import json, os\n"
+        "from pathlib import Path\n"
+        "from project_module import VALUE\n"
+        f"Path({str(output)!r}).write_text(json.dumps({{"
+        "'value': VALUE, 'uv_python': os.environ['UV_PYTHON'], "
+        "'virtual_env': os.environ['VIRTUAL_ENV']}))\n"
+    )
+
+    running = supervisor.run_training(
+        TrainingSpec(
+            argv=[sys.executable, str(script)],
+            cwd=str(workspace),
+            timeout_seconds=30,
+        )
+    )
+    terminal = wait_for_terminal(supervisor, running.training_id)
+
+    assert terminal.state is TrainingState.FINISHED
+    assert json.loads(output.read_text()) == {
+        "value": "project-import",
+        "uv_python": str(target_env / "bin" / "python"),
+        "virtual_env": str(target_env),
+    }
 
 
 def test_training_timeout_honors_the_requested_deadline(tmp_path: Path):

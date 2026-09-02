@@ -96,11 +96,11 @@ def test_container_health_success_resets_consecutive_failures(tmp_path: Path):
     assert not failures.exists()
 
 
-def test_role_images_use_the_bootstrap_aware_health_wrapper():
+def test_role_images_do_not_spawn_credential_bearing_health_processes():
     for name in ("Dockerfile.advisor", "Dockerfile.student"):
         dockerfile = (ROOT / name).read_text()
-        assert "CMD senpai-container-health" in dockerfile
-        assert "|| kill -TERM 1" not in dockerfile
+        assert "HEALTHCHECK" not in dockerfile
+        assert "senpai-container-health" not in dockerfile
     for name in ("entrypoint-advisor.sh", "entrypoint-student.sh"):
         entrypoint = (ROOT / "k8s" / name).read_text()
         assert entrypoint.index(".bootstrap-started") < entrypoint.index("git clone")
@@ -110,3 +110,15 @@ def test_role_entrypoints_default_openhands_turns_to_two_hours_of_inactivity():
     for name in ("entrypoint-advisor.sh", "entrypoint-student.sh"):
         entrypoint = (ROOT / "k8s" / name).read_text()
         assert 'SENPAI_OPENHANDS_TIMEOUT_SECONDS:-7200' in entrypoint
+
+
+def test_role_entrypoints_use_the_launch_owned_program_snapshot_file():
+    for name in ("entrypoint-advisor.sh", "entrypoint-student.sh"):
+        entrypoint = (ROOT / "k8s" / name).read_text()
+        assert (
+            ': "${SENPAI_PROGRAM_SOURCE_COMMIT:?Launch-pinned program source '
+            'commit is required}"'
+        ) in entrypoint
+        assert "SENPAI_PROGRAM_CONTEXT_FILE:?Launch-owned" in entrypoint
+        assert '[ -r "$SENPAI_PROGRAM_CONTEXT_FILE" ]' in entrypoint
+        assert "fetch --no-tags origin" not in entrypoint

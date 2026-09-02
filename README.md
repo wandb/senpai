@@ -60,6 +60,10 @@ ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
 EXA_API_KEY=
 WANDB_API_KEY=
+# Required only for wandb/... model profiles:
+WANDB_INFERENCE_API_KEY=
+# One distinct key for each resolved student name:
+WANDB_API_KEY_FRIEREN=
 ```
 
 | Credential | Required access |
@@ -67,8 +71,10 @@ WANDB_API_KEY=
 | `GITHUB_TOKEN` | Target-repository Contents, Pull requests, and Issues read/write. A classic token with `repo` scope also works. GitHub CLI authentication is the fallback when this value is absent. |
 | `ANTHROPIC_API_KEY` | Required when an `anthropic/...` model is configured. |
 | `OPENAI_API_KEY` | Required when an `openai/...` model is configured. Every default profile uses GPT-5.6. |
-| `EXA_API_KEY` | General-web and research-publication search. |
-| `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. |
+| `EXA_API_KEY` | General-web and research-publication search through the typed Exa tool. |
+| `WANDB_API_KEY` | Controller-only W&B access for tracing and metric monitoring. |
+| `WANDB_INFERENCE_API_KEY` | Required when a `wandb/...` model is configured. Use a distinct viewer with only the W&B Inference access that the model profiles require. |
+| `WANDB_API_KEY_<STUDENT>` | A key for a distinct W&B viewer for each student. Configure that viewer with only the target-project write access the assignment requires. Replace non-alphanumeric characters in the uppercased student name with `_`, for example `team-fern` becomes `WANDB_API_KEY_TEAM_FERN`. The default four names require `WANDB_API_KEY_FRIEREN`, `WANDB_API_KEY_FERN`, `WANDB_API_KEY_TANJIRO`, and `WANDB_API_KEY_NEZUKO`. |
 
 To add a credential, put its value in `.env` and list its name in the launch
 configuration:
@@ -86,7 +92,30 @@ its value is redacted from tool output and traces.
 
 `k8s/launch.py` reads shell environment variables first and then the repository-root `.env`; only the GitHub token also falls back to `gh auth token`. Direct Docker or host execution must export or pass credentials explicitly.
 
-The launcher places credentials in a per-launch Kubernetes Secret. During bootstrap, the GitHub write token is removed from the process environment and handed to the controller through a one-use channel; it is not exposed to the model or subagents.
+The launcher stores each set of shared controller and custom credentials in an
+immutable, content-addressed Kubernetes Secret. It stores each student's W&B
+writer key in a separate immutable, content-addressed Secret. During
+bootstrap, it hands the GitHub, Exa, and
+controller W&B credentials to the controller through one-use files and pipes.
+The HTTP health probe carries no credential and spawns no process. The built-in
+controller credentials do not enter the terminal, training, or
+delegated-child environment. Supervised training receives only its student's
+W&B writer key. A role that uses a `wandb/...` model passes the separate W&B
+Inference key to its model runners. Delegated children inherit model keys
+through a bounded, one-use descriptor, not their environment. They disable
+process dumping before they read and close it. A short same-UID startup race
+remains, as described below. The launcher records the
+controller, inference, and writer viewers on desired Deployments and live Pods.
+It scans every Senpai role in the namespace and rejects missing bindings or
+viewer reuse across owners, launch tags, and old and new rollout identities. The preflight
+viewer query cannot verify project membership or role, so the operator must
+restrict both for each viewer. The launcher also cannot verify assignment
+binding or bind a reported run to merge evidence.
+
+The controller necessarily holds its W&B and Exa credentials in memory, and a
+student's supervised training process intentionally receives that student's
+writer key. Process hardening reduces same-user inspection risk, but it is not
+a complete same-UID secrecy boundary.
 
 ### 4. Prepare the target repository
 
@@ -101,6 +130,27 @@ A useful structure is:
 - `## Research` — Add useful task or domain background and possible research directions without prescribing a narrow approach that limits the agents' creativity.
 
 Put it at the repository root. If it lives elsewhere, set `program_path` in `senpai.yaml` or pass `--program_path` at launch. Senpai appends the selected file to every agent's system prompt.
+
+At launch, Senpai pins the exact advisor-branch commit. The launcher reads the
+selected file from that commit, limits it to 64 KiB, and independently verifies
+the commit, traversed trees, and blob against their Git object IDs. It stores
+the content, path, commit, and digest in a separate, immutable,
+content-addressed Secret that each pod mounts read-only. The snapshot therefore
+survives a later force-push or deleted branch without fetching the original
+object again. Each supervisor verifies the mounted snapshot before it starts a
+model process. Container restarts and delegated agents verify a digest-bound
+snapshot of the complete system suffix. Senpai agents cannot publish changes
+to any `program.md`, and `merge_experiment` rejects pull requests that add,
+change, remove, or rename one. Update this operator-owned policy through a
+separate reviewed Git workflow and start a new launch. A changed encoded
+snapshot creates a new immutable Secret; it does not require replacing the
+launch credential Secret.
+
+One active launch tag uses one exact encoded program snapshot. An incremental
+launch reuses that original snapshot when the normalized path and content are
+unchanged, even if the advisor branch has advanced. If the path or content has
+changed, the launcher rejects the active tag; start the updated policy under a
+new tag.
 
 The target repository must be different from the SENPAI runner repository.
 
@@ -158,8 +208,9 @@ OpenAI Pro mode.
 `compaction_trigger_tokens` sets the compaction limit. OpenAI and Anthropic
 apply it for their models; OpenHands handles compaction for other providers.
 
-If using W&B Inference use `wandb/` provider as the provider. For example `wandb/zai-org/GLM-5.2`, SENPAI
-uses `WANDB_API_KEY` for auth.
+To use W&B Inference, select the `wandb/` provider, for example
+`wandb/zai-org/GLM-5.2`. Senpai uses the dedicated
+`WANDB_INFERENCE_API_KEY` for model authentication.
 
 The defaults in `senpai.yaml` describe W&B's deployment and should not be copied unchanged into another environment. Every setting can also be overridden on the command line. `--tag` and `--target_repo_url` are required unless your chosen config file supplies them.
 
@@ -199,7 +250,16 @@ uv run python k8s/launch.py \
   --student_image "ghcr.io/wandb/senpai-student:sha-$revision"
 ```
 
-The launcher creates routing labels, one launch Secret, role ConfigMaps, and Deployments. It does not create the namespace, PVC, Service, or general cluster RBAC.
+The launcher creates routing labels, one content-addressed launch-credential
+Secret for the roles in that invocation, one immutable content-addressed
+`program.md` Secret, one content-addressed W&B writer Secret for each student,
+role ConfigMaps, and Deployments. It does not create the namespace, PVC,
+Service, or general cluster RBAC. Reapplying a tag can add or replace a student.
+Changed credentials create new Secrets. Only Deployments rendered by that
+invocation move to those credential Secrets; other running roles keep their
+prior references. To rotate a role's credentials, include that role in the
+launch command. The active tag's original program snapshot remains fixed.
+Label-based cleanup removes retained Secrets after the launch stops.
 
 Inspect and stop the launch:
 
@@ -390,8 +450,11 @@ entrypoint
   exec supervisor
 
 supervisor
-  restart crashed workers with bounded backoff
-  terminate and restart an overdue phase
+  start one controller with one-shot credential pipes
+  terminate descendants and exit when the controller stops or wedges
+
+container runtime
+  restart the complete container
 
 controller
   poll -> reconcile -> bounded OpenHands turn -> verify -> acknowledge -> sleep
@@ -402,7 +465,7 @@ The controller owns cadence, durable events, conversation selection, verified Gi
 - The advisor keeps one conversation UUID across restarts, recovery, and quarantine.
 - A student uses one UUID per assignment revision; feedback, monitor events, and child-task results resume that exact conversation.
 - Still-actionable GitHub state is re-delivered on the configured reminder cadence, which defaults to at least ten minutes even when GitHub is polled more frequently. Human Issue and PR comment versions are retained across failed or interrupted turns and are never delivered again after successful acknowledgement. New trusted text creates a new version; a changed Human Issue title also creates a new version. `research_base_changed` and student assignment comments are also delivered once per exact event version. Immediate post-turn polls deliver changed state but not timed reminders, so a successful research-only turn cannot enter a no-sleep reminder loop. `research_base_changed` is keyed by assignment, revision, PR head, and the exact required/current base pair; each identity or base movement requires a new decision. Merge repeats the live-base check immediately before its mutation, while external base writers still require strict up-to-date branch protection or a merge queue for an atomic guarantee.
-- Each model request has a hard 90-minute ceiling. OpenHands uses five attempts with 8/16/32/64-second waits (`SENPAI_LLM_NUM_RETRIES`). Foreground terminal calls return within ten minutes, delegated children retain hard 20/60/120-minute tier limits, and root turns use a two-hour inactivity lease renewed by OpenHands events. Two consecutive failed turns exit to the supervisor for a clean worker restart. Restart backoff grows across failed workers to a five-minute ceiling; only a successfully acknowledged turn resets that streak, not process uptime or idle sleep.
+- Each model request has a hard 90-minute ceiling. OpenHands uses five attempts with 8/16/32/64-second waits (`SENPAI_LLM_NUM_RETRIES`). Foreground terminal calls return within ten minutes, delegated children retain hard 20/60/120-minute tier limits, and root turns use a two-hour inactivity lease renewed by OpenHands events. Two consecutive failed turns end the controller. The one-shot supervisor then terminates remaining descendants and exits. Kubernetes, or another external process manager, must restart the complete container so bootstrap can create fresh credential handoffs.
 - Every input follows one durable `pending -> delivered -> processed` inbox. Authenticated human Issues and PR comments are the interrupt tier: tools get up to 60 seconds to finish before the active run is interrupted and resumed, even when its inbox batch is full. Student assignments and trusted PR feedback share a FIFO queue tier; feedback waits for the next completed agent step without cancelling it. Ordinary events remain FIFO. Turn formation and non-human attachments are bounded to 16 events or 64 KiB; prioritized overflow leads the next turn.
 - A completed tool observation renews the three-attempt no-progress budget; timeout, error, interruption, state, and delivery events do not. Thirty-six inference starts on one branch are a separate restart backstop and do not limit one productive run. Either exhausted budget triggers bounded canonical fresh-branch recovery; exhausting recovery quarantines the turn and reports it on every controller start. Only an authenticated human instruction reopens quarantine and resets both budgets; trusted PR feedback stays pending. A persisted final response is reconciled even if cancellation left the SDK status paused. `SENPAI_INBOX_MAX_STALLED_ATTEMPTS` and `SENPAI_INBOX_MAX_RECOVERY_GENERATIONS` configure recovery.
 - Typed context/history failures use durable bounded fresh-branch recovery. Exhausted transient provider failures preserve the turn and its budgets behind durable 30/60/120/240/300-second cooldowns with jitter and `Retry-After` while mailbox polling continues; permanent provider errors fail immediately.
@@ -413,7 +476,13 @@ The controller owns cadence, durable events, conversation selection, verified Gi
 
 The command policy blocks raw GitHub mutations, direct training, `git push`, polling loops, and log streams. Operation-specific typed tools enforce repository, branch, assignment, revision, head-SHA, label, and replay preconditions. This policy keeps routine operations deterministic while leaving high-entropy research work to the agent.
 
-When `WANDB_ENTITY` and `WANDB_PROJECT` are configured, [`weave-openhands`](https://github.com/morganmcg1/weave-openhands) traces advisor, student, and child conversations. Each `OPENHANDS_RUN` record includes a direct Weave Agent Observability URL.
+When `WANDB_ENTITY` and `WANDB_PROJECT` are configured,
+[`weave-openhands`](https://github.com/morganmcg1/weave-openhands) traces the
+main advisor and student conversations. Delegated children receive no
+controller W&B credential and do not create independent Weave traces. A child
+using a `wandb/...` model receives only the dedicated inference credential.
+Each main-role
+`OPENHANDS_RUN` record includes a direct Weave Agent Observability URL.
 
 ## Operations
 
@@ -431,13 +500,31 @@ Advisor and student images are built from the same source revision. The advisor 
 
 For multi-day fleets, [`arm_senpai_cluster_cutoff.sh`](scripts/arm_senpai_cluster_cutoff.sh) creates a cluster-side hard cutoff that does not depend on an operator laptop remaining online. It can also hold a shared start gate until the expected fleet is ready or its readiness deadline expires.
 
-Pod startup and liveness probes read the supervisor lease. Container restarts resume the advisor or student conversation from the pod-local state volume; replacing or rescheduling the pod starts fresh state. Stop a container before copying or snapshotting a live advisor state directory.
+The supervisor serves `/healthz` from the controller lease. Kubernetes startup
+and liveness probes use `httpGet`; they do not spawn a credential-bearing
+process. An unhealthy probe restarts the complete container. Container restarts
+resume the advisor or student conversation from the pod-local state volume;
+replacing or rescheduling the pod starts fresh state. Stop a container before
+copying or snapshotting a live advisor state directory.
+
+This security update adds content-addressed trusted prompt snapshots. Before
+you reuse state created by an older Senpai image, stop the role and remove only
+`$SENPAI_OPENHANDS_STATE_DIR/system-instructions`, or start with fresh role
+state. The next supervisor recreates that directory from the launch-owned
+inputs. Keep the remaining OpenHands conversation state if you need to preserve
+history. Apply the same stopped-state migration when you intentionally change
+the harness, role charter, launch context, or `program.md` for a persisted role.
+Existing roles from an older image do not have the live-Pod viewer and program
+bindings required by the hardened launcher. Stop and remove those legacy role
+resources, or upgrade all of them to hardened manifests, before the first
+hardened launch. Then use a new launch tag. The launcher scans the namespace
+and fails closed instead of inferring missing security bindings.
 
 ### Other deployment environments
 
 GitHub coordination works across Docker, cloud VMs, or local hosts without private networking. The current repository does not yet provide a Compose or direct-host launcher: the Kubernetes manifests perform the source clone, environment assembly, skill installation, token handoff, mounts, and entrypoint selection.
 
-To build another launcher, reproduce [entrypoint-advisor.sh](k8s/entrypoint-advisor.sh) or [entrypoint-student.sh](k8s/entrypoint-student.sh), render `SENPAI-LAUNCH-CONTEXT.md` with runtime identity, limits, and isolation through `render_launch_context`, and provide it as base64 in `SENPAI_LAUNCH_CONTEXT_B64`. Pass the built-in role template and its required non-secret values to the Python supervisor, which renders and persists that role snapshot. Keep optional operator guidance in `EXTRA_INSTRUCTIONS_B64`. Persist `/var/lib/senpai/<tag>/advisor` for the advisor and use the container healthcheck with a restart policy. Student execution requires Linux, an NVIDIA runtime, and compatible CUDA hardware; Docker Desktop on macOS cannot run the GPU student image.
+To build another launcher, reproduce [entrypoint-advisor.sh](k8s/entrypoint-advisor.sh) or [entrypoint-student.sh](k8s/entrypoint-student.sh). Preinstall `senpai_agent` in a trusted interpreter that the target user cannot modify, invoke the supervisor with that absolute interpreter and `-P`, and provide a trusted, non-target-writable `SENPAI_AGENT_DIR`. Provide a separate writable target Python environment for terminal and training commands; let it import the image's read-only training packages without granting write access to the controller environment. Render `SENPAI-LAUNCH-CONTEXT.md` through `render_launch_context`, then provide it as base64 in `SENPAI_LAUNCH_CONTEXT_B64`. Capture and verify `program.md` while the pinned commit is available. Provide its encoded snapshot through a read-only file named by `SENPAI_PROGRAM_CONTEXT_FILE`; do not pass the bounded file content through an environment value. Pass the built-in role template and its required non-secret values to the Python supervisor. The supervisor renders and verifies the persisted role and complete system snapshots. Keep optional operator guidance in `EXTRA_INSTRUCTIONS_B64`. Persist `/var/lib/senpai/<tag>/advisor` for the advisor, probe the supervisor's `/healthz` endpoint, and restart the complete container when it fails. Student execution requires Linux, an NVIDIA runtime, and compatible CUDA hardware. Docker Desktop on macOS cannot run the GPU student image.
 
 ## Development and reference
 
@@ -453,6 +540,6 @@ Deep references:
 - [OpenHands plugin](plugins/senpai/README.md): skills and lifecycle hooks.
 - [Harness instructions](system_instructions/SENPAI-HARNESS.md): shared agent/tool contract.
 - [Advisor instructions](system_instructions/ADVISOR.md) and [student instructions](system_instructions/STUDENT.md): role workflows.
-- [OpenHands fork modifications](https://github.com/morganmcg1/software-agent-sdk/blob/main/FORK_MODS.md): provider continuation, compaction, reasoning, and cache changes.
+- [OpenHands fork modifications](https://github.com/morganmcg1/software-agent-sdk/blob/f69134273ee3a31a233d6201786570eb9c4c141b/FORK_MODS.md): provider continuation, compaction, reasoning, and cache changes at the pinned runtime source.
 - [Contributing](CONTRIBUTING.md): development and CLA requirements.
 - [W&B dashboard](https://wandb.ai/wandb-applied-ai-team/senpai-v1): the default project's experiment record.

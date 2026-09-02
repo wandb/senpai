@@ -896,6 +896,7 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
         workspace=tmp_path,
         conversation_id=CONVERSATION_ID,
         timeout_seconds=7200,
+        training_wandb_api_key=None,
         harness_file=tmp_path / "harness.md",
         role_file=tmp_path / "role.md",
         instructions=SenpaiSystemInstructions(
@@ -903,7 +904,8 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
             role="advisor role",
             program=ProgramSystemPrompt(
                 program_path="program.md",
-                prompt="# program.md - program.md\n\nTest programme.",
+                source_commit="a" * 40,
+                content="Test programme.",
             ),
             launch="# Authoritative launch context\n\nSystem policy.",
         ),

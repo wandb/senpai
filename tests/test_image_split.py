@@ -1,4 +1,6 @@
 import re
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -57,7 +59,9 @@ def test_student_dockerfile_declares_the_cuda_training_runtime():
 
     assert "coreweave/ml-containers" in lowered
     assert "uv export --locked" in dockerfile
-    assert "import importlib.metadata, openhands.sdk, sys, torch" in dockerfile
+    assert "import importlib.metadata" in dockerfile
+    assert "openhands.sdk" in dockerfile
+    assert "torch.__version__" in dockerfile
     assert "NVIDIA_VISIBLE_DEVICES=all" in dockerfile
     assert "senpai-gpu-smoke-test" in dockerfile
     assert "@anthropic-ai/claude-code" not in lowered
@@ -102,12 +106,36 @@ def test_both_role_images_run_as_the_same_explicit_non_root_user():
         )
 
 
-def test_both_images_expose_the_controller_lease_as_their_healthcheck():
+def test_both_images_root_own_the_reserved_agent_definitions():
     for role in ("advisor", "student"):
         dockerfile = (ROOT / f"Dockerfile.{role}").read_text(encoding="utf-8")
 
-        assert "HEALTHCHECK" in dockerfile
-        assert "CMD senpai-container-health" in dockerfile
+        assert "SENPAI_AGENT_DIR=/opt/senpai-agent-definitions" in dockerfile
+        copy = dockerfile.index(
+            "COPY .agents/agents /opt/senpai-agent-definitions"
+        )
+        non_root = dockerfile.index("USER 10001:10001")
+        root_setup = dockerfile[copy:non_root]
+        assert "chown -R root:root" in root_setup
+        assert "chmod -R a-w" in root_setup
+        assert root_setup.count('"$SENPAI_AGENT_DIR"') == 2
+
+
+def test_target_uv_projects_cannot_reuse_the_controller_environment():
+    for role in ("advisor", "student"):
+        dockerfile = (ROOT / f"Dockerfile.{role}").read_text(encoding="utf-8")
+
+        assert "UV_PROJECT_ENVIRONMENT" not in dockerfile
+        assert "SENPAI_PYTHON=/opt/senpai-venv/bin/python" in dockerfile
+        assert "UV_PYTHON=/opt/senpai-venv/bin/python" in dockerfile
+
+
+def test_both_images_delegate_health_to_kubernetes_http_probes():
+    for role in ("advisor", "student"):
+        dockerfile = (ROOT / f"Dockerfile.{role}").read_text(encoding="utf-8")
+
+        assert "HEALTHCHECK" not in dockerfile
+        assert "senpai-container-health" not in dockerfile
 
 
 def test_both_images_record_the_exact_source_revision():
@@ -210,22 +238,64 @@ def test_entrypoints_delegate_runtime_lifecycle_to_the_python_supervisor(
         f'SENPAI_OPENHANDS_ROLE_FILE="$WORKDIR/system_instructions/{role.upper()}.md"'
         in entrypoint
     )
-    assert f"exec python -m senpai_agent.supervisor {role}" in entrypoint
+    assert "PYTHONSAFEPATH" not in entrypoint
+    assert 'uv pip install --python "$SENPAI_PYTHON" --no-deps -e .' not in entrypoint
+    target_env = 'export SENPAI_TARGET_PYTHON_ENV="$HOME/.venvs/senpai-target"'
+    assert target_env in entrypoint
+    assert '"$SENPAI_PYTHON" -m venv "$SENPAI_TARGET_PYTHON_ENV"' in entrypoint
+    assert '"$TARGET_SITE/senpai-runtime.pth"' in entrypoint
+    assert 'export PATH="$SENPAI_TARGET_PYTHON_ENV/bin:$PATH"' not in entrypoint
+    trusted_exec = f'exec "$SENPAI_PYTHON" -P -m senpai_agent.supervisor {role}'
+    assert entrypoint.index('unset GITHUB_TOKEN') < entrypoint.index(
+        '"$SENPAI_PYTHON" -m venv'
+    )
+    assert trusted_exec in entrypoint
+    assert entrypoint.index('cd "$WORKDIR"', entrypoint.index("unset GITHUB_TOKEN")) < (
+        entrypoint.index(trusted_exec)
+    )
     assert "wait_for_senpai_start_gate" not in entrypoint
     trust_runner = 'git config --global safe.directory "$WORKDIR"'
     assert entrypoint.index(trust_runner) < entrypoint.index(
         'install_senpai_git_guard "$WORKDIR"'
     )
     assert "readinessProbe" not in container
-    assert container["livenessProbe"]["exec"]["command"][:2] == [
-        "/bin/sh",
-        "-c",
-    ]
-    assert (
-        "senpai_agent.supervisor health"
-        in container["livenessProbe"]["exec"]["command"][2]
-    )
+    assert container["livenessProbe"]["httpGet"] == {
+        "path": "/healthz",
+        "port": 8080,
+    }
     assert deployment["spec"]["strategy"] == {"type": "Recreate"}
+
+
+def test_writable_target_python_falls_through_to_immutable_runtime_packages(
+    tmp_path: Path,
+):
+    target_env = tmp_path / "target-env"
+    subprocess.run(
+        [sys.executable, "-m", "venv", str(target_env)],
+        check=True,
+    )
+    site_query = "import sysconfig; print(sysconfig.get_path('purelib'))"
+    controller_site = subprocess.check_output(
+        [sys.executable, "-P", "-c", site_query],
+        text=True,
+    ).strip()
+    target_site = Path(
+        subprocess.check_output(
+            [str(target_env / "bin" / "python"), "-P", "-c", site_query],
+            text=True,
+        ).strip()
+    )
+    (target_site / "senpai-runtime.pth").write_text(f"{controller_site}\n")
+
+    subprocess.run(
+        [
+            str(target_env / "bin" / "python"),
+            "-P",
+            "-c",
+            "import pydantic; assert pydantic.__file__",
+        ],
+        check=True,
+    )
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
@@ -256,10 +326,10 @@ def test_bootstrap_git_credentials_are_not_exposed_in_process_arguments():
 
     for role in ("advisor", "student"):
         container = container_for(load_kubernetes_template(f"{role}-deployment.yaml"))
-        assert (
-            "senpai_agent.supervisor health"
-            in container["startupProbe"]["exec"]["command"][2]
-        )
+        assert container["startupProbe"]["httpGet"] == {
+            "path": "/healthz",
+            "port": 8080,
+        }
         assert container["startupProbe"]["failureThreshold"] == 60
 
 
@@ -297,16 +367,20 @@ def test_runtime_git_auth_uses_ephemeral_askpass_not_a_credential_store():
     assert ".git-credentials" not in guard
     assert 'credential.helper "store' not in guard
     assert "x-access-token:%s@github.com" not in guard
+    assert "git-guard-bin" not in guard
+    assert "export PATH=" not in guard
 
     for role in ("advisor", "student"):
         entrypoint = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text(
             encoding="utf-8"
         )
         assert 'GIT_ASKPASS_FILE="/tmp/senpai-git-askpass"' in entrypoint
+        assert "mktemp -d /tmp/senpai-supervisor.XXXXXX" in entrypoint
         assert (
-            'SENPAI_GITHUB_TOKEN_FILE="/tmp/senpai-supervisor-github-token"'
+            'SENPAI_GITHUB_TOKEN_FILE="$CREDENTIAL_HANDOFF_DIR/github-token"'
             in entrypoint
         )
+        assert "/tmp/senpai-supervisor-github-token" not in entrypoint
         assert ".git-credentials" not in entrypoint
         assert 'credential.helper "store' not in entrypoint
 

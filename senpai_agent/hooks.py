@@ -10,6 +10,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from senpai_agent.git_transport import GIT_EXECUTABLE
+from senpai_agent.secrets import SHELL_STARTUP_ENV_NAMES
 from senpai_agent.training import training_result_paths
 
 
@@ -28,6 +30,28 @@ class PolicyDecision:
 
 _SHELL_SEPARATOR_CHARACTERS = frozenset(";&|\n")
 _SHELL_BODY_PREFIXES = {"do", "elif", "else", "if", "then"}
+_SHELL_REEVALUATORS = {
+    ".",
+    "alias",
+    "bind",
+    "compgen",
+    "complete",
+    "compopt",
+    "eval",
+    "fc",
+    "history",
+    "source",
+    "trap",
+}
+_SHELL_EXPANSION_MARKS = frozenset("$`*?[<({")
+_SHELL_PROGRAMS = {
+    "bash": "bash",
+    "dash": "dash",
+    "rbash": "bash",
+    "sh": "sh",
+    "zsh": "zsh",
+}
+_SHELL_VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _GH_READ_ONLY = {
     "auth": {"status"},
     "issue": {"list", "status", "view"},
@@ -40,7 +64,19 @@ _GH_READ_ONLY = {
 _TRAIN_LAUNCHERS = {"accelerate", "deepspeed", "torchrun"}
 _TRAIN_SCRIPT = re.compile(r"^train[^/]*[.]py$")
 _HELP_FLAGS = {"-h", "--help"}
-_REDIRECTION_OPERATORS = {"<", ">", ">>", "<>", ">|", "<&", ">&", "&>", "&>>"}
+_REDIRECTION_OPERATORS = {
+    "<",
+    "<<",
+    "<<<",
+    ">",
+    ">>",
+    "<>",
+    ">|",
+    "<&",
+    ">&",
+    "&>",
+    "&>>",
+}
 _GIT_TERMINAL_COMMANDS = {
     "add",
     "apply",
@@ -207,6 +243,36 @@ def _descendants(root: object) -> list[object]:
     return nodes
 
 
+def _bash_commands(command: str) -> list[str] | None:
+    import tree_sitter_bash
+    from tree_sitter import Language, Parser
+
+    source = command.encode()
+    tree = Parser(Language(tree_sitter_bash.language())).parse(source)
+    if tree.root_node.has_error:
+        return None
+    nodes = _descendants(tree.root_node)
+    if any(
+        node.type == "arithmetic_expansion"
+        or node.type == "c_style_for_statement"
+        or (
+            node.type == "expansion"
+            and source[node.start_byte : node.end_byte].endswith(b"@P}")
+        )
+        or (
+            node.type == "compound_statement"
+            and source[node.start_byte : node.end_byte].lstrip().startswith(b"((")
+        )
+        for node in nodes
+    ):
+        return None
+    return [
+        source[node.start_byte : node.end_byte].decode()
+        for node in nodes
+        if node.type in {"command", "declaration_command"}
+    ]
+
+
 def _command_segments(command: str) -> list[list[str]]:
     command = _without_literal_file_heredocs(command)
     lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>\n")
@@ -225,12 +291,18 @@ def _command_segments(command: str) -> list[list[str]]:
 
 def _program_index(tokens: list[str]) -> int | None:
     for index, token in enumerate(tokens):
-        if "=" in token and not token.startswith(("/", "./")):
-            name, _, _value = token.partition("=")
-            if name.replace("_", "").isalnum():
-                continue
+        if not token.startswith(("/", "./")) and _assignment_name(token) is not None:
+            continue
         return index
     return None
+
+
+def _assignment_name(value: str) -> str | None:
+    name, separator, _value = value.partition("=")
+    if not separator:
+        return None
+    name = name.removesuffix("+")
+    return name if _SHELL_VARIABLE_NAME.fullmatch(name) else None
 
 
 def _gh_policy(tokens: list[str], index: int) -> PolicyDecision:
@@ -334,7 +406,7 @@ def _env_command(arguments: list[str]) -> list[str]:
             return shlex.split(value.partition("=")[2]) + arguments[position + 1 :]
     return _wrapper_command(
         arguments,
-        value_options={"-u", "--unset", "-C", "--chdir"},
+        value_options={"-a", "--argv0", "-u", "--unset", "-C", "--chdir"},
     )
 
 
@@ -346,6 +418,196 @@ def _shell_command(arguments: list[str]) -> str | None:
         if is_command_option and position + 1 < len(arguments):
             return arguments[position + 1]
     return None
+
+
+def _enables_shell_allexport(arguments: Sequence[str]) -> bool:
+    position = 0
+    while position < len(arguments):
+        argument = arguments[position]
+        if argument == "--":
+            return False
+        if argument == "-o":
+            if (
+                position + 1 < len(arguments)
+                and arguments[position + 1] == "allexport"
+            ):
+                return True
+            position += 2
+            continue
+        if argument.startswith("-") and not argument.startswith("--"):
+            options = argument[1:]
+            if "a" in options:
+                return True
+            if "c" in options:
+                return False
+        position += 1
+    return False
+
+
+def _has_dynamic_set_arguments(arguments: Sequence[str]) -> bool:
+    for argument in arguments:
+        if argument == "--":
+            return False
+        if any(mark in argument for mark in _SHELL_EXPANSION_MARKS):
+            return True
+    return False
+
+
+def _has_dynamic_shell_options(arguments: Sequence[str]) -> bool:
+    position = 0
+    while position < len(arguments):
+        argument = arguments[position]
+        if argument == "--":
+            return False
+        if any(mark in argument for mark in _SHELL_EXPANSION_MARKS):
+            return True
+        if argument == "-o":
+            if position + 1 >= len(arguments):
+                return False
+            if any(
+                mark in arguments[position + 1]
+                for mark in _SHELL_EXPANSION_MARKS
+            ):
+                return True
+            position += 2
+            continue
+        if argument.startswith("-") and not argument.startswith("--"):
+            if "c" in argument[1:]:
+                return False
+            position += 1
+            continue
+        return False
+    return False
+
+
+def _uses_shell_startup_files(arguments: Sequence[str]) -> bool:
+    for argument in arguments:
+        if argument == "--":
+            return False
+        reads_named_file = argument in {"--init-file", "--login", "--rcfile"}
+        reads_named_file = reads_named_file or argument.startswith(
+            ("--init-file=", "--rcfile=")
+        )
+        if reads_named_file:
+            return True
+        if argument.startswith("-") and not argument.startswith("--"):
+            options = argument[1:]
+            if {"i", "l"} & set(options):
+                return True
+            if "c" in options:
+                return False
+    return False
+
+
+def _time_command(arguments: list[str]) -> list[str] | None:
+    while arguments[:1] == ["-p"]:
+        arguments = arguments[1:]
+    if arguments[:1] == ["--"]:
+        arguments = arguments[1:]
+    if not arguments or arguments[0].startswith("-"):
+        return None
+    return arguments
+
+
+def _declaration_policy(program: str, arguments: list[str]) -> PolicyDecision:
+    options = ""
+    separator = False
+    values: list[str] = []
+    for argument in _without_redirections(arguments):
+        if argument == "--":
+            separator = True
+            continue
+        if not separator and argument[:1] in {"-", "+"}:
+            options += argument[1:]
+            continue
+        values.append(argument)
+    if {"i", "n"} & set(options):
+        return PolicyDecision(
+            False,
+            "Do not use shell arithmetic or nameref variables.",
+        )
+    return _variable_name_policy(program, values)
+
+
+def _read_policy(arguments: list[str]) -> PolicyDecision:
+    names: list[str] = []
+    arguments = _without_redirections(arguments)
+    position = 0
+    while position < len(arguments):
+        argument = arguments[position]
+        if argument == "--":
+            names.extend(arguments[position + 1 :])
+            break
+        if argument == "-a":
+            if position + 1 < len(arguments):
+                names.append(arguments[position + 1])
+            position += 2
+            continue
+        if argument in {"-d", "-i", "-n", "-N", "-p", "-t", "-u"}:
+            position += 2
+            continue
+        if argument.startswith("-"):
+            position += 1
+            continue
+        names.extend(arguments[position:])
+        break
+    return _variable_name_policy("read", names)
+
+
+def _mapfile_target(arguments: Sequence[str]) -> str | None:
+    arguments = _without_redirections(arguments)
+    value_options = {"-C", "-O", "-c", "-d", "-n", "-s", "-u"}
+    position = 0
+    while position < len(arguments):
+        argument = arguments[position]
+        if argument == "--":
+            return arguments[position + 1] if position + 1 < len(arguments) else None
+        if argument in value_options:
+            position += 2
+            continue
+        if argument.startswith("-"):
+            position += 1
+            continue
+        return argument
+    return None
+
+
+def _without_redirections(arguments: Sequence[str]) -> list[str]:
+    command_arguments: list[str] = []
+    position = 0
+    while position < len(arguments):
+        operator_position = position + int(arguments[position].isdecimal())
+        if (
+            operator_position < len(arguments)
+            and arguments[operator_position] in _REDIRECTION_OPERATORS
+            and operator_position + 1 < len(arguments)
+        ):
+            position = operator_position + 2
+            continue
+        command_arguments.append(arguments[position])
+        position += 1
+    return command_arguments
+
+
+def _variable_name_policy(
+    program: str,
+    arguments: Sequence[str],
+) -> PolicyDecision:
+    for argument in arguments:
+        name = _assignment_name(argument)
+        if name is None and "=" not in argument:
+            name = argument
+        if name in SHELL_STARTUP_ENV_NAMES:
+            return PolicyDecision(
+                False,
+                f"Do not alter shell startup variable {name}.",
+            )
+        if name is None or _SHELL_VARIABLE_NAME.fullmatch(name) is None:
+            return PolicyDecision(
+                False,
+                f"Do not pass dynamic variable names to {program}.",
+            )
+    return PolicyDecision(True)
 
 
 def _curl_policy(tokens: list[str], index: int) -> PolicyDecision:
@@ -496,36 +758,152 @@ def _git_policy(arguments: list[str]) -> PolicyDecision:
     )
 
 
-def _segment_policy(tokens: list[str]) -> PolicyDecision:
+def _shell_program(program: str, workspace: Path) -> str | None:
+    shell = _SHELL_PROGRAMS.get(Path(program).name)
+    if shell is not None or "/" not in program:
+        return shell
+    path = Path(program)
+    if not path.is_absolute():
+        path = workspace / path
+    try:
+        return _SHELL_PROGRAMS.get(path.resolve(strict=True).name)
+    except OSError:
+        return None
+
+
+def _segment_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
     index = _program_index(tokens)
+    assignment_tokens = tokens if index is None else tokens[:index]
+    for token in assignment_tokens:
+        name = _assignment_name(token)
+        if name in SHELL_STARTUP_ENV_NAMES:
+            return PolicyDecision(
+                False,
+                f"Do not alter shell startup variable {name}.",
+            )
     if index is None:
         return PolicyDecision(True)
-    program = Path(tokens[index]).name
+    program_token = tokens[index]
+    program = "." if program_token == "." else Path(program_token).name
+    if any(mark in program for mark in ("$", "`", "*", "?", "\n", "\r")) or (
+        "[" in program and program not in {"[", "[["}
+    ):
+        return PolicyDecision(
+            False,
+            "Do not construct executable names with shell expansion.",
+        )
 
     arguments = tokens[index + 1 :]
     if program in _SHELL_BODY_PREFIXES:
-        return _segment_policy(arguments)
+        return _segment_policy(arguments, workspace)
     if program == "env":
+        decision = _variable_name_policy(
+            "env",
+            [
+                argument
+                for argument in arguments
+                if "=" in argument
+                and _SHELL_VARIABLE_NAME.fullmatch(argument.partition("=")[0])
+            ],
+        )
+        if not decision.allowed:
+            return decision
         command = _env_command(arguments)
-        return _segment_policy(command) if command else PolicyDecision(True)
-    if program in {"command", "exec", "nohup"}:
+        return _segment_policy(command, workspace) if command else PolicyDecision(True)
+    if program == "exec":
+        command = _wrapper_command(arguments, value_options={"-a"})
+        return _segment_policy(command, workspace) if command else PolicyDecision(True)
+    if program in {"builtin", "command", "nohup"}:
         command = _wrapper_command(arguments)
-        return _segment_policy(command) if command else PolicyDecision(True)
+        return _segment_policy(command, workspace) if command else PolicyDecision(True)
     if program == "timeout":
         command = _timeout_command(arguments)
-        return _segment_policy(command) if command else PolicyDecision(True)
+        return _segment_policy(command, workspace) if command else PolicyDecision(True)
     if program == "setsid":
         command = _wrapper_command(arguments)
-        return _segment_policy(command) if command else PolicyDecision(True)
-    if program in {"bash", "dash", "sh", "zsh"}:
+        return _segment_policy(command, workspace) if command else PolicyDecision(True)
+    shell = _shell_program(program_token, workspace)
+    if shell is not None:
+        if shell == "zsh" or _uses_shell_startup_files(arguments):
+            return PolicyDecision(
+                False,
+                "Do not launch nested shells that load startup files.",
+            )
+        if _has_dynamic_shell_options(arguments):
+            return PolicyDecision(
+                False,
+                "Do not construct nested-shell options with expansion.",
+            )
+        if _enables_shell_allexport(arguments):
+            return PolicyDecision(
+                False,
+                "Do not enable automatic export in nested shells.",
+            )
         command = _shell_command(arguments)
         if command is not None:
-            return terminal_policy(command, "", Path.cwd())
-    if program == "eval":
+            return terminal_policy(command, "", workspace)
+    if program == "time":
+        command = _time_command(arguments)
+        if command is None:
+            return PolicyDecision(False, "Senpai could not parse `time` safely.")
+        return _segment_policy(command, workspace)
+    if program == "coproc":
+        return PolicyDecision(False, "Do not launch asynchronous shell coprocesses.")
+    if program in _SHELL_REEVALUATORS:
         return PolicyDecision(
             False,
-            "Do not use eval to execute commands hidden from Senpai's policy.",
+            "Do not use shell constructs that reinterpret commands or arguments.",
         )
+    if program == "let":
+        return PolicyDecision(False, "Do not use shell arithmetic evaluation.")
+    if program == "set":
+        if _has_dynamic_set_arguments(arguments):
+            return PolicyDecision(
+                False,
+                "Do not construct shell options with expansion.",
+            )
+        if _enables_shell_allexport(arguments):
+            return PolicyDecision(
+                False,
+                "Do not enable automatic export of shell variables.",
+            )
+    if program in {"declare", "local", "typeset"}:
+        return _declaration_policy(program, arguments)
+    if program in {"export", "readonly", "unset"}:
+        return _declaration_policy(program, arguments)
+    if program == "read":
+        return _read_policy(arguments)
+    if program == "getopts" and len(arguments) >= 2:
+        decision = _variable_name_policy(program, arguments[1:2])
+        if not decision.allowed:
+            return decision
+    if program in {"mapfile", "readarray"}:
+        target = _mapfile_target(arguments)
+        if target is not None:
+            decision = _variable_name_policy(program, [target])
+            if not decision.allowed:
+                return decision
+    if program in {"mapfile", "readarray"} and any(
+        argument == "-C" or argument.startswith("-C")
+        for argument in arguments
+    ):
+        return PolicyDecision(False, "Do not use shell callback evaluation.")
+    if program == "hash" and any(
+        argument == "-p" or argument.startswith("-p")
+        for argument in arguments
+    ):
+        return PolicyDecision(False, "Do not bind alternate executable names.")
+    if program == "jobs" and any(
+        argument.startswith("-") and "x" in argument[1:]
+        for argument in arguments
+    ):
+        return PolicyDecision(False, "Do not use shell command runners.")
+    if program == "shopt" and "expand_aliases" in arguments:
+        return PolicyDecision(False, "Do not enable shell alias expansion.")
+    if program == "printf" and "-v" in arguments:
+        return PolicyDecision(False, "Do not use printf to evaluate variable names.")
+    if program in {"[", "[[", "test"} and "-v" in arguments:
+        return PolicyDecision(False, "Do not evaluate dynamic variable names.")
 
     if program == "git":
         return _git_policy(arguments)
@@ -535,7 +913,7 @@ def _segment_policy(tokens: list[str]) -> PolicyDecision:
         return _curl_policy(tokens, index)
 
     if program == "uv" and arguments[:1] == ["run"]:
-        return _segment_policy(tokens[index + 2 :])
+        return _segment_policy(tokens[index + 2 :], workspace)
     if program.startswith("python") and _python_launches_training(tokens, index):
         return PolicyDecision(
             False,
@@ -549,6 +927,10 @@ def _segment_policy(tokens: list[str]) -> PolicyDecision:
             "Use run_training so timeouts, logs, status, and W&B IDs are supervised.",
         )
 
+    if program in {"for", "select"}:
+        decision = _variable_name_policy(program, arguments[:1])
+        if not decision.allowed:
+            return decision
     if program == "for":
         if any("((" in argument for argument in arguments):
             return PolicyDecision(
@@ -578,9 +960,20 @@ def terminal_policy(
     role: str,
     workspace: Path,
 ) -> PolicyDecision:
-    del role, workspace
+    del role
+    nested_commands = _bash_commands(command)
+    if nested_commands is None:
+        return PolicyDecision(
+            False,
+            "Senpai could not parse this shell command safely.",
+        )
+    for nested_command in nested_commands:
+        for segment in _command_segments(nested_command):
+            decision = _segment_policy(segment, workspace)
+            if not decision.allowed:
+                return decision
     for segment in _command_segments(command):
-        decision = _segment_policy(segment)
+        decision = _segment_policy(segment, workspace)
         if not decision.allowed:
             return decision
     return PolicyDecision(True)
@@ -615,7 +1008,7 @@ def _stop_policy(
             )
     if require_clean_workspace:
         status = subprocess.run(
-            ["git", "status", "--porcelain"],
+            [GIT_EXECUTABLE, "status", "--porcelain"],
             cwd=working_dir,
             text=True,
             capture_output=True,

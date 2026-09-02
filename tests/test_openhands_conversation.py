@@ -85,24 +85,15 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     config = runtime_config(
         tmp_path,
         conversation_secrets={
-            "WANDB_API_KEY": "wandb-key",
             "PRIVATE_AUTH": "private-key",
         },
     )
 
     assert run_openhands("first task", config) == 0
     assert captured["prompt"] == "first task"
-    assert captured["role"] == (
-        "# Senpai harness\n\nharness instructions\n\n"
-        "# Senpai role\n\nadvisor role\n\n"
-        "# program.md - program.md\n\nTest programme.\n\n"
-        "# Authoritative launch context\n\nTest launch policy.\n"
-    )
+    assert captured["role"] == config.instructions.prompt
     assert captured["plugin"] == str(PLUGIN_DIR)
-    assert captured["secrets"] == {
-        "WANDB_API_KEY": "wandb-key",
-        "PRIVATE_AUTH": "private-key",
-    }
+    assert captured["secrets"] == {"PRIVATE_AUTH": "private-key"}
     assert registered_secrets == ["github-key"]
     assert captured["conversation_id_env"] == config.conversation_id.hex
     assert captured["delete_on_close"] is False
@@ -953,7 +944,11 @@ def test_child_result_at_emergency_limit_is_returned_unchanged(
         lambda *_args, **_kwargs: runner.MAX_INLINE_CHILD_RESULT_TOKENS,
     )
     isolate_agent_discovery(monkeypatch, runner)
-    monkeypatch.setattr(runner, "WEAVE_PROJECT", "wandb-applied-ai-team/senpai-v1")
+    monkeypatch.setattr(
+        runner,
+        "current_weave_project",
+        lambda: "wandb-applied-ai-team/senpai-v1",
+    )
     config = runtime_config(tmp_path, child=True)
 
     assert run_openhands("child task", config) == 0
@@ -1557,7 +1552,7 @@ def test_main_removes_the_model_key_and_flushes_weave_after_failure(monkeypatch)
     monkeypatch.setattr(
         runner,
         "resolve_config",
-        lambda _args: SimpleNamespace(api_key_env="ANTHROPIC_API_KEY"),
+        lambda _args, _env: SimpleNamespace(api_key_env="ANTHROPIC_API_KEY"),
     )
     monkeypatch.setattr(runner, "run_openhands", fail_run)
     monkeypatch.setattr(runner, "finish_weave_monitoring", lambda: flushed.append(True))

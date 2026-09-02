@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from pydantic import SecretStr
 
@@ -110,6 +110,16 @@ class GitHubMailbox:
             }
         )
         return self._github.objects(f"/repos/{self.repo}/pulls?{query}")
+
+    def _has_write_permission(self, login: str) -> bool:
+        permission = self._github.get(
+            f"/repos/{self.repo}/collaborators/{quote(login, safe='')}/permission"
+        )
+        if not isinstance(permission, dict) or not isinstance(
+            permission.get("permission"), str
+        ):
+            raise GitHubReadError("GitHub returned an invalid collaborator permission")
+        return permission["permission"] in {"admin", "maintain", "write"}
 
     def _issues(self) -> list[dict[str, object]]:
         query = urlencode(

@@ -3,8 +3,9 @@
 #
 # The job waits inside Kubernetes until all expected Senpai pods are Ready,
 # records that timestamp on the PVC, sleeps for the requested budget, then
-# deletes the tagged Senpai deployments/configmaps/secrets. This keeps the hard
-# cutoff independent of the operator laptop staying awake.
+# deletes the tagged Senpai deployments. This keeps the hard cutoff independent
+# of the operator laptop staying awake. Operators clean up retained launch
+# ConfigMaps and Secrets separately.
 
 set -euo pipefail
 
@@ -125,6 +126,11 @@ import uuid
 print(uuid.uuid4())
 PY
 )"
+STATE_AUTH_KEY="$(python - <<'PY'
+import secrets
+print(secrets.token_hex(32))
+PY
+)"
 BUDGET_SECONDS="$(python - "$BUDGET_HOURS" <<'PY'
 import sys
 print(int(float(sys.argv[1]) * 3600))
@@ -140,6 +146,16 @@ if not math.isfinite(minutes) or minutes < 0:
 print(int(minutes * 60))
 PY
 )"
+read -r ARMING_DEADLINE_EPOCH HARD_KILL_AT_EPOCH < <(
+  python - "$READINESS_TIMEOUT_SECONDS" "$BUDGET_SECONDS" <<'PY'
+import sys
+import time
+
+readiness, budget = map(int, sys.argv[1:])
+arming_deadline = int(time.time()) + readiness
+print(arming_deadline, arming_deadline + budget)
+PY
+)
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -150,6 +166,7 @@ JOB_MANIFEST="${TMP_DIR}/job.yaml"
 cat > "$CUTOFF_SCRIPT" <<'JOBSCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 RUN_SLUG="${RUN_SLUG:?}"
 TAGS_CSV="${TAGS_CSV:?}"
@@ -157,19 +174,25 @@ EXPECTED_PODS="${EXPECTED_PODS:?}"
 EXPECTED_DEPLOYMENTS="${EXPECTED_DEPLOYMENTS:?}"
 READINESS_TIMEOUT_SECONDS="${READINESS_TIMEOUT_SECONDS:?}"
 BUDGET_SECONDS="${BUDGET_SECONDS:?}"
+ARMING_DEADLINE_EPOCH="${ARMING_DEADLINE_EPOCH:?}"
+HARD_KILL_AT_EPOCH="${HARD_KILL_AT_EPOCH:?}"
 REQUESTED_ARM_ID="${ARM_ID:?}"
+STATE_AUTH_KEY="${STATE_AUTH_KEY:?}"
 PVC_LOG_ROOT="${PVC_LOG_ROOT:?}"
 START_GATE_PATH="${START_GATE_PATH:-}"
 NAMESPACE="${NAMESPACE:-default}"
 SELECTOR="research-tag in (${TAGS_CSV})"
 
 RUN_DIR="${PVC_LOG_ROOT}/${RUN_SLUG}"
-STATE_FILE="${RUN_DIR}/cutoff_state.env"
-mkdir -p "$RUN_DIR"
+STATE_FILE="${RUN_DIR}/cutoff_state.json"
 
 log() {
   printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"
 }
+
+if ! mkdir -p "$RUN_DIR"; then
+  log "Shared cutoff telemetry directory is unavailable; continuing fail closed"
+fi
 
 utc_from_epoch() {
   python - "$1" <<'PY'
@@ -199,64 +222,183 @@ deployment_count() {
 }
 
 write_state() {
-  local reason="$1" now kill_at kill_at_utc tmp
+  local reason="$1" now tmp persisted="true"
   now="$(date -u '+%s')"
-  kill_at=$((now + BUDGET_SECONDS))
-  kill_at_utc="$(utc_from_epoch "$kill_at")"
-  tmp="${STATE_FILE}.tmp"
-  {
-    printf 'PERSISTED_ARM_ID=%q\n' "$REQUESTED_ARM_ID"
-    printf 'RUN_SLUG=%q\n' "$RUN_SLUG"
-    printf 'TAGS_CSV=%q\n' "$TAGS_CSV"
-    printf 'ARMED_AT_UTC=%q\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    printf 'ARM_REASON=%q\n' "$reason"
-    printf 'KILL_AT_EPOCH=%q\n' "$kill_at"
-    printf 'KILL_AT_UTC=%q\n' "$kill_at_utc"
-    printf 'EXPECTED_PODS=%q\n' "$EXPECTED_PODS"
-    printf 'EXPECTED_DEPLOYMENTS=%q\n' "$EXPECTED_DEPLOYMENTS"
-    printf 'SELECTOR=%q\n' "$SELECTOR"
-    printf 'START_GATE_PATH=%q\n' "$START_GATE_PATH"
-  } > "$tmp"
-  mv "$tmp" "$STATE_FILE"
+  PERSISTED_ARM_ID="$REQUESTED_ARM_ID"
+  ARMED_AT_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  ARM_REASON="$reason"
+  KILL_AT_EPOCH=$((now + BUDGET_SECONDS))
+  if [ "$KILL_AT_EPOCH" -gt "$HARD_KILL_AT_EPOCH" ]; then
+    KILL_AT_EPOCH="$HARD_KILL_AT_EPOCH"
+  fi
+  KILL_AT_UTC="$(utc_from_epoch "$KILL_AT_EPOCH")"
+  if ! tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")"; then
+    log "Shared cutoff telemetry is unavailable; using in-memory deadline"
+    return 0
+  fi
+  python - \
+    "$tmp" "$STATE_AUTH_KEY" "$REQUESTED_ARM_ID" "$RUN_SLUG" "$TAGS_CSV" \
+    "$ARMED_AT_UTC" "$reason" "$KILL_AT_EPOCH" "$KILL_AT_UTC" "$EXPECTED_PODS" \
+    "$EXPECTED_DEPLOYMENTS" "$SELECTOR" "$START_GATE_PATH" <<'PY' || persisted="false"
+import hashlib
+import hmac
+import json
+import sys
+
+(
+    path,
+    key,
+    arm_id,
+    run_slug,
+    tags_csv,
+    armed_at,
+    reason,
+    kill_at,
+    kill_at_utc,
+    expected_pods,
+    expected_deployments,
+    selector,
+    start_gate_path,
+) = sys.argv[1:]
+payload = {
+    "PERSISTED_ARM_ID": arm_id,
+    "RUN_SLUG": run_slug,
+    "TAGS_CSV": tags_csv,
+    "ARMED_AT_UTC": armed_at,
+    "ARM_REASON": reason,
+    "KILL_AT_EPOCH": int(kill_at),
+    "KILL_AT_UTC": kill_at_utc,
+    "EXPECTED_PODS": int(expected_pods),
+    "EXPECTED_DEPLOYMENTS": int(expected_deployments),
+    "SELECTOR": selector,
+    "START_GATE_PATH": start_gate_path,
+}
+encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+document = {
+    "payload": payload,
+    "mac": hmac.new(key.encode(), encoded, hashlib.sha256).hexdigest(),
+}
+with open(path, "w", encoding="utf-8") as file:
+    json.dump(document, file, sort_keys=True, separators=(",", ":"))
+    file.write("\n")
+PY
+  if [ "$persisted" = "true" ] && ! mv "$tmp" "$STATE_FILE"; then
+    persisted="false"
+  fi
+  if [ "$persisted" = "false" ]; then
+    rm -f "$tmp" || log "Unable to remove shared cutoff telemetry temporary"
+    log "Shared cutoff telemetry changed concurrently; using in-memory deadline"
+  fi
+}
+
+read_state_value() {
+  python - "$STATE_FILE" "$STATE_AUTH_KEY" "$1" <<'PY'
+import hashlib
+import hmac
+import json
+import os
+import stat
+import sys
+
+path, key, requested = sys.argv[1:]
+allowed = {
+    "PERSISTED_ARM_ID",
+    "RUN_SLUG",
+    "TAGS_CSV",
+    "ARMED_AT_UTC",
+    "ARM_REASON",
+    "KILL_AT_EPOCH",
+    "KILL_AT_UTC",
+    "EXPECTED_PODS",
+    "EXPECTED_DEPLOYMENTS",
+    "SELECTOR",
+    "START_GATE_PATH",
+}
+if requested not in allowed:
+    raise SystemExit("invalid cutoff state field")
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 16_384:
+        raise SystemExit("invalid cutoff state file")
+    with os.fdopen(fd, encoding="utf-8") as file:
+        document = json.load(file)
+    fd = -1
+finally:
+    if fd >= 0:
+        os.close(fd)
+if set(document) != {"payload", "mac"} or not isinstance(document["payload"], dict):
+    raise SystemExit("invalid cutoff state document")
+payload = document["payload"]
+if set(payload) != allowed:
+    raise SystemExit("invalid cutoff state fields")
+encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+expected_mac = hmac.new(key.encode(), encoded, hashlib.sha256).hexdigest()
+if not hmac.compare_digest(document["mac"], expected_mac):
+    raise SystemExit("cutoff state authentication failed")
+if not isinstance(payload["KILL_AT_EPOCH"], int) or payload["KILL_AT_EPOCH"] < 0:
+    raise SystemExit("invalid cutoff deadline")
+value = payload[requested]
+if not isinstance(value, (str, int)):
+    raise SystemExit("invalid cutoff state value")
+print(value, end="")
+PY
+}
+
+load_state() {
+  PERSISTED_ARM_ID="$(read_state_value PERSISTED_ARM_ID)"
+  ARMED_AT_UTC="$(read_state_value ARMED_AT_UTC)"
+  KILL_AT_EPOCH="$(read_state_value KILL_AT_EPOCH)"
+  KILL_AT_UTC="$(read_state_value KILL_AT_UTC)"
 }
 
 open_start_gate() {
   local tmp
   [ -n "$START_GATE_PATH" ] || return 0
-  mkdir -p "$(dirname "$START_GATE_PATH")"
-  tmp="${START_GATE_PATH}.tmp"
+  if ! mkdir -p "$(dirname "$START_GATE_PATH")" || \
+     ! tmp="$(mktemp "${START_GATE_PATH}.tmp.XXXXXX")"; then
+    log "Unable to open the shared start gate; cutoff remains armed"
+    return 0
+  fi
   {
     printf 'RUN_SLUG=%q\n' "$RUN_SLUG"
     printf 'TAGS_CSV=%q\n' "$TAGS_CSV"
     printf 'OPENED_AT_UTC=%q\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf 'KILL_AT_UTC=%q\n' "${KILL_AT_UTC:-}"
     printf 'SELECTOR=%q\n' "$SELECTOR"
-  } > "$tmp"
-  mv "$tmp" "$START_GATE_PATH"
+  } > "$tmp" || {
+    rm -f "$tmp" || log "Unable to remove shared start-gate temporary"
+    log "Unable to write the shared start gate; cutoff remains armed"
+    return 0
+  }
+  if ! mv "$tmp" "$START_GATE_PATH"; then
+    rm -f "$tmp" || log "Unable to remove shared start-gate temporary"
+    log "Shared start gate changed concurrently; cutoff remains armed"
+    return 0
+  fi
   log "Opened start gate: ${START_GATE_PATH}"
 }
 
 wait_for_ready_gate() {
   local total ready deploys deadline now delay existing_arm_id
   if [ -f "$STATE_FILE" ]; then
-    existing_arm_id="$(
-      # shellcheck source=/dev/null
-      source "$STATE_FILE"
-      printf '%s' "${PERSISTED_ARM_ID:-}"
-    )"
-    if [ "$existing_arm_id" = "$REQUESTED_ARM_ID" ]; then
-      # shellcheck source=/dev/null
-      source "$STATE_FILE"
+    if existing_arm_id="$(read_state_value PERSISTED_ARM_ID 2>/dev/null)" && \
+       [ "$existing_arm_id" = "$REQUESTED_ARM_ID" ] && load_state; then
       log "Loaded existing cutoff state: KILL_AT_UTC=${KILL_AT_UTC}"
+      if [ "$KILL_AT_EPOCH" -gt "$HARD_KILL_AT_EPOCH" ]; then
+        KILL_AT_EPOCH="$HARD_KILL_AT_EPOCH"
+        KILL_AT_UTC="$(utc_from_epoch "$KILL_AT_EPOCH")"
+      fi
       open_start_gate
       return 0
     fi
     log "Discarding cutoff state from an earlier arm of this run slug"
-    rm -f "$STATE_FILE"
-    [ -z "$START_GATE_PATH" ] || rm -f "$START_GATE_PATH"
+    rm -f "$STATE_FILE" || log "Unable to remove stale cutoff telemetry"
+    [ -z "$START_GATE_PATH" ] || rm -f "$START_GATE_PATH" || \
+      log "Unable to remove stale start gate"
   fi
 
-  deadline=$(($(date -u '+%s') + READINESS_TIMEOUT_SECONDS))
+  deadline="$ARMING_DEADLINE_EPOCH"
   log "Waiting for ready gate: expected pods=${EXPECTED_PODS}, deployments=${EXPECTED_DEPLOYMENTS}, timeout=${READINESS_TIMEOUT_SECONDS}s, selector=${SELECTOR}"
   while true; do
     read -r total ready < <(pod_counts)
@@ -264,8 +406,6 @@ wait_for_ready_gate() {
     log "Ready gate poll: ready=${ready}/${EXPECTED_PODS}, pods=${total}/${EXPECTED_PODS}, deployments=${deploys}/${EXPECTED_DEPLOYMENTS}"
     if [ "$total" = "$EXPECTED_PODS" ] && [ "$ready" = "$EXPECTED_PODS" ] && [ "$deploys" = "$EXPECTED_DEPLOYMENTS" ]; then
       write_state "all_ready"
-      # shellcheck source=/dev/null
-      source "$STATE_FILE"
       log "Ready gate passed: ARMED_AT_UTC=${ARMED_AT_UTC}, KILL_AT_UTC=${KILL_AT_UTC}"
       open_start_gate
       return 0
@@ -274,8 +414,6 @@ wait_for_ready_gate() {
     if [ "$now" -ge "$deadline" ]; then
       log "Readiness deadline reached; arming cutoff anyway"
       write_state "readiness_timeout"
-      # shellcheck source=/dev/null
-      source "$STATE_FILE"
       open_start_gate
       return 0
     fi
@@ -305,19 +443,19 @@ delete_targets() {
   local deploys
   deploys="$(deployment_count)"
   if [ "$deploys" = "0" ]; then
-    log "No target deployments remain; deleting any residual launch resources"
+    log "No target deployments remain; the delete command is idempotent"
   fi
-  log "Deleting deployments/configmaps/secrets with selector: ${SELECTOR}"
-  kubectl -n "$NAMESPACE" delete deployments,configmaps,secrets -l "$SELECTOR" --ignore-not-found=true
-  date -u '+%Y-%m-%dT%H:%M:%SZ' > "${RUN_DIR}/delete_done_utc.txt"
+  log "Deleting deployments with selector: ${SELECTOR}"
+  kubectl -n "$NAMESPACE" delete deployments -l "$SELECTOR" --ignore-not-found=true
+  log "ConfigMaps and Secrets remain for operator cleanup"
+  date -u '+%Y-%m-%dT%H:%M:%SZ' > "${RUN_DIR}/delete_done_utc.txt" || \
+    log "Unable to persist cutoff completion telemetry"
   log "Delete command completed"
 }
 
 main() {
   log "Cluster cutoff job starting: ${RUN_SLUG}"
   wait_for_ready_gate
-  # shellcheck source=/dev/null
-  source "$STATE_FILE"
   sleep_until "$KILL_AT_EPOCH" "hard cutoff delete"
   delete_targets
   log "Cluster cutoff job done: ${RUN_SLUG}"
@@ -344,9 +482,6 @@ rules:
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list", "watch"]
-- apiGroups: [""]
-  resources: ["configmaps", "secrets"]
-  verbs: ["get", "list", "watch", "delete"]
 - apiGroups: ["apps"]
   resources: ["deployments"]
   verbs: ["get", "list", "watch", "delete"]
@@ -388,12 +523,24 @@ spec:
         run-slug: ${SAFE_SLUG}
     spec:
       serviceAccountName: ${SA_NAME}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       restartPolicy: OnFailure
       containers:
       - name: cutoff
         image: ${IMAGE}
         imagePullPolicy: Always
         command: ["/bin/bash", "/opt/senpai-cutoff/cutoff-job.sh"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
         env:
         - name: RUN_SLUG
           value: "${RUN_SLUG}"
@@ -407,8 +554,14 @@ spec:
           value: "${READINESS_TIMEOUT_SECONDS}"
         - name: BUDGET_SECONDS
           value: "${BUDGET_SECONDS}"
+        - name: ARMING_DEADLINE_EPOCH
+          value: "${ARMING_DEADLINE_EPOCH}"
+        - name: HARD_KILL_AT_EPOCH
+          value: "${HARD_KILL_AT_EPOCH}"
         - name: ARM_ID
           value: "${ARM_ID}"
+        - name: STATE_AUTH_KEY
+          value: "${STATE_AUTH_KEY}"
         - name: PVC_LOG_ROOT
           value: "${PVC_LOG_ROOT}"
         - name: START_GATE_PATH

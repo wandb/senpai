@@ -78,6 +78,17 @@ def test_agent_observability_url_targets_the_durable_conversation():
     assert monitoring.weave_conversation_url(None, "conversation-17") is None
 
 
+def test_reading_current_project_never_initializes_weave(monkeypatch):
+    monkeypatch.setattr(monitoring, "_project_name", None)
+    monkeypatch.setattr(
+        monitoring,
+        "weave_init",
+        lambda *_args, **_kwargs: pytest.fail("project lookup must not initialize"),
+    )
+
+    assert monitoring.current_weave_project() is None
+
+
 def test_monitoring_redacts_a_secret_registered_after_initialization(monkeypatch):
     calls = []
     monkeypatch.setattr(monitoring, "_initialized", False)

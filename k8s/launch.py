@@ -12,28 +12,26 @@ import shlex
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Literal
 
 import simple_parsing as sp
+from pydantic import SecretStr
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from senpai_agent.launch_context import (
-    LAUNCH_CONTEXT_ENV,
-    load_operator_instructions,
-    render_launch_context,
-)
-from senpai_agent.program_context import PROGRAM_PATH_ENV, normalize_program_path
-from senpai_agent.secrets import validate_custom_secret_env_names
-
 from launch_helpers import (
     ensure_advisor_branch,
     ensure_target_repo_labels,
+    existing_controller_wandb_viewers,
+    existing_program_context_secret,
     existing_student_names,
+    existing_wandb_viewer_owners,
     expand_student_names,
     is_immutable_image_reference,
+    kubernetes_resource_name,
     kubectl_apply,
     kubectl_command,
     pod_template_hash,
@@ -45,24 +43,51 @@ from launch_helpers import (
     preflight_check_target_repo_branch,
     preflight_check_wandb_api_key,
     preflight_check_wandb_inference,
+    read_program_context_secret,
     render_configmap,
     render_launch_secret,
+    render_program_context_secret,
+    render_student_wandb_secret,
     render_template,
+    require_distinct_wandb_viewers,
     resolve_anthropic_api_key,
     resolve_custom_secrets,
     resolve_exa_api_key,
     resolve_github_token,
     resolve_openai_api_key,
+    resolve_student_wandb_api_keys,
     resolve_wandb_api_key,
+    resolve_wandb_inference_api_key,
     routing_labels,
     source_revision_for_image,
+    student_wandb_api_key_env,
     target_repo_slug,
+    validate_kubernetes_label,
 )
+
+from senpai_agent.git_transport import github_repository_url, run_git
+from senpai_agent.launch_context import (
+    LAUNCH_CONTEXT_ENV,
+    load_operator_instructions,
+    render_launch_context,
+)
+from senpai_agent.program_context import (
+    PROGRAM_CONTEXT_FILE_ENV,
+    PROGRAM_PATH_ENV,
+    PROGRAM_SOURCE_COMMIT_ENV,
+    ProgramSystemPrompt,
+    decode_program_system_prompt,
+    encode_program_system_prompt,
+    load_program_system_prompt,
+    normalize_program_path,
+)
+from senpai_agent.secrets import validate_custom_secret_env_names
 
 STUDENT_TEMPLATE = Path(__file__).parent / "student-deployment.yaml"
 ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-deployment.yaml"
 SENPAI_CONFIG = Path(__file__).parent.parent / "senpai.yaml"
 DOTENV_PATH = Path(__file__).parent.parent / ".env"
+PROGRAM_CONTEXT_MOUNT_PATH = "/var/run/senpai-context/program-context.b64"
 
 
 @dataclass
@@ -138,7 +163,7 @@ class Args:
 MODEL_PROVIDERS = {
     "anthropic": ("ANTHROPIC_API_KEY", "anthropic-api-key"),
     "openai": ("OPENAI_API_KEY", "openai-api-key"),
-    "wandb": ("WANDB_API_KEY", "wandb-api-key"),
+    "wandb": ("WANDB_INFERENCE_API_KEY", "wandb-inference-api-key"),
 }
 REASONING_EFFORTS = {
     "low",
@@ -267,7 +292,7 @@ def secret_env_refs(
 
 
 def model_secret_env_refs(args: Args, role: str) -> list[tuple[str, str]]:
-    providers = sorted(configured_model_providers(args, role) - {"wandb"})
+    providers = sorted(configured_model_providers(args, role))
     return [MODEL_PROVIDERS[provider] for provider in providers]
 
 
@@ -357,16 +382,59 @@ def encoded_operator_instructions(args: Args) -> str:
     ).decode()
 
 
+def load_launch_program_snapshot(
+    target_repo_url: str,
+    advisor_branch: str,
+    program_path: str,
+    github_token: str,
+) -> ProgramSystemPrompt:
+    """Clone the advertised branch head and verify its committed program.md."""
+
+    with TemporaryDirectory(prefix="senpai-program-") as directory:
+        repository = Path(directory) / "target.git"
+        run_git(
+            Path(directory),
+            "clone",
+            "--bare",
+            "--depth",
+            "1",
+            "--branch",
+            advisor_branch,
+            "--single-branch",
+            "--no-tags",
+            "--",
+            github_repository_url(target_repo_slug(target_repo_url)),
+            str(repository),
+            token=SecretStr(github_token),
+        )
+        return load_program_system_prompt(
+            repository,
+            program_path,
+        )
+
+
 def render_student(
     template: str,
     student_name: str,
     tag: str,
     secret_name: str,
     launch_secret: str,
+    program_secret_name: str,
+    program_secret: str,
+    wandb_secret_name: str,
+    wandb_secret: str,
+    wandb_viewer: str,
+    controller_wandb_viewer: str,
+    inference_wandb_viewer: str | None,
     args: Args,
+    program: ProgramSystemPrompt,
 ) -> str:
-    student_configmap_name = f"senpai-config-student-{tag}-{student_name}"
-    student_deployment_name = f"senpai-{tag}-{student_name}"
+    student_configmap_name = kubernetes_resource_name(
+        f"senpai-config-student-{tag}-{student_name}"
+    )
+    student_deployment_name = kubernetes_resource_name(
+        f"senpai-{tag}-{student_name}"
+    )
     student_cpu = args.cpu_per_gpu * args.gpus_per_student
     student_memory_gi = args.memory_gi_per_gpu * args.gpus_per_student
     configmap = render_configmap(
@@ -378,7 +446,9 @@ def render_student(
             "SENPAI_REPO_REVISION": args.senpai_repo_revision,
             "TARGET_REPO_URL": args.target_repo_url,
             "TARGET_REPO_BRANCH": args.target_repo_branch,
-            PROGRAM_PATH_ENV: args.program_path,
+            PROGRAM_PATH_ENV: program.program_path,
+            PROGRAM_SOURCE_COMMIT_ENV: program.source_commit,
+            PROGRAM_CONTEXT_FILE_ENV: PROGRAM_CONTEXT_MOUNT_PATH,
             "GH_REPO": target_repo_slug(args.target_repo_url),
             "STUDENT_NAME": student_name,
             "RESEARCH_TAG": tag,
@@ -419,10 +489,28 @@ def render_student(
             "PVC_CLAIM_NAME": args.pvc_claim_name,
             "PVC_MOUNT_PATH": args.pvc_mount_path,
             "LAUNCH_SECRET_NAME": secret_name,
+            "PROGRAM_CONTEXT_SECRET_NAME": program_secret_name,
+            "WANDB_TRAINING_SECRET_NAME": wandb_secret_name,
+            "WANDB_VIEWER": base64.b64encode(wandb_viewer.encode()).decode(),
+            "CONTROLLER_WANDB_VIEWER": base64.b64encode(
+                controller_wandb_viewer.encode()
+            ).decode(),
+            "INFERENCE_WANDB_VIEWER": base64.b64encode(
+                (
+                    inference_wandb_viewer
+                    if "wandb" in configured_model_providers(args, "student")
+                    else ""
+                ).encode()
+            ).decode(),
             "STUDENT_CPU": str(student_cpu),
             "STUDENT_MEMORY": f"{student_memory_gi}Gi",
             "GPUS_PER_STUDENT": str(args.gpus_per_student),
-            "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
+            "POD_CONFIG_HASH": pod_template_hash(
+                configmap,
+                launch_secret,
+                program_secret,
+                wandb_secret,
+            ),
             "MODEL_PROVIDER_ENV": secret_env_refs(
                 model_secret_env_refs(args, "student"), secret_name
             ),
@@ -440,17 +528,26 @@ def render_advisor(
     student_list: list[str],
     secret_name: str,
     launch_secret: str,
+    program_secret_name: str,
+    program_secret: str,
+    wandb_viewer: str,
+    inference_wandb_viewer: str | None,
     args: Args,
+    program: ProgramSystemPrompt,
 ) -> str:
-    advisor_configmap_name = f"senpai-config-advisor-{tag}"
-    advisor_deployment_name = f"senpai-advisor-{tag}"
+    advisor_configmap_name = kubernetes_resource_name(
+        f"senpai-config-advisor-{tag}"
+    )
+    advisor_deployment_name = kubernetes_resource_name(f"senpai-advisor-{tag}")
     data = {
         **role_model_config(args, "advisor"),
         "SENPAI_REPO_URL": args.senpai_repo_url,
         "SENPAI_REPO_REVISION": args.senpai_repo_revision,
         "TARGET_REPO_URL": args.target_repo_url,
         "TARGET_REPO_BRANCH": args.target_repo_branch,
-        PROGRAM_PATH_ENV: args.program_path,
+        PROGRAM_PATH_ENV: program.program_path,
+        PROGRAM_SOURCE_COMMIT_ENV: program.source_commit,
+        PROGRAM_CONTEXT_FILE_ENV: PROGRAM_CONTEXT_MOUNT_PATH,
         "GH_REPO": target_repo_slug(args.target_repo_url),
         "RESEARCH_TAG": tag,
         "STUDENT_NAMES": ",".join(student_list),
@@ -492,7 +589,20 @@ def render_advisor(
             "PVC_CLAIM_NAME": args.pvc_claim_name,
             "PVC_MOUNT_PATH": args.pvc_mount_path,
             "LAUNCH_SECRET_NAME": secret_name,
-            "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
+            "PROGRAM_CONTEXT_SECRET_NAME": program_secret_name,
+            "WANDB_VIEWER": base64.b64encode(wandb_viewer.encode()).decode(),
+            "INFERENCE_WANDB_VIEWER": base64.b64encode(
+                (
+                    inference_wandb_viewer
+                    if "wandb" in configured_model_providers(args, "advisor")
+                    else ""
+                ).encode()
+            ).decode(),
+            "POD_CONFIG_HASH": pod_template_hash(
+                configmap,
+                launch_secret,
+                program_secret,
+            ),
             "MODEL_PROVIDER_ENV": secret_env_refs(
                 model_secret_env_refs(args, "advisor"), secret_name
             ),
@@ -559,9 +669,19 @@ def main():
         student_list = expand_student_names(args.n_students)
     if args.student_prefix:
         student_list = [f"{args.student_prefix}-{name}" for name in student_list]
+    try:
+        validate_kubernetes_label(args.tag, "--tag")
+        for name in student_list:
+            validate_kubernetes_label(name, "student name")
+    except ValueError as error:
+        sys.exit(f"ERROR: {error}")
 
     model_providers = deployed_model_providers(args)
     github_token = exa_api_key = wandb_api_key = ""
+    student_wandb_api_keys: dict[str, str] = {}
+    student_wandb_viewers: dict[str, str] = {}
+    controller_wandb_viewer = ""
+    inference_wandb_viewer: str | None = None
     provider_api_keys: dict[str, str] = {}
     custom_secrets: dict[str, str] = {}
     if not args.dry_run or args.preflight_only:
@@ -573,8 +693,17 @@ def main():
             provider_api_keys["anthropic"] = resolve_anthropic_api_key(DOTENV_PATH)
         if "openai" in model_providers:
             provider_api_keys["openai"] = resolve_openai_api_key(DOTENV_PATH)
+        if "wandb" in model_providers:
+            provider_api_keys["wandb"] = resolve_wandb_inference_api_key(DOTENV_PATH)
         exa_api_key = resolve_exa_api_key(DOTENV_PATH)
         wandb_api_key = resolve_wandb_api_key(DOTENV_PATH)
+        student_wandb_api_keys = resolve_student_wandb_api_keys(
+            DOTENV_PATH, student_list
+        )
+        if wandb_api_key in student_wandb_api_keys.values():
+            sys.exit(
+                "ERROR: controller and student W&B API keys must be distinct"
+            )
         preflight_check_target_repo_access(args.target_repo_url, github_token)
         args.target_repo_branch = preflight_check_target_repo_branch(
             args.target_repo_url,
@@ -593,16 +722,65 @@ def main():
             preflight_check_openai_api_key(openai_api_key)
         if "wandb" in model_providers:
             preflight_check_wandb_inference(
-                wandb_api_key,
+                provider_api_keys["wandb"],
                 args.wandb_entity,
                 args.wandb_project,
             )
         preflight_check_exa_api_key(exa_api_key)
-        preflight_check_wandb_api_key(wandb_api_key)
+        controller_wandb_viewer = preflight_check_wandb_api_key(wandb_api_key)
+        inference_wandb_viewer = (
+            preflight_check_wandb_api_key(provider_api_keys["wandb"])
+            if "wandb" in model_providers
+            else None
+        )
+        student_wandb_viewers = {
+            name: preflight_check_wandb_api_key(key)
+            for name, key in student_wandb_api_keys.items()
+        }
+        deployed_controller_viewers: dict[str, set[str]] = {}
+        active_viewer_owners: dict[str, set[str]] = {}
+        if not args.preflight_only:
+            deployed_controller_viewers = existing_controller_wandb_viewers(
+                args.tag,
+                kube_context=args.kube_context,
+                namespace=args.namespace,
+            )
+            active_viewer_owners = existing_wandb_viewer_owners(
+                kube_context=args.kube_context,
+                namespace=args.namespace,
+            )
+            replaced_roles = {f"student/{name}" for name in student_list}
+            if args.advisor:
+                replaced_roles.add("advisor")
+            for identity, viewers in deployed_controller_viewers.items():
+                if identity not in replaced_roles and viewers != {
+                    controller_wandb_viewer
+                }:
+                    sys.exit(
+                        "ERROR: the supplied controller W&B key does not match "
+                        f"the deployed {identity.replace('/', ' ')} viewer; redeploy the complete "
+                        "fleet to rotate the controller identity"
+                    )
+        require_distinct_wandb_viewers(
+            controller_wandb_viewer,
+            student_wandb_viewers,
+            inference_viewers=(
+                (inference_wandb_viewer,)
+                if inference_wandb_viewer is not None
+                else ()
+            ),
+            active_viewer_owners=active_viewer_owners,
+            owner_scope=f"tag {args.tag!r}",
+        )
         if args.preflight_only:
             print("Preflight OK — credentials and target repo access verified.")
             return
 
+    program = ProgramSystemPrompt(
+        program_path=args.program_path or "program.md",
+        source_commit="0" * 40,
+        content="Resolved and verified during a real launch.",
+    )
     if not args.dry_run:
         ensure_advisor_branch(
             args.target_repo_url,
@@ -610,6 +788,33 @@ def main():
             args.target_repo_branch,
             args.advisor_branch,
         )
+        program = load_launch_program_snapshot(
+            args.target_repo_url,
+            args.advisor_branch,
+            args.program_path,
+            github_token,
+        )
+        if bound_secret := existing_program_context_secret(
+            args.tag,
+            kube_context=args.kube_context,
+            namespace=args.namespace,
+        ):
+            bound_program = decode_program_system_prompt(
+                read_program_context_secret(
+                    bound_secret,
+                    kube_context=args.kube_context,
+                    namespace=args.namespace,
+                )
+            )
+            if (
+                bound_program.program_path != program.program_path
+                or bound_program.content != program.content
+            ):
+                sys.exit(
+                    "ERROR: program.md changed for an active launch tag; use a "
+                    "new tag so every role receives one immutable policy snapshot"
+                )
+            program = bound_program
         ensure_target_repo_labels(
             args.target_repo_url,
             github_token,
@@ -618,7 +823,6 @@ def main():
 
     student_template = STUDENT_TEMPLATE.read_text()
     advisor_template = ADVISOR_TEMPLATE.read_text()
-    secret_name = f"senpai-launch-secrets-{args.tag}"
     if args.dry_run:
         provider_api_keys = {
             provider: f"<REDACTED_{MODEL_PROVIDERS[provider][0]}>"
@@ -627,14 +831,33 @@ def main():
         custom_secrets = {
             name: f"<REDACTED_{name}>" for name in args.custom_secret_env_names
         }
-    launch_secret = render_launch_secret(
+        student_wandb_api_keys = {
+            name: f"<REDACTED_{student_wandb_api_key_env(name)}>"
+            for name in student_list
+        }
+        student_wandb_viewers = {
+            name: f"<REDACTED_WANDB_VIEWER_{name.upper()}>"
+            for name in student_list
+        }
+        controller_wandb_viewer = "<REDACTED_WANDB_VIEWER_CONTROLLER>"
+        inference_wandb_viewer = (
+            "<REDACTED_WANDB_VIEWER_INFERENCE>"
+            if "wandb" in model_providers
+            else None
+        )
+    secret_name, launch_secret = render_launch_secret(
         args.tag,
         github_token if not args.dry_run else "<REDACTED_GITHUB_TOKEN>",
         exa_api_key if not args.dry_run else "<REDACTED_EXA_API_KEY>",
         wandb_api_key if not args.dry_run else "<REDACTED_WANDB_API_KEY>",
         anthropic_api_key=provider_api_keys.get("anthropic"),
         openai_api_key=provider_api_keys.get("openai"),
+        wandb_inference_api_key=provider_api_keys.get("wandb"),
         custom_secrets=custom_secrets,
+    )
+    program_secret_name, program_secret = render_program_context_secret(
+        args.tag,
+        encode_program_system_prompt(program),
     )
 
     # --- Apply per-launch secret first (pods reference it on startup) ---
@@ -650,15 +873,52 @@ def main():
             namespace=args.namespace,
         )
 
+    if args.dry_run:
+        print(f"--- Program context: {program_secret_name} ---")
+        print(program_secret)
+        print()
+    else:
+        kubectl_apply(
+            program_secret,
+            f"program context secret {program_secret_name}",
+            kube_context=args.kube_context,
+            namespace=args.namespace,
+        )
+
     # --- Deploy students ---
     for name in student_list:
+        wandb_secret_name, wandb_secret = render_student_wandb_secret(
+            args.tag,
+            name,
+            student_wandb_api_keys[name],
+            student_wandb_viewers[name],
+        )
+        if args.dry_run:
+            print(f"--- W&B writer secret: {name} ---")
+            print(wandb_secret)
+            print()
+        else:
+            kubectl_apply(
+                wandb_secret,
+                f"W&B writer secret for student {name}",
+                kube_context=args.kube_context,
+                namespace=args.namespace,
+            )
         manifest = render_student(
             student_template,
             name,
             args.tag,
             secret_name,
             launch_secret,
+            program_secret_name,
+            program_secret,
+            wandb_secret_name,
+            wandb_secret,
+            student_wandb_viewers[name],
+            controller_wandb_viewer,
+            inference_wandb_viewer,
             args,
+            program,
         )
         if args.dry_run:
             print(f"--- Student: {name} ---")
@@ -693,7 +953,12 @@ def main():
             advisor_student_list,
             secret_name,
             launch_secret,
+            program_secret_name,
+            program_secret,
+            controller_wandb_viewer,
+            inference_wandb_viewer,
             args,
+            program,
         )
         if args.dry_run:
             print("--- Advisor ---")
@@ -720,11 +985,17 @@ def main():
         print("\nMonitor:")
         print(f"  {kubectl} get deployments -l research-tag={args.tag}")
         if args.advisor:
-            print(f"  {kubectl} get deployment senpai-advisor-{args.tag}")
+            advisor_name = kubernetes_resource_name(
+                f"senpai-advisor-{args.tag}"
+            )
+            print(f"  {kubectl} get deployment {advisor_name}")
         if student_list:
+            student_name = kubernetes_resource_name(
+                f"senpai-{args.tag}-{student_list[0]}"
+            )
             print(
                 f"  {kubectl} logs -f "
-                f"deployment/senpai-{args.tag}-{student_list[0]}"
+                f"deployment/{student_name}"
             )
         print("\nStop:")
         print(

@@ -11,7 +11,9 @@ from enum import StrEnum
 from pathlib import Path
 
 import psutil
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
+
+from senpai_agent.secrets import scrub_github_credentials, scrub_service_credentials
 
 from senpai_agent.processes import signal_process_group, terminate_process_group
 
@@ -88,11 +90,13 @@ class TrainingSupervisor:
         *,
         workspace: Path,
         state_dir: Path,
+        wandb_api_key: SecretStr | None = None,
         terminate_grace_seconds: float = 10,
     ):
         self.workspace = workspace.resolve()
         self.state_dir = state_dir.resolve()
         self.terminate_grace_seconds = terminate_grace_seconds
+        self.wandb_api_key = wandb_api_key
         self._lock = threading.Lock()
         self._active: dict[str, _ActiveTraining] = {}
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -132,9 +136,20 @@ class TrainingSupervisor:
         log_path = self.state_dir / f"{training_id}.log"
         started = time.monotonic()
         with log_path.open("wb") as log:
+            environment = dict(os.environ)
+            environment.pop("PYTHONSAFEPATH", None)
+            if target_env := environment.get("SENPAI_TARGET_PYTHON_ENV", "").strip():
+                environment["PATH"] = f"{target_env}/bin:{environment['PATH']}"
+                environment["UV_PYTHON"] = f"{target_env}/bin/python"
+                environment["VIRTUAL_ENV"] = target_env
+            scrub_github_credentials(environment)
+            scrub_service_credentials(environment)
+            if self.wandb_api_key is not None:
+                environment["WANDB_API_KEY"] = self.wandb_api_key.get_secret_value()
             process = subprocess.Popen(
                 list(spec.argv),
                 cwd=cwd,
+                env=environment,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 shell=False,

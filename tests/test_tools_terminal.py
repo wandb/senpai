@@ -132,6 +132,8 @@ def test_terminal_tool_bounds_silent_commands(monkeypatch, tmp_path):
 
     monkeypatch.setattr("senpai_agent.tools.TerminalTool.create", create)
     monkeypatch.setenv("SENPAI_TERMINAL_NO_CHANGE_TIMEOUT_SECONDS", "600")
+    monkeypatch.setenv("SENPAI_TARGET_PYTHON_ENV", "/home/senpai/.venvs/target")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
     conv_state = SimpleNamespace(
         workspace=SimpleNamespace(working_dir=str(tmp_path))
     )
@@ -139,5 +141,10 @@ def test_terminal_tool_bounds_silent_commands(monkeypatch, tmp_path):
     SenpaiTerminalTool.create(conv_state, role="student")
 
     assert captured["no_change_timeout_seconds"] == 600
+    assert captured["env"] == {
+        "PATH": "/home/senpai/.venvs/target/bin:/usr/bin:/bin",
+        "UV_PYTHON": "/home/senpai/.venvs/target/bin/python",
+        "VIRTUAL_ENV": "/home/senpai/.venvs/target",
+    }
     assert isinstance(captured["executor"], SenpaiTerminalExecutor)
     assert captured["executor"].foreground_timeout_seconds == 600

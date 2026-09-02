@@ -4,12 +4,16 @@ import subprocess
 import sys
 import time
 import uuid
+from base64 import b64decode, b64encode
 from pathlib import Path
-from base64 import b64decode
 
-import pytest
 import psutil
+import pytest
+from git_workflow_support import commit_workspace
 from openhands.sdk.llm import Message, TextContent
+from openhands_support import TEST_LAUNCH_CONTEXT, runtime_config
+
+import senpai_agent.delegation as delegation_module
 
 from senpai_agent.delegation import (
     AgentTask,
@@ -28,10 +32,25 @@ from senpai_agent.launch_context import (
 )
 from senpai_agent.local_events import LocalEventStore
 from senpai_agent.openhands_runner import delegation_config as runner_delegation_config
-from senpai_agent.program_context import PROGRAM_PATH_ENV
-from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV
+from senpai_agent.program_context import (
+    PROGRAM_CONTEXT_FILE_ENV,
+    PROGRAM_PATH_ENV,
+    PROGRAM_SOURCE_COMMIT_ENV,
+    ProgramSystemPrompt,
+    encode_program_system_prompt,
+    load_program_system_prompt,
+)
+from senpai_agent.secrets import (
+    CUSTOM_SECRET_ENV_NAMES_ENV,
+    MODEL_CREDENTIALS_FD_ENV,
+    consume_model_credential_fd,
+)
 from senpai_agent.supervisor import prepare_system_context_environment
-from openhands_support import runtime_config
+from senpai_agent.system_instructions import (
+    SYSTEM_INSTRUCTIONS_FILE_ENV,
+    SYSTEM_INSTRUCTIONS_SHA256_ENV,
+    decode_system_instructions,
+)
 
 
 def delegation_request(
@@ -89,9 +108,15 @@ def delegation_config(tmp_path: Path, **updates) -> DelegationConfig:
         "harness_file": tmp_path / "SENPAI-HARNESS.md",
         "plugin_dir": tmp_path / "plugin",
         "enable_browser": True,
-        "conversation_secrets": {"EXA_API_KEY": "exa-secret"},
+        "conversation_secrets": {"PRIVATE_AUTH": "private-secret"},
         "role": "advisor",
-        "program_path": "program.md",
+        "harness_context": "harness instructions",
+        "role_context": "advisor role",
+        "program": ProgramSystemPrompt(
+            program_path="program.md",
+            source_commit="a" * 40,
+            content="Research policy.",
+        ),
         "launch_context": "# Authoritative launch context\n\nSystem policy.",
     }
     values.update(updates)
@@ -194,14 +219,14 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
         "OPENAI_API_KEY"
     )
     assert fast.state_dir.parent == config.state_dir / "children"
-    assert fast.environment["ANTHROPIC_API_KEY"] == "anthropic-secret"
-    assert fast.environment["OPENAI_API_KEY"] == "openai-secret"
+    assert "ANTHROPIC_API_KEY" not in fast.environment
+    assert "OPENAI_API_KEY" not in fast.environment
     assert fast.environment["SENPAI_OPENHANDS_API_KEY_ENV"] == "ANTHROPIC_API_KEY"
     assert frontier.environment["SENPAI_OPENHANDS_API_KEY_ENV"] == "OPENAI_API_KEY"
     assert fast.environment["GH_REPO"] == "acme/widgets"
     assert "GITHUB_TOKEN" not in fast.environment
     assert "GH_TOKEN" not in fast.environment
-    assert fast.environment["EXA_API_KEY"] == "exa-secret"
+    assert "EXA_API_KEY" not in fast.environment
     assert fast.environment["SENPAI_OPENHANDS_SMART_MODEL"] == config.smart_model
     assert fast.environment["SENPAI_OPENHANDS_SMART_API_KEY_ENV"] == (
         config.smart_api_key_env
@@ -232,28 +257,85 @@ def test_child_environment_carries_the_resolved_program_path(tmp_path: Path):
     child = OpenHandsChildProcess(
         delegation_config(
             tmp_path,
-            program_path="senpai/program.md",
+            program=ProgramSystemPrompt(
+                program_path="senpai/program.md",
+                source_commit="b" * 40,
+                content="Nested research policy.",
+            ),
         ),
         delegation_request(),
     )
 
-    assert child.environment[PROGRAM_PATH_ENV] == "senpai/program.md"
+    environment = child.environment
+    assert environment[PROGRAM_PATH_ENV] == "senpai/program.md"
+    assert environment[PROGRAM_SOURCE_COMMIT_ENV] == "b" * 40
+    assert decode_system_instructions(
+        Path(environment[SYSTEM_INSTRUCTIONS_FILE_ENV]).read_text().strip(),
+        environment[SYSTEM_INSTRUCTIONS_SHA256_ENV],
+    ).program == ProgramSystemPrompt(
+        program_path="senpai/program.md",
+        source_commit="b" * 40,
+        content="Nested research policy.",
+    )
     assert (
-        b64decode(child.environment[LAUNCH_CONTEXT_ENV], validate=True).decode()
+        b64decode(environment[LAUNCH_CONTEXT_ENV], validate=True).decode()
         == "# Authoritative launch context\n\nSystem policy."
     )
+
+
+def test_child_restart_rejects_a_tampered_system_snapshot(tmp_path: Path):
+    child = OpenHandsChildProcess(delegation_config(tmp_path), delegation_request())
+    environment = child.environment
+    Path(environment[SYSTEM_INSTRUCTIONS_FILE_ENV]).write_text("attacker policy")
+
+    with pytest.raises(ValueError, match="controller-held"):
+        _ = child.environment
+
+
+def test_maximum_program_snapshot_is_transported_by_file_not_environment(
+    tmp_path: Path,
+):
+    child = OpenHandsChildProcess(
+        delegation_config(
+            tmp_path,
+            program=ProgramSystemPrompt(
+                program_path="program.md",
+                source_commit="a" * 40,
+                content="\\" * (64 * 1024),
+            ),
+        ),
+        delegation_request(),
+    )
+
+    environment = child.environment
+
+    assert max(
+        len(f"{name}={value}".encode()) for name, value in environment.items()
+    ) < (128 * 1024)
+    assert Path(environment[SYSTEM_INSTRUCTIONS_FILE_ENV]).stat().st_size > 128 * 1024
 
 
 def test_child_reuses_the_supervisor_rendered_role_prompt(tmp_path: Path):
     workspace = tmp_path / "target"
     workspace.mkdir()
     (workspace / "program.md").write_text("Research policy.\n")
+    source_commit = commit_workspace(workspace)
+    program = load_program_system_prompt(workspace, "program.md", source_commit)
+    program_file = tmp_path / "program-context.b64"
+    program_file.write_text(encode_program_system_prompt(program))
     prepared = prepare_system_context_environment(
         "advisor",
         tmp_path / "state",
         {
             "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
             "SENPAI_OPENHANDS_ROLE_FILE": str(INSTRUCTIONS_ROOT / "ADVISOR.md"),
+            "SENPAI_OPENHANDS_HARNESS_FILE": str(
+                INSTRUCTIONS_ROOT / "SENPAI-HARNESS.md"
+            ),
+            PROGRAM_CONTEXT_FILE_ENV: str(program_file),
+            PROGRAM_PATH_ENV: "program.md",
+            PROGRAM_SOURCE_COMMIT_ENV: source_commit,
+            LAUNCH_CONTEXT_ENV: b64encode(TEST_LAUNCH_CONTEXT.encode()).decode(),
             "GH_REPO": "acme/widgets",
             "ADVISOR_BRANCH": "research",
             "WANDB_ENTITY": "acme",
@@ -265,7 +347,16 @@ def test_child_reuses_the_supervisor_rendered_role_prompt(tmp_path: Path):
         },
     )
     role_file = Path(prepared["SENPAI_OPENHANDS_ROLE_FILE"])
-    parent = runtime_config(tmp_path, role_file=role_file)
+    prepared_instructions = decode_system_instructions(
+        Path(prepared[SYSTEM_INSTRUCTIONS_FILE_ENV]).read_text().strip(),
+        prepared[SYSTEM_INSTRUCTIONS_SHA256_ENV],
+    )
+    parent = runtime_config(
+        tmp_path,
+        role_file=role_file,
+        harness_file=Path(prepared["SENPAI_OPENHANDS_HARNESS_FILE"]),
+        instructions=prepared_instructions,
+    )
     delegated = runner_delegation_config(parent)
     child = OpenHandsChildProcess(
         delegated,
@@ -274,7 +365,7 @@ def test_child_reuses_the_supervisor_rendered_role_prompt(tmp_path: Path):
 
     assert delegated.role_file == parent.role_file
     assert delegated.harness_file == parent.harness_file
-    assert delegated.program_path == parent.instructions.program.program_path
+    assert delegated.program == parent.instructions.program
     assert delegated.launch_context == parent.instructions.launch
     assert child.command[child.command.index("--role-file") + 1] == str(role_file)
     assert child.command[child.command.index("--harness-file") + 1] == str(
@@ -284,6 +375,11 @@ def test_child_reuses_the_supervisor_rendered_role_prompt(tmp_path: Path):
         child.environment[PROGRAM_PATH_ENV]
         == parent.instructions.program.program_path
     )
+    child_environment = child.environment
+    assert decode_system_instructions(
+        Path(child_environment[SYSTEM_INSTRUCTIONS_FILE_ENV]).read_text().strip(),
+        child_environment[SYSTEM_INSTRUCTIONS_SHA256_ENV],
+    ).program == parent.instructions.program
     role_prompt = role_file.read_text()
     assert "## Runtime identity" not in role_prompt
     assert "Use the `2` GPUs available to each student" in role_prompt
@@ -305,9 +401,95 @@ def test_child_environment_replaces_ambient_model_credentials(
         delegation_request(model="frontier", agent="general-purpose"),
     ).environment
 
-    assert environment["ANTHROPIC_API_KEY"] == "anthropic-secret"
-    assert environment["OPENAI_API_KEY"] == "openai-secret"
+    assert "ANTHROPIC_API_KEY" not in environment
+    assert "OPENAI_API_KEY" not in environment
     assert "GEMINI_API_KEY" not in environment
+
+
+def test_child_model_credentials_use_a_private_fd_bundle(tmp_path: Path):
+    runner = OpenHandsChildProcess(delegation_config(tmp_path), delegation_request())
+
+    descriptor = runner._open_model_credentials_fd()
+    environment = {MODEL_CREDENTIALS_FD_ENV: str(descriptor)}
+
+    assert consume_model_credential_fd(environment) == {
+        "ANTHROPIC_API_KEY": "anthropic-secret",
+        "OPENAI_API_KEY": "openai-secret",
+    }
+    assert MODEL_CREDENTIALS_FD_ENV not in environment
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_wandb_children_receive_only_the_inference_credential(monkeypatch, tmp_path):
+    monkeypatch.setenv("WANDB_API_KEY", "controller-key")
+    monkeypatch.setenv("SENPAI_WANDB_TRAINING_API_KEY", "training-key")
+    config = delegation_config(
+        tmp_path,
+        smart_model="wandb/zai-org/GLM-5.2",
+        smart_api_key_env="WANDB_INFERENCE_API_KEY",
+        smart_api_key="inference-key",
+        fast_model="wandb/zai-org/GLM-5.2",
+        fast_api_key_env="WANDB_INFERENCE_API_KEY",
+        fast_api_key="inference-key",
+        frontier_model="wandb/zai-org/GLM-5.2",
+        frontier_api_key_env="WANDB_INFERENCE_API_KEY",
+        frontier_api_key="inference-key",
+    )
+    runner = OpenHandsChildProcess(config, delegation_request())
+
+    assert "WANDB_API_KEY" not in runner.environment
+    assert "SENPAI_WANDB_TRAINING_API_KEY" not in runner.environment
+    assert "WANDB_INFERENCE_API_KEY" not in runner.environment
+    descriptor = runner._open_model_credentials_fd()
+    credentials = consume_model_credential_fd(
+        {MODEL_CREDENTIALS_FD_ENV: str(descriptor)}
+    )
+    assert credentials == {"WANDB_INFERENCE_API_KEY": "inference-key"}
+
+
+def test_child_rejects_conflicting_keys_for_one_provider_env(tmp_path: Path):
+    runner = OpenHandsChildProcess(
+        delegation_config(tmp_path, fast_api_key="different-anthropic-key"),
+        delegation_request(),
+    )
+
+    with pytest.raises(RuntimeError, match="conflicting values.*ANTHROPIC_API_KEY"):
+        runner._model_credentials()
+
+
+def test_child_start_passes_model_credentials_only_through_the_fd(monkeypatch, tmp_path):
+    captured = {}
+
+    class Process:
+        pass
+
+    class Thread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    def popen(command, **kwargs):
+        captured.update(command=command, **kwargs)
+        return Process()
+
+    monkeypatch.setattr(delegation_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(delegation_module.threading, "Thread", Thread)
+    runner = OpenHandsChildProcess(delegation_config(tmp_path), delegation_request())
+
+    runner.start("Inspect the result.", 60, lambda _result, _error: None)
+
+    environment = captured["env"]
+    descriptor = int(environment[MODEL_CREDENTIALS_FD_ENV])
+    assert captured["pass_fds"] == (descriptor,)
+    assert "ANTHROPIC_API_KEY" not in environment
+    assert "OPENAI_API_KEY" not in environment
+    assert "anthropic-secret" not in repr(environment)
+    assert "openai-secret" not in repr(environment)
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
 
 
 def test_child_environment_carries_only_configured_custom_secrets(
@@ -335,6 +517,7 @@ def test_child_environment_carries_only_configured_custom_secrets(
     )
     assert environment["PRIVATE_AUTH"] == "private-secret"
     assert environment["REGISTRY_API_KEY"] == "registry-secret"
+    assert "EXA_API_KEY" not in environment
     assert "STALE_AUTH" not in environment
 
 
