@@ -240,6 +240,20 @@ def existing_student_names(
     return [line for line in result.stdout.splitlines() if line]
 
 
+def _live_role_resources(items: list[dict]) -> list[dict]:
+    """Drop Pods that no longer run: terminal phases and pending deletions."""
+
+    return [
+        resource
+        for resource in items
+        if resource.get("kind") != "Pod"
+        or (
+            resource.get("status", {}).get("phase") not in {"Succeeded", "Failed"}
+            and "deletionTimestamp" not in resource.get("metadata", {})
+        )
+    ]
+
+
 def _role_annotation_values(
     tag: str,
     annotation: str,
@@ -269,7 +283,7 @@ def _role_annotation_values(
         check=True,
     )
     bindings: dict[str, set[str]] = {}
-    for resource in json.loads(result.stdout).get("items", []):
+    for resource in _live_role_resources(json.loads(result.stdout).get("items", [])):
         metadata = resource.get("metadata", {})
         labels = metadata.get("labels", {})
         role = labels.get("role")
@@ -396,7 +410,7 @@ def existing_wandb_viewer_owners(
         check=True,
     )
     owners: dict[str, set[str]] = {}
-    for resource in json.loads(result.stdout).get("items", []):
+    for resource in _live_role_resources(json.loads(result.stdout).get("items", [])):
         metadata = resource.get("metadata", {})
         labels = metadata.get("labels", {})
         tag = labels.get("research-tag")

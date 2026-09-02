@@ -7,6 +7,7 @@
 """Launch senpai advisor and student agents as K8s resources."""
 
 import base64
+import os
 import posixpath
 import shlex
 import sys
@@ -65,7 +66,11 @@ from launch_helpers import (
     validate_kubernetes_label,
 )
 
-from senpai_agent.git_transport import github_repository_url, run_git
+from senpai_agent.git_transport import (
+    PROXY_ENVIRONMENT,
+    github_repository_url,
+    run_git,
+)
 from senpai_agent.launch_context import (
     LAUNCH_CONTEXT_ENV,
     load_operator_instructions,
@@ -406,6 +411,12 @@ def load_launch_program_snapshot(
             github_repository_url(target_repo_slug(target_repo_url)),
             str(repository),
             token=SecretStr(github_token),
+            # The operator's machine, not a pod: honor its proxy settings.
+            extra_env={
+                name: os.environ[name]
+                for name in PROXY_ENVIRONMENT
+                if name in os.environ
+            },
         )
         return load_program_system_prompt(
             repository,
@@ -788,12 +799,15 @@ def main():
             args.target_repo_branch,
             args.advisor_branch,
         )
-        program = load_launch_program_snapshot(
-            args.target_repo_url,
-            args.advisor_branch,
-            args.program_path,
-            github_token,
-        )
+        try:
+            program = load_launch_program_snapshot(
+                args.target_repo_url,
+                args.advisor_branch,
+                args.program_path,
+                github_token,
+            )
+        except RuntimeError as error:
+            sys.exit(f"ERROR: {error}")
         if bound_secret := existing_program_context_secret(
             args.tag,
             kube_context=args.kube_context,

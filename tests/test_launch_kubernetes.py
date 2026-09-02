@@ -75,6 +75,7 @@ def test_student_discovery_uses_the_requested_cluster_scope(monkeypatch):
 def test_existing_student_viewers_include_desired_and_live_bindings(monkeypatch):
     encoded = base64.b64encode(b"viewer-existing").decode()
     rotated = base64.b64encode(b"viewer-rotated").decode()
+    evicted = base64.b64encode(b"viewer-evicted").decode()
 
     def run(argv, **_kwargs):
         assert argv[-2:] == ["-o", "json"]
@@ -113,6 +114,33 @@ def test_existing_student_viewers_include_desired_and_live_bindings(monkeypatch)
                                     "senpai.wandb.com/wandb-viewer": rotated
                                 },
                             },
+                        },
+                        {
+                            "kind": "Pod",
+                            "metadata": {
+                                "labels": {
+                                    "role": "student",
+                                    "student": "frieren",
+                                },
+                                "annotations": {
+                                    "senpai.wandb.com/wandb-viewer": evicted
+                                },
+                            },
+                            "status": {"phase": "Failed"},
+                        },
+                        {
+                            "kind": "Pod",
+                            "metadata": {
+                                "labels": {
+                                    "role": "student",
+                                    "student": "frieren",
+                                },
+                                "annotations": {
+                                    "senpai.wandb.com/wandb-viewer": evicted
+                                },
+                                "deletionTimestamp": "2026-09-01T00:00:00Z",
+                            },
+                            "status": {"phase": "Running"},
                         },
                     ]
                 }
@@ -279,6 +307,22 @@ def test_namespace_viewer_owners_include_every_launch_tag(monkeypatch):
                         ),
                     },
                 },
+            },
+            {
+                "kind": "Pod",
+                "metadata": {
+                    "labels": {
+                        "research-tag": "track-c",
+                        "role": "advisor",
+                    },
+                    "annotations": {
+                        "senpai.wandb.com/controller-wandb-viewer": encoded(
+                            "controller-evicted"
+                        ),
+                        "senpai.wandb.com/inference-wandb-viewer": "",
+                    },
+                },
+                "status": {"phase": "Failed"},
             },
         ]
     }
