@@ -1,14 +1,32 @@
+import asyncio
 import re
 import tomllib
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
+import httpx
 import pytest
+from litellm.exceptions import ContentPolicyViolationError, ServiceUnavailableError
+from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+from litellm.types.utils import (
+    Delta,
+    ModelResponse,
+    ModelResponseStream,
+    StreamingChoices,
+    Usage,
+)
 from openhands.sdk import Agent, LLM, LocalConversation
 from openhands.sdk.llm import Message, TextContent
+from openhands.sdk.llm.fallback_strategy import FallbackStrategy
 from pydantic import SecretStr
 
+from senpai_agent.anthropic_safety import (
+    AnthropicModelFallbackError,
+    AnthropicSafetyLLM,
+    AnthropicSafetyRefusalError,
+    enforce_anthropic_safety,
+)
 from senpai_agent.openhands_runner import (
     EVENT_TEXT_LIMIT,
     apply_reasoning_profile,
@@ -25,6 +43,125 @@ from senpai_agent.inbox import DeliveryState, PersistentInbox, deliver_turn_mess
 from openhands_support import REPO_ROOT, runtime_config
 
 TEST_COMPACTION_TRIGGER_TOKENS = 180_000
+
+
+def _completion_response(
+    *,
+    model: str,
+    finish_reason: str = "stop",
+    content: str = "accepted response",
+    iterations: list[dict[str, object]] | None = None,
+) -> ModelResponse:
+    return ModelResponse(
+        model=model,
+        choices=[
+            {
+                "index": 0,
+                "finish_reason": finish_reason,
+                "message": {"role": "assistant", "content": content},
+            }
+        ],
+        usage=Usage(
+            prompt_tokens=10,
+            completion_tokens=2,
+            total_tokens=12,
+            iterations=iterations or [],
+        ),
+    )
+
+
+def _anthropic_llm() -> AnthropicSafetyLLM:
+    return AnthropicSafetyLLM(
+        model="anthropic/claude-fable-5",
+        api_key=SecretStr("test-key"),
+        num_retries=5,
+    )
+
+
+def _normalized_anthropic_fallback() -> ModelResponse:
+    payload = {
+        "id": "msg_fallback_test",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-4-8",
+        "content": [
+            {
+                "type": "fallback",
+                "from": {"model": "claude-fable-5"},
+                "to": {"model": "claude-opus-4-8"},
+            },
+            {"type": "text", "text": "substituted response"},
+        ],
+        "stop_reason": "end_turn",
+        "stop_details": None,
+        "usage": {
+            "input_tokens": 12,
+            "output_tokens": 2,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "iterations": [
+                {
+                    "type": "message",
+                    "model": "claude-fable-5",
+                    "input_tokens": 10,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+                {
+                    "type": "fallback_message",
+                    "model": "claude-opus-4-8",
+                    "input_tokens": 12,
+                    "output_tokens": 2,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            ],
+        },
+    }
+    return AnthropicConfig().transform_parsed_response(
+        completion_response=payload,
+        raw_response=httpx.Response(200),
+        model_response=ModelResponse(),
+    )
+
+
+def _streamed_anthropic_fallback() -> list[ModelResponseStream]:
+    return [
+        ModelResponseStream(
+            id="msg_fallback_test",
+            model="claude-opus-4-8",
+            choices=[
+                StreamingChoices(
+                    index=0,
+                    delta=Delta(role="assistant", content="substituted response"),
+                )
+            ],
+        ),
+        ModelResponseStream(
+            id="msg_fallback_test",
+            model="claude-opus-4-8",
+            choices=[
+                StreamingChoices(
+                    index=0,
+                    delta=Delta(),
+                    finish_reason="stop",
+                )
+            ],
+            usage=Usage(
+                prompt_tokens=12,
+                completion_tokens=2,
+                total_tokens=14,
+                iterations=[
+                    {"type": "message", "model": "claude-fable-5"},
+                    {
+                        "type": "fallback_message",
+                        "model": "claude-opus-4-8",
+                    },
+                ],
+            ),
+        ),
+    ]
 
 
 def test_openhands_fork_revision_is_consistent_across_install_paths():
@@ -310,6 +447,364 @@ def test_anthropic_max_uses_provider_native_effort(model):
     assert call_kwargs["reasoning_effort"] == "max"
     assert "reasoning" not in (llm.litellm_extra_body or {})
     assert "reasoning" not in call_kwargs.get("extra_body", {})
+
+
+def test_anthropic_fallback_fails_without_retry(monkeypatch):
+    response = _normalized_anthropic_fallback()
+    calls = 0
+
+    def complete(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return response
+
+    monkeypatch.setattr("openhands.sdk.llm.llm.litellm_completion", complete)
+
+    with pytest.raises(
+        AnthropicModelFallbackError,
+        match="Anthropic safety fallback rejected.*claude-opus-4-8",
+    ):
+        _anthropic_llm().completion(
+            [Message(role="user", content=[TextContent(text="Investigate")])]
+        )
+
+    assert calls == 1
+
+
+def test_streamed_anthropic_fallback_fails_without_retry(monkeypatch):
+    chunks = _streamed_anthropic_fallback()
+    seen_chunks = []
+    calls = 0
+
+    def complete(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return iter(chunks)
+
+    monkeypatch.setattr("openhands.sdk.llm.llm.litellm_completion", complete)
+    llm = _anthropic_llm().model_copy(update={"stream": True})
+
+    with pytest.raises(
+        AnthropicModelFallbackError,
+        match="Anthropic safety fallback rejected.*claude-opus-4-8",
+    ):
+        llm.completion(
+            [Message(role="user", content=[TextContent(text="Investigate")])],
+            on_token=seen_chunks.append,
+        )
+
+    assert calls == 1
+    assert seen_chunks == chunks
+
+
+def test_async_streamed_anthropic_fallback_fails_without_retry(monkeypatch):
+    chunks = _streamed_anthropic_fallback()
+    seen_chunks = []
+    calls = 0
+
+    async def stream():
+        for chunk in chunks:
+            yield chunk
+
+    async def complete(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return stream()
+
+    monkeypatch.setattr("openhands.sdk.llm.llm.litellm_acompletion", complete)
+    llm = _anthropic_llm().model_copy(update={"stream": True})
+
+    async def call():
+        return await llm.acompletion(
+            [Message(role="user", content=[TextContent(text="Investigate")])],
+            on_token=seen_chunks.append,
+        )
+
+    with pytest.raises(AnthropicModelFallbackError):
+        asyncio.run(call())
+
+    assert calls == 1
+    assert seen_chunks == chunks
+
+
+@pytest.mark.parametrize(
+    ("response", "error_type"),
+    [
+        (
+            _completion_response(
+                model="claude-opus-4-8",
+                iterations=[
+                    {"type": "message", "model": "claude-fable-5"},
+                    {
+                        "type": "fallback_message",
+                        "model": "claude-opus-4-8",
+                    },
+                ],
+            ),
+            AnthropicModelFallbackError,
+        ),
+        (
+            _completion_response(
+                model="claude-fable-5",
+                finish_reason="content_filter",
+                content="refused",
+                iterations=[{"type": "message", "model": "claude-fable-5"}],
+            ),
+            AnthropicSafetyRefusalError,
+        ),
+    ],
+)
+def test_async_anthropic_safety_response_fails_without_retry(
+    monkeypatch,
+    response,
+    error_type,
+):
+    calls = 0
+
+    async def complete(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return response
+
+    monkeypatch.setattr("openhands.sdk.llm.llm.litellm_acompletion", complete)
+
+    async def call():
+        return await _anthropic_llm().acompletion(
+            [Message(role="user", content=[TextContent(text="Investigate")])]
+        )
+
+    with pytest.raises(error_type):
+        asyncio.run(call())
+
+    assert calls == 1
+
+
+def test_anthropic_refusal_fails_without_retry(monkeypatch):
+    response = _completion_response(
+        model="claude-fable-5",
+        finish_reason="content_filter",
+        content="refused",
+        iterations=[{"type": "message", "model": "claude-fable-5"}],
+    )
+    calls = 0
+
+    def complete(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return response
+
+    monkeypatch.setattr("openhands.sdk.llm.llm.litellm_completion", complete)
+
+    with pytest.raises(
+        AnthropicSafetyRefusalError,
+        match="Anthropic safety refusal.*will not retry",
+    ):
+        _anthropic_llm().completion(
+            [Message(role="user", content=[TextContent(text="Investigate")])]
+        )
+
+    assert calls == 1
+
+
+def test_anthropic_provider_exception_becomes_a_loud_refusal(monkeypatch):
+    calls = 0
+
+    def refuse(**_kwargs):
+        nonlocal calls
+        calls += 1
+        raise ContentPolicyViolationError(
+            "blocked",
+            model="claude-fable-5",
+            llm_provider="anthropic",
+        )
+
+    monkeypatch.setattr("openhands.sdk.llm.llm.litellm_completion", refuse)
+
+    with pytest.raises(AnthropicSafetyRefusalError, match="Anthropic safety refusal"):
+        _anthropic_llm().completion(
+            [Message(role="user", content=[TextContent(text="Investigate")])]
+        )
+
+    assert calls == 1
+
+
+def test_async_anthropic_provider_exception_becomes_a_loud_refusal(monkeypatch):
+    calls = 0
+
+    async def refuse(**_kwargs):
+        nonlocal calls
+        calls += 1
+        raise ContentPolicyViolationError(
+            "blocked",
+            model="claude-fable-5",
+            llm_provider="anthropic",
+        )
+
+    monkeypatch.setattr("openhands.sdk.llm.llm.litellm_acompletion", refuse)
+
+    async def call():
+        return await _anthropic_llm().acompletion(
+            [Message(role="user", content=[TextContent(text="Investigate")])]
+        )
+
+    with pytest.raises(AnthropicSafetyRefusalError, match="Anthropic safety refusal"):
+        asyncio.run(call())
+
+    assert calls == 1
+
+
+def test_normal_anthropic_response_is_unchanged(monkeypatch):
+    response = _completion_response(
+        model="claude-fable-5",
+        iterations=[
+            {"type": "compaction", "model": "claude-fable-5"},
+            {"type": "message", "model": "claude-fable-5"},
+        ],
+    )
+    monkeypatch.setattr(
+        "openhands.sdk.llm.llm.litellm_completion",
+        lambda **_kwargs: response,
+    )
+
+    result = _anthropic_llm().completion(
+        [Message(role="user", content=[TextContent(text="Investigate")])]
+    )
+
+    assert result.raw_response is response
+    assert result.message.content == [TextContent(text="accepted response")]
+
+
+def test_anthropic_request_omits_server_side_fallback():
+    model = "anthropic/claude-fable-5"
+    configuration = model_runtime_configuration(
+        model,
+        "max",
+        compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
+    )
+    llm = AnthropicSafetyLLM(
+        model=model,
+        api_key=SecretStr("test-key"),
+        **configuration,
+    )
+    _messages, _tools, _mocked, call_kwargs, _telemetry = (
+        llm._prepare_completion_params(
+            [Message(role="user", content=[TextContent(text="Investigate")])],
+            tools=None,
+            add_security_risk_prediction=False,
+            kwargs={},
+        )
+    )
+
+    assert "fallbacks" not in call_kwargs
+    assert "fallbacks" not in call_kwargs.get("extra_body", {})
+
+
+def test_anthropic_server_fallback_configuration_fails_before_request():
+    llm = AnthropicSafetyLLM(
+        model="anthropic/claude-fable-5",
+        api_key=SecretStr("test-key"),
+        litellm_extra_body={"fallbacks": "default"},
+    )
+
+    with pytest.raises(
+        AnthropicModelFallbackError,
+        match="server-side fallback configuration rejected before request",
+    ):
+        llm._prepare_completion_params(
+            [Message(role="user", content=[TextContent(text="Investigate")])],
+            tools=None,
+            add_security_risk_prediction=False,
+            kwargs={},
+        )
+
+
+def test_async_anthropic_server_fallback_configuration_fails_before_request():
+    llm = AnthropicSafetyLLM(
+        model="anthropic/claude-fable-5",
+        api_key=SecretStr("test-key"),
+        litellm_extra_body={"fallbacks": "default"},
+    )
+
+    async def call():
+        return await llm.acompletion(
+            [Message(role="user", content=[TextContent(text="Investigate")])]
+        )
+
+    with pytest.raises(
+        AnthropicModelFallbackError,
+        match="server-side fallback configuration rejected before request",
+    ):
+        asyncio.run(call())
+
+
+def test_anthropic_profile_preserves_streaming_and_fallback_configuration():
+    def retry_listener(*_args):
+        pass
+    profile_llm = LLM(
+        model="anthropic/claude-fable-5",
+        api_key=SecretStr("profile-key"),
+        stream=True,
+        fallback_strategy=FallbackStrategy(fallback_llms=["backup-profile"]),
+        retry_listener=retry_listener,
+    )
+
+    guarded_llm = enforce_anthropic_safety(profile_llm)
+
+    assert type(guarded_llm) is AnthropicSafetyLLM
+    assert guarded_llm.model == profile_llm.model
+    assert guarded_llm.api_key == profile_llm.api_key
+    assert guarded_llm.stream is True
+    assert guarded_llm.fallback_strategy == profile_llm.fallback_strategy
+    assert guarded_llm.retry_listener is retry_listener
+    assert type(guarded_llm.model_copy()) is AnthropicSafetyLLM
+
+
+def test_anthropic_transport_failure_keeps_openhands_fallback(monkeypatch):
+    strategy = FallbackStrategy(fallback_llms=["unused"])
+    strategy._resolved = [
+        LLM(
+            model="openai/gpt-5",
+            api_key=SecretStr("test-key"),
+            num_retries=0,
+        )
+    ]
+    llm = AnthropicSafetyLLM(
+        model="anthropic/claude-fable-5",
+        api_key=SecretStr("test-key"),
+        num_retries=0,
+        fallback_strategy=strategy,
+    )
+    calls = []
+
+    def complete(**kwargs):
+        calls.append(kwargs["model"])
+        if len(calls) == 1:
+            raise ServiceUnavailableError(
+                "down",
+                model="claude-fable-5",
+                llm_provider="anthropic",
+            )
+        return _completion_response(model="gpt-5")
+
+    monkeypatch.setattr("openhands.sdk.llm.llm.litellm_completion", complete)
+
+    result = llm.completion(
+        [Message(role="user", content=[TextContent(text="Investigate")])]
+    )
+
+    assert result.message.content == [TextContent(text="accepted response")]
+    assert calls == ["claude-fable-5", "gpt-5"]
+
+
+def test_non_anthropic_profile_is_unchanged():
+    profile_llm = LLM(
+        model="openai/gpt-5",
+        api_key=SecretStr("profile-key"),
+        stream=True,
+        fallback_strategy=FallbackStrategy(fallback_llms=["backup-profile"]),
+    )
+
+    assert enforce_anthropic_safety(profile_llm) is profile_llm
 
 
 def test_wandb_gateway_uses_chat_thinking_and_project_routing():
