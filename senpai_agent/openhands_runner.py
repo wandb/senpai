@@ -1274,6 +1274,17 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
     return tools
 
 
+def senpai_terminal_tools(tools: Sequence[Tool], role: str) -> list[Tool]:
+    """Route a file-defined agent's terminal through Senpai's policy and target env."""
+
+    return [
+        Tool(name="senpai_terminal", params={"role": role})
+        if tool.name == "terminal"
+        else tool
+        for tool in tools
+    ]
+
+
 def delegation_config(
     config: RunnerConfig,
     *,
@@ -1308,6 +1319,7 @@ def delegation_config(
         role_context=config.instructions.role,
         program=config.instructions.program,
         launch_context=config.instructions.launch,
+        exa_api_key=config.exa_api_key,
         root_state_dir=config.delegation_root_state_dir,
         tree_id=config.delegation_tree_id,
         depth=config.delegation_depth,
@@ -1822,6 +1834,7 @@ def run_openhands(
             agent = agent.model_copy(
                 update={
                     "llm": apply_reasoning_profile(agent.llm),
+                    "tools": senpai_terminal_tools(agent.tools, config.role),
                     "agent_context": (
                         agent.agent_context or AgentContext()
                     ).model_copy(update={"skills": resolved_skills}),

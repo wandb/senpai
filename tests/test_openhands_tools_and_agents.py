@@ -358,6 +358,7 @@ def test_markdown_agents_register_and_construct_with_the_native_loader(tmp_path)
             for name, definition in definitions.items()
         }
         assert {tool.name for tool in agents["search"].tools} == {
+            "senpai_exa",
             "terminal",
             "file_editor",
         }
@@ -454,7 +455,7 @@ def test_subagents_receive_skills_from_the_runtime_plugin(
             "search.md",
             "search",
             None,
-            {"terminal", "file_editor"},
+            {"senpai_exa", "terminal", "file_editor"},
             set(),
         ),
     ],
@@ -811,3 +812,19 @@ def test_harness_states_bounded_delegation_tree_contract():
         "two hours for `frontier`",
     ):
         assert required in normalized
+
+
+def test_child_agents_route_terminal_through_senpai_terminal():
+    from openhands.sdk import Tool
+
+    from senpai_agent.openhands_runner import senpai_terminal_tools
+
+    tools = senpai_terminal_tools(
+        [Tool(name="terminal"), Tool(name="file_editor")],
+        "student",
+    )
+
+    assert [(tool.name, tool.params) for tool in tools] == [
+        ("senpai_terminal", {"role": "student"}),
+        ("file_editor", {}),
+    ]

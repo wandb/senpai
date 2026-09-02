@@ -30,7 +30,7 @@ from openhands.sdk.tool import (
     ToolDefinition,
     ToolExecutor,
 )
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV
 from senpai_agent.local_events import LocalEvent, LocalEventStore
@@ -181,6 +181,7 @@ class DelegationConfig:
     role_context: str
     program: ProgramSystemPrompt
     launch_context: str
+    exa_api_key: SecretStr | None = None
     root_state_dir: Path | None = None
     tree_id: str | None = None
     depth: int = 0
@@ -481,7 +482,9 @@ class OpenHandsChildProcess:
         environment[SYSTEM_INSTRUCTIONS_SHA256_ENV] = instructions.content_sha256
         return environment
 
-    def _model_credentials(self) -> dict[str, str]:
+    def _child_credentials(self) -> dict[str, str]:
+        """Model keys for every child, plus Exa for the search agent only."""
+
         credentials: dict[str, str] = {}
         for profile in self._config.profiles():
             existing = credentials.setdefault(profile.api_key_env, profile.api_key)
@@ -490,11 +493,13 @@ class OpenHandsChildProcess:
                     f"delegation profiles assign conflicting values to "
                     f"{profile.api_key_env}"
                 )
+        if self._request.agent == "search" and self._config.exa_api_key is not None:
+            credentials["EXA_API_KEY"] = self._config.exa_api_key.get_secret_value()
         return credentials
 
     def _open_model_credentials_fd(self) -> int:
         payload = json.dumps(
-            self._model_credentials(), separators=(",", ":"), sort_keys=True
+            self._child_credentials(), separators=(",", ":"), sort_keys=True
         ).encode()
         if len(payload) > MAX_MODEL_CREDENTIAL_BUNDLE_BYTES:
             raise RuntimeError("delegated model credential bundle is too large")

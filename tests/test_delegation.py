@@ -10,6 +10,7 @@ from pathlib import Path
 import psutil
 import pytest
 from git_workflow_support import commit_workspace
+from pydantic import SecretStr
 from openhands.sdk.llm import Message, TextContent
 from openhands_support import TEST_LAUNCH_CONTEXT, runtime_config
 
@@ -455,7 +456,29 @@ def test_child_rejects_conflicting_keys_for_one_provider_env(tmp_path: Path):
     )
 
     with pytest.raises(RuntimeError, match="conflicting values.*ANTHROPIC_API_KEY"):
-        runner._model_credentials()
+        runner._child_credentials()
+
+
+@pytest.mark.parametrize(
+    ("agent", "expected"),
+    [("search", {"EXA_API_KEY": "exa-secret"}), ("general-purpose", {})],
+)
+def test_only_the_search_child_receives_exa_through_the_private_bundle(
+    tmp_path: Path,
+    agent: str,
+    expected: dict[str, str],
+):
+    runner = OpenHandsChildProcess(
+        delegation_config(tmp_path, exa_api_key=SecretStr("exa-secret")),
+        delegation_request(agent=agent),
+    )
+
+    credentials = runner._child_credentials()
+
+    assert {name: value for name, value in credentials.items() if "EXA" in name} == (
+        expected
+    )
+    assert "EXA_API_KEY" not in runner.environment
 
 
 def test_child_start_passes_model_credentials_only_through_the_fd(monkeypatch, tmp_path):

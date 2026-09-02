@@ -6,8 +6,8 @@ description: Search the general web or scholarly publications through Exa. Use f
 # Exa Search
 
 Call the `exa_search` tool. Exa authentication stays inside the Senpai runtime;
-it is never available to terminal commands, training code, or delegated child
-processes.
+it is never available to terminal commands or training code, and only the
+delegated search agent receives it through the private credential handoff.
 
 Set `mode="general-web"` for current documentation, source code, release notes,
 news, and technical writing. Set `mode="research-publications"` for papers,

@@ -8,6 +8,7 @@ model: inherit
 reasoning_effort: inherit
 permission_mode: never_confirm
 tools:
+  - senpai_exa
   - terminal
   - file_editor
 ---
