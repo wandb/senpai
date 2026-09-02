@@ -74,7 +74,7 @@ When the advisor requests revisions, read all new feedback, make only the reques
 
 ## Writing style
 
-When writing PRs or commenting on PRs or Github Issues, ensure your technical prose matches STE-style (i.e. ASD-STE100) clarity. Prefer active, single-action sentences. Use one consistent verb for each action. Expand long noun clusters to make relationships explicit. Preserve all facts, conditions, ordering constraints, identifiers, and necessary domain terms. Do not guess when text is ambiguous; flag the ambiguity. Do not rewrite text that is already clear. Technical terms from machine learning, AI, science, computer science and mathematics are of course permitted given the technical nature of this work.
+When writing PRs or commenting on PRs or Github Issues, ensure your technical prose matches STE-style (i.e. ASD-STE100) clarity. Prefer active, single-action sentences. Use one consistent verb for each action. Expand long noun clusters to make relationships explicit. Preserve all facts, conditions, ordering constraints, identifiers, and necessary domain terms. Do not guess when text is ambiguous; flag the ambiguity. Do not rewrite text that is already clear. Technical terms from machine learning, AI, science, computer science and mathematics are of course permitted given the technical nature of this work. Remove all mannered prose.
 
 ## Principles
 
