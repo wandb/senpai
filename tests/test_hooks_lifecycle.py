@@ -4,7 +4,6 @@
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from openhands.sdk.plugin import Plugin
@@ -133,8 +132,8 @@ def test_student_stop_allows_durable_monitored_training(
     state_dir = tmp_path / "state"
     write_running_training(state_dir, monitored=True)
     monkeypatch.setattr(
-        "senpai_agent.hooks.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(stdout=""),
+        "senpai_agent.hooks.run_git",
+        lambda *_args, **_kwargs: "",
     )
 
     exit_code, output = invoke_hook(
@@ -164,8 +163,8 @@ def test_student_stop_ignores_non_training_json_sidecars(
         '{"metrics": {}, "passed": true, "score": 1.0}'
     )
     monkeypatch.setattr(
-        "senpai_agent.hooks.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(stdout=""),
+        "senpai_agent.hooks.run_git",
+        lambda *_args, **_kwargs: "",
     )
 
     exit_code, output = invoke_hook(
@@ -188,8 +187,8 @@ def test_student_stop_denies_a_dirty_assignment_workspace(
     capsys: pytest.CaptureFixture[str],
 ):
     monkeypatch.setattr(
-        "senpai_agent.hooks.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(stdout=" M model.py\n"),
+        "senpai_agent.hooks.run_git",
+        lambda *_args, **_kwargs: " M model.py\n",
     )
 
     exit_code, output = invoke_hook(
@@ -213,8 +212,8 @@ def test_queued_feedback_temporarily_allows_a_clean_unwind(
     state_dir.mkdir()
     queued_feedback_marker(state_dir).touch()
     monkeypatch.setattr(
-        "senpai_agent.hooks.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(stdout=" M model.py\n"),
+        "senpai_agent.hooks.run_git",
+        lambda *_args, **_kwargs: " M model.py\n",
     )
 
     exit_code, output = invoke_hook(

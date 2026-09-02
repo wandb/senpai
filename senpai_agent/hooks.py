@@ -4,13 +4,12 @@ import json
 import os
 import re
 import shlex
-import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from senpai_agent.git_transport import GIT_EXECUTABLE
+from senpai_agent.git_transport import run_git
 from senpai_agent.secrets import SHELL_STARTUP_ENV_NAMES
 from senpai_agent.training import training_result_paths
 
@@ -30,6 +29,36 @@ class PolicyDecision:
 
 _SHELL_SEPARATOR_CHARACTERS = frozenset(";&|\n")
 _SHELL_BODY_PREFIXES = {"do", "elif", "else", "if", "then"}
+# Every statement kind whose own head carries policy meaning; nested inside
+# substitutions or groups these are the only way a restricted construct hides.
+_POLICY_NODE_TYPES = {
+    "command",
+    "declaration_command",
+    "for_statement",
+    "test_command",
+    "unset_command",
+    "variable_assignment",
+    "while_statement",
+}
+# Programs that run another command after their own options and operands.
+_COMMAND_RUNNERS = {
+    "builtin",
+    "chrt",
+    "command",
+    "flock",
+    "ionice",
+    "nice",
+    "nohup",
+    "script",
+    "setpriv",
+    "setsid",
+    "stdbuf",
+    "taskset",
+    "timeout",
+    "unshare",
+    "xargs",
+}
+_FIND_EXEC_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
 _SHELL_REEVALUATORS = {
     ".",
     "alias",
@@ -269,7 +298,7 @@ def _bash_commands(command: str) -> list[str] | None:
     return [
         source[node.start_byte : node.end_byte].decode()
         for node in nodes
-        if node.type in {"command", "declaration_command"}
+        if node.type in _POLICY_NODE_TYPES
     ]
 
 
@@ -700,20 +729,37 @@ def _help_only(arguments: list[str]) -> bool:
     return len(command_arguments) == 1 and command_arguments[0] in _HELP_FLAGS
 
 
-def _timeout_command(arguments: list[str]) -> list[str]:
-    position = 0
-    while position < len(arguments) and arguments[position].startswith("-"):
-        option = arguments[position]
-        if option == "--":
-            position += 1
-            break
-        if option in {"-k", "--kill-after", "-s", "--signal"}:
-            position += 2
-        else:
-            position += 1
-    if position >= len(arguments):
-        return []
-    return arguments[position + 1 :]
+def _runner_policy(arguments: list[str], workspace: Path) -> PolicyDecision:
+    """Evaluate every argument that could start the wrapped command.
+
+    Runner option grammars differ, so rather than model each one, every
+    non-option argument is checked as a possible program; option values are
+    harmless program names. A ``-c`` command string is a nested shell body.
+    """
+
+    command = _shell_command(arguments)
+    if command is not None:
+        decision = terminal_policy(command, "", workspace)
+        if not decision.allowed:
+            return decision
+    for position, argument in enumerate(arguments):
+        if argument == "--":
+            return _segment_policy(arguments[position + 1 :], workspace)
+        if argument.startswith("-"):
+            continue
+        decision = _segment_policy(arguments[position:], workspace)
+        if not decision.allowed:
+            return decision
+    return PolicyDecision(True)
+
+
+def _find_policy(arguments: list[str], workspace: Path) -> PolicyDecision:
+    for position, argument in enumerate(arguments):
+        if argument in _FIND_EXEC_ACTIONS:
+            decision = _segment_policy(arguments[position + 1 :], workspace)
+            if not decision.allowed:
+                return decision
+    return PolicyDecision(True)
 
 
 def _git_policy(arguments: list[str]) -> PolicyDecision:
@@ -794,7 +840,7 @@ def _segment_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
         )
 
     arguments = tokens[index + 1 :]
-    if program in _SHELL_BODY_PREFIXES:
+    if program in _SHELL_BODY_PREFIXES or program_token in _FIND_EXEC_ACTIONS:
         return _segment_policy(arguments, workspace)
     if program == "env":
         decision = _variable_name_policy(
@@ -813,15 +859,10 @@ def _segment_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
     if program == "exec":
         command = _wrapper_command(arguments, value_options={"-a"})
         return _segment_policy(command, workspace) if command else PolicyDecision(True)
-    if program in {"builtin", "command", "nohup"}:
-        command = _wrapper_command(arguments)
-        return _segment_policy(command, workspace) if command else PolicyDecision(True)
-    if program == "timeout":
-        command = _timeout_command(arguments)
-        return _segment_policy(command, workspace) if command else PolicyDecision(True)
-    if program == "setsid":
-        command = _wrapper_command(arguments)
-        return _segment_policy(command, workspace) if command else PolicyDecision(True)
+    if program in _COMMAND_RUNNERS:
+        return _runner_policy(arguments, workspace)
+    if program == "find":
+        return _find_policy(arguments, workspace)
     shell = _shell_program(program_token, workspace)
     if shell is not None:
         if shell == "zsh" or _uses_shell_startup_files(arguments):
@@ -1007,14 +1048,7 @@ def _stop_policy(
                 f"{', '.join(sorted(unmonitored))}",
             )
     if require_clean_workspace:
-        status = subprocess.run(
-            [GIT_EXECUTABLE, "status", "--porcelain"],
-            cwd=working_dir,
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout
-        if status.strip():
+        if run_git(working_dir, "status", "--porcelain", "--untracked-files=all"):
             return PolicyDecision(
                 False,
                 "Commit the exact implementation before training or discard "

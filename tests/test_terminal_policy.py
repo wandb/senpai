@@ -373,3 +373,51 @@ def test_policy_preserves_safe_static_nested_commands(command: str):
 )
 def test_policy_preserves_safe_shell_variable_builtins(command: str):
     assert is_allowed(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo \"$([[ -v 'a[$(git push origin experiment)]' ]])\"",
+        "a=(x); echo \"$(unset 'a[$(git push origin experiment)]')\"",
+        "echo \"$(while true; do :; done)\"",
+        "{ PROMPT_COMMAND='git push origin experiment'; }; date -u",
+        "f() { PROMPT_COMMAND='git push origin experiment'; }; f",
+        "case x in x) PROMPT_COMMAND='git push origin experiment';; esac",
+        "nice python train.py --epochs 10",
+        "nice -n 10 python train.py --epochs 10",
+        "stdbuf -oL accelerate launch train.py",
+        "chrt 0 python train.py",
+        "taskset 0x1 python train.py",
+        "flock /tmp/lock python train.py",
+        "flock /tmp/lock -c 'git push origin experiment'",
+        "script -qc 'git push origin experiment' /dev/null",
+        "unshare -r sleep 3600",
+        "echo x | xargs git push origin experiment",
+        "xargs -n 1 sleep < delays.txt",
+        "find . -maxdepth 0 -exec python train.py \\;",
+        "find . -exec true \\; -exec python train.py \\;",
+    ],
+)
+def test_runners_and_nested_statements_cannot_hide_restricted_commands(command: str):
+    assert is_allowed(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "nice -n 10 date -u",
+        "stdbuf -oL date -u",
+        "timeout -k 5 10 date -u",
+        "ionice -c 3 date -u",
+        "taskset 0x1 date -u",
+        "flock -w 5 /tmp/lock date -u",
+        "echo x | xargs -n 1 echo",
+        "find . -name 'train*.py' -newer results.log",
+        "find . -type f -exec wc -l {} +",
+        "echo \"$([[ -f results.log ]])\"",
+        "{ x=1; date -u; }",
+    ],
+)
+def test_runners_preserve_safe_commands(command: str):
+    assert is_allowed(command) is True
