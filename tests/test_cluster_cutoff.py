@@ -411,3 +411,50 @@ esac
         "--context pai-2 -n review-ns delete job senpai-cutoff-namespaced "
         "--ignore-not-found=true"
     ) in kubectl_log.read_text(encoding="utf-8").splitlines()
+
+
+def test_cutoff_rejects_a_negative_budget(tmp_path):
+    result, _ = render_cutoff(
+        tmp_path,
+        "--run-slug",
+        "acceptance",
+        "--tags-csv",
+        "track-a",
+        "--budget-hours",
+        "-48",
+    )
+
+    assert result.returncode != 0
+    assert "--budget-hours must be a non-negative number" in result.stderr
+
+
+def test_cutoff_state_root_defaults_beneath_the_configured_pvc_mount(tmp_path):
+    result, _ = render_cutoff(
+        tmp_path,
+        "--run-slug",
+        "acceptance",
+        "--tags-csv",
+        "track-a",
+        "--budget-hours",
+        "0",
+        "--pvc-mount-path",
+        "/mnt/data",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert 'value: "/mnt/data/senpai-conversation-logs"' in result.stdout
+
+
+def test_cutoff_rejects_a_state_root_outside_its_shared_pvc(tmp_path):
+    result, _ = render_cutoff(
+        tmp_path,
+        "--run-slug",
+        "acceptance",
+        "--tags-csv",
+        "track-a",
+        "--pvc-log-root",
+        "/var/tmp/cutoff",
+    )
+
+    assert result.returncode == 2
+    assert "--pvc-log-root must be" in result.stderr

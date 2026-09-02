@@ -1,3 +1,4 @@
+import sqlite3
 import subprocess
 import threading
 import uuid
@@ -61,7 +62,7 @@ def finished_result(tmp_path: Path) -> TrainingResult:
         exit_code=0,
         elapsed_seconds=12.5,
         log_path=str(tmp_path / "training.log"),
-        wandb_run_ids=("run-abc",),
+        wandb_run_paths=("acme/cfd/run-abc",),
     )
 
 
@@ -85,7 +86,7 @@ def test_run_training_registers_a_monitor_for_its_conversation(tmp_path: Path):
 
         assert training.launched == [spec]
         assert observation.training_id == "training-17"
-        assert observation.wandb_run_ids == ("run-abc",)
+        assert observation.wandb_run_paths == ("acme/cfd/run-abc",)
         monitor = monitors.spec("training-17")
         assert monitor.conversation_id == conversation_id
         assert monitor.metric is None
@@ -437,3 +438,22 @@ def test_registered_training_tools_share_one_runtime(tmp_path: Path):
         )
     finally:
         close_training_runtimes()
+
+
+def test_run_training_cancels_the_run_when_its_monitor_cannot_be_registered(
+    tmp_path: Path,
+):
+    workspace = init_workspace(tmp_path)
+    training = StubTraining(workspace, finished_result(tmp_path))
+
+    class BrokenMonitors:
+        def register(self, spec):
+            raise sqlite3.OperationalError("database is locked")
+
+    tool = RunTrainingTool.create(training, BrokenMonitors())[0]
+    spec = TrainingSpec(argv=("python", "train.py"), cwd=workspace, timeout_seconds=600)
+
+    with pytest.raises(sqlite3.OperationalError):
+        tool.executor(RunTrainingAction(spec=spec), SimpleNamespace(id=uuid.uuid4()))
+
+    assert training.cancelled == ["training-17"]

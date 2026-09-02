@@ -805,3 +805,22 @@ def test_state_directory_is_explicit_and_outside_the_target_checkout(
 
     with pytest.raises(RuntimeError, match=message):
         resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+
+def test_shared_wandb_credential_survives_model_credential_scrubbing(tmp_path: Path):
+    environment = {
+        "ANTHROPIC_API_KEY": "anthropic-key",
+        "OPENAI_API_KEY": "openai-key",
+        "WANDB_API_KEY": "wandb-key",
+    }
+
+    scrub_model_credentials(
+        environment,
+        runtime_config(
+            tmp_path,
+            model="wandb/zai-org/GLM-5.2",
+            api_key_env="WANDB_API_KEY",
+        ),
+    )
+
+    assert environment == {"WANDB_API_KEY": "wandb-key"}

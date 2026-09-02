@@ -297,6 +297,7 @@ def test_runtime_git_auth_uses_ephemeral_askpass_not_a_credential_store():
     assert ".git-credentials" not in guard
     assert 'credential.helper "store' not in guard
     assert "x-access-token:%s@github.com" not in guard
+    assert "${GITHUB_TOKEN}@github.com" not in guard
 
     for role in ("advisor", "student"):
         entrypoint = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text(
@@ -347,3 +348,13 @@ def test_launch_configuration_names_only_the_two_role_images():
     assert "student_image" in config
     assert "control_image" not in config
     assert "image" not in config
+
+
+def test_advisor_entrypoint_creates_the_advisor_branch_only_when_it_is_absent():
+    entrypoint = (ROOT / "k8s" / "entrypoint-advisor.sh").read_text(encoding="utf-8")
+
+    assert (
+        'git ls-remote --exit-code --heads "$TARGET_REPO_URL" '
+        '"refs/heads/$ADVISOR_BRANCH"'
+    ) in entrypoint
+    assert 'rm -rf "$PROBLEM_DIR"' not in entrypoint

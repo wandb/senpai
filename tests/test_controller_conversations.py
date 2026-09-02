@@ -234,3 +234,26 @@ def test_bounded_backlog_yields_to_another_ready_conversation(tmp_path: Path):
 
     assert [call[1] for call in turns.calls] == [first, second, first]
     assert [len(call[2]) for call in turns.calls] == [16, 1, 4]
+
+
+def test_student_human_issue_routes_to_a_quarantined_conversation_first(
+    tmp_path: Path,
+):
+    registry = AssignmentConversationRegistry(tmp_path / "students.json")
+    quarantined = registry.for_assignment("assignment-17", "revision-2")
+    event = ControllerEvent(
+        kind="human_issue",
+        dedupe_key="human_issue:23:700",
+        payload={"number": 23, "human_message_id": 700},
+    )
+
+    routed = StudentConversationSelector(
+        registry,
+        quarantined=lambda: (str(quarantined),),
+    )((event,))
+    thread = StudentConversationSelector(registry)((event,))
+
+    assert [batch.conversation_id for batch in routed] == [quarantined]
+    assert [batch.conversation_id for batch in thread] == [
+        registry.for_assignment("human-issue-23", "thread")
+    ]

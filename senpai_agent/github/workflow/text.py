@@ -36,7 +36,7 @@ def role_prefixed_comment(
     marker, separator, content = body.partition("\n\n")
     if not (separator and marker.startswith("<!-- senpai-")):
         marker, separator, content = "", "", body
-    content = _ROLE_COMMENT_PREFIX.sub("", content)
+    content = _quote_senpai_marker_lines(_ROLE_COMMENT_PREFIX.sub("", content))
     return f"{marker}{separator}{role.upper()}: {content}"
 
 

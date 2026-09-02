@@ -1016,10 +1016,7 @@ def controller_main(
             runner_config.workspace,
             runner_config.state_dir / "training",
         )
-        metrics = WandbMetricSource(
-            env["WANDB_ENTITY"],
-            env["WANDB_PROJECT"],
-        )
+        metrics = WandbMetricSource()
         mailbox = CompositeMailbox(
             github_mailbox,
             LocalStudentMailbox(runner_config.state_dir / "student-events.sqlite3"),
@@ -1031,7 +1028,10 @@ def controller_main(
         registry = AssignmentConversationRegistry(
             runner_config.state_dir / "student-conversations.json"
         )
-        conversation_selector = StudentConversationSelector(registry)
+        conversation_selector = StudentConversationSelector(
+            registry,
+            quarantined=inbox.quarantined_conversation_ids,
+        )
         reconcile = StudentWorkspaceReconciler(
             runner_config.workspace,
             repo=runner_config.github_repo,
