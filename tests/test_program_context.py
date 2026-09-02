@@ -90,6 +90,19 @@ def test_blank_program_path_lists_every_match(tmp_path: Path):
     assert "--program_path" in str(error.value)
 
 
+def test_blank_program_path_rejects_an_unsafe_directory_name(tmp_path: Path):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    write_program(workspace, "alpha/program.md", "Alpha policy.")
+    write_program(workspace, "beta gamma/program.md", "Beta policy.")
+    commit_workspace(workspace)
+
+    with pytest.raises(RuntimeError, match="beta gamma") as error:
+        load_program_system_prompt(workspace, "")
+
+    assert "--program_path" in str(error.value)
+
+
 def test_blank_program_path_does_not_search_deeper_than_one_level(tmp_path: Path):
     workspace = tmp_path / "target"
     workspace.mkdir()

@@ -237,18 +237,20 @@ def _discover_program_path(workspace: Path, root_tree: str) -> str:
         "program.md" for entry in root_entries if entry.name == b"program.md"
     ]
     for directory in root_entries:
-        if directory.mode != "40000":
-            continue
-        try:
-            name = directory.name.decode("ascii")
-            candidate = normalize_program_path(f"{name}/program.md")
-        except (UnicodeDecodeError, ValueError):
-            continue
-        if any(
+        if directory.mode != "40000" or not any(
             entry.name == b"program.md"
             for entry in _tree_entries(workspace, directory.object_id)
         ):
-            candidates.append(candidate)
+            continue
+        try:
+            name = directory.name.decode("ascii")
+            candidates.append(normalize_program_path(f"{name}/program.md"))
+        except (UnicodeDecodeError, ValueError):
+            raise RuntimeError(
+                f"program.md lives under directory {directory.name!r}, whose "
+                "name is not a safe program path; rename the directory or "
+                f"{PROGRAM_PATH_GUIDANCE}"
+            ) from None
     candidates.sort()
     if len(candidates) == 1:
         return candidates[0]
