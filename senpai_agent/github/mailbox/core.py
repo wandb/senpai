@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal
@@ -18,6 +19,7 @@ from .values import (
     DEFAULT_FEEDBACK_BATCH_BYTES,
     DEFAULT_FEEDBACK_BATCH_EVENTS,
     FeedbackBinding,
+    object_value,
 )
 
 
@@ -70,7 +72,7 @@ class GitHubMailbox:
 
     def poll(self) -> tuple[ControllerEvent, ...]:
         self._pull_comment_cache.clear()
-        pulls = self._pulls()
+        pulls = self._authorized_pulls(self._pulls())
         issues = self._issues() if self.human_issues_enabled else ()
         if self.role == "advisor":
             return advisor_events(self, pulls, issues)
@@ -110,6 +112,37 @@ class GitHubMailbox:
             }
         )
         return self._github.objects(f"/repos/{self.repo}/pulls?{query}")
+
+    def _authorized_pulls(
+        self,
+        pulls: Sequence[dict[str, object]],
+    ) -> tuple[dict[str, object], ...]:
+        """Keep same-repository PRs whose authors currently have write access."""
+
+        permissions: dict[str, bool] = {}
+        authorized: list[dict[str, object]] = []
+        for pull in pulls:
+            try:
+                head = object_value(pull["head"])
+                head_repo = object_value(head["repo"])["full_name"]
+                author = object_value(pull["user"])["login"]
+                if not isinstance(head_repo, str) or not isinstance(author, str):
+                    raise TypeError("GitHub pull request has invalid trust metadata")
+                if head_repo.casefold() != self.repo.casefold():
+                    continue
+                login = author.casefold()
+                if login not in permissions:
+                    permissions[login] = self._has_write_permission(author)
+                if permissions[login]:
+                    authorized.append(pull)
+            except (GitHubReadError, KeyError, TypeError) as error:
+                print(
+                    "SENPAI_PULL_AUTHORIZATION_ERROR "
+                    f"pr={pull.get('number')!r} {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return tuple(authorized)
 
     def _has_write_permission(self, login: str) -> bool:
         permission = self._github.get(

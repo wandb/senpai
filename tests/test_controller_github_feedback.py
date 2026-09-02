@@ -89,7 +89,12 @@ def student_mailbox(
         "html_url": "https://github.test/acme/widgets/pull/17",
         "updated_at": "2026-07-29T18:00:00Z",
         "body": render_assignment_marker(assignment),
-        "head": {"ref": "student/candidate", "sha": "a" * 40},
+        "user": {"login": "senpai-bot"},
+        "head": {
+            "ref": "student/candidate",
+            "sha": "a" * 40,
+            "repo": {"full_name": "acme/widgets"},
+        },
         "base": {"ref": "research", "sha": "b" * 40},
         "labels": [
             {"name": "research"},
@@ -118,8 +123,28 @@ def student_mailbox(
     )
     monkeypatch.setattr(mailbox, "_pulls", lambda: [assigned_pull])
     monkeypatch.setattr(mailbox, "_issues", list)
+    monkeypatch.setattr(mailbox, "_has_write_permission", lambda _login: True)
     monkeypatch.setattr(mailbox._github, "objects", lambda url: responses[url])
     return mailbox
+
+
+@pytest.mark.parametrize(
+    ("head_repo", "has_write_permission"),
+    [("outsider/widgets", True), ("acme/widgets", False)],
+)
+def test_student_ignores_assignments_from_unauthorized_pulls(
+    monkeypatch,
+    head_repo: str,
+    has_write_permission: bool,
+):
+    mailbox = student_mailbox(monkeypatch, {})
+    pull = mailbox._pulls()[0]
+    pull["head"]["repo"]["full_name"] = head_repo
+    monkeypatch.setattr(
+        mailbox, "_has_write_permission", lambda _login: has_write_permission
+    )
+
+    assert mailbox.poll() == ()
 
 
 class Turns:

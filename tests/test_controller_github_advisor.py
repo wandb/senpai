@@ -149,7 +149,7 @@ def test_advisor_permission_read_failure_rejects_the_pull(monkeypatch, capsys):
     monkeypatch.setattr(advisor, "_has_write_permission", fail)
 
     assert advisor.poll() == ()
-    assert "SENPAI_ADVISOR_PULL_AUTHORIZATION_ERROR pr=17" in capsys.readouterr().err
+    assert "SENPAI_PULL_AUTHORIZATION_ERROR pr=17" in capsys.readouterr().err
 
 
 def assignment(
