@@ -346,10 +346,10 @@ PY
 }
 
 load_state() {
-  PERSISTED_ARM_ID="$(read_state_value PERSISTED_ARM_ID)"
-  ARMED_AT_UTC="$(read_state_value ARMED_AT_UTC)"
-  KILL_AT_EPOCH="$(read_state_value KILL_AT_EPOCH)"
-  KILL_AT_UTC="$(read_state_value KILL_AT_UTC)"
+  PERSISTED_ARM_ID="$(read_state_value PERSISTED_ARM_ID)" &&
+    ARMED_AT_UTC="$(read_state_value ARMED_AT_UTC)" &&
+    KILL_AT_EPOCH="$(read_state_value KILL_AT_EPOCH)" &&
+    KILL_AT_UTC="$(read_state_value KILL_AT_UTC)"
 }
 
 open_start_gate() {
@@ -357,8 +357,8 @@ open_start_gate() {
   [ -n "$START_GATE_PATH" ] || return 0
   if ! mkdir -p "$(dirname "$START_GATE_PATH")" || \
      ! tmp="$(mktemp "${START_GATE_PATH}.tmp.XXXXXX")"; then
-    log "Unable to open the shared start gate; cutoff remains armed"
-    return 0
+    log "Unable to open the shared start gate; failing so the Job restarts"
+    return 1
   fi
   {
     printf 'RUN_SLUG=%q\n' "$RUN_SLUG"
@@ -368,13 +368,13 @@ open_start_gate() {
     printf 'SELECTOR=%q\n' "$SELECTOR"
   } > "$tmp" || {
     rm -f "$tmp" || log "Unable to remove shared start-gate temporary"
-    log "Unable to write the shared start gate; cutoff remains armed"
-    return 0
+    log "Unable to write the shared start gate; failing so the Job restarts"
+    return 1
   }
   if ! mv "$tmp" "$START_GATE_PATH"; then
     rm -f "$tmp" || log "Unable to remove shared start-gate temporary"
-    log "Shared start gate changed concurrently; cutoff remains armed"
-    return 0
+    log "Unable to publish the shared start gate; failing so the Job restarts"
+    return 1
   fi
   log "Opened start gate: ${START_GATE_PATH}"
 }
@@ -425,6 +425,9 @@ wait_for_ready_gate() {
 
 sleep_until() {
   local target="$1" label="$2" now delay chunk
+  case "$target" in
+    ''|*[!0-9]*) log "Invalid deadline for ${label}: '${target}'"; return 1 ;;
+  esac
   while true; do
     now="$(date -u '+%s')"
     delay=$((target - now))
