@@ -24,17 +24,17 @@ def test_running_training_publishes_wandb_id_before_exit(tmp_path: Path):
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
             status = supervisor.get_training_status(running.training_id)
-            if status.wandb_run_ids:
+            if status.wandb_run_paths:
                 break
             time.sleep(0.02)
 
         assert status.state is TrainingState.RUNNING
-        assert status.wandb_run_ids == ("live-run",)
+        assert status.wandb_run_paths == ("acme/cfd/live-run",)
     finally:
         supervisor.close()
 
 
-def test_large_failed_log_keeps_run_ids_and_only_the_bounded_tail(tmp_path: Path):
+def test_large_failed_log_keeps_run_paths_and_only_the_bounded_tail(tmp_path: Path):
     workspace, supervisor = make_supervisor(tmp_path)
     output_code = (
         "import sys;"
@@ -49,7 +49,7 @@ def test_large_failed_log_keeps_run_ids_and_only_the_bounded_tail(tmp_path: Path
 
     assert terminal.state is TrainingState.FAILED
     assert terminal.exit_code == 7
-    assert terminal.wandb_run_ids == ("first-run", "last-run")
+    assert terminal.wandb_run_paths == ("acme/cfd/first-run", "acme/cfd/last-run")
     assert len(terminal.error_tail.encode()) <= 8192
     assert "last-run" in terminal.error_tail
     assert "first-run" not in terminal.error_tail
@@ -68,4 +68,4 @@ def test_wandb_url_can_span_log_read_chunks(tmp_path: Path):
     terminal = wait_for_terminal(supervisor, running.training_id)
 
     assert terminal.state is TrainingState.FINISHED
-    assert terminal.wandb_run_ids == ("split-run",)
+    assert terminal.wandb_run_paths == ("acme/cfd/split-run",)

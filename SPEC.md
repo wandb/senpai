@@ -147,7 +147,9 @@ A completed tool observation resets the three-attempt no-progress budget. A
 separate 36-inference-start backstop applies to each turn branch across worker
 restarts without limiting one productive run. Either exhausted budget enters
 bounded fresh-branch recovery and then quarantine. Only authenticated human
-steering can reopen quarantine; trusted PR feedback remains pending.
+steering can reopen quarantine; trusted PR feedback remains pending. A
+student's human Issue is routed to its quarantined conversation when one
+exists, so the same steering reopens it.
 
 ## State and conversations
 

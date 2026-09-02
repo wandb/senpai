@@ -20,7 +20,7 @@ READINESS_TIMEOUT_MINUTES="30"
 BUDGET_HOURS="48"
 PVC_CLAIM_NAME="new-pvc"
 PVC_MOUNT_PATH="/mnt/new-pvc"
-PVC_LOG_ROOT="/mnt/new-pvc/senpai-conversation-logs"
+PVC_LOG_ROOT=""
 IMAGE=""
 START_GATE_PATH=""
 DRY_RUN="false"
@@ -40,7 +40,7 @@ Options:
   --budget-hours H            Fleet runtime after readiness or timeout arming (default: 48)
   --pvc-claim NAME            PVC claim mounted into cutoff job (default: new-pvc)
   --pvc-mount-path PATH       Mount path inside cutoff job (default: /mnt/new-pvc)
-  --pvc-log-root PATH         PVC cutoff-state root (default: /mnt/new-pvc/senpai-conversation-logs)
+  --pvc-log-root PATH         PVC cutoff-state root (default: <pvc-mount-path>/senpai-conversation-logs)
   --image IMAGE               Immutable cutoff image digest or :sha-<commit> tag
                               (default: this checkout's senpai-cutoff commit tag)
   --start-gate-path PATH      Write this file after readiness or timeout, releasing gated pods
@@ -84,25 +84,32 @@ if [[ ! "$IMAGE" =~ @sha256:[0-9a-f]{64}$ && ! "$IMAGE" =~ :sha-[0-9a-f]{40}$ ]]
   echo "--image must be an immutable digest or :sha-<40-character-commit> tag" >&2
   exit 2
 fi
-if [ -n "$START_GATE_PATH" ] && ! python - "$START_GATE_PATH" "$PVC_MOUNT_PATH" <<'PY'
+# Cutoff state must live on the shared PVC: a Job pod rescheduled onto the
+# overlay filesystem would otherwise forget KILL_AT and restart the budget.
+beneath_pvc_mount() {
+  python - "$1" "$PVC_MOUNT_PATH" "$2" <<'PY'
 import posixpath
 import sys
 
-gate, mount = map(posixpath.normpath, sys.argv[1:])
+path, mount, flag = sys.argv[1:]
 valid = (
-    posixpath.isabs(gate)
-    and gate == sys.argv[1]
+    posixpath.isabs(path)
+    and posixpath.normpath(path) == path
     and posixpath.isabs(mount)
-    and gate.startswith(f"{mount.rstrip('/')}/")
+    and path.startswith(f"{posixpath.normpath(mount).rstrip('/')}/")
 )
 if not valid:
     raise SystemExit(
-        "ERROR: --start-gate-path must be an absolute normalized file path "
-        "beneath the shared PVC --pvc-mount-path"
+        f"ERROR: {flag} must be an absolute normalized path beneath the shared "
+        "PVC --pvc-mount-path"
     )
 PY
-then
-  exit 2
+}
+
+PVC_LOG_ROOT="${PVC_LOG_ROOT:-${PVC_MOUNT_PATH%/}/senpai-conversation-logs}"
+beneath_pvc_mount "$PVC_LOG_ROOT" --pvc-log-root || exit 2
+if [ -n "$START_GATE_PATH" ]; then
+  beneath_pvc_mount "$START_GATE_PATH" --start-gate-path || exit 2
 fi
 
 safe_name() {
@@ -126,8 +133,13 @@ print(uuid.uuid4())
 PY
 )"
 BUDGET_SECONDS="$(python - "$BUDGET_HOURS" <<'PY'
+import math
 import sys
-print(int(float(sys.argv[1]) * 3600))
+
+hours = float(sys.argv[1])
+if not math.isfinite(hours) or hours < 0:
+    raise SystemExit("--budget-hours must be a non-negative number")
+print(int(hours * 3600))
 PY
 )"
 READINESS_TIMEOUT_SECONDS="$(python - "$READINESS_TIMEOUT_MINUTES" <<'PY'

@@ -15,11 +15,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from senpai_agent.processes import signal_process_group, terminate_process_group
 
+# A W&B run path is entity/project/run_id; the URL decides which project the
+# monitor queries, not the launcher's defaults.
 _WANDB_RUN_URL_BYTES = re.compile(
-    rb"https?://wandb\.ai/[^/\s]+/[^/\s]+/runs/([A-Za-z0-9_-]+)"
+    rb"https?://wandb\.ai/([^/\s]+/[^/\s]+)/runs/([A-Za-z0-9_-]+)"
 )
 _WANDB_COMPLETE_RUN_URL_BYTES = re.compile(
-    rb"https?://wandb\.ai/[^/\s]+/[^/\s]+/runs/"
+    rb"https?://wandb\.ai/([^/\s]+/[^/\s]+)/runs/"
     rb"([A-Za-z0-9_-]+)(?=[^A-Za-z0-9_-])"
 )
 _LOG_READ_BYTES = 64 * 1024
@@ -54,7 +56,7 @@ class TrainingResult(BaseModel):
     exit_code: int | None
     elapsed_seconds: float
     log_path: str
-    wandb_run_ids: tuple[str, ...] = ()
+    wandb_run_paths: tuple[str, ...] = ()
     error_tail: str = ""
 
 
@@ -205,8 +207,8 @@ class TrainingSupervisor:
     def _monitor(self, training_id: str) -> None:
         with self._lock:
             active = self._active[training_id]
-        run_ids: dict[str, None] = {}
-        published_run_ids: tuple[str, ...] = ()
+        run_paths: dict[str, None] = {}
+        published_run_paths: tuple[str, ...] = ()
         error_tail = b""
         scan_overlap = b""
         deadline = active.started + active.timeout_seconds
@@ -227,10 +229,10 @@ class TrainingSupervisor:
                     log,
                     error_tail,
                     scan_overlap,
-                    run_ids,
+                    run_paths,
                 )
-                discovered_run_ids = tuple(run_ids)
-                if discovered_run_ids != published_run_ids:
+                discovered_run_paths = tuple(run_paths)
+                if discovered_run_paths != published_run_paths:
                     self._write_result(
                         TrainingResult(
                             training_id=training_id,
@@ -241,10 +243,10 @@ class TrainingSupervisor:
                             exit_code=None,
                             elapsed_seconds=time.monotonic() - active.started,
                             log_path=str(active.log_path),
-                            wandb_run_ids=discovered_run_ids,
+                            wandb_run_paths=discovered_run_paths,
                         )
                     )
-                    published_run_ids = discovered_run_ids
+                    published_run_paths = discovered_run_paths
                 if active.cancelled:
                     state = TrainingState.CANCELLED
                     self._terminate_process_group(
@@ -285,17 +287,17 @@ class TrainingSupervisor:
                 log,
                 error_tail,
                 scan_overlap,
-                run_ids,
+                run_paths,
             )
             while log.peek(1):
                 error_tail, scan_overlap = self._consume_log(
                     log,
                     error_tail,
                     scan_overlap,
-                    run_ids,
+                    run_paths,
                 )
             for match in _WANDB_RUN_URL_BYTES.findall(scan_overlap):
-                run_ids.setdefault(match.decode(), None)
+                run_paths.setdefault(b"/".join(match).decode(), None)
 
         result = TrainingResult(
             training_id=training_id,
@@ -306,7 +308,7 @@ class TrainingSupervisor:
             exit_code=exit_code,
             elapsed_seconds=time.monotonic() - active.started,
             log_path=str(active.log_path),
-            wandb_run_ids=tuple(run_ids),
+            wandb_run_paths=tuple(run_paths),
             error_tail=(
                 error_tail.decode(errors="ignore")
                 if state is not TrainingState.FINISHED
@@ -322,14 +324,14 @@ class TrainingSupervisor:
         log,
         error_tail: bytes,
         scan_overlap: bytes,
-        run_ids: dict[str, None],
+        run_paths: dict[str, None],
     ) -> tuple[bytes, bytes]:
         chunk = log.read(_LOG_READ_BYTES)
         if not chunk:
             return error_tail, scan_overlap
         scan = scan_overlap + chunk
         for match in _WANDB_COMPLETE_RUN_URL_BYTES.findall(scan):
-            run_ids.setdefault(match.decode(), None)
+            run_paths.setdefault(b"/".join(match).decode(), None)
         scan_overlap = scan[-_WANDB_SCAN_OVERLAP_BYTES:]
         error_tail = (error_tail + chunk)[-_ERROR_TAIL_BYTES:]
         return error_tail, scan_overlap

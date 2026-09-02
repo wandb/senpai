@@ -27,6 +27,7 @@ class PolicyDecision:
 
 
 _SHELL_SEPARATOR_CHARACTERS = frozenset(";&|\n")
+_REDIRECTION_CHARACTERS = frozenset("<>&|")
 _SHELL_BODY_PREFIXES = {"do", "elif", "else", "if", "then"}
 _GH_READ_ONLY = {
     "auth": {"status"},
@@ -223,13 +224,35 @@ def _command_segments(command: str) -> list[list[str]]:
     return [segment for segment in segments if segment]
 
 
+def _is_redirection(token: str) -> bool:
+    characters = set(token)
+    return bool(characters & {"<", ">"}) and characters <= _REDIRECTION_CHARACTERS
+
+
+def _is_assignment(token: str) -> bool:
+    if "=" not in token or token.startswith(("/", "./")):
+        return False
+    name, _, _value = token.partition("=")
+    return name.replace("_", "").isalnum()
+
+
 def _program_index(tokens: list[str]) -> int | None:
-    for index, token in enumerate(tokens):
-        if "=" in token and not token.startswith(("/", "./")):
-            name, _, _value = token.partition("=")
-            if name.replace("_", "").isalnum():
-                continue
-        return index
+    """Locate the command word after any leading assignments and redirections."""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if _is_redirection(token):
+            index += 2  # the operator and its target
+        elif (
+            token.isdigit()
+            and index + 1 < len(tokens)
+            and _is_redirection(tokens[index + 1])
+        ):
+            index += 1  # a file descriptor prefix such as the 2 in 2>&1
+        elif _is_assignment(token):
+            index += 1
+        else:
+            return index
     return None
 
 
@@ -579,7 +602,15 @@ def terminal_policy(
     workspace: Path,
 ) -> PolicyDecision:
     del role, workspace
-    for segment in _command_segments(command):
+    try:
+        segments = _command_segments(command)
+    except ValueError as error:
+        return PolicyDecision(
+            False,
+            f"Senpai could not parse this command ({error}). Balance the quotes, "
+            "or quote the heredoc delimiter (<<'EOF') so its body is literal text.",
+        )
+    for segment in segments:
         decision = _segment_policy(segment)
         if not decision.allowed:
             return decision

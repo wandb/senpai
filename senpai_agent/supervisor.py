@@ -235,6 +235,12 @@ class WorkerSupervisor:
                 file=sys.stderr,
                 flush=True,
             )
+            # The dead worker's lease would fail the health probe for the whole
+            # backoff; publish the supervisor's own deliberate wait instead.
+            ProgressLease(self.lease_path).update(
+                "restart-backoff",
+                delay + self.config.startup_timeout_seconds,
+            )
             stop.wait(delay)
         return 0
 

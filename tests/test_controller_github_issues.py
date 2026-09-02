@@ -347,3 +347,26 @@ def test_disabled_human_issue_polling_skips_the_github_query(monkeypatch):
     monkeypatch.setattr(advisor, "_issues", unexpected_query)
 
     assert advisor.poll() == ()
+
+
+def test_deleted_account_comments_are_skipped_not_fatal(monkeypatch):
+    advisor = mailbox()
+    monkeypatch.setattr(advisor, "_pulls", list)
+    monkeypatch.setattr(advisor, "_issues", lambda: [issue()])
+    monkeypatch.setattr(
+        advisor,
+        "_issue_comments",
+        lambda _issue: [
+            {
+                "id": 701,
+                "body": "Written by an account that no longer exists.",
+                "created_at": "2026-07-29T18:10:00Z",
+                "user": None,
+                "author_association": "NONE",
+            }
+        ],
+    )
+
+    event = advisor.poll()[0]
+
+    assert event.payload["human_message_id"] == 700
