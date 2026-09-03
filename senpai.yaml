@@ -45,6 +45,8 @@ wandb_project: senpai-v1
 #   - HF_TOKEN  # Set HF_TOKEN=abc123 in .env
 
 # OpenHands models
+# Prefix `chatgpt/` (for example chatgpt/gpt-5.5) to bill OpenAI models to a
+# ChatGPT subscription via `codex login` instead of OPENAI_API_KEY.
 advisor_model: anthropic/claude-fable-5-1
 advisor_reasoning_effort: high
 student_model: anthropic/claude-fable-5-1

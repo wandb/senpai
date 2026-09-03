@@ -1,7 +1,9 @@
 import base64
 import subprocess
+from pathlib import Path
 
 import pytest
+import yaml
 
 from launch_test_support import launch, launch_args, launch_helpers
 
@@ -92,6 +94,7 @@ def bypass_external_preflight(monkeypatch):
     for name, value in (
         ("resolve_anthropic_api_key", "anthropic"),
         ("resolve_openai_api_key", "openai"),
+        ("resolve_chatgpt_oauth_credentials", "chatgpt"),
         ("resolve_exa_api_key", "exa"),
         ("resolve_wandb_api_key", "wandb"),
     ):
@@ -101,6 +104,7 @@ def bypass_external_preflight(monkeypatch):
         "preflight_check_student_name_availability",
         "preflight_check_anthropic_api_key",
         "preflight_check_openai_api_key",
+        "preflight_check_chatgpt_oauth_credentials",
         "preflight_check_exa_api_key",
         "preflight_check_wandb_api_key",
         "preflight_check_wandb_inference",
@@ -246,6 +250,56 @@ def test_launch_resolves_and_preflights_only_referenced_model_providers(
 
     assert resolved == [expected_provider]
     assert checked == [expected_provider]
+
+
+def test_launch_reads_the_codex_login_for_chatgpt_models(monkeypatch):
+    model = "chatgpt/gpt-5.5"
+    args = launch_args(
+        advisor=False,
+        advisor_model=model,
+        student_model=model,
+        smart_model=model,
+        fast_model=model,
+        frontier_model=model,
+        frontier_reasoning_effort="xhigh",
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    for provider in ("anthropic", "openai"):
+        monkeypatch.setattr(
+            launch,
+            f"resolve_{provider}_api_key",
+            lambda _path, provider=provider: pytest.fail(f"{provider} key resolved"),
+        )
+    read = []
+    checked = []
+    applied = []
+    monkeypatch.setattr(launch, "codex_home", lambda: Path("/home/operator/.codex"))
+    monkeypatch.setattr(
+        launch,
+        "resolve_chatgpt_oauth_credentials",
+        lambda home: read.append(home) or '{"type": "oauth"}',
+    )
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_chatgpt_oauth_credentials",
+        lambda credentials: checked.append(credentials),
+    )
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda manifest, *_args, **_kwargs: applied.append(manifest),
+    )
+
+    launch.main()
+
+    assert read == [Path("/home/operator/.codex")]
+    assert checked == ['{"type": "oauth"}']
+    secret_data = yaml.safe_load(applied[0])["data"]
+    assert base64.b64decode(secret_data["chatgpt-oauth-credentials"]) == (
+        b'{"type": "oauth"}'
+    )
+    assert "openai-api-key" not in secret_data
 
 
 def test_students_only_launch_ignores_the_inactive_advisor_provider(

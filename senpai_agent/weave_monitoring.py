@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from threading import Lock
@@ -11,6 +12,7 @@ from weave_openhands import finish as weave_finish
 from weave_openhands import init as weave_init
 
 from senpai_agent.secrets import (
+    CHATGPT_OAUTH_CREDENTIALS_ENV,
     GITHUB_TOKEN_ENV_NAMES,
     configured_custom_secret_env_names,
 )
@@ -23,6 +25,7 @@ TRACE_SECRET_ENV_NAMES = (
     "WANDB_API_KEY",
     "EXA_API_KEY",
     "ANTHROPIC_API_KEY",
+    CHATGPT_OAUTH_CREDENTIALS_ENV,
 )
 
 
@@ -30,6 +33,14 @@ def _is_secret_env(name: str) -> bool:
     return name in TRACE_SECRET_ENV_NAMES or name.endswith(
         ("_API_KEY", "_TOKEN", "_PASSWORD", "_SECRET", "_CREDENTIAL")
     )
+
+
+def _secret_values(name: str, value: str) -> set[str]:
+    """Expand a JSON credential into the tokens that could appear on their own."""
+    if name != CHATGPT_OAUTH_CREDENTIALS_ENV:
+        return {value}
+    credentials = json.loads(value)
+    return {value, credentials["access_token"], credentials["refresh_token"]}
 
 
 def weave_project_name(env: Mapping[str, str]) -> str | None:
@@ -91,7 +102,7 @@ def secret_redactor(env: Mapping[str, str]) -> SecretRedactor:
     custom_secret_env_names = set(configured_custom_secret_env_names(env))
     return SecretRedactor(
         {
-            value
+            secret
             for name, value in env.items()
             if value
             and (
@@ -99,6 +110,7 @@ def secret_redactor(env: Mapping[str, str]) -> SecretRedactor:
                 or name in custom_secret_env_names
                 or (configured_model_key is not None and name == configured_model_key)
             )
+            for secret in _secret_values(name, value)
         }
     )
 

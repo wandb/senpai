@@ -40,6 +40,7 @@ def test_configured_custom_secret_names_default_to_empty(environment):
         (["PRIVATE-AUTH"], "invalid"),
         (["PRIVATE_AUTH", "PRIVATE_AUTH"], "duplicate"),
         (["OPENAI_API_KEY"], "reserved"),
+        (["CHATGPT_OAUTH_CREDENTIALS"], "reserved"),
         (["GH_PRIVATE_KEY"], "reserved"),
         (["GITHUB_APP_TOKEN"], "reserved"),
         (["SENPAI_INTERNAL_KEY"], "reserved"),

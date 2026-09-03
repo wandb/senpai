@@ -44,6 +44,7 @@ from senpai_agent.inbox import (
 )
 from senpai_agent.secrets import (
     BUILTIN_CONVERSATION_SECRET_ENV_NAMES,
+    CHATGPT_OAUTH_CREDENTIALS_ENV,
     GITHUB_TOKEN_ENV_NAMES,
     GITHUB_TOKEN_FD_ENV,
     GITHUB_TOKEN_FILE_ENV,
@@ -64,6 +65,11 @@ from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
 from openhands.sdk.event import ActionEvent, MessageEvent, ObservationEvent
 from openhands.sdk.llm import Message, TextContent
+from openhands.sdk.llm.auth import (
+    CredentialStore,
+    OAuthCredentials,
+    OpenAISubscriptionAuth,
+)
 from openhands.sdk.plugin import PluginSource
 from openhands.sdk.skills import (
     Skill,
@@ -130,6 +136,8 @@ REPOSITORY_INSTRUCTION_FILENAMES = frozenset(
 PROVIDER_API_KEY_ENVS = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
+    # ChatGPT-subscription access to OpenAI models; the value is OAuth JSON.
+    "chatgpt": CHATGPT_OAUTH_CREDENTIALS_ENV,
     "wandb": "WANDB_API_KEY",
 }
 EVENT_TEXT_LIMIT = 20000
@@ -1043,7 +1051,7 @@ def prompt_cache_configuration(model: str) -> dict[str, object]:
 
 
 def conversation_prompt_cache_key(config: RunnerConfig) -> str | None:
-    if config.model.split("/", 1)[0].lower() != "openai":
+    if model_provider(config.model) not in {"openai", "chatgpt"}:
         return None
     agent_kind = config.agent_name or ("child" if config.child else "main")
     return f"senpai:{config.role}:{agent_kind}"
@@ -1053,7 +1061,18 @@ def openai_responses_configuration(
     model: str,
     reasoning_effort: str | None = None,
 ) -> dict[str, object]:
-    if model.split("/", 1)[0].lower() != "openai":
+    provider = model_provider(model)
+    if provider == "chatgpt":
+        # The ChatGPT subscription backend is a stateless Responses API: it
+        # rejects stored chains, so every request carries the full context.
+        return {
+            "api_mode": "responses",
+            "reasoning_summary": "auto",
+            "reasoning_context": "all_turns",
+            "responses_store": False,
+            "responses_use_previous_response_id": False,
+        }
+    if provider != "openai":
         return {}
     configuration: dict[str, object] = {
         "api_mode": "responses",
@@ -1137,6 +1156,43 @@ def model_runtime_configuration(
     if extra_body:
         configuration["litellm_extra_body"] = extra_body
     return configuration
+
+
+def chatgpt_credential_dir(config: RunnerConfig) -> Path:
+    """One token store per pod so a refresh by any process serves them all."""
+    return (config.delegation_root_state_dir or config.state_dir) / "chatgpt-auth"
+
+
+def chatgpt_subscription_llm(
+    model: str,
+    credentials: SecretStr,
+    *,
+    credential_dir: Path,
+    **llm_options: object,
+) -> LLM:
+    """Build an OpenHands subscription LLM for a `chatgpt/<model>` profile.
+
+    `credentials` is the launcher's snapshot of the operator's Codex CLI login.
+    The pod-local store keeps whichever credential expires later, so a token
+    refreshed by an earlier process is not replaced by the stale launch copy.
+    """
+    launched = OAuthCredentials.model_validate_json(credentials.get_secret_value())
+    store = CredentialStore(credential_dir)
+    stored = store.get(launched.vendor)
+    if stored is None or stored.expires_at < launched.expires_at:
+        store.save(launched)
+        stored = launched
+    auth = OpenAISubscriptionAuth(credential_store=store)
+    llm = auth.create_llm(
+        model=model.split("/", 1)[1],
+        credentials=stored,
+        **llm_options,
+    )
+    # Identify the harness honestly; OpenAI serves third-party clients under
+    # their own originator rather than the Codex CLI's.
+    return llm.model_copy(
+        update={"extra_headers": {**(llm.extra_headers or {}), "originator": "senpai"}}
+    )
 
 
 def local_event_db_path(config: RunnerConfig) -> Path:
@@ -1717,16 +1773,14 @@ def run_openhands(
             finally:
                 retried_provider_errors.reset(token)
 
-        llm = LLM(
-            model=config.model,
-            api_key=config.api_key,
-            timeout=config.llm_timeout_seconds,
-            num_retries=config.llm_num_retries,
-            reasoning_effort=openhands_reasoning_effort(
+        llm_options: dict[str, object] = {
+            "timeout": config.llm_timeout_seconds,
+            "num_retries": config.llm_num_retries,
+            "reasoning_effort": openhands_reasoning_effort(
                 config.reasoning_effort, config.model
             ),
-            usage_id="senpai",
-            retry_listener=record_retry,
+            "usage_id": "senpai",
+            "retry_listener": record_retry,
             **model_runtime_configuration(
                 config.model,
                 config.reasoning_effort,
@@ -1734,7 +1788,16 @@ def run_openhands(
                 wandb_entity=config.wandb_entity,
                 wandb_project=config.wandb_project,
             ),
-        )
+        }
+        if model_provider(config.model) == "chatgpt":
+            llm = chatgpt_subscription_llm(
+                config.model,
+                config.api_key,
+                credential_dir=chatgpt_credential_dir(config),
+                **llm_options,
+            )
+        else:
+            llm = LLM(model=config.model, api_key=config.api_key, **llm_options)
         llm.set_request_scope(model_request)
         if config.agent_name:
             definition = depth_aware_child_definition(

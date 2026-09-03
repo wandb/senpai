@@ -527,6 +527,7 @@ def test_launch_rejects_unsupported_reasoning_effort(overrides, message):
     [
         ("anthropic/claude-opus-4-8", "ANTHROPIC_API_KEY", "anthropic-api-key"),
         ("openai/gpt-5.6-sol", "OPENAI_API_KEY", "openai-api-key"),
+        ("chatgpt/gpt-5.5", "CHATGPT_OAUTH_CREDENTIALS", "chatgpt-oauth-credentials"),
         ("wandb/zai-org/GLM-5.2", "WANDB_API_KEY", "wandb-api-key"),
     ],
 )

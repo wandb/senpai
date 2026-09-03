@@ -286,6 +286,14 @@ every process restart, passed as `previous_response_id`, and paired only with
 inputs created after that response. System instructions and tools remain
 explicit on every request.
 
+`chatgpt/*` models reach the same OpenAI models through a ChatGPT subscription
+using OpenHands' subscription transport: the ChatGPT backend the Codex CLI
+uses, `store=false`, no `previous_response_id`, no prompt-cache retention, and
+OpenHands condensation instead of provider-native compaction. The launcher
+reads the operator's Codex CLI login and never runs an OAuth flow itself; each
+pod refreshes the access token in one store shared with its delegated
+children.
+
 Senpai sets `reasoning_context="all_turns"` and `reasoning_summary="auto"` so
 supported models can reuse server-side private reasoning and return the most
 detailed available summary. The standalone runner and launcher default to
@@ -546,9 +554,9 @@ execution, and extraction. `model=smart` defaults to
 `anthropic/claude-fable-5-1` at `high` for ordinary review, literature research,
 synthesis, and failure diagnosis. `model=frontier` defaults to
 `anthropic/claude-fable-5-1` at `max` for the hardest quality-first work. The
-provider prefix determines the required credential
-(`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`); model-facing calls never select
-credential names.
+provider prefix determines the required credential (`ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, or the `CHATGPT_OAUTH_CREDENTIALS` JSON seeded from the
+operator's Codex CLI login); model-facing calls never select credential names.
 
 Reasoning effort is validated against the selected model. Provider-specific
 request configuration maps GPT-5.6 `max` to Responses Pro mode; invalid
