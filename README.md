@@ -67,8 +67,40 @@ WANDB_API_KEY=
 | `GITHUB_TOKEN` | Target-repository Contents, Pull requests, and Issues read/write. A classic token with `repo` scope also works. GitHub CLI authentication is the fallback when this value is absent. |
 | `ANTHROPIC_API_KEY` | Required when an `anthropic/...` model is configured. Every default profile uses Anthropic. |
 | `OPENAI_API_KEY` | Required when an `openai/...` model is configured. |
+| ChatGPT login | Required when a `chatgpt/...` model is configured. Not a `.env` value: run `codex login` and the launcher reads the Codex CLI's `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`). |
 | `EXA_API_KEY` | General-web and research-publication search. |
 | `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. |
+
+#### ChatGPT subscription instead of an OpenAI API key
+
+Prefix a model with `chatgpt/` (for example `chatgpt/gpt-5.5`) to bill it to a
+ChatGPT Plus, Pro, Business, or Enterprise subscription through the backend the
+Codex CLI uses. Sign in once with the Codex CLI:
+
+```bash
+codex login
+```
+
+`k8s/launch.py` reads the resulting `auth.json`, checks that the access token is
+unexpired and belongs to a ChatGPT account, and copies the access and refresh
+tokens into the per-launch Kubernetes Secret as `CHATGPT_OAUTH_CREDENTIALS`.
+Senpai never runs an OAuth flow of its own. Each pod keeps one token store under
+its OpenHands state directory and refreshes the access token there when it
+expires, so a single refresh serves the main agent and its delegated children.
+
+`chatgpt/` models use OpenHands' subscription transport: a stateless Responses
+API chain with no stored responses, no prompt-cache retention, and OpenHands
+condensation instead of provider-native compaction. The available models are
+the ones OpenHands lists for Codex subscriptions (currently `gpt-5.4`,
+`gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6`, and the `gpt-5.6-*` variants), and `max`
+effort is not available. OpenAI publicly supports ChatGPT subscriptions in
+third-party harnesses; the login is personal, so launch from your own account.
+
+Anthropic subscriptions (Claude Pro and Max) cannot be used this way.
+Anthropic's terms allow subscription OAuth only inside Claude Code and other
+Anthropic applications and prohibit third-party harnesses from routing requests
+through, or storing, those credentials, so `anthropic/...` models always need
+`ANTHROPIC_API_KEY`.
 
 To add a credential, put its value in `.env` and list its name in the launch
 configuration:
@@ -84,7 +116,7 @@ custom_secret_env_names: [HF_TOKEN]
 The credential is available to every advisor, student, and delegated child;
 its value is redacted from tool output and traces.
 
-`k8s/launch.py` reads shell environment variables first and then the repository-root `.env`; only the GitHub token also falls back to `gh auth token`. Direct Docker or host execution must export or pass credentials explicitly.
+`k8s/launch.py` reads shell environment variables first and then the repository-root `.env`; only the GitHub token also falls back to `gh auth token`, and the ChatGPT login comes only from the Codex CLI. Direct Docker or host execution must export or pass credentials explicitly.
 
 The launcher places credentials in a per-launch Kubernetes Secret. During bootstrap, the GitHub write token is removed from the process environment and handed to the controller through a one-use channel; it is not exposed to the model or subagents.
 
@@ -156,7 +188,12 @@ provider-native and is sent as `output_config.effort: max`; it does not enable
 OpenAI Pro mode.
 
 `compaction_trigger_tokens` sets the compaction limit. OpenAI and Anthropic
-apply it for their models; OpenHands handles compaction for other providers.
+apply it for their models; OpenHands handles compaction for other providers,
+including `chatgpt/` and `wandb/`.
+
+To bill OpenAI models to a ChatGPT subscription instead of an API key, use the
+`chatgpt/` prefix, for example `chatgpt/gpt-5.5`, and sign in with `codex login`
+as described under credentials.
 
 If using W&B Inference use `wandb/` provider as the provider. For example `wandb/zai-org/GLM-5.2`, SENPAI
 uses `WANDB_API_KEY` for auth.

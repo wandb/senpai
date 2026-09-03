@@ -15,12 +15,16 @@ GITHUB_CREDENTIAL_ENV_NAMES = (
 )
 CUSTOM_SECRET_ENV_NAMES_ENV = "SENPAI_CUSTOM_SECRET_ENV_NAMES"
 BUILTIN_CONVERSATION_SECRET_ENV_NAMES = ("WANDB_API_KEY", "EXA_API_KEY")
+# JSON OAuth credentials (access token, refresh token, expiry) for `chatgpt/`
+# models, seeded by the launcher from the operator's Codex CLI login.
+CHATGPT_OAUTH_CREDENTIALS_ENV = "CHATGPT_OAUTH_CREDENTIALS"
 _RESERVED_CUSTOM_SECRET_ENV_NAMES = frozenset(
     {
         # Built-in credentials use separate trust boundaries.
         "GITHUB_TOKEN",
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
+        CHATGPT_OAUTH_CREDENTIALS_ENV,
         *BUILTIN_CONVERSATION_SECRET_ENV_NAMES,
         # The launcher and entrypoints own these names in both roles.
         "ADVISOR_BRANCH",

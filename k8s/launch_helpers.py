@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -407,9 +408,14 @@ LAUNCH_CREDENTIAL_ENV_NAMES = (
     "GITHUB_TOKEN",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
+    "CHATGPT_OAUTH_CREDENTIALS",
     "EXA_API_KEY",
     "WANDB_API_KEY",
 )
+CHATGPT_ACCESS_TOKEN_MIN_REMAINING_SECONDS = 5 * 60
+_OPENAI_AUTH_CLAIM = "https://api.openai.com/auth"
+
+
 def _dotenv_values(path: Path) -> dict[str, str | None]:
     """Read literal values from a dotenv file without mutating the environment."""
     if not path.exists():
@@ -509,6 +515,85 @@ def resolve_wandb_api_key(dotenv_path: Path) -> str:
     return resolve_required_secret(dotenv_path, "WANDB_API_KEY", "W&B API key")
 
 
+def codex_home() -> Path:
+    """The Codex CLI state directory: $CODEX_HOME → ~/.codex."""
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
+def jwt_claims(token: str) -> dict:
+    """Decode the unverified payload of a JWT; the provider verifies signatures."""
+    parts = token.split(".")
+    if len(parts) < 2:
+        raise ValueError("token is not a JWT")
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload))
+
+
+def resolve_chatgpt_oauth_credentials(codex_home_dir: Path) -> str:
+    """Convert the operator's `codex login` into OpenHands OAuth credentials JSON.
+
+    Senpai never runs an OAuth flow of its own: the Codex CLI owns the browser
+    or device-code login, and the launcher only reads its `auth.json`.
+    """
+    auth_file = codex_home_dir / "auth.json"
+    if not auth_file.exists():
+        sys.exit(
+            f"ERROR: no ChatGPT login at {auth_file}. Run `codex login` "
+            "(or `codex login --device-auth` on a headless machine) to sign in "
+            "with your ChatGPT subscription, or configure an `openai/...` model "
+            "with OPENAI_API_KEY."
+        )
+    tokens = json.loads(auth_file.read_text()).get("tokens") or {}
+    access_token = tokens.get("access_token")
+    refresh_token = tokens.get("refresh_token")
+    if not access_token or not refresh_token:
+        sys.exit(
+            f"ERROR: {auth_file} holds no ChatGPT OAuth tokens. Run `codex login` "
+            "and sign in with ChatGPT rather than an API key."
+        )
+    try:
+        expires_at = int(jwt_claims(access_token)["exp"])
+    except (ValueError, KeyError, TypeError) as error:
+        sys.exit(f"ERROR: {auth_file} access token is not a ChatGPT JWT: {error}")
+    return json.dumps(
+        {
+            "type": "oauth",
+            "vendor": "openai",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": expires_at * 1000,
+        }
+    )
+
+
+def preflight_check_chatgpt_oauth_credentials(credentials_json: str) -> None:
+    """Verify the ChatGPT access token is usable without spending subscription quota.
+
+    A live probe would either refresh the token (rotating the operator's Codex
+    login) or run a billable request, so this checks the token claims only.
+    """
+    credentials = json.loads(credentials_json)
+    claims = jwt_claims(credentials["access_token"])
+    auth_claims = claims.get(_OPENAI_AUTH_CLAIM) or {}
+    if not auth_claims.get("chatgpt_account_id"):
+        sys.exit(
+            "ERROR: ChatGPT access token carries no chatgpt_account_id claim; "
+            "run `codex login` again and sign in with a ChatGPT account."
+        )
+    remaining_seconds = credentials["expires_at"] / 1000 - time.time()
+    if remaining_seconds < CHATGPT_ACCESS_TOKEN_MIN_REMAINING_SECONDS:
+        sys.exit(
+            "ERROR: ChatGPT access token has expired. Run any `codex` command "
+            "or `codex login` to refresh it, then relaunch."
+        )
+    print(
+        "  ChatGPT subscription: "
+        f"plan={auth_claims.get('chatgpt_plan_type', 'unknown')} "
+        f"access token valid for {remaining_seconds / 3600:.1f}h; "
+        "pods refresh it with the stored refresh token"
+    )
+
+
 def render_launch_secret(
     tag: str,
     github_token: str,
@@ -517,6 +602,7 @@ def render_launch_secret(
     *,
     anthropic_api_key: str | None = None,
     openai_api_key: str | None = None,
+    chatgpt_oauth_credentials: str | None = None,
     custom_secrets: dict[str, str],
 ) -> str:
     """Per-launch k8s Secret holding API credentials used by advisor/student pods."""
@@ -529,6 +615,8 @@ def render_launch_secret(
         credentials["anthropic-api-key"] = anthropic_api_key
     if openai_api_key is not None:
         credentials["openai-api-key"] = openai_api_key
+    if chatgpt_oauth_credentials is not None:
+        credentials["chatgpt-oauth-credentials"] = chatgpt_oauth_credentials
     credentials.update(custom_secrets)
     encoded = {
         name: base64.b64encode(value.encode()).decode()

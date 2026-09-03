@@ -29,6 +29,7 @@ from senpai_agent.program_context import PROGRAM_PATH_ENV, normalize_program_pat
 from senpai_agent.secrets import validate_custom_secret_env_names
 
 from launch_helpers import (
+    codex_home,
     ensure_advisor_branch,
     ensure_target_repo_labels,
     existing_student_names,
@@ -38,6 +39,7 @@ from launch_helpers import (
     kubectl_command,
     pod_template_hash,
     preflight_check_anthropic_api_key,
+    preflight_check_chatgpt_oauth_credentials,
     preflight_check_exa_api_key,
     preflight_check_openai_api_key,
     preflight_check_student_name_availability,
@@ -49,6 +51,7 @@ from launch_helpers import (
     render_launch_secret,
     render_template,
     resolve_anthropic_api_key,
+    resolve_chatgpt_oauth_credentials,
     resolve_custom_secrets,
     resolve_exa_api_key,
     resolve_github_token,
@@ -138,6 +141,9 @@ class Args:
 MODEL_PROVIDERS = {
     "anthropic": ("ANTHROPIC_API_KEY", "anthropic-api-key"),
     "openai": ("OPENAI_API_KEY", "openai-api-key"),
+    # `chatgpt/<model>` reaches OpenAI through a ChatGPT subscription login
+    # instead of an API key; the credential is the operator's Codex CLI OAuth.
+    "chatgpt": ("CHATGPT_OAUTH_CREDENTIALS", "chatgpt-oauth-credentials"),
     "wandb": ("WANDB_API_KEY", "wandb-api-key"),
 }
 REASONING_EFFORTS = {
@@ -573,6 +579,10 @@ def main():
             provider_api_keys["anthropic"] = resolve_anthropic_api_key(DOTENV_PATH)
         if "openai" in model_providers:
             provider_api_keys["openai"] = resolve_openai_api_key(DOTENV_PATH)
+        if "chatgpt" in model_providers:
+            provider_api_keys["chatgpt"] = resolve_chatgpt_oauth_credentials(
+                codex_home()
+            )
         exa_api_key = resolve_exa_api_key(DOTENV_PATH)
         wandb_api_key = resolve_wandb_api_key(DOTENV_PATH)
         preflight_check_target_repo_access(args.target_repo_url, github_token)
@@ -591,6 +601,8 @@ def main():
             preflight_check_anthropic_api_key(anthropic_api_key)
         if openai_api_key := provider_api_keys.get("openai"):
             preflight_check_openai_api_key(openai_api_key)
+        if chatgpt_oauth_credentials := provider_api_keys.get("chatgpt"):
+            preflight_check_chatgpt_oauth_credentials(chatgpt_oauth_credentials)
         if "wandb" in model_providers:
             preflight_check_wandb_inference(
                 wandb_api_key,
@@ -634,6 +646,7 @@ def main():
         wandb_api_key if not args.dry_run else "<REDACTED_WANDB_API_KEY>",
         anthropic_api_key=provider_api_keys.get("anthropic"),
         openai_api_key=provider_api_keys.get("openai"),
+        chatgpt_oauth_credentials=provider_api_keys.get("chatgpt"),
         custom_secrets=custom_secrets,
     )
 
