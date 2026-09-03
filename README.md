@@ -96,11 +96,14 @@ the ones OpenHands lists for Codex subscriptions (currently `gpt-5.4`,
 effort is not available. OpenAI publicly supports ChatGPT subscriptions in
 third-party harnesses; the login is personal, so launch from your own account.
 
-Anthropic subscriptions (Claude Pro and Max) cannot be used this way.
-Anthropic's terms allow subscription OAuth only inside Claude Code and other
-Anthropic applications and prohibit third-party harnesses from routing requests
-through, or storing, those credentials, so `anthropic/...` models always need
-`ANTHROPIC_API_KEY`.
+Anthropic subscriptions (Claude Pro and Max) have no equivalent here.
+Anthropic reserves subscription OAuth for Claude Code and its other native
+applications, tells developers building on the Agent SDK to use API keys, and
+forbids third-party tools from storing or intermediating Claude.ai tokens.
+Senpai's LiteLLM transport is not Claude Code, so `anthropic/...` models need
+`ANTHROPIC_API_KEY`. Anthropic's recommended keyless alternative is Workload
+Identity Federation, which exchanges a Kubernetes service-account token for a
+short-lived API token; Senpai does not implement it yet.
 
 To add a credential, put its value in `.env` and list its name in the launch
 configuration:
