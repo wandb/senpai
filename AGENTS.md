@@ -89,6 +89,10 @@ The OpenHands base prompt is extended with one stable system suffix, assembled i
 - the selected target `program.md`, with its repository-relative path in the header
 - the rendered `system_instructions/SENPAI-LAUNCH-CONTEXT.md`
 
+The suffix keeps the Markdown headings and wraps these four fragments in
+`<SENPAI_HARNESS>`, `<SENPAI_ROLE>`, `<SENPAI_PROGRAM>`, and
+`<SENPAI_LAUNCH_CONTEXT>` sections, in that order.
+
 The runner loads this complete suffix once when the agent process starts and does not refresh it during the session. Optional human operator instructions remain user context.
 
 Target skills are loaded explicitly through OpenHands skill context. Target and runner `AGENTS.md`, `AGENT.md`, or `CLAUDE.md` instruction files are human-facing development context and are not loaded as Senpai project context; the checked-in root `CLAUDE.md` links to this canonical guide.
