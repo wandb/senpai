@@ -18,7 +18,7 @@ from typing import Literal, Protocol
 from uuid import UUID
 
 from senpai_agent.agent_markdown import strip_spdx_header
-from senpai_agent.github.mailbox import ActiveGitHubWatcher, GitHubMailbox
+from senpai_agent.github.mailbox import GitHubMailbox, GitHubMailboxWatcher
 from senpai_agent.inbox import (
     EXACT_ONCE_EVENT_KINDS,
     QUEUE_PRIORITY,
@@ -58,6 +58,7 @@ from senpai_agent.state import (
 )
 from senpai_agent.supervisor import LEASE_ENV, ProgressLease
 from senpai_agent.workspace import StudentWorkspaceReconciler, WorkspaceDivergence
+from senpai_agent.wake import WakeCoordinator
 
 
 _EDGE_TRIGGERED_EVENT_KINDS = EXACT_ONCE_EVENT_KINDS | {
@@ -248,8 +249,7 @@ class OpenHandsTurnRunner:
         config: object,
         *,
         full_prompt: str,
-        github_mailbox: Mailbox | None = None,
-        active_poll_interval_seconds: float = 75,
+        github_watcher: GitHubMailboxWatcher | None = None,
         on_activity: Callable[[], None] | None = None,
         on_inference_state: (
             Callable[[float | None, float | None], None] | None
@@ -257,8 +257,7 @@ class OpenHandsTurnRunner:
     ):
         self.config = config
         self.full_prompt = full_prompt.strip()
-        self.github_mailbox = github_mailbox
-        self.active_poll_interval_seconds = active_poll_interval_seconds
+        self.github_watcher = github_watcher
         self.on_activity = on_activity
         self.on_inference_state = on_inference_state
 
@@ -296,6 +295,8 @@ class OpenHandsTurnRunner:
                 options["on_activity"] = self.on_activity
             if self.on_inference_state is not None:
                 options["on_inference_state"] = self.on_inference_state
+            if self.github_watcher is not None:
+                options["event_source_error"] = self.github_watcher.error
             return options
 
         def run_turn() -> int:
@@ -326,37 +327,23 @@ class OpenHandsTurnRunner:
                         ) from recovery_error
                     raise
 
-        if self.github_mailbox is None:
+        if self.github_watcher is None:
             return TurnResult(exit_code=run_turn())
 
         store_path = local_event_db_path(config)
-        map_event = None
-        if config.role == "student":
-            registry = AssignmentConversationRegistry(
-                config.state_dir / "student-conversations.json"
-            )
-            map_event = partial(
-                _student_live_event,
-                conversation_id=conversation_id,
-                registry=registry,
-            )
-
         # A late watcher event may still be pending locally when the next
         # controller prompt carries that same GitHub event. The prompt is the
         # delivery path for this turn, so keep the event pump from repeating it.
         with LocalEventStore(store_path) as store:
             for event_key in event_keys:
                 store.acknowledge(event_key)
-        with ActiveGitHubWatcher(
-            self.github_mailbox,
-            store_path,
-            known_keys=visible_event_keys | event_keys,
-            poll_interval_seconds=self.active_poll_interval_seconds,
-            map_event=map_event,
-        ) as watcher:
+        with self.github_watcher.bind_active(
+            conversation_id,
+            visible_event_keys=visible_event_keys | event_keys,
+        ) as active:
             exit_code = run_turn()
         with LocalEventStore(store_path) as store:
-            delivered = store.acknowledged(tuple(watcher.enqueued_keys))
+            delivered = store.acknowledged(tuple(active.enqueued_keys))
         return TurnResult(
             exit_code=exit_code,
             delivered_event_keys=frozenset(delivered),
@@ -365,16 +352,17 @@ class OpenHandsTurnRunner:
 
 def _student_live_event(
     event: ControllerEvent,
+    conversation_id: object,
     *,
-    conversation_id: UUID,
     registry: AssignmentConversationRegistry,
 ) -> LocalEvent | None:
+    active_conversation_id = UUID(str(conversation_id))
     if event.kind == "student_pr_feedback":
         target = registry.for_assignment(
             str(event.payload["assignment_id"]),
             str(event.payload["revision_id"]),
         )
-        if target != conversation_id:
+        if target != active_conversation_id:
             return None
     elif event.kind != "human_issue":
         return None
@@ -383,13 +371,13 @@ def _student_live_event(
         dedupe_key=event.dedupe_key,
         payload={
             **event.payload,
-            "parent_conversation_id": str(conversation_id),
+            "parent_conversation_id": str(active_conversation_id),
         },
     )
 
 
 class Controller:
-    """Poll, reconcile, run one turn, and immediately verify GitHub again."""
+    """Reconcile cached events, run ready turns, and request fresh snapshots."""
 
     def __init__(
         self,
@@ -415,8 +403,11 @@ class Controller:
         launch_gate_path: Path | None = None,
         start_gate_poll_seconds: float = 30,
         sleep: Callable[[float], None] = time.sleep,
-        poll_interval_seconds: float = 600,
+        poll_interval_seconds: float = 300,
         jitter_seconds: float = 120,
+        wake: WakeCoordinator | None = None,
+        monitor_mailbox: MonitorMailbox | None = None,
+        request_mailbox_refresh: Callable[[], None] | None = None,
     ):
         if min(poll_interval_seconds, jitter_seconds) < 0:
             raise ValueError("poll and jitter intervals must not be negative")
@@ -447,6 +438,9 @@ class Controller:
         self.sleep = sleep
         self.poll_interval_seconds = poll_interval_seconds
         self.jitter_seconds = jitter_seconds
+        self.wake = wake
+        self.monitor_mailbox = monitor_mailbox
+        self.request_mailbox_refresh = request_mailbox_refresh
         self.event_reminder_seconds = (
             max(poll_interval_seconds, 600)
             if event_reminder_seconds is None
@@ -475,9 +469,20 @@ class Controller:
             )
         cycles = 0
         turn_failures: dict[UUID, int] = {}
+        startup_training_ids = (
+            tuple(spec.training_id for spec in self.monitor_mailbox.store.active())
+            if self.monitor_mailbox is not None
+            else ()
+        )
+        if self.wake is not None:
+            for training_id in startup_training_ids:
+                self.wake.training_finished(training_id)
+            startup_training_ids = ()
         while max_cycles is None or cycles < max_cycles:
+            wake_checkpoint = self.wake.checkpoint() if self.wake is not None else 0
             self._acknowledge_processed_turns()
-            self._poll_into_inbox()
+            self._poll_into_inbox(training_ids=startup_training_ids)
+            startup_training_ids = ()
             cycle_had_failure = False
             failed_conversations: set[UUID] = set()
             served_conversations: set[UUID] = set()
@@ -596,6 +601,8 @@ class Controller:
                 self._acknowledge_processed_turns()
                 turn_failures.pop(conversation_id, None)
                 served_conversations.add(conversation_id)
+                if self.request_mailbox_refresh is not None:
+                    self.request_mailbox_refresh()
                 self._poll_into_inbox(allow_reminders=False)
             cycles += 1
             if max_cycles is not None and cycles >= max_cycles:
@@ -609,7 +616,12 @@ class Controller:
                     self.poll_interval_seconds,
                     2 ** min(longest_streak, 8),
                 )
-                self._sleep("turn-backoff", delay)
+                self._sleep(
+                    "turn-backoff",
+                    delay,
+                    wake_checkpoint,
+                    wakeable=False,
+                )
                 continue
             normal_delay = self.poll_interval_seconds + random.uniform(
                 0,
@@ -619,9 +631,9 @@ class Controller:
             if provider_delay is not None and (
                 normal_delay <= 0 or provider_delay < normal_delay
             ):
-                self._sleep("provider-cooldown", provider_delay)
+                self._sleep("provider-cooldown", provider_delay, wake_checkpoint)
             else:
-                self._sleep("sleep", normal_delay)
+                self._sleep("sleep", normal_delay, wake_checkpoint)
 
     def _provider_cooldown_remaining(self) -> float | None:
         cooldown = self.inbox.provider_cooldown()
@@ -630,10 +642,51 @@ class Controller:
         remaining = cooldown.retry_at - time.time()
         return remaining if remaining > 0 else None
 
-    def _poll_into_inbox(self, *, allow_reminders: bool = True) -> None:
+    def _poll_into_inbox(
+        self,
+        *,
+        allow_reminders: bool = True,
+        training_ids: Sequence[str] = (),
+    ) -> None:
         self._publish_progress("poll")
+        terminal_ids = tuple(training_ids)
+        pending_training_hints = ()
+        if self.wake is not None:
+            pending_training_hints = self.wake.training_hints()
+            terminal_ids = tuple(
+                dict.fromkeys(
+                    (
+                        *terminal_ids,
+                        *(hint.training_id for hint in pending_training_hints),
+                    )
+                )
+            )
         try:
-            polled = self.mailbox.poll()
+            forced_poll = (
+                self.monitor_mailbox.poll_terminal(terminal_ids)
+                if self.monitor_mailbox is not None and terminal_ids
+                else None
+            )
+            forced = () if forced_poll is None else forced_poll.items
+            if self.wake is not None and pending_training_hints:
+                resolved = (
+                    frozenset()
+                    if forced_poll is None
+                    else forced_poll.resolved_training_ids
+                )
+                self.wake.acknowledge_training(
+                    tuple(
+                        hint
+                        for hint in pending_training_hints
+                        if hint.training_id in resolved
+                    )
+                )
+            polled = tuple(
+                {
+                    event.dedupe_key: event
+                    for event in (*forced, *self.mailbox.poll())
+                }.values()
+            )
         except Exception as error:  # noqa: BLE001
             if allow_reminders:
                 raise
@@ -809,12 +862,29 @@ class Controller:
                 completed_turn=completed_turn,
             )
 
-    def _sleep(self, phase: str, seconds: float) -> None:
+    def _sleep(
+        self,
+        phase: str,
+        seconds: float,
+        wake_checkpoint: int,
+        *,
+        wakeable: bool = True,
+    ) -> None:
+        monitor_delay = (
+            self.monitor_mailbox.seconds_until_next_poll()
+            if wakeable and self.monitor_mailbox is not None
+            else None
+        )
+        if monitor_delay is not None:
+            seconds = min(seconds, monitor_delay)
         self._publish_progress(
             phase,
             max(seconds + self.operation_timeout_seconds, 1),
         )
-        self.sleep(seconds)
+        if self.wake is None or not wakeable:
+            self.sleep(seconds)
+        else:
+            self.wake.wait(wake_checkpoint, timeout_seconds=seconds)
 
     def _has_started(self, conversation_id: UUID) -> bool:
         return conversation_id in self._started or (
@@ -978,6 +1048,7 @@ def controller_main(
         runner_config.state_dir / "delivery-inbox.sqlite3",
         legacy_path=runner_config.state_dir / "pending-message-deliveries.json",
     )
+    wake = WakeCoordinator()
     github_mailbox = GitHubMailbox(
         repo=runner_config.github_repo,
         token=runner_config.github_token,
@@ -994,43 +1065,66 @@ def controller_main(
             else None
         ),
     )
-    mailbox: Mailbox = github_mailbox
-    active_github_mailbox: Mailbox = github_mailbox
+    registry = (
+        AssignmentConversationRegistry(
+            runner_config.state_dir / "student-conversations.json"
+        )
+        if role == "student"
+        else None
+    )
+    github_watcher = GitHubMailboxWatcher(
+        github_mailbox,
+        runner_config.state_dir / f"{role}-events.sqlite3",
+        coordinator=wake,
+        poll_interval_seconds=_role_interval(
+            env,
+            role,
+            "POLL_INTERVAL_S",
+            300,
+        ),
+        map_event=(
+            partial(_student_live_event, registry=registry)
+            if registry is not None
+            else None
+        ),
+    )
+    mailbox: Mailbox = github_watcher
     conversation_selector = None
     reconcile = None
+    monitor_mailbox = None
 
     if role == "advisor":
         advisor_event_store = runner_config.state_dir / "advisor-events.sqlite3"
-        active_github_mailbox = StudentAssignmentAvailabilityMailbox(
-            github_mailbox,
+        reconciled_github = StudentAssignmentAvailabilityMailbox(
+            github_watcher,
             inbox=inbox,
             conversation_id=runner_config.conversation_id,
             event_store_path=advisor_event_store,
         )
         mailbox = CompositeMailbox(
-            active_github_mailbox,
+            reconciled_github,
             LocalAdvisorMailbox(advisor_event_store),
         )
     else:
         training, monitor_store = training_runtime(
             runner_config.workspace,
             runner_config.state_dir / "training",
+            on_terminal=wake.training_finished,
         )
         metrics = WandbMetricSource(
             env["WANDB_ENTITY"],
             env["WANDB_PROJECT"],
         )
+        monitor_mailbox = MonitorMailbox(
+            TrainingMonitorEngine(monitor_store, training, metrics),
+            monitor_store,
+        )
         mailbox = CompositeMailbox(
-            github_mailbox,
+            github_watcher,
             LocalStudentMailbox(runner_config.state_dir / "student-events.sqlite3"),
-            MonitorMailbox(
-                TrainingMonitorEngine(monitor_store, training, metrics),
-                monitor_store,
-            ),
+            monitor_mailbox,
         )
-        registry = AssignmentConversationRegistry(
-            runner_config.state_dir / "student-conversations.json"
-        )
+        assert registry is not None
         conversation_selector = StudentConversationSelector(registry)
         reconcile = StudentWorkspaceReconciler(
             runner_config.workspace,
@@ -1043,10 +1137,7 @@ def controller_main(
     turns = OpenHandsTurnRunner(
         runner_config,
         full_prompt=full_prompt,
-        github_mailbox=active_github_mailbox,
-        active_poll_interval_seconds=float(
-            env.get("SENPAI_ACTIVE_GITHUB_POLL_INTERVAL_S", "75")
-        ),
+        github_watcher=github_watcher,
         on_activity=(
             _activity_lease(progress, turn_lease_seconds)
             if progress is not None
@@ -1103,7 +1194,7 @@ def controller_main(
             env,
             role,
             "POLL_INTERVAL_S",
-            600,
+            300,
         ),
         jitter_seconds=_role_interval(
             env,
@@ -1111,6 +1202,9 @@ def controller_main(
             "POLL_JITTER_S",
             120,
         ),
+        wake=wake,
+        monitor_mailbox=monitor_mailbox,
+        request_mailbox_refresh=github_watcher.request_refresh,
     )
 
     def interrupt(_signum: int, _frame: object) -> None:
@@ -1121,7 +1215,8 @@ def controller_main(
         for signum in (signal.SIGTERM, signal.SIGINT)
     }
     try:
-        controller.run()
+        with github_watcher:
+            controller.run()
     except KeyboardInterrupt:
         return 0
     finally:

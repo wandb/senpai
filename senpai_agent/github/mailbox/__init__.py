@@ -1,6 +1,6 @@
 """GitHub-backed controller mailbox."""
 
 from .core import GitHubMailbox
-from .watcher import ActiveGitHubWatcher
+from .watcher import GitHubMailboxWatcher
 
-__all__ = ["ActiveGitHubWatcher", "GitHubMailbox"]
+__all__ = ["GitHubMailbox", "GitHubMailboxWatcher"]

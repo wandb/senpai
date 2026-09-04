@@ -1022,6 +1022,46 @@ def test_event_pump_failure_after_arming_interrupts_again_when_the_run_starts(
     assert conversation.interrupts == 1
 
 
+def test_external_event_source_failure_interrupts_the_active_run(tmp_path: Path):
+    conversation = SteeringConversation()
+    failure: list[BaseException] = []
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
+        pump = AdvisorEventPump(
+            store,
+            conversation,
+            poll_interval=0.01,
+            failure_source=lambda: failure[-1] if failure else None,
+        )
+        assert pump.prepare_run()
+        with pytest.raises(RuntimeError, match="watcher failed"):
+            with pump:
+                pump.run_started()
+                failure.append(RuntimeError("watcher failed"))
+                assert conversation.interrupted.wait(1)
+
+    assert conversation.interrupts == 1
+
+
+def test_external_event_source_failure_does_not_mask_a_primary_error(
+    tmp_path: Path,
+):
+    conversation = SteeringConversation()
+    failure = RuntimeError("watcher failed")
+    with LocalEventStore(tmp_path / "events.sqlite3") as store:
+        pump = AdvisorEventPump(
+            store,
+            conversation,
+            poll_interval=0.01,
+            failure_source=lambda: failure,
+        )
+        assert pump.prepare_run()
+        with pytest.raises(ValueError, match="primary turn failure"):
+            with pump:
+                pump.run_started()
+                assert conversation.interrupted.wait(1)
+                raise ValueError("primary turn failure")
+
+
 def test_event_pump_surfaces_a_mid_batch_failure_without_boundary_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1,5 +1,7 @@
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -24,13 +26,15 @@ from senpai_agent.controller import (
     OpenHandsTurnRunner,
     _context_recovery_prompt,
     _provider_failure,
+    _student_live_event,
 )
 from senpai_agent.github.http import GitHubReadError
-from senpai_agent.github.mailbox import ActiveGitHubWatcher
+from senpai_agent.github.mailbox import GitHubMailboxWatcher
 from senpai_agent.inbox import DeliveryState, PersistentInbox, deliver_turn_messages
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.state import AssignmentConversationRegistry
+from senpai_agent.wake import WakeCoordinator
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,29 @@ class Mailbox:
 
     def poll(self):
         return self.events
+
+    def acknowledge(self, _dedupe_keys):
+        return
+
+
+@contextmanager
+def watched_mailbox(config, mailbox):
+    map_event = None
+    if config.role == "student":
+        registry = AssignmentConversationRegistry(
+            config.state_dir / "student-conversations.json"
+        )
+        map_event = partial(_student_live_event, registry=registry)
+    watcher = GitHubMailboxWatcher(
+        mailbox,
+        config.state_dir
+        / ("student-events.sqlite3" if config.role == "student" else "advisor-events.sqlite3"),
+        coordinator=WakeCoordinator(),
+        poll_interval_seconds=0.001,
+        map_event=map_event,
+    )
+    with watcher:
+        yield watcher
 
 
 def feedback_event(revision_id="revision-2"):
@@ -174,6 +201,34 @@ def test_turn_runner_passes_the_inference_state_out_of_band(
     assert observed == [(1_755_000_000.0, 1_755_000_001.0)]
 
 
+def test_turn_runner_passes_the_watcher_failure_source_to_openhands(
+    tmp_path: Path,
+    monkeypatch,
+):
+    conversation_id = UUID("00000000-0000-0000-0000-000000000095")
+    observed = []
+
+    def run_openhands(_prompt, _config, *, event_source_error):
+        observed.append(event_source_error())
+        return 0
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+    config = Config("advisor", tmp_path / "state", conversation_id)
+    with watched_mailbox(config, Mailbox(())) as watcher:
+        result = OpenHandsTurnRunner(
+            config,
+            full_prompt="complete current controller context",
+            github_watcher=watcher,
+        ).run(
+            "current actionable event",
+            conversation_id=conversation_id,
+            event_keys=frozenset(),
+        )
+
+    assert result.exit_code == 0
+    assert observed == [None]
+
+
 def test_running_student_receives_only_feedback_bound_to_its_conversation(
     tmp_path: Path,
     monkeypatch,
@@ -187,7 +242,7 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
     other_revision = feedback_event("revision-3")
     messages = []
 
-    def run_openhands(_prompt, config):
+    def run_openhands(_prompt, config, *, event_source_error):
         class Conversation:
             def send_message(self, message):
                 messages.append(message)
@@ -199,6 +254,7 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
             Conversation(),
             poll_interval=0.001,
             parent_conversation_id=str(config.conversation_id),
+            failure_source=event_source_error,
         ):
             deadline = time.monotonic() + 1
             while not messages and time.monotonic() < deadline:
@@ -207,16 +263,17 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
 
     monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
 
-    result = OpenHandsTurnRunner(
-        Config("student", state_dir, conversation_id),
-        full_prompt="student initial controller context",
-        github_mailbox=Mailbox((current, other_revision)),
-        active_poll_interval_seconds=0.001,
-    ).run(
-        "current student turn",
-        conversation_id=conversation_id,
-        event_keys=frozenset(),
-    )
+    config = Config("student", state_dir, conversation_id)
+    with watched_mailbox(config, Mailbox((current, other_revision))) as watcher:
+        result = OpenHandsTurnRunner(
+            config,
+            full_prompt="student initial controller context",
+            github_watcher=watcher,
+        ).run(
+            "current student turn",
+            conversation_id=conversation_id,
+            event_keys=frozenset(),
+        )
 
     assert len(messages) == 1
     assert "Feedback for revision-2." in messages[0]
@@ -240,7 +297,8 @@ def test_observed_student_input_routes_to_the_active_pump_until_it_is_delivered(
     conversation_id = registry.for_assignment("assignment-17", "revision-2")
     store_path = state_dir / "student-events.sqlite3"
 
-    def run_openhands(_prompt, _config):
+    def run_openhands(_prompt, _config, *, event_source_error):
+        assert event_source_error() is None
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
             with LocalEventStore(store_path) as store:
@@ -251,16 +309,17 @@ def test_observed_student_input_routes_to_the_active_pump_until_it_is_delivered(
 
     monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
 
-    result = OpenHandsTurnRunner(
-        Config("student", state_dir, conversation_id),
-        full_prompt="student initial controller context",
-        github_mailbox=Mailbox((incoming,)),
-        active_poll_interval_seconds=0.001,
-    ).run(
-        "student turn",
-        conversation_id=conversation_id,
-        event_keys=frozenset(),
-    )
+    config = Config("student", state_dir, conversation_id)
+    with watched_mailbox(config, Mailbox((incoming,))) as watcher:
+        result = OpenHandsTurnRunner(
+            config,
+            full_prompt="student initial controller context",
+            github_watcher=watcher,
+        ).run(
+            "student turn",
+            conversation_id=conversation_id,
+            event_keys=frozenset(),
+        )
 
     assert result.delivered_event_keys == frozenset()
     with LocalEventStore(store_path) as store:
@@ -296,7 +355,7 @@ def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
         )
     messages = []
 
-    def run_openhands(_prompt, config):
+    def run_openhands(_prompt, config, *, event_source_error):
         class Conversation:
             def send_message(self, message):
                 messages.append(message)
@@ -306,22 +365,24 @@ def test_prompt_delivery_suppresses_a_late_duplicate_watcher_event(
             Conversation(),
             poll_interval=0.001,
             parent_conversation_id=str(config.conversation_id),
+            failure_source=event_source_error,
         ):
             time.sleep(0.01)
         return 0
 
     monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
 
-    result = OpenHandsTurnRunner(
-        Config("student", state_dir, conversation_id),
-        full_prompt="student initial controller context",
-        github_mailbox=Mailbox((feedback,)),
-        active_poll_interval_seconds=0.001,
-    ).run(
-        feedback.to_prompt(),
-        conversation_id=conversation_id,
-        event_keys=frozenset({feedback.dedupe_key}),
-    )
+    config = Config("student", state_dir, conversation_id)
+    with watched_mailbox(config, Mailbox((feedback,))) as watcher:
+        result = OpenHandsTurnRunner(
+            config,
+            full_prompt="student initial controller context",
+            github_watcher=watcher,
+        ).run(
+            feedback.to_prompt(),
+            conversation_id=conversation_id,
+            event_keys=frozenset({feedback.dedupe_key}),
+        )
 
     assert messages == []
     assert result.delivered_event_keys == frozenset()
@@ -340,7 +401,7 @@ def test_full_visible_set_suppresses_events_handled_in_an_earlier_turn(
     store_path = state_dir / "advisor-events.sqlite3"
     messages = []
 
-    def run_openhands(_prompt, _config):
+    def run_openhands(_prompt, _config, *, event_source_error):
         class Conversation:
             def send_message(self, message):
                 messages.append(message)
@@ -349,25 +410,27 @@ def test_full_visible_set_suppresses_events_handled_in_an_earlier_turn(
             store,
             Conversation(),
             poll_interval=0.001,
+            failure_source=event_source_error,
         ):
             time.sleep(0.01)
         return 0
 
     monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
 
-    result = OpenHandsTurnRunner(
-        Config("advisor", state_dir, conversation_id),
-        full_prompt="advisor initial controller context",
-        github_mailbox=Mailbox((handled, current)),
-        active_poll_interval_seconds=0.001,
-    ).run(
-        current.to_prompt(),
-        conversation_id=conversation_id,
-        event_keys=frozenset({current.dedupe_key}),
-        visible_event_keys=frozenset(
-            {handled.dedupe_key, current.dedupe_key}
-        ),
-    )
+    config = Config("advisor", state_dir, conversation_id)
+    with watched_mailbox(config, Mailbox((handled, current))) as watcher:
+        result = OpenHandsTurnRunner(
+            config,
+            full_prompt="advisor initial controller context",
+            github_watcher=watcher,
+        ).run(
+            current.to_prompt(),
+            conversation_id=conversation_id,
+            event_keys=frozenset({current.dedupe_key}),
+            visible_event_keys=frozenset(
+                {handled.dedupe_key, current.dedupe_key}
+            ),
+        )
 
     assert messages == []
     assert result.delivered_event_keys == frozenset()
@@ -393,22 +456,24 @@ def test_acknowledged_store_rows_are_not_reported_as_this_turn_deliveries(
         )
         store.acknowledge(handled.dedupe_key)
 
-    def run_openhands(_prompt, _config):
+    def run_openhands(_prompt, _config, *, event_source_error):
+        assert event_source_error() is None
         time.sleep(0.01)
         return 0
 
     monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
 
-    result = OpenHandsTurnRunner(
-        Config("advisor", state_dir, conversation_id),
-        full_prompt="advisor initial controller context",
-        github_mailbox=Mailbox((handled,)),
-        active_poll_interval_seconds=0.001,
-    ).run(
-        "current advisor turn",
-        conversation_id=conversation_id,
-        event_keys=frozenset(),
-    )
+    config = Config("advisor", state_dir, conversation_id)
+    with watched_mailbox(config, Mailbox((handled,))) as watcher:
+        result = OpenHandsTurnRunner(
+            config,
+            full_prompt="advisor initial controller context",
+            github_watcher=watcher,
+        ).run(
+            "current advisor turn",
+            conversation_id=conversation_id,
+            event_keys=frozenset(),
+        )
 
     assert result.delivered_event_keys == frozenset()
 
@@ -431,26 +496,18 @@ def test_active_watcher_retries_after_a_transient_github_read_error(
 
     mailbox = FlakyMailbox()
     store_path = tmp_path / "advisor-events.sqlite3"
-    with ActiveGitHubWatcher(
+    with GitHubMailboxWatcher(
         mailbox,
         store_path,
-        known_keys=frozenset(),
+        coordinator=WakeCoordinator(),
         poll_interval_seconds=0.001,
     ) as watcher:
         deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            with LocalEventStore(store_path) as store:
-                if store.pending_count():
-                    break
+        while mailbox.calls < 2 and time.monotonic() < deadline:
             time.sleep(0.001)
-        assert watcher.thread.is_alive()
 
-    assert watcher.error is None
     assert mailbox.calls >= 2
-    with LocalEventStore(store_path) as store:
-        assert [pending.dedupe_key for pending in store.pending()] == [
-            event.dedupe_key
-        ]
+    assert watcher.poll() == (event,)
     assert "SENPAI_GITHUB_WATCHER_POLL_ERROR" in capsys.readouterr().err
 
 
@@ -471,18 +528,22 @@ def test_active_watcher_does_not_queue_student_availability(tmp_path: Path):
 
     mailbox = Mailbox()
     store_path = tmp_path / "advisor-events.sqlite3"
-    with ActiveGitHubWatcher(
+    with GitHubMailboxWatcher(
         mailbox,
         store_path,
-        known_keys=frozenset(),
+        coordinator=WakeCoordinator(),
         poll_interval_seconds=0.001,
     ) as watcher:
-        deadline = time.monotonic() + 1
-        while mailbox.calls < 2 and time.monotonic() < deadline:
-            time.sleep(0.001)
+        with watcher.bind_active(
+            UUID("00000000-0000-0000-0000-000000000019"),
+            visible_event_keys=frozenset(),
+        ) as active:
+            deadline = time.monotonic() + 1
+            while mailbox.calls < 2 and time.monotonic() < deadline:
+                time.sleep(0.001)
 
     assert mailbox.calls >= 2
-    assert watcher.enqueued_keys == set()
+    assert active.enqueued_keys == set()
     with LocalEventStore(store_path) as store:
         assert store.pending() == []
 

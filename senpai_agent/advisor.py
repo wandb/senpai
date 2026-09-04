@@ -99,6 +99,7 @@ class AdvisorEventPump:
         inbox: PersistentInbox | None = None,
         conversation_id: str | uuid.UUID | None = None,
         steering_grace_seconds: float = _STEERING_GRACE_SECONDS,
+        failure_source: Callable[[], BaseException | None] | None = None,
     ):
         self._store = store
         self._conversation = conversation
@@ -111,6 +112,7 @@ class AdvisorEventPump:
             else None
         )
         self._steering_grace_seconds = steering_grace_seconds
+        self._failure_source = failure_source
         if inbox is not None:
             if conversation_id is None:
                 raise ValueError("inbox event pump requires a conversation ID")
@@ -142,6 +144,10 @@ class AdvisorEventPump:
     def _run(self) -> None:
         try:
             while not self._stop.is_set():
+                if self._failure_source is not None:
+                    failure = self._failure_source()
+                    if failure is not None:
+                        raise failure
                 if self._store.pending_count():
                     self._deliver_if_safe()
                 self._stop.wait(self._poll_interval)
@@ -438,8 +444,8 @@ class AdvisorEventPump:
             ):
                 for key in sorted(self._delivered_event_keys):
                     self._store.acknowledge(key)
-        if self._error is not None and _exc is not self._error:
-            raise self._error from _exc
+        if self._error is not None and _exc is None:
+            raise self._error
 
     def _clear_queued_feedback_marker(self) -> None:
         if self._queued_feedback_marker is not None:

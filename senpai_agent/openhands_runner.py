@@ -1590,6 +1590,7 @@ def run_openhands(
     on_inference_state: (
         Callable[[float | None, float | None], None] | None
     ) = None,
+    event_source_error: Callable[[], BaseException | None] | None = None,
 ) -> int:
     if (inbox is None) != (inbox_turn_id is None):
         raise ValueError("inbox and inbox_turn_id must be provided together")
@@ -1898,6 +1899,7 @@ def run_openhands(
                             ),
                             inbox=inbox,
                             conversation_id=config.conversation_id,
+                            failure_source=event_source_error,
                         )
                         with event_pump:
                             run_steerable_conversation(

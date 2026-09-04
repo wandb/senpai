@@ -193,14 +193,20 @@ def test_restart_does_not_signal_a_reused_pid(tmp_path: Path):
         log_path=str(state_dir / "orphan.log"),
     )
     (state_dir / f"{orphan.training_id}.json").write_text(orphan.model_dump_json())
+    notified = []
 
     try:
-        supervisor = TrainingSupervisor(workspace=workspace, state_dir=state_dir)
+        supervisor = TrainingSupervisor(
+            workspace=workspace,
+            state_dir=state_dir,
+            on_terminal=notified.append,
+        )
 
         recovered = supervisor.get_training_status(orphan.training_id)
         assert recovered.state is TrainingState.CANCELLED
         assert "no signal was sent" in recovered.error_tail
         assert unrelated.is_running()
+        assert notified == [orphan.training_id]
     finally:
         unrelated.send_signal(signal.SIGKILL)
         unrelated.wait()

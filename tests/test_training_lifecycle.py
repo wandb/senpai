@@ -1,8 +1,9 @@
+import threading
 from pathlib import Path
 
 import pytest
 
-from senpai_agent.training import TrainingState, TrainingSupervisor
+from senpai_agent.training import TrainingResult, TrainingState, TrainingSupervisor
 from training_test_support import (
     assert_process_stopped,
     make_supervisor,
@@ -33,6 +34,42 @@ def test_finished_training_persists_its_result_and_log(tmp_path: Path):
     assert terminal.wandb_run_ids == ("run-123",)
     assert Path(terminal.log_path).read_text().strip().endswith("/runs/run-123")
     assert reopened == terminal
+
+
+def test_terminal_notification_follows_the_committed_result(tmp_path: Path):
+    committed: list[TrainingResult] = []
+
+    def on_terminal(training_id: str) -> None:
+        result_path = tmp_path / "state" / f"{training_id}.json"
+        committed.append(TrainingResult.model_validate_json(result_path.read_text()))
+
+    workspace, supervisor = make_supervisor(tmp_path, on_terminal=on_terminal)
+    running = run_python(supervisor, workspace, "pass")
+
+    terminal = wait_for_terminal(supervisor, running.training_id)
+    supervisor.drain()
+
+    assert committed == [terminal]
+
+
+def test_terminal_notification_failure_is_harmless(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    escaped = []
+    monkeypatch.setattr(threading, "excepthook", escaped.append)
+
+    def on_terminal(_training_id: str) -> None:
+        raise RuntimeError("notification transport failed")
+
+    workspace, supervisor = make_supervisor(tmp_path, on_terminal=on_terminal)
+    running = run_python(supervisor, workspace, "pass")
+
+    supervisor.drain()
+    terminal = supervisor.get_training_status(running.training_id)
+
+    assert terminal.state is TrainingState.FINISHED
+    assert escaped == []
 
 
 def test_recovery_ignores_non_training_json_sidecars(tmp_path: Path):
