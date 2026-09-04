@@ -25,6 +25,11 @@ from senpai_agent.launch_context import (
     load_operator_instructions,
     render_launch_context,
 )
+from senpai_agent.model_transport import (
+    model_api_mode,
+    model_base_url,
+    model_extra_headers,
+)
 from senpai_agent.program_context import PROGRAM_PATH_ENV, normalize_program_path
 from senpai_agent.secrets import validate_custom_secret_env_names
 
@@ -102,6 +107,11 @@ class Args:
     fast_reasoning_effort: str = "medium"
     frontier_model: str = "anthropic/claude-fable-5-1"
     frontier_reasoning_effort: str = "max"
+    model_base_url: str = ""  # optional shared OpenHands/LiteLLM API base
+    model_api_mode: str = (
+        ""  # blank keeps provider defaults; auto/chat/responses override
+    )
+    model_extra_headers_env: str = ""  # env/.env name containing a JSON header object
     compaction_trigger_tokens: int = 200_000
     human_issues: bool = (
         True  # allow human GitHub issue triage; disable for isolated launches
@@ -195,6 +205,20 @@ def _supports_openai_pro(model: str) -> bool:
 def validate_model_config(args: Args) -> None:
     if args.compaction_trigger_tokens < 50_000:
         sys.exit("ERROR: --compaction_trigger_tokens must be at least 50000")
+    try:
+        args.model_base_url = model_base_url(args.model_base_url) or ""
+        args.model_api_mode = model_api_mode(args.model_api_mode) or ""
+        if args.model_extra_headers_env:
+            validate_custom_secret_env_names([args.model_extra_headers_env])
+    except ValueError as error:
+        sys.exit(f"ERROR: {error}")
+    if args.model_extra_headers_env and not args.model_base_url:
+        sys.exit("ERROR: model_extra_headers_env requires model_base_url")
+    if args.model_extra_headers_env in args.custom_secret_env_names:
+        sys.exit(
+            "ERROR: model_extra_headers_env must not also be listed in "
+            "custom_secret_env_names"
+        )
     profiles = {
         "student": (args.student_model, args.student_reasoning_effort),
         "smart": (args.smart_model, args.smart_reasoning_effort),
@@ -245,6 +269,9 @@ def role_model_config(args: Args, role: str) -> dict[str, str]:
         "SENPAI_OPENHANDS_FAST_REASONING_EFFORT": args.fast_reasoning_effort,
         "SENPAI_OPENHANDS_FRONTIER_MODEL": args.frontier_model,
         "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": args.frontier_reasoning_effort,
+        "SENPAI_OPENHANDS_BASE_URL": args.model_base_url,
+        "SENPAI_OPENHANDS_API_MODE": args.model_api_mode,
+        "SENPAI_OPENHANDS_EXTRA_HEADERS_ENV": args.model_extra_headers_env,
         "SENPAI_COMPACTION_TRIGGER_TOKENS": str(args.compaction_trigger_tokens),
     }
 
@@ -268,7 +295,10 @@ def secret_env_refs(
 
 def model_secret_env_refs(args: Args, role: str) -> list[tuple[str, str]]:
     providers = sorted(configured_model_providers(args, role) - {"wandb"})
-    return [MODEL_PROVIDERS[provider] for provider in providers]
+    references = [MODEL_PROVIDERS[provider] for provider in providers]
+    if args.model_extra_headers_env:
+        references.append((args.model_extra_headers_env, args.model_extra_headers_env))
+    return references
 
 
 def validate_timing_args(args: Args) -> None:
@@ -561,14 +591,24 @@ def main():
         student_list = [f"{args.student_prefix}-{name}" for name in student_list]
 
     model_providers = deployed_model_providers(args)
+    model_transport_override = bool(args.model_base_url)
+    launch_secret_env_names = [*args.custom_secret_env_names]
+    if args.model_extra_headers_env:
+        launch_secret_env_names.append(args.model_extra_headers_env)
     github_token = exa_api_key = wandb_api_key = ""
     provider_api_keys: dict[str, str] = {}
     custom_secrets: dict[str, str] = {}
     if not args.dry_run or args.preflight_only:
-        custom_secrets = resolve_custom_secrets(
-            DOTENV_PATH, args.custom_secret_env_names
-        )
-        github_token = resolve_github_token(DOTENV_PATH, args.custom_secret_env_names)
+        custom_secrets = resolve_custom_secrets(DOTENV_PATH, launch_secret_env_names)
+        if args.model_extra_headers_env:
+            try:
+                model_extra_headers(
+                    custom_secrets[args.model_extra_headers_env],
+                    source=args.model_extra_headers_env,
+                )
+            except ValueError as error:
+                sys.exit(f"ERROR: {error}")
+        github_token = resolve_github_token(DOTENV_PATH, launch_secret_env_names)
         if "anthropic" in model_providers:
             provider_api_keys["anthropic"] = resolve_anthropic_api_key(DOTENV_PATH)
         if "openai" in model_providers:
@@ -587,20 +627,32 @@ def main():
             student_list,
             args.advisor_branch,
         )
-        if anthropic_api_key := provider_api_keys.get("anthropic"):
-            preflight_check_anthropic_api_key(anthropic_api_key)
-        if openai_api_key := provider_api_keys.get("openai"):
-            preflight_check_openai_api_key(openai_api_key)
-        if "wandb" in model_providers:
-            preflight_check_wandb_inference(
-                wandb_api_key,
-                args.wandb_entity,
-                args.wandb_project,
+        if model_transport_override:
+            print(
+                "Preflight: custom model transport configured; skipping direct "
+                "provider authentication checks"
             )
+        else:
+            if anthropic_api_key := provider_api_keys.get("anthropic"):
+                preflight_check_anthropic_api_key(anthropic_api_key)
+            if openai_api_key := provider_api_keys.get("openai"):
+                preflight_check_openai_api_key(openai_api_key)
+            if "wandb" in model_providers:
+                preflight_check_wandb_inference(
+                    wandb_api_key,
+                    args.wandb_entity,
+                    args.wandb_project,
+                )
         preflight_check_exa_api_key(exa_api_key)
         preflight_check_wandb_api_key(wandb_api_key)
         if args.preflight_only:
-            print("Preflight OK — credentials and target repo access verified.")
+            if model_transport_override:
+                print(
+                    "Preflight OK — target access and non-model credentials "
+                    "verified; custom model transport validated locally."
+                )
+            else:
+                print("Preflight OK — credentials and target repo access verified.")
             return
 
     if not args.dry_run:
@@ -625,7 +677,7 @@ def main():
             for provider in model_providers
         }
         custom_secrets = {
-            name: f"<REDACTED_{name}>" for name in args.custom_secret_env_names
+            name: f"<REDACTED_{name}>" for name in launch_secret_env_names
         }
     launch_secret = render_launch_secret(
         args.tag,

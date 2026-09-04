@@ -136,6 +136,35 @@ def test_preflight_resolves_custom_secrets(monkeypatch):
     ]
 
 
+def test_custom_model_transport_skips_public_provider_authentication(
+    monkeypatch, capsys
+):
+    args = launch_args(
+        preflight_only=True,
+        model_base_url="https://gateway.example/v1",
+        model_api_mode="chat",
+        model_extra_headers_env="MODEL_GATEWAY_HEADERS",
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "resolve_custom_secrets",
+        lambda _path, names: {name: '{"X-Tenant":"research"}' for name in names},
+    )
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_anthropic_api_key",
+        lambda _key: pytest.fail("custom credentials must not reach Anthropic"),
+    )
+
+    launch.main()
+
+    output = capsys.readouterr().out
+    assert "skipping direct provider authentication checks" in output
+    assert "custom model transport validated locally" in output
+
+
 def test_launch_reports_invalid_custom_secret_names_without_a_traceback(monkeypatch):
     args = launch_args(custom_secret_env_names=["NOT-VALID"])
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)

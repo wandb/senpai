@@ -39,6 +39,9 @@ def test_default_config_exposes_every_model_profile_and_effort():
         "fast_reasoning_effort": "medium",
         "frontier_model": "anthropic/claude-fable-5-1",
         "frontier_reasoning_effort": "max",
+        "model_base_url": "",
+        "model_api_mode": "",
+        "model_extra_headers_env": "",
         "compaction_trigger_tokens": 200_000,
     }.items() <= config.items()
     assert config["program_path"] == ""
@@ -434,6 +437,65 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         assert config["SENPAI_OPENHANDS_FRONTIER_MODEL"] == args.frontier_model
         assert config["SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT"] == "max"
         assert config["SENPAI_COMPACTION_TRIGGER_TOKENS"] == "180000"
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_custom_model_transport_keeps_headers_in_the_launch_secret(role):
+    args = launch_args(
+        model_base_url="https://gateway.example/v1/",
+        model_api_mode="chat",
+        model_extra_headers_env="MODEL_GATEWAY_HEADERS",
+    )
+    launch.validate_model_config(args)
+
+    configmap, deployment, secret = render_role(role, args)
+    config = yaml.safe_load(configmap)["data"]
+    secret_data = yaml.safe_load(secret)["data"]
+    environment = yaml.safe_load(deployment)["spec"]["template"]["spec"][
+        "containers"
+    ][0]["env"]
+
+    assert config["SENPAI_OPENHANDS_BASE_URL"] == "https://gateway.example/v1"
+    assert config["SENPAI_OPENHANDS_API_MODE"] == "chat"
+    assert config["SENPAI_OPENHANDS_EXTRA_HEADERS_ENV"] == "MODEL_GATEWAY_HEADERS"
+    assert "test-route" not in configmap
+    assert base64.b64decode(secret_data["MODEL_GATEWAY_HEADERS"]).decode() == (
+        '{"X-Test-Route": "test-route"}'
+    )
+    assert {
+        item["name"]: item["valueFrom"]["secretKeyRef"]
+        for item in environment
+        if item["name"] == "MODEL_GATEWAY_HEADERS"
+    } == {
+        "MODEL_GATEWAY_HEADERS": {
+            "name": "senpai-launch-secrets-test-track",
+            "key": "MODEL_GATEWAY_HEADERS",
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"model_base_url": "gateway.example/v1"}, "absolute HTTP"),
+        ({"model_api_mode": "completions"}, "must be one of"),
+        (
+            {"model_extra_headers_env": "MODEL_HEADERS"},
+            "requires model_base_url",
+        ),
+        (
+            {
+                "model_base_url": "https://gateway.example/v1",
+                "model_extra_headers_env": "MODEL_HEADERS",
+                "custom_secret_env_names": ["MODEL_HEADERS"],
+            },
+            "must not also be listed",
+        ),
+    ],
+)
+def test_launch_rejects_invalid_model_transport(overrides, message):
+    with pytest.raises(SystemExit, match=message):
+        launch.validate_model_config(launch_args(**overrides))
 
 
 def test_launch_rejects_a_compaction_trigger_below_provider_minimum():
