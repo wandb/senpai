@@ -280,11 +280,12 @@ receiving an Anthropic TTL parameter. Laminar is an optional SDK extra and is
 not part of Senpai's locked runtime; Weave is the agent observability
 integration.
 
-Direct `openai/*` models use a stored Responses API chain. The active branch's
-latest `resp_*` ID is recovered from the durable OpenHands event log after
-every process restart, passed as `previous_response_id`, and paired only with
-inputs created after that response. System instructions and tools remain
-explicit on every request.
+Direct `openai/*` models use a stored Responses API chain unless
+`model_api_mode` overrides it for a custom transport. The active branch's
+latest `resp_*` ID is recovered from the durable OpenHands event log after every
+process restart, passed as `previous_response_id`, and paired only with inputs
+created after that response. System instructions and tools remain explicit on
+every request.
 
 Senpai sets `reasoning_context="all_turns"` and `reasoning_summary="auto"` so
 supported models can reuse server-side private reasoning and return the most
@@ -314,6 +315,24 @@ compaction block. Senpai leaves Anthropic's compaction instructions unset so
 the provider uses its model-specific native prompt. The local condenser is
 disabled for these conversations.
 Other providers retain the high-quality OpenHands condenser.
+
+## Custom model transport
+
+The optional `model_base_url`, `model_api_mode`, and
+`model_extra_headers_env` settings apply one transport to every root and
+delegated model profile. The runner passes them to OpenHands as `base_url`,
+`api_mode`, and `extra_headers`. Header values are a JSON object stored in the
+named shell or `.env` variable. The launcher places that value in the
+per-launch Kubernetes Secret; only the variable name enters ConfigMaps. Header
+configuration requires a custom base URL.
+
+The runner validates header names and values, registers each value with Weave
+redaction, and removes the source variable from the agent environment. Because
+OpenHands stores extra headers as plain strings, local OpenHands state is
+credential-bearing when headers contain secrets. A custom base URL disables
+direct model-provider authentication preflight. This prevents custom
+credentials from reaching a public provider endpoint; the first model request
+checks remote connectivity and authentication.
 
 The complete durable transcript remains available as plain event JSON under
 `$SENPAI_OPENHANDS_STATE_DIR/$SENPAI_CONVERSATION_ID/events/`. The harness
@@ -714,8 +733,9 @@ escalation, and use the runtime-default seccomp profile.
 
 Weave content capture applies a longest-first transform over all configured
 API keys, tokens, passwords, secrets, credentials, custom secrets, and the
-selected custom model credential before content is sent. Custom secrets do not
-depend on naming conventions for redaction. The pinned
+selected custom model credential before content is sent. Custom model header
+values are registered explicitly. Custom secrets do not depend on naming
+conventions for redaction. The pinned
 `weave-openhands` integration is initialized before OpenHands imports. Each
 conversation run is an agent trace with child LLM and tool spans, all carrying
 the durable OpenHands conversation ID. These OTLP records are stored in Weave
@@ -740,7 +760,8 @@ out that exact revision.
 Launch preflight verifies:
 
 - target-repository push and branch access;
-- every model-provider credential referenced by the configured profiles;
+- every directly routed model-provider credential referenced by the configured
+  profiles; custom transport credentials are validated locally only;
 - the Exa key with one `type="instant"`, publication-category, one-result
   search;
 - the W&B key with a minimal viewer query; and

@@ -55,6 +55,13 @@ fast_model: anthropic/claude-sonnet-5
 fast_reasoning_effort: medium
 frontier_model: anthropic/claude-fable-5-1
 frontier_reasoning_effort: max
+# Optional transport shared by every model profile. For an OpenAI-compatible
+# gateway, use openai/<model> profiles and usually set model_api_mode: chat.
+model_base_url: ""
+model_api_mode: ""  # auto, chat, or responses; blank keeps Senpai's provider default
+# Name of a shell/.env variable containing a JSON object of request headers.
+# The launcher stores its value in the Kubernetes Secret, not the ConfigMap.
+model_extra_headers_env: ""
 # Provider-native rendered/input-token trigger for supported compaction APIs.
 compaction_trigger_tokens: 200000
 

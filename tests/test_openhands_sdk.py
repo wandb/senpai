@@ -276,6 +276,27 @@ def test_file_agent_reasoning_override_replaces_the_parent_request_profile(
     }
 
 
+def test_file_agent_chat_mode_does_not_restore_responses_reasoning():
+    model = "openai/gpt-5.6-sol"
+    configuration = model_runtime_configuration(
+        model,
+        "max",
+        compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
+        api_mode="chat",
+    )
+    configured = apply_reasoning_profile(
+        LLM(
+            model=model,
+            api_key=SecretStr("test-key"),
+            reasoning_effort="max",
+            **configuration,
+        )
+    )
+
+    assert configured.uses_responses_api() is False
+    assert "reasoning" not in configured.litellm_extra_body
+
+
 @pytest.mark.parametrize(
     "model",
     [
@@ -365,6 +386,38 @@ def test_wandb_gateway_uses_chat_thinking_and_project_routing():
     assert "reasoning_effort" not in call_kwargs
     assert llm._provider_info.name == "wandb"
     assert llm._provider_info.api_base == "https://api.inference.wandb.ai/v1"
+
+
+def test_custom_transport_reaches_litellm_chat_requests():
+    configuration = model_runtime_configuration(
+        "openai/custom-model",
+        "medium",
+        compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
+        base_url="https://gateway.example/v1",
+        api_mode="chat",
+        extra_headers={"X-Tenant": "research"},
+    )
+    llm = LLM(
+        model="openai/custom-model",
+        api_key=SecretStr("test-key"),
+        **configuration,
+    )
+    _messages, _tools, _mocked, call_kwargs, _telemetry = (
+        llm._prepare_completion_params(
+            [Message(role="user", content=[TextContent(text="Investigate")])],
+            tools=None,
+            add_security_risk_prediction=False,
+            kwargs={},
+        )
+    )
+
+    assert llm.base_url == "https://gateway.example/v1"
+    assert llm.uses_responses_api() is False
+    assert llm.responses_use_previous_response_id is False
+    assert llm._provider_info.api_base == "https://gateway.example/v1"
+    assert call_kwargs["extra_headers"]["X-Tenant"] == "research"
+    assert "responses_compact_threshold" not in configuration
+    assert "prompt_cache_retention" not in configuration
 
 
 @pytest.mark.parametrize(
@@ -499,6 +552,7 @@ def test_gpt56_marks_only_the_stable_system_cache_boundary():
             {"model": "openai/gpt-5.6", "agent_name": "explore"},
             "senpai:advisor:explore",
         ),
+        ({"model": "openai/custom-model", "api_mode": "chat"}, None),
         ({"model": "anthropic/claude-opus-4-8"}, None),
     ],
 )

@@ -135,6 +135,9 @@ fast_model: anthropic/claude-sonnet-5
 fast_reasoning_effort: medium
 frontier_model: anthropic/claude-fable-5-1
 frontier_reasoning_effort: max
+model_base_url: ""
+model_api_mode: ""
+model_extra_headers_env: ""
 compaction_trigger_tokens: 200000
 
 pvc_claim_name: your-existing-pvc
@@ -158,6 +161,52 @@ OpenAI Pro mode.
 `compaction_trigger_tokens` sets the compaction limit. OpenAI and Anthropic
 apply it for their models; OpenHands handles compaction for other providers.
 
+#### Custom model API endpoint
+
+`model_base_url`, `model_api_mode`, and `model_extra_headers_env` expose the
+corresponding OpenHands/LiteLLM transport settings. They apply to the advisor,
+student, smart, fast, and frontier model profiles. Configure every profile with
+a model served by the same endpoint. Extra headers require `model_base_url`, so
+Senpai never sends custom header secrets to a provider's default public URL.
+
+For an OpenAI-compatible Chat Completions gateway, put its API key and optional
+JSON header object in `.env`:
+
+```dotenv
+OPENAI_API_KEY=your-gateway-api-key
+MODEL_GATEWAY_HEADERS={"X-Tenant":"research","X-Gateway-Key":"secret"}
+```
+
+Then configure the gateway and use its model names with LiteLLM's `openai/`
+provider prefix:
+
+```yaml
+advisor_model: openai/custom-model
+student_model: openai/custom-model
+smart_model: openai/custom-model
+fast_model: openai/custom-model
+frontier_model: openai/custom-model
+
+model_base_url: https://gateway.example/v1
+model_api_mode: chat
+model_extra_headers_env: MODEL_GATEWAY_HEADERS
+```
+
+Use `model_api_mode: responses` when the endpoint implements OpenAI's Responses
+API. Leave it blank to keep Senpai's provider-specific default. The launcher
+stores the header JSON in the per-launch Kubernetes Secret, passes the parsed
+headers to OpenHands' `extra_headers`, redacts each value from Weave traces, and
+removes the source variable from agent shell environments. OpenHands represents
+extra headers as plain strings, so treat its private local state directory as
+credential-bearing. Do not commit `.env` or a local launch configuration that
+contains credentials.
+
+When custom routing is configured, preflight validates the URL, API mode,
+header JSON, and credential presence locally. It skips the provider's public
+authentication endpoint so it never sends gateway credentials or headers to
+OpenAI, Anthropic, or W&B. The first model request therefore performs the remote
+gateway connectivity and authentication check.
+
 If using W&B Inference use `wandb/` provider as the provider. For example `wandb/zai-org/GLM-5.2`, SENPAI
 uses `WANDB_API_KEY` for auth.
 
@@ -175,12 +224,14 @@ uv run python k8s/launch.py \
   --preflight_only
 ```
 
-Preflight authenticates GitHub, Exa, W&B, and every model provider referenced by
-the configured model profiles. It also verifies GitHub Contents write access,
-resolves the target branch, and rejects student labels already carrying active
-assignments. It deliberately skips image validation and makes no cluster
-changes. A real launch additionally verifies immutable image syntax and that
-both role images identify the same source revision.
+Preflight authenticates GitHub, Exa, W&B, and each directly configured model
+provider. For a custom model transport, it validates the local transport config
+without sending its credentials to a public provider endpoint. It also verifies
+GitHub Contents write access, resolves the target branch, and rejects student
+labels already carrying active assignments. It deliberately skips image
+validation and makes no cluster changes. A real launch additionally verifies
+immutable image syntax and that both role images identify the same source
+revision.
 
 ### 7. Launch
 

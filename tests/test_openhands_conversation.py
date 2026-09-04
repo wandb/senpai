@@ -88,6 +88,13 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
             "WANDB_API_KEY": "wandb-key",
             "PRIVATE_AUTH": "private-key",
         },
+        base_url="https://gateway.example/v1",
+        api_mode="chat",
+        extra_headers_env="MODEL_GATEWAY_HEADERS",
+        extra_headers={
+            "X-Tenant": "research-route",
+            "X-Gateway-Key": "gateway-secret",
+        },
     )
 
     assert run_openhands("first task", config) == 0
@@ -103,7 +110,13 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
         "WANDB_API_KEY": "wandb-key",
         "PRIVATE_AUTH": "private-key",
     }
-    assert registered_secrets == ["github-key"]
+    assert registered_secrets == [
+        "research-route",
+        "gateway-secret",
+        "github-key",
+    ]
+    assert captured["llm"].base_url == "https://gateway.example/v1"
+    assert captured["llm"].extra_headers == config.extra_headers
     assert captured["conversation_id_env"] == config.conversation_id.hex
     assert captured["delete_on_close"] is False
     assert captured["llm_timeout"] == 5400

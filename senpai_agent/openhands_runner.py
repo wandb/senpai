@@ -49,6 +49,7 @@ from senpai_agent.secrets import (
     GITHUB_TOKEN_FILE_ENV,
     configured_custom_secret_env_names,
     scrub_github_credentials,
+    validate_custom_secret_env_names,
 )
 from senpai_agent.weave_monitoring import (
     finish_weave_monitoring,
@@ -92,6 +93,12 @@ from senpai_agent.github.tools import (
 from senpai_agent.inference_heartbeat import InferenceHeartbeat
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV, decode_launch_context
 from senpai_agent.local_events import LocalEventStore
+from senpai_agent.model_transport import (
+    MODEL_API_MODES,
+    model_api_mode,
+    model_base_url,
+    model_extra_headers,
+)
 from senpai_agent.program_context import (
     PROGRAM_PATH_ENV,
     load_program_system_prompt,
@@ -166,6 +173,16 @@ class RunnerArgs:
         alias="--frontier-reasoning-effort",
         choices=REASONING_EFFORTS,
     )
+    base_url: str | None = field(default=None, alias="--base-url")
+    api_mode: str | None = field(
+        default=None,
+        alias="--api-mode",
+        choices=tuple(sorted(MODEL_API_MODES)),
+    )
+    extra_headers_env: str | None = field(
+        default=None,
+        alias="--extra-headers-env",
+    )
     compaction_trigger_tokens: int | None = field(
         default=None,
         alias="--compaction-trigger-tokens",
@@ -219,6 +236,10 @@ class RunnerConfig:
     role_file: Path
     plugin_dir: Path
     instructions: SenpaiSystemInstructions
+    base_url: str | None = None
+    api_mode: str | None = None
+    extra_headers_env: str | None = None
+    extra_headers: Mapping[str, str] = field(default_factory=dict)
     advisor_branch: str | None = None
     student_names: tuple[str, ...] | None = None
     student_name: str | None = None
@@ -304,7 +325,9 @@ def apply_reasoning_profile(llm: LLM) -> LLM:
         llm.model,
     )
     extra_body = dict(llm.litellm_extra_body or {})
-    if reasoning := _openai_pro_reasoning(llm.model, reasoning_effort):
+    if llm.uses_responses_api() and (
+        reasoning := _openai_pro_reasoning(llm.model, reasoning_effort)
+    ):
         extra_body["reasoning"] = reasoning
     else:
         extra_body.pop("reasoning", None)
@@ -372,10 +395,10 @@ def resolve_api_key(env: Mapping[str, str], key_env: str) -> SecretStr:
 def conversation_secrets(
     env: Mapping[str, str],
     *,
-    model_api_key_env_names: Sequence[str],
+    model_secret_env_names: Sequence[str],
 ) -> dict[str, str]:
     custom_secret_env_names = configured_custom_secret_env_names(env)
-    model_credentials = set(model_api_key_env_names)
+    model_credentials = set(model_secret_env_names)
     overlap = tuple(
         name for name in custom_secret_env_names if name in model_credentials
     )
@@ -866,13 +889,56 @@ def resolve_config(
     smart_api_key = resolve_api_key(env, smart_api_key_env)
     fast_api_key = resolve_api_key(env, fast_api_key_env)
     frontier_api_key = resolve_api_key(env, frontier_api_key_env)
+    try:
+        base_url = model_base_url(
+            env_value(args.base_url, env, "SENPAI_OPENHANDS_BASE_URL")
+        )
+        api_mode = model_api_mode(
+            env_value(args.api_mode, env, "SENPAI_OPENHANDS_API_MODE")
+        )
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
+    extra_headers_env = (
+        env_value(
+            args.extra_headers_env,
+            env,
+            "SENPAI_OPENHANDS_EXTRA_HEADERS_ENV",
+        )
+        or ""
+    ).strip() or None
+    extra_headers: dict[str, str] = {}
+    if extra_headers_env:
+        if not base_url:
+            raise RuntimeError(
+                "SENPAI_OPENHANDS_EXTRA_HEADERS_ENV requires "
+                "SENPAI_OPENHANDS_BASE_URL"
+            )
+        try:
+            validate_custom_secret_env_names([extra_headers_env])
+        except ValueError as error:
+            raise RuntimeError(
+                f"SENPAI_OPENHANDS_EXTRA_HEADERS_ENV: {error}"
+            ) from error
+        headers_value = env.get(extra_headers_env)
+        if headers_value is None or not headers_value.strip():
+            raise RuntimeError(
+                f"{extra_headers_env} is required for OpenHands extra headers"
+            )
+        try:
+            extra_headers = model_extra_headers(
+                headers_value,
+                source=extra_headers_env,
+            )
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
     resolved_conversation_secrets = conversation_secrets(
         env,
-        model_api_key_env_names=(
+        model_secret_env_names=(
             api_key_env,
             smart_api_key_env,
             fast_api_key_env,
             frontier_api_key_env,
+            *((extra_headers_env,) if extra_headers_env else ()),
         ),
     )
     models = (model, smart_model, fast_model, frontier_model)
@@ -939,6 +1005,10 @@ def resolve_config(
             env_value(args.plugin_dir, env, "SENPAI_PLUGIN"),
         ),
         instructions=instructions,
+        base_url=base_url,
+        api_mode=api_mode,
+        extra_headers_env=extra_headers_env,
+        extra_headers=extra_headers,
         advisor_branch=env.get("ADVISOR_BRANCH") or None,
         student_names=tuple(
             name.strip()
@@ -1043,7 +1113,10 @@ def prompt_cache_configuration(model: str) -> dict[str, object]:
 
 
 def conversation_prompt_cache_key(config: RunnerConfig) -> str | None:
-    if config.model.split("/", 1)[0].lower() != "openai":
+    if (
+        config.model.split("/", 1)[0].lower() != "openai"
+        or config.api_mode in {"auto", "chat"}
+    ):
         return None
     agent_kind = config.agent_name or ("child" if config.child else "main")
     return f"senpai:{config.role}:{agent_kind}"
@@ -1093,6 +1166,9 @@ def model_runtime_configuration(
     compaction_trigger_tokens: int,
     wandb_entity: str | None = None,
     wandb_project: str | None = None,
+    base_url: str | None = None,
+    api_mode: str | None = None,
+    extra_headers: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Merge provider options, including nested LiteLLM request fields."""
     if model_provider(model) == "wandb":
@@ -1120,22 +1196,50 @@ def model_runtime_configuration(
                     "reasoning_effort": reasoning_effort,
                 },
             }
-        return configuration
+    else:
+        configuration = {}
+        extra_body: dict[str, object] = {}
+        provider = model_provider(model)
+        uses_openai_responses = provider == "openai" and api_mode not in {
+            "auto",
+            "chat",
+        }
+        for options in (
+            (
+                prompt_cache_configuration(model)
+                if provider != "openai" or uses_openai_responses
+                else {}
+            ),
+            (
+                openai_responses_configuration(model, reasoning_effort)
+                if uses_openai_responses
+                else {}
+            ),
+            (
+                compaction_configuration(model, compaction_trigger_tokens)
+                if provider != "openai" or uses_openai_responses
+                else {}
+            ),
+        ):
+            for key, value in options.items():
+                if key == "litellm_extra_body":
+                    extra_body.update(value)
+                else:
+                    configuration[key] = value
+        if extra_body:
+            configuration["litellm_extra_body"] = extra_body
 
-    configuration: dict[str, object] = {}
-    extra_body: dict[str, object] = {}
-    for options in (
-        prompt_cache_configuration(model),
-        openai_responses_configuration(model, reasoning_effort),
-        compaction_configuration(model, compaction_trigger_tokens),
-    ):
-        for key, value in options.items():
-            if key == "litellm_extra_body":
-                extra_body.update(value)
-            else:
-                configuration[key] = value
-    if extra_body:
-        configuration["litellm_extra_body"] = extra_body
+    if base_url:
+        configuration["base_url"] = base_url
+    if api_mode:
+        configuration["api_mode"] = api_mode
+    if extra_headers:
+        configured_headers = configuration.get("extra_headers", {})
+        assert isinstance(configured_headers, dict)
+        configuration["extra_headers"] = {
+            **configured_headers,
+            **extra_headers,
+        }
     return configuration
 
 
@@ -1152,8 +1256,10 @@ def scrub_model_credentials(
         config.smart_api_key_env,
         config.fast_api_key_env,
         config.frontier_api_key_env,
+        config.extra_headers_env,
     }:
-        environment.pop(key_env, None)
+        if key_env:
+            environment.pop(key_env, None)
 
 
 def build_main_tools(config: RunnerConfig) -> list[Tool]:
@@ -1239,6 +1345,10 @@ def delegation_config(
         role=config.role,
         program_path=config.instructions.program.program_path,
         launch_context=config.instructions.launch,
+        model_base_url=config.base_url,
+        model_api_mode=config.api_mode,
+        model_extra_headers_env=config.extra_headers_env,
+        model_extra_headers=config.extra_headers,
         root_state_dir=config.delegation_root_state_dir,
         tree_id=config.delegation_tree_id,
         depth=config.delegation_depth,
@@ -1605,6 +1715,8 @@ def run_openhands(
     if run_deadline is not None and run_deadline <= started_at:
         raise TimeoutError("the inherited OpenHands deadline has expired")
     scrub_model_credentials(os.environ, config)
+    for header_value in config.extra_headers.values():
+        register_trace_secret(header_value)
     register_default_tools(enable_browser=False)
     register_senpai_tools()
     file_agents = sanitized_agent_definitions(config.workspace)
@@ -1628,6 +1740,9 @@ def run_openhands(
                 "frontier_model": config.frontier_model,
                 "frontier_reasoning_effort": config.frontier_reasoning_effort,
                 "compaction_trigger_tokens": config.compaction_trigger_tokens,
+                "model_base_url": config.base_url,
+                "model_api_mode": config.api_mode,
+                "model_extra_headers": bool(config.extra_headers),
                 "prompt_cache": (
                     prompt_cache_configuration(config.model)
                     or {"provider_default": True}
@@ -1733,6 +1848,9 @@ def run_openhands(
                 compaction_trigger_tokens=config.compaction_trigger_tokens,
                 wandb_entity=config.wandb_entity,
                 wandb_project=config.wandb_project,
+                base_url=config.base_url,
+                api_mode=config.api_mode,
+                extra_headers=config.extra_headers,
             ),
         )
         llm.set_request_scope(model_request)
