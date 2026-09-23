@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import threading
 import uuid
 from pathlib import Path
@@ -7,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 from openhands.sdk.tool import Tool, resolve_tool
 
-from senpai_agent.monitor import MonitorStore
+from senpai_agent.monitor import MonitorMailbox, MonitorStore, TrainingMonitorEngine
 from senpai_agent.tools import (
     CancelTrainingAction,
     CancelTrainingTool,
@@ -19,7 +20,12 @@ from senpai_agent.tools import (
     close_training_runtimes,
     register_senpai_tools,
 )
-from senpai_agent.training import TrainingResult, TrainingSpec, TrainingState
+from senpai_agent.training import (
+    TrainingResult,
+    TrainingSpec,
+    TrainingState,
+    TrainingSupervisor,
+)
 
 
 class StubTraining:
@@ -91,6 +97,118 @@ def test_run_training_registers_a_monitor_for_its_conversation(tmp_path: Path):
         assert monitor.metric is None
         assert monitor.gates == ()
     finally:
+        monitors.close()
+
+
+def test_fast_training_completion_survives_finish_before_monitor_registration(
+    tmp_path: Path,
+):
+    terminal = threading.Event()
+    terminal_ids = []
+
+    def on_terminal(training_id: str) -> None:
+        terminal_ids.append(training_id)
+        terminal.set()
+
+    class WaitForCompletionStore(MonitorStore):
+        def register(self, spec):
+            assert terminal.wait(2)
+            return super().register(spec)
+
+    class NoMetrics:
+        def latest(self, _run_id, _metric):
+            raise AssertionError("terminal completion must not query W&B")
+
+    workspace = init_workspace(tmp_path)
+    training = TrainingSupervisor(
+        workspace=workspace,
+        state_dir=tmp_path / "training",
+        on_terminal=on_terminal,
+    )
+    monitors = WaitForCompletionStore(tmp_path / "monitors.sqlite3")
+    conversation_id = uuid.uuid4()
+
+    try:
+        observation = RunTrainingTool.create(training, monitors)[0].executor(
+            RunTrainingAction(
+                spec=TrainingSpec(
+                    argv=(sys.executable, "-c", "pass"),
+                    cwd=workspace,
+                    timeout_seconds=20,
+                )
+            ),
+            SimpleNamespace(id=conversation_id),
+        )
+        mailbox = MonitorMailbox(
+            TrainingMonitorEngine(monitors, training, NoMetrics()),
+            monitors,
+        )
+
+        polled = mailbox.poll_terminal(tuple(terminal_ids))
+
+        assert terminal_ids == [observation.training_id]
+        assert [event.dedupe_key for event in polled.items] == [
+            f"{observation.training_id}:status:finished"
+        ]
+        assert polled.resolved_training_ids == frozenset(
+            {observation.training_id}
+        )
+        assert polled.items[0].payload["conversation_id"] == str(
+            conversation_id
+        )
+    finally:
+        training.close()
+        monitors.close()
+
+
+def test_explicit_cancel_retires_the_monitor_before_the_terminal_hint(
+    tmp_path: Path,
+):
+    terminal_ids = []
+    workspace = init_workspace(tmp_path)
+    training = TrainingSupervisor(
+        workspace=workspace,
+        state_dir=tmp_path / "training",
+        terminate_grace_seconds=0.1,
+        on_terminal=terminal_ids.append,
+    )
+    monitors = MonitorStore(tmp_path / "monitors.sqlite3")
+    conversation = SimpleNamespace(id=uuid.uuid4())
+
+    try:
+        running = RunTrainingTool.create(training, monitors)[0].executor(
+            RunTrainingAction(
+                spec=TrainingSpec(
+                    argv=(sys.executable, "-c", "import time; time.sleep(60)"),
+                    cwd=workspace,
+                    timeout_seconds=60,
+                )
+            ),
+            conversation,
+        )
+        cancel = CancelTrainingTool.create(training, monitors)[0].executor
+
+        first = cancel(
+            CancelTrainingAction(training_id=running.training_id),
+            conversation,
+        )
+        second = cancel(
+            CancelTrainingAction(training_id=running.training_id),
+            conversation,
+        )
+        polled = MonitorMailbox(
+            TrainingMonitorEngine(monitors, training, SimpleNamespace()),
+            monitors,
+        ).poll_terminal(tuple(terminal_ids))
+
+        assert first.state is TrainingState.CANCELLED
+        assert second.state is TrainingState.CANCELLED
+        assert terminal_ids == [running.training_id]
+        assert monitors.active() == []
+        assert polled.items == ()
+        assert polled.resolved_training_ids == frozenset({running.training_id})
+    finally:
+        training.close()
         monitors.close()
 
 

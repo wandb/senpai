@@ -67,7 +67,7 @@ timeout_minutes: 30.0
 max_epochs: 50
 
 # responsiveness / polling
-poll_interval_s: 600
+poll_interval_s: 300
 poll_jitter_s: 120
 stale_wip_seconds: 7200
 human_issues: true

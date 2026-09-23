@@ -7,7 +7,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from senpai_agent.github.http import GitHubReadError
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.models import (
     AssignmentRecord,
@@ -44,21 +43,13 @@ def student_assignment_comment_events(
 
     if not assignments:
         return []
-    try:
-        actor = mailbox._github.actor()
-    except GitHubReadError as error:
-        _report_read_error(f"actor {type(error).__name__}: {error}")
-        return []
+    actor = mailbox._github.actor()
 
     candidates_by_key: dict[str, _CommentCandidate] = {}
     conflicted_keys: set[str] = set()
     for pull, assignment in assignments:
         number = int(pull["number"])
-        try:
-            comments = mailbox._pull_comments(number)
-        except GitHubReadError as error:
-            _report_read_error(f"pr={number} {type(error).__name__}: {error}")
-            continue
+        comments = mailbox._pull_comments(number)
         for comment in comments:
             candidate = _comment_candidate(
                 mailbox,

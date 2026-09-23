@@ -59,6 +59,20 @@ def test_registration_and_stop_hook_marker_survive_reopen(tmp_path: Path):
         assert reopened.active() == [monitor]
 
 
+def test_next_poll_deadline_tracks_active_monitor_state(tmp_path: Path):
+    monitor = spec(poll_interval_seconds=60)
+
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(monitor)
+        assert store.seconds_until_next_poll(NOW) == 0
+
+        store.record_poll(monitor, MonitorEvaluation(), None, now=NOW)
+        assert store.seconds_until_next_poll(NOW + timedelta(seconds=15)) == 45
+
+        store.complete(monitor.training_id)
+        assert store.seconds_until_next_poll(NOW) is None
+
+
 def test_same_policy_reregistration_preserves_derived_state(tmp_path: Path):
     monitor = spec()
     repeated = monitor.model_copy(update={"registered_at": NOW + timedelta(minutes=5)})

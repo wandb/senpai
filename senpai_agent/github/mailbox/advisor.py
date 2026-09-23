@@ -161,7 +161,9 @@ def _research_base_events(
                 current_bases[assignment.base_ref] = branch_head_sha(
                     mailbox, assignment.base_ref
                 )
-            except (GitHubReadError, TypeError) as error:
+            except GitHubReadError:
+                raise
+            except TypeError as error:
                 failed_bases.add(assignment.base_ref)
                 print(
                     "SENPAI_RESEARCH_BASE_WATCH_ERROR "
@@ -239,7 +241,9 @@ def has_research_base_acceptance(
     try:
         actor = mailbox._github.actor()
         comments = mailbox._pull_comments(int(pull["number"]))
-    except (GitHubReadError, TypeError) as error:
+    except GitHubReadError:
+        raise
+    except TypeError as error:
         print(
             "SENPAI_RESEARCH_BASE_ACCEPTANCE_READ_ERROR "
             f"pr={pull['number']} {type(error).__name__}: {error}",

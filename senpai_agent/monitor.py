@@ -6,6 +6,7 @@ import math
 import sqlite3
 import threading
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
@@ -80,12 +81,19 @@ class MonitorSignal(Contract):
     detail: str = Field(min_length=1, max_length=1_000)
     hard_failure: bool = False
 
+
 class MonitorEvaluation(Contract):
     signals: tuple[MonitorSignal, ...] = ()
 
     @property
     def dedupe_keys(self) -> tuple[str, ...]:
         return tuple(signal.dedupe_key for signal in self.signals)
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalPollResult[T]:
+    items: tuple[T, ...]
+    resolved_training_ids: frozenset[str]
 
 
 def evaluate_monitor(
@@ -357,6 +365,18 @@ class MonitorStore:
         ).fetchall()
         return [TrainingMonitorSpec.model_validate_json(row[0]) for row in rows]
 
+    def seconds_until_next_poll(
+        self,
+        now: datetime | None = None,
+    ) -> float | None:
+        row = self.connection.execute(
+            "SELECT MIN(next_poll_at) FROM monitors WHERE active = 1"
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        timestamp = (now or datetime.now(UTC)).timestamp()
+        return max(0, float(row[0]) - timestamp)
+
     def emitted(self, training_id: str) -> frozenset[str]:
         rows = self.connection.execute(
             "SELECT dedupe_key FROM monitor_signals WHERE training_id = ?",
@@ -571,8 +591,46 @@ class TrainingMonitorEngine:
 
     def poll(self, now: datetime | None = None) -> tuple[MonitorSignal, ...]:
         now = now or datetime.now(UTC)
+        return self._poll_specs(self.store.due(now), now=now).items
+
+    def poll_terminal(
+        self,
+        training_ids: Sequence[str],
+        now: datetime | None = None,
+    ) -> TerminalPollResult[MonitorSignal]:
+        """Resolve terminal hints immediately without sampling running jobs."""
+
+        now = now or datetime.now(UTC)
+        requested = tuple(dict.fromkeys(training_ids))
+        active = {spec.training_id: spec for spec in self.store.active()}
+        specs = tuple(
+            active[training_id]
+            for training_id in requested
+            if training_id in active
+        )
+        polled = self._poll_specs(specs, now=now, terminal_only=True)
+        return TerminalPollResult(
+            items=polled.items,
+            resolved_training_ids=(
+                polled.resolved_training_ids
+                | frozenset(
+                    training_id
+                    for training_id in requested
+                    if training_id not in active
+                )
+            ),
+        )
+
+    def _poll_specs(
+        self,
+        specs: Sequence[TrainingMonitorSpec],
+        *,
+        now: datetime,
+        terminal_only: bool = False,
+    ) -> TerminalPollResult[MonitorSignal]:
         produced: list[MonitorSignal] = []
-        for spec in self.store.due(now):
+        resolved: set[str] = set()
+        for spec in specs:
             try:
                 result = self.training.get_training_status(spec.training_id)
             except Exception as error:  # noqa: BLE001
@@ -584,6 +642,9 @@ class TrainingMonitorEngine:
                 )
                 if signal is not None:
                     produced.append(signal)
+                continue
+            if terminal_only and result.state is TrainingState.RUNNING:
+                resolved.add(spec.training_id)
                 continue
             sample = None
             try:
@@ -641,7 +702,12 @@ class TrainingMonitorEngine:
                     produced.append(signal)
                 continue
             produced.extend(evaluation.signals)
-        return tuple(produced)
+            if terminal_only:
+                resolved.add(spec.training_id)
+        return TerminalPollResult(
+            items=tuple(produced),
+            resolved_training_ids=frozenset(resolved),
+        )
 
 
 class MonitorMailbox:
@@ -653,6 +719,22 @@ class MonitorMailbox:
 
     def poll(self) -> tuple[ControllerEvent, ...]:
         self.engine.poll()
+        return self._pending_events()
+
+    def poll_terminal(
+        self,
+        training_ids: Sequence[str],
+    ) -> TerminalPollResult[ControllerEvent]:
+        polled = self.engine.poll_terminal(training_ids)
+        return TerminalPollResult(
+            items=self._pending_events(),
+            resolved_training_ids=polled.resolved_training_ids,
+        )
+
+    def seconds_until_next_poll(self) -> float | None:
+        return self.store.seconds_until_next_poll()
+
+    def _pending_events(self) -> tuple[ControllerEvent, ...]:
         return tuple(
             ControllerEvent(
                 kind="training_monitor",

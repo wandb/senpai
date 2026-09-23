@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Self
 
@@ -163,6 +163,8 @@ class SenpaiTaskTrackerTool(TaskTrackerTool):
 def training_runtime(
     workspace: Path,
     state_dir: Path,
+    *,
+    on_terminal: Callable[[str], None] | None = None,
 ) -> tuple[TrainingSupervisor, MonitorStore]:
     key = state_dir.resolve()
     runtime = _TRAINING_RUNTIMES.get(key)
@@ -171,10 +173,16 @@ def training_runtime(
             TrainingSupervisor(
                 workspace=workspace,
                 state_dir=key,
+                on_terminal=on_terminal,
             ),
             MonitorStore(key / "monitors.sqlite3"),
         )
         _TRAINING_RUNTIMES[key] = runtime
+    elif on_terminal is not None:
+        training, _monitors = runtime
+        if training.on_terminal not in (None, on_terminal):
+            raise RuntimeError("training runtime already has a terminal notifier")
+        training.on_terminal = on_terminal
     return runtime
 
 
