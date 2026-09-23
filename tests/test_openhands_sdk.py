@@ -93,6 +93,7 @@ def test_openhands_fork_revision_is_consistent_across_install_paths():
         ("xhigh", "anthropic/claude-opus-4-8", "xhigh"),
         ("medium", "anthropic/claude-opus-5-5", "medium"),
         ("high", "anthropic/claude-opus-5-5", "high"),
+        ("xhigh", "anthropic/claude-opus-5-5", "xhigh"),
         ("max", "anthropic/claude-opus-5-5", "max"),
         ("max", "anthropic/claude-fable-5-1", "max"),
         ("max", "anthropic/claude-opus-5", "max"),

@@ -30,11 +30,11 @@ def test_default_config_exposes_every_model_profile_and_effort():
     } <= set(config)
     assert {
         "advisor_model": "anthropic/claude-opus-5-5",
-        "advisor_reasoning_effort": "high",
+        "advisor_reasoning_effort": "xhigh",
         "student_model": "anthropic/claude-opus-5-5",
-        "student_reasoning_effort": "medium",
+        "student_reasoning_effort": "high",
         "smart_model": "anthropic/claude-opus-5-5",
-        "smart_reasoning_effort": "high",
+        "smart_reasoning_effort": "xhigh",
         "fast_model": "anthropic/claude-sonnet-5",
         "fast_reasoning_effort": "medium",
         "frontier_model": "anthropic/claude-opus-5-5",

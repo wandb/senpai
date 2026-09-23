@@ -93,11 +93,11 @@ class Args:
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
     wandb_project: str = "senpai-v1"  # W&B project name
     advisor_model: str = "anthropic/claude-opus-5-5"
-    advisor_reasoning_effort: str = "high"
+    advisor_reasoning_effort: str = "xhigh"
     student_model: str = "anthropic/claude-opus-5-5"
-    student_reasoning_effort: str = "medium"
+    student_reasoning_effort: str = "high"
     smart_model: str = "anthropic/claude-opus-5-5"
-    smart_reasoning_effort: str = "high"
+    smart_reasoning_effort: str = "xhigh"
     fast_model: str = "anthropic/claude-sonnet-5"
     fast_reasoning_effort: str = "medium"
     frontier_model: str = "anthropic/claude-opus-5-5"
