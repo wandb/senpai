@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -62,7 +63,12 @@ def render_role(role: str, args: launch.Args | None = None) -> tuple[str, str, s
         custom_secrets={
             name: f"{name.lower()}-secret"
             for name in args.custom_secret_env_names
-        },
+        }
+        | (
+            {args.model_extra_headers_env: json.dumps({"X-Test-Route": "test-route"})}
+            if args.model_extra_headers_env
+            else {}
+        ),
     )
     template = (ROOT / "k8s" / f"{role}-deployment.yaml").read_text()
     if role == "student":

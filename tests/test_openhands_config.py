@@ -224,11 +224,81 @@ def test_resolved_config_separates_runtime_credentials_from_conversation_secrets
     assert config.llm_timeout_seconds == 5400
     assert config.llm_num_retries == 5
     assert config.compaction_trigger_tokens == 200_000
+    assert config.base_url is None
+    assert config.api_mode is None
+    assert config.extra_headers == {}
 
     delegated = runner.delegation_config(config)
     assert delegated.smart_api_key == "anthropic-key"
     assert delegated.fast_api_key == "anthropic-key"
     assert delegated.frontier_api_key == "anthropic-key"
+
+
+def test_custom_model_transport_resolves_and_scrubs_secret_headers(tmp_path: Path):
+    env = runtime_env(tmp_path)
+    env.update(
+        {
+            "SENPAI_OPENHANDS_BASE_URL": "https://gateway.example/v1/",
+            "SENPAI_OPENHANDS_API_MODE": "chat",
+            "SENPAI_OPENHANDS_EXTRA_HEADERS_ENV": "MODEL_GATEWAY_HEADERS",
+            "MODEL_GATEWAY_HEADERS": (
+                '{"X-Tenant":"research","X-Gateway-Key":"secret"}'
+            ),
+        }
+    )
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert config.base_url == "https://gateway.example/v1"
+    assert config.api_mode == "chat"
+    assert config.extra_headers_env == "MODEL_GATEWAY_HEADERS"
+    assert config.extra_headers == {
+        "X-Tenant": "research",
+        "X-Gateway-Key": "secret",
+    }
+    assert "MODEL_GATEWAY_HEADERS" not in config.conversation_secrets
+    scrub_model_credentials(env, config)
+    assert "MODEL_GATEWAY_HEADERS" not in env
+
+
+@pytest.mark.parametrize(
+    ("headers", "message"),
+    [
+        ("[]", "JSON object"),
+        ('{"X-Route": 7}', "string headers"),
+        ('{"X-Route":"one","x-route":"two"}', "duplicate"),
+        ('{"X-Route":"line\\nvalue"}', "CR/LF"),
+    ],
+)
+def test_custom_model_transport_rejects_invalid_headers(
+    tmp_path: Path,
+    headers: str,
+    message: str,
+):
+    env = runtime_env(tmp_path)
+    env.update(
+        {
+            "SENPAI_OPENHANDS_BASE_URL": "https://gateway.example/v1",
+            "SENPAI_OPENHANDS_EXTRA_HEADERS_ENV": "MODEL_GATEWAY_HEADERS",
+            "MODEL_GATEWAY_HEADERS": headers,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+
+def test_custom_headers_require_a_custom_base_url(tmp_path: Path):
+    env = runtime_env(tmp_path)
+    env.update(
+        {
+            "SENPAI_OPENHANDS_EXTRA_HEADERS_ENV": "MODEL_GATEWAY_HEADERS",
+            "MODEL_GATEWAY_HEADERS": '{"X-Tenant":"research"}',
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="requires.*BASE_URL"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
 def test_training_limits_are_not_read_from_environment(tmp_path: Path):

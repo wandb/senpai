@@ -15,7 +15,7 @@ import uuid
 from base64 import b64encode
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, Self
 
@@ -166,6 +166,10 @@ class DelegationConfig:
     role: str
     program_path: str
     launch_context: str
+    model_base_url: str | None = None
+    model_api_mode: str | None = None
+    model_extra_headers_env: str | None = None
+    model_extra_headers: Mapping[str, str] = field(default_factory=dict)
     root_state_dir: Path | None = None
     tree_id: str | None = None
     depth: int = 0
@@ -343,6 +347,8 @@ class OpenHandsChildProcess:
     @property
     def environment(self) -> dict[str, str]:
         environment = dict(os.environ)
+        if self._config.model_extra_headers_env:
+            environment.pop(self._config.model_extra_headers_env, None)
         for name in configured_custom_secret_env_names(environment):
             environment.pop(name, None)
         scrub_github_credentials(environment)
@@ -391,6 +397,11 @@ class OpenHandsChildProcess:
                 "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": (
                     self._config.frontier_reasoning_effort
                 ),
+                "SENPAI_OPENHANDS_BASE_URL": self._config.model_base_url or "",
+                "SENPAI_OPENHANDS_API_MODE": self._config.model_api_mode or "",
+                "SENPAI_OPENHANDS_EXTRA_HEADERS_ENV": (
+                    self._config.model_extra_headers_env or ""
+                ),
                 "SENPAI_COMPACTION_TRIGGER_TOKENS": str(
                     self._config.compaction_trigger_tokens
                 ),
@@ -404,6 +415,12 @@ class OpenHandsChildProcess:
                 "SENPAI_DELEGATION_TREE_ID": self._request.tree_id,
             }
         )
+        if self._config.model_extra_headers_env:
+            environment[self._config.model_extra_headers_env] = json.dumps(
+                self._config.model_extra_headers,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
         if self._request.deadline_epoch is not None:
             remaining = self._request.deadline_epoch - time.time()
             if remaining <= 0:
