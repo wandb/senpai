@@ -93,10 +93,18 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     assert run_openhands("first task", config) == 0
     assert captured["prompt"] == "first task"
     assert captured["role"] == (
-        "# Senpai harness\n\nharness instructions\n\n"
-        "# Senpai role\n\nadvisor role\n\n"
-        "# program.md - program.md\n\nTest programme.\n\n"
+        "<SENPAI_HARNESS>\n"
+        "# Senpai harness\n\nharness instructions\n"
+        "</SENPAI_HARNESS>\n\n"
+        "<SENPAI_ROLE>\n"
+        "# Senpai role\n\nadvisor role\n"
+        "</SENPAI_ROLE>\n\n"
+        "<SENPAI_PROGRAM>\n"
+        "# program.md - program.md\n\nTest programme.\n"
+        "</SENPAI_PROGRAM>\n\n"
+        "<SENPAI_LAUNCH_CONTEXT>\n"
         "# Authoritative launch context\n\nTest launch policy.\n"
+        "</SENPAI_LAUNCH_CONTEXT>\n"
     )
     assert captured["plugin"] == str(PLUGIN_DIR)
     assert captured["secrets"] == {

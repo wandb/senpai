@@ -222,6 +222,9 @@ The model receives:
      `program_path` searches root
      `program.md` and one-level `*/program.md` paths and requires exactly one
      total match.
+   The suffix keeps each fragment's Markdown headings and wraps the fragments
+   in `<SENPAI_HARNESS>`, `<SENPAI_ROLE>`, `<SENPAI_PROGRAM>`, and
+   `<SENPAI_LAUNCH_CONTEXT>` sections, in that order.
 3. Explicit project and Senpai skills through OpenHands skill context. Agent Skills bodies are loaded only when invoked. Repository `AGENTS.md`, `AGENT.md`, and `CLAUDE.md` instruction files are not loaded as project context.
 4. User turns containing optional human operator instructions, current state, and current UTC time.
 
