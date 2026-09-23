@@ -27,12 +27,11 @@ from openhands_support import REPO_ROOT, runtime_config
 TEST_COMPACTION_TRIGGER_TOKENS = 180_000
 
 
-def test_openhands_fork_revision_is_consistent_across_install_paths():
+def test_openhands_fork_main_is_consistent_across_install_paths():
     package_names = {"openhands-sdk", "openhands-tools"}
     fork_url = "git+https://github.com/morganmcg1/software-agent-sdk.git"
-    fork_revision = "f69134273ee3a31a233d6201786570eb9c4c141b"
     expected_requirements = {
-        f"{name} @ {fork_url}@{fork_revision}#subdirectory={name}"
+        f"{name} @ {fork_url}@main#subdirectory={name}"
         for name in package_names
     }
 
@@ -77,9 +76,9 @@ def test_openhands_fork_revision_is_consistent_across_install_paths():
         assert source.path == "/morganmcg1/software-agent-sdk.git"
         assert parse_qs(source.query) == {
             "subdirectory": [name],
-            "rev": [fork_revision],
+            "rev": ["main"],
         }
-        assert source.fragment == fork_revision
+        assert re.fullmatch(r"[0-9a-f]{40}", source.fragment)
         resolved_revisions.add(source.fragment)
 
     assert len(resolved_revisions) == 1
