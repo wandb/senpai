@@ -1147,12 +1147,20 @@ def scrub_model_credentials(
     environment: MutableMapping[str, str],
     config: RunnerConfig,
 ) -> None:
-    for key_env in {
+    """Drop model credentials from the worker's process environment.
+
+    Shared conversation secrets such as WANDB_API_KEY stay: the controller's
+    own training and metric processes need them even when a ``wandb/`` model
+    authenticates with the same variable.
+    """
+
+    model_keys = {
         config.api_key_env,
         config.smart_api_key_env,
         config.fast_api_key_env,
         config.frontier_api_key_env,
-    }:
+    }
+    for key_env in model_keys - set(BUILTIN_CONVERSATION_SECRET_ENV_NAMES):
         environment.pop(key_env, None)
 
 

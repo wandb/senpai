@@ -517,23 +517,19 @@ class TrainingStatusSource(Protocol):
 
 
 class MetricSource(Protocol):
-    def latest(self, run_id: str, metric: str) -> MetricSample | None: ...
+    def latest(self, run_path: str, metric: str) -> MetricSample | None: ...
 
 
 class WandbMetricSource:
     """Fetch one latest metric value without carrying history into the agent."""
 
-    def __init__(self, entity: str, project: str, timeout_seconds: int = 30):
-        self.entity = entity
-        self.project = project
+    def __init__(self, timeout_seconds: int = 30):
         self.timeout_seconds = timeout_seconds
 
-    def latest(self, run_id: str, metric: str) -> MetricSample | None:
+    def latest(self, run_path: str, metric: str) -> MetricSample | None:
         import wandb
 
-        run = wandb.Api(timeout=self.timeout_seconds).run(
-            f"{self.entity}/{self.project}/{run_id}"
-        )
+        run = wandb.Api(timeout=self.timeout_seconds).run(run_path)
         rows = run.history(
             keys=[metric, "_timestamp"],
             samples=2,
@@ -590,10 +586,10 @@ class TrainingMonitorEngine:
                 if (
                     result.state is TrainingState.RUNNING
                     and spec.metric
-                    and result.wandb_run_ids
+                    and result.wandb_run_paths
                 ):
                     sample = self.metrics.latest(
-                        result.wandb_run_ids[-1],
+                        result.wandb_run_paths[-1],
                         spec.metric,
                     )
             except Exception as error:  # noqa: BLE001

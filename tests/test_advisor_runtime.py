@@ -357,9 +357,9 @@ def test_event_pump_queues_into_the_controller_inbox_without_mid_turn_injection(
     Interface: AdvisorEventPump, PersistentInbox, and the active conversation.
     """
     event = LocalEvent(
-        kind="agent_result",
-        dedupe_key="agent_result:task-1",
-        payload={"task_id": "task-1"},
+        kind="research_base_changed",
+        dedupe_key="research_base_changed:17:abc",
+        payload={"number": 17},
     )
     conversation_id = "00000000-0000-0000-0000-000000000017"
 
@@ -1147,3 +1147,35 @@ def test_student_availability_rendering_matches_controller_and_watcher_paths():
     )
 
     assert watcher_event.to_inbox_message() == controller_event.to_prompt()
+
+
+def test_event_pump_leaves_collectable_child_results_for_the_foreground_poll(
+    tmp_path: Path,
+):
+    """
+    Requirement: a result collected by await_agents is never delivered twice.
+    Interface: AdvisorEventPump, LocalEventStore, and PersistentInbox.
+    """
+    event = LocalEvent(
+        kind="agent_result",
+        dedupe_key="agent_result:task-1",
+        payload={"task_id": "task-1"},
+    )
+    conversation_id = "00000000-0000-0000-0000-000000000017"
+
+    with (
+        LocalEventStore(tmp_path / "events.sqlite3") as store,
+        PersistentInbox() as inbox,
+    ):
+        store.enqueue(event)
+        pump = AdvisorEventPump(
+            store,
+            SteeringConversation(),
+            inbox=inbox,
+            conversation_id=conversation_id,
+        )
+
+        assert pump._transfer_to_inbox() == 0
+
+        assert store.pending() == [event]
+        assert inbox.pending_count(conversation_id) == 0

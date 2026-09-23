@@ -12,7 +12,6 @@ from .values import (
     bounded_text,
     github_datetime,
     label_names,
-    object_value,
     payload_digest,
     versioned_event,
 )
@@ -39,7 +38,9 @@ def human_issue_events(
         actor = mailbox._github.actor()
         human_messages = []
         for item in (issue, *mailbox._issue_comments(issue)):
-            user = object_value(item["user"])
+            user = item.get("user")
+            if not isinstance(user, dict):
+                continue  # deleted account
             author = str(user["login"])
             body = str(item.get("body") or "")
             if not is_trusted_human_message(

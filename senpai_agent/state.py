@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
@@ -117,8 +117,13 @@ class ConversationBatch:
 
 
 class StudentConversationSelector:
-    def __init__(self, registry: AssignmentConversationRegistry):
+    def __init__(
+        self,
+        registry: AssignmentConversationRegistry,
+        quarantined: Callable[[], Sequence[str]] = tuple,
+    ):
         self.registry = registry
+        self.quarantined = quarantined
 
     def __call__(
         self,
@@ -145,6 +150,11 @@ class StudentConversationSelector:
                 str(event.payload["revision_id"]),
             )
         if event.kind == "human_issue":
+            # Human steering is the only thing that reopens a quarantined
+            # conversation, so it goes there before a per-Issue thread.
+            quarantined = self.quarantined()
+            if quarantined:
+                return UUID(quarantined[-1])
             return self.registry.for_assignment(
                 f"human-issue-{event.payload['number']}",
                 "thread",

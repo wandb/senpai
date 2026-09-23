@@ -1652,3 +1652,31 @@ def test_context_is_copied_only_for_tasks_that_request_it(tmp_path):
         "assistant",
     ]
     assert requests[1].parent_context == ()
+
+
+def test_child_processes_leave_orphan_recovery_to_the_root(tmp_path):
+    registry = DelegationRegistry(tmp_path / "state" / "delegation" / "tasks.sqlite3")
+    rows, _created = registry.reserve(
+        operation_key="conversation:sibling",
+        tree_id="sibling-tree",
+        parent_conversation_id="conversation",
+        parent_task_id=None,
+        depth=1,
+        specs=[AgentTask(key="sibling", task="Still running", model="smart")],
+        deadlines=[time.time() + 60],
+    )
+    task_id = rows[0]["task_id"]
+    registry.mark_running(task_id, 999_999_999)
+
+    tools(
+        tmp_path,
+        lambda _: None,
+        depth=1,
+        agent_name="general-purpose",
+        root_state_dir=tmp_path / "state",
+        state_dir=tmp_path / "state" / "children" / "sibling",
+    )
+    assert registry.rows([task_id])[0]["status"] == "running"
+
+    tools(tmp_path, lambda _: None)
+    assert registry.rows([task_id])[0]["status"] == "failed"

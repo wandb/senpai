@@ -8,6 +8,7 @@ from typing import Protocol, Self
 
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
 
+from senpai_agent.delegation import COLLECTABLE_EVENT_KINDS
 from senpai_agent.hooks import queued_feedback_marker
 from senpai_agent.inbox import (
     ADVISOR_ACTIVE_STEERING_PRIORITIES,
@@ -201,6 +202,10 @@ class AdvisorEventPump:
         steer_generation = 0
         steer_active_run = False
         for event in pending:
+            if event.kind in COLLECTABLE_EVENT_KINDS:
+                # await_agents acknowledges collected results in the store, so
+                # they wait there for the foreground poll instead of the inbox.
+                continue
             mode = ADVISOR_ACTIVE_STEERING_PRIORITIES.get(event.kind)
             if mode is not None:
                 with self._steer_lock:

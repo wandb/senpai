@@ -1193,6 +1193,10 @@ def _row_state(row: sqlite3.Row) -> AgentTaskState:
     )
 
 
+# Terminal child results; await_agents and cancel_agents acknowledge them.
+COLLECTABLE_EVENT_KINDS = frozenset({"agent_result", "agent_error"})
+
+
 def _task_event(row: sqlite3.Row) -> LocalEvent:
     successful = row["status"] == "finished"
     payload = {
@@ -1360,8 +1364,11 @@ class _DelegationManager:
         self.child_runner_factory = child_runner_factory
         self.event_sink = event_sink
         self.event_db_path = event_db_path
-        with self.registry.lifecycle():
-            self._reconcile(self.registry.active_rows())
+        if config.depth == 0:
+            # Only the root process recovers orphaned tasks; a child's wake
+            # events would land in its private event store, which nothing reads.
+            with self.registry.lifecycle():
+                self._reconcile(self.registry.active_rows())
 
     def _validate_spawn(self, tasks: Sequence[AgentTaskBase]) -> None:
         if not tasks or len(tasks) > MAX_SPAWN_BATCH:

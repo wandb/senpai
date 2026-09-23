@@ -186,3 +186,32 @@ def test_eval_cannot_hide_a_push_inside_a_nested_heredoc():
     )
 
     assert is_allowed(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "> /tmp/out git push origin experiment",
+        ">| /tmp/out git push origin experiment",
+        "2>/dev/null python train.py --epochs 50",
+        "2>&1 gh pr merge 17 --squash",
+        "LOG=/tmp/out 2>>/tmp/err python train.py --epochs 50",
+    ],
+)
+def test_leading_redirections_do_not_hide_the_command(command: str):
+    assert is_allowed(command) is False
+
+
+def test_leading_redirections_keep_allowed_commands_allowed():
+    assert is_allowed("2>/dev/null git status --short") is True
+
+
+def test_unbalanced_quotes_fail_closed_with_an_actionable_reason():
+    decision = terminal_policy(
+        "cat <<EOF > notes.md\nDon't do this\nEOF",
+        "student",
+        WORKSPACE,
+    )
+
+    assert decision.allowed is False
+    assert "quote the heredoc delimiter" in decision.reason

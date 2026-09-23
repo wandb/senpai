@@ -1078,6 +1078,11 @@ class PersistentInbox:
             ).fetchall()
             return tuple(self._turn(self._connection, row[0]) for row in rows)
 
+    def quarantined_conversation_ids(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(turn.conversation_id for turn in self.quarantined_turns())
+        )
+
     def processed_turns(self) -> tuple[InboxTurn, ...]:
         with self._lock:
             rows = self._connection.execute(

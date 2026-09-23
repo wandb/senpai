@@ -276,7 +276,7 @@ class TrainingResultObservation(Observation):
     exit_code: int | None = None
     elapsed_seconds: float
     log_path: str
-    wandb_run_ids: tuple[str, ...] = ()
+    wandb_run_paths: tuple[str, ...] = ()
     error_tail: str = ""
 
     @classmethod
@@ -312,7 +312,7 @@ class TrainingResultObservation(Observation):
             "exit_code": self.exit_code,
             "elapsed_seconds": round(self.elapsed_seconds, 3),
             "log_path": self.log_path,
-            "wandb_run_ids": self.wandb_run_ids,
+            "wandb_run_paths": self.wandb_run_paths,
         }
         if self.error_tail:
             result["error_tail"] = self.error_tail
@@ -351,10 +351,15 @@ class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObserva
                     conversation_id=conversation.id,
                 )
             )
-            return TrainingResultObservation.from_result(result, conversation)
+        except Exception:
+            # A running training without its monitor could never be finished
+            # or repaired, so stop it rather than leave it behind.
+            self.training.cancel_training(result.training_id)
+            raise
         finally:
             with self._lock:
                 self._in_flight.discard(result.training_id)
+        return TrainingResultObservation.from_result(result, conversation)
 
     def close(self) -> None:
         return

@@ -650,3 +650,32 @@ conversation.close()
 
     assert crashed.returncode == 17
     assert resumed.returncode == 0
+
+
+def test_restart_backoff_publishes_a_healthy_supervisor_lease(tmp_path: Path):
+    lease_path = tmp_path / "controller-lease.json"
+    stop = threading.Event()
+    supervisor = WorkerSupervisor(
+        command=(sys.executable, "-c", "raise SystemExit(1)"),
+        lease_path=lease_path,
+        config=SupervisorConfig(
+            startup_timeout_seconds=1,
+            check_interval_seconds=0.01,
+            terminate_grace_seconds=0.05,
+            initial_backoff_seconds=30,
+            max_backoff_seconds=30,
+        ),
+    )
+
+    thread, results = run_supervisor(supervisor, stop)
+    try:
+        wait_for(lease_path)
+        lease = WorkerLease.read(lease_path)
+    finally:
+        stop.set()
+        thread.join(5)
+
+    assert lease.phase == "restart-backoff"
+    assert lease.pid == os.getpid()
+    assert supervisor_module.lease_is_healthy(lease_path)
+    assert results == [0]

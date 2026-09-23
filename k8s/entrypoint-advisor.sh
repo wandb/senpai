@@ -41,52 +41,43 @@ git config --global safe.directory "$WORKDIR"
 source "$SOURCE_SENPAI_PLUGIN/scripts/git-guard.sh"
 install_senpai_git_guard "$WORKDIR" "$TARGET_WORKDIR" "$GIT_ASKPASS_FILE"
 
-clone_single_target_branch() {
-    local branch="$1"
-    local depth=()
-    [ "$GH_HISTORY_SCOPE" = "fresh" ] && depth=(--depth 1)
-    git clone --branch "$branch" --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$PROBLEM_DIR"
-}
-
-clone_target_repo() {
-    case "$GH_HISTORY_SCOPE" in
-        branch|fresh)
-            if clone_single_target_branch "$ADVISOR_BRANCH"; then
-                return 0
-            fi
-            if [ -z "$TARGET_REPO_BRANCH" ]; then
-                return 1
-            fi
-            rm -rf "$PROBLEM_DIR"
-            if ! clone_single_target_branch "$TARGET_REPO_BRANCH"; then
-                return 1
-            fi
-            cd "$WORKDIR/$PROBLEM_DIR"
-            git checkout -b "$ADVISOR_BRANCH"
-            git push -u origin "$ADVISOR_BRANCH"
-            cd "$WORKDIR"
-            ;;
-        repo) git clone "$TARGET_REPO_URL" "$PROBLEM_DIR" ;;
-        *) echo "ERROR: GH_HISTORY_SCOPE must be one of: branch, repo, fresh" >&2; exit 2 ;;
+advisor_branch_exists() {
+    local status=0
+    git ls-remote --exit-code --heads "$TARGET_REPO_URL" "refs/heads/$ADVISOR_BRANCH" >/dev/null || status=$?
+    case "$status" in
+        0) return 0 ;;
+        2) return 1 ;;
+        *) echo "ERROR: could not query $TARGET_REPO_URL for branch '$ADVISOR_BRANCH'" >&2; exit 1 ;;
     esac
 }
 
 # Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
-# agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
-if [ ! -d "$PROBLEM_DIR/.git" ] && ! clone_target_repo; then
-    if [ -n "$TARGET_REPO_BRANCH" ]; then
-        echo "ERROR: could not clone advisor branch '$ADVISOR_BRANCH' or target base branch '$TARGET_REPO_BRANCH'" >&2
-        exit 1
-    fi
-    [ "$GH_HISTORY_SCOPE" = "repo" ] && exit 1
-    depth=()
+# agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai). The advisor
+# branch is created from the base branch only when it is genuinely absent, so a
+# transient clone failure can never fast-forward an existing advisor branch.
+clone_target_repo() {
+    local depth=() base=()
     [ "$GH_HISTORY_SCOPE" = "fresh" ] && depth=(--depth 1)
-    git clone --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$PROBLEM_DIR"
-    cd "$WORKDIR/$PROBLEM_DIR"
-    git checkout -b "$ADVISOR_BRANCH"
-    git push -u origin "$ADVISOR_BRANCH"
-    cd "$WORKDIR"
-fi
+    [ -n "$TARGET_REPO_BRANCH" ] && base=(--branch "$TARGET_REPO_BRANCH")
+    case "$GH_HISTORY_SCOPE" in
+        repo) git clone "$TARGET_REPO_URL" "$PROBLEM_DIR" ;;
+        branch|fresh)
+            if advisor_branch_exists; then
+                git clone --branch "$ADVISOR_BRANCH" --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$PROBLEM_DIR"
+            else
+                git clone "${base[@]}" --single-branch "${depth[@]}" --no-tags "$TARGET_REPO_URL" "$PROBLEM_DIR"
+                (
+                    cd "$PROBLEM_DIR"
+                    git checkout -b "$ADVISOR_BRANCH"
+                    git push -u origin "$ADVISOR_BRANCH"
+                )
+            fi
+            ;;
+        *) echo "ERROR: GH_HISTORY_SCOPE must be one of: branch, repo, fresh" >&2; exit 2 ;;
+    esac
+}
+
+[ -d "$PROBLEM_DIR/.git" ] || clone_target_repo
 git config --global --unset-all credential.helper 2>/dev/null || true
 
 uv pip install --python "$SENPAI_PYTHON" --no-deps -e .

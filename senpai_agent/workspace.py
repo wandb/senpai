@@ -250,7 +250,6 @@ class StudentWorkspaceReconciler:
                 "--atomic",
                 self.remote,
                 *(f"+{source}:{destination}" for source, destination in refs),
-                timeout=300,
             )
             return
 
@@ -275,7 +274,6 @@ class StudentWorkspaceReconciler:
                 self.remote,
                 *(f"+{source}:{staged}" for source, staged, _ in staged_refs),
                 environment=self._authenticated_git_environment(),
-                timeout=300,
             )
             self._run(
                 "fetch",
@@ -284,7 +282,6 @@ class StudentWorkspaceReconciler:
                 str(staging),
                 *(f"+{staged}:{destination}" for _, staged, destination in staged_refs),
                 environment=self._file_git_environment(),
-                timeout=300,
             )
 
     def _commit_exists(self, sha: str) -> bool:
@@ -356,14 +353,12 @@ class StudentWorkspaceReconciler:
         *arguments: str,
         check: bool = True,
         environment: dict[str, str] | None = None,
-        timeout: int = 30,
     ) -> subprocess.CompletedProcess[str]:
         return self._run_at(
             self.workspace,
             *arguments,
             check=check,
             environment=environment or git_process_env(None),
-            timeout=timeout,
         )
 
     @staticmethod
@@ -372,7 +367,6 @@ class StudentWorkspaceReconciler:
         *arguments: str,
         check: bool = True,
         environment: dict[str, str],
-        timeout: int = 30,
     ) -> subprocess.CompletedProcess[str]:
         completed = subprocess.run(
             ["git", *arguments],
@@ -380,7 +374,6 @@ class StudentWorkspaceReconciler:
             check=False,
             text=True,
             capture_output=True,
-            timeout=timeout,
             env=environment,
         )
         if check and completed.returncode != 0:

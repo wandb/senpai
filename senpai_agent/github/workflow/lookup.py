@@ -127,8 +127,8 @@ class LookupMixin:
         if issue.id == human_message_id:
             return HumanIssueMessage(
                 body=issue.body or "",
-                author=issue.user.login,
-                author_type=issue.user.type,
+                author=issue.user.login if issue.user else "",
+                author_type=issue.user.type if issue.user else "",
                 author_association=issue.author_association,
             )
         match = next(

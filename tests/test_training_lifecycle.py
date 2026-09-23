@@ -30,7 +30,7 @@ def test_finished_training_persists_its_result_and_log(tmp_path: Path):
     assert running.pid is not None
     assert terminal.state is TrainingState.FINISHED
     assert terminal.exit_code == 0
-    assert terminal.wandb_run_ids == ("run-123",)
+    assert terminal.wandb_run_paths == ("acme/cfd/run-123",)
     assert Path(terminal.log_path).read_text().strip().endswith("/runs/run-123")
     assert reopened == terminal
 

@@ -32,7 +32,12 @@ from senpai_agent.mailbox import (
     StudentAssignmentAvailabilityMailbox,
 )
 from senpai_agent.program_context import ProgramSystemPrompt
-from senpai_agent.state import StartedConversationLedger, WorkspaceDivergenceLedger
+from senpai_agent.state import (
+    AssignmentConversationRegistry,
+    StartedConversationLedger,
+    StudentConversationSelector,
+    WorkspaceDivergenceLedger,
+)
 from senpai_agent.supervisor import ProgressLease, WorkerLease
 from senpai_agent.system_instructions import SenpaiSystemInstructions
 from senpai_agent.workspace import WorkspaceDivergence
@@ -1752,3 +1757,36 @@ def test_failed_acknowledgement_does_not_advance_supervisor_progress(tmp_path: P
         ).run(max_cycles=1)
 
     assert WorkerLease.read(lease_path).completed_turns == 0
+
+
+def test_a_human_issue_reopens_a_quarantined_student_conversation(tmp_path: Path):
+    runtime = controller(
+        Mailbox(((student_assignment_event(),), ())),
+        QuarantiningTurns(),
+        role="student",
+        max_consecutive_turn_failures=1,
+    )
+    runtime.run(max_cycles=1)
+    quarantined = runtime.inbox.quarantined_turns()[0]
+    mailbox = Mailbox(((human_event(),), ()))
+    turns = Turns()
+
+    controller(
+        mailbox,
+        turns,
+        role="student",
+        inbox=runtime.inbox,
+        conversation_for_events=StudentConversationSelector(
+            AssignmentConversationRegistry(tmp_path / "students.json"),
+            quarantined=runtime.inbox.quarantined_conversation_ids,
+        ),
+    ).run(max_cycles=1)
+
+    assert [call[1] for call in turns.calls] == [CONVERSATION_ID]
+    assert turns.calls[0][2] == frozenset(
+        {student_assignment_event().dedupe_key, human_event().dedupe_key}
+    )
+    assert runtime.inbox.turn(quarantined.turn_id).quarantine_reason is None
+    assert mailbox.acknowledged == [
+        (student_assignment_event().dedupe_key, human_event().dedupe_key)
+    ]

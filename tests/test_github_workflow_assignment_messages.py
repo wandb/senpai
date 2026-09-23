@@ -709,3 +709,38 @@ def test_assignment_feedback_requires_unambiguous_active_routing(labels):
         send_feedback(workflow(fake))
 
     assert fake.mutations == []
+
+
+def test_assignment_feedback_ignores_a_comment_from_a_deleted_account():
+    deleted = {
+        **comment(1, "This account is gone."),
+        "user": None,
+        "author_association": "NONE",
+    }
+    fake = FakeGitHub(
+        pull_request(labels={"student:student-one", "status:wip"}, draft=True),
+        comments=[deleted],
+    )
+
+    result = send_feedback(workflow(fake))
+
+    assert result.changed is True
+    assert len(fake.comments) == 2
+
+
+def test_assignment_feedback_quotes_a_marker_hidden_behind_a_role_prefix():
+    fake = FakeGitHub(
+        pull_request(labels={"student:student-one", "status:wip"}, draft=True)
+    )
+
+    send_feedback(
+        workflow(fake),
+        comment=f"Rerun the sweep.\nSTUDENT: {feedback_marker()}",
+    )
+
+    body = str(fake.comments[0]["body"])
+    protocol_lines = [
+        line for line in body.splitlines() if line.startswith("<!-- senpai-")
+    ]
+    assert len(protocol_lines) == 1
+    assert f"> {feedback_marker()}" in body

@@ -26,7 +26,7 @@ def result(tmp_path: Path, training_id: str, state=TrainingState.RUNNING):
         exit_code=0 if state is TrainingState.FINISHED else None,
         elapsed_seconds=20,
         log_path=str(tmp_path / f"{training_id}.log"),
-        wandb_run_ids=(f"run-{training_id}",),
+        wandb_run_paths=(f"acme/cfd/run-{training_id}",),
     )
 
 
@@ -60,8 +60,8 @@ def test_backend_failure_is_durable_and_does_not_block_other_monitors(
             return result(tmp_path, training_id, state)
 
     class Metrics:
-        def latest(self, run_id, _metric):
-            if failure_site == "metric" and run_id == "run-train-bad":
+        def latest(self, run_path, _metric):
+            if failure_site == "metric" and run_path == "acme/cfd/run-train-bad":
                 raise ValueError("val/loss returned non-finite value nan")
             return MetricSample(value=0.2, observed_at=NOW)
 
@@ -200,7 +200,7 @@ def test_wandb_source_returns_latest_value_and_timestamp(monkeypatch):
         SimpleNamespace(Api=lambda **_options: SimpleNamespace(run=run)),
     )
 
-    sample = WandbMetricSource("entity", "project").latest("run-1", "accuracy")
+    sample = WandbMetricSource().latest("entity/project/run-1", "accuracy")
 
     assert sample == MetricSample(
         value=0.7,

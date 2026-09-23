@@ -172,7 +172,7 @@ class IssueCommentResponse(GitHubResponse):
     id: PositiveInteger
     body: StrictStr
     html_url: StrictStr
-    user: GitHubAuthor
+    user: GitHubAuthor | None  # null for deleted accounts
     author_association: RequiredString
 
     def comment(self) -> IssueComment:
@@ -180,8 +180,8 @@ class IssueCommentResponse(GitHubResponse):
             id=self.id,
             body=self.body,
             url=self.html_url,
-            author=self.user.login,
-            author_type=self.user.type,
+            author=self.user.login if self.user else "",
+            author_type=self.user.type if self.user else "",
             author_association=self.author_association,
         )
 
@@ -191,7 +191,7 @@ class IssueResponse(GitHubResponse):
     body: StrictStr | None
     state: StrictStr
     labels: tuple[GitHubLabel, ...]
-    user: GitHubAuthor
+    user: GitHubAuthor | None
     author_association: RequiredString
     pull_request: dict[str, object] | None = None
 

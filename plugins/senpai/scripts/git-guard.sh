@@ -14,7 +14,6 @@ install_senpai_git_guard() {
 
     git remote set-url --push origin DISABLED
     git config remote.origin.pushurl DISABLED
-    git config --unset-all url."https://${GITHUB_TOKEN}@github.com/".insteadOf 2>/dev/null || true
 
     export TARGET_WORKDIR="$target_workdir"
     export SENPAI_REAL_GIT="${SENPAI_REAL_GIT:-$(command -v git)}"
