@@ -289,7 +289,7 @@ explicit on every request.
 Senpai sets `reasoning_context="all_turns"` and `reasoning_summary="auto"` so
 supported models can reuse server-side private reasoning and return the most
 detailed available summary. The standalone runner and launcher default to
-Claude Fable 5.1 at `high` for advisors and `medium` for students. Explicit
+Claude Opus 5.5 at `xhigh` for advisors and `high` for students. Explicit
 GPT-5.6 profiles also accept `max`, which uses API `max` effort with Responses
 `reasoning.mode: pro`. Automatic OpenAI compaction starts at
 the `compaction_trigger_tokens` value from `senpai.yaml`, which defaults to
@@ -297,8 +297,8 @@ the `compaction_trigger_tokens` value from `senpai.yaml`, which defaults to
 chain, but its complete local event log remains durable and is used to recover
 the latest response ID after restart.
 
-Claude Fable 5.1, Fable 5, Opus 5, and Sonnet 5 profiles pass `max` through as
-provider-native `output_config.effort: max` with adaptive thinking. Senpai
+Claude Opus 5.5, Fable 5.1, Fable 5, Opus 5, and Sonnet 5 profiles pass `max`
+through as provider-native `output_config.effort: max` with adaptive thinking. Senpai
 never adds the OpenAI-only `reasoning.mode: pro` request body to Anthropic
 calls.
 
@@ -543,9 +543,9 @@ outlives an ancestor deadline.
 Each tier selects one explicit model-and-effort profile. `model=fast` defaults
 to `anthropic/claude-sonnet-5` at `medium` for mechanical search, command
 execution, and extraction. `model=smart` defaults to
-`anthropic/claude-fable-5-1` at `high` for ordinary review, literature research,
+`anthropic/claude-opus-5-5` at `xhigh` for ordinary review, literature research,
 synthesis, and failure diagnosis. `model=frontier` defaults to
-`anthropic/claude-fable-5-1` at `max` for the hardest quality-first work. The
+`anthropic/claude-opus-5-5` at `max` for the hardest quality-first work. The
 provider prefix determines the required credential
 (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`); model-facing calls never select
 credential names.

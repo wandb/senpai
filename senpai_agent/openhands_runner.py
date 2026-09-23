@@ -104,12 +104,12 @@ from senpai_agent.PROMPTS import (
 from senpai_agent.system_instructions import SenpaiSystemInstructions
 from senpai_agent.tools import register_senpai_tools
 
-DEFAULT_MODEL = "anthropic/claude-fable-5-1"
+DEFAULT_MODEL = "anthropic/claude-opus-5-5"
 DEFAULT_FAST_MODEL = "anthropic/claude-sonnet-5"
-DEFAULT_FRONTIER_MODEL = "anthropic/claude-fable-5-1"
-DEFAULT_ADVISOR_REASONING_EFFORT = "high"
-DEFAULT_STUDENT_REASONING_EFFORT = "medium"
-DEFAULT_SMART_REASONING_EFFORT = "high"
+DEFAULT_FRONTIER_MODEL = "anthropic/claude-opus-5-5"
+DEFAULT_ADVISOR_REASONING_EFFORT = "xhigh"
+DEFAULT_STUDENT_REASONING_EFFORT = "high"
+DEFAULT_SMART_REASONING_EFFORT = "xhigh"
 DEFAULT_FAST_REASONING_EFFORT = "medium"
 DEFAULT_FRONTIER_REASONING_EFFORT = "max"
 DEFAULT_COMPACTION_TRIGGER_TOKENS = 200_000

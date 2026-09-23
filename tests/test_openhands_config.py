@@ -394,7 +394,7 @@ def test_inbox_recovery_budget_rejects_invalid_values(tmp_path, key, value):
 
 @pytest.mark.parametrize(
     ("role", "main_reasoning_effort"),
-    [("advisor", "high"), ("student", "medium")],
+    [("advisor", "xhigh"), ("student", "high")],
 )
 def test_default_model_profiles_are_explicit_and_provider_credentials_are_inferred(
     tmp_path: Path,
@@ -411,7 +411,7 @@ def test_default_model_profiles_are_explicit_and_provider_credentials_are_inferr
         config.api_key_env,
         config.reasoning_effort,
     ) == (
-        "anthropic/claude-fable-5-1",
+        "anthropic/claude-opus-5-5",
         "ANTHROPIC_API_KEY",
         main_reasoning_effort,
     )
@@ -419,7 +419,7 @@ def test_default_model_profiles_are_explicit_and_provider_credentials_are_inferr
         config.smart_model,
         config.smart_api_key_env,
         config.smart_reasoning_effort,
-    ) == ("anthropic/claude-fable-5-1", "ANTHROPIC_API_KEY", "high")
+    ) == ("anthropic/claude-opus-5-5", "ANTHROPIC_API_KEY", "xhigh")
     assert (
         config.fast_model,
         config.fast_api_key_env,
@@ -429,7 +429,7 @@ def test_default_model_profiles_are_explicit_and_provider_credentials_are_inferr
         config.frontier_model,
         config.frontier_api_key_env,
         config.frontier_reasoning_effort,
-    ) == ("anthropic/claude-fable-5-1", "ANTHROPIC_API_KEY", "max")
+    ) == ("anthropic/claude-opus-5-5", "ANTHROPIC_API_KEY", "max")
 
 
 def test_ultra_environment_value_is_rejected(tmp_path: Path):
@@ -486,7 +486,7 @@ def test_fast_model_inherits_an_openai_main_profile(tmp_path: Path):
 
     assert config.smart_model == "openai/gpt-5.6"
     assert config.fast_model == "openai/gpt-5.6"
-    assert config.fast_reasoning_effort == "high"
+    assert config.fast_reasoning_effort == "xhigh"
     assert config.api_key_env == "OPENAI_API_KEY"
     assert config.smart_api_key_env == "OPENAI_API_KEY"
     assert config.fast_api_key_env == "OPENAI_API_KEY"
@@ -520,6 +520,7 @@ def test_fast_profile_inherits_smart_effort_for_a_wandb_main_override(
             "WANDB_PROJECT": "mlxfast",
             "SENPAI_OPENHANDS_MODEL": "wandb/zai-org/GLM-5.2",
             "SENPAI_OPENHANDS_REASONING_EFFORT": "max",
+            "SENPAI_OPENHANDS_SMART_REASONING_EFFORT": "high",
         }
     )
 
@@ -582,13 +583,13 @@ def test_anthropic_max_is_accepted_across_model_profiles(tmp_path: Path):
     env = runtime_env(tmp_path)
     env.update(
         {
-            "SENPAI_OPENHANDS_MODEL": "anthropic/claude-fable-5-1",
+            "SENPAI_OPENHANDS_MODEL": "anthropic/claude-opus-5-5",
             "SENPAI_OPENHANDS_REASONING_EFFORT": "max",
             "SENPAI_OPENHANDS_SMART_MODEL": "anthropic/claude-opus-5",
             "SENPAI_OPENHANDS_SMART_REASONING_EFFORT": "max",
             "SENPAI_OPENHANDS_FAST_MODEL": "anthropic/claude-sonnet-5",
             "SENPAI_OPENHANDS_FAST_REASONING_EFFORT": "max",
-            "SENPAI_OPENHANDS_FRONTIER_MODEL": "anthropic/claude-fable-5-1",
+            "SENPAI_OPENHANDS_FRONTIER_MODEL": "anthropic/claude-opus-5-5",
             "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": "max",
         }
     )
@@ -596,7 +597,7 @@ def test_anthropic_max_is_accepted_across_model_profiles(tmp_path: Path):
     config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
     assert (config.model, config.reasoning_effort) == (
-        "anthropic/claude-fable-5-1",
+        "anthropic/claude-opus-5-5",
         "max",
     )
     assert (config.smart_model, config.smart_reasoning_effort) == (
@@ -608,7 +609,7 @@ def test_anthropic_max_is_accepted_across_model_profiles(tmp_path: Path):
         "max",
     )
     assert (config.frontier_model, config.frontier_reasoning_effort) == (
-        "anthropic/claude-fable-5-1",
+        "anthropic/claude-opus-5-5",
         "max",
     )
 
