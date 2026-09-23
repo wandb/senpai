@@ -29,15 +29,15 @@ def test_default_config_exposes_every_model_profile_and_effort():
         for name in (f"{profile}_model", f"{profile}_reasoning_effort")
     } <= set(config)
     assert {
-        "advisor_model": "anthropic/claude-fable-5-1",
+        "advisor_model": "anthropic/claude-opus-5-5",
         "advisor_reasoning_effort": "high",
-        "student_model": "anthropic/claude-fable-5-1",
+        "student_model": "anthropic/claude-opus-5-5",
         "student_reasoning_effort": "medium",
-        "smart_model": "anthropic/claude-fable-5-1",
+        "smart_model": "anthropic/claude-opus-5-5",
         "smart_reasoning_effort": "high",
         "fast_model": "anthropic/claude-sonnet-5",
         "fast_reasoning_effort": "medium",
-        "frontier_model": "anthropic/claude-fable-5-1",
+        "frontier_model": "anthropic/claude-opus-5-5",
         "frontier_reasoning_effort": "max",
         "compaction_trigger_tokens": 200_000,
     }.items() <= config.items()
@@ -455,7 +455,7 @@ def test_openai_ultra_launch_value_is_rejected():
 
 def test_launch_accepts_anthropic_max_for_every_model_profile():
     args = launch_args(
-        advisor_model="anthropic/claude-fable-5-1",
+        advisor_model="anthropic/claude-opus-5-5",
         advisor_reasoning_effort="max",
         student_model="anthropic/claude-opus-5",
         student_reasoning_effort="max",
@@ -463,7 +463,7 @@ def test_launch_accepts_anthropic_max_for_every_model_profile():
         smart_reasoning_effort="max",
         fast_model="anthropic/claude-sonnet-5",
         fast_reasoning_effort="max",
-        frontier_model="anthropic/claude-fable-5-1",
+        frontier_model="anthropic/claude-opus-5-5",
         frontier_reasoning_effort="max",
     )
 
