@@ -162,3 +162,37 @@ def test_role_startup_isolates_target_uv_commands_from_agent_environment(
         "VIRTUAL_ENV": None,
         "SENPAI_PYTHON": "/opt/senpai-venv/bin/python",
     }
+
+
+def test_kubectl_proxy_uses_agent_python_inside_target_uv_environment(tmp_path: Path):
+    entrypoint = (ROOT / "k8s" / "entrypoint-student.sh").read_text()
+    proxy_setup = entrypoint[
+        entrypoint.index('    proxy_dir="$LOGDIR/bin"'):
+        entrypoint.index('    export PATH="$proxy_dir:$PATH"')
+    ]
+    runner_python = tmp_path / "runner-python"
+    runner_python.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        "print(json.dumps(sys.argv[1:]))\n"
+    )
+    runner_python.chmod(0o755)
+    target_bin = tmp_path / "target-venv" / "bin"
+    target_bin.mkdir(parents=True)
+    (target_bin / "python").write_text("#!/bin/sh\nexit 99\n")
+    (target_bin / "python").chmod(0o755)
+    environment = {
+        **os.environ,
+        "LOGDIR": str(tmp_path),
+        "SENPAI_PYTHON": str(runner_python),
+        "PATH": f"{target_bin}:{os.environ['PATH']}",
+    }
+    subprocess.run(["bash", "-c", proxy_setup], env=environment, check=True)
+
+    completed = subprocess.run(
+        [str(tmp_path / "bin" / "kubectl"), "apply", "-f", "-"],
+        env=environment, capture_output=True, text=True, check=True,
+    )
+    assert json.loads(completed.stdout) == [
+        "-m", "senpai_agent.kubernetes_executor", "kubectl", "apply", "-f", "-",
+    ]
