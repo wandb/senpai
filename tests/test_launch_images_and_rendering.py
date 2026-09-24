@@ -302,7 +302,7 @@ def test_multinode_kubectl_wrapper_can_be_reinstalled(tmp_path):
     kubectl = tmp_path / "state" / "bin" / "kubectl"
     assert kubectl.stat().st_mode & 0o777 == 0o500
     assert kubectl.read_text() == (
-        '#!/bin/sh\nexec python -m senpai_agent.kubernetes_executor kubectl "$@"\n'
+        '#!/bin/sh\nexec "$SENPAI_PYTHON" -m senpai_agent.kubernetes_executor kubectl "$@"\n'
     )
     assert list(kubectl.parent.glob(".kubectl.*")) == []
 

@@ -232,8 +232,12 @@ so long research and student names still produce valid Kubernetes DNS labels.
 
 `get_training_status` includes a bounded `kubernetes_diagnostics` snapshot while
 a workload runs, refreshed at most once every 30 seconds and again at completion.
+Live diagnostic reads run separately from status polling, so slow logs do not
+delay status or deadline checks.
 It includes pod placement, scheduling and container states, recent init and
 training logs, and bounded Kubernetes events for the exact workload and pod UIDs.
+The snapshot preserves status and event summaries before allocating space to
+container log excerpts, with failed containers first.
 Workload events expose validation failures before the MPI controller creates any
 pods. A launcher pod owned through a Job is included only when both owner UIDs
 lead to the reserved MPIJob. Log-read failures appear in diagnostics

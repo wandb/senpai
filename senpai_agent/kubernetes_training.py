@@ -14,6 +14,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -333,31 +334,35 @@ class KubernetesApiClient:
 
         deadline = time.monotonic() + 30
         pods = self._owned_pods(resource)
-        output = self._events(
+        events = self._events(
             resource.namespace, resource.uid, f"{resource.kind}/{resource.name}", deadline
         )
+        problems = []
+        statuses = []
+        log_requests = []
         if not pods:
-            output.append("No owned workload pods exist yet.")
-        for pod in pods:
+            statuses.append("No owned workload pods exist yet.")
+        for pod in sorted(pods, key=lambda pod: pod["metadata"]["name"]):
             pod_name = pod["metadata"]["name"]
             status = pod.get("status", {})
             prefix = f"[pod/{pod_name}] "
-            output.append(
+            statuses.append(
                 prefix + f"phase={status.get('phase', 'Unknown')} "
                 f"node={pod['spec'].get('nodeName', 'unassigned')}"
             )
-            output.extend(self._events(
+            events.extend(self._events(
                 resource.namespace, pod["metadata"]["uid"], f"pod/{pod_name}", deadline
             ))
             for condition in status.get("conditions", []):
                 if condition.get("status") == "False" and condition.get("message"):
-                    output.append(prefix + f"{condition['type']}: {condition['message']}")
+                    problems.append(prefix + f"{condition['type']}: {condition['message']}")
             container_states = {
                 item["name"]: item.get("state", {})
                 for item in status.get("initContainerStatuses", [])
                 + status.get("containerStatuses", [])
             }
-            containers = pod["spec"].get("initContainers", []) + pod["spec"]["containers"]
+            init_containers = pod["spec"].get("initContainers", [])
+            containers = init_containers + pod["spec"]["containers"]
             for container in containers[:8]:
                 name = container["name"]
                 prefix = f"[pod/{pod_name}/{name}] "
@@ -365,40 +370,70 @@ class KubernetesApiClient:
                 waiting = state.get("waiting")
                 terminated = state.get("terminated")
                 if waiting is not None:
-                    output.append(
+                    problems.append(
                         prefix + f"waiting: {waiting.get('reason', '')} "
                         f"{waiting.get('message', '')}"
                     )
                     continue
                 if terminated is not None:
-                    output.append(
+                    messages = problems if terminated.get("exitCode") != 0 else statuses
+                    messages.append(
                         prefix + f"terminated: {terminated.get('reason', '')} "
                         f"exit={terminated.get('exitCode')} "
                         f"{terminated.get('message', '')}"
                     )
                 if not state:
                     continue
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return "\n".join(output)
-                params = urllib.parse.urlencode(
-                    {"container": name, "tailLines": 200, "limitBytes": 8192}
+                priority = (
+                    0 if terminated and terminated.get("exitCode") != 0
+                    else 1 if container in init_containers
+                    else 2
                 )
-                path = (
-                    f"/api/v1/namespaces/{urllib.parse.quote(resource.namespace, safe='')}"
-                    f"/pods/{urllib.parse.quote(pod_name, safe='')}/log?{params}"
+                log_requests.append((priority, pod_name, name))
+
+        container_logs = []
+        for _, pod_name, name in sorted(log_requests):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            prefix = f"[pod/{pod_name}/{name}] "
+            params = urllib.parse.urlencode(
+                {"container": name, "tailLines": 200, "limitBytes": 8192}
+            )
+            path = (
+                f"/api/v1/namespaces/{urllib.parse.quote(resource.namespace, safe='')}"
+                f"/pods/{urllib.parse.quote(pod_name, safe='')}/log?{params}"
+            )
+            try:
+                text = self._request_text(
+                    "GET",
+                    path,
+                    allow_not_found=True,
+                    timeout_seconds=min(5, remaining),
                 )
-                try:
-                    text = self._request_text(
-                        "GET",
-                        path,
-                        allow_not_found=True,
-                        timeout_seconds=max(1, min(5, remaining)),
-                    )
-                except KubernetesApiError as error:
-                    output.append(prefix + f"logs unavailable: HTTP {error.status_code}")
-                    continue
-                output.extend(prefix + line for line in text.splitlines())
+            except KubernetesApiError as error:
+                problems.append(prefix + f"logs unavailable: HTTP {error.status_code}")
+                continue
+            if text:
+                container_logs.append((prefix, text))
+        return self._diagnostics_text(problems + statuses + events, container_logs)
+
+    @staticmethod
+    def _diagnostics_text(statuses: list[str], logs: list[tuple[str, str]]) -> str:
+        # Reserve at least half the snapshot for container log context.
+        status_budget = _ERROR_TAIL_BYTES // 2 if logs else _ERROR_TAIL_BYTES
+        summary = "\n".join(statuses).encode()[:status_budget].decode(errors="ignore")
+        if not logs:
+            return summary
+        log_budget = (_ERROR_TAIL_BYTES - len(summary.encode()) - len(logs)) // len(logs)
+        output = [summary] if summary else []
+        for prefix, text in logs:
+            text_budget = log_budget - len(prefix.encode())
+            if text_budget <= 0:
+                continue
+            # Keep each identity ahead of its tail, including when a line is long.
+            excerpt = text.encode()[-text_budget:].decode(errors="ignore")
+            output.append(prefix + excerpt)
         return "\n".join(output)
 
     def _events(self, namespace: str, uid: str, owner: str, deadline: float) -> list[str]:
@@ -564,6 +599,7 @@ class _ActiveRemoteTraining:
     cancelled: bool = False
     thread: threading.Thread | None = None
     next_diagnostics_at: float = 0
+    diagnostics_future: Future[str] | None = None
 
 
 class KubernetesTrainingSupervisor:
@@ -1067,7 +1103,7 @@ class KubernetesTrainingSupervisor:
                 )
 
         if active.resource is not None:
-            self._capture_diagnostics(training_id, active, detail)
+            self._capture_diagnostics(training_id, active, detail, wait=True)
         try:
             local_tail = active.log_path.read_bytes()[-_ERROR_TAIL_BYTES:].decode(
                 errors="ignore"
@@ -1091,20 +1127,48 @@ class KubernetesTrainingSupervisor:
         self._release_terminal(training_id, active, delete_required)
 
     def _capture_diagnostics(
-        self, training_id: str, active: _ActiveRemoteTraining, detail: str
+        self,
+        training_id: str,
+        active: _ActiveRemoteTraining,
+        detail: str,
+        *,
+        wait: bool = False,
     ) -> None:
-        try:
-            diagnostics = self.client.logs(active.resource)
-        except Exception as error:  # diagnostics must not interrupt workload supervision
-            diagnostics = f"Kubernetes diagnostics unavailable: {type(error).__name__}: {error}"
-        diagnostics = "\n".join(part for part in (detail, diagnostics) if part)[-_ERROR_TAIL_BYTES:]
+        # Terminal refreshes must not reuse a stale in-flight live snapshot.
+        if wait or active.diagnostics_future is None:
+            future: Future[str] = Future()
+            resource = active.resource
+
+            def collect() -> None:
+                try:
+                    diagnostics = self.client.logs(resource)
+                except Exception as error:  # optional diagnostics must not stop supervision
+                    diagnostics = (
+                        f"Kubernetes diagnostics unavailable: {type(error).__name__}: {error}"
+                    )
+                future.set_result(diagnostics)
+
+            active.diagnostics_future = future
+            threading.Thread(
+                target=collect,
+                name=f"senpai-kubernetes-diagnostics-{training_id}",
+                daemon=True,
+            ).start()
+        if not wait and not active.diagnostics_future.done():
+            return
+        detail = detail.encode()[:1024].decode(errors="ignore")
+        diagnostics = "\n".join(
+            part for part in (detail, active.diagnostics_future.result()) if part
+        )
+        summary = diagnostics.encode()[:_ERROR_TAIL_BYTES].decode(errors="ignore")
         result = self.get_training_status(training_id)
-        if diagnostics != result.kubernetes_diagnostics:
+        if summary != result.kubernetes_diagnostics:
             with active.log_path.open("a") as log:
                 log.write("\n=== Kubernetes workload diagnostics ===\n" + diagnostics + "\n")
             self._write_result(
-                result.model_copy(update={"kubernetes_diagnostics": diagnostics})
+                result.model_copy(update={"kubernetes_diagnostics": summary})
             )
+        active.diagnostics_future = None
         active.next_diagnostics_at = time.monotonic() + _DIAGNOSTICS_SECONDS
 
     def _release_terminal(
