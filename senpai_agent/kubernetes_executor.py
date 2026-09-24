@@ -120,10 +120,14 @@ class KubernetesExecutor:
                 return None
             if operation == "logs":
                 resource = self._require_resource(request["resource"])
-                return self.client.logs(resource) if self._verify_current(resource) else ""
+                if not self._verify_current(resource):
+                    return ""
             if operation == "release":
                 self._release(request["training_id"])
                 return None
+        if operation == "logs":
+            # The API client rechecks the UID; slow log reads must not block control.
+            return self.client.logs(resource)
         raise ValueError(f"unsupported executor operation {operation!r}")
 
     def reconcile(self) -> None:

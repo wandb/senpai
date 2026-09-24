@@ -87,6 +87,9 @@ ls \
 
 export IS_SANDBOX=1
 
+# Target uv commands must not synchronize the running agent's environment.
+unset UV_PROJECT_ENVIRONMENT UV_PYTHON VIRTUAL_ENV
+
 export SENPAI_OPENHANDS_STATE_DIR="$LOGDIR/openhands_state"
 export SENPAI_OPENHANDS_ROLE_FILE="$WORKDIR/system_instructions/STUDENT.md"
 export SENPAI_OPENHANDS_WORKSPACE="$TARGET_WORKDIR"
@@ -104,7 +107,7 @@ if [ "${NODES_PER_STUDENT:-1}" -gt 1 ]; then
     kubectl_wrapper="$(mktemp "$proxy_dir/.kubectl.XXXXXX")"
     printf '%s\n' \
         '#!/bin/sh' \
-        'exec python -m senpai_agent.kubernetes_executor kubectl "$@"' \
+        'exec "$SENPAI_PYTHON" -m senpai_agent.kubernetes_executor kubectl "$@"' \
         > "$kubectl_wrapper"
     chmod 500 "$kubectl_wrapper"
     mv -f "$kubectl_wrapper" "$proxy_dir/kubectl"

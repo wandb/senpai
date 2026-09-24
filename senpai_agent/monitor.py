@@ -63,6 +63,10 @@ class MetricSample(Contract):
     observed_at: datetime
 
 
+class MetricRunNotFoundError(LookupError):
+    """The metrics project is accessible, but the requested run does not exist."""
+
+
 class MonitorSignal(Contract):
     """Compact event handed back to the student conversation."""
 
@@ -531,9 +535,16 @@ class WandbMetricSource:
     def latest(self, run_id: str, metric: str) -> MetricSample | None:
         import wandb
 
-        run = wandb.Api(timeout=self.timeout_seconds).run(
-            f"{self.entity}/{self.project}/{run_id}"
+        runs = wandb.Api(timeout=self.timeout_seconds).runs(
+            f"{self.entity}/{self.project}",
+            filters={"name": run_id},
+            per_page=1,
         )
+        run = next(iter(runs), None)
+        if run is None:
+            raise MetricRunNotFoundError(
+                f"W&B run {self.entity}/{self.project}/{run_id} does not exist"
+            )
         rows = run.history(
             keys=[metric, "_timestamp"],
             samples=2,
@@ -592,10 +603,14 @@ class TrainingMonitorEngine:
                     and spec.metric
                     and result.wandb_run_ids
                 ):
-                    sample = self.metrics.latest(
-                        result.wandb_run_ids[-1],
-                        spec.metric,
-                    )
+                    try:
+                        sample = self.metrics.latest(
+                            result.wandb_run_ids[-1],
+                            spec.metric,
+                        )
+                    except MetricRunNotFoundError:
+                        if self.store.baseline_sample(spec.training_id) is not None:
+                            raise
             except Exception as error:  # noqa: BLE001
                 signal = self.store.record_poll_error(
                     spec,

@@ -224,7 +224,26 @@ exact-commit bundle checkout, binds the W&B/source annotations, persists the
 created UID, and uses UID-preconditioned activation and deletion. Workloads are
 created suspended, so a late ambiguous API request cannot start GPU pods. The
 model-facing student has no Kubernetes token or real `kubectl`; its
-`kubectl apply -f -` command is a validated socket proxy.
+`kubectl apply -f -` command is a validated socket proxy. A target launcher must
+submit the manifest and exit; it must not call `kubectl get`, `wait`, or `logs`.
+The supervisor owns polling and cleanup after submission. Generated workload
+names reserve space for the MPI launcher's and highest-index worker's suffixes,
+so long research and student names still produce valid Kubernetes DNS labels.
+
+`get_training_status` includes a bounded `kubernetes_diagnostics` snapshot while
+a workload runs, refreshed at most once every 30 seconds and again at completion.
+Live diagnostic reads run separately from status polling, so slow logs do not
+delay status or deadline checks.
+It includes pod placement, scheduling and container states, recent init and
+training logs, and bounded Kubernetes events for the exact workload and pod UIDs.
+The snapshot preserves status and event summaries before allocating space to
+container log excerpts, with failed containers first.
+Workload events expose validation failures before the MPI controller creates any
+pods. A launcher pod owned through a Job is included only when both owner UIDs
+lead to the reserved MPIJob. Log-read failures appear in diagnostics
+instead of disappearing silently. These reads stay inside the executor broker;
+students receive neither Kubernetes credentials nor namespace-wide read access.
+When a smoke run stalls before W&B starts, inspect these diagnostics first.
 
 The launcher creates routing labels, one launch Secret, role ConfigMaps, and Deployments. Multi-node students also receive one namespaced ServiceAccount, Role, and RoleBinding. It does not create the namespace, PVC, Service, or cluster-wide RBAC.
 
@@ -321,6 +340,12 @@ Students do not start GPU work, stream logs, sleep, or poll through the terminal
 | `cancel_training` | Stops the complete process group through the supervised TERM/KILL path, waits for a durable terminal state, and retires its monitor. |
 
 After launch, the student can finish its turn. The deterministic controller polls process state and at most one selected W&B metric without consuming model tokens. A threshold crossing, regression, stale metric, terminal state, or monitor error creates one compact durable event and resumes the same student conversation. One broken monitor cannot block other training, GitHub feedback, or child-agent results.
+
+Before the first metric arrives, an absent W&B run in an accessible project
+counts as a missing sample. The monitor keeps polling and emits a stale-metric
+signal after `stale_after_seconds`, measured from monitor registration.
+Authentication, project-access, and network errors remain hard monitor failures.
+A run that disappears after reporting a metric also remains a hard failure.
 
 `improved_by` and `regressed_by` compare with the monitor policy's first observed sample; they do not silently reuse the assignment's documented baseline.
 
@@ -487,6 +512,8 @@ Useful launch controls:
 - `human_issues: false` disables GitHub Issue polling for isolated launches.
 
 All role images are built from the same source revision. The advisor image excludes CUDA and PyTorch; the student image contains the CUDA/PyTorch runtime; the executor image contains only its Python broker; the cutoff image contains only the minimal job runtime and pinned `kubectl`. Advisor and student builds install Chromium and execute an OpenHands browser smoke test.
+
+The agent runs from `/opt/senpai-venv`. Before starting the controller, both role entrypoints clear `UV_PROJECT_ENVIRONMENT`, `UV_PYTHON`, and `VIRTUAL_ENV` so target-repository `uv run` and `uv sync` commands use that repository's `.venv`. Do not point target dependency installation at the agent environment: synchronizing it against a target lockfile can remove OpenHands dependencies or PyTorch while the controller is still running. If that happens, redeploy the affected pod from its pinned image to restore the agent environment.
 
 For multi-day fleets, [`arm_senpai_cluster_cutoff.sh`](scripts/arm_senpai_cluster_cutoff.sh) creates a cluster-side hard cutoff that does not depend on an operator laptop remaining online. It can also hold a shared start gate until the expected fleet is ready or its readiness deadline expires.
 

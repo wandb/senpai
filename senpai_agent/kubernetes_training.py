@@ -14,6 +14,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -32,6 +33,7 @@ from senpai_agent.training import (
 
 _ERROR_TAIL_BYTES = 8192
 _POLL_SECONDS = 2.0
+_DIAGNOSTICS_SECONDS = 30.0
 _JOIN_SECONDS = 120.0
 _DETACH_GRACE_SECONDS = 0.1
 EXECUTOR_SOCKET_ENV = "SENPAI_KUBERNETES_EXECUTOR_SOCKET"
@@ -328,46 +330,176 @@ class KubernetesApiClient:
             time.sleep(0.5)
 
     def logs(self, resource: KubernetesResourceRef) -> str:
+        """Return bounded status and logs for this workload's exact pod owner chain."""
+
         deadline = time.monotonic() + 30
-        label = (
-            f"job-name={resource.name}"
-            if resource.kind == "Job"
-            else f"training.kubeflow.org/job-name={resource.name}"
+        pods = self._owned_pods(resource)
+        events = self._events(
+            resource.namespace, resource.uid, f"{resource.kind}/{resource.name}", deadline
         )
-        query = urllib.parse.urlencode({"labelSelector": label})
+        problems = []
+        statuses = []
+        log_requests = []
+        if not pods:
+            statuses.append("No owned workload pods exist yet.")
+        for pod in sorted(pods, key=lambda pod: pod["metadata"]["name"]):
+            pod_name = pod["metadata"]["name"]
+            status = pod.get("status", {})
+            prefix = f"[pod/{pod_name}] "
+            statuses.append(
+                prefix + f"phase={status.get('phase', 'Unknown')} "
+                f"node={pod['spec'].get('nodeName', 'unassigned')}"
+            )
+            events.extend(self._events(
+                resource.namespace, pod["metadata"]["uid"], f"pod/{pod_name}", deadline
+            ))
+            for condition in status.get("conditions", []):
+                if condition.get("status") == "False" and condition.get("message"):
+                    problems.append(prefix + f"{condition['type']}: {condition['message']}")
+            container_states = {
+                item["name"]: item.get("state", {})
+                for item in status.get("initContainerStatuses", [])
+                + status.get("containerStatuses", [])
+            }
+            init_containers = pod["spec"].get("initContainers", [])
+            containers = init_containers + pod["spec"]["containers"]
+            for container in containers[:8]:
+                name = container["name"]
+                prefix = f"[pod/{pod_name}/{name}] "
+                state = container_states.get(name, {})
+                waiting = state.get("waiting")
+                terminated = state.get("terminated")
+                if waiting is not None:
+                    problems.append(
+                        prefix + f"waiting: {waiting.get('reason', '')} "
+                        f"{waiting.get('message', '')}"
+                    )
+                    continue
+                if terminated is not None:
+                    messages = problems if terminated.get("exitCode") != 0 else statuses
+                    messages.append(
+                        prefix + f"terminated: {terminated.get('reason', '')} "
+                        f"exit={terminated.get('exitCode')} "
+                        f"{terminated.get('message', '')}"
+                    )
+                if not state:
+                    continue
+                priority = (
+                    0 if terminated and terminated.get("exitCode") != 0
+                    else 1 if container in init_containers
+                    else 2
+                )
+                log_requests.append((priority, pod_name, name))
+
+        container_logs = []
+        for _, pod_name, name in sorted(log_requests):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            prefix = f"[pod/{pod_name}/{name}] "
+            params = urllib.parse.urlencode(
+                {"container": name, "tailLines": 200, "limitBytes": 8192}
+            )
+            path = (
+                f"/api/v1/namespaces/{urllib.parse.quote(resource.namespace, safe='')}"
+                f"/pods/{urllib.parse.quote(pod_name, safe='')}/log?{params}"
+            )
+            try:
+                text = self._request_text(
+                    "GET",
+                    path,
+                    allow_not_found=True,
+                    timeout_seconds=min(5, remaining),
+                )
+            except KubernetesApiError as error:
+                problems.append(prefix + f"logs unavailable: HTTP {error.status_code}")
+                continue
+            if text:
+                container_logs.append((prefix, text))
+        return self._diagnostics_text(problems + statuses + events, container_logs)
+
+    @staticmethod
+    def _diagnostics_text(statuses: list[str], logs: list[tuple[str, str]]) -> str:
+        # Reserve at least half the snapshot for container log context.
+        status_budget = _ERROR_TAIL_BYTES // 2 if logs else _ERROR_TAIL_BYTES
+        summary = "\n".join(statuses).encode()[:status_budget].decode(errors="ignore")
+        if not logs:
+            return summary
+        log_budget = (_ERROR_TAIL_BYTES - len(summary.encode()) - len(logs)) // len(logs)
+        output = [summary] if summary else []
+        for prefix, text in logs:
+            text_budget = log_budget - len(prefix.encode())
+            if text_budget <= 0:
+                continue
+            # Keep each identity ahead of its tail, including when a line is long.
+            excerpt = text.encode()[-text_budget:].decode(errors="ignore")
+            output.append(prefix + excerpt)
+        return "\n".join(output)
+
+    def _events(self, namespace: str, uid: str, owner: str, deadline: float) -> list[str]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return []
+        query = urllib.parse.urlencode({
+            "fieldSelector": f"involvedObject.uid={uid}",
+            "limit": 20,
+        })
+        try:
+            response = self._request_json(
+                "GET",
+                f"/api/v1/namespaces/{urllib.parse.quote(namespace, safe='')}/events?{query}",
+                timeout_seconds=min(3, remaining),
+            )
+        except KubernetesApiError as error:
+            return [f"[{owner}/events] unavailable: HTTP {error.status_code}"]
+        events = [
+            event for event in response["items"]
+            if event.get("involvedObject", {}).get("uid") == uid
+        ]
+        events.sort(key=lambda event: event.get("lastTimestamp") or event["metadata"]["creationTimestamp"])
+        return [
+            f"[{owner}/event] {event.get('type', '')} {event.get('reason', '')}: "
+            f"{event.get('message', '')[:1024]}"
+            for event in events[-5:]
+        ]
+
+    def _owned_pods(self, resource: KubernetesResourceRef) -> list[dict]:
+        document = self._get(resource.kind, resource.name, resource.namespace)
+        if document is None:
+            return []
+        if document["metadata"]["uid"] != resource.uid:
+            raise RuntimeError("refusing to read pods for a replaced training workload")
+        training_id = document["metadata"]["labels"]["senpai-training-id"]
+        query = urllib.parse.urlencode({"labelSelector": f"senpai-training-id={training_id}"})
         pods = self._request_json(
             "GET",
             f"/api/v1/namespaces/{urllib.parse.quote(resource.namespace, safe='')}/pods?{query}",
             timeout_seconds=5,
         )
-        output = []
-        for pod in pods.get("items", [])[: resource.nodes + 2]:
-            if not any(
-                owner.get("uid") == resource.uid
-                for owner in pod["metadata"].get("ownerReferences", [])
-            ):
-                continue
-            pod_name = pod["metadata"]["name"]
-            for container in pod["spec"].get("containers", [])[:8]:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return "\n".join(output)
-                params = urllib.parse.urlencode(
-                    {"container": container["name"], "tailLines": 200}
-                )
-                path = (
-                    f"/api/v1/namespaces/{urllib.parse.quote(resource.namespace, safe='')}"
-                    f"/pods/{urllib.parse.quote(pod_name, safe='')}/log?{params}"
-                )
-                text = self._request_text(
-                    "GET",
-                    path,
-                    allow_not_found=True,
-                    timeout_seconds=max(1, min(5, remaining)),
-                )
-                prefix = f"[pod/{pod_name}/{container['name']}] "
-                output.extend(prefix + line for line in text.splitlines())
-        return "\n".join(output)
+        owned = []
+        jobs = {}
+        for pod in pods["items"]:
+            for owner in pod["metadata"].get("ownerReferences", []):
+                if owner.get("uid") == resource.uid and owner.get("kind") == resource.kind:
+                    owned.append(pod)
+                    break
+                if resource.kind != "MPIJob" or owner.get("kind") != "Job":
+                    continue
+                name = owner["name"]
+                if name not in jobs:
+                    jobs[name] = self._get("Job", name, resource.namespace)
+                job = jobs[name]
+                if (
+                    job is not None
+                    and job["metadata"]["uid"] == owner.get("uid")
+                    and any(
+                        parent.get("kind") == "MPIJob" and parent.get("uid") == resource.uid
+                        for parent in job["metadata"].get("ownerReferences", [])
+                    )
+                ):
+                    owned.append(pod)
+                    break
+        return owned[: resource.nodes + 2]
 
     def _get(self, kind: str, name: str, namespace: str) -> dict | None:
         path = (
@@ -466,6 +598,8 @@ class _ActiveRemoteTraining:
     resource: KubernetesResourceRef | None = None
     cancelled: bool = False
     thread: threading.Thread | None = None
+    next_diagnostics_at: float = 0
+    diagnostics_future: Future[str] | None = None
 
 
 class KubernetesTrainingSupervisor:
@@ -535,7 +669,7 @@ class KubernetesTrainingSupervisor:
         reserved = False
         try:
             training_id = str(uuid.uuid4())
-            kubernetes_spec = _training_spec(training_id)
+            kubernetes_spec = _training_spec(training_id, nodes=self.nodes)
             log_path = self.state_dir / f"{training_id}.log"
             started_at = time.time()
             deadline_at = started_at + spec.timeout_seconds
@@ -940,6 +1074,8 @@ class KubernetesTrainingSupervisor:
                     state, detail = snapshot
                     if state is not TrainingState.RUNNING:
                         break
+                    if time.monotonic() >= active.next_diagnostics_at:
+                        self._capture_diagnostics(training_id, active, detail)
                     if (
                         self._shutdown.wait(self.poll_seconds)
                         and self._should_detach(active)
@@ -966,18 +1102,8 @@ class KubernetesTrainingSupervisor:
                     if part
                 )
 
-        try:
-            remote_logs = (
-                self.client.logs(active.resource)
-                if active.resource is not None
-                else ""
-            )
-            if remote_logs:
-                with active.log_path.open("a") as log:
-                    log.write("\n=== Kubernetes logs (last 200 lines per pod) ===\n")
-                    log.write(remote_logs)
-        except Exception:
-            pass
+        if active.resource is not None:
+            self._capture_diagnostics(training_id, active, detail, wait=True)
         try:
             local_tail = active.log_path.read_bytes()[-_ERROR_TAIL_BYTES:].decode(
                 errors="ignore"
@@ -999,6 +1125,51 @@ class KubernetesTrainingSupervisor:
         )
         self._write_result(terminal)
         self._release_terminal(training_id, active, delete_required)
+
+    def _capture_diagnostics(
+        self,
+        training_id: str,
+        active: _ActiveRemoteTraining,
+        detail: str,
+        *,
+        wait: bool = False,
+    ) -> None:
+        # Terminal refreshes must not reuse a stale in-flight live snapshot.
+        if wait or active.diagnostics_future is None:
+            future: Future[str] = Future()
+            resource = active.resource
+
+            def collect() -> None:
+                try:
+                    diagnostics = self.client.logs(resource)
+                except Exception as error:  # optional diagnostics must not stop supervision
+                    diagnostics = (
+                        f"Kubernetes diagnostics unavailable: {type(error).__name__}: {error}"
+                    )
+                future.set_result(diagnostics)
+
+            active.diagnostics_future = future
+            threading.Thread(
+                target=collect,
+                name=f"senpai-kubernetes-diagnostics-{training_id}",
+                daemon=True,
+            ).start()
+        if not wait and not active.diagnostics_future.done():
+            return
+        detail = detail.encode()[:1024].decode(errors="ignore")
+        diagnostics = "\n".join(
+            part for part in (detail, active.diagnostics_future.result()) if part
+        )
+        summary = diagnostics.encode()[:_ERROR_TAIL_BYTES].decode(errors="ignore")
+        result = self.get_training_status(training_id)
+        if summary != result.kubernetes_diagnostics:
+            with active.log_path.open("a") as log:
+                log.write("\n=== Kubernetes workload diagnostics ===\n" + diagnostics + "\n")
+            self._write_result(
+                result.model_copy(update={"kubernetes_diagnostics": summary})
+            )
+        active.diagnostics_future = None
+        active.next_diagnostics_at = time.monotonic() + _DIAGNOSTICS_SECONDS
 
     def _release_terminal(
         self,
@@ -1077,11 +1248,13 @@ def _materialize_source_snapshot(workspace: Path) -> tuple[Path, str]:
     return snapshot, head
 
 
-def _training_spec(training_id: str) -> KubernetesTrainingSpec:
+def _training_spec(training_id: str, *, nodes: int) -> KubernetesTrainingSpec:
     research = _dns_label(os.environ["RESEARCH_TAG"])
     student = _dns_label(os.environ["STUDENT_NAME"])
     suffix = uuid.UUID(training_id).hex[:12]
-    prefix = f"senpai-{research}-{student}"[: 62 - len(suffix)].rstrip("-.")
+    child_suffix_length = max(len("-launcher"), len(f"-worker-{nodes - 1}"))
+    prefix_limit = 63 - child_suffix_length - 1 - len(suffix)
+    prefix = f"senpai-{research}-{student}"[:prefix_limit].rstrip("-")
     return KubernetesTrainingSpec(
         kind="MPIJob",
         name=f"{prefix}-{suffix}",

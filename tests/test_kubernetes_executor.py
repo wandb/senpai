@@ -4,6 +4,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -203,6 +204,49 @@ def apply(broker: KubernetesExecutor, document: dict) -> str:
     import yaml
 
     return broker.handle({"operation": "apply", "manifest": yaml.safe_dump(document)})
+
+
+def test_slow_logs_do_not_block_executor_status_or_cancellation(tmp_path):
+    logs_started = threading.Event()
+    finish_logs = threading.Event()
+    control_finished = threading.Event()
+    results = []
+
+    class SlowLogsApi(FakeApi):
+        def logs(self, resource):
+            logs_started.set()
+            assert finish_logs.wait(5)
+            return "worker log"
+
+    api = SlowLogsApi()
+    broker = executor(tmp_path, api)
+    reservation = reserve(broker)
+    apply(broker, manifest())
+    resource = broker.handle({
+        "operation": "resource_identity", "spec": reservation["spec"],
+    })
+
+    def control():
+        results.append(broker.handle({"operation": "state", "resource": resource}))
+        broker.handle({"operation": "delete", "resource": resource, "timeout_seconds": 5})
+        control_finished.set()
+
+    log_thread = threading.Thread(
+        target=lambda: broker.handle({"operation": "logs", "resource": resource}),
+    )
+    control_thread = threading.Thread(target=control)
+    log_thread.start()
+    try:
+        assert logs_started.wait(2)
+        control_thread.start()
+        assert control_finished.wait(2), "logs held the executor control lock"
+        assert results == [["running", "active"]]
+        assert len(api.deleted) == 1
+    finally:
+        finish_logs.set()
+        log_thread.join(2)
+        if control_thread.ident is not None:
+            control_thread.join(2)
 
 
 def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(tmp_path):
@@ -1104,3 +1148,204 @@ def test_api_activation_is_uid_bound(kind, suspend_path):
         {"op": "replace", "path": suspend_path, "value": False},
     ]
     assert kwargs["content_type"] == "application/json-patch+json"
+
+
+def test_workload_diagnostics_include_owned_init_and_launcher_logs(monkeypatch):
+    client = object.__new__(KubernetesApiClient)
+    resource = KubernetesResourceRef(
+        kind="MPIJob", name="run", namespace="research", uid="mpi-uid",
+        nodes=2, gpus_per_node=8,
+    )
+    workload = {"metadata": {"uid": "mpi-uid", "labels": {"senpai-training-id": "run-id"}}}
+    launcher_job = {"metadata": {"uid": "job-uid", "ownerReferences": [
+        {"kind": "MPIJob", "uid": "mpi-uid"},
+    ]}}
+
+    def pod(name, owner, status, *, init=False):
+        return {
+            "metadata": {"name": name, "uid": name + "-uid", "ownerReferences": [owner]},
+            "spec": {"containers": [{"name": "train"}],
+                     "initContainers": [{"name": "checkout"}] if init else []},
+            "status": status,
+        }
+
+    worker = pod("worker-0", {"kind": "MPIJob", "uid": "mpi-uid"}, {
+        "phase": "Pending",
+        "conditions": [{"type": "PodScheduled", "status": "False", "message": "Insufficient GPUs"}],
+        "initContainerStatuses": [{"name": "checkout", "state": {
+            "terminated": {"reason": "Error", "exitCode": 1},
+        }}],
+        "containerStatuses": [{"name": "train", "state": {
+            "waiting": {"reason": "PodInitializing"},
+        }}],
+    }, init=True)
+    launcher = pod("launcher", {"kind": "Job", "name": "launcher-job", "uid": "job-uid"}, {
+        "phase": "Running", "containerStatuses": [{"name": "train", "state": {"running": {}}}],
+    })
+    unrelated = pod("not-owned", {"kind": "MPIJob", "uid": "other-uid"}, {
+        "phase": "Running", "containerStatuses": [{"name": "train", "state": {"running": {}}}],
+    })
+    replaced = pod("replaced-job-pod", {"kind": "Job", "name": "launcher-job", "uid": "old-job-uid"}, {
+        "phase": "Running", "containerStatuses": [{"name": "train", "state": {"running": {}}}],
+    })
+    requests = []
+
+    def get(kind, name, namespace):
+        assert namespace == "research"
+        return workload if kind == "MPIJob" else launcher_job
+
+    def request_json(method, path, **kwargs):
+        if "/events?" in path:
+            assert "involvedObject.uid%3D" in path
+            return {"items": []}
+        assert "senpai-training-id%3Drun-id" in path
+        return {"items": [unrelated, replaced, worker, launcher]}
+
+    def request_text(method, path, **kwargs):
+        requests.append(path)
+        assert "limitBytes=8192" in path
+        return "permission denied" if "container=checkout" in path else "rank 0 started"
+
+    monkeypatch.setattr(client, "_get", get)
+    monkeypatch.setattr(client, "_request_json", request_json)
+    monkeypatch.setattr(client, "_request_text", request_text)
+
+    result = client.logs(resource)
+
+    assert "Insufficient GPUs" in result
+    assert "checkout] terminated: Error exit=1" in result
+    assert "checkout] permission denied" in result
+    assert "train] waiting: PodInitializing" in result
+    assert "launcher/train] rank 0 started" in result
+    assert len(requests) == 2
+    assert "not-owned" not in result
+    assert "replaced-job-pod" not in result
+
+
+def test_workload_diagnostics_reject_replaced_uid(monkeypatch):
+    client = object.__new__(KubernetesApiClient)
+    monkeypatch.setattr(client, "_get", lambda *args: {"metadata": {"uid": "replacement"}})
+    resource = KubernetesResourceRef(
+        kind="MPIJob", name="run", namespace="research", uid="original",
+        nodes=2, gpus_per_node=8,
+    )
+    with pytest.raises(RuntimeError, match="replaced training workload"):
+        client.logs(resource)
+
+
+def test_diagnostics_preserve_failed_init_with_noisy_healthy_worker(monkeypatch):
+    client = object.__new__(KubernetesApiClient)
+    resource = KubernetesResourceRef(
+        kind="MPIJob", name="run", namespace="research", uid="mpi-uid",
+        nodes=2, gpus_per_node=8,
+    )
+    failed = {
+        "metadata": {"name": "run-launcher", "uid": "launcher-uid"},
+        "spec": {
+            "initContainers": [{"name": "checkout"}],
+            "containers": [{"name": "train"}],
+        },
+        "status": {
+            "phase": "Pending",
+            "initContainerStatuses": [{"name": "checkout", "state": {
+                "terminated": {"reason": "Error", "exitCode": 1},
+            }}],
+            "containerStatuses": [{"name": "train", "state": {
+                "waiting": {"reason": "PodInitializing"},
+            }}],
+        },
+    }
+    healthy = {
+        "metadata": {"name": "run-worker-1", "uid": "worker-uid"},
+        "spec": {"containers": [{"name": "train"}]},
+        "status": {
+            "phase": "Running",
+            "containerStatuses": [{"name": "train", "state": {"running": {}}}],
+        },
+    }
+    pods = [healthy, failed]
+    monkeypatch.setattr(client, "_owned_pods", lambda _resource: pods)
+    monkeypatch.setattr(client, "_events", lambda *args: ["[event] " + "x" * 2000])
+
+    def request_text(method, path, **kwargs):
+        if "container=checkout" in path:
+            return "checkout progress\n" * 400 + "Permission denied opening source.bundle"
+        return "正常な学習出力\n" * 300 + "healthy worker tail"
+
+    monkeypatch.setattr(client, "_request_text", request_text)
+
+    result = client.logs(resource)
+
+    assert len(result.encode()) <= 8192
+    assert "checkout] terminated: Error exit=1" in result
+    assert "Permission denied opening source.bundle" in result
+    assert "[pod/run-worker-1/train] " in result
+    assert "healthy worker tail" in result
+    assert result.index("terminated: Error") < result.index("Permission denied")
+    assert result.rindex("[pod/run-launcher/checkout] ") < result.index(
+        "[pod/run-worker-1/train] "
+    )
+    assert "\ufffd" not in result
+    pods.reverse()
+    assert client.logs(resource) == result
+
+
+def test_diagnostics_report_pre_pod_validation_events_and_reject_foreign_uid(monkeypatch):
+    client = object.__new__(KubernetesApiClient)
+    resource = KubernetesResourceRef(
+        kind="MPIJob", name="run", namespace="research", uid="mpi-uid",
+        nodes=4, gpus_per_node=8,
+    )
+    workload = {"metadata": {"uid": "mpi-uid", "labels": {"senpai-training-id": "run-id"}}}
+    monkeypatch.setattr(client, "_get", lambda *args: workload)
+    requests = []
+
+    def request_json(method, path, **kwargs):
+        requests.append(path)
+        if "/pods?" in path:
+            return {"items": []}
+        assert "/namespaces/research/events?" in path
+        assert "fieldSelector=involvedObject.uid%3Dmpi-uid" in path
+        assert "limit=20" in path
+        return {"items": [
+            {"involvedObject": {"uid": "other-uid"}, "message": "foreign secret"},
+            {
+                "metadata": {"creationTimestamp": "2026-09-24T08:50:00Z"},
+                "involvedObject": {"uid": "mpi-uid"},
+                "type": "Warning", "reason": "ValidationError",
+                "message": "worker hostname must be no more than 63 characters",
+            },
+        ]}
+
+    monkeypatch.setattr(client, "_request_json", request_json)
+    result = client.logs(resource)
+
+    assert "ValidationError: worker hostname must be no more than 63 characters" in result
+    assert "No owned workload pods exist yet" in result
+    assert "foreign secret" not in result
+    assert len(requests) == 2
+
+
+def test_workload_events_are_bounded_and_surface_rbac_errors(monkeypatch):
+    client = object.__new__(KubernetesApiClient)
+    events = [{
+        "metadata": {"creationTimestamp": f"2026-09-24T08:50:{index:02d}Z"},
+        "involvedObject": {"uid": "pod-uid"},
+        "reason": f"Reason{index}", "message": "x" * 5000,
+    } for index in range(8)]
+    monkeypatch.setattr(client, "_request_json", lambda *args, **kwargs: {"items": events})
+
+    result = client._events("research", "pod-uid", "pod/worker", time.monotonic() + 10)
+
+    assert len(result) == 5
+    assert "Reason3" in result[0]
+    assert "Reason7" in result[-1]
+    assert all(line.count("x") == 1024 for line in result)
+
+    def forbidden(*args, **kwargs):
+        raise KubernetesApiError("GET", "/events", 403)
+
+    monkeypatch.setattr(client, "_request_json", forbidden)
+    assert client._events("research", "pod-uid", "pod/worker", time.monotonic() + 10) == [
+        "[pod/worker/events] unavailable: HTTP 403"
+    ]

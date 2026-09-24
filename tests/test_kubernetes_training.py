@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -786,3 +787,158 @@ def test_supervisor_recovers_an_unconfirmed_terminal_release(tmp_path, monkeypat
     result = recovered.get_training_status(training_id)
     assert result.kubernetes_released is True
     assert client.releases == [training_id]
+
+
+def test_supervisor_persists_live_diagnostics_before_training_finishes(tmp_path, monkeypatch):
+    class PendingCluster(FakeCluster):
+        def __init__(self):
+            super().__init__(state=TrainingState.RUNNING)
+            self.log_reads = 0
+
+        def logs(self, resource):
+            self.log_reads += 1
+            return "[pod/worker/checkout] terminated: Error exit=1\nPermission denied"
+
+    client = PendingCluster()
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5,
+    ))
+    try:
+        deadline = time.monotonic() + 2
+        while True:
+            result = runtime.get_training_status(started.training_id)
+            if result.kubernetes_diagnostics:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert result.state is TrainingState.RUNNING
+        assert "Permission denied" in result.kubernetes_diagnostics
+        assert "Permission denied" in Path(result.log_path).read_text()
+        assert client.log_reads == 1
+    finally:
+        runtime.cancel_training(started.training_id)
+
+
+def test_supervisor_reports_diagnostics_failure_without_losing_training(tmp_path, monkeypatch):
+    class BrokenLogsCluster(FakeCluster):
+        def logs(self, resource):
+            raise RuntimeError("HTTP 403")
+
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, BrokenLogsCluster())
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5,
+    ))
+    runtime.drain()
+    result = runtime.get_training_status(started.training_id)
+    assert result.state is TrainingState.FINISHED
+    assert "Kubernetes diagnostics unavailable: RuntimeError: HTTP 403" in result.kubernetes_diagnostics
+
+
+def test_slow_diagnostics_do_not_hide_remote_completion(tmp_path, monkeypatch):
+    logs_started = threading.Event()
+    finish_logs = threading.Event()
+    completion_observed = threading.Event()
+
+    class SlowDiagnosticsCluster(FakeCluster):
+        def logs(self, resource):
+            logs_started.set()
+            assert finish_logs.wait(5)
+            return "worker diagnostics"
+
+        def state(self, resource):
+            snapshot = super().state(resource)
+            if snapshot[0] is TrainingState.FINISHED:
+                completion_observed.set()
+            return snapshot
+
+    client = SlowDiagnosticsCluster(TrainingState.RUNNING)
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5,
+    ))
+    try:
+        assert logs_started.wait(2)
+        client.state_value = TrainingState.FINISHED
+        assert completion_observed.wait(2), "diagnostics blocked status polling"
+        # The completion decision must survive a deadline passing during log reads.
+        with runtime._lock:
+            runtime._active[started.training_id].deadline_at = time.time() - 1
+    finally:
+        finish_logs.set()
+        runtime.drain()
+
+    result = runtime.get_training_status(started.training_id)
+    assert result.state is TrainingState.FINISHED
+    assert result.kubernetes_released is True
+    assert client.deletions == []
+
+
+def test_long_workload_message_keeps_container_failure_details(tmp_path, monkeypatch):
+    class VerboseFailure(FakeCluster):
+        def state(self, resource):
+            return TrainingState.FAILED, "workload status " * 1000
+
+        def logs(self, resource):
+            return "[pod/worker/checkout] Permission denied opening source.bundle"
+
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, VerboseFailure())
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5,
+    ))
+    runtime.drain()
+    result = runtime.get_training_status(started.training_id)
+    assert len(result.kubernetes_diagnostics.encode()) <= 8192
+    assert "Permission denied" in result.kubernetes_diagnostics
+    assert "Permission denied" in Path(result.log_path).read_text()
+
+
+def test_completion_refreshes_diagnostics_after_an_inflight_live_read(tmp_path, monkeypatch):
+    live_read_started = threading.Event()
+    finish_live_read = threading.Event()
+
+    class DelayedLiveDiagnostics(FakeCluster):
+        def logs(self, resource):
+            if not live_read_started.is_set():
+                live_read_started.set()
+                assert finish_live_read.wait(5)
+                return "stale live snapshot"
+            return "final failure details"
+
+    client = DelayedLiveDiagnostics(TrainingState.RUNNING)
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5,
+    ))
+    try:
+        assert live_read_started.wait(2)
+        client.state_value = TrainingState.FAILED
+        runtime.drain()
+        result = runtime.get_training_status(started.training_id)
+        assert result.state is TrainingState.FAILED
+        assert "final failure details" in result.kubernetes_diagnostics
+        assert "stale live snapshot" not in result.kubernetes_diagnostics
+    finally:
+        finish_live_read.set()
+        runtime.drain()
+
+
+@pytest.mark.parametrize("nodes", [4, 1000])
+@pytest.mark.parametrize("research", [
+    "cfd-batch-jc-vandam-sep23",
+    "r" * 33 + "-" + "r" * 40,
+])
+def test_training_identity_leaves_room_for_mpi_child_names(monkeypatch, nodes, research):
+    monkeypatch.setenv("RESEARCH_TAG", research)
+    monkeypatch.setenv("STUDENT_NAME", "JC_Vandam Edward with a long student name")
+    monkeypatch.setenv("SENPAI_KUBERNETES_NAMESPACE", "research")
+    training_id = "d30b8238-81b6-4841-b541-9df20cddf6f9"
+
+    spec = kubernetes_training._training_spec(training_id, nodes=nodes)
+
+    assert spec.wandb_run_id == training_id.replace("-", "")
+    assert spec.name.endswith("-d30b823881b6")
+    assert not spec.name.removesuffix("-d30b823881b6").endswith("-")
+    for name in (spec.name, f"{spec.name}-launcher", f"{spec.name}-worker-{nodes - 1}"):
+        assert len(name) <= 63
+        assert re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", name)

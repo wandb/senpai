@@ -136,6 +136,9 @@ ls \
 # start_hivemind
 
 export IS_SANDBOX=1
+# Target uv commands must not synchronize the running agent's environment.
+unset UV_PROJECT_ENVIRONMENT UV_PYTHON VIRTUAL_ENV
+
 export SENPAI_OPENHANDS_WORKSPACE="$TARGET_WORKDIR"
 export SENPAI_OPENHANDS_HARNESS_FILE="$WORKDIR/system_instructions/SENPAI-HARNESS.md"
 export SENPAI_OPENHANDS_TIMEOUT_SECONDS="${SENPAI_OPENHANDS_TIMEOUT_SECONDS:-7200}"
