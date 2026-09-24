@@ -337,6 +337,12 @@ Students do not start GPU work, stream logs, sleep, or poll through the terminal
 
 After launch, the student can finish its turn. The deterministic controller polls process state and at most one selected W&B metric without consuming model tokens. A threshold crossing, regression, stale metric, terminal state, or monitor error creates one compact durable event and resumes the same student conversation. One broken monitor cannot block other training, GitHub feedback, or child-agent results.
 
+Before the first metric arrives, an absent W&B run in an accessible project
+counts as a missing sample. The monitor keeps polling and emits a stale-metric
+signal after `stale_after_seconds`, measured from monitor registration.
+Authentication, project-access, and network errors remain hard monitor failures.
+A run that disappears after reporting a metric also remains a hard failure.
+
 `improved_by` and `regressed_by` compare with the monitor policy's first observed sample; they do not silently reuse the assignment's documented baseline.
 
 Worker and container restarts preserve completed OpenHands events. Local processes are terminated rather than adopted under unverifiable identity. Kubernetes workloads are re-adopted only by their persisted UID and broker-injected ownership; the original student conversation receives the persisted terminal outcome.
