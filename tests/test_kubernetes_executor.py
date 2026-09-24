@@ -1104,3 +1104,83 @@ def test_api_activation_is_uid_bound(kind, suspend_path):
         {"op": "replace", "path": suspend_path, "value": False},
     ]
     assert kwargs["content_type"] == "application/json-patch+json"
+
+
+def test_workload_diagnostics_include_owned_init_and_launcher_logs(monkeypatch):
+    client = object.__new__(KubernetesApiClient)
+    resource = KubernetesResourceRef(
+        kind="MPIJob", name="run", namespace="research", uid="mpi-uid",
+        nodes=2, gpus_per_node=8,
+    )
+    workload = {"metadata": {"uid": "mpi-uid", "labels": {"senpai-training-id": "run-id"}}}
+    launcher_job = {"metadata": {"uid": "job-uid", "ownerReferences": [
+        {"kind": "MPIJob", "uid": "mpi-uid"},
+    ]}}
+
+    def pod(name, owner, status, *, init=False):
+        return {
+            "metadata": {"name": name, "ownerReferences": [owner]},
+            "spec": {"containers": [{"name": "train"}],
+                     "initContainers": [{"name": "checkout"}] if init else []},
+            "status": status,
+        }
+
+    worker = pod("worker-0", {"kind": "MPIJob", "uid": "mpi-uid"}, {
+        "phase": "Pending",
+        "conditions": [{"type": "PodScheduled", "status": "False", "message": "Insufficient GPUs"}],
+        "initContainerStatuses": [{"name": "checkout", "state": {
+            "terminated": {"reason": "Error", "exitCode": 1},
+        }}],
+        "containerStatuses": [{"name": "train", "state": {
+            "waiting": {"reason": "PodInitializing"},
+        }}],
+    }, init=True)
+    launcher = pod("launcher", {"kind": "Job", "name": "launcher-job", "uid": "job-uid"}, {
+        "phase": "Running", "containerStatuses": [{"name": "train", "state": {"running": {}}}],
+    })
+    unrelated = pod("not-owned", {"kind": "MPIJob", "uid": "other-uid"}, {
+        "phase": "Running", "containerStatuses": [{"name": "train", "state": {"running": {}}}],
+    })
+    replaced = pod("replaced-job-pod", {"kind": "Job", "name": "launcher-job", "uid": "old-job-uid"}, {
+        "phase": "Running", "containerStatuses": [{"name": "train", "state": {"running": {}}}],
+    })
+    requests = []
+
+    def get(kind, name, namespace):
+        assert namespace == "research"
+        return workload if kind == "MPIJob" else launcher_job
+
+    def request_json(method, path, **kwargs):
+        assert "senpai-training-id%3Drun-id" in path
+        return {"items": [unrelated, replaced, worker, launcher]}
+
+    def request_text(method, path, **kwargs):
+        requests.append(path)
+        assert "limitBytes=8192" in path
+        return "permission denied" if "container=checkout" in path else "rank 0 started"
+
+    monkeypatch.setattr(client, "_get", get)
+    monkeypatch.setattr(client, "_request_json", request_json)
+    monkeypatch.setattr(client, "_request_text", request_text)
+
+    result = client.logs(resource)
+
+    assert "Insufficient GPUs" in result
+    assert "checkout] terminated: Error exit=1" in result
+    assert "checkout] permission denied" in result
+    assert "train] waiting: PodInitializing" in result
+    assert "launcher/train] rank 0 started" in result
+    assert len(requests) == 2
+    assert "not-owned" not in result
+    assert "replaced-job-pod" not in result
+
+
+def test_workload_diagnostics_reject_replaced_uid(monkeypatch):
+    client = object.__new__(KubernetesApiClient)
+    monkeypatch.setattr(client, "_get", lambda *args: {"metadata": {"uid": "replacement"}})
+    resource = KubernetesResourceRef(
+        kind="MPIJob", name="run", namespace="research", uid="original",
+        nodes=2, gpus_per_node=8,
+    )
+    with pytest.raises(RuntimeError, match="replaced training workload"):
+        client.logs(resource)

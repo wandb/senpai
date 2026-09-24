@@ -1,7 +1,11 @@
+import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 HEALTH_SCRIPT = ROOT / "scripts" / "senpai-container-health.sh"
@@ -110,3 +114,51 @@ def test_role_entrypoints_default_openhands_turns_to_two_hours_of_inactivity():
     for name in ("entrypoint-advisor.sh", "entrypoint-student.sh"):
         entrypoint = (ROOT / "k8s" / name).read_text()
         assert 'SENPAI_OPENHANDS_TIMEOUT_SECONDS:-7200' in entrypoint
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_role_startup_isolates_target_uv_commands_from_agent_environment(
+    tmp_path: Path, role: str
+):
+    entrypoint = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text()
+    startup = entrypoint[entrypoint.index("export IS_SANDBOX=1"):]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    python = fake_bin / "python"
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "print(json.dumps({'args': sys.argv[1:], 'environment': "
+        "{key: os.environ.get(key) for key in "
+        "('UV_PROJECT_ENVIRONMENT', 'UV_PYTHON', 'VIRTUAL_ENV', 'SENPAI_PYTHON')}}))\n"
+    )
+    python.chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", "-c", startup],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "LOGDIR": str(tmp_path),
+            "WORKDIR": str(tmp_path),
+            "TARGET_WORKDIR": str(tmp_path / "target"),
+            "GIT_ASKPASS_FILE": str(tmp_path / "askpass"),
+            "SENPAI_GITHUB_TOKEN_FILE": str(tmp_path / "token"),
+            "NODES_PER_STUDENT": "1",
+            "SENPAI_PYTHON": "/opt/senpai-venv/bin/python",
+            "UV_PROJECT_ENVIRONMENT": "/opt/senpai-venv",
+            "UV_PYTHON": "/opt/senpai-venv/bin/python",
+            "VIRTUAL_ENV": "/opt/senpai-venv",
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    launched = json.loads(completed.stdout)
+    assert launched["args"] == ["-m", "senpai_agent.supervisor", role]
+    assert launched["environment"] == {
+        "UV_PROJECT_ENVIRONMENT": None,
+        "UV_PYTHON": None,
+        "VIRTUAL_ENV": None,
+        "SENPAI_PYTHON": "/opt/senpai-venv/bin/python",
+    }

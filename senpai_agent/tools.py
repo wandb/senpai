@@ -306,6 +306,7 @@ class TrainingResultObservation(Observation):
     kubernetes_spec: KubernetesTrainingSpec | None = None
     kubernetes_resource: KubernetesResourceRef | None = None
     kubernetes_released: bool | None = None
+    kubernetes_diagnostics: str = ""
     source_snapshot: str | None = None
     source_commit: str | None = None
 
@@ -316,7 +317,7 @@ class TrainingResultObservation(Observation):
         conversation: LocalConversation | None,
     ) -> Self:
         observation = cls.model_validate(result.model_dump())
-        if not observation.error_tail:
+        if not observation.error_tail and not observation.kubernetes_diagnostics:
             return observation
 
         state = getattr(conversation, "state", None)
@@ -327,9 +328,8 @@ class TrainingResultObservation(Observation):
             )
         return observation.model_copy(
             update={
-                "error_tail": secret_registry.mask_secrets_in_output(
-                    observation.error_tail
-                )
+                field: secret_registry.mask_secrets_in_output(getattr(observation, field))
+                for field in ("error_tail", "kubernetes_diagnostics")
             }
         )
 
@@ -350,6 +350,8 @@ class TrainingResultObservation(Observation):
             result["kubernetes_released"] = self.kubernetes_released
         if self.error_tail:
             result["error_tail"] = self.error_tail
+        if self.kubernetes_diagnostics:
+            result["kubernetes_diagnostics"] = self.kubernetes_diagnostics
         text = json.dumps(result, separators=(",", ":"), default=str)
         return [TextContent(text=text)]
 

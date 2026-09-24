@@ -786,3 +786,49 @@ def test_supervisor_recovers_an_unconfirmed_terminal_release(tmp_path, monkeypat
     result = recovered.get_training_status(training_id)
     assert result.kubernetes_released is True
     assert client.releases == [training_id]
+
+
+def test_supervisor_persists_live_diagnostics_before_training_finishes(tmp_path, monkeypatch):
+    class PendingCluster(FakeCluster):
+        def __init__(self):
+            super().__init__(state=TrainingState.RUNNING)
+            self.log_reads = 0
+
+        def logs(self, resource):
+            self.log_reads += 1
+            return "[pod/worker/checkout] terminated: Error exit=1\nPermission denied"
+
+    client = PendingCluster()
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5,
+    ))
+    try:
+        deadline = time.monotonic() + 2
+        while True:
+            result = runtime.get_training_status(started.training_id)
+            if result.kubernetes_diagnostics:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert result.state is TrainingState.RUNNING
+        assert "Permission denied" in result.kubernetes_diagnostics
+        assert "Permission denied" in Path(result.log_path).read_text()
+        assert client.log_reads == 1
+    finally:
+        runtime.cancel_training(started.training_id)
+
+
+def test_supervisor_reports_diagnostics_failure_without_losing_training(tmp_path, monkeypatch):
+    class BrokenLogsCluster(FakeCluster):
+        def logs(self, resource):
+            raise RuntimeError("HTTP 403")
+
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, BrokenLogsCluster())
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5,
+    ))
+    runtime.drain()
+    result = runtime.get_training_status(started.training_id)
+    assert result.state is TrainingState.FINISHED
+    assert "Kubernetes diagnostics unavailable: RuntimeError: HTTP 403" in result.kubernetes_diagnostics

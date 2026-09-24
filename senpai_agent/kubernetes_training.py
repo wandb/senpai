@@ -32,6 +32,7 @@ from senpai_agent.training import (
 
 _ERROR_TAIL_BYTES = 8192
 _POLL_SECONDS = 2.0
+_DIAGNOSTICS_SECONDS = 30.0
 _JOIN_SECONDS = 120.0
 _DETACH_GRACE_SECONDS = 0.1
 EXECUTOR_SOCKET_ENV = "SENPAI_KUBERNETES_EXECUTOR_SOCKET"
@@ -328,46 +329,107 @@ class KubernetesApiClient:
             time.sleep(0.5)
 
     def logs(self, resource: KubernetesResourceRef) -> str:
+        """Return bounded status and logs for this workload's exact pod owner chain."""
+
         deadline = time.monotonic() + 30
-        label = (
-            f"job-name={resource.name}"
-            if resource.kind == "Job"
-            else f"training.kubeflow.org/job-name={resource.name}"
-        )
-        query = urllib.parse.urlencode({"labelSelector": label})
-        pods = self._request_json(
-            "GET",
-            f"/api/v1/namespaces/{urllib.parse.quote(resource.namespace, safe='')}/pods?{query}",
-            timeout_seconds=5,
-        )
         output = []
-        for pod in pods.get("items", [])[: resource.nodes + 2]:
-            if not any(
-                owner.get("uid") == resource.uid
-                for owner in pod["metadata"].get("ownerReferences", [])
-            ):
-                continue
+        for pod in self._owned_pods(resource):
             pod_name = pod["metadata"]["name"]
-            for container in pod["spec"].get("containers", [])[:8]:
+            status = pod.get("status", {})
+            prefix = f"[pod/{pod_name}] "
+            output.append(
+                prefix + f"phase={status.get('phase', 'Unknown')} "
+                f"node={pod['spec'].get('nodeName', 'unassigned')}"
+            )
+            for condition in status.get("conditions", []):
+                if condition.get("status") == "False" and condition.get("message"):
+                    output.append(prefix + f"{condition['type']}: {condition['message']}")
+            container_states = {
+                item["name"]: item.get("state", {})
+                for item in status.get("initContainerStatuses", [])
+                + status.get("containerStatuses", [])
+            }
+            containers = pod["spec"].get("initContainers", []) + pod["spec"]["containers"]
+            for container in containers[:8]:
+                name = container["name"]
+                prefix = f"[pod/{pod_name}/{name}] "
+                state = container_states.get(name, {})
+                waiting = state.get("waiting")
+                terminated = state.get("terminated")
+                if waiting is not None:
+                    output.append(
+                        prefix + f"waiting: {waiting.get('reason', '')} "
+                        f"{waiting.get('message', '')}"
+                    )
+                    continue
+                if terminated is not None:
+                    output.append(
+                        prefix + f"terminated: {terminated.get('reason', '')} "
+                        f"exit={terminated.get('exitCode')} "
+                        f"{terminated.get('message', '')}"
+                    )
+                if not state:
+                    continue
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return "\n".join(output)
                 params = urllib.parse.urlencode(
-                    {"container": container["name"], "tailLines": 200}
+                    {"container": name, "tailLines": 200, "limitBytes": 8192}
                 )
                 path = (
                     f"/api/v1/namespaces/{urllib.parse.quote(resource.namespace, safe='')}"
                     f"/pods/{urllib.parse.quote(pod_name, safe='')}/log?{params}"
                 )
-                text = self._request_text(
-                    "GET",
-                    path,
-                    allow_not_found=True,
-                    timeout_seconds=max(1, min(5, remaining)),
-                )
-                prefix = f"[pod/{pod_name}/{container['name']}] "
+                try:
+                    text = self._request_text(
+                        "GET",
+                        path,
+                        allow_not_found=True,
+                        timeout_seconds=max(1, min(5, remaining)),
+                    )
+                except KubernetesApiError as error:
+                    output.append(prefix + f"logs unavailable: HTTP {error.status_code}")
+                    continue
                 output.extend(prefix + line for line in text.splitlines())
-        return "\n".join(output)
+        return "\n".join(output) or "No owned workload pods exist yet."
+
+    def _owned_pods(self, resource: KubernetesResourceRef) -> list[dict]:
+        document = self._get(resource.kind, resource.name, resource.namespace)
+        if document is None:
+            return []
+        if document["metadata"]["uid"] != resource.uid:
+            raise RuntimeError("refusing to read pods for a replaced training workload")
+        training_id = document["metadata"]["labels"]["senpai-training-id"]
+        query = urllib.parse.urlencode({"labelSelector": f"senpai-training-id={training_id}"})
+        pods = self._request_json(
+            "GET",
+            f"/api/v1/namespaces/{urllib.parse.quote(resource.namespace, safe='')}/pods?{query}",
+            timeout_seconds=5,
+        )
+        owned = []
+        jobs = {}
+        for pod in pods["items"]:
+            for owner in pod["metadata"].get("ownerReferences", []):
+                if owner.get("uid") == resource.uid and owner.get("kind") == resource.kind:
+                    owned.append(pod)
+                    break
+                if resource.kind != "MPIJob" or owner.get("kind") != "Job":
+                    continue
+                name = owner["name"]
+                if name not in jobs:
+                    jobs[name] = self._get("Job", name, resource.namespace)
+                job = jobs[name]
+                if (
+                    job is not None
+                    and job["metadata"]["uid"] == owner.get("uid")
+                    and any(
+                        parent.get("kind") == "MPIJob" and parent.get("uid") == resource.uid
+                        for parent in job["metadata"].get("ownerReferences", [])
+                    )
+                ):
+                    owned.append(pod)
+                    break
+        return owned[: resource.nodes + 2]
 
     def _get(self, kind: str, name: str, namespace: str) -> dict | None:
         path = (
@@ -466,6 +528,7 @@ class _ActiveRemoteTraining:
     resource: KubernetesResourceRef | None = None
     cancelled: bool = False
     thread: threading.Thread | None = None
+    next_diagnostics_at: float = 0
 
 
 class KubernetesTrainingSupervisor:
@@ -940,6 +1003,8 @@ class KubernetesTrainingSupervisor:
                     state, detail = snapshot
                     if state is not TrainingState.RUNNING:
                         break
+                    if time.monotonic() >= active.next_diagnostics_at:
+                        self._capture_diagnostics(training_id, active, detail)
                     if (
                         self._shutdown.wait(self.poll_seconds)
                         and self._should_detach(active)
@@ -966,18 +1031,8 @@ class KubernetesTrainingSupervisor:
                     if part
                 )
 
-        try:
-            remote_logs = (
-                self.client.logs(active.resource)
-                if active.resource is not None
-                else ""
-            )
-            if remote_logs:
-                with active.log_path.open("a") as log:
-                    log.write("\n=== Kubernetes logs (last 200 lines per pod) ===\n")
-                    log.write(remote_logs)
-        except Exception:
-            pass
+        if active.resource is not None:
+            self._capture_diagnostics(training_id, active, detail)
         try:
             local_tail = active.log_path.read_bytes()[-_ERROR_TAIL_BYTES:].decode(
                 errors="ignore"
@@ -999,6 +1054,23 @@ class KubernetesTrainingSupervisor:
         )
         self._write_result(terminal)
         self._release_terminal(training_id, active, delete_required)
+
+    def _capture_diagnostics(
+        self, training_id: str, active: _ActiveRemoteTraining, detail: str
+    ) -> None:
+        try:
+            diagnostics = self.client.logs(active.resource)
+        except Exception as error:  # diagnostics must not interrupt workload supervision
+            diagnostics = f"Kubernetes diagnostics unavailable: {type(error).__name__}: {error}"
+        diagnostics = "\n".join(part for part in (detail, diagnostics) if part)[-_ERROR_TAIL_BYTES:]
+        result = self.get_training_status(training_id)
+        if diagnostics != result.kubernetes_diagnostics:
+            with active.log_path.open("a") as log:
+                log.write("\n=== Kubernetes workload diagnostics ===\n" + diagnostics + "\n")
+            self._write_result(
+                result.model_copy(update={"kubernetes_diagnostics": diagnostics})
+            )
+        active.next_diagnostics_at = time.monotonic() + _DIAGNOSTICS_SECONDS
 
     def _release_terminal(
         self,

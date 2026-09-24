@@ -87,6 +87,9 @@ ls \
 
 export IS_SANDBOX=1
 
+# Target uv commands must not synchronize the running agent's environment.
+unset UV_PROJECT_ENVIRONMENT UV_PYTHON VIRTUAL_ENV
+
 export SENPAI_OPENHANDS_STATE_DIR="$LOGDIR/openhands_state"
 export SENPAI_OPENHANDS_ROLE_FILE="$WORKDIR/system_instructions/STUDENT.md"
 export SENPAI_OPENHANDS_WORKSPACE="$TARGET_WORKDIR"
