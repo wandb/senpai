@@ -226,13 +226,17 @@ created suspended, so a late ambiguous API request cannot start GPU pods. The
 model-facing student has no Kubernetes token or real `kubectl`; its
 `kubectl apply -f -` command is a validated socket proxy. A target launcher must
 submit the manifest and exit; it must not call `kubectl get`, `wait`, or `logs`.
-The supervisor owns polling and cleanup after submission.
+The supervisor owns polling and cleanup after submission. Generated workload
+names reserve space for the MPI launcher's and highest-index worker's suffixes,
+so long research and student names still produce valid Kubernetes DNS labels.
 
 `get_training_status` includes a bounded `kubernetes_diagnostics` snapshot while
 a workload runs, refreshed at most once every 30 seconds and again at completion.
-It includes pod placement, scheduling and container states, and recent init and
-training logs. A launcher pod owned through a Job is included only when both
-owner UIDs lead to the reserved MPIJob. Log-read failures appear in diagnostics
+It includes pod placement, scheduling and container states, recent init and
+training logs, and bounded Kubernetes events for the exact workload and pod UIDs.
+Workload events expose validation failures before the MPI controller creates any
+pods. A launcher pod owned through a Job is included only when both owner UIDs
+lead to the reserved MPIJob. Log-read failures appear in diagnostics
 instead of disappearing silently. These reads stay inside the executor broker;
 students receive neither Kubernetes credentials nor namespace-wide read access.
 When a smoke run stalls before W&B starts, inspect these diagnostics first.

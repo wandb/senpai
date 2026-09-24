@@ -76,6 +76,8 @@ def test_multinode_controller_is_cpu_only_with_a_credential_isolated_executor():
     assert service_account["automountServiceAccountToken"] is False
     assert role_binding["roleRef"]["name"] == role["metadata"]["name"]
     assert all("secrets" not in rule["resources"] for rule in role["rules"])
+    event_rules = [rule for rule in role["rules"] if "events" in rule["resources"]]
+    assert event_rules == [{"apiGroups": [""], "resources": ["events"], "verbs": ["list"]}]
     assert all("list" not in rule["verbs"] for rule in role["rules"][:2])
     assert all("patch" in rule["verbs"] for rule in role["rules"][:2])
     assert configmap["data"]["NODES_PER_STUDENT"] == "2"

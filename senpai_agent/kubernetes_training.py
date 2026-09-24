@@ -332,8 +332,13 @@ class KubernetesApiClient:
         """Return bounded status and logs for this workload's exact pod owner chain."""
 
         deadline = time.monotonic() + 30
-        output = []
-        for pod in self._owned_pods(resource):
+        pods = self._owned_pods(resource)
+        output = self._events(
+            resource.namespace, resource.uid, f"{resource.kind}/{resource.name}", deadline
+        )
+        if not pods:
+            output.append("No owned workload pods exist yet.")
+        for pod in pods:
             pod_name = pod["metadata"]["name"]
             status = pod.get("status", {})
             prefix = f"[pod/{pod_name}] "
@@ -341,6 +346,9 @@ class KubernetesApiClient:
                 prefix + f"phase={status.get('phase', 'Unknown')} "
                 f"node={pod['spec'].get('nodeName', 'unassigned')}"
             )
+            output.extend(self._events(
+                resource.namespace, pod["metadata"]["uid"], f"pod/{pod_name}", deadline
+            ))
             for condition in status.get("conditions", []):
                 if condition.get("status") == "False" and condition.get("message"):
                     output.append(prefix + f"{condition['type']}: {condition['message']}")
@@ -391,7 +399,34 @@ class KubernetesApiClient:
                     output.append(prefix + f"logs unavailable: HTTP {error.status_code}")
                     continue
                 output.extend(prefix + line for line in text.splitlines())
-        return "\n".join(output) or "No owned workload pods exist yet."
+        return "\n".join(output)
+
+    def _events(self, namespace: str, uid: str, owner: str, deadline: float) -> list[str]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return []
+        query = urllib.parse.urlencode({
+            "fieldSelector": f"involvedObject.uid={uid}",
+            "limit": 20,
+        })
+        try:
+            response = self._request_json(
+                "GET",
+                f"/api/v1/namespaces/{urllib.parse.quote(namespace, safe='')}/events?{query}",
+                timeout_seconds=min(3, remaining),
+            )
+        except KubernetesApiError as error:
+            return [f"[{owner}/events] unavailable: HTTP {error.status_code}"]
+        events = [
+            event for event in response["items"]
+            if event.get("involvedObject", {}).get("uid") == uid
+        ]
+        events.sort(key=lambda event: event.get("lastTimestamp") or event["metadata"]["creationTimestamp"])
+        return [
+            f"[{owner}/event] {event.get('type', '')} {event.get('reason', '')}: "
+            f"{event.get('message', '')[:1024]}"
+            for event in events[-5:]
+        ]
 
     def _owned_pods(self, resource: KubernetesResourceRef) -> list[dict]:
         document = self._get(resource.kind, resource.name, resource.namespace)
@@ -598,7 +633,7 @@ class KubernetesTrainingSupervisor:
         reserved = False
         try:
             training_id = str(uuid.uuid4())
-            kubernetes_spec = _training_spec(training_id)
+            kubernetes_spec = _training_spec(training_id, nodes=self.nodes)
             log_path = self.state_dir / f"{training_id}.log"
             started_at = time.time()
             deadline_at = started_at + spec.timeout_seconds
@@ -1149,11 +1184,13 @@ def _materialize_source_snapshot(workspace: Path) -> tuple[Path, str]:
     return snapshot, head
 
 
-def _training_spec(training_id: str) -> KubernetesTrainingSpec:
+def _training_spec(training_id: str, *, nodes: int) -> KubernetesTrainingSpec:
     research = _dns_label(os.environ["RESEARCH_TAG"])
     student = _dns_label(os.environ["STUDENT_NAME"])
     suffix = uuid.UUID(training_id).hex[:12]
-    prefix = f"senpai-{research}-{student}"[: 62 - len(suffix)].rstrip("-.")
+    child_suffix_length = max(len("-launcher"), len(f"-worker-{nodes - 1}"))
+    prefix_limit = 63 - child_suffix_length - 1 - len(suffix)
+    prefix = f"senpai-{research}-{student}"[:prefix_limit].rstrip("-")
     return KubernetesTrainingSpec(
         kind="MPIJob",
         name=f"{prefix}-{suffix}",

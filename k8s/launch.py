@@ -550,6 +550,11 @@ def _student_training_access(student_name: str, tag: str, namespace: str) -> str
                     "resources": ["pods/log"],
                     "verbs": ["get"],
                 },
+                {
+                    "apiGroups": [""],
+                    "resources": ["events"],
+                    "verbs": ["list"],
+                },
             ],
         },
         {

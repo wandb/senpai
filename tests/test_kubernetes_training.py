@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -832,3 +833,24 @@ def test_supervisor_reports_diagnostics_failure_without_losing_training(tmp_path
     result = runtime.get_training_status(started.training_id)
     assert result.state is TrainingState.FINISHED
     assert "Kubernetes diagnostics unavailable: RuntimeError: HTTP 403" in result.kubernetes_diagnostics
+
+
+@pytest.mark.parametrize("nodes", [4, 1000])
+@pytest.mark.parametrize("research", [
+    "cfd-batch-jc-vandam-sep23",
+    "r" * 33 + "-" + "r" * 40,
+])
+def test_training_identity_leaves_room_for_mpi_child_names(monkeypatch, nodes, research):
+    monkeypatch.setenv("RESEARCH_TAG", research)
+    monkeypatch.setenv("STUDENT_NAME", "JC_Vandam Edward with a long student name")
+    monkeypatch.setenv("SENPAI_KUBERNETES_NAMESPACE", "research")
+    training_id = "d30b8238-81b6-4841-b541-9df20cddf6f9"
+
+    spec = kubernetes_training._training_spec(training_id, nodes=nodes)
+
+    assert spec.wandb_run_id == training_id.replace("-", "")
+    assert spec.name.endswith("-d30b823881b6")
+    assert not spec.name.removesuffix("-d30b823881b6").endswith("-")
+    for name in (spec.name, f"{spec.name}-launcher", f"{spec.name}-worker-{nodes - 1}"):
+        assert len(name) <= 63
+        assert re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", name)

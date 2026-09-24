@@ -1119,7 +1119,7 @@ def test_workload_diagnostics_include_owned_init_and_launcher_logs(monkeypatch):
 
     def pod(name, owner, status, *, init=False):
         return {
-            "metadata": {"name": name, "ownerReferences": [owner]},
+            "metadata": {"name": name, "uid": name + "-uid", "ownerReferences": [owner]},
             "spec": {"containers": [{"name": "train"}],
                      "initContainers": [{"name": "checkout"}] if init else []},
             "status": status,
@@ -1151,6 +1151,9 @@ def test_workload_diagnostics_include_owned_init_and_launcher_logs(monkeypatch):
         return workload if kind == "MPIJob" else launcher_job
 
     def request_json(method, path, **kwargs):
+        if "/events?" in path:
+            assert "involvedObject.uid%3D" in path
+            return {"items": []}
         assert "senpai-training-id%3Drun-id" in path
         return {"items": [unrelated, replaced, worker, launcher]}
 
@@ -1184,3 +1187,64 @@ def test_workload_diagnostics_reject_replaced_uid(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="replaced training workload"):
         client.logs(resource)
+
+
+def test_diagnostics_report_pre_pod_validation_events_and_reject_foreign_uid(monkeypatch):
+    client = object.__new__(KubernetesApiClient)
+    resource = KubernetesResourceRef(
+        kind="MPIJob", name="run", namespace="research", uid="mpi-uid",
+        nodes=4, gpus_per_node=8,
+    )
+    workload = {"metadata": {"uid": "mpi-uid", "labels": {"senpai-training-id": "run-id"}}}
+    monkeypatch.setattr(client, "_get", lambda *args: workload)
+    requests = []
+
+    def request_json(method, path, **kwargs):
+        requests.append(path)
+        if "/pods?" in path:
+            return {"items": []}
+        assert "/namespaces/research/events?" in path
+        assert "fieldSelector=involvedObject.uid%3Dmpi-uid" in path
+        assert "limit=20" in path
+        return {"items": [
+            {"involvedObject": {"uid": "other-uid"}, "message": "foreign secret"},
+            {
+                "metadata": {"creationTimestamp": "2026-09-24T08:50:00Z"},
+                "involvedObject": {"uid": "mpi-uid"},
+                "type": "Warning", "reason": "ValidationError",
+                "message": "worker hostname must be no more than 63 characters",
+            },
+        ]}
+
+    monkeypatch.setattr(client, "_request_json", request_json)
+    result = client.logs(resource)
+
+    assert "ValidationError: worker hostname must be no more than 63 characters" in result
+    assert "No owned workload pods exist yet" in result
+    assert "foreign secret" not in result
+    assert len(requests) == 2
+
+
+def test_workload_events_are_bounded_and_surface_rbac_errors(monkeypatch):
+    client = object.__new__(KubernetesApiClient)
+    events = [{
+        "metadata": {"creationTimestamp": f"2026-09-24T08:50:{index:02d}Z"},
+        "involvedObject": {"uid": "pod-uid"},
+        "reason": f"Reason{index}", "message": "x" * 5000,
+    } for index in range(8)]
+    monkeypatch.setattr(client, "_request_json", lambda *args, **kwargs: {"items": events})
+
+    result = client._events("research", "pod-uid", "pod/worker", time.monotonic() + 10)
+
+    assert len(result) == 5
+    assert "Reason3" in result[0]
+    assert "Reason7" in result[-1]
+    assert all(line.count("x") == 1024 for line in result)
+
+    def forbidden(*args, **kwargs):
+        raise KubernetesApiError("GET", "/events", 403)
+
+    monkeypatch.setattr(client, "_request_json", forbidden)
+    assert client._events("research", "pod-uid", "pod/worker", time.monotonic() + 10) == [
+        "[pod/worker/events] unavailable: HTTP 403"
+    ]
