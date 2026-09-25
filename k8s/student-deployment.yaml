@@ -112,20 +112,16 @@ spec:
             memory: "{{STUDENT_MEMORY}}"
             nvidia.com/gpu: "{{GPUS_PER_STUDENT}}"
         startupProbe:
-          exec:
-            command:
-            - /bin/sh
-            - -c
-            - python -m senpai_agent.supervisor health "/var/lib/senpai/openhands_state/controller-lease.json"
+          httpGet:
+            path: /healthz
+            port: 8080
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 60
         livenessProbe:
-          exec:
-            command:
-            - /bin/sh
-            - -c
-            - python -m senpai_agent.supervisor health "/var/lib/senpai/openhands_state/controller-lease.json"
+          httpGet:
+            path: /healthz
+            port: 8080
           periodSeconds: 30
           timeoutSeconds: 5
           failureThreshold: 5

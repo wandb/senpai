@@ -9,7 +9,6 @@ set -o pipefail
 umask "${SENPAI_UMASK:-0022}"
 LOGDIR="/var/lib/senpai/$RESEARCH_TAG/advisor"
 rm -f "$LOGDIR/openhands_state/controller-lease.json"
-date +%s > "${SENPAI_BOOTSTRAP_STARTED_PATH:-/var/lib/senpai/.bootstrap-started}"
 
 WORKDIR="/workspace/senpai"
 GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"

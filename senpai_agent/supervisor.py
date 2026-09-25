@@ -11,8 +11,10 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Literal
 
@@ -32,6 +34,8 @@ from senpai_agent.secrets import (
 )
 
 LEASE_ENV = "SENPAI_CONTROLLER_LEASE_PATH"
+HEALTH_PORT_ENV = "SENPAI_HEALTH_PORT"
+DEFAULT_HEALTH_PORT = 8080
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,6 +381,46 @@ def lease_is_healthy(path: Path) -> bool:
         return False
 
 
+@contextmanager
+def serve_lease_health(
+    lease_path: Path,
+    *,
+    host: str = "0.0.0.0",
+    port: int = DEFAULT_HEALTH_PORT,
+) -> Iterator[ThreadingHTTPServer]:
+    """Serve the worker lease without spawning credential-bearing probes."""
+
+    class LeaseHealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path != "/healthz":
+                self.send_error(404)
+                return
+            healthy = lease_is_healthy(lease_path)
+            body = b"ok\n" if healthy else b"unhealthy\n"
+            self.send_response(200 if healthy else 503)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer((host, port), LeaseHealthHandler)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="senpai-health",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def supervisor_main(
     argv: Sequence[str] | None = None,
     env: Mapping[str, str] = os.environ,
@@ -393,6 +437,13 @@ def supervisor_main(
 
     if args.command == "health":
         return 0 if lease_is_healthy(args.lease_path) else 1
+
+    try:
+        health_port = int(env.get(HEALTH_PORT_ENV, str(DEFAULT_HEALTH_PORT)))
+    except ValueError as error:
+        raise RuntimeError(f"{HEALTH_PORT_ENV} must be an integer") from error
+    if not 1 <= health_port <= 65535:
+        raise RuntimeError(f"{HEALTH_PORT_ENV} must be between 1 and 65535")
 
     state_dir = Path(env["SENPAI_OPENHANDS_STATE_DIR"]).resolve()
     worker_environment = prepare_system_context_environment(
@@ -411,18 +462,20 @@ def supervisor_main(
         for signum in (signal.SIGTERM, signal.SIGINT)
     }
     try:
-        return WorkerSupervisor(
-            command=(
-                sys.executable,
-                "-P",
-                "-m",
-                "senpai_agent.controller",
-                args.command,
-            ),
-            lease_path=state_dir / "controller-lease.json",
-            environment=worker_environment,
-            github_token=github_token,
-        ).run(stop)
+        lease_path = state_dir / "controller-lease.json"
+        with serve_lease_health(lease_path, port=health_port):
+            return WorkerSupervisor(
+                command=(
+                    sys.executable,
+                    "-P",
+                    "-m",
+                    "senpai_agent.controller",
+                    args.command,
+                ),
+                lease_path=lease_path,
+                environment=worker_environment,
+                github_token=github_token,
+            ).run(stop)
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
