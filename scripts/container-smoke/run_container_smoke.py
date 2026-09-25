@@ -11,11 +11,11 @@ import tempfile
 import uuid
 
 
-def command(argv, *, timeout=120, **kwargs):
+def command(argv, *, timeout=120, combine_output=False, **kwargs):
     result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, **kwargs)
     if result.returncode:
         raise RuntimeError(f'Command failed ({result.returncode}): {argv!r}\n{result.stdout}\n{result.stderr}')
-    return result.stdout.strip()
+    return (result.stdout + (result.stderr if combine_output else "")).strip()
 
 
 def main():
@@ -86,7 +86,7 @@ def main():
                 *runtime, *mounts, *env_args, args.advisor_image, '/smoke/startup.sh'])
             for start in (1, 2):
                 code = command(docker + ['wait', container], timeout=90)
-                logs = command(docker + ['logs', container])
+                logs = command(docker + ['logs', container], combine_output=True)
                 if code != '0':
                     raise AssertionError(f'advisor smoke start {start} exited {code}\n{logs}')
                 assert f'"container_start": {start}' in logs and '"status": "ok"' in logs, logs
