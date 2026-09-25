@@ -32,15 +32,19 @@ def bootstrap_runtime(tmp_path, role):
 import json, os, subprocess
 from pathlib import Path
 from senpai_agent.supervisor import _consume_github_token, _consume_private_credential_files
-names = ("SENPAI_GITHUB_TOKEN_FILE", "SENPAI_WANDB_API_KEY_FILE", "SENPAI_EXA_API_KEY_FILE")
+names = ["SENPAI_GITHUB_TOKEN_FILE", "SENPAI_WANDB_API_KEY_FILE", "SENPAI_EXA_API_KEY_FILE"]
+expected_services = {"WANDB_API_KEY": "wandb-fixture", "EXA_API_KEY": "exa-fixture"}
+if os.environ["SENPAI_ROLE"] == "student":
+    names.append("SENPAI_WANDB_TRAINING_API_KEY_FILE")
+    expected_services["SENPAI_WANDB_TRAINING_API_KEY"] = "writer-fixture"
 paths = [Path(os.environ[name]) for name in names]
-assert all(name not in os.environ for name in ("GITHUB_TOKEN", "GH_TOKEN", "WANDB_API_KEY", "EXA_API_KEY"))
+assert all(name not in os.environ for name in ("GITHUB_TOKEN", "GH_TOKEN", "WANDB_API_KEY", "EXA_API_KEY", "SENPAI_WANDB_TRAINING_API_KEY"))
 assert len({path.parent for path in paths}) == 1
 assert paths[0].parent.stat().st_mode & 0o777 == 0o700
 assert all(path.stat().st_mode & 0o777 == 0o600 for path in paths)
 assert _consume_github_token(os.environ).get_secret_value() == "github-fixture"
 services = _consume_private_credential_files(os.environ)
-assert {name: value.get_secret_value() for name, value in services.items()} == {"WANDB_API_KEY": "wandb-fixture", "EXA_API_KEY": "exa-fixture"}
+assert {name: value.get_secret_value() for name, value in services.items()} == expected_services
 assert all(not path.exists() for path in paths)
 safe_directories = subprocess.check_output(["git", "config", "--global", "--get-all", "safe.directory"], text=True).splitlines()
 with Path(os.environ["START_RECORD"]).open("a") as output:
@@ -116,6 +120,8 @@ with Path(os.environ["START_RECORD"]).open("a") as output:
         "STARTUP_RECORDER": str(recorder),
         "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
     }
+    if role == "student":
+        environment["SENPAI_WANDB_TRAINING_API_KEY"] = "writer-fixture"
 
     def start():
         home.mkdir(parents=True, exist_ok=True)

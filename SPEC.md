@@ -760,8 +760,34 @@ parent passes its descriptor to the child and closes its copy after spawning.
 The child closes the descriptor after reading and resolves configuration from
 an in-memory mapping. W&B and Exa conversation secrets remain available to child
 tools; a model key that also serves one of those services remains in the
-environment. W&B inference still shares `WANDB_API_KEY` until the W&B identity
-cutover. No per-student W&B key is required by this handoff change.
+environment. W&B inference uses `WANDB_INFERENCE_API_KEY`. The launcher requires
+one distinct W&B writer per student and transfers it through the private file/
+descriptor handoff as `SENPAI_WANDB_TRAINING_API_KEY`. The controller holds it in
+memory, removes that variable, and supplies it only to supervised training as
+`WANDB_API_KEY`. Supervised output redacts the writer before log persistence,
+including keys split across pipe reads. The output reader drains the buffered
+backlog at shutdown without waiting for an escaped descendant to close its pipe.
+Training clears `WANDB_SERVICE` so it cannot reuse the controller's sidecar, and
+an explicit writer clears `WANDB_IDENTITY_TOKEN_FILE` to avoid conflicting auth.
+Research tools and independent child/standalone traces retain
+the existing research credential until a complete research replacement exists.
+
+Additive research tools use an explicit credential configured by the runner;
+their serialized definitions contain only the export directory. Main agents and
+general-purpose children can query W&B, Weave, and workspace/report views and
+create new Report drafts. Explore children receive the read tools. Results use
+generated JSONL paths outside the target checkout. Export writes reject symlinks;
+artifact downloads use generated filenames and do not execute downloaded data.
+Full run history preserves sparse rows. Reports accept complete specifications,
+including arbitrary blocks, runsets, and panels, and require authenticated
+read-back before reporting a verified draft. Uncertain creation returns a receipt
+or generated name to inspect before any retry.
+
+This is an additive migration. Existing SDK access and child/standalone tracing
+remain available while live API parity and W&B SDK service-state isolation are
+unverified. The replacement explicitly reports unsupported full system histories
+and external artifact-storage credentials; it must not silently substitute sampled
+data or a narrower research workflow.
 
 The supervisor, controller, and runner disable process dumping on Linux,
 including standalone runner invocations. This also disables core dumps and
@@ -804,7 +830,7 @@ policies are behavioral guardrails, not a credential-containment boundary.
 `custom_secret_env_names` is an explicit, shared list of additional
 environment-variable names. Names must be unique and match
 `[A-Za-z_][A-Za-z0-9_]*`. Built-in launch credential names and names beginning
-with `GH_`, `GITHUB_`, or `SENPAI_` are reserved. Launcher-owned and
+with `GH_`, `GITHUB_`, `SENPAI_`, or `WANDB_API_KEY_` are reserved. Launcher-owned and
 process-control environment-variable names are also reserved. The launcher
 resolves each value from the shell and then the repository-root `.env`. It
 reads `.env` values literally without variable interpolation. A missing listed
@@ -854,14 +880,16 @@ Launch preflight verifies:
 - every model-provider credential referenced by the configured profiles;
 - the Exa key with one `type="instant"`, publication-category, one-result
   search;
-- the W&B key with a minimal viewer query; and
+- each W&B research, inference, and student writer key with a minimal viewer
+  query, rejecting reuse across owners; and
 - the presence of every configured custom secret, without attempting
   a service-specific authentication check.
 
 Exa is a progressive skill/script integration, not an always-connected MCP
 server.
 
-The Kubernetes launcher creates one Secret, ConfigMaps, and Deployments. It
+The Kubernetes launcher creates an immutable shared Secret, a separate immutable
+writer Secret per student, ConfigMaps, and Deployments. It
 creates no Service or RBAC. Docker and local hosts need no shared network for
 Senpai communication.
 
@@ -918,3 +946,29 @@ The change is acceptable when:
   never becomes Ready; and
 - a live credential preflight plus GitHub read-only smoke succeeds before
   production rollout.
+
+### W&B identity rollout
+
+Shared launch credentials and each student writer use separate immutable,
+content-addressed Secrets. Credential changes roll only the rendered roles;
+other roles retain their previous Secret references. Desired Deployments and
+nonterminal Pods record research, inference, and writer viewer IDs. The launcher
+checks all Senpai roles in the namespace, including terminating Pods and desired
+Deployments with no replicas. Ownership includes the launch tag for every role.
+Missing legacy bindings fail closed. A partial update cannot change the research
+viewer while unchanged roles retain another viewer.
+
+The ownership scan and apply are not atomic. Operators must serialize launches
+within each namespace. Preflight-only checks authenticate the supplied viewers
+but neither inspect cluster ownership nor reserve viewers. Before migration,
+remove stopped legacy resources or apply verified viewer bindings to all of them.
+A fresh tag does not bypass this namespace-wide check. Viewer checks do not prove
+project roles, assignment ownership, or the integrity of reported metrics.
+
+This staged rollout preserves authenticated W&B research and tracing. The agent
+can still use the research key; separate training writers do not yet isolate
+research privileges from agent-controlled code. A future cutover requires usable
+private discovery/config/summary/full-history/artifact interfaces, workspace and
+Weave research workflows, Reports, and an explicit tracing solution. It must
+preserve complete local data for analysis and must not narrow the research
+contract through arbitrary tool or prompt restrictions.

@@ -6,7 +6,6 @@ import urllib.error
 import urllib.parse
 
 import pytest
-
 from launch_test_support import launch_helpers
 
 
@@ -81,10 +80,14 @@ def test_custom_secrets_report_every_missing_or_blank_name(monkeypatch, tmp_path
     assert "BLANK_SECRET" in message
 
 
-def test_github_cli_fallback_does_not_inherit_custom_secrets(monkeypatch, tmp_path):
+def test_github_cli_fallback_does_not_inherit_custom_secrets(
+    monkeypatch, tmp_path
+):
     captured = {}
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setenv("HF_TOKEN", "custom-secret")
+    monkeypatch.setenv("WANDB_API_KEY_FERN", "writer-key")
+    monkeypatch.setenv("WANDB_INFERENCE_API_KEY", "inference-key")
     monkeypatch.setenv("VISIBLE_SETTING", "safe")
 
     def run(argv, **kwargs):
@@ -93,10 +96,15 @@ def test_github_cli_fallback_does_not_inherit_custom_secrets(monkeypatch, tmp_pa
 
     monkeypatch.setattr(launch_helpers.subprocess, "run", run)
 
-    token = launch_helpers.resolve_github_token(tmp_path / "missing.env", ["HF_TOKEN"])
+    token = launch_helpers.resolve_github_token(
+        tmp_path / "missing.env", ["HF_TOKEN"]
+    )
 
     assert token == "github-token"
-    assert "HF_TOKEN" not in captured["kwargs"]["env"]
+    assert (
+        not {"HF_TOKEN", "WANDB_API_KEY_FERN", "WANDB_INFERENCE_API_KEY"}
+        & captured["kwargs"]["env"].keys()
+    )
     assert captured["kwargs"]["env"]["VISIBLE_SETTING"] == "safe"
 
 
@@ -136,13 +144,17 @@ def test_exa_preflight_rejects_a_success_response_without_search_results(monkeyp
         launch_helpers.preflight_check_exa_api_key("exa-secret")
 
 
-def test_wandb_preflight_authenticates_with_the_minimal_viewer_query(monkeypatch):
+def test_wandb_preflight_authenticates_with_the_minimal_viewer_query(
+    monkeypatch,
+):
     captured = capture_request(
         monkeypatch,
         {"data": {"viewer": {"id": "user"}}},
     )
 
-    launch_helpers.preflight_check_wandb_api_key("wandb-secret")
+    assert (
+        launch_helpers.preflight_check_wandb_api_key("wandb-secret") == "user"
+    )
 
     request = captured["request"]
     assert request.full_url == "https://api.wandb.ai/graphql"
@@ -419,3 +431,69 @@ def test_student_name_preflight_checks_every_issue_page(monkeypatch):
 
     assert any("page=1" in request for request in requests)
     assert any("page=2" in request for request in requests)
+
+
+@pytest.mark.parametrize(
+    "viewer",
+    [{}, {"id": ""}, {"id": 123}, None],
+)
+def test_wandb_preflight_requires_a_viewer_identity(monkeypatch, viewer):
+    capture_request(monkeypatch, {"data": {"viewer": viewer}})
+
+    with pytest.raises(SystemExit, match="failed to resolve a viewer"):
+        launch_helpers.preflight_check_wandb_api_key("wandb-secret")
+
+
+@pytest.mark.parametrize(
+    "names,values,message",
+    [
+        (
+            ["fern", "frieren"],
+            {"WANDB_API_KEY_FERN": "same", "WANDB_API_KEY_FRIEREN": "same"},
+            "distinct W&B training",
+        ),
+        (["team-fern", "team.fern"], {}, "distinct credential suffixes"),
+        (["fern"], {}, "WANDB_API_KEY_FERN"),
+    ],
+)
+def test_writer_credentials_fail_closed_for_missing_or_aliased_keys(
+    monkeypatch, tmp_path, names, values, message
+):
+    for name in (
+        "WANDB_API_KEY_FERN",
+        "WANDB_API_KEY_FRIEREN",
+        "WANDB_API_KEY_TEAM_FERN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(SystemExit, match=message):
+        launch_helpers.resolve_student_wandb_api_keys(
+            tmp_path / "missing.env", names
+        )
+
+
+def test_writer_credentials_use_final_student_names_and_shell_precedence(
+    monkeypatch, tmp_path
+):
+    dotenv = tmp_path / "fixture.env"
+    dotenv.write_text(
+        "WANDB_API_KEY_TRACK_FERN=dotenv-fern\nWANDB_API_KEY_TRACK_FRIEREN=dotenv-frieren\n"
+    )
+    monkeypatch.setenv("WANDB_API_KEY_TRACK_FERN", "shell-fern")
+    monkeypatch.delenv("WANDB_API_KEY_TRACK_FRIEREN", raising=False)
+    assert launch_helpers.resolve_student_wandb_api_keys(
+        dotenv, ["track-fern", "track.frieren"]
+    ) == {
+        "track-fern": "shell-fern",
+        "track.frieren": "dotenv-frieren",
+    }
+
+
+@pytest.mark.parametrize("data", [None, []])
+def test_wandb_preflight_reports_unresolved_graphql_data(monkeypatch, data):
+    capture_request(
+        monkeypatch, {"data": data, "errors": [{"message": "No viewer"}]}
+    )
+    with pytest.raises(SystemExit, match="failed to resolve a viewer"):
+        launch_helpers.preflight_check_wandb_api_key("wandb-secret")

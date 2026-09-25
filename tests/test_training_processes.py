@@ -1,18 +1,14 @@
 import json
+import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import psutil
-
-from senpai_agent.training import (
-    TrainingResult,
-    TrainingSpec,
-    TrainingState,
-    TrainingSupervisor,
-)
+from pydantic import SecretStr
 from training_test_support import (
     assert_process_stopped,
     make_supervisor,
@@ -21,11 +17,15 @@ from training_test_support import (
     wait_for_terminal,
 )
 
+from senpai_agent.training import (
+    TrainingResult,
+    TrainingSpec,
+    TrainingState,
+    TrainingSupervisor,
+)
 
 TERM_IGNORING_SLEEP = (
-    "import signal,time;"
-    "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
-    "time.sleep(60)"
+    "import signal,time;signal.signal(signal.SIGTERM, signal.SIG_IGN);time.sleep(60)"
 )
 
 
@@ -251,3 +251,199 @@ def test_restart_does_not_signal_a_reused_pid(tmp_path: Path):
     finally:
         unrelated.send_signal(signal.SIGKILL)
         unrelated.wait()
+
+
+def test_training_masks_split_writer_output_before_log_and_result_persistence(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WANDB_API_KEY", "research-secret")
+    monkeypatch.setenv("WANDB_INFERENCE_API_KEY", "inference-secret")
+    monkeypatch.setenv("SENPAI_WANDB_TRAINING_API_KEY", "stale-writer-secret")
+    monkeypatch.setenv("WANDB_SERVICE", "parent-service")
+    monkeypatch.setenv("WANDB_IDENTITY_TOKEN_FILE", "/parent/identity-token")
+    workspace, supervisor = make_supervisor(
+        tmp_path,
+        wandb_api_key=SecretStr("student-writer-secret"),
+        terminate_grace_seconds=0.1,
+    )
+    environment_path = workspace / "environment.json"
+    prefix_written = workspace / "prefix-written"
+    continue_output = workspace / "continue-output"
+    running = run_python(
+        supervisor,
+        workspace,
+        "import json,os,pathlib,sys,time;"
+        "values={key: os.environ.get(key) for key in "
+        "['WANDB_API_KEY','WANDB_INFERENCE_API_KEY','SENPAI_WANDB_TRAINING_API_KEY',"
+        "'WANDB_SERVICE','WANDB_IDENTITY_TOKEN_FILE']};"
+        f"pathlib.Path({str(environment_path)!r}).write_text(json.dumps(values));"
+        "key=os.environ['WANDB_API_KEY'].encode();"
+        "os.write(1,b'failed with key='+key[:7]);"
+        f"pathlib.Path({str(prefix_written)!r}).touch();\n"
+        f"while not pathlib.Path({str(continue_output)!r}).exists(): time.sleep(.01)\n"
+        "os.write(2,key[7:]+b'\\n');"
+        "os.write(1,b'https://wandb.ai/team/project/runs/writer-run\\n');"
+        "sys.exit(1)",
+    )
+    log = Path(running.log_path)
+    try:
+        wait_for_path(prefix_written)
+        deadline = time.monotonic() + 3
+        while log.read_bytes() != b"failed with key=" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        # The reader has consumed the first write, but keeps the possible key
+        # prefix in memory until the next write completes or disproves it.
+        assert log.read_bytes() == b"failed with key="
+        continue_output.touch()
+        result = wait_for_terminal(supervisor, running.training_id)
+    finally:
+        supervisor.close()
+
+    assert result.state is TrainingState.FAILED
+    assert json.loads(environment_path.read_text()) == {
+        "WANDB_API_KEY": "student-writer-secret",
+        "WANDB_INFERENCE_API_KEY": None,
+        "SENPAI_WANDB_TRAINING_API_KEY": None,
+        "WANDB_SERVICE": None,
+        "WANDB_IDENTITY_TOKEN_FILE": None,
+    }
+    expected = (
+        "failed with key=<secret-hidden>\n"
+        "https://wandb.ai/team/project/runs/writer-run\n"
+    )
+    assert log.read_text() == expected
+    assert result.error_tail == expected
+    assert result.wandb_run_ids == ("writer-run",)
+    persisted = tmp_path / "state" / f"{running.training_id}.json"
+    assert "student-writer-secret" not in persisted.read_text()
+
+
+def test_training_masks_a_partial_writer_key_at_natural_eof(tmp_path):
+    workspace, supervisor = make_supervisor(
+        tmp_path,
+        wandb_api_key=SecretStr("0123456789abcdef0123456789abcdef01234567"),
+        terminate_grace_seconds=0.1,
+    )
+    running = run_python(
+        supervisor,
+        workspace,
+        "import os,sys;"
+        "os.write(1,b'partial writer='+os.environ['WANDB_API_KEY'].encode()[:24]);"
+        "sys.exit(1)",
+    )
+    try:
+        result = wait_for_terminal(supervisor, running.training_id)
+    finally:
+        supervisor.close()
+
+    expected = "partial writer=<secret-hidden>"
+    assert result.state is TrainingState.FAILED
+    assert Path(running.log_path).read_text() == expected
+    assert result.error_tail == expected
+    persisted = tmp_path / "state" / f"{running.training_id}.json"
+    assert json.loads(persisted.read_text())["error_tail"] == expected
+
+
+def test_writer_redaction_does_not_create_truncated_wandb_run_ids(tmp_path):
+    workspace, supervisor = make_supervisor(
+        tmp_path,
+        wandb_api_key=SecretStr("0123456789abcdef0123456789abcdef01234567"),
+        terminate_grace_seconds=0.1,
+    )
+    running = run_python(
+        supervisor,
+        workspace,
+        "import os;"
+        "base=b'https://wandb.ai/team/project/runs/';"
+        "os.write(1,base+b'masked'+os.environ['WANDB_API_KEY'].encode()+b'\\n');"
+        "os.write(1,base+b'valid0\\n');"
+        "os.write(1,base+b'abc0')",
+    )
+    try:
+        result = wait_for_terminal(supervisor, running.training_id)
+    finally:
+        supervisor.close()
+
+    assert result.state is TrainingState.FINISHED
+    assert Path(running.log_path).read_text() == (
+        "https://wandb.ai/team/project/runs/masked<secret-hidden>\n"
+        "https://wandb.ai/team/project/runs/valid0\n"
+        "https://wandb.ai/team/project/runs/abc<secret-hidden>"
+    )
+    assert result.wandb_run_ids == ("valid0",)
+
+
+def test_cancel_does_not_wait_for_a_detached_output_writer(tmp_path):
+    workspace, supervisor = make_supervisor(
+        tmp_path,
+        wandb_api_key=SecretStr("student-writer-secret"),
+        terminate_grace_seconds=0.1,
+    )
+    child_pid = workspace / "detached.pid"
+    writer = (
+        "import os,threading\n"
+        "def emit():\n"
+        " while True: os.write(1,os.environ['WANDB_API_KEY'].encode()*256)\n"
+        "for _ in range(4): threading.Thread(target=emit,daemon=True).start()\n"
+        "emit()\n"
+    )
+    running = run_python(
+        supervisor,
+        workspace,
+        "import pathlib,subprocess,sys,time;"
+        f"child=subprocess.Popen([sys.executable,'-c',{writer!r}],start_new_session=True);"
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(child.pid));"
+        "time.sleep(60)",
+        timeout_seconds=30,
+    )
+    cancellation = threading.Thread(
+        target=supervisor.cancel_training, args=(running.training_id,)
+    )
+    try:
+        wait_for_path(child_pid)
+        log = Path(running.log_path)
+        deadline = time.monotonic() + 3
+        while log.stat().st_size < 64 * 1024 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert log.stat().st_size >= 64 * 1024
+        cancellation.start()
+        cancellation.join(timeout=3)
+        finished_on_time = not cancellation.is_alive()
+    finally:
+        if child_pid.exists():
+            try:
+                os.killpg(int(child_pid.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        supervisor.close()
+        if cancellation.ident is not None:
+            cancellation.join()
+
+    assert finished_on_time
+    assert (
+        supervisor.get_training_status(running.training_id).state
+        is TrainingState.CANCELLED
+    )
+    output = Path(running.log_path).read_bytes()
+    assert b"student-writer-secret" not in output
+    assert output.endswith(b"<secret-hidden>")
+
+
+def test_output_capture_failure_cannot_report_success(tmp_path, monkeypatch):
+    workspace, supervisor = make_supervisor(tmp_path, terminate_grace_seconds=0.1)
+    original_open = Path.open
+
+    def fail_log_write(path, mode="r", *args, **kwargs):
+        if path.suffix == ".log" and mode == "wb":
+            raise OSError("fixture disk full")
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_log_write)
+    running = run_python(supervisor, workspace, "import time;time.sleep(.05)")
+    try:
+        result = wait_for_terminal(supervisor, running.training_id)
+    finally:
+        supervisor.close()
+
+    assert result.state is TrainingState.FAILED
+    assert result.error_tail == "Training output capture failed (OSError)."
