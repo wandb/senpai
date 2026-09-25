@@ -484,9 +484,19 @@ Kubernetes startup and liveness probes use `httpGet` on fixed port 8080;
 repeated failures restart the container without spawning a probe process.
 The external process manager restarts the complete entrypoint after the
 supervisor exits.
-Container restarts resume the advisor or student conversation from the pod-local
-state volume; replacing or rescheduling the pod starts fresh state. Stop a
-container before copying or snapshotting a live advisor state directory.
+Container restarts resume the advisor or student conversation from pod-local
+storage. The supplied manifests also preserve the target checkout and target
+Python environment in separate `emptyDir` volumes. Bootstrap keeps the existing
+branch, uncommitted files, unpushed commits, and installed target dependencies.
+Replacing or rescheduling the Pod starts fresh state, checkout, and target
+environment. Store durable outputs on the mounted PVC and publish experiment
+work through the supported Git workflow. Stop a container before copying or
+snapshotting a live advisor state directory.
+
+`problem_dir` must be a relative child directory outside tracked runner assets
+and Git metadata. The dataset PVC mount must not overlap the target checkout or
+target Python environment. The launcher rejects these overlaps before reading
+credentials.
 
 ### Other deployment environments
 
@@ -505,7 +515,12 @@ read-only packages. `python`, `uv pip install`, and `uv run` select that target
 environment through `PATH`, `VIRTUAL_ENV`, `UV_PYTHON`, and
 `UV_PROJECT_ENVIRONMENT`. Senpai applies these settings after shell startup,
 preserves other PATH entries, and allows later commands to change their
-session environment. Bootstrap creates it without running `ensurepip`.
+session environment. Shared dependency commands such as `torchrun` receive
+target launchers so they and their Python workers can import target packages.
+Existing commands installed in the target environment take precedence.
+Bootstrap creates it without running `ensurepip` or target Python.
+Environment changes belong to the terminal pane that received the command;
+parallel tmux execution can leave several panes with different settings.
 The image supplies pip through the shared package path: use
 `python -m pip install` for additive installs that reuse image packages.
 uv does not inspect packages exposed through that path, so `uv pip install`
@@ -527,11 +542,12 @@ training, and delegation tools remain available. Operators who need an
 additional runtime plugin must review and include it in the trusted image
 plugin; copying it into a target or home plugin directory does not enable it.
 
-The target venv follows the lifetime of HOME. The standard Kubernetes
-Deployments do not persist HOME, so container replacement reinstalls target
-dependencies. Custom launchers must also point the trusted hook manifest at
-their absolute trusted Python interpreter with `-P`; the bundled manifest
-uses `/opt/senpai-venv/bin/python`.
+The standard Kubernetes Deployments mount only
+`/home/senpai/.venvs/senpai-target` from HOME. Target dependencies survive a
+container restart in the same Pod. Custom launchers must preserve the target
+checkout and target environment alongside role state for equivalent recovery.
+They must also point the trusted hook manifest at their absolute trusted Python
+interpreter with `-P`; the bundled manifest uses `/opt/senpai-venv/bin/python`.
 
 To build another launcher, reproduce [entrypoint-advisor.sh](k8s/entrypoint-advisor.sh) or [entrypoint-student.sh](k8s/entrypoint-student.sh), render `SENPAI-LAUNCH-CONTEXT.md` with runtime identity, limits, and isolation through `render_launch_context`, and provide it as base64 in `SENPAI_LAUNCH_CONTEXT_B64`. Pass the built-in role template and its required non-secret values to the Python supervisor, which renders and persists that role snapshot. Keep optional operator guidance in `EXTRA_INSTRUCTIONS_B64`. Persist `/var/lib/senpai/<tag>/advisor` for the advisor. Student execution requires Linux, an NVIDIA runtime, and compatible CUDA hardware; Docker Desktop on macOS cannot run the GPU student image.
 
