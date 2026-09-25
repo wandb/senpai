@@ -123,9 +123,10 @@ def test_images_install_the_runner_and_protect_runtime_assets(role: str):
     root_setup = dockerfile.split("USER 10001:10001", 1)[0].replace("\\\n", " ")
 
     assert (
-        'uv pip install --python "$SENPAI_PYTHON" --no-deps /tmp/senpai'
+        'uv pip install --python "$SENPAI_PYTHON" --no-deps --compile-bytecode /tmp/senpai'
         in root_setup
     )
+    assert '"pip==25.3"' in root_setup
     assert "SENPAI_PYTHON=/opt/senpai-venv/bin/python" in dockerfile
     assert "UV_PYTHON=/opt/senpai-venv/bin/python" in dockerfile
     assert "UV_PROJECT_ENVIRONMENT" not in dockerfile
@@ -364,6 +365,68 @@ def test_target_environment_setup_does_not_execute_target_code(
     assert Path(runtime_package).is_relative_to(sysconfig.get_path("purelib"))
     assert Path(target_package).is_relative_to(target_site)
     assert value == "target dependency"
+
+
+def test_target_pip_reuses_shared_dependencies_and_keeps_upgrades_local(tmp_path):
+    runtime = tmp_path / "runtime"
+    subprocess.run([sys.executable, "-P", "-m", "venv", str(runtime)], check=True)
+    runtime_python = runtime / "bin/python"
+    wheel_dir = tmp_path / "wheels"
+    wheel_dir.mkdir()
+
+    def wheel(name, version, requires=()):
+        path = wheel_dir / f"{name}-{version}-py3-none-any.whl"
+        info = f"{name}-{version}.dist-info"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr(f"{name}.py", f"VERSION = {version!r}\n")
+            archive.writestr(
+                f"{info}/METADATA",
+                f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+                + "".join(f"Requires-Dist: {requirement}\n" for requirement in requires),
+            )
+            archive.writestr(
+                f"{info}/WHEEL",
+                "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            )
+            archive.writestr(f"{info}/RECORD", "")
+        return path
+
+    shared = wheel("shared_example", "1.0")
+    subprocess.run(
+        [str(runtime_python), "-m", "pip", "install", "--no-index", str(shared)],
+        check=True, capture_output=True,
+    )
+    home = tmp_path / "home"
+    setup = (ROOT / "k8s/entrypoint-student.sh").read_text()
+    setup = setup[setup.index("export SENPAI_TARGET_PYTHON_ENV=") :]
+    setup = setup.split('cd "$WORKDIR"', 1)[0]
+    environment = {"PATH": os.environ["PATH"], "HOME": str(home),
+                   "SENPAI_PYTHON": str(runtime_python)}
+    subprocess.run(["bash", "-e", "-c", setup], env=environment, check=True)
+    target = home / ".venvs/senpai-target"
+    target_python = target / "bin/python"
+    target_site = Path(sysconfig.get_path("purelib", vars={"base": str(target)}))
+    addon = wheel("target_addon", "1.0", ("shared-example>=1.0",))
+    # No index or find-links: resolving the addon's dependency must reuse the
+    # installed shared distribution, not fetch or copy it into the target.
+    subprocess.run(
+        [str(target_python), "-m", "pip", "install", "--no-index", str(addon)],
+        env=environment, check=True, capture_output=True,
+    )
+    assert not (target_site / "shared_example.py").exists()
+    assert (target_site / "target_addon.py").is_file()
+
+    upgrade = wheel("shared_example", "2.0")
+    subprocess.run(
+        [str(target_python), "-m", "pip", "install", "--no-index", str(upgrade)],
+        env=environment, check=True, capture_output=True,
+    )
+    for python, expected in ((runtime_python, "1.0"), (target_python, "2.0")):
+        version = subprocess.check_output(
+            [str(python), "-P", "-c", "import shared_example; print(shared_example.VERSION)"],
+            env=environment, text=True,
+        ).strip()
+        assert version == expected
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
