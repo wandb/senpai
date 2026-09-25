@@ -462,7 +462,8 @@ default). It returns HTTP 200 for a live controller lease and HTTP 503 when
 the lease is missing, invalid, or expired, or its worker is no longer running.
 Kubernetes startup and liveness probes use `httpGet` on fixed port 8080;
 repeated failures restart the container without spawning a probe process.
-The supervisor continues to restart failed workers with bounded backoff.
+The external process manager restarts the complete entrypoint after the
+supervisor exits.
 Container restarts resume the advisor or student conversation from the pod-local
 state volume; replacing or rescheduling the pod starts fresh state. Stop a
 container before copying or snapshotting a live advisor state directory.
@@ -507,6 +508,11 @@ or repeat host bootstrap when recovery fails. Standalone launchers can set
 `SENPAI_HEALTH_PORT`; changing it also requires updating the monitor. Keep port
 8080 with the supplied Kubernetes manifests. This listener monitors one
 supervisor; GitHub remains the cross-node coordination protocol.
+
+Outside container PID 1, the supervisor cleans up only descendants it observed
+before the worker exited. Before restarting the entrypoint, a host process
+manager must terminate every descendant process group, including groups created
+by detached children, or terminate the workload's cgroup.
 
 ## Development and reference
 

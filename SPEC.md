@@ -755,8 +755,13 @@ Model values can remain there until process exit. A same-UID process can also
 race a delegated child's inherited descriptor before Python disables dumping.
 These measures reduce exposure; they do not establish complete same-UID secrecy.
 
-The supervisor cleans up the worker and detached descendants under one shared
+The supervisor cleans up the worker and observed descendants under one shared
 60-second grace allowance, below the 75-second liveness termination grace.
+When it runs as container PID 1, it also terminates adopted descendants. On a
+host where it is not PID 1, detached children can become orphans between polls.
+Before restarting the entrypoint, the host process manager must terminate every
+descendant process group, including groups created by detached children, or
+terminate the workload's cgroup.
 Existing post-SIGKILL waits can still depend on kernel process termination.
 Kubernetes or another process manager must restart the complete entrypoint;
 restarting only the Python supervisor cannot recreate consumed handoff files.

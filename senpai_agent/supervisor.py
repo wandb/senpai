@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -476,22 +476,26 @@ def supervisor_main(
     if args.command == "health":
         return 0 if lease_is_healthy(args.lease_path) else 1
 
-    try:
-        health_port = int(env.get(HEALTH_PORT_ENV, str(DEFAULT_HEALTH_PORT)))
-    except ValueError as error:
-        raise RuntimeError(f"{HEALTH_PORT_ENV} must be an integer") from error
-    if not 1 <= health_port <= 65535:
-        raise RuntimeError(f"{HEALTH_PORT_ENV} must be between 1 and 65535")
+    with ExitStack() as handoffs:
+        for name in (GITHUB_TOKEN_FILE_ENV, *PRIVATE_CREDENTIAL_FILE_ENVS.values()):
+            if value := env.get(name):
+                handoffs.callback(Path(value).unlink, missing_ok=True)
+        try:
+            health_port = int(env.get(HEALTH_PORT_ENV, str(DEFAULT_HEALTH_PORT)))
+        except ValueError as error:
+            raise RuntimeError(f"{HEALTH_PORT_ENV} must be an integer") from error
+        if not 1 <= health_port <= 65535:
+            raise RuntimeError(f"{HEALTH_PORT_ENV} must be between 1 and 65535")
 
-    set_process_nondumpable()
-    state_dir = Path(env["SENPAI_OPENHANDS_STATE_DIR"]).resolve()
-    worker_environment = prepare_system_context_environment(
-        args.command,
-        state_dir,
-        env,
-    )
-    github_token = _consume_github_token(env)
-    private_credentials = _consume_private_credential_files(env)
+        set_process_nondumpable()
+        state_dir = Path(env["SENPAI_OPENHANDS_STATE_DIR"]).resolve()
+        worker_environment = prepare_system_context_environment(
+            args.command,
+            state_dir,
+            env,
+        )
+        github_token = _consume_github_token(env)
+        private_credentials = _consume_private_credential_files(env)
     stop = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:

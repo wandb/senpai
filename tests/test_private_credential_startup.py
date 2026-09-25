@@ -1,8 +1,11 @@
 """Exercise credential handoffs across real Python process startup."""
 
+import json
 import os
+import select
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -18,6 +21,60 @@ from senpai_agent.openhands_runner import (
 from senpai_agent.secrets import PRIVATE_CREDENTIAL_FD_ENVS
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or os.getuid() == 0,
+    reason="requires Linux procfs inspection by a non-root user",
+)
+def test_nondumpable_child_denies_same_uid_process_inspection():
+    """Readiness follows hardening; the exec-to-prctl race remains outside this guarantee."""
+
+    startup = """
+import ctypes
+import json
+import os
+import sys
+from pathlib import Path
+from senpai_agent import secrets
+
+assert Path(secrets.__file__).resolve() == Path(os.environ["PYTHONPATH"]) / "senpai_agent/secrets.py"
+secrets.set_process_nondumpable()
+descriptor = int(sys.argv[1])
+assert os.pread(descriptor, 100, 0) == b"private-model-key"
+dumpable = ctypes.CDLL(None).prctl(3, 0, 0, 0, 0)
+print(json.dumps({"dumpable": dumpable, "uid": os.getuid()}), flush=True)
+sys.stdin.read(1)
+"""
+    with tempfile.TemporaryFile() as credentials:
+        credentials.write(b"private-model-key")
+        credentials.flush()
+        descriptor = credentials.fileno()
+        process = subprocess.Popen(
+            (sys.executable, "-P", "-c", startup, str(descriptor)),
+            env={"PYTHONPATH": str(ROOT), "PRIVATE_MODEL_KEY": "private-model-key"},
+            pass_fds=(descriptor,),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    try:
+        assert select.select([process.stdout], [], [], 10)[0], "child did not become ready"
+        ready = json.loads(process.stdout.readline())
+        assert ready == {"dumpable": 0, "uid": os.getuid()}
+        for path in (
+            Path(f"/proc/{process.pid}/environ"),
+            Path(f"/proc/{process.pid}/fd/{descriptor}"),
+        ):
+            with pytest.raises(PermissionError):
+                path.read_bytes()
+        _stdout, stderr = process.communicate("\n", timeout=5)
+        assert process.returncode == 0, stderr
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
 
 
 def test_real_child_startup_resolves_private_models_and_preserves_services(
