@@ -50,6 +50,7 @@ from senpai_agent.secrets import (
     MODEL_CREDENTIALS_FD_ENV,
     configured_custom_secret_env_names,
     consume_model_credential_fd,
+    scrub_exa_credentials,
     scrub_github_credentials,
     set_process_nondumpable,
 )
@@ -88,6 +89,7 @@ from simple_parsing import ArgumentParser, field
 from simple_parsing.helpers import flag
 
 from senpai_agent.agent_markdown import read_agent_markdown, strip_spdx_header
+from senpai_agent.exa_tool import configure_exa_credentials
 from senpai_agent.github.tools import (
     clear_github_credentials,
     configure_github_credentials,
@@ -229,6 +231,7 @@ class RunnerConfig:
     student_name: str | None = None
     wandb_entity: str | None = None
     wandb_project: str | None = None
+    exa_api_key: SecretStr | None = None
     timeout_seconds: float = 7200
     llm_timeout_seconds: int = 5400
     llm_num_retries: int = 5
@@ -874,6 +877,9 @@ def resolve_config(
     smart_api_key = resolve_api_key(env, smart_api_key_env)
     fast_api_key = resolve_api_key(env, fast_api_key_env)
     frontier_api_key = resolve_api_key(env, frontier_api_key_env)
+    exa_api_key = (
+        SecretStr(value) if (value := env.get("EXA_API_KEY", "").strip()) else None
+    )
     resolved_conversation_secrets = conversation_secrets(
         env,
         model_api_key_env_names=(
@@ -956,6 +962,7 @@ def resolve_config(
         student_name=env.get("STUDENT_NAME") or None,
         wandb_entity=wandb_entity,
         wandb_project=wandb_project,
+        exa_api_key=exa_api_key,
         timeout_seconds=timeout_seconds,
         llm_timeout_seconds=llm_timeout_seconds,
         llm_num_retries=llm_num_retries,
@@ -1155,6 +1162,7 @@ def scrub_model_credentials(
     environment: MutableMapping[str, str],
     config: RunnerConfig,
 ) -> None:
+    scrub_exa_credentials(environment)
     for key_env in {
         *PROVIDER_API_KEY_ENVS.values(),
         config.api_key_env,
@@ -1199,6 +1207,8 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
         # Keep the persisted spec name stable while its resolver exposes only
         # the lightweight load_browser definition until the model opts in.
         tools.append(Tool(name="browser_tool_set"))
+    if config.exa_api_key is not None:
+        tools.append(Tool(name="senpai_exa"))
     delegation_params = {"event_db_path": str(local_event_db_path(config))}
     if not config.child:
         tools.append(Tool(name="delegate_agent", params=delegation_params))
@@ -1260,6 +1270,7 @@ def delegation_config(
         role=config.role,
         program_path=config.instructions.program.program_path,
         launch_context=config.instructions.launch,
+        exa_api_key=config.exa_api_key,
         root_state_dir=config.delegation_root_state_dir,
         tree_id=config.delegation_tree_id,
         depth=config.delegation_depth,
@@ -1699,6 +1710,9 @@ def run_openhands(
     cleanup_error: BaseException | None = None
     active_inbox_turn_id = inbox_turn_id
     try:
+        configure_exa_credentials(config.exa_api_key)
+        if config.exa_api_key is not None:
+            register_trace_secret(config.exa_api_key.get_secret_value())
         retried_provider_errors: ContextVar[tuple[BaseException, ...]] = ContextVar(
             "retried_provider_errors",
             default=(),
@@ -1987,6 +2001,7 @@ def run_openhands(
                     if cleanup_error is None:
                         cleanup_error = error
         clear_github_credentials()
+        configure_exa_credentials(None)
         configure_delegation(None)
         if inference_heartbeat is not None:
             inference_heartbeat.close()

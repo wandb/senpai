@@ -64,6 +64,25 @@ def test_child_mode_keeps_bounded_delegation_lifecycle_tools(tmp_path):
     assert delegation_config(config).depth == 0
 
 
+@pytest.mark.parametrize("configured", [False, True])
+def test_exa_tool_spec_exposes_search_without_its_runtime_credential(tmp_path, configured):
+    specs = [
+        tool
+        for tool in build_main_tools(runtime_config(
+            tmp_path,
+            exa_api_key=SecretStr("exa-secret-sentinel") if configured else None,
+        ))
+        if tool.name == "senpai_exa"
+    ]
+    assert len(specs) == int(configured)
+    if configured:
+        assert specs[0].params == {}
+        assert "exa-secret-sentinel" not in specs[0].model_dump_json()
+        assert [tool.name for tool in resolve_tool(specs[0], SimpleNamespace())] == [
+            "exa_search"
+        ]
+
+
 def test_browser_family_is_lazy_and_respects_disable_flag(tmp_path):
     enabled_tools = build_main_tools(runtime_config(tmp_path, enable_browser=True))
     enabled = {tool.name for tool in enabled_tools}
@@ -342,6 +361,7 @@ def test_markdown_agents_register_and_construct_with_the_native_loader(tmp_path)
             for name, definition in definitions.items()
         }
         assert {tool.name for tool in agents["search"].tools} == {
+            "senpai_exa",
             "terminal",
             "file_editor",
         }
@@ -438,7 +458,7 @@ def test_subagents_receive_skills_from_the_runtime_plugin(
             "search.md",
             "search",
             None,
-            {"terminal", "file_editor"},
+            {"senpai_exa", "terminal", "file_editor"},
             set(),
         ),
     ],

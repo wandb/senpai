@@ -742,9 +742,14 @@ and applies its own branch and lease checks.
 Delegated model credentials use a bounded JSON bundle in an unnamed file. The
 parent passes its descriptor to the child and closes its copy after spawning.
 The child closes the descriptor after reading and resolves configuration from
-an in-memory mapping. W&B and Exa conversation secrets remain available to child
-tools; a model key that also serves one of those services remains in the
-environment. W&B inference still shares `WANDB_API_KEY` until the W&B identity
+an in-memory mapping. The same private bundle carries Exa through intermediate
+runtimes so general-purpose children can delegate to search grandchildren.
+Exa stays outside shell environments, tool parameters, and conversation secrets.
+The root and search agents expose `exa_search`; intermediate runtimes retain the
+key in trusted process memory for onward delegation. This boundary does not
+protect against compromise of the trusted runtime or a privileged host process.
+W&B conversation secrets remain available to child tools. W&B inference still
+shares `WANDB_API_KEY` until the W&B identity
 cutover. No per-student W&B key is required by this handoff change.
 
 The supervisor, controller, and delegated runner disable process dumping on
@@ -824,8 +829,12 @@ Launch preflight verifies:
 - the presence of every configured custom secret, without attempting
   a service-specific authentication check.
 
-Exa is a progressive skill/script integration, not an always-connected MCP
-server.
+Exa uses a credential-isolated native `exa_search` tool with progressive skill
+guidance. It preserves the standalone script's request controls, web/publication
+defaults of 10/30 results, counts up to 100, and complete requested evidence and
+metadata. The legacy script remains an operator interface outside the agent
+runtime. Standalone runtimes without an Exa key omit the root tool; a search tool
+invocation without configured credentials fails before contacting Exa.
 
 The Kubernetes launcher creates one Secret, ConfigMaps, and Deployments. It
 creates no Service or RBAC. Docker and local hosts need no shared network for
