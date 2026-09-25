@@ -375,7 +375,7 @@ class StudentWorkspaceReconciler:
         timeout: int = 30,
     ) -> subprocess.CompletedProcess[str]:
         completed = subprocess.run(
-            [GIT_EXECUTABLE, *arguments],
+            [GIT_EXECUTABLE, "-c", f"safe.directory={workspace.resolve()}", *arguments],
             cwd=workspace,
             check=False,
             text=True,
