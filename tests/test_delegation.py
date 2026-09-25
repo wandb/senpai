@@ -11,6 +11,7 @@ from dataclasses import replace
 import pytest
 import psutil
 from openhands.sdk.llm import Message, TextContent
+from pydantic import SecretStr
 
 import senpai_agent.delegation as delegation_module
 from senpai_agent.delegation import (
@@ -101,7 +102,8 @@ def delegation_config(tmp_path: Path, **updates) -> DelegationConfig:
         "harness_file": tmp_path / "SENPAI-HARNESS.md",
         "plugin_dir": tmp_path / "plugin",
         "enable_browser": True,
-        "conversation_secrets": {"EXA_API_KEY": "exa-secret"},
+        "conversation_secrets": {"PRIVATE_AUTH": "private-secret"},
+        "exa_api_key": SecretStr("exa-secret"),
         "role": "advisor",
         "instructions": runtime_config(tmp_path).instructions,
     }
@@ -215,7 +217,7 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
     assert fast.environment["GH_REPO"] == "acme/widgets"
     assert "GITHUB_TOKEN" not in fast.environment
     assert "GH_TOKEN" not in fast.environment
-    assert fast.environment["EXA_API_KEY"] == "exa-secret"
+    assert "EXA_API_KEY" not in fast.environment
     assert fast.environment["SENPAI_OPENHANDS_SMART_MODEL"] == config.smart_model
     assert fast.environment["SENPAI_OPENHANDS_SMART_API_KEY_ENV"] == (
         config.smart_api_key_env
@@ -335,13 +337,47 @@ def test_child_preserves_the_shared_wandb_service_credential(tmp_path):
         tmp_path,
         smart_api_key_env="WANDB_API_KEY",
         smart_api_key="wandb-key",
-        conversation_secrets={"WANDB_API_KEY": "wandb-key", "EXA_API_KEY": "exa-key"},
+        conversation_secrets={"WANDB_API_KEY": "wandb-key"},
     )
 
     environment = OpenHandsChildProcess(config, delegation_request()).environment
 
     assert environment["WANDB_API_KEY"] == "wandb-key"
-    assert environment["EXA_API_KEY"] == "exa-key"
+    assert "EXA_API_KEY" not in environment
+
+
+def test_nested_search_retains_private_exa_credentials_across_execs(
+    tmp_path, monkeypatch
+):
+    from exa_delegation_support import child_command
+
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    (workspace / "program.md").write_text("Find evidence for the research question.")
+    config = runtime_config(
+        tmp_path,
+        workspace=workspace,
+        conversation_secrets={},
+        exa_api_key=SecretStr("nested-exa-key"),
+    )
+    for name in ("WANDB_ENTITY", "WANDB_PROJECT", "SENPAI_AGENT_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("EXA_API_KEY", "ambient-exa-key")
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    monkeypatch.setattr(OpenHandsChildProcess, "command", property(child_command))
+    child = OpenHandsChildProcess(
+        runner_delegation_config(config),
+        delegation_request(agent="general-purpose"),
+    )
+
+    result = json.loads(child.run("Delegate this research to search.", 60))
+
+    assert [hop["agent"] for hop in result["hops"]] == ["general-purpose", "search"]
+    assert len({os.getpid(), *(hop["pid"] for hop in result["hops"])}) == 3
+    assert "https://example.test/nested" in result["evidence"]
+    assert "Evidence returned through both child processes." in result["evidence"]
+    assert "nested-exa-key" not in json.dumps(result)
+    assert "nested-exa-key" not in child.output_path.read_text()
 
 
 def test_child_start_closes_credential_fd_if_exec_fails(monkeypatch, tmp_path):
@@ -388,7 +424,6 @@ def test_child_environment_carries_only_configured_custom_secrets(
     config = delegation_config(
         tmp_path,
         conversation_secrets={
-            "EXA_API_KEY": "exa-secret",
             "PRIVATE_AUTH": "private-secret",
             "REGISTRY_API_KEY": "registry-secret",
         },
@@ -404,6 +439,7 @@ def test_child_environment_carries_only_configured_custom_secrets(
     )
     assert environment["PRIVATE_AUTH"] == "private-secret"
     assert environment["REGISTRY_API_KEY"] == "registry-secret"
+    assert "EXA_API_KEY" not in environment
     assert "STALE_AUTH" not in environment
 
 

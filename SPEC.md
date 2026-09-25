@@ -855,9 +855,15 @@ branch prefix.
 Delegated model credentials use a bounded JSON bundle in an unnamed file. The
 parent passes its descriptor to the child and closes its copy after spawning.
 The child closes the descriptor after reading and resolves configuration from
-an in-memory mapping. W&B and Exa conversation secrets remain available to child
-tools; a model key that also serves one of those services remains in the
-environment. W&B inference still shares `WANDB_API_KEY` until the W&B identity
+an in-memory mapping. The same private bundle carries Exa to every delegated
+runtime so general-purpose children can delegate to search grandchildren.
+Exa stays outside shell environments, tool parameters, and conversation secrets.
+The root and search agents expose `exa_search`; all child runtimes retain the
+key in trusted process memory, including those that can delegate onward. This
+boundary does not protect against compromise of the trusted runtime or a
+privileged host process.
+W&B conversation secrets remain available to child tools. W&B inference still
+shares `WANDB_API_KEY` until the W&B identity
 cutover. No per-student W&B key is required by this handoff change.
 
 The supervisor, controller, and runner disable process dumping on Linux,
@@ -956,8 +962,21 @@ Launch preflight verifies:
 - the presence of every configured custom secret, without attempting
   a service-specific authentication check.
 
-Exa is a progressive skill/script integration, not an always-connected MCP
-server.
+Exa uses a credential-isolated native `exa_search` tool with progressive skill
+guidance. It preserves the standalone script's request controls, web/publication
+defaults of 10/30 results, counts up to 100, and complete requested evidence and
+metadata. The legacy script remains an operator interface outside the agent
+runtime. The root tool remains declared when a standalone runtime has no Exa key
+so persisted conversations can resume. Calls without configured credentials fail
+before contacting Exa. Responses above 30,000 characters persist the complete
+Markdown in the conversation's observations directory and return an explicit
+preview with the file path and range-read guidance. A failed write fails the
+tool call instead of losing evidence. Local conversation cleanup retains these
+files, so parents can read results from completed search children. The preview
+fits below the pinned SDK's 50,000-character tool-message limit; SDK serializers
+and other tools retain their existing limits. The legacy terminal path also
+previews at 30,000 characters. Complete evidence is available through bounded
+file reads; it is not sent to a model in one unbounded message.
 
 The Kubernetes launcher creates one Secret, ConfigMaps, and Deployments. A
 student launch first scans every requested name for an existing Deployment,

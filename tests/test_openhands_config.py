@@ -291,9 +291,9 @@ def test_resolved_config_separates_runtime_credentials_from_conversation_secrets
     assert config.fast_api_key.get_secret_value() == "anthropic-key"
     assert config.frontier_api_key.get_secret_value() == "anthropic-key"
     assert config.github_token.get_secret_value() == "github-key"
+    assert config.exa_api_key.get_secret_value() == "exa-key"
     assert config.conversation_secrets == {
         "WANDB_API_KEY": "wandb-key",
-        "EXA_API_KEY": "exa-key",
         "PRIVATE_AUTH": "private-key",
     }
     assert "ANTHROPIC_API_KEY" not in config.conversation_secrets
@@ -836,18 +836,21 @@ def test_model_scrubbing_preserves_intentionally_shared_service_credentials(tmp_
         tmp_path,
         api_key_env="WANDB_API_KEY",
         api_key=SecretStr("wandb-key"),
-        conversation_secrets={"WANDB_API_KEY": "wandb-key", "EXA_API_KEY": "exa-key"},
+        conversation_secrets={"WANDB_API_KEY": "wandb-key"},
+        exa_api_key=SecretStr("exa-key"),
     )
     environment = {
         "ANTHROPIC_API_KEY": "anthropic-key",
         "OPENAI_API_KEY": "openai-key",
         "WANDB_API_KEY": "wandb-key",
         "EXA_API_KEY": "exa-key",
+        "SENPAI_EXA_API_KEY_FILE": "/private/consumed-exa",
+        "SENPAI_EXA_API_KEY_FD": "99",
     }
 
     scrub_model_credentials(environment, config)
 
-    assert environment == {"WANDB_API_KEY": "wandb-key", "EXA_API_KEY": "exa-key"}
+    assert environment == {"WANDB_API_KEY": "wandb-key"}
 
 
 def test_config_consumes_a_private_one_use_github_token_file(tmp_path: Path):
