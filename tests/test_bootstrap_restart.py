@@ -8,6 +8,7 @@ import sys
 import sysconfig
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -18,8 +19,8 @@ from launch_test_support import launch_args, render_role
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("role", ["advisor", "student"])
-def test_fresh_container_preserves_target_work_and_dependencies(tmp_path, role):
+@pytest.fixture
+def bootstrap_runtime(tmp_path, role):
     container = tmp_path / "container"
     home = container / "home/senpai"
     runner = container / "workspace/senpai"
@@ -121,10 +122,28 @@ with Path(os.environ["START_RECORD"]).open("a") as output:
         (container / "tmp").mkdir(exist_ok=True)
         for path in retained_paths.values():
             path.mkdir(parents=True, exist_ok=True)
-        result = subprocess.run(
+        return subprocess.run(
             ["bash", "-c", bootstrap], env=environment,
             capture_output=True, text=True, timeout=30,
         )
+
+    return SimpleNamespace(
+        start=start, container=container, runner=runner, target=target,
+        target_env=target_env, record=record, environment=environment,
+        retained_paths=retained_paths, target_baseline=target_baseline,
+    )
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_fresh_container_preserves_target_work_and_dependencies(tmp_path, bootstrap_runtime):
+    runtime = bootstrap_runtime
+    container, runner, target = runtime.container, runtime.runner, runtime.target
+    target_env, record = runtime.target_env, runtime.record
+    environment, retained_paths = runtime.environment, runtime.retained_paths
+    target_baseline = runtime.target_baseline
+
+    def start():
+        result = runtime.start()
         assert result.returncode == 0, result.stdout + result.stderr
 
     # A mounted emptyDir cannot be removed and recreated during clone fallback.
@@ -183,3 +202,32 @@ with Path(os.environ["START_RECORD"]).open("a") as output:
     assert len(starts) == 2
     assert starts[0]["handoff_dir"] != starts[1]["handoff_dir"]
     assert {str(runner.resolve()), str(target.resolve())} <= set(starts[1]["safe_directories"])
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_incomplete_checkout_fails_without_changing_retained_work(bootstrap_runtime):
+    runtime = bootstrap_runtime
+    target = runtime.target
+    target.mkdir(parents=True)
+    git(target, "init")
+    git(target, "remote", "add", "origin", runtime.environment["TARGET_REPO_URL"])
+    git(target, "fetch", "origin", "experiment-7:refs/heads/recovered")
+    git(target, "symbolic-ref", "HEAD", "refs/heads/incomplete")
+    (target / "untracked.txt").write_text("untracked recovery work\n")
+    (target / "staged.txt").write_text("staged recovery work\n")
+    git(target, "add", "staged.txt")
+    original_refs = git(target, "show-ref")
+    original_index = git(target, "ls-files", "--stage")
+    original_head = (target / ".git/HEAD").read_text()
+
+    result = runtime.start()
+
+    assert result.returncode != 0
+    assert "has no valid HEAD commit" in result.stderr
+    assert "inspect and repair the retained checkout" in result.stderr
+    assert not runtime.record.exists()
+    assert git(target, "show-ref") == original_refs
+    assert git(target, "ls-files", "--stage") == original_index
+    assert (target / ".git/HEAD").read_text() == original_head
+    assert (target / "untracked.txt").read_text() == "untracked recovery work\n"
+    assert (target / "staged.txt").read_text() == "staged recovery work\n"

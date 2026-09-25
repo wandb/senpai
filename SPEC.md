@@ -791,6 +791,11 @@ uncommitted files, unpushed commits, and installed dependencies. It does not
 checkout, pull, or reset an existing advisor checkout. The runner checkout and
 the rest of HOME are recreated. Pod replacement starts fresh role state,
 checkout, and target environment; the dataset PVC follows its own lifetime.
+An existing target without a valid HEAD commit fails bootstrap with an
+operator-repair message. Bootstrap preserves all files and refs instead of
+deleting or resetting an incomplete checkout. Isolated Python Git commands trust
+only their exact resolved working directory through command-scope configuration;
+they continue to ignore global and system Git configuration.
 
 Generic child processes receive no GitHub token and no GitHub tools. Main-role
 GitHub operations remain typed and lease/state guarded. Terminal and hook

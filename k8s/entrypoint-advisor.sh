@@ -89,6 +89,10 @@ elif ! clone_target_repo; then
     git push -u origin "$ADVISOR_BRANCH"
     cd "$WORKDIR"
 fi
+if ! git -C "$TARGET_WORKDIR" rev-parse --verify 'HEAD^{commit}' >/dev/null 2>&1; then
+    echo "ERROR: target checkout '$TARGET_WORKDIR' has no valid HEAD commit; inspect and repair the retained checkout before restarting." >&2
+    exit 1
+fi
 git config --global --unset-all credential.helper 2>/dev/null || true
 
 # --- Git identity (inside the problem-package repo) ---

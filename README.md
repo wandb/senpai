@@ -478,6 +478,11 @@ and Git metadata. The dataset PVC mount must not overlap the target checkout or
 target Python environment. The launcher rejects these overlaps before reading
 credentials.
 
+If the initial clone is interrupted before it records a valid HEAD commit,
+bootstrap stops and preserves the retained checkout. Inspect and repair that
+checkout before restarting. Bootstrap does not delete it or discard local work
+to recover automatically.
+
 ### Other deployment environments
 
 GitHub coordination works across Docker, cloud VMs, or local hosts without private networking. The current repository does not yet provide a Compose or direct-host launcher: the Kubernetes manifests perform the source clone, environment assembly, skill installation, token handoff, mounts, and entrypoint selection.
