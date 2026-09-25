@@ -198,6 +198,9 @@ def test_eval_cannot_hide_a_push_inside_a_nested_heredoc():
         "{ git push origin experiment; }",
         "publish() { git push origin experiment; }; publish",
         "case x in x) git push origin experiment;; esac",
+        "case x in\n*) git push origin experiment;;\nesac",
+        'case x in "$(git push origin experiment)") echo ok;; esac',
+        "arr[0]=$(git push origin experiment)",
     ],
 )
 def test_nested_shell_execution_cannot_hide_restricted_commands(command: str):
@@ -256,6 +259,8 @@ def test_alias_expansion_cannot_defer_restricted_command_parsing():
         "read 'a[$(git push origin experiment)]' <<< value",
         "declare 'a[$(git push origin experiment)]=x'",
         "typeset 'a[$(git push origin experiment)]=x'",
+        "arr[$i]=x",
+        "arr[1+2]=x",
         "f() { local 'a[$(git push origin experiment)]=x'; }; f",
         "a=(x); unset 'a[$(git push origin experiment)]'",
         "mapfile -C 'git push origin experiment' -c 1 values",
@@ -294,6 +299,7 @@ def test_alias_expansion_cannot_defer_restricted_command_parsing():
         "SHELLOPTS=xtrace PS4='$(git push origin experiment)' bash -c date",
         "PROMPT_COMMAND='git push origin experiment'",
         "PROMPT_COMMAND+='; git push origin experiment'",
+        "PROMPT_COMMAND[0]='git push origin experiment'",
         "export PROMPT_COMMAND='git push origin experiment'",
         "declare PROMPT_COMMAND='git push origin experiment'",
         "readonly PROMPT_COMMAND='git push origin experiment'",
@@ -341,6 +347,8 @@ def test_shell_aliases_cannot_load_startup_files(tmp_path: Path):
         "{ date -u; }",
         "report() { date -u; }; report",
         "case x in x) date -u;; esac",
+        "case x in\n*) echo ok;;\nesac",
+        "case x in x) echo x;; *) echo ok;; esac",
     ],
 )
 def test_policy_preserves_safe_static_nested_commands(command: str):
@@ -353,6 +361,8 @@ def test_policy_preserves_safe_static_nested_commands(command: str):
         "export CUDA_VISIBLE_DEVICES=0",
         "f() { local x=value; }; f",
         "declare -a values",
+        "arr[0]=x",
+        "arr[12]+=value",
         "typeset x=value",
         "read value",
         "read value < input.txt",

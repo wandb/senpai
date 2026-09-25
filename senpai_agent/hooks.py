@@ -81,6 +81,7 @@ _SHELL_PROGRAMS = {
     "zsh": "zsh",
 }
 _SHELL_VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SHELL_ASSIGNMENT_TARGET = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[[0-9]+\])?")
 _GH_READ_ONLY = {
     "auth": {"status"},
     "issue": {"list", "status", "view"},
@@ -166,9 +167,9 @@ _GIT_TERMINAL_COMMANDS = {
 }
 
 
-def _without_literal_file_heredocs(command: str) -> str:
-    """Remove literal heredocs written directly to files by ``cat``."""
-    if "<<" not in command:
+def _without_shell_data(command: str) -> str:
+    """Mask case patterns and literal file heredocs before flat tokenization."""
+    if "<<" not in command and "case" not in command:
         return command
 
     import tree_sitter_bash
@@ -178,18 +179,24 @@ def _without_literal_file_heredocs(command: str) -> str:
     tree = Parser(Language(tree_sitter_bash.language())).parse(source)
     if tree.root_node.has_error:
         return command
-    if any(
+    has_functions = any(
         node.type == "function_definition"
         for node in _descendants(tree.root_node)
-    ):
-        return command
+    )
 
     policy_source = bytearray(source)
+    spans: list[tuple[int, int]] = []
     nodes = [tree.root_node]
     while nodes:
         node = nodes.pop()
-        if node.type == "heredoc_redirect" and _is_literal_cat_file_sink(
-            node, source
+        if node.type == "case_item":
+            # _bash_commands checks substitutions in the original pattern.
+            pattern_end = next(child for child in node.children if child.type == ")")
+            spans.append((node.start_byte, pattern_end.end_byte))
+        if (
+            not has_functions
+            and node.type == "heredoc_redirect"
+            and _is_literal_cat_file_sink(node, source)
         ):
             start = next(
                 child for child in node.children if child.type == "heredoc_start"
@@ -198,10 +205,12 @@ def _without_literal_file_heredocs(command: str) -> str:
             if any(mark in delimiter for mark in b"'\"\\"):
                 for child in node.children:
                     if child.type in {"heredoc_body", "heredoc_end"}:
-                        for position in range(child.start_byte, child.end_byte):
-                            if policy_source[position] not in b"\r\n":
-                                policy_source[position] = ord(" ")
+                        spans.append((child.start_byte, child.end_byte))
         nodes.extend(node.children)
+    for start, end in spans:
+        for position in range(start, end):
+            if policy_source[position] not in b"\r\n":
+                policy_source[position] = ord(" ")
     return policy_source.decode()
 
 
@@ -303,7 +312,7 @@ def _bash_commands(command: str) -> list[str] | None:
 
 
 def _command_segments(command: str) -> list[list[str]]:
-    command = _without_literal_file_heredocs(command)
+    command = _without_shell_data(command)
     lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>\n")
     lexer.commenters = ""
     lexer.whitespace = " \t\r"
@@ -331,7 +340,8 @@ def _assignment_name(value: str) -> str | None:
     if not separator:
         return None
     name = name.removesuffix("+")
-    return name if _SHELL_VARIABLE_NAME.fullmatch(name) else None
+    match = _SHELL_ASSIGNMENT_TARGET.fullmatch(name)
+    return match[1] if match else None
 
 
 def _gh_policy(tokens: list[str], index: int) -> PolicyDecision:

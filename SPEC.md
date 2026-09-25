@@ -444,9 +444,11 @@ without the exact authenticated terminal result for that assignment revision
 and head. Revision requests bind the new revision to an exact required
 research-base SHA rather than leaving that base implicit.
 
-Student submission requires a clean assignment branch, lease-pushes the local
-commit, upserts the typed result, marks the PR ready, reconciles
-`status:review`, and verifies all postconditions. The label itself is the
+Student submission verifies the assignment branch and exact local result commit,
+publishes that commit with a remote-head lease, upserts the typed result, marks
+the PR ready, reconciles `status:review`, and verifies all postconditions.
+Uncommitted worktree changes are not published. Training separately requires a
+clean worktree. The label itself is the
 cross-node notification. A schema-valid result is immutable for its assignment
 revision and head: canonical-identical duplicates are one idempotent result,
 while different evidence must use a new commit or revision. Result records are

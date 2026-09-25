@@ -137,19 +137,21 @@ def test_advisor_rejects_a_same_repo_pull_without_current_write_permission(
     assert permission_checks == ["former-maintainer"]
 
 
-def test_advisor_permission_read_failure_rejects_the_pull(monkeypatch, capsys):
+def test_advisor_permission_read_failure_does_not_report_student_available(
+    monkeypatch,
+):
     candidate = pull(
-        labels=("research", "student:student-1", "status:review"),
+        labels=("research", "student:student-1", "status:wip"),
     )
-    advisor = mailbox(monkeypatch, [candidate])
+    advisor = mailbox(monkeypatch, [candidate], students=("student-1",))
 
     def fail(_login):
         raise GitHubReadError("permission unavailable")
 
     monkeypatch.setattr(advisor, "_has_write_permission", fail)
 
-    assert advisor.poll() == ()
-    assert "SENPAI_PULL_AUTHORIZATION_ERROR pr=17" in capsys.readouterr().err
+    with pytest.raises(GitHubReadError, match="permission unavailable"):
+        advisor.poll()
 
 
 def assignment(

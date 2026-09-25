@@ -135,7 +135,7 @@ class GitHubMailbox:
                     permissions[login] = self._has_write_permission(author)
                 if permissions[login]:
                     authorized.append(pull)
-            except (GitHubReadError, KeyError, TypeError) as error:
+            except (KeyError, TypeError) as error:
                 print(
                     "SENPAI_PULL_AUTHORIZATION_ERROR "
                     f"pr={pull.get('number')!r} {type(error).__name__}: {error}",

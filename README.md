@@ -68,7 +68,7 @@ WANDB_API_KEY_FRIEREN=
 
 | Credential | Required access |
 |---|---|
-| `GITHUB_TOKEN` | Target-repository Contents, Pull requests, and Issues read/write. A classic token with `repo` scope also works. GitHub CLI authentication is the fallback when this value is absent. |
+| `GITHUB_TOKEN` | Target-repository Contents, Pull requests, and Issues read/write, plus access to read collaborator permissions. A classic token with `repo` scope also works. GitHub CLI authentication is the fallback when this value is absent. |
 | `ANTHROPIC_API_KEY` | Required when an `anthropic/...` model is configured. Every default profile uses Anthropic. |
 | `OPENAI_API_KEY` | Required when an `openai/...` model is configured. |
 | `EXA_API_KEY` | General-web and research-publication search through the typed Exa tool. |
@@ -298,6 +298,10 @@ flowchart LR
 The structured result records its terminal status, exact result commit, W&B run IDs and URLs, bounded conclusion, and baseline/candidate metric comparison when available. Once published for an assignment revision and head, that evidence is immutable: exact duplicate publication is an idempotent replay, while changed evidence requires a new commit or revision. Non-revision feedback continues the same student conversation; a revision request intentionally creates a fresh revision identity and conversation.
 
 A student cannot receive another assignment while an open assignment has `status:wip` or `status:review`. The student becomes available after the advisor merges or closes the PR. Sibling assignment mutations within one worker are serialized end to end, including advisor-base publication and student preflight, push, and result publication. Across advisor and student workers, exact assignment, revision, head, and branch-lease preconditions detect stale work; if a revision wins during result publication, SENPAI restores the current revision's WIP routing before returning the stale-result error.
+
+Both roles require same-repository PR heads and current author write permission.
+A permission lookup error fails the current poll. Senpai does not infer that a
+student is available when it cannot authorize that student's active PR.
 
 PR comments from verified GitHub owners, members, and collaborators steer the advisor and reach the student. Submitted reviews and inline comments also reach the student. The system ignores untrusted authors, unrecognized bots, and advisor protocol comments. `get_prs` can still retrieve the complete discussion explicitly. If the configured research base changes while an experiment is running, SENPAI emits `research_base_changed` with the assignment's `required_base_sha` and the live `current_base_sha` without cancelling the assignment. When reviewing its terminal result, the advisor either requests a revision on the current base or records why that exact result remains valid with `accept_result_on_current_base`; `merge_experiment` still verifies the live SHA immediately before merging.
 
