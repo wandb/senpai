@@ -242,7 +242,7 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
 
 
 def test_descendants_and_restarts_use_the_complete_parent_snapshot(tmp_path: Path):
-    env = launch_env(tmp_path)
+    env = launch_env(tmp_path, program_content="Research policy.\n" * 10_000)
     env.update({
         "SENPAI_OPENHANDS_ROLE_FILE": str(INSTRUCTIONS_ROOT / "ADVISOR.md"),
         "ADVISOR_BRANCH": "research",
@@ -268,6 +268,11 @@ def test_descendants_and_restarts_use_the_complete_parent_snapshot(tmp_path: Pat
     )
     restarted = resolve_config(parse_runner_args(child.command[4:]), child.environment)
 
+    assert Path(child_environment[SYSTEM_INSTRUCTIONS_FILE_ENV]).stat().st_size > 128 * 1024
+    assert all(
+        len(name.encode()) + len(value.encode()) + 2 < 128 * 1024
+        for name, value in child_environment.items()
+    )
     assert delegated.instructions is parent.instructions
     assert child_environment[PROGRAM_PATH_ENV] == parent.instructions.program.program_path
     assert child_environment[PROGRAM_SOURCE_COMMIT_ENV] == parent.instructions.program.source_commit

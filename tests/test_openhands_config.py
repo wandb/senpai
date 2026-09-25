@@ -19,6 +19,7 @@ from senpai_agent.openhands_runner import (
     without_eager_skill_discovery,
 )
 from senpai_agent.program_context import (
+    PROGRAM_CONTENT_SHA256_ENV,
     PROGRAM_PATH_ENV,
     PROGRAM_SOURCE_COMMIT_ENV,
     ProgramSystemPrompt,
@@ -318,6 +319,7 @@ def test_resolved_config_uses_launch_snapshot_despite_target_workspace_edits(
         (SYSTEM_INSTRUCTIONS_SHA256_ENV, "0" * 64, "controller-held"),
         (PROGRAM_PATH_ENV, "other/program.md", "inherited program snapshot"),
         (PROGRAM_SOURCE_COMMIT_ENV, "b" * 40, "inherited system snapshot"),
+        (PROGRAM_CONTENT_SHA256_ENV, "0" * 64, "inherited program snapshot"),
         (
             "SENPAI_LAUNCH_CONTEXT_B64",
             b64encode(b"Changed launch policy").decode(),

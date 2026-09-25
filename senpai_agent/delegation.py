@@ -447,14 +447,10 @@ class OpenHandsChildProcess:
         system_context = self.state_dir / "system-instructions.b64"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         if system_context.exists():
-            persisted = decode_system_instructions(
+            decode_system_instructions(
                 system_context.read_text(encoding="utf-8").strip(),
                 instructions.content_sha256,
             )
-            if persisted != instructions:
-                raise RuntimeError(
-                    "persisted child system context does not match its parent snapshot"
-                )
         else:
             temporary = system_context.with_suffix(".tmp")
             temporary.write_text(

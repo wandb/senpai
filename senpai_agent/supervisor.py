@@ -513,14 +513,10 @@ def prepare_system_context_environment(
     encoded_instructions = encode_system_instructions(instructions)
     system_context = role_prompt.with_suffix(".context.b64")
     if system_context.exists():
-        persisted = decode_system_instructions(
+        decode_system_instructions(
             system_context.read_text(encoding="utf-8").strip(),
             instructions.content_sha256,
         )
-        if persisted != instructions:
-            raise RuntimeError(
-                "persisted system context does not match the controller snapshot"
-            )
     else:
         temporary = system_context.with_suffix(".tmp")
         temporary.write_text(f"{encoded_instructions}\n", encoding="utf-8")

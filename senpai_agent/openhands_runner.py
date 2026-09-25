@@ -94,6 +94,7 @@ from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV, decode_launch_contex
 from senpai_agent.local_events import LocalEventStore
 from senpai_agent.openhands_security import disable_ambient_plugin_discovery
 from senpai_agent.program_context import (
+    PROGRAM_CONTENT_SHA256_ENV,
     PROGRAM_PATH_ENV,
     PROGRAM_SOURCE_COMMIT_ENV,
 )
@@ -654,6 +655,10 @@ def resolve_config(
     if env.get(PROGRAM_SOURCE_COMMIT_ENV, "") != program.source_commit:
         raise RuntimeError(
             f"{PROGRAM_SOURCE_COMMIT_ENV} does not match the inherited system snapshot"
+        )
+    if env.get(PROGRAM_CONTENT_SHA256_ENV, "") != program.content_sha256:
+        raise RuntimeError(
+            f"{PROGRAM_CONTENT_SHA256_ENV} does not match the inherited program snapshot"
         )
     role = env.get("SENPAI_ROLE", "")
     if role not in {"advisor", "student"}:
