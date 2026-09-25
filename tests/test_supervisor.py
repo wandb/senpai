@@ -5,10 +5,27 @@ import subprocess
 import sys
 import threading
 import time
+from base64 import b64encode
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
+
+from openhands_support import launch_env
+from senpai_agent.program_context import (
+    PROGRAM_CONTENT_SHA256_ENV,
+    PROGRAM_CONTEXT_FILE_ENV,
+    PROGRAM_PATH_ENV,
+    PROGRAM_SOURCE_COMMIT_ENV,
+    decode_program_system_prompt,
+    encode_program_system_prompt,
+)
+from senpai_agent.system_instructions import (
+    SYSTEM_INSTRUCTIONS_FILE_ENV,
+    SYSTEM_INSTRUCTIONS_SHA256_ENV,
+    decode_system_instructions,
+)
 
 import senpai_agent.supervisor as supervisor_module
 from senpai_agent.supervisor import (
@@ -100,106 +117,130 @@ def test_worker_lease_reads_legacy_state_without_inference_fields(tmp_path: Path
     assert lease.llm_request_heartbeat_at is None
 
 
-def test_supervisor_snapshots_program_and_rendered_role_before_starting_workers(
+def test_supervisor_preserves_launch_snapshot_across_restart(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ):
-    workspace = tmp_path / "target"
-    program = workspace / "senpai" / "program.md"
-    program.parent.mkdir(parents=True)
-    program.write_text("Research policy.")
-    role_template = tmp_path / "ADVISOR.md"
+    env = launch_env(tmp_path, program_path="senpai/program.md")
+    role_template = Path(env["SENPAI_OPENHANDS_ROLE_FILE"])
     role_template.write_text(
         "Role={{ROLE}} Repo={{GH_REPO}} Project={{WANDB_PROJECT}}\n"
     )
-    state_dir = tmp_path / "state"
+    env.update({
+        "WANDB_PROJECT": "cfd",
+        "GITHUB_TOKEN": "github-secret-sentinel",
+        "WANDB_API_KEY": "wandb-secret-sentinel",
+    })
+    state_dir = Path(env["SENPAI_OPENHANDS_STATE_DIR"])
 
-    environment = prepare_system_context_environment(
-        "advisor",
-        state_dir,
-        {
-            "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
-            "SENPAI_OPENHANDS_ROLE_FILE": str(role_template),
-            "GH_REPO": "acme/widgets",
-            "WANDB_PROJECT": "cfd",
-            "GITHUB_TOKEN": "github-secret-sentinel",
-            "WANDB_API_KEY": "wandb-secret-sentinel",
-        },
-    )
-
-    assert environment["SENPAI_PROGRAM_PATH"] == "senpai/program.md"
+    environment = prepare_system_context_environment("advisor", state_dir, env)
     role_prompt = Path(environment["SENPAI_OPENHANDS_ROLE_FILE"])
-    assert role_prompt == state_dir / "system-instructions" / "advisor.md"
+    system_context = Path(environment[SYSTEM_INSTRUCTIONS_FILE_ENV])
+    instructions = decode_system_instructions(
+        system_context.read_text().strip(), environment[SYSTEM_INSTRUCTIONS_SHA256_ENV]
+    )
+
     assert role_prompt.read_text() == "Role=advisor Repo=acme/widgets Project=cfd\n"
+    assert instructions.role == "Role=advisor Repo=acme/widgets Project=cfd"
+    assert instructions.program.content == "# Test programme\n\nUse the target contract."
+    assert instructions.program.source_commit == env[PROGRAM_SOURCE_COMMIT_ENV]
     assert role_template.read_text().startswith("Role={{ROLE}}")
-    assert capsys.readouterr().out == (
-        "SENPAI_PROGRAM_CONTEXT path=senpai/program.md\n"
-        f"SENPAI_ROLE_PROMPT path={role_prompt}\n"
+    output = capsys.readouterr().out
+    assert env[PROGRAM_SOURCE_COMMIT_ENV] in output
+    assert environment[SYSTEM_INSTRUCTIONS_SHA256_ENV] in output
+    assert "github-secret-sentinel" not in output + instructions.prompt
+    assert "wandb-secret-sentinel" not in output + instructions.prompt
+
+    (Path(env["SENPAI_OPENHANDS_WORKSPACE"]) / "senpai/program.md").write_text(
+        "Workspace policy changed after launch."
+    )
+    restarted = prepare_system_context_environment("advisor", state_dir, env)
+
+    assert restarted[SYSTEM_INSTRUCTIONS_SHA256_ENV] == environment[SYSTEM_INSTRUCTIONS_SHA256_ENV]
+    assert decode_system_instructions(
+        Path(restarted[SYSTEM_INSTRUCTIONS_FILE_ENV]).read_text().strip(),
+        restarted[SYSTEM_INSTRUCTIONS_SHA256_ENV],
+    ).prompt == instructions.prompt
+
+
+@pytest.mark.parametrize("component", ["role", "system", "harness", "launch"])
+def test_supervisor_rejects_changed_persisted_or_source_context(
+    tmp_path: Path, component: str,
+):
+    env = launch_env(tmp_path)
+    state_dir = Path(env["SENPAI_OPENHANDS_STATE_DIR"])
+    prepared = prepare_system_context_environment("advisor", state_dir, env)
+    if component == "role":
+        Path(prepared["SENPAI_OPENHANDS_ROLE_FILE"]).write_text("Tampered role")
+    elif component == "system":
+        Path(prepared[SYSTEM_INSTRUCTIONS_FILE_ENV]).write_text("not-base64")
+    elif component == "harness":
+        Path(env["SENPAI_OPENHANDS_HARNESS_FILE"]).write_text("Changed harness")
+    else:
+        env["SENPAI_LAUNCH_CONTEXT_B64"] = b64encode(b"Changed launch").decode()
+
+    with pytest.raises((RuntimeError, ValueError), match="snapshot|controller-held"):
+        prepare_system_context_environment("advisor", state_dir, env)
+
+
+def test_supervisor_checks_launch_digest_before_first_snapshot(tmp_path: Path):
+    env = launch_env(tmp_path)
+    program_file = Path(env[PROGRAM_CONTEXT_FILE_ENV])
+    program = decode_program_system_prompt(program_file.read_text())
+    program_file.write_text(
+        encode_program_system_prompt(replace(program, content="Altered policy"))
     )
 
-    restarted = prepare_system_context_environment(
-        "advisor",
-        state_dir,
-        {
-            "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
-            "GH_REPO": "changed/widgets",
-            "WANDB_PROJECT": "changed",
-        },
-    )
+    with pytest.raises(RuntimeError, match=PROGRAM_CONTENT_SHA256_ENV):
+        prepare_system_context_environment("advisor", tmp_path / "state", env)
 
-    assert restarted["SENPAI_OPENHANDS_ROLE_FILE"] == str(role_prompt)
-    assert role_prompt.read_text() == "Role=advisor Repo=acme/widgets Project=cfd\n"
+    assert not (tmp_path / "state" / "system-instructions").exists()
+
+
+@pytest.mark.parametrize(
+    ("key", "replacement", "message"),
+    [
+        (PROGRAM_SOURCE_COMMIT_ENV, None, "is required"),
+        (PROGRAM_CONTEXT_FILE_ENV, None, "is required"),
+        (PROGRAM_CONTENT_SHA256_ENV, None, "launch snapshot"),
+        (PROGRAM_SOURCE_COMMIT_ENV, "b" * 40, "launch snapshot"),
+        (PROGRAM_PATH_ENV, "other/program.md", "launch snapshot"),
+        (PROGRAM_CONTENT_SHA256_ENV, "0" * 64, "launch snapshot"),
+    ],
+)
+def test_supervisor_does_not_start_worker_with_invalid_launch_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    replacement: str | None,
+    message: str,
+):
+    env = launch_env(tmp_path)
+    if replacement is None:
+        env.pop(key)
+    else:
+        env[key] = replacement
+
+    def unexpected_worker(*_args, **_kwargs):
+        pytest.fail("worker must not start without a verified launch snapshot")
+
+    monkeypatch.setattr(supervisor_module, "WorkerSupervisor", unexpected_worker)
+    with pytest.raises(RuntimeError, match=message):
+        supervisor_module.supervisor_main(["advisor"], env)
 
 
 def test_supervisor_fails_before_snapshotting_a_role_with_missing_values(
     tmp_path: Path,
 ):
-    workspace = tmp_path / "target"
-    workspace.mkdir()
-    (workspace / "program.md").write_text("Research policy.")
-    role_template = tmp_path / "STUDENT.md"
-    role_template.write_text("Student={{STUDENT_NAME}} Repo={{GH_REPO}}\n")
+    env = launch_env(tmp_path, role="student")
+    Path(env["SENPAI_OPENHANDS_ROLE_FILE"]).write_text(
+        "Student={{STUDENT_NAME}} Repo={{GH_REPO}}\n"
+    )
 
-    with pytest.raises(ValueError, match="Missing STUDENT.md values: STUDENT_NAME"):
-        prepare_system_context_environment(
-            "student",
-            tmp_path / "state",
-            {
-                "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
-                "SENPAI_OPENHANDS_ROLE_FILE": str(role_template),
-                "GH_REPO": "acme/widgets",
-            },
-        )
+    with pytest.raises(ValueError, match="Missing SENPAI-STUDENT.md values: STUDENT_NAME"):
+        prepare_system_context_environment("student", tmp_path / "state", env)
 
     assert not (tmp_path / "state" / "system-instructions" / "student.md").exists()
-
-
-def test_supervisor_does_not_start_a_worker_without_a_discoverable_program(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    workspace = tmp_path / "target"
-    workspace.mkdir()
-    (workspace / "README.md").write_text("No programme here.")
-
-    def unexpected_worker(*_args, **_kwargs):
-        pytest.fail("worker must not be constructed when program.md is missing")
-
-    monkeypatch.setattr(supervisor_module, "WorkerSupervisor", unexpected_worker)
-
-    with pytest.raises(RuntimeError) as error:
-        supervisor_module.supervisor_main(
-            ["advisor"],
-            {
-                "SENPAI_OPENHANDS_STATE_DIR": str(tmp_path / "state"),
-                "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
-            },
-        )
-
-    message = str(error.value)
-    assert "searched program.md and */program.md" in message
-    assert "--program_path" in message
-    assert "senpai.yaml" in message
 
 
 def test_pid_one_reaps_adopted_children_without_reaping_its_worker(monkeypatch):

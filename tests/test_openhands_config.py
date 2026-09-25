@@ -1,4 +1,5 @@
 import os
+from base64 import b64encode
 from pathlib import Path
 
 import pytest
@@ -17,9 +18,17 @@ from senpai_agent.openhands_runner import (
     scrub_model_credentials,
     without_eager_skill_discovery,
 )
-from senpai_agent.program_context import ProgramSystemPrompt
+from senpai_agent.program_context import (
+    PROGRAM_PATH_ENV,
+    PROGRAM_SOURCE_COMMIT_ENV,
+    ProgramSystemPrompt,
+)
 from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV
-from senpai_agent.system_instructions import SenpaiSystemInstructions
+from senpai_agent.system_instructions import (
+    SYSTEM_INSTRUCTIONS_FILE_ENV,
+    SYSTEM_INSTRUCTIONS_SHA256_ENV,
+    SenpaiSystemInstructions,
+)
 from openhands_support import TEST_LAUNCH_CONTEXT, runtime_config, runtime_env
 from test_agent_markdown import HTML_HEADER, PLAIN_HEADER
 
@@ -85,18 +94,23 @@ def test_main_agent_context_appends_program_after_harness_and_role():
             role="advisor role",
             program=ProgramSystemPrompt(
                 program_path="senpai/program.md",
-                prompt="# program.md - senpai/program.md\n\nResearch policy.",
+                source_commit="a" * 40,
+                content="Research policy.",
             ),
             launch="# Authoritative launch context\n\nRuntime policy.",
         ),
     )
 
-    assert context.system_message_suffix == (
-        "# Senpai harness\n\nharness instructions\n\n"
-        "# Senpai role\n\nadvisor role\n\n"
-        "# program.md - senpai/program.md\n\nResearch policy.\n\n"
-        "# Authoritative launch context\n\nRuntime policy.\n"
-    )
+    suffix = context.system_message_suffix
+    components = [
+        "# Senpai harness\n\nharness instructions",
+        "# Senpai role\n\nadvisor role",
+        "Research policy.",
+        "# Authoritative launch context\n\nRuntime policy.",
+    ]
+    positions = [suffix.index(component) for component in components]
+    assert positions == sorted(positions)
+    assert f"commit `{'a' * 40}`" in suffix
     assert context.current_datetime is None
     assert context.load_user_skills is False
     assert context.load_project_skills is False
@@ -276,7 +290,7 @@ def test_configured_custom_secret_requires_a_nonblank_value(tmp_path: Path):
         resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
-def test_resolved_config_discovers_one_level_program_from_target_workspace(
+def test_resolved_config_uses_launch_snapshot_despite_target_workspace_edits(
     tmp_path: Path,
 ):
     env = runtime_env(
@@ -284,23 +298,53 @@ def test_resolved_config_discovers_one_level_program_from_target_workspace(
         program_path="senpai/program.md",
         program_content="# Mission\n\nImprove the model.\n",
     )
+    (Path(env["SENPAI_OPENHANDS_WORKSPACE"]) / "senpai/program.md").write_text(
+        "Uncommitted replacement policy."
+    )
     config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
     assert config.instructions.program.program_path == "senpai/program.md"
-    assert config.instructions.program.prompt == (
-        "# program.md - senpai/program.md\n\n"
-        "# Mission\n\nImprove the model."
-    )
+    assert config.instructions.program.content == "# Mission\n\nImprove the model."
+    assert config.instructions.program.source_commit == env[PROGRAM_SOURCE_COMMIT_ENV]
     assert config.instructions.launch == TEST_LAUNCH_CONTEXT
-    assert config.instructions.prompt == (
-        "# Senpai harness\n\nharness instructions\n\n"
-        "# Senpai role\n\nadvisor role\n\n"
-        "# program.md - senpai/program.md\n\n"
-        "# Mission\n\nImprove the model.\n\n"
-        f"{TEST_LAUNCH_CONTEXT}\n"
-    )
     delegated = runner.delegation_config(config)
-    assert delegated.program_path == config.instructions.program.program_path
+    assert delegated.instructions is config.instructions
+
+
+@pytest.mark.parametrize(
+    ("key", "replacement", "message"),
+    [
+        (SYSTEM_INSTRUCTIONS_FILE_ENV, None, "is required"),
+        (SYSTEM_INSTRUCTIONS_SHA256_ENV, "0" * 64, "controller-held"),
+        (PROGRAM_PATH_ENV, "other/program.md", "inherited program snapshot"),
+        (PROGRAM_SOURCE_COMMIT_ENV, "b" * 40, "inherited system snapshot"),
+        (
+            "SENPAI_LAUNCH_CONTEXT_B64",
+            b64encode(b"Changed launch policy").decode(),
+            "inherited system snapshot",
+        ),
+    ],
+)
+def test_runner_rejects_inherited_snapshot_binding_mismatch(
+    tmp_path: Path, key: str, replacement: str | None, message: str
+):
+    env = runtime_env(tmp_path)
+    if replacement is None:
+        env.pop(key)
+    else:
+        env[key] = replacement
+
+    with pytest.raises((RuntimeError, ValueError), match=message):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+
+@pytest.mark.parametrize("component", ["HARNESS", "ROLE"])
+def test_runner_rejects_changed_instruction_files(tmp_path: Path, component: str):
+    env = runtime_env(tmp_path)
+    Path(env[f"SENPAI_OPENHANDS_{component}_FILE"]).write_text("Changed policy")
+
+    with pytest.raises(RuntimeError, match="controller-held snapshot"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
 def test_resolved_system_instructions_do_not_change_with_source_files(

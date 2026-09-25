@@ -95,14 +95,19 @@ from senpai_agent.local_events import LocalEventStore
 from senpai_agent.openhands_security import disable_ambient_plugin_discovery
 from senpai_agent.program_context import (
     PROGRAM_PATH_ENV,
-    load_program_system_prompt,
+    PROGRAM_SOURCE_COMMIT_ENV,
 )
 from senpai_agent.PROMPTS import (
     DELEGATED_RESULT_SUMMARY_PROMPT,
     RECOVERED_ACTION_PROMPT,
     render_prompt,
 )
-from senpai_agent.system_instructions import SenpaiSystemInstructions
+from senpai_agent.system_instructions import (
+    SYSTEM_INSTRUCTIONS_FILE_ENV,
+    SYSTEM_INSTRUCTIONS_SHA256_ENV,
+    SenpaiSystemInstructions,
+    decode_system_instructions,
+)
 from senpai_agent.tools import register_senpai_tools
 
 DEFAULT_MODEL = "anthropic/claude-opus-5-5"
@@ -633,10 +638,23 @@ def resolve_config(
         raise RuntimeError(
             "OpenHands state directory must be outside the target workspace"
         )
-    program = load_program_system_prompt(
-        workspace,
-        env.get(PROGRAM_PATH_ENV, ""),
+    system_context = env.get(SYSTEM_INSTRUCTIONS_FILE_ENV)
+    if not system_context:
+        raise RuntimeError(f"{SYSTEM_INSTRUCTIONS_FILE_ENV} is required")
+    instructions = decode_system_instructions(
+        Path(system_context).read_text(encoding="utf-8").strip(),
+        env.get(SYSTEM_INSTRUCTIONS_SHA256_ENV, ""),
     )
+    program = instructions.program
+    configured_program_path = env.get(PROGRAM_PATH_ENV, "")
+    if configured_program_path != program.program_path:
+        raise RuntimeError(
+            f"{PROGRAM_PATH_ENV} does not match the inherited program snapshot"
+        )
+    if env.get(PROGRAM_SOURCE_COMMIT_ENV, "") != program.source_commit:
+        raise RuntimeError(
+            f"{PROGRAM_SOURCE_COMMIT_ENV} does not match the inherited system snapshot"
+        )
     role = env.get("SENPAI_ROLE", "")
     if role not in {"advisor", "student"}:
         raise RuntimeError("SENPAI_ROLE must be advisor or student")
@@ -650,12 +668,21 @@ def resolve_config(
     role_file = find_role_file(
         env_value(args.role_file, env, "SENPAI_OPENHANDS_ROLE_FILE"),
     )
-    instructions = SenpaiSystemInstructions(
-        harness=read_instruction_file(harness_file),
-        role=read_instruction_file(role_file),
-        program=program,
-        launch=decode_launch_context(env.get(LAUNCH_CONTEXT_ENV, "")),
-    )
+    if read_instruction_file(harness_file) != instructions.harness:
+        raise RuntimeError(
+            "OpenHands harness file does not match the controller-held snapshot"
+        )
+    if read_instruction_file(role_file) != instructions.role:
+        raise RuntimeError(
+            "OpenHands role file does not match the controller-held snapshot"
+        )
+    if (
+        decode_launch_context(env.get(LAUNCH_CONTEXT_ENV, ""))
+        != instructions.launch
+    ):
+        raise RuntimeError(
+            f"{LAUNCH_CONTEXT_ENV} does not match the inherited system snapshot"
+        )
     try:
         timeout_seconds = float(env.get("SENPAI_OPENHANDS_TIMEOUT_SECONDS", "7200"))
     except ValueError as error:
@@ -1253,8 +1280,7 @@ def delegation_config(
         enable_browser=config.enable_browser,
         conversation_secrets=config.conversation_secrets,
         role=config.role,
-        program_path=config.instructions.program.program_path,
-        launch_context=config.instructions.launch,
+        instructions=config.instructions,
         root_state_dir=config.delegation_root_state_dir,
         tree_id=config.delegation_tree_id,
         depth=config.delegation_depth,
