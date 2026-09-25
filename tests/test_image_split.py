@@ -141,6 +141,12 @@ def test_images_install_the_runner_and_protect_runtime_assets(role: str):
         assert '"$SENPAI_PLUGIN"' in protected
         if role == "student":
             assert '"$UV_PYTHON_INSTALL_DIR"' in protected
+    for user_ownership in root_setup.split("chown -R 10001:10001")[1:]:
+        writable = user_ownership.split("&&", 1)[0]
+        assert "/opt/senpai-venv" not in writable
+        assert '"$SENPAI_AGENT_DIR"' not in writable
+        assert '"$SENPAI_PLUGIN"' not in writable
+        assert '"$UV_PYTHON_INSTALL_DIR"' not in writable
 
 
 def test_both_images_record_the_exact_source_revision():
