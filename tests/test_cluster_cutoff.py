@@ -254,6 +254,7 @@ def test_cutoff_dry_run_keeps_readiness_and_delete_without_archive_rbac(tmp_path
         "runAsUser": 10001,
         "runAsGroup": 10001,
         "fsGroup": 10001,
+        "fsGroupChangePolicy": "OnRootMismatch",
         "seccompProfile": {"type": "RuntimeDefault"},
     }
     container = pod["containers"][0]
@@ -632,23 +633,31 @@ esac
 
 
 @pytest.mark.parametrize("budget, deadline", [("0", 1000), ("120", 1120)])
+@pytest.mark.parametrize("obstacle", ["parent_file", "gate_directory"])
 def test_generated_cutoff_deletes_at_deadline_when_the_start_gate_cannot_open(
-    tmp_path, run_generated_cutoff, budget, deadline
+    tmp_path, run_generated_cutoff, budget, deadline, obstacle
 ):
     blocker = tmp_path / "blocker"
-    blocker.write_text("not a directory", encoding="utf-8")
+    if obstacle == "parent_file":
+        blocker.write_text("not a directory", encoding="utf-8")
+        gate = blocker / "start-gate"
+    else:
+        blocker.mkdir()
+        gate = blocker
     result = run_generated_cutoff(
-        BUDGET_SECONDS=budget, START_GATE_PATH=str(blocker / "start-gate")
+        BUDGET_SECONDS=budget, START_GATE_PATH=str(gate)
     )
 
     assert result.returncode == 0, result.stderr
-    assert "Unable to open the shared start gate" in result.stdout + result.stderr
+    assert "Start gate remains unavailable at the cutoff deadline" in result.stdout
     assert (tmp_path / "sleeps").read_text().splitlines() == (
         ["60", "60"] if budget == "120" else []
     )
     assert f"{deadline} -n test-ns delete deployments -l research-tag in (track-a)" in (
         tmp_path / "calls"
     ).read_text()
+    if obstacle == "gate_directory":
+        assert list(gate.iterdir()) == []
 
 
 @pytest.mark.parametrize(
@@ -659,6 +668,7 @@ def test_generated_cutoff_deletes_at_deadline_when_the_start_gate_cannot_open(
         ("missing", 1220),
         ("symlink", 1220),
         ("fifo", 1220),
+        ("directory", 1220),
         ("hard_cap", 1080),
     ],
 )
@@ -674,7 +684,7 @@ def test_cutoff_restart_authenticates_state_and_preserves_deadlines(
         state = json.loads(saved_state)
         state["payload"]["KILL_AT_EPOCH"] = 9999
         state_file.write_text(json.dumps(state))
-    elif state_change in {"missing", "symlink", "fifo"}:
+    elif state_change in {"missing", "symlink", "fifo", "directory"}:
         state_file.unlink()
         if state_change == "symlink":
             target = tmp_path / "untrusted-state"
@@ -682,6 +692,8 @@ def test_cutoff_restart_authenticates_state_and_preserves_deadlines(
             state_file.symlink_to(target)
         elif state_change == "fifo":
             os.mkfifo(state_file)
+        elif state_change == "directory":
+            state_file.mkdir()
     (tmp_path / "clock").write_text("1005\n")
     overrides = {"PODS_READY": "false"}
     if state_change == "hard_cap":
@@ -697,3 +709,6 @@ def test_cutoff_restart_authenticates_state_and_preserves_deadlines(
     assert f"{deadline} -n test-ns delete deployments -l research-tag in (track-a)" in calls
     if state_change == "symlink":
         assert target.read_text() == saved_state
+    elif state_change == "directory":
+        assert "using in-memory deadline" in restarted.stdout
+        assert list(state_file.iterdir()) == []

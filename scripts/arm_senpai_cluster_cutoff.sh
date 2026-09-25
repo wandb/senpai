@@ -222,7 +222,7 @@ deployment_count() {
 }
 
 write_state() {
-  local reason="$1" now tmp persisted="true"
+  local reason="$1" now tmp
   now="$(date -u '+%s')"
   PERSISTED_ARM_ID="$REQUESTED_ARM_ID"
   ARMED_AT_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -237,9 +237,9 @@ write_state() {
     return 0
   fi
   python - \
-    "$tmp" "$STATE_AUTH_KEY" "$REQUESTED_ARM_ID" "$RUN_SLUG" "$TAGS_CSV" \
+    "$tmp" "$STATE_FILE" "$STATE_AUTH_KEY" "$REQUESTED_ARM_ID" "$RUN_SLUG" "$TAGS_CSV" \
     "$ARMED_AT_UTC" "$reason" "$KILL_AT_EPOCH" "$KILL_AT_UTC" "$EXPECTED_PODS" \
-    "$EXPECTED_DEPLOYMENTS" "$SELECTOR" "$START_GATE_PATH" <<'PY' || persisted="false"
+    "$EXPECTED_DEPLOYMENTS" "$SELECTOR" "$START_GATE_PATH" <<'PY' || {
 import hashlib
 import hmac
 import json
@@ -249,6 +249,7 @@ import sys
 
 (
     path,
+    destination,
     key,
     arm_id,
     run_slug,
@@ -287,14 +288,11 @@ with os.fdopen(fd, "w", encoding="utf-8") as file:
     os.ftruncate(file.fileno(), 0)
     json.dump(document, file, sort_keys=True, separators=(",", ":"))
     file.write("\n")
+os.replace(path, destination)
 PY
-  if [ "$persisted" = "true" ] && ! mv "$tmp" "$STATE_FILE"; then
-    persisted="false"
-  fi
-  if [ "$persisted" = "false" ]; then
     rm -f "$tmp" || log "Unable to remove shared cutoff telemetry temporary"
     log "Shared cutoff telemetry changed concurrently; using in-memory deadline"
-  fi
+  }
 }
 
 read_state_value() {
@@ -373,28 +371,24 @@ open_start_gate() {
     printf 'KILL_AT_UTC=%q\n' "${KILL_AT_UTC:-}"
     printf 'SELECTOR=%q\n' "$SELECTOR"
   )"
-  python - "$tmp" "$contents" <<'PY' || {
+  python - "$tmp" "$START_GATE_PATH" "$contents" <<'PY' || {
 import os
 import stat
 import sys
 
-path, contents = sys.argv[1:]
+path, destination, contents = sys.argv[1:]
 fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
 with os.fdopen(fd, "w", encoding="utf-8") as file:
     if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
         raise SystemExit("invalid start-gate temporary")
     os.ftruncate(file.fileno(), 0)
     file.write(contents + "\n")
+os.replace(path, destination)
 PY
-    rm -f "$tmp" || log "Unable to remove shared start-gate temporary"
-    log "Unable to write the shared start gate"
-    return 1
-  }
-  if ! mv "$tmp" "$START_GATE_PATH"; then
     rm -f "$tmp" || log "Unable to remove shared start-gate temporary"
     log "Unable to publish the shared start gate"
     return 1
-  fi
+  }
   log "Opened start gate: ${START_GATE_PATH}"
 }
 
@@ -559,6 +553,7 @@ spec:
         runAsUser: 10001
         runAsGroup: 10001
         fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       restartPolicy: OnFailure
