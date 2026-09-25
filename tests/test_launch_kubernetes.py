@@ -490,8 +490,11 @@ def launch_with_existing_roles(monkeypatch, resources, **overrides):
         launch_helpers.existing_wandb_viewer_owners,
     )
     scans = []
+    run_process = subprocess.run
 
-    def run(argv, **_kwargs):
+    def run(argv, **kwargs):
+        if argv[0] != "kubectl":
+            return run_process(argv, **kwargs)
         scans.append(argv)
         selector = argv[argv.index("-l") + 1]
         selected = resources
