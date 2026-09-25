@@ -291,6 +291,10 @@ Each native terminal session receives target settings after shell startup,
 including new and recovered tmux panes. Later commands can change that
 session's environment. This adapter uses the pinned SDK's environment-export
 callback and preserves native parallel terminal execution.
+Bootstrap also creates missing target launchers for the trusted environment's
+console scripts. Each launcher executes the original read-only script with
+target Python, so shared commands and their Python workers see target packages.
+Bootstrap preserves existing target scripts and never executes target Python.
 
 OpenHands ambient plugin discovery is disabled before root or child
 conversations are created. Only the explicitly supplied trusted plugin loads
@@ -730,9 +734,11 @@ its stored credentials and copied worker environment. The worker reads and
 closes the descriptors before tool initialization. Bootstrap also hands off
 W&B and Exa through private files. The controller restores those service keys
 before importing the runner so research access and import-time Weave tracing
-continue to work. Standalone launches may omit services they do not use. No raw token
-is written to conversation/dataset storage. The long-lived PID 1 environment,
-model-facing tool schemas, and agent terminal contain no GitHub token.
+continue to work. Standalone launches may omit services they do not use. When a
+service key is set at supervisor startup, its private file handoff is required;
+a raw key without that handoff fails startup. No raw token is written to
+conversation/dataset storage. The long-lived PID 1 environment, model-facing
+tool schemas, and agent terminal contain no GitHub token.
 
 Authenticated Git publication runs `/usr/bin/git` in a disposable bare repository.
 The controller supplies the GitHub URL from its configured repository, disables
@@ -783,10 +789,12 @@ unverified. The replacement explicitly reports unsupported full system histories
 and external artifact-storage credentials; it must not silently substitute sampled
 data or a narrower research workflow.
 
-The supervisor, controller, and delegated runner disable process dumping on
-Linux. After capturing the worker environment, the supervisor removes current
-model-provider values and discards its environment copies. Removing an
-`os.environ` entry does not erase the kernel's original startup environment.
+The supervisor, controller, and runner disable process dumping on Linux,
+including standalone runner invocations. This also disables core dumps and
+ptrace-based debugging of those processes. After capturing the worker
+environment, the supervisor removes current model-provider values and discards
+its environment copies. Removing an `os.environ` entry does not erase the
+kernel's original startup environment.
 Model values can remain there until process exit. A same-UID process can also
 race a delegated child's inherited descriptor before Python disables dumping.
 These measures reduce exposure; they do not establish complete same-UID secrecy.
@@ -801,8 +809,14 @@ terminate the workload's cgroup.
 Existing post-SIGKILL waits can still depend on kernel process termination.
 Kubernetes or another process manager must restart the complete entrypoint;
 restarting only the Python supervisor cannot recreate consumed handoff files.
-Container restarts retain pod-local conversation state, while pod replacement
-does not retain that state.
+The supplied manifests use separate pod-local `emptyDir` volumes for role state,
+the target checkout at `/workspace/senpai/$PROBLEM_DIR`, and the writable target
+environment at `/home/senpai/.venvs/senpai-target`. A container restart in the
+same Pod retains all three. Bootstrap preserves the existing target branch,
+uncommitted files, unpushed commits, and installed dependencies. It does not
+checkout, pull, or reset an existing advisor checkout. The runner checkout and
+the rest of HOME are recreated. Pod replacement starts fresh role state,
+checkout, and target environment; the dataset PVC follows its own lifetime.
 
 Generic child processes receive no GitHub token and no GitHub tools. Main-role
 GitHub operations remain typed and lease/state guarded. Terminal and hook
@@ -893,7 +907,7 @@ Removed:
 - `.claude/` runtime resources;
 - Claude-named and OpenHands shell watchdog/supervisor loops;
 - the Exa MCP configuration;
-- the HTTP advisor service, bearer token, port, probes, and Kubernetes RBAC;
+- the old HTTP advisor service and its bearer token, port, probes, and Kubernetes RBAC;
 - shell GitHub polling and pod-process inspection;
 - cutoff conversation harvesting;
 - obsolete tool-role instructions; and

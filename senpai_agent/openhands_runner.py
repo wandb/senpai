@@ -48,6 +48,7 @@ from senpai_agent.secrets import (
     GITHUB_TOKEN_FD_ENV,
     GITHUB_TOKEN_FILE_ENV,
     MODEL_CREDENTIALS_FD_ENV,
+    PROVIDER_API_KEY_ENVS,
     WANDB_TRAINING_API_KEY_ENV,
     configured_custom_secret_env_names,
     consume_model_credential_fd,
@@ -135,11 +136,6 @@ SOURCE_SENPAI_AGENT_DIR = Path(__file__).resolve().parents[1] / ".agents" / "age
 REPOSITORY_INSTRUCTION_FILENAMES = frozenset(
     {"agents.md", "agent.md", "claude.md"}
 )
-PROVIDER_API_KEY_ENVS = {
-    "anthropic": "ANTHROPIC_API_KEY",
-    "openai": "OPENAI_API_KEY",
-    "wandb": "WANDB_INFERENCE_API_KEY",
-}
 EVENT_TEXT_LIMIT = 20000
 MAX_INLINE_CHILD_RESULT_TOKENS = 15_000
 DEFAULT_INBOX_MAX_STALLED_ATTEMPTS = 3

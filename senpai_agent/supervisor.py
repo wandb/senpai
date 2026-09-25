@@ -33,6 +33,7 @@ from senpai_agent.secrets import (
     GITHUB_TOKEN_FILE_ENV,
     PRIVATE_CREDENTIAL_FD_ENVS,
     PRIVATE_CREDENTIAL_FILE_ENVS,
+    PROVIDER_API_KEY_ENVS,
     scrub_github_credentials,
     scrub_service_credentials,
     set_process_nondumpable,
@@ -241,6 +242,8 @@ class WorkerSupervisor:
         )
         if reason.startswith("exit:"):
             exit_code = int(reason.partition(":")[2])
+            if exit_code < 0:
+                return 128 - exit_code
             return exit_code or 1
         return 1
 
@@ -429,6 +432,8 @@ def serve_lease_health(
     """Serve the worker lease without spawning credential-bearing probes."""
 
     class LeaseHealthHandler(BaseHTTPRequestHandler):
+        timeout = 5
+
         def do_GET(self) -> None:  # noqa: N802
             if self.path != "/healthz":
                 self.send_error(404)
@@ -494,52 +499,50 @@ def supervisor_main(
             state_dir,
             env,
         )
-        github_token = _consume_github_token(env)
-        private_credentials = _consume_private_credential_files(env)
-    stop = threading.Event()
+        stop = threading.Event()
 
-    def request_stop(_signum: int, _frame: object) -> None:
-        stop.set()
+        def request_stop(_signum: int, _frame: object) -> None:
+            stop.set()
 
-    previous_handlers = {
-        signum: signal.signal(signum, request_stop)
-        for signum in (signal.SIGTERM, signal.SIGINT)
-    }
-    try:
-        lease_path = state_dir / "controller-lease.json"
-        with serve_lease_health(lease_path, port=health_port):
-            worker = WorkerSupervisor(
-                command=(
-                    sys.executable,
-                    "-P",
-                    "-m",
-                    "senpai_agent.controller",
-                    args.command,
-                ),
-                lease_path=lease_path,
-                environment=worker_environment,
-                github_token=github_token,
-                private_credentials=private_credentials,
-            )
-            github_token = None
-            private_credentials.clear()
-            worker_environment.clear()
-            # The worker has its own startup environment. Drop PID 1's current
-            # model values; this does not erase the kernel's original environ.
-            model_names = {
-                "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "WANDB_INFERENCE_API_KEY"
-            }
-            for profile in ("", "SMART_", "FAST_", "FRONTIER_"):
-                if name := env.get(f"SENPAI_OPENHANDS_{profile}API_KEY_ENV"):
-                    model_names.add(name)
-            for name in model_names:
-                os.environ.pop(name, None)
-            scrub_github_credentials(os.environ)
-            scrub_service_credentials(os.environ)
-            return worker.run(stop)
-    finally:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
+        previous_handlers = {
+            signum: signal.signal(signum, request_stop)
+            for signum in (signal.SIGTERM, signal.SIGINT)
+        }
+        try:
+            lease_path = state_dir / "controller-lease.json"
+            with serve_lease_health(lease_path, port=health_port):
+                github_token = _consume_github_token(env)
+                private_credentials = _consume_private_credential_files(env)
+                worker = WorkerSupervisor(
+                    command=(
+                        sys.executable,
+                        "-P",
+                        "-m",
+                        "senpai_agent.controller",
+                        args.command,
+                    ),
+                    lease_path=lease_path,
+                    environment=worker_environment,
+                    github_token=github_token,
+                    private_credentials=private_credentials,
+                )
+                github_token = None
+                private_credentials.clear()
+                worker_environment.clear()
+                # The worker has its own startup environment. Drop PID 1's current
+                # model values; this does not erase the kernel's original environ.
+                model_names = set(PROVIDER_API_KEY_ENVS.values())
+                for profile in ("", "SMART_", "FAST_", "FRONTIER_"):
+                    if name := env.get(f"SENPAI_OPENHANDS_{profile}API_KEY_ENV", "").strip():
+                        model_names.add(name)
+                for name in model_names:
+                    os.environ.pop(name, None)
+                scrub_github_credentials(os.environ)
+                scrub_service_credentials(os.environ)
+                return worker.run(stop)
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
 
 
 def prepare_system_context_environment(
@@ -604,6 +607,10 @@ def _consume_private_credential_files(
     for credential_name, file_env in PRIVATE_CREDENTIAL_FILE_ENVS.items():
         file_value = env.get(file_env)
         if not file_value:
+            if env.get(credential_name):
+                raise RuntimeError(
+                    f"{file_env} is required when {credential_name} is configured"
+                )
             continue
         value = _consume_private_file(Path(file_value), file_env)
         if not value:

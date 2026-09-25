@@ -137,9 +137,17 @@ spec:
           mountPath: {{PVC_MOUNT_PATH}}
         - name: state
           mountPath: /var/lib/senpai
+        - name: target
+          mountPath: {{TARGET_WORKSPACE_MOUNT}}
+        - name: target-environment
+          mountPath: /home/senpai/.venvs/senpai-target
       volumes:
       - name: dataset
         persistentVolumeClaim:
           claimName: {{PVC_CLAIM_NAME}}
       - name: state
+        emptyDir: {}
+      - name: target
+        emptyDir: {}
+      - name: target-environment
         emptyDir: {}

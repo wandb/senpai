@@ -31,7 +31,10 @@ echo "GPUs:         $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/n
 
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
-git config --global safe.directory "$WORKDIR"
+git config --global --add safe.directory "$WORKDIR"
+mkdir -p "$TARGET_WORKDIR"
+export TARGET_WORKDIR="$(cd "$TARGET_WORKDIR" && pwd -P)"
+git config --global --add safe.directory "$TARGET_WORKDIR"
 source "$SENPAI_PLUGIN/scripts/git-guard.sh"
 install_senpai_git_guard "$WORKDIR" "$GIT_ASKPASS_FILE"
 
@@ -116,5 +119,6 @@ CONTROLLER_SITE="$("$SENPAI_PYTHON" -P -c 'import sysconfig; print(sysconfig.get
 # The target interpreter is agent-writable; never execute it during trusted startup.
 TARGET_SITE="$("$SENPAI_PYTHON" -P -c 'import sys, sysconfig; print(sysconfig.get_path("purelib", vars={"base": sys.argv[1]}))' "$SENPAI_TARGET_PYTHON_ENV")"
 printf '%s\n' "$CONTROLLER_SITE" > "$TARGET_SITE/senpai-runtime.pth"
+"$SENPAI_PYTHON" -P -m senpai_agent.target_environment "$SENPAI_TARGET_PYTHON_ENV"
 cd "$WORKDIR"
 exec "$SENPAI_PYTHON" -P -m senpai_agent.supervisor student

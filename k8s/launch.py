@@ -7,8 +7,10 @@
 """Launch senpai advisor and student agents as K8s resources."""
 
 import base64
+import json
 import posixpath
 import shlex
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -320,6 +322,39 @@ def validate_program_path(args: Args) -> None:
         sys.exit(f"ERROR: --program_path: {error}")
 
 
+def validate_mount_paths(args: Args) -> str:
+    problem_dir = args.problem_dir.removesuffix("/")
+    if (
+        not problem_dir
+        or problem_dir in {".", ".."}
+        or posixpath.isabs(problem_dir)
+        or posixpath.normpath(problem_dir) != problem_dir
+        or problem_dir.startswith("../")
+    ):
+        sys.exit("ERROR: --problem_dir must be a normalized relative child directory")
+    tracked_paths = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "-z"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split("\0")
+    runner_roots = {path.partition("/")[0] for path in tracked_paths if path}
+    if problem_dir.partition("/")[0] in runner_roots | {".git", ".agents", ".codex"}:
+        sys.exit("ERROR: --problem_dir must not cover tracked runner assets or metadata")
+    target_mount = f"/workspace/senpai/{problem_dir}"
+    if not posixpath.isabs(args.pvc_mount_path):
+        sys.exit("ERROR: --pvc_mount_path must be absolute")
+    pvc_mount = "/" + posixpath.normpath(args.pvc_mount_path).lstrip("/")
+    for private_mount in (target_mount, "/home/senpai/.venvs/senpai-target"):
+        if posixpath.commonpath((pvc_mount, private_mount)) in {pvc_mount, private_mount}:
+            sys.exit(
+                "ERROR: --pvc_mount_path must not overlap the target checkout "
+                "or target virtual environment"
+            )
+    args.problem_dir = problem_dir
+    return target_mount
+
+
 def build_launch_context(
     args: Args,
     tag: str,
@@ -382,6 +417,7 @@ def render_student(
     inference_wandb_viewer: str | None,
     args: Args,
 ) -> str:
+    target_workspace_mount = validate_mount_paths(args)
     student_configmap_name = kubernetes_resource_name(
         f"senpai-config-student-{tag}-{student_name}"
     )
@@ -440,7 +476,8 @@ def render_student(
             "STUDENT_IMAGE": args.student_image,
             "ADVISOR_BRANCH": args.advisor_branch,
             "PVC_CLAIM_NAME": args.pvc_claim_name,
-            "PVC_MOUNT_PATH": args.pvc_mount_path,
+            "PVC_MOUNT_PATH": json.dumps(args.pvc_mount_path),
+            "TARGET_WORKSPACE_MOUNT": json.dumps(target_workspace_mount),
             "LAUNCH_SECRET_NAME": secret_name,
             "WANDB_TRAINING_SECRET_NAME": wandb_secret_name,
             "WANDB_VIEWER": base64.b64encode(wandb_viewer.encode()).decode(),
@@ -484,6 +521,7 @@ def render_advisor(
     inference_wandb_viewer: str | None,
     args: Args,
 ) -> str:
+    target_workspace_mount = validate_mount_paths(args)
     advisor_configmap_name = kubernetes_resource_name(
         f"senpai-config-advisor-{tag}"
     )
@@ -536,7 +574,8 @@ def render_advisor(
             "RESEARCH_TAG": tag,
             "ADVISOR_IMAGE": args.advisor_image,
             "PVC_CLAIM_NAME": args.pvc_claim_name,
-            "PVC_MOUNT_PATH": args.pvc_mount_path,
+            "PVC_MOUNT_PATH": json.dumps(args.pvc_mount_path),
+            "TARGET_WORKSPACE_MOUNT": json.dumps(target_workspace_mount),
             "LAUNCH_SECRET_NAME": secret_name,
             "WANDB_VIEWER": base64.b64encode(wandb_viewer.encode()).decode(),
             "INFERENCE_WANDB_VIEWER": base64.b64encode(
@@ -564,6 +603,7 @@ def render_advisor(
 
 def main():
     args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
+    validate_mount_paths(args)
     if min(args.gpus_per_student, args.cpu_per_gpu, args.memory_gi_per_gpu) < 1:
         sys.exit(
             "ERROR: --gpus_per_student, --cpu_per_gpu, and --memory_gi_per_gpu must all be at least 1"

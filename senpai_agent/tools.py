@@ -661,7 +661,7 @@ class TargetTerminalExecutor(TerminalExecutor):
                     timeout=10,
                 ))
                 if result.is_error or result.exit_code != 0:
-                    raise RuntimeError(
+                    raise ValueError(
                         "Target Python environment setup failed "
                         f"(exit code {result.exit_code})."
                     )

@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import socket
@@ -5,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import urlopen
@@ -544,10 +546,7 @@ def test_http_health_server_closes_when_the_supervisor_fails(tmp_path: Path):
         socket.create_connection(address, timeout=1)
 
 
-@pytest.mark.parametrize("port", ["abc", "0", "-1", "65536"])
-def test_invalid_health_port_discards_the_token_handoff(
-    tmp_path: Path, port: str
-):
+def supervisor_environment(tmp_path: Path) -> dict[str, str]:
     workspace = tmp_path / "target"
     workspace.mkdir()
     (workspace / "program.md").write_text("Research policy.")
@@ -556,17 +555,176 @@ def test_invalid_health_port_discards_the_token_handoff(
     token = tmp_path / "github-token"
     token.write_text("test-token")
     token.chmod(0o600)
+    return {
+        "SENPAI_GITHUB_TOKEN_FILE": str(token),
+        "SENPAI_OPENHANDS_STATE_DIR": str(tmp_path / "state"),
+        "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
+        "SENPAI_OPENHANDS_ROLE_FILE": str(role),
+    }
+
+
+def test_supervisor_entrypoint_forwards_private_credentials_and_clears_parent_keys(
+    tmp_path, monkeypatch
+):
+    environment = supervisor_environment(tmp_path)
+    environment.update(
+        {
+            "SENPAI_HEALTH_PORT": "8765",
+            "ANTHROPIC_API_KEY": "anthropic-fixture",
+            "OPENAI_API_KEY": "openai-fixture",
+            "WANDB_API_KEY": "wandb-current-fixture",
+            "EXA_API_KEY": "exa-current-fixture",
+            "GITHUB_TOKEN": "github-current-fixture",
+            "GH_TOKEN": "gh-current-fixture",
+        }
+    )
+    handoffs = [Path(environment["SENPAI_GITHUB_TOKEN_FILE"])]
+    for name, file_env in (
+        ("wandb", "SENPAI_WANDB_API_KEY_FILE"),
+        ("exa", "SENPAI_EXA_API_KEY_FILE"),
+    ):
+        path = tmp_path / f"{name}-handoff"
+        path.write_text(f"{name}-private-fixture")
+        path.chmod(0o600)
+        environment[file_env] = str(path)
+        handoffs.append(path)
+    model_names = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "WANDB_API_KEY"}
+    for profile in ("", "SMART_", "FAST_", "FRONTIER_"):
+        name = f"TEST_{profile}MODEL_CREDENTIAL"
+        environment[f"SENPAI_OPENHANDS_{profile}API_KEY_ENV"] = f" {name} "
+        environment[name] = f"{profile.lower()}model-fixture"
+        model_names.add(name)
+    cleared_names = model_names | {
+        "EXA_API_KEY", "GITHUB_TOKEN", "GH_TOKEN",
+        "SENPAI_GITHUB_TOKEN_FILE", "SENPAI_GITHUB_TOKEN_FD",
+        "SENPAI_WANDB_API_KEY_FILE", "SENPAI_WANDB_API_KEY_FD",
+        "SENPAI_EXA_API_KEY_FILE", "SENPAI_EXA_API_KEY_FD",
+        "SENPAI_MODEL_CREDENTIALS_FD",
+    }
+    for name in cleared_names:
+        # Register every key that supervisor_main removes so pytest restores
+        # any pre-existing operator environment after this test.
+        monkeypatch.setenv(name, environment.get(name, "stale-handoff"))
+    observed = {}
+
+    @contextmanager
+    def health_listener(lease_path, *, port):
+        assert port == 8765
+        with serve_lease_health(lease_path, host="127.0.0.1", port=0) as server:
+            observed["address"] = ("127.0.0.1", server.server_port)
+            yield server
+
+    def run_worker(worker, stop):
+        observed["worker"] = worker
+        assert not stop.is_set()
+        assert all(name not in os.environ for name in cleared_names)
+        assert all(not path.exists() for path in handoffs)
+        address, port = observed["address"]
+        with pytest.raises(HTTPError) as unhealthy:
+            urlopen(f"http://{address}:{port}/healthz", timeout=1)
+        assert unhealthy.value.code == 503
+        unhealthy.value.close()
+        return 23
+
+    monkeypatch.setattr(supervisor_module, "serve_lease_health", health_listener)
+    # Keep the real constructor: it must copy state before supervisor_main
+    # clears its temporary dictionaries. Existing tests exercise worker exec.
+    monkeypatch.setattr(WorkerSupervisor, "run", run_worker)
+
+    assert supervisor_module.supervisor_main(["advisor"], environment) == 23
+
+    worker = observed["worker"]
+    assert worker.github_token.get_secret_value() == "test-token"
+    assert {
+        name: value.get_secret_value()
+        for name, value in worker.private_credentials.items()
+    } == {"WANDB_API_KEY": "wandb-private-fixture", "EXA_API_KEY": "exa-private-fixture"}
+    # W&B is restored through its private service handoff. Other model keys
+    # remain in the prepared worker environment even after parent cleanup.
+    for name in model_names - {"WANDB_API_KEY"}:
+        assert worker.environment[name] == environment[name]
+    assert "WANDB_API_KEY" not in worker.environment
+    assert "EXA_API_KEY" not in worker.environment
+    assert worker.environment["SENPAI_PROGRAM_PATH"] == "program.md"
+    assert Path(worker.environment["SENPAI_OPENHANDS_ROLE_FILE"]).read_text() == "Advisor policy.\n"
+    assert worker.command == (sys.executable, "-P", "-m", "senpai_agent.controller", "advisor")
+    assert worker.lease_path == tmp_path / "state" / "controller-lease.json"
+    with pytest.raises(ConnectionRefusedError):
+        socket.create_connection(observed["address"], timeout=1)
+
+
+@pytest.mark.parametrize(
+    ("credential", "file_env", "sibling_file_env"),
+    [
+        ("WANDB_API_KEY", "SENPAI_WANDB_API_KEY_FILE", "SENPAI_EXA_API_KEY_FILE"),
+        ("EXA_API_KEY", "SENPAI_EXA_API_KEY_FILE", "SENPAI_WANDB_API_KEY_FILE"),
+    ],
+)
+def test_configured_service_requires_private_handoff_and_cleans_siblings(
+    tmp_path, monkeypatch, credential, file_env, sibling_file_env
+):
+    environment = supervisor_environment(tmp_path)
+    environment[credential] = "raw-service-fixture"
+    sibling = tmp_path / "sibling-handoff"
+    sibling.write_text("private-sibling-fixture")
+    sibling.chmod(0o600)
+    environment[sibling_file_env] = str(sibling)
+    monkeypatch.setattr(
+        supervisor_module, "serve_lease_health", lambda *_args, **_kwargs: nullcontext()
+    )
+
+    def unexpected_worker(*_args, **_kwargs):
+        pytest.fail("raw service credentials must fail before worker construction")
+
+    monkeypatch.setattr(supervisor_module, "WorkerSupervisor", unexpected_worker)
+
+    with pytest.raises(RuntimeError, match=file_env):
+        supervisor_module.supervisor_main(["advisor"], environment)
+
+    assert not sibling.exists()
+    assert not Path(environment["SENPAI_GITHUB_TOKEN_FILE"]).exists()
+
+
+@pytest.mark.parametrize("port", ["abc", "0", "-1", "65536"])
+def test_invalid_health_port_discards_the_token_handoff(
+    tmp_path: Path, port: str
+):
+    environment = supervisor_environment(tmp_path)
+    environment["SENPAI_HEALTH_PORT"] = port
 
     with pytest.raises(RuntimeError, match="SENPAI_HEALTH_PORT must be"):
-        supervisor_module.supervisor_main(["advisor"], {
-            "SENPAI_HEALTH_PORT": port,
-            "SENPAI_GITHUB_TOKEN_FILE": str(token),
-            "SENPAI_OPENHANDS_STATE_DIR": str(tmp_path / "state"),
-            "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
-            "SENPAI_OPENHANDS_ROLE_FILE": str(role),
-        })
+        supervisor_module.supervisor_main(["advisor"], environment)
 
-    assert not token.exists()
+    assert not Path(environment["SENPAI_GITHUB_TOKEN_FILE"]).exists()
+
+
+def test_unavailable_health_port_discards_handoff_without_reading_it(
+    tmp_path: Path, monkeypatch,
+):
+    environment = supervisor_environment(tmp_path)
+    monkeypatch.setattr(
+        supervisor_module, "_consume_github_token",
+        lambda _env: pytest.fail("credentials read before health listener bound"),
+    )
+    with socket.socket() as occupied:
+        occupied.bind(("0.0.0.0", 0))
+        occupied.listen()
+        environment["SENPAI_HEALTH_PORT"] = str(occupied.getsockname()[1])
+        with pytest.raises(OSError) as error:
+            supervisor_module.supervisor_main(["advisor"], environment)
+
+    assert error.value.errno == errno.EADDRINUSE
+    assert not Path(environment["SENPAI_GITHUB_TOKEN_FILE"]).exists()
+
+
+def test_http_health_server_closes_idle_connections(tmp_path: Path):
+    with serve_lease_health(
+        tmp_path / "lease.json", host="127.0.0.1", port=0
+    ) as server:
+        with socket.create_connection(
+            ("127.0.0.1", server.server_port), timeout=10
+        ) as connection:
+            assert connection.recv(1) == b""
 
 
 def test_openhands_reopens_durable_events_after_an_unclean_worker_exit(
@@ -832,13 +990,17 @@ def test_requested_stop_forgets_credentials_without_starting_worker(tmp_path):
     assert supervisor.environment == {}
 
 
-def test_unexpected_clean_worker_exit_requires_external_restart(tmp_path):
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [("pass", 1), ("import os, signal; os.kill(os.getpid(), signal.SIGTERM)", 143)],
+)
+def test_worker_exit_reports_status_to_external_process_manager(tmp_path, command, expected):
     supervisor = WorkerSupervisor(
-        command=(sys.executable, "-c", "pass"),
+        command=(sys.executable, "-c", command),
         lease_path=tmp_path / "lease.json",
         config=SupervisorConfig(check_interval_seconds=0.01),
     )
-    assert supervisor.run() == 1
+    assert supervisor.run() == expected
 
 
 @pytest.mark.parametrize("kind", ["fifo", "public", "empty"])
