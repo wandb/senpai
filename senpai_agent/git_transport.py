@@ -107,15 +107,21 @@ def remote_head(
     *,
     token: SecretStr | None,
 ) -> str:
+    expected_ref = f"refs/heads/{branch}"
     result = run_git(
         workspace,
         "ls-remote",
         "--refs",
         remote,
-        f"refs/heads/{branch}",
+        expected_ref,
         token=token,
     )
-    return result.split(maxsplit=1)[0] if result else ""
+    # ls-remote patterns match ref-name suffixes as well as full names.
+    for line in result.splitlines():
+        sha, ref = line.split(maxsplit=1)
+        if ref == expected_ref:
+            return sha
+    return ""
 
 
 def run_git(
