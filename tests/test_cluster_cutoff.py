@@ -3,6 +3,7 @@ import os
 import shutil
 import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -48,6 +49,85 @@ printf '%s\n' 'apiVersion: v1' 'kind: ConfigMap'
         },
     )
     return result, captured_script
+
+
+def execute_job(script: Path, env: dict[str, str]):
+    with subprocess.Popen(
+        ["bash", str(script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        env={**os.environ, **env},
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+            pytest.fail(f"cutoff blocked beyond its deadline:\n{stdout}\n{stderr}")
+    return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+
+
+@pytest.fixture
+def run_generated_cutoff(tmp_path):
+    rendered, script = render_cutoff(
+        tmp_path,
+        "--run-slug",
+        "restart",
+        "--tags-csv",
+        "track-a",
+        "--expected-pods",
+        "1",
+        "--expected-deployments",
+        "1",
+    )
+    assert rendered.returncode == 0, rendered.stderr
+    job = yaml.safe_load(rendered.stdout.split("--- Job ---\n")[1])
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    env = {item["name"]: item["value"] for item in container["env"]}
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    commands = {
+        "date": '''if [ "$2" = '+%s' ]; then cat "$CLOCK_FILE"; else exec "$REAL_DATE" "$@"; fi''',
+        "sleep": '''printf '%s\\n' "$1" >> "$SLEEP_LOG"
+printf '%s\\n' "$(( $(cat "$CLOCK_FILE") + $1 ))" > "$CLOCK_FILE"''',
+        "kubectl": '''printf '%s %s\\n' "$(cat "$CLOCK_FILE")" "$*" >> "$KUBECTL_LOG"
+case "$*" in
+  *"get pods"*) printf '{"items":[{"status":{"containerStatuses":[{"ready":%s}]}}]}\\n' "$PODS_READY" ;;
+  *"get deployments"*) printf '%s\\n' 'senpai-track-a' ;;
+  *"delete deployments"*) ;;
+  *) exit 2 ;;
+esac''',
+    }
+    for name, contents in commands.items():
+        command = bin_dir / name
+        command.write_text(f"#!/bin/sh\n{contents}\n", encoding="utf-8")
+        command.chmod(0o755)
+    (tmp_path / "clock").write_text("1000\n", encoding="utf-8")
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "REAL_DATE": shutil.which("date"),
+            "CLOCK_FILE": str(tmp_path / "clock"),
+            "SLEEP_LOG": str(tmp_path / "sleeps"),
+            "KUBECTL_LOG": str(tmp_path / "calls"),
+            "PODS_READY": "true",
+            "PVC_LOG_ROOT": str(tmp_path / "state"),
+            "READINESS_TIMEOUT_SECONDS": "100",
+            "ARMING_DEADLINE_EPOCH": "1100",
+            "BUDGET_SECONDS": "120",
+            "HARD_KILL_AT_EPOCH": "1220",
+            "NAMESPACE": "test-ns",
+        }
+    )
+
+    def run(**overrides):
+        (tmp_path / "calls").write_text("", encoding="utf-8")
+        (tmp_path / "sleeps").write_text("", encoding="utf-8")
+        return execute_job(script, {**env, **overrides})
+
+    return run
 
 
 def test_cutoff_defaults_to_the_image_built_from_the_checked_out_commit(tmp_path):
@@ -131,6 +211,7 @@ def test_cutoff_has_a_minimal_commit_built_image():
 
 
 def test_cutoff_dry_run_keeps_readiness_and_delete_without_archive_rbac(tmp_path):
+    started_at = int(time.time())
     result, captured_script = render_cutoff(
         tmp_path,
         "--run-slug",
@@ -154,14 +235,36 @@ def test_cutoff_dry_run_keeps_readiness_and_delete_without_archive_rbac(tmp_path
     assert "delete deployments" in job_script
     assert "harvest" not in job_script.lower()
     assert "kubectl exec" not in job_script
-    assert 'resources: ["pods/log"]' not in rendered
-    assert 'resources: ["pods/exec"]' not in rendered
-    assert 'resources: ["configmaps", "secrets"]' not in rendered
-    assert "runAsNonRoot: true" in rendered
-    assert "runAsUser: 10001" in rendered
-    assert "allowPrivilegeEscalation: false" in rendered
-    assert "readOnlyRootFilesystem: true" in rendered
-    assert 'drop: ["ALL"]' in rendered
+    rbac = yaml.safe_load_all(
+        rendered.split("--- RBAC ---\n")[1].split("--- ConfigMap ---\n")[0]
+    )
+    role = next(document for document in rbac if document["kind"] == "Role")
+    assert role["rules"] == [
+        {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "watch"]},
+        {
+            "apiGroups": ["apps"],
+            "resources": ["deployments"],
+            "verbs": ["get", "list", "watch", "delete"],
+        },
+    ]
+    job = yaml.safe_load(rendered.split("--- Job ---\n")[1])
+    pod = job["spec"]["template"]["spec"]
+    assert pod["securityContext"] == {
+        "runAsNonRoot": True,
+        "runAsUser": 10001,
+        "runAsGroup": 10001,
+        "fsGroup": 10001,
+        "seccompProfile": {"type": "RuntimeDefault"},
+    }
+    container = pod["containers"][0]
+    assert container["securityContext"] == {
+        "allowPrivilegeEscalation": False,
+        "readOnlyRootFilesystem": True,
+        "capabilities": {"drop": ["ALL"]},
+    }
+    env = {item["name"]: item["value"] for item in container["env"]}
+    assert started_at + 1800 <= int(env["ARMING_DEADLINE_EPOCH"]) <= int(time.time()) + 1800
+    assert env["HARD_KILL_AT_EPOCH"] == env["ARMING_DEADLINE_EPOCH"]
 
 
 @pytest.mark.parametrize("replaced_temporary", [None, "cutoff_state.json", "start-gate"])
@@ -230,14 +333,9 @@ printf '%s\\n' "$created"
         racing_mktemp.chmod(0o755)
     state_root = tmp_path / "state"
     gate = tmp_path / "start-gate"
-    with subprocess.Popen(
-        ["bash", str(captured_script)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-        env={
-            **os.environ,
+    result = execute_job(
+        captured_script,
+        {
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "DELETE_LOG": str(delete_log),
             "RUN_SLUG": "acceptance",
@@ -257,15 +355,9 @@ printf '%s\\n' "$created"
             "REPLACED_TEMPORARY": replaced_temporary or "",
             "REPLACEMENT_LOG": str(replacement_log),
         },
-    ) as process:
-        try:
-            stdout, stderr = process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            stdout, stderr = process.communicate()
-            pytest.fail(f"cutoff blocked beyond its deadline:\n{stdout}\n{stderr}")
+    )
 
-    assert process.returncode == 0, stderr
+    assert result.returncode == 0, result.stderr
     if replaced_temporary != "start-gate":
         assert gate.is_file()
     if replaced_temporary is not None:
@@ -539,70 +631,69 @@ esac
     ) in kubectl_log.read_text(encoding="utf-8").splitlines()
 
 
-def test_generated_cutoff_deletes_at_deadline_when_the_start_gate_cannot_open(tmp_path):
-    generated, captured_script = render_cutoff(
-        tmp_path,
-        "--run-slug",
-        "acceptance",
-        "--tags-csv",
-        "track-a",
-        "--expected-pods",
-        "1",
-        "--expected-deployments",
-        "1",
-        "--budget-hours",
-        "0",
-    )
-    assert generated.returncode == 0, generated.stderr
-
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    delete_log = tmp_path / "delete.log"
-    runtime_kubectl = bin_dir / "kubectl"
-    runtime_kubectl.write_text(
-        """#!/bin/sh
-case "$*" in
-  *"get pods"*)
-    printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"ready":true}]}}]}'
-    ;;
-  *"get deployments"*)
-    printf '%s\n' 'senpai-track-a'
-    ;;
-  *"delete deployments"*)
-    printf '%s\n' "$*" > "$DELETE_LOG"
-    ;;
-esac
-""",
-        encoding="utf-8",
-    )
-    runtime_kubectl.chmod(0o755)
+@pytest.mark.parametrize("budget, deadline", [("0", 1000), ("120", 1120)])
+def test_generated_cutoff_deletes_at_deadline_when_the_start_gate_cannot_open(
+    tmp_path, run_generated_cutoff, budget, deadline
+):
     blocker = tmp_path / "blocker"
     blocker.write_text("not a directory", encoding="utf-8")
-    result = subprocess.run(
-        ["bash", str(captured_script)],
-        capture_output=True,
-        text=True,
-        env={
-            **os.environ,
-            "PATH": f"{bin_dir}:{os.environ['PATH']}",
-            "DELETE_LOG": str(delete_log),
-            "RUN_SLUG": "acceptance",
-            "TAGS_CSV": "track-a",
-            "EXPECTED_PODS": "1",
-            "EXPECTED_DEPLOYMENTS": "1",
-            "READINESS_TIMEOUT_SECONDS": "1800",
-            "BUDGET_SECONDS": "0",
-            "ARMING_DEADLINE_EPOCH": "0",
-            "HARD_KILL_AT_EPOCH": "0",
-            "ARM_ID": "acceptance-arm",
-            "STATE_AUTH_KEY": "a" * 64,
-            "PVC_LOG_ROOT": str(tmp_path / "state"),
-            "START_GATE_PATH": str(blocker / "start-gate"),
-            "NAMESPACE": "test-ns",
-        },
-        check=False,
+    result = run_generated_cutoff(
+        BUDGET_SECONDS=budget, START_GATE_PATH=str(blocker / "start-gate")
     )
 
     assert result.returncode == 0, result.stderr
     assert "Unable to open the shared start gate" in result.stdout + result.stderr
-    assert "research-tag in (track-a)" in delete_log.read_text(encoding="utf-8")
+    assert (tmp_path / "sleeps").read_text().splitlines() == (
+        ["60", "60"] if budget == "120" else []
+    )
+    assert f"{deadline} -n test-ns delete deployments -l research-tag in (track-a)" in (
+        tmp_path / "calls"
+    ).read_text()
+
+
+@pytest.mark.parametrize(
+    "state_change, deadline",
+    [
+        ("none", 1120),
+        ("tamper", 1220),
+        ("missing", 1220),
+        ("symlink", 1220),
+        ("fifo", 1220),
+        ("hard_cap", 1080),
+    ],
+)
+def test_cutoff_restart_authenticates_state_and_preserves_deadlines(
+    tmp_path, run_generated_cutoff, state_change, deadline
+):
+    first = run_generated_cutoff()
+    assert first.returncode == 0, first.stderr
+    state_file = tmp_path / "state" / "restart" / "cutoff_state.json"
+    saved_state = state_file.read_text()
+    assert json.loads(saved_state)["payload"]["KILL_AT_EPOCH"] == 1120
+    if state_change == "tamper":
+        state = json.loads(saved_state)
+        state["payload"]["KILL_AT_EPOCH"] = 9999
+        state_file.write_text(json.dumps(state))
+    elif state_change in {"missing", "symlink", "fifo"}:
+        state_file.unlink()
+        if state_change == "symlink":
+            target = tmp_path / "untrusted-state"
+            target.write_text(saved_state)
+            state_file.symlink_to(target)
+        elif state_change == "fifo":
+            os.mkfifo(state_file)
+    (tmp_path / "clock").write_text("1005\n")
+    overrides = {"PODS_READY": "false"}
+    if state_change == "hard_cap":
+        overrides["HARD_KILL_AT_EPOCH"] = "1080"
+
+    restarted = run_generated_cutoff(**overrides)
+
+    assert restarted.returncode == 0, restarted.stderr
+    reused = state_change in {"none", "hard_cap"}
+    assert ("Loaded existing cutoff state" in restarted.stdout) == reused
+    calls = (tmp_path / "calls").read_text()
+    assert ("get pods" in calls) != reused
+    assert f"{deadline} -n test-ns delete deployments -l research-tag in (track-a)" in calls
+    if state_change == "symlink":
+        assert target.read_text() == saved_state
