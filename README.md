@@ -268,6 +268,19 @@ After launch, the student can finish its turn. The deterministic controller poll
 
 Worker and container restarts preserve completed OpenHands events. Recovered live training is terminated safely rather than being adopted under an unverifiable process identity; the original student conversation receives the persisted terminal outcome.
 
+The terminal policy checks nested shell commands, substitutions, and command
+wrappers. Quoted input to `python -` remains Python data; heredocs fed to a
+shell are checked as shell commands. Literal numeric arithmetic such as
+`echo $((2 + 2))` is supported. Variable-based arithmetic, dynamic executable
+names, startup-variable changes, and shell reevaluation are rejected.
+
+Use the target environment already supplied to terminals instead of
+`source .venv/bin/activate`. `source` can load unchecked commands and redefine
+the current shell. Use `bash -c` instead of `bash -lc`; login and interactive
+shells can load unchecked startup files. The policy is a behavioral guardrail,
+not a shell sandbox or a credential-containment boundary. It does not inspect
+arbitrary Python programs or executable files.
+
 Interactive browser operations are progressively disclosed. A fresh root
 conversation initially sees only `load_browser`; invoking it adds the fourteen
 OpenHands browser operations and records the choice in conversation state so a
