@@ -14,6 +14,7 @@ from openhands.sdk.tool import ToolAnnotations, ToolExecutor
 from pydantic import SecretStr
 
 from senpai_agent import git_workflow
+from senpai_agent.git_transport import github_repository_url
 from senpai_agent.github.workflow import (
     GitHubWorkflow,
     MutationResult,
@@ -181,7 +182,7 @@ class SubmitExperimentResultExecutor(
                     branch=action.branch,
                     expected_remote_sha=action.remote_branch_sha_before_push,
                     expected_local_sha=commit_sha,
-                    authenticated_remote=git_workflow.github_repository_url(
+                    authenticated_remote=github_repository_url(
                         self.runtime.workflow.repo
                     ),
                     token=self.runtime.git_token,

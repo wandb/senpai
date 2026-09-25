@@ -202,6 +202,34 @@ def test_supervisor_does_not_start_a_worker_without_a_discoverable_program(
     assert "senpai.yaml" in message
 
 
+def test_supervisor_starts_the_controller_with_trusted_safe_path_python(tmp_path, monkeypatch):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    (workspace / "program.md").write_text("Research policy.")
+    role_file = tmp_path / "advisor.md"
+    role_file.write_text("Advisor role.")
+    token_file = tmp_path / "github-token"
+    token_file.write_text("test-token")
+    token_file.chmod(0o600)
+    commands = []
+
+    def capture_worker(self, _stop):
+        commands.append(self.command)
+        return 0
+
+    monkeypatch.setattr(WorkerSupervisor, "run", capture_worker)
+    assert supervisor_module.supervisor_main(
+        ["advisor"],
+        {
+            "SENPAI_OPENHANDS_STATE_DIR": str(tmp_path / "state"),
+            "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
+            "SENPAI_OPENHANDS_ROLE_FILE": str(role_file),
+            "SENPAI_GITHUB_TOKEN_FILE": str(token_file),
+        },
+    ) == 0
+    assert commands == [(sys.executable, "-P", "-m", "senpai_agent.controller", "advisor")]
+
+
 def test_pid_one_reaps_adopted_children_without_reaping_its_worker(monkeypatch):
     reaped = []
     monkeypatch.setattr(supervisor_module.os, "getpid", lambda: 1)
