@@ -173,6 +173,9 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
     )
 
     assert "--agent" in fast.command
+    assert fast.command[:4] == (
+        str(config.python_executable), "-P", "-m", "senpai_agent.openhands_runner"
+    )
     assert fast.command[fast.command.index("--agent") + 1] == "bash-runner"
     assert "anthropic/claude-haiku-4-5" in fast.command
     assert fast.command[fast.command.index("--reasoning-effort") + 1] == "low"

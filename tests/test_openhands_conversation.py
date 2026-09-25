@@ -38,6 +38,89 @@ from openhands_support import (
 )
 
 
+@pytest.mark.parametrize("child", [False, True])
+def test_runtime_loads_explicit_assets_without_ambient_plugins(
+    tmp_path, monkeypatch, child,
+):
+    from openhands.sdk.conversation.impl import local_conversation
+    from openhands.sdk.plugin.discovery import load_available_plugins
+
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    target_skill = workspace / ".agents/skills/research-check/SKILL.md"
+    target_skill.parent.mkdir(parents=True)
+    target_skill.write_text(
+        "---\nname: research-check\ndescription: Target research checks\n---\n"
+        "Inspect the target measurements.\n"
+    )
+    target_agent = workspace / ".agents/agents/target-worker.md"
+    target_agent.parent.mkdir(parents=True)
+    target_agent.write_text(
+        "---\nname: target-worker\ndescription: Target worker\nmodel: inherit\n"
+        "tools: [terminal]\nskills: [research-check]\n"
+        "mcp_config:\n  research:\n    url: https://example.invalid/mcp\n"
+        "    transport: streamable-http\n---\nInspect the target.\n"
+    )
+    ambient = workspace / ".agents/plugins/untrusted"
+    (ambient / ".plugin").mkdir(parents=True)
+    (ambient / ".plugin/plugin.json").write_text('{"name":"untrusted"}')
+    skill = ambient / "skills/ambient-only/SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(
+        "---\nname: ambient-only\ndescription: Ambient skill\n---\nUntrusted.\n"
+    )
+    marker = tmp_path / "ambient-hook-ran"
+    (ambient / "hooks").mkdir()
+    (ambient / "hooks/hooks.json").write_text(json.dumps({
+        "hooks": {"SessionStart": [{"hooks": [{
+            "type": "command", "command": f"touch '{marker}'",
+        }]}]},
+    }))
+    (ambient / ".mcp.json").write_text(json.dumps({
+        "mcpServers": {"ambient": {
+            "url": "https://example.invalid/ambient", "transport": "streamable-http",
+        }},
+    }))
+    assert "untrusted" in load_available_plugins(workspace, include_project=True)
+    # Restore the real discovery function for this case, then restore prior
+    # process state after run_openhands installs its process-wide boundary.
+    monkeypatch.setattr(local_conversation, "load_available_plugins", load_available_plugins)
+    captured = {}
+
+    class InspectConversation(runner.LocalConversation):
+        def send_message(self, _prompt):
+            self._ensure_plugins_loaded()
+            captured["agent"] = self.agent
+
+        async def arun(self):
+            with self.state:
+                self.state.execution_status = ConversationExecutionStatus.FINISHED
+
+    monkeypatch.setattr(runner, "LocalConversation", InspectConversation)
+    monkeypatch.setattr(runner, "final_agent_result", lambda _conversation: "Inspected")
+    config = runtime_config(
+        tmp_path,
+        workspace=workspace,
+        child=child,
+        agent_name="target-worker" if child else None,
+        conversation_secrets={},
+    )
+
+    assert run_openhands("Inspect the project", config) == 0
+
+    agent = captured["agent"]
+    skills = {skill.name for skill in agent.agent_context.skills}
+    assert {"research-check", "exa-search", "wandb-primary"} <= skills
+    assert "ambient-only" not in skills
+    assert "ambient" not in agent.mcp_config
+    assert not marker.exists()
+    if child:
+        assert [(tool.name, tool.params) for tool in agent.tools] == [
+            ("senpai_terminal", {"role": "advisor"}),
+        ]
+        assert "research" in agent.mcp_config
+
+
 def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     tmp_path,
     monkeypatch,

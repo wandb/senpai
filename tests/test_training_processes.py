@@ -1,4 +1,6 @@
+import json
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -7,6 +9,7 @@ import psutil
 
 from senpai_agent.training import (
     TrainingResult,
+    TrainingSpec,
     TrainingState,
     TrainingSupervisor,
 )
@@ -24,6 +27,50 @@ TERM_IGNORING_SLEEP = (
     "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
     "time.sleep(60)"
 )
+
+
+def test_training_preserves_target_python_and_project_imports(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    workspace, supervisor = make_supervisor(tmp_path)
+    target_env = tmp_path / "target-env"
+    subprocess.run(
+        [sys.executable, "-P", "-m", "venv", "--without-pip", str(target_env)],
+        check=True,
+    )
+    monkeypatch.setenv("SENPAI_TARGET_PYTHON_ENV", str(target_env))
+    (workspace / "project_module.py").write_text("VALUE = 'project import'\n")
+    output = workspace / "environment.json"
+    script = workspace / "train.py"
+    script.write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "from project_module import VALUE\n"
+        f"Path({str(output)!r}).write_text(json.dumps({{"
+        "'value': VALUE, 'prefix': sys.prefix, 'safe_path': sys.flags.safe_path, "
+        "'uv_python': os.environ['UV_PYTHON'], "
+        "'uv_project_environment': os.environ['UV_PROJECT_ENVIRONMENT'], "
+        "'virtual_env': os.environ['VIRTUAL_ENV']}))\n"
+    )
+
+    running = supervisor.run_training(
+        TrainingSpec(
+            argv=["python", str(script)], cwd=str(workspace), timeout_seconds=30,
+        )
+    )
+    terminal = wait_for_terminal(supervisor, running.training_id)
+
+    assert terminal.state is TrainingState.FINISHED
+    assert json.loads(output.read_text()) == {
+        "value": "project import",
+        "prefix": str(target_env),
+        "safe_path": False,
+        "uv_python": str(target_env / "bin" / "python"),
+        "uv_project_environment": str(target_env),
+        "virtual_env": str(target_env),
+    }
 
 
 def test_training_timeout_honors_the_requested_deadline(tmp_path: Path):

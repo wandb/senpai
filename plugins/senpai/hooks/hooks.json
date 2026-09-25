@@ -5,7 +5,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "python -m senpai_agent.hooks pre-tool-use",
+          "command": "/opt/senpai-venv/bin/python -P -m senpai_agent.hooks pre-tool-use",
           "timeout": 10
         }
       ]
@@ -15,7 +15,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "python -m senpai_agent.hooks pre-tool-use",
+          "command": "/opt/senpai-venv/bin/python -P -m senpai_agent.hooks pre-tool-use",
           "timeout": 10
         }
       ]
@@ -27,7 +27,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "python -m senpai_agent.hooks stop",
+          "command": "/opt/senpai-venv/bin/python -P -m senpai_agent.hooks stop",
           "timeout": 15
         }
       ]
@@ -39,7 +39,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "python -m senpai_agent.hooks session-end",
+          "command": "/opt/senpai-venv/bin/python -P -m senpai_agent.hooks session-end",
           "timeout": 15
         }
       ]

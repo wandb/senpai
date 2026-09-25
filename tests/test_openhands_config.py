@@ -44,6 +44,32 @@ def test_explicit_role_file_is_loaded(tmp_path: Path):
     assert read_instruction_file(selected) == "student role"
 
 
+def test_reserved_agents_load_from_the_explicit_runtime_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        runner,
+        "SOURCE_SENPAI_AGENT_DIR",
+        tmp_path / "missing-source-tree-agents",
+    )
+    monkeypatch.setenv(
+        runner.SENPAI_AGENT_DIR_ENV,
+        str(ROOT / ".agents" / "agents"),
+    )
+
+    definitions = sanitized_agent_definitions(workspace)
+
+    assert {definition.name for definition in definitions} == {
+        "bash-runner",
+        "general-purpose",
+        "explore",
+        "search",
+    }
+
+
 @pytest.mark.parametrize("explicit", [None, "missing.md"])
 def test_role_file_must_be_explicit_and_exist(tmp_path: Path, explicit: str | None):
     path = None if explicit is None else str(tmp_path / explicit)
