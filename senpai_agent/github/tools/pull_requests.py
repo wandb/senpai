@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
@@ -109,13 +109,11 @@ class GetPRsObservation(Observation):
 class _GetPRsExecutor(ToolExecutor[GetPRsAction, GetPRsObservation]):
     def __init__(
         self,
-        get_prs_fn: Callable[..., PRRetrievalResult],
         *,
-        credentials: GitHubCredentials | None,
+        credentials: GitHubCredentials,
         artifact_dir: Path,
         target_workspace: Path,
     ):
-        self.get_prs = get_prs_fn
         self.credentials = credentials
         self.artifact_dir = artifact_dir
         self.target_workspace = target_workspace
@@ -125,12 +123,11 @@ class _GetPRsExecutor(ToolExecutor[GetPRsAction, GetPRsObservation]):
         action: GetPRsAction,
         conversation: LocalConversation | None = None,
     ) -> GetPRsObservation:
-        if self.credentials is not None and action.repo != self.credentials.repo:
+        if action.repo != self.credentials.repo:
             raise PermissionError(
                 "requested repository does not match configured GitHub credentials"
             )
-        auth = {"token": self.credentials.token} if self.credentials is not None else {}
-        result = self.get_prs(
+        result = get_prs(
             action.repo,
             numbers=action.numbers,
             date_range=action.date_range,
@@ -138,7 +135,7 @@ class _GetPRsExecutor(ToolExecutor[GetPRsAction, GetPRsObservation]):
             max_inline_prs=action.max_inline_prs,
             artifact_dir=self.artifact_dir,
             target_workspace=self.target_workspace,
-            **auth,
+            token=self.credentials.token,
         )
         return GetPRsObservation.from_result(result)
 
@@ -153,14 +150,11 @@ class GetPRsTool(ToolDefinition[GetPRsAction, GetPRsObservation]):
         cls,
         conv_state: object | None = None,
         *,
-        get_prs_fn: Callable[..., PRRetrievalResult] = get_prs,
         state_dir: str | Path | None = None,
         workspace: str | Path | None = None,
     ) -> Sequence[Self]:
-        credentials = (
-            current_github_credentials() if get_prs_fn is get_prs else None
-        )
-        if get_prs_fn is get_prs and credentials is None:
+        credentials = current_github_credentials()
+        if credentials is None:
             raise RuntimeError(
                 "configure GitHub credentials before initializing get_prs"
             )
@@ -189,7 +183,6 @@ class GetPRsTool(ToolDefinition[GetPRsAction, GetPRsObservation]):
                 observation_type=GetPRsObservation,
                 annotations=tool_annotations("Get pull requests", read_only=True),
                 executor=_GetPRsExecutor(
-                    get_prs_fn,
                     credentials=credentials,
                     artifact_dir=artifact_dir,
                     target_workspace=target_workspace,
