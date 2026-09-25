@@ -92,7 +92,7 @@ The supervisor consumes and unlinks those files, passes each key through a
 one-use descriptor, and drops its stored credentials after starting the worker.
 The controller keeps Exa authentication in trusted runtime memory. Root agents
 and search children use `exa_search`; terminals and training no longer receive
-`EXA_API_KEY`. Intermediate child runtimes carry Exa through private descriptors
+`EXA_API_KEY`. All delegated runtimes carry Exa through private descriptors
 so a general-purpose child can still delegate to a search grandchild. The key
 never enters tool parameters or conversation secrets. W&B remains available to
 research tools, terminals, training, and tracing. GitHub credentials remain
@@ -350,14 +350,18 @@ Children share the parent workspace, so their process and conversation are isola
 The Exa tool preserves the standalone script's controls: 1–100 results,
 publication dates, domains, text filters, freshness, six search types, extra
 queries, summaries, and highlight budgets. Web searches default to 10 results;
-publication searches default to 30. Returned evidence includes every result,
-summary, highlight, and available metadata without a runtime output cutoff.
+publication searches default to 30. Evidence includes every result, summary,
+highlight, and available metadata. Responses above 30,000 characters return an
+explicit preview and save the complete Markdown under the conversation's
+observations directory, outside the target checkout. Agents can read that file
+in bounded ranges, including after a search child finishes. This keeps large
+searches retrievable without filling one model request with all the evidence.
 See the [Exa skill](plugins/senpai/skills/exa-search/SKILL.md) for parameters.
 
 The standalone script remains available to operators outside the agent runtime:
 `python plugins/senpai/skills/exa-search/scripts/search_exa.py general-web "query"`.
-It uses the operator's `EXA_API_KEY` environment or dotenv configuration. Agent
-terminals use the tool instead because their environment has no Exa key.
+It uses the operator's `EXA_API_KEY` environment or dotenv configuration. Within
+Senpai, agents call `exa_search` because terminals receive no Exa key.
 
 ## Task guides
 

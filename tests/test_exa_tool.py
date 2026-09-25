@@ -1,10 +1,32 @@
+import shlex
 from dataclasses import asdict
+from pathlib import Path
 
 import pytest
 from exa_search_support import exa_search
+from openhands.sdk import Agent, LLM, LocalConversation, Tool
+from openhands.sdk.llm import Message
+from openhands.sdk.tool import resolve_tool
+from openhands.tools.terminal import TerminalAction
 from pydantic import SecretStr, ValidationError
 
 import senpai_agent.exa_tool as exa_tool
+from senpai_agent.tools import register_senpai_tools
+
+
+def serialized_tool_text(message, serializer):
+    if serializer == "responses":
+        return message.to_responses_dict(vision_enabled=False)[0]["output"]
+    content = message.to_chat_dict(
+        cache_enabled=False,
+        vision_enabled=False,
+        function_calling_enabled=True,
+        force_string_serializer=serializer == "chat-string",
+        send_reasoning_content=False,
+    )["content"]
+    return content if isinstance(content, str) else "\n".join(
+        block["text"] for block in content
+    )
 
 
 @pytest.fixture
@@ -81,7 +103,12 @@ def exa_service(monkeypatch):
 def test_search_controls_reach_exa_without_exposing_credentials(
     exa_service, arguments, options
 ):
-    calls, _ = exa_service
+    calls, response = exa_service
+    response["results"] = [{
+        "title": "Short result",
+        "url": "https://example.test/short",
+        "id": "short-result",
+    }]
     action = exa_tool.ExaSearchAction(query="neural operators", **arguments)
 
     observation = exa_tool.ExaSearchExecutor()(action)
@@ -92,6 +119,19 @@ def test_search_controls_reach_exa_without_exposing_credentials(
     assert "runtime-key-sentinel" not in action.model_dump_json()
     assert "runtime-key-sentinel" not in observation.markdown
     assert "untrusted external data" in observation.markdown
+    for serializer in ("chat-list", "chat-string", "responses"):
+        output = serialized_tool_text(
+            Message(
+                role="tool",
+                name="exa_search",
+                tool_call_id="short-exa-call",
+                content=observation.to_llm_content,
+            ),
+            serializer,
+        )
+        assert "## 1. Short result" in output
+        assert "**URL:** <https://example.test/short>" in output
+        assert "**Exa ID:** short-result" in output
 
 
 @pytest.mark.parametrize("mode", ["general-web", "research-publications"])
@@ -127,7 +167,10 @@ def test_tool_matches_legacy_script_request_contract(exa_service, mode, search_t
     assert calls[1] == calls[0]
 
 
-def test_search_returns_all_requested_evidence_and_escapes_external_text(exa_service):
+def test_search_returns_all_requested_evidence_and_escapes_external_text(
+    exa_service, tmp_path
+):
+    register_senpai_tools()
     _, response = exa_service
     response.update(
         searchTime=123,
@@ -135,7 +178,7 @@ def test_search_returns_all_requested_evidence_and_escapes_external_text(exa_ser
         results=[
             {
                 "title": f"Result {index}\n# injected heading",
-                "url": f"https://example.test/{index}\n- injected",
+                "url": f" \thttps://example.test/{index}\n- injected \t",
                 "author": "A. Researcher",
                 "publishedDate": "2026-06-01",
                 "id": f"publication:{index}",
@@ -153,13 +196,70 @@ def test_search_returns_all_requested_evidence_and_escapes_external_text(exa_ser
         ],
     )
 
-    observation = exa_tool.ExaSearchExecutor()(
-        exa_tool.ExaSearchAction(
-            query="operators", num_results=100, summary_query="Explain the mechanism"
-        )
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    conversation = LocalConversation(
+        agent=Agent(
+            llm=LLM(model="anthropic/claude-haiku-4-5", api_key=SecretStr("test-key")),
+            tools=[Tool(name="senpai_exa")],
+        ),
+        workspace=workspace,
+        persistence_dir=tmp_path / "state",
+        visualizer=None,
+        delete_on_close=True,
     )
+    try:
+        tool = resolve_tool(Tool(name="senpai_exa"), conversation.state)[0]
+        observation = tool.executor(
+            exa_tool.ExaSearchAction(
+                query="operators", num_results=100, summary_query="Explain the mechanism"
+            ),
+            conversation,
+        )
+        artifacts = list(
+            Path(conversation.state.env_observation_persistence_dir).rglob("*.md")
+        )
+        assert len(artifacts) == 1, "Oversized search must retain complete evidence"
+        artifact = artifacts[0]
+        output = artifact.read_text()
+        for serializer in ("chat-list", "chat-string", "responses"):
+            receipt = serialized_tool_text(
+                Message(
+                    role="tool",
+                    name="exa_search",
+                    tool_call_id="exa-call",
+                    content=observation.to_llm_content,
+                ),
+                serializer,
+            )
+            assert len(receipt) < 50_000
+            assert str(artifact) in receipt
+            assert str(len(output)) in receipt
+            assert "preview" in receipt.lower()
+            assert "bounded ranges" in receipt
+            assert "100 returned / 100 requested" in receipt
+            assert "runtime-key-sentinel" not in receipt
 
-    output = "\n".join(content.text for content in observation.to_llm_content)
+        terminal = resolve_tool(
+            Tool(name="senpai_terminal", params={"role": "advisor"}),
+            conversation.state,
+        )[0]
+        try:
+            late_evidence = terminal.executor(
+                TerminalAction(command=f"tail -n 6 {shlex.quote(str(artifact))}"),
+                conversation,
+            )
+            assert not late_evidence.is_error, late_evidence.text
+            assert late_evidence.exit_code == 0, late_evidence.text
+            assert "Summary tail 100." in late_evidence.text
+            assert "Evidence tail 100." in late_evidence.text
+            assert "Second tail 100." in late_evidence.text
+        finally:
+            terminal.executor.close()
+    finally:
+        conversation.close()
+
+    assert artifact.read_text() == output
     assert "100 returned / 100 requested" in output
     assert "**Search time:** 123 ms" in output
     assert "**Total:** 0.007" in output

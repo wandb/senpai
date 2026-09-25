@@ -66,21 +66,25 @@ def test_child_mode_keeps_bounded_delegation_lifecycle_tools(tmp_path):
 
 @pytest.mark.parametrize("configured", [False, True])
 def test_exa_tool_spec_exposes_search_without_its_runtime_credential(tmp_path, configured):
+    config = runtime_config(
+        tmp_path,
+        exa_api_key=SecretStr("exa-secret-sentinel") if configured else None,
+    )
     specs = [
         tool
-        for tool in build_main_tools(runtime_config(
-            tmp_path,
-            exa_api_key=SecretStr("exa-secret-sentinel") if configured else None,
-        ))
+        for tool in build_main_tools(config)
         if tool.name == "senpai_exa"
     ]
-    assert len(specs) == int(configured)
-    if configured:
-        assert specs[0].params == {}
-        assert "exa-secret-sentinel" not in specs[0].model_dump_json()
-        assert [tool.name for tool in resolve_tool(specs[0], SimpleNamespace())] == [
-            "exa_search"
-        ]
+    assert len(specs) == 1
+    assert specs[0].params == {}
+    assert "exa-secret-sentinel" not in specs[0].model_dump_json()
+    assert [tool.name for tool in resolve_tool(specs[0], SimpleNamespace())] == [
+        "exa_search"
+    ]
+    llm = LLM(model="anthropic/claude-opus-4-8", api_key=SecretStr("test-key"))
+    persisted = Agent(llm=llm, tools=[Tool(name="senpai_exa")])
+    runtime = Agent(llm=llm, tools=specs)
+    assert runtime.verify(persisted) is runtime
 
 
 def test_browser_family_is_lazy_and_respects_disable_flag(tmp_path):
