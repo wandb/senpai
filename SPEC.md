@@ -710,8 +710,8 @@ The terminal policy parses Bash syntax before checking nested commands and
 recognized command runners. It rejects malformed syntax, dynamic executable
 names, startup-file loading, shell callbacks, aliases, and variable-name
 reevaluation. Shell startup and prompt variables are also reserved against
-custom-secret injection. Quoted Python, `cat`, and `tee` heredocs are data
-when every recognized consumer reads data; recognized shell-fed heredocs receive recursive shell checks,
+custom-secret injection. Quoted Python and known text-consumer heredocs are
+data when every recognized consumer reads data; recognized shell-fed heredocs receive recursive shell checks,
 including substitutions inside their bodies. Literal numeric arithmetic is
 allowed, while variable arithmetic and C-style polling loops remain rejected.
 Common argv wrappers preserve the wrapped command's data arguments. Runners

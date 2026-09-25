@@ -214,6 +214,10 @@ def test_quoted_python_stdin_is_data_for_the_shell_policy(body: str):
         "PYTHONUNBUFFERED=1 python3 - <<'PY'\nprint(*xs)\nPY",
         "cat <<'PY' | python3\nprint(*xs)\nPY",
         "tee notes.md <<'DOC'\nconfig['lr'] = 0.1\nDOC",
+        "cd data && python - <<'PY'\nprint(*xs)\nPY",
+        "mkdir -p output && uv run python - <<'PY'\nconfig['lr'] = 0.1\nPY",
+        "python - <<'PY' | head\nprint(*xs)\nPY",
+        "python - <<'PY' | grep result\nprint(*xs)\nPY",
     ],
 )
 def test_quoted_heredocs_preserve_known_data_consumers(command: str):
@@ -248,6 +252,8 @@ def test_python_named_shell_symlink_does_not_hide_executable_heredoc(tmp_path: P
         "exec 3> >(bash); cat >&3 <<'SH'\necho \"$(git push origin experiment)\"\nSH",
         "exec 3> >(bash); tee /dev/fd/3 <<'SH'\necho \"$(git push origin experiment)\"\nSH",
         "python - <<'PYCODE'\nprint(*xs)\nPYCODE\ngit push origin experiment",
+        "git push origin experiment && python - <<'PY'\nprint(*xs)\nPY",
+        "cat <<'SH' | head | sh\necho \"$(git push origin experiment)\"\nSH",
     ],
 )
 def test_heredoc_shell_execution_checks_the_actual_restricted_command(command: str):

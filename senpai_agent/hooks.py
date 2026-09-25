@@ -259,6 +259,8 @@ def _heredoc_feeds_data_sinks(node: object, source: bytes, workspace: Path) -> b
 
 
 def _is_heredoc_data_sink(node: object, source: bytes, workspace: Path) -> bool:
+    if node is not None and node.type == "list":
+        node = node.named_children[-1]
     if node is not None and node.type == "redirected_statement":
         node = node.child_by_field_name("body")
     if node is None or node.type != "command":
@@ -285,7 +287,7 @@ def _is_heredoc_data_sink(node: object, source: bytes, workspace: Path) -> bool:
         for argument in arguments[1:]
     ):
         return False
-    return program in {"cat", "tee"} or re.fullmatch(
+    return program in {"cat", "tee", "head", "grep"} or re.fullmatch(
         r"python(?:[0-9]+(?:[.][0-9]+)*)?", program
     ) is not None
 

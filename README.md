@@ -269,8 +269,9 @@ After launch, the student can finish its turn. The deterministic controller poll
 Worker and container restarts preserve completed OpenHands events. Recovered live training is terminated safely rather than being adopted under an unverifiable process identity; the original student conversation receives the persisted terminal outcome.
 
 The terminal policy checks nested shell commands, substitutions, and command
-wrappers. Quoted heredocs passed to Python, `cat`, or `tee` remain data,
-including `uv run python`. Heredocs fed to a shell are checked as shell
+wrappers. Quoted heredocs passed to Python or known text consumers (`cat`,
+`tee`, `head`, and `grep`) remain data, including `uv run python` after `cd &&`.
+Heredocs fed to a shell are checked as shell
 commands. Literal numeric arithmetic such as
 `echo $((2 + 2))` is supported. Variable-based arithmetic, dynamic executable
 names, startup-variable changes, and shell reevaluation are rejected.
