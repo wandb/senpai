@@ -181,6 +181,9 @@ class SubmitExperimentResultExecutor(
                     branch=action.branch,
                     expected_remote_sha=action.remote_branch_sha_before_push,
                     expected_local_sha=commit_sha,
+                    authenticated_remote=git_workflow.github_repository_url(
+                        self.runtime.workflow.repo
+                    ),
                     token=self.runtime.git_token,
                 )
                 result = self._submit_after_push(number, action.result)

@@ -412,6 +412,16 @@ The controller owns cadence, durable events, conversation selection, verified Gi
 
 The command policy blocks raw GitHub mutations, direct training, `git push`, polling loops, and log streams. Operation-specific typed tools enforce repository, branch, assignment, revision, head-SHA, label, and replay preconditions. This policy keeps routine operations deterministic while leaving high-entropy research work to the agent.
 
+Authenticated Git publication uses `/usr/bin/git` in a temporary bare repository.
+It derives the GitHub URL from the configured repository and ignores checkout
+remote URLs, hooks, Git configuration, and proxy settings. Assignment creation
+fetches only the base commit and tree; replay fetches one generation of parents
+to verify the existing assignment. The advisor checkout keeps its shallow boundary.
+Publication checks the exact local commit and remote head, then uses a remote
+lease. It publishes that commit even if the worktree has uncommitted changes;
+training still requires a clean worktree. Bootstrap retains the runner and target
+pre-push hooks, but no longer installs a Git executable shim on `PATH`.
+
 When `WANDB_ENTITY` and `WANDB_PROJECT` are configured, [`weave-openhands`](https://github.com/morganmcg1/weave-openhands) traces advisor, student, and child conversations. Each `OPENHANDS_RUN` record includes a direct Weave Agent Observability URL.
 
 ## Operations

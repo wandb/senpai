@@ -36,7 +36,7 @@ echo "GPUs:         $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/n
 cd "$WORKDIR"
 git config --global safe.directory "$WORKDIR"
 source "$SOURCE_SENPAI_PLUGIN/scripts/git-guard.sh"
-install_senpai_git_guard "$WORKDIR" "$TARGET_WORKDIR" "$GIT_ASKPASS_FILE"
+install_senpai_git_guard "$WORKDIR" "$GIT_ASKPASS_FILE"
 
 clone_target_repo() {
     local depth=()

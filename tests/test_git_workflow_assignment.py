@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 import senpai_agent.git_workflow as git_workflow
 from senpai_agent.git_workflow import (
@@ -52,6 +53,26 @@ def test_create_assignment_branch_is_empty_idempotent_and_worktree_safe(
         "rev-parse",
         f"{base_sha}^{{tree}}",
     )
+
+
+def test_credentialed_assignment_creation_uses_an_isolated_repository(tmp_path: Path):
+    workspace, remote, base_sha = advisor_repository(tmp_path)
+    attacker_remote = tmp_path / "attacker.git"
+    git(tmp_path, "init", "--bare", str(attacker_remote))
+    git(workspace, "remote", "set-url", "--push", "origin", str(attacker_remote))
+
+    created = create_assignment_branch(
+        workspace,
+        branch="student-one/lower-lr",
+        base_branch="schmidhuber",
+        expected_base_sha=base_sha,
+        assignment_id="assignment-7",
+        authenticated_remote=remote.resolve().as_uri(),
+        token=SecretStr("typed-write-token"),
+    )
+
+    assert git(remote, "rev-parse", f"refs/heads/{created.branch}") == created.head_sha
+    assert git(attacker_remote, "branch", "--list", created.branch) == ""
 
 
 def test_create_assignment_branch_rejects_foreign_existing_history(
@@ -108,3 +129,48 @@ def test_create_assignment_branch_rejects_a_base_that_moves_during_fetch(
         )
 
     assert git(remote, "branch", "--list", "student-one/lower-lr") == ""
+
+
+def test_credentialed_assignments_fetch_bounded_history_from_a_shallow_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace, remote, base_sha = advisor_repository(tmp_path)
+    for index in range(16):
+        base_sha = detached_commit(workspace, base_sha, f"history {index}")
+    git(workspace, "push", "origin", f"{base_sha}:refs/heads/schmidhuber")
+    shallow_workspace = tmp_path / "shallow-workspace"
+    git(
+        tmp_path, "clone", "--depth=1", "--branch=schmidhuber",
+        remote.resolve().as_uri(), str(shallow_workspace),
+    )
+    original_boundary = (shallow_workspace / ".git" / "shallow").read_bytes()
+    fetched_commit_counts = []
+    real_git = git_workflow._git
+
+    def observe_fetch(repository, *arguments, **kwargs):
+        result = real_git(repository, *arguments, **kwargs)
+        if arguments[0] == "fetch":
+            objects = git(
+                repository, "cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"
+            )
+            fetched_commit_counts.append(objects.splitlines().count("commit"))
+        return result
+
+    monkeypatch.setattr(git_workflow, "_git", observe_fetch)
+    arguments = dict(
+        branch="student-one/lower-lr",
+        base_branch="schmidhuber",
+        expected_base_sha=base_sha,
+        assignment_id="assignment-7",
+        authenticated_remote=remote.resolve().as_uri(),
+        token=SecretStr("typed-write-token"),
+    )
+    first = create_assignment_branch(shallow_workspace, **arguments)
+    repeated = create_assignment_branch(shallow_workspace, **arguments)
+
+    assert first.changed and not repeated.changed
+    assert first.head_sha == repeated.head_sha
+    assert git(remote, "rev-parse", f"{first.head_sha}^") == base_sha
+    assert (shallow_workspace / ".git" / "shallow").read_bytes() == original_boundary
+    assert fetched_commit_counts == [1, 1, 2]
