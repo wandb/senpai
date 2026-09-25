@@ -15,6 +15,24 @@ GITHUB_CREDENTIAL_ENV_NAMES = (
 )
 CUSTOM_SECRET_ENV_NAMES_ENV = "SENPAI_CUSTOM_SECRET_ENV_NAMES"
 BUILTIN_CONVERSATION_SECRET_ENV_NAMES = ("WANDB_API_KEY", "EXA_API_KEY")
+SHELL_STARTUP_ENV_NAMES = frozenset(
+    {
+        "BASHOPTS",
+        "BASH_ENV",
+        "BASH_XTRACEFD",
+        "ENV",
+        "MAILCHECK",
+        "MAILPATH",
+        "PROMPT_COMMAND",
+        "PS0",
+        "PS1",
+        "PS2",
+        "PS3",
+        "PS4",
+        "SHELLOPTS",
+        "ZDOTDIR",
+    }
+)
 _RESERVED_CUSTOM_SECRET_ENV_NAMES = frozenset(
     {
         # Built-in credentials use separate trust boundaries.
@@ -44,8 +62,7 @@ _RESERVED_CUSTOM_SECRET_ENV_NAMES = frozenset(
         "WANDB_MODE",
         "WANDB_PROJECT",
         # Custom credentials must not change process startup or executable routing.
-        "BASH_ENV",
-        "ENV",
+        *SHELL_STARTUP_ENV_NAMES,
         "GIT_ASKPASS",
         "GIT_CONFIG_GLOBAL",
         "GIT_CONFIG_SYSTEM",
@@ -61,6 +78,7 @@ _RESERVED_CUSTOM_SECRET_ENV_NAMES = frozenset(
         "PATH",
         "PYTHONHOME",
         "PYTHONPATH",
+        "PYTHONSAFEPATH",
         "PYTHONSTARTUP",
         "SHELL",
         "SSH_ASKPASS",

@@ -765,6 +765,22 @@ Denied patterns include raw GitHub mutations, raw `git push`, direct training
 launches, sleeps, polling loops, `watch`, and `tail -f`, including nested shell
 and `env` wrappers.
 
+The terminal policy parses Bash syntax before checking nested commands and
+recognized command runners. It rejects malformed syntax, dynamic executable
+names, startup-file loading, shell callbacks, aliases, and variable-name
+reevaluation. Shell startup and prompt variables are also reserved against
+custom-secret injection. Quoted Python and known text-consumer heredocs are
+data when every consumer and output path is recognized. Process substitutions
+anywhere in the command, inherited output redirects to unknown streams, and
+dynamic or device-file destinations disable that exemption. Other heredocs
+receive recursive shell checks, including substitutions inside their bodies.
+These conservative checks can reject valid data. Literal numeric arithmetic is
+allowed, while variable arithmetic and C-style polling loops remain rejected.
+Common argv wrappers preserve the wrapped command's data arguments. Runners
+with more complex grammars retain conservative checks and can reject otherwise
+valid commands. These checks do not inspect arbitrary executable files or
+Python code and do not establish a shell sandbox.
+
 Every OpenHands turn has a controller-configured hard deadline. The deadline
 interrupts the conversation, produces a non-success result, and leaves durable
 events unacknowledged. The controller then retries with bounded exponential
