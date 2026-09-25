@@ -13,14 +13,15 @@ from senpai_agent.program_context import ProgramSystemPrompt
 from senpai_agent.system_instructions import SenpaiSystemInstructions
 
 
-def test_default_fleet_is_four_students_with_one_gpu_each():
+def test_default_fleet_is_four_students_with_one_single_gpu_node_each():
     args = launch.Args(
         tag="defaults",
         target_repo_url="https://github.com/example/problem.git",
     )
 
     assert args.n_students == 4
-    assert args.gpus_per_student == 1
+    assert args.nodes_per_student == 1
+    assert args.gpus_per_student_node == 1
     assert args.program_path == ""
     assert args.timeout_minutes == 30
     assert args.max_epochs == 50
@@ -32,7 +33,8 @@ def test_launch_context_records_resolved_runtime_facts(backend):
         tag="foil-run",
         advisor_branch="research-v2",
         target_repo_branch="main",
-        gpus_per_student=3,
+        nodes_per_student=2,
+        gpus_per_student_node=3,
         timeout_minutes=12.5,
         max_epochs=7,
     )
@@ -48,10 +50,13 @@ def test_launch_context_records_resolved_runtime_facts(backend):
     assert "resolved by the Senpai launcher" in context
     assert "override conflicting compute or run-limit claims" in context
     assert f"Compute backend: `{backend}`" in context
+    assert (
+        "Training capacity per student: `2` worker nodes x `3` GPUs per node"
+        in context
+    )
     assert "Role: `advisor`" in context
     assert "GitHub repository: `example/problem`" in context
     assert "W&B project: `wandb-applied-ai-team/senpai-v1`" in context
-    assert "Visible GPUs per student: `3`" in context
     assert (
         "Hard limits for each training run: `12.5` minutes wall-clock and `7` epochs"
         in context
@@ -92,7 +97,8 @@ def test_launch_context_limits_each_role_to_its_assigned_students():
 def test_each_role_receives_authoritative_launch_context(role):
     args = launch_args(
         advisor_branch="research",
-        gpus_per_student=2,
+        nodes_per_student=2,
+        gpus_per_student_node=8,
         timeout_minutes=20,
         max_epochs=9,
         extra_instructions="Prefer small, measurable experiments.",
@@ -108,12 +114,15 @@ def test_each_role_receives_authoritative_launch_context(role):
     ).decode()
 
     assert "Compute backend: `kubernetes`" in context
+    assert (
+        "Training capacity per student: `2` worker nodes x `8` GPUs per node"
+        in context
+    )
     assert f"Role: `{role}`" in context
     assert "GitHub repository: `example/problem`" in context
     assert "Advisor branch: `research`" in context
     assert "W&B project: `wandb-applied-ai-team/senpai-v1`" in context
     assert "Students in scope: `fern`" in context
-    assert "Visible GPUs per student: `2`" in context
     assert (
         "Hard limits for each training run: `20` minutes wall-clock and `9` epochs"
         in context
@@ -177,7 +186,8 @@ def test_launch_context_owns_role_scoped_runtime_identity(
         "WANDB_PROJECT": "cfd",
         "STUDENT_NAMES": "fern,frieren",
         "STUDENT_NAME": "stark",
-        "GPUS_PER_STUDENT": "2",
+        "NODES_PER_STUDENT": "1",
+        "GPUS_PER_STUDENT_NODE": "2",
         "WANDB_API_KEY": "wandb-secret-sentinel",
         "GITHUB_TOKEN": "github-secret-sentinel",
         "EXTRA_INSTRUCTIONS_B64": "mutable-operator-sentinel",
@@ -187,7 +197,8 @@ def test_launch_context_owns_role_scoped_runtime_identity(
     launch_context = launch.build_launch_context(
         launch_args(
             advisor_branch="research",
-            gpus_per_student=2,
+            nodes_per_student=1,
+            gpus_per_student_node=2,
             target_repo_url="https://github.com/acme/widgets.git",
             wandb_entity="acme",
             wandb_project="cfd",
@@ -229,21 +240,29 @@ def test_launch_context_owns_role_scoped_runtime_identity(
         assert excluded not in system_prompt
 
 
-def test_advisor_role_prompt_retains_the_gpu_placeholder_value(tmp_path):
+def test_advisor_role_prompt_retains_multinode_capacity_values(tmp_path):
     template = tmp_path / "ADVISOR.md"
-    template.write_text("GPUs: {{GPUS_PER_STUDENT}}\n")
+    template.write_text(
+        "Capacity: {{NODES_PER_STUDENT}} x {{GPUS_PER_STUDENT_NODE}}\n"
+    )
 
     with pytest.raises(
         ValueError,
-        match="Missing ADVISOR.md values: GPUS_PER_STUDENT",
+        match=(
+            "Missing ADVISOR.md values: "
+            "GPUS_PER_STUDENT_NODE, NODES_PER_STUDENT"
+        ),
     ):
         render_role_prompt(template, "advisor", {})
 
     assert render_role_prompt(
         template,
         "advisor",
-        {"GPUS_PER_STUDENT": "2"},
-    ) == "GPUs: 2"
+        {
+            "NODES_PER_STUDENT": "2",
+            "GPUS_PER_STUDENT_NODE": "8",
+        },
+    ) == "Capacity: 2 x 8"
 
 
 def test_role_prompt_never_renders_a_secret_placeholder(tmp_path):
@@ -268,13 +287,13 @@ def test_role_prompt_rejects_an_unmapped_placeholder_containing_a_digit(tmp_path
 
 def test_role_prompt_does_not_render_placeholders_introduced_by_values(tmp_path):
     template = tmp_path / "ADVISOR.md"
-    template.write_text("GPUs: {{GPUS_PER_STUDENT}}\n")
+    template.write_text("GPUs: {{GPUS_PER_STUDENT_NODE}}\n")
 
     rendered = render_role_prompt(
         template,
         "advisor",
         {
-            "GPUS_PER_STUDENT": "{{WANDB_PROJECT}}",
+            "GPUS_PER_STUDENT_NODE": "{{WANDB_PROJECT}}",
             "WANDB_PROJECT": "must-not-be-rendered",
         },
     )

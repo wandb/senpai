@@ -94,11 +94,12 @@ def test_run_training_registers_a_monitor_for_its_conversation(tmp_path: Path):
         monitors.close()
 
 
-def test_training_error_tail_masks_registered_secrets(tmp_path: Path):
+@pytest.mark.parametrize("field", ["error_tail", "kubernetes_diagnostics"])
+def test_training_diagnostics_mask_registered_secrets(tmp_path: Path, field):
     workspace = init_workspace(tmp_path)
     secret = "private-training-token"
     result = finished_result(tmp_path).model_copy(
-        update={"error_tail": f"authentication failed for {secret}"}
+        update={field: f"authentication failed for {secret}"}
     )
     training = StubTraining(workspace, result)
     monitors = MonitorStore(tmp_path / "monitors.sqlite3")
@@ -125,9 +126,9 @@ def test_training_error_tail_masks_registered_secrets(tmp_path: Path):
             conversation,
         )
 
-        assert observation.error_tail == "authentication failed for <secret-hidden>"
+        assert getattr(observation, field) == "authentication failed for <secret-hidden>"
         assert secret not in observation.to_llm_content[0].text
-        assert result.error_tail.endswith(secret)
+        assert getattr(result, field).endswith(secret)
     finally:
         monitors.close()
 

@@ -10,6 +10,7 @@ import yaml
 from git_workflow_support import commit_file, git, repository
 from launch_test_support import (
     ADVISOR_IMAGE,
+    ROOT,
     REVISION,
     STUDENT_IMAGE,
     launch,
@@ -92,6 +93,31 @@ def test_image_reference_accepts_only_full_source_sha_tags_or_digests(image):
 )
 def test_image_reference_rejects_mutable_or_incomplete_pins(image):
     assert not launch_helpers.is_immutable_image_reference(image)
+
+
+def test_digest_image_reference_rejects_source_sha_tags():
+    assert launch_helpers.is_digest_image_reference(
+        f"ghcr.io/wandb/senpai@sha256:{'b' * 64}"
+    )
+    assert not launch_helpers.is_digest_image_reference(
+        f"ghcr.io/wandb/senpai:sha-{REVISION}"
+    )
+
+
+def test_multinode_executor_requires_a_registry_digest():
+    result = run_launch(
+        "--advisor_image",
+        ADVISOR_IMAGE,
+        "--student_image",
+        STUDENT_IMAGE,
+        "--nodes_per_student",
+        "2",
+        "--executor_image",
+        f"ghcr.io/wandb/senpai-executor:sha-{REVISION}",
+    )
+
+    assert result.returncode != 0
+    assert "--executor_image must use an immutable @sha256 digest" in result.stderr
 
 
 def test_source_revision_is_derived_from_a_full_sha_tag():
@@ -258,6 +284,27 @@ def test_role_bootstrap_reuses_runner_checkout_without_touching_target(role, tmp
     assert git(runner, "rev-parse", "HEAD") == revision
     assert token_handoff.stat().st_mode & 0o777 == 0o600
     assert int(umask_output.read_text().strip(), 8) == 0o22
+
+
+def test_multinode_kubectl_wrapper_can_be_reinstalled(tmp_path):
+    entrypoint = (ROOT / "k8s" / "entrypoint-student.sh").read_text()
+    wrapper = entrypoint[
+        entrypoint.index('    proxy_dir="$LOGDIR/bin"') : entrypoint.index(
+            "    for _ in $(seq 1 180)"
+        )
+    ]
+    script = f"set -e\numask 077\n{wrapper}"
+    env = os.environ | {"LOGDIR": str(tmp_path / "state")}
+
+    subprocess.run(["bash", "-c", script], check=True, env=env)
+    subprocess.run(["bash", "-c", script], check=True, env=env)
+
+    kubectl = tmp_path / "state" / "bin" / "kubectl"
+    assert kubectl.stat().st_mode & 0o777 == 0o500
+    assert kubectl.read_text() == (
+        '#!/bin/sh\nexec "$SENPAI_PYTHON" -m senpai_agent.kubernetes_executor kubectl "$@"\n'
+    )
+    assert list(kubectl.parent.glob(".kubectl.*")) == []
 
 
 @pytest.mark.parametrize(
