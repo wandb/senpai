@@ -646,7 +646,15 @@ kubectl --context "$CONTEXT" -n "$NAMESPACE" delete configmaps,secrets \
 This command leaves PVC data and the cutoff Job, script ConfigMap, and shared
 cutoff RBAC resources in place. Operators own their retention and cleanup.
 
-Pod startup and liveness probes read the supervisor lease. Container restarts resume the advisor or student conversation from the pod-local state volume; replacing or rescheduling the pod starts fresh state. Stop a container before copying or snapshotting a live advisor state directory.
+The supervisor serves `/healthz` on all IPv4 interfaces (`0.0.0.0:8080` by
+default). It returns HTTP 200 for a live controller lease and HTTP 503 when
+the lease is missing, invalid, or expired, or its worker is no longer running.
+Kubernetes startup and liveness probes use `httpGet` on fixed port 8080;
+repeated failures restart the container without spawning a probe process.
+The supervisor continues to restart failed workers with bounded backoff.
+Container restarts resume the advisor or student conversation from the pod-local
+state volume; replacing or rescheduling the pod starts fresh state. Stop a
+container before copying or snapshotting a live advisor state directory.
 
 ### Other deployment environments
 
@@ -698,7 +706,14 @@ dependencies. Custom launchers must also point the trusted hook manifest at
 their absolute trusted Python interpreter with `-P`; the bundled manifest
 uses `/opt/senpai-venv/bin/python`.
 
-To build another launcher, reproduce [entrypoint-advisor.sh](k8s/entrypoint-advisor.sh) or [entrypoint-student.sh](k8s/entrypoint-student.sh), render `SENPAI-LAUNCH-CONTEXT.md` with runtime identity, limits, and isolation through `render_launch_context`, and provide it as base64 in `SENPAI_LAUNCH_CONTEXT_B64`. Pass the built-in role template and its required non-secret values to the Python supervisor, which renders and persists that role snapshot. Keep optional operator guidance in `EXTRA_INSTRUCTIONS_B64`. Persist `/var/lib/senpai/<tag>/advisor` for the advisor and use the container healthcheck with a restart policy. Student execution requires Linux, an NVIDIA runtime, and compatible CUDA hardware; Docker Desktop on macOS cannot run the GPU student image.
+To build another launcher, reproduce [entrypoint-advisor.sh](k8s/entrypoint-advisor.sh) or [entrypoint-student.sh](k8s/entrypoint-student.sh), render `SENPAI-LAUNCH-CONTEXT.md` with runtime identity, limits, and isolation through `render_launch_context`, and provide it as base64 in `SENPAI_LAUNCH_CONTEXT_B64`. Pass the built-in role template and its required non-secret values to the Python supervisor, which renders and persists that role snapshot. Keep optional operator guidance in `EXTRA_INSTRUCTIONS_B64`. Persist `/var/lib/senpai/<tag>/advisor` for the advisor. Student execution requires Linux, an NVIDIA runtime, and compatible CUDA hardware; Docker Desktop on macOS cannot run the GPU student image.
+
+The images have no Docker `HEALTHCHECK`. Configure an external monitor to query
+`/healthz`, allow startup grace and repeated failures, and restart the container
+or repeat host bootstrap when recovery fails. Standalone launchers can set
+`SENPAI_HEALTH_PORT`; changing it also requires updating the monitor. Keep port
+8080 with the supplied Kubernetes manifests. This listener monitors one
+supervisor; GitHub remains the cross-node coordination protocol.
 
 ## Development and reference
 

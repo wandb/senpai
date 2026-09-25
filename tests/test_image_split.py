@@ -122,12 +122,12 @@ def test_both_role_images_run_as_the_same_explicit_non_root_user():
         )
 
 
-def test_both_images_expose_the_controller_lease_as_their_healthcheck():
+def test_both_images_do_not_spawn_credential_bearing_health_processes():
     for role in ("advisor", "student"):
         dockerfile = (ROOT / f"Dockerfile.{role}").read_text(encoding="utf-8")
 
-        assert "HEALTHCHECK" in dockerfile
-        assert "CMD senpai-container-health" in dockerfile
+        assert "HEALTHCHECK" not in dockerfile
+        assert "senpai-container-health" not in dockerfile
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
@@ -273,14 +273,6 @@ def test_entrypoints_delegate_runtime_lifecycle_to_the_python_supervisor(
         'install_senpai_git_guard "$WORKDIR"'
     )
     assert "readinessProbe" not in container
-    assert container["livenessProbe"]["exec"]["command"][:2] == [
-        "/bin/sh",
-        "-c",
-    ]
-    assert (
-        "senpai_agent.supervisor health"
-        in container["livenessProbe"]["exec"]["command"][2]
-    )
     assert deployment["spec"]["strategy"] == {"type": "Recreate"}
 
 
@@ -507,7 +499,7 @@ def test_roles_clear_a_stale_lease_before_bootstrap(role: str):
     bootstrap = container["args"][0]
     lease = "openhands_state/controller-lease.json"
 
-    assert entrypoint.index(lease) < entrypoint.index("SENPAI_BOOTSTRAP_STARTED_PATH")
+    assert entrypoint.index(lease) < entrypoint.index("git clone")
     assert bootstrap.index(lease) < bootstrap.index("git init /workspace/senpai")
 
 
@@ -524,13 +516,29 @@ def test_bootstrap_git_credentials_are_not_exposed_in_process_arguments():
         assert "unset GITHUB_TOKEN GH_TOKEN" in bootstrap
         assert "exec bash" in bootstrap
 
-    for role in ("advisor", "student"):
-        container = container_for(load_kubernetes_template(f"{role}-deployment.yaml"))
-        assert (
-            "senpai_agent.supervisor health"
-            in container["startupProbe"]["exec"]["command"][2]
-        )
-        assert container["startupProbe"]["failureThreshold"] == 60
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_role_probes_query_http_without_starting_a_process(role: str):
+    container = container_for(load_kubernetes_template(f"{role}-deployment.yaml"))
+    assert container["startupProbe"] == {
+        "httpGet": {"path": "/healthz", "port": 8080},
+        "periodSeconds": 10,
+        "timeoutSeconds": 5,
+        "failureThreshold": 60,
+    }
+    assert container["livenessProbe"] == {
+        "httpGet": {"path": "/healthz", "port": 8080},
+        "periodSeconds": 30,
+        "timeoutSeconds": 5,
+        "failureThreshold": 5,
+        "terminationGracePeriodSeconds": 75,
+    }
+
+
+def test_role_entrypoints_default_openhands_turns_to_two_hours_of_inactivity():
+    for name in ("entrypoint-advisor.sh", "entrypoint-student.sh"):
+        entrypoint = (ROOT / "k8s" / name).read_text()
+        assert 'SENPAI_OPENHANDS_TIMEOUT_SECONDS:-7200' in entrypoint
 
 
 def test_role_pods_enforce_non_root_process_isolation():
@@ -555,7 +563,6 @@ def test_role_pods_enforce_non_root_process_isolation():
             pod["terminationGracePeriodSeconds"]
             > container["livenessProbe"]["terminationGracePeriodSeconds"]
         )
-        assert container["livenessProbe"]["terminationGracePeriodSeconds"] >= 75
 
 
 def test_runtime_git_auth_uses_ephemeral_askpass_not_a_credential_store():
@@ -617,3 +624,37 @@ def test_launch_configuration_names_only_the_two_role_images():
     assert "student_image" in config
     assert "control_image" not in config
     assert "image" not in config
+
+
+def test_kubectl_proxy_uses_agent_python_inside_target_uv_environment(tmp_path: Path):
+    entrypoint = (ROOT / "k8s" / "entrypoint-student.sh").read_text()
+    proxy_setup = entrypoint[
+        entrypoint.index('    proxy_dir="$LOGDIR/bin"'):
+        entrypoint.index('    export PATH="$proxy_dir:$PATH"')
+    ]
+    runner_python = tmp_path / "runner-python"
+    runner_python.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        "print(json.dumps(sys.argv[1:]))\n"
+    )
+    runner_python.chmod(0o755)
+    target_bin = tmp_path / "target-venv" / "bin"
+    target_bin.mkdir(parents=True)
+    (target_bin / "python").write_text("#!/bin/sh\nexit 99\n")
+    (target_bin / "python").chmod(0o755)
+    environment = {
+        **os.environ,
+        "LOGDIR": str(tmp_path),
+        "SENPAI_PYTHON": str(runner_python),
+        "PATH": f"{target_bin}:{os.environ['PATH']}",
+    }
+    subprocess.run(["bash", "-c", proxy_setup], env=environment, check=True)
+
+    completed = subprocess.run(
+        [str(tmp_path / "bin" / "kubectl"), "apply", "-f", "-"],
+        env=environment, capture_output=True, text=True, check=True,
+    )
+    assert json.loads(completed.stdout) == [
+        "-P", "-m", "senpai_agent.kubernetes_executor", "kubectl", "apply", "-f", "-",
+    ]

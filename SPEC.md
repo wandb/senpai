@@ -70,11 +70,19 @@ OpenHands and Kubernetes.
 OpenHands events renew the root turn's lease; its configured timeout measures
 inactivity rather than total elapsed time. Provider, tool, training, and child
 deadlines remain hard.
-Kubernetes liveness and Docker health checks inspect the same lease, while the
-supervisor provides the same recovery on a plain host.
+The supervisor serves `/healthz` on all IPv4 interfaces, using port 8080 by
+default. It returns HTTP 200 for a live worker lease and HTTP 503 otherwise.
+Kubernetes startup and liveness probes query this endpoint on fixed port 8080
+without creating a process inside the container. The images have no Docker
+`HEALTHCHECK`. Standalone launchers can set `SENPAI_HEALTH_PORT` and configure
+an external monitor with startup grace and retries. After persistent failure,
+the monitor restarts the container or repeats host bootstrap. The supervisor
+retains its worker restart loop on every deployment platform.
 
-The core controller imports no Kubernetes API and needs no Service, port, DNS
-record, ServiceAccount, RBAC, cross-node token, or tailnet.
+The health listener monitors one supervisor. Advisor/student communication
+continues through GitHub. The core controller imports no Kubernetes API.
+Cross-node coordination needs no Service, listening port, DNS record,
+ServiceAccount, RBAC, cross-node token, or tailnet.
 
 GitHub state is level-triggered:
 
@@ -923,7 +931,7 @@ Removed:
 - `.claude/` runtime resources;
 - Claude-named and OpenHands shell watchdog/supervisor loops;
 - the Exa MCP configuration;
-- the HTTP advisor service, bearer token, port, probes, and Kubernetes RBAC;
+- the old HTTP advisor service and its bearer token, port, probes, and Kubernetes RBAC;
 - shell GitHub polling and pod-process inspection;
 - cutoff conversation harvesting;
 - obsolete tool-role instructions; and
