@@ -6,6 +6,7 @@ import time
 import uuid
 from pathlib import Path
 from base64 import b64decode
+from dataclasses import replace
 
 import pytest
 import psutil
@@ -27,11 +28,21 @@ from senpai_agent.launch_context import (
     PLACEHOLDER,
 )
 from senpai_agent.local_events import LocalEventStore
-from senpai_agent.openhands_runner import delegation_config as runner_delegation_config
-from senpai_agent.program_context import PROGRAM_PATH_ENV
+from senpai_agent.openhands_runner import (
+    delegation_config as runner_delegation_config,
+    parse_runner_args,
+    resolve_config,
+)
+from senpai_agent.program_context import PROGRAM_PATH_ENV, PROGRAM_SOURCE_COMMIT_ENV
 from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV
 from senpai_agent.supervisor import prepare_system_context_environment
-from openhands_support import runtime_config
+from senpai_agent.system_instructions import (
+    SYSTEM_INSTRUCTIONS_FILE_ENV,
+    SYSTEM_INSTRUCTIONS_SHA256_ENV,
+    decode_system_instructions,
+    encode_system_instructions,
+)
+from openhands_support import launch_env, runtime_config
 
 
 def delegation_request(
@@ -91,8 +102,7 @@ def delegation_config(tmp_path: Path, **updates) -> DelegationConfig:
         "enable_browser": True,
         "conversation_secrets": {"EXA_API_KEY": "exa-secret"},
         "role": "advisor",
-        "program_path": "program.md",
-        "launch_context": "# Authoritative launch context\n\nSystem policy.",
+        "instructions": runtime_config(tmp_path).instructions,
     }
     values.update(updates)
     return DelegationConfig(**values)
@@ -231,68 +241,65 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
     assert fast.environment["SENPAI_COMPACTION_TRIGGER_TOKENS"] == "200000"
 
 
-def test_child_environment_carries_the_resolved_program_path(tmp_path: Path):
-    child = OpenHandsChildProcess(
-        delegation_config(
-            tmp_path,
-            program_path="senpai/program.md",
-        ),
-        delegation_request(),
-    )
-
-    assert child.environment[PROGRAM_PATH_ENV] == "senpai/program.md"
-    assert (
-        b64decode(child.environment[LAUNCH_CONTEXT_ENV], validate=True).decode()
-        == "# Authoritative launch context\n\nSystem policy."
-    )
-
-
-def test_child_reuses_the_supervisor_rendered_role_prompt(tmp_path: Path):
-    workspace = tmp_path / "target"
-    workspace.mkdir()
-    (workspace / "program.md").write_text("Research policy.\n")
-    prepared = prepare_system_context_environment(
-        "advisor",
-        tmp_path / "state",
-        {
-            "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
-            "SENPAI_OPENHANDS_ROLE_FILE": str(INSTRUCTIONS_ROOT / "ADVISOR.md"),
-            "GH_REPO": "acme/widgets",
-            "ADVISOR_BRANCH": "research",
-            "WANDB_ENTITY": "acme",
-            "WANDB_PROJECT": "cfd",
-            "STUDENT_NAMES": "fern,frieren",
-            "GPUS_PER_STUDENT": "2",
-            "GITHUB_TOKEN": "github-secret-sentinel",
-            "WANDB_API_KEY": "wandb-secret-sentinel",
-        },
-    )
-    role_file = Path(prepared["SENPAI_OPENHANDS_ROLE_FILE"])
-    parent = runtime_config(tmp_path, role_file=role_file)
+def test_descendants_and_restarts_use_the_complete_parent_snapshot(tmp_path: Path):
+    env = launch_env(tmp_path, program_content="Research policy.\n" * 10_000)
+    env.update({
+        "SENPAI_OPENHANDS_ROLE_FILE": str(INSTRUCTIONS_ROOT / "ADVISOR.md"),
+        "ADVISOR_BRANCH": "research",
+        "WANDB_ENTITY": "acme",
+        "WANDB_PROJECT": "cfd",
+        "STUDENT_NAMES": "fern,frieren",
+        "GPUS_PER_STUDENT": "2",
+        "GITHUB_TOKEN": "github-secret-sentinel",
+        "WANDB_API_KEY": "wandb-secret-sentinel",
+    })
+    prepared = prepare_system_context_environment("advisor", tmp_path / "state", env)
+    parent = resolve_config(parse_runner_args(["--max-turns", "1"]), prepared)
+    (parent.workspace / "program.md").write_text("Later workspace policy.")
     delegated = runner_delegation_config(parent)
-    child = OpenHandsChildProcess(
-        delegated,
-        delegation_request(),
+    child = OpenHandsChildProcess(delegated, delegation_request())
+    child_environment = child.environment
+    child_config = resolve_config(parse_runner_args(child.command[4:]), child_environment)
+    grandchild = OpenHandsChildProcess(
+        runner_delegation_config(child_config), delegation_request()
     )
+    grandchild_config = resolve_config(
+        parse_runner_args(grandchild.command[4:]), grandchild.environment
+    )
+    restarted = resolve_config(parse_runner_args(child.command[4:]), child.environment)
 
-    assert delegated.role_file == parent.role_file
-    assert delegated.harness_file == parent.harness_file
-    assert delegated.program_path == parent.instructions.program.program_path
-    assert delegated.launch_context == parent.instructions.launch
-    assert child.command[child.command.index("--role-file") + 1] == str(role_file)
-    assert child.command[child.command.index("--harness-file") + 1] == str(
-        parent.harness_file
+    assert Path(child_environment[SYSTEM_INSTRUCTIONS_FILE_ENV]).stat().st_size > 128 * 1024
+    assert all(
+        len(name.encode()) + len(value.encode()) + 2 < 128 * 1024
+        for name, value in child_environment.items()
     )
-    assert (
-        child.environment[PROGRAM_PATH_ENV]
-        == parent.instructions.program.program_path
-    )
-    role_prompt = role_file.read_text()
-    assert "## Runtime identity" not in role_prompt
+    assert delegated.instructions is parent.instructions
+    assert child_environment[PROGRAM_PATH_ENV] == parent.instructions.program.program_path
+    assert child_environment[PROGRAM_SOURCE_COMMIT_ENV] == parent.instructions.program.source_commit
+    assert b64decode(child_environment[LAUNCH_CONTEXT_ENV], validate=True).decode() == parent.instructions.launch
+    assert child_config.instructions.prompt == parent.instructions.prompt
+    assert grandchild_config.instructions.prompt == parent.instructions.prompt
+    assert restarted.instructions.prompt == parent.instructions.prompt
+    assert child_config.role_file == parent.role_file
+    assert child_config.harness_file == parent.harness_file
+    role_prompt = parent.role_file.read_text()
     assert "Use the `2` GPUs available to each student" in role_prompt
     assert PLACEHOLDER.search(role_prompt) is None
-    assert "github-secret-sentinel" not in role_prompt
-    assert "wandb-secret-sentinel" not in role_prompt
+    assert "github-secret-sentinel" not in parent.instructions.prompt
+    assert "wandb-secret-sentinel" not in parent.instructions.prompt
+
+
+def test_child_rejects_replaced_snapshot_using_parent_digest(tmp_path: Path):
+    child = OpenHandsChildProcess(delegation_config(tmp_path), delegation_request())
+    environment = child.environment
+    context_file = Path(environment[SYSTEM_INSTRUCTIONS_FILE_ENV])
+    original = decode_system_instructions(
+        context_file.read_text().strip(), environment[SYSTEM_INSTRUCTIONS_SHA256_ENV]
+    )
+    context_file.write_text(encode_system_instructions(replace(original, role="Altered role")))
+
+    with pytest.raises(ValueError, match="controller-held"):
+        child.environment
 
 
 def test_child_environment_replaces_ambient_model_credentials(

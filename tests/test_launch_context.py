@@ -3,7 +3,7 @@ import base64
 import pytest
 import yaml
 
-from launch_test_support import launch, launch_args, render_role
+from launch_test_support import REVISION, launch, launch_args, render_role
 from senpai_agent.launch_context import (
     INSTRUCTIONS_ROOT,
     PLACEHOLDER,
@@ -120,6 +120,7 @@ def test_each_role_receives_authoritative_launch_context(role):
     )
     assert "SENPAI_TIMEOUT_MINUTES" not in data
     assert "SENPAI_MAX_EPOCHS" not in data
+    assert data["SENPAI_PROGRAM_SOURCE_COMMIT"] == REVISION
     assert "Prefer small, measurable experiments." not in context
     assert operator == "Prefer small, measurable experiments."
 
@@ -133,15 +134,20 @@ def test_launch_context_source_is_combined():
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
-def test_each_role_receives_the_configured_program_path(role):
+@pytest.mark.parametrize("path", ["senpai/program.md", 'équipe "A"/program.md'])
+def test_each_role_receives_the_configured_program_path(role, path):
     configmap, _deployment, _secret = render_role(
         role,
-        launch_args(program_path="senpai/program.md"),
+        launch_args(program_path=path),
     )
 
-    assert yaml.safe_load(configmap)["data"]["SENPAI_PROGRAM_PATH"] == (
-        "senpai/program.md"
+    data = yaml.safe_load(configmap)["data"]
+    assert data["SENPAI_PROGRAM_PATH"] == path
+    assert data["SENPAI_PROGRAM_CONTEXT_FILE"] == (
+        "/var/run/senpai-context/program-context.b64"
     )
+    assert len(data["SENPAI_PROGRAM_CONTENT_SHA256"]) == 64
+    assert "SENPAI_PROGRAM_CONTEXT_B64" not in data
 
 
 @pytest.mark.parametrize(
@@ -202,7 +208,8 @@ def test_launch_context_owns_role_scoped_runtime_identity(
         role=role_prompt,
         program=ProgramSystemPrompt(
             program_path="program.md",
-            prompt="# program.md - program.md\n\nProgramme.",
+            source_commit=REVISION,
+            content="Programme.",
         ),
         launch=launch_context,
     ).prompt

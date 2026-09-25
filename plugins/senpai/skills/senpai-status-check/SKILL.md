@@ -27,7 +27,7 @@ Resolve these values from the environment before collecting evidence:
 If a required value is absent, record an evidence gap. Never substitute a
 remembered repository, branch, cluster, project, dataset, or metric.
 
-Read the `program.md` identified in the system prompt for its goals, metric contracts, benchmarks, training constraints, and permitted reporting paths. Derive every metric and benchmark in the report from that file or live evidence.
+Use the immutable `program.md` snapshot embedded in your system prompt for its goals, metric contracts, benchmarks, training constraints, and permitted reporting paths. Derive every metric and benchmark in the report from that snapshot or live evidence.
 
 ## Collect bounded evidence
 

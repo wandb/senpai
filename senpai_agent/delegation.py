@@ -35,7 +35,11 @@ from pydantic import BaseModel, Field, model_validator
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.processes import terminate_process_group
-from senpai_agent.program_context import PROGRAM_PATH_ENV
+from senpai_agent.program_context import (
+    PROGRAM_CONTENT_SHA256_ENV,
+    PROGRAM_PATH_ENV,
+    PROGRAM_SOURCE_COMMIT_ENV,
+)
 from senpai_agent.PROMPTS import (
     AWAIT_AGENTS_SATISFIED_PROMPT,
     AWAIT_AGENTS_TIMEOUT_PROMPT,
@@ -52,6 +56,13 @@ from senpai_agent.secrets import (
     CUSTOM_SECRET_ENV_NAMES_ENV,
     configured_custom_secret_env_names,
     scrub_github_credentials,
+)
+from senpai_agent.system_instructions import (
+    SYSTEM_INSTRUCTIONS_FILE_ENV,
+    SYSTEM_INSTRUCTIONS_SHA256_ENV,
+    SenpaiSystemInstructions,
+    decode_system_instructions,
+    encode_system_instructions,
 )
 
 if TYPE_CHECKING:
@@ -164,8 +175,7 @@ class DelegationConfig:
     enable_browser: bool
     conversation_secrets: Mapping[str, str]
     role: str
-    program_path: str
-    launch_context: str
+    instructions: SenpaiSystemInstructions
     root_state_dir: Path | None = None
     tree_id: str | None = None
     depth: int = 0
@@ -427,10 +437,29 @@ class OpenHandsChildProcess:
             )
         if self._config.github_trusted_actor is not None:
             environment["SENPAI_GITHUB_ACTOR"] = self._config.github_trusted_actor
-        environment[PROGRAM_PATH_ENV] = self._config.program_path
+        instructions = self._config.instructions
+        environment[PROGRAM_PATH_ENV] = instructions.program.program_path
+        environment[PROGRAM_SOURCE_COMMIT_ENV] = instructions.program.source_commit
+        environment[PROGRAM_CONTENT_SHA256_ENV] = instructions.program.content_sha256
         environment[LAUNCH_CONTEXT_ENV] = b64encode(
-            self._config.launch_context.encode()
+            instructions.launch.encode()
         ).decode()
+        system_context = self.state_dir / "system-instructions.b64"
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        if system_context.exists():
+            decode_system_instructions(
+                system_context.read_text(encoding="utf-8").strip(),
+                instructions.content_sha256,
+            )
+        else:
+            temporary = system_context.with_suffix(".tmp")
+            temporary.write_text(
+                f"{encode_system_instructions(instructions)}\n",
+                encoding="utf-8",
+            )
+            temporary.replace(system_context)
+        environment[SYSTEM_INSTRUCTIONS_FILE_ENV] = str(system_context)
+        environment[SYSTEM_INSTRUCTIONS_SHA256_ENV] = instructions.content_sha256
         return environment
 
     def start(

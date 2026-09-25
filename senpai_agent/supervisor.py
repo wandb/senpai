@@ -19,16 +19,31 @@ from typing import Literal
 import psutil
 from pydantic import SecretStr
 
-from senpai_agent.launch_context import render_role_prompt
+from senpai_agent.agent_markdown import read_agent_markdown
+from senpai_agent.launch_context import (
+    LAUNCH_CONTEXT_ENV,
+    decode_launch_context,
+    render_role_prompt,
+)
 from senpai_agent.processes import terminate_process_group
 from senpai_agent.program_context import (
+    PROGRAM_CONTENT_SHA256_ENV,
+    PROGRAM_CONTEXT_FILE_ENV,
     PROGRAM_PATH_ENV,
-    load_program_system_prompt,
+    PROGRAM_SOURCE_COMMIT_ENV,
+    decode_program_system_prompt,
 )
 from senpai_agent.secrets import (
     GITHUB_TOKEN_FD_ENV,
     GITHUB_TOKEN_FILE_ENV,
     scrub_github_credentials,
+)
+from senpai_agent.system_instructions import (
+    SYSTEM_INSTRUCTIONS_FILE_ENV,
+    SYSTEM_INSTRUCTIONS_SHA256_ENV,
+    SenpaiSystemInstructions,
+    decode_system_instructions,
+    encode_system_instructions,
 )
 
 LEASE_ENV = "SENPAI_CONTROLLER_LEASE_PATH"
@@ -436,37 +451,89 @@ def prepare_system_context_environment(
     """Snapshot the stable system context before any model process starts."""
 
     environment = dict(env)
-    program = load_program_system_prompt(
-        Path(environment["SENPAI_OPENHANDS_WORKSPACE"]),
-        environment.get(PROGRAM_PATH_ENV, ""),
+    source_commit = environment.get(PROGRAM_SOURCE_COMMIT_ENV)
+    if not source_commit:
+        raise RuntimeError(f"{PROGRAM_SOURCE_COMMIT_ENV} is required")
+    program_file = environment.get(PROGRAM_CONTEXT_FILE_ENV)
+    if not program_file:
+        raise RuntimeError(f"{PROGRAM_CONTEXT_FILE_ENV} is required")
+    program = decode_program_system_prompt(
+        Path(program_file).read_text(encoding="utf-8").strip()
     )
-    environment[PROGRAM_PATH_ENV] = program.program_path
+    if source_commit != program.source_commit:
+        raise RuntimeError(
+            f"{PROGRAM_SOURCE_COMMIT_ENV} does not match the launch snapshot"
+        )
+    if environment.get(PROGRAM_CONTENT_SHA256_ENV, "") != program.content_sha256:
+        raise RuntimeError(
+            f"{PROGRAM_CONTENT_SHA256_ENV} does not match the launch snapshot"
+        )
+    configured_program_path = environment.get(PROGRAM_PATH_ENV, "")
+    if configured_program_path != program.program_path:
+        raise RuntimeError(f"{PROGRAM_PATH_ENV} does not match the launch snapshot")
+    source_value = environment.get("SENPAI_OPENHANDS_ROLE_FILE")
+    if not source_value:
+        raise RuntimeError(
+            "OpenHands role instructions are required; set "
+            "SENPAI_OPENHANDS_ROLE_FILE"
+        )
+    rendered = render_role_prompt(
+        Path(source_value).resolve(),
+        role,
+        environment,
+    )
     role_prompt = state_dir / "system-instructions" / f"{role}.md"
     if role_prompt.exists():
-        if not role_prompt.read_text(encoding="utf-8").strip():
-            raise RuntimeError(f"persisted role prompt is empty: {role_prompt}")
-    else:
-        source_value = environment.get("SENPAI_OPENHANDS_ROLE_FILE")
-        if not source_value:
+        if role_prompt.read_text(encoding="utf-8").strip() != rendered:
             raise RuntimeError(
-                "OpenHands role instructions are required; set "
-                "SENPAI_OPENHANDS_ROLE_FILE"
+                "persisted role prompt does not match the controller-rendered "
+                f"snapshot: {role_prompt}"
             )
-        rendered = render_role_prompt(
-            Path(source_value).resolve(),
-            role,
-            environment,
-        )
+    else:
         role_prompt.parent.mkdir(parents=True, exist_ok=True)
         temporary = role_prompt.with_suffix(".tmp")
         temporary.write_text(f"{rendered}\n", encoding="utf-8")
         temporary.replace(role_prompt)
     environment["SENPAI_OPENHANDS_ROLE_FILE"] = str(role_prompt)
+    harness_value = environment.get("SENPAI_OPENHANDS_HARNESS_FILE")
+    if not harness_value:
+        raise RuntimeError(
+            "OpenHands harness instructions are required; set "
+            "SENPAI_OPENHANDS_HARNESS_FILE"
+        )
+    harness = read_agent_markdown(Path(harness_value).resolve()).strip()
+    if not harness:
+        raise RuntimeError("OpenHands harness instructions must not be empty")
+    instructions = SenpaiSystemInstructions(
+        harness=harness,
+        role=rendered,
+        program=program,
+        launch=decode_launch_context(environment.get(LAUNCH_CONTEXT_ENV, "")),
+    )
+    encoded_instructions = encode_system_instructions(instructions)
+    system_context = role_prompt.with_suffix(".context.b64")
+    if system_context.exists():
+        decode_system_instructions(
+            system_context.read_text(encoding="utf-8").strip(),
+            instructions.content_sha256,
+        )
+    else:
+        temporary = system_context.with_suffix(".tmp")
+        temporary.write_text(f"{encoded_instructions}\n", encoding="utf-8")
+        temporary.replace(system_context)
+    environment[SYSTEM_INSTRUCTIONS_FILE_ENV] = str(system_context)
+    environment[SYSTEM_INSTRUCTIONS_SHA256_ENV] = instructions.content_sha256
     print(
-        f"SENPAI_PROGRAM_CONTEXT path={program.program_path}",
+        "SENPAI_PROGRAM_CONTEXT "
+        f"path={program.program_path} commit={program.source_commit} "
+        f"sha256={program.content_sha256}",
         flush=True,
     )
-    print(f"SENPAI_ROLE_PROMPT path={role_prompt}", flush=True)
+    print(
+        f"SENPAI_SYSTEM_CONTEXT path={system_context} "
+        f"sha256={instructions.content_sha256}",
+        flush=True,
+    )
     return environment
 
 
