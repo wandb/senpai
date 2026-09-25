@@ -1628,7 +1628,7 @@ def test_recovered_actions_are_rejected_before_the_conversation_resumes(
     assert "rerun it explicitly" in rejected[0]
 
 
-def test_main_removes_the_model_key_and_flushes_weave_after_failure(monkeypatch):
+def test_main_removes_the_model_key_and_flushes_weave_after_failure(monkeypatch, tmp_path):
     flushed = []
 
     def fail_run(_prompt, _config):
@@ -1640,7 +1640,7 @@ def test_main_removes_the_model_key_and_flushes_weave_after_failure(monkeypatch)
     monkeypatch.setattr(
         runner,
         "resolve_config",
-        lambda _args: SimpleNamespace(api_key_env="ANTHROPIC_API_KEY"),
+        lambda _args, _env: runtime_config(tmp_path),
     )
     monkeypatch.setattr(runner, "run_openhands", fail_run)
     monkeypatch.setattr(runner, "finish_weave_monitoring", lambda: flushed.append(True))

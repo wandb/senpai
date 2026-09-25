@@ -31,7 +31,10 @@ echo "GPUs:         $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/n
 
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
-git config --global safe.directory "$WORKDIR"
+git config --global --add safe.directory "$WORKDIR"
+mkdir -p "$TARGET_WORKDIR"
+export TARGET_WORKDIR="$(cd "$TARGET_WORKDIR" && pwd -P)"
+git config --global --add safe.directory "$TARGET_WORKDIR"
 source "$SENPAI_PLUGIN/scripts/git-guard.sh"
 install_senpai_git_guard "$WORKDIR" "$GIT_ASKPASS_FILE"
 
@@ -48,6 +51,10 @@ clone_target_repo() {
 # Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
 # agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
 [ -d "$PROBLEM_DIR/.git" ] || clone_target_repo
+if ! git -C "$TARGET_WORKDIR" rev-parse --verify 'HEAD^{commit}' >/dev/null 2>&1; then
+    echo "ERROR: target checkout '$TARGET_WORKDIR' has no valid HEAD commit; inspect and repair the retained checkout before restarting." >&2
+    exit 1
+fi
 git config --global --unset-all credential.helper 2>/dev/null || true
 
 # --- Git identity for commits (inside the problem-package repo) ---
@@ -80,11 +87,28 @@ export SENPAI_OPENHANDS_ROLE_FILE="$WORKDIR/system_instructions/STUDENT.md"
 export SENPAI_OPENHANDS_WORKSPACE="$TARGET_WORKDIR"
 export SENPAI_OPENHANDS_HARNESS_FILE="$WORKDIR/system_instructions/SENPAI-HARNESS.md"
 export SENPAI_OPENHANDS_TIMEOUT_SECONDS="${SENPAI_OPENHANDS_TIMEOUT_SECONDS:-7200}"
+CREDENTIAL_HANDOFF_DIR=""
+prepare_credential_handoff_dir() {
+    [ -n "$CREDENTIAL_HANDOFF_DIR" ] && return
+    CREDENTIAL_HANDOFF_DIR="$(mktemp -d /tmp/senpai-supervisor.XXXXXX)"
+    chmod 700 "$CREDENTIAL_HANDOFF_DIR"
+}
 if [ -z "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
-    export SENPAI_GITHUB_TOKEN_FILE="/tmp/senpai-supervisor-github-token"
+    prepare_credential_handoff_dir
+    export SENPAI_GITHUB_TOKEN_FILE="$CREDENTIAL_HANDOFF_DIR/github-token"
     (umask 077; printf '%s' "$GITHUB_TOKEN" > "$SENPAI_GITHUB_TOKEN_FILE")
 fi
-unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS
+if [ -z "${SENPAI_WANDB_API_KEY_FILE:-}" ] && [ -n "${WANDB_API_KEY:-}" ]; then
+    prepare_credential_handoff_dir
+    export SENPAI_WANDB_API_KEY_FILE="$CREDENTIAL_HANDOFF_DIR/wandb-api-key"
+    (umask 077; printf '%s' "$WANDB_API_KEY" > "$SENPAI_WANDB_API_KEY_FILE")
+fi
+if [ -z "${SENPAI_EXA_API_KEY_FILE:-}" ] && [ -n "${EXA_API_KEY:-}" ]; then
+    prepare_credential_handoff_dir
+    export SENPAI_EXA_API_KEY_FILE="$CREDENTIAL_HANDOFF_DIR/exa-api-key"
+    (umask 077; printf '%s' "$EXA_API_KEY" > "$SENPAI_EXA_API_KEY_FILE")
+fi
+unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS WANDB_API_KEY EXA_API_KEY
 rm -f "$GIT_ASKPASS_FILE"
 export SENPAI_TARGET_PYTHON_ENV="$HOME/.venvs/senpai-target"
 if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then

@@ -71,19 +71,35 @@ def assignment_event(
 
 def test_reconciliation_preserves_unpushed_commits_and_dirty_files(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     _remote, _seed, workspace, base_sha, assigned_head = assigned_workspace(tmp_path)
     (workspace / "program.py").write_text("candidate\n")
     git("commit", "-am", "candidate", cwd=workspace)
     local_head = git("rev-parse", "HEAD", cwd=workspace)
     (workspace / "notes.txt").write_text("dirty but recoverable\n")
+    hook_marker = tmp_path / "hook-ran"
+    hook = workspace / ".git" / "hooks" / "post-checkout"
+    hook.write_text(f"#!/bin/sh\ntouch '{hook_marker}'\n")
+    hook.chmod(0o755)
+    real_run = subprocess.run
 
+    def different_owner(command, **kwargs):
+        if kwargs.get("cwd") == workspace and "env" in kwargs:
+            kwargs["env"] = {
+                **kwargs["env"],
+                "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
+            }
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr("senpai_agent.workspace.subprocess.run", different_owner)
     StudentWorkspaceReconciler(workspace)(
         (assignment_event(assigned_head, base_sha),)
     )
 
     assert git("rev-parse", "HEAD", cwd=workspace) == local_head
     assert (workspace / "notes.txt").read_text() == "dirty but recoverable\n"
+    assert not hook_marker.exists()
 
 
 def test_reconciliation_surfaces_a_remote_head_not_present_locally(
@@ -348,6 +364,10 @@ def test_reconciliation_isolates_typed_auth_from_hostile_git_configuration(
 ):
     remote, _seed, workspace, base_sha, assigned_head = assigned_workspace(tmp_path)
     real_run = subprocess.run
+    hook_marker = tmp_path / "hook-ran"
+    hook = workspace / ".git" / "hooks" / "post-checkout"
+    hook.write_text(f"#!/bin/sh\ntouch '{hook_marker}'\n")
+    hook.chmod(0o755)
     git(
         "remote",
         "set-url",
@@ -429,13 +449,18 @@ def test_reconciliation_isolates_typed_auth_from_hostile_git_configuration(
                 }
             )
             kwargs["env"] = replacement_environment
-        elif command[1] == "fetch":
+        elif "fetch" in command:
             assert Path(kwargs["cwd"]) == workspace
             assert env["GIT_ALLOW_PROTOCOL"] == "file"
             assert any(argument.endswith("/objects.git") for argument in command)
             assert not any("Authorization:" in value for value in env.values())
         else:
             assert not any("typed-token" in value for value in env.values())
+        if Path(kwargs["cwd"]) == workspace:
+            kwargs["env"] = {
+                **kwargs["env"],
+                "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
+            }
         return real_run(command, **kwargs)
 
     monkeypatch.setattr("senpai_agent.workspace.subprocess.run", guarded_run)
@@ -450,3 +475,4 @@ def test_reconciliation_isolates_typed_auth_from_hostile_git_configuration(
         repo="acme/widgets",
         token=SecretStr("typed-token"),
     )((assignment_event(assigned_head, base_sha),))
+    assert not hook_marker.exists()

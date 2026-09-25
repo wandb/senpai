@@ -8,7 +8,7 @@ import signal
 import sys
 import time
 from base64 import b64decode
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -49,6 +49,7 @@ from senpai_agent.PROMPTS import (
     OPERATOR_INSTRUCTIONS_PROMPT,
     render_prompt,
 )
+from senpai_agent.secrets import PRIVATE_CREDENTIAL_FD_ENVS, set_process_nondumpable
 from senpai_agent.state import (
     AssignmentConversationRegistry,
     ConversationBatch,
@@ -922,11 +923,33 @@ def _role_interval(
     return float(env.get(role_key, env.get(shared_key, str(default))))
 
 
+def _consume_private_credential_fds(env: MutableMapping[str, str]) -> None:
+    for credential_name, fd_env in PRIVATE_CREDENTIAL_FD_ENVS.items():
+        descriptor_value = env.pop(fd_env, None)
+        if descriptor_value is None:
+            continue
+        try:
+            descriptor = int(descriptor_value)
+            if descriptor < 0:
+                raise ValueError
+        except ValueError as error:
+            raise RuntimeError(f"{fd_env} must be a nonnegative integer") from error
+        with os.fdopen(descriptor, encoding="utf-8") as stream:
+            value = stream.read().strip()
+        if not value:
+            raise RuntimeError(f"{fd_env} is empty")
+        env[credential_name] = value
+
+
 def controller_main(
     argv: Sequence[str] | None = None,
     env: Mapping[str, str] = os.environ,
 ) -> int:
     import argparse
+
+    env = os.environ if env is os.environ else dict(env)
+    set_process_nondumpable()
+    _consume_private_credential_fds(env)
 
     progress = ProgressLease(Path(env[LEASE_ENV])) if env.get(LEASE_ENV) else None
     if progress is not None:

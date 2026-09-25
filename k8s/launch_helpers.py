@@ -212,10 +212,11 @@ def existing_student_names(
 
 def render_template(template: str, replacements: dict[str, str]) -> str:
     """Replace {{PLACEHOLDER}} tokens in a K8s manifest template."""
-    out = template
-    for key, value in replacements.items():
-        out = out.replace(f"{{{{{key}}}}}", value)
-    return out
+    return re.sub(
+        r"\{\{(\w+)\}\}",
+        lambda match: replacements.get(match[1], match[0]),
+        template,
+    )
 
 
 def render_configmap(name: str, labels: dict[str, str], data: dict[str, str]) -> str:
@@ -231,7 +232,7 @@ def render_configmap(name: str, labels: dict[str, str], data: dict[str, str]) ->
         lines.append(f"    {k}: {v}")
     lines.append("data:")
     for k, v in data.items():
-        lines.append(f'  {k}: "{v}"')
+        lines.append(f"  {k}: {json.dumps(v)}")
     return "\n".join(lines)
 
 
