@@ -350,6 +350,14 @@ A student cannot receive another assignment while an open assignment has `status
 
 PR comments from verified GitHub owners, members, and collaborators steer the advisor and reach the student. Submitted reviews and inline comments also reach the student. The system ignores untrusted authors, unrecognized bots, and advisor protocol comments. `get_prs` can still retrieve the complete discussion explicitly. If the configured research base changes while an experiment is running, SENPAI emits `research_base_changed` with the assignment's `required_base_sha` and the live `current_base_sha` without cancelling the assignment. When reviewing its terminal result, the advisor either requests a revision on the current base or records why that exact result remains valid with `accept_result_on_current_base`; `merge_experiment` still verifies the live SHA immediately before merging.
 
+A revision request may retain the assignment's recorded base SHA or select the
+exact live base SHA. Retain the recorded SHA when a follow-up must preserve the
+tested source, including when the advisor only published research notes. This
+does not exempt documentation from source checks: the result must still contain
+the selected base commit, and merging onto a changed live base still requires
+`accept_result_on_current_base`. Selecting a new base requires the student to
+incorporate it before running the revised experiment.
+
 Before each assignment or PR-feedback turn, the student controller authenticates
 and hydrates the exact assignment head and recorded baseline into
 `refs/senpai/assignment/` without resetting the checkout. A revision can

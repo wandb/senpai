@@ -71,10 +71,11 @@ class RevisionMixin:
         require_open(before)
         if assignment.revision_id == current_revision_id:
             live_base_sha = self._branch_head_sha(assignment.base_ref)
-            if live_base_sha != required_base_sha:
+            if required_base_sha not in (assignment.base_sha, live_base_sha):
                 raise StaleResearchBaseError(
                     f"required research base {assignment.base_ref}@"
-                    f"{required_base_sha} does not match live {live_base_sha}"
+                    f"{required_base_sha} does not match live {live_base_sha} "
+                    f"or assigned {assignment.base_sha}"
                 )
             applied_revision = False
         elif not (
