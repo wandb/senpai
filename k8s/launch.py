@@ -8,16 +8,20 @@
 
 import base64
 import json
+import os
 import posixpath
 import shlex
+import subprocess
 import sys
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Literal
 
 import simple_parsing as sp
 import yaml
+from pydantic import SecretStr
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -28,13 +32,29 @@ from senpai_agent.launch_context import (
     load_operator_instructions,
     render_launch_context,
 )
-from senpai_agent.program_context import PROGRAM_PATH_ENV, normalize_program_path
+from senpai_agent.git_transport import (
+    PROXY_ENVIRONMENT,
+    github_repository_url,
+    run_git,
+)
+from senpai_agent.program_context import (
+    PROGRAM_CONTENT_SHA256_ENV,
+    PROGRAM_CONTEXT_FILE_ENV,
+    PROGRAM_PATH_ENV,
+    PROGRAM_SOURCE_COMMIT_ENV,
+    ProgramSystemPrompt,
+    decode_program_system_prompt,
+    encode_program_system_prompt,
+    load_program_system_prompt,
+    normalize_program_path,
+)
 from senpai_agent.secrets import validate_custom_secret_env_names
 
 from launch_helpers import (
     ensure_advisor_branch,
     ensure_new_student_slot,
     ensure_target_repo_labels,
+    existing_program_context_secret,
     existing_student_names,
     expand_student_names,
     is_digest_image_reference,
@@ -51,8 +71,10 @@ from launch_helpers import (
     preflight_check_target_repo_branch,
     preflight_check_wandb_api_key,
     preflight_check_wandb_inference,
+    read_program_context_secret,
     render_configmap,
     render_launch_secret,
+    render_program_context_secret,
     render_template,
     resolve_anthropic_api_key,
     resolve_custom_secrets,
@@ -69,6 +91,7 @@ STUDENT_TEMPLATE = Path(__file__).parent / "student-deployment.yaml"
 ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-deployment.yaml"
 SENPAI_CONFIG = Path(__file__).parent.parent / "senpai.yaml"
 DOTENV_PATH = Path(__file__).parent.parent / ".env"
+PROGRAM_CONTEXT_MOUNT_PATH = "/var/run/senpai-context/program-context.b64"
 
 
 @dataclass
@@ -580,6 +603,59 @@ def _student_training_access(student_name: str, tag: str, namespace: str) -> str
     )
 
 
+def load_launch_program_snapshot(
+    target_repo_url: str,
+    advisor_branch: str,
+    program_path: str,
+    github_token: str,
+    fallback_branch: str = "",
+) -> ProgramSystemPrompt:
+    """Capture and verify the committed program from one advertised branch head."""
+
+    with TemporaryDirectory(prefix="senpai-program-") as directory:
+        repository = Path(directory) / "target.git"
+        remote = github_repository_url(target_repo_slug(target_repo_url))
+        operator_proxies = {
+            name: os.environ[name]
+            for name in PROXY_ENVIRONMENT
+            if name in os.environ
+        }
+        if fallback_branch:
+            advertised = run_git(
+                Path(directory),
+                "ls-remote",
+                "--heads",
+                "--",
+                remote,
+                f"refs/heads/{advisor_branch}",
+                token=SecretStr(github_token),
+                extra_env=operator_proxies,
+            )
+            if not any(
+                line.split(maxsplit=1)[1:] == [f"refs/heads/{advisor_branch}"]
+                for line in advertised.splitlines()
+            ):
+                advisor_branch = fallback_branch
+        run_git(
+            Path(directory),
+            "clone",
+            "--bare",
+            "--depth",
+            "1",
+            "--branch",
+            advisor_branch,
+            "--single-branch",
+            "--no-tags",
+            "--",
+            remote,
+            str(repository),
+            token=SecretStr(github_token),
+            # Capture runs on the operator's machine, so honor its proxy settings.
+            extra_env=operator_proxies,
+        )
+        return load_program_system_prompt(repository, program_path)
+
+
 def render_student(
     template: str,
     student_name: str,
@@ -587,6 +663,10 @@ def render_student(
     secret_name: str,
     launch_secret: str,
     args: Args,
+    *,
+    program: ProgramSystemPrompt,
+    program_secret_name: str,
+    program_secret: str,
 ) -> str:
     student_configmap_name = f"senpai-config-student-{tag}-{student_name}"
     student_deployment_name = f"senpai-{tag}-{student_name}"
@@ -599,7 +679,10 @@ def render_student(
             "SENPAI_REPO_REVISION": args.senpai_repo_revision,
             "TARGET_REPO_URL": args.target_repo_url,
             "TARGET_REPO_BRANCH": args.target_repo_branch,
-            PROGRAM_PATH_ENV: args.program_path,
+            PROGRAM_PATH_ENV: program.program_path,
+            PROGRAM_SOURCE_COMMIT_ENV: program.source_commit,
+            PROGRAM_CONTENT_SHA256_ENV: program.content_sha256,
+            PROGRAM_CONTEXT_FILE_ENV: PROGRAM_CONTEXT_MOUNT_PATH,
             "GH_REPO": target_repo_slug(args.target_repo_url),
             "STUDENT_NAME": student_name,
             "RESEARCH_TAG": tag,
@@ -690,7 +773,10 @@ def render_student(
                 student_configmap_name,
             ),
             "KUBERNETES_EXECUTOR_VOLUMES": _executor_volumes(args),
-            "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
+            "PROGRAM_CONTEXT_SECRET_NAME": program_secret_name,
+            "POD_CONFIG_HASH": pod_template_hash(
+                configmap, launch_secret, program_secret
+            ),
             "MODEL_PROVIDER_ENV": secret_env_refs(
                 model_secret_env_refs(args, "student"), secret_name
             ),
@@ -713,6 +799,10 @@ def render_advisor(
     secret_name: str,
     launch_secret: str,
     args: Args,
+    *,
+    program: ProgramSystemPrompt,
+    program_secret_name: str,
+    program_secret: str,
 ) -> str:
     advisor_configmap_name = f"senpai-config-advisor-{tag}"
     advisor_deployment_name = f"senpai-advisor-{tag}"
@@ -722,7 +812,10 @@ def render_advisor(
         "SENPAI_REPO_REVISION": args.senpai_repo_revision,
         "TARGET_REPO_URL": args.target_repo_url,
         "TARGET_REPO_BRANCH": args.target_repo_branch,
-        PROGRAM_PATH_ENV: args.program_path,
+        PROGRAM_PATH_ENV: program.program_path,
+        PROGRAM_SOURCE_COMMIT_ENV: program.source_commit,
+        PROGRAM_CONTENT_SHA256_ENV: program.content_sha256,
+        PROGRAM_CONTEXT_FILE_ENV: PROGRAM_CONTEXT_MOUNT_PATH,
         "GH_REPO": target_repo_slug(args.target_repo_url),
         "RESEARCH_TAG": tag,
         "STUDENT_NAMES": ",".join(student_list),
@@ -765,7 +858,10 @@ def render_advisor(
             "PVC_CLAIM_NAME": args.pvc_claim_name,
             "PVC_MOUNT_PATH": args.pvc_mount_path,
             "LAUNCH_SECRET_NAME": secret_name,
-            "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
+            "PROGRAM_CONTEXT_SECRET_NAME": program_secret_name,
+            "POD_CONFIG_HASH": pod_template_hash(
+                configmap, launch_secret, program_secret
+            ),
             "MODEL_PROVIDER_ENV": secret_env_refs(
                 model_secret_env_refs(args, "advisor"), secret_name
             ),
@@ -925,6 +1021,43 @@ def main():
             print("Preflight OK — credentials and target repo access verified.")
             return
 
+    program = ProgramSystemPrompt(
+        program_path=args.program_path or "program.md",
+        source_commit="0" * 40,
+        content="Resolved and verified during a real launch.",
+    )
+    if not args.dry_run:
+        try:
+            program = load_launch_program_snapshot(
+                args.target_repo_url,
+                args.advisor_branch,
+                args.program_path,
+                github_token,
+                args.target_repo_branch,
+            )
+            advisor_source_commit = program.source_commit
+            if bound_secret := existing_program_context_secret(
+                args.tag, kube_context=args.kube_context, namespace=args.namespace
+            ):
+                bound_program = decode_program_system_prompt(
+                    read_program_context_secret(
+                        bound_secret,
+                        args.tag,
+                        kube_context=args.kube_context,
+                        namespace=args.namespace,
+                    )
+                )
+                if (bound_program.program_path, bound_program.content) != (
+                    program.program_path,
+                    program.content,
+                ):
+                    raise RuntimeError(
+                        "program.md changed for an active launch tag; use a new tag "
+                        "so every role receives one immutable policy snapshot"
+                    )
+                program = bound_program
+        except (RuntimeError, ValueError, subprocess.CalledProcessError) as error:
+            sys.exit(f"ERROR: {error}")
     student_template = STUDENT_TEMPLATE.read_text()
     advisor_template = ADVISOR_TEMPLATE.read_text()
     secret_name = f"senpai-launch-secrets-{args.tag}"
@@ -946,6 +1079,12 @@ def main():
         custom_secrets=custom_secrets,
         immutable=bool(student_list),
     )
+    try:
+        program_secret_name, program_secret = render_program_context_secret(
+            args.tag, encode_program_system_prompt(program)
+        )
+    except ValueError as error:
+        sys.exit(f"ERROR: {error}")
 
     student_manifests = []
     for name in student_list:
@@ -956,6 +1095,9 @@ def main():
             secret_name,
             launch_secret,
             args,
+            program=program,
+            program_secret_name=program_secret_name,
+            program_secret=program_secret,
         )
         student_manifests.append(
             (name, manifest, validated_student_resources(manifest, name))
@@ -997,6 +1139,7 @@ def main():
             github_token,
             args.target_repo_branch,
             args.advisor_branch,
+            advisor_source_commit,
         )
         ensure_target_repo_labels(
             args.target_repo_url,
@@ -1012,6 +1155,18 @@ def main():
         kubectl_apply(
             launch_secret,
             f"secret {secret_name}",
+            kube_context=args.kube_context,
+            namespace=args.namespace,
+        )
+
+    if args.dry_run:
+        print(f"--- Program context: {program_secret_name} ---")
+        print(program_secret)
+        print()
+    else:
+        kubectl_apply(
+            program_secret,
+            f"program context secret {program_secret_name}",
             kube_context=args.kube_context,
             namespace=args.namespace,
         )
@@ -1061,6 +1216,9 @@ def main():
             secret_name,
             launch_secret,
             args,
+            program=program,
+            program_secret_name=program_secret_name,
+            program_secret=program_secret,
         )
         if args.dry_run:
             print("--- Advisor ---")

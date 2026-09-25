@@ -1,10 +1,12 @@
 import base64
 import json
 import subprocess
+import urllib.error
 
 import pytest
 import yaml
 
+from git_workflow_support import commit_file, git, repository
 from launch_test_support import launch, launch_args, launch_helpers
 
 
@@ -50,6 +52,84 @@ def test_kubectl_apply_raises_with_the_resource_and_error_detail(monkeypatch):
         "-",
     ]
     assert captured["kwargs"]["input"] == "kind: Service"
+
+
+@pytest.mark.parametrize("advisor_exists", [False, True])
+def test_program_capture_uses_base_only_when_exact_advisor_ref_is_absent(
+    tmp_path, monkeypatch, advisor_exists
+):
+    workspace, remote, _head = repository(tmp_path)
+    base_commit = commit_file(workspace, "program.md", "Base policy.", "base policy")
+    git(workspace, "push", "origin", f"{base_commit}:refs/heads/main")
+    advisor_commit = commit_file(
+        workspace, "program.md", "Advisor policy.", "advisor policy"
+    )
+    # A similarly named branch must not suppress the base-branch fallback.
+    ref = "research" if advisor_exists else "research-extra"
+    git(workspace, "push", "origin", f"{advisor_commit}:refs/heads/{ref}")
+    monkeypatch.setattr(launch, "github_repository_url", lambda _repo: str(remote))
+
+    snapshot = launch.load_launch_program_snapshot(
+        "https://github.com/acme/widgets.git", "research", "", "github", "main"
+    )
+
+    assert snapshot.source_commit == (advisor_commit if advisor_exists else base_commit)
+    assert snapshot.content == ("Advisor policy." if advisor_exists else "Base policy.")
+
+
+def test_program_capture_does_not_fallback_after_a_failed_ref_lookup(monkeypatch):
+    calls = []
+
+    def fail(*_args, **_kwargs):
+        calls.append(_args)
+        raise subprocess.CalledProcessError(128, ["git", "ls-remote"])
+
+    monkeypatch.setattr(launch, "run_git", fail)
+    with pytest.raises(subprocess.CalledProcessError):
+        launch.load_launch_program_snapshot(
+            "https://github.com/acme/widgets.git", "research", "", "github", "main"
+        )
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("advisor_head", [None, "a" * 40, "b" * 40, 403])
+def test_advisor_branch_preserves_the_captured_commit(monkeypatch, advisor_head):
+    monkeypatch.setattr(
+        launch_helpers, "preflight_check_target_repo_branch", lambda *_args: "main"
+    )
+    writes = []
+
+    def github_api(path, _token, *, method="GET", data=None):
+        if method == "POST":
+            writes.append(json.loads(data))
+            return {}
+        if path.endswith("/branches/research"):
+            if advisor_head is None or advisor_head == 403:
+                code = 404 if advisor_head is None else 403
+                raise urllib.error.HTTPError(path, code, "unavailable", {}, None)
+            return {"commit": {"sha": advisor_head}}
+        assert path.endswith("/branches/main")
+        return {"commit": {"sha": "c" * 40}}
+
+    monkeypatch.setattr(launch_helpers, "_github_api", github_api)
+
+    def ensure():
+        launch_helpers.ensure_advisor_branch(
+            "https://github.com/acme/widgets.git", "github", "main", "research", "a" * 40
+        )
+
+    if advisor_head == "b" * 40:
+        with pytest.raises(SystemExit, match="changed after the program snapshot"):
+            ensure()
+    elif advisor_head == 403:
+        with pytest.raises(urllib.error.HTTPError):
+            ensure()
+    else:
+        ensure()
+    assert writes == (
+        [{"ref": "refs/heads/research", "sha": "a" * 40}]
+        if advisor_head is None else []
+    )
 
 
 def test_kubectl_create_is_create_only_and_reports_the_resource(monkeypatch):
@@ -328,6 +408,113 @@ def test_kubectl_default_scope_omits_an_empty_context():
     ]
 
 
+@pytest.mark.parametrize(
+    ("bindings", "expected", "error"),
+    [
+        ([], None, None),
+        ([("Deployment", "one", ""), ("Pod", "one", "Running")], "one", None),
+        ([("Deployment", "one", ""), ("Pod", "old", "Failed")], "one", None),
+        ([("Pod", "old", "Succeeded")], None, None),
+        (
+            [("Deployment", "one", ""), ("Pod", "two", "Running")],
+            None,
+            "different program snapshots",
+        ),
+        (
+            [("Deployment", None, "")],
+            None,
+            "lacks a valid program context binding",
+        ),
+        ([("Pod", "one", "Terminating")], "one", None),
+    ],
+)
+def test_program_binding_accounts_for_desired_roles_and_live_pods(
+    monkeypatch, bindings, expected, error
+):
+    resources = []
+    for kind, name, phase in bindings:
+        metadata = {
+            "annotations": {"senpai.wandb.com/program-context-secret": name}
+        }
+        resource = {
+            "kind": kind, "metadata": metadata, "status": {"phase": phase}
+        }
+        if kind == "Deployment":
+            resource["spec"] = {"template": {"metadata": metadata}}
+        if phase == "Terminating":
+            metadata["deletionTimestamp"] = "2026-09-25T00:00:00Z"
+            resource["status"]["phase"] = "Running"
+        resources.append(resource)
+
+    def run(argv, **_kwargs):
+        assert "app=senpai,research-tag=track-a" in argv
+        assert argv[:5] == [
+            "kubectl", "--context", "cluster", "--namespace", "research"
+        ]
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps({"items": resources}), ""
+        )
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+    if error:
+        with pytest.raises(RuntimeError, match=error):
+            launch_helpers.existing_program_context_secret(
+                "track-a", kube_context="cluster", namespace="research"
+            )
+    else:
+        assert launch_helpers.existing_program_context_secret(
+            "track-a", kube_context="cluster", namespace="research"
+        ) == expected
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [None, "mutable", "tag", "role", "name", "content", "base64", "empty"],
+)
+def test_reused_program_secret_verifies_ownership_immutability_and_content(
+    monkeypatch, corruption
+):
+    program = launch.ProgramSystemPrompt("program.md", "a" * 40, "Launch policy.")
+    encoded = launch.encode_program_system_prompt(program)
+    name, manifest = launch_helpers.render_program_context_secret(
+        "track-a", encoded
+    )
+    document = yaml.safe_load(manifest)
+    if corruption == "mutable":
+        document["immutable"] = False
+    elif corruption == "tag":
+        document["metadata"]["labels"]["research-tag"] = "another-track"
+    elif corruption == "role":
+        document["metadata"]["labels"]["senpai.wandb.com/secret-role"] = (
+            "credentials"
+        )
+    elif corruption == "name":
+        document["metadata"]["name"] = "another-name"
+    elif corruption == "content":
+        document["data"]["program-context"] = base64.b64encode(
+            b"different-payload"
+        ).decode()
+    elif corruption == "base64":
+        document["data"]["program-context"] = "%%%"
+    elif corruption == "empty":
+        document["data"]["program-context"] = ""
+    monkeypatch.setattr(
+        launch_helpers.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 0, json.dumps(document), ""
+        ),
+    )
+
+    if corruption:
+        with pytest.raises(RuntimeError, match="bound program context Secret"):
+            launch_helpers.read_program_context_secret(name, "track-a")
+    else:
+        assert launch_helpers.read_program_context_secret(
+            name, "track-a"
+        ) == encoded
+
+
 def bypass_external_preflight(monkeypatch):
     monkeypatch.setattr(
         launch,
@@ -364,6 +551,130 @@ def bypass_external_preflight(monkeypatch):
         lambda *_args, **_kwargs: None,
         raising=False,
     )
+    monkeypatch.setattr(
+        launch, "existing_program_context_secret", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        launch,
+        "load_launch_program_snapshot",
+        lambda *_args: launch.ProgramSystemPrompt(
+            "program.md", "a" * 40, "Test launch research policy."
+        ),
+    )
+
+
+def test_incremental_launch_reuses_original_snapshot_for_both_roles(monkeypatch):
+    args = launch_args()
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    bound = launch.ProgramSystemPrompt(
+        "program.md", "b" * 40, "Test launch research policy."
+    )
+    bound_name, _manifest = launch_helpers.render_program_context_secret(
+        args.tag, launch.encode_program_system_prompt(bound)
+    )
+    monkeypatch.setattr(
+        launch, "existing_program_context_secret", lambda *_args, **_kwargs: bound_name
+    )
+    monkeypatch.setattr(
+        launch, "read_program_context_secret",
+        lambda *_args, **_kwargs: launch.encode_program_system_prompt(bound),
+    )
+    monkeypatch.setattr(
+        launch, "existing_student_names", lambda *_args, **_kwargs: []
+    )
+    branch_commits = []
+    monkeypatch.setattr(
+        launch, "ensure_advisor_branch",
+        lambda _repo, _token, _base, _advisor, commit: branch_commits.append(commit),
+    )
+    writes = []
+    monkeypatch.setattr(
+        launch, "kubectl_apply",
+        lambda manifest, description, **_kwargs: writes.append(("apply", description, manifest)),
+    )
+    monkeypatch.setattr(
+        launch, "kubectl_create",
+        lambda manifest, description, **_kwargs: writes.append(("create", description, manifest)),
+    )
+
+    launch.main()
+
+    assert branch_commits == ["a" * 40]
+    assert [(operation, description) for operation, description, _ in writes] == [
+        ("create", "secret senpai-launch-secrets-test-track"),
+        ("apply", f"program context secret {bound_name}"),
+        ("create", "student fern ConfigMap senpai-config-student-test-track-fern"),
+        ("create", "student fern Deployment senpai-test-track-fern"),
+        ("apply", "advisor"),
+    ]
+    resources = [document for _, _, manifest in writes[2:] for document in yaml.safe_load_all(manifest)]
+    for resource in resources:
+        if resource["kind"] == "ConfigMap":
+            assert resource["data"]["SENPAI_PROGRAM_SOURCE_COMMIT"] == "b" * 40
+            assert resource["data"]["SENPAI_PROGRAM_CONTENT_SHA256"] == bound.content_sha256
+        elif resource["kind"] == "Deployment":
+            assert resource["spec"]["template"]["metadata"]["annotations"][
+                "senpai.wandb.com/program-context-secret"
+            ] == bound_name
+
+
+@pytest.mark.parametrize(
+    "path,content",
+    [
+        ("program.md", "Old policy."),
+        ("nested/program.md", "Test launch research policy."),
+    ],
+)
+def test_incremental_launch_rejects_policy_or_path_drift_before_apply(
+    monkeypatch, path, content
+):
+    args = launch_args(advisor=False)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    bound = launch.ProgramSystemPrompt(path, "b" * 40, content)
+    monkeypatch.setattr(
+        launch, "existing_program_context_secret",
+        lambda *_args, **_kwargs: "bound-secret",
+    )
+    monkeypatch.setattr(
+        launch, "read_program_context_secret",
+        lambda *_args, **_kwargs: launch.encode_program_system_prompt(bound),
+    )
+    monkeypatch.setattr(
+        launch, "kubectl_apply",
+        lambda *_args, **_kwargs: pytest.fail("policy drift must fail before apply"),
+    )
+
+    with pytest.raises(SystemExit, match="^ERROR: program.md changed.*new tag"):
+        launch.main()
+
+
+@pytest.mark.parametrize("failure", ["invalid", "missing"])
+def test_invalid_bound_program_reports_a_clean_launch_error(monkeypatch, failure):
+    args = launch_args()
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch, "existing_program_context_secret",
+        lambda *_args, **_kwargs: "bound-secret",
+    )
+
+    def read(*_args, **_kwargs):
+        if failure == "missing":
+            raise subprocess.CalledProcessError(
+                1, ["kubectl", "get", "secret", "bound-secret"]
+            )
+        return "not-a-snapshot"
+
+    monkeypatch.setattr(launch, "read_program_context_secret", read)
+    monkeypatch.setattr(
+        launch, "kubectl_apply",
+        lambda *_args, **_kwargs: pytest.fail("invalid binding must fail before apply"),
+    )
+
+    with pytest.raises(SystemExit, match="^ERROR:"):
+        launch.main()
 
 
 def test_preflight_resolves_custom_secrets(monkeypatch):
@@ -566,7 +877,11 @@ def test_launch_uses_one_scope_for_create_discovery_and_handoff_commands(
     launch.main()
 
     assert discovery == [("scope-test", "gpu-cluster", "research")]
-    assert mutations == [
+    assert len(mutations) == 5
+    assert mutations[1][0] == "apply"
+    assert mutations[1][1].startswith("program context secret senpai-program-context-scope-test-")
+    assert mutations[1][2:] == ("gpu-cluster", "research")
+    assert [mutations[0], *mutations[2:]] == [
         (
             "create",
             "secret senpai-launch-secrets-scope-test",
@@ -673,7 +988,15 @@ def test_every_student_is_scanned_before_the_atomic_tag_reservation(monkeypatch)
         lambda *_args: events.append(("github", "labels")),
     )
 
+    program_writes = []
+    monkeypatch.setattr(
+        launch, "kubectl_apply",
+        lambda manifest, description, **_kwargs: program_writes.append((description, yaml.safe_load(manifest))),
+    )
     launch.main()
+    assert len(program_writes) == 1
+    assert program_writes[0][0].startswith("program context secret ")
+    assert program_writes[0][1]["immutable"] is True
 
     assert events[:5] == [
         ("scan", "fern", "senpai-test-track-fern"),
@@ -695,7 +1018,15 @@ def test_student_launch_reservation_is_immutable(monkeypatch):
 
     monkeypatch.setattr(launch, "kubectl_create", create)
 
+    program_writes = []
+    monkeypatch.setattr(
+        launch, "kubectl_apply",
+        lambda manifest, description, **_kwargs: program_writes.append((description, yaml.safe_load(manifest))),
+    )
     launch.main()
+    assert len(program_writes) == 1
+    assert program_writes[0][0].startswith("program context secret ")
+    assert program_writes[0][1]["immutable"] is True
 
     reservation_name, reservation = created[0]
     assert reservation_name == "secret senpai-launch-secrets-test-track"
@@ -725,7 +1056,15 @@ def test_reordered_student_manifest_still_creates_the_deployment_last(monkeypatc
         ),
     )
 
+    program_writes = []
+    monkeypatch.setattr(
+        launch, "kubectl_apply",
+        lambda manifest, description, **_kwargs: program_writes.append((description, yaml.safe_load(manifest))),
+    )
     launch.main()
+    assert len(program_writes) == 1
+    assert program_writes[0][0].startswith("program context secret ")
+    assert program_writes[0][1]["immutable"] is True
 
     assert created == ["Secret", "ConfigMap", "Deployment"]
 
@@ -805,7 +1144,15 @@ def test_multinode_student_resources_are_created_in_dependency_order(monkeypatch
 
     monkeypatch.setattr(launch, "kubectl_create", create, raising=False)
 
+    program_writes = []
+    monkeypatch.setattr(
+        launch, "kubectl_apply",
+        lambda manifest, description, **_kwargs: program_writes.append((description, yaml.safe_load(manifest))),
+    )
     launch.main()
+    assert len(program_writes) == 1
+    assert program_writes[0][0].startswith("program context secret ")
+    assert program_writes[0][1]["immutable"] is True
 
     assert [kind for kind, _name in created] == [
         "Secret",
@@ -900,7 +1247,10 @@ def test_advisor_only_launch_keeps_apply_semantics(monkeypatch):
 
     launch.main()
 
-    assert applied == ["secret senpai-launch-secrets-test-track", "advisor"]
+    assert len(applied) == 3
+    assert applied[0] == "secret senpai-launch-secrets-test-track"
+    assert applied[1].startswith("program context secret senpai-program-context-test-track-")
+    assert applied[2] == "advisor"
 
 
 def test_dry_run_does_not_scan_or_reserve_student_slots(monkeypatch):

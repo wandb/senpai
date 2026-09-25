@@ -34,6 +34,7 @@ from senpai_agent.delegation import (
     reconcile_delegated_tasks,
 )
 from senpai_agent.local_events import LocalEventStore
+from openhands_support import runtime_config
 
 
 def test_model_tier_runtime_limits():
@@ -307,8 +308,7 @@ def config(tmp_path: Path, **updates) -> DelegationConfig:
         "enable_browser": False,
         "conversation_secrets": {},
         "role": "advisor",
-        "program_path": "program.md",
-        "launch_context": "# Authoritative launch context\n\nSystem policy.",
+        "instructions": runtime_config(tmp_path).instructions,
     }
     values.update(updates)
     return DelegationConfig(**values)

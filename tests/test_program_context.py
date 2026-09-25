@@ -1,12 +1,18 @@
+import base64
+import json
 from pathlib import Path
 
 import pytest
+from git_workflow_support import commit_workspace, git
+from test_agent_markdown import HTML_HEADER
 
 from senpai_agent.program_context import (
+    MAX_PROGRAM_BYTES,
+    decode_program_system_prompt,
+    encode_program_system_prompt,
     load_program_system_prompt,
     normalize_program_path,
 )
-from test_agent_markdown import HTML_HEADER
 
 
 @pytest.mark.parametrize(
@@ -18,6 +24,10 @@ from test_agent_markdown import HTML_HEADER
         "./senpai/program.md",
         "senpai//program.md",
         "senpai/PROGRAM.md",
+        "unsafe\\path/program.md",
+        "unsafe\u202epath/program.md",
+        "unsafe\u200bpath/program.md",
+        "unsafe\npath/program.md",
     ],
 )
 def test_program_path_must_be_normalized_and_repo_relative(path: str):
@@ -31,28 +41,38 @@ def write_program(workspace: Path, path: str, content: str) -> None:
     program.write_text(content)
 
 
+def loose_object(workspace: Path, object_id: str) -> Path:
+    return workspace / ".git" / "objects" / object_id[:2] / object_id[2:]
+
+
 def test_blank_program_path_discovers_the_only_root_program(tmp_path: Path):
     workspace = tmp_path / "target"
     workspace.mkdir()
     write_program(workspace, "program.md", "Root policy.")
+    commit_workspace(workspace)
 
     program = load_program_system_prompt(workspace, "")
 
     assert program.program_path == "program.md"
-    assert program.prompt == "# program.md - program.md\n\nRoot policy."
+    assert program.content == "Root policy."
+    assert f"commit `{program.source_commit}`" in program.prompt
+    assert f"Content SHA-256: `{program.content_sha256}`" in program.prompt
+    assert "cannot override the Senpai harness" in program.prompt
 
 
-def test_blank_program_path_discovers_the_only_one_level_program(tmp_path: Path):
+@pytest.mark.parametrize("directory", ["senpai", "research notes", '研究 "é" `x`'])
+def test_blank_program_path_discovers_the_only_one_level_program(
+    tmp_path: Path, directory: str
+):
     workspace = tmp_path / "target"
     workspace.mkdir()
-    write_program(workspace, "senpai/program.md", "Nested policy.")
+    write_program(workspace, f"{directory}/program.md", "Nested policy.")
+    commit_workspace(workspace)
 
     program = load_program_system_prompt(workspace, "")
 
-    assert program.program_path == "senpai/program.md"
-    assert program.prompt == (
-        "# program.md - senpai/program.md\n\nNested policy."
-    )
+    assert program.program_path == f"{directory}/program.md"
+    assert program.content == "Nested policy."
 
 
 def test_blank_program_path_lists_every_match(tmp_path: Path):
@@ -61,6 +81,7 @@ def test_blank_program_path_lists_every_match(tmp_path: Path):
     write_program(workspace, "program.md", "Root policy.")
     write_program(workspace, "alpha/program.md", "Alpha policy.")
     write_program(workspace, "beta/program.md", "Beta policy.")
+    commit_workspace(workspace)
 
     with pytest.raises(
         RuntimeError,
@@ -72,10 +93,36 @@ def test_blank_program_path_lists_every_match(tmp_path: Path):
     assert "--program_path" in str(error.value)
 
 
+def test_discovery_ignores_a_directory_named_program_md(tmp_path: Path):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    write_program(workspace, "program.md/notes.txt", "Not a policy file.")
+    write_program(workspace, "research/program.md", "Research policy.")
+    commit_workspace(workspace)
+
+    assert load_program_system_prompt(workspace, "").program_path == (
+        "research/program.md"
+    )
+
+
+def test_blank_program_path_rejects_an_unsafe_directory_name(tmp_path: Path):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    write_program(workspace, "alpha/program.md", "Alpha policy.")
+    write_program(workspace, "beta\n gamma/program.md", "Beta policy.")
+    commit_workspace(workspace)
+
+    with pytest.raises(RuntimeError, match="not a safe program path") as error:
+        load_program_system_prompt(workspace, "")
+
+    assert "--program_path" in str(error.value)
+
+
 def test_blank_program_path_does_not_search_deeper_than_one_level(tmp_path: Path):
     workspace = tmp_path / "target"
     workspace.mkdir()
     write_program(workspace, "configs/senpai/program.md", "Too deep.")
+    commit_workspace(workspace)
 
     with pytest.raises(
         RuntimeError,
@@ -91,11 +138,12 @@ def test_explicit_program_path_selects_one_of_multiple_matches(tmp_path: Path):
     workspace.mkdir()
     write_program(workspace, "program.md", "Root policy.")
     write_program(workspace, "senpai/program.md", "Nested policy.")
+    commit_workspace(workspace)
 
     program = load_program_system_prompt(workspace, "senpai/program.md")
 
     assert program.program_path == "senpai/program.md"
-    assert program.prompt.endswith("Nested policy.")
+    assert program.content == "Nested policy."
 
 
 def test_program_prompt_strips_the_spdx_header(tmp_path: Path):
@@ -106,19 +154,23 @@ def test_program_prompt_strips_the_spdx_header(tmp_path: Path):
         "program.md",
         HTML_HEADER + "# Research policy\n\nWin safely.\n",
     )
+    commit_workspace(workspace)
 
     program = load_program_system_prompt(workspace, "program.md")
 
-    assert program.prompt == (
-        "# program.md - program.md\n\n# Research policy\n\nWin safely."
-    )
+    assert program.content == "# Research policy\n\nWin safely."
 
 
 def test_explicit_program_path_must_exist(tmp_path: Path):
     workspace = tmp_path / "target"
     workspace.mkdir()
+    (workspace / "README.md").write_text("Target repository.")
+    commit_workspace(workspace)
 
-    with pytest.raises(RuntimeError, match="does not exist: senpai/program.md"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"does not exist at commit .*: senpai/program\.md",
+    ):
         load_program_system_prompt(workspace, "senpai/program.md")
 
 
@@ -128,6 +180,127 @@ def test_program_path_cannot_escape_through_a_symlink(tmp_path: Path):
     outside = tmp_path / "program.md"
     outside.write_text("Outside policy.")
     (workspace / "program.md").symlink_to(outside)
+    commit_workspace(workspace)
 
-    with pytest.raises(RuntimeError, match="beneath the target workspace"):
+    with pytest.raises(RuntimeError, match="regular file in the target commit"):
         load_program_system_prompt(workspace, "program.md")
+
+
+def test_program_uses_the_launch_pinned_commit_not_current_head(tmp_path: Path):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    write_program(workspace, "program.md", "Reviewed policy.")
+    source_commit = commit_workspace(workspace)
+    (workspace / "program.md").write_text("Unreviewed replacement.")
+    commit_workspace(workspace, "unreviewed local policy")
+
+    program = load_program_system_prompt(workspace, "program.md", source_commit)
+
+    assert program.source_commit == source_commit
+    assert program.content == "Reviewed policy."
+    assert "Unreviewed replacement" not in program.prompt
+
+
+@pytest.mark.parametrize("source_commit", ["not-a-commit", "b" * 40])
+def test_program_requires_an_available_full_launch_commit(
+    tmp_path: Path,
+    source_commit: str,
+):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    write_program(workspace, "program.md", "Reviewed policy.")
+    commit_workspace(workspace)
+
+    with pytest.raises(RuntimeError, match="program.*commit"):
+        load_program_system_prompt(workspace, "program.md", source_commit)
+
+
+@pytest.mark.parametrize("object_type", ["commit", "tree", "blob"])
+def test_program_rejects_a_substituted_object_in_the_agent_writable_store(
+    tmp_path: Path,
+    object_type: str,
+):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    write_program(workspace, "program.md", "Reviewed policy.")
+    source_commit = commit_workspace(workspace)
+    reviewed = {
+        "commit": source_commit,
+        "tree": git(workspace, "rev-parse", f"{source_commit}^{{tree}}"),
+        "blob": git(workspace, "rev-parse", f"{source_commit}:program.md"),
+    }
+    write_program(workspace, "program.md", "Substituted policy.")
+    substituted_commit = commit_workspace(workspace, "substituted policy")
+    substituted = {
+        "commit": substituted_commit,
+        "tree": git(workspace, "rev-parse", f"{substituted_commit}^{{tree}}"),
+        "blob": git(workspace, "rev-parse", f"{substituted_commit}:program.md"),
+    }
+
+    reviewed_object = loose_object(workspace, reviewed[object_type])
+    substituted_object = loose_object(workspace, substituted[object_type])
+    reviewed_object.chmod(0o600)
+    reviewed_object.write_bytes(substituted_object.read_bytes())
+
+    with pytest.raises(RuntimeError, match="object integrity verification"):
+        load_program_system_prompt(workspace, "program.md", source_commit)
+
+
+def test_program_ignores_a_corrupt_unrelated_object(tmp_path: Path):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    write_program(workspace, "program.md", "Reviewed policy.")
+    source_commit = commit_workspace(workspace)
+    (workspace / "unrelated").write_text("Not reachable from the pinned commit.")
+    unrelated = git(workspace, "hash-object", "-w", "unrelated")
+    unrelated_object = loose_object(workspace, unrelated)
+    unrelated_object.chmod(0o600)
+    unrelated_object.write_bytes(b"not a Git object")
+
+    program = load_program_system_prompt(workspace, "program.md", source_commit)
+
+    assert program.content == "Reviewed policy."
+
+
+def test_program_rejects_a_blob_larger_than_the_system_context_limit(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    write_program(workspace, "program.md", "x" * (MAX_PROGRAM_BYTES + 1))
+    commit_workspace(workspace)
+
+    with pytest.raises(RuntimeError, match=f"{MAX_PROGRAM_BYTES}-byte system-context limit"):
+        load_program_system_prompt(workspace, "program.md")
+
+
+def test_program_at_the_utf8_byte_limit_survives_snapshot_transport(tmp_path: Path):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    content = "é" * (MAX_PROGRAM_BYTES // 2)
+    write_program(workspace, "program.md", content)
+    commit_workspace(workspace)
+
+    program = load_program_system_prompt(workspace, "program.md")
+
+    assert len(program.content.encode()) == 256 * 1024
+    inherited = decode_program_system_prompt(encode_program_system_prompt(program))
+    assert inherited.content == content
+
+
+def test_inherited_program_snapshot_is_content_addressed(tmp_path: Path):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    write_program(workspace, "program.md", "Reviewed policy.")
+    commit_workspace(workspace)
+    program = load_program_system_prompt(workspace, "program.md")
+
+    encoded = encode_program_system_prompt(program)
+
+    assert decode_program_system_prompt(encoded) == program
+
+    payload = json.loads(base64.b64decode(encoded))
+    payload["content"] = "Tampered policy."
+    tampered = base64.b64encode(json.dumps(payload).encode()).decode()
+    with pytest.raises(ValueError, match="content-addressed snapshot"):
+        decode_program_system_prompt(tampered)

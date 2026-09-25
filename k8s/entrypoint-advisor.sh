@@ -21,6 +21,13 @@ if [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
     export GITHUB_TOKEN="$(<"$SENPAI_GITHUB_TOKEN_FILE")"
 fi
 : "${GITHUB_TOKEN:?GitHub bootstrap token is required}"
+: "${SENPAI_PROGRAM_SOURCE_COMMIT:?Launch-pinned program source commit is required}"
+: "${SENPAI_PROGRAM_CONTENT_SHA256:?Launch-pinned program digest is required}"
+: "${SENPAI_PROGRAM_CONTEXT_FILE:?Launch-owned program snapshot file is required}"
+[ -r "$SENPAI_PROGRAM_CONTEXT_FILE" ] || {
+    echo "ERROR: program snapshot file is not readable" >&2
+    exit 1
+}
 export SENPAI_OPENHANDS_STATE_DIR="$LOGDIR/openhands_state"
 export SENPAI_OPENHANDS_ROLE_FILE="$WORKDIR/system_instructions/ADVISOR.md"
 

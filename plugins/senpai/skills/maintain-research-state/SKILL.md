@@ -13,7 +13,7 @@ description: >
 
 # Maintain research state
 
-Read the `program.md` identified in the system prompt. It is authoritative for
+Use the immutable `program.md` snapshot embedded in your system prompt. It defines
 target-specific objectives, metrics, constraints, protected files, and any
 baseline or research-log format.
 
