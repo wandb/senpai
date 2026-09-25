@@ -87,7 +87,7 @@ def mailbox(monkeypatch, pulls, *, students=(), check_author_permissions=False):
     ],
 )
 def test_advisor_authorizes_pulls_using_current_base_permission(
-    monkeypatch, permission, role_name, accepted,
+    monkeypatch, permission, role_name, accepted
 ):
     candidate = pull(labels=("research", "student:student-1", "status:review"))
     advisor = mailbox(monkeypatch, [candidate], check_author_permissions=True)
@@ -116,7 +116,7 @@ def test_advisor_authorizes_pulls_using_current_base_permission(
     ],
 )
 def test_advisor_rejects_untrusted_pull_metadata_before_permission_lookup(
-    monkeypatch, metadata,
+    monkeypatch, metadata
 ):
     candidate = pull(labels=("research", "student:student-1", "status:review"))
     if "head" in metadata:
@@ -171,15 +171,22 @@ def test_author_permissions_are_shared_within_a_poll_and_refreshed_next_poll(
 
 @pytest.mark.parametrize(
     "response",
-    [GitHubReadError("permission unavailable"), None, {}, {"permission": []},
-     {"permission": "unexpected"}],
+    [
+        GitHubReadError("permission unavailable"),
+        None,
+        {},
+        {"permission": []},
+        {"permission": "unexpected"},
+    ],
 )
 def test_permission_failure_invalidates_github_snapshot_and_preserves_local_events(
-    monkeypatch, tmp_path, response,
+    monkeypatch, tmp_path, response
 ):
     candidate = pull(labels=("research", "student:student-1", "status:wip"))
     advisor = mailbox(
-        monkeypatch, [candidate], students=("student-1", "student-2"),
+        monkeypatch,
+        [candidate],
+        students=("student-1", "student-2"),
         check_author_permissions=True,
     )
 
@@ -192,13 +199,14 @@ def test_permission_failure_invalidates_github_snapshot_and_preserves_local_even
     monkeypatch.setattr(advisor._github, "get", get)
     store_path = tmp_path / "advisor-events.sqlite3"
     local_event = LocalEvent(
-        kind="child_completed", dedupe_key="child:done", payload={"result": "done"},
+        kind="child_completed", dedupe_key="child:done", payload={"result": "done"}
     )
     with LocalEventStore(store_path) as store:
         store.enqueue(local_event)
     composed = CompositeMailbox(
         StudentAssignmentAvailabilityMailbox(
-            advisor, inbox=PersistentInbox(tmp_path / "inbox.sqlite3"),
+            advisor,
+            inbox=PersistentInbox(tmp_path / "inbox.sqlite3"),
             conversation_id="00000000-0000-0000-0000-000000000123",
             event_store_path=store_path,
         ),

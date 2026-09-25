@@ -150,7 +150,10 @@ class GitHubMailbox:
             f"/repos/{self.repo}/collaborators/{quote(login, safe='')}/permission"
         )
         if not isinstance(permission, dict) or permission.get("permission") not in (
-            "admin", "write", "read", "none"
+            "admin",
+            "write",
+            "read",
+            "none",
         ):
             raise GitHubReadError("GitHub returned an invalid collaborator permission")
         # GitHub maps maintain to write and triage to read in this field.
