@@ -886,7 +886,7 @@ def test_launch_uses_one_scope_for_apply_discovery_and_handoff_commands(
         "github",
         "exa",
         "wandb",
-        openai_api_key="openai",
+        anthropic_api_key="anthropic",
         custom_secrets={},
     )
     program = launch.ProgramSystemPrompt(
