@@ -206,7 +206,10 @@ def _without_shell_data(command: str, workspace: Path) -> str:
             # Bash grammar attaches later argv words as extra destinations.
             destination = node.child_by_field_name("destination")
             if destination is not None:
-                spans.append((node.start_byte, destination.end_byte))
+                # Quoted filename newlines are argv data, not command separators.
+                policy_source[node.start_byte : destination.end_byte] = (
+                    b" " * (destination.end_byte - node.start_byte)
+                )
         if node.type == "case_item":
             # _bash_commands checks substitutions in the original pattern.
             pattern_end = next(child for child in node.children if child.type == ")")
@@ -237,15 +240,21 @@ def _heredoc_feeds_data_sinks(node: object, source: bytes, workspace: Path) -> b
     if statement is None or statement.type != "redirected_statement":
         return False
     ancestor = statement.parent
+    root = statement
     while ancestor is not None:
         if ancestor.type in {
             "pipeline", "command_substitution", "process_substitution", "redirected_statement"
         }:
             return False
+        root = ancestor
         ancestor = ancestor.parent
+    # Earlier redirects can replace inherited stdout with an opaque stream.
+    if any(
+        child.type == "process_substitution" or _is_opaque_exec_redirect(child, source)
+        for child in _descendants(root)
+    ):
+        return False
     for child in _descendants(statement):
-        if child.type == "process_substitution":
-            return False
         if child.type == "file_redirect":
             if any(operator.type in {">&", "<&"} for operator in child.children):
                 return False
@@ -265,10 +274,7 @@ def _is_heredoc_data_sink(node: object, source: bytes, workspace: Path) -> bool:
         node = node.child_by_field_name("body")
     if node is None or node.type != "command":
         return False
-    name = node.child_by_field_name("name")
-    if name is None:
-        return False
-    words = [name, *node.children_by_field_name("argument")]
+    words = _command_words(node)
     tokens = [
         shlex.split(source[word.start_byte : word.end_byte].decode())
         for word in words
@@ -278,13 +284,12 @@ def _is_heredoc_data_sink(node: object, source: bytes, workspace: Path) -> bool:
     arguments = [token[0] for token in tokens]
     if arguments[:2] == ["uv", "run"]:
         arguments = arguments[2:]
+        words = words[2:]
     if not arguments or _shell_program(arguments[0], workspace) is not None:
         return False
     program = Path(arguments[0]).name
-    if program == "tee" and any(
-        argument.startswith(("/dev/fd/", "/proc/"))
-        or argument in {"/dev/stdout", "/dev/stderr"}
-        for argument in arguments[1:]
+    if program == "tee" and not all(
+        _is_literal_file_argument(word, source) for word in words[1:]
     ):
         return False
     return program in {"cat", "tee", "head", "grep"} or re.fullmatch(
@@ -292,9 +297,48 @@ def _is_heredoc_data_sink(node: object, source: bytes, workspace: Path) -> bool:
     ) is not None
 
 
+def _command_words(node: object) -> list[object]:
+    name = node.child_by_field_name("name")
+    if name is None:
+        return []
+    words = [name, *node.children_by_field_name("argument")]
+    owner = node.parent
+    if owner is not None and owner.type == "list" and owner.named_children[-1] == node:
+        owner = owner.parent
+    if owner is not None and owner.type == "redirected_statement":
+        for redirect in owner.children_by_field_name("redirect"):
+            if redirect.type == "file_redirect":
+                words.extend(redirect.children_by_field_name("destination")[1:])
+            elif redirect.type == "heredoc_redirect":
+                words.extend(redirect.children_by_field_name("argument"))
+    return sorted(words, key=lambda word: word.start_byte)
+
+
+def _is_opaque_exec_redirect(node: object, source: bytes) -> bool:
+    if node.type != "file_redirect":
+        return False
+    body = node.parent.child_by_field_name("body")
+    if body is not None and body.type == "list":
+        body = body.named_children[-1]
+    if body is None or body.type != "command":
+        return False
+    arguments = [
+        token
+        for word in _command_words(body)
+        for token in shlex.split(source[word.start_byte : word.end_byte].decode())
+    ]
+    while arguments and arguments[0] in {"builtin", "command"}:
+        arguments = _wrapper_command(arguments[1:])
+    if not arguments or arguments[0] != "exec":
+        return False
+    return any(child.type == ">&" for child in node.children) or (
+        _redirects_stdout(node, source) and not _redirects_stdout_to_literal_file(node, source)
+    )
+
+
 def _redirects_stdout(redirect: object, source: bytes) -> bool:
     operator = next(
-        (child.type for child in redirect.children if child.type in {">", ">>", ">|"}),
+        (child.type for child in redirect.children if child.type in {">", ">>", ">|", "&>", "&>>"}),
         None,
     )
     descriptor = redirect.child_by_field_name("descriptor")
@@ -308,19 +352,24 @@ def _redirects_stdout(redirect: object, source: bytes) -> bool:
 
 def _redirects_stdout_to_literal_file(redirect: object, source: bytes) -> bool:
     destination = redirect.child_by_field_name("destination")
-    if destination is None:
+    return destination is not None and _is_literal_file_argument(destination, source)
+
+
+def _is_literal_file_argument(node: object, source: bytes) -> bool:
+    if node.type not in {"word", "raw_string", "string"}:
         return False
-    if destination.type not in {"word", "raw_string", "string"}:
+    if node.type == "word" and node.named_child_count:
         return False
-    if destination.type == "word" and destination.named_child_count:
-        return False
-    if destination.type == "string" and any(
-        child.type != "string_content" for child in destination.named_children
+    if node.type == "string" and any(
+        child.type != "string_content" for child in node.named_children
     ):
         return False
-    target = source[destination.start_byte : destination.end_byte].strip(b"'\"")
-    return target not in {b"-", b"/dev/stdout", b"/dev/stderr"} and not target.startswith(
-        (b"/dev/fd/", b"/proc/")
+    target = os.path.normpath(shlex.split(source[node.start_byte : node.end_byte].decode())[0])
+    if target.startswith("/"):
+        target = "/" + target.lstrip("/")
+    return target == "/dev/null" or (
+        target not in {"-", "/dev", "/proc"}
+        and not target.startswith(("/dev/", "/proc/"))
     )
 
 
@@ -356,14 +405,11 @@ def _heredoc_runs_shell(owner: object, source: bytes, workspace: Path) -> bool:
         if _shell_program(words[0], workspace) is not None:
             return True
         if Path(words[0]).name in _COMMAND_RUNNERS | {"env", "exec", "timeout", "uv"}:
-            arguments = shlex.split(source[node.start_byte : node.end_byte].decode())
-            if node.parent is not None and node.parent.type == "redirected_statement":
-                for redirect in node.parent.children_by_field_name("redirect"):
-                    if redirect.type == "file_redirect":
-                        for argument in redirect.children_by_field_name("destination")[1:]:
-                            arguments.extend(
-                                shlex.split(source[argument.start_byte : argument.end_byte].decode())
-                            )
+            arguments = [
+                token
+                for word in _command_words(node)
+                for token in shlex.split(source[word.start_byte : word.end_byte].decode())
+            ]
             if any(_shell_program(word, workspace) is not None for word in arguments[1:]):
                 return True
     return False
@@ -403,7 +449,6 @@ def _bash_commands(command: str, workspace: Path) -> list[str] | None:
         if node.type in _POLICY_NODE_TYPES
     ]
     has_functions = any(node.type == "function_definition" for node in nodes)
-    has_shell = _heredoc_runs_shell(tree.root_node, source, workspace)
     for node in nodes:
         if (
             node.type == "file_redirect"
@@ -420,9 +465,7 @@ def _bash_commands(command: str, workspace: Path) -> list[str] | None:
         owner = node.parent
         if owner is None:
             continue
-        if not has_functions and (
-            not has_shell or _heredoc_feeds_data_sinks(node, source, workspace)
-        ):
+        if not has_functions and _heredoc_feeds_data_sinks(node, source, workspace):
             continue
         body = next((child for child in node.children if child.type == "heredoc_body"), None)
         if body is None:

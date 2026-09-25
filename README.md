@@ -270,9 +270,11 @@ Worker and container restarts preserve completed OpenHands events. Recovered liv
 
 The terminal policy checks nested shell commands, substitutions, and command
 wrappers. Quoted heredocs passed to Python or known text consumers (`cat`,
-`tee`, `head`, and `grep`) remain data, including `uv run python` after `cd &&`.
-Heredocs fed to a shell are checked as shell
-commands. Literal numeric arithmetic such as
+`tee`, `head`, and `grep`) remain data when their output paths are known,
+including `uv run python` after `cd &&`. Commands that combine heredocs with
+process substitutions or unknown inherited output streams receive conservative
+shell checks, which can reject valid data. Other heredoc consumers also receive
+shell checks. Literal numeric arithmetic such as
 `echo $((2 + 2))` is supported. Variable-based arithmetic, dynamic executable
 names, startup-variable changes, and shell reevaluation are rejected.
 

@@ -214,6 +214,10 @@ def test_quoted_python_stdin_is_data_for_the_shell_policy(body: str):
         "PYTHONUNBUFFERED=1 python3 - <<'PY'\nprint(*xs)\nPY",
         "cat <<'PY' | python3\nprint(*xs)\nPY",
         "tee notes.md <<'DOC'\nconfig['lr'] = 0.1\nDOC",
+        "tee 'output notes.md' > /dev/null <<'DOC'\nconfig['lr'] = 0.1\nDOC",
+        "tee > /dev/null notes.md <<'DOC'\nconfig['lr'] = 0.1\nDOC",
+        "tee <<'DOC' notes.md\nconfig['lr'] = 0.1\nDOC",
+        "exec > logfile; cat <<'SH'\ngit push origin experiment\nSH",
         "cd data && python - <<'PY'\nprint(*xs)\nPY",
         "mkdir -p output && uv run python - <<'PY'\nconfig['lr'] = 0.1\nPY",
         "python - <<'PY' | head\nprint(*xs)\nPY",
@@ -244,6 +248,7 @@ def test_python_named_shell_symlink_does_not_hide_executable_heredoc(tmp_path: P
         "bash <<'SH'\necho \"$(git push origin experiment)\"\nSH",
         "'bash' <<'SH'\necho \"$(git push origin experiment)\"\nSH",
         "nice -n 10 'bash' <<'SH'\necho \"$(git push origin experiment)\"\nSH",
+        "nice <<'SH' bash\necho \"$(git push origin experiment)\"\nSH",
         "cat <<'SH' | sh\necho \"$(git push origin experiment)\"\nSH",
         "cat <<'SH' | 'sh'\necho \"$(git push origin experiment)\"\nSH",
         "cat > >(sh) <<'SH'\necho \"$(git push origin experiment)\"\nSH",
@@ -251,6 +256,9 @@ def test_python_named_shell_symlink_does_not_hide_executable_heredoc(tmp_path: P
         "{ cat <<'SH'\necho \"$(git push origin experiment)\"\nSH\n} > >(sh)",
         "exec 3> >(bash); cat >&3 <<'SH'\necho \"$(git push origin experiment)\"\nSH",
         "exec 3> >(bash); tee /dev/fd/3 <<'SH'\necho \"$(git push origin experiment)\"\nSH",
+        "exec > >(bash); cat <<'SH'\ngit push origin experiment\nSH",
+        "exec &> >(bash); tee notes.md <<'SH'\ngit push origin experiment\nSH",
+        "cd data && tee > /dev/null /dev/fd/3 <<'SH'\ngit push origin experiment\nSH",
         "python - <<'PYCODE'\nprint(*xs)\nPYCODE\ngit push origin experiment",
         "git push origin experiment && python - <<'PY'\nprint(*xs)\nPY",
         "cat <<'SH' | head | sh\necho \"$(git push origin experiment)\"\nSH",
@@ -261,6 +269,64 @@ def test_heredoc_shell_execution_checks_the_actual_restricted_command(command: s
 
     assert decision.allowed is False
     assert "git push" in decision.reason
+
+
+@pytest.mark.parametrize("runner", ["exec", "builtin exec", "command -p exec", "cd data && exec"])
+def test_inherited_opaque_stdout_does_not_hide_heredoc_commands(runner: str):
+    decision = terminal_policy(
+        f"{runner} > /dev/fd/3; cat <<'SH'\necho \"$(git push origin experiment)\"\nSH",
+        "student",
+        WORKSPACE,
+    )
+
+    assert decision.allowed is False
+    assert "git push" in decision.reason
+
+
+def test_tee_arguments_after_heredoc_delimiter_still_identify_opaque_streams():
+    decision = terminal_policy(
+        "tee <<'SH' /dev/fd/3\ngit push origin experiment\nSH",
+        "student",
+        WORKSPACE,
+    )
+
+    assert decision.allowed is False
+    assert "git push" in decision.reason
+
+
+@pytest.mark.parametrize(
+    "destination",
+    [
+        '"$fd"',
+        '"$(echo /dev/fd/3)"',
+        "/dev/./fd/3",
+        "//dev/fd/3",
+        "$'/dev/fd/3'",
+        "> /dev/null /dev/fd/3",
+    ],
+)
+def test_tee_heredocs_do_not_hide_commands_sent_to_opaque_streams(destination: str):
+    decision = terminal_policy(
+        f"tee {destination} <<'SH'\ngit push origin experiment\nSH",
+        "student",
+        WORKSPACE,
+    )
+
+    assert decision.allowed is False
+    assert "git push" in decision.reason
+
+
+@pytest.mark.parametrize("redirect", [">", "2>", "2>>"])
+def test_newlines_in_redirect_filenames_do_not_hide_trailing_argv(redirect: str):
+    decision = terminal_policy(
+        f'git {redirect} "first\nsecond" push origin experiment',
+        "student",
+        WORKSPACE,
+    )
+
+    assert decision.allowed is False
+    assert "git push" in decision.reason
+    assert is_allowed(f'git {redirect} "first\nsecond" status') is True
 
 
 @pytest.mark.parametrize(
