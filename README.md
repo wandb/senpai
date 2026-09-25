@@ -431,8 +431,8 @@ Advisor and student images are built from the same source revision. The advisor 
 For multi-day fleets, [`arm_senpai_cluster_cutoff.sh`](scripts/arm_senpai_cluster_cutoff.sh) creates a cluster-side hard cutoff that does not depend on an operator laptop remaining online. It can also hold a shared start gate until the expected fleet is ready or its readiness deadline expires.
 
 The cutoff Job runs as UID/GID 10001 and deletes only Deployments with the
-requested `research-tag` labels. Its service account cannot read or delete
-Secrets or ConfigMaps. The operator fixes the readiness deadline and latest
+requested `research-tag` labels. Its Role grants no Secret or ConfigMap
+access. The operator fixes the readiness deadline and latest
 cutoff time when arming the Job; restarts and failed gate writes cannot extend
 that limit. Shared cutoff state is authenticated JSON, never executable shell
 input. The shared PVC must support access by UID/GID 10001.

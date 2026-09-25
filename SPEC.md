@@ -766,8 +766,9 @@ starting. The operator fixes the readiness deadline and latest cutoff time
 when arming the Job. The runtime budget begins on readiness or timeout, capped
 by that latest cutoff time across restarts. The Job authenticates persisted
 JSON state with a per-arm key and never sources shared files. It rejects
-symlinks and non-regular state files, opens shared files without blocking on
-FIFOs, and keeps an in-memory deadline when state persistence fails. Failed
+symlinks and non-regular state files. State reads and temporary writes use
+nonblocking opens to avoid FIFO hangs. The Job keeps an in-memory deadline
+when state persistence fails. Failed
 start-gate writes retry only until the cutoff deadline.
 
 At the deadline, the Job deletes matching Deployments. It runs as UID/GID
