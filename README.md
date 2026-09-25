@@ -493,6 +493,8 @@ session environment. Shared dependency commands such as `torchrun` receive
 target launchers so they and their Python workers can import target packages.
 Existing commands installed in the target environment take precedence.
 Bootstrap creates it without running `ensurepip` or target Python.
+Environment changes belong to the terminal pane that received the command;
+parallel tmux execution can leave several panes with different settings.
 The image supplies pip through the shared package path: use
 `python -m pip install` for additive installs that reuse image packages.
 uv does not inspect packages exposed through that path, so `uv pip install`
