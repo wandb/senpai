@@ -67,7 +67,7 @@ WANDB_API_KEY=
 | `GITHUB_TOKEN` | Target-repository Contents, Pull requests, and Issues read/write. A classic token with `repo` scope also works. GitHub CLI authentication is the fallback when this value is absent. |
 | `ANTHROPIC_API_KEY` | Required when an `anthropic/...` model is configured. Every default profile uses Anthropic. |
 | `OPENAI_API_KEY` | Required when an `openai/...` model is configured. |
-| `EXA_API_KEY` | General-web and research-publication search. |
+| `EXA_API_KEY` | General-web and publication search through the credential-isolated `exa_search` tool. |
 | `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. |
 
 To add a credential, put its value in `.env` and list its name in the launch
@@ -90,9 +90,13 @@ The launcher places credentials in a per-launch Kubernetes Secret. Bootstrap
 writes GitHub, W&B, and Exa keys to owner-only files in a fresh private directory.
 The supervisor consumes and unlinks those files, passes each key through a
 one-use descriptor, and drops its stored credentials after starting the worker.
-The controller restores W&B and Exa access before tracing starts. These service
-keys remain available to research tools, terminals, and training.
-GitHub credentials remain private to the controller.
+The controller keeps Exa authentication in trusted runtime memory. Root agents
+and search children use `exa_search`; terminals and training no longer receive
+`EXA_API_KEY`. All delegated runtimes carry Exa through private descriptors
+so a general-purpose child can still delegate to a search grandchild. The key
+never enters tool parameters or conversation secrets. W&B remains available to
+research tools, terminals, training, and tracing. GitHub credentials remain
+private to the controller.
 
 Delegated model keys travel through a private descriptor and are resolved in
 memory. They do not enter the child environment, except when the same key is
@@ -342,6 +346,22 @@ leave useful tasks running and receives their terminal results as durable
 events; nested children may not detach descendants.
 
 Children share the parent workspace, so their process and conversation are isolated but their filesystem is not. They receive only their declared tools and never receive GitHub credentials, GitHub workflow tools, or training tools.
+
+The Exa tool preserves the standalone script's controls: 1–100 results,
+publication dates, domains, text filters, freshness, six search types, extra
+queries, summaries, and highlight budgets. Web searches default to 10 results;
+publication searches default to 30. Evidence includes every result, summary,
+highlight, and available metadata. Responses above 30,000 characters return an
+explicit preview and save the complete Markdown under the conversation's
+observations directory, outside the target checkout. Agents can read that file
+in bounded ranges, including after a search child finishes. This keeps large
+searches retrievable without filling one model request with all the evidence.
+See the [Exa skill](plugins/senpai/skills/exa-search/SKILL.md) for parameters.
+
+The standalone script remains available to operators outside the agent runtime:
+`python plugins/senpai/skills/exa-search/scripts/search_exa.py general-web "query"`.
+It uses the operator's `EXA_API_KEY` environment or dotenv configuration. Within
+Senpai, agents call `exa_search` because terminals receive no Exa key.
 
 ## Task guides
 

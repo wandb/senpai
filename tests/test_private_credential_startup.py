@@ -134,13 +134,14 @@ def inspect_runtime(prompt, config):
     assert config.smart_api_key.get_secret_value() == "anthropic-key"
     assert config.fast_api_key.get_secret_value() == "anthropic-key"
     assert config.frontier_api_key.get_secret_value() == "openai-key"
-    for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SENPAI_MODEL_CREDENTIALS_FD", "GITHUB_TOKEN"):
+    assert config.exa_api_key.get_secret_value() == "exa-service-key"
+    for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "EXA_API_KEY", "SENPAI_MODEL_CREDENTIALS_FD", "GITHUB_TOKEN"):
         assert name not in os.environ
-    expected = {"WANDB_API_KEY": "wandb-service-key", "EXA_API_KEY": "exa-service-key", "PRIVATE_AUTH": "custom-service-key"}
+    expected = {"WANDB_API_KEY": "wandb-service-key", "PRIVATE_AUTH": "custom-service-key"}
     assert config.conversation_secrets == expected
     assert {name: os.environ[name] for name in expected} == expected
     assert len(transforms) == 1
-    for credential in ("anthropic-key", "openai-key", *expected.values()):
+    for credential in ("anthropic-key", "openai-key", "exa-service-key", *expected.values()):
         assert transforms[0]("private " + credential) == "private <secret-hidden>"
     try:
         os.fstat(descriptor)

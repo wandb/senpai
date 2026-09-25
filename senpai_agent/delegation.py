@@ -30,7 +30,7 @@ from openhands.sdk.tool import (
     ToolDefinition,
     ToolExecutor,
 )
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV
 from senpai_agent.local_events import LocalEvent, LocalEventStore
@@ -53,6 +53,7 @@ from senpai_agent.secrets import (
     MAX_MODEL_CREDENTIAL_BUNDLE_BYTES,
     MODEL_CREDENTIALS_FD_ENV,
     configured_custom_secret_env_names,
+    scrub_exa_credentials,
     scrub_github_credentials,
 )
 
@@ -168,6 +169,7 @@ class DelegationConfig:
     role: str
     program_path: str
     launch_context: str
+    exa_api_key: SecretStr | None = None
     root_state_dir: Path | None = None
     tree_id: str | None = None
     depth: int = 0
@@ -349,6 +351,7 @@ class OpenHandsChildProcess:
         for name in configured_custom_secret_env_names(environment):
             environment.pop(name, None)
         scrub_github_credentials(environment)
+        scrub_exa_credentials(environment)
         for name in tuple(environment):
             if name.endswith("_API_KEY"):
                 environment.pop(name)
@@ -447,6 +450,9 @@ class OpenHandsChildProcess:
                     "delegation profiles assign conflicting values to "
                     f"{profile.api_key_env}"
                 )
+        # Intermediate runtimes retain Exa so they can delegate to search.
+        if self._config.exa_api_key is not None:
+            credentials["EXA_API_KEY"] = self._config.exa_api_key.get_secret_value()
         return credentials
 
     def _open_model_credentials_fd(self) -> int:

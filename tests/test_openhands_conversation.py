@@ -17,7 +17,9 @@ from openhands.sdk.event import (
 from openhands.sdk.llm import Message, TextContent
 from openhands.sdk.llm.exceptions import LLMServiceUnavailableError
 from openhands.sdk.tool import resolve_tool
+from pydantic import SecretStr
 
+import senpai_agent.exa_tool as exa_tool
 import senpai_agent.openhands_runner as runner
 from senpai_agent.controller import OpenHandsTurnRunner, _provider_failure
 from senpai_agent.inbox import (
@@ -1298,6 +1300,10 @@ def test_conversation_and_credentials_are_cleaned_up_after_failures(
     class FakeConversation:
         def __init__(self, **kwargs):
             self.id = kwargs["conversation_id"]
+            assert "EXA_API_KEY" not in runner.os.environ
+            assert "EXA_API_KEY" not in kwargs["secrets"]
+            assert "exa-runtime-sentinel" not in kwargs["agent"].model_dump_json()
+            exa_tool.ExaSearchExecutor()(exa_tool.ExaSearchAction(query="test"))
 
         def send_message(self, _prompt):
             if failure_stage == "send_message":
@@ -1314,13 +1320,26 @@ def test_conversation_and_credentials_are_cleaned_up_after_failures(
     isolate_agent_discovery(monkeypatch, runner)
     monkeypatch.setattr(runner, "clear_github_credentials", lambda: cleared.append(True))
     monkeypatch.setattr(runner, "configure_delegation", delegation.append)
+    requests = []
+
+    def request(client, _path, _options):
+        requests.append(client.headers["x-api-key"])
+        return {"results": []}
+
+    monkeypatch.setattr(exa_tool.Exa, "request", request)
+    monkeypatch.setenv("EXA_API_KEY", "ambient-exa-must-not-be-used")
 
     with pytest.raises(RuntimeError, match="failed"):
-        run_openhands("task", runtime_config(tmp_path))
+        run_openhands("task", runtime_config(
+            tmp_path, exa_api_key=SecretStr("exa-runtime-sentinel"),
+        ))
 
     assert closed == [True]
     assert cleared
     assert delegation[-1] is None
+    with pytest.raises(RuntimeError, match="Exa search credentials are not configured"):
+        exa_tool.ExaSearchExecutor()(exa_tool.ExaSearchAction(query="after cleanup"))
+    assert requests == ["exa-runtime-sentinel"]
 
 
 def test_runtime_credentials_remain_configured_through_lazy_tool_initialization(

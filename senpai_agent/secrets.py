@@ -18,7 +18,7 @@ GITHUB_CREDENTIAL_ENV_NAMES = (
     GITHUB_TOKEN_FD_ENV,
 )
 CUSTOM_SECRET_ENV_NAMES_ENV = "SENPAI_CUSTOM_SECRET_ENV_NAMES"
-BUILTIN_CONVERSATION_SECRET_ENV_NAMES = ("WANDB_API_KEY", "EXA_API_KEY")
+BUILTIN_CONVERSATION_SECRET_ENV_NAMES = ("WANDB_API_KEY",)
 PROVIDER_API_KEY_ENVS = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
@@ -38,6 +38,7 @@ _RESERVED_CUSTOM_SECRET_ENV_NAMES = frozenset(
     {
         # Built-in credentials use separate trust boundaries.
         "GITHUB_TOKEN",
+        "EXA_API_KEY",
         *PROVIDER_API_KEY_ENVS.values(),
         *BUILTIN_CONVERSATION_SECRET_ENV_NAMES,
         # The launcher and entrypoints own these names in both roles.
@@ -199,9 +200,20 @@ def scrub_service_credentials(environment: MutableMapping[str, str]) -> None:
     """Remove service credentials and stale handoffs before supervisor launch."""
 
     for name in (
-        *BUILTIN_CONVERSATION_SECRET_ENV_NAMES,
+        *PRIVATE_CREDENTIAL_FILE_ENVS,
         *PRIVATE_CREDENTIAL_FILE_ENVS.values(),
         *PRIVATE_CREDENTIAL_FD_ENVS.values(),
         MODEL_CREDENTIALS_FD_ENV,
+    ):
+        environment.pop(name, None)
+
+
+def scrub_exa_credentials(environment: MutableMapping[str, str]) -> None:
+    """Keep Exa authentication and its handoffs out of agent child environments."""
+
+    for name in (
+        "EXA_API_KEY",
+        PRIVATE_CREDENTIAL_FILE_ENVS["EXA_API_KEY"],
+        PRIVATE_CREDENTIAL_FD_ENVS["EXA_API_KEY"],
     ):
         environment.pop(name, None)
