@@ -1,8 +1,11 @@
 import json
 import os
+import shutil
+import signal
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -161,7 +164,10 @@ def test_cutoff_dry_run_keeps_readiness_and_delete_without_archive_rbac(tmp_path
     assert 'drop: ["ALL"]' in rendered
 
 
-def test_generated_cutoff_waits_for_readiness_then_deletes_selected_resources(tmp_path):
+@pytest.mark.parametrize("replaced_temporary", [None, "cutoff_state.json", "start-gate"])
+def test_generated_cutoff_waits_for_readiness_then_deletes_selected_resources(
+    tmp_path, replaced_temporary
+):
     generated, captured_script = render_cutoff(
         tmp_path,
         "--run-slug",
@@ -202,12 +208,34 @@ esac
         encoding="utf-8",
     )
     runtime_kubectl.chmod(0o755)
+    replacement_log = tmp_path / "replacement.log"
+    if replaced_temporary is not None:
+        # Replace the newly created file before the cutoff reopens its path.
+        # This schedules the shared-PVC race deterministically at the boundary.
+        racing_mktemp = bin_dir / "mktemp"
+        racing_mktemp.write_text(
+            """#!/bin/sh
+created=$("$REAL_MKTEMP" "$@") || exit
+case "$created" in
+  *"$REPLACED_TEMPORARY".tmp.*)
+    rm "$created"
+    mkfifo "$created"
+    printf '%s\\n' "$created" > "$REPLACEMENT_LOG"
+    ;;
+esac
+printf '%s\\n' "$created"
+""",
+            encoding="utf-8",
+        )
+        racing_mktemp.chmod(0o755)
     state_root = tmp_path / "state"
     gate = tmp_path / "start-gate"
-    result = subprocess.run(
+    with subprocess.Popen(
         ["bash", str(captured_script)],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
+        start_new_session=True,
         env={
             **os.environ,
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
@@ -225,12 +253,23 @@ esac
             "PVC_LOG_ROOT": str(state_root),
             "START_GATE_PATH": str(gate),
             "NAMESPACE": "test-ns",
+            "REAL_MKTEMP": shutil.which("mktemp"),
+            "REPLACED_TEMPORARY": replaced_temporary or "",
+            "REPLACEMENT_LOG": str(replacement_log),
         },
-        check=False,
-    )
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+            pytest.fail(f"cutoff blocked beyond its deadline:\n{stdout}\n{stderr}")
 
-    assert result.returncode == 0, result.stderr
-    assert gate.is_file()
+    assert process.returncode == 0, stderr
+    if replaced_temporary != "start-gate":
+        assert gate.is_file()
+    if replaced_temporary is not None:
+        assert replacement_log.is_file()
     deleted = delete_log.read_text(encoding="utf-8")
     assert "delete deployments" in deleted
     assert "research-tag in (track-a)" in deleted

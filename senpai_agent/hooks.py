@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import getopt
 import json
 import os
 import re
@@ -54,7 +55,6 @@ _COMMAND_RUNNERS = {
     "setsid",
     "stdbuf",
     "taskset",
-    "timeout",
     "unshare",
     "xargs",
 }
@@ -729,6 +729,38 @@ def _help_only(arguments: list[str]) -> bool:
     return len(command_arguments) == 1 and command_arguments[0] in _HELP_FLAGS
 
 
+def _timeout_policy(arguments: list[str], workspace: Path) -> PolicyDecision:
+    """Separate timeout options and duration from the wrapped command's data."""
+
+    try:
+        options, remaining = getopt.getopt(
+            arguments,
+            "k:s:v",
+            [
+                "foreground",
+                "preserve-status",
+                "kill-after=",
+                "signal=",
+                "verbose",
+                "help",
+                "version",
+            ],
+        )
+    except getopt.GetoptError:
+        return PolicyDecision(False, "Senpai could not parse `timeout` safely.")
+    timeout_values = [value for _option, value in options] + remaining[:1]
+    if any(
+        mark in value
+        for value in timeout_values
+        for mark in _SHELL_EXPANSION_MARKS
+    ):
+        return PolicyDecision(
+            False,
+            "Do not construct timeout options or duration with expansion.",
+        )
+    return _segment_policy(remaining[1:], workspace)
+
+
 def _runner_policy(arguments: list[str], workspace: Path) -> PolicyDecision:
     """Evaluate every argument that could start the wrapped command.
 
@@ -859,6 +891,8 @@ def _segment_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
     if program == "exec":
         command = _wrapper_command(arguments, value_options={"-a"})
         return _segment_policy(command, workspace) if command else PolicyDecision(True)
+    if program == "timeout":
+        return _timeout_policy(arguments, workspace)
     if program in _COMMAND_RUNNERS:
         return _runner_policy(arguments, workspace)
     if program == "find":

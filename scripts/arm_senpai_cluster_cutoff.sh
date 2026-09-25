@@ -243,6 +243,8 @@ write_state() {
 import hashlib
 import hmac
 import json
+import os
+import stat
 import sys
 
 (
@@ -278,7 +280,11 @@ document = {
     "payload": payload,
     "mac": hmac.new(key.encode(), encoded, hashlib.sha256).hexdigest(),
 }
-with open(path, "w", encoding="utf-8") as file:
+fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+with os.fdopen(fd, "w", encoding="utf-8") as file:
+    if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+        raise SystemExit("invalid cutoff state temporary")
+    os.ftruncate(file.fileno(), 0)
     json.dump(document, file, sort_keys=True, separators=(",", ":"))
     file.write("\n")
 PY
@@ -316,7 +322,7 @@ allowed = {
 }
 if requested not in allowed:
     raise SystemExit("invalid cutoff state field")
-fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
 try:
     metadata = os.fstat(fd)
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 16_384:
@@ -353,20 +359,33 @@ load_state() {
 }
 
 open_start_gate() {
-  local tmp
+  local tmp contents
   [ -n "$START_GATE_PATH" ] || return 0
   if ! mkdir -p "$(dirname "$START_GATE_PATH")" || \
      ! tmp="$(mktemp "${START_GATE_PATH}.tmp.XXXXXX")"; then
     log "Unable to open the shared start gate"
     return 1
   fi
-  {
+  contents="$(
     printf 'RUN_SLUG=%q\n' "$RUN_SLUG"
     printf 'TAGS_CSV=%q\n' "$TAGS_CSV"
     printf 'OPENED_AT_UTC=%q\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf 'KILL_AT_UTC=%q\n' "${KILL_AT_UTC:-}"
     printf 'SELECTOR=%q\n' "$SELECTOR"
-  } > "$tmp" || {
+  )"
+  python - "$tmp" "$contents" <<'PY' || {
+import os
+import stat
+import sys
+
+path, contents = sys.argv[1:]
+fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+with os.fdopen(fd, "w", encoding="utf-8") as file:
+    if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+        raise SystemExit("invalid start-gate temporary")
+    os.ftruncate(file.fileno(), 0)
+    file.write(contents + "\n")
+PY
     rm -f "$tmp" || log "Unable to remove shared start-gate temporary"
     log "Unable to write the shared start gate"
     return 1

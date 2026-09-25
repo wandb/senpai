@@ -604,6 +604,7 @@ def test_wandb_inference_cannot_reuse_the_controller_key(tmp_path: Path):
             "WANDB_PROJECT": "mlxfast",
             "SENPAI_OPENHANDS_MODEL": "wandb/zai-org/GLM-5.2",
             "SENPAI_OPENHANDS_REASONING_EFFORT": "max",
+            "SENPAI_OPENHANDS_SMART_REASONING_EFFORT": "high",
         }
     )
 
@@ -653,6 +654,7 @@ def test_fast_profile_inherits_smart_effort_for_a_wandb_main_override(
     env.update(
         {
             "WANDB_API_KEY": "wandb-key",
+            "WANDB_INFERENCE_API_KEY": "wandb-inference-key",
             "WANDB_ENTITY": "research-team",
             "WANDB_PROJECT": "mlxfast",
             "SENPAI_OPENHANDS_MODEL": "wandb/zai-org/GLM-5.2",
