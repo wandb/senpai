@@ -1694,13 +1694,6 @@ def run_openhands(
     if run_deadline is not None and run_deadline <= started_at:
         raise TimeoutError("the inherited OpenHands deadline has expired")
     scrub_model_credentials(os.environ, config)
-    configure_training_credentials(config.training_wandb_api_key)
-    configure_wandb_credentials(config.wandb_api_key, base_url=config.wandb_base_url)
-    configure_weave_credentials(
-        config.wandb_api_key,
-        trace_base_url=config.weave_trace_base_url,
-        wandb_base_url=config.wandb_base_url,
-    )
     disable_ambient_plugin_discovery()
     register_default_tools(enable_browser=False)
     register_senpai_tools()
@@ -1774,6 +1767,13 @@ def run_openhands(
     cleanup_error: BaseException | None = None
     active_inbox_turn_id = inbox_turn_id
     try:
+        configure_training_credentials(config.training_wandb_api_key)
+        configure_wandb_credentials(config.wandb_api_key, base_url=config.wandb_base_url)
+        configure_weave_credentials(
+            config.wandb_api_key,
+            trace_base_url=config.weave_trace_base_url,
+            wandb_base_url=config.wandb_base_url,
+        )
         retried_provider_errors: ContextVar[tuple[BaseException, ...]] = ContextVar(
             "retried_provider_errors",
             default=(),
