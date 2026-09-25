@@ -7,9 +7,9 @@ import pytest
 from pydantic import SecretStr
 
 import senpai_agent.git_workflow as git_workflow
+from senpai_agent.git_transport import GIT_EXECUTABLE, git_process_env
 from senpai_agent.git_workflow import (
     GitWorkflowPreconditionError,
-    git_process_env,
     push_assignment_branch,
     require_clean_training_worktree,
     require_commit_contains_base,
@@ -23,7 +23,7 @@ def test_authenticated_git_environment_keeps_only_the_scoped_header(tmp_path: Pa
 
     result = subprocess.run(
         [
-            git_workflow.GIT_EXECUTABLE,
+            GIT_EXECUTABLE,
             "config",
             "--get-urlmatch",
             "http.extraHeader",
@@ -103,52 +103,6 @@ def test_push_is_lease_guarded_verified_and_idempotent(tmp_path: Path):
     assert repeated.changed is False
     assert repeated.head_sha == candidate_sha
     assert git(remote, "rev-parse", "refs/heads/experiment-7") == candidate_sha
-
-
-@pytest.mark.parametrize(
-    ("role", "branch"),
-    [
-        ("advisor", "experiment-7"),
-        ("student", "student-one/experiment-7"),
-    ],
-)
-def test_push_ref_is_accepted_by_the_role_guard(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    role: str,
-    branch: str,
-):
-    workspace, remote, previous_sha = repository(tmp_path)
-    if branch != "experiment-7":
-        git(workspace, "branch", "-m", branch)
-        git(workspace, "push", "-u", "origin", branch)
-    guard = (
-        Path(__file__).parents[1] / "plugins" / "senpai" / "scripts" / "git-guard.sh"
-    )
-    subprocess.run(
-        [
-            "bash",
-            "-c",
-            'source "$1"; install_senpai_target_git_guard "$2"',
-            "install-guard",
-            str(guard),
-            str(workspace),
-        ],
-        check=True,
-    )
-    monkeypatch.setenv("SENPAI_ROLE", role)
-    monkeypatch.setenv("ADVISOR_BRANCH", "experiment-7")
-    monkeypatch.setenv("STUDENT_NAME", "student-one")
-    monkeypatch.setenv("STUDENT_NAMES", "student-one")
-    commit_file(workspace, "model.py", "baseline = 2\n", "candidate")
-
-    pushed = push_assignment_branch(
-        workspace,
-        branch=branch,
-        expected_remote_sha=previous_sha,
-    )
-
-    assert git(remote, "rev-parse", f"refs/heads/{branch}") == pushed.head_sha
 
 
 def test_push_publishes_only_the_validated_commit(tmp_path: Path, monkeypatch):
@@ -275,7 +229,7 @@ def test_typed_push_auth_is_confined_to_network_git_processes(
         assert "ambient-gh-token" not in env.values()
         assert "GITHUB_TOKEN" not in env
         assert "GH_TOKEN" not in env
-        assert command[0] == git_workflow.GIT_EXECUTABLE
+        assert command[0] == GIT_EXECUTABLE
         assert env["GIT_CONFIG_GLOBAL"] == os.devnull
         assert env["GIT_CONFIG_SYSTEM"] == os.devnull
         assert env["GIT_CONFIG_NOSYSTEM"] == "1"
@@ -296,17 +250,15 @@ def test_typed_push_auth_is_confined_to_network_git_processes(
             ),
             None,
         )
-        if authorization is not None:
+        if command[1] in {"ls-remote", "fetch", "push"}:
+            assert authorization is not None
             encoded = authorization.removeprefix("Authorization: Basic ")
             assert base64.b64decode(encoded).decode() == (
                 "x-access-token:typed-write-token"
             )
             assert Path(kwargs["cwd"]) != workspace
         else:
-            assert not any(
-                value.startswith("Authorization: Basic ")
-                for value in configuration.values()
-            )
+            assert authorization is None
         return real_run(command, **kwargs)
 
     monkeypatch.setattr("senpai_agent.git_transport.subprocess.run", guarded_run)

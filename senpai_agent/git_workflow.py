@@ -9,9 +9,7 @@ from pathlib import Path
 from pydantic import SecretStr
 
 from senpai_agent.git_transport import (
-    GIT_EXECUTABLE,
     GitWorkflowPreconditionError,
-    git_process_env,
     github_repository_url,
     isolated_bare_repository as _isolated_bare_repository,
     remote_head as _remote_head,
