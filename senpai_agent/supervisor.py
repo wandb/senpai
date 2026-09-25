@@ -1,14 +1,15 @@
-"""Small process boundary that restarts a crashed or wedged Senpai controller."""
+"""One-shot process boundary for a credential-bearing Senpai controller."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import random
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -30,7 +31,11 @@ from senpai_agent.program_context import (
 from senpai_agent.secrets import (
     GITHUB_TOKEN_FD_ENV,
     GITHUB_TOKEN_FILE_ENV,
+    PRIVATE_CREDENTIAL_FD_ENVS,
+    PRIVATE_CREDENTIAL_FILE_ENVS,
     scrub_github_credentials,
+    scrub_service_credentials,
+    set_process_nondumpable,
 )
 
 LEASE_ENV = "SENPAI_CONTROLLER_LEASE_PATH"
@@ -43,8 +48,6 @@ class SupervisorConfig:
     startup_timeout_seconds: float = 300
     check_interval_seconds: float = 5
     terminate_grace_seconds: float = 60
-    initial_backoff_seconds: float = 1
-    max_backoff_seconds: float = 300
 
     def __post_init__(self) -> None:
         if (
@@ -52,8 +55,6 @@ class SupervisorConfig:
                 self.startup_timeout_seconds,
                 self.check_interval_seconds,
                 self.terminate_grace_seconds,
-                self.initial_backoff_seconds,
-                self.max_backoff_seconds,
             )
             <= 0
         ):
@@ -164,7 +165,7 @@ class ProgressLease:
 
 
 class WorkerSupervisor:
-    """Keep one long-running controller worker alive behind a hard lease."""
+    """Run one controller worker and let the container runtime restart it."""
 
     def __init__(
         self,
@@ -174,6 +175,7 @@ class WorkerSupervisor:
         config: SupervisorConfig | None = None,
         environment: Mapping[str, str] | None = None,
         github_token: SecretStr | None = None,
+        private_credentials: Mapping[str, SecretStr] | None = None,
     ):
         if not command:
             raise ValueError("worker command must not be empty")
@@ -182,81 +184,91 @@ class WorkerSupervisor:
         self.config = config or SupervisorConfig()
         self.environment = dict(os.environ if environment is None else environment)
         scrub_github_credentials(self.environment)
+        scrub_service_credentials(self.environment)
         self.github_token = github_token
+        self.private_credentials = dict(private_credentials or {})
 
     def run(self, stop: threading.Event | None = None) -> int:
         stop = stop or threading.Event()
-        failures = 0
-        while not stop.is_set():
-            self.lease_path.unlink(missing_ok=True)
-            environment = {
-                **self.environment,
-                LEASE_ENV: str(self.lease_path),
-            }
-            token_fd = self._open_github_token_pipe()
-            if token_fd is not None:
-                environment[GITHUB_TOKEN_FD_ENV] = str(token_fd)
-            try:
-                process = subprocess.Popen(
-                    self.command,
-                    env=environment,
-                    start_new_session=True,
-                    pass_fds=(token_fd,) if token_fd is not None else (),
-                )
-            finally:
-                if token_fd is not None:
-                    os.close(token_fd)
-            started = time.monotonic()
-            descendants: dict[int, float] = {}
-            try:
-                reason, made_progress = self._wait_for_worker(
-                    process,
-                    descendants,
-                    stop,
-                    started,
-                )
-            finally:
-                self._terminate_worker(process, descendants)
-                self._reap_orphaned_children(None)
-            if stop.is_set():
-                return 0
-
-            runtime = time.monotonic() - started
-            failures = 1 if made_progress else failures + 1
-            exponential_delay = min(
-                self.config.max_backoff_seconds,
-                self.config.initial_backoff_seconds * (2 ** min(failures - 1, 16)),
-            )
-            delay = min(
-                self.config.max_backoff_seconds,
-                exponential_delay * random.uniform(0.8, 1.2),
-            )
-            print(
-                "SENPAI_CONTROLLER_RESTART "
-                f"reason={reason} runtime_seconds={runtime:.1f} "
-                f"completed_turn={str(made_progress).lower()} "
-                f"restart_failures={failures} backoff_seconds={delay:.1f}",
-                file=sys.stderr,
-                flush=True,
-            )
-            stop.wait(delay)
-        return 0
-
-    def _open_github_token_pipe(self) -> int | None:
-        if self.github_token is None:
-            return None
-        read_fd, write_fd = os.pipe()
+        if stop.is_set():
+            self._forget_credentials()
+            return 0
+        self.lease_path.unlink(missing_ok=True)
+        environment = {
+            **self.environment,
+            LEASE_ENV: str(self.lease_path),
+        }
+        credential_fds: dict[str, int] = {}
         try:
-            os.write(
-                write_fd,
-                self.github_token.get_secret_value().encode(),
+            credential_fds = self._open_credential_fds()
+            for env_name, descriptor in credential_fds.items():
+                environment[env_name] = str(descriptor)
+            process = subprocess.Popen(
+                self.command,
+                env=environment,
+                start_new_session=True,
+                pass_fds=tuple(credential_fds.values()),
             )
-        except BaseException:
-            os.close(read_fd)
-            raise
         finally:
-            os.close(write_fd)
-        return read_fd
+            for descriptor in credential_fds.values():
+                os.close(descriptor)
+            environment.clear()
+            self._forget_credentials()
+
+        started = time.monotonic()
+        descendants: dict[int, float] = {}
+        try:
+            reason, made_progress = self._wait_for_worker(
+                process,
+                descendants,
+                stop,
+                started,
+            )
+        finally:
+            deadline = time.monotonic() + self.config.terminate_grace_seconds
+            self._terminate_worker(process, descendants, deadline)
+            self._terminate_adopted_children(deadline)
+            self._reap_orphaned_children(None)
+        if stop.is_set():
+            return 0
+
+        print(
+            "SENPAI_CONTROLLER_EXIT "
+            f"reason={reason} runtime_seconds={time.monotonic() - started:.1f} "
+            f"completed_turn={str(made_progress).lower()}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if reason.startswith("exit:"):
+            exit_code = int(reason.partition(":")[2])
+            return exit_code or 1
+        return 1
+
+    def _forget_credentials(self) -> None:
+        self.github_token = None
+        self.private_credentials.clear()
+        self.environment.clear()
+
+    def _open_credential_fds(self) -> dict[str, int]:
+        credentials = {
+            PRIVATE_CREDENTIAL_FD_ENVS[name]: value
+            for name, value in self.private_credentials.items()
+        }
+        if self.github_token is not None:
+            credentials[GITHUB_TOKEN_FD_ENV] = self.github_token
+        descriptors: dict[str, int] = {}
+        try:
+            for name, credential in credentials.items():
+                # An unnamed file avoids pipe-capacity deadlocks before Popen.
+                with tempfile.TemporaryFile() as stream:
+                    stream.write(credential.get_secret_value().encode())
+                    stream.seek(0)
+                    descriptors[name] = os.dup(stream.fileno())
+            return descriptors
+        except BaseException:
+            for descriptor in descriptors.values():
+                os.close(descriptor)
+            raise
 
     def _wait_for_worker(
         self,
@@ -320,11 +332,12 @@ class WorkerSupervisor:
         self,
         process: subprocess.Popen[bytes],
         descendants: Mapping[int, float],
+        deadline: float,
     ) -> None:
         self._signal_descendants(descendants, signal.SIGTERM)
         terminate_process_group(
             process,
-            grace_seconds=self.config.terminate_grace_seconds,
+            grace_seconds=max(0, deadline - time.monotonic()),
         )
         self._signal_descendants(descendants, signal.SIGKILL)
 
@@ -340,6 +353,31 @@ class WorkerSupervisor:
                     process.send_signal(sig)
             except (OSError, psutil.Error):
                 continue
+
+    def _terminate_adopted_children(self, deadline: float) -> None:
+        """Stop detached descendants before container PID 1 exits."""
+
+        if os.getpid() != 1:
+            return
+        try:
+            children = psutil.Process().children(recursive=True)
+        except (OSError, psutil.Error):
+            return
+        for child in children:
+            try:
+                child.terminate()
+            except (OSError, psutil.Error):
+                continue
+        _, alive = psutil.wait_procs(
+            children,
+            timeout=max(0, deadline - time.monotonic()),
+        )
+        for child in alive:
+            try:
+                child.kill()
+            except (OSError, psutil.Error):
+                continue
+        psutil.wait_procs(alive, timeout=max(0, deadline - time.monotonic()))
 
     @staticmethod
     def _reap_orphaned_children(worker_pid: int | None) -> None:
@@ -426,7 +464,7 @@ def supervisor_main(
     env: Mapping[str, str] = os.environ,
 ) -> int:
     parser = argparse.ArgumentParser(
-        description="Supervise a durable Senpai controller worker."
+        description="Run one Senpai controller worker per container start."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for role in ("advisor", "student"):
@@ -445,6 +483,7 @@ def supervisor_main(
     if not 1 <= health_port <= 65535:
         raise RuntimeError(f"{HEALTH_PORT_ENV} must be between 1 and 65535")
 
+    set_process_nondumpable()
     state_dir = Path(env["SENPAI_OPENHANDS_STATE_DIR"]).resolve()
     worker_environment = prepare_system_context_environment(
         args.command,
@@ -452,6 +491,7 @@ def supervisor_main(
         env,
     )
     github_token = _consume_github_token(env)
+    private_credentials = _consume_private_credential_files(env)
     stop = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -464,7 +504,7 @@ def supervisor_main(
     try:
         lease_path = state_dir / "controller-lease.json"
         with serve_lease_health(lease_path, port=health_port):
-            return WorkerSupervisor(
+            worker = WorkerSupervisor(
                 command=(
                     sys.executable,
                     "-P",
@@ -475,7 +515,22 @@ def supervisor_main(
                 lease_path=lease_path,
                 environment=worker_environment,
                 github_token=github_token,
-            ).run(stop)
+                private_credentials=private_credentials,
+            )
+            github_token = None
+            private_credentials.clear()
+            worker_environment.clear()
+            # The worker has its own startup environment. Drop PID 1's current
+            # model values; this does not erase the kernel's original environ.
+            model_names = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY"}
+            for profile in ("", "SMART_", "FAST_", "FRONTIER_"):
+                if name := env.get(f"SENPAI_OPENHANDS_{profile}API_KEY_ENV"):
+                    model_names.add(name)
+            for name in model_names:
+                os.environ.pop(name, None)
+            scrub_github_credentials(os.environ)
+            scrub_service_credentials(os.environ)
+            return worker.run(stop)
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
@@ -527,16 +582,54 @@ def _consume_github_token(env: Mapping[str, str]) -> SecretStr:
     value = env.get(GITHUB_TOKEN_FILE_ENV)
     if not value:
         raise RuntimeError(f"{GITHUB_TOKEN_FILE_ENV} is required")
-    path = Path(value).resolve()
-    try:
-        if not path.is_file() or path.stat().st_mode & 0o077:
-            raise RuntimeError("GitHub token handoff must be a private regular file")
-        token = path.read_text(encoding="utf-8").strip()
-    finally:
-        path.unlink(missing_ok=True)
+    token = _consume_private_file(
+        Path(value),
+        "GitHub token handoff",
+    )
     if not token:
         raise RuntimeError("GitHub token handoff is empty")
     return SecretStr(token)
+
+
+def _consume_private_credential_files(
+    env: Mapping[str, str],
+) -> dict[str, SecretStr]:
+    credentials: dict[str, SecretStr] = {}
+    for credential_name, file_env in PRIVATE_CREDENTIAL_FILE_ENVS.items():
+        file_value = env.get(file_env)
+        if not file_value:
+            continue
+        value = _consume_private_file(Path(file_value), file_env)
+        if not value:
+            raise RuntimeError(f"{file_env} is empty")
+        credentials[credential_name] = SecretStr(value)
+    return credentials
+
+
+def _consume_private_file(path: Path, label: str) -> str:
+    """Read and unlink an owner-only handoff without following symlinks."""
+
+    try:
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
+    except OSError as error:
+        raise RuntimeError(f"{label} must be an owner-only regular file") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_mode & 0o077
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise RuntimeError(f"{label} must be an owner-only regular file")
+        with os.fdopen(descriptor, encoding="utf-8") as source:
+            descriptor = -1
+            return source.read().strip()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

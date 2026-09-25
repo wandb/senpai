@@ -48,8 +48,8 @@ entrypoint
 
 Python supervisor
   start one controller worker process group
-  restart crashes with bounded exponential backoff
-  TERM/KILL a worker whose current phase lease expires
+  forget stored credentials after handoff
+  TERM/KILL descendants and exit when the worker stops or its lease expires
 
 Python controller worker
   poll GitHub + local durable monitor/event state
@@ -63,10 +63,11 @@ The worker publishes an atomic lease containing its PID, current phase, hard
 deadline, completed-turn counter, and active LLM request timestamps. A
 non-model-visible heartbeat updates `llm_request_heartbeat_at` while preserving
 the request's original `llm_request_started_at`. It does not add conversation
-events or renew the hard deadline. The supervisor resets bounded restart
-backoff only after a turn is successfully acknowledged; process uptime and
-idle sleep do not count as progress. The supervisor is independent of
-OpenHands and Kubernetes.
+events or renew the hard deadline. The supervisor starts exactly one worker.
+A worker crash, clean exit, or expired lease causes descendant cleanup and a
+nonzero supervisor exit. An operator stop returns zero. An external process
+manager owns restart and backoff. The supervisor is independent of OpenHands
+and Kubernetes.
 OpenHands events renew the root turn's lease; its configured timeout measures
 inactivity rather than total elapsed time. Provider, tool, training, and child
 deadlines remain hard.
@@ -76,8 +77,8 @@ Kubernetes startup and liveness probes query this endpoint on fixed port 8080
 without creating a process inside the container. The images have no Docker
 `HEALTHCHECK`. Standalone launchers can set `SENPAI_HEALTH_PORT` and configure
 an external monitor with startup grace and retries. After persistent failure,
-the monitor restarts the container or repeats host bootstrap. The supervisor
-retains its worker restart loop on every deployment platform.
+the monitor restarts the container or repeats host bootstrap. Restarting the
+complete entrypoint recreates the one-use credential handoffs.
 
 The health listener monitors one supervisor. Advisor/student communication
 continues through GitHub. The core controller imports no Kubernetes API.
@@ -716,8 +717,12 @@ The entrypoint uses the GitHub write token only for bootstrap, writes it to a
 private mode-0600 file under the pod-local `/tmp`, removes the askpass helper,
 clears all raw token environment variables, and execs the supervisor. The
 supervisor consumes and unlinks that bootstrap file into typed in-process
-memory. Before each controller restart it creates a one-shot inherited pipe;
-the worker reads and closes that pipe before tool initialization. No raw token
+memory. It creates one-use inherited descriptors for one controller, then drops
+its stored credentials and copied worker environment. The worker reads and
+closes the descriptors before tool initialization. Bootstrap also hands off
+W&B and Exa through private files. The controller restores those service keys
+before importing the runner so research access and import-time Weave tracing
+continue to work. Standalone launches may omit services they do not use. No raw token
 is written to conversation/dataset storage. The long-lived PID 1 environment,
 model-facing tool schemas, and agent terminal contain no GitHub token.
 
@@ -733,6 +738,30 @@ not change the advisor checkout. Pushes retain expected-SHA checks, ancestry
 checks, exact ref leases, and post-push verification. The bootstrap runner and
 target pre-push hooks remain behavioral guards; typed publication bypasses them
 and applies its own branch and lease checks.
+
+Delegated model credentials use a bounded JSON bundle in an unnamed file. The
+parent passes its descriptor to the child and closes its copy after spawning.
+The child closes the descriptor after reading and resolves configuration from
+an in-memory mapping. W&B and Exa conversation secrets remain available to child
+tools; a model key that also serves one of those services remains in the
+environment. W&B inference still shares `WANDB_API_KEY` until the W&B identity
+cutover. No per-student W&B key is required by this handoff change.
+
+The supervisor, controller, and delegated runner disable process dumping on
+Linux. After capturing the worker environment, the supervisor removes current
+model-provider values and discards its environment copies. Removing an
+`os.environ` entry does not erase the kernel's original startup environment.
+Model values can remain there until process exit. A same-UID process can also
+race a delegated child's inherited descriptor before Python disables dumping.
+These measures reduce exposure; they do not establish complete same-UID secrecy.
+
+The supervisor cleans up the worker and detached descendants under one shared
+60-second grace allowance, below the 75-second liveness termination grace.
+Existing post-SIGKILL waits can still depend on kernel process termination.
+Kubernetes or another process manager must restart the complete entrypoint;
+restarting only the Python supervisor cannot recreate consumed handoff files.
+Container restarts retain pod-local conversation state, while pod replacement
+does not retain that state.
 
 Generic child processes receive no GitHub token and no GitHub tools. Main-role
 GitHub operations remain typed and lease/state guarded. Terminal and hook

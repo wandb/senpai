@@ -127,11 +127,28 @@ export IS_SANDBOX=1
 export SENPAI_OPENHANDS_WORKSPACE="$TARGET_WORKDIR"
 export SENPAI_OPENHANDS_HARNESS_FILE="$WORKDIR/system_instructions/SENPAI-HARNESS.md"
 export SENPAI_OPENHANDS_TIMEOUT_SECONDS="${SENPAI_OPENHANDS_TIMEOUT_SECONDS:-7200}"
+CREDENTIAL_HANDOFF_DIR=""
+prepare_credential_handoff_dir() {
+    [ -n "$CREDENTIAL_HANDOFF_DIR" ] && return
+    CREDENTIAL_HANDOFF_DIR="$(mktemp -d /tmp/senpai-supervisor.XXXXXX)"
+    chmod 700 "$CREDENTIAL_HANDOFF_DIR"
+}
 if [ -z "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
-    export SENPAI_GITHUB_TOKEN_FILE="/tmp/senpai-supervisor-github-token"
+    prepare_credential_handoff_dir
+    export SENPAI_GITHUB_TOKEN_FILE="$CREDENTIAL_HANDOFF_DIR/github-token"
     (umask 077; printf '%s' "$GITHUB_TOKEN" > "$SENPAI_GITHUB_TOKEN_FILE")
 fi
-unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS
+if [ -z "${SENPAI_WANDB_API_KEY_FILE:-}" ] && [ -n "${WANDB_API_KEY:-}" ]; then
+    prepare_credential_handoff_dir
+    export SENPAI_WANDB_API_KEY_FILE="$CREDENTIAL_HANDOFF_DIR/wandb-api-key"
+    (umask 077; printf '%s' "$WANDB_API_KEY" > "$SENPAI_WANDB_API_KEY_FILE")
+fi
+if [ -z "${SENPAI_EXA_API_KEY_FILE:-}" ] && [ -n "${EXA_API_KEY:-}" ]; then
+    prepare_credential_handoff_dir
+    export SENPAI_EXA_API_KEY_FILE="$CREDENTIAL_HANDOFF_DIR/exa-api-key"
+    (umask 077; printf '%s' "$EXA_API_KEY" > "$SENPAI_EXA_API_KEY_FILE")
+fi
+unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS WANDB_API_KEY EXA_API_KEY
 rm -f "$GIT_ASKPASS_FILE"
 export SENPAI_TARGET_PYTHON_ENV="$HOME/.venvs/senpai-target"
 if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then

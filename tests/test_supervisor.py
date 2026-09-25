@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import socket
 import subprocess
 import sys
@@ -43,19 +42,8 @@ def run_supervisor(
     return thread, results
 
 
-def restart_backoffs(stderr: str) -> list[float]:
-    return [
-        float(match.group(1))
-        for match in re.finditer(r"backoff_seconds=([0-9.]+)", stderr)
-    ]
-
-
 def test_supervisor_default_termination_grace_is_sixty_seconds():
     assert SupervisorConfig().terminate_grace_seconds == 60
-
-
-def test_supervisor_caps_repeated_restart_backoff_at_five_minutes():
-    assert SupervisorConfig().max_backoff_seconds == 300
 
 
 def test_inference_heartbeat_is_observational_controller_state(tmp_path: Path):
@@ -234,7 +222,7 @@ def test_pid_one_reaps_adopted_children_without_reaping_its_worker(monkeypatch):
     assert reaped == [(42, os.WNOHANG)]
 
 
-def test_restarted_workers_receive_github_token_without_environment_exposure(
+def test_one_worker_consumes_credentials_once_and_forces_a_container_restart(
     tmp_path: Path,
 ):
     worker = tmp_path / "worker.py"
@@ -253,11 +241,21 @@ count_path.write_text(str(count))
 token_fd = int(os.environ["SENPAI_GITHUB_TOKEN_FD"])
 with os.fdopen(token_fd) as token_stream:
     token = token_stream.read()
+private = {}
+for name, fd_name in {
+    "wandb": "SENPAI_WANDB_API_KEY_FD",
+    "exa": "SENPAI_EXA_API_KEY_FD",
+}.items():
+    with os.fdopen(int(os.environ[fd_name])) as stream:
+        private[name] = stream.read()
 with (state / "observations").open("a") as output:
     output.write(json.dumps({
         "token": token,
+        "private": private,
         "github_env": os.environ.get("GITHUB_TOKEN"),
         "gh_env": os.environ.get("GH_TOKEN"),
+        "wandb_env": os.environ.get("WANDB_API_KEY"),
+        "exa_env": os.environ.get("EXA_API_KEY"),
         "token_file_env": os.environ.get("SENPAI_GITHUB_TOKEN_FILE"),
     }) + "\\n")
 
@@ -267,11 +265,9 @@ lease.write_text(json.dumps({
     "phase": "ready",
     "deadline": time.monotonic() + 30,
 }))
-if count == 1:
-    raise SystemExit(19)
-(state / "ready").write_text("ready")
-while True:
-    time.sleep(1)
+while not (state / "release").exists():
+    time.sleep(0.01)
+raise SystemExit(19)
 """.strip()
     )
     stop = threading.Event()
@@ -279,39 +275,65 @@ while True:
         command=(sys.executable, str(worker), str(tmp_path)),
         lease_path=tmp_path / "controller-lease.json",
         github_token=SecretStr("write-token-sentinel"),
+        private_credentials={
+            "WANDB_API_KEY": SecretStr("wandb-controller-sentinel"),
+            "EXA_API_KEY": SecretStr("exa-sentinel"),
+        },
         environment={
             **os.environ,
             "GITHUB_TOKEN": "must-not-survive",
             "GH_TOKEN": "must-not-survive",
+            "WANDB_API_KEY": "must-not-survive",
+            "EXA_API_KEY": "must-not-survive",
         },
         config=SupervisorConfig(
             startup_timeout_seconds=1,
             check_interval_seconds=0.01,
             terminate_grace_seconds=0.1,
-            initial_backoff_seconds=0.01,
-            max_backoff_seconds=0.01,
         ),
     )
 
-    thread, results = run_supervisor(supervisor, stop)
-    wait_for(tmp_path / "ready")
-    stop.set()
+    results = []
+    thread = threading.Thread(target=lambda: results.append(supervisor.run(stop)))
+    thread.start()
+    deadline = time.monotonic() + 5
+    while not (tmp_path / "observations").exists():
+        if time.monotonic() > deadline:
+            pytest.fail("worker did not consume credential handoffs")
+        time.sleep(0.01)
+
+    assert supervisor.github_token is None
+    assert supervisor.private_credentials == {}
+    assert supervisor.environment == {}
+    (tmp_path / "release").write_text("release")
     thread.join(5)
 
-    assert results == [0]
+    assert not thread.is_alive()
+    assert results == [19]
     observations = [
         json.loads(line)
         for line in (tmp_path / "observations").read_text().splitlines()
     ]
-    assert len(observations) == 2
+    assert len(observations) == 1
+    assert (tmp_path / "starts").read_text() == "1"
     assert all(item["token"] == "write-token-sentinel" for item in observations)
+    assert all(
+        item["private"]
+        == {
+            "wandb": "wandb-controller-sentinel",
+            "exa": "exa-sentinel",
+        }
+        for item in observations
+    )
     assert all(item["github_env"] is None for item in observations)
     assert all(item["gh_env"] is None for item in observations)
+    assert all(item["wandb_env"] is None for item in observations)
+    assert all(item["exa_env"] is None for item in observations)
     assert all(item["token_file_env"] is None for item in observations)
     assert not list(tmp_path.glob(".github-token-*"))
 
 
-def test_overdue_worker_is_killed_and_restarted(tmp_path: Path):
+def test_overdue_worker_is_killed_without_an_in_container_restart(tmp_path: Path):
     worker = tmp_path / "worker.py"
     worker.write_text(
         """
@@ -332,13 +354,11 @@ lease = Path(os.environ["SENPAI_CONTROLLER_LEASE_PATH"])
 temporary = lease.with_suffix(".tmp")
 temporary.write_text(json.dumps({
     "pid": os.getpid(),
-    "phase": "wedged-turn" if count == 1 else "healthy-turn",
-    "deadline": time.monotonic() + (0.05 if count == 1 else 30),
+    "phase": "wedged-turn",
+    "deadline": time.monotonic() + 0.05,
 }))
 temporary.replace(lease)
 
-if count > 1:
-    (state / "restarted").write_text("restarted")
 while True:
     time.sleep(1)
 """.strip()
@@ -351,80 +371,11 @@ while True:
             startup_timeout_seconds=1,
             check_interval_seconds=0.01,
             terminate_grace_seconds=0.05,
-            initial_backoff_seconds=0.01,
-            max_backoff_seconds=0.01,
         ),
     )
 
-    thread, results = run_supervisor(supervisor, stop)
-    wait_for(tmp_path / "restarted")
-    stop.set()
-    thread.join(5)
-
-    assert not thread.is_alive()
-    assert results == [0]
-    assert int((tmp_path / "starts").read_text()) >= 2
-
-
-def test_worker_uptime_without_a_completed_turn_does_not_reset_restart_backoff(
-    tmp_path: Path,
-    monkeypatch,
-    capsys,
-):
-    worker = tmp_path / "worker.py"
-    worker.write_text(
-        """
-import json
-import os
-import sys
-import time
-from pathlib import Path
-
-state = Path(sys.argv[1])
-count_path = state / "starts"
-count = int(count_path.read_text()) + 1 if count_path.exists() else 1
-count_path.write_text(str(count))
-lease = Path(os.environ["SENPAI_CONTROLLER_LEASE_PATH"])
-lease.write_text(json.dumps({
-    "pid": os.getpid(),
-    "phase": "sleep",
-    "deadline": 1e100,
-}))
-time.sleep(0.03)
-if count < 3:
-    raise SystemExit(19)
-(state / "ready").write_text("ready")
-while True:
-    time.sleep(1)
-""".strip()
-    )
-    class AcceleratedClock:
-        @staticmethod
-        def monotonic():
-            return time.monotonic() * 100_000
-
-    monkeypatch.setattr(supervisor_module, "time", AcceleratedClock())
-    monkeypatch.setattr(supervisor_module.random, "uniform", lambda _a, _b: 1.2)
-    stop = threading.Event()
-    supervisor = WorkerSupervisor(
-        command=(sys.executable, str(worker), str(tmp_path)),
-        lease_path=tmp_path / "controller-lease.json",
-        config=SupervisorConfig(
-            startup_timeout_seconds=1_000_000_000,
-            check_interval_seconds=0.005,
-            terminate_grace_seconds=0.05,
-            initial_backoff_seconds=0.2,
-            max_backoff_seconds=0.4,
-        ),
-    )
-
-    thread, results = run_supervisor(supervisor, stop)
-    wait_for(tmp_path / "ready")
-    stop.set()
-    thread.join(5)
-
-    assert results == [0]
-    assert restart_backoffs(capsys.readouterr().err) == [0.2, 0.4]
+    assert supervisor.run(stop) == 1
+    assert (tmp_path / "starts").read_text() == "1"
 
 
 def test_worker_exit_samples_its_final_completed_turn(tmp_path: Path, monkeypatch):
@@ -466,62 +417,6 @@ def test_worker_exit_samples_its_final_completed_turn(tmp_path: Path, monkeypatc
 
     assert reason == "exit:19"
     assert made_progress is True
-
-
-def test_completed_turn_resets_restart_backoff(
-    tmp_path: Path,
-    monkeypatch,
-    capsys,
-):
-    worker = tmp_path / "worker.py"
-    worker.write_text(
-        """
-import json
-import os
-import sys
-import time
-from pathlib import Path
-
-state = Path(sys.argv[1])
-count_path = state / "starts"
-count = int(count_path.read_text()) + 1 if count_path.exists() else 1
-count_path.write_text(str(count))
-lease = Path(os.environ["SENPAI_CONTROLLER_LEASE_PATH"])
-lease.write_text(json.dumps({
-    "pid": os.getpid(),
-    "phase": "poll",
-    "deadline": time.monotonic() + 30,
-    "completed_turns": 1 if count == 2 else 0,
-}))
-time.sleep(0.03)
-if count < 4:
-    raise SystemExit(19)
-(state / "ready").write_text("ready")
-while True:
-    time.sleep(1)
-""".strip()
-    )
-    monkeypatch.setattr(supervisor_module.random, "uniform", lambda _a, _b: 1.0)
-    stop = threading.Event()
-    supervisor = WorkerSupervisor(
-        command=(sys.executable, str(worker), str(tmp_path)),
-        lease_path=tmp_path / "controller-lease.json",
-        config=SupervisorConfig(
-            startup_timeout_seconds=1,
-            check_interval_seconds=0.005,
-            terminate_grace_seconds=0.05,
-            initial_backoff_seconds=0.1,
-            max_backoff_seconds=0.4,
-        ),
-    )
-
-    thread, results = run_supervisor(supervisor, stop)
-    wait_for(tmp_path / "ready")
-    stop.set()
-    thread.join(5)
-
-    assert results == [0]
-    assert restart_backoffs(capsys.readouterr().err) == [0.1, 0.1, 0.2]
 
 
 def test_health_command_reports_live_and_expired_worker_leases(tmp_path: Path):
@@ -724,3 +619,223 @@ conversation.close()
 
     assert crashed.returncode == 17
     assert resumed.returncode == 0
+
+
+def test_private_service_handoff_files_are_consumed_once(tmp_path: Path):
+    paths = {}
+    environment = {}
+    for credential, file_env in {
+        "WANDB_API_KEY": "SENPAI_WANDB_API_KEY_FILE",
+        "EXA_API_KEY": "SENPAI_EXA_API_KEY_FILE",
+    }.items():
+        path = tmp_path / credential.lower()
+        path.write_text(f"{credential}-value")
+        path.chmod(0o600)
+        paths[credential] = path
+        environment[file_env] = str(path)
+
+    credentials = supervisor_module._consume_private_credential_files(environment)
+
+    assert {
+        name: value.get_secret_value() for name, value in credentials.items()
+    } == {name: f"{name}-value" for name in paths}
+    assert all(not path.exists() for path in paths.values())
+
+
+def test_private_service_handoffs_do_not_follow_symlinks(tmp_path: Path):
+    target = tmp_path / "credential"
+    target.write_text("secret")
+    target.chmod(0o600)
+    handoff = tmp_path / "handoff"
+    handoff.symlink_to(target)
+
+    with pytest.raises(RuntimeError, match="owner-only regular file"):
+        supervisor_module._consume_private_credential_files(
+            {"SENPAI_EXA_API_KEY_FILE": str(handoff)}
+        )
+
+    assert target.read_text() == "secret"
+
+
+def test_pid_one_terminates_and_kills_detached_descendants(monkeypatch):
+    class Child:
+        def __init__(self, pid):
+            self.pid = pid
+            self.signals = []
+
+        def terminate(self):
+            self.signals.append("terminate")
+
+        def kill(self):
+            self.signals.append("kill")
+
+    children = [Child(41), Child(42)]
+    waits = []
+    monkeypatch.setattr(supervisor_module.os, "getpid", lambda: 1)
+    monkeypatch.setattr(
+        supervisor_module.psutil,
+        "Process",
+        lambda: type(
+            "SupervisorProcess",
+            (),
+            {"children": lambda self, recursive: children},
+        )(),
+    )
+
+    def wait_procs(processes, timeout):
+        waits.append((list(processes), timeout))
+        return ([], [children[1]]) if len(waits) == 1 else (list(processes), [])
+
+    monkeypatch.setattr(supervisor_module.psutil, "wait_procs", wait_procs)
+    supervisor = WorkerSupervisor(
+        command=("worker",),
+        lease_path=Path("lease.json"),
+        config=SupervisorConfig(terminate_grace_seconds=7),
+    )
+
+    deadline = time.monotonic() + 7
+    supervisor._terminate_adopted_children(deadline)
+
+    assert children[0].signals == ["terminate"]
+    assert children[1].signals == ["terminate", "kill"]
+    assert len(waits) == 2
+    assert 0 <= waits[1][1] <= waits[0][1] <= 7
+
+
+@pytest.mark.parametrize("failure", ["allocation", "spawn"])
+def test_failed_worker_start_closes_handoffs_and_forgets_credentials(
+    tmp_path, monkeypatch, failure,
+):
+    descriptors = []
+    original_dup = os.dup
+
+    def duplicate(fd):
+        if failure == "allocation" and descriptors:
+            raise OSError("handoff failed")
+        result = original_dup(fd)
+        descriptors.append(result)
+        return result
+
+    def spawn(*args, **kwargs):
+        assert failure == "spawn"
+        raise OSError("handoff failed")
+
+    monkeypatch.setattr(supervisor_module.os, "dup", duplicate)
+    monkeypatch.setattr(supervisor_module.subprocess, "Popen", spawn)
+    supervisor = WorkerSupervisor(
+        command=("worker",),
+        lease_path=tmp_path / "lease.json",
+        github_token=SecretStr("github-secret"),
+        private_credentials={"WANDB_API_KEY": SecretStr("wandb-secret")},
+        environment={"ANTHROPIC_API_KEY": "model-secret"},
+    )
+
+    with pytest.raises(OSError, match="handoff failed"):
+        supervisor.run()
+
+    assert descriptors
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    assert supervisor.github_token is None
+    assert supervisor.private_credentials == {}
+    assert supervisor.environment == {}
+
+
+def test_requested_stop_forgets_credentials_without_starting_worker(tmp_path):
+    stop = threading.Event()
+    stop.set()
+    supervisor = WorkerSupervisor(
+        command=("must-not-run",),
+        lease_path=tmp_path / "lease.json",
+        github_token=SecretStr("github-secret"),
+        private_credentials={"EXA_API_KEY": SecretStr("exa-secret")},
+        environment={"OPENAI_API_KEY": "model-secret"},
+    )
+    assert supervisor.run(stop) == 0
+    assert supervisor.github_token is None
+    assert supervisor.private_credentials == {}
+    assert supervisor.environment == {}
+
+
+def test_unexpected_clean_worker_exit_requires_external_restart(tmp_path):
+    supervisor = WorkerSupervisor(
+        command=(sys.executable, "-c", "pass"),
+        lease_path=tmp_path / "lease.json",
+        config=SupervisorConfig(check_interval_seconds=0.01),
+    )
+    assert supervisor.run() == 1
+
+
+@pytest.mark.parametrize("kind", ["fifo", "public", "empty"])
+def test_invalid_private_handoff_fails_promptly_and_is_unlinked(tmp_path, kind):
+    handoff = tmp_path / "credential"
+    if kind == "fifo":
+        os.mkfifo(handoff, 0o600)
+    else:
+        handoff.write_text("" if kind == "empty" else "secret")
+        handoff.chmod(0o644 if kind == "public" else 0o600)
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import sys
+from senpai_agent.supervisor import _consume_private_credential_files
+try:
+    _consume_private_credential_files({"SENPAI_EXA_API_KEY_FILE": sys.argv[1]})
+except RuntimeError:
+    raise SystemExit(23)
+""", str(handoff)],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
+        capture_output=True,
+        timeout=5,
+    )
+    assert result.returncode == 23, result.stderr.decode()
+    assert not handoff.exists()
+
+
+@pytest.mark.parametrize("shutdown", ["stop", "overdue"])
+def test_supervisor_cleans_up_a_detached_term_ignoring_child(tmp_path, shutdown):
+    child_code = (
+        "import os,signal,sys,time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"
+    )
+    worker = tmp_path / "worker.py"
+    worker.write_text(f'''
+import json, os, subprocess, sys, time
+from pathlib import Path
+state = Path(sys.argv[1])
+subprocess.Popen([sys.executable, "-c", {child_code!r}, str(state / "child")],
+                 start_new_session=True)
+while not (state / "child").exists():
+    time.sleep(0.01)
+Path(os.environ["SENPAI_CONTROLLER_LEASE_PATH"]).write_text(json.dumps({{
+    "pid": os.getpid(), "phase": "ready",
+    "deadline": time.monotonic() + {30 if shutdown == 'stop' else 0.2},
+}}))
+while True:
+    time.sleep(1)
+''')
+    stop = threading.Event()
+    supervisor = WorkerSupervisor(
+        command=(sys.executable, str(worker), str(tmp_path)),
+        lease_path=tmp_path / "lease.json",
+        config=SupervisorConfig(check_interval_seconds=0.01, terminate_grace_seconds=0.1),
+    )
+    thread, results = run_supervisor(supervisor, stop)
+    wait_for(tmp_path / "lease.json")
+    child = supervisor_module.psutil.Process(int((tmp_path / "child").read_text()))
+    try:
+        if shutdown == "stop":
+            stop.set()
+        thread.join(5)
+        assert not thread.is_alive()
+        assert results == [0 if shutdown == "stop" else 1]
+        deadline = time.monotonic() + 2
+        while child.is_running() and child.status() != supervisor_module.psutil.STATUS_ZOMBIE:
+            assert time.monotonic() < deadline, "detached child survived cleanup"
+            time.sleep(0.01)
+    finally:
+        stop.set()
+        if child.is_running():
+            child.kill()
+        thread.join(5)

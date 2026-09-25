@@ -47,8 +47,11 @@ from senpai_agent.secrets import (
     GITHUB_TOKEN_ENV_NAMES,
     GITHUB_TOKEN_FD_ENV,
     GITHUB_TOKEN_FILE_ENV,
+    MODEL_CREDENTIALS_FD_ENV,
     configured_custom_secret_env_names,
+    consume_model_credential_fd,
     scrub_github_credentials,
+    set_process_nondumpable,
 )
 from senpai_agent.weave_monitoring import (
     finish_weave_monitoring,
@@ -1153,12 +1156,14 @@ def scrub_model_credentials(
     config: RunnerConfig,
 ) -> None:
     for key_env in {
+        *PROVIDER_API_KEY_ENVS.values(),
         config.api_key_env,
         config.smart_api_key_env,
         config.fast_api_key_env,
         config.frontier_api_key_env,
     }:
-        environment.pop(key_env, None)
+        if key_env not in config.conversation_secrets:
+            environment.pop(key_env, None)
 
 
 def build_main_tools(config: RunnerConfig) -> list[Tool]:
@@ -2026,12 +2031,24 @@ def run_openhands(
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         try:
+            set_process_nondumpable()
+            credential_fd_present = MODEL_CREDENTIALS_FD_ENV in os.environ
+            model_credentials = consume_model_credential_fd(os.environ)
+            for credential in model_credentials.values():
+                register_trace_secret(credential)
+            runtime_environment = {**os.environ, **model_credentials}
             args = parse_runner_args(argv)
+            if args.child and not credential_fd_present:
+                raise RuntimeError(
+                    "delegated OpenHands children require the private model "
+                    "credential handoff"
+                )
             prompt = sys.stdin.read()
             if not prompt:
                 raise RuntimeError("OpenHands runner requires a prompt on stdin")
-            config = resolve_config(args)
-            os.environ.pop(config.api_key_env, None)
+            config = resolve_config(args, runtime_environment)
+            del runtime_environment, model_credentials
+            scrub_model_credentials(os.environ, config)
             return run_openhands(prompt, config)
         except BaseException as error:  # noqa: BLE001
             if task_id := os.environ.get("SENPAI_DELEGATION_TASK_ID"):

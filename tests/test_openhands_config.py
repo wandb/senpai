@@ -1,3 +1,4 @@
+import io
 import os
 from pathlib import Path
 
@@ -18,12 +19,48 @@ from senpai_agent.openhands_runner import (
     without_eager_skill_discovery,
 )
 from senpai_agent.program_context import ProgramSystemPrompt
-from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV
+from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV, MODEL_CREDENTIALS_FD_ENV
 from senpai_agent.system_instructions import SenpaiSystemInstructions
 from openhands_support import TEST_LAUNCH_CONTEXT, runtime_config, runtime_env
 from test_agent_markdown import HTML_HEADER, PLAIN_HEADER
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("malformed_bundle", [False, True])
+def test_child_handoff_failure_records_the_result_and_finishes_tracing(
+    monkeypatch, malformed_bundle
+):
+    monkeypatch.delenv(MODEL_CREDENTIALS_FD_ENV, raising=False)
+    monkeypatch.setenv("SENPAI_DELEGATION_TASK_ID", "child-task")
+    descriptor = None
+    if malformed_bundle:
+        descriptor, writer = os.pipe()
+        os.write(writer, b"not-json")
+        os.close(writer)
+        monkeypatch.setenv(MODEL_CREDENTIALS_FD_ENV, str(descriptor))
+    events = []
+    monkeypatch.setattr(runner, "set_process_nondumpable", lambda: events.append("private"))
+    monkeypatch.setattr(
+        runner,
+        "record_delegated_task_result",
+        lambda task_id, **result: events.append((task_id, result)),
+    )
+    monkeypatch.setattr(runner, "finish_weave_monitoring", lambda: events.append("finished"))
+    monkeypatch.setattr(runner.sys, "stdin", io.StringIO("Delegated task"))
+    message = "credential bundle is invalid" if malformed_bundle else "private model credential handoff"
+
+    with pytest.raises(RuntimeError, match=message):
+        runner.main(["--max-turns", "1", "--child"])
+
+    assert events[0] == "private"
+    assert events[1][0] == "child-task"
+    assert message in events[1][1]["error"]
+    assert events[2] == "finished"
+    assert MODEL_CREDENTIALS_FD_ENV not in os.environ
+    if descriptor is not None:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_browser_is_enabled_by_default_and_can_be_disabled():
@@ -746,6 +783,25 @@ def test_model_credentials_are_removed_from_the_agent_environment(tmp_path: Path
     scrub_model_credentials(environment, runtime_config(tmp_path))
 
     assert environment == {"WANDB_API_KEY": "wandb-key"}
+
+
+def test_model_scrubbing_preserves_intentionally_shared_service_credentials(tmp_path):
+    config = runtime_config(
+        tmp_path,
+        api_key_env="WANDB_API_KEY",
+        api_key=SecretStr("wandb-key"),
+        conversation_secrets={"WANDB_API_KEY": "wandb-key", "EXA_API_KEY": "exa-key"},
+    )
+    environment = {
+        "ANTHROPIC_API_KEY": "anthropic-key",
+        "OPENAI_API_KEY": "openai-key",
+        "WANDB_API_KEY": "wandb-key",
+        "EXA_API_KEY": "exa-key",
+    }
+
+    scrub_model_credentials(environment, config)
+
+    assert environment == {"WANDB_API_KEY": "wandb-key", "EXA_API_KEY": "exa-key"}
 
 
 def test_config_consumes_a_private_one_use_github_token_file(tmp_path: Path):
