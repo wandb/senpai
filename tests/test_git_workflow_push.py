@@ -87,6 +87,15 @@ def test_push_is_lease_guarded_verified_and_idempotent(tmp_path: Path):
         "candidate",
     )
 
+    # ls-remote patterns also match ref-name suffixes. This decoy must not
+    # make the real assignment look already published.
+    git(
+        workspace,
+        "push",
+        str(remote),
+        f"{candidate_sha}:refs/heads/decoy/refs/heads/experiment-7",
+    )
+
     first = push_assignment_branch(
         workspace,
         branch="experiment-7",

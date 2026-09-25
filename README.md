@@ -470,7 +470,8 @@ Terminals and supervised training use a separate writable environment at
 `$HOME/.venvs/senpai-target`. Its packages take precedence over the image's
 read-only packages. `python`, `uv pip install`, and `uv run` select that target
 environment through `PATH`, `VIRTUAL_ENV`, `UV_PYTHON`, and
-`UV_PROJECT_ENVIRONMENT`. Bootstrap creates it without running `ensurepip`;
+`UV_PROJECT_ENVIRONMENT`. Custom shell startup files can still override these
+terminal settings. Bootstrap creates it without running `ensurepip`;
 use `uv pip install` to add dependencies (including `pip` if needed).
 Training retains normal project imports. File-defined child agents use the
 same Senpai terminal policy, timeouts, and target environment as their parent.

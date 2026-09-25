@@ -1,3 +1,6 @@
+import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -149,3 +152,38 @@ def test_terminal_tool_bounds_silent_commands(monkeypatch, tmp_path):
     assert captured["no_change_timeout_seconds"] == 600
     assert isinstance(captured["executor"], SenpaiTerminalExecutor)
     assert captured["executor"].foreground_timeout_seconds == 600
+
+
+def test_native_terminal_uses_target_python_and_project_imports(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    target = tmp_path / "target-env"
+    subprocess.run(
+        [sys.executable, "-P", "-m", "venv", "--without-pip", str(target)],
+        check=True,
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("SENPAI_TARGET_PYTHON_ENV", str(target))
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    (tmp_path / "project_module.py").write_text("VALUE = 'project import'\n")
+    (tmp_path / "check_target.py").write_text(
+        "import json, os, sys\nfrom pathlib import Path\n"
+        "from project_module import VALUE\n"
+        "Path('result.json').write_text(json.dumps({"
+        "'prefix': sys.prefix, 'value': VALUE, "
+        "'uv': os.environ['UV_PROJECT_ENVIRONMENT']}))\n"
+    )
+    state = SimpleNamespace(
+        workspace=SimpleNamespace(working_dir=str(tmp_path)),
+        env_observation_persistence_dir=None,
+    )
+    tool = SenpaiTerminalTool.create(state, role="advisor")[0]
+    try:
+        result = tool.executor(TerminalAction(command="python check_target.py", timeout=30))
+        assert not result.is_error, result.text
+        assert result.exit_code == 0, result.text
+        assert json.loads((tmp_path / "result.json").read_text()) == {
+            "prefix": str(target), "value": "project import", "uv": str(target),
+        }
+    finally:
+        tool.executor.close()
