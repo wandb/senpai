@@ -308,6 +308,9 @@ def test_target_environment_setup_does_not_execute_target_code(
         HOME=str(home),
         SENPAI_PYTHON=sys.executable,
         EXPOSURE_PATH=str(exposure),
+        # The image imports an installed package; this source-level harness
+        # explicitly supplies the trusted package under test.
+        PYTHONPATH=str(ROOT),
     )
 
     completed = subprocess.run(
@@ -367,18 +370,21 @@ def test_target_environment_setup_does_not_execute_target_code(
     assert value == "target dependency"
 
 
-def test_target_pip_reuses_shared_dependencies_and_keeps_upgrades_local(tmp_path):
-    runtime = tmp_path / "runtime"
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_target_packages_and_shared_console_scripts_use_target_environment(
+    tmp_path: Path, role: str,
+):
+    runtime = tmp_path / "runtime's environment"
     subprocess.run([sys.executable, "-P", "-m", "venv", str(runtime)], check=True)
     runtime_python = runtime / "bin/python"
     wheel_dir = tmp_path / "wheels"
     wheel_dir.mkdir()
 
-    def wheel(name, version, requires=()):
+    def wheel(name, version, requires=(), module="", console_scripts=()):
         path = wheel_dir / f"{name}-{version}-py3-none-any.whl"
         info = f"{name}-{version}.dist-info"
         with zipfile.ZipFile(path, "w") as archive:
-            archive.writestr(f"{name}.py", f"VERSION = {version!r}\n")
+            archive.writestr(f"{name}.py", f"VERSION = {version!r}\n" + module)
             archive.writestr(
                 f"{info}/METADATA",
                 f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
@@ -389,21 +395,43 @@ def test_target_pip_reuses_shared_dependencies_and_keeps_upgrades_local(tmp_path
                 "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
             )
             archive.writestr(f"{info}/RECORD", "")
+            if console_scripts:
+                archive.writestr(
+                    f"{info}/entry_points.txt",
+                    "[console_scripts]\n"
+                    + "".join(f"{script} = {name}:main\n" for script in console_scripts),
+                )
         return path
 
-    shared = wheel("shared_example", "1.0")
+    shared = wheel(
+        "shared_example", "1.0",
+        module=(
+            "def main():\n"
+            "    import json, sys, target_addon\n"
+            "    print(json.dumps([sys.executable, sys.prefix, sys.argv[1:], "
+            "target_addon.VERSION]))\n"
+        ),
+        console_scripts=("shared-example", "existing-tool", "linked-tool"),
+    )
     subprocess.run(
         [str(runtime_python), "-m", "pip", "install", "--no-index", str(shared)],
         check=True, capture_output=True,
     )
-    home = tmp_path / "home"
-    setup = (ROOT / "k8s/entrypoint-student.sh").read_text()
+    home = tmp_path / "user's home"
+    target = home / ".venvs/senpai-target"
+    target_bin = target / "bin"
+    target_bin.mkdir(parents=True)
+    existing_script = target_bin / "existing-tool"
+    existing_script.write_text("#!/bin/sh\nprintf 'retained target script\\n'\n")
+    existing_script.chmod(0o755)
+    existing_link = target_bin / "linked-tool"
+    existing_link.symlink_to("missing-target-tool")
+    setup = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text()
     setup = setup[setup.index("export SENPAI_TARGET_PYTHON_ENV=") :]
     setup = setup.split('cd "$WORKDIR"', 1)[0]
     environment = {"PATH": os.environ["PATH"], "HOME": str(home),
-                   "SENPAI_PYTHON": str(runtime_python)}
+                   "SENPAI_PYTHON": str(runtime_python), "PYTHONPATH": str(ROOT)}
     subprocess.run(["bash", "-e", "-c", setup], env=environment, check=True)
-    target = home / ".venvs/senpai-target"
     target_python = target / "bin/python"
     target_site = Path(sysconfig.get_path("purelib", vars={"base": str(target)}))
     addon = wheel("target_addon", "1.0", ("shared-example>=1.0",))
@@ -415,6 +443,26 @@ def test_target_pip_reuses_shared_dependencies_and_keeps_upgrades_local(tmp_path
     )
     assert not (target_site / "shared_example.py").exists()
     assert (target_site / "target_addon.py").is_file()
+
+    target_environment = {
+        **environment,
+        "PATH": f"{target_bin}:{runtime / 'bin'}:{environment['PATH']}",
+    }
+    arguments = ["two words", "quote'and\"double", "$(printf unsafe); *", ""]
+    result = subprocess.run(
+        ["shared-example", *arguments],
+        env=target_environment, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [
+        str(target_python), str(target), arguments, "1.0",
+    ]
+    subprocess.run(["bash", "-e", "-c", setup], env=environment, check=True)
+    assert subprocess.check_output(
+        [str(existing_script)], env=target_environment, text=True,
+    ) == "retained target script\n"
+    assert existing_link.is_symlink()
+    assert existing_link.readlink() == Path("missing-target-tool")
 
     upgrade = wheel("shared_example", "2.0")
     subprocess.run(
