@@ -50,6 +50,8 @@ def test_policy_denies_recognized_publication_and_github_mutations(command: str)
         "gh pr view 17 --json title",
         "gh api repos/wandb/senpai/pulls/17",
         "env GH_HOST=github.com gh repo view wandb/senpai",
+        "env python -S inspect_results.py",
+        "env printf '%s\\n' 'BASH_FUNC_git%%=literal data'",
         "curl https://api.github.com/repos/wandb/senpai/pulls/17",
     ],
 )
@@ -200,6 +202,35 @@ def test_eval_cannot_hide_a_push_inside_a_nested_heredoc():
 )
 def test_quoted_python_stdin_is_data_for_the_shell_policy(body: str):
     assert is_allowed(f"python - <<'PYCODE'\n{body}\nPYCODE") is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 <<'PY'\nprint(*xs)\nPY",
+        "python -u - <<'PY'\nprint(*xs)\nPY",
+        ".venv/bin/python - <<'PY'\nprint(*xs)\nPY",
+        "uv run python - <<'PY'\nprint(*xs)\nPY",
+        "PYTHONUNBUFFERED=1 python3 - <<'PY'\nprint(*xs)\nPY",
+        "cat <<'PY' | python3\nprint(*xs)\nPY",
+        "tee notes.md <<'DOC'\nconfig['lr'] = 0.1\nDOC",
+    ],
+)
+def test_quoted_heredocs_preserve_known_data_consumers(command: str):
+    assert is_allowed(command) is True
+
+
+def test_python_named_shell_symlink_does_not_hide_executable_heredoc(tmp_path: Path):
+    (tmp_path / "python3").symlink_to("/bin/bash")
+
+    decision = terminal_policy(
+        "./python3 <<'SH'\necho \"$(git push origin experiment)\"\nSH",
+        "student",
+        tmp_path,
+    )
+
+    assert decision.allowed is False
+    assert "git push" in decision.reason
 
 
 @pytest.mark.parametrize(
@@ -371,6 +402,9 @@ def test_alias_expansion_cannot_defer_restricted_command_parsing():
         "bash -lc 'date -u'",
         "bash --rcfile=/tmp/commands -ic 'date -u'",
         "zsh -f -c 'date -u'",
+        "bash <<< 'git push origin experiment'",
+        "env 'BASH_FUNC_git%%=() { git push origin experiment; }' bash -c 'git status'",
+        "env -S \"'BASH_FUNC_git%%=() { git push origin experiment; }' bash -c 'git status'\"",
     ],
 )
 def test_shell_argument_reevaluation_cannot_hide_restricted_commands(command: str):

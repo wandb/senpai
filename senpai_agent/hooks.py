@@ -180,7 +180,7 @@ _GIT_TERMINAL_COMMANDS = {
 }
 
 
-def _without_shell_data(command: str) -> str:
+def _without_shell_data(command: str, workspace: Path) -> str:
     """Mask case patterns and quoted heredoc data before flat tokenization."""
     if "<<" not in command and "case" not in command:
         return command
@@ -209,10 +209,7 @@ def _without_shell_data(command: str) -> str:
         if (
             not has_functions
             and node.type == "heredoc_redirect"
-            and (
-                _is_literal_cat_file_sink(node, source)
-                or _is_literal_python_stdin(node, source)
-            )
+            and _heredoc_feeds_data_sinks(node, source, workspace)
         ):
             start = next(
                 child for child in node.children if child.type == "heredoc_start"
@@ -230,63 +227,50 @@ def _without_shell_data(command: str) -> str:
     return policy_source.decode()
 
 
-def _is_literal_python_stdin(node: object, source: bytes) -> bool:
-    parent = node.parent
-    if parent is None or parent.type != "redirected_statement":
+def _heredoc_feeds_data_sinks(node: object, source: bytes, workspace: Path) -> bool:
+    statement = node.parent
+    if statement is None or statement.type != "redirected_statement":
         return False
-    ancestor = parent
-    while ancestor is not None:
-        if ancestor.type in {"command_substitution", "process_substitution", "pipeline"}:
+    for child in _descendants(statement):
+        if child.type == "process_substitution":
             return False
-        ancestor = ancestor.parent
-    if any(
-        child.type in {"pipeline", "process_substitution"}
-        for child in _descendants(parent)
-    ):
-        return False
-    body = parent.child_by_field_name("body")
-    if body is None or body.type != "command":
-        return False
-    segments = _command_segments(source[parent.start_byte : node.start_byte].decode())
-    if len(segments) != 1:
-        return False
-    tokens = _without_redirections(segments[0])
-    index = _program_index(tokens)
-    if index is None:
-        return False
-    return (
-        re.fullmatch(r"python(?:[0-9]+(?:[.][0-9]+)*)?", Path(tokens[index]).name)
-        is not None
-        and tokens[index + 1 :] == ["-"]
-    )
+        if (
+            child.type == "file_redirect"
+            and _redirects_stdout(child, source)
+            and not _redirects_stdout_to_literal_file(child, source)
+        ):
+            return False
+    consumers = [statement.child_by_field_name("body")]
+    for child in node.children:
+        if child.type == "pipeline":
+            consumers.extend(child.named_children)
+    return all(_is_heredoc_data_sink(consumer, source, workspace) for consumer in consumers)
 
 
-def _is_literal_cat_file_sink(node: object, source: bytes) -> bool:
-    parent = node.parent
-    if parent is None or parent.type != "redirected_statement":
+def _is_heredoc_data_sink(node: object, source: bytes, workspace: Path) -> bool:
+    if node is not None and node.type == "redirected_statement":
+        node = node.child_by_field_name("body")
+    if node is None or node.type != "command":
         return False
-    body = parent.child_by_field_name("body")
-    name = body.child_by_field_name("name") if body is not None else None
-    if name is None or source[name.start_byte : name.end_byte] != b"cat":
+    name = node.child_by_field_name("name")
+    if name is None:
         return False
-
-    if any(child.type == "pipeline" for child in node.children):
-        return False
-    redirects = [
-        redirect
-        for owner in (parent, node)
-        for redirect in owner.children_by_field_name("redirect")
-        if redirect.type == "file_redirect"
+    words = [name, *node.children_by_field_name("argument")]
+    tokens = [
+        shlex.split(source[word.start_byte : word.end_byte].decode())
+        for word in words
     ]
-    stdout_redirects = [
-        redirect
-        for redirect in redirects
-        if _redirects_stdout(redirect, source)
-    ]
-    if not stdout_redirects:
+    if any(len(token) != 1 for token in tokens):
         return False
-    redirect = max(stdout_redirects, key=lambda candidate: candidate.start_byte)
-    return _redirects_stdout_to_literal_file(redirect, source)
+    arguments = [token[0] for token in tokens]
+    if arguments[:2] == ["uv", "run"]:
+        arguments = arguments[2:]
+    if not arguments or _shell_program(arguments[0], workspace) is not None:
+        return False
+    program = Path(arguments[0]).name
+    return program in {"cat", "tee"} or re.fullmatch(
+        r"python(?:[0-9]+(?:[.][0-9]+)*)?", program
+    ) is not None
 
 
 def _redirects_stdout(redirect: object, source: bytes) -> bool:
@@ -411,8 +395,8 @@ def _bash_commands(command: str, workspace: Path) -> list[str] | None:
     return commands
 
 
-def _command_segments(command: str) -> list[list[str]]:
-    command = _without_shell_data(command)
+def _command_segments(command: str, workspace: Path) -> list[list[str]]:
+    command = _without_shell_data(command, workspace)
     lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>\n")
     lexer.commenters = ""
     lexer.whitespace = " \t\r"
@@ -530,7 +514,7 @@ def _wrapper_command(
         if value in value_options:
             position += 2
             continue
-        if value.startswith("-") or _program_index([value]) is None:
+        if value.startswith("-"):
             position += 1
             continue
         return arguments[position:]
@@ -538,15 +522,26 @@ def _wrapper_command(
 
 
 def _env_command(arguments: list[str]) -> list[str]:
-    for position, value in enumerate(arguments):
+    position = 0
+    while position < len(arguments):
+        value = arguments[position]
+        if value == "--":
+            return arguments[position + 1 :]
         if value in {"-S", "--split-string"} and position + 1 < len(arguments):
-            return shlex.split(arguments[position + 1]) + arguments[position + 2 :]
+            return _env_command(
+                shlex.split(arguments[position + 1]) + arguments[position + 2 :]
+            )
         if value.startswith("--split-string="):
-            return shlex.split(value.partition("=")[2]) + arguments[position + 1 :]
-    return _wrapper_command(
-        arguments,
-        value_options={"-a", "--argv0", "-u", "--unset", "-C", "--chdir"},
-    )
+            return _env_command(
+                shlex.split(value.partition("=")[2]) + arguments[position + 1 :]
+            )
+        if value in {"-a", "--argv0", "-u", "--unset", "-C", "--chdir"}:
+            position += 2
+        elif value.startswith("-"):
+            position += 1
+        else:
+            return arguments[position:]
+    return []
 
 
 def _shell_command(arguments: list[str]) -> str | None:
@@ -998,19 +993,15 @@ def _segment_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
     if program in _SHELL_BODY_PREFIXES or program_token in _FIND_EXEC_ACTIONS:
         return _segment_policy(arguments, workspace)
     if program == "env":
-        decision = _variable_name_policy(
-            "env",
-            [
-                argument
-                for argument in arguments
-                if "=" in argument
-                and _SHELL_VARIABLE_NAME.fullmatch(argument.partition("=")[0])
-            ],
+        command = _env_command(_without_redirections(arguments))
+        assignment_count = next(
+            (position for position, argument in enumerate(command) if "=" not in argument),
+            len(command),
         )
+        decision = _variable_name_policy("env", command[:assignment_count])
         if not decision.allowed:
             return decision
-        command = _env_command(arguments)
-        return _segment_policy(command, workspace) if command else PolicyDecision(True)
+        return _segment_policy(command[assignment_count:], workspace)
     if program == "exec":
         command = _wrapper_command(arguments, value_options={"-a"})
         return _segment_policy(command, workspace) if command else PolicyDecision(True)
@@ -1022,6 +1013,8 @@ def _segment_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
         return _find_policy(arguments, workspace)
     shell = _shell_program(program_token, workspace)
     if shell is not None:
+        if "<<<" in arguments:
+            return PolicyDecision(False, "Use a checked shell -c command instead of a here-string.")
         arguments = _without_redirections(arguments)
         if shell == "zsh" or _uses_shell_startup_files(arguments):
             return PolicyDecision(
@@ -1167,11 +1160,11 @@ def terminal_policy(
             "Senpai could not parse this shell command safely.",
         )
     for nested_command in nested_commands:
-        for segment in _command_segments(nested_command):
+        for segment in _command_segments(nested_command, workspace):
             decision = _segment_policy(segment, workspace)
             if not decision.allowed:
                 return decision
-    for segment in _command_segments(command):
+    for segment in _command_segments(command, workspace):
         decision = _segment_policy(segment, workspace)
         if not decision.allowed:
             return decision
