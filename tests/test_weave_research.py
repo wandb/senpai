@@ -3,15 +3,19 @@
 import base64
 import json
 import os
+import shlex
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from openhands.sdk.llm import Message
 from pydantic import SecretStr, ValidationError
 from weave.trace_server import trace_server_interface as tsi
 
+from senpai_agent.hooks import terminal_policy
 from senpai_agent.weave_research import (
     WandbReportDraftAction,
     WandbViewsAction,
@@ -151,6 +155,37 @@ def test_private_eval_calls_preserve_full_results_and_sdk_query_contract(
     assert "controller-research-sentinel" not in Path(complete.path).read_text()
     assert len(complete.to_llm_content[0].text) < 1000
     assert not Path(complete.path).is_relative_to(service.workspace)
+
+    # The provider gets a compact file receipt; all evidence remains retrievable
+    # through bounded terminal reads beyond the provider's tool-text cap.
+    assert Path(complete.path).stat().st_size > 50_000
+    message = Message(
+        role="tool",
+        name="weave_research",
+        tool_call_id="calls-export",
+        content=complete.to_llm_content,
+    )
+    payloads = [
+        message.to_chat_dict(
+            cache_enabled=False,
+            vision_enabled=False,
+            function_calling_enabled=True,
+            force_string_serializer=force_string,
+            send_reasoning_content=False,
+        )
+        for force_string in (False, True)
+    ]
+    payloads.append(message.to_responses_dict(vision_enabled=False))
+    for payload in payloads:
+        serialized = json.dumps(payload)
+        assert complete.path in serialized
+        assert len(serialized) < 2_000
+    command = f"sed -n '2501p' {shlex.quote(complete.path)}"
+    assert terminal_policy(command, "student", service.workspace).allowed
+    last_row = subprocess.check_output(
+        ["sed", "-n", "2501p", complete.path], cwd=service.workspace, text=True
+    )
+    assert json.loads(last_row) == records[-1]
 
 
 def test_call_costs_and_stats_use_server_side_queries(research_service):

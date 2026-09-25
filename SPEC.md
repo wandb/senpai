@@ -758,7 +758,12 @@ environment. W&B inference uses `WANDB_INFERENCE_API_KEY`. The launcher requires
 one distinct W&B writer per student and transfers it through the private file/
 descriptor handoff as `SENPAI_WANDB_TRAINING_API_KEY`. The controller holds it in
 memory, removes that variable, and supplies it only to supervised training as
-`WANDB_API_KEY`. Research tools and independent child/standalone traces retain
+`WANDB_API_KEY`. Supervised output redacts the writer before log persistence,
+including keys split across pipe reads. The output reader drains the buffered
+backlog at shutdown without waiting for an escaped descendant to close its pipe.
+Training clears `WANDB_SERVICE` so it cannot reuse the controller's sidecar, and
+an explicit writer clears `WANDB_IDENTITY_TOKEN_FILE` to avoid conflicting auth.
+Research tools and independent child/standalone traces retain
 the existing research credential until a complete research replacement exists.
 
 Additive research tools use an explicit credential configured by the runner;

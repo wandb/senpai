@@ -148,7 +148,7 @@ class ViewRequest(BaseModel):
 class DraftReportRequest(BaseModel):
     op: Literal["create_report_draft"]
     project: ProjectPath
-    title: str = Field(min_length=1, max_length=128)
+    title: str = Field(max_length=128)
     description: str = ""
     spec: dict[str, Any] = Field(
         description="Full W&B report viewspec JSON, including version, blocks, width, panel settings and runsets. Export one with views/view or construct it with the Reports SDK outside this tool."
@@ -577,7 +577,7 @@ class WandbReportDraftTool(ToolDefinition[WandbReportDraftAction, ResearchObserv
     ) -> Sequence[ToolDefinition]:
         return [
             cls(
-                description="Create a new W&B report draft when the user asks for one. Supply any authorized project and a full JSON report spec with arbitrary blocks/runsets/panels. No existing view is overwritten. Read-back verifies the draft; an unverified receipt is an error with a view_id to inspect. Never automatically retry draft creation after uncertainty.",
+                description="Create a new W&B report draft. Supply any authorized project and a full JSON report spec with arbitrary blocks/runsets/panels. No existing view is overwritten. Read-back verifies the draft; an unverified receipt is an error with a view_id to inspect. Never automatically retry draft creation after uncertainty.",
                 action_type=WandbReportDraftAction,
                 observation_type=ResearchObservation,
                 annotations=ToolAnnotations(

@@ -103,8 +103,10 @@ still be uploading it. Request `sampled=true` explicitly when a sampled system
 history is sufficient. Artifact lineage reflects the SDK response, whose server
 completeness is not guaranteed. External artifact references that require cloud
 credentials still need the existing SDK route. Report drafts require an existing
-project. Project creation, workspace edits, Report updates/publication, Launch,
-and executing Weave scorers also use the existing SDK workflows. Live service compatibility and
+project and follow that project's visibility permissions. Draft status does not
+make a Report author-private. Project creation, workspace edits, Report
+updates/publication, Launch, and executing Weave scorers also use the existing
+SDK workflows. Live service compatibility and
 the SDK's process-wide credential handling remain unverified, so these tools do
 not establish a completed service-key cutover.
 

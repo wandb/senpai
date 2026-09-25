@@ -99,6 +99,9 @@ one-use descriptor, and drops its stored credentials after starting the worker.
 The controller restores W&B and Exa access before tracing starts. These service
 keys remain available to research tools and terminals. Supervised training uses
 its student writer as `WANDB_API_KEY`, replacing the research key.
+Its stdout and stderr pass through writer-key redaction before reaching the
+training log. Training starts without the controller's `WANDB_SERVICE` connection;
+an explicit writer also replaces any identity-token-file authentication.
 GitHub credentials remain private to the controller.
 
 Delegated model keys travel through a private descriptor and are resolved in
