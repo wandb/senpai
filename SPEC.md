@@ -698,7 +698,9 @@ assignment at depth two to verify its parent, tree, and message. These fetches d
 not change the advisor checkout. Pushes retain expected-SHA checks, ancestry
 checks, exact ref leases, and post-push verification. The bootstrap runner and
 target pre-push hooks remain behavioral guards; typed publication bypasses them
-and applies its own branch and lease checks.
+and applies its own branch and lease checks. Before creating a remote branch,
+the typed assignment tool requires a configured student and a `<student>/`
+branch prefix.
 
 Generic child processes receive no GitHub token and no GitHub tools. Main-role
 GitHub operations remain typed and lease/state guarded. Terminal and hook
