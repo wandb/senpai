@@ -25,7 +25,7 @@ def issue(
 
 
 def mailbox(*, role="advisor", human_issues_enabled=True):
-    return GitHubMailbox(
+    value = GitHubMailbox(
         repo="acme/widgets",
         token=SecretStr("github-token"),
         role=role,
@@ -34,6 +34,8 @@ def mailbox(*, role="advisor", human_issues_enabled=True):
         trusted_actor="senpai-bot",
         human_issues_enabled=human_issues_enabled,
     )
+    value._has_write_permission = lambda _login: True
+    return value
 
 
 def test_malformed_assignment_does_not_suppress_a_human_issue(monkeypatch):
@@ -44,7 +46,12 @@ def test_malformed_assignment_does_not_suppress_a_human_issue(monkeypatch):
         "html_url": "https://github.test/acme/widgets/pull/17",
         "updated_at": "2026-07-29T18:00:00Z",
         "body": "<!-- senpai-assignment:v1 not-json -->",
-        "head": {"ref": "student/candidate", "sha": "a" * 40},
+        "user": {"login": "senpai-bot"},
+        "head": {
+            "ref": "student/candidate",
+            "sha": "a" * 40,
+            "repo": {"full_name": "acme/widgets"},
+        },
         "labels": [
             {"name": "research"},
             {"name": "student:student-1"},
@@ -76,7 +83,12 @@ def test_malformed_assignment_versions_only_actionable_error_changes(monkeypatch
         "html_url": "https://github.test/acme/widgets/pull/17",
         "updated_at": "2026-07-29T18:00:00Z",
         "body": "<!-- senpai-assignment:v1 not-json -->",
-        "head": {"ref": "student/candidate", "sha": "a" * 40},
+        "user": {"login": "senpai-bot"},
+        "head": {
+            "ref": "student/candidate",
+            "sha": "a" * 40,
+            "repo": {"full_name": "acme/widgets"},
+        },
         "labels": [
             {"name": "research"},
             {"name": "student:student-1"},

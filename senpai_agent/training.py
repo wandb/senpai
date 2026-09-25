@@ -5,13 +5,15 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
 import psutil
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
+
+from senpai_agent.secrets import scrub_github_credentials, scrub_service_credentials
 
 from senpai_agent.processes import signal_process_group, terminate_process_group
 
@@ -25,6 +27,23 @@ _WANDB_COMPLETE_RUN_URL_BYTES = re.compile(
 _LOG_READ_BYTES = 64 * 1024
 _WANDB_SCAN_OVERLAP_BYTES = 4096
 _ERROR_TAIL_BYTES = 8192
+TARGET_PYTHON_ENV = "SENPAI_TARGET_PYTHON_ENV"
+
+
+def target_python_environment(
+    environment: Mapping[str, str] = os.environ,
+) -> dict[str, str]:
+    """Point interpreter, PATH, and uv project commands at the target venv."""
+
+    target_env = environment.get(TARGET_PYTHON_ENV, "").strip()
+    if not target_env:
+        return {}
+    return {
+        "PATH": f"{target_env}/bin:{environment['PATH']}",
+        "UV_PROJECT_ENVIRONMENT": target_env,
+        "UV_PYTHON": f"{target_env}/bin/python",
+        "VIRTUAL_ENV": target_env,
+    }
 
 
 class TrainingState(StrEnum):
@@ -88,11 +107,13 @@ class TrainingSupervisor:
         *,
         workspace: Path,
         state_dir: Path,
+        wandb_api_key: SecretStr | None = None,
         terminate_grace_seconds: float = 10,
     ):
         self.workspace = workspace.resolve()
         self.state_dir = state_dir.resolve()
         self.terminate_grace_seconds = terminate_grace_seconds
+        self.wandb_api_key = wandb_api_key
         self._lock = threading.Lock()
         self._active: dict[str, _ActiveTraining] = {}
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -132,9 +153,17 @@ class TrainingSupervisor:
         log_path = self.state_dir / f"{training_id}.log"
         started = time.monotonic()
         with log_path.open("wb") as log:
+            environment = dict(os.environ)
+            environment.pop("PYTHONSAFEPATH", None)
+            environment.update(target_python_environment(environment))
+            scrub_github_credentials(environment)
+            scrub_service_credentials(environment)
+            if self.wandb_api_key is not None:
+                environment["WANDB_API_KEY"] = self.wandb_api_key.get_secret_value()
             process = subprocess.Popen(
                 list(spec.argv),
                 cwd=cwd,
+                env=environment,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 shell=False,

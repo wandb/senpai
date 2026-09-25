@@ -12,6 +12,7 @@ from openhands.sdk.event import MessageEvent
 from openhands.sdk.llm import Message, TextContent
 
 from senpai_agent.delegation import (
+    MODEL_TIER_TIMEOUT_SECONDS,
     AgentStatusAction,
     AgentStatusTool,
     AgentTask,
@@ -25,7 +26,6 @@ from senpai_agent.delegation import (
     DelegationRequest,
     LeafAgentTask,
     LeafSpawnAgentsAction,
-    MODEL_TIER_TIMEOUT_SECONDS,
     OpenHandsChildProcess,
     SpawnAgentsAction,
     SpawnAgentsTool,
@@ -34,6 +34,7 @@ from senpai_agent.delegation import (
     reconcile_delegated_tasks,
 )
 from senpai_agent.local_events import LocalEventStore
+from senpai_agent.program_context import ProgramSystemPrompt
 
 
 def test_model_tier_runtime_limits():
@@ -307,7 +308,13 @@ def config(tmp_path: Path, **updates) -> DelegationConfig:
         "enable_browser": False,
         "conversation_secrets": {},
         "role": "advisor",
-        "program_path": "program.md",
+        "harness_context": "harness instructions",
+        "role_context": "advisor role",
+        "program": ProgramSystemPrompt(
+            program_path="program.md",
+            source_commit="a" * 40,
+            content="Research policy.",
+        ),
         "launch_context": "# Authoritative launch context\n\nSystem policy.",
     }
     values.update(updates)

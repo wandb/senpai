@@ -9,6 +9,15 @@ description: Comprehensive primary skill for agents working with Weights & Biase
 
 # W&B Primary Skill
 
+## Senpai credential boundary
+
+The controller does not expose `WANDB_API_KEY` to terminal commands or child
+agents. Student training launched through `run_training` receives a distinct
+per-student writer key so the target's existing W&B logging continues to work.
+Do not run ad hoc authenticated W&B administration or query scripts. Use the
+typed training status and metric-monitor tools, the run links returned from
+training, and public browser views for research decisions.
+
 ## Python environment detection (DO THIS FIRST)
 
 Before running any Python code, you MUST determine how the user runs Python in this project. Check for clues in this order:

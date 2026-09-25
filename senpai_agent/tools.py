@@ -26,7 +26,7 @@ from openhands.tools.terminal import (
     TerminalTool,
 )
 from openhands.tools.task_tracker import TaskTrackerTool
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 
 from senpai_agent.delegation import (
     AgentStatusTool,
@@ -35,6 +35,7 @@ from senpai_agent.delegation import (
     DelegateAgentTool,
     SpawnAgentsTool,
 )
+from senpai_agent.exa_tool import ExaSearchTool
 from senpai_agent.git_workflow import require_clean_training_worktree
 from senpai_agent.github.tools import GitHubWorkflowToolSet
 from senpai_agent.monitor import MetricGate, MonitorStore, TrainingMonitorSpec
@@ -44,6 +45,7 @@ from senpai_agent.training import (
     TrainingSpec,
     TrainingState,
     TrainingSupervisor,
+    target_python_environment,
 )
 
 if TYPE_CHECKING:
@@ -55,6 +57,14 @@ _TRAINING_RUNTIMES: dict[
     tuple[TrainingSupervisor, MonitorStore],
 ] = {}
 _BROWSER_ENABLED_STATE_KEY = "senpai.browser_enabled"
+_training_wandb_api_key: SecretStr | None = None
+
+
+def configure_training_credentials(api_key: SecretStr | None) -> None:
+    """Hold the per-student W&B writer outside model-facing tool state."""
+
+    global _training_wandb_api_key
+    _training_wandb_api_key = api_key
 
 
 class LoadBrowserAction(Action):
@@ -171,6 +181,7 @@ def training_runtime(
             TrainingSupervisor(
                 workspace=workspace,
                 state_dir=key,
+                wandb_api_key=_training_wandb_api_key,
             ),
             MonitorStore(key / "monitors.sqlite3"),
         )
@@ -702,6 +713,7 @@ class SenpaiTerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
         native = TerminalTool.create(
             conv_state,
             no_change_timeout_seconds=no_change_timeout,
+            env=target_python_environment() or None,
         )[0]
         if native.executor is None:
             raise RuntimeError("native terminal tool has no executor")
@@ -737,4 +749,5 @@ def register_senpai_tools() -> None:
     register_tool("load_browser", LoadBrowserTool)
     register_tool("task_tracker", SenpaiTaskTrackerTool)
     register_tool("senpai_terminal", SenpaiTerminalTool)
+    register_tool("senpai_exa", ExaSearchTool)
     _TOOLS_REGISTERED = True

@@ -12,7 +12,7 @@ from types import TracebackType
 from typing import Literal, Protocol, Self
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 
 from senpai_agent.models import Contract
 from senpai_agent.mailbox import ControllerEvent
@@ -523,15 +523,25 @@ class MetricSource(Protocol):
 class WandbMetricSource:
     """Fetch one latest metric value without carrying history into the agent."""
 
-    def __init__(self, entity: str, project: str, timeout_seconds: int = 30):
+    def __init__(
+        self,
+        entity: str,
+        project: str,
+        api_key: SecretStr | None = None,
+        timeout_seconds: int = 30,
+    ):
         self.entity = entity
         self.project = project
+        self.api_key = api_key
         self.timeout_seconds = timeout_seconds
 
     def latest(self, run_id: str, metric: str) -> MetricSample | None:
         import wandb
 
-        run = wandb.Api(timeout=self.timeout_seconds).run(
+        run = wandb.Api(
+            api_key=(self.api_key.get_secret_value() if self.api_key else None),
+            timeout=self.timeout_seconds,
+        ).run(
             f"{self.entity}/{self.project}/{run_id}"
         )
         rows = run.history(

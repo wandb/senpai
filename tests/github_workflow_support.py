@@ -183,6 +183,7 @@ class FakeGitHub:
         ignore_draft_mutations: bool = False,
         branch_heads: dict[str, str] | None = None,
         actor_login: str = "senpai-bot",
+        files: list[dict[str, object]] | None = None,
     ):
         self.pr = pr
         self.comments = list(comments or [])
@@ -192,6 +193,11 @@ class FakeGitHub:
         self.ignore_draft_mutations = ignore_draft_mutations
         self.branch_heads = branch_heads or {str(pr["base_ref"]): BASE_SHA}
         self.actor_login = actor_login
+        self.files = list(
+            files
+            if files is not None
+            else [{"filename": "model.py", "status": "modified"}]
+        )
         self.requests: list[tuple[str, str, object | None, dict[str, str]]] = []
 
     @property
@@ -215,6 +221,7 @@ class FakeGitHub:
         self.requests.append((method, path, json_body, dict(headers)))
 
         pull_path = f"/repos/{REPO}/pulls/7"
+        pull_files_path = f"{pull_path}/files"
         pulls_path = f"/repos/{REPO}/pulls"
         issues_path = f"/repos/{REPO}/issues"
         issue_path = f"/repos/{REPO}/issues/7"
@@ -226,6 +233,11 @@ class FakeGitHub:
 
         if method == "GET" and path == pull_path:
             return HttpResponse(200, self._pull_payload())
+
+        if method == "GET" and path == pull_files_path:
+            page = int(parse_qs(parsed.query).get("page", ["1"])[0])
+            start = (page - 1) * 100
+            return HttpResponse(200, self.files[start : start + 100])
 
         ref_prefix = f"/repos/{REPO}/git/ref/heads/"
         if method == "GET" and path.startswith(ref_prefix):

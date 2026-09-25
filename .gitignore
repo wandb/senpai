@@ -50,6 +50,9 @@ results.tsv
 experiment_log/
 advisor_logs/
 student_logs/
+conversation_logs/
+openhands_state/
+*.tgz
 
 # Claude worktrees
 .claude/worktrees/

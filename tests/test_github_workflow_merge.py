@@ -1,18 +1,6 @@
 from urllib.parse import urlsplit
 
 import pytest
-
-from senpai_agent.github.workflow import (
-    ReconciliationError,
-    StaleAssignmentRevisionError,
-    StaleResearchBaseError,
-    WorkflowPreconditionError,
-)
-from senpai_agent.models import (
-    render_assignment_marker,
-    render_result_comment,
-    render_result_marker,
-)
 from github_workflow_support import (
     ASSIGNMENT_ID,
     BASE_SHA,
@@ -25,6 +13,18 @@ from github_workflow_support import (
     experiment_result,
     pull_request,
     workflow,
+)
+
+from senpai_agent.github.workflow import (
+    ReconciliationError,
+    StaleAssignmentRevisionError,
+    StaleResearchBaseError,
+    WorkflowPreconditionError,
+)
+from senpai_agent.models import (
+    render_assignment_marker,
+    render_result_comment,
+    render_result_marker,
 )
 
 
@@ -100,6 +100,79 @@ def test_merge_sends_the_expected_head_and_replays_without_baseline_reads():
         method == "GET" and "/git/ref/heads/" in path
         for method, path, _body, _headers in fake.requests
     ) == base_reads_after_first
+
+
+@pytest.mark.parametrize(
+    ("filename", "status"),
+    [
+        ("program.md", "added"),
+        ("policy/program.md", "modified"),
+        ("nested/program.md", "removed"),
+    ],
+)
+def test_merge_rejects_every_program_policy_change(filename, status):
+    fake = FakeGitHub(
+        mergeable_pull(),
+        comments=[result_comment()],
+        files=[{"filename": filename, "status": status}],
+    )
+
+    with pytest.raises(WorkflowPreconditionError, match="operator publication"):
+        merge_experiment(workflow(fake))
+
+    assert fake.pr["merged"] is False
+    assert fake.mutations == []
+
+
+@pytest.mark.parametrize(
+    "changed_file",
+    [
+        {
+            "filename": "policy.txt",
+            "previous_filename": "program.md",
+            "status": "renamed",
+        },
+        {
+            "filename": "nested/program.md",
+            "previous_filename": "policy.txt",
+            "status": "renamed",
+        },
+    ],
+    ids=("rename-away", "rename-into"),
+)
+def test_merge_rejects_program_policy_renames(changed_file):
+    fake = FakeGitHub(
+        mergeable_pull(), comments=[result_comment()], files=[changed_file]
+    )
+
+    with pytest.raises(WorkflowPreconditionError, match="operator publication"):
+        merge_experiment(workflow(fake))
+
+    assert fake.mutations == []
+
+
+def test_merge_program_policy_check_matches_case_sensitive_typed_push_semantics():
+    fake = FakeGitHub(
+        mergeable_pull(),
+        comments=[result_comment()],
+        files=[{"filename": "policy/PROGRAM.md", "status": "modified"}],
+    )
+
+    assert merge_experiment(workflow(fake)).state == "experiment_merged"
+
+
+def test_merge_checks_every_changed_file_page_for_program_policy():
+    files = [
+        {"filename": f"results/{index}.json", "status": "added"}
+        for index in range(100)
+    ]
+    files.append({"filename": "nested/program.md", "status": "removed"})
+    fake = FakeGitHub(mergeable_pull(), comments=[result_comment()], files=files)
+
+    with pytest.raises(WorkflowPreconditionError, match="operator publication"):
+        merge_experiment(workflow(fake))
+
+    assert fake.mutations == []
 
 
 def test_merge_recovers_when_the_success_response_is_lost():

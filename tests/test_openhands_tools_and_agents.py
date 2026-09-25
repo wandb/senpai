@@ -64,6 +64,22 @@ def test_child_mode_keeps_bounded_delegation_lifecycle_tools(tmp_path):
     assert delegation_config(config).depth == 0
 
 
+def test_exa_tool_spec_never_contains_its_runtime_credential(tmp_path):
+    tool = next(
+        tool
+        for tool in build_main_tools(
+            runtime_config(
+                tmp_path,
+                exa_api_key=SecretStr("exa-secret-sentinel"),
+            )
+        )
+        if tool.name == "senpai_exa"
+    )
+
+    assert tool.params == {}
+    assert "exa-secret-sentinel" not in repr(tool)
+
+
 def test_browser_family_is_lazy_and_respects_disable_flag(tmp_path):
     enabled_tools = build_main_tools(runtime_config(tmp_path, enable_browser=True))
     enabled = {tool.name for tool in enabled_tools}
@@ -342,6 +358,7 @@ def test_markdown_agents_register_and_construct_with_the_native_loader(tmp_path)
             for name, definition in definitions.items()
         }
         assert {tool.name for tool in agents["search"].tools} == {
+            "senpai_exa",
             "terminal",
             "file_editor",
         }
@@ -438,7 +455,7 @@ def test_subagents_receive_skills_from_the_runtime_plugin(
             "search.md",
             "search",
             None,
-            {"terminal", "file_editor"},
+            {"senpai_exa", "terminal", "file_editor"},
             set(),
         ),
     ],
@@ -495,7 +512,9 @@ def test_system_instructions_refer_to_program_md_by_filename():
     }
 
     assert all("programme" not in prompt.lower() for prompt in prompts.values())
-    assert "program.md" not in prompts["SENPAI-HARNESS.md"]
+    harness = " ".join(prompts["SENPAI-HARNESS.md"].split())
+    assert "target repository's `program.md` is research policy" in harness
+    assert "authoritative launch context" in harness
     advisor = " ".join(prompts["ADVISOR.md"].split())
     assert (
         "NEVER accept results where the primary validation metrics required by "
@@ -793,3 +812,19 @@ def test_harness_states_bounded_delegation_tree_contract():
         "two hours for `frontier`",
     ):
         assert required in normalized
+
+
+def test_child_agents_route_terminal_through_senpai_terminal():
+    from openhands.sdk import Tool
+
+    from senpai_agent.openhands_runner import senpai_terminal_tools
+
+    tools = senpai_terminal_tools(
+        [Tool(name="terminal"), Tool(name="file_editor")],
+        "student",
+    )
+
+    assert [(tool.name, tool.params) for tool in tools] == [
+        ("senpai_terminal", {"role": "student"}),
+        ("file_editor", {}),
+    ]

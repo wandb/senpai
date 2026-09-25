@@ -25,6 +25,17 @@ def commit_file(
     return git(workspace, "rev-parse", "HEAD")
 
 
+def commit_workspace(workspace: Path, message: str = "program snapshot") -> str:
+    if not (workspace / ".git").is_dir():
+        git(workspace.parent, "init", str(workspace))
+        git(workspace, "config", "user.name", "Operator")
+        git(workspace, "config", "user.email", "operator@example.com")
+    if git(workspace, "status", "--porcelain"):
+        git(workspace, "add", "-A")
+        git(workspace, "commit", "-m", message)
+    return git(workspace, "rev-parse", "HEAD")
+
+
 def detached_commit(workspace: Path, parent: str, message: str) -> str:
     tree = git(workspace, "rev-parse", f"{parent}^{{tree}}")
     return git(workspace, "commit-tree", tree, "-p", parent, "-m", message)

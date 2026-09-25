@@ -1,5 +1,6 @@
 """Merge one reviewed experiment without losing its result evidence."""
 
+from pathlib import PurePosixPath
 from typing import Literal
 
 from senpai_agent.github.workflow.errors import (
@@ -20,6 +21,48 @@ from senpai_agent.models import ResearchBaseAcceptanceRecord, experiment_result_
 
 class MergeMixin:
     __slots__ = ()
+
+    def _require_program_policy_unchanged(self, number: int) -> None:
+        """Reject any PR that changes a program.md policy file."""
+
+        for page in range(1, 31):
+            response = self._request(
+                "GET",
+                f"/repos/{self._repo}/pulls/{number}/files?per_page=100&page={page}",
+                expected_statuses={200},
+            )
+            files = response.json_body
+            if not isinstance(files, list) or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("filename"), str)
+                or (
+                    "previous_filename" in item
+                    and not isinstance(item["previous_filename"], str)
+                )
+                for item in files
+            ):
+                raise ReconciliationError(
+                    "GitHub returned invalid pull-request file metadata"
+                )
+            if any(
+                any(
+                    PurePosixPath(path).name == "program.md"
+                    for path in (
+                        item["filename"],
+                        item.get("previous_filename", ""),
+                    )
+                )
+                for item in files
+            ):
+                raise WorkflowPreconditionError(
+                    "program.md changes require explicit operator publication"
+                )
+            if len(files) < 100:
+                return
+        raise WorkflowPreconditionError(
+            "cannot verify program.md policy for a pull request with 3000 or "
+            "more changed files"
+        )
 
     def merge_experiment(
         self,
@@ -130,6 +173,7 @@ class MergeMixin:
             live_base_sha=self._branch_head_sha(assignment.base_ref),
             expected_current_base_sha=expected_current_base_sha,
         )
+        self._require_program_policy_unchanged(number)
         require_same_result(
             terminal_result,
             self._require_result(

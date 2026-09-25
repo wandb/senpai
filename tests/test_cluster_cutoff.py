@@ -1,7 +1,11 @@
+import json
 import os
+import shutil
+import signal
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -147,14 +151,23 @@ def test_cutoff_dry_run_keeps_readiness_and_delete_without_archive_rbac(tmp_path
     job_script = captured_script.read_text(encoding="utf-8")
     assert "Waiting for ready gate" in job_script
     assert 'sleep_until "$KILL_AT_EPOCH" "hard cutoff delete"' in job_script
-    assert "delete deployments,configmaps,secrets" in job_script
+    assert "delete deployments" in job_script
     assert "harvest" not in job_script.lower()
     assert "kubectl exec" not in job_script
     assert 'resources: ["pods/log"]' not in rendered
     assert 'resources: ["pods/exec"]' not in rendered
+    assert 'resources: ["configmaps", "secrets"]' not in rendered
+    assert "runAsNonRoot: true" in rendered
+    assert "runAsUser: 10001" in rendered
+    assert "allowPrivilegeEscalation: false" in rendered
+    assert "readOnlyRootFilesystem: true" in rendered
+    assert 'drop: ["ALL"]' in rendered
 
 
-def test_generated_cutoff_waits_for_readiness_then_deletes_selected_resources(tmp_path):
+@pytest.mark.parametrize("replaced_temporary", [None, "cutoff_state.json", "start-gate"])
+def test_generated_cutoff_waits_for_readiness_then_deletes_selected_resources(
+    tmp_path, replaced_temporary
+):
     generated, captured_script = render_cutoff(
         tmp_path,
         "--run-slug",
@@ -183,7 +196,7 @@ case "$*" in
   *"get deployments"*)
     printf '%s\n' 'senpai-track-a'
     ;;
-  *"delete deployments,configmaps,secrets"*)
+  *"delete deployments"*)
     printf '%s\n' "$*" > "$DELETE_LOG"
     ;;
   *)
@@ -195,12 +208,34 @@ esac
         encoding="utf-8",
     )
     runtime_kubectl.chmod(0o755)
+    replacement_log = tmp_path / "replacement.log"
+    if replaced_temporary is not None:
+        # Replace the newly created file before the cutoff reopens its path.
+        # This schedules the shared-PVC race deterministically at the boundary.
+        racing_mktemp = bin_dir / "mktemp"
+        racing_mktemp.write_text(
+            """#!/bin/sh
+created=$("$REAL_MKTEMP" "$@") || exit
+case "$created" in
+  *"$REPLACED_TEMPORARY".tmp.*)
+    rm "$created"
+    mkfifo "$created"
+    printf '%s\\n' "$created" > "$REPLACEMENT_LOG"
+    ;;
+esac
+printf '%s\\n' "$created"
+""",
+            encoding="utf-8",
+        )
+        racing_mktemp.chmod(0o755)
     state_root = tmp_path / "state"
     gate = tmp_path / "start-gate"
-    result = subprocess.run(
+    with subprocess.Popen(
         ["bash", str(captured_script)],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
+        start_new_session=True,
         env={
             **os.environ,
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
@@ -211,18 +246,32 @@ esac
             "EXPECTED_DEPLOYMENTS": "1",
             "READINESS_TIMEOUT_SECONDS": "1800",
             "BUDGET_SECONDS": "0",
+            "ARMING_DEADLINE_EPOCH": "0",
+            "HARD_KILL_AT_EPOCH": "0",
             "ARM_ID": "acceptance-arm",
+            "STATE_AUTH_KEY": "a" * 64,
             "PVC_LOG_ROOT": str(state_root),
             "START_GATE_PATH": str(gate),
             "NAMESPACE": "test-ns",
+            "REAL_MKTEMP": shutil.which("mktemp"),
+            "REPLACED_TEMPORARY": replaced_temporary or "",
+            "REPLACEMENT_LOG": str(replacement_log),
         },
-        check=False,
-    )
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+            pytest.fail(f"cutoff blocked beyond its deadline:\n{stdout}\n{stderr}")
 
-    assert result.returncode == 0, result.stderr
-    assert gate.is_file()
+    assert process.returncode == 0, stderr
+    if replaced_temporary != "start-gate":
+        assert gate.is_file()
+    if replaced_temporary is not None:
+        assert replacement_log.is_file()
     deleted = delete_log.read_text(encoding="utf-8")
-    assert "delete deployments,configmaps,secrets" in deleted
+    assert "delete deployments" in deleted
     assert "research-tag in (track-a)" in deleted
 
 
@@ -259,7 +308,7 @@ case "$*" in
   *"get deployments"*)
     printf '%s\n' 'senpai-track-a'
     ;;
-  *"delete deployments,configmaps,secrets"*)
+  *"delete deployments"*)
     printf '%s\n' "$*" > "$DELETE_LOG"
     ;;
   *)
@@ -288,7 +337,10 @@ esac
             "EXPECTED_DEPLOYMENTS": "1",
             "READINESS_TIMEOUT_SECONDS": "0",
             "BUDGET_SECONDS": "0",
+            "ARMING_DEADLINE_EPOCH": "0",
+            "HARD_KILL_AT_EPOCH": "0",
             "ARM_ID": "never-ready-arm",
+            "STATE_AUTH_KEY": "a" * 64,
             "PVC_LOG_ROOT": str(state_root),
             "START_GATE_PATH": str(gate),
             "NAMESPACE": "test-ns",
@@ -328,7 +380,7 @@ case "$*" in
     printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"ready":true}]}}]}'
     ;;
   *"get deployments"*) printf '%s\n' 'senpai-track-a' ;;
-  *"delete deployments,configmaps,secrets"*) exit 0 ;;
+  *"delete deployments"*) exit 0 ;;
   *) exit 2 ;;
 esac
 """,
@@ -338,8 +390,10 @@ esac
     state_root = tmp_path / "state"
     run_dir = state_root / "reused"
     run_dir.mkdir(parents=True)
-    state_file = run_dir / "cutoff_state.env"
+    state_file = run_dir / "cutoff_state.json"
+    executed = tmp_path / "payload-executed"
     state_file.write_text(
+        f"PERSISTED_ARM_ID=$(touch {executed})\n"
         "RUN_SLUG=reused\n"
         "TAGS_CSV=track-a\n"
         "ARMED_AT_UTC=2026-01-01T00:00:00Z\n"
@@ -366,7 +420,10 @@ esac
             "EXPECTED_DEPLOYMENTS": "1",
             "READINESS_TIMEOUT_SECONDS": "0",
             "BUDGET_SECONDS": "0",
+            "ARMING_DEADLINE_EPOCH": "0",
+            "HARD_KILL_AT_EPOCH": "0",
             "ARM_ID": "fresh-arm",
+            "STATE_AUTH_KEY": "a" * 64,
             "PVC_LOG_ROOT": str(state_root),
             "NAMESPACE": "test-ns",
         },
@@ -375,9 +432,78 @@ esac
 
     assert result.returncode == 0, result.stderr
     assert "Discarding cutoff state from an earlier arm" in result.stdout
-    state = state_file.read_text(encoding="utf-8")
-    assert "PERSISTED_ARM_ID=fresh-arm" in state
-    assert "KILL_AT_EPOCH=1\n" not in state
+    assert not executed.exists()
+    state = json.loads(state_file.read_text(encoding="utf-8"))["payload"]
+    assert state["PERSISTED_ARM_ID"] == "fresh-arm"
+    assert state["KILL_AT_EPOCH"] != 1
+
+
+def test_generated_cutoff_deletes_when_shared_state_cannot_be_replaced(tmp_path):
+    generated, captured_script = render_cutoff(
+        tmp_path,
+        "--run-slug",
+        "state-race",
+        "--tags-csv",
+        "track-a",
+        "--expected-pods",
+        "1",
+        "--expected-deployments",
+        "1",
+        "--budget-hours",
+        "0",
+    )
+    assert generated.returncode == 0, generated.stderr
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    delete_log = tmp_path / "delete.log"
+    runtime_kubectl = bin_dir / "kubectl"
+    runtime_kubectl.write_text(
+        """#!/bin/sh
+case "$*" in
+  *"get pods"*)
+    printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"ready":true}]}}]}'
+    ;;
+  *"get deployments"*) printf '%s\n' 'senpai-track-a' ;;
+  *"delete deployments"*) printf '%s\n' "$*" > "$DELETE_LOG" ;;
+  *) exit 2 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    runtime_kubectl.chmod(0o755)
+    state_root = tmp_path / "state"
+    run_dir = state_root / "state-race"
+    run_dir.mkdir(parents=True)
+    run_dir.chmod(0o555)
+
+    result = subprocess.run(
+        ["bash", str(captured_script)],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "DELETE_LOG": str(delete_log),
+            "RUN_SLUG": "state-race",
+            "TAGS_CSV": "track-a",
+            "EXPECTED_PODS": "1",
+            "EXPECTED_DEPLOYMENTS": "1",
+            "READINESS_TIMEOUT_SECONDS": "0",
+            "BUDGET_SECONDS": "0",
+            "ARMING_DEADLINE_EPOCH": "0",
+            "HARD_KILL_AT_EPOCH": "0",
+            "ARM_ID": "state-race-arm",
+            "STATE_AUTH_KEY": "a" * 64,
+            "PVC_LOG_ROOT": str(state_root),
+            "NAMESPACE": "test-ns",
+        },
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "using in-memory deadline" in result.stdout
+    assert delete_log.is_file()
 
 
 def test_operator_job_replacement_is_scoped_to_the_requested_namespace(tmp_path):
@@ -411,3 +537,72 @@ esac
         "--context pai-2 -n review-ns delete job senpai-cutoff-namespaced "
         "--ignore-not-found=true"
     ) in kubectl_log.read_text(encoding="utf-8").splitlines()
+
+
+def test_generated_cutoff_deletes_at_deadline_when_the_start_gate_cannot_open(tmp_path):
+    generated, captured_script = render_cutoff(
+        tmp_path,
+        "--run-slug",
+        "acceptance",
+        "--tags-csv",
+        "track-a",
+        "--expected-pods",
+        "1",
+        "--expected-deployments",
+        "1",
+        "--budget-hours",
+        "0",
+    )
+    assert generated.returncode == 0, generated.stderr
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    delete_log = tmp_path / "delete.log"
+    runtime_kubectl = bin_dir / "kubectl"
+    runtime_kubectl.write_text(
+        """#!/bin/sh
+case "$*" in
+  *"get pods"*)
+    printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"ready":true}]}}]}'
+    ;;
+  *"get deployments"*)
+    printf '%s\n' 'senpai-track-a'
+    ;;
+  *"delete deployments"*)
+    printf '%s\n' "$*" > "$DELETE_LOG"
+    ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    runtime_kubectl.chmod(0o755)
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    result = subprocess.run(
+        ["bash", str(captured_script)],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "DELETE_LOG": str(delete_log),
+            "RUN_SLUG": "acceptance",
+            "TAGS_CSV": "track-a",
+            "EXPECTED_PODS": "1",
+            "EXPECTED_DEPLOYMENTS": "1",
+            "READINESS_TIMEOUT_SECONDS": "1800",
+            "BUDGET_SECONDS": "0",
+            "ARMING_DEADLINE_EPOCH": "0",
+            "HARD_KILL_AT_EPOCH": "0",
+            "ARM_ID": "acceptance-arm",
+            "STATE_AUTH_KEY": "a" * 64,
+            "PVC_LOG_ROOT": str(tmp_path / "state"),
+            "START_GATE_PATH": str(blocker / "start-gate"),
+            "NAMESPACE": "test-ns",
+        },
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Unable to open the shared start gate" in result.stdout + result.stderr
+    assert "research-tag in (track-a)" in delete_log.read_text(encoding="utf-8")
