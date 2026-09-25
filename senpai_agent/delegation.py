@@ -312,6 +312,7 @@ class OpenHandsChildProcess:
         profile = self._config.profile(self._request.model)
         return (
             str(self._config.python_executable),
+            "-P",
             "-m",
             "senpai_agent.openhands_runner",
             "--child",

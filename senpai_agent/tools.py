@@ -8,6 +8,7 @@ import threading
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Self
+from weakref import WeakSet
 
 from openhands.sdk.llm import TextContent
 from openhands.sdk.tool import (
@@ -25,6 +26,8 @@ from openhands.tools.terminal import (
     TerminalObservation,
     TerminalTool,
 )
+from openhands.tools.terminal.impl import TerminalExecutor
+from openhands.tools.terminal.terminal.terminal_session import TerminalSession
 from openhands.tools.task_tracker import TaskTrackerTool
 from pydantic import Field, model_validator
 
@@ -44,6 +47,7 @@ from senpai_agent.training import (
     TrainingSpec,
     TrainingState,
     TrainingSupervisor,
+    target_python_environment,
 )
 
 if TYPE_CHECKING:
@@ -602,6 +606,55 @@ class TrainingToolSet(ToolDefinition[RunTrainingAction, TrainingResultObservatio
         )
 
 
+class TargetTerminalExecutor(TerminalExecutor):
+    """Restore target Python settings after each native shell starts."""
+
+    def __init__(
+        self,
+        *,
+        working_dir: str,
+        no_change_timeout_seconds: int,
+        full_output_save_dir: str | None,
+    ):
+        self._target_sessions: WeakSet[TerminalSession] = WeakSet()
+        super().__init__(
+            working_dir=working_dir,
+            no_change_timeout_seconds=no_change_timeout_seconds,
+            full_output_save_dir=full_output_save_dir,
+            env=target_python_environment() or None,
+        )
+
+    def _export_envs(
+        self,
+        action: TerminalAction,
+        conversation: LocalConversation | None = None,
+        session: TerminalSession | None = None,
+    ) -> None:
+        # This pinned SDK hook runs after pooled checkout and session reset.
+        if self._env and action.command.strip() and not action.is_input:
+            target = session or self.session
+            if target not in self._target_sessions:
+                exports = self._build_env_exports(
+                    {key: value for key, value in self._env.items() if key != "PATH"},
+                    target,
+                )
+                target_bin = self._bash_quote(f"{self._env['VIRTUAL_ENV']}/bin")
+                result = target.execute(TerminalAction(
+                    command=(
+                        "unset PYTHONSAFEPATH && "
+                        f'{exports} && export PATH={target_bin}:"$PATH"'
+                    ),
+                    timeout=10,
+                ))
+                if result.is_error or result.exit_code != 0:
+                    raise ValueError(
+                        "Target Python environment setup failed "
+                        f"(exit code {result.exit_code})."
+                    )
+                self._target_sessions.add(target)
+        super()._export_envs(action, conversation, session)
+
+
 class SenpaiTerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
     """Fail-closed policy wrapper around the native terminal executor."""
 
@@ -701,7 +754,11 @@ class SenpaiTerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
             raise RuntimeError("Senpai terminal timeout settings must be positive")
         native = TerminalTool.create(
             conv_state,
-            no_change_timeout_seconds=no_change_timeout,
+            executor=TargetTerminalExecutor(
+                working_dir=conv_state.workspace.working_dir,
+                no_change_timeout_seconds=no_change_timeout,
+                full_output_save_dir=conv_state.env_observation_persistence_dir,
+            ),
         )[0]
         if native.executor is None:
             raise RuntimeError("native terminal tool has no executor")

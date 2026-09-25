@@ -16,8 +16,6 @@ GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 TARGET_REPO_BRANCH="${TARGET_REPO_BRANCH:-}"
 export SENPAI_ROLE="student"
 export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
-SOURCE_SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
-export SENPAI_PLUGIN="$SOURCE_SENPAI_PLUGIN"
 GIT_ASKPASS_FILE="/tmp/senpai-git-askpass"
 mkdir -p "$LOGDIR"
 if [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
@@ -35,7 +33,7 @@ echo "GPUs:         $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/n
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
 git config --global safe.directory "$WORKDIR"
-source "$SOURCE_SENPAI_PLUGIN/scripts/git-guard.sh"
+source "$SENPAI_PLUGIN/scripts/git-guard.sh"
 install_senpai_git_guard "$WORKDIR" "$GIT_ASKPASS_FILE"
 
 clone_target_repo() {
@@ -53,15 +51,6 @@ clone_target_repo() {
 [ -d "$PROBLEM_DIR/.git" ] || clone_target_repo
 git config --global --unset-all credential.helper 2>/dev/null || true
 
-uv pip install --python "$SENPAI_PYTHON" --no-deps -e .
-
-source "$SOURCE_SENPAI_PLUGIN/scripts/agent-context.sh"
-AGENT_CONTEXT_ROOT="$(mktemp -d /tmp/senpai-agent-context.XXXXXX)"
-export SENPAI_PLUGIN="$(
-    install_senpai_agent_context \
-        "$WORKDIR" "$SOURCE_SENPAI_PLUGIN" "$AGENT_CONTEXT_ROOT"
-)"
-
 # --- Git identity for commits (inside the problem-package repo) ---
 cd "$WORKDIR/$PROBLEM_DIR"
 git config user.name "senpai-$STUDENT_NAME"
@@ -75,10 +64,10 @@ fi
 
 echo "=== Agent config installed ==="
 ls \
-    "$HOME/.agents/agents/bash-runner.md" \
-    "$HOME/.agents/agents/general-purpose.md" \
-    "$HOME/.agents/agents/explore.md" \
-    "$HOME/.agents/agents/search.md" \
+    "$SENPAI_AGENT_DIR/bash-runner.md" \
+    "$SENPAI_AGENT_DIR/general-purpose.md" \
+    "$SENPAI_AGENT_DIR/explore.md" \
+    "$SENPAI_AGENT_DIR/search.md" \
     "$SENPAI_PLUGIN/skills/wandb-primary/SKILL.md"
 
 # --- Hivemind is intentionally disabled pending its OpenHands rewrite. ---
@@ -98,4 +87,14 @@ if [ -z "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
 fi
 unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS
 rm -f "$GIT_ASKPASS_FILE"
-exec python -m senpai_agent.supervisor student
+export SENPAI_TARGET_PYTHON_ENV="$HOME/.venvs/senpai-target"
+if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then
+    "$SENPAI_PYTHON" -P -m venv --without-pip "$SENPAI_TARGET_PYTHON_ENV"
+fi
+CONTROLLER_SITE="$("$SENPAI_PYTHON" -P -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+# The target interpreter is agent-writable; never execute it during trusted startup.
+TARGET_SITE="$("$SENPAI_PYTHON" -P -c 'import sys, sysconfig; print(sysconfig.get_path("purelib", vars={"base": sys.argv[1]}))' "$SENPAI_TARGET_PYTHON_ENV")"
+printf '%s\n' "$CONTROLLER_SITE" > "$TARGET_SITE/senpai-runtime.pth"
+"$SENPAI_PYTHON" -P -m senpai_agent.target_environment "$SENPAI_TARGET_PYTHON_ENV"
+cd "$WORKDIR"
+exec "$SENPAI_PYTHON" -P -m senpai_agent.supervisor student

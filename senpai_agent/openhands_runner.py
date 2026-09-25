@@ -92,6 +92,7 @@ from senpai_agent.github.tools import (
 from senpai_agent.inference_heartbeat import InferenceHeartbeat
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV, decode_launch_context
 from senpai_agent.local_events import LocalEventStore
+from senpai_agent.openhands_security import disable_ambient_plugin_discovery
 from senpai_agent.program_context import (
     PROGRAM_PATH_ENV,
     load_program_system_prompt,
@@ -123,7 +124,8 @@ REASONING_EFFORTS = (
     "none",
 )
 SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore", "search")
-SENPAI_AGENT_DIR = Path(__file__).resolve().parents[1] / ".agents" / "agents"
+SENPAI_AGENT_DIR_ENV = "SENPAI_AGENT_DIR"
+SOURCE_SENPAI_AGENT_DIR = Path(__file__).resolve().parents[1] / ".agents" / "agents"
 REPOSITORY_INSTRUCTION_FILENAMES = frozenset(
     {"agents.md", "agent.md", "claude.md"}
 )
@@ -527,8 +529,11 @@ def sanitized_project_skills(workspace: Path) -> list[Skill]:
 def sanitized_agent_definitions(workspace: Path) -> list[AgentDefinition]:
     """Load Senpai agents first, then unshadowed target and user agents."""
 
+    agent_dir = Path(
+        os.environ.get(SENPAI_AGENT_DIR_ENV, SOURCE_SENPAI_AGENT_DIR)
+    ).resolve()
     reserved = {
-        name: AgentDefinition.load(SENPAI_AGENT_DIR / f"{name}.md")
+        name: AgentDefinition.load(agent_dir / f"{name}.md")
         for name in SENPAI_AGENT_NAMES
     }
     return [
@@ -1207,6 +1212,17 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
     return tools
 
 
+def senpai_terminal_tools(tools: Sequence[Tool], role: str) -> list[Tool]:
+    """Route a file-defined agent's terminal through Senpai's policy and target env."""
+
+    return [
+        Tool(name="senpai_terminal", params={"role": role})
+        if tool.name == "terminal"
+        else tool
+        for tool in tools
+    ]
+
+
 def delegation_config(
     config: RunnerConfig,
     *,
@@ -1605,6 +1621,7 @@ def run_openhands(
     if run_deadline is not None and run_deadline <= started_at:
         raise TimeoutError("the inherited OpenHands deadline has expired")
     scrub_model_credentials(os.environ, config)
+    disable_ambient_plugin_discovery()
     register_default_tools(enable_browser=False)
     register_senpai_tools()
     file_agents = sanitized_agent_definitions(config.workspace)
@@ -1749,6 +1766,7 @@ def run_openhands(
             agent = agent.model_copy(
                 update={
                     "llm": apply_reasoning_profile(agent.llm),
+                    "tools": senpai_terminal_tools(agent.tools, config.role),
                     "agent_context": (
                         agent.agent_context or AgentContext()
                     ).model_copy(update={"skills": resolved_skills}),
