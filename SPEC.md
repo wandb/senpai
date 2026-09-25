@@ -761,6 +761,23 @@ memory, removes that variable, and supplies it only to supervised training as
 `WANDB_API_KEY`. Research tools and independent child/standalone traces retain
 the existing research credential until a complete research replacement exists.
 
+Additive research tools use an explicit credential configured by the runner;
+their serialized definitions contain only the export directory. Main agents and
+general-purpose children can query W&B, Weave, and workspace/report views and
+create new Report drafts. Explore children receive the read tools. Results use
+generated JSONL paths outside the target checkout. Export writes reject symlinks;
+artifact downloads use generated filenames and do not execute downloaded data.
+Full run history preserves sparse rows. Reports accept complete specifications,
+including arbitrary blocks, runsets, and panels, and require authenticated
+read-back before reporting a verified draft. Uncertain creation returns a receipt
+or generated name to inspect before any retry.
+
+This is an additive migration. Existing SDK access and child/standalone tracing
+remain available while live API parity and W&B SDK service-state isolation are
+unverified. The replacement explicitly reports unsupported full system histories
+and external artifact-storage credentials; it must not silently substitute sampled
+data or a narrower research workflow.
+
 The supervisor, controller, and delegated runner disable process dumping on
 Linux. After capturing the worker environment, the supervisor removes current
 model-provider values and discards its environment copies. Removing an

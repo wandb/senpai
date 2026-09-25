@@ -49,6 +49,12 @@ from senpai_agent.training import (
     TrainingSupervisor,
     target_python_environment,
 )
+from senpai_agent.wandb_research import WandbResearchTool
+from senpai_agent.weave_research import (
+    WandbReportDraftTool,
+    WandbViewsTool,
+    WeaveResearchTool,
+)
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation import ConversationState, LocalConversation
@@ -802,4 +808,8 @@ def register_senpai_tools() -> None:
     register_tool("load_browser", LoadBrowserTool)
     register_tool("task_tracker", SenpaiTaskTrackerTool)
     register_tool("senpai_terminal", SenpaiTerminalTool)
+    register_tool("wandb_research", WandbResearchTool)
+    register_tool("weave_research", WeaveResearchTool)
+    register_tool("wandb_views", WandbViewsTool)
+    register_tool("wandb_report_draft", WandbReportDraftTool)
     _TOOLS_REGISTERED = True

@@ -130,11 +130,25 @@ Changed credentials create new Secrets; include every role that must rotate in
 the launch command. Keep old Secrets until their Pods stop, then use the existing
 label-based cleanup command.
 
-This rollout retains the authenticated W&B SDK route while equivalent credential-
-isolated research tools are implemented. Do not remove that route until private
-run discovery, complete histories, artifacts, workspace inspection, Weave queries,
-and Reports work through the replacement. Training logging and metric monitoring
-alone do not provide research parity.
+The additive `wandb_research`, `weave_research`, and `wandb_views` tools export
+private run data, histories, artifacts, Weave records, and workspace/report
+specifications to generated files outside the target checkout. Main agents and
+general-purpose children also receive `wandb_report_draft`, which creates a new
+Report draft from a full JSON specification and verifies it by reading it back.
+Explore children receive the read tools. Tool definitions contain no API keys.
+These tools accept any project accessible to the configured research identity.
+They honor `WANDB_BASE_URL` for W&B requests and `WF_TRACE_SERVER_URL` for Weave
+requests. For self-hosted W&B, Weave defaults to `/traces` under
+`WANDB_PUBLIC_BASE_URL`, or under `WANDB_BASE_URL` when no public URL is set.
+
+The authenticated SDK route remains available. The new tools do not yet prove
+complete research parity or credential containment: live W&B behavior is
+unverified, full system history requires an uploaded `wandb-events.jsonl`, external
+artifact references may require cloud credentials, and the W&B SDK can reuse
+process-wide service state. Keep SDK access and independent tracing until those
+gaps are resolved. Training logging and metric monitoring alone do not provide
+research parity. See the bundled [research workflow](plugins/senpai/skills/wandb-primary/SKILL.md)
+for exporting data and using the existing analysis helpers without credentials.
 
 ### 4. Prepare the target repository
 

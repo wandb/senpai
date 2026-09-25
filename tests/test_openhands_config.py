@@ -538,7 +538,6 @@ def test_wandb_gateway_configuration_is_explicit_and_uses_max_glm_reasoning(
     assert config.frontier_reasoning_effort == "max"
 
 
-
 def test_fast_model_inherits_an_openai_main_profile(tmp_path: Path):
     env = runtime_env(tmp_path)
     env.update(
@@ -874,6 +873,21 @@ def test_advisor_config_reuses_its_durable_conversation_id(tmp_path: Path):
     assert first.conversation_id == second.conversation_id
 
 
+def test_research_service_configuration_preserves_weave_self_hosted_routing(tmp_path):
+    env = runtime_env(tmp_path)
+    env.update(
+        WANDB_API_KEY="research-key",
+        WANDB_BASE_URL="https://api.private.example/",
+        WANDB_PUBLIC_BASE_URL="https://private.example/",
+    )
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+    assert config.wandb_base_url == "https://api.private.example"
+    assert config.weave_trace_base_url == "https://private.example/traces"
+    env["WF_TRACE_SERVER_URL"] = "https://traces.private.example/custom"
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+    assert config.weave_trace_base_url == "https://traces.private.example/custom"
+
+
 @pytest.mark.parametrize("state_location", [None, "inside-workspace"])
 def test_state_directory_is_explicit_and_outside_the_target_checkout(
     tmp_path: Path,
@@ -892,12 +906,15 @@ def test_state_directory_is_explicit_and_outside_the_target_checkout(
         resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
-def test_student_requires_a_distinct_training_writer_without_removing_research(tmp_path):
+def test_student_requires_a_distinct_training_writer_without_removing_research(
+    tmp_path,
+):
     env = runtime_env(tmp_path, role="student")
     env["WANDB_API_KEY"] = "research-key"
     config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
     assert config.training_wandb_api_key.get_secret_value() == "student-writer-key"
     assert config.conversation_secrets["WANDB_API_KEY"] == "research-key"
+    assert config.wandb_api_key.get_secret_value() == "research-key"
     child_environment = dict(env)
     scrub_model_credentials(child_environment, config)
     assert "SENPAI_WANDB_TRAINING_API_KEY" not in child_environment
