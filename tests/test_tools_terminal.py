@@ -240,7 +240,7 @@ def test_native_terminal_uses_target_python_and_project_imports(
 
     with (tmp_path / "home" / ".bashrc").open("a") as startup:
         startup.write("readonly UV_PYTHON\n")
-    with pytest.raises(RuntimeError, match="Target Python environment setup failed"):
+    with pytest.raises(ValueError, match="Target Python environment setup failed"):
         executor(TerminalAction(command="touch must-not-run", reset=True, timeout=30))
     assert not (tmp_path / "must-not-run").exists()
 
