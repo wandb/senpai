@@ -100,7 +100,7 @@ def test_both_role_images_run_as_the_same_explicit_non_root_user():
         assert "HOME=/home/senpai" in dockerfile
         assert "PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright" in dockerfile
         assert 'ln -s "$chromium_path" /usr/local/bin/chromium' in dockerfile
-        assert "mkdir -p /workspace /workspaces /var/lib/senpai" in dockerfile
+        assert "mkdir -p /workspace/senpai /workspaces /var/lib/senpai" in dockerfile
         assert dockerfile.rindex("ENV HOME=/home/senpai") < dockerfile.index(
             "USER 10001:10001"
         )
@@ -255,7 +255,7 @@ def test_entrypoints_delegate_runtime_lifecycle_to_the_python_supervisor(
     assert "agent-context.sh" not in entrypoint
     assert "PYTHONSAFEPATH" not in entrypoint
     assert "wait_for_senpai_start_gate" not in entrypoint
-    trust_runner = 'git config --global safe.directory "$WORKDIR"'
+    trust_runner = 'git config --global --add safe.directory "$WORKDIR"'
     assert entrypoint.index(trust_runner) < entrypoint.index(
         'install_senpai_git_guard "$WORKDIR"'
     )

@@ -585,7 +585,7 @@ def test_supervisor_entrypoint_forwards_private_credentials_and_clears_parent_ke
     model_names = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "WANDB_API_KEY"}
     for profile in ("", "SMART_", "FAST_", "FRONTIER_"):
         name = f"TEST_{profile}MODEL_CREDENTIAL"
-        environment[f"SENPAI_OPENHANDS_{profile}API_KEY_ENV"] = name
+        environment[f"SENPAI_OPENHANDS_{profile}API_KEY_ENV"] = f" {name} "
         environment[name] = f"{profile.lower()}model-fixture"
         model_names.add(name)
     cleared_names = model_names | {

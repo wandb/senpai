@@ -533,7 +533,7 @@ def supervisor_main(
                 # model values; this does not erase the kernel's original environ.
                 model_names = set(PROVIDER_API_KEY_ENVS.values())
                 for profile in ("", "SMART_", "FAST_", "FRONTIER_"):
-                    if name := env.get(f"SENPAI_OPENHANDS_{profile}API_KEY_ENV"):
+                    if name := env.get(f"SENPAI_OPENHANDS_{profile}API_KEY_ENV", "").strip():
                         model_names.add(name)
                 for name in model_names:
                     os.environ.pop(name, None)

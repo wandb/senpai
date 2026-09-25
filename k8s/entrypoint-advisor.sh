@@ -34,7 +34,10 @@ echo "GitHub history: $GH_HISTORY_SCOPE"
 
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
-git config --global safe.directory "$WORKDIR"
+git config --global --add safe.directory "$WORKDIR"
+mkdir -p "$TARGET_WORKDIR"
+export TARGET_WORKDIR="$(cd "$TARGET_WORKDIR" && pwd -P)"
+git config --global --add safe.directory "$TARGET_WORKDIR"
 source "$SENPAI_PLUGIN/scripts/git-guard.sh"
 install_senpai_git_guard "$WORKDIR" "$GIT_ASKPASS_FILE"
 
@@ -54,7 +57,6 @@ clone_target_repo() {
             if [ -z "$TARGET_REPO_BRANCH" ]; then
                 return 1
             fi
-            rm -rf "$PROBLEM_DIR"
             if ! clone_single_target_branch "$TARGET_REPO_BRANCH"; then
                 return 1
             fi
@@ -70,7 +72,10 @@ clone_target_repo() {
 
 # Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
 # agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
-if [ ! -d "$PROBLEM_DIR/.git" ] && ! clone_target_repo; then
+TARGET_CHECKOUT_EXISTS=false
+if [ -d "$PROBLEM_DIR/.git" ]; then
+    TARGET_CHECKOUT_EXISTS=true
+elif ! clone_target_repo; then
     if [ -n "$TARGET_REPO_BRANCH" ]; then
         echo "ERROR: could not clone advisor branch '$ADVISOR_BRANCH' or target base branch '$TARGET_REPO_BRANCH'" >&2
         exit 1
@@ -93,22 +98,24 @@ git config user.email "senpai-advisor@senpai"
 gh repo set-default "$GH_REPO"
 install_senpai_target_git_guard "$TARGET_WORKDIR"
 
-# --- Create or checkout advisor branch ---
-if [ "$GH_HISTORY_SCOPE" != "repo" ]; then
-    git remote set-branches origin "$ADVISOR_BRANCH"
-    git config remote.origin.tagOpt --no-tags
-fi
-if git rev-parse --verify "origin/$ADVISOR_BRANCH" >/dev/null 2>&1; then
-    git checkout "$ADVISOR_BRANCH"
-    git pull --ff-only origin "$ADVISOR_BRANCH"
-else
-    if [ -n "$TARGET_REPO_BRANCH" ]; then
-        git fetch origin "$TARGET_REPO_BRANCH"
-        git checkout -B "$ADVISOR_BRANCH" "origin/$TARGET_REPO_BRANCH"
-    else
-        git checkout -b "$ADVISOR_BRANCH"
+# Preserve an existing checkout for controller reconciliation after restart.
+if [ "$TARGET_CHECKOUT_EXISTS" = false ]; then
+    if [ "$GH_HISTORY_SCOPE" != "repo" ]; then
+        git remote set-branches origin "$ADVISOR_BRANCH"
+        git config remote.origin.tagOpt --no-tags
     fi
-    git push -u origin "$ADVISOR_BRANCH"
+    if git rev-parse --verify "origin/$ADVISOR_BRANCH" >/dev/null 2>&1; then
+        git checkout "$ADVISOR_BRANCH"
+        git pull --ff-only origin "$ADVISOR_BRANCH"
+    else
+        if [ -n "$TARGET_REPO_BRANCH" ]; then
+            git fetch origin "$TARGET_REPO_BRANCH"
+            git checkout -B "$ADVISOR_BRANCH" "origin/$TARGET_REPO_BRANCH"
+        else
+            git checkout -b "$ADVISOR_BRANCH"
+        fi
+        git push -u origin "$ADVISOR_BRANCH"
+    fi
 fi
 
 echo "=== Agent config installed ==="
