@@ -1,11 +1,15 @@
+import errno
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import urlopen
 
 import pytest
 from pydantic import SecretStr
@@ -17,6 +21,7 @@ from senpai_agent.supervisor import (
     WorkerLease,
     WorkerSupervisor,
     prepare_system_context_environment,
+    serve_lease_health,
 )
 
 
@@ -592,6 +597,104 @@ def test_health_command_reports_live_and_expired_worker_leases(tmp_path: Path):
 
     assert healthy.returncode == 0
     assert expired.returncode == 1
+
+
+def test_http_health_endpoint_tracks_the_worker_lease(tmp_path: Path):
+    lease = tmp_path / "controller-lease.json"
+    live = json.dumps({
+        "pid": os.getpid(), "phase": "poll", "deadline": time.monotonic() + 30,
+    })
+    expired = json.dumps({
+        "pid": os.getpid(), "phase": "poll", "deadline": time.monotonic() - 1,
+    })
+    with serve_lease_health(lease, host="127.0.0.1", port=0) as server:
+        url = f"http://127.0.0.1:{server.server_port}/healthz"
+        for content, status, body in (
+            (None, 503, b"unhealthy\n"),
+            (live, 200, b"ok\n"),
+            (expired, 503, b"unhealthy\n"),
+            (live, 200, b"ok\n"),
+            ("incomplete lease", 503, b"unhealthy\n"),
+        ):
+            if content is not None:
+                lease.write_text(content)
+            try:
+                response = urlopen(url, timeout=1)
+            except HTTPError as error:
+                response = error
+            with response:
+                assert response.status == status
+                assert response.read() == body
+
+        with pytest.raises(HTTPError) as unknown:
+            urlopen(f"http://127.0.0.1:{server.server_port}/unknown", timeout=1)
+        assert unknown.value.code == 404
+        unknown.value.close()
+
+
+def test_http_health_server_closes_when_the_supervisor_fails(tmp_path: Path):
+    with pytest.raises(RuntimeError, match="worker failed"):
+        with serve_lease_health(
+            tmp_path / "lease.json", host="127.0.0.1", port=0
+        ) as server:
+            address = ("127.0.0.1", server.server_port)
+            raise RuntimeError("worker failed")
+
+    with pytest.raises(ConnectionRefusedError):
+        socket.create_connection(address, timeout=1)
+
+
+def supervisor_environment(tmp_path: Path) -> dict[str, str]:
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    (workspace / "program.md").write_text("Research policy.")
+    role = tmp_path / "ADVISOR.md"
+    role.write_text("Advisor policy.")
+    token = tmp_path / "github-token"
+    token.write_text("test-token")
+    token.chmod(0o600)
+    return {
+        "SENPAI_GITHUB_TOKEN_FILE": str(token),
+        "SENPAI_OPENHANDS_STATE_DIR": str(tmp_path / "state"),
+        "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
+        "SENPAI_OPENHANDS_ROLE_FILE": str(role),
+    }
+
+
+@pytest.mark.parametrize("port", ["abc", "0", "-1", "65536"])
+def test_invalid_health_port_fails_before_consuming_the_token(
+    tmp_path: Path, port: str
+):
+    environment = supervisor_environment(tmp_path)
+    environment["SENPAI_HEALTH_PORT"] = port
+
+    with pytest.raises(RuntimeError, match="SENPAI_HEALTH_PORT must be"):
+        supervisor_module.supervisor_main(["advisor"], environment)
+
+    assert Path(environment["SENPAI_GITHUB_TOKEN_FILE"]).read_text() == "test-token"
+
+
+def test_unavailable_health_port_preserves_the_token_handoff(tmp_path: Path):
+    environment = supervisor_environment(tmp_path)
+    with socket.socket() as occupied:
+        occupied.bind(("0.0.0.0", 0))
+        occupied.listen()
+        environment["SENPAI_HEALTH_PORT"] = str(occupied.getsockname()[1])
+        with pytest.raises(OSError) as error:
+            supervisor_module.supervisor_main(["advisor"], environment)
+
+    assert error.value.errno == errno.EADDRINUSE
+    assert Path(environment["SENPAI_GITHUB_TOKEN_FILE"]).read_text() == "test-token"
+
+
+def test_http_health_server_closes_idle_connections(tmp_path: Path):
+    with serve_lease_health(
+        tmp_path / "lease.json", host="127.0.0.1", port=0
+    ) as server:
+        with socket.create_connection(
+            ("127.0.0.1", server.server_port), timeout=10
+        ) as connection:
+            assert connection.recv(1) == b""
 
 
 def test_openhands_reopens_durable_events_after_an_unclean_worker_exit(

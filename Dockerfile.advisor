@@ -64,7 +64,6 @@ RUN cd /tmp/senpai && \
     rm -rf /root/.cache/uv /tmp/senpai
 
 COPY scripts/senpai-browser-smoke-test.py /usr/local/bin/senpai-browser-smoke-test
-COPY scripts/senpai-container-health.sh /usr/local/bin/senpai-container-health
 
 # Expose the pinned browser on PATH because launchers give roles a persistent HOME.
 RUN uvx --from "playwright==${PLAYWRIGHT_VERSION}" \
@@ -73,18 +72,13 @@ RUN uvx --from "playwright==${PLAYWRIGHT_VERSION}" \
       -type f -path '*/chrome-linux*/chrome' -print -quit) && \
     test -x "$chromium_path" && \
     ln -s "$chromium_path" /usr/local/bin/chromium && \
-    chmod +x /usr/local/bin/senpai-browser-smoke-test \
-      /usr/local/bin/senpai-container-health && \
+    chmod +x /usr/local/bin/senpai-browser-smoke-test && \
     mkdir -p /workspace /workspaces /var/lib/senpai && \
     chown -R 10001:10001 \
       /home/senpai /workspace /workspaces /var/lib/senpai && \
     rm -rf /root/.cache/uv /root/.config/browseruse /var/lib/apt/lists/*
 
 ENV HOME=/home/senpai
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10m --retries=5 \
-    CMD senpai-container-health \
-      "/var/lib/senpai/${RESEARCH_TAG}/advisor/openhands_state/controller-lease.json"
 
 WORKDIR /workspaces
 USER 10001:10001
