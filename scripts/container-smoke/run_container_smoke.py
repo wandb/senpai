@@ -32,6 +32,13 @@ def main():
     prefix = f'senpai-offline-smoke-{uid}'
     volumes = [f'{prefix}-{name}' for name in ('workspace', 'home', 'state')]
     container = f'{prefix}-advisor'
+    containers = [container]
+
+    def run_container(name, argv, **kwargs):
+        name = f'{prefix}-{name}'
+        containers.append(name)
+        return command(docker + ['run', '--name', name, *argv], **kwargs)
+
     with tempfile.TemporaryDirectory(prefix='senpai-offline-smoke-') as raw:
         files = Path(raw)
         files.chmod(0o755)
@@ -68,7 +75,7 @@ def main():
         try:
             for name in volumes:
                 command(docker + ['volume', 'create', '--label', 'senpai.smoke=pr3515', name])
-            command(docker + ['run', '--rm', '--network', 'none', '--user', '0', *mounts,
+            run_container('seed', ['--rm', '--network', 'none', '--user', '0', *mounts,
                 args.advisor_image, '/opt/senpai-venv/bin/python', '-P', '/smoke/container_smoke.py', 'seed'])
             env = {
                 'SENPAI_PYTHON':'/smoke/trusted-python',
@@ -92,23 +99,23 @@ def main():
                 assert f'"container_start": {start}' in logs and '"status": "ok"' in logs, logs
                 print(f'advisor container start {start}: passed')
                 if start == 1:
-                    command(docker + ['run', '--rm', '--network', 'none', '--user', '10001:10001',
+                    run_container('poison', ['--rm', '--network', 'none', '--user', '10001:10001',
                         *mounts, args.advisor_image, '/opt/senpai-venv/bin/python', '-P',
                         '/smoke/container_smoke.py', 'poison'])
                     command(docker + ['start', container])
             print(logs)
-            artifact = command(docker + ['run', '--rm', '--user', '10001:10001', *runtime, *mounts,
+            artifact = run_container('artifact', ['--rm', '--user', '10001:10001', *runtime, *mounts,
                 args.advisor_image, '/opt/senpai-venv/bin/python', '-P', '/smoke/artifact_terminal_smoke.py', '/workspace/senpai'], timeout=90)
             assert '"result": "PASS"' in artifact and '"pooled_terminal": true' in artifact, artifact
             print(artifact)
-            cutoff_smoke(docker, args.cutoff_image, source, files, mounts, runtime, revision)
+            cutoff_smoke(run_container, args.cutoff_image, source, files, mounts, runtime, revision)
         finally:
-            subprocess.run(docker + ['rm', '-f', container], capture_output=True)
+            subprocess.run(docker + ['rm', '-f', *containers], capture_output=True)
             for name in volumes:
                 subprocess.run(docker + ['volume', 'rm', name], capture_output=True)
 
 
-def cutoff_smoke(docker, image, source, files, mounts, runtime, revision):
+def cutoff_smoke(run_container, image, source, files, mounts, runtime, revision):
     capture = files / 'capture-kubectl'
     capture.write_text('#!/bin/sh\nfor arg in "$@"; do\n case "$arg" in\n'
         ' --from-file=cutoff-job.sh=*) cp "${arg#--from-file=cutoff-job.sh=}" "$CAPTURED_CUTOFF_SCRIPT" ;;\n'
@@ -139,7 +146,7 @@ elif args[:2] == ['delete','deployments']:
 else: raise SystemExit('unexpected kubectl operation')
 ''')
     (files / 'bin' / 'kubectl').chmod(0o755)
-    version = command(docker + ['run', '--rm', '--network', 'none', '--read-only', '--user', '10001:10001', image,
+    version = run_container('cutoff-version', ['--rm', '--network', 'none', '--read-only', '--user', '10001:10001', image,
         '/usr/local/bin/kubectl', 'version', '--client', '-o', 'json'])
     assert json.loads(version)['clientVersion']['gitVersion']
     env = {'PATH':'/smoke/bin:/usr/local/bin:/usr/bin:/bin', 'RUN_SLUG':'offline-cutoff',
@@ -148,13 +155,13 @@ else: raise SystemExit('unexpected kubectl operation')
         'HARD_KILL_AT_EPOCH':'1', 'ARM_ID':'synthetic-arm', 'STATE_AUTH_KEY':'synthetic-authentication-key',
         'PVC_LOG_ROOT':'/state', 'START_GATE_PATH':'/state/gate', 'NAMESPACE':'synthetic-smoke'}
     env_args = [item for name,value in env.items() for item in ('--env',f'{name}={value}')]
-    output = command(docker + ['run','--rm','--user','10001:10001',*runtime,*mounts,*env_args,image,
+    output = run_container('cutoff', ['--rm','--user','10001:10001',*runtime,*mounts,*env_args,image,
         '/bin/bash','/smoke/cutoff-job.sh'], timeout=20)
     assert 'synthetic deletion recorded' in output and 'Cluster cutoff job done' in output, output
     print('cutoff non-root/read-only-root execution: passed (synthetic kubectl; no cluster contact)')
-    command(docker + ['run', '--rm', '--user', '10001:10001', *runtime, *mounts, image, 'python', '-c',
+    run_container('cutoff-fifo-setup', ['--rm', '--user', '10001:10001', *runtime, *mounts, image, 'python', '-c',
         'import os;from pathlib import Path; paths=[Path("/state/offline-cutoff/cutoff_state.json"),Path("/state/gate")];[(p.unlink(missing_ok=True),os.mkfifo(p)) for p in paths]'])
-    fifo_output = command(docker + ['run','--rm','--user','10001:10001',*runtime,*mounts,*env_args,image,
+    fifo_output = run_container('cutoff-fifo', ['--rm','--user','10001:10001',*runtime,*mounts,*env_args,image,
         '/bin/bash','/smoke/cutoff-job.sh'], timeout=20)
     assert 'synthetic deletion recorded' in fifo_output and 'Cluster cutoff job done' in fifo_output, fifo_output
     print('cutoff Linux FIFO state/gate substitution: passed without blocking')
