@@ -566,7 +566,7 @@ def test_assignment_feedback_replays_without_changing_assignment_state():
             draft=True,
         )
     )
-    original_state = (fake.pr["body"], fake.pr["draft"], fake.pr["labels"])
+    original_state = (fake.pr["body"], fake.pr["draft"], frozenset(fake.pr["labels"]))
     client = workflow(fake)
 
     first = send_feedback(

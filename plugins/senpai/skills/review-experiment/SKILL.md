@@ -8,8 +8,6 @@ description: >
   Review one terminal experiment and choose the next step: merge a reproducible
   winner, close a useful negative or dead end, or request missing evidence.
 argument-hint: "<pr-number> <problem-dir>"
-model: claude-sonnet-4-6
-effort: high
 ---
 
 # Review an experiment

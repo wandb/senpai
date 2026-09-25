@@ -8,8 +8,6 @@ description: >
   Post material interim assignment updates, then commit and submit a terminal
   experiment result through the typed Senpai GitHub tools.
 argument-hint: "<pr-number> <problem-dir>"
-model: claude-sonnet-4-6
-effort: high
 ---
 
 # Submit experiment results

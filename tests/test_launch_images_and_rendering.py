@@ -30,15 +30,15 @@ def test_default_config_exposes_every_model_profile_and_effort():
         for name in (f"{profile}_model", f"{profile}_reasoning_effort")
     } <= set(config)
     assert {
-        "advisor_model": "openai/gpt-5.6-sol",
+        "advisor_model": "anthropic/claude-opus-5-5",
         "advisor_reasoning_effort": "xhigh",
-        "student_model": "openai/gpt-5.6-sol",
-        "student_reasoning_effort": "xhigh",
-        "smart_model": "openai/gpt-5.6-sol",
+        "student_model": "anthropic/claude-opus-5-5",
+        "student_reasoning_effort": "high",
+        "smart_model": "anthropic/claude-opus-5-5",
         "smart_reasoning_effort": "xhigh",
-        "fast_model": "openai/gpt-5.6-luna",
-        "fast_reasoning_effort": "high",
-        "frontier_model": "openai/gpt-5.6-sol",
+        "fast_model": "anthropic/claude-sonnet-5",
+        "fast_reasoning_effort": "medium",
+        "frontier_model": "anthropic/claude-opus-5-5",
         "frontier_reasoning_effort": "max",
         "compaction_trigger_tokens": 200_000,
     }.items() <= config.items()
@@ -346,7 +346,7 @@ def test_launcher_captures_program_before_the_pinned_remote_ref_disappears(
 def test_credentials_program_and_student_writer_use_separate_secrets():
     expected_values = {
         "github-token": "github",
-        "openai-api-key": "openai",
+        "anthropic-api-key": "anthropic",
         "exa-api-key": "exa",
         "wandb-api-key": "wandb",
     }
@@ -395,9 +395,9 @@ def test_credentials_program_and_student_writer_use_separate_secrets():
                 "name": secret_document["metadata"]["name"],
                 "key": "github-token",
             },
-            "OPENAI_API_KEY": {
+            "ANTHROPIC_API_KEY": {
                 "name": secret_document["metadata"]["name"],
-                "key": "openai-api-key",
+                "key": "anthropic-api-key",
             },
             "WANDB_API_KEY": {
                 "name": secret_document["metadata"]["name"],
@@ -603,7 +603,7 @@ def test_openai_ultra_launch_value_is_rejected():
 
 def test_launch_accepts_anthropic_max_for_every_model_profile():
     args = launch_args(
-        advisor_model="anthropic/claude-fable-5",
+        advisor_model="anthropic/claude-opus-5-5",
         advisor_reasoning_effort="max",
         student_model="anthropic/claude-opus-5",
         student_reasoning_effort="max",
@@ -611,7 +611,7 @@ def test_launch_accepts_anthropic_max_for_every_model_profile():
         smart_reasoning_effort="max",
         fast_model="anthropic/claude-sonnet-5",
         fast_reasoning_effort="max",
-        frontier_model="anthropic/claude-fable-5",
+        frontier_model="anthropic/claude-opus-5-5",
         frontier_reasoning_effort="max",
     )
 

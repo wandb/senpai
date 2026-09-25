@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 
 from openhands.sdk.tool import ToolDefinition
 
-from senpai_agent.github import PRRetrievalResult, get_prs
 from senpai_agent.github.workflow import GitHubWorkflow
 
 from .definitions import (
@@ -49,7 +48,6 @@ class GitHubWorkflowToolSet(
         advisor_branch: str | None = None,
         student_names: Sequence[str] | str | None = None,
         student_name: str | None = None,
-        get_prs_fn: Callable[..., PRRetrievalResult] = get_prs,
     ) -> Sequence[ToolDefinition]:
         role = role or os.environ.get("SENPAI_ROLE")
         if role not in {"advisor", "student"}:
@@ -95,7 +93,6 @@ class GitHubWorkflowToolSet(
         common = (
             *GetPRsTool.create(
                 conv_state,
-                get_prs_fn=get_prs_fn,
                 state_dir=state_dir,
                 workspace=workspace,
             ),

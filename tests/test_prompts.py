@@ -54,7 +54,7 @@ def test_python_sources_do_not_embed_centralized_prompt_text():
         "# Conversation context recovery",
         "Actionable events follow as separately tracked messages.",
         "You are a fresh Senpai subagent.",
-        "Your response is too large to send to directly to your parent",
+        "Your response is too large to send directly to your parent",
         "Senpai restarted before this action completed.",
         "Open feedback_url to read the omitted text.",
         "You may finish this turn; the controller will resume",

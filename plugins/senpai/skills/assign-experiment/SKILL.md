@@ -9,8 +9,6 @@ description: >
   advisor has a concrete hypothesis and the student has no open `status:wip`
   or `status:review` assignment.
 argument-hint: "<student-name> <hypothesis-slug> <problem-dir>"
-model: claude-sonnet-4-6
-effort: high
 ---
 
 # Assign an experiment
