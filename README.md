@@ -236,8 +236,13 @@ Live diagnostic reads run separately from status polling, so slow logs do not
 delay status or deadline checks.
 It includes pod placement, scheduling and container states, recent init and
 training logs, and bounded Kubernetes events for the exact workload and pod UIDs.
-The snapshot preserves status and event summaries before allocating space to
-container log excerpts, with failed containers first.
+The snapshot preserves each pod and container state before allocating space to
+error messages, events, and log excerpts. Logs from failed and running containers
+come before completed containers. Each excerpt retains its beginning and end.
+The GPU summary distinguishes the original allocation from GPU requests of
+nonterminal pods that are scheduled or still pending. These counts describe
+Kubernetes requests, not GPU utilization. W&B completion does not release a
+workload while evaluation or cleanup processes are still running.
 Workload events expose validation failures before the MPI controller creates any
 pods. A launcher pod owned through a Job is included only when both owner UIDs
 lead to the reserved MPIJob. Log-read failures appear in diagnostics

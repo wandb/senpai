@@ -338,7 +338,15 @@ class KubernetesApiClient:
             resource.namespace, resource.uid, f"{resource.kind}/{resource.name}", deadline
         )
         problems = []
-        statuses = []
+        active_pods = [
+            pod for pod in pods
+            if pod.get("status", {}).get("phase") not in {"Succeeded", "Failed"}
+        ]
+        statuses = [
+            f"[workload] requested_gpus={resource.nodes * resource.gpus_per_node} "
+            f"scheduled_gpu_requests={sum(_pod_gpus(pod['spec']) for pod in active_pods if pod['spec'].get('nodeName'))} "
+            f"pending_gpu_requests={sum(_pod_gpus(pod['spec']) for pod in active_pods if not pod['spec'].get('nodeName'))}"
+        ]
         log_requests = []
         if not pods:
             statuses.append("No owned workload pods exist yet.")
@@ -370,24 +378,27 @@ class KubernetesApiClient:
                 waiting = state.get("waiting")
                 terminated = state.get("terminated")
                 if waiting is not None:
-                    problems.append(
-                        prefix + f"waiting: {waiting.get('reason', '')} "
-                        f"{waiting.get('message', '')}"
-                    )
+                    statuses.append(prefix + f"waiting: {waiting.get('reason', '')}")
+                    if waiting.get("message"):
+                        problems.append(prefix + waiting["message"])
                     continue
                 if terminated is not None:
-                    messages = problems if terminated.get("exitCode") != 0 else statuses
-                    messages.append(
+                    statuses.append(
                         prefix + f"terminated: {terminated.get('reason', '')} "
-                        f"exit={terminated.get('exitCode')} "
-                        f"{terminated.get('message', '')}"
+                        f"exit={terminated.get('exitCode')}"
                     )
+                    if terminated.get("message"):
+                        problems.append(prefix + terminated["message"])
+                elif "running" in state:
+                    statuses.append(prefix + "running")
                 if not state:
+                    statuses.append(prefix + "state=Unknown")
                     continue
                 priority = (
                     0 if terminated and terminated.get("exitCode") != 0
-                    else 1 if container in init_containers
-                    else 2
+                    else 1 if "running" in state
+                    else 2 if container in init_containers
+                    else 3
                 )
                 log_requests.append((priority, pod_name, name))
 
@@ -416,13 +427,22 @@ class KubernetesApiClient:
                 continue
             if text:
                 container_logs.append((prefix, text))
-        return self._diagnostics_text(problems + statuses + events, container_logs)
+        return self._diagnostics_text(statuses, problems + events, container_logs)
 
     @staticmethod
-    def _diagnostics_text(statuses: list[str], logs: list[tuple[str, str]]) -> str:
-        # Reserve at least half the snapshot for container log context.
-        status_budget = _ERROR_TAIL_BYTES // 2 if logs else _ERROR_TAIL_BYTES
-        summary = "\n".join(statuses).encode()[:status_budget].decode(errors="ignore")
+    def _diagnostics_text(
+        statuses: list[str], problems: list[str], logs: list[tuple[str, str]]
+    ) -> str:
+        # Keep every status identity; one long error must not hide the other pods.
+        summary_budget = _ERROR_TAIL_BYTES // 2 if logs else _ERROR_TAIL_BYTES
+        status_budget = summary_budget * 3 // 4 if problems else summary_budget
+        per_status = max(0, status_budget // len(statuses) - 1)
+        summary = "\n".join(
+            status.encode()[:per_status].decode(errors="ignore") for status in statuses
+        )
+        if problems:
+            problem_budget = summary_budget - len(summary.encode()) - 1
+            summary += "\n" + "\n".join(problems).encode()[:problem_budget].decode(errors="ignore")
         if not logs:
             return summary
         log_budget = (_ERROR_TAIL_BYTES - len(summary.encode()) - len(logs)) // len(logs)
@@ -431,8 +451,18 @@ class KubernetesApiClient:
             text_budget = log_budget - len(prefix.encode())
             if text_budget <= 0:
                 continue
-            # Keep each identity ahead of its tail, including when a line is long.
-            excerpt = text.encode()[-text_budget:].decode(errors="ignore")
+            encoded = text.encode()
+            marker = b"\n... truncated ...\n"
+            if len(encoded) > text_budget > len(marker) + 1:
+                # Preserve the first error and final context within the fetched tail.
+                end_budget = (text_budget - len(marker)) // 2
+                excerpt = (
+                    encoded[:text_budget - len(marker) - end_budget].decode(errors="ignore")
+                    + marker.decode()
+                    + encoded[-end_budget:].decode(errors="ignore")
+                )
+            else:
+                excerpt = encoded[:text_budget].decode(errors="ignore")
             output.append(prefix + excerpt)
         return "\n".join(output)
 

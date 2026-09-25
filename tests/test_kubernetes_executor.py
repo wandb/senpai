@@ -1282,12 +1282,71 @@ def test_diagnostics_preserve_failed_init_with_noisy_healthy_worker(monkeypatch)
     assert "[pod/run-worker-1/train] " in result
     assert "healthy worker tail" in result
     assert result.index("terminated: Error") < result.index("Permission denied")
-    assert result.rindex("[pod/run-launcher/checkout] ") < result.index(
+    assert result.rindex("[pod/run-launcher/checkout] ") < result.rindex(
         "[pod/run-worker-1/train] "
     )
     assert "\ufffd" not in result
     pods.reverse()
     assert client.logs(resource) == result
+
+
+def test_diagnostics_show_remaining_gpu_requests_and_every_container(monkeypatch):
+    client = object.__new__(KubernetesApiClient)
+    resource = KubernetesResourceRef(
+        kind="MPIJob", name="run", namespace="research", uid="mpi-uid",
+        nodes=4, gpus_per_node=8,
+    )
+    pods = []
+    for index, phase in enumerate(("Running", "Succeeded", "Failed", "Pending")):
+        state = (
+            {"running": {}} if index == 0
+            else {"waiting": {"reason": "Pending", "message": "long problem " * 2000}} if index == 3
+            else {"terminated": {"reason": "Completed" if index == 1 else "Error", "exitCode": index - 1}}
+        )
+        pods.append({
+            "metadata": {"name": f"run-worker-{index}", "uid": str(index)},
+            "spec": {
+                **({"nodeName": f"node-{index}"} if index != 3 else {}),
+                "initContainers": [{"name": "checkout"}],
+                "containers": [{"name": "train", "resources": {"limits": {"nvidia.com/gpu": 8}}}],
+            },
+            "status": {
+                "phase": phase,
+                "initContainerStatuses": [{"name": "checkout", "state": {"terminated": {"reason": "Completed", "exitCode": 0}}}],
+                "containerStatuses": [{"name": "train", "state": state}],
+            },
+        })
+    monkeypatch.setattr(client, "_owned_pods", lambda _resource: pods)
+    monkeypatch.setattr(client, "_events", lambda *args: [])
+    requests = []
+
+    def request_text(method, path, **kwargs):
+        requests.append(path)
+        if "run-worker-0/log?container=train" in path:
+            return "cleanup entered\n" + "noise\n" * 1200 + "still waiting for shutdown"
+        if "run-worker-2/log?container=train" in path:
+            return "FIRST FAILURE: connection reset\n" + "noise\n" * 1200 + "exit barrier failed"
+        return "正常な学習出力\n" * 600
+
+    monkeypatch.setattr(client, "_request_text", request_text)
+    result = client.logs(resource)
+
+    assert len(result.encode()) <= 8192
+    for index, phase in enumerate(("Running", "Succeeded", "Failed", "Pending")):
+        assert f"[pod/run-worker-{index}] phase={phase}" in result
+        assert f"[pod/run-worker-{index}/checkout] terminated: Completed exit=0" in result
+    assert "[pod/run-worker-0/train] running" in result
+    assert "[pod/run-worker-1/train] terminated: Completed exit=0" in result
+    assert "[pod/run-worker-2/train] terminated: Error exit=1" in result
+    assert "[pod/run-worker-3/train] waiting: Pending" in result
+    assert "requested_gpus=32 scheduled_gpu_requests=8 pending_gpu_requests=8" in result
+    assert "FIRST FAILURE: connection reset" in result
+    assert "exit barrier failed" in result
+    assert "cleanup entered" in result
+    assert "still waiting for shutdown" in result
+    assert "\ufffd" not in result
+    assert "run-worker-2/log?container=train" in requests[0]
+    assert "run-worker-0/log?container=train" in requests[1]
 
 
 def test_diagnostics_report_pre_pod_validation_events_and_reject_foreign_uid(monkeypatch):
