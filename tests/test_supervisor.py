@@ -194,6 +194,34 @@ def test_supervisor_does_not_start_a_worker_without_a_discoverable_program(
     assert "senpai.yaml" in message
 
 
+def test_supervisor_starts_the_controller_with_trusted_safe_path_python(tmp_path, monkeypatch):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    (workspace / "program.md").write_text("Research policy.")
+    role_file = tmp_path / "advisor.md"
+    role_file.write_text("Advisor role.")
+    token_file = tmp_path / "github-token"
+    token_file.write_text("test-token")
+    token_file.chmod(0o600)
+    commands = []
+
+    def capture_worker(self, _stop):
+        commands.append(self.command)
+        return 0
+
+    monkeypatch.setattr(WorkerSupervisor, "run", capture_worker)
+    assert supervisor_module.supervisor_main(
+        ["advisor"],
+        {
+            "SENPAI_OPENHANDS_STATE_DIR": str(tmp_path / "state"),
+            "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
+            "SENPAI_OPENHANDS_ROLE_FILE": str(role_file),
+            "SENPAI_GITHUB_TOKEN_FILE": str(token_file),
+        },
+    ) == 0
+    assert commands == [(sys.executable, "-P", "-m", "senpai_agent.controller", "advisor")]
+
+
 def test_pid_one_reaps_adopted_children_without_reaping_its_worker(monkeypatch):
     reaped = []
     monkeypatch.setattr(supervisor_module.os, "getpid", lambda: 1)
@@ -517,7 +545,7 @@ def test_http_health_server_closes_when_the_supervisor_fails(tmp_path: Path):
 
 
 @pytest.mark.parametrize("port", ["abc", "0", "-1", "65536"])
-def test_invalid_health_port_fails_before_consuming_the_token(
+def test_invalid_health_port_discards_the_token_handoff(
     tmp_path: Path, port: str
 ):
     workspace = tmp_path / "target"
@@ -538,7 +566,7 @@ def test_invalid_health_port_fails_before_consuming_the_token(
             "SENPAI_OPENHANDS_ROLE_FILE": str(role),
         })
 
-    assert token.read_text() == "test-token"
+    assert not token.exists()
 
 
 def test_openhands_reopens_durable_events_after_an_unclean_worker_exit(
@@ -647,6 +675,45 @@ def test_private_service_handoff_files_are_consumed_once(tmp_path: Path):
         name: value.get_secret_value() for name, value in credentials.items()
     } == {name: f"{name}-value" for name in paths}
     assert all(not path.exists() for path in paths.values())
+
+
+@pytest.mark.parametrize("failure", ["github", "wandb", "context"])
+def test_failed_supervisor_start_removes_all_credential_handoffs(tmp_path, failure):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    if failure != "context":
+        (workspace / "program.md").write_text("Research policy.")
+    role = tmp_path / "ADVISOR.md"
+    role.write_text("Advisor policy.")
+    environment = {
+        "SENPAI_OPENHANDS_STATE_DIR": str(tmp_path / "state"),
+        "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
+        "SENPAI_OPENHANDS_ROLE_FILE": str(role),
+    }
+    handoff_dir = tmp_path / "handoffs"
+    handoff_dir.mkdir(mode=0o700)
+    paths = []
+    for name, file_env in (
+        ("github", "SENPAI_GITHUB_TOKEN_FILE"),
+        ("wandb", "SENPAI_WANDB_API_KEY_FILE"),
+        ("exa", "SENPAI_EXA_API_KEY_FILE"),
+    ):
+        path = handoff_dir / name
+        path.write_text("" if failure == name else f"{name}-fixture")
+        path.chmod(0o600)
+        environment[file_env] = str(path)
+        paths.append(path)
+    expected_error = {
+        "github": "GitHub token handoff is empty",
+        "wandb": "SENPAI_WANDB_API_KEY_FILE is empty",
+        "context": "searched program.md and \\*/program.md",
+    }[failure]
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        supervisor_module.supervisor_main(["advisor"], environment)
+
+    assert all(not path.exists() for path in paths)
+    assert handoff_dir.is_dir()
 
 
 def test_private_service_handoffs_do_not_follow_symlinks(tmp_path: Path):

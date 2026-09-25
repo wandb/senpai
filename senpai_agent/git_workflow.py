@@ -10,7 +10,6 @@ from pydantic import SecretStr
 
 from senpai_agent.git_transport import (
     GitWorkflowPreconditionError,
-    github_repository_url,
     isolated_bare_repository as _isolated_bare_repository,
     remote_head as _remote_head,
     run_git as _git,

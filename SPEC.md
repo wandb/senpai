@@ -278,11 +278,19 @@ operator's system-instruction files.
 `SENPAI_TARGET_PYTHON_ENV` selects a writable target venv for terminals and
 training. Its site-packages include the trusted environment through a `.pth`
 path entry. Target packages can override those shared packages without writing
-to the trusted environment. Bootstrap computes both paths with trusted Python
+to the trusted environment. The image includes pip so additive target installs
+can resolve packages on the shared path. uv resolves a separate target package
+set and does not inspect that path. The image compiles runtime bytecode before
+making the environment read-only. Bootstrap computes both paths with trusted Python
 and creates the target venv without pip bootstrapping, which would execute
 target Python. Terminal and training environments select the target through
-PATH and uv settings. Training removes inherited `PYTHONSAFEPATH` so project
-imports work normally. File-defined child terminals use the same routing.
+PATH and uv settings. Training and terminal setup remove inherited
+`PYTHONSAFEPATH` so project imports work normally. File-defined child terminals
+use the same routing.
+Each native terminal session receives target settings after shell startup,
+including new and recovered tmux panes. Later commands can change that
+session's environment. This adapter uses the pinned SDK's environment-export
+callback and preserves native parallel terminal execution.
 
 OpenHands ambient plugin discovery is disabled before root or child
 conversations are created. Only the explicitly supplied trusted plugin loads
@@ -737,7 +745,9 @@ assignment at depth two to verify its parent, tree, and message. These fetches d
 not change the advisor checkout. Pushes retain expected-SHA checks, ancestry
 checks, exact ref leases, and post-push verification. The bootstrap runner and
 target pre-push hooks remain behavioral guards; typed publication bypasses them
-and applies its own branch and lease checks.
+and applies its own branch and lease checks. Before creating a remote branch,
+the typed assignment tool requires a configured student and a `<student>/`
+branch prefix.
 
 Delegated model credentials use a bounded JSON bundle in an unnamed file. The
 parent passes its descriptor to the child and closes its copy after spawning.
@@ -759,8 +769,13 @@ Model values can remain there until process exit. A same-UID process can also
 race a delegated child's inherited descriptor before Python disables dumping.
 These measures reduce exposure; they do not establish complete same-UID secrecy.
 
-The supervisor cleans up the worker and detached descendants under one shared
+The supervisor cleans up the worker and observed descendants under one shared
 60-second grace allowance, below the 75-second liveness termination grace.
+When it runs as container PID 1, it also terminates adopted descendants. On a
+host where it is not PID 1, detached children can become orphans between polls.
+Before restarting the entrypoint, the host process manager must terminate every
+descendant process group, including groups created by detached children, or
+terminate the workload's cgroup.
 Existing post-SIGKILL waits can still depend on kernel process termination.
 Kubernetes or another process manager must restart the complete entrypoint;
 restarting only the Python supervisor cannot recreate consumed handoff files.
