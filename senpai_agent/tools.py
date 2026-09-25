@@ -40,6 +40,7 @@ from senpai_agent.github.tools import GitHubWorkflowToolSet
 from senpai_agent.kubernetes_training import KubernetesTrainingSupervisor
 from senpai_agent.monitor import MetricGate, MonitorStore, TrainingMonitorSpec
 from senpai_agent.PROMPTS import MONITOR_TRAINING_STARTED_PROMPT, render_prompt
+from senpai_agent.training_assignment import TrainingAssignmentGuard
 from senpai_agent.training import (
     KubernetesResourceRef,
     KubernetesTrainingSpec,
@@ -357,9 +358,15 @@ class TrainingResultObservation(Observation):
 
 
 class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObservation]):
-    def __init__(self, training: TrainingRuntime, monitor_store: MonitorStore):
+    def __init__(
+        self,
+        training: TrainingRuntime,
+        monitor_store: MonitorStore,
+        assignment_guard: TrainingAssignmentGuard,
+    ):
         self.training = training
         self.monitor_store = monitor_store
+        self.assignment_guard = assignment_guard
         self._lock = threading.Lock()
         self._in_flight: set[str] = set()
         self._interrupt_generation = 0
@@ -374,6 +381,7 @@ class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObserva
         require_clean_training_worktree(self.training.workspace)
         with self._lock:
             interrupt_generation = self._interrupt_generation
+        self.assignment_guard.require_current(conversation.id)
         result = self.training.run_training(action.spec)
         with self._lock:
             self._in_flight.add(result.training_id)
@@ -455,12 +463,14 @@ class RunTrainingTool(ToolDefinition[RunTrainingAction, TrainingResultObservatio
         cls,
         training: TrainingRuntime,
         monitor_store: MonitorStore,
+        assignment_guard: TrainingAssignmentGuard,
     ) -> Sequence[Self]:
         return [
             cls(
                 description=(
                     "Start one supervised training process without blocking and "
                     "automatically monitor its terminal state for this conversation. "
+                    "Only the current assignment revision conversation may launch. "
                     "Use monitor_training only to add metric gates or staleness "
                     "policy; use get_training_status for a bounded immediate check."
                 ),
@@ -473,7 +483,7 @@ class RunTrainingTool(ToolDefinition[RunTrainingAction, TrainingResultObservatio
                     idempotentHint=False,
                     openWorldHint=False,
                 ),
-                executor=_RunTrainingExecutor(training, monitor_store),
+                executor=_RunTrainingExecutor(training, monitor_store, assignment_guard),
             )
         ]
 
@@ -625,6 +635,10 @@ class TrainingToolSet(ToolDefinition[RunTrainingAction, TrainingResultObservatio
             *RunTrainingTool.create(
                 training=training,
                 monitor_store=monitor_store,
+                assignment_guard=TrainingAssignmentGuard(
+                    Path(state_dir).parent / "student-conversations.json",
+                    os.environ.get("STUDENT_NAME", ""),
+                ),
             ),
             *GetTrainingStatusTool.create(training=training),
             *CancelTrainingTool.create(

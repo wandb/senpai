@@ -36,6 +36,26 @@ class AssignmentConversationRegistry:
             _replace_json(self.path, values)
         return UUID(values[key])
 
+    def require_assignment(
+        self, conversation_id: UUID, assignment_id: str, revision_id: str
+    ) -> None:
+        """Reject a conversation that is not bound to this assignment revision."""
+
+        values = self._read()
+        current = f"{assignment_id}:{revision_id}"
+        if values.get(current) == str(conversation_id):
+            return
+        bound = next(
+            (key for key, value in values.items() if value == str(conversation_id)),
+            None,
+        )
+        raise PermissionError(
+            f"training conversation is bound to assignment revision {bound!r}; "
+            f"current assignment revision is {current!r}. "
+            "Only the current revision may launch new training; existing runs "
+            "remain available for monitoring and cancellation."
+        )
+
     def _read(self) -> dict[str, str]:
         if not self.path.exists():
             return {}

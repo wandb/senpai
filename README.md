@@ -389,6 +389,8 @@ Students do not start GPU work, stream logs, sleep, or poll through the terminal
 | `monitor_training` | Adds a W&B metric, minimize/maximize direction, `lte`, `gte`, `improved_by`, or `regressed_by` gates, a poll interval, and stale-update detection. It cannot disable terminal wakes. |
 | `cancel_training` | Stops the local process group through TERM/KILL or deletes the remote workload by its UID, waits for a durable terminal state, and retires its monitor. |
 
+Before each launch, Senpai reads the current GitHub assignment and checks its revision against the conversation identity saved by the controller. A superseded or unbound conversation cannot reserve resources or start training. It can still monitor or cancel its existing runs. If GitHub cannot confirm one current WIP assignment, the launch fails without starting work.
+
 After launch, the student can finish its turn. The deterministic controller polls process state and at most one selected W&B metric without consuming model tokens. A threshold crossing, regression, stale metric, terminal state, or monitor error creates one compact durable event and resumes the same student conversation. One broken monitor cannot block other training, GitHub feedback, or child-agent results.
 
 Before the first metric arrives, an absent W&B run in an accessible project
