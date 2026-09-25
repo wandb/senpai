@@ -640,3 +640,60 @@ def test_same_student_rotation_keeps_old_live_writer_reserved_and_secret_immutab
     ):
         launch.main()
     assert applied == []
+
+
+@pytest.mark.parametrize("credential_owner", ["controller", "W&B Inference"])
+def test_controller_and_inference_viewers_belong_to_one_tag(
+    monkeypatch, credential_owner
+):
+    overrides = {}
+    if credential_owner == "controller":
+        resource = role_resource(tag="older-track", role="advisor")
+    else:
+        resource = role_resource(
+            tag="older-track",
+            role="advisor",
+            controller="older-controller",
+            inference="viewer-wandb-inference",
+        )
+        overrides = {
+            "student_model": "wandb/zai-org/GLM-5.2",
+            "student_reasoning_effort": "max",
+        }
+    applied, _scans = launch_with_existing_roles(
+        monkeypatch, [resource], **overrides
+    )
+
+    with pytest.raises(
+        SystemExit,
+        match=(
+            f"tag 'older-track' {credential_owner} and "
+            f"tag 'test-track' {credential_owner}.*same viewer"
+        ),
+    ):
+        launch.main()
+
+    assert applied == []
+
+
+def test_relaunch_accepts_the_same_controller_inference_and_writer_owners(
+    monkeypatch,
+):
+    resources = [
+        role_resource(kind=kind, inference="viewer-wandb-inference")
+        for kind in ("Deployment", "Pod")
+    ]
+    applied, _scans = launch_with_existing_roles(
+        monkeypatch,
+        resources,
+        student_model="wandb/zai-org/GLM-5.2",
+        student_reasoning_effort="max",
+    )
+
+    launch.main()
+
+    assert [
+        item["metadata"]["name"]
+        for item in applied
+        if item["kind"] == "Deployment"
+    ] == ["senpai-test-track-fern"]
