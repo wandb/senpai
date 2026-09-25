@@ -652,7 +652,12 @@ timeout still delete the remote workload and persist a terminal result before
 releasing ownership.
 
 The student commits the exact implementation and cleans the worktree before an
-expensive launch. Every successful `run_training` launch immediately registers
+expensive launch. Before reserving resources or starting a process, `run_training`
+reads the current open WIP assignment from GitHub and checks that its revision
+maps to this conversation in `student-conversations.json`. Missing, ambiguous,
+unreadable, or superseded assignments prevent a new launch. This admission check
+does not affect monitoring, cancellation, or terminal delivery for existing runs.
+Every successful `run_training` launch immediately registers
 a terminal-state monitor bound to the current conversation. `monitor_training`
 is an optional policy upgrade for useful metric gates or staleness detection;
 repeating it replaces the default or previous policy.
