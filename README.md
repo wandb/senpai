@@ -368,6 +368,16 @@ new feedback still do.
 
 `get_prs` returns complete PR bodies and discussions. Up to five PRs are returned in context by default; larger selections become a Markdown artifact outside the target checkout so long histories do not pollute the main conversation.
 
+`get_pr_source` lets advisors and students inspect private PR code using the
+runtime's credentials. Supply the exact PR base and head SHAs from `get_prs` to
+list changed files, then select paths to retrieve complete source and text diffs
+in a private artifact outside the target checkout. The reader supports merged
+PRs, verifies blob identities, and checks that the PR has not moved before
+returning. It accepts at most 100 changed files and eight selected paths, with
+256 KiB per source file and 2 MiB per API response. It reports the comparison
+merge base separately from the PR base tip. Binary and oversized sources fail
+explicitly; the tool does not silently truncate review evidence.
+
 ## Long-running training and monitoring
 
 Students do not start GPU work, stream logs, sleep, or poll through the terminal. Four typed tools make training a durable controller operation:

@@ -24,6 +24,7 @@ class GitHubReader:
         api_url: str = "https://api.github.com",
         trusted_actor: str | None = None,
         timeout: int = 30,
+        max_response_bytes: int | None = None,
     ):
         if token is not None and not isinstance(token, SecretStr):
             raise TypeError("token must be a SecretStr")
@@ -36,6 +37,7 @@ class GitHubReader:
         self._origin = urlsplit(self._api_url)[:2]
         self._actor = trusted_actor
         self._timeout = timeout
+        self._max_response_bytes = max_response_bytes
 
     def get(self, path: str) -> object:
         """Return one decoded GitHub JSON response."""
@@ -54,7 +56,14 @@ class GitHubReader:
         github_request = request.Request(url, headers=headers)
         try:
             with request.urlopen(github_request, timeout=self._timeout) as response:
-                return json.loads(response.read()), next_link(
+                payload = (
+                    response.read()
+                    if self._max_response_bytes is None
+                    else response.read(self._max_response_bytes + 1)
+                )
+                if self._max_response_bytes is not None and len(payload) > self._max_response_bytes:
+                    raise GitHubReadError("GitHub response exceeds the source-read byte limit")
+                return json.loads(payload), next_link(
                     response.headers.get("Link")
                 )
         except HTTPError as error:

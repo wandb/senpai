@@ -26,6 +26,7 @@ from senpai_agent.tools import register_senpai_tools
 
 ADVISOR_GITHUB_TOOLS = {
     "get_prs",
+    "get_pr_source",
     "respond_to_human_issue",
     "create_assignment",
     "publish_advisor_branch",
@@ -38,6 +39,7 @@ ADVISOR_GITHUB_TOOLS = {
 }
 STUDENT_GITHUB_TOOLS = {
     "get_prs",
+    "get_pr_source",
     "post_assignment_comment",
     "respond_to_human_issue",
     "submit_experiment_result",
