@@ -831,7 +831,7 @@ Removed:
 - `.claude/` runtime resources;
 - Claude-named and OpenHands shell watchdog/supervisor loops;
 - the Exa MCP configuration;
-- the HTTP advisor service, bearer token, port, probes, and Kubernetes RBAC;
+- the old HTTP advisor service and its bearer token, port, probes, and Kubernetes RBAC;
 - shell GitHub polling and pod-process inspection;
 - cutoff conversation harvesting;
 - obsolete tool-role instructions; and

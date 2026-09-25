@@ -391,6 +391,8 @@ def serve_lease_health(
     """Serve the worker lease without spawning credential-bearing probes."""
 
     class LeaseHealthHandler(BaseHTTPRequestHandler):
+        timeout = 5
+
         def do_GET(self) -> None:  # noqa: N802
             if self.path != "/healthz":
                 self.send_error(404)
@@ -451,7 +453,6 @@ def supervisor_main(
         state_dir,
         env,
     )
-    github_token = _consume_github_token(env)
     stop = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -464,6 +465,7 @@ def supervisor_main(
     try:
         lease_path = state_dir / "controller-lease.json"
         with serve_lease_health(lease_path, port=health_port):
+            github_token = _consume_github_token(env)
             return WorkerSupervisor(
                 command=(
                     sys.executable,

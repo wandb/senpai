@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import re
@@ -643,10 +644,7 @@ def test_http_health_server_closes_when_the_supervisor_fails(tmp_path: Path):
         socket.create_connection(address, timeout=1)
 
 
-@pytest.mark.parametrize("port", ["abc", "0", "-1", "65536"])
-def test_invalid_health_port_fails_before_consuming_the_token(
-    tmp_path: Path, port: str
-):
+def supervisor_environment(tmp_path: Path) -> dict[str, str]:
     workspace = tmp_path / "target"
     workspace.mkdir()
     (workspace / "program.md").write_text("Research policy.")
@@ -655,17 +653,48 @@ def test_invalid_health_port_fails_before_consuming_the_token(
     token = tmp_path / "github-token"
     token.write_text("test-token")
     token.chmod(0o600)
+    return {
+        "SENPAI_GITHUB_TOKEN_FILE": str(token),
+        "SENPAI_OPENHANDS_STATE_DIR": str(tmp_path / "state"),
+        "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
+        "SENPAI_OPENHANDS_ROLE_FILE": str(role),
+    }
+
+
+@pytest.mark.parametrize("port", ["abc", "0", "-1", "65536"])
+def test_invalid_health_port_fails_before_consuming_the_token(
+    tmp_path: Path, port: str
+):
+    environment = supervisor_environment(tmp_path)
+    environment["SENPAI_HEALTH_PORT"] = port
 
     with pytest.raises(RuntimeError, match="SENPAI_HEALTH_PORT must be"):
-        supervisor_module.supervisor_main(["advisor"], {
-            "SENPAI_HEALTH_PORT": port,
-            "SENPAI_GITHUB_TOKEN_FILE": str(token),
-            "SENPAI_OPENHANDS_STATE_DIR": str(tmp_path / "state"),
-            "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
-            "SENPAI_OPENHANDS_ROLE_FILE": str(role),
-        })
+        supervisor_module.supervisor_main(["advisor"], environment)
 
-    assert token.read_text() == "test-token"
+    assert Path(environment["SENPAI_GITHUB_TOKEN_FILE"]).read_text() == "test-token"
+
+
+def test_unavailable_health_port_preserves_the_token_handoff(tmp_path: Path):
+    environment = supervisor_environment(tmp_path)
+    with socket.socket() as occupied:
+        occupied.bind(("0.0.0.0", 0))
+        occupied.listen()
+        environment["SENPAI_HEALTH_PORT"] = str(occupied.getsockname()[1])
+        with pytest.raises(OSError) as error:
+            supervisor_module.supervisor_main(["advisor"], environment)
+
+    assert error.value.errno == errno.EADDRINUSE
+    assert Path(environment["SENPAI_GITHUB_TOKEN_FILE"]).read_text() == "test-token"
+
+
+def test_http_health_server_closes_idle_connections(tmp_path: Path):
+    with serve_lease_health(
+        tmp_path / "lease.json", host="127.0.0.1", port=0
+    ) as server:
+        with socket.create_connection(
+            ("127.0.0.1", server.server_port), timeout=10
+        ) as connection:
+            assert connection.recv(1) == b""
 
 
 def test_openhands_reopens_durable_events_after_an_unclean_worker_exit(
