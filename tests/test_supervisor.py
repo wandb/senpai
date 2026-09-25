@@ -10,6 +10,7 @@ from base64 import b64encode
 from dataclasses import replace
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
@@ -908,10 +909,13 @@ def test_private_service_handoffs_do_not_follow_symlinks(tmp_path: Path):
     assert target.read_text() == "secret"
 
 
-def test_pid_one_terminates_and_kills_detached_descendants(monkeypatch):
+def test_pid_one_reserves_reap_time_after_worker_exhausts_term_budget(
+    tmp_path, monkeypatch,
+):
     class Child:
-        def __init__(self, pid):
-            self.pid = pid
+        pid = 41
+
+        def __init__(self):
             self.signals = []
 
         def terminate(self):
@@ -920,37 +924,92 @@ def test_pid_one_terminates_and_kills_detached_descendants(monkeypatch):
         def kill(self):
             self.signals.append("kill")
 
-    children = [Child(41), Child(42)]
-    waits = []
-    monkeypatch.setattr(supervisor_module.os, "getpid", lambda: 1)
+    child = Child()
+    clock = [100.0]
+    worker_waits = []
+    adopted_waits = []
     monkeypatch.setattr(
-        supervisor_module.psutil,
-        "Process",
-        lambda: type(
-            "SupervisorProcess",
-            (),
-            {"children": lambda self, recursive: children},
-        )(),
+        supervisor_module, "time", SimpleNamespace(monotonic=lambda: clock[0]),
+    )
+    monkeypatch.setattr(
+        supervisor_module, "os", SimpleNamespace(**(vars(os) | {"getpid": lambda: 1})),
+    )
+    monkeypatch.setattr(
+        supervisor_module.psutil, "Process",
+        lambda: SimpleNamespace(children=lambda recursive: [child]),
+    )
+    monkeypatch.setattr(
+        supervisor_module.subprocess, "Popen", lambda *args, **kwargs: object(),
     )
 
     def wait_procs(processes, timeout):
-        waits.append((list(processes), timeout))
-        return ([], [children[1]]) if len(waits) == 1 else (list(processes), [])
+        adopted_waits.append(timeout)
+        clock[0] += timeout
+        return ([], processes) if len(adopted_waits) == 1 else (processes, [])
+
+    def exhaust_worker_term_budget(_process, _descendants, deadline):
+        worker_waits.append(deadline - clock[0])
+        clock[0] = deadline
 
     monkeypatch.setattr(supervisor_module.psutil, "wait_procs", wait_procs)
     supervisor = WorkerSupervisor(
         command=("worker",),
-        lease_path=Path("lease.json"),
+        lease_path=tmp_path / "lease.json",
         config=SupervisorConfig(terminate_grace_seconds=7),
+        environment={},
+    )
+    monkeypatch.setattr(
+        supervisor, "_wait_for_worker", lambda *args: ("exit:17", False),
+    )
+    monkeypatch.setattr(supervisor, "_terminate_worker", exhaust_worker_term_budget)
+    monkeypatch.setattr(supervisor, "_reap_orphaned_children", lambda _worker: None)
+
+    assert supervisor.run() == 17
+
+    assert child.signals == ["terminate", "kill"]
+    assert len(adopted_waits) == 2
+    assert adopted_waits[1] > 0, "SIGKILL must retain time to observe child exit"
+    assert 0 <= sum(worker_waits + adopted_waits) <= 7
+    assert clock[0] <= 107
+
+
+def test_pid_one_cleanup_reaps_term_ignoring_child_before_return(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import os, signal, subprocess, sys, time
+from pathlib import Path
+from types import SimpleNamespace
+import psutil
+import senpai_agent.supervisor as supervisor
+
+# Simulate only this module's PID-1 gate. psutil must use the real subprocess PID.
+supervisor.os = SimpleNamespace(**(vars(os) | {"getpid": lambda: 1}))
+child = subprocess.Popen(
+    [sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); time.sleep(60)"],
+    stdout=subprocess.PIPE, text=True, start_new_session=True,
+)
+try:
+    assert child.stdout.readline().strip() == "ready"
+    worker = supervisor.WorkerSupervisor(command=("unused",), lease_path=Path(sys.argv[1]))
+    started = time.monotonic()
+    worker._terminate_adopted_children(started + 0.02, started + 0.5)
+    assert not psutil.pid_exists(child.pid), "child PID survived adopted cleanup return"
+finally:
+    if child.poll() is None:
+        child.kill()
+    child.wait(timeout=5)
+    child.stdout.close()
+""",
+            str(tmp_path / "lease.json"),
+        ],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
+        capture_output=True, text=True, timeout=10,
     )
 
-    deadline = time.monotonic() + 7
-    supervisor._terminate_adopted_children(deadline)
-
-    assert children[0].signals == ["terminate"]
-    assert children[1].signals == ["terminate", "kill"]
-    assert len(waits) == 2
-    assert 0 <= waits[1][1] <= waits[0][1] <= 7
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("failure", ["allocation", "spawn"])

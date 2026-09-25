@@ -242,8 +242,9 @@ class WorkerSupervisor:
             )
         finally:
             deadline = time.monotonic() + self.config.terminate_grace_seconds
-            self._terminate_worker(process, descendants, deadline)
-            self._terminate_adopted_children(deadline)
+            term_deadline = deadline - min(1.0, self.config.terminate_grace_seconds / 2)
+            self._terminate_worker(process, descendants, term_deadline)
+            self._terminate_adopted_children(term_deadline, deadline)
             self._reap_orphaned_children(None)
         if stop.is_set():
             return 0
@@ -372,7 +373,7 @@ class WorkerSupervisor:
             except (OSError, psutil.Error):
                 continue
 
-    def _terminate_adopted_children(self, deadline: float) -> None:
+    def _terminate_adopted_children(self, term_deadline: float, deadline: float) -> None:
         """Stop detached descendants before container PID 1 exits."""
 
         if os.getpid() != 1:
@@ -388,7 +389,7 @@ class WorkerSupervisor:
                 continue
         _, alive = psutil.wait_procs(
             children,
-            timeout=max(0, deadline - time.monotonic()),
+            timeout=max(0, term_deadline - time.monotonic()),
         )
         for child in alive:
             try:

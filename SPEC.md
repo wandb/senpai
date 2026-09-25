@@ -903,6 +903,8 @@ These measures reduce exposure; they do not establish complete same-UID secrecy.
 
 The supervisor cleans up the worker and observed descendants under one shared
 60-second grace allowance, below the 75-second liveness termination grace.
+It reserves the smaller of one second or half that allowance for SIGKILL and
+reaping. Worker and adopted-child TERM waits share the earlier cutoff.
 When it runs as container PID 1, it also terminates adopted descendants. On a
 host where it is not PID 1, detached children can become orphans between polls.
 Before restarting the entrypoint, the host process manager must terminate every
