@@ -31,6 +31,7 @@ def seed() -> None:
         archive.extractall(WORKSPACE, filter='data')
     for repo, branch in ((WORKSPACE, 'runner'), (TARGET, 'advisor')):
         repo.mkdir(parents=True, exist_ok=True)
+        os.chown(repo, 0, 0)
         git('init', '-q', '-b', branch, cwd=repo)
         git('config', 'user.name', 'Synthetic Smoke', cwd=repo)
         git('config', 'user.email', 'smoke@example.invalid', cwd=repo)
