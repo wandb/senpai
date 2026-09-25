@@ -509,7 +509,8 @@ def test_wandb_gateway_configuration_is_explicit_and_uses_max_glm_reasoning(
     env = runtime_env(tmp_path)
     env.update(
         {
-            "WANDB_API_KEY": "wandb-key",
+            "WANDB_API_KEY": "research-key",
+            "WANDB_INFERENCE_API_KEY": "inference-key",
             "WANDB_ENTITY": "research-team",
             "WANDB_PROJECT": "mlxfast",
             "SENPAI_OPENHANDS_MODEL": "wandb/zai-org/GLM-5.2",
@@ -529,12 +530,13 @@ def test_wandb_gateway_configuration_is_explicit_and_uses_max_glm_reasoning(
     assert config.wandb_project == "mlxfast"
     assert config.model == config.smart_model == config.fast_model
     assert config.model == config.frontier_model == "wandb/zai-org/GLM-5.2"
-    assert config.api_key_env == "WANDB_API_KEY"
-    assert config.api_key.get_secret_value() == "wandb-key"
+    assert config.api_key_env == "WANDB_INFERENCE_API_KEY"
+    assert config.api_key.get_secret_value() == "inference-key"
     assert config.reasoning_effort == "max"
     assert config.smart_reasoning_effort == "max"
     assert config.fast_reasoning_effort == "max"
     assert config.frontier_reasoning_effort == "max"
+
 
 
 def test_fast_model_inherits_an_openai_main_profile(tmp_path: Path):
@@ -578,7 +580,7 @@ def test_fast_profile_inherits_smart_effort_for_a_wandb_main_override(
     env = runtime_env(tmp_path)
     env.update(
         {
-            "WANDB_API_KEY": "wandb-key",
+            "WANDB_INFERENCE_API_KEY": "wandb-key",
             "WANDB_ENTITY": "research-team",
             "WANDB_PROJECT": "mlxfast",
             "SENPAI_OPENHANDS_MODEL": "wandb/zai-org/GLM-5.2",
@@ -887,4 +889,22 @@ def test_state_directory_is_explicit_and_outside_the_target_checkout(
         message = "outside the target workspace"
 
     with pytest.raises(RuntimeError, match=message):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+
+def test_student_requires_a_distinct_training_writer_without_removing_research(tmp_path):
+    env = runtime_env(tmp_path, role="student")
+    env["WANDB_API_KEY"] = "research-key"
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+    assert config.training_wandb_api_key.get_secret_value() == "student-writer-key"
+    assert config.conversation_secrets["WANDB_API_KEY"] == "research-key"
+    child_environment = dict(env)
+    scrub_model_credentials(child_environment, config)
+    assert "SENPAI_WANDB_TRAINING_API_KEY" not in child_environment
+    assert child_environment["WANDB_API_KEY"] == "research-key"
+    env.pop("SENPAI_WANDB_TRAINING_API_KEY")
+    with pytest.raises(RuntimeError, match="required for student training"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+    env["SENPAI_WANDB_TRAINING_API_KEY"] = "research-key"
+    with pytest.raises(RuntimeError, match="must be distinct"):
         resolve_config(parse_runner_args(["--max-turns", "1"]), env)

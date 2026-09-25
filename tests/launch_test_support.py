@@ -48,30 +48,43 @@ def run_launch(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def render_role(role: str, args: launch.Args | None = None) -> tuple[str, str, str]:
+def render_role(
+    role: str, args: launch.Args | None = None
+) -> tuple[str, str, str]:
     args = launch_args() if args is None else args
-    secret_name = f"senpai-launch-secrets-{args.tag}"
     providers = launch.deployed_model_providers(args)
-    secret = launch_helpers.render_launch_secret(
+    secret_name, secret = launch_helpers.render_launch_secret(
         args.tag,
         "github",
         "exa",
         "wandb",
         anthropic_api_key="anthropic" if "anthropic" in providers else None,
         openai_api_key="openai" if "openai" in providers else None,
+        wandb_inference_api_key="wandb-inference"
+        if "wandb" in providers
+        else None,
         custom_secrets={
             name: f"{name.lower()}-secret"
             for name in args.custom_secret_env_names
         },
     )
     template = (ROOT / "k8s" / f"{role}-deployment.yaml").read_text()
+    inference_viewer = "viewer-inference" if "wandb" in providers else None
     if role == "student":
+        writer_name, writer_secret = launch_helpers.render_student_wandb_secret(
+            args.tag, "fern", "wandb-training-fern", "viewer-fern"
+        )
         manifest = launch.render_student(
             template,
             "fern",
             args.tag,
             secret_name,
             secret,
+            writer_name,
+            writer_secret,
+            "viewer-fern",
+            "viewer-controller",
+            inference_viewer,
             args,
         )
     else:
@@ -81,6 +94,8 @@ def render_role(role: str, args: launch.Args | None = None) -> tuple[str, str, s
             ["fern"],
             secret_name,
             secret,
+            "viewer-controller",
+            inference_viewer,
             args,
         )
     configmap, deployment = manifest.split("\n---\n", 1)

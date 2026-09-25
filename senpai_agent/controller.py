@@ -963,6 +963,7 @@ def controller_main(
     )
     from senpai_agent.tools import (
         close_training_runtimes,
+        configure_training_credentials,
         training_runtime,
     )
     from senpai_agent.weave_monitoring import finish_weave_monitoring
@@ -987,6 +988,7 @@ def controller_main(
     if runner_config.github_token is None:
         raise RuntimeError("controller worker requires GitHub credentials")
     scrub_model_credentials(os.environ, runner_config)
+    configure_training_credentials(runner_config.training_wandb_api_key)
     reconcile_delegated_tasks(
         getattr(runner_config, "delegation_root_state_dir", None)
         or runner_config.state_dir,
@@ -1152,6 +1154,7 @@ def controller_main(
             signal.signal(signum, handler)
         inbox.close()
         close_training_runtimes()
+        configure_training_credentials(None)
         finish_weave_monitoring()
     return 0
 

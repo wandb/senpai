@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import psutil
+from pydantic import SecretStr
 
 from senpai_agent.training import (
     TrainingResult,
@@ -251,3 +252,29 @@ def test_restart_does_not_signal_a_reused_pid(tmp_path: Path):
     finally:
         unrelated.send_signal(signal.SIGKILL)
         unrelated.wait()
+
+
+def test_training_uses_its_writer_and_masks_it_in_persisted_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "research-secret")
+    monkeypatch.setenv("WANDB_INFERENCE_API_KEY", "inference-secret")
+    monkeypatch.setenv("SENPAI_WANDB_TRAINING_API_KEY", "stale-writer-secret")
+    workspace, supervisor = make_supervisor(tmp_path, wandb_api_key=SecretStr("student-writer-secret"))
+    environment_path = workspace / "environment.json"
+    running = run_python(
+        supervisor,
+        workspace,
+        "import json,os,pathlib,sys;"
+        "values={key: os.environ.get(key) for key in "
+        "['WANDB_API_KEY','WANDB_INFERENCE_API_KEY','SENPAI_WANDB_TRAINING_API_KEY']};"
+        f"pathlib.Path({str(environment_path)!r}).write_text(json.dumps(values));"
+        "print('failed with key=' + os.environ['WANDB_API_KEY']);sys.exit(1)",
+    )
+    result = wait_for_terminal(supervisor, running.training_id)
+    assert result.state is TrainingState.FAILED
+    assert json.loads(environment_path.read_text()) == {
+        "WANDB_API_KEY": "student-writer-secret",
+        "WANDB_INFERENCE_API_KEY": None,
+        "SENPAI_WANDB_TRAINING_API_KEY": None,
+    }
+    assert result.error_tail == "failed with key=<secret-hidden>\n"
+    assert "student-writer-secret" not in (tmp_path / "state" / f"{running.training_id}.json").read_text()

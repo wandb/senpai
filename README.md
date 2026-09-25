@@ -60,6 +60,10 @@ ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
 EXA_API_KEY=
 WANDB_API_KEY=
+# Required only for wandb/... model profiles:
+WANDB_INFERENCE_API_KEY=
+# One distinct writer for each configured student:
+WANDB_API_KEY_FRIEREN=
 ```
 
 | Credential | Required access |
@@ -68,7 +72,9 @@ WANDB_API_KEY=
 | `ANTHROPIC_API_KEY` | Required when an `anthropic/...` model is configured. Every default profile uses Anthropic. |
 | `OPENAI_API_KEY` | Required when an `openai/...` model is configured. |
 | `EXA_API_KEY` | General-web and research-publication search. |
-| `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. |
+| `WANDB_API_KEY` | Research, monitoring, and Weave access. Existing authenticated agent research remains available during this staged rollout. |
+| `WANDB_INFERENCE_API_KEY` | Required for `wandb/...` model profiles. Use a viewer distinct from research and training viewers. |
+| `WANDB_API_KEY_<STUDENT>` | One distinct training writer per student. Uppercase the student name and replace punctuation with `_`: `team-fern` becomes `WANDB_API_KEY_TEAM_FERN`. |
 
 To add a credential, put its value in `.env` and list its name in the launch
 configuration:
@@ -86,21 +92,49 @@ its value is redacted from tool output and traces.
 
 `k8s/launch.py` reads shell environment variables first and then the repository-root `.env`; only the GitHub token also falls back to `gh auth token`. Direct Docker or host execution must export or pass credentials explicitly.
 
-The launcher places credentials in a per-launch Kubernetes Secret. Bootstrap
+The launcher stores shared credentials in an immutable, content-addressed Kubernetes Secret. It stores each student writer in a separate immutable Secret. Bootstrap
 writes GitHub, W&B, and Exa keys to owner-only files in a fresh private directory.
 The supervisor consumes and unlinks those files, passes each key through a
 one-use descriptor, and drops its stored credentials after starting the worker.
 The controller restores W&B and Exa access before tracing starts. These service
-keys remain available to research tools, terminals, and training.
+keys remain available to research tools and terminals. Supervised training uses
+its student writer as `WANDB_API_KEY`, replacing the research key.
 GitHub credentials remain private to the controller.
 
 Delegated model keys travel through a private descriptor and are resolved in
-memory. They do not enter the child environment, except when the same key is
-also an intentionally available service credential. In particular, W&B inference
-still shares `WANDB_API_KEY` with W&B research and tracing. Separating those
-identities is a later change. Linux credential holders disable process dumping;
+memory. W&B inference uses its dedicated key. Research access and independent
+child and standalone Weave traces remain available. Linux credential holders disable process dumping;
 this reduces inspection risk but does not isolate mutually untrusted processes
 that share a UID.
+
+Each student writer must authenticate as a different W&B viewer, including from
+research and inference viewers. Restrict project membership and permissions for
+each viewer; the launcher's viewer query does not verify those permissions or
+bind a run to an assignment. Different keys for the same viewer do not provide
+identity isolation. The existing research credential remains accessible to agent
+code in this staged rollout, so identity separation does not yet contain its use.
+
+The launcher checks desired Deployments and all nonterminal Pods across the
+namespace. Viewer ownership includes the launch tag, so different active tags
+need different research and inference viewers as well as student writers. Old
+Pods retain ownership during a rollout. A partial fleet update cannot change the
+research viewer while unreplaced roles use another viewer. Before the first
+launch with these checks, stop and remove all legacy Senpai role resources in the
+namespace, or migrate their manifests with verified viewer annotations. A new
+tag alone does not bypass missing legacy bindings.
+
+Run one launcher at a time per namespace. The ownership scan and resource apply
+are not atomic; concurrent launchers can both pass the scan. `--preflight_only`
+checks supplied identities but does not reserve them or inspect cluster ownership.
+Changed credentials create new Secrets; include every role that must rotate in
+the launch command. Keep old Secrets until their Pods stop, then use the existing
+label-based cleanup command.
+
+This rollout retains the authenticated W&B SDK route while equivalent credential-
+isolated research tools are implemented. Do not remove that route until private
+run discovery, complete histories, artifacts, workspace inspection, Weave queries,
+and Reports work through the replacement. Training logging and metric monitoring
+alone do not provide research parity.
 
 ### 4. Prepare the target repository
 
@@ -173,7 +207,7 @@ does not enable OpenAI Pro mode.
 apply it for their models; OpenHands handles compaction for other providers.
 
 If using W&B Inference use `wandb/` provider as the provider. For example `wandb/zai-org/GLM-5.2`, SENPAI
-uses `WANDB_API_KEY` for auth.
+uses `WANDB_INFERENCE_API_KEY` for auth.
 
 The defaults in `senpai.yaml` describe W&B's deployment and should not be copied unchanged into another environment. Every setting can also be overridden on the command line. `--tag` and `--target_repo_url` are required unless your chosen config file supplies them.
 
@@ -213,7 +247,8 @@ uv run python k8s/launch.py \
   --student_image "ghcr.io/wandb/senpai-student:sha-$revision"
 ```
 
-The launcher creates routing labels, one launch Secret, role ConfigMaps, and Deployments. It does not create the namespace, PVC, Service, or general cluster RBAC.
+The launcher creates routing labels, an immutable shared Secret, a separate
+immutable writer Secret per student, role ConfigMaps, and Deployments. It does not create the namespace, PVC, Service, or general cluster RBAC.
 
 Inspect and stop the launch:
 

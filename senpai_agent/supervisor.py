@@ -522,7 +522,9 @@ def supervisor_main(
             worker_environment.clear()
             # The worker has its own startup environment. Drop PID 1's current
             # model values; this does not erase the kernel's original environ.
-            model_names = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY"}
+            model_names = {
+                "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "WANDB_INFERENCE_API_KEY"
+            }
             for profile in ("", "SMART_", "FAST_", "FRONTIER_"):
                 if name := env.get(f"SENPAI_OPENHANDS_{profile}API_KEY_ENV"):
                     model_names.add(name)

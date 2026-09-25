@@ -101,7 +101,12 @@ if [ -z "${SENPAI_EXA_API_KEY_FILE:-}" ] && [ -n "${EXA_API_KEY:-}" ]; then
     export SENPAI_EXA_API_KEY_FILE="$CREDENTIAL_HANDOFF_DIR/exa-api-key"
     (umask 077; printf '%s' "$EXA_API_KEY" > "$SENPAI_EXA_API_KEY_FILE")
 fi
-unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS WANDB_API_KEY EXA_API_KEY
+if [ -z "${SENPAI_WANDB_TRAINING_API_KEY_FILE:-}" ] && [ -n "${SENPAI_WANDB_TRAINING_API_KEY:-}" ]; then
+    prepare_credential_handoff_dir
+    export SENPAI_WANDB_TRAINING_API_KEY_FILE="$CREDENTIAL_HANDOFF_DIR/wandb-training-api-key"
+    (umask 077; printf '%s' "$SENPAI_WANDB_TRAINING_API_KEY" > "$SENPAI_WANDB_TRAINING_API_KEY_FILE")
+fi
+unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS WANDB_API_KEY EXA_API_KEY SENPAI_WANDB_TRAINING_API_KEY
 rm -f "$GIT_ASKPASS_FILE"
 export SENPAI_TARGET_PYTHON_ENV="$HOME/.venvs/senpai-target"
 if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then

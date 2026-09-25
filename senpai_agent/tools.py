@@ -26,7 +26,7 @@ from openhands.tools.terminal import (
     TerminalTool,
 )
 from openhands.tools.task_tracker import TaskTrackerTool
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 
 from senpai_agent.delegation import (
     AgentStatusTool,
@@ -56,6 +56,13 @@ _TRAINING_RUNTIMES: dict[
     tuple[TrainingSupervisor, MonitorStore],
 ] = {}
 _BROWSER_ENABLED_STATE_KEY = "senpai.browser_enabled"
+_training_wandb_api_key: SecretStr | None = None
+
+
+def configure_training_credentials(api_key: SecretStr | None) -> None:
+    """Hold the student writer outside model-facing tool state."""
+    global _training_wandb_api_key
+    _training_wandb_api_key = api_key
 
 
 class LoadBrowserAction(Action):
@@ -172,6 +179,7 @@ def training_runtime(
             TrainingSupervisor(
                 workspace=workspace,
                 state_dir=key,
+                wandb_api_key=_training_wandb_api_key,
             ),
             MonitorStore(key / "monitors.sqlite3"),
         )

@@ -11,9 +11,10 @@ from enum import StrEnum
 from pathlib import Path
 
 import psutil
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from senpai_agent.processes import signal_process_group, terminate_process_group
+from senpai_agent.secrets import WANDB_TRAINING_API_KEY_ENV
 
 _WANDB_RUN_URL_BYTES = re.compile(
     rb"https?://wandb\.ai/[^/\s]+/[^/\s]+/runs/([A-Za-z0-9_-]+)"
@@ -107,11 +108,13 @@ class TrainingSupervisor:
         *,
         workspace: Path,
         state_dir: Path,
+        wandb_api_key: SecretStr | None = None,
         terminate_grace_seconds: float = 10,
     ):
         self.workspace = workspace.resolve()
         self.state_dir = state_dir.resolve()
         self.terminate_grace_seconds = terminate_grace_seconds
+        self.wandb_api_key = wandb_api_key
         self._lock = threading.Lock()
         self._active: dict[str, _ActiveTraining] = {}
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -154,6 +157,10 @@ class TrainingSupervisor:
             environment = dict(os.environ)
             environment.pop("PYTHONSAFEPATH", None)
             environment.update(target_python_environment(environment))
+            environment.pop(WANDB_TRAINING_API_KEY_ENV, None)
+            environment.pop("WANDB_INFERENCE_API_KEY", None)
+            if self.wandb_api_key is not None:
+                environment["WANDB_API_KEY"] = self.wandb_api_key.get_secret_value()
             process = subprocess.Popen(
                 list(spec.argv),
                 cwd=cwd,
@@ -320,6 +327,11 @@ class TrainingSupervisor:
             for match in _WANDB_RUN_URL_BYTES.findall(scan_overlap):
                 run_ids.setdefault(match.decode(), None)
 
+        failure_text = error_tail.decode(errors="ignore")
+        if self.wandb_api_key is not None:
+            failure_text = failure_text.replace(
+                self.wandb_api_key.get_secret_value(), "<secret-hidden>"
+            )
         result = TrainingResult(
             training_id=training_id,
             state=state,
@@ -330,11 +342,7 @@ class TrainingSupervisor:
             elapsed_seconds=time.monotonic() - active.started,
             log_path=str(active.log_path),
             wandb_run_ids=tuple(run_ids),
-            error_tail=(
-                error_tail.decode(errors="ignore")
-                if state is not TrainingState.FINISHED
-                else ""
-            ),
+            error_tail=failure_text if state is not TrainingState.FINISHED else "",
         )
         self._write_result(result)
         with self._lock:

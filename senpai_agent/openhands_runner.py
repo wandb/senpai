@@ -48,6 +48,7 @@ from senpai_agent.secrets import (
     GITHUB_TOKEN_FD_ENV,
     GITHUB_TOKEN_FILE_ENV,
     MODEL_CREDENTIALS_FD_ENV,
+    WANDB_TRAINING_API_KEY_ENV,
     configured_custom_secret_env_names,
     consume_model_credential_fd,
     scrub_github_credentials,
@@ -106,7 +107,7 @@ from senpai_agent.PROMPTS import (
     render_prompt,
 )
 from senpai_agent.system_instructions import SenpaiSystemInstructions
-from senpai_agent.tools import register_senpai_tools
+from senpai_agent.tools import configure_training_credentials, register_senpai_tools
 
 DEFAULT_MODEL = "anthropic/claude-opus-5-5"
 DEFAULT_FAST_MODEL = "anthropic/claude-sonnet-5"
@@ -135,7 +136,7 @@ REPOSITORY_INSTRUCTION_FILENAMES = frozenset(
 PROVIDER_API_KEY_ENVS = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
-    "wandb": "WANDB_API_KEY",
+    "wandb": "WANDB_INFERENCE_API_KEY",
 }
 EVENT_TEXT_LIMIT = 20000
 MAX_INLINE_CHILD_RESULT_TOKENS = 15_000
@@ -229,6 +230,7 @@ class RunnerConfig:
     student_name: str | None = None
     wandb_entity: str | None = None
     wandb_project: str | None = None
+    training_wandb_api_key: SecretStr | None = None
     timeout_seconds: float = 7200
     llm_timeout_seconds: int = 5400
     llm_num_retries: int = 5
@@ -874,6 +876,33 @@ def resolve_config(
     smart_api_key = resolve_api_key(env, smart_api_key_env)
     fast_api_key = resolve_api_key(env, fast_api_key_env)
     frontier_api_key = resolve_api_key(env, frontier_api_key_env)
+    training_wandb_api_key = (
+        SecretStr(value)
+        if (value := env.get(WANDB_TRAINING_API_KEY_ENV, "").strip())
+        else None
+    )
+    if role == "student" and not args.child and training_wandb_api_key is None:
+        raise RuntimeError(
+            f"{WANDB_TRAINING_API_KEY_ENV} is required for student training"
+        )
+    research_key = env.get("WANDB_API_KEY", "").strip()
+    training_key = (
+        training_wandb_api_key.get_secret_value() if training_wandb_api_key else ""
+    )
+    if research_key and research_key == training_key:
+        raise RuntimeError("W&B research and training keys must be distinct")
+    inference_keys = {
+        key.get_secret_value()
+        for profile_model, key in (
+            (model, api_key),
+            (smart_model, smart_api_key),
+            (fast_model, fast_api_key),
+            (frontier_model, frontier_api_key),
+        )
+        if model_provider(profile_model) == "wandb"
+    }
+    if inference_keys & {research_key, training_key}:
+        raise RuntimeError("W&B research, inference, and training keys must be distinct")
     resolved_conversation_secrets = conversation_secrets(
         env,
         model_api_key_env_names=(
@@ -956,6 +985,7 @@ def resolve_config(
         student_name=env.get("STUDENT_NAME") or None,
         wandb_entity=wandb_entity,
         wandb_project=wandb_project,
+        training_wandb_api_key=training_wandb_api_key,
         timeout_seconds=timeout_seconds,
         llm_timeout_seconds=llm_timeout_seconds,
         llm_num_retries=llm_num_retries,
@@ -1155,6 +1185,7 @@ def scrub_model_credentials(
     environment: MutableMapping[str, str],
     config: RunnerConfig,
 ) -> None:
+    environment.pop(WANDB_TRAINING_API_KEY_ENV, None)
     for key_env in {
         *PROVIDER_API_KEY_ENVS.values(),
         config.api_key_env,
@@ -1626,6 +1657,7 @@ def run_openhands(
     if run_deadline is not None and run_deadline <= started_at:
         raise TimeoutError("the inherited OpenHands deadline has expired")
     scrub_model_credentials(os.environ, config)
+    configure_training_credentials(config.training_wandb_api_key)
     disable_ambient_plugin_discovery()
     register_default_tools(enable_browser=False)
     register_senpai_tools()
@@ -1987,6 +2019,7 @@ def run_openhands(
                     if cleanup_error is None:
                         cleanup_error = error
         clear_github_credentials()
+        configure_training_credentials(None)
         configure_delegation(None)
         if inference_heartbeat is not None:
             inference_heartbeat.close()
