@@ -815,7 +815,7 @@ def validated_student_resources(manifest: str, student_name: str) -> list[dict]:
 
 
 def main():
-    args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
+    args = sp.parse(Args, config_path=str(SENPAI_CONFIG), allow_abbrev=False)
     if min(
         args.nodes_per_student,
         args.gpus_per_student_node,

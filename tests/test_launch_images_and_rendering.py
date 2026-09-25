@@ -69,6 +69,13 @@ def test_yaml_config_parses_custom_secret_names_as_a_list(monkeypatch, tmp_path)
     assert args.custom_secret_env_names == ["HF_TOKEN", "DATASET_LICENSE_KEY"]
 
 
+def test_launch_rejects_the_retired_gpu_option_instead_of_abbreviating_it():
+    result = run_launch("--gpus_per_student", "8")
+
+    assert result.returncode == 2
+    assert "unrecognized arguments: --gpus_per_student 8" in result.stderr
+
+
 @pytest.mark.parametrize(
     "image",
     [

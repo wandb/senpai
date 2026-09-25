@@ -622,13 +622,32 @@ bundle mutation fails before training starts. Cancellation, timeout, and restart
 recovery remain UID-bound; uncertain deletion retains the broker reservation for
 deadline cleanup rather than releasing ownership early.
 
+The public multi-node tool path reserves an MPIJob. Its target submitter follows
+the [target launcher contract](README.md#multi-node-target-launcher-contract):
+it uses the generated workload name, namespace, snapshot SHA, and W&B identity,
+and supplies the matching source/run annotations before submission. Worker
+resources must match the configured CPU, memory, and GPU allocation; additional
+resource types are rejected. Main containers may receive the scoped W&B key and
+receive canonical `WANDB_RUN_ID`; target code uses the configured W&B entity and
+project. The broker replaces target init containers with the fixed checkout and
+removes pod annotations. The checkout runs as UID/GID 0 and leaves the source
+tree owned by root; Restricted Pod Security namespaces are not supported.
+Preserved target labels can affect configured admission and network policies
+despite annotation removal. They are not a trust boundary.
+The broker preserves target scheduling constraints, overwrites ownership and
+`senpai-training-role` labels, and adds required hostname anti-affinity between
+this run's workers. The injected term excludes launcher pods from its selector;
+target affinity terms remain unchanged.
+
 Controller shutdown detaches from a running Kubernetes workload. It terminates
 the local launcher process. It leaves the remote workload running, keeps the
 durable result in the `RUNNING` state, and retains the workload UID and broker
 reservation. A restarted controller in the same Pod reserves the same training
 identity and re-adopts only that UID before it resumes monitoring. Recovery
 requires retained state and the same controller Pod UID; the default state
-volumes do not survive Pod replacement. Explicit cancellation and
+volumes do not survive Pod replacement. Ordinary controller Pod deletion or
+replacement also garbage-collects its owned MPIJob and terminates remote
+training. Explicit cancellation and
 timeout still delete the remote workload and persist a terminal result before
 releasing ownership.
 
@@ -789,6 +808,9 @@ Role, and RoleBinding that allow creating, getting, patching, and deleting Jobs
 or MPIJobs; getting and listing Pods; reading pod logs; and listing Events.
 The launcher's operator identity needs get access to Deployments, list access
 to Pods and Jobs, API discovery, and create access to the rendered resources.
+Creating the Role and RoleBinding also requires every delegated permission in
+that namespace, or explicit `escalate` permission for the Role and `bind`
+permission on the referenced Role, respectively.
 When the MPIJob API is installed,
 every launch needs list access to MPIJobs so it can reject orphaned workloads;
 multi-node preflight also requires the API to exist. The controller requests

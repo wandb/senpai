@@ -219,18 +219,16 @@ For supervised two-node training, add:
   --executor_image "ghcr.io/wandb/senpai-executor@sha256:<manifest-digest>"
 ```
 
-Each student controller remains CPU-only and may supervise one workload at a
-time. Before submission, Senpai publishes the clean assignment `HEAD` as a
-per-student Git bundle on the PVC. The target launcher receives the bundle,
-MPIJob name, namespace, W&B run ID, and launch-secret name as authoritative
-environment variables. Its manifest must request the configured worker shape.
-The broker supplies `WANDB_RUN_ID` to worker containers and rejects a conflicting
-explicit value. Target launchers must use the supplied identity for any
-framework-specific run arguments. The broker preserves pod labels used by
-target scheduling rules and replaces the Senpai ownership labels.
+The cluster must provide the MPIJob API with `runPolicy.suspend` support and
+a shared writable PVC. Each student controller remains CPU-only and may
+supervise one workload at a time. Before submission, Senpai publishes the clean assignment `HEAD` as a
+per-student Git bundle on the PVC. The target launcher submits one MPIJob using
+the generated identity and configured worker shape. See the
+[target launcher contract](#multi-node-target-launcher-contract) for the exact
+inputs and manifest requirements.
 
 Only the executor sidecar receives a projected Kubernetes token. Its socket
-broker accepts one bounded Job/MPIJob, injects ownership, pod hardening, and an
+broker accepts the reserved MPIJob, injects ownership, pod hardening, and an
 exact-commit bundle checkout, binds the W&B/source annotations, persists the
 created UID, and uses UID-preconditioned activation and deletion. Workloads are
 created suspended, so a late ambiguous API request cannot start GPU pods. The
@@ -261,12 +259,13 @@ instead of disappearing silently. These reads stay inside the executor broker;
 students receive neither Kubernetes credentials nor namespace-wide read access.
 When a smoke run stalls before W&B starts, inspect these diagnostics first.
 
-If the controller's state volume fills or exceeds its quota, an active Kubernetes
-monitor retries result writes with backoff and reports the pending write to
-container stderr. It keeps an observed terminal outcome until it can persist
+If a controller state write reports disk-space or quota exhaustion, an active
+Kubernetes monitor retries result writes with backoff and reports the pending
+write to container stderr. It keeps an observed terminal outcome until it can persist
 that outcome, release the workload, and persist the release acknowledgement.
-The student slot remains occupied until those writes succeed. Optional
-diagnostic writes can be skipped without failing the workload. Closing the
+Cancellation and timeout delete the owned workload before waiting for state
+storage to recover. The student slot remains occupied until those writes
+succeed. Optional diagnostic writes can be skipped without failing the workload. Closing the
 controller interrupts storage retries; after storage recovers, restart recovery
 uses the last durable record and the existing workload UID. A terminal decision
 that could not be persisted cannot survive process loss, so broker deadlines
@@ -298,8 +297,14 @@ and Jobs; discover namespaced APIs; and create Secrets, ConfigMaps, and
 Deployments. When the MPIJob API is installed, the identity must also list
 MPIJobs so every launch can reject an orphaned workload. Multi-node launches
 require that API and create permission for the rendered ServiceAccount, Role,
-and RoleBinding. Advisor launch and reconciliation retain their existing apply
-permissions until an immutable student reservation owns the tag.
+and RoleBinding. The operator must also hold the permissions delegated by the
+Role in that namespace: `create/get/patch/delete` on Jobs and MPIJobs,
+`get/list` on Pods, `get` on `pods/log`, and `list` on Events. Otherwise, Role
+creation requires explicit `escalate` permission and RoleBinding creation
+requires `bind` permission on the referenced Role, in addition to create
+permission. See [Kubernetes RBAC delegation restrictions](https://kubernetes.io/docs/reference/access-authn-authz/rbac/#privilege-escalation-prevention-and-bootstrapping).
+Advisor launch and reconciliation retain their existing apply permissions
+until an immutable student reservation owns the tag.
 
 Inspect and stop the launch:
 
@@ -382,13 +387,64 @@ unverifiable identity. Kubernetes workloads are re-adopted only by their
 persisted UID and broker-injected ownership; the original student conversation
 receives the persisted terminal outcome. Recovery requires retained state and
 the same controller Pod UID. Replacing the Pod is not a supported recovery path;
-the default state volumes do not survive Pod replacement.
+the default state volumes do not survive Pod replacement. With Kubernetes'
+[default cascading deletion](https://kubernetes.io/docs/concepts/architecture/garbage-collection/#background-cascading-deletion),
+deleting or replacing the controller Pod also deletes its owned MPIJob and
+terminates remote training.
 
 Interactive browser operations are progressively disclosed. A fresh root
 conversation initially sees only `load_browser`; invoking it adds the fourteen
 OpenHands browser operations and records the choice in conversation state so a
 resumed conversation restores them. `--no-browser` exposes neither the loader
 nor the browser family.
+
+### Multi-node target launcher contract
+
+With `nodes_per_student > 1`, `run_training` executes a target-owned submitter.
+It must submit one `kubeflow.org/v2beta1` MPIJob through `kubectl apply -f -`
+and exit. The supervisor provides these authoritative environment values:
+
+| Variable | Use in the target launcher |
+|---|---|
+| `SENPAI_TRAINING_SOURCE_SNAPSHOT` | Absolute Git bundle path on the PVC. Its filename is `<HEAD-SHA>.bundle`; use the full 40-character SHA for `metadata.annotations["senpai.wandb.com/source-commit"]`. |
+| `SENPAI_KUBERNETES_WORKLOAD_NAME` | Set `metadata.name`. |
+| `SENPAI_KUBERNETES_NAMESPACE` | Set `metadata.namespace`. |
+| `SENPAI_WANDB_RUN_ID` | Set `metadata.annotations["senpai.wandb.com/run-id"]` and any framework-specific run-ID arguments. |
+| `SENPAI_LAUNCH_SECRET_NAME` | W&B credential source; the broker binds `WANDB_API_KEY` to this Secret's `wandb-api-key` entry. |
+
+The submitter also inherits the launch configuration below. These values do
+not automatically become environment variables inside the submitted pods.
+
+| Variables | Manifest requirement |
+|---|---|
+| `NODES_PER_STUDENT`, `GPUS_PER_STUDENT_NODE` | Use one Launcher replica without GPUs, `NODES_PER_STUDENT` Worker replicas, and `slotsPerWorker: GPUS_PER_STUDENT_NODE`. Both roles use `restartPolicy: Never`. |
+| `CPU_PER_STUDENT_GPU`, `MEMORY_GI_PER_STUDENT_GPU` | Each worker requests exactly GPUs-per-worker times these CPU and memory amounts, plus the configured GPUs. Launcher CPU and memory may not exceed one GPU's share. Every container declares equal CPU/memory requests and limits; worker GPU requests and limits also match. Only `cpu`, `memory`, and `nvidia.com/gpu` resource keys are supported. |
+| `PVC_CLAIM_NAME`, `PVC_MOUNT_PATH` | Both pod templates declare exactly one volume for the configured dataset PVC, which supplies the source bundle to the injected checkout. GPU containers also mount that PVC writable. The snapshot resides beneath the configured mount path. |
+| `WANDB_ENTITY`, `WANDB_PROJECT` | Pass the configured destination to every container that reports W&B metrics. |
+
+Declare `WANDB_API_KEY` in reporting main containers, including the MPI
+launcher when it reports metrics. The broker replaces that entry with the
+scoped Secret reference and supplies canonical `WANDB_RUN_ID` to main
+containers. It rejects a conflicting explicit run ID and preserves unrelated
+target environment variables.
+
+The broker replaces all target `initContainers` with its fixed bundle checkout
+at `/workspace` and removes pod-template annotations. Put required target setup
+in the image or main command. Target pod labels and scheduling constraints are
+preserved, except for Senpai ownership labels and the reserved
+`senpai-training-role` label. Preserved labels can still affect configured
+[admission webhooks](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/#matching-requests-objectselector)
+and [network policies](https://kubernetes.io/docs/concepts/services-networking/network-policies/#the-networkpolicy-resource).
+Operators must not treat target-controlled labels as a trust boundary.
+Use cluster admission policies to enforce node-pool restrictions.
+The broker adds required hostname anti-affinity
+that selects only this run's worker pods. Preserved target affinity rules still
+apply and may also constrain launcher placement.
+
+The injected checkout runs as UID/GID 0 and leaves the source tree owned by
+root. Target containers that modify the checkout must use a compatible runtime
+identity and permissions. Namespaces that enforce Restricted Pod Security
+cannot run this checkout.
 
 ## Subagents
 

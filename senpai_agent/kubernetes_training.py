@@ -983,7 +983,7 @@ class KubernetesTrainingSupervisor:
         thread = threading.Thread(
             target=self._release_terminal,
             args=(
-                result.training_id,
+                result,
                 active,
                 result.state is not TrainingState.FINISHED,
             ),
@@ -1046,7 +1046,7 @@ class KubernetesTrainingSupervisor:
                             )
                         except Exception as error:  # retry transient broker/API outages
                             detail = f"Waiting for Kubernetes ownership: {error}"
-                        if active.resource is not None:
+                        else:
                             break
                         if active.cancelled or time.time() >= active.deadline_at:
                             break
@@ -1065,7 +1065,8 @@ class KubernetesTrainingSupervisor:
                             f"{active.spec.namespace}/{active.spec.name}"
                         )
                     if not self._publish_resource(training_id, active):
-                        return
+                        if self._should_detach(active):
+                            return
                 elif exit_code not in {None, 0}:
                     delete_required = True
 
@@ -1156,9 +1157,7 @@ class KubernetesTrainingSupervisor:
                 "kubernetes_released": False,
             }
         )
-        if not self._persist_result(terminal):
-            return
-        self._release_terminal(training_id, active, delete_required)
+        self._release_terminal(terminal, active, delete_required)
 
     def _capture_diagnostics(
         self,
@@ -1217,10 +1216,12 @@ class KubernetesTrainingSupervisor:
 
     def _release_terminal(
         self,
-        training_id: str,
+        result: TrainingResult,
         active: _ActiveRemoteTraining,
         delete_required: bool,
     ) -> None:
+        training_id = result.training_id
+        terminal_persisted = False
         while True:
             try:
                 if delete_required:
@@ -1228,6 +1229,17 @@ class KubernetesTrainingSupervisor:
                         active.resource = self.client.resource_identity(active.spec)
                     if active.resource is not None:
                         self.client.delete(active.resource)
+            except Exception:
+                if active.cancelled:
+                    time.sleep(self.poll_seconds)
+                elif self._shutdown.wait(self.poll_seconds):
+                    return
+                continue
+            if not terminal_persisted:
+                if not self._persist_result(result):
+                    return
+                terminal_persisted = True
+            try:
                 self.client.release(training_id)
                 break
             except Exception:
@@ -1235,7 +1247,6 @@ class KubernetesTrainingSupervisor:
                     time.sleep(self.poll_seconds)
                 elif self._shutdown.wait(self.poll_seconds):
                     return
-        result = self.get_training_status(training_id)
         if not self._persist_result(result.model_copy(update={"kubernetes_released": True})):
             return
         with self._lock:
@@ -1255,13 +1266,24 @@ class KubernetesTrainingSupervisor:
     ) -> bool:
         result = self.get_training_status(training_id)
         return self._persist_result(
-            result.model_copy(update={"kubernetes_resource": active.resource})
+            result.model_copy(update={"kubernetes_resource": active.resource}),
+            active=active,
         )
 
-    def _persist_result(self, result: TrainingResult) -> bool:
-        retry_seconds = min(self.poll_seconds, 30.0)
+    def _persist_result(
+        self,
+        result: TrainingResult,
+        *,
+        active: _ActiveRemoteTraining | None = None,
+    ) -> bool:
+        retry_limit = min(self.poll_seconds, 30.0) if active is not None else 30.0
+        retry_seconds = min(self.poll_seconds, retry_limit)
         deferred = False
         while True:
+            if active is not None and (
+                active.cancelled or time.time() >= active.deadline_at
+            ):
+                return False
             try:
                 self._write_result(result)
                 break
@@ -1278,7 +1300,7 @@ class KubernetesTrainingSupervisor:
                 )
                 if self._shutdown.wait(retry_seconds):
                     return False
-                retry_seconds = min(retry_seconds * 2, 30.0)
+                retry_seconds = min(retry_seconds * 2, retry_limit)
         if deferred:
             print(
                 f"Kubernetes result persistence recovered: training_id={result.training_id}",

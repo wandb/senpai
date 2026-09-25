@@ -249,7 +249,10 @@ def test_slow_logs_do_not_block_executor_status_or_cancellation(tmp_path):
             control_thread.join(2)
 
 
-def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(tmp_path):
+@pytest.mark.parametrize("wandb_key_role", ["Worker", "Launcher"])
+def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(
+    tmp_path, wandb_key_role,
+):
     api = FakeApi()
     broker = executor(tmp_path, api)
     reserve(broker)
@@ -262,8 +265,13 @@ def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(tmp_path
             "research-tag": "foreign-track",
             "student": "foreign-student",
             "senpai-training-id": "foreign-training",
+            "senpai-training-role": "foreign-role",
         })
     worker = document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]
+    if wandb_key_role == "Launcher":
+        key = worker["spec"]["containers"][0]["env"].pop(0)
+        launcher = document["spec"]["mpiReplicaSpecs"]["Launcher"]["template"]
+        launcher["spec"]["containers"][0].setdefault("env", []).append(key)
     worker["metadata"]["labels"]["example.org/training-group"] = "experiment-one"
     worker["spec"]["affinity"] = {
         "podAntiAffinity": {
@@ -315,15 +323,24 @@ def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(tmp_path
         template = created["spec"]["mpiReplicaSpecs"][role]["template"]
         assert {
             key: template["metadata"]["labels"][key]
-            for key in ("research-tag", "student", "senpai-training-id")
+            for key in (
+                "research-tag", "student", "senpai-training-id", "senpai-training-role",
+            )
         } == {
             "research-tag": "fred",
             "student": "fern",
             "senpai-training-id": "training-one",
+            "senpai-training-role": role.lower(),
         }
         pod_spec = template["spec"]
+        if role == "Launcher":
+            assert "affinity" not in pod_spec
         assert pod_spec["automountServiceAccountToken"] is False
         assert pod_spec["terminationGracePeriodSeconds"] == 30
+        for container in pod_spec["containers"]:
+            assert [item for item in container["env"] if item["name"] == "WANDB_RUN_ID"] == [
+                {"name": "WANDB_RUN_ID", "value": "wandb-one"}
+            ]
         for container in [*pod_spec["initContainers"], *pod_spec["containers"]]:
             assert container["securityContext"]["allowPrivilegeEscalation"] is False
             assert container["securityContext"]["capabilities"] == {"drop": ["ALL"]}
@@ -359,13 +376,19 @@ def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(tmp_path
             "matchLabels": {"example.org/training-group": "experiment-one"},
         },
         "topologyKey": "kubernetes.io/hostname",
+    }, {
+        "labelSelector": {"matchLabels": {
+            "senpai-training-id": "training-one",
+            "senpai-training-role": "worker",
+        }},
+        "topologyKey": "kubernetes.io/hostname",
     }]
     worker_env = worker["spec"]["containers"][0]["env"]
     assert {"name": "TARGET_RUN_LABEL", "value": "wandb-one"} in worker_env
-    assert [item for item in worker_env if item["name"] == "WANDB_RUN_ID"] == [
-        {"name": "WANDB_RUN_ID", "value": "wandb-one"}
-    ]
-    assert next(item for item in worker_env if item["name"] == "WANDB_API_KEY") == {
+    key_env = created["spec"]["mpiReplicaSpecs"][wandb_key_role]["template"][
+        "spec"
+    ]["containers"][0]["env"]
+    assert next(item for item in key_env if item["name"] == "WANDB_API_KEY") == {
         "name": "WANDB_API_KEY",
         "valueFrom": {
             "secretKeyRef": {

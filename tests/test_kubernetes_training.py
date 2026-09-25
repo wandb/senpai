@@ -229,6 +229,144 @@ def test_supervisor_retries_transient_status_and_release_failures(
     assert client.deletions == []
 
 
+@pytest.mark.parametrize(
+    ("lookup_outage", "late_create"),
+    [(False, False), (True, False), (False, True)],
+    ids=["missing", "lookup-outage", "late-create"],
+)
+def test_successful_submitter_without_a_workload_fails_promptly(
+    tmp_path, monkeypatch, lookup_outage, late_create,
+):
+    released = threading.Event()
+
+    class MissingWorkload(FakeCluster):
+        def __init__(self):
+            super().__init__()
+            self.lookups = 0
+
+        def reserve(self, *args):
+            super().reserve(*args)
+            self.pending_resource = self.resource_value
+            self.resource_value = None
+
+        def resource(self, *args, **kwargs):
+            self.lookups += 1
+            if lookup_outage and self.lookups == 1:
+                raise TimeoutError("temporary ownership lookup outage")
+            return super().resource(*args, **kwargs)
+
+        def release(self, training_id):
+            if late_create and self.pending_resource is not None:
+                self.resource_value = self.pending_resource
+                self.pending_resource = None
+            if self.resource_value is not None:
+                raise RuntimeError("cannot release a live Kubernetes workload")
+            super().release(training_id)
+            released.set()
+
+    client = MissingWorkload()
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5,
+    ))
+    try:
+        assert released.wait(1), "successful no-op submitter waited for its deadline"
+        runtime.drain()
+        result = runtime.get_training_status(started.training_id)
+        assert result.state is TrainingState.FAILED
+        assert "submission finished without creating MPIJob" in result.error_tail
+        assert result.kubernetes_released is True
+        assert client.lookups == (2 if lookup_outage else 1)
+        assert len(client.deletions) == (1 if late_create else 0)
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("write_phase", ["resource", "terminal"])
+def test_cancellation_deletes_remote_before_retrying_full_terminal_storage(
+    tmp_path, monkeypatch, restart, write_phase,
+):
+    client = FakeCluster(TrainingState.RUNNING)
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    storage_failed = threading.Event()
+    terminal_failed = threading.Event()
+    storage_restored = threading.Event()
+    write_text = Path.write_text
+
+    def exhausted_terminal(path, text, *args, **kwargs):
+        if path.parent == runtime.state_dir and path.suffix == ".tmp":
+            record = json.loads(text)
+            phase = (
+                "terminal" if record["state"] != "running" else
+                "resource" if record["kubernetes_resource"] else "launch"
+            )
+            if (phase == write_phase or storage_failed.is_set()) and not storage_restored.is_set():
+                storage_failed.set()
+                if phase == "terminal":
+                    terminal_failed.set()
+                raise OSError(errno.ENOSPC, "storage exhausted", str(path))
+        return write_text(path, text, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", exhausted_terminal)
+    spec = TrainingSpec(argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5)
+    started = runtime.run_training(spec)
+    original = client.resource_value
+    if write_phase == "resource":
+        assert storage_failed.wait(2)
+    errors = []
+
+    def cancel():
+        try:
+            runtime.cancel_training(started.training_id)
+        except Exception as error:
+            errors.append(error)
+
+    cancelling = threading.Thread(target=cancel)
+    cancelling.start()
+    recovered = None
+    try:
+        assert terminal_failed.wait(2), "cancellation was blocked by resource publication"
+        assert client.deletions == [original]
+        assert client.resource_value is None
+        assert client.releases == []
+        assert runtime.get_training_status(started.training_id).state is TrainingState.RUNNING
+        with pytest.raises(RuntimeError, match="already has an active"):
+            runtime.run_training(spec)
+        if restart:
+            runtime.close()
+            cancelling.join(1)
+            reserve = client.reserve
+
+            def preserve_deleted_workload(*args):
+                reserve(*args)
+                client.resource_value = None
+
+            monkeypatch.setattr(client, "reserve", preserve_deleted_workload)
+            storage_restored.set()
+            recovered = KubernetesTrainingSupervisor(
+                workspace=workspace, state_dir=runtime.state_dir, nodes=2, gpus_per_node=8,
+                poll_seconds=0.01, client=client,
+            )
+            recovered.drain()
+        else:
+            storage_restored.set()
+            cancelling.join(2)
+        result = (recovered or runtime).get_training_status(started.training_id)
+        assert not cancelling.is_alive()
+        assert errors == []
+        assert client.adoptions == []
+        assert result.state is TrainingState.CANCELLED
+        assert result.kubernetes_released is True
+        assert client.releases == [started.training_id]
+    finally:
+        storage_restored.set()
+        cancelling.join(2)
+        runtime.close()
+        if recovered is not None:
+            recovered.close()
+
+
 @pytest.mark.parametrize("storage_errno", [errno.ENOSPC, errno.EDQUOT])
 @pytest.mark.parametrize("write_phase", ["resource", "terminal", "release"])
 def test_supervisor_recovers_result_persistence_after_storage_exhaustion(

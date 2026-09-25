@@ -31,7 +31,6 @@ _MAX_REQUEST_BYTES = 2 * 1024 * 1024
 _SOURCE_COMMIT = re.compile(r"[0-9a-f]{40}")
 _RUN_ID_ANNOTATION = "senpai.wandb.com/run-id"
 _SOURCE_ANNOTATION = "senpai.wandb.com/source-commit"
-_OWNERSHIP_LABELS = ("research-tag", "student", "senpai-training-id")
 _TRAINING_RESOURCE_NAMES = {"cpu", "memory", "nvidia.com/gpu"}
 _SOURCE_BUNDLE_MOUNT = "/var/lib/senpai-source/source.bundle"
 _WORKSPACE_MOUNT = "/workspace"
@@ -439,10 +438,24 @@ class KubernetesExecutor:
             app = labels.get("app")
             template_metadata["annotations"] = {}
             labels.update(self._ownership_labels(reservation))
+            labels["senpai-training-role"] = "worker" if allow_gpus else "launcher"
             if app:
                 labels["app"] = app
             if spec.kind == "Job":
                 labels["job-name"] = spec.name
+            if allow_gpus and self.nodes > 1:
+                anti_affinity = template["spec"].setdefault("affinity", {}).setdefault(
+                    "podAntiAffinity", {}
+                )
+                anti_affinity.setdefault(
+                    "requiredDuringSchedulingIgnoredDuringExecution", []
+                ).append({
+                    "labelSelector": {"matchLabels": {
+                        "senpai-training-id": reservation["training_id"],
+                        "senpai-training-role": "worker",
+                    }},
+                    "topologyKey": "kubernetes.io/hostname",
+                })
             found_key |= self._secure_pod_spec(
                 template["spec"],
                 allow_gpus=allow_gpus,
@@ -450,7 +463,7 @@ class KubernetesExecutor:
                 reservation=reservation,
             )
         if not found_key:
-            raise ValueError("training worker must bind the launch W&B key")
+            raise ValueError("training must bind the launch W&B key")
         if _workload_shape(manifest) != (self.nodes, self.gpus_per_node):
             raise ValueError(
                 f"training must request exactly {self.nodes} nodes x "
@@ -514,7 +527,7 @@ class KubernetesExecutor:
             self._secure_container(container, allow_gpu=allow_gpus)
             found_key |= self._secure_environment(
                 container,
-                allow_wandb=allow_gpus,
+                allow_wandb=True,
                 wandb_run_id=wandb_run_id,
             )
 
@@ -727,7 +740,7 @@ class KubernetesExecutor:
                 raise ValueError(f"training manifest may not receive {name}")
             if name == "WANDB_API_KEY":
                 if not allow_wandb:
-                    raise ValueError("only a training worker may receive the W&B key")
+                    raise ValueError("only training main containers may receive the W&B key")
                 item.pop("value", None)
                 item["valueFrom"] = {
                     "secretKeyRef": {
