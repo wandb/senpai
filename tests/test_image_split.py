@@ -113,7 +113,7 @@ def test_both_role_images_run_as_the_same_explicit_non_root_user():
         assert "HOME=/home/senpai" in dockerfile
         assert "PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright" in dockerfile
         assert 'ln -s "$chromium_path" /usr/local/bin/chromium' in dockerfile
-        assert "mkdir -p /workspace /workspaces /var/lib/senpai" in dockerfile
+        assert "mkdir -p /workspace/senpai /workspaces /var/lib/senpai" in dockerfile
         assert dockerfile.rindex("ENV HOME=/home/senpai") < dockerfile.index(
             "USER 10001:10001"
         )
@@ -268,7 +268,7 @@ def test_entrypoints_delegate_runtime_lifecycle_to_the_python_supervisor(
     assert "agent-context.sh" not in entrypoint
     assert "PYTHONSAFEPATH" not in entrypoint
     assert "wait_for_senpai_start_gate" not in entrypoint
-    trust_runner = 'git config --global safe.directory "$WORKDIR"'
+    trust_runner = 'git config --global --add safe.directory "$WORKDIR"'
     assert entrypoint.index(trust_runner) < entrypoint.index(
         'install_senpai_git_guard "$WORKDIR"'
     )
@@ -580,10 +580,6 @@ def test_runtime_git_auth_uses_ephemeral_askpass_not_a_credential_store():
             encoding="utf-8"
         )
         assert 'GIT_ASKPASS_FILE="/tmp/senpai-git-askpass"' in entrypoint
-        assert (
-            'SENPAI_GITHUB_TOKEN_FILE="/tmp/senpai-supervisor-github-token"'
-            in entrypoint
-        )
         assert ".git-credentials" not in entrypoint
         assert 'credential.helper "store' not in entrypoint
 
@@ -599,6 +595,66 @@ def test_entrypoint_umask_is_configurable_but_token_creation_stays_private():
             "(umask 077; printf '%s' \"$GITHUB_TOKEN\" > "
             '"$SENPAI_GITHUB_TOKEN_FILE")'
         ) in entrypoint
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+@pytest.mark.parametrize("services", ["absent", "environment", "files"])
+def test_entrypoint_hands_off_credentials_without_requiring_optional_services(
+    tmp_path: Path, role: str, services: str
+):
+    entrypoint = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text()
+    handoff = entrypoint[
+        entrypoint.index('CREDENTIAL_HANDOFF_DIR=""') : entrypoint.index(
+            'rm -f "$GIT_ASKPASS_FILE"'
+        )
+    ].replace("/tmp/senpai-supervisor.", str(tmp_path / "handoff."))
+    handoff += '''
+test "${GITHUB_TOKEN+x}${GH_TOKEN+x}${WANDB_API_KEY+x}${EXA_API_KEY+x}" = ""
+printf '%s\\n' "$SENPAI_GITHUB_TOKEN_FILE" "${SENPAI_WANDB_API_KEY_FILE:-}" "${SENPAI_EXA_API_KEY_FILE:-}"
+umask > "$UMASK_OUTPUT"
+'''
+    credential_names = ("GITHUB_TOKEN", "WANDB_API_KEY", "EXA_API_KEY")
+    env = {
+        key: value for key, value in os.environ.items()
+        if key not in credential_names
+        and key not in {f"SENPAI_{name}_FILE" for name in credential_names}
+    }
+    env |= {
+        "GITHUB_TOKEN": "github-fixture",
+        "GH_TOKEN": "github-alias-fixture",
+        "UMASK_OUTPUT": str(tmp_path / "umask"),
+    }
+    expected = ["github-fixture"]
+    if services != "absent":
+        expected += ["wandb-fixture", "exa-fixture"]
+    if services == "environment":
+        env |= {"WANDB_API_KEY": "wandb-fixture", "EXA_API_KEY": "exa-fixture"}
+    elif services == "files":
+        existing = tmp_path / "provided"
+        existing.mkdir(mode=0o700)
+        for name, value in zip(credential_names, expected, strict=True):
+            path = existing / name.lower()
+            path.write_text(value)
+            path.chmod(0o600)
+            env[f"SENPAI_{name}_FILE"] = str(path)
+
+    result = subprocess.run(
+        ["bash", "-e", "-c", "umask 0022\n" + handoff],
+        env=env, capture_output=True, text=True, check=True,
+    )
+
+    paths = result.stdout.splitlines()
+    assert len(paths) == 3
+    assert bool(paths[1]) == bool(paths[2]) == (services != "absent")
+    active_paths = [Path(path) for path in paths if path]
+    assert len({path.parent for path in active_paths}) == 1
+    assert active_paths[0].parent.stat().st_mode & 0o777 == 0o700
+    for path, value in zip(active_paths, expected, strict=True):
+        assert path.read_text() == value
+        assert path.stat().st_mode & 0o777 == 0o600
+    if services == "files":
+        assert active_paths[0].parent == existing
+    assert int((tmp_path / "umask").read_text().strip(), 8) == 0o22
 
 
 def test_manifests_expose_no_advisor_service_or_callback_credentials():

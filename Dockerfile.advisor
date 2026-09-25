@@ -65,7 +65,7 @@ RUN cd /tmp/senpai && \
 
 COPY scripts/senpai-browser-smoke-test.py /usr/local/bin/senpai-browser-smoke-test
 
-# Expose the pinned browser on PATH because launchers give roles a persistent HOME.
+# Expose the pinned browser on PATH for each role's runtime HOME.
 RUN uvx --from "playwright==${PLAYWRIGHT_VERSION}" \
       playwright install chromium --with-deps --no-shell && \
     chromium_path=$(find "$PLAYWRIGHT_BROWSERS_PATH" \
@@ -73,7 +73,7 @@ RUN uvx --from "playwright==${PLAYWRIGHT_VERSION}" \
     test -x "$chromium_path" && \
     ln -s "$chromium_path" /usr/local/bin/chromium && \
     chmod +x /usr/local/bin/senpai-browser-smoke-test && \
-    mkdir -p /workspace /workspaces /var/lib/senpai && \
+    mkdir -p /workspace/senpai /workspaces /var/lib/senpai && \
     chown -R 10001:10001 \
       /home/senpai /workspace /workspaces /var/lib/senpai && \
     rm -rf /root/.cache/uv /root/.config/browseruse /var/lib/apt/lists/*

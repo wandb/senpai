@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import yaml
@@ -256,22 +257,34 @@ def test_role_bootstrap_reuses_runner_checkout_without_touching_target(role, tmp
         command.index("askpass=") : command.index("exec bash")
     ]
     bootstrap = bootstrap.replace("/tmp/senpai-git-askpass", str(tmp_path / "askpass"))
-    token_handoff = tmp_path / "github-token"
     bootstrap = bootstrap.replace(
-        "/tmp/senpai-supervisor-github-token", str(token_handoff)
+        "/tmp/senpai-supervisor.", str(tmp_path / "handoff.")
     )
     bootstrap = bootstrap.replace("/workspace", str(workspace_root))
     umask_output = tmp_path / "umask"
-    bootstrap += '\numask > "$UMASK_OUTPUT"\n'
+    handoff_output = tmp_path / "handoffs"
+    bootstrap += '''
+test "${GITHUB_TOKEN+x}${GH_TOKEN+x}${WANDB_API_KEY+x}${EXA_API_KEY+x}" = ""
+printf '%s\\n' "$SENPAI_GITHUB_TOKEN_FILE" "$SENPAI_WANDB_API_KEY_FILE" "$SENPAI_EXA_API_KEY_FILE" >> "$HANDOFF_OUTPUT"
+umask > "$UMASK_OUTPUT"
+'''
     env = os.environ | {
-        "GITHUB_TOKEN": "unused",
+        "GITHUB_TOKEN": "github-fixture",
+        "GH_TOKEN": "github-alias-fixture",
+        "WANDB_API_KEY": "wandb-fixture",
+        "EXA_API_KEY": "exa-fixture",
         "SENPAI_IMAGE_REVISION": revision,
         "SENPAI_REPO_REVISION": revision,
         "SENPAI_REPO_URL": str(source),
         "UMASK_OUTPUT": str(umask_output),
+        "HANDOFF_OUTPUT": str(handoff_output),
     }
 
     subprocess.run(["bash", "-c", bootstrap], check=True, env=env)
+    first_handoffs = [Path(path) for path in handoff_output.read_text().splitlines()]
+    for path in first_handoffs:
+        path.unlink()
+    first_handoffs[0].parent.rmdir()
     target = runner / "target"
     target.mkdir()
     git(target, "init", "--quiet")
@@ -289,7 +302,17 @@ def test_role_bootstrap_reuses_runner_checkout_without_touching_target(role, tmp
     assert (target / "state.txt").read_text() == "in progress\n"
     assert git(runner, "remote", "get-url", "origin") == str(source)
     assert git(runner, "rev-parse", "HEAD") == revision
-    assert token_handoff.stat().st_mode & 0o777 == 0o600
+    new_handoffs = [Path(path) for path in handoff_output.read_text().splitlines()[3:]]
+    assert len(new_handoffs) == 3
+    handoff_dir = new_handoffs[0].parent
+    assert handoff_dir != first_handoffs[0].parent
+    assert handoff_dir.stat().st_mode & 0o777 == 0o700
+    for path, expected in zip(
+        new_handoffs, ("github-fixture", "wandb-fixture", "exa-fixture"), strict=True
+    ):
+        assert path.parent == handoff_dir
+        assert path.read_text() == expected
+        assert path.stat().st_mode & 0o777 == 0o600
     assert int(umask_output.read_text().strip(), 8) == 0o22
 
 
@@ -309,7 +332,7 @@ def test_multinode_kubectl_wrapper_can_be_reinstalled(tmp_path):
     kubectl = tmp_path / "state" / "bin" / "kubectl"
     assert kubectl.stat().st_mode & 0o777 == 0o500
     assert kubectl.read_text() == (
-        '#!/bin/sh\nexec "$SENPAI_PYTHON" -m senpai_agent.kubernetes_executor kubectl "$@"\n'
+        '#!/bin/sh\nexec "$SENPAI_PYTHON" -P -m senpai_agent.kubernetes_executor kubectl "$@"\n'
     )
     assert list(kubectl.parent.glob(".kubectl.*")) == []
 

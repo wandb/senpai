@@ -11,6 +11,18 @@ from launch_test_support import (
 )
 
 
+def program_context(tag):
+    program = launch.ProgramSystemPrompt("program.md", REVISION, "Research policy.")
+    name, secret = launch_helpers.render_program_context_secret(
+        tag, launch.encode_program_system_prompt(program)
+    )
+    return {
+        "program": program,
+        "program_secret_name": name,
+        "program_secret": secret,
+    }
+
+
 def render_student(**overrides):
     args = launch_args(
         advisor=False,
@@ -38,6 +50,7 @@ def render_student(**overrides):
                 secret_name,
                 secret,
                 args,
+                **program_context(args.tag),
             )
         )
     )
@@ -105,6 +118,7 @@ def test_single_node_student_keeps_local_gpu_resources_without_executor_rbac():
                 f"senpai-launch-secrets-{args.tag}",
                 secret,
                 args,
+                **program_context(args.tag),
             )
         )
     )
@@ -142,7 +156,9 @@ def test_advisor_placement_is_portable_by_default():
                 "ADVISOR_IMAGE",
                 "PVC_CLAIM_NAME",
                 "PVC_MOUNT_PATH",
+                "TARGET_WORKSPACE_MOUNT",
                 "LAUNCH_SECRET_NAME",
+                "PROGRAM_CONTEXT_SECRET_NAME",
                 "POD_CONFIG_HASH",
                 "CONTROLLER_NODE_SELECTOR",
             )

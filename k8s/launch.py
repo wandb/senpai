@@ -354,6 +354,39 @@ def validate_program_path(args: Args) -> None:
         sys.exit(f"ERROR: --program_path: {error}")
 
 
+def validate_mount_paths(args: Args) -> str:
+    problem_dir = args.problem_dir.removesuffix("/")
+    if (
+        not problem_dir
+        or problem_dir in {".", ".."}
+        or posixpath.isabs(problem_dir)
+        or posixpath.normpath(problem_dir) != problem_dir
+        or problem_dir.startswith("../")
+    ):
+        sys.exit("ERROR: --problem_dir must be a normalized relative child directory")
+    tracked_paths = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "-z"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split("\0")
+    runner_roots = {path.partition("/")[0] for path in tracked_paths if path}
+    if problem_dir.partition("/")[0] in runner_roots | {".git", ".agents", ".codex"}:
+        sys.exit("ERROR: --problem_dir must not cover tracked runner assets or metadata")
+    target_mount = f"/workspace/senpai/{problem_dir}"
+    if not posixpath.isabs(args.pvc_mount_path):
+        sys.exit("ERROR: --pvc_mount_path must be absolute")
+    pvc_mount = "/" + posixpath.normpath(args.pvc_mount_path).lstrip("/")
+    for private_mount in (target_mount, "/home/senpai/.venvs/senpai-target"):
+        if posixpath.commonpath((pvc_mount, private_mount)) in {pvc_mount, private_mount}:
+            sys.exit(
+                "ERROR: --pvc_mount_path must not overlap the target checkout "
+                "or target virtual environment"
+            )
+    args.problem_dir = problem_dir
+    return target_mount
+
+
 def build_launch_context(
     args: Args,
     tag: str,
@@ -668,6 +701,7 @@ def render_student(
     program_secret_name: str,
     program_secret: str,
 ) -> str:
+    target_workspace_mount = validate_mount_paths(args)
     student_configmap_name = f"senpai-config-student-{tag}-{student_name}"
     student_deployment_name = f"senpai-{tag}-{student_name}"
     configmap = render_configmap(
@@ -742,7 +776,8 @@ def render_student(
             "EXECUTOR_IMAGE": args.executor_image,
             "ADVISOR_BRANCH": args.advisor_branch,
             "PVC_CLAIM_NAME": args.pvc_claim_name,
-            "PVC_MOUNT_PATH": args.pvc_mount_path,
+            "PVC_MOUNT_PATH": json.dumps(args.pvc_mount_path),
+            "TARGET_WORKSPACE_MOUNT": json.dumps(target_workspace_mount),
             "LAUNCH_SECRET_NAME": secret_name,
             "STUDENT_SERVICE_ACCOUNT_NAME": (
                 f"senpai-training-{tag}-{student_name}"
@@ -804,6 +839,7 @@ def render_advisor(
     program_secret_name: str,
     program_secret: str,
 ) -> str:
+    target_workspace_mount = validate_mount_paths(args)
     advisor_configmap_name = f"senpai-config-advisor-{tag}"
     advisor_deployment_name = f"senpai-advisor-{tag}"
     data = {
@@ -856,7 +892,8 @@ def render_advisor(
             "RESEARCH_TAG": tag,
             "ADVISOR_IMAGE": args.advisor_image,
             "PVC_CLAIM_NAME": args.pvc_claim_name,
-            "PVC_MOUNT_PATH": args.pvc_mount_path,
+            "PVC_MOUNT_PATH": json.dumps(args.pvc_mount_path),
+            "TARGET_WORKSPACE_MOUNT": json.dumps(target_workspace_mount),
             "LAUNCH_SECRET_NAME": secret_name,
             "PROGRAM_CONTEXT_SECRET_NAME": program_secret_name,
             "POD_CONFIG_HASH": pod_template_hash(
@@ -912,6 +949,7 @@ def validated_student_resources(manifest: str, student_name: str) -> list[dict]:
 
 def main():
     args = sp.parse(Args, config_path=str(SENPAI_CONFIG), allow_abbrev=False)
+    validate_mount_paths(args)
     if min(
         args.nodes_per_student,
         args.gpus_per_student_node,

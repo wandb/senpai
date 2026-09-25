@@ -528,10 +528,11 @@ def render_program_context_secret(tag: str, program_context: str) -> tuple[str, 
 
 def render_template(template: str, replacements: dict[str, str]) -> str:
     """Replace {{PLACEHOLDER}} tokens in a K8s manifest template."""
-    out = template
-    for key, value in replacements.items():
-        out = out.replace(f"{{{{{key}}}}}", value)
-    return out
+    return re.sub(
+        r"\{\{(\w+)\}\}",
+        lambda match: replacements.get(match[1], match[0]),
+        template,
+    )
 
 
 def render_configmap(name: str, labels: dict[str, str], data: dict[str, str]) -> str:

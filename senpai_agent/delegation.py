@@ -54,6 +54,8 @@ from senpai_agent.PROMPTS import (
 from senpai_agent.secrets import (
     BUILTIN_CONVERSATION_SECRET_ENV_NAMES,
     CUSTOM_SECRET_ENV_NAMES_ENV,
+    MAX_MODEL_CREDENTIAL_BUNDLE_BYTES,
+    MODEL_CREDENTIALS_FD_ENV,
     configured_custom_secret_env_names,
     scrub_github_credentials,
 )
@@ -374,9 +376,10 @@ class OpenHandsChildProcess:
         configured_custom_secret_env_names(environment)
         environment.update(self._config.conversation_secrets)
         profiles = self._config.profiles()
-        environment.update(
-            {profile.api_key_env: profile.api_key for profile in profiles}
-        )
+        environment.pop(MODEL_CREDENTIALS_FD_ENV, None)
+        for profile in profiles:
+            if profile.api_key_env not in self._config.conversation_secrets:
+                environment.pop(profile.api_key_env, None)
         selected = self._config.profile(self._request.model)
         environment.update(
             {
@@ -462,6 +465,30 @@ class OpenHandsChildProcess:
         environment[SYSTEM_INSTRUCTIONS_SHA256_ENV] = instructions.content_sha256
         return environment
 
+    def _child_credentials(self) -> dict[str, str]:
+        """Supply each model profile without putting its key in the child env."""
+
+        credentials: dict[str, str] = {}
+        for profile in self._config.profiles():
+            existing = credentials.setdefault(profile.api_key_env, profile.api_key)
+            if existing != profile.api_key:
+                raise RuntimeError(
+                    "delegation profiles assign conflicting values to "
+                    f"{profile.api_key_env}"
+                )
+        return credentials
+
+    def _open_model_credentials_fd(self) -> int:
+        payload = json.dumps(
+            self._child_credentials(), separators=(",", ":"), sort_keys=True
+        ).encode()
+        if len(payload) > MAX_MODEL_CREDENTIAL_BUNDLE_BYTES:
+            raise RuntimeError("delegated model credential bundle is too large")
+        with tempfile.TemporaryFile() as stream:
+            stream.write(payload)
+            stream.seek(0)
+            return os.dup(stream.fileno())
+
     def start(
         self,
         task: str,
@@ -478,15 +505,22 @@ class OpenHandsChildProcess:
         ):
             input_stream.write(render_child_prompt(self._request, task))
             input_stream.seek(0)
-            process = subprocess.Popen(
-                self.command,
-                stdin=input_stream,
-                stdout=output_stream,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=self.environment,
-                start_new_session=True,
-            )
+            environment = self.environment
+            credential_fd = self._open_model_credentials_fd()
+            environment[MODEL_CREDENTIALS_FD_ENV] = str(credential_fd)
+            try:
+                process = subprocess.Popen(
+                    self.command,
+                    stdin=input_stream,
+                    stdout=output_stream,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=environment,
+                    start_new_session=True,
+                    pass_fds=(credential_fd,),
+                )
+            finally:
+                os.close(credential_fd)
         try:
             with self._lock:
                 self._process = process
