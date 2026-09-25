@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import re
 from pathlib import Path
@@ -68,6 +69,8 @@ class FakeCluster:
 
     def delete(self, resource, timeout_seconds=60):
         assert timeout_seconds <= 60
+        if self.resource_value is not None and self.resource_value.uid != resource.uid:
+            raise RuntimeError("refusing to delete replaced workload")
         self.deletions.append(resource)
         self.resource_value = None
 
@@ -224,6 +227,160 @@ def test_supervisor_retries_transient_status_and_release_failures(
     assert client.state_attempts == 2
     assert client.release_attempts == 2
     assert client.deletions == []
+
+
+@pytest.mark.parametrize("storage_errno", [errno.ENOSPC, errno.EDQUOT])
+@pytest.mark.parametrize("write_phase", ["resource", "terminal", "release"])
+def test_supervisor_recovers_result_persistence_after_storage_exhaustion(
+    tmp_path, monkeypatch, capsys, storage_errno, write_phase,
+):
+    client = FakeCluster()
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    storage_failed = threading.Event()
+    storage_restored = threading.Event()
+    retried = threading.Event()
+    write_text = Path.write_text
+
+    def exhausted_write(path, text, *args, **kwargs):
+        if path.parent == runtime.state_dir and path.suffix == ".tmp":
+            record = json.loads(text)
+            phase = (
+                "release" if record["kubernetes_released"] else
+                "terminal" if record["state"] != "running" else
+                "resource" if record["kubernetes_resource"] else "launch"
+            )
+            if phase == write_phase and not storage_restored.is_set():
+                if storage_failed.is_set():
+                    retried.set()
+                storage_failed.set()
+                raise OSError(storage_errno, "storage exhausted", str(path))
+        return write_text(path, text, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", exhausted_write)
+    spec = TrainingSpec(argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5)
+    started = runtime.run_training(spec)
+    try:
+        assert storage_failed.wait(2)
+        assert retried.wait(1), "result persistence stopped after the first storage error"
+        assert runtime.get_training_status(started.training_id).kubernetes_released is False
+        assert client.releases == ([started.training_id] if write_phase == "release" else [])
+        with pytest.raises(RuntimeError, match="already has an active"):
+            runtime.run_training(spec)
+        if write_phase != "resource":
+            client.state_value = TrainingState.FAILED
+        storage_restored.set()
+        runtime.drain()
+        result = runtime.get_training_status(started.training_id)
+        assert result.state is TrainingState.FINISHED
+        assert result.kubernetes_released is True
+        assert result.kubernetes_resource.uid == "remote-uid"
+        assert client.releases == [started.training_id]
+        assert client.deletions == []
+        client.state_value = TrainingState.FINISHED
+        following = runtime.run_training(spec)
+        runtime.drain()
+        assert runtime.get_training_status(following.training_id).state is TrainingState.FINISHED
+        assert "persistence recovered" in capsys.readouterr().err
+    finally:
+        storage_restored.set()
+        runtime.close()
+
+
+@pytest.mark.parametrize("storage_errno", [errno.ENOSPC, errno.EDQUOT])
+@pytest.mark.parametrize("write_phase", ["log", "summary"])
+def test_storage_exhaustion_in_optional_diagnostics_does_not_fail_training(
+    tmp_path, monkeypatch, capsys, storage_errno, write_phase,
+):
+    client = FakeCluster(state=TrainingState.RUNNING)
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    storage_failed = threading.Event()
+    open_path = Path.open
+    write_text = Path.write_text
+
+    def exhausted_log(path, mode="r", *args, **kwargs):
+        if path.parent == runtime.state_dir and path.suffix == ".log" and mode == "a":
+            storage_failed.set()
+            raise OSError(storage_errno, "storage exhausted", str(path))
+        return open_path(path, mode, *args, **kwargs)
+
+    def exhausted_summary(path, text, *args, **kwargs):
+        if path.parent == runtime.state_dir and path.suffix == ".tmp":
+            if json.loads(text)["kubernetes_diagnostics"]:
+                storage_failed.set()
+                raise OSError(storage_errno, "storage exhausted", str(path))
+        return write_text(path, text, *args, **kwargs)
+
+    if write_phase == "log":
+        monkeypatch.setattr(Path, "open", exhausted_log)
+    else:
+        monkeypatch.setattr(Path, "write_text", exhausted_summary)
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5,
+    ))
+    try:
+        assert storage_failed.wait(2)
+        client.state_value = TrainingState.FINISHED
+        runtime.drain()
+        result = runtime.get_training_status(started.training_id)
+        assert result.state is TrainingState.FINISHED
+        assert result.kubernetes_released is True
+        assert client.deletions == []
+        assert "diagnostics persistence skipped" in capsys.readouterr().err
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_close_during_terminal_storage_outage_recovers_only_original_workload(
+    tmp_path, monkeypatch, replacement,
+):
+    client = FakeCluster()
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    storage_failed = threading.Event()
+    storage_restored = threading.Event()
+    write_text = Path.write_text
+
+    def exhausted_terminal(path, text, *args, **kwargs):
+        if path.parent == runtime.state_dir and path.suffix == ".tmp":
+            if json.loads(text)["state"] != "running" and not storage_restored.is_set():
+                storage_failed.set()
+                raise OSError(errno.EDQUOT, "storage exhausted", str(path))
+        return write_text(path, text, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", exhausted_terminal)
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5,
+    ))
+    assert storage_failed.wait(2)
+    runtime.close()
+    assert client.releases == []
+    assert client.deletions == []
+    original = runtime.get_training_status(started.training_id).kubernetes_resource
+    resource = original.model_copy(update={"uid": "replacement-uid"}) if replacement else original
+    reserve = client.reserve
+
+    def preserve_remote_identity(*args):
+        reserve(*args)
+        client.resource_value = resource
+
+    monkeypatch.setattr(client, "reserve", preserve_remote_identity)
+    storage_restored.set()
+    recovered = KubernetesTrainingSupervisor(
+        workspace=workspace, state_dir=runtime.state_dir, nodes=2, gpus_per_node=8,
+        poll_seconds=0.01, client=client,
+    )
+    if not replacement:
+        recovered.drain()
+    recovered.close()
+    result = recovered.get_training_status(started.training_id)
+    assert result.state is (TrainingState.FAILED if replacement else TrainingState.FINISHED)
+    assert result.kubernetes_resource == original
+    assert client.deletions == []
+    assert client.adoptions == ([] if replacement else [original])
+    assert client.releases == ([] if replacement else [started.training_id])
+    assert result.kubernetes_released is (not replacement)
+    if replacement:
+        assert client.resource_value == resource
 
 
 def test_source_bundle_ignores_replace_refs_and_replaces_poisoned_artifacts(

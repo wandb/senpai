@@ -250,6 +250,17 @@ instead of disappearing silently. These reads stay inside the executor broker;
 students receive neither Kubernetes credentials nor namespace-wide read access.
 When a smoke run stalls before W&B starts, inspect these diagnostics first.
 
+If the controller's state volume fills or exceeds its quota, an active Kubernetes
+monitor retries result writes with backoff and reports the pending write to
+container stderr. It keeps an observed terminal outcome until it can persist
+that outcome, release the workload, and persist the release acknowledgement.
+The student slot remains occupied until those writes succeed. Optional
+diagnostic writes can be skipped without failing the workload. Closing the
+controller interrupts storage retries; after storage recovers, restart recovery
+uses the last durable record and the existing workload UID. A terminal decision
+that could not be persisted cannot survive process loss, so broker deadlines
+and normal recovery rules still apply.
+
 The launcher creates routing labels, one launch Secret, role ConfigMaps, and Deployments. Multi-node students also receive one namespaced ServiceAccount, Role, and RoleBinding. It does not create the namespace, PVC, Service, or cluster-wide RBAC.
 
 Student launches are create-only. Before the first write, the launcher rejects

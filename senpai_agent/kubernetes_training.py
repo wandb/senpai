@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
 import socket
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -1062,7 +1064,8 @@ class KubernetesTrainingSupervisor:
                             f"submission finished without creating {active.spec.kind} "
                             f"{active.spec.namespace}/{active.spec.name}"
                         )
-                    self._publish_resource(training_id, active)
+                    if not self._publish_resource(training_id, active):
+                        return
                 elif exit_code not in {None, 0}:
                     delete_required = True
 
@@ -1153,7 +1156,8 @@ class KubernetesTrainingSupervisor:
                 "kubernetes_released": False,
             }
         )
-        self._write_result(terminal)
+        if not self._persist_result(terminal):
+            return
         self._release_terminal(training_id, active, delete_required)
 
     def _capture_diagnostics(
@@ -1193,11 +1197,21 @@ class KubernetesTrainingSupervisor:
         summary = diagnostics.encode()[:_ERROR_TAIL_BYTES].decode(errors="ignore")
         result = self.get_training_status(training_id)
         if summary != result.kubernetes_diagnostics:
-            with active.log_path.open("a") as log:
-                log.write("\n=== Kubernetes workload diagnostics ===\n" + diagnostics + "\n")
-            self._write_result(
-                result.model_copy(update={"kubernetes_diagnostics": summary})
-            )
+            try:
+                with active.log_path.open("a") as log:
+                    log.write("\n=== Kubernetes workload diagnostics ===\n" + diagnostics + "\n")
+                self._write_result(
+                    result.model_copy(update={"kubernetes_diagnostics": summary})
+                )
+            except OSError as error:
+                if error.errno not in {errno.ENOSPC, errno.EDQUOT}:
+                    raise
+                print(
+                    f"Kubernetes diagnostics persistence skipped: training_id={training_id} "
+                    f"path={error.filename} errno={error.errno}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         active.diagnostics_future = None
         active.next_diagnostics_at = time.monotonic() + _DIAGNOSTICS_SECONDS
 
@@ -1222,7 +1236,8 @@ class KubernetesTrainingSupervisor:
                 elif self._shutdown.wait(self.poll_seconds):
                     return
         result = self.get_training_status(training_id)
-        self._write_result(result.model_copy(update={"kubernetes_released": True}))
+        if not self._persist_result(result.model_copy(update={"kubernetes_released": True})):
+            return
         with self._lock:
             self._active.pop(training_id, None)
 
@@ -1237,11 +1252,40 @@ class KubernetesTrainingSupervisor:
         self,
         training_id: str,
         active: _ActiveRemoteTraining,
-    ) -> None:
+    ) -> bool:
         result = self.get_training_status(training_id)
-        self._write_result(
+        return self._persist_result(
             result.model_copy(update={"kubernetes_resource": active.resource})
         )
+
+    def _persist_result(self, result: TrainingResult) -> bool:
+        retry_seconds = min(self.poll_seconds, 30.0)
+        deferred = False
+        while True:
+            try:
+                self._write_result(result)
+                break
+            except OSError as error:
+                if error.errno not in {errno.ENOSPC, errno.EDQUOT}:
+                    raise
+                deferred = True
+                print(
+                    f"Kubernetes result persistence deferred: training_id={result.training_id} "
+                    f"state={result.state.value} released={result.kubernetes_released} "
+                    f"path={error.filename} errno={error.errno} retry_seconds={retry_seconds}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if self._shutdown.wait(retry_seconds):
+                    return False
+                retry_seconds = min(retry_seconds * 2, 30.0)
+        if deferred:
+            print(
+                f"Kubernetes result persistence recovered: training_id={result.training_id}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return True
 
     def _write_result(self, result: TrainingResult) -> None:
         path = self.state_dir / f"{result.training_id}.json"
