@@ -242,23 +242,25 @@ def test_editing_the_latest_human_comment_creates_a_new_event_version(monkeypatc
     assert edited.payload["human_message_id"] == first.payload["human_message_id"]
 
 
-def test_editing_the_omitted_prefix_of_a_long_human_message_versions_it(
+def test_editing_the_omitted_middle_of_a_long_human_message_versions_it(
     monkeypatch,
 ):
     advisor = mailbox()
     human_issue = issue()
-    human_issue["body"] = "prefix A\n" + "x" * 13_000
+    human_issue["body"] = "x" * 10_000 + "direction A" + "y" * 4_000
     monkeypatch.setattr(advisor, "_pulls", list)
     monkeypatch.setattr(advisor, "_issues", lambda: [human_issue])
     monkeypatch.setattr(advisor, "_issue_comments", lambda _issue: [])
     first = advisor.poll()[0]
 
-    human_issue["body"] = "prefix B\n" + "x" * 13_000
+    human_issue["body"] = "x" * 10_000 + "direction B" + "y" * 4_000
     edited = advisor.poll()[0]
 
-    assert "prefix A" in first.payload["message"]
-    assert "prefix B" in edited.payload["message"]
+    assert "direction A" not in first.payload["message"]
+    assert "direction B" not in edited.payload["message"]
     assert "open the event URL for full text" in edited.payload["message"]
+    assert edited.payload == first.payload
+    assert edited.to_prompt() == first.to_prompt()
     assert edited.dedupe_key != first.dedupe_key
 
 

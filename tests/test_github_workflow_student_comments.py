@@ -69,7 +69,7 @@ def test_student_comment_is_visible_idempotent_and_state_preserving():
     original = (
         fake.pr["body"],
         fake.pr["draft"],
-        fake.pr["labels"],
+        frozenset(fake.pr["labels"]),
         fake.pr["head_sha"],
     )
     client = workflow(fake, role="student")

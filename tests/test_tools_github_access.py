@@ -1,6 +1,8 @@
 import json
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from openhands.sdk.tool import Tool, resolve_tool
@@ -8,7 +10,6 @@ from pydantic import SecretStr
 
 from github_workflow_support import FakeGitHub, pull_request, workflow
 from senpai_agent.github import tools as github_tools_module
-from senpai_agent.github import PRManifestEntry, PRRetrievalResult
 from senpai_agent.github.tools import (
     GetPRsAction,
     GetPRsTool,
@@ -164,15 +165,48 @@ def test_both_roles_can_respond_to_a_verified_human_message(
     ]
 
 
-def test_get_prs_is_scoped_to_the_configured_repo_and_credential(tmp_path: Path):
+def test_get_prs_is_scoped_to_the_configured_repo_and_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
     workspace = tmp_path / "target"
     workspace.mkdir()
+    # Artifact placement must use the configured workspace over ambient state.
+    monkeypatch.setenv("SENPAI_OPENHANDS_WORKSPACE", str(tmp_path))
     calls = []
     configure_github_credentials(
         "acme/widgets",
         SecretStr("github-secret"),
         trusted_actor="senpai-bot",
     )
+    responses = {
+        "/search/issues": {
+            "incomplete_results": False,
+            "total_count": 0,
+            "items": [],
+        },
+        "/repos/acme/widgets/pulls/17": {
+            "number": 17,
+            "title": "Try spectral loss",
+            "head": {"sha": "abc123"},
+            "html_url": "https://github.test/acme/widgets/pull/17",
+            "body": "Complete context.",
+        },
+        "/repos/acme/widgets/issues/17/comments": [],
+        "/repos/acme/widgets/pulls/17/reviews": [],
+        "/repos/acme/widgets/pulls/17/comments": [],
+    }
+
+    @contextmanager
+    def urlopen(request, timeout):
+        calls.append(request)
+        payload = responses[urlsplit(request.full_url).path]
+        yield SimpleNamespace(
+            headers={},
+            read=lambda: json.dumps(payload).encode(),
+        )
+
+    monkeypatch.setattr("senpai_agent.github.http.request.urlopen", urlopen)
 
     try:
         tool = GetPRsTool.create(
@@ -180,24 +214,9 @@ def test_get_prs_is_scoped_to_the_configured_repo_and_credential(tmp_path: Path)
             workspace=workspace,
         )[0]
 
-        def retrieve(repo: str, **kwargs) -> PRRetrievalResult:
-            calls.append((repo, kwargs))
-            return PRRetrievalResult(
-                manifest=(
-                    PRManifestEntry(
-                        number=17,
-                        title="Try spectral loss",
-                        head_sha="abc123",
-                        url="https://github.test/acme/widgets/pull/17",
-                    ),
-                ),
-                markdown="# PR #17\n\nComplete context.\n",
-                path=None,
-            )
-
-        tool.executor.get_prs = retrieve
         with pytest.raises(PermissionError, match="configured GitHub credentials"):
             tool(GetPRsAction(repo="other/widgets"))
+        assert calls == []
 
         observation = tool(
             GetPRsAction(
@@ -208,12 +227,25 @@ def test_get_prs_is_scoped_to_the_configured_repo_and_credential(tmp_path: Path)
         )
 
         assert observation.manifest[0].head_sha == "abc123"
-        assert observation.to_llm_content[0].text.startswith("# PR #17")
-        assert calls[0][0] == "acme/widgets"
-        assert calls[0][1]["numbers"] == (17,)
-        assert calls[0][1]["search"] == "label:status:review"
-        assert calls[0][1]["target_workspace"] == workspace.resolve()
-        assert calls[0][1]["token"].get_secret_value() == "github-secret"
+        assert "Complete context." in observation.to_llm_content[0].text
+        requests_by_path = {
+            urlsplit(request.full_url).path: request for request in calls
+        }
+        assert requests_by_path.keys() == responses.keys()
+        assert all(
+            request.headers["Authorization"] == "Bearer github-secret"
+            for request in calls
+        )
+        search_query = urlsplit(requests_by_path["/search/issues"].full_url).query
+        assert parse_qs(search_query)["q"] == [
+            "repo:acme/widgets is:pr label:status:review"
+        ]
+        artifact = tool(
+            GetPRsAction(repo="acme/widgets", numbers=(17,), max_inline_prs=0)
+        )
+        assert artifact.path is not None
+        assert Path(artifact.path).parent == tmp_path / "state" / "github"
+        assert "Complete context." in Path(artifact.path).read_text()
     finally:
         clear_github_credentials()
 
@@ -222,12 +254,13 @@ def test_get_prs_artifacts_must_live_outside_the_target_checkout(tmp_path: Path)
     workspace = tmp_path / "target"
     workspace.mkdir()
 
-    with pytest.raises(ValueError, match="outside the target workspace"):
-        GetPRsTool.create(
-            get_prs_fn=lambda *_args, **_kwargs: PRRetrievalResult((), "", None),
-            state_dir=workspace / "state",
-            workspace=workspace,
-        )
+    configure_github_credentials("acme/widgets", SecretStr("github-secret"))
+
+    try:
+        with pytest.raises(ValueError, match="outside the target workspace"):
+            GetPRsTool.create(state_dir=workspace / "state", workspace=workspace)
+    finally:
+        clear_github_credentials()
 
 
 def test_registered_github_tools_ignore_ambient_write_tokens(
