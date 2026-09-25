@@ -457,9 +457,16 @@ Terminals and supervised training use a separate writable environment at
 `$HOME/.venvs/senpai-target`. Its packages take precedence over the image's
 read-only packages. `python`, `uv pip install`, and `uv run` select that target
 environment through `PATH`, `VIRTUAL_ENV`, `UV_PYTHON`, and
-`UV_PROJECT_ENVIRONMENT`. Custom shell startup files can still override these
-terminal settings. Bootstrap creates it without running `ensurepip`;
-use `uv pip install` to add dependencies (including `pip` if needed).
+`UV_PROJECT_ENVIRONMENT`. Senpai applies these settings after shell startup,
+preserves other PATH entries, and allows later commands to change their
+session environment. Bootstrap creates it without running `ensurepip`.
+The image supplies pip through the shared package path: use
+`python -m pip install` for additive installs that reuse image packages.
+uv does not inspect packages exposed through that path, so `uv pip install`
+and `uv sync` can install separate copies, including large CUDA dependencies.
+Use `uv pip install --no-deps` when all required dependencies are already
+available, and `uv run --no-sync` to run with the installed package set.
+Sync the target lock when a separate dependency set is intended.
 Training retains normal project imports. File-defined child agents use the
 same Senpai terminal policy, timeouts, and target environment as their parent.
 
@@ -473,6 +480,12 @@ The bundled Exa and W&B skill integrations, browser tools, and typed GitHub,
 training, and delegation tools remain available. Operators who need an
 additional runtime plugin must review and include it in the trusted image
 plugin; copying it into a target or home plugin directory does not enable it.
+
+The target venv follows the lifetime of HOME. The standard Kubernetes
+Deployments do not persist HOME, so container replacement reinstalls target
+dependencies. Custom launchers must also point the trusted hook manifest at
+their absolute trusted Python interpreter with `-P`; the bundled manifest
+uses `/opt/senpai-venv/bin/python`.
 
 To build another launcher, reproduce [entrypoint-advisor.sh](k8s/entrypoint-advisor.sh) or [entrypoint-student.sh](k8s/entrypoint-student.sh), render `SENPAI-LAUNCH-CONTEXT.md` with runtime identity, limits, and isolation through `render_launch_context`, and provide it as base64 in `SENPAI_LAUNCH_CONTEXT_B64`. Pass the built-in role template and its required non-secret values to the Python supervisor, which renders and persists that role snapshot. Keep optional operator guidance in `EXTRA_INSTRUCTIONS_B64`. Persist `/var/lib/senpai/<tag>/advisor` for the advisor and use the container healthcheck with a restart policy. Student execution requires Linux, an NVIDIA runtime, and compatible CUDA hardware; Docker Desktop on macOS cannot run the GPU student image.
 
