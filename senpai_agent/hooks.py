@@ -182,7 +182,7 @@ _GIT_TERMINAL_COMMANDS = {
 
 def _without_shell_data(command: str, workspace: Path) -> str:
     """Mask case patterns and quoted heredoc data before flat tokenization."""
-    if "<<" not in command and "case" not in command:
+    if not any(mark in command for mark in ("<", ">", "case")):
         return command
 
     import tree_sitter_bash
@@ -202,6 +202,11 @@ def _without_shell_data(command: str, workspace: Path) -> str:
     nodes = [tree.root_node]
     while nodes:
         node = nodes.pop()
+        if node.type == "file_redirect":
+            # Bash grammar attaches later argv words as extra destinations.
+            destination = node.child_by_field_name("destination")
+            if destination is not None:
+                spans.append((node.start_byte, destination.end_byte))
         if node.type == "case_item":
             # _bash_commands checks substitutions in the original pattern.
             pattern_end = next(child for child in node.children if child.type == ")")
@@ -231,15 +236,21 @@ def _heredoc_feeds_data_sinks(node: object, source: bytes, workspace: Path) -> b
     statement = node.parent
     if statement is None or statement.type != "redirected_statement":
         return False
+    ancestor = statement.parent
+    while ancestor is not None:
+        if ancestor.type in {
+            "pipeline", "command_substitution", "process_substitution", "redirected_statement"
+        }:
+            return False
+        ancestor = ancestor.parent
     for child in _descendants(statement):
         if child.type == "process_substitution":
             return False
-        if (
-            child.type == "file_redirect"
-            and _redirects_stdout(child, source)
-            and not _redirects_stdout_to_literal_file(child, source)
-        ):
-            return False
+        if child.type == "file_redirect":
+            if any(operator.type in {">&", "<&"} for operator in child.children):
+                return False
+            if _redirects_stdout(child, source) and not _redirects_stdout_to_literal_file(child, source):
+                return False
     consumers = [statement.child_by_field_name("body")]
     for child in node.children:
         if child.type == "pipeline":
@@ -268,6 +279,12 @@ def _is_heredoc_data_sink(node: object, source: bytes, workspace: Path) -> bool:
     if not arguments or _shell_program(arguments[0], workspace) is not None:
         return False
     program = Path(arguments[0]).name
+    if program == "tee" and any(
+        argument.startswith(("/dev/fd/", "/proc/"))
+        or argument in {"/dev/stdout", "/dev/stderr"}
+        for argument in arguments[1:]
+    ):
+        return False
     return program in {"cat", "tee"} or re.fullmatch(
         r"python(?:[0-9]+(?:[.][0-9]+)*)?", program
     ) is not None
@@ -338,6 +355,13 @@ def _heredoc_runs_shell(owner: object, source: bytes, workspace: Path) -> bool:
             return True
         if Path(words[0]).name in _COMMAND_RUNNERS | {"env", "exec", "timeout", "uv"}:
             arguments = shlex.split(source[node.start_byte : node.end_byte].decode())
+            if node.parent is not None and node.parent.type == "redirected_statement":
+                for redirect in node.parent.children_by_field_name("redirect"):
+                    if redirect.type == "file_redirect":
+                        for argument in redirect.children_by_field_name("destination")[1:]:
+                            arguments.extend(
+                                shlex.split(source[argument.start_byte : argument.end_byte].decode())
+                            )
             if any(_shell_program(word, workspace) is not None for word in arguments[1:]):
                 return True
     return False
@@ -377,13 +401,26 @@ def _bash_commands(command: str, workspace: Path) -> list[str] | None:
         if node.type in _POLICY_NODE_TYPES
     ]
     has_functions = any(node.type == "function_definition" for node in nodes)
+    has_shell = _heredoc_runs_shell(tree.root_node, source, workspace)
     for node in nodes:
+        if (
+            node.type == "file_redirect"
+            and any(child.type in {"<", "<&"} for child in node.children)
+            and _heredoc_runs_shell(node.parent, source, workspace)
+            and (
+                any(child.type == "<&" for child in node.children)
+                or any(child.type == "process_substitution" for child in _descendants(node))
+            )
+        ):
+            return None
         if node.type != "heredoc_redirect":
             continue
         owner = node.parent
         if owner is None:
             continue
-        if not has_functions and not _heredoc_runs_shell(owner, source, workspace):
+        if not has_functions and (
+            not has_shell or _heredoc_feeds_data_sinks(node, source, workspace)
+        ):
             continue
         body = next((child for child in node.children if child.type == "heredoc_body"), None)
         if body is None:
@@ -874,7 +911,7 @@ def _runner_policy(
     grammar = _ARGV_RUNNER_OPTIONS.get(program)
     if grammar is not None:
         try:
-            options, command = getopt.getopt(_without_redirections(arguments), *grammar)
+            options, command = getopt.getopt(arguments, *grammar)
         except getopt.GetoptError:
             return PolicyDecision(False, f"Senpai could not parse `{program}` safely.")
         if any(
@@ -993,7 +1030,7 @@ def _segment_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
     if program in _SHELL_BODY_PREFIXES or program_token in _FIND_EXEC_ACTIONS:
         return _segment_policy(arguments, workspace)
     if program == "env":
-        command = _env_command(_without_redirections(arguments))
+        command = _env_command(arguments)
         assignment_count = next(
             (position for position, argument in enumerate(command) if "=" not in argument),
             len(command),
