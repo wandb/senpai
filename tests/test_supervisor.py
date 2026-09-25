@@ -308,6 +308,7 @@ with os.fdopen(token_fd) as token_stream:
 private = {}
 for name, fd_name in {
     "wandb": "SENPAI_WANDB_API_KEY_FD",
+    "writer": "SENPAI_WANDB_TRAINING_API_KEY_FD",
     "exa": "SENPAI_EXA_API_KEY_FD",
 }.items():
     with os.fdopen(int(os.environ[fd_name])) as stream:
@@ -320,6 +321,7 @@ with (state / "observations").open("a") as output:
         "gh_env": os.environ.get("GH_TOKEN"),
         "wandb_env": os.environ.get("WANDB_API_KEY"),
         "exa_env": os.environ.get("EXA_API_KEY"),
+        "writer_env": os.environ.get("SENPAI_WANDB_TRAINING_API_KEY"),
         "token_file_env": os.environ.get("SENPAI_GITHUB_TOKEN_FILE"),
     }) + "\\n")
 
@@ -341,6 +343,7 @@ raise SystemExit(19)
         github_token=SecretStr("write-token-sentinel"),
         private_credentials={
             "WANDB_API_KEY": SecretStr("wandb-controller-sentinel"),
+            "SENPAI_WANDB_TRAINING_API_KEY": SecretStr("writer-sentinel"),
             "EXA_API_KEY": SecretStr("exa-sentinel"),
         },
         environment={
@@ -348,6 +351,7 @@ raise SystemExit(19)
             "GITHUB_TOKEN": "must-not-survive",
             "GH_TOKEN": "must-not-survive",
             "WANDB_API_KEY": "must-not-survive",
+            "SENPAI_WANDB_TRAINING_API_KEY": "must-not-survive",
             "EXA_API_KEY": "must-not-survive",
         },
         config=SupervisorConfig(
@@ -385,6 +389,7 @@ raise SystemExit(19)
         item["private"]
         == {
             "wandb": "wandb-controller-sentinel",
+            "writer": "writer-sentinel",
             "exa": "exa-sentinel",
         }
         for item in observations
@@ -393,6 +398,7 @@ raise SystemExit(19)
     assert all(item["gh_env"] is None for item in observations)
     assert all(item["wandb_env"] is None for item in observations)
     assert all(item["exa_env"] is None for item in observations)
+    assert all(item["writer_env"] is None for item in observations)
     assert all(item["token_file_env"] is None for item in observations)
     assert not list(tmp_path.glob(".github-token-*"))
 
@@ -839,6 +845,7 @@ def test_private_service_handoff_files_are_consumed_once(tmp_path: Path):
     environment = {}
     for credential, file_env in {
         "WANDB_API_KEY": "SENPAI_WANDB_API_KEY_FILE",
+        "SENPAI_WANDB_TRAINING_API_KEY": "SENPAI_WANDB_TRAINING_API_KEY_FILE",
         "EXA_API_KEY": "SENPAI_EXA_API_KEY_FILE",
     }.items():
         path = tmp_path / credential.lower()

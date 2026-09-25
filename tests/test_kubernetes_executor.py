@@ -87,6 +87,7 @@ def executor(tmp_path: Path, client: FakeApi | None = None) -> KubernetesExecuto
         snapshot_root=tmp_path / "snapshots",
         executor_image="executor@sha256:" + "a" * 64,
         launch_secret_name="senpai-launch-secrets-fred",
+        writer_secret_name="senpai-wandb-student-fred-fern-writer",
         research_tag="fred",
         student_name="fern",
         pod_name="senpai-fred-fern-123",
@@ -392,7 +393,7 @@ def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(
         "name": "WANDB_API_KEY",
         "valueFrom": {
             "secretKeyRef": {
-                "name": "senpai-launch-secrets-fred",
+                "name": "senpai-wandb-student-fred-fern-writer",
                 "key": "wandb-api-key",
             }
         },
@@ -603,6 +604,19 @@ def test_executor_rejects_a_dataset_mount_replaced_by_the_workspace(tmp_path):
             ),
             "elevate privileges",
         ),
+    ] + [
+        (
+            lambda value, name=name: value["spec"]["mpiReplicaSpecs"]["Worker"][
+                "template"
+            ]["spec"]["containers"][0]["env"].append({"name": name, "value": "override"}),
+            name,
+        )
+        for name in (
+            "WANDB_SERVICE",
+            "WANDB_IDENTITY_TOKEN_FILE",
+            "WANDB_INFERENCE_API_KEY",
+            "SENPAI_WANDB_TRAINING_API_KEY",
+        )
     ],
 )
 def test_executor_rejects_privileged_or_out_of_shape_manifests(

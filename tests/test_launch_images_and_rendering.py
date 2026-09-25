@@ -7,12 +7,12 @@ from pathlib import Path
 
 import pytest
 import yaml
-
 from git_workflow_support import commit_file, git, repository
 from launch_test_support import (
     ADVISOR_IMAGE,
     ROOT,
     REVISION,
+    ROOT,
     STUDENT_IMAGE,
     launch,
     launch_args,
@@ -242,37 +242,48 @@ def test_role_bootstrap_verifies_both_checkout_and_image_source_revision(role):
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
-def test_role_bootstrap_reuses_runner_checkout_without_touching_target(role, tmp_path):
+def test_role_bootstrap_reuses_runner_checkout_without_touching_target(
+    role, tmp_path
+):
     source_root = tmp_path / "source"
     source_root.mkdir()
     source, _remote, revision = repository(source_root)
 
     _configmap, deployment, _secret = render_role(role)
-    command = yaml.safe_load(deployment)["spec"]["template"]["spec"]["containers"][
-        0
-    ]["args"][0]
+    command = yaml.safe_load(deployment)["spec"]["template"]["spec"][
+        "containers"
+    ][0]["args"][0]
     workspace_root = tmp_path / "workspace"
     runner = workspace_root / "senpai"
-    bootstrap = "set -e\numask 022\n" + command[
-        command.index("askpass=") : command.index("exec bash")
-    ]
-    bootstrap = bootstrap.replace("/tmp/senpai-git-askpass", str(tmp_path / "askpass"))
+    bootstrap = (
+        "set -e\numask 022\n"
+        + command[command.index("askpass=") : command.index("exec bash")]
+    )
+    bootstrap = bootstrap.replace(
+        "/tmp/senpai-git-askpass", str(tmp_path / "askpass")
+    )
     bootstrap = bootstrap.replace(
         "/tmp/senpai-supervisor.", str(tmp_path / "handoff.")
     )
     bootstrap = bootstrap.replace("/workspace", str(workspace_root))
     umask_output = tmp_path / "umask"
     handoff_output = tmp_path / "handoffs"
-    bootstrap += '''
+    bootstrap += """
 test "${GITHUB_TOKEN+x}${GH_TOKEN+x}${WANDB_API_KEY+x}${EXA_API_KEY+x}" = ""
 printf '%s\\n' "$SENPAI_GITHUB_TOKEN_FILE" "$SENPAI_WANDB_API_KEY_FILE" "$SENPAI_EXA_API_KEY_FILE" >> "$HANDOFF_OUTPUT"
 umask > "$UMASK_OUTPUT"
-'''
+"""
+    expected_handoffs = ["github-fixture", "wandb-fixture", "exa-fixture"]
+    if role == "student":
+        bootstrap += '\ntest "${SENPAI_WANDB_TRAINING_API_KEY+x}" = ""\n'
+        bootstrap += """printf '%s\\n' "$SENPAI_WANDB_TRAINING_API_KEY_FILE" >> "$HANDOFF_OUTPUT"\n"""
+        expected_handoffs.append("writer-fixture")
     env = os.environ | {
         "GITHUB_TOKEN": "github-fixture",
         "GH_TOKEN": "github-alias-fixture",
         "WANDB_API_KEY": "wandb-fixture",
         "EXA_API_KEY": "exa-fixture",
+        "SENPAI_WANDB_TRAINING_API_KEY": "writer-fixture",
         "SENPAI_IMAGE_REVISION": revision,
         "SENPAI_REPO_REVISION": revision,
         "SENPAI_REPO_URL": str(source),
@@ -281,7 +292,9 @@ umask > "$UMASK_OUTPUT"
     }
 
     subprocess.run(["bash", "-c", bootstrap], check=True, env=env)
-    first_handoffs = [Path(path) for path in handoff_output.read_text().splitlines()]
+    first_handoffs = [
+        Path(path) for path in handoff_output.read_text().splitlines()
+    ]
     for path in first_handoffs:
         path.unlink()
     first_handoffs[0].parent.rmdir()
@@ -302,14 +315,17 @@ umask > "$UMASK_OUTPUT"
     assert (target / "state.txt").read_text() == "in progress\n"
     assert git(runner, "remote", "get-url", "origin") == str(source)
     assert git(runner, "rev-parse", "HEAD") == revision
-    new_handoffs = [Path(path) for path in handoff_output.read_text().splitlines()[3:]]
-    assert len(new_handoffs) == 3
+    new_handoffs = [
+        Path(path)
+        for path in handoff_output.read_text().splitlines()[
+            len(expected_handoffs) :
+        ]
+    ]
+    assert len(new_handoffs) == len(expected_handoffs)
     handoff_dir = new_handoffs[0].parent
     assert handoff_dir != first_handoffs[0].parent
     assert handoff_dir.stat().st_mode & 0o777 == 0o700
-    for path, expected in zip(
-        new_handoffs, ("github-fixture", "wandb-fixture", "exa-fixture"), strict=True
-    ):
+    for path, expected in zip(new_handoffs, expected_handoffs, strict=True):
         assert path.parent == handoff_dir
         assert path.read_text() == expected
         assert path.stat().st_mode & 0o777 == 0o600
@@ -465,6 +481,8 @@ def test_launch_secret_contains_each_credential_and_both_roles_reference_it():
 
     _configmap, _deployment, secret = render_role("advisor")
     secret_document = yaml.safe_load(secret)
+    secret_name = secret_document["metadata"]["name"]
+    assert secret_document["immutable"] is True
     assert {
         key: base64.b64decode(value).decode()
         for key, value in secret_document["data"].items()
@@ -479,24 +497,33 @@ def test_launch_secret_contains_each_credential_and_both_roles_reference_it():
             item["name"]: item["valueFrom"]["secretKeyRef"]
             for item in container["env"]
         }
-        assert references == {
+        expected_references = {
             "GITHUB_TOKEN": {
-                "name": "senpai-launch-secrets-test-track",
+                "name": secret_name,
                 "key": "github-token",
             },
             "ANTHROPIC_API_KEY": {
-                "name": "senpai-launch-secrets-test-track",
+                "name": secret_name,
                 "key": "anthropic-api-key",
             },
             "EXA_API_KEY": {
-                "name": "senpai-launch-secrets-test-track",
+                "name": secret_name,
                 "key": "exa-api-key",
             },
             "WANDB_API_KEY": {
-                "name": "senpai-launch-secrets-test-track",
+                "name": secret_name,
                 "key": "wandb-api-key",
             },
         }
+
+        if role == "student":
+            expected_references["SENPAI_WANDB_TRAINING_API_KEY"] = {
+                "name": launch_helpers.render_student_wandb_secret(
+                    "test-track", "fern", "wandb-training-fern", "viewer-fern"
+                )[0],
+                "key": "wandb-api-key",
+            }
+        assert references == expected_references
 
 
 def test_secret_env_refs_preserve_environment_names_and_secret_keys():
@@ -537,7 +564,9 @@ def test_custom_secrets_are_shared_by_both_roles_without_entering_configmaps():
     for role in ("advisor", "student"):
         configmap, deployment, secret = render_role(role, args)
         config = yaml.safe_load(configmap)["data"]
-        secret_data = yaml.safe_load(secret)["data"]
+        secret_document = yaml.safe_load(secret)
+        secret_name = secret_document["metadata"]["name"]
+        secret_data = secret_document["data"]
         environment = yaml.safe_load(deployment)["spec"]["template"]["spec"][
             "containers"
         ][0]["env"]
@@ -554,7 +583,7 @@ def test_custom_secrets_are_shared_by_both_roles_without_entering_configmaps():
         } == {name: f"{name.lower()}-secret" for name in names}
         assert references == {
             name: {
-                "name": "senpai-launch-secrets-test-track",
+                "name": secret_name,
                 "key": name,
             }
             for name in names
@@ -686,7 +715,11 @@ def test_launch_rejects_unsupported_reasoning_effort(overrides, message):
     [
         ("anthropic/claude-opus-4-8", "ANTHROPIC_API_KEY", "anthropic-api-key"),
         ("openai/gpt-5.6-sol", "OPENAI_API_KEY", "openai-api-key"),
-        ("wandb/zai-org/GLM-5.2", "WANDB_API_KEY", "wandb-api-key"),
+        (
+            "wandb/zai-org/GLM-5.2",
+            "WANDB_INFERENCE_API_KEY",
+            "wandb-inference-api-key",
+        ),
     ],
 )
 def test_roles_mount_only_the_provider_used_by_their_models(
@@ -707,7 +740,12 @@ def test_roles_mount_only_the_provider_used_by_their_models(
     ][0]["env"]
     environment_names = [item["name"] for item in environment]
 
-    assert secret_keys == {"github-token", secret_key, "exa-api-key", "wandb-api-key"}
+    assert secret_keys == {
+        "github-token",
+        secret_key,
+        "exa-api-key",
+        "wandb-api-key",
+    }
     assert len(environment_names) == len(set(environment_names))
     assert set(environment_names) == {
         "GITHUB_TOKEN",
@@ -735,9 +773,17 @@ def test_role_mounts_include_its_main_model_and_shared_profiles_only():
         ][0]["env"]
         mounted[role] = {item["name"] for item in environment}
 
-    common = {"GITHUB_TOKEN", "ANTHROPIC_API_KEY", "EXA_API_KEY", "WANDB_API_KEY"}
+    common = {
+        "GITHUB_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "EXA_API_KEY",
+        "WANDB_API_KEY",
+    }
     assert mounted["advisor"] == common
-    assert mounted["student"] == common | {"OPENAI_API_KEY"}
+    assert mounted["student"] == common | {
+        "OPENAI_API_KEY",
+        "SENPAI_WANDB_TRAINING_API_KEY",
+    }
 
 
 def test_pod_template_hash_covers_complete_config_and_secret_content():
@@ -779,6 +825,65 @@ def test_rendered_role_annotation_matches_its_effective_content_hash(role):
     _name, program_secret = launch_helpers.render_program_context_secret(
         "test-track", launch.encode_program_system_prompt(program)
     )
-    assert annotation == launch_helpers.pod_template_hash(
-        configmap, secret, program_secret
+    resources = [configmap, secret, program_secret]
+    if role == "student":
+        _name, writer_secret = launch_helpers.render_student_wandb_secret(
+            "test-track", "fern", "wandb-training-fern", "viewer-fern"
+        )
+        resources.append(writer_secret)
+    assert annotation == launch_helpers.pod_template_hash(*resources)
+
+
+def test_student_writer_rotation_changes_its_secret_and_rollout_hash():
+    args = launch_args()
+    template = (ROOT / "k8s" / "student-deployment.yaml").read_text()
+    program = launch.ProgramSystemPrompt("program.md", REVISION, "Research policy.")
+    program_name, program_secret = launch_helpers.render_program_context_secret(
+        args.tag, launch.encode_program_system_prompt(program)
     )
+    deployments = []
+    for key in ("original-writer", "rotated-writer"):
+        name, writer_secret = launch_helpers.render_student_wandb_secret(
+            args.tag, "fern", key, "viewer-fern"
+        )
+        documents = list(
+            yaml.safe_load_all(
+                launch.render_student(
+                    template,
+                    "fern",
+                    args.tag,
+                    "shared-secret",
+                    "shared-manifest",
+                    name,
+                    writer_secret,
+                    "viewer-fern",
+                    "viewer-controller",
+                    None,
+                    args,
+                    program=program,
+                    program_secret_name=program_name,
+                    program_secret=program_secret,
+                )
+            )
+        )
+        deployments.append(documents[1]["spec"]["template"])
+        secret = yaml.safe_load(writer_secret)
+        assert secret["immutable"] is True
+        assert base64.b64decode(secret["data"]["wandb-api-key"]).decode() == key
+    assert (
+        deployments[0]["metadata"]["annotations"][
+            "senpai.wandb.com/content-hash"
+        ]
+        != deployments[1]["metadata"]["annotations"][
+            "senpai.wandb.com/content-hash"
+        ]
+    )
+    refs = [
+        next(
+            item["valueFrom"]["secretKeyRef"]["name"]
+            for item in deployment["spec"]["containers"][0]["env"]
+            if item["name"] == "SENPAI_WANDB_TRAINING_API_KEY"
+        )
+        for deployment in deployments
+    ]
+    assert refs[0] != refs[1]

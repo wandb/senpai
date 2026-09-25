@@ -15,6 +15,7 @@ import yaml
 
 from git_workflow_support import commit_file, git, repository
 from launch_test_support import launch_args, render_role
+from senpai_agent.program_context import encode_program_system_prompt, load_program_system_prompt
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -32,15 +33,19 @@ def bootstrap_runtime(tmp_path, role):
 import json, os, subprocess
 from pathlib import Path
 from senpai_agent.supervisor import _consume_github_token, _consume_private_credential_files
-names = ("SENPAI_GITHUB_TOKEN_FILE", "SENPAI_WANDB_API_KEY_FILE", "SENPAI_EXA_API_KEY_FILE")
+names = ["SENPAI_GITHUB_TOKEN_FILE", "SENPAI_WANDB_API_KEY_FILE", "SENPAI_EXA_API_KEY_FILE"]
+expected_services = {"WANDB_API_KEY": "wandb-fixture", "EXA_API_KEY": "exa-fixture"}
+if os.environ["SENPAI_ROLE"] == "student":
+    names.append("SENPAI_WANDB_TRAINING_API_KEY_FILE")
+    expected_services["SENPAI_WANDB_TRAINING_API_KEY"] = "writer-fixture"
 paths = [Path(os.environ[name]) for name in names]
-assert all(name not in os.environ for name in ("GITHUB_TOKEN", "GH_TOKEN", "WANDB_API_KEY", "EXA_API_KEY"))
+assert all(name not in os.environ for name in ("GITHUB_TOKEN", "GH_TOKEN", "WANDB_API_KEY", "EXA_API_KEY", "SENPAI_WANDB_TRAINING_API_KEY"))
 assert len({path.parent for path in paths}) == 1
 assert paths[0].parent.stat().st_mode & 0o777 == 0o700
 assert all(path.stat().st_mode & 0o777 == 0o600 for path in paths)
 assert _consume_github_token(os.environ).get_secret_value() == "github-fixture"
 services = _consume_private_credential_files(os.environ)
-assert {name: value.get_secret_value() for name, value in services.items()} == {"WANDB_API_KEY": "wandb-fixture", "EXA_API_KEY": "exa-fixture"}
+assert {name: value.get_secret_value() for name, value in services.items()} == expected_services
 assert all(not path.exists() for path in paths)
 safe_directories = subprocess.check_output(["git", "config", "--global", "--get-all", "safe.directory"], text=True).splitlines()
 with Path(os.environ["START_RECORD"]).open("a") as output:
@@ -74,6 +79,11 @@ with Path(os.environ["START_RECORD"]).open("a") as output:
     target_source_root = tmp_path / "target-source"
     target_source_root.mkdir()
     target_source, target_remote, target_baseline = repository(target_source_root)
+    target_baseline = commit_file(target_source, "program.md", "Research policy.\n", "program")
+    git(target_source, "push", "origin", "experiment-7")
+    snapshot = load_program_system_prompt(target_source, "program.md")
+    snapshot_file = tmp_path / "program-context.b64"
+    snapshot_file.write_text(encode_program_system_prompt(snapshot))
     if role == "student":
         git(target_source, "push", "origin", "HEAD:refs/heads/research")
 
@@ -99,6 +109,10 @@ with Path(os.environ["START_RECORD"]).open("a") as output:
         "SENPAI_REPO_URL": str(source),
         "SENPAI_REPO_REVISION": revision,
         "SENPAI_IMAGE_REVISION": revision,
+        "SENPAI_PROGRAM_PATH": snapshot.program_path,
+        "SENPAI_PROGRAM_SOURCE_COMMIT": snapshot.source_commit,
+        "SENPAI_PROGRAM_CONTENT_SHA256": snapshot.content_sha256,
+        "SENPAI_PROGRAM_CONTEXT_FILE": str(snapshot_file),
         "TARGET_REPO_URL": str(target_remote),
         "TARGET_REPO_BRANCH": "experiment-7",
         "PROBLEM_DIR": "target",
@@ -116,6 +130,8 @@ with Path(os.environ["START_RECORD"]).open("a") as output:
         "STARTUP_RECORDER": str(recorder),
         "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
     }
+    if role == "student":
+        environment["SENPAI_WANDB_TRAINING_API_KEY"] = "writer-fixture"
 
     def start():
         home.mkdir(parents=True, exist_ok=True)

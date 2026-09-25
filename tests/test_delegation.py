@@ -36,7 +36,11 @@ from senpai_agent.openhands_runner import (
     resolve_config,
 )
 from senpai_agent.program_context import PROGRAM_PATH_ENV, PROGRAM_SOURCE_COMMIT_ENV
-from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV, MODEL_CREDENTIALS_FD_ENV
+from senpai_agent.secrets import (
+    CUSTOM_SECRET_ENV_NAMES_ENV,
+    MODEL_CREDENTIALS_FD_ENV,
+    consume_model_credential_fd,
+)
 from senpai_agent.supervisor import prepare_system_context_environment
 from senpai_agent.system_instructions import (
     SYSTEM_INSTRUCTIONS_FILE_ENV,
@@ -245,6 +249,14 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
 
 
 def test_descendants_and_restarts_use_the_complete_parent_snapshot(tmp_path: Path):
+    def resolve_child(child: OpenHandsChildProcess):
+        environment = child.environment
+        environment[MODEL_CREDENTIALS_FD_ENV] = str(child._open_model_credentials_fd())
+        credentials = consume_model_credential_fd(environment)
+        return resolve_config(
+            parse_runner_args(child.command[4:]), {**environment, **credentials}
+        )
+
     env = launch_env(tmp_path, program_content="Research policy.\n" * 10_000)
     env.update({
         "SENPAI_OPENHANDS_ROLE_FILE": str(INSTRUCTIONS_ROOT / "ADVISOR.md"),
@@ -263,14 +275,12 @@ def test_descendants_and_restarts_use_the_complete_parent_snapshot(tmp_path: Pat
     delegated = runner_delegation_config(parent)
     child = OpenHandsChildProcess(delegated, delegation_request())
     child_environment = child.environment
-    child_config = resolve_config(parse_runner_args(child.command[4:]), child_environment)
+    child_config = resolve_child(child)
     grandchild = OpenHandsChildProcess(
         runner_delegation_config(child_config), delegation_request()
     )
-    grandchild_config = resolve_config(
-        parse_runner_args(grandchild.command[4:]), grandchild.environment
-    )
-    restarted = resolve_config(parse_runner_args(child.command[4:]), child.environment)
+    grandchild_config = resolve_child(grandchild)
+    restarted = resolve_child(child)
 
     assert Path(child_environment[SYSTEM_INSTRUCTIONS_FILE_ENV]).stat().st_size > 128 * 1024
     assert all(
@@ -360,6 +370,7 @@ def test_nested_search_retains_private_exa_credentials_across_execs(
         conversation_secrets={},
         exa_api_key=SecretStr("nested-exa-key"),
     )
+    (workspace / "program.md").write_text("Later workspace policy must not replace the snapshot.")
     for name in ("WANDB_ENTITY", "WANDB_PROJECT", "SENPAI_AGENT_DIR"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("EXA_API_KEY", "ambient-exa-key")
@@ -378,6 +389,13 @@ def test_nested_search_retains_private_exa_credentials_across_execs(
     assert "Evidence returned through both child processes." in result["evidence"]
     assert "nested-exa-key" not in json.dumps(result)
     assert "nested-exa-key" not in child.output_path.read_text()
+    snapshots = list(config.state_dir.rglob("system-instructions.b64"))
+    assert len(snapshots) == 2
+    for snapshot in snapshots:
+        inherited = decode_system_instructions(
+            snapshot.read_text().strip(), config.instructions.content_sha256
+        )
+        assert inherited == config.instructions
 
 
 def test_child_start_closes_credential_fd_if_exec_fails(monkeypatch, tmp_path):

@@ -63,7 +63,7 @@ def render_role(
     program_secret_name, program_secret = launch_helpers.render_program_context_secret(
         args.tag, launch.encode_program_system_prompt(program)
     )
-    secret_name = f"senpai-launch-secrets-{args.tag}"
+    secret_name = launch_helpers.kubernetes_resource_name(f"senpai-launch-secrets-{args.tag}")
     providers = launch.deployed_model_providers(args)
     secret = launch_helpers.render_launch_secret(
         args.tag,
@@ -72,19 +72,32 @@ def render_role(
         "wandb",
         anthropic_api_key="anthropic" if "anthropic" in providers else None,
         openai_api_key="openai" if "openai" in providers else None,
+        wandb_inference_api_key="wandb-inference"
+        if "wandb" in providers
+        else None,
+        immutable=bool(args.names or args.n_students),
         custom_secrets={
             name: f"{name.lower()}-secret"
             for name in args.custom_secret_env_names
         },
     )
     template = (ROOT / "k8s" / f"{role}-deployment.yaml").read_text()
+    inference_viewer = "viewer-inference" if "wandb" in providers else None
     if role == "student":
+        writer_name, writer_secret = launch_helpers.render_student_wandb_secret(
+            args.tag, "fern", "wandb-training-fern", "viewer-fern"
+        )
         manifest = launch.render_student(
             template,
             "fern",
             args.tag,
             secret_name,
             secret,
+            writer_name,
+            writer_secret,
+            "viewer-fern",
+            "viewer-controller",
+            inference_viewer,
             args,
             program=program,
             program_secret_name=program_secret_name,
@@ -97,6 +110,8 @@ def render_role(
             ["fern"],
             secret_name,
             secret,
+            "viewer-controller",
+            inference_viewer,
             args,
             program=program,
             program_secret_name=program_secret_name,

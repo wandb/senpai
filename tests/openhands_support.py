@@ -104,6 +104,7 @@ def launch_env(
         "GITHUB_TOKEN": "github-key",
         "GH_REPO": "acme/widgets",
         "SENPAI_ROLE": role,
+        **({"SENPAI_WANDB_TRAINING_API_KEY": "student-writer-key"} if role == "student" else {}),
         "SENPAI_OPENHANDS_WORKSPACE": str(workspace),
         "SENPAI_OPENHANDS_STATE_DIR": str(tmp_path / "state"),
         "SENPAI_OPENHANDS_ROLE_FILE": str(role_file),

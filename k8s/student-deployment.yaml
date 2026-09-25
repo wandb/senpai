@@ -28,6 +28,9 @@ spec:
       annotations:
         senpai.wandb.com/content-hash: "{{POD_CONFIG_HASH}}"
         senpai.wandb.com/program-context-secret: "{{PROGRAM_CONTEXT_SECRET_NAME}}"
+        senpai.wandb.com/controller-wandb-viewer: "{{CONTROLLER_WANDB_VIEWER}}"
+        senpai.wandb.com/inference-wandb-viewer: "{{INFERENCE_WANDB_VIEWER}}"
+        senpai.wandb.com/wandb-viewer: "{{WANDB_VIEWER}}"
       labels:
         app: senpai
         role: student
@@ -86,10 +89,13 @@ spec:
           (umask 077; printf '%s' "$WANDB_API_KEY" > "$wandb_handoff")
           exa_handoff="$handoff_dir/exa-api-key"
           (umask 077; printf '%s' "$EXA_API_KEY" > "$exa_handoff")
+          training_wandb_handoff="$handoff_dir/wandb-training-api-key"
+          (umask 077; printf '%s' "$SENPAI_WANDB_TRAINING_API_KEY" > "$training_wandb_handoff")
+          export SENPAI_WANDB_TRAINING_API_KEY_FILE="$training_wandb_handoff"
           export SENPAI_GITHUB_TOKEN_FILE="$token_handoff"
           export SENPAI_WANDB_API_KEY_FILE="$wandb_handoff"
           export SENPAI_EXA_API_KEY_FILE="$exa_handoff"
-          unset GITHUB_TOKEN GH_TOKEN WANDB_API_KEY EXA_API_KEY
+          unset GITHUB_TOKEN GH_TOKEN WANDB_API_KEY EXA_API_KEY SENPAI_WANDB_TRAINING_API_KEY
           rm -f "$askpass"
           exec bash k8s/entrypoint-student.sh
         envFrom:
@@ -106,6 +112,11 @@ spec:
             secretKeyRef:
               name: {{LAUNCH_SECRET_NAME}}
               key: github-token
+        - name: SENPAI_WANDB_TRAINING_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{WANDB_TRAINING_SECRET_NAME}}
+              key: wandb-api-key
 {{MODEL_PROVIDER_ENV}}
         - name: EXA_API_KEY
           valueFrom:

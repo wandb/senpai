@@ -27,6 +27,8 @@ spec:
       annotations:
         senpai.wandb.com/content-hash: "{{POD_CONFIG_HASH}}"
         senpai.wandb.com/program-context-secret: "{{PROGRAM_CONTEXT_SECRET_NAME}}"
+        senpai.wandb.com/controller-wandb-viewer: "{{WANDB_VIEWER}}"
+        senpai.wandb.com/inference-wandb-viewer: "{{INFERENCE_WANDB_VIEWER}}"
       labels:
         app: senpai
         role: advisor

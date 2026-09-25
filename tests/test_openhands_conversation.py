@@ -1282,12 +1282,16 @@ def test_nonfinished_conversation_returns_failure(tmp_path, monkeypatch, status)
     assert run_openhands("task", runtime_config(tmp_path)) == 1
 
 
-@pytest.mark.parametrize("failure_stage", ["send_message", "run"])
+@pytest.mark.parametrize("failure_stage", ["configuration", "send_message", "run"])
 def test_conversation_and_credentials_are_cleaned_up_after_failures(
     tmp_path,
     monkeypatch,
     failure_stage: str,
 ):
+    from pydantic import SecretStr
+
+    from senpai_agent import tools, wandb_research, weave_research
+
     closed = []
     cleared = []
     delegation = []
@@ -1324,17 +1328,37 @@ def test_conversation_and_credentials_are_cleaned_up_after_failures(
     monkeypatch.setattr(exa_tool.Exa, "request", request)
     monkeypatch.setenv("EXA_API_KEY", "ambient-exa-must-not-be-used")
 
-    with pytest.raises(RuntimeError, match="failed"):
-        run_openhands("task", runtime_config(
-            tmp_path, exa_api_key=SecretStr("exa-runtime-sentinel"),
-        ))
+    setup_failure = failure_stage == "configuration"
+    config = runtime_config(
+        tmp_path,
+        exa_api_key=SecretStr("exa-runtime-sentinel"),
+        wandb_api_key=SecretStr("research-cleanup-fixture"),
+        training_wandb_api_key=SecretStr("writer-cleanup-fixture"),
+        weave_trace_base_url=(
+            "ftp://invalid.example" if setup_failure else "https://trace.wandb.ai"
+        ),
+    )
+    try:
+        with pytest.raises(
+            ValueError if setup_failure else RuntimeError,
+            match="research service URL" if setup_failure else "failed",
+        ):
+            run_openhands("task", config)
 
-    assert closed == [True]
-    assert cleared
-    assert delegation[-1] is None
-    with pytest.raises(RuntimeError, match="Exa search credentials are not configured"):
-        exa_tool.ExaSearchExecutor()(exa_tool.ExaSearchAction(query="after cleanup"))
-    assert requests == ["exa-runtime-sentinel"]
+        assert tools._training_wandb_api_key is None
+        assert wandb_research._api_key is None
+        assert weave_research._api_key is None
+        assert closed == ([] if setup_failure else [True])
+        assert cleared
+        assert delegation[-1] is None
+        with pytest.raises(RuntimeError, match="Exa search credentials are not configured"):
+            exa_tool.ExaSearchExecutor()(exa_tool.ExaSearchAction(query="after cleanup"))
+        assert requests == ([] if setup_failure else ["exa-runtime-sentinel"])
+    finally:
+        exa_tool.configure_exa_credentials(None)
+        tools.configure_training_credentials(None)
+        wandb_research.configure_wandb_credentials(None)
+        weave_research.configure_weave_credentials(None)
 
 
 def test_runtime_credentials_remain_configured_through_lazy_tool_initialization(

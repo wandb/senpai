@@ -57,6 +57,7 @@ class KubernetesExecutor:
         snapshot_root: Path,
         executor_image: str,
         launch_secret_name: str,
+        writer_secret_name: str,
         research_tag: str,
         student_name: str,
         pod_name: str,
@@ -75,6 +76,7 @@ class KubernetesExecutor:
         self.snapshot_root = snapshot_root
         self.executor_image = executor_image
         self.launch_secret_name = launch_secret_name
+        self.writer_secret_name = writer_secret_name
         self.research_tag = research_tag
         self.student_name = student_name
         self.pod_name = pod_name
@@ -732,6 +734,10 @@ class KubernetesExecutor:
             "GITHUB_TOKEN",
             "GH_TOKEN",
             "OPENAI_API_KEY",
+            "WANDB_SERVICE",
+            "WANDB_IDENTITY_TOKEN_FILE",
+            "WANDB_INFERENCE_API_KEY",
+            "SENPAI_WANDB_TRAINING_API_KEY",
         }
         for item in container.get("env", []):
             name = item.get("name")
@@ -744,13 +750,13 @@ class KubernetesExecutor:
                 item.pop("value", None)
                 item["valueFrom"] = {
                     "secretKeyRef": {
-                        "name": self.launch_secret_name,
+                        "name": self.writer_secret_name,
                         "key": "wandb-api-key",
                     }
                 }
                 found_key = True
             elif "secretKeyRef" in value_from:
-                raise ValueError("training may reference only the launch W&B key")
+                raise ValueError("training may reference only its student W&B writer key")
             if name == "WANDB_RUN_ID":
                 if item.get("value") != wandb_run_id:
                     raise ValueError("training manifest W&B run ID does not match reservation")
@@ -992,6 +998,7 @@ def serve() -> None:
         snapshot_root=Path(os.environ["SENPAI_TRAINING_SNAPSHOT_ROOT"]),
         executor_image=os.environ["SENPAI_EXECUTOR_IMAGE"],
         launch_secret_name=os.environ["SENPAI_LAUNCH_SECRET_NAME"],
+        writer_secret_name=os.environ["SENPAI_WANDB_TRAINING_SECRET_NAME"],
         research_tag=os.environ["RESEARCH_TAG"],
         student_name=os.environ["STUDENT_NAME"],
         pod_name=os.environ["SENPAI_POD_NAME"],

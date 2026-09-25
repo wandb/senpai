@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import json
+import os
 import re
 from pathlib import Path
 import subprocess
@@ -11,6 +12,7 @@ import time
 
 import psutil
 import pytest
+from pydantic import SecretStr
 
 import senpai_agent.kubernetes_training as kubernetes_training
 from senpai_agent.kubernetes_training import KubernetesTrainingSupervisor
@@ -135,6 +137,17 @@ def test_supervisor_injects_authoritative_identity_and_bundles_clean_head(
 ):
     client = FakeCluster()
     runtime, workspace, snapshot_root = supervisor(tmp_path, monkeypatch, client)
+    target_env = tmp_path / "target-env"
+    subprocess.run(
+        [sys.executable, "-P", "-m", "venv", "--without-pip", str(target_env)],
+        check=True,
+    )
+    monkeypatch.setenv("SENPAI_TARGET_PYTHON_ENV", str(target_env))
+    monkeypatch.setenv("PATH", f"{Path(sys.executable).parent}{os.pathsep}{os.defpath}")
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", sys.prefix)
+    monkeypatch.setenv("UV_PYTHON", sys.executable)
+    monkeypatch.setenv("VIRTUAL_ENV", sys.prefix)
     keys = [
         "SENPAI_TRAINING_SOURCE_SNAPSHOT",
         "SENPAI_KUBERNETES_WORKLOAD_NAME",
@@ -142,15 +155,26 @@ def test_supervisor_injects_authoritative_identity_and_bundles_clean_head(
         "SENPAI_WANDB_RUN_ID",
         "SENPAI_LAUNCH_SECRET_NAME",
     ]
-    code = (
-        "import json,os,time; "
-        f"print(json.dumps({{key: os.environ[key] for key in {keys!r}}})); "
-        "time.sleep(0.2)"
+    (workspace / "project_module.py").write_text("VALUE = 'project import'\n")
+    script = workspace / "launch.py"
+    script.write_text(
+        "import json, os, sys, time\n"
+        "time.sleep(0.2)\n"
+        "from project_module import VALUE\n"
+        f"print(json.dumps({{key: os.environ[key] for key in {keys!r}}} | {{"
+        "'project_value': VALUE, 'python_prefix': sys.prefix, "
+        "'safe_path': sys.flags.safe_path, 'uv_python': os.environ['UV_PYTHON'], "
+        "'uv_project_environment': os.environ['UV_PROJECT_ENVIRONMENT'], "
+        "'virtual_env': os.environ['VIRTUAL_ENV']}))\n"
     )
+    subprocess.run(
+        ["git", "add", "project_module.py", "launch.py"], cwd=workspace, check=True,
+    )
+    subprocess.run(["git", "commit", "-qm", "target launcher"], cwd=workspace, check=True)
 
     started = runtime.run_training(
         TrainingSpec(
-            argv=(sys.executable, "-c", code),
+            argv=("python", str(script)),
             cwd=workspace,
             timeout_seconds=5,
         )
@@ -182,6 +206,12 @@ def test_supervisor_injects_authoritative_identity_and_bundles_clean_head(
         "SENPAI_KUBERNETES_NAMESPACE": "research",
         "SENPAI_WANDB_RUN_ID": result.kubernetes_spec.wandb_run_id,
         "SENPAI_LAUNCH_SECRET_NAME": "senpai-launch-secrets-fred",
+        "project_value": "project import",
+        "python_prefix": str(target_env),
+        "safe_path": False,
+        "uv_python": str(target_env / "bin" / "python"),
+        "uv_project_environment": str(target_env),
+        "virtual_env": str(target_env),
     }
     assert client.reservations[0][1:] == (str(snapshot), result.source_commit)
     assert client.releases == [result.training_id]
@@ -1147,6 +1177,10 @@ def test_supervisor_recovers_an_unconfirmed_terminal_release(tmp_path, monkeypat
 
 
 def test_supervisor_persists_live_diagnostics_before_training_finishes(tmp_path, monkeypatch):
+    writer = "student-writer-sentinel"
+    monkeypatch.setenv("WANDB_API_KEY", "research-reader-sentinel")
+    monkeypatch.delenv("SENPAI_WANDB_TRAINING_API_KEY", raising=False)
+
     class PendingCluster(FakeCluster):
         def __init__(self):
             super().__init__(state=TrainingState.RUNNING)
@@ -1154,12 +1188,25 @@ def test_supervisor_persists_live_diagnostics_before_training_finishes(tmp_path,
 
         def logs(self, resource):
             self.log_reads += 1
-            return "[pod/worker/checkout] terminated: Error exit=1\nPermission denied"
+            return (
+                "[pod/worker/checkout] terminated: Error exit=1\nPermission denied\n"
+                f"writer={writer}\npartial writer={writer[:12]}"
+            )
+
+        def state(self, resource):
+            return self.state_value, f"workload writer={writer}"
 
     client = PendingCluster()
-    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    runtime, workspace, _ = supervisor(
+        tmp_path, monkeypatch, client, wandb_api_key=SecretStr(writer),
+    )
     started = runtime.run_training(TrainingSpec(
-        argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5,
+        argv=(sys.executable, "-c", (
+            "import os; print('launcher', os.environ.get('WANDB_API_KEY'), "
+            "os.environ.get('SENPAI_WANDB_TRAINING_API_KEY'))"
+        )),
+        cwd=workspace,
+        timeout_seconds=5,
     ))
     try:
         deadline = time.monotonic() + 2
@@ -1171,10 +1218,21 @@ def test_supervisor_persists_live_diagnostics_before_training_finishes(tmp_path,
             time.sleep(0.01)
         assert result.state is TrainingState.RUNNING
         assert "Permission denied" in result.kubernetes_diagnostics
-        assert "Permission denied" in Path(result.log_path).read_text()
+        log = Path(result.log_path).read_text()
+        assert "Permission denied" in log
+        assert log.startswith("launcher research-reader-sentinel None\n")
+        assert writer not in log
+        assert "partial writer=<secret-hidden>" in log
+        assert writer not in result.model_dump_json()
+        assert writer not in (runtime.state_dir / f"{started.training_id}.json").read_text()
         assert client.log_reads == 1
     finally:
-        runtime.cancel_training(started.training_id)
+        terminal = runtime.cancel_training(started.training_id)
+    assert terminal.state is TrainingState.CANCELLED
+    assert "writer=<secret-hidden>" in terminal.error_tail
+    assert writer not in terminal.model_dump_json()
+    assert writer not in Path(terminal.log_path).read_text()
+    assert writer not in (runtime.state_dir / f"{started.training_id}.json").read_text()
 
 
 def test_supervisor_reports_diagnostics_failure_without_losing_training(tmp_path, monkeypatch):

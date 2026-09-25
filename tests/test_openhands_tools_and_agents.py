@@ -15,6 +15,7 @@ from pydantic import SecretStr
 
 from senpai_agent.openhands_runner import (
     build_main_tools,
+    configured_agent_tools,
     depth_aware_child_definition,
     delegation_config,
     find_named_agent,
@@ -28,6 +29,55 @@ from senpai_agent.tools import (
     register_senpai_tools,
 )
 from openhands_support import AGENT_DIR, PLUGIN_DIR, REPO_ROOT, runtime_config
+
+
+def test_research_tools_resolve_for_main_and_declared_children_without_serialized_keys(
+    tmp_path,
+):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    config = runtime_config(
+        tmp_path,
+        workspace=workspace,
+        wandb_api_key=SecretStr("private-research-key"),
+    )
+    state = SimpleNamespace(workspace=SimpleNamespace(working_dir=str(workspace)))
+    definitions = sanitized_agent_definitions(workspace)
+    explore = find_named_agent("explore", definitions)
+    general = find_named_agent("general-purpose", definitions)
+    selections = [
+        (build_main_tools(config), True),
+        (
+            configured_agent_tools([Tool(name=name) for name in explore.tools], config),
+            False,
+        ),
+        (
+            configured_agent_tools([Tool(name=name) for name in general.tools], config),
+            True,
+        ),
+    ]
+    for specs, can_create in selections:
+        selected = {
+            spec.name: spec
+            for spec in specs
+            if spec.name.startswith(("wandb_", "weave_"))
+        }
+        assert {"wandb_research", "weave_research", "wandb_views"} <= selected.keys()
+        assert ("wandb_report_draft" in selected) is can_create
+        for spec in selected.values():
+            assert "private-research-key" not in spec.model_dump_json()
+            tool = resolve_tool(spec, state)[0]
+            assert tool.name == spec.name
+            assert "private-research-key" not in tool.model_dump_json()
+            assert tool.annotations.readOnlyHint is (spec.name != "wandb_report_draft")
+
+    unconfigured = runtime_config(tmp_path, workspace=workspace)
+    assert not any(
+        spec.name.startswith(("wandb_", "weave_"))
+        for spec in configured_agent_tools(
+            [Tool(name=name) for name in explore.tools], unconfigured
+        )
+    )
 
 
 def test_runtime_agent_keeps_the_persisted_delegate_tool_compatible():
@@ -282,6 +332,10 @@ def test_target_agents_cannot_shadow_senpai_delegation_agents(tmp_path):
     assert set(definition.tools) == {
         "terminal",
         "file_editor",
+        "wandb_research",
+        "weave_research",
+        "wandb_views",
+        "wandb_report_draft",
         "task_tracker",
         "spawn_agents",
         "await_agents",
@@ -440,7 +494,13 @@ def test_subagents_receive_skills_from_the_runtime_plugin(
             "explore.md",
             "explore",
             None,
-            {"terminal", "file_editor"},
+            {
+                "terminal",
+                "file_editor",
+                "wandb_research",
+                "weave_research",
+                "wandb_views",
+            },
             set(),
         ),
         (
@@ -448,6 +508,10 @@ def test_subagents_receive_skills_from_the_runtime_plugin(
             "general-purpose",
             None,
             {
+                "wandb_research",
+                "weave_research",
+                "wandb_views",
+                "wandb_report_draft",
                 "terminal",
                 "file_editor",
                 "task_tracker",

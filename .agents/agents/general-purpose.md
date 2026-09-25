@@ -11,6 +11,10 @@ permission_mode: never_confirm
 tools:
   - terminal
   - file_editor
+  - wandb_research
+  - weave_research
+  - wandb_views
+  - wandb_report_draft
   - task_tracker
   - spawn_agents
   - await_agents

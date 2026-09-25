@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Protocol
 
 import psutil
+from pydantic import SecretStr
 
 from senpai_agent.processes import terminate_process_group
 from senpai_agent.training import (
@@ -30,6 +31,8 @@ from senpai_agent.training import (
     TrainingResult,
     TrainingSpec,
     TrainingState,
+    _mask_output_chunk,
+    target_python_environment,
     training_result_paths,
 )
 
@@ -648,6 +651,7 @@ class KubernetesTrainingSupervisor:
         terminate_grace_seconds: float = 10,
         poll_seconds: float = _POLL_SECONDS,
         client: TrainingClusterClient | None = None,
+        wandb_api_key: SecretStr | None = None,
     ):
         if min(nodes, gpus_per_node) < 1:
             raise ValueError("Kubernetes training resources must be positive")
@@ -662,6 +666,7 @@ class KubernetesTrainingSupervisor:
         self.max_timeout_seconds = max_timeout_seconds
         self.terminate_grace_seconds = terminate_grace_seconds
         self.poll_seconds = poll_seconds
+        self.wandb_api_key = wandb_api_key
         socket_path = os.environ.get(
             EXECUTOR_SOCKET_ENV,
             "/var/run/senpai-kubernetes/executor.sock",
@@ -718,12 +723,15 @@ class KubernetesTrainingSupervisor:
             reserved = True
             if self._shutdown.is_set():
                 raise RuntimeError("Kubernetes training supervisor is closed")
+            environment = dict(os.environ)
+            environment.pop("PYTHONSAFEPATH", None)
+            environment.update(target_python_environment(environment))
             with log_path.open("wb") as log:
                 process = subprocess.Popen(
                     list(spec.argv),
                     cwd=cwd,
                     env={
-                        **os.environ,
+                        **environment,
                         "SENPAI_TRAINING_SOURCE_SNAPSHOT": str(source_snapshot),
                         "SENPAI_KUBERNETES_WORKLOAD_NAME": kubernetes_spec.name,
                         "SENPAI_KUBERNETES_NAMESPACE": kubernetes_spec.namespace,
@@ -1136,12 +1144,14 @@ class KubernetesTrainingSupervisor:
                     if part
                 )
 
+        detail = self._mask_writer_output(detail)
         if active.resource is not None:
             self._capture_diagnostics(training_id, active, detail, wait=True)
         try:
-            local_tail = active.log_path.read_bytes()[-_ERROR_TAIL_BYTES:].decode(
-                errors="ignore"
+            log_text = self._mask_writer_output(
+                active.log_path.read_bytes().decode(errors="ignore")
             )
+            local_tail = log_text.encode()[-_ERROR_TAIL_BYTES:].decode(errors="ignore")
         except OSError:
             local_tail = ""
         error_tail = "" if state is TrainingState.FINISHED else "\n".join(
@@ -1158,6 +1168,14 @@ class KubernetesTrainingSupervisor:
             }
         )
         self._release_terminal(terminal, active, delete_required)
+
+    def _mask_writer_output(self, text: str) -> str:
+        if self.wandb_api_key is None:
+            return text
+        masked, pending = _mask_output_chunk(
+            text.encode(), self.wandb_api_key.get_secret_value().encode(),
+        )
+        return (masked + (b"<secret-hidden>" if pending else b"")).decode()
 
     def _capture_diagnostics(
         self,
@@ -1189,9 +1207,10 @@ class KubernetesTrainingSupervisor:
             ).start()
         if not wait and not active.diagnostics_future.done():
             return
-        detail = detail.encode()[:1024].decode(errors="ignore")
+        detail = self._mask_writer_output(detail).encode()[:1024].decode(errors="ignore")
+        collected = self._mask_writer_output(active.diagnostics_future.result())
         diagnostics = "\n".join(
-            part for part in (detail, active.diagnostics_future.result()) if part
+            part for part in (detail, collected) if part
         )
         summary = diagnostics.encode()[:_ERROR_TAIL_BYTES].decode(errors="ignore")
         result = self.get_training_status(training_id)

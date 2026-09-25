@@ -32,7 +32,7 @@ jobs:
             psutil \
             python-dotenv \
             simple-parsing \
-            wandb \
+            "wandb==0.28.1" \
             "exa-py @ https://github.com/exa-labs/exa-py/archive/71f315b4be07d474df128c8fafc70cc7d0e47b56.tar.gz" \
             "weave>=0.53.1,<0.54" \
             "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@c1e9cda697e10ee92e5629b19c7d81cac8bcf54b" \
@@ -41,3 +41,22 @@ jobs:
 
       - name: Test the complete control plane (no cluster)
         run: .venv/bin/python -m pytest
+  container-smoke:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the isolated validation branch
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Build local advisor and cutoff images
+        run: |
+          docker build --build-arg SENPAI_SOURCE_REVISION="$GITHUB_SHA" -t "senpai-smoke-advisor:sha-$GITHUB_SHA" -f Dockerfile.advisor .
+          docker build --build-arg SENPAI_SOURCE_REVISION="$GITHUB_SHA" -t "senpai-smoke-cutoff:sha-$GITHUB_SHA" -f Dockerfile.cutoff .
+      - name: Offline Linux runtime, restart, terminal and cutoff smoke
+        run: |
+          python3 scripts/container-smoke/run_container_smoke.py \
+            --source "$GITHUB_WORKSPACE" \
+            --advisor-image "senpai-smoke-advisor:sha-$GITHUB_SHA" \
+            --cutoff-image "senpai-smoke-cutoff:sha-$GITHUB_SHA"

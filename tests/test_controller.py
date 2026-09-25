@@ -890,6 +890,7 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
     config = SimpleNamespace(
         model="anthropic/claude-opus-4-8",
         github_token="token",
+        training_wandb_api_key=None,
         github_repo="acme/widgets",
         github_trusted_actor=None,
         state_dir=tmp_path,
