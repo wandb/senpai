@@ -282,6 +282,10 @@ Each native terminal session receives target settings after shell startup,
 including new and recovered tmux panes. Later commands can change that
 session's environment. This adapter uses the pinned SDK's environment-export
 callback and preserves native parallel terminal execution.
+Bootstrap also creates missing target launchers for the trusted environment's
+console scripts. Each launcher executes the original read-only script with
+target Python, so shared commands and their Python workers see target packages.
+Bootstrap preserves existing target scripts and never executes target Python.
 
 OpenHands ambient plugin discovery is disabled before root or child
 conversations are created. Only the explicitly supplied trusted plugin loads

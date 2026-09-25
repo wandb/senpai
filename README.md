@@ -459,7 +459,10 @@ read-only packages. `python`, `uv pip install`, and `uv run` select that target
 environment through `PATH`, `VIRTUAL_ENV`, `UV_PYTHON`, and
 `UV_PROJECT_ENVIRONMENT`. Senpai applies these settings after shell startup,
 preserves other PATH entries, and allows later commands to change their
-session environment. Bootstrap creates it without running `ensurepip`.
+session environment. Shared dependency commands such as `torchrun` receive
+target launchers so they and their Python workers can import target packages.
+Existing commands installed in the target environment take precedence.
+Bootstrap creates it without running `ensurepip` or target Python.
 The image supplies pip through the shared package path: use
 `python -m pip install` for additive installs that reuse image packages.
 uv does not inspect packages exposed through that path, so `uv pip install`
