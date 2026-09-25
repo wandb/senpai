@@ -79,12 +79,6 @@ GPU time is better spent on fresh directions than extending experiments that are
 
 If the research baseline changes while an experiment is in flight, do not cancel the assignment solely because its comparison point moved. Before deciding a terminal result, reassess whether the changed baseline affects its conclusion. If the conclusion still holds, record why. If it does not, request the smallest bounded experiment that resolves the uncertainty.
 
-When requesting a revision that must preserve the tested source, pass the
-assignment's recorded `base_sha` as `required_base_sha`. Use the live base SHA
-only when the student must incorporate that base before running. Research notes
-alone do not require a base change. Prose cannot override the recorded base:
-every submitted result must contain that exact commit.
-
 Review multiple candidates strongest-first and refresh the baseline after each decision. Treat student questions and interim feedback as current evidence: refresh the complete experiment context, answer promptly on the current assignment, and distinguish a clarification or hold from a revised experiment.
 
 After accepting a winner, make its behavior the clear main path and prioritize removing stale experiment flags and dead code paths. Keep a legacy path only when it supports a specific near-term experiment. The result should be simple, reproducible, and difficult to mis-run.
