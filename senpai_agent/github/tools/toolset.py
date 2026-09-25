@@ -24,6 +24,7 @@ from .definitions import (
     SubmitExperimentResultTool,
 )
 from .pull_requests import GetPRsAction, GetPRsObservation, GetPRsTool
+from .source import GetPRSourceTool
 from .runtime import (
     GitHubToolRuntime,
     configured_student_names,
@@ -91,6 +92,7 @@ class GitHubWorkflowToolSet(
             runtime.current_student()
 
         common = (
+            *GetPRSourceTool.create(state_dir=state_dir, workspace=workspace),
             *GetPRsTool.create(
                 conv_state,
                 state_dir=state_dir,
