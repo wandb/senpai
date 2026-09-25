@@ -288,11 +288,21 @@ def test_cancellation_deletes_remote_before_retrying_full_terminal_storage(
     tmp_path, monkeypatch, restart, write_phase,
 ):
     client = FakeCluster(TrainingState.RUNNING)
-    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    runtime, workspace, _ = supervisor(
+        tmp_path, monkeypatch, client, max_timeout_seconds=60,
+    )
+    deleted = threading.Event()
     storage_failed = threading.Event()
     terminal_failed = threading.Event()
     storage_restored = threading.Event()
     write_text = Path.write_text
+    delete = client.delete
+
+    def observed_delete(*args, **kwargs):
+        delete(*args, **kwargs)
+        deleted.set()
+
+    monkeypatch.setattr(client, "delete", observed_delete)
 
     def exhausted_terminal(path, text, *args, **kwargs):
         if path.parent == runtime.state_dir and path.suffix == ".tmp":
@@ -309,7 +319,7 @@ def test_cancellation_deletes_remote_before_retrying_full_terminal_storage(
         return write_text(path, text, *args, **kwargs)
 
     monkeypatch.setattr(Path, "write_text", exhausted_terminal)
-    spec = TrainingSpec(argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5)
+    spec = TrainingSpec(argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=30)
     started = runtime.run_training(spec)
     original = client.resource_value
     if write_phase == "resource":
@@ -327,6 +337,7 @@ def test_cancellation_deletes_remote_before_retrying_full_terminal_storage(
     recovered = None
     try:
         assert terminal_failed.wait(2), "cancellation was blocked by resource publication"
+        assert deleted.wait(2), "full terminal storage blocked workload deletion"
         assert client.deletions == [original]
         assert client.resource_value is None
         assert client.releases == []
@@ -362,6 +373,57 @@ def test_cancellation_deletes_remote_before_retrying_full_terminal_storage(
     finally:
         storage_restored.set()
         cancelling.join(2)
+        runtime.close()
+        if recovered is not None:
+            recovered.close()
+
+
+def test_failed_submitter_remains_terminal_after_delete_outage_and_restart(
+    tmp_path, monkeypatch,
+):
+    delete_attempted = threading.Event()
+    delete_available = threading.Event()
+
+    class UnavailableDeletion(FakeCluster):
+        def delete(self, *args, **kwargs):
+            delete_attempted.set()
+            if not delete_available.is_set():
+                raise TimeoutError("executor unavailable during deletion")
+            super().delete(*args, **kwargs)
+
+    client = UnavailableDeletion(TrainingState.RUNNING)
+    runtime, workspace, _ = supervisor(
+        tmp_path, monkeypatch, client, max_timeout_seconds=60,
+    )
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", "raise SystemExit(7)"),
+        cwd=workspace, timeout_seconds=30,
+    ))
+    original = client.resource_value
+    recovered = None
+    try:
+        assert delete_attempted.wait(2)
+        runtime.close()
+        durable = runtime.get_training_status(started.training_id)
+        assert durable.state is TrainingState.FAILED
+        assert durable.kubernetes_released is False
+        assert client.resource_value == original
+        assert client.releases == []
+
+        delete_available.set()
+        recovered = KubernetesTrainingSupervisor(
+            workspace=workspace, state_dir=runtime.state_dir, nodes=2, gpus_per_node=8,
+            poll_seconds=0.01, client=client,
+        )
+        recovered.drain()
+        result = recovered.get_training_status(started.training_id)
+        assert result.state is TrainingState.FAILED
+        assert result.kubernetes_released is True
+        assert client.adoptions == []
+        assert client.deletions == [original]
+        assert client.releases == [started.training_id]
+    finally:
+        delete_available.set()
         runtime.close()
         if recovered is not None:
             recovered.close()

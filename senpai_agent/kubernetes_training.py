@@ -1222,6 +1222,17 @@ class KubernetesTrainingSupervisor:
     ) -> None:
         training_id = result.training_id
         terminal_persisted = False
+        try:
+            self._write_result(result)
+            terminal_persisted = True
+        except OSError as error:
+            print(
+                f"Kubernetes terminal persistence deferred before cleanup: "
+                f"training_id={training_id} state={result.state.value} "
+                f"path={error.filename} errno={error.errno}",
+                file=sys.stderr,
+                flush=True,
+            )
         while True:
             try:
                 if delete_required:
