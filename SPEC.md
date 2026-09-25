@@ -757,8 +757,9 @@ tools; a model key that also serves one of those services remains in the
 environment. W&B inference still shares `WANDB_API_KEY` until the W&B identity
 cutover. No per-student W&B key is required by this handoff change.
 
-The supervisor, controller, and delegated runner disable process dumping on
-Linux. After capturing the worker environment, the supervisor removes current
+The supervisor, controller, and runner disable process dumping on Linux,
+including standalone runner invocations. This also disables core dumps and
+ptrace-based debugging of those processes. After capturing the worker environment, the supervisor removes current
 model-provider values and discards its environment copies. Removing an
 `os.environ` entry does not erase the kernel's original startup environment.
 Model values can remain there until process exit. A same-UID process can also
@@ -776,7 +777,13 @@ Existing post-SIGKILL waits can still depend on kernel process termination.
 Kubernetes or another process manager must restart the complete entrypoint;
 restarting only the Python supervisor cannot recreate consumed handoff files.
 Container restarts retain pod-local conversation state, while pod replacement
-does not retain that state.
+does not retain that state. With the supplied manifests, Kubernetes container
+restarts reset the target checkout and writable target Python environment:
+`/workspace` and `$HOME/.venvs` are outside the mounted state volume. Uncommitted
+edits, unpushed commits, and packages installed there are lost, even when the
+conversation resumes. Bootstrap reconstructs the checkout from the remote and
+recreates the environment. A deployment that needs those files to survive must
+provide its own persistence; this lifecycle change does not add those mounts.
 
 Generic child processes receive no GitHub token and no GitHub tools. Main-role
 GitHub operations remain typed and lease/state guarded. Terminal and hook
@@ -865,7 +872,7 @@ Removed:
 - `.claude/` runtime resources;
 - Claude-named and OpenHands shell watchdog/supervisor loops;
 - the Exa MCP configuration;
-- the HTTP advisor service, bearer token, port, probes, and Kubernetes RBAC;
+- the old HTTP advisor service and its bearer token, port, probes, and Kubernetes RBAC;
 - shell GitHub polling and pod-process inspection;
 - cutoff conversation harvesting;
 - obsolete tool-role instructions; and

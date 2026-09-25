@@ -19,6 +19,11 @@ GITHUB_CREDENTIAL_ENV_NAMES = (
 )
 CUSTOM_SECRET_ENV_NAMES_ENV = "SENPAI_CUSTOM_SECRET_ENV_NAMES"
 BUILTIN_CONVERSATION_SECRET_ENV_NAMES = ("WANDB_API_KEY", "EXA_API_KEY")
+PROVIDER_API_KEY_ENVS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "wandb": "WANDB_API_KEY",
+}
 MODEL_CREDENTIALS_FD_ENV = "SENPAI_MODEL_CREDENTIALS_FD"
 MAX_MODEL_CREDENTIAL_BUNDLE_BYTES = 64 * 1024
 PRIVATE_CREDENTIAL_FILE_ENVS = {
@@ -33,8 +38,7 @@ _RESERVED_CUSTOM_SECRET_ENV_NAMES = frozenset(
     {
         # Built-in credentials use separate trust boundaries.
         "GITHUB_TOKEN",
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
+        *PROVIDER_API_KEY_ENVS.values(),
         *BUILTIN_CONVERSATION_SECRET_ENV_NAMES,
         # The launcher and entrypoints own these names in both roles.
         "ADVISOR_BRANCH",
