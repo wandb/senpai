@@ -830,8 +830,24 @@ file path beneath their shared PVC mount. Cluster cutoff arms as soon as all
 expected resources are Ready or when its bounded readiness window expires,
 whichever comes first, and opens the optional start gate in either case. One
 missing or crash-looping pod therefore cannot prevent the runtime budget from
-starting. At the persisted deadline it deletes launch resources; all
-conversation harvest/archive code is removed.
+starting. The operator fixes the readiness deadline and latest cutoff time
+when arming the Job. The runtime budget begins on readiness or timeout, capped
+by that latest cutoff time across restarts. The Job authenticates persisted
+JSON state with a per-arm key and never sources shared files. It rejects
+symlinks and non-regular state files. State reads and temporary writes use
+nonblocking opens to avoid FIFO hangs. The Job keeps an in-memory deadline
+when state persistence fails. Failed
+start-gate writes retry only until the cutoff deadline.
+
+At the deadline, the Job deletes matching Deployments. It runs as UID/GID
+10001 with a read-only root filesystem, no added capabilities, and no privilege
+escalation. Its namespace Role permits pod observation and Deployment deletion;
+it grants no Secret or ConfigMap access. ConfigMaps, Secrets, PVC data, and
+other launch resources remain for explicit operator cleanup. Use the
+`research-tag` selector to delete retained launch ConfigMaps and Secrets as
+documented in README.md. The cutoff Job, its script ConfigMap, and its shared
+RBAC resources are separate from those launch labels. All conversation
+harvest/archive code is removed.
 
 ## Removed code
 

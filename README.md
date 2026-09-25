@@ -613,6 +613,25 @@ The agent runs from `/opt/senpai-venv`. Before starting the controller, both rol
 
 For multi-day fleets, [`arm_senpai_cluster_cutoff.sh`](scripts/arm_senpai_cluster_cutoff.sh) creates a cluster-side hard cutoff that does not depend on an operator laptop remaining online. It can also hold a shared start gate until the expected fleet is ready or its readiness deadline expires.
 
+The cutoff Job runs as UID/GID 10001 and deletes only Deployments with the
+requested `research-tag` labels. Its Role grants no Secret or ConfigMap
+access. The operator fixes the readiness deadline and latest
+cutoff time when arming the Job; restarts and failed gate writes cannot extend
+that limit. Shared cutoff state is authenticated JSON, never executable shell
+input. The shared PVC must support access by UID/GID 10001.
+
+After cutoff, remove retained launch ConfigMaps and Secrets with the existing
+label-based cleanup command. Select the context, namespace, and tags used for
+the launch:
+
+```bash
+kubectl --context "$CONTEXT" -n "$NAMESPACE" delete configmaps,secrets \
+  -l "research-tag in ($TAGS_CSV)" --ignore-not-found=true
+```
+
+This command leaves PVC data and the cutoff Job, script ConfigMap, and shared
+cutoff RBAC resources in place. Operators own their retention and cleanup.
+
 Pod startup and liveness probes read the supervisor lease. Container restarts resume the advisor or student conversation from the pod-local state volume; replacing or rescheduling the pod starts fresh state. Stop a container before copying or snapshotting a live advisor state directory.
 
 ### Other deployment environments
