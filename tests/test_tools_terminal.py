@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -167,7 +168,7 @@ def native_target_terminal(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("SENPAI_TARGET_PYTHON_ENV", str(target))
-    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
     (tmp_path / "project_module.py").write_text("VALUE = 'project import'\n")
     (tmp_path / "check_target.py").write_text(
         "import json, os, sys, time\nfrom pathlib import Path\n"
@@ -230,6 +231,12 @@ def test_native_terminal_uses_target_python_and_project_imports(
         assert customized["path"][0] == str(tmp_path / "home" / "later-bin")
         assert str(tmp_path / "home" / "custom-bin") in customized["path"]
         assert customized["uv_python"] == "custom-python"
+        result = executor(TerminalAction(command="export PYTHONSAFEPATH=1", timeout=30))
+        assert result.exit_code == 0, result.text
+        result = executor(TerminalAction(
+            command="python -c 'import sys; assert sys.flags.safe_path'", timeout=30,
+        ))
+        assert result.exit_code == 0, result.text
 
     with (tmp_path / "home" / ".bashrc").open("a") as startup:
         startup.write("readonly UV_PYTHON\n")
@@ -240,8 +247,9 @@ def test_native_terminal_uses_target_python_and_project_imports(
 
 def test_native_tmux_initializes_each_parallel_pane(native_target_terminal, tmp_path):
     executor, target = native_target_terminal
-    if not executor.is_pooled:
+    if shutil.which("tmux") is None:
         pytest.skip("tmux is unavailable; subprocess terminals are serial")
+    assert executor.is_pooled, "tmux is installed but the native pool was not selected"
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(

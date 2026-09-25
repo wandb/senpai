@@ -275,8 +275,9 @@ set and does not inspect that path. The image compiles runtime bytecode before
 making the environment read-only. Bootstrap computes both paths with trusted Python
 and creates the target venv without pip bootstrapping, which would execute
 target Python. Terminal and training environments select the target through
-PATH and uv settings. Training removes inherited `PYTHONSAFEPATH` so project
-imports work normally. File-defined child terminals use the same routing.
+PATH and uv settings. Training and terminal setup remove inherited
+`PYTHONSAFEPATH` so project imports work normally. File-defined child terminals
+use the same routing.
 Each native terminal session receives target settings after shell startup,
 including new and recovered tmux panes. Later commands can change that
 session's environment. This adapter uses the pinned SDK's environment-export

@@ -640,7 +640,10 @@ class TargetTerminalExecutor(TerminalExecutor):
                 )
                 target_bin = self._bash_quote(f"{self._env['VIRTUAL_ENV']}/bin")
                 result = target.execute(TerminalAction(
-                    command=f'{exports} && export PATH={target_bin}:"$PATH"',
+                    command=(
+                        "unset PYTHONSAFEPATH && "
+                        f'{exports} && export PATH={target_bin}:"$PATH"'
+                    ),
                     timeout=10,
                 ))
                 if result.is_error or result.exit_code != 0:
