@@ -8,7 +8,6 @@ from test_agent_markdown import HTML_HEADER
 
 from senpai_agent.program_context import (
     MAX_PROGRAM_BYTES,
-    PROGRAM_SOURCE_COMMIT_ENV,
     decode_program_system_prompt,
     encode_program_system_prompt,
     load_program_system_prompt,
@@ -212,7 +211,7 @@ def test_program_requires_an_available_full_launch_commit(
     write_program(workspace, "program.md", "Reviewed policy.")
     commit_workspace(workspace)
 
-    with pytest.raises(RuntimeError, match=PROGRAM_SOURCE_COMMIT_ENV):
+    with pytest.raises(RuntimeError, match="program.*commit"):
         load_program_system_prompt(workspace, "program.md", source_commit)
 
 

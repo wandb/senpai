@@ -32,7 +32,7 @@ _COMMIT_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _GIT_READ_ENV = {"GIT_NO_REPLACE_OBJECTS": "1"}
 _GIT_TREE_MODES = {"40000", "100644", "100755", "120000", "160000"}
 _OBJECT_INTEGRITY_ERROR = (
-    f"{PROGRAM_SOURCE_COMMIT_ENV} launch-pinned program commit failed "
+    "launch-pinned program commit failed "
     "Git object integrity verification"
 )
 
@@ -111,7 +111,7 @@ def load_program_system_prompt(
     workspace = workspace.resolve()
     if source_commit is not None and not _COMMIT_SHA.fullmatch(source_commit):
         raise RuntimeError(
-            f"{PROGRAM_SOURCE_COMMIT_ENV} must name one available full commit SHA"
+            "program source commit must name one available full commit SHA"
         )
     if source_commit is None:
         source_commit = run_git(
