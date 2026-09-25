@@ -63,6 +63,19 @@ def test_student_dockerfile_declares_the_cuda_training_runtime():
     assert "@anthropic-ai/claude-code" not in lowered
 
 
+def test_executor_image_is_a_minimal_non_root_credential_boundary():
+    dockerfile = (ROOT / "Dockerfile.executor").read_text(encoding="utf-8")
+    lowered = dockerfile.lower()
+
+    assert dockerfile.startswith("FROM python:3.13-slim")
+    assert "USER 10001:10001" in dockerfile
+    assert "COPY senpai_agent /opt/senpai/senpai_agent" in dockerfile
+    assert "pydantic==" in dockerfile
+    assert "pyyaml==" in lowered
+    for forbidden in ("kubectl", " gh", "curl", "entrypoint", "secret"):
+        assert forbidden not in lowered
+
+
 def test_lock_targets_linux_and_macos_without_the_unused_notebook_stack():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
@@ -130,7 +143,7 @@ def test_build_workflow_builds_all_images_from_the_exact_checked_out_commit():
     roles = build["strategy"]["matrix"]["role"]
     steps = {step["name"]: step for step in build["steps"]}
 
-    assert set(roles) == {"advisor", "student", "cutoff"}
+    assert set(roles) == {"advisor", "student", "executor", "cutoff"}
     assert events["pull_request"] == {}
     assert workflow["env"]["SOURCE_REVISION"] == (
         "${{ github.event.pull_request.head.sha || github.sha }}"

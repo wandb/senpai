@@ -87,6 +87,9 @@ ls \
 
 export IS_SANDBOX=1
 
+# Target uv commands must not synchronize the running agent's environment.
+unset UV_PROJECT_ENVIRONMENT UV_PYTHON VIRTUAL_ENV
+
 export SENPAI_OPENHANDS_STATE_DIR="$LOGDIR/openhands_state"
 export SENPAI_OPENHANDS_ROLE_FILE="$WORKDIR/system_instructions/STUDENT.md"
 export SENPAI_OPENHANDS_WORKSPACE="$TARGET_WORKDIR"
@@ -98,4 +101,24 @@ if [ -z "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
 fi
 unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS
 rm -f "$GIT_ASKPASS_FILE"
+if [ "${NODES_PER_STUDENT:-1}" -gt 1 ]; then
+    proxy_dir="$LOGDIR/bin"
+    mkdir -p "$proxy_dir"
+    kubectl_wrapper="$(mktemp "$proxy_dir/.kubectl.XXXXXX")"
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'exec "$SENPAI_PYTHON" -m senpai_agent.kubernetes_executor kubectl "$@"' \
+        > "$kubectl_wrapper"
+    chmod 500 "$kubectl_wrapper"
+    mv -f "$kubectl_wrapper" "$proxy_dir/kubectl"
+    export PATH="$proxy_dir:$PATH"
+    for _ in $(seq 1 180); do
+        [ -S "$SENPAI_KUBERNETES_EXECUTOR_SOCKET" ] && break
+        sleep 1
+    done
+    [ -S "$SENPAI_KUBERNETES_EXECUTOR_SOCKET" ] || {
+        echo "ERROR: Kubernetes executor socket did not become ready" >&2
+        exit 1
+    }
+fi
 exec python -m senpai_agent.supervisor student

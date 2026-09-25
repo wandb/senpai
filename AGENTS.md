@@ -66,9 +66,11 @@ to README.md or SPEC.md as appropriate.
 - **Advisor pod** - lightweight, no GPU, keeps one durable OpenHands
   conversation and uses typed control-plane tools for GitHub and generic
   child-agent dispatch.
-- **Student pods** - heavy GPU workers, use one OpenHands conversation per
-  assignment revision, implement one assigned PR, run supervised training, and
-  resume the same conversation for actionable monitor events.
+- **Student pods** - use one OpenHands conversation per assignment revision,
+  implement one assigned PR, and resume the same conversation for actionable
+  monitor events. Single-node students train in their GPU pod. Multi-node
+  students use a CPU controller and a credentialed executor sidecar to supervise
+  training in separate worker pods.
 - **Cross-node communication** - GitHub PR labels and human-tagged Issues only;
   Senpai requires no RPC service or cluster-specific network setup.
 - **GitHub Issues** - human-to-agent communication channel. Agents poll for and respond to these alongside their normal PR workflow.

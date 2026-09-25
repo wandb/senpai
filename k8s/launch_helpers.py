@@ -147,6 +147,11 @@ def is_immutable_image_reference(image: str) -> bool:
     return bool(FULL_SHA_IMAGE.fullmatch(image) or DIGEST_IMAGE.fullmatch(image))
 
 
+def is_digest_image_reference(image: str) -> bool:
+    """Return whether an image is pinned by an immutable registry digest."""
+    return bool(DIGEST_IMAGE.fullmatch(image))
+
+
 def source_revision_for_image(image: str, senpai_repo_revision: str = "") -> str:
     """Resolve the exact runner commit that must match the image metadata."""
     tagged = FULL_SHA_IMAGE.fullmatch(image)
@@ -208,6 +213,175 @@ def existing_student_names(
         check=True,
     )
     return [line for line in result.stdout.splitlines() if line]
+
+
+def _kubectl_json(
+    *arguments: str,
+    kube_context: str,
+    namespace: str,
+    allow_empty: bool = False,
+) -> dict | None:
+    result = subprocess.run(
+        kubectl_command(
+            *arguments,
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "kubectl returned no error text"
+        raise RuntimeError(f"Kubernetes launch safety check failed: {detail}")
+    if allow_empty and not result.stdout.strip():
+        return None
+    try:
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "Kubernetes launch safety check returned invalid JSON"
+        ) from error
+    if not isinstance(document, dict):
+        raise RuntimeError("Kubernetes launch safety check returned invalid data")
+    return document
+
+
+def _nonterminal_workload_names(document: dict, kind: str) -> list[str]:
+    terminal_conditions = {
+        "Job": {"Complete", "Failed"},
+        "MPIJob": {"Succeeded", "Failed"},
+    }[kind]
+    items = document.get("items")
+    if not isinstance(items, list):
+        raise RuntimeError("Kubernetes launch safety check returned invalid data")
+    active = []
+    for item in items:
+        metadata = item.get("metadata") if isinstance(item, dict) else None
+        status = item.get("status") if isinstance(item, dict) else None
+        conditions = status.get("conditions", []) if isinstance(status, dict) else None
+        if (
+            not isinstance(metadata, dict)
+            or not isinstance(metadata.get("name"), str)
+            or not isinstance(conditions, list)
+        ):
+            raise RuntimeError("Kubernetes launch safety check returned invalid data")
+        if not any(
+            isinstance(condition, dict)
+            and condition.get("type") in terminal_conditions
+            and str(condition.get("status", "")).lower() == "true"
+            for condition in conditions
+        ):
+            active.append(f"{kind} {metadata['name']}")
+    return active
+
+
+def ensure_new_student_slot(
+    deployment_name: str,
+    *,
+    tag: str,
+    student_name: str,
+    require_mpijob: bool,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> None:
+    """Require a clean student name; launch.py never replaces controllers."""
+    deployment = _kubectl_json(
+        "get",
+        "deployment",
+        deployment_name,
+        "--ignore-not-found",
+        "-o",
+        "json",
+        kube_context=kube_context,
+        namespace=namespace,
+        allow_empty=True,
+    )
+    if deployment is not None:
+        raise RuntimeError(
+            f"student Deployment {deployment_name} already exists; launch.py will not "
+            "replace a running controller"
+        )
+
+    controller_selector = (
+        f"app=senpai,role=student,research-tag={tag},student={student_name}"
+    )
+    pods = _kubectl_json(
+        "get",
+        "pods",
+        "-l",
+        controller_selector,
+        "-o",
+        "json",
+        kube_context=kube_context,
+        namespace=namespace,
+    )
+    pod_items = pods.get("items")
+    if not isinstance(pod_items, list):
+        raise RuntimeError("Kubernetes launch safety check returned invalid data")
+    if pod_items:
+        raise RuntimeError(
+            f"student {student_name} still has controller Pod objects; wait for "
+            "cleanup before relaunching"
+        )
+
+    workload_selector = (
+        f"app=senpai-training,research-tag={tag},student={student_name}"
+    )
+    active = _nonterminal_workload_names(
+        _kubectl_json(
+            "get",
+            "jobs",
+            "-l",
+            workload_selector,
+            "-o",
+            "json",
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        "Job",
+    )
+    resources = subprocess.run(
+        kubectl_command(
+            "api-resources",
+            "--api-group=kubeflow.org",
+            "--namespaced=true",
+            "-o",
+            "name",
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if resources.returncode != 0:
+        detail = resources.stderr.strip() or "kubectl returned no error text"
+        raise RuntimeError(f"Kubernetes launch safety check failed: {detail}")
+    has_mpijob = "mpijobs.kubeflow.org" in resources.stdout.splitlines()
+    if require_mpijob and not has_mpijob:
+        raise RuntimeError("Kubernetes cluster does not provide the MPIJob API")
+    if has_mpijob:
+        active.extend(
+            _nonterminal_workload_names(
+                _kubectl_json(
+                    "get",
+                    "mpijobs",
+                    "-l",
+                    workload_selector,
+                    "-o",
+                    "json",
+                    kube_context=kube_context,
+                    namespace=namespace,
+                ),
+                "MPIJob",
+            )
+        )
+    if active:
+        raise RuntimeError(
+            f"student {student_name} still has nonterminal workload(s): "
+            f"{', '.join(active)}"
+        )
 
 
 def render_template(template: str, replacements: dict[str, str]) -> str:
@@ -518,6 +692,7 @@ def render_launch_secret(
     anthropic_api_key: str | None = None,
     openai_api_key: str | None = None,
     custom_secrets: dict[str, str],
+    immutable: bool = False,
 ) -> str:
     """Per-launch k8s Secret holding API credentials used by advisor/student pods."""
     credentials = {
@@ -542,9 +717,10 @@ def render_launch_secret(
         "  labels:",
         "    app: senpai",
         f"    research-tag: {tag}",
-        "type: Opaque",
-        "data:",
     ]
+    if immutable:
+        lines.append("immutable: true")
+    lines.extend(("type: Opaque", "data:"))
     lines.extend(f"  {name}: {value}" for name, value in encoded.items())
     return "\n".join(lines) + "\n"
 
@@ -788,4 +964,32 @@ def kubectl_apply(
     if result.returncode != 0:
         detail = result.stderr.strip() or "kubectl returned no error text"
         raise RuntimeError(f"kubectl apply failed for {name}: {detail}")
+    print(f"  {result.stdout.strip()}")
+
+
+def kubectl_create(
+    manifest: str,
+    name: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> None:
+    """Create a manifest without replacing an existing object."""
+    print(f"Creating: {name}")
+    result = subprocess.run(
+        kubectl_command(
+            "create",
+            "-f",
+            "-",
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        input=manifest,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "kubectl returned no error text"
+        raise RuntimeError(f"kubectl create failed for {name}: {detail}")
     print(f"  {result.stdout.strip()}")

@@ -91,7 +91,7 @@ Prefer experiments that distinguish competing explanations. Be concrete about ar
 
 Read student suggestions. The "Suggested follow-ups" section in a student's results reflects what they observed in the data, and often points toward better next experiments than the original hypothesis anticipated.
 
-When work spans multiple benchmarks, the default unit of work should be a hypothesis family that is tested across all relevant datasets, not a one-off single-benchmark tweak. Use the `{{GPUS_PER_STUDENT}}` GPUs available to each student to cover a small matrix across datasets and nearby variants unless a single-dataset evidence-closing or best-checkpoint recovery run is clearly the highest-value use of that slot.
+When work spans multiple benchmarks, the default unit of work should be a hypothesis family that is tested across all relevant datasets, not a one-off single-benchmark tweak. Use the `{{NODES_PER_STUDENT}}` worker nodes x `{{GPUS_PER_STUDENT_NODE}}` GPUs per node available to each student to cover a small matrix across datasets and nearby variants unless a single-dataset evidence-closing or best-checkpoint recovery run is clearly the highest-value use of that slot.
 
 Use subagents when an independent perspective can materially improve a high-leverage research decision:
 

@@ -26,6 +26,7 @@ target_repo_branch: ""
 # Required: use digests or matching sha-<full-commit> tags.
 advisor_image: ""
 student_image: ""
+executor_image: ""
 
 # Kubernetes target
 kube_context: ""
@@ -75,7 +76,11 @@ human_issues: true
 # students
 n_students: 4
 student_prefix: ""
-gpus_per_student: 1
+nodes_per_student: 1
+gpus_per_student_node: 1
 cpu_per_gpu: 15
 memory_gi_per_gpu: 120
+# Optional key=value selectors for the advisor and multi-node student controllers.
+# controller_node_selector: [compute.coreweave.com/node-pool=cpu]
+controller_node_selector: []
 preflight_only: false
