@@ -51,6 +51,10 @@ clone_target_repo() {
 # Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
 # agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
 [ -d "$PROBLEM_DIR/.git" ] || clone_target_repo
+if ! git -C "$TARGET_WORKDIR" rev-parse --verify 'HEAD^{commit}' >/dev/null 2>&1; then
+    echo "ERROR: target checkout '$TARGET_WORKDIR' has no valid HEAD commit; inspect and repair the retained checkout before restarting." >&2
+    exit 1
+fi
 git config --global --unset-all credential.helper 2>/dev/null || true
 
 # --- Git identity for commits (inside the problem-package repo) ---
