@@ -344,6 +344,35 @@ def test_training_masks_a_partial_writer_key_at_natural_eof(tmp_path):
     assert json.loads(persisted.read_text())["error_tail"] == expected
 
 
+def test_writer_redaction_does_not_create_truncated_wandb_run_ids(tmp_path):
+    workspace, supervisor = make_supervisor(
+        tmp_path,
+        wandb_api_key=SecretStr("0123456789abcdef0123456789abcdef01234567"),
+        terminate_grace_seconds=0.1,
+    )
+    running = run_python(
+        supervisor,
+        workspace,
+        "import os;"
+        "base=b'https://wandb.ai/team/project/runs/';"
+        "os.write(1,base+b'masked'+os.environ['WANDB_API_KEY'].encode()+b'\\n');"
+        "os.write(1,base+b'valid0\\n');"
+        "os.write(1,base+b'abc0')",
+    )
+    try:
+        result = wait_for_terminal(supervisor, running.training_id)
+    finally:
+        supervisor.close()
+
+    assert result.state is TrainingState.FINISHED
+    assert Path(running.log_path).read_text() == (
+        "https://wandb.ai/team/project/runs/masked<secret-hidden>\n"
+        "https://wandb.ai/team/project/runs/valid0\n"
+        "https://wandb.ai/team/project/runs/abc<secret-hidden>"
+    )
+    assert result.wandb_run_ids == ("valid0",)
+
+
 def test_cancel_does_not_wait_for_a_detached_output_writer(tmp_path):
     workspace, supervisor = make_supervisor(
         tmp_path,
