@@ -230,9 +230,21 @@ def test_create_assignment_uses_the_created_branch_head_for_the_pr(
     }
 
 
-def test_create_assignment_rejects_students_outside_the_launch_before_mutation(
+@pytest.mark.parametrize(
+    ("student", "head_branch", "error"),
+    [
+        ("student-outside-launch", "student-outside-launch/run", "outside this launch"),
+        ("student-one", "unowned/run", "must belong to student"),
+        ("student-one", "student-one-other/run", "must belong to student"),
+        ("student-one", "student-one", "must belong to student"),
+    ],
+)
+def test_create_assignment_rejects_unowned_students_or_branches_before_mutation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    student: str,
+    head_branch: str,
+    error: str,
 ):
     workflow = RecordingWorkflow()
     monkeypatch.setattr(
@@ -243,14 +255,14 @@ def test_create_assignment_rejects_students_outside_the_launch_before_mutation(
     action = CreateAssignmentAction(
         assignment_id="assignment-18",
         revision_id="revision-1",
-        student="student-outside-launch",
+        student=student,
         expected_base_sha="b" * 40,
-        head_branch="student-outside-launch/lower-lr",
+        head_branch=head_branch,
         title="Try a lower learning rate",
         body="Run one bounded comparison.",
     )
 
-    with pytest.raises(PermissionError, match="outside this launch"):
+    with pytest.raises(PermissionError, match=error):
         tool(action)
 
     assert workflow.calls == []

@@ -298,11 +298,19 @@ operator's system-instruction files.
 `SENPAI_TARGET_PYTHON_ENV` selects a writable target venv for terminals and
 training. Its site-packages include the trusted environment through a `.pth`
 path entry. Target packages can override those shared packages without writing
-to the trusted environment. Bootstrap computes both paths with trusted Python
+to the trusted environment. The image includes pip so additive target installs
+can resolve packages on the shared path. uv resolves a separate target package
+set and does not inspect that path. The image compiles runtime bytecode before
+making the environment read-only. Bootstrap computes both paths with trusted Python
 and creates the target venv without pip bootstrapping, which would execute
 target Python. Terminal and training environments select the target through
-PATH and uv settings. Training removes inherited `PYTHONSAFEPATH` so project
-imports work normally. File-defined child terminals use the same routing.
+PATH and uv settings. Training and terminal setup remove inherited
+`PYTHONSAFEPATH` so project imports work normally. File-defined child terminals
+use the same routing.
+Each native terminal session receives target settings after shell startup,
+including new and recovered tmux panes. Later commands can change that
+session's environment. This adapter uses the pinned SDK's environment-export
+callback and preserves native parallel terminal execution.
 
 OpenHands ambient plugin discovery is disabled before root or child
 conversations are created. Only the explicitly supplied trusted plugin loads
@@ -753,7 +761,9 @@ assignment at depth two to verify its parent, tree, and message. These fetches d
 not change the advisor checkout. Pushes retain expected-SHA checks, ancestry
 checks, exact ref leases, and post-push verification. The bootstrap runner and
 target pre-push hooks remain behavioral guards; typed publication bypasses them
-and applies its own branch and lease checks.
+and applies its own branch and lease checks. Before creating a remote branch,
+the typed assignment tool requires a configured student and a `<student>/`
+branch prefix.
 
 Generic child processes receive no GitHub token and no GitHub tools. Main-role
 GitHub operations remain typed and lease/state guarded. Terminal and hook

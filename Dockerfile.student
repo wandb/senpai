@@ -55,7 +55,7 @@ RUN cd /tmp/senpai && \
       --only-binary pydantic-core \
       --only-binary rpds-py \
       -r requirements.txt && \
-    uv pip install --python "$SENPAI_PYTHON" --no-deps /tmp/senpai && \
+    uv pip install --python "$SENPAI_PYTHON" --no-deps --compile-bytecode /tmp/senpai "pip==25.3" && \
     python -P -c 'import importlib.metadata, openhands.sdk, senpai_agent, sys, torch; assert sys.version_info[:2] == (3, 13); assert torch.__version__.startswith("2.13."); assert torch.version.cuda and torch.version.cuda.startswith("13."); assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
     python -P -m senpai_agent.agent_markdown "$SENPAI_PLUGIN" && \
     chown -R root:root \
@@ -102,7 +102,7 @@ WORKDIR /workspaces
 USER 10001:10001
 
 # Verify installed imports and immutable runtime assets as the role user.
-RUN python -P -c 'import os, pathlib, senpai_agent, sys; assert pathlib.Path(senpai_agent.__file__).is_relative_to(sys.prefix); assert all(not os.access(path, os.W_OK) for path in (sys.prefix, os.environ["SENPAI_AGENT_DIR"], os.environ["SENPAI_PLUGIN"]))'
+RUN python -P -c 'import os, pathlib, pip, senpai_agent, sys; assert pathlib.Path(senpai_agent.__file__).is_relative_to(sys.prefix); assert all(not os.access(path, os.W_OK) for path in (sys.prefix, os.environ["SENPAI_AGENT_DIR"], os.environ["SENPAI_PLUGIN"]))'
 
 # Exercise the browser as the same non-root user used in production.
 RUN HOME=/var/lib/senpai/home senpai-browser-smoke-test

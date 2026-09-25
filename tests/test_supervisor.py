@@ -243,6 +243,27 @@ def test_supervisor_fails_before_snapshotting_a_role_with_missing_values(
     assert not (tmp_path / "state" / "system-instructions" / "student.md").exists()
 
 
+def test_supervisor_starts_the_controller_with_trusted_safe_path_python(
+    tmp_path, monkeypatch
+):
+    environment = launch_env(tmp_path)
+    token_file = tmp_path / "github-token"
+    token_file.write_text("test-token")
+    token_file.chmod(0o600)
+    environment["SENPAI_GITHUB_TOKEN_FILE"] = str(token_file)
+    commands = []
+
+    def capture_worker(self, _stop):
+        commands.append(self.command)
+        return 0
+
+    monkeypatch.setattr(WorkerSupervisor, "run", capture_worker)
+    assert supervisor_module.supervisor_main(["advisor"], environment) == 0
+    assert commands == [
+        (sys.executable, "-P", "-m", "senpai_agent.controller", "advisor")
+    ]
+
+
 def test_pid_one_reaps_adopted_children_without_reaping_its_worker(monkeypatch):
     reaped = []
     monkeypatch.setattr(supervisor_module.os, "getpid", lambda: 1)
