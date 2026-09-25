@@ -31,6 +31,7 @@ spec:
         role: advisor
         research-tag: {{RESEARCH_TAG}}
     spec:
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 90
       securityContext:
         runAsNonRoot: true
@@ -131,10 +132,12 @@ spec:
           mountPath: {{PVC_MOUNT_PATH}}
         - name: state
           mountPath: /var/lib/senpai
+        # {{CAPACITY_SNAPSHOT_MOUNT}}
       volumes:
       - name: dataset
         persistentVolumeClaim:
           claimName: {{PVC_CLAIM_NAME}}
       - name: state
         emptyDir: {}
+      # {{CAPACITY_SNAPSHOT_VOLUME}}
       nodeSelector: {{CONTROLLER_NODE_SELECTOR}}

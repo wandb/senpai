@@ -259,6 +259,58 @@ instead of disappearing silently. These reads stay inside the executor broker;
 students receive neither Kubernetes credentials nor namespace-wide read access.
 When a smoke run stalls before W&B starts, inspect these diagnostics first.
 
+### Advisory cluster capacity
+
+Add `--capacity_observer true` to install a dedicated observer. It uses the same
+immutable `--executor_image` and source revision, including for single-node
+fleets. Both root roles receive `get_cluster_capacity`, a no-argument tool that
+reads a sanitized ConfigMap snapshot. Without an observer it returns unknown.
+It never reserves resources, clears an assignment hold, or authorizes a launch.
+
+The observed worker shape comes from `--nodes_per_student`,
+`--gpus_per_student_node`, `--cpu_per_gpu`, and `--memory_gi_per_gpu`. Configure
+`--capacity_node_selector key=value ...` and
+`--capacity_tolerations '{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}'`
+to describe the intended workers. These options affect observation only; they do
+not change training manifests. Unspecified tolerations are empty. Enable
+`--capacity_hpc_verification true` only where the operator confirms CoreWeave's
+preemptible HPC-verification policy. That policy requires the verification
+namespace, exact priority class, priority -1, and verification workload name;
+other low-priority workloads remain occupied capacity.
+
+The observer subtracts effective requests for all nonterminal Pods, including
+CPU-only workloads, bound Pending Pods, concurrent init sidecars, Pod overhead,
+and allocated resources during resize. It checks GPU, CPU, and memory on each
+Ready, uncordoned node that matches the configured selector and tolerations.
+It reports physical availability separately from verified preemptible capacity.
+Unbound Pending demand is separate from reservations. Resize accounting retains
+the largest declared, allocated, or actuated request, which can conservatively
+overcount an infeasible resize. Pod slots, affinity, topology, quota, PVC placement,
+launcher overhead, and concurrent submissions remain unassessed. The scheduler
+is authoritative; enough resource-fit nodes do not guarantee admission.
+
+The observer waits 30 seconds between collection attempts. API response sizes
+and pagination are bounded. A process timer limits collection to 25 seconds and
+the full collection/publication attempt to 40 seconds. The tool reports the
+observation time and age. ConfigMap directory
+projection can add delivery delay; snapshots older than 120 seconds, incomplete
+reads, malformed data, and collection failures return unknown without capacity
+counts. The projection uses no `subPath`, so kubelet can refresh it.
+
+Installation requires an operator who can create cluster-scoped RBAC and
+delegate list access to Nodes and Pods across namespaces. Only the observer's
+ServiceAccount receives those permissions, plus get/update access to its one
+precreated snapshot ConfigMap. It cannot read Secrets or mutate training jobs.
+The observer receives no model, GitHub, W&B, or target-repository credentials;
+model containers receive only the read-only sanitized snapshot. Existing
+student executor permissions and the apply-only kubectl proxy stay unchanged.
+
+The cutoff stops the observer with the tagged fleet while counting only
+`app=senpai` controllers for readiness. It does not gain cluster-wide cleanup
+permissions. The launcher prints an operator cleanup command for the observer's
+ClusterRole and ClusterRoleBinding, scoped by application, research tag, and
+namespace labels; remove those after terminating the fleet.
+
 If a controller state write reports disk-space or quota exhaustion, an active
 Kubernetes monitor retries result writes with backoff and reports the pending
 write to container stderr. It keeps an observed terminal outcome until it can persist

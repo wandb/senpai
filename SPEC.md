@@ -827,6 +827,21 @@ source/W&B evidence, volumes, pod security, and workload ownership across a
 Unix socket. Docker and local hosts need no shared network for Senpai
 communication.
 
+An opt-in capacity observer is separate from the research controllers and
+training executor. It lists Nodes and nonterminal Pods through a dedicated
+credentialed process and updates only its named, precreated snapshot ConfigMap.
+The advisor and students mount that sanitized snapshot read-only and expose
+`get_cluster_capacity` without Kubernetes credentials or mutation inputs.
+The observer needs explicit cluster-scoped read RBAC; namespace-only executor
+permissions stay unchanged. Observation shape, selectors, tolerations, and any
+CoreWeave verification exemption are operator-owned configuration. All three
+worker resources must fit on the same eligible node. Missing, incomplete,
+malformed, or stale snapshots return unknown. This is timestamped advisory
+capacity, never a reservation or assignment transition; scheduling remains
+Kubernetes' responsibility. Raw Pod specifications, environments, logs, and
+unrelated project identifiers never enter the snapshot. Cluster-scoped observer
+RBAC cleanup remains an operator action rather than expanding cutoff authority.
+
 Hivemind startup remains commented with a clear note. The Python controller
 waits for the optional cluster start gate while continuously refreshing a
 `start-gate` lease; readiness therefore cannot deadlock gated launch. Cluster

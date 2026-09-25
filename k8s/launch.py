@@ -31,6 +31,7 @@ from senpai_agent.launch_context import (
 from senpai_agent.program_context import PROGRAM_PATH_ENV, normalize_program_path
 from senpai_agent.secrets import validate_custom_secret_env_names
 
+from capacity_observer import render_capacity_observer
 from launch_helpers import (
     ensure_advisor_branch,
     ensure_new_student_slot,
@@ -90,6 +91,14 @@ class Args:
     controller_node_selector: list[str] = field(
         default_factory=list
     )  # optional key=value placement selectors for advisor and multi-node controllers
+    capacity_observer: bool = False  # install a credential-isolated cluster capacity observer
+    capacity_node_selector: list[str] = field(
+        default_factory=list
+    )  # key=value selectors for the observed worker shape
+    capacity_tolerations: list[str] = field(
+        default_factory=list
+    )  # JSON toleration objects for the observed worker shape
+    capacity_hpc_verification: bool = False  # apply the operator-confirmed CoreWeave HPC eligibility policy
     senpai_repo_url: str = (
         "https://github.com/wandb/senpai.git"  # public read-only runner source
     )
@@ -98,7 +107,7 @@ class Args:
     )
     advisor_image: str = ""  # advisor source-SHA tag or image digest — REQUIRED
     student_image: str = ""  # student source-SHA tag or image digest — REQUIRED
-    executor_image: str = ""  # credentialed Kubernetes broker image; required for multi-node students
+    executor_image: str = ""  # immutable broker image; required for multi-node students or the capacity observer
     kube_context: str = ""  # kubectl context; empty uses the current context
     namespace: str = "default"  # Kubernetes namespace for all launch resources
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
@@ -187,16 +196,32 @@ def configured_models(args: Args, role: str | None = None) -> tuple[str, ...]:
     return (*main_models.values(), *models)
 
 
-def controller_node_selector(values: list[str]) -> dict[str, str]:
+def controller_node_selector(
+    values: list[str], *, kind: str = "controller"
+) -> dict[str, str]:
     selector: dict[str, str] = {}
     for item in values:
         key, separator, value = item.partition("=")
         if not separator or not key or not value:
-            raise ValueError("controller node selectors must use key=value")
+            raise ValueError(f"{kind} node selectors must use key=value")
         if key in selector:
-            raise ValueError(f"duplicate controller node selector: {key}")
+            raise ValueError(f"duplicate {kind} node selector: {key}")
         selector[key] = value
     return selector
+
+
+def capacity_config(args: Args) -> dict:
+    from senpai_agent.cluster_capacity import CapacityConfig
+
+    return CapacityConfig(
+        nodes=args.nodes_per_student,
+        gpus_per_node=args.gpus_per_student_node,
+        cpu_per_node=args.cpu_per_gpu * args.gpus_per_student_node,
+        memory_gib_per_node=args.memory_gi_per_gpu * args.gpus_per_student_node,
+        node_selector=controller_node_selector(args.capacity_node_selector, kind="capacity"),
+        tolerations=[json.loads(value) for value in args.capacity_tolerations],
+        hpc_verification=args.capacity_hpc_verification,
+    ).model_dump(mode="json")
 
 
 def configured_model_providers(args: Args, role: str | None = None) -> set[str]:
@@ -413,6 +438,30 @@ def _executor_socket_mount(args: Args) -> str:
             "mountPath": "/var/run/senpai-kubernetes",
         },
         8,
+    )
+
+
+def _capacity_snapshot_mount(args: Args) -> str:
+    if not args.capacity_observer:
+        return ""
+    return _yaml_list_insertion(
+        {"name": "capacity-snapshot", "mountPath": "/var/run/senpai-capacity", "readOnly": True},
+        8,
+    )
+
+
+def _capacity_snapshot_volume(args: Args, tag: str) -> str:
+    if not args.capacity_observer:
+        return ""
+    return _yaml_list_insertion(
+        {
+            "name": "capacity-snapshot",
+            "configMap": {
+                "name": f"senpai-capacity-{tag}",
+                "items": [{"key": "snapshot.json", "path": "snapshot.json"}],
+            },
+        },
+        6,
     )
 
 
@@ -646,6 +695,7 @@ def render_student(
             "PVC_CLAIM_NAME": args.pvc_claim_name,
             "SENPAI_LAUNCH_SECRET_NAME": secret_name,
             "SENPAI_START_GATE_PATH": args.start_gate_path,
+            **({"SENPAI_CAPACITY_SNAPSHOT": "/var/run/senpai-capacity/snapshot.json"} if args.capacity_observer else {}),
         },
     )
     deployment = render_template(
@@ -690,6 +740,8 @@ def render_student(
                 student_configmap_name,
             ),
             "KUBERNETES_EXECUTOR_VOLUMES": _executor_volumes(args),
+            "CAPACITY_SNAPSHOT_MOUNT": _capacity_snapshot_mount(args),
+            "CAPACITY_SNAPSHOT_VOLUME": _capacity_snapshot_volume(args, tag),
             "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
             "MODEL_PROVIDER_ENV": secret_env_refs(
                 model_secret_env_refs(args, "student"), secret_name
@@ -750,6 +802,8 @@ def render_advisor(
         role="advisor",
     )
     data["EXTRA_INSTRUCTIONS_B64"] = encoded_operator_instructions(args)
+    if args.capacity_observer:
+        data["SENPAI_CAPACITY_SNAPSHOT"] = "/var/run/senpai-capacity/snapshot.json"
     configmap = render_configmap(
         name=advisor_configmap_name,
         labels={"app": "senpai", "role": "advisor", "research-tag": tag},
@@ -775,6 +829,8 @@ def render_advisor(
             "CONTROLLER_NODE_SELECTOR": json.dumps(
                 controller_node_selector(args.controller_node_selector)
             ),
+            "CAPACITY_SNAPSHOT_MOUNT": _capacity_snapshot_mount(args),
+            "CAPACITY_SNAPSHOT_VOLUME": _capacity_snapshot_volume(args, tag),
         },
     )
     return configmap + "\n---\n" + deployment
@@ -831,6 +887,8 @@ def main():
     validate_model_config(args)
     try:
         controller_node_selector(args.controller_node_selector)
+        if args.capacity_observer:
+            capacity_config(args)
     except ValueError as error:
         sys.exit(f"ERROR: {error}")
     try:
@@ -842,7 +900,7 @@ def main():
             ("advisor", args.advisor_image),
             ("student", args.student_image),
         ]
-        if args.nodes_per_student > 1:
+        if args.nodes_per_student > 1 or args.capacity_observer:
             role_images.append(("executor", args.executor_image))
         for role, image in role_images:
             if role == "executor" and not is_digest_image_reference(image):
@@ -1016,6 +1074,27 @@ def main():
             namespace=args.namespace,
         )
 
+    if args.capacity_observer:
+        manifest = render_capacity_observer(
+            tag=args.tag,
+            namespace=args.namespace,
+            image=args.executor_image,
+            revision=args.senpai_repo_revision,
+            config=capacity_config(args),
+            node_selector=controller_node_selector(args.controller_node_selector),
+        )
+        if args.dry_run:
+            print("--- Capacity observer ---")
+            print(manifest)
+            print()
+        else:
+            kubectl_apply(
+                manifest,
+                "capacity observer",
+                kube_context=args.kube_context,
+                namespace=args.namespace,
+            )
+
     # --- Deploy students ---
     for name, manifest, documents in student_manifests:
         if args.dry_run:
@@ -1102,6 +1181,12 @@ def main():
             f"  {kubectl} delete configmaps,secrets,serviceaccounts,roles,rolebindings "
             f"-l research-tag={args.tag}"
         )
+        if args.capacity_observer:
+            print(
+                f"  {kubectl} delete clusterroles,clusterrolebindings "
+                f"-l app=senpai-capacity-observer,research-tag={args.tag},"
+                f"senpai.wandb.com/namespace={args.namespace}"
+            )
 
 
 if __name__ == "__main__":

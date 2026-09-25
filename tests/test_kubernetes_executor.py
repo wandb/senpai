@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -1142,21 +1143,14 @@ def test_api_delete_uses_a_uid_precondition_and_foreground_propagation(
     requests = []
     gets = 0
 
-    class Response:
-        def __init__(self, value):
-            self.value = value
-
-        def read(self):
-            return self.value
-
     def urlopen(request, **_kwargs):
         nonlocal gets
         requests.append(request)
         if request.get_method() == "DELETE":
-            return Response(b"{}")
+            return io.BytesIO(b"{}")
         gets += 1
         if gets == 1:
-            return Response(
+            return io.BytesIO(
                 json.dumps(
                     {
                         "kind": "MPIJob",

@@ -180,7 +180,7 @@ PY
 }
 
 pod_counts() {
-  kubectl -n "$NAMESPACE" get pods -l "$SELECTOR" -o json | python -c '
+  kubectl -n "$NAMESPACE" get pods -l "app=senpai,$SELECTOR" -o json | python -c '
 import json
 import sys
 data = json.load(sys.stdin)
@@ -195,7 +195,7 @@ print(f"{len(items)} {ready}")
 }
 
 deployment_count() {
-  kubectl -n "$NAMESPACE" get deployments -l "$SELECTOR" --no-headers 2>/dev/null | wc -l | tr -d ' '
+  kubectl -n "$NAMESPACE" get deployments -l "app=senpai,$SELECTOR" --no-headers 2>/dev/null | wc -l | tr -d ' '
 }
 
 write_state() {
