@@ -44,6 +44,7 @@ from senpai_agent.training import (
     TrainingSpec,
     TrainingState,
     TrainingSupervisor,
+    target_python_environment,
 )
 
 if TYPE_CHECKING:
@@ -702,6 +703,7 @@ class SenpaiTerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
         native = TerminalTool.create(
             conv_state,
             no_change_timeout_seconds=no_change_timeout,
+            env=target_python_environment() or None,
         )[0]
         if native.executor is None:
             raise RuntimeError("native terminal tool has no executor")

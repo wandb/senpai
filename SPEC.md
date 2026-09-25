@@ -257,6 +257,32 @@ concatenated into agent definitions. The OpenHands fork's `main` branch applies
 each agent definition's `reasoning_effort` override after resolving its
 inherited LLM or stored model profile.
 
+The images install the runner as a non-editable package and make its Python
+environment, built-in agent definitions, and plugin assets root-owned and
+read-only. `SENPAI_AGENT_DIR` selects the installed built-in definitions;
+`SENPAI_PLUGIN` selects the installed plugin. The supervisor, controller,
+delegated children, and plugin hooks use trusted Python with `-P`, so a target
+working directory cannot shadow the installed runner. These controls protect
+runtime imports and assets; they do not sandbox target code or freeze the
+operator's system-instruction files.
+
+`SENPAI_TARGET_PYTHON_ENV` selects a writable target venv for terminals and
+training. Its site-packages include the trusted environment through a `.pth`
+path entry. Target packages can override those shared packages without writing
+to the trusted environment. Bootstrap computes both paths with trusted Python
+and creates the target venv without pip bootstrapping, which would execute
+target Python. Terminal and training environments select the target through
+PATH and uv settings. Training removes inherited `PYTHONSAFEPATH` so project
+imports work normally. File-defined child terminals use the same routing.
+
+OpenHands ambient plugin discovery is disabled before root or child
+conversations are created. Only the explicitly supplied trusted plugin loads
+through the plugin loader. Explicit target skills, unreserved target/user
+agents, and their declared MCP configurations remain supported. This removes
+automatic plugin hooks, MCP servers, and skills from writable user/project
+plugin directories. The adapter depends on the pinned SDK's discovery call;
+SDK upgrades must retain the executable plugin-isolation test.
+
 ## Prompt caching
 
 The SDK and tools track the `main` branch of

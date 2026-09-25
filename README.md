@@ -446,6 +446,33 @@ Pod startup and liveness probes read the supervisor lease. Container restarts re
 
 GitHub coordination works across Docker, cloud VMs, or local hosts without private networking. The current repository does not yet provide a Compose or direct-host launcher: the Kubernetes manifests perform the source clone, environment assembly, skill installation, token handoff, mounts, and entrypoint selection.
 
+The role images install `senpai_agent` into `/opt/senpai-venv` at build time.
+That environment, the built-in agent definitions (`SENPAI_AGENT_DIR`), and the
+Senpai plugin (`SENPAI_PLUGIN`) are root-owned and read-only to the role user.
+Startup uses the installed runner with an absolute Python path and `-P`;
+it does not install the writable runner checkout or execute target Python.
+Changes to these installed assets require a new image.
+
+Terminals and supervised training use a separate writable environment at
+`$HOME/.venvs/senpai-target`. Its packages take precedence over the image's
+read-only packages. `python`, `uv pip install`, and `uv run` select that target
+environment through `PATH`, `VIRTUAL_ENV`, `UV_PYTHON`, and
+`UV_PROJECT_ENVIRONMENT`. Bootstrap creates it without running `ensurepip`;
+use `uv pip install` to add dependencies (including `pip` if needed).
+Training retains normal project imports. File-defined child agents use the
+same Senpai terminal policy, timeouts, and target environment as their parent.
+
+Senpai loads its explicit plugin and explicit target skills and agent
+definitions. It does not auto-load installed, user, or project plugins through
+OpenHands ambient discovery. Those plugins' hooks, MCP servers, and skills
+therefore no longer appear automatically. Target skills in `.agents/skills`,
+`.openhands/skills`, and `.openhands/microagents` remain supported, as do
+unreserved target/user agents and MCP configuration declared on those agents.
+The bundled Exa and W&B skill integrations, browser tools, and typed GitHub,
+training, and delegation tools remain available. Operators who need an
+additional runtime plugin must review and include it in the trusted image
+plugin; copying it into a target or home plugin directory does not enable it.
+
 To build another launcher, reproduce [entrypoint-advisor.sh](k8s/entrypoint-advisor.sh) or [entrypoint-student.sh](k8s/entrypoint-student.sh), render `SENPAI-LAUNCH-CONTEXT.md` with runtime identity, limits, and isolation through `render_launch_context`, and provide it as base64 in `SENPAI_LAUNCH_CONTEXT_B64`. Pass the built-in role template and its required non-secret values to the Python supervisor, which renders and persists that role snapshot. Keep optional operator guidance in `EXTRA_INSTRUCTIONS_B64`. Persist `/var/lib/senpai/<tag>/advisor` for the advisor and use the container healthcheck with a restart policy. Student execution requires Linux, an NVIDIA runtime, and compatible CUDA hardware; Docker Desktop on macOS cannot run the GPU student image.
 
 ## Development and reference

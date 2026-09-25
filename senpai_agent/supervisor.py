@@ -414,6 +414,7 @@ def supervisor_main(
         return WorkerSupervisor(
             command=(
                 sys.executable,
+                "-P",
                 "-m",
                 "senpai_agent.controller",
                 args.command,
