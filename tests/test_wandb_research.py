@@ -501,27 +501,49 @@ def test_private_project_discovery_and_artifact_existence_use_sdk_responses(rese
 
 
 def test_metadata_and_error_outputs_redact_configured_key(research):
+    encoded_auth = base64.b64encode(f"api:{RESEARCH_KEY}".encode()).decode()
+
     def respond(query, variables):
         if "query Run(" in query:
             node = run_node()
             node["summaryMetrics"] = json.dumps(
-                {"nested": {"accidental-key": RESEARCH_KEY}}
+                {
+                    "nested": {
+                        "accidental-key": RESEARCH_KEY,
+                        "authorization": f"Basic {encoded_auth}",
+                    }
+                }
             )
             return {"project": {"run": node}}
 
     research.handler = respond
     observation, rows = invoke(research, op="run", path="other/private/r1")
-    assert rows[0]["summary"] == {"nested": {"accidental-key": "[REDACTED]"}}
+    assert rows[0]["summary"] == {
+        "nested": {
+            "accidental-key": "[REDACTED]",
+            "authorization": "Basic [REDACTED]",
+        }
+    }
     assert RESEARCH_KEY not in Path(observation.path).read_text()
+    assert encoded_auth not in Path(observation.path).read_text()
 
     def fail(*_):
-        raise ValueError(f"rejected authorization {RESEARCH_KEY}")
+        raise ValueError(f"rejected authorization {RESEARCH_KEY}; Basic {encoded_auth}")
 
     research.handler = fail
     with pytest.raises(RuntimeError) as raised:
         invoke(research, op="run", path="other/private/r1")
     assert RESEARCH_KEY not in str(raised.value)
-    assert "rejected authorization [REDACTED]" in str(raised.value)
+    assert encoded_auth not in str(raised.value)
+    assert "rejected authorization [REDACTED]; Basic [REDACTED]" in str(raised.value)
+
+
+def test_trusted_self_hosted_path_prefix_reaches_actual_sdk(research):
+    base_url = "https://selfhost.example/platform/wandb"
+    configure_wandb_credentials(SecretStr(RESEARCH_KEY), base_url=base_url + "/")
+    _, rows = invoke(research, op="run", path="other/private/r1")
+    assert research.verified == [(RESEARCH_KEY, base_url)]
+    assert rows[0]["url"] == base_url + "/other/private/runs/r1"
 
 
 @pytest.mark.parametrize("failure", ["digest", "external_reference"])

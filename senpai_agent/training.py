@@ -308,7 +308,8 @@ class TrainingSupervisor:
                     sanitized, pending = _mask_output_chunk(pending + chunk, secret)
                     log.write(sanitized)
                     log.flush()
-                log.write(pending)
+                if pending:
+                    log.write(b"<secret-hidden>")
         except Exception as error:
             active.output_error = (
                 f"Training output capture failed ({type(error).__name__})."

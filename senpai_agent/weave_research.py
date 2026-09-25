@@ -37,20 +37,19 @@ def configure_weave_credentials(
     wandb_base_url: str = "https://api.wandb.ai",
 ) -> None:
     """Accept credentials and service addresses only from trusted process setup."""
-    for origin, allow_prefix in ((trace_base_url, True), (wandb_base_url, False)):
-        parsed = urlsplit(origin)
+    for base_url in (trace_base_url, wandb_base_url):
+        parsed = urlsplit(base_url)
         if (
             parsed.scheme not in {"http", "https"}
             or not parsed.hostname
-            or parsed.username
-            or parsed.password
-            or (parsed.path.rstrip("/") and not allow_prefix)
+            or parsed.username is not None
+            or parsed.password is not None
             or parsed.query
             or parsed.fragment
         ):
             raise ValueError(
                 "research service URL must use HTTP(S) without credentials, query or "
-                "fragment; only the trace service accepts a path prefix"
+                "fragment"
             )
     if api_key is not None and not api_key.get_secret_value():
         raise ValueError("research API key must not be empty")

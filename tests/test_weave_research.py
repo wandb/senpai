@@ -235,22 +235,26 @@ def test_call_costs_and_stats_use_server_side_queries(research_service):
     assert len(service.requests) == 2
 
 
-def test_self_hosted_trace_path_prefix_preserves_authenticated_queries(
+def test_self_hosted_path_prefixes_preserve_authenticated_queries(
     research_service,
 ):
     service = research_service
     configure_weave_credentials(
         SecretStr("controller-research-sentinel"),
         trace_base_url=service.origin + "/traces/",
-        wandb_base_url=service.origin,
+        wandb_base_url=service.origin + "/wandb/",
     )
 
     def route(path, payload):
-        assert path == "/traces/calls/query_stats"
-        assert (
-            tsi.CallsQueryStatsReq.model_validate(payload).project_id == "team/private"
-        )
-        return _json({"count": 42})
+        if path == "/traces/calls/query_stats":
+            assert (
+                tsi.CallsQueryStatsReq.model_validate(payload).project_id
+                == "team/private"
+            )
+            return _json({"count": 42})
+        assert path == "/wandb/graphql"
+        assert payload["variables"] == {"reportId": "private-view"}
+        return _json({"data": {"view": {"id": "private-view", "spec": "{}"}}})
 
     service.route = route
     result = service.weave(
@@ -262,6 +266,14 @@ def test_self_hosted_trace_path_prefix_preserves_authenticated_queries(
         )
     )
     assert result.details["matching_calls"] == 42
+    view = service.views(
+        WandbViewsAction(request={"op": "view", "view_id": "private-view"})
+    )
+    assert _rows(view) == [{"id": "private-view", "spec": {}}]
+    assert [path for path, _, _ in service.requests] == [
+        "/traces/calls/query_stats",
+        "/wandb/graphql",
+    ]
 
 
 def test_refs_objects_and_dataset_tables_remain_plain_data(research_service):

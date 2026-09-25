@@ -53,22 +53,28 @@ ObjectPath = Annotated[
 def configure_wandb_credentials(
     api_key: SecretStr | None, *, base_url: str = "https://api.wandb.ai"
 ) -> None:
-    """Accept credentials and the API origin only from trusted process setup."""
+    """Accept credentials and the API URL only from trusted process setup."""
     parsed = urlsplit(base_url)
     if (
         parsed.scheme not in {"https", "http"}
         or not parsed.hostname
-        or parsed.username
-        or parsed.password
-        or parsed.path.rstrip("/")
+        or parsed.username is not None
+        or parsed.password is not None
         or parsed.query
         or parsed.fragment
     ):
-        raise ValueError("W&B base_url must be an HTTP(S) origin")
+        raise ValueError(
+            "W&B base_url must use HTTP(S) without credentials, query or fragment"
+        )
     if api_key is not None and not api_key.get_secret_value():
         raise ValueError("W&B API key must not be empty")
     global _api_key, _base_url
     _api_key, _base_url = api_key, base_url.rstrip("/")
+
+
+def _credential_redactions(api_key: SecretStr) -> tuple[str, str]:
+    key = api_key.get_secret_value()
+    return key, base64.b64encode(f"api:{key}".encode()).decode()
 
 
 class PageRequest(BaseModel):
@@ -394,7 +400,9 @@ class WandbResearchExecutor(
             return self._execute(action)
         except Exception as error:  # noqa: BLE001 - redact every SDK error boundary
             # SDK errors may include response bodies; never relay our credential.
-            message = str(error).replace(_api_key.get_secret_value(), "[REDACTED]")
+            message = str(error)
+            for secret in _credential_redactions(_api_key):
+                message = message.replace(secret, "[REDACTED]")
             if isinstance(error, requests.RequestException):
                 # Signed storage URLs are capabilities too.
                 message = "The file transfer failed; no complete result was published"
@@ -411,7 +419,7 @@ class WandbResearchExecutor(
         )
         with export_directory(self.output_dir) as descriptor:
             exports = ResearchExports(
-                self.output_dir, descriptor, secrets=(_api_key.get_secret_value(),)
+                self.output_dir, descriptor, secrets=_credential_redactions(_api_key)
             )
             rows: Iterable[object]
             details: dict[str, Any] = {

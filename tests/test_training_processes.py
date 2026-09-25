@@ -318,6 +318,32 @@ def test_training_masks_split_writer_output_before_log_and_result_persistence(
     assert "student-writer-secret" not in persisted.read_text()
 
 
+def test_training_masks_a_partial_writer_key_at_natural_eof(tmp_path):
+    workspace, supervisor = make_supervisor(
+        tmp_path,
+        wandb_api_key=SecretStr("0123456789abcdef0123456789abcdef01234567"),
+        terminate_grace_seconds=0.1,
+    )
+    running = run_python(
+        supervisor,
+        workspace,
+        "import os,sys;"
+        "os.write(1,b'partial writer='+os.environ['WANDB_API_KEY'].encode()[:24]);"
+        "sys.exit(1)",
+    )
+    try:
+        result = wait_for_terminal(supervisor, running.training_id)
+    finally:
+        supervisor.close()
+
+    expected = "partial writer=<secret-hidden>"
+    assert result.state is TrainingState.FAILED
+    assert Path(running.log_path).read_text() == expected
+    assert result.error_tail == expected
+    persisted = tmp_path / "state" / f"{running.training_id}.json"
+    assert json.loads(persisted.read_text())["error_tail"] == expected
+
+
 def test_cancel_does_not_wait_for_a_detached_output_writer(tmp_path):
     workspace, supervisor = make_supervisor(
         tmp_path,
@@ -369,7 +395,9 @@ def test_cancel_does_not_wait_for_a_detached_output_writer(tmp_path):
         supervisor.get_training_status(running.training_id).state
         is TrainingState.CANCELLED
     )
-    assert b"student-writer-secret" not in Path(running.log_path).read_bytes()
+    output = Path(running.log_path).read_bytes()
+    assert b"student-writer-secret" not in output
+    assert output.endswith(b"<secret-hidden>")
 
 
 def test_output_capture_failure_cannot_report_success(tmp_path, monkeypatch):

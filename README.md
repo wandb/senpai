@@ -130,8 +130,10 @@ Run one launcher at a time per namespace. The ownership scan and resource apply
 are not atomic; concurrent launchers can both pass the scan. `--preflight_only`
 checks supplied identities but does not reserve them or inspect cluster ownership.
 Changed credentials create new Secrets; include every role that must rotate in
-the launch command. Keep old Secrets until their Pods stop, then use the existing
-label-based cleanup command.
+the launch command. Retain old Secrets until no Deployment or nonterminal Pod
+references them, then delete only those unreferenced Secrets by name. The
+label-based cleanup command below tears down the entire launch; use it only when
+stopping that launch.
 
 The additive `wandb_research`, `weave_research`, and `wandb_views` tools export
 private run data, histories, artifacts, Weave records, and workspace/report
