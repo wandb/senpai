@@ -50,6 +50,8 @@ def test_policy_denies_recognized_publication_and_github_mutations(command: str)
         "gh pr view 17 --json title",
         "gh api repos/wandb/senpai/pulls/17",
         "env GH_HOST=github.com gh repo view wandb/senpai",
+        "env python -S inspect_results.py",
+        "env printf '%s\\n' 'BASH_FUNC_git%%=literal data'",
         "curl https://api.github.com/repos/wandb/senpai/pulls/17",
     ],
 )
@@ -141,8 +143,9 @@ def test_policy_denies_foreground_polling(command: str):
     assert is_allowed(command) is False
 
 
-def test_quoted_file_heredoc_treats_restricted_words_as_literal_data():
-    command = """cat > /tmp/notes.txt <<'EOF'
+@pytest.mark.parametrize("destination", ["/tmp/notes.txt", "sh"])
+def test_quoted_file_heredoc_treats_restricted_words_as_literal_data(destination: str):
+    command = f"""cat > {destination} <<'EOF'
 git push origin experiment
 gh pr merge 17 --squash
 python train.py --epochs 10
@@ -186,3 +189,431 @@ def test_eval_cannot_hide_a_push_inside_a_nested_heredoc():
     )
 
     assert is_allowed(command) is False
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'config["lr"] = 0.1',
+        "for k, v in d.items():\n    print(k, v)",
+        "print(*xs)",
+        "print('$(git push origin experiment)')",
+    ],
+)
+def test_quoted_python_stdin_is_data_for_the_shell_policy(body: str):
+    assert is_allowed(f"python - <<'PYCODE'\n{body}\nPYCODE") is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 <<'PY'\nprint(*xs)\nPY",
+        "python -u - <<'PY'\nprint(*xs)\nPY",
+        ".venv/bin/python - <<'PY'\nprint(*xs)\nPY",
+        "uv run python - <<'PY'\nprint(*xs)\nPY",
+        "PYTHONUNBUFFERED=1 python3 - <<'PY'\nprint(*xs)\nPY",
+        "cat <<'PY' | python3\nprint(*xs)\nPY",
+        "tee notes.md <<'DOC'\nconfig['lr'] = 0.1\nDOC",
+        "tee 'output notes.md' > /dev/null <<'DOC'\nconfig['lr'] = 0.1\nDOC",
+        "tee > /dev/null notes.md <<'DOC'\nconfig['lr'] = 0.1\nDOC",
+        "tee <<'DOC' notes.md\nconfig['lr'] = 0.1\nDOC",
+        "exec > logfile; cat <<'SH'\ngit push origin experiment\nSH",
+        "cd data && python - <<'PY'\nprint(*xs)\nPY",
+        "mkdir -p output && uv run python - <<'PY'\nconfig['lr'] = 0.1\nPY",
+        "python - <<'PY' | head\nprint(*xs)\nPY",
+        "python - <<'PY' | grep result\nprint(*xs)\nPY",
+    ],
+)
+def test_quoted_heredocs_preserve_known_data_consumers(command: str):
+    assert is_allowed(command) is True
+
+
+def test_python_named_shell_symlink_does_not_hide_executable_heredoc(tmp_path: Path):
+    (tmp_path / "python3").symlink_to("/bin/bash")
+
+    decision = terminal_policy(
+        "./python3 <<'SH'\necho \"$(git push origin experiment)\"\nSH",
+        "student",
+        tmp_path,
+    )
+
+    assert decision.allowed is False
+    assert "git push" in decision.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python - <<PYCODE\nprint('$(git push origin experiment)')\nPYCODE",
+        "bash <<'SH'\necho \"$(git push origin experiment)\"\nSH",
+        "'bash' <<'SH'\necho \"$(git push origin experiment)\"\nSH",
+        "nice -n 10 'bash' <<'SH'\necho \"$(git push origin experiment)\"\nSH",
+        "nice <<'SH' bash\necho \"$(git push origin experiment)\"\nSH",
+        "cat <<'SH' | sh\necho \"$(git push origin experiment)\"\nSH",
+        "cat <<'SH' | 'sh'\necho \"$(git push origin experiment)\"\nSH",
+        "cat > >(sh) <<'SH'\necho \"$(git push origin experiment)\"\nSH",
+        "{ cat <<'SH'\necho \"$(git push origin experiment)\"\nSH\n} | sh",
+        "{ cat <<'SH'\necho \"$(git push origin experiment)\"\nSH\n} > >(sh)",
+        "exec 3> >(bash); cat >&3 <<'SH'\necho \"$(git push origin experiment)\"\nSH",
+        "exec 3> >(bash); tee /dev/fd/3 <<'SH'\necho \"$(git push origin experiment)\"\nSH",
+        "exec > >(bash); cat <<'SH'\ngit push origin experiment\nSH",
+        "exec &> >(bash); tee notes.md <<'SH'\ngit push origin experiment\nSH",
+        "cd data && tee > /dev/null /dev/fd/3 <<'SH'\ngit push origin experiment\nSH",
+        "python - <<'PYCODE'\nprint(*xs)\nPYCODE\ngit push origin experiment",
+        "git push origin experiment && python - <<'PY'\nprint(*xs)\nPY",
+        "cat <<'SH' | head | sh\necho \"$(git push origin experiment)\"\nSH",
+    ],
+)
+def test_heredoc_shell_execution_checks_the_actual_restricted_command(command: str):
+    decision = terminal_policy(command, "student", WORKSPACE)
+
+    assert decision.allowed is False
+    assert "git push" in decision.reason
+
+
+@pytest.mark.parametrize("runner", ["exec", "builtin exec", "command -p exec", "cd data && exec"])
+def test_inherited_opaque_stdout_does_not_hide_heredoc_commands(runner: str):
+    decision = terminal_policy(
+        f"{runner} > /dev/fd/3; cat <<'SH'\necho \"$(git push origin experiment)\"\nSH",
+        "student",
+        WORKSPACE,
+    )
+
+    assert decision.allowed is False
+    assert "git push" in decision.reason
+
+
+def test_tee_arguments_after_heredoc_delimiter_still_identify_opaque_streams():
+    decision = terminal_policy(
+        "tee <<'SH' /dev/fd/3\ngit push origin experiment\nSH",
+        "student",
+        WORKSPACE,
+    )
+
+    assert decision.allowed is False
+    assert "git push" in decision.reason
+
+
+@pytest.mark.parametrize(
+    "destination",
+    [
+        '"$fd"',
+        '"$(echo /dev/fd/3)"',
+        "/dev/./fd/3",
+        "//dev/fd/3",
+        "$'/dev/fd/3'",
+        "> /dev/null /dev/fd/3",
+    ],
+)
+def test_tee_heredocs_do_not_hide_commands_sent_to_opaque_streams(destination: str):
+    decision = terminal_policy(
+        f"tee {destination} <<'SH'\ngit push origin experiment\nSH",
+        "student",
+        WORKSPACE,
+    )
+
+    assert decision.allowed is False
+    assert "git push" in decision.reason
+
+
+@pytest.mark.parametrize("redirect", [">", "2>", "2>>"])
+def test_newlines_in_redirect_filenames_do_not_hide_trailing_argv(redirect: str):
+    decision = terminal_policy(
+        f'git {redirect} "first\nsecond" push origin experiment',
+        "student",
+        WORKSPACE,
+    )
+
+    assert decision.allowed is False
+    assert "git push" in decision.reason
+    assert is_allowed(f'git {redirect} "first\nsecond" status') is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash <<'SH'\necho \"$(date -u)\"\nSH",
+        "python - >out <<'PY'\nprint(*xs)\nPY",
+        "echo $((2 + 2))",
+        "echo $((16#FF + (2 << 1)))",
+        "((2 + 2))",
+    ],
+)
+def test_policy_preserves_static_shell_calculations_and_scripts(command: str):
+    assert is_allowed(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'echo "$(git push origin experiment)"',
+        "echo `python train.py --epochs 10`",
+        "cat <(gh issue comment 12 --body done)",
+        "(setsid sleep 3600)",
+        "{ git push origin experiment; }",
+        "publish() { git push origin experiment; }; publish",
+        "case x in x) git push origin experiment;; esac",
+        "case x in\n*) git push origin experiment;;\nesac",
+        'case x in "$(git push origin experiment)") echo ok;; esac',
+        "arr[0]=$(git push origin experiment)",
+    ],
+)
+def test_nested_shell_execution_cannot_hide_restricted_commands(command: str):
+    assert is_allowed(command) is False
+
+
+def test_policy_allows_nested_shell_execution_when_every_command_is_safe():
+    assert is_allowed('echo "$(date -u)"') is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "$(printf git) push origin experiment",
+        "$'git' push origin experiment",
+        "g$''it push origin experiment",
+        "G=git; $G push origin experiment",
+        "command $(printf git) push origin experiment",
+        "env $(printf git) push origin experiment",
+        "/usr/bin/g?t push origin experiment",
+    ],
+)
+def test_dynamic_executable_names_cannot_hide_restricted_commands(command: str):
+    assert is_allowed(command) is False
+
+
+def test_alias_expansion_cannot_defer_restricted_command_parsing():
+    command = "\n".join(
+        [
+            "shopt -s expand_aliases",
+            "alias ship='git push'",
+            "ship origin experiment",
+        ]
+    )
+
+    assert is_allowed(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "[[ -v 'a[$(git push origin experiment)]' ]]",
+        "printf -v 'a[$(git push origin experiment)]' x",
+        "x='a[$(git push origin experiment)]'; echo $((x))",
+        "x='a[$(git push origin experiment)]'; ((x))",
+        (
+            "x='a[$(git push origin experiment)]'; "
+            "for ((i=x; i<1; i++)); do :; done"
+        ),
+        "x='a[$(git push origin experiment)]'; let x",
+        "x='a[$(git push origin experiment)]'; declare -i y=x",
+        (
+            "declare -n ref='a[$(git push origin experiment)]'; "
+            'echo "$ref"'
+        ),
+        "read 'a[$(git push origin experiment)]' <<< value",
+        "declare 'a[$(git push origin experiment)]=x'",
+        "typeset 'a[$(git push origin experiment)]=x'",
+        "arr[$i]=x",
+        "arr[1+2]=x",
+        "f() { local 'a[$(git push origin experiment)]=x'; }; f",
+        "a=(x); unset 'a[$(git push origin experiment)]'",
+        "mapfile -C 'git push origin experiment' -c 1 values",
+        "mapfile -t PROMPT_COMMAND < commands.txt",
+        "readarray -t PROMPT_COMMAND < commands.txt",
+        "getopts a PROMPT_COMMAND -a",
+        "x=PROMPT_COMMAND; mapfile -t \"$x\" < commands.txt",
+        "x=PROMPT_COMMAND; readarray -t \"$x\" < commands.txt",
+        "x=PROMPT_COMMAND; getopts a \"$x\" -a",
+        "for PROMPT_COMMAND in 'git push origin experiment'; do :; done",
+        "select PROMPT_COMMAND in 'git push origin experiment'; do break; done",
+        "hash -p /usr/bin/git ship; ship push origin experiment",
+        "trap 'git push origin experiment' EXIT",
+        "fc -s status=push",
+        "history -s 'git push origin experiment'",
+        "jobs -x git push origin experiment",
+        "bind -x '\"\\C-x\":git push origin experiment'",
+        "complete -C 'git push origin experiment' git",
+        "time git push origin experiment",
+        "time python train.py --epochs 10",
+        "time sleep 3600",
+        "coproc git push origin experiment",
+        "coproc date -u",
+        "exec -a audit git push origin experiment",
+        "env -a audit git push origin experiment",
+        "env --argv0 audit git push origin experiment",
+        "env --argv0=audit git push origin experiment",
+        "env -a '>' git push origin experiment",
+        "nice -n '>' git push origin experiment",
+        "source ./commands.sh",
+        ". ./commands.sh",
+        "BASH_ENV=/tmp/commands bash -c 'date -u'",
+        "BASH_ENV=<(printf 'git push origin experiment\\n') bash -c 'date -u'",
+        "env BASH_ENV=/tmp/commands bash -c 'date -u'",
+        "export BASH_ENV=/tmp/commands; bash -c 'date -u'",
+        "ENV=/tmp/commands sh -c 'date -u'",
+        "ZDOTDIR=/tmp/commands zsh -c 'date -u'",
+        "SHELLOPTS=xtrace PS4='$(git push origin experiment)' bash -c date",
+        "PROMPT_COMMAND='git push origin experiment'",
+        "PROMPT_COMMAND+='; git push origin experiment'",
+        "PROMPT_COMMAND[0]='git push origin experiment'",
+        "export PROMPT_COMMAND='git push origin experiment'",
+        "declare PROMPT_COMMAND='git push origin experiment'",
+        "readonly PROMPT_COMMAND='git push origin experiment'",
+        "PS0='$(git push origin experiment)'",
+        "MAILCHECK=0 MAILPATH='/tmp/mail?$(git push origin experiment)'",
+        "x='$(git push origin experiment)'; echo \"${x@P}\"",
+        "set -a; for BASH_ENV in x; do bash -c 'date -u'; done",
+        (
+            "set -o allexport; set -- -x; getopts x BASH_ENV; "
+            "bash -c 'date -u'"
+        ),
+        "set -ae; for BASH_ENV in x; do bash -c 'date -u'; done",
+        "bash -ac 'for BASH_ENV in x; do bash -c date; done'",
+        "v=a; set -$v; for BASH_ENV in x; do bash -c 'date -u'; done",
+        (
+            "v=allexport; set -o $v; for BASH_ENV in x; "
+            "do bash -c 'date -u'; done"
+        ),
+        "v=ac; bash -$v 'for BASH_ENV in x; do bash -c date; done'",
+        "set -{a,e}; for BASH_ENV in x; do bash -c date; done",
+        "bash -lc 'date -u'",
+        "bash --rcfile=/tmp/commands -ic 'date -u'",
+        "zsh -f -c 'date -u'",
+        "bash <<< 'git push origin experiment'",
+        "bash < <(printf 'git push origin experiment')",
+        "env 'BASH_FUNC_git%%=() { git push origin experiment; }' bash -c 'git status'",
+        "env -S \"'BASH_FUNC_git%%=() { git push origin experiment; }' bash -c 'git status'\"",
+    ],
+)
+def test_shell_argument_reevaluation_cannot_hide_restricted_commands(command: str):
+    assert is_allowed(command) is False
+
+
+def test_shell_aliases_cannot_load_startup_files(tmp_path: Path):
+    (tmp_path / "shell-runner").symlink_to("/bin/bash")
+
+    assert terminal_policy(
+        "./shell-runner -lc 'date -u'",
+        "student",
+        tmp_path,
+    ).allowed is False
+    assert is_allowed("rbash -lc 'date -u'") is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "(date -u)",
+        "{ date -u; }",
+        "report() { date -u; }; report",
+        "case x in x) date -u;; esac",
+        "case x in\n*) echo ok;;\nesac",
+        "case x in x) echo x;; *) echo ok;; esac",
+    ],
+)
+def test_policy_preserves_safe_static_nested_commands(command: str):
+    assert is_allowed(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "export CUDA_VISIBLE_DEVICES=0",
+        "f() { local x=value; }; f",
+        "declare -a values",
+        "arr[0]=x",
+        "arr[12]+=value",
+        "typeset x=value",
+        "read value",
+        "read value < input.txt",
+        "readonly VERSION=1",
+        "export RESULT=ok > output.txt",
+        "unset value",
+        "mapfile values",
+        "hash -r",
+        "time -p date -u",
+        "exec -a audit date -u",
+        "env --argv0 audit date -u",
+        "set +a",
+        "set +o allexport",
+        "set -o nounset",
+        "set -- one two",
+        "bash -c 'date -u'",
+    ],
+)
+def test_policy_preserves_safe_shell_variable_builtins(command: str):
+    assert is_allowed(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo \"$([[ -v 'a[$(git push origin experiment)]' ]])\"",
+        "a=(x); echo \"$(unset 'a[$(git push origin experiment)]')\"",
+        "echo \"$(while true; do :; done)\"",
+        "{ PROMPT_COMMAND='git push origin experiment'; }; date -u",
+        "f() { PROMPT_COMMAND='git push origin experiment'; }; f",
+        "case x in x) PROMPT_COMMAND='git push origin experiment';; esac",
+        "nice python train.py --epochs 10",
+        "nice -n 10 python train.py --epochs 10",
+        "nice >output -n 10 git push origin experiment",
+        "command >output git push origin experiment",
+        "setsid 2>errors python train.py",
+        "timeout --kill-after=5 --signal TERM 10 bash -c 'git push origin experiment'",
+        "timeout -k5 --signal=TERM 10 python train.py",
+        "timeout $options 5 git push origin experiment",
+        "timeout --sig TERM 5 git push origin experiment",
+        "stdbuf -oL accelerate launch train.py",
+        "chrt 0 python train.py",
+        "taskset 0x1 python train.py",
+        "flock /tmp/lock python train.py",
+        "flock /tmp/lock -c 'git push origin experiment'",
+        "script -qc 'git push origin experiment' /dev/null",
+        "unshare -r sleep 3600",
+        "echo x | xargs git push origin experiment",
+        "xargs -n 1 sleep < delays.txt",
+        "find . -maxdepth 0 -exec python train.py \\;",
+        "find . -exec true \\; -exec python train.py \\;",
+    ],
+)
+def test_runners_and_nested_statements_cannot_hide_restricted_commands(command: str):
+    assert is_allowed(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "nice -n 10 date -u",
+        "stdbuf -oL date -u",
+        "timeout -k 5 10 date -u",
+        "timeout 5 python -c 'import json; print(json.dumps({\"a\": 1}))'",
+        "timeout -k1 --signal=TERM 5 printf '%s\\n' 'git' 'push'",
+        "timeout --kill-after=1 -s TERM -- 5 bash -c 'date -u'",
+        "ionice -c 3 date -u",
+        "taskset 0x1 date -u",
+        "flock -w 5 /tmp/lock date -u",
+        "echo x | xargs -n 1 echo",
+        "find . -name 'train*.py' -newer results.log",
+        "find . -type f -exec wc -l {} +",
+        "echo \"$([[ -f results.log ]])\"",
+        "{ x=1; date -u; }",
+    ],
+)
+def test_runners_preserve_safe_commands(command: str):
+    assert is_allowed(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "nice -n 10 echo '*.py'",
+        "nice -n 10 printf '%s\\n' git push",
+        "nice -n 10 python -c 'print(*xs)'",
+        "stdbuf -oL python -c 'import json; print(json.dumps({\"a\": 1}))'",
+        "command printf '%s\\n' source",
+        "command -v git",
+    ],
+)
+def test_argv_runners_preserve_command_arguments_as_data(command: str):
+    assert is_allowed(command) is True
