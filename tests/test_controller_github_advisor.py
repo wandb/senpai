@@ -4,6 +4,13 @@ from pydantic import SecretStr
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.github.mailbox import GitHubMailbox
 from senpai_agent.github.mailbox.values import payload_digest
+from senpai_agent.inbox import PersistentInbox
+from senpai_agent.local_events import LocalEvent, LocalEventStore
+from senpai_agent.mailbox import (
+    CompositeMailbox,
+    LocalAdvisorMailbox,
+    StudentAssignmentAvailabilityMailbox,
+)
 from senpai_agent.models import (
     AssignmentCommentRecord,
     AssignmentKey,
@@ -25,6 +32,8 @@ def pull(
     number=17,
     body="",
     head_sha=None,
+    head_repo="acme/widgets",
+    author="maintainer",
     comments_url=None,
     updated_at="2099-07-29T18:00:00Z",
 ):
@@ -34,9 +43,11 @@ def pull(
         "html_url": f"https://github.test/acme/widgets/pull/{number}",
         "updated_at": updated_at,
         "body": body,
+        "user": {"login": author},
         "head": {
             "ref": f"student/candidate-{number}",
             "sha": head_sha or str(number % 10) * 40,
+            "repo": {"full_name": head_repo},
         },
         "labels": [{"name": label} for label in labels],
     }
@@ -45,7 +56,7 @@ def pull(
     return value
 
 
-def mailbox(monkeypatch, pulls, *, students=()):
+def mailbox(monkeypatch, pulls, *, students=(), check_author_permissions=False):
     value = GitHubMailbox(
         repo="acme/widgets",
         token=SecretStr("github-token"),
@@ -56,8 +67,155 @@ def mailbox(monkeypatch, pulls, *, students=()):
     )
     monkeypatch.setattr(value, "_pulls", lambda: list(pulls))
     monkeypatch.setattr(value, "_issues", list)
+    if not check_author_permissions:
+        monkeypatch.setattr(value, "_has_write_permission", lambda _login: True)
     monkeypatch.setattr(value._github, "objects", lambda _url: [])
     return value
+
+
+@pytest.mark.parametrize(
+    ("permission", "role_name", "accepted"),
+    [
+        ("admin", "admin", True),
+        ("write", "write", True),
+        ("write", "maintain", True),
+        ("write", "custom-writer", True),
+        ("read", "triage", False),
+        ("read", "read", False),
+        ("read", "admin", False),
+        ("none", "none", False),
+    ],
+)
+def test_advisor_authorizes_pulls_using_current_base_permission(
+    monkeypatch, permission, role_name, accepted
+):
+    candidate = pull(labels=("research", "student:student-1", "status:review"))
+    advisor = mailbox(monkeypatch, [candidate], check_author_permissions=True)
+    requests = []
+
+    def get(path):
+        requests.append(path)
+        return {"permission": permission, "role_name": role_name}
+
+    monkeypatch.setattr(advisor._github, "get", get)
+
+    assert [event.kind for event in advisor.poll()] == (
+        ["review_ready"] if accepted else []
+    )
+    assert requests == ["/repos/acme/widgets/collaborators/maintainer/permission"]
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"head": {"repo": {"full_name": "outsider/widgets"}}},
+        {"head": {"repo": None}},
+        {"head": {}},
+        {"user": None},
+        {"user": {"login": 17}},
+    ],
+)
+def test_advisor_rejects_untrusted_pull_metadata_before_permission_lookup(
+    monkeypatch, metadata
+):
+    candidate = pull(labels=("research", "student:student-1", "status:review"))
+    if "head" in metadata:
+        metadata = {
+            "head": {
+                "ref": candidate["head"]["ref"],
+                "sha": candidate["head"]["sha"],
+                **metadata["head"],
+            }
+        }
+    candidate.update(metadata)
+    advisor = mailbox(monkeypatch, [candidate], check_author_permissions=True)
+
+    def unexpected_get(path):
+        pytest.fail(f"Unexpected GitHub request: {path}")
+
+    monkeypatch.setattr(advisor._github, "get", unexpected_get)
+
+    assert advisor.poll() == ()
+
+
+def test_author_permissions_are_shared_within_a_poll_and_refreshed_next_poll(
+    monkeypatch,
+):
+    labels = ("research", "student:student-1", "status:review")
+    candidates = [
+        pull(labels=labels, number=17, head_repo="ACME/Widgets", author="Senpai[bot]"),
+        pull(labels=labels, number=18, author="senpai[bot]"),
+    ]
+    advisor = mailbox(monkeypatch, candidates, check_author_permissions=True)
+    requests = []
+    permission = "write"
+
+    def get(path):
+        requests.append(path)
+        return {"permission": permission}
+
+    monkeypatch.setattr(advisor._github, "get", get)
+
+    assert [
+        event.payload["number"]
+        for event in advisor.poll()
+        if event.kind == "review_ready"
+    ] == [17, 18]
+    permission = "none"
+    assert advisor.poll() == ()
+    assert requests == [
+        "/repos/acme/widgets/collaborators/Senpai%5Bbot%5D/permission",
+        "/repos/acme/widgets/collaborators/Senpai%5Bbot%5D/permission",
+    ]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        GitHubReadError("permission unavailable"),
+        None,
+        {},
+        {"permission": []},
+        {"permission": "unexpected"},
+    ],
+)
+def test_permission_failure_invalidates_github_snapshot_and_preserves_local_events(
+    monkeypatch, tmp_path, response
+):
+    candidate = pull(labels=("research", "student:student-1", "status:wip"))
+    advisor = mailbox(
+        monkeypatch,
+        [candidate],
+        students=("student-1", "student-2"),
+        check_author_permissions=True,
+    )
+
+    def get(path):
+        assert path == "/repos/acme/widgets/collaborators/maintainer/permission"
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(advisor._github, "get", get)
+    store_path = tmp_path / "advisor-events.sqlite3"
+    local_event = LocalEvent(
+        kind="child_completed", dedupe_key="child:done", payload={"result": "done"}
+    )
+    with LocalEventStore(store_path) as store:
+        store.enqueue(local_event)
+    composed = CompositeMailbox(
+        StudentAssignmentAvailabilityMailbox(
+            advisor,
+            inbox=PersistentInbox(tmp_path / "inbox.sqlite3"),
+            conversation_id="00000000-0000-0000-0000-000000000123",
+            event_store_path=store_path,
+        ),
+        LocalAdvisorMailbox(store_path),
+    )
+
+    with pytest.raises(GitHubReadError):
+        advisor.poll()
+    assert [event.dedupe_key for event in composed.poll()] == ["child:done"]
 
 
 def assignment(
