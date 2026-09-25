@@ -76,6 +76,7 @@ def test_existing_student_viewers_include_desired_and_live_bindings(monkeypatch)
     encoded = base64.b64encode(b"viewer-existing").decode()
     rotated = base64.b64encode(b"viewer-rotated").decode()
     evicted = base64.b64encode(b"viewer-evicted").decode()
+    terminating = base64.b64encode(b"viewer-terminating").decode()
 
     def run(argv, **_kwargs):
         assert argv[-2:] == ["-o", "json"]
@@ -136,7 +137,7 @@ def test_existing_student_viewers_include_desired_and_live_bindings(monkeypatch)
                                     "student": "frieren",
                                 },
                                 "annotations": {
-                                    "senpai.wandb.com/wandb-viewer": evicted
+                                    "senpai.wandb.com/wandb-viewer": terminating
                                 },
                                 "deletionTimestamp": "2026-09-01T00:00:00Z",
                             },
@@ -151,7 +152,7 @@ def test_existing_student_viewers_include_desired_and_live_bindings(monkeypatch)
     monkeypatch.setattr(launch_helpers.subprocess, "run", run)
 
     assert launch_helpers.existing_student_wandb_viewers("track-a") == {
-        "frieren": {"viewer-existing", "viewer-rotated"}
+        "frieren": {"viewer-existing", "viewer-rotated", "viewer-terminating"}
     }
 
 
@@ -298,6 +299,7 @@ def test_namespace_viewer_owners_include_every_launch_tag(monkeypatch):
                         "research-tag": "track-b",
                         "role": "advisor",
                     },
+                    "deletionTimestamp": "2026-09-01T00:00:00Z",
                     "annotations": {
                         "senpai.wandb.com/controller-wandb-viewer": encoded(
                             "controller-b"
@@ -307,6 +309,7 @@ def test_namespace_viewer_owners_include_every_launch_tag(monkeypatch):
                         ),
                     },
                 },
+                "status": {"phase": "Running"},
             },
             {
                 "kind": "Pod",

@@ -357,7 +357,7 @@ open_start_gate() {
   [ -n "$START_GATE_PATH" ] || return 0
   if ! mkdir -p "$(dirname "$START_GATE_PATH")" || \
      ! tmp="$(mktemp "${START_GATE_PATH}.tmp.XXXXXX")"; then
-    log "Unable to open the shared start gate; failing so the Job restarts"
+    log "Unable to open the shared start gate"
     return 1
   fi
   {
@@ -368,12 +368,12 @@ open_start_gate() {
     printf 'SELECTOR=%q\n' "$SELECTOR"
   } > "$tmp" || {
     rm -f "$tmp" || log "Unable to remove shared start-gate temporary"
-    log "Unable to write the shared start gate; failing so the Job restarts"
+    log "Unable to write the shared start gate"
     return 1
   }
   if ! mv "$tmp" "$START_GATE_PATH"; then
     rm -f "$tmp" || log "Unable to remove shared start-gate temporary"
-    log "Unable to publish the shared start gate; failing so the Job restarts"
+    log "Unable to publish the shared start gate"
     return 1
   fi
   log "Opened start gate: ${START_GATE_PATH}"
@@ -389,7 +389,6 @@ wait_for_ready_gate() {
         KILL_AT_EPOCH="$HARD_KILL_AT_EPOCH"
         KILL_AT_UTC="$(utc_from_epoch "$KILL_AT_EPOCH")"
       fi
-      open_start_gate
       return 0
     fi
     log "Discarding cutoff state from an earlier arm of this run slug"
@@ -407,14 +406,12 @@ wait_for_ready_gate() {
     if [ "$total" = "$EXPECTED_PODS" ] && [ "$ready" = "$EXPECTED_PODS" ] && [ "$deploys" = "$EXPECTED_DEPLOYMENTS" ]; then
       write_state "all_ready"
       log "Ready gate passed: ARMED_AT_UTC=${ARMED_AT_UTC}, KILL_AT_UTC=${KILL_AT_UTC}"
-      open_start_gate
       return 0
     fi
     now="$(date -u '+%s')"
     if [ "$now" -ge "$deadline" ]; then
       log "Readiness deadline reached; arming cutoff anyway"
       write_state "readiness_timeout"
-      open_start_gate
       return 0
     fi
     delay=$((deadline - now))
@@ -457,8 +454,20 @@ delete_targets() {
 }
 
 main() {
+  local now delay
   log "Cluster cutoff job starting: ${RUN_SLUG}"
   wait_for_ready_gate
+  until open_start_gate; do
+    now="$(date -u '+%s')"
+    delay=$((KILL_AT_EPOCH - now))
+    if [ "$delay" -le 0 ]; then
+      log "Start gate remains unavailable at the cutoff deadline; deleting targets"
+      break
+    fi
+    [ "$delay" -gt 60 ] && delay=60
+    log "Retrying the shared start gate in ${delay}s; cutoff deadline is unchanged"
+    sleep "$delay"
+  done
   sleep_until "$KILL_AT_EPOCH" "hard cutoff delete"
   delete_targets
   log "Cluster cutoff job done: ${RUN_SLUG}"

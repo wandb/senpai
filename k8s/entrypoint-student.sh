@@ -120,7 +120,8 @@ if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then
     "$SENPAI_PYTHON" -m venv "$SENPAI_TARGET_PYTHON_ENV"
 fi
 CONTROLLER_SITE="$("$SENPAI_PYTHON" -P -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
-TARGET_SITE="$("$SENPAI_TARGET_PYTHON_ENV/bin/python" -P -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+# The target interpreter is agent-writable; never execute it during trusted startup.
+TARGET_SITE="$("$SENPAI_PYTHON" -P -c 'import sys, sysconfig; print(sysconfig.get_path("purelib", vars={"base": sys.argv[1]}))' "$SENPAI_TARGET_PYTHON_ENV")"
 printf '%s\n' "$CONTROLLER_SITE" > "$TARGET_SITE/senpai-runtime.pth"
 cd "$WORKDIR"
 exec "$SENPAI_PYTHON" -P -m senpai_agent.supervisor student

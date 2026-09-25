@@ -500,7 +500,7 @@ esac
     ) in kubectl_log.read_text(encoding="utf-8").splitlines()
 
 
-def test_generated_cutoff_fails_visibly_when_the_start_gate_cannot_open(tmp_path):
+def test_generated_cutoff_deletes_at_deadline_when_the_start_gate_cannot_open(tmp_path):
     generated, captured_script = render_cutoff(
         tmp_path,
         "--run-slug",
@@ -564,6 +564,6 @@ esac
         check=False,
     )
 
-    assert result.returncode != 0
+    assert result.returncode == 0, result.stderr
     assert "Unable to open the shared start gate" in result.stdout + result.stderr
-    assert not delete_log.exists()
+    assert "research-tag in (track-a)" in delete_log.read_text(encoding="utf-8")

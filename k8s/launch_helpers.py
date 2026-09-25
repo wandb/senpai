@@ -241,16 +241,13 @@ def existing_student_names(
 
 
 def _live_role_resources(items: list[dict]) -> list[dict]:
-    """Drop Pods that no longer run: terminal phases and pending deletions."""
+    """Keep terminating Pods until their workloads reach a terminal phase."""
 
     return [
         resource
         for resource in items
         if resource.get("kind") != "Pod"
-        or (
-            resource.get("status", {}).get("phase") not in {"Succeeded", "Failed"}
-            and "deletionTimestamp" not in resource.get("metadata", {})
-        )
+        or resource.get("status", {}).get("phase") not in {"Succeeded", "Failed"}
     ]
 
 

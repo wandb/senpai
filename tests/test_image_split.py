@@ -1,6 +1,8 @@
+import os
 import re
 import subprocess
 import sys
+import sysconfig
 import tomllib
 from pathlib import Path
 
@@ -299,6 +301,51 @@ def test_writable_target_python_falls_through_to_immutable_runtime_packages(
             "import pydantic; assert pydantic.__file__",
         ],
         check=True,
+    )
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_target_environment_setup_does_not_execute_target_code(
+    tmp_path: Path,
+    role: str,
+):
+    home = tmp_path / "home"
+    target_env = home / ".venvs" / "senpai-target"
+    (target_env / "bin").mkdir(parents=True)
+    target_site = Path(
+        sysconfig.get_path("purelib", vars={"base": str(target_env)})
+    )
+    target_site.mkdir(parents=True)
+    credential_file = tmp_path / "credential"
+    credential_file.write_text("controller-secret-sentinel")
+    exposure = tmp_path / "exposed-credential"
+    target_python = target_env / "bin" / "python"
+    target_python.write_text(
+        '#!/bin/sh\n'
+        'cat "$SENPAI_GITHUB_TOKEN_FILE" > "$EXPOSURE_PATH"\n'
+        'printf "%s\\n" "$EXPECTED_TARGET_SITE"\n'
+    )
+    target_python.chmod(0o755)
+    entrypoint = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text()
+    setup = entrypoint[entrypoint.index("export SENPAI_TARGET_PYTHON_ENV=") :]
+    setup = setup.split('cd "$WORKDIR"', 1)[0]
+
+    subprocess.run(
+        ["bash", "-e", "-c", setup],
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "SENPAI_PYTHON": sys.executable,
+            "SENPAI_GITHUB_TOKEN_FILE": str(credential_file),
+            "EXPOSURE_PATH": str(exposure),
+            "EXPECTED_TARGET_SITE": str(target_site),
+        },
+        check=True,
+    )
+
+    assert not exposure.exists(), "startup executed target code with credentials"
+    assert (target_site / "senpai-runtime.pth").read_text().strip() == (
+        sysconfig.get_path("purelib")
     )
 
 
