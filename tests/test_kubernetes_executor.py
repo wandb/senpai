@@ -1258,7 +1258,7 @@ def test_workload_diagnostics_include_owned_init_and_launcher_logs(monkeypatch):
     })
     requests = []
 
-    def get(kind, name, namespace):
+    def get(kind, name, namespace, **kwargs):
         assert namespace == "research"
         return workload if kind == "MPIJob" else launcher_job
 
@@ -1292,7 +1292,7 @@ def test_workload_diagnostics_include_owned_init_and_launcher_logs(monkeypatch):
 
 def test_workload_diagnostics_reject_replaced_uid(monkeypatch):
     client = object.__new__(KubernetesApiClient)
-    monkeypatch.setattr(client, "_get", lambda *args: {"metadata": {"uid": "replacement"}})
+    monkeypatch.setattr(client, "_get", lambda *args, **kwargs: {"metadata": {"uid": "replacement"}})
     resource = KubernetesResourceRef(
         kind="MPIJob", name="run", namespace="research", uid="original",
         nodes=2, gpus_per_node=8,
@@ -1333,7 +1333,7 @@ def test_diagnostics_preserve_failed_init_with_noisy_healthy_worker(monkeypatch)
     }
     pods = [healthy, failed]
     monkeypatch.setattr(client, "_owned_pods", lambda _resource: pods)
-    monkeypatch.setattr(client, "_events", lambda *args: ["[event] " + "x" * 2000])
+    monkeypatch.setattr(client, "_events", lambda *args, **kwargs: ["[event] " + "x" * 2000])
 
     def request_text(method, path, **kwargs):
         if "container=checkout" in path:
@@ -1385,7 +1385,7 @@ def test_diagnostics_show_remaining_gpu_requests_and_every_container(monkeypatch
             },
         })
     monkeypatch.setattr(client, "_owned_pods", lambda _resource: pods)
-    monkeypatch.setattr(client, "_events", lambda *args: [])
+    monkeypatch.setattr(client, "_events", lambda *args, **kwargs: [])
     requests = []
 
     def request_text(method, path, **kwargs):
@@ -1424,7 +1424,7 @@ def test_diagnostics_report_pre_pod_validation_events_and_reject_foreign_uid(mon
         nodes=4, gpus_per_node=8,
     )
     workload = {"metadata": {"uid": "mpi-uid", "labels": {"senpai-training-id": "run-id"}}}
-    monkeypatch.setattr(client, "_get", lambda *args: workload)
+    monkeypatch.setattr(client, "_get", lambda *args, **kwargs: workload)
     requests = []
 
     def request_json(method, path, **kwargs):
@@ -1476,3 +1476,232 @@ def test_workload_events_are_bounded_and_surface_rbac_errors(monkeypatch):
     assert client._events("research", "pod-uid", "pod/worker", time.monotonic() + 10) == [
         "[pod/worker/events] unavailable: HTTP 403"
     ]
+
+
+@pytest.mark.parametrize('operation', ['release', 'delete', 'deadline'])
+def test_executor_preserves_pod_receipt_before_release_or_cleanup(tmp_path, monkeypatch, operation):
+    client = FakeApi()
+    broker = executor(tmp_path, client)
+    request = reserve(broker)
+    broker.handle({'operation': 'apply', 'manifest': json.dumps(manifest())})
+    client.state_value = (TrainingState.FINISHED, 'done')
+    resource = broker._reservation['resource']
+    observed = {'pods': [{'uid': 'worker-uid', 'restart_count': 2}], 'complete': False,
+                'expected_pods': 3, 'capture_error': None}
+    client.pod_snapshot = lambda _resource: deepcopy(observed)
+    original_write = broker._write_state
+    original_delete = client.delete
+
+    def receipt():
+        files = list((tmp_path / 'reservation.receipts').glob('*.json'))
+        assert len(files) == 1, 'receipt must be durable before cleanup or release'
+        return json.loads(files[0].read_text())
+
+    def write_state():
+        if broker._reservation.get('released'):
+            assert receipt()['pods'] == observed['pods']
+        original_write()
+
+    def delete(ref, timeout=60):
+        assert receipt()['resource']['uid'] == ref.uid
+        original_delete(ref, timeout)
+
+    monkeypatch.setattr(broker, '_write_state', write_state)
+    monkeypatch.setattr(client, 'delete', delete)
+    if operation == 'release':
+        returned = broker.handle({'operation': 'release', 'training_id': 'training-one'})
+        assert returned == receipt()
+    elif operation == 'delete':
+        broker.handle({'operation': 'delete', 'resource': resource, 'timeout_seconds': 60})
+        broker.handle({'operation': 'release', 'training_id': 'training-one'})
+    else:
+        broker._reservation['deadline_at'] = time.time() - 1
+        broker.reconcile()
+    saved = receipt()
+    assert saved['training_id'] == 'training-one'
+    assert saved['source_commit'] == 'a' * 40
+    assert saved['resource']['uid'] == 'created-uid'
+    broker = executor(tmp_path, client)
+    broker.handle({**request, 'training_id': 'training-two'})
+    assert receipt() == saved  # New reservations cannot erase a prior run's evidence.
+
+
+@pytest.mark.parametrize('operation', ['release', 'delete', 'deadline'])
+def test_receipt_storage_failure_blocks_normal_release_but_not_forced_cleanup(
+    tmp_path, monkeypatch, capsys, operation,
+):
+    import errno
+    client = FakeApi()
+    broker = executor(tmp_path, client)
+    reserve(broker)
+    broker.handle({'operation': 'apply', 'manifest': json.dumps(manifest())})
+    client.state_value = ((TrainingState.FINISHED, 'done') if operation == 'release'
+                          else (TrainingState.RUNNING, 'active'))
+    client.pod_snapshot = lambda _resource: {'pods': [], 'complete': False,
+                                          'expected_pods': 3, 'capture_error': None}
+    original_replace = Path.replace
+
+    def replace(path, target):
+        if Path(target).parent.name == 'reservation.receipts':
+            raise OSError(errno.ENOSPC, 'fixture receipt storage full')
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, 'replace', replace)
+    if operation == 'release':
+        with pytest.raises(OSError):
+            broker.handle({'operation': 'release', 'training_id': 'training-one'})
+        assert broker._reservation['released'] is False
+        assert not client.deleted
+    elif operation == 'delete':
+        broker.handle({'operation': 'delete', 'resource': broker._reservation['resource'],
+                       'timeout_seconds': 60})
+        assert len(client.deleted) == 1
+    else:
+        broker._reservation['deadline_at'] = time.time() - 1
+        broker.reconcile()
+        assert len(client.deleted) == 1
+        assert broker._reservation['released'] is True
+    if operation != 'release':
+        assert 'Kubernetes Pod receipt persistence failed' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('case', ['complete', 'missing', 'active', 'extra', 'unknown_restart', 'missing_timestamp', 'null_timestamp', 'overflow', 'paginated'])
+def test_pod_snapshot_preserves_owned_status_without_text_truncation(monkeypatch, case):
+    client = object.__new__(KubernetesApiClient)
+    resource = KubernetesResourceRef(kind='MPIJob', name='run', namespace='research',
+                                     uid='mpi-uid', nodes=32, gpus_per_node=8)
+    workload = {'metadata': {'uid': 'mpi-uid', 'labels': {'senpai-training-id': 'run-id'}}}
+    launcher_job = {'metadata': {'uid': 'launcher-job-uid', 'ownerReferences': [
+        {'kind': 'MPIJob', 'uid': 'mpi-uid'},
+    ]}}
+
+    def pod(index, worker=True):
+        owner = ({'kind': 'MPIJob', 'name': 'run', 'uid': 'mpi-uid'} if worker else
+                 {'kind': 'Job', 'name': 'launcher-job', 'uid': 'launcher-job-uid'})
+        return {
+            'metadata': {'name': ('worker-' if worker else 'launcher-') + str(index),
+                         'uid': 'uid-' + str(index), 'creationTimestamp': '2026-09-26T01:00:00Z',
+                         'ownerReferences': [owner]},
+            'spec': {'nodeName': 'gpu-node-' + str(index), 'containers': [
+                {'name': 'train', 'resources': {'limits': {'nvidia.com/gpu': '8' if worker else '0'}}},
+            ]},
+            'status': {'phase': 'Succeeded', 'containerStatuses': [{
+                'name': 'train', 'restartCount': 2 if index == 0 else 0,
+                'state': {'terminated': {'exitCode': 0, 'reason': 'Completed',
+                                        'startedAt': '2026-09-26T01:00:03Z',
+                                        'finishedAt': '2026-09-26T02:00:00Z',
+                                        'message': 'must not enter receipt'}},
+                'lastState': {'terminated': {'exitCode': 137, 'reason': 'OOMKilled',
+                                            'finishedAt': '2026-09-26T01:00:02Z'}},
+            }]},
+        }
+
+    pods = [pod(i) for i in range(32)] + [pod(32, worker=False)]
+    if case == 'missing':
+        pods.pop(3)
+    elif case == 'active':
+        pods[3]['status']['phase'] = 'Running'
+        pods[3]['status']['containerStatuses'][0]['state'] = {'running': {'startedAt': '2026-09-26T01:00:03Z'}}
+    elif case == 'extra':
+        pods.extend(pod(i) for i in range(33, 38))  # Beyond the old diagnostic nodes+2 cap.
+    elif case == 'unknown_restart':
+        pods[3]['status']['containerStatuses'][0].pop('restartCount')
+    elif case == 'missing_timestamp':
+        pods[3]['status']['containerStatuses'][0]['state']['terminated'].pop('finishedAt')
+    elif case == 'null_timestamp':
+        pods[3]['status']['containerStatuses'][0]['state']['terminated']['finishedAt'] = None
+    elif case == 'overflow':
+        pods.extend(pod(i) for i in range(33, 257))
+    foreign = pod(100)
+    foreign['metadata']['ownerReferences'][0]['uid'] = 'different-mpi'
+    old_launcher = pod(101, worker=False)
+    old_launcher['metadata']['ownerReferences'][0]['uid'] = 'replaced-job-uid'
+
+    def get(kind, name, namespace, **kwargs):
+        assert 0 < kwargs['timeout_seconds'] <= 5
+        return workload if kind == 'MPIJob' else launcher_job
+
+    def request_json(method, path, **kwargs):
+        assert 'limit=256' in path
+        assert kwargs['max_response_bytes'] == 4 * 1024 * 1024
+        assert 0 < kwargs['timeout_seconds'] <= 5
+        return {'items': [*pods, foreign, old_launcher],
+                'metadata': {'continue': 'next-page' if case == 'paginated' else ''}}
+
+    monkeypatch.setattr(client, '_get', get)
+    monkeypatch.setattr(client, '_request_json', request_json)
+    if case in {'overflow', 'paginated'}:
+        with pytest.raises(RuntimeError, match='bounded capture limit'):
+            client.pod_snapshot(resource)
+        return
+    snapshot = client.pod_snapshot(resource)
+    assert snapshot['complete'] is (case == 'complete')
+    assert snapshot['expected_pods'] == 33
+    assert len(snapshot['pods']) == len(pods)
+    assert len(json.dumps(snapshot)) > 8192
+    first = snapshot['pods'][0]
+    assert first['uid'] == 'uid-0' and first['node'] == 'gpu-node-0'
+    assert first['owners'] == [{'kind': 'MPIJob', 'name': 'run', 'uid': 'mpi-uid'}]
+    assert first['containers'][0]['restartCount'] == 2  # Factual, not silently zeroed.
+    assert first['containers'][0]['lastState']['terminated']['exitCode'] == 137
+    assert first['containers'][0]['state']['terminated']['finishedAt'] == '2026-09-26T02:00:00Z'
+    assert 'must not enter receipt' not in json.dumps(snapshot)
+    if case == 'unknown_restart':
+        assert snapshot['pods'][3]['containers'][0]['restartCount'] is None
+
+
+def test_executor_records_api_failure_as_unknown_and_rejects_receipt_identity_reuse(tmp_path):
+    client = FakeApi()
+    broker = executor(tmp_path, client)
+    reserve(broker)
+    broker.handle({'operation': 'apply', 'manifest': json.dumps(manifest())})
+    client.state_value = (TrainingState.FINISHED, 'done')
+
+    def unavailable(_resource):
+        raise TimeoutError('temporary outage')
+
+    client.pod_snapshot = unavailable
+    receipt = broker.handle({'operation': 'release', 'training_id': 'training-one'})
+    assert receipt['complete'] is False and receipt['pods'] == []
+    assert receipt['capture_error'] == 'Pod status read failed: TimeoutError'
+    broker._reservation['source_commit'] = 'b' * 40
+    with pytest.raises(RuntimeError, match='different workload'):
+        broker.handle({'operation': 'release', 'training_id': 'training-one'})
+
+
+@pytest.mark.parametrize('operation', ['delete', 'deadline'])
+@pytest.mark.parametrize('fault', ['corrupt_receipt', 'stalled_read'])
+def test_forced_cleanup_survives_receipt_read_failures(tmp_path, monkeypatch, capsys, operation, fault):
+    import hashlib
+    import senpai_agent.kubernetes_executor as executor_module
+    client = FakeApi()
+    broker = executor(tmp_path, client)
+    reserve(broker)
+    broker.handle({'operation': 'apply', 'manifest': json.dumps(manifest())})
+    finish = threading.Event()
+    receipt_dir = tmp_path / 'reservation.receipts'
+    if fault == 'corrupt_receipt':
+        receipt_dir.mkdir()
+        (receipt_dir / (hashlib.sha256(b'training-one').hexdigest() + '.json')).write_text('{broken json')
+    else:
+        def blocked(_resource):
+            assert finish.wait(2)
+            return {'pods': [], 'complete': False, 'capture_error': 'fixture'}
+        client.pod_snapshot = blocked
+        monkeypatch.setattr(executor_module, '_POD_RECEIPT_TIMEOUT_SECONDS', 0.02)
+    try:
+        if operation == 'delete':
+            broker.handle({'operation': 'delete', 'resource': broker._reservation['resource'], 'timeout_seconds': 60})
+        else:
+            broker._reservation['deadline_at'] = time.time() - 1
+            broker.reconcile()
+        assert client.deleted, 'forced cleanup must survive receipt read failure'
+        if fault == 'stalled_read':
+            receipt_path, = receipt_dir.glob('*.json')
+            saved = json.loads(receipt_path.read_text())
+            assert saved['complete'] is False
+            assert saved['capture_error'] == 'Pod status read failed: TimeoutError'
+        else:
+            assert 'Kubernetes Pod receipt persistence failed' in capsys.readouterr().err
+    finally:
+        finish.set()

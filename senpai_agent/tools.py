@@ -309,6 +309,7 @@ class TrainingResultObservation(Observation):
     kubernetes_resource: KubernetesResourceRef | None = None
     kubernetes_released: bool | None = None
     kubernetes_diagnostics: str = ""
+    kubernetes_pod_receipt: dict | None = None
     source_snapshot: str | None = None
     source_commit: str | None = None
 
@@ -354,6 +355,8 @@ class TrainingResultObservation(Observation):
             result["error_tail"] = self.error_tail
         if self.kubernetes_diagnostics:
             result["kubernetes_diagnostics"] = self.kubernetes_diagnostics
+        if self.kubernetes_pod_receipt is not None:
+            result["kubernetes_pod_receipt"] = self.kubernetes_pod_receipt
         text = json.dumps(result, separators=(",", ":"), default=str)
         return [TextContent(text=text)]
 

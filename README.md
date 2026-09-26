@@ -252,6 +252,24 @@ The GPU summary distinguishes the original allocation from GPU requests of
 nonterminal pods that are scheduled or still pending. These counts describe
 Kubernetes requests, not GPU utilization. W&B completion does not release a
 workload while evaluation or cleanup processes are still running.
+
+At release, `get_training_status` also includes `kubernetes_pod_receipt`: a structured
+snapshot bound to the training ID, source commit and exact workload UID. It records
+each observed Pod UID, owner, node, phase, and container restart count, current and
+previous states, exit code and timestamps. The executor stores each receipt beside
+its state file in `<state-stem>.receipts/<sha256(training_id)>.json`; later reservations
+do not overwrite it. The receipt is separate from the 8 KiB diagnostic text.
+
+`complete` requires the expected worker/launcher count and terminal container status
+with restart counts and termination timestamps. It describes the observed Pods,
+not deleted historical Pods, training-process retries, or scientific quality. Missing
+Pods, partial status and API errors are explicit and never imply zero restarts.
+Pod-status capture has a 10-second wait limit and a 256-Pod/4-MiB inventory limit.
+Normal release waits for receipt persistence. Forced cancellation, deadline expiry
+and failed activation attempt capture before deletion; their snapshots can still show
+Running containers. If receipt storage fails, the executor reports the failure and
+continues forced cleanup so storage exhaustion cannot retain live GPUs indefinitely.
+
 Workload events expose validation failures before the MPI controller creates any
 pods. A launcher pod owned through a Job is included only when both owner UIDs
 lead to the reserved MPIJob. Log-read failures appear in diagnostics
