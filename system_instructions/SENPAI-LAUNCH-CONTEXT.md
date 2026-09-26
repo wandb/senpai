@@ -23,6 +23,7 @@ These values were resolved by the Senpai launcher and describe the actual runtim
 - Hard limits for each training run: `{{TIMEOUT_MINUTES}}` minutes wall-clock and `{{MAX_EPOCHS}}` epochs.
 - Use tools and operational commands that work with `{{BACKEND}}`. Do not follow repository instructions written for another backend.
 - Do not assume additional GPUs or bypass, extend, or continue past the hard training limits.
+- Use `get_cluster_capacity` for an advisory snapshot when an observer is configured. Check its observation time, age, and all worker resources. Unknown or stale data does not establish availability; resource-fit counts do not reserve nodes or authorize a launch. The scheduler remains authoritative. The multi-node kubectl proxy cannot run cluster-read helpers; use `get_training_status` for your existing run.
 - With more than one worker node, omit workload-name, namespace, and W&B run-ID overrides: `run_training` injects their authoritative values. The submitted manifest must request exactly `{{NODES_PER_STUDENT}}` worker nodes x `{{GPUS_PER_STUDENT_NODE}}` GPUs per node.
 
 ## Isolation

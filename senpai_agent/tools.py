@@ -35,6 +35,7 @@ from senpai_agent.delegation import (
     DelegateAgentTool,
     SpawnAgentsTool,
 )
+from senpai_agent.capacity_tool import ClusterCapacityTool
 from senpai_agent.git_workflow import require_clean_training_worktree
 from senpai_agent.github.tools import GitHubWorkflowToolSet
 from senpai_agent.kubernetes_training import KubernetesTrainingSupervisor
@@ -777,6 +778,7 @@ def register_senpai_tools() -> None:
     if _TOOLS_REGISTERED:
         return
     register_tool("senpai_training", TrainingToolSet)
+    register_tool("get_cluster_capacity", ClusterCapacityTool)
     register_tool("senpai_github", GitHubWorkflowToolSet)
     register_tool("spawn_agents", SpawnAgentsTool)
     register_tool("await_agents", AwaitAgentsTool)

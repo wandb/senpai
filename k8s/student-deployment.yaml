@@ -132,6 +132,7 @@ spec:
         - name: state
           mountPath: /var/lib/senpai
         # {{EXECUTOR_SOCKET_MOUNT}}
+        # {{CAPACITY_SNAPSHOT_MOUNT}}
       # {{KUBERNETES_EXECUTOR_CONTAINER}}
       volumes:
       - name: dshm
@@ -144,5 +145,6 @@ spec:
       - name: state
         emptyDir: {}
       # {{KUBERNETES_EXECUTOR_VOLUMES}}
+      # {{CAPACITY_SNAPSHOT_VOLUME}}
       nodeSelector: {{STUDENT_NODE_SELECTOR}}
       tolerations: {{STUDENT_TOLERATIONS}}

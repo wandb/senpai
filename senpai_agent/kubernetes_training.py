@@ -558,6 +558,7 @@ class KubernetesApiClient:
         allow_not_found: bool = False,
         content_type: str = "application/json",
         timeout_seconds: float = 30,
+        max_response_bytes: int | None = None,
     ) -> dict | None:
         text = self._request_text(
             method,
@@ -566,6 +567,7 @@ class KubernetesApiClient:
             allow_not_found=allow_not_found,
             content_type=content_type,
             timeout_seconds=timeout_seconds,
+            max_response_bytes=max_response_bytes,
         )
         return json.loads(text) if text else None
 
@@ -578,6 +580,7 @@ class KubernetesApiClient:
         allow_not_found: bool = False,
         content_type: str = "application/json",
         timeout_seconds: float = 30,
+        max_response_bytes: int | None = None,
     ) -> str:
         request = urllib.request.Request(
             f"{self.api_server.rstrip('/')}{path}",
@@ -589,11 +592,15 @@ class KubernetesApiClient:
             },
         )
         try:
-            return urllib.request.urlopen(
+            with urllib.request.urlopen(
                 request,
                 context=self.ssl_context,
                 timeout=timeout_seconds,
-            ).read().decode()
+            ) as response:
+                payload = response.read(max_response_bytes + 1) if max_response_bytes is not None else response.read()
+            if max_response_bytes is not None and len(payload) > max_response_bytes:
+                raise ValueError("Kubernetes response exceeds the configured byte limit")
+            return payload.decode()
         except urllib.error.HTTPError as error:
             if allow_not_found and error.code == 404:
                 return ""
