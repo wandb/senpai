@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from openhands.sdk.tool import ToolExecutor
 
 from senpai_agent import git_workflow
+from senpai_agent.git_transport import github_repository_url
 from senpai_agent.models import (
     AssignmentRecord,
     DispositionRecord,
@@ -44,6 +45,10 @@ class CreateAssignmentExecutor(
     ) -> GitHubMutationObservation:
         base_branch = self.runtime.assignment_base_branch()
         self.runtime.require_configured_student(action.student)
+        if not action.head_branch.startswith(f"{action.student}/"):
+            raise PermissionError(
+                f"assignment branch must belong to student {action.student!r}"
+            )
         with self.runtime.workflow.serialized_assignment_mutation():
             branch = git_workflow.create_assignment_branch(
                 self.runtime.workspace,
@@ -51,6 +56,9 @@ class CreateAssignmentExecutor(
                 base_branch=base_branch,
                 expected_base_sha=action.expected_base_sha,
                 assignment_id=action.assignment_id,
+                authenticated_remote=github_repository_url(
+                    self.runtime.workflow.repo
+                ),
                 token=self.runtime.git_token,
             )
             result = self.runtime.workflow.create_assignment(
@@ -89,6 +97,9 @@ class PublishAdvisorBranchExecutor(
                 branch=self.runtime.advisor_branch,
                 expected_remote_sha=action.remote_branch_sha_before_push,
                 expected_local_sha=action.local_commit_sha,
+                authenticated_remote=github_repository_url(
+                    self.runtime.workflow.repo
+                ),
                 token=self.runtime.git_token,
             )
         return GitHubMutationObservation(

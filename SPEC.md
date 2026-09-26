@@ -405,10 +405,11 @@ without the exact authenticated terminal result for that assignment revision
 and head. Revision requests bind the new revision to an exact required
 research-base SHA rather than leaving that base implicit.
 
-Student submission requires a clean assignment branch, lease-pushes the local
-commit, upserts the typed result, marks the PR ready, reconciles
-`status:review`, and verifies all postconditions. The label itself is the
-cross-node notification. A schema-valid result is immutable for its assignment
+Student submission verifies the assignment branch and exact local result commit,
+publishes that commit with a remote-head lease, upserts the typed result, marks
+the PR ready, reconciles `status:review`, and verifies all postconditions.
+Uncommitted worktree changes are not published. Training separately requires a
+clean worktree. The label itself is the cross-node notification. A schema-valid result is immutable for its assignment
 revision and head: canonical-identical duplicates are one idempotent result,
 while different evidence must use a new commit or revision. Result records are
 append-only across revision/head identities, and gates select only the record
@@ -730,6 +731,21 @@ memory. Before each controller restart it creates a one-shot inherited pipe;
 the worker reads and closes that pipe before tool initialization. No raw token
 is written to conversation/dataset storage. The long-lived PID 1 environment,
 model-facing tool schemas, and agent terminal contain no GitHub token.
+
+Authenticated Git publication runs `/usr/bin/git` in a disposable bare repository.
+The controller supplies the GitHub URL from its configured repository, disables
+hooks and credential helpers, ignores global and system Git configuration, and
+clears inherited Git and proxy settings. The network process never reads the
+checkout's Git configuration. Push staging shares only the checkout's object
+directory and shallow boundaries, then verifies the staged commit SHA.
+Assignment creation fetches the base at depth one; idempotent replay fetches the
+assignment at depth two to verify its parent, tree, and message. These fetches do
+not change the advisor checkout. Pushes retain expected-SHA checks, ancestry
+checks, exact ref leases, and post-push verification. The bootstrap runner and
+target pre-push hooks remain behavioral guards; typed publication bypasses them
+and applies its own branch and lease checks. Before creating a remote branch,
+the typed assignment tool requires a configured student and a `<student>/`
+branch prefix.
 
 Generic child processes receive no GitHub token and no GitHub tools. Main-role
 GitHub operations remain typed and lease/state guarded. Terminal and hook
