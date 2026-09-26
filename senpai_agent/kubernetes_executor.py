@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future
+import hashlib
 import json
 import math
 import os
@@ -28,6 +30,7 @@ from senpai_agent.kubernetes_training import (
 from senpai_agent.training import KubernetesResourceRef, KubernetesTrainingSpec, TrainingState
 
 _MAX_REQUEST_BYTES = 2 * 1024 * 1024
+_POD_RECEIPT_TIMEOUT_SECONDS = 10.0
 _SOURCE_COMMIT = re.compile(r"[0-9a-f]{40}")
 _RUN_ID_ANNOTATION = "senpai.wandb.com/run-id"
 _SOURCE_ANNOTATION = "senpai.wandb.com/source-commit"
@@ -112,6 +115,7 @@ class KubernetesExecutor:
             if operation == "delete":
                 resource = self._require_resource(request["resource"])
                 if self._verify_current(resource):
+                    self._pod_receipt(resource, "delete", forced=True)
                     self.client.delete(
                         resource,
                         min(int(request["timeout_seconds"]), 60),
@@ -122,8 +126,7 @@ class KubernetesExecutor:
                 if not self._verify_current(resource):
                     return ""
             if operation == "release":
-                self._release(request["training_id"])
-                return None
+                return self._release(request["training_id"])
         if operation == "logs":
             # The API client rechecks the UID; slow log reads must not block control.
             return self.client.logs(resource)
@@ -156,6 +159,7 @@ class KubernetesExecutor:
                 return
             if resource is None and self._reservation.get("create_attempted"):
                 return
+            self._pod_receipt(resource, "deadline", forced=True)
             if resource is not None and self._verify_current(resource):
                 self.client.delete(resource, 60)
             self._reservation["released"] = True
@@ -306,6 +310,7 @@ class KubernetesExecutor:
         resource: KubernetesResourceRef,
         phase: str,
     ) -> Never:
+        self._pod_receipt(resource, "activation_deadline", forced=True)
         self.client.delete(resource, 60)
         reservation = self._require_reservation()
         reservation["released"] = True
@@ -868,12 +873,12 @@ class KubernetesExecutor:
             raise PermissionError("resource does not belong to the reserved training run")
         return resource
 
-    def _release(self, training_id: str) -> None:
+    def _release(self, training_id: str) -> dict:
         reservation = self._require_reservation()
         if reservation["training_id"] != training_id:
             raise PermissionError("training reservation belongs to a different run")
         if reservation.get("released"):
-            return
+            return self._pod_receipt(self._recorded_resource(), "release")
         recorded = self._recorded_resource()
         resource = self._current_resource()
         if resource is None and recorded is None and reservation.get("create_attempted"):
@@ -882,8 +887,71 @@ class KubernetesExecutor:
             state = self.client.state(resource)
             if state is not None and state[0] is TrainingState.RUNNING:
                 raise RuntimeError("cannot release a live Kubernetes workload")
+        receipt = self._pod_receipt(resource or recorded, "release")
         reservation["released"] = True
         self._write_state()
+        return receipt
+
+    def _pod_receipt(
+        self, resource: KubernetesResourceRef | None, reason: str, *, forced: bool = False,
+    ) -> dict | None:
+        try:
+            return self._write_pod_receipt(resource, reason)
+        except Exception as error:
+            if not forced:
+                raise
+            print(
+                f"Kubernetes Pod receipt persistence failed: "
+                f"training_id={self._require_reservation()['training_id']} "
+                f"reason={reason} error={type(error).__name__} errno={getattr(error, 'errno', None)}; "
+                "forced cleanup continues without durable proof",
+                file=sys.stderr, flush=True,
+            )
+            return None
+
+    def _write_pod_receipt(self, resource: KubernetesResourceRef | None, reason: str) -> dict:
+        reservation = self._require_reservation()
+        training_id = reservation["training_id"]
+        receipt_dir = self.state_path.with_suffix(".receipts")
+        path = receipt_dir / (hashlib.sha256(training_id.encode()).hexdigest() + ".json")
+        identity = {
+            "training_id": training_id,
+            "source_commit": reservation["source_commit"],
+            "resource": resource.model_dump(mode="json") if resource else None,
+        }
+        if path.exists():
+            saved = json.loads(path.read_text())
+            if any(saved[key] != value for key, value in identity.items()):
+                raise RuntimeError("Kubernetes Pod receipt belongs to a different workload")
+            return saved
+        receipt = {
+            **identity,
+            "captured_at": time.time(),
+            "capture_reason": reason,
+            "expected_pods": self.nodes + (reservation["spec"]["kind"] == "MPIJob"),
+            "complete": False,
+            "capture_error": "No Kubernetes resource was observed",
+            "pods": [],
+        }
+        if resource is not None:
+            future: Future[dict] = Future()
+
+            def capture() -> None:
+                try:
+                    future.set_result(self.client.pod_snapshot(resource))
+                except Exception as error:
+                    future.set_exception(error)
+
+            threading.Thread(target=capture, daemon=True, name="senpai-pod-receipt").start()
+            try:
+                receipt.update(future.result(timeout=_POD_RECEIPT_TIMEOUT_SECONDS))
+            except Exception as error:
+                receipt["capture_error"] = f"Pod status read failed: {type(error).__name__}"
+        receipt_dir.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(receipt, sort_keys=True))
+        temporary.replace(path)
+        return receipt
 
     def _ownership_labels(self, reservation: dict) -> dict[str, str]:
         return {

@@ -1299,3 +1299,25 @@ def test_training_identity_leaves_room_for_mpi_child_names(monkeypatch, nodes, r
     for name in (spec.name, f"{spec.name}-launcher", f"{spec.name}-worker-{nodes - 1}"):
         assert len(name) <= 63
         assert re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", name)
+
+
+def test_supervisor_persists_executor_receipt_with_terminal_acknowledgement(tmp_path, monkeypatch):
+    receipt = {'training_id': 'from-executor', 'source_commit': 'a' * 40,
+               'resource': {'uid': 'remote-uid'}, 'complete': False,
+               'capture_error': 'Missing one terminal worker',
+               'pods': [{'uid': 'observed-worker', 'containers': [{'restartCount': None}]}]}
+
+    class ReceiptCluster(FakeCluster):
+        def release(self, training_id):
+            super().release(training_id)
+            return receipt
+
+    runtime, workspace, _snapshot_root = supervisor(tmp_path, monkeypatch, ReceiptCluster())
+    started = runtime.run_training(TrainingSpec(argv=(sys.executable, '-c', 'pass'),
+                                               cwd=workspace, timeout_seconds=5))
+    runtime.drain()
+    saved = TrainingResult.model_validate_json(
+        (tmp_path / 'state' / (started.training_id + '.json')).read_text()
+    )
+    assert saved.kubernetes_released is True
+    assert saved.kubernetes_pod_receipt == receipt

@@ -88,7 +88,7 @@ class TrainingClusterClient(Protocol):
 
     def logs(self, resource: KubernetesResourceRef) -> str: ...
 
-    def release(self, training_id: str) -> None: ...
+    def release(self, training_id: str) -> dict: ...
 
 
 class KubernetesExecutorClient:
@@ -165,8 +165,8 @@ class KubernetesExecutorClient:
     def logs(self, resource: KubernetesResourceRef) -> str:
         return str(self._request("logs", resource=resource.model_dump(mode="json")))
 
-    def release(self, training_id: str) -> None:
-        self._request("release", training_id=training_id)
+    def release(self, training_id: str) -> dict:
+        return self._request("release", training_id=training_id)
 
     def apply(self, manifest: str) -> str:
         return str(self._request("apply", manifest=manifest))
@@ -335,7 +335,7 @@ class KubernetesApiClient:
         """Return bounded status and logs for this workload's exact pod owner chain."""
 
         deadline = time.monotonic() + 30
-        pods = self._owned_pods(resource)
+        pods = self._owned_pods(resource)[: resource.nodes + 2]
         events = self._events(
             resource.namespace, resource.uid, f"{resource.kind}/{resource.name}", deadline
         )
@@ -495,19 +495,81 @@ class KubernetesApiClient:
             for event in events[-5:]
         ]
 
-    def _owned_pods(self, resource: KubernetesResourceRef) -> list[dict]:
-        document = self._get(resource.kind, resource.name, resource.namespace)
+    def pod_snapshot(self, resource: KubernetesResourceRef) -> dict:
+        """Capture factual Pod status; container restarts are not elastic restarts."""
+        pods = self._owned_pods(resource, timeout_seconds=10)
+        rows = []
+        for pod in pods:
+            status = pod.get("status", {})
+            containers = []
+            for spec_key, status_key in [
+                ("initContainers", "initContainerStatuses"),
+                ("containers", "containerStatuses"),
+            ]:
+                statuses = {item["name"]: item for item in status.get(status_key, [])}
+                for container in pod["spec"].get(spec_key, []):
+                    value = statuses.get(container["name"], {})
+                    states = {}
+                    for field in ("state", "lastState"):
+                        states[field] = {
+                            state: {key: item[key] for key in (
+                                "reason", "exitCode", "signal", "startedAt", "finishedAt",
+                            ) if key in item}
+                            for state, item in value.get(field, {}).items()
+                        }
+                    containers.append({
+                        "name": container["name"], "init": spec_key == "initContainers",
+                        "restartCount": value.get("restartCount"), **states,
+                    })
+            rows.append({
+                "name": pod["metadata"]["name"], "uid": pod["metadata"]["uid"],
+                "owners": [{key: owner.get(key) for key in ("kind", "name", "uid")}
+                           for owner in pod["metadata"].get("ownerReferences", [])],
+                "node": pod["spec"].get("nodeName"), "phase": status.get("phase"),
+                "created_at": pod["metadata"].get("creationTimestamp"),
+                "role": "worker" if _pod_gpus(pod["spec"]) else "launcher",
+                "containers": containers,
+            })
+        expected = resource.nodes + (resource.kind == "MPIJob")
+        complete = (
+            len(rows) == expected
+            and sum(row["role"] == "worker" for row in rows) == resource.nodes
+            and all(row["phase"] in {"Succeeded", "Failed"} and row["containers"]
+                    and all(c["restartCount"] is not None
+                            and all(c["state"].get("terminated", {}).get(key) is not None
+                                    for key in ("exitCode", "startedAt", "finishedAt"))
+                            for c in row["containers"]) for row in rows)
+        )
+        return {"pods": rows, "expected_pods": expected, "complete": complete,
+                "capture_error": None if complete else "Expected terminal Pod/container coverage is incomplete"}
+
+    def _owned_pods(
+        self, resource: KubernetesResourceRef, *, timeout_seconds: float = 30,
+    ) -> list[dict]:
+        deadline = time.monotonic() + timeout_seconds
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise TimeoutError("Kubernetes Pod inventory exceeded its deadline")
+            return min(value, 5)
+
+        document = self._get(resource.kind, resource.name, resource.namespace,
+                             timeout_seconds=remaining())
         if document is None:
             return []
         if document["metadata"]["uid"] != resource.uid:
             raise RuntimeError("refusing to read pods for a replaced training workload")
         training_id = document["metadata"]["labels"]["senpai-training-id"]
-        query = urllib.parse.urlencode({"labelSelector": f"senpai-training-id={training_id}"})
+        query = urllib.parse.urlencode({"labelSelector": f"senpai-training-id={training_id}", "limit": 256})
         pods = self._request_json(
             "GET",
             f"/api/v1/namespaces/{urllib.parse.quote(resource.namespace, safe='')}/pods?{query}",
-            timeout_seconds=5,
+            timeout_seconds=remaining(),
+            max_response_bytes=4 * 1024 * 1024,
         )
+        if pods.get("metadata", {}).get("continue") or len(pods["items"]) > 256:
+            raise RuntimeError("Kubernetes Pod inventory exceeds the bounded capture limit")
         owned = []
         jobs = {}
         for pod in pods["items"]:
@@ -519,7 +581,7 @@ class KubernetesApiClient:
                     continue
                 name = owner["name"]
                 if name not in jobs:
-                    jobs[name] = self._get("Job", name, resource.namespace)
+                    jobs[name] = self._get("Job", name, resource.namespace, timeout_seconds=remaining())
                 job = jobs[name]
                 if (
                     job is not None
@@ -531,14 +593,16 @@ class KubernetesApiClient:
                 ):
                     owned.append(pod)
                     break
-        return owned[: resource.nodes + 2]
+        return owned
 
-    def _get(self, kind: str, name: str, namespace: str) -> dict | None:
+    def _get(
+        self, kind: str, name: str, namespace: str, *, timeout_seconds: float = 30,
+    ) -> dict | None:
         path = (
             f"{self._collection_path(kind, namespace)}/"
             f"{urllib.parse.quote(name, safe='')}"
         )
-        return self._request_json("GET", path, allow_not_found=True)
+        return self._request_json("GET", path, allow_not_found=True, timeout_seconds=timeout_seconds)
 
     @staticmethod
     def _collection_path(kind: str, namespace: str) -> str:
@@ -1258,7 +1322,8 @@ class KubernetesTrainingSupervisor:
                     return
                 terminal_persisted = True
             try:
-                self.client.release(training_id)
+                receipt = self.client.release(training_id)
+                result = result.model_copy(update={"kubernetes_pod_receipt": receipt})
                 break
             except Exception:
                 if active.cancelled:

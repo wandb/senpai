@@ -610,3 +610,27 @@ def test_registered_training_tools_share_one_runtime(tmp_path: Path):
         )
     finally:
         close_training_runtimes()
+
+
+def test_get_training_status_delivers_complete_structured_pod_receipt(tmp_path):
+    from senpai_agent.tools import GetTrainingStatusAction, GetTrainingStatusTool
+
+    receipt = {
+        'training_id': 'training-17', 'source_commit': 'a' * 40,
+        'resource': {'uid': 'exact-mpi-uid'}, 'complete': True,
+        'pods': [{
+            'uid': f'worker-{index}-uid', 'node': f'gpu-node-{index}', 'phase': 'Succeeded',
+            'containers': [{'name': 'train', 'restartCount': 0,
+                            'state': {'terminated': {'exitCode': 0, 'startedAt': '2026-09-26T01:00:00Z',
+                                                     'finishedAt': '2026-09-26T02:00:00Z'}},
+                            'lastState': {}}],
+        } for index in range(32)],
+    }
+    assert len(json.dumps(receipt)) > 8192
+    result = finished_result(tmp_path).model_copy(update={'kubernetes_pod_receipt': receipt})
+    training = StubTraining(tmp_path, result)
+    tool = GetTrainingStatusTool.create(training)[0]
+    observed = tool.executor(GetTrainingStatusAction(training_id='training-17'))
+    delivered = json.loads(observed.to_llm_content[0].text)
+    assert delivered['kubernetes_pod_receipt'] == receipt
+    assert training.status_checks == ['training-17']
