@@ -505,8 +505,7 @@ spawn_agents(
   tasks: [{
     key: str | null = null,
     task: str,
-    agent: general-purpose | explore | search_general_web |
-           search_research_publications | bash-runner = general-purpose,
+    agent: general-purpose | explore | bash-runner = general-purpose,
     model: fast | smart | frontier,
     include_context: bool = false,
   }],
@@ -577,8 +576,9 @@ eight, and the role registry allows at most eight active tasks concurrently
 across all trees. Root tasks consume that lifetime budget, so callers must
 leave capacity when a General Purpose child needs helpers. A later sequential
 root batch forms a new tree. The root is depth zero. It may spawn any registered
-agent at depth one, and a depth-one General Purpose agent may spawn leaf helpers
-at depth two. Explore, Search, Bash Runner, and every depth-two agent are leaves.
+agent at depth one, and a depth-one General Purpose agent may spawn any of the
+three agent types at depth two. Explore, Bash Runner, and every depth-two agent
+are leaves.
 This makes chains such as Explore -> Explore impossible without constraining a
 later research phase to the first batch's lifetime budget.
 
@@ -604,13 +604,12 @@ combinations fail clearly. The built-in file agents inherit the selected
 profile's effort.
 
 `explore` searches code, data, PR artifacts, and durable history and returns
-concise conclusions with paths and line numbers. `search_general_web` uses
-Exa's general index with agent-oriented defaults, while
-`search_research_publications` uses Exa's publication index and primary papers.
-`general-purpose` handles mixed terminal investigation, code editing, task
-tracking, tests, and one controlled level of leaf delegation. It is the default
+concise conclusions with paths and line numbers. `general-purpose` handles
+external research through `exa_search`, terminal investigation, code editing,
+task tracking, tests, and one controlled level of delegation. It is the default
 frontier agent, so a frontier task is generalist unless the caller deliberately
-selects `explore`, one of the explicit search forms, or `bash-runner`.
+selects `explore` or `bash-runner`. The `delegate-subagents` skill explains how
+to assign external research with a fresh context.
 `bash-runner` has only the terminal and runs tests, builds, linters, formatters,
 dependency commands, Git inspection, or system checks. It normally uses the
 fast model and returns counts and actionable failures rather than raw command
@@ -621,8 +620,12 @@ task and may search the parent's durable history path. With
 `include_context=true`, it also receives the complete model-visible parent
 history, including progressively disclosed skill content.
 
+Persisted search tasks normalize to general-purpose assignments with their
+original Exa mode. Historical results retain their recorded agent name; the
+runtime no longer registers a dedicated search agent.
+
 Each child receives only the tools and progressively disclosed skills declared
-by its Markdown definition. Bash Runner is terminal-only. Explore, Search, and
+by its Markdown definition. Bash Runner is terminal-only. Explore and
 Bash Runner have no delegation tools. A depth-one General Purpose child can use
 the lifecycle tools for depth-two leaf work, subject to the same tree budget
 and deadline. Children receive neither GitHub credentials nor GitHub
@@ -759,10 +762,10 @@ Delegated model credentials use a bounded JSON bundle in an unnamed file. The
 parent passes its descriptor to the child and closes its copy after spawning.
 The child closes the descriptor after reading and resolves configuration from
 an in-memory mapping. The same private bundle carries Exa to every delegated
-runtime so general-purpose children can delegate to search grandchildren.
+runtime so general-purpose children and grandchildren can use Exa directly.
 Exa stays outside shell environments, tool parameters, and conversation secrets.
-The root and search agents expose `exa_search`; all child runtimes retain the
-key in trusted process memory, including those that can delegate onward. This
+The root and general-purpose agents expose `exa_search`; all child runtimes
+retain the key in trusted process memory, including those that can delegate onward. This
 boundary does not protect against compromise of the trusted runtime or a
 privileged host process.
 W&B conversation secrets remain available to child tools. W&B inference still
@@ -880,7 +883,7 @@ before contacting Exa. Every response persists the complete Markdown in the
 conversation's observations directory and returns its file path and character
 count. Responses above 30,000 characters return an explicit preview. A failed
 write fails the tool call instead of losing evidence. Local conversation cleanup
-retains these files, so parents can read results from completed search children.
+retains these files, so parents can read results from completed research subagents.
 The preview fits below the pinned SDK's 50,000-character tool-message limit; SDK serializers
 and other tools retain their existing limits. The legacy terminal path also
 previews at 30,000 characters. Complete evidence is available through bounded

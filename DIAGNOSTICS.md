@@ -1452,9 +1452,10 @@ category
 active_branch
 ```
 
-The supported `agent_type` values are `general-purpose`, `explore`,
-`bash-runner`, `search_general_web`, and
-`search_research_publications`. The `model_tier` value is `fast`,
+The supported `agent_type` values are `general-purpose`, `explore`, and
+`bash-runner`. Older traces may contain the retired `search`,
+`search_general_web`, or `search_research_publications` values.
+The `model_tier` value is `fast`,
 `smart`, or `frontier`; it is a routing tier, not necessarily the provider
 model name. Read the exact provider model from the child's frozen
 `base_state.agent.llm.model`. Leave it unknown when that state is

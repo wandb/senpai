@@ -129,7 +129,7 @@ REASONING_EFFORTS = (
     "max",
     "none",
 )
-SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore", "search")
+SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore")
 SENPAI_AGENT_DIR_ENV = "SENPAI_AGENT_DIR"
 SOURCE_SENPAI_AGENT_DIR = Path(__file__).resolve().parents[1] / ".agents" / "agents"
 REPOSITORY_INSTRUCTION_FILENAMES = frozenset(

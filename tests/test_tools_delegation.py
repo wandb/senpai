@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from openhands.sdk.context.view import View
-from openhands.sdk.event import MessageEvent
+from openhands.sdk.event import ActionEvent, Event, MessageEvent
 from openhands.sdk.llm import Message, TextContent
 
 from senpai_agent.delegation import (
@@ -23,8 +23,6 @@ from senpai_agent.delegation import (
     DelegationConfig,
     DelegationRegistry,
     DelegationRequest,
-    LeafAgentTask,
-    LeafSpawnAgentsAction,
     MODEL_TIER_TIMEOUT_SECONDS,
     OpenHandsChildProcess,
     SpawnAgentsAction,
@@ -48,21 +46,20 @@ def test_legacy_delegate_action_keeps_its_smart_default():
     assert DelegateAgentAction(task="Inspect persisted work").model == "smart"
 
 
-def test_task_schema_requires_an_explicit_model_tier():
-    for task_type in (AgentTask, LeafAgentTask):
-        schema = task_type.model_json_schema()
+def test_task_schema_exposes_general_research_without_search_specializations():
+    schema = AgentTask.model_json_schema()
 
-        assert "model" in schema["required"]
-        assert "default" not in schema["properties"]["model"]
-        assert schema["properties"]["model"]["description"] == (
-            "Select fast, smart, or frontier according to the delegation policy."
-        )
+    assert "model" in schema["required"]
+    assert "default" not in schema["properties"]["model"]
+    assert schema["properties"]["agent"]["enum"] == [
+        "general-purpose", "explore", "bash-runner"
+    ]
+    assert "search_mode" not in schema["properties"]
 
 
-@pytest.mark.parametrize("action_type", [SpawnAgentsAction, LeafSpawnAgentsAction])
-def test_spawn_rejects_a_task_without_a_model_tier(action_type):
+def test_spawn_rejects_a_task_without_a_model_tier():
     with pytest.raises(ValueError, match=r"tasks\.0\.model\s+Field required"):
-        action_type.model_validate(
+        SpawnAgentsAction.model_validate(
             {
                 "batch_key": "missing-model",
                 "tasks": [{"task": "Inspect", "agent": "explore"}],
@@ -70,37 +67,44 @@ def test_spawn_rejects_a_task_without_a_model_tier(action_type):
         )
 
 
-def test_explicit_search_task_forms_resolve_to_internal_search_modes():
-    web = AgentTask(
-        task="Find current documentation",
-        agent="search_general_web",
-        model="smart",
+def test_sdk_restores_historical_leaf_spawn_events_as_general_research():
+    action = {
+        "kind": "LeafSpawnAgentsAction",
+        "batch_key": "old-literature-search",
+        "tasks": [
+            {
+                "agent": "search_research_publications",
+                "task": "Find primary papers",
+                "model": "smart",
+                "include_context": False,
+            }
+        ],
+    }
+    restored = Event.model_validate_json(
+        json.dumps(
+            {
+                "kind": "ActionEvent",
+                "thought": [],
+                "action": action,
+                "tool_name": "spawn_agents",
+                "tool_call_id": "legacy-spawn",
+                "tool_call": {
+                    "id": "legacy-spawn",
+                    "name": "spawn_agents",
+                    "arguments": json.dumps(action),
+                    "origin": "completion",
+                },
+                "llm_response_id": "legacy-response",
+            }
+        )
     )
-    papers = LeafAgentTask(
-        task="Find primary papers",
-        agent="search_research_publications",
-        model="smart",
-    )
 
-    assert web.resolved_agent() == ("search", "general-web")
-    assert papers.resolved_agent() == ("search", "research-publications")
-    assert "search_mode" not in web.model_dump()
-
-
-def test_persisted_search_task_restores_without_exposing_the_old_schema():
-    restored = AgentTask.model_validate(
-        {
-            "task": "Find primary papers",
-            "agent": "search",
-            "model": "smart",
-            "search_mode": "research-publications",
-        }
-    )
-
-    assert restored.agent == "search_research_publications"
-    task_schema = AgentTask.model_json_schema()["properties"]
-    assert "search_mode" not in task_schema
-    assert "search" not in task_schema["agent"]["enum"]
+    assert isinstance(restored, ActionEvent)
+    assert restored.action.batch_key == "old-literature-search"
+    task = restored.action.tasks[0]
+    assert task.agent == "general-purpose"
+    assert task.task == "Search mode: research-publications\n\nFind primary papers"
+    assert task.include_context is False
 
 
 @pytest.mark.parametrize(
@@ -125,8 +129,8 @@ def test_persisted_search_task_restores_without_exposing_the_old_schema():
         (
             AgentTask(
                 key="papers",
-                task="Find primary papers",
-                agent="search_research_publications",
+                task="Search mode: research-publications\n\nFind primary papers",
+                agent="general-purpose",
                 model="smart",
             ),
             {
@@ -138,6 +142,27 @@ def test_persisted_search_task_restores_without_exposing_the_old_schema():
                 "search_mode": "research-publications",
             },
         ),
+        *[
+            (
+                AgentTask(
+                    key="sources",
+                    task=f"Search mode: {mode}\n\nFind primary sources",
+                    agent="general-purpose",
+                    model="smart",
+                ),
+                {
+                    "key": "sources",
+                    "task": "Find primary sources",
+                    "agent": agent,
+                    "model": "smart",
+                    "include_context": False,
+                },
+            )
+            for agent, mode in (
+                ("search_general_web", "general-web"),
+                ("search_research_publications", "research-publications"),
+            )
+        ],
     ],
 )
 def test_pre_upgrade_registry_specs_replay_semantically(
@@ -189,31 +214,6 @@ def test_pre_upgrade_registry_specs_replay_semantically(
         )
     with pytest.raises(RuntimeError, match="unknown fields: unexpected"):
         registry.reserve(specs=[current], **reserve)
-
-
-def test_depth_one_generalist_schema_cannot_request_generalist_child(tmp_path):
-    configure_delegation(config(tmp_path, depth=0))
-    root = SpawnAgentsTool.create(child_runner_factory=lambda _: None)[0]
-    assert root.action_type is SpawnAgentsAction
-
-    configure_delegation(
-        config(tmp_path, depth=1, agent_name="general-purpose")
-    )
-    nested = SpawnAgentsTool.create(child_runner_factory=lambda _: None)[0]
-    assert nested.action_type is LeafSpawnAgentsAction
-    with pytest.raises(ValueError, match="literal_error"):
-        LeafSpawnAgentsAction.model_validate(
-            {
-                "batch_key": "invalid-generalist-chain",
-                "tasks": [
-                    {
-                        "task": "Recurse",
-                        "agent": "general-purpose",
-                        "model": "smart",
-                    }
-                ],
-            }
-        )
 
 
 class EventSink:
@@ -444,27 +444,38 @@ def test_compacted_result_is_the_only_parent_visible_task_value(tmp_path):
     assert all(raw_report not in message for message in parent_messages)
 
 
-def test_search_task_form_is_resolved_in_registry_and_child_request(tmp_path):
+@pytest.mark.parametrize(
+    ("legacy", "mode"),
+    [
+        ({"agent": "search", "search_mode": "general-web"}, "general-web"),
+        ({"agent": "search_general_web"}, "general-web"),
+        ({"agent": "search_research_publications"}, "research-publications"),
+    ],
+)
+def test_persisted_search_tasks_dispatch_generalists_with_the_original_mode(
+    tmp_path, legacy, mode
+):
     release = threading.Event()
     release.set()
     requests = []
+    children = []
 
     def factory(request):
         requests.append(request)
-        return FakeChild(release)
+        child = FakeChild(release)
+        children.append(child)
+        return child
 
     spawn, *_ = tools(tmp_path, factory)
     parent = parent_conversation()
     spawned = spawn(
-        SpawnAgentsAction(
-            batch_key="publication-search",
-            tasks=[
-                AgentTask(
-                    task="Find primary sources",
-                    agent="search_research_publications",
-                    model="smart",
-                )
-            ],
+        SpawnAgentsAction.model_validate(
+            {
+                "batch_key": "publication-search",
+                "tasks": [
+                    {"task": "Find primary sources", "model": "smart", **legacy}
+                ],
+            }
         ),
         parent,
     )
@@ -472,14 +483,11 @@ def test_search_task_form_is_resolved_in_registry_and_child_request(tmp_path):
         tmp_path / "state" / "delegation" / "tasks.sqlite3"
     ).rows([spawned.tasks[0].task_id])[0]
 
-    assert (requests[0].agent, requests[0].search_mode) == (
-        "search",
-        "research-publications",
+    assert requests[0].agent == row["agent"] == "general-purpose"
+    assert children[0].calls[0][0] == row["task"] == (
+        f"Search mode: {mode}\n\nFind primary sources"
     )
-    assert (row["agent"], row["search_mode"]) == (
-        "search",
-        "research-publications",
-    )
+    assert requests[0].parent_context == ()
 
 
 def test_await_quorum_and_timeout_leave_unfinished_tasks_running(tmp_path):
@@ -1034,39 +1042,43 @@ def test_tree_and_depth_guards_apply_before_any_child_starts(tmp_path):
             parent_conversation(),
         )
 
-    with pytest.raises(ValueError, match="depth-2 helpers must be leaf"):
-        nested_spawn(
-            SpawnAgentsAction(
-                batch_key="general-purpose-chain",
-                tasks=[
-                    AgentTask(
-                        task="Another GP",
-                        agent="general-purpose",
-                        model="smart",
-                    )
-                ],
-            ),
-            nested_parent,
-        )
+    generalist = nested_spawn(
+        SpawnAgentsAction(
+            batch_key="general-purpose-chain",
+            tasks=[
+                AgentTask(
+                    task="Research primary sources with Exa",
+                    agent="general-purpose",
+                    model="smart",
+                )
+            ],
+        ),
+        nested_parent,
+    ).tasks[0]
+    assert requests[-1].agent == "general-purpose"
+    assert requests[-1].depth == 2
+    assert requests[-1].parent_context == ()
+    assert len(requests) == len(root.tasks) + 1
 
     depth_two_spawn, *_ = tools(
         tmp_path,
         factory,
         tree_id=tree_id,
         depth=2,
-        agent_name="explore",
-        current_task_id=str(uuid.uuid4()),
+        agent_name="general-purpose",
+        current_task_id=generalist.task_id,
     )
     with pytest.raises(ValueError, match="maximum delegation depth"):
         depth_two_spawn(
             SpawnAgentsAction(
                 batch_key="cedar-depth-four",
                 tasks=[
-                    AgentTask(task="Too deep", agent="explore", model="smart")
+                    AgentTask(task="Too deep", agent="general-purpose", model="smart")
                 ],
             ),
             parent_conversation(),
         )
+    assert len(requests) == len(root.tasks) + 1
 
     for release in releases:
         release.set()

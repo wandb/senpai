@@ -280,6 +280,7 @@ def test_target_agents_cannot_shadow_senpai_delegation_agents(tmp_path):
 
     assert definition.reasoning_effort is None
     assert set(definition.tools) == {
+        "senpai_exa",
         "terminal",
         "file_editor",
         "task_tracker",
@@ -349,7 +350,6 @@ def test_markdown_agents_register_and_construct_with_the_native_loader(tmp_path)
             "bash-runner",
             "general-purpose",
             "explore",
-            "search",
         }
         definitions = {
             definition.name: definition
@@ -364,13 +364,9 @@ def test_markdown_agents_register_and_construct_with_the_native_loader(tmp_path)
             name: agent_definition_to_factory(definition, work_dir=workspace)(llm)
             for name, definition in definitions.items()
         }
-        assert {tool.name for tool in agents["search"].tools} == {
-            "senpai_exa",
-            "terminal",
-            "file_editor",
-        }
+        assert "senpai_exa" in {tool.name for tool in agents["general-purpose"].tools}
         assert {tool.name for tool in agents["bash-runner"].tools} == {"terminal"}
-        assert agents["search"].llm.reasoning_effort == "low"
+        assert agents["general-purpose"].llm.reasoning_effort == "low"
         assert agents["explore"].llm.reasoning_effort == "low"
         """
     )
@@ -394,17 +390,15 @@ def test_markdown_agents_register_and_construct_with_the_native_loader(tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("agent_file", ["search.md", "general-purpose.md"])
 def test_subagents_receive_skills_from_the_runtime_plugin(
     monkeypatch,
     tmp_path,
-    agent_file,
 ):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("SENPAI_ROLE", "advisor")
     register_default_tools(enable_browser=False)
     register_senpai_tools()
-    definition = AgentDefinition.load(AGENT_DIR / agent_file)
+    definition = AgentDefinition.load(AGENT_DIR / "general-purpose.md")
     agent = agent_definition_to_factory(definition, work_dir=tmp_path)(
         LLM(
             model="anthropic/claude-opus-4-8",
@@ -448,6 +442,7 @@ def test_subagents_receive_skills_from_the_runtime_plugin(
             "general-purpose",
             None,
             {
+                "senpai_exa",
                 "terminal",
                 "file_editor",
                 "task_tracker",
@@ -456,13 +451,6 @@ def test_subagents_receive_skills_from_the_runtime_plugin(
                 "agent_status",
                 "cancel_agents",
             },
-            set(),
-        ),
-        (
-            "search.md",
-            "search",
-            None,
-            {"senpai_exa", "terminal", "file_editor"},
             set(),
         ),
     ],
@@ -690,8 +678,6 @@ def test_delegation_guidance_lives_in_the_plugin_skill():
         "`await_agents`",
         "`agent_status`",
         "`cancel_agents`",
-        "`search_general_web`",
-        "`search_research_publications`",
         '`model="frontier"`',
         '`agent="general-purpose"`',
         "Every task must explicitly set `model`",
@@ -810,7 +796,7 @@ def test_harness_states_bounded_delegation_tree_contract():
     for required in (
         "at most eight children in total",
         "depth-one general-purpose child",
-        "Explore, Search, Bash Runner, and every depth-two child are leaves",
+        "Explore, Bash Runner, and every depth-two child are leaves",
         "descendants inherit the earlier ancestor deadline",
         "twenty minutes for `fast`",
         "one hour for `smart`",

@@ -49,10 +49,6 @@ PROGRAM_SYSTEM_PROMPT = """# program.md - {{PROGRAM_PATH}}
 
 {{PROGRAM_CONTENT}}"""
 
-DELEGATED_SEARCH_MODE_PROMPT = """Search mode: {{SEARCH_MODE}}
-
-{{ASSIGNMENT}}"""
-
 DELEGATED_TASK_PROMPT = """# Delegated task
 
 You are a fresh Senpai subagent. Perform only the assigned task and return a concise, evidence-linked report to the parent.
