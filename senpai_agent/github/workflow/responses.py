@@ -5,7 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Annotated, Literal, Protocol
 
-from pydantic import ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError
+from pydantic import (
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    ValidationError,
+)
 
 from senpai_agent.github.workflow.errors import ReconciliationError
 from senpai_agent.models import AssignmentRecord, Contract, ExperimentResult
@@ -194,6 +201,12 @@ class IssueResponse(GitHubResponse):
     user: GitHubAuthor
     author_association: RequiredString
     pull_request: dict[str, object] | None = None
+
+
+class CreatedIssueResponse(IssueResponse):
+    number: PositiveInteger
+    title: RequiredString
+    html_url: RequiredString
 
 
 class NumberedResponse(GitHubResponse):

@@ -137,12 +137,17 @@ class GitHubToolRuntime:
             raise RuntimeError("student GitHub tools require a student name")
         return self.student_name
 
+    def human_issue_audience_label(self) -> str:
+        """Return this role's configured Issue audience label."""
+
+        if self.role == "advisor":
+            return self.assignment_base_branch()
+        return f"student:{self.current_student()}"
+
     def human_issue_audience(self) -> set[str]:
         """Return the only Issue audience labels this role may answer."""
 
-        if self.role == "advisor":
-            return {"team", self.assignment_base_branch()}
-        return {"team", f"student:{self.current_student()}"}
+        return {"team", self.human_issue_audience_label()}
 
     def human_issue_responder(self) -> str:
         """Return the role or pod identity used to key one Issue reply."""

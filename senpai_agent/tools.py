@@ -115,6 +115,10 @@ class _LoadBrowserExecutor(
             return LoadBrowserObservation(tools=names)
 
         browser_tools = BrowserToolSet.create(conversation.state)
+        if not browser_tools:
+            raise RuntimeError(
+                "Browser tools could not be loaded; try load_browser again."
+            )
         conversation.agent.add_runtime_tools(browser_tools)
         conversation.state.agent_state = {
             **conversation.state.agent_state,
@@ -135,7 +139,13 @@ class LoadBrowserTool(ToolDefinition[LoadBrowserAction, LoadBrowserObservation])
         conv_state: ConversationState,
     ) -> Sequence[ToolDefinition]:
         if conv_state.agent_state.get(_BROWSER_ENABLED_STATE_KEY):
-            return BrowserToolSet.create(conv_state)
+            browser_tools = BrowserToolSet.create(conv_state)
+            if browser_tools:
+                return browser_tools
+            conv_state.agent_state = {
+                **conv_state.agent_state,
+                _BROWSER_ENABLED_STATE_KEY: False,
+            }
         return [
             cls(
                 description=(

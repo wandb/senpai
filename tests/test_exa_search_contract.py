@@ -9,7 +9,7 @@ def test_installed_sdk_serializes_publication_category(monkeypatch):
     captured = {}
     client = exa_search.Exa("test-key")
 
-    def request(path, options):
+    def request(path, options, *, headers=None):
         captured.update(path=path, options=options)
         return {"results": []}
 
@@ -25,7 +25,7 @@ def test_installed_sdk_serializes_general_scope_without_a_category(monkeypatch):
     captured = {}
     client = exa_search.Exa("test-key")
 
-    def request(path, options):
+    def request(path, options, *, headers=None):
         captured.update(path=path, options=options)
         return {"results": []}
 

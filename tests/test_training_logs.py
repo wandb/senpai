@@ -1,8 +1,36 @@
+import os
+import resource
 import time
+from contextlib import ExitStack
 from pathlib import Path
+
+import pytest
 
 from senpai_agent.training import TrainingState
 from training_test_support import make_supervisor, run_python, wait_for_terminal
+
+
+def test_training_captures_output_with_many_open_files(tmp_path: Path):
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit != resource.RLIM_INFINITY and soft_limit < 2048:
+        pytest.skip("requires room for a subprocess above file descriptor 1024")
+    workspace, supervisor = make_supervisor(tmp_path, terminate_grace_seconds=0.1)
+    with ExitStack() as files:
+        # Force the training pipe above select()'s descriptor limit.
+        while files.enter_context(open(os.devnull, "rb")).fileno() < 1024:
+            pass
+        try:
+            running = run_python(
+                supervisor,
+                workspace,
+                "import time; time.sleep(0.1); print('captured', flush=True)",
+            )
+            terminal = wait_for_terminal(supervisor, running.training_id)
+
+            assert terminal.state is TrainingState.FINISHED
+            assert Path(terminal.log_path).read_text() == "captured\n"
+        finally:
+            supervisor.close()
 
 
 def test_running_training_publishes_wandb_id_before_exit(tmp_path: Path):

@@ -13,6 +13,10 @@ from pydantic import SecretStr
 class GitHubReadError(RuntimeError):
     """A GitHub read failed or returned an invalid response."""
 
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class GitHubReader:
     """Read JSON objects and paginated lists from one GitHub API origin."""
@@ -45,7 +49,9 @@ class GitHubReader:
         payload, _ = self._request(path)
         return payload
 
-    def _request(self, path: str) -> tuple[object, str | None]:
+    def _request(
+        self, path: str, *, json_body: object | None = None
+    ) -> tuple[object, str | None]:
         url = self._url(path)
         headers = {
             "Accept": "application/vnd.github+json",
@@ -53,7 +59,12 @@ class GitHubReader:
         }
         if self._token is not None:
             headers["Authorization"] = f"Bearer {self._token.get_secret_value()}"
-        github_request = request.Request(url, headers=headers)
+        data = None
+        if json_body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(json_body).encode()
+        github_request = request.Request(url, headers=headers, data=data)
+        method = github_request.get_method()
         try:
             with request.urlopen(github_request, timeout=self._timeout) as response:
                 payload = (
@@ -68,15 +79,16 @@ class GitHubReader:
                 )
         except HTTPError as error:
             raise GitHubReadError(
-                f"GitHub GET {self._safe_path(url)} returned HTTP {error.code}"
+                f"GitHub {method} {self._safe_path(url)} returned HTTP {error.code}",
+                status_code=error.code,
             ) from error
         except (URLError, TimeoutError) as error:
             raise GitHubReadError(
-                f"GitHub GET {self._safe_path(url)} failed before an HTTP response"
+                f"GitHub {method} {self._safe_path(url)} failed before an HTTP response"
             ) from error
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise GitHubReadError(
-                f"GitHub GET {self._safe_path(url)} returned invalid JSON"
+                f"GitHub {method} {self._safe_path(url)} returned invalid JSON"
             ) from error
 
     def pages(self, path: str) -> tuple[object, ...]:
@@ -109,10 +121,19 @@ class GitHubReader:
         """Return and cache the authenticated GitHub login."""
 
         if self._actor is None:
-            user = self.get("/user")
-            if not isinstance(user, dict) or not isinstance(user.get("login"), str):
-                raise GitHubReadError("GitHub returned an invalid authenticated user")
-            self._actor = user["login"]
+            try:
+                user = self.get("/user")
+            except GitHubReadError as error:
+                if error.status_code != 403:
+                    raise
+                payload, _ = self._request(
+                    "/graphql", json_body={"query": "query { viewer { login } }"}
+                )
+                self._actor = graphql_viewer_login(payload)
+            else:
+                if not isinstance(user, dict) or not isinstance(user.get("login"), str):
+                    raise GitHubReadError("GitHub returned an invalid authenticated user")
+                self._actor = user["login"]
         return self._actor
 
     def _url(self, path: str) -> str:
@@ -143,3 +164,16 @@ def next_link(value: str | None) -> str | None:
             if target.startswith("<") and target.endswith(">"):
                 return target[1:-1]
     return None
+
+
+def graphql_viewer_login(payload: object) -> str:
+    """Read the authenticated publishing identity, including an App's bot."""
+
+    if not isinstance(payload, dict) or payload.get("errors"):
+        raise GitHubReadError("GitHub returned an invalid GraphQL viewer")
+    data = payload.get("data")
+    viewer = data.get("viewer") if isinstance(data, dict) else None
+    login = viewer.get("login") if isinstance(viewer, dict) else None
+    if not isinstance(login, str) or not login or login.strip() != login:
+        raise GitHubReadError("GitHub returned an invalid GraphQL viewer")
+    return login

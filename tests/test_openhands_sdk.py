@@ -30,7 +30,7 @@ TEST_COMPACTION_TRIGGER_TOKENS = 180_000
 def test_openhands_fork_revision_is_consistent_across_install_paths():
     package_names = {"openhands-sdk", "openhands-tools"}
     fork_url = "git+https://github.com/morganmcg1/software-agent-sdk.git"
-    fork_revision = "f69134273ee3a31a233d6201786570eb9c4c141b"
+    fork_revision = "03b60423725411ad485b665009024b6444694cc7"
     expected_requirements = {
         f"{name} @ {fork_url}@{fork_revision}#subdirectory={name}"
         for name in package_names

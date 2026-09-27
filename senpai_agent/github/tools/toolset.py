@@ -14,6 +14,7 @@ from .definitions import (
     AcceptResultOnCurrentBaseTool,
     CloseExperimentTool,
     CreateAssignmentTool,
+    CreateHumanIssueTool,
     MergeExperimentTool,
     PostAssignmentCommentTool,
     PublishAdvisorBranchTool,
@@ -99,6 +100,7 @@ class GitHubWorkflowToolSet(
                 state_dir=state_dir,
                 workspace=workspace,
             ),
+            *CreateHumanIssueTool.create(runtime),
             *RespondToHumanIssueTool.create(runtime),
         )
         if role == "student":

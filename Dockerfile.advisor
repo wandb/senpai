@@ -1,6 +1,6 @@
-FROM python:3.13-slim-bookworm
+FROM python:3.14-slim-bookworm
 
-ARG PLAYWRIGHT_VERSION=1.55.0
+ARG PLAYWRIGHT_VERSION=1.63.0
 ARG SENPAI_SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.revision="${SENPAI_SOURCE_REVISION}"
 
@@ -39,7 +39,7 @@ COPY senpai_agent /tmp/senpai/senpai_agent
 COPY .agents/agents /opt/senpai-agent-definitions
 COPY plugins/senpai /opt/senpai-plugin
 RUN cd /tmp/senpai && \
-    uv export --locked --python 3.13 --no-dev --no-emit-project \
+    uv export --locked --python 3.14 --no-dev --no-emit-project \
       --format requirements.txt \
       --prune torch \
       --prune torchvision \
@@ -56,7 +56,7 @@ RUN cd /tmp/senpai && \
       --only-binary rpds-py \
       -r requirements.txt && \
     uv pip install --python "$SENPAI_PYTHON" --no-deps --compile-bytecode /tmp/senpai "pip==25.3" && \
-    python -P -c 'import importlib.metadata, importlib.util, openhands.sdk, senpai_agent, sys; assert sys.version_info[:2] == (3, 13); assert importlib.util.find_spec("torch") is None; assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
+    python -P -c 'import importlib.metadata, importlib.util, openhands.sdk, senpai_agent, sys; assert sys.version_info[:2] == (3, 14); assert importlib.util.find_spec("torch") is None; assert importlib.metadata.version("openhands-sdk") == "1.49.6"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
     python -P -m senpai_agent.agent_markdown "$SENPAI_PLUGIN" && \
     chown -R root:root /opt/senpai-venv "$SENPAI_AGENT_DIR" "$SENPAI_PLUGIN" && \
     chmod -R a-w /opt/senpai-venv "$SENPAI_AGENT_DIR" "$SENPAI_PLUGIN" && \

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from openhands.sdk import Agent, LLM, LocalConversation, Tool
+from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.tool import resolve_tool
 from openhands.sdk.plugin import Plugin, PluginSource
 from openhands.sdk.subagent import AgentDefinition, agent_definition_to_factory
@@ -64,6 +65,50 @@ def test_child_mode_keeps_bounded_delegation_lifecycle_tools(tmp_path):
     assert delegation_config(config).depth == 0
 
 
+@pytest.mark.parametrize(
+    ("encoding", "preserved_comment"),
+    [
+        ("utf-8", "Research log ‚Äî with existing mojibake"),
+        ("cp1251", "Тестовый файл с кириллицей"),
+    ],
+    ids=["utf-8", "cp1251"],
+)
+def test_installed_file_editor_preserves_source_encoding(
+    tmp_path, encoding, preserved_comment,
+):
+    path = tmp_path / "experiment.py"
+    original = (
+        f"# -*- coding: {encoding} -*-\n\n"
+        f"# {preserved_comment}\n"
+        'text = "Привет, мир!"\n'
+        "numbers = [1, 2, 3, 4, 5]\n"
+        'message = "Это тестовая строка"\n'
+    )
+    path.write_bytes(original.encode(encoding))
+    spec = next(
+        tool
+        for tool in build_main_tools(runtime_config(tmp_path))
+        if tool.name == "file_editor"
+    )
+    state = SimpleNamespace(
+        workspace=SimpleNamespace(working_dir=str(tmp_path)),
+        agent=SimpleNamespace(llm=SimpleNamespace(vision_is_active=lambda: False)),
+    )
+    editor = resolve_tool(spec, state)[0]
+
+    result = editor(editor.action_type(
+        command="str_replace",
+        path=str(path),
+        old_str="Привет, мир!",
+        new_str="Здравствуй, мир!",
+    ))
+
+    assert result.is_error is False, result.text
+    assert path.read_bytes() == original.replace(
+        "Привет, мир!", "Здравствуй, мир!",
+    ).encode(encoding)
+
+
 @pytest.mark.parametrize("configured", [False, True])
 def test_exa_tool_spec_exposes_search_without_its_runtime_credential(tmp_path, configured):
     config = runtime_config(
@@ -114,14 +159,16 @@ def test_lazy_browser_keeps_the_persisted_tool_spec_compatible():
     assert runtime.verify(persisted) is runtime
 
 
-def test_browser_loader_uses_runtime_tools_and_persists_activation(monkeypatch):
+@pytest.mark.parametrize("resuming", [False, True], ids=["initial", "resumed"])
+def test_browser_loader_retries_startup_and_persists_activation(monkeypatch, resuming):
     from openhands.tools.browser_use import BrowserToolSet
 
     browser_tool = SimpleNamespace(name="browser_navigate")
+    startup_ready = False
     monkeypatch.setattr(
         BrowserToolSet,
         "create",
-        classmethod(lambda cls, state: [browser_tool]),
+        classmethod(lambda cls, state: [browser_tool] if startup_ready else []),
     )
 
     class RuntimeAgent:
@@ -133,11 +180,22 @@ def test_browser_loader_uses_runtime_tools_and_persists_activation(monkeypatch):
             self.added.extend(tools)
             self.tools_map.update({tool.name: tool for tool in tools})
 
-    state = SimpleNamespace(agent_state={})
+    state = SimpleNamespace(
+        agent_state={"senpai.browser_enabled": True} if resuming else {},
+        secret_registry=SecretRegistry(),
+    )
     agent = RuntimeAgent()
     conversation = SimpleNamespace(state=state, agent=agent)
     loader = LoadBrowserTool.create(state)[0]
 
+    with pytest.raises(RuntimeError, match="Browser tools could not be loaded"):
+        loader(LoadBrowserAction(), conversation)
+
+    assert not state.agent_state.get("senpai.browser_enabled")
+    assert agent.added == []
+    assert LoadBrowserTool.create(state)[0].name == "load_browser"
+
+    startup_ready = True
     observation = loader(LoadBrowserAction(), conversation)
 
     assert observation.tools == ("browser_navigate",)
@@ -494,6 +552,7 @@ def test_file_agent_definitions_keep_bounded_tools_and_no_github_mutations(
         "accept_result_on_current_base",
         "merge_experiment",
         "close_experiment",
+        "create_human_issue",
         "respond_to_human_issue",
         "submit_experiment_result",
     }.isdisjoint(definition.tools)

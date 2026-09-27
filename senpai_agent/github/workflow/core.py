@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 from pydantic import SecretStr
 
+from senpai_agent.github.http import next_link
 from senpai_agent.github.workflow.errors import (
     GitHubAPIError,
     GitHubTransportError,
@@ -319,6 +320,27 @@ class WorkflowCore:
             )
         except GitHubTransportError:
             return None
+
+    def _objects(self, path: str) -> Iterator[dict[str, object]]:
+        """Read a complete list from this GitHub origin."""
+
+        url: str | None = self._url(path)
+        visited: set[str] = set()
+        while url is not None:
+            if not url.startswith(f"{self._api_url}/"):
+                raise ReconciliationError(
+                    "GitHub pagination returned an unexpected origin"
+                )
+            if url in visited:
+                raise ReconciliationError("GitHub pagination contains a cycle")
+            visited.add(url)
+            response = self._request("GET", url, expected_statuses={200})
+            if not isinstance(response.json_body, list) or any(
+                not isinstance(item, dict) for item in response.json_body
+            ):
+                raise ReconciliationError("GitHub returned an invalid paginated list")
+            yield from response.json_body
+            url = next_link(response.header("Link"))
 
     def _url(self, value: str) -> str:
         if value.startswith(("https://", "http://")):
