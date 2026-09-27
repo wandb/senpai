@@ -1393,6 +1393,7 @@ def test_runtime_credentials_remain_configured_through_lazy_tool_initialization(
             "get_prs",
             "get_pr_source",
             "post_assignment_comment",
+            "publish_assignment_branch",
             "respond_to_human_issue",
             "submit_experiment_result",
         },
