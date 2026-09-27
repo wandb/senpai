@@ -1,6 +1,10 @@
+import json
+import os
 import shutil
 import subprocess
 import sys
+import sysconfig
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -79,12 +83,10 @@ def test_human_issue_skill_keeps_the_single_intent_response_contract():
     assert "STUDENT $0" not in content
 
 
-def test_plugin_sanitizer_builds_a_loadable_runtime_copy(tmp_path: Path):
+@pytest.fixture
+def readonly_runtime_plugin(tmp_path: Path):
     runtime_plugin = tmp_path / "plugin"
     shutil.copytree(PLUGIN_DIR, runtime_plugin)
-    source_skill = PLUGIN_DIR / "skills" / "review-experiment" / "SKILL.md"
-    original = source_skill.read_text(encoding="utf-8")
-
     subprocess.run(
         [sys.executable, "-m", "senpai_agent.agent_markdown", str(runtime_plugin)],
         check=True,
@@ -92,6 +94,19 @@ def test_plugin_sanitizer_builds_a_loadable_runtime_copy(tmp_path: Path):
         text=True,
         cwd=ROOT,
     )
+    modes = {path: path.stat().st_mode for path in runtime_plugin.rglob("*")}
+    modes[runtime_plugin] = runtime_plugin.stat().st_mode
+    try:
+        for path, mode in modes.items():
+            path.chmod(mode & ~0o222)
+        yield runtime_plugin
+    finally:
+        for path, mode in modes.items():
+            path.chmod(mode)
+
+
+def test_plugin_sanitizer_builds_a_loadable_runtime_copy(readonly_runtime_plugin: Path):
+    runtime_plugin = readonly_runtime_plugin
 
     plugin = Plugin.load(runtime_plugin)
 
@@ -112,7 +127,81 @@ def test_plugin_sanitizer_builds_a_loadable_runtime_copy(tmp_path: Path):
         for path in runtime_plugin.rglob("*.md")
         if (text := path.read_text(encoding="utf-8"))
     )
-    assert source_skill.read_text(encoding="utf-8") == original
+
+
+def test_bundled_helpers_run_without_syncing_target_dependencies(
+    readonly_runtime_plugin: Path, tmp_path: Path,
+):
+    target = tmp_path / "target-env"
+    subprocess.run(
+        [
+            "uv", "venv", "--no-project", "--no-config", "--no-python-downloads",
+            "--python", sys.executable, str(target),
+        ],
+        check=True,
+        env={**os.environ, "UV_CACHE_DIR": str(tmp_path / "uv-cache")},
+        capture_output=True,
+        text=True,
+    )
+    target_site = Path(sysconfig.get_path("purelib", vars={"base": str(target)}))
+    (target_site / "senpai-runtime.pth").write_text(sysconfig.get_path("purelib") + "\n")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "pyproject.toml").write_text(
+        '[project]\nname = "offline-analysis"\nversion = "0.0.0"\n'
+        'requires-python = ">=3.13"\n'
+        'dependencies = ["senpai-must-not-resolve==0"]\n'
+    )
+    (workspace / "analysis.py").write_text(textwrap.dedent("""\
+        import json, os, sys
+        from types import SimpleNamespace
+        sys.path.insert(0, f"{os.environ['SENPAI_PLUGIN']}/skills/wandb-primary/scripts")
+        from wandb_helpers import runs_to_dataframe
+        from weave_helpers import get_token_usage
+        from step_axis import list_candidate_step_keys
+
+        rows = [{"_step": step, "loss": 20 - step} for step in range(20)]
+        run = SimpleNamespace(
+            id="offline", name="offline", state="finished", created_at=None,
+            config={}, summary_metrics={"loss": 1},
+            scan_history=lambda **kwargs: iter(rows),
+        )
+        usage = get_token_usage(SimpleNamespace(summary={
+            "usage": {"model": {"input_tokens": 3, "output_tokens": 2}},
+        }))
+        print(json.dumps({
+            "prefix": sys.prefix,
+            "loss": runs_to_dataframe([run])[0]["loss"],
+            "steps": list_candidate_step_keys(run),
+            "tokens": usage["total_tokens"],
+        }))
+    """))
+    environment = {
+        "PATH": f"{target / 'bin'}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "SENPAI_PLUGIN": str(readonly_runtime_plugin),
+        "UV_PROJECT_ENVIRONMENT": str(target),
+        "UV_PYTHON": str(target / "bin/python"),
+        "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
+    }
+    result = subprocess.run(
+        ["uv", "run", "--offline", "--no-sync", "python", "analysis.py"],
+        cwd=workspace, env=environment, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "prefix": str(target), "loss": 1, "steps": ["_step"],
+        "tokens": 5,
+    }
+    assert not (workspace / "uv.lock").exists()
+    exa = readonly_runtime_plugin / "skills/exa-search/scripts/search_exa.py"
+    help_result = subprocess.run(
+        ["uv", "run", "--offline", "--no-sync", "python", str(exa), "--help"],
+        cwd=workspace, env=environment, capture_output=True, text=True,
+    )
+    assert help_result.returncode == 0, help_result.stderr
+    assert "general-web" in help_result.stdout
+    assert "research-publications" in help_result.stdout
 
 
 def test_delegate_subagents_skill_advertises_frontier_research_judgment():

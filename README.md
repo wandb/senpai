@@ -482,23 +482,35 @@ preserves other PATH entries, and allows later commands to change their
 session environment. Shared dependency commands such as `torchrun` receive
 target launchers so they and their Python workers can import target packages.
 Existing commands installed in the target environment take precedence.
-Bootstrap creates it without running `ensurepip` or target Python.
+Bootstrap creates it with `uv venv`, using the trusted interpreter and ignoring
+target project configuration. It does not run `ensurepip` or target Python.
 Environment changes belong to the terminal pane that received the command;
 parallel tmux execution can leave several panes with different settings.
-The image supplies pip through the shared package path: use
-`python -m pip install` for additive installs that reuse image packages.
-uv does not inspect packages exposed through that path, so `uv pip install`
-and `uv sync` can install separate copies, including large CUDA dependencies.
-Use `uv pip install --no-deps` when all required dependencies are already
-available, and `uv run --no-sync` to run with the installed package set.
-Sync the target lock when a separate dependency set is intended.
+Use uv for environment creation, locked image dependencies, and target project
+dependency management. The images copy pinned uv binaries directly from the
+official uv image. For skill scripts and analysis with the installed package
+set, use `uv run --no-sync python script.py` to avoid an incidental sync.
+One package-installation exception remains: the image supplies pip through the
+shared package path, and `python -m pip install` can reuse those shared packages.
+Pinned uv 0.10.9 does not inspect that path when resolving dependencies, so
+`uv pip install` and `uv sync` can install separate copies, including large CUDA
+dependencies. Use `uv pip install --no-deps` only when all required dependencies
+are already available. Sync the target lock when a separate dependency set is
+intended.
 Training retains normal project imports. File-defined child agents use the
 same Senpai terminal policy, timeouts, and target environment as their parent.
 
-Senpai loads its explicit plugin and explicit target skills and agent
-definitions. It does not auto-load installed, user, or project plugins through
-OpenHands ambient discovery. Those plugins' hooks, MCP servers, and skills
-therefore no longer appear automatically. Target skills in `.agents/skills`,
+Senpai still explicitly loads its bundled plugin, including all ten workflow
+skills and the command-policy and lifecycle hooks. Previously, startup copied
+that plugin into a writable directory; it now loads the read-only image copy.
+The bundled W&B and Exa skills run in the writable target environment and do
+not modify their installed skill files. Both role images include pandas and
+matplotlib for the bundled W&B diagnostics and plotting helpers.
+
+Previously, OpenHands also discovered additional plugins in project and home
+directories and its enabled-plugin store. Senpai now disables that automatic
+discovery. Those extra plugins' hooks, MCP servers, and skills therefore no
+longer appear automatically. Target skills in `.agents/skills`,
 `.openhands/skills`, and `.openhands/microagents` remain supported, as do
 unreserved target/user agents and MCP configuration declared on those agents.
 The bundled Exa and W&B skill integrations, browser tools, and typed GitHub,
