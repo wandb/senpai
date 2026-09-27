@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import sysconfig
@@ -39,6 +41,16 @@ def container_for(manifest: dict) -> dict:
 
 def named_items(items: list[dict]) -> dict[str, dict]:
     return {item["name"]: item for item in items}
+
+
+def target_environment_setup(role: str) -> str:
+    entrypoint = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text()
+    setup = entrypoint[entrypoint.index("export SENPAI_TARGET_PYTHON_ENV=") :]
+    setup = setup.split('cd "$WORKDIR"', 1)[0]
+    uv = shutil.which("uv")
+    assert uv is not None, "the bootstrap contract requires uv"
+    # Map the image's fixed binary path to the local test runtime.
+    return setup.replace("/usr/local/bin/uv", shlex.quote(uv))
 
 
 def test_advisor_dockerfile_prunes_the_training_stack():
@@ -266,7 +278,10 @@ def test_entrypoints_delegate_runtime_lifecycle_to_the_python_supervisor(
 @pytest.mark.parametrize("role", ["advisor", "student"])
 @pytest.mark.parametrize(
     "target_state",
-    ["fresh", "workspace_module", "existing_interpreter", "existing_site"],
+    [
+        "fresh", "workspace_module", "workspace_configuration",
+        "path_command", "existing_interpreter", "existing_site",
+    ],
 )
 def test_target_environment_setup_does_not_execute_target_code(
     tmp_path: Path,
@@ -283,7 +298,17 @@ def test_target_environment_setup_does_not_execute_target_code(
     exposure = tmp_path / "target-code-executed"
     hostile_code = f"from pathlib import Path; Path({str(exposure)!r}).touch()\n"
     if target_state == "workspace_module":
-        (workspace / "venv.py").write_text(hostile_code)
+        for module in ("venv.py", "sysconfig.py"):
+            (workspace / module).write_text(hostile_code)
+    elif target_state == "workspace_configuration":
+        # Trusted bootstrap must not parse target project or uv settings.
+        for name in ("uv.toml", "pyproject.toml"):
+            (workspace / name).write_text("invalid = [")
+    elif target_state == "path_command":
+        hostile_uv = home / ".local/bin/uv"
+        hostile_uv.parent.mkdir(parents=True)
+        hostile_uv.write_text('#!/bin/sh\ntouch "$EXPOSURE_PATH"\n')
+        hostile_uv.chmod(0o755)
     elif target_state == "existing_interpreter":
         target_python = target_env / "bin" / "python"
         target_python.parent.mkdir(parents=True)
@@ -296,9 +321,7 @@ def test_target_environment_setup_does_not_execute_target_code(
             f"import pathlib; pathlib.Path({str(exposure)!r}).touch()\n"
         )
 
-    entrypoint = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text()
-    setup = entrypoint[entrypoint.index("export SENPAI_TARGET_PYTHON_ENV=") :]
-    setup = setup.split('cd "$WORKDIR"', 1)[0]
+    setup = target_environment_setup(role)
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -308,6 +331,7 @@ def test_target_environment_setup_does_not_execute_target_code(
         HOME=str(home),
         SENPAI_PYTHON=sys.executable,
         EXPOSURE_PATH=str(exposure),
+        PATH=f"{home / '.local/bin'}:{environment['PATH']}",
         # The image imports an installed package; this source-level harness
         # explicitly supplies the trusted package under test.
         PYTHONPATH=str(ROOT),
@@ -407,9 +431,12 @@ def test_target_packages_and_shared_console_scripts_use_target_environment(
         "shared_example", "1.0",
         module=(
             "def main():\n"
-            "    import json, sys, target_addon\n"
+            "    import json, subprocess, sys, target_addon\n"
+            "    worker = subprocess.check_output([sys.executable, '-c', "
+            "'import json, sys, target_addon; "
+            "print(json.dumps([sys.prefix, target_addon.VERSION]))'], text=True)\n"
             "    print(json.dumps([sys.executable, sys.prefix, sys.argv[1:], "
-            "target_addon.VERSION]))\n"
+            "target_addon.VERSION, json.loads(worker)]))\n"
         ),
         console_scripts=("shared-example", "existing-tool", "linked-tool"),
     )
@@ -426,9 +453,7 @@ def test_target_packages_and_shared_console_scripts_use_target_environment(
     existing_script.chmod(0o755)
     existing_link = target_bin / "linked-tool"
     existing_link.symlink_to("missing-target-tool")
-    setup = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text()
-    setup = setup[setup.index("export SENPAI_TARGET_PYTHON_ENV=") :]
-    setup = setup.split('cd "$WORKDIR"', 1)[0]
+    setup = target_environment_setup(role)
     environment = {"PATH": os.environ["PATH"], "HOME": str(home),
                    "SENPAI_PYTHON": str(runtime_python), "PYTHONPATH": str(ROOT)}
     subprocess.run(["bash", "-e", "-c", setup], env=environment, check=True)
@@ -455,7 +480,7 @@ def test_target_packages_and_shared_console_scripts_use_target_environment(
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == [
-        str(target_python), str(target), arguments, "1.0",
+        str(target_python), str(target), arguments, "1.0", [str(target), "1.0"],
     ]
     subprocess.run(["bash", "-e", "-c", setup], env=environment, check=True)
     assert subprocess.check_output(

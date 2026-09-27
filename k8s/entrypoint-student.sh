@@ -21,6 +21,13 @@ if [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
     export GITHUB_TOKEN="$(<"$SENPAI_GITHUB_TOKEN_FILE")"
 fi
 : "${GITHUB_TOKEN:?GitHub bootstrap token is required}"
+: "${SENPAI_PROGRAM_SOURCE_COMMIT:?Launch-pinned program source commit is required}"
+: "${SENPAI_PROGRAM_CONTENT_SHA256:?Launch-pinned program digest is required}"
+: "${SENPAI_PROGRAM_CONTEXT_FILE:?Launch-owned program snapshot file is required}"
+[ -r "$SENPAI_PROGRAM_CONTEXT_FILE" ] || {
+    echo "ERROR: program snapshot file is not readable" >&2
+    exit 1
+}
 
 echo "=== Senpai Student: $STUDENT_NAME ==="
 echo "Runner repo:  $SENPAI_REPO_URL (revision: $SENPAI_REPO_REVISION)"
@@ -112,7 +119,8 @@ unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS WANDB_API_KEY EXA_API_KEY
 rm -f "$GIT_ASKPASS_FILE"
 export SENPAI_TARGET_PYTHON_ENV="$HOME/.venvs/senpai-target"
 if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then
-    "$SENPAI_PYTHON" -P -m venv --without-pip "$SENPAI_TARGET_PYTHON_ENV"
+    /usr/local/bin/uv venv --no-project --no-config --no-python-downloads \
+        --python "$SENPAI_PYTHON" --allow-existing "$SENPAI_TARGET_PYTHON_ENV"
 fi
 CONTROLLER_SITE="$("$SENPAI_PYTHON" -P -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
 # The target interpreter is agent-writable; never execute it during trusted startup.

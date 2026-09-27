@@ -286,6 +286,29 @@ After launch, the student can finish its turn. The deterministic controller poll
 
 Worker and container restarts preserve completed OpenHands events. Recovered live training is terminated safely rather than being adopted under an unverifiable process identity; the original student conversation receives the persisted terminal outcome.
 
+The terminal policy checks executable shell commands, including nested commands
+and common wrappers. Multiline input to ordinary programs remains data: Python,
+R, JavaScript, JSON, and other research formats do not need a language allowlist.
+The checker still inspects shell expansions in unquoted input and blocks
+restricted commands fed to recognized shells. Unrelated helper functions or
+file comparisons do not change how a data block is checked. Common wrappers
+such as `env`, `timeout`, `nice`, `xargs`, `taskset`, and `flock` preserve the
+wrapped program's data arguments. Shell loops, arithmetic, variable executable
+names, and variable timeout durations are supported. The checker inspects
+recognized commands inside loop bodies and command substitutions. It does not
+evaluate variable values or prove that loops terminate. Startup-file loading
+and explicit shell callbacks remain restricted.
+
+Use the target environment already supplied to terminals instead of
+`source .venv/bin/activate`. `source` can load unchecked commands and redefine
+the current shell. Use `bash -c` instead of `bash -lc`; login and interactive
+shells can load unchecked startup files. The policy is a behavioral guardrail,
+not a shell sandbox or a credential-containment boundary. It does not inspect
+arbitrary Python programs or executable files, and commands selected through
+variables can fall outside its recognition.
+Some unsupported wrapper syntax and unclear shell streams can still reject
+valid commands. The policy does not reconstruct state from previous commands.
+
 Interactive browser operations are progressively disclosed. A fresh root
 conversation initially sees only `load_browser`; invoking it adds the fourteen
 OpenHands browser operations and records the choice in conversation state so a
@@ -454,7 +477,7 @@ The controller owns cadence, durable events, conversation selection, verified Gi
 - Student state may be ephemeral because the branch, PR, typed result, W&B runs, and Weave trace are the durable handoff.
 - Explicit project skills remain available through OpenHands skill context. Repository `AGENTS.md`, `AGENT.md`, and `CLAUDE.md` instruction files are reserved for human-facing development tools and are not loaded as Senpai project context.
 
-The command policy blocks raw GitHub mutations, direct training, `git push`, polling loops, and log streams. Operation-specific typed tools enforce repository, branch, assignment, revision, head-SHA, label, and replay preconditions. This policy keeps routine operations deterministic while leaving high-entropy research work to the agent.
+The command policy blocks recognized raw GitHub mutations, direct training, `git push`, explicit polling commands, and log streams. Operation-specific typed tools enforce repository, branch, assignment, revision, head-SHA, label, and replay preconditions. This policy keeps routine operations deterministic while leaving high-entropy research work to the agent.
 
 Authenticated Git publication uses `/usr/bin/git` in a temporary bare repository.
 It derives the GitHub URL from the configured repository and ignores checkout
@@ -514,52 +537,8 @@ to recover automatically.
 
 GitHub coordination works across Docker, cloud VMs, or local hosts without private networking. The current repository does not yet provide a Compose or direct-host launcher: the Kubernetes manifests perform the source clone, environment assembly, skill installation, token handoff, mounts, and entrypoint selection.
 
-The role images install `senpai_agent` into `/opt/senpai-venv` at build time.
-That environment, the built-in agent definitions (`SENPAI_AGENT_DIR`), and the
-Senpai plugin (`SENPAI_PLUGIN`) are root-owned and read-only to the role user.
-Startup uses the installed runner with an absolute Python path and `-P`;
-it does not install the writable runner checkout or execute target Python.
-Changes to these installed assets require a new image.
-
-Terminals and supervised training use a separate writable environment at
-`$HOME/.venvs/senpai-target`. Its packages take precedence over the image's
-read-only packages. `python`, `uv pip install`, and `uv run` select that target
-environment through `PATH`, `VIRTUAL_ENV`, `UV_PYTHON`, and
-`UV_PROJECT_ENVIRONMENT`. Senpai applies these settings after shell startup,
-preserves other PATH entries, and allows later commands to change their
-session environment. Shared dependency commands such as `torchrun` receive
-target launchers so they and their Python workers can import target packages.
-Existing commands installed in the target environment take precedence.
-Bootstrap creates it without running `ensurepip` or target Python.
-Environment changes belong to the terminal pane that received the command;
-parallel tmux execution can leave several panes with different settings.
-The image supplies pip through the shared package path: use
-`python -m pip install` for additive installs that reuse image packages.
-uv does not inspect packages exposed through that path, so `uv pip install`
-and `uv sync` can install separate copies, including large CUDA dependencies.
-Use `uv pip install --no-deps` when all required dependencies are already
-available, and `uv run --no-sync` to run with the installed package set.
-Sync the target lock when a separate dependency set is intended.
-Training retains normal project imports. File-defined child agents use the
-same Senpai terminal policy, timeouts, and target environment as their parent.
-
-Senpai loads its explicit plugin and explicit target skills and agent
-definitions. It does not auto-load installed, user, or project plugins through
-OpenHands ambient discovery. Those plugins' hooks, MCP servers, and skills
-therefore no longer appear automatically. Target skills in `.agents/skills`,
-`.openhands/skills`, and `.openhands/microagents` remain supported, as do
-unreserved target/user agents and MCP configuration declared on those agents.
-The bundled Exa and W&B skill integrations, browser tools, and typed GitHub,
-training, and delegation tools remain available. Operators who need an
-additional runtime plugin must review and include it in the trusted image
-plugin; copying it into a target or home plugin directory does not enable it.
-
-The standard Kubernetes Deployments mount only
-`/home/senpai/.venvs/senpai-target` from HOME. Target dependencies survive a
-container restart in the same Pod. Custom launchers must preserve the target
-checkout and target environment alongside role state for equivalent recovery.
-They must also point the trusted hook manifest at their absolute trusted Python
-interpreter with `-P`; the bundled manifest uses `/opt/senpai-venv/bin/python`.
+Custom launchers must preserve the target checkout and target environment
+alongside role state for equivalent recovery.
 
 To build another launcher, reproduce [entrypoint-advisor.sh](k8s/entrypoint-advisor.sh) or [entrypoint-student.sh](k8s/entrypoint-student.sh), render `SENPAI-LAUNCH-CONTEXT.md` with runtime identity, limits, and isolation through `render_launch_context`, and provide it as base64 in `SENPAI_LAUNCH_CONTEXT_B64`. Pass the built-in role template and its required non-secret values to the Python supervisor, which renders and persists that role snapshot. Keep optional operator guidance in `EXTRA_INSTRUCTIONS_B64`. Persist `/var/lib/senpai/<tag>/advisor` for the advisor. Student execution requires Linux, an NVIDIA runtime, and compatible CUDA hardware; Docker Desktop on macOS cannot run the GPU student image.
 

@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -15,6 +16,10 @@ import yaml
 
 from git_workflow_support import commit_file, git, repository
 from launch_test_support import launch_args, render_role
+from senpai_agent.program_context import (
+    encode_program_system_prompt,
+    load_program_system_prompt,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -59,7 +64,9 @@ with Path(os.environ["START_RECORD"]).open("a") as output:
     def container_paths(script):
         for path in ("/workspace", "/var/lib/senpai", "/tmp/senpai"):
             script = script.replace(path, str(container / path.lstrip("/")))
-        return script
+        uv = shutil.which("uv")
+        assert uv is not None, "the bootstrap contract requires uv"
+        return script.replace("/usr/local/bin/uv", shlex.quote(uv))
 
     source_root = tmp_path / "runner-source"
     source_root.mkdir()
@@ -73,12 +80,20 @@ with Path(os.environ["START_RECORD"]).open("a") as output:
     revision = commit_file(source, f"k8s/entrypoint-{role}.sh", entrypoint, "entrypoint")
     target_source_root = tmp_path / "target-source"
     target_source_root.mkdir()
-    target_source, target_remote, target_baseline = repository(target_source_root)
+    target_source, target_remote, _target_revision = repository(target_source_root)
+    target_baseline = commit_file(
+        target_source, "program.md", "Preserve research work across restarts.\n", "program"
+    )
+    git(target_source, "push", "origin", "experiment-7")
     if role == "student":
         git(target_source, "push", "origin", "HEAD:refs/heads/research")
+    program = load_program_system_prompt(target_source, "program.md", target_baseline)
+    program_context = tmp_path / "program-context.b64"
+    program_context.write_text(encode_program_system_prompt(program))
 
-    _configmap, deployment, _secret = render_role(
-        role, launch_args(problem_dir="target/", advisor_branch="research")
+    configmap, deployment, _secret = render_role(
+        role, launch_args(problem_dir="target/", advisor_branch="research"),
+        program=program,
     )
     pod = yaml.safe_load(deployment)["spec"]["template"]["spec"]
     app = pod["containers"][0]
@@ -90,12 +105,14 @@ with Path(os.environ["START_RECORD"]).open("a") as output:
     bootstrap = container_paths(app["args"][0])
     environment = {
         **os.environ,
+        **yaml.safe_load(configmap)["data"],
         "HOME": str(home),
         "PATH": f"{tools}:{os.environ['PATH']}",
         "PYTHONPATH": str(ROOT),
         "SENPAI_PYTHON": sys.executable,
         "SENPAI_PLUGIN": str(ROOT / "plugins/senpai"),
         "SENPAI_AGENT_DIR": str(ROOT / ".agents/agents"),
+        "SENPAI_PROGRAM_CONTEXT_FILE": str(program_context),
         "SENPAI_REPO_URL": str(source),
         "SENPAI_REPO_REVISION": revision,
         "SENPAI_IMAGE_REVISION": revision,

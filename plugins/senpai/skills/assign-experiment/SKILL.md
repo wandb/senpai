@@ -13,7 +13,7 @@ argument-hint: "<student-name> <hypothesis-slug> <problem-dir>"
 
 # Assign an experiment
 
-Read the current baseline and `program.md`, then write one complete assignment:
+Read the current baseline. Use the immutable `program.md` snapshot embedded in your system prompt as policy when you write one complete assignment:
 
 - a falsifiable hypothesis and mechanism;
 - exact files and changes in scope;

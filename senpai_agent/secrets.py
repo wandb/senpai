@@ -34,6 +34,24 @@ PRIVATE_CREDENTIAL_FD_ENVS = {
     "WANDB_API_KEY": "SENPAI_WANDB_API_KEY_FD",
     "EXA_API_KEY": "SENPAI_EXA_API_KEY_FD",
 }
+SHELL_STARTUP_ENV_NAMES = frozenset(
+    {
+        "BASHOPTS",
+        "BASH_ENV",
+        "BASH_XTRACEFD",
+        "ENV",
+        "MAILCHECK",
+        "MAILPATH",
+        "PROMPT_COMMAND",
+        "PS0",
+        "PS1",
+        "PS2",
+        "PS3",
+        "PS4",
+        "SHELLOPTS",
+        "ZDOTDIR",
+    }
+)
 _RESERVED_CUSTOM_SECRET_ENV_NAMES = frozenset(
     {
         # Built-in credentials use separate trust boundaries.
@@ -58,8 +76,7 @@ _RESERVED_CUSTOM_SECRET_ENV_NAMES = frozenset(
         "WANDB_MODE",
         "WANDB_PROJECT",
         # Custom credentials must not change process startup or executable routing.
-        "BASH_ENV",
-        "ENV",
+        *SHELL_STARTUP_ENV_NAMES,
         "GIT_ASKPASS",
         "GIT_CONFIG_GLOBAL",
         "GIT_CONFIG_SYSTEM",
@@ -75,6 +92,7 @@ _RESERVED_CUSTOM_SECRET_ENV_NAMES = frozenset(
         "PATH",
         "PYTHONHOME",
         "PYTHONPATH",
+        "PYTHONSAFEPATH",
         "PYTHONSTARTUP",
         "SHELL",
         "SSH_ASKPASS",

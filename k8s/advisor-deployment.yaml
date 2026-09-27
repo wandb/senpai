@@ -26,6 +26,7 @@ spec:
     metadata:
       annotations:
         senpai.wandb.com/content-hash: "{{POD_CONFIG_HASH}}"
+        senpai.wandb.com/program-context-secret: "{{PROGRAM_CONTEXT_SECRET_NAME}}"
       labels:
         app: senpai
         role: advisor
@@ -139,6 +140,9 @@ spec:
           mountPath: {{TARGET_WORKSPACE_MOUNT}}
         - name: target-environment
           mountPath: /home/senpai/.venvs/senpai-target
+        - name: program-context
+          mountPath: /var/run/senpai-context
+          readOnly: true
       volumes:
       - name: dataset
         persistentVolumeClaim:
@@ -149,3 +153,9 @@ spec:
         emptyDir: {}
       - name: target-environment
         emptyDir: {}
+      - name: program-context
+        secret:
+          secretName: {{PROGRAM_CONTEXT_SECRET_NAME}}
+          items:
+          - key: program-context
+            path: program-context.b64
