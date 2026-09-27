@@ -87,13 +87,16 @@ def push_assignment_branch(
         if authenticated_remote is None:
             raise ValueError("authenticated_remote is required for a credentialed push")
         network_remote = authenticated_remote
+        tracking_ref = f"refs/remotes/{remote}/{branch}"
+        _git(workspace, "check-ref-format", tracking_ref)
+        tracking_sha = _local_ref_head(workspace, tracking_ref)
     repository = (
         _staged_commit(workspace, local_sha)
         if token is not None
         else nullcontext(workspace)
     )
     with repository as network_workspace:
-        return _push_validated_commit(
+        result = _push_validated_commit(
             network_workspace,
             branch=branch,
             expected_remote_sha=expected_remote_sha,
@@ -101,6 +104,34 @@ def push_assignment_branch(
             remote=network_remote,
             token=token,
         )
+    if token is not None:
+        try:
+            # Never follow a checkout-controlled symbolic ref into a local branch.
+            _git(
+                workspace,
+                "update-ref",
+                "--no-deref",
+                tracking_ref,
+                result.head_sha,
+                tracking_sha,
+            )
+        except GitWorkflowPreconditionError as error:
+            # A concurrent fetch owns its newer observation; do not overwrite it.
+            if _local_ref_head(workspace, tracking_ref) == tracking_sha:
+                raise GitWorkflowPreconditionError(
+                    f"commit {result.head_sha} was published, but local tracking ref "
+                    f"{tracking_ref} could not be updated: {error}"
+                ) from error
+    return result
+
+
+def _local_ref_head(workspace: Path, ref: str) -> str:
+    refs = _git(workspace, "for-each-ref", "--format=%(refname) %(objectname)", ref)
+    for line in refs.splitlines():
+        name, sha = line.split()
+        if name == ref:
+            return sha
+    return ""
 
 
 def create_assignment_branch(

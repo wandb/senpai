@@ -696,7 +696,13 @@ directory and shallow boundaries, then verifies the staged commit SHA.
 Assignment creation fetches the base at depth one; idempotent replay fetches the
 assignment at depth two to verify its parent, tree, and message. These fetches do
 not change the advisor checkout. Pushes retain expected-SHA checks, ancestry
-checks, exact ref leases, and post-push verification. The bootstrap runner and
+checks, exact ref leases, and post-push verification. After verified publication,
+including an idempotent retry, a credential-free local Git command updates
+`refs/remotes/<remote>/<branch>` to the published SHA. It compares the ref with
+its value before network work and preserves concurrent changes. It does not
+follow symbolic refs, run hooks, or move the working branch, HEAD, index, or files.
+Other local update failures report that publication succeeded so a retry can
+repair the tracking ref. The bootstrap runner and
 target pre-push hooks remain behavioral guards; typed publication bypasses them
 and applies its own branch and lease checks. Before creating a remote branch,
 the typed assignment tool requires a configured student and a `<student>/`

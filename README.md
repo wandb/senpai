@@ -419,8 +419,12 @@ fetches only the base commit and tree; replay fetches one generation of parents
 to verify the existing assignment. The advisor checkout keeps its shallow boundary.
 Publication checks the exact local commit and remote head, then uses a remote
 lease. It publishes that commit even if the worktree has uncommitted changes;
-training still requires a clean worktree. Bootstrap retains the runner and target
-pre-push hooks, but no longer installs a Git executable shim on `PATH`.
+training still requires a clean worktree. After verified publication, it refreshes
+the checkout's local record of the remote branch, so Git status reflects the push.
+This also repairs stale records on retry and preserves concurrent updates to that
+record. The working branch and files stay in the same checkout. Bootstrap retains
+the runner and target pre-push hooks, but no longer installs a Git executable shim
+on `PATH`.
 
 When `WANDB_ENTITY` and `WANDB_PROJECT` are configured, [`weave-openhands`](https://github.com/morganmcg1/weave-openhands) traces advisor, student, and child conversations. Each `OPENHANDS_RUN` record includes a direct Weave Agent Observability URL.
 
