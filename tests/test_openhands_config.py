@@ -52,7 +52,7 @@ def test_role_file_must_be_explicit_and_exist(tmp_path: Path, explicit: str | No
         find_role_file(path)
 
 
-def test_main_agent_context_appends_program_after_harness_and_role():
+def test_main_agent_context_delimits_system_instruction_sections_in_order():
     context = build_main_agent_context(
         SenpaiSystemInstructions(
             harness="harness instructions",
@@ -66,10 +66,18 @@ def test_main_agent_context_appends_program_after_harness_and_role():
     )
 
     assert context.system_message_suffix == (
-        "# Senpai harness\n\nharness instructions\n\n"
-        "# Senpai role\n\nadvisor role\n\n"
-        "# program.md - senpai/program.md\n\nResearch policy.\n\n"
+        "<SENPAI_HARNESS>\n"
+        "# Senpai harness\n\nharness instructions\n"
+        "</SENPAI_HARNESS>\n\n"
+        "<SENPAI_ROLE>\n"
+        "# Senpai role\n\nadvisor role\n"
+        "</SENPAI_ROLE>\n\n"
+        "<SENPAI_PROGRAM>\n"
+        "# program.md - senpai/program.md\n\nResearch policy.\n"
+        "</SENPAI_PROGRAM>\n\n"
+        "<SENPAI_LAUNCH_CONTEXT>\n"
         "# Authoritative launch context\n\nRuntime policy.\n"
+        "</SENPAI_LAUNCH_CONTEXT>\n"
     )
     assert context.current_datetime is None
     assert context.load_user_skills is False
@@ -267,11 +275,19 @@ def test_resolved_config_discovers_one_level_program_from_target_workspace(
     )
     assert config.instructions.launch == TEST_LAUNCH_CONTEXT
     assert config.instructions.prompt == (
-        "# Senpai harness\n\nharness instructions\n\n"
-        "# Senpai role\n\nadvisor role\n\n"
+        "<SENPAI_HARNESS>\n"
+        "# Senpai harness\n\nharness instructions\n"
+        "</SENPAI_HARNESS>\n\n"
+        "<SENPAI_ROLE>\n"
+        "# Senpai role\n\nadvisor role\n"
+        "</SENPAI_ROLE>\n\n"
+        "<SENPAI_PROGRAM>\n"
         "# program.md - senpai/program.md\n\n"
-        "# Mission\n\nImprove the model.\n\n"
+        "# Mission\n\nImprove the model.\n"
+        "</SENPAI_PROGRAM>\n\n"
+        "<SENPAI_LAUNCH_CONTEXT>\n"
         f"{TEST_LAUNCH_CONTEXT}\n"
+        "</SENPAI_LAUNCH_CONTEXT>\n"
     )
     delegated = runner.delegation_config(config)
     assert delegated.program_path == config.instructions.program.program_path
