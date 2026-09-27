@@ -40,7 +40,6 @@ from senpai_agent.PROMPTS import (
     AWAIT_AGENTS_SATISFIED_PROMPT,
     AWAIT_AGENTS_TIMEOUT_PROMPT,
     DELEGATE_AGENT_DEPRECATION_PROMPT,
-    DELEGATED_SEARCH_MODE_PROMPT,
     DELEGATED_TASK_BACKGROUND_PROMPT,
     DELEGATED_TASK_FINISHED_PROMPT,
     DELEGATED_TASK_PROMPT,
@@ -61,22 +60,8 @@ if TYPE_CHECKING:
     from openhands.sdk.conversation import LocalConversation
 
 
-AgentKind = Literal["general-purpose", "explore", "search", "bash-runner"]
-TaskAgentKind = Literal[
-    "general-purpose",
-    "explore",
-    "search_general_web",
-    "search_research_publications",
-    "bash-runner",
-]
-LeafTaskAgentKind = Literal[
-    "explore",
-    "search_general_web",
-    "search_research_publications",
-    "bash-runner",
-]
+AgentKind = Literal["general-purpose", "explore", "bash-runner"]
 ModelTier = Literal["smart", "fast", "frontier"]
-SearchMode = Literal["general-web", "research-publications"]
 MAX_PARALLEL_AGENTS = 8
 MAX_DELEGATION_DEPTH = 2
 MAX_TREE_AGENTS = 8
@@ -109,7 +94,6 @@ class DelegationRequest:
     parent_context: tuple[Message, ...]
     agent: AgentKind
     model: ModelTier
-    search_mode: SearchMode | None
     tree_id: str = ""
     depth: int = 1
     deadline_epoch: float | None = None
@@ -224,12 +208,6 @@ def configured_child_runner_factory() -> ChildAgentRunnerFactory:
 
 def render_child_prompt(request: DelegationRequest, task: str) -> str:
     assignment = task.strip()
-    if request.search_mode is not None:
-        assignment = render_prompt(
-            DELEGATED_SEARCH_MODE_PROMPT,
-            SEARCH_MODE=request.search_mode,
-            ASSIGNMENT=assignment,
-        )
     if not request.parent_context:
         return (
             render_prompt(
@@ -450,7 +428,7 @@ class OpenHandsChildProcess:
                     "delegation profiles assign conflicting values to "
                     f"{profile.api_key_env}"
                 )
-        # Intermediate runtimes retain Exa so they can delegate to search.
+        # Retain Exa across the full delegation tree.
         if self._config.exa_api_key is not None:
             credentials["EXA_API_KEY"] = self._config.exa_api_key.get_secret_value()
         return credentials
@@ -623,11 +601,11 @@ class DelegateAgentAction(Action):
     """Legacy action schema retained so persisted conversations can resume."""
 
     task: str = Field(min_length=1)
-    agent: AgentKind = "general-purpose"
+    agent: AgentKind | Literal["search"] = "general-purpose"
     model: ModelTier = "smart"
     background: bool = False
     include_context: bool = False
-    search_mode: SearchMode | None = None
+    search_mode: Literal["general-web", "research-publications"] | None = None
 
 
 class DelegateAgentObservation(Observation):
@@ -659,16 +637,14 @@ class DelegateAgentObservation(Observation):
         ]
 
 
-def resolve_task_agent(agent: TaskAgentKind) -> tuple[AgentKind, SearchMode | None]:
-    if agent == "search_general_web":
-        return "search", "general-web"
-    if agent == "search_research_publications":
-        return "search", "research-publications"
-    return agent, None
-
-
-class AgentTaskBase(BaseModel):
-    agent: TaskAgentKind
+class AgentTask(BaseModel):
+    agent: AgentKind = Field(
+        default="general-purpose",
+        description=(
+            "Use general-purpose for research or mixed work, explore for local "
+            "investigation, and bash-runner for bounded commands."
+        ),
+    )
     key: str | None = Field(
         default=None,
         min_length=1,
@@ -687,47 +663,36 @@ class AgentTaskBase(BaseModel):
         description="Copy the complete model-visible parent history into this child.",
     )
 
-    def resolved_agent(self) -> tuple[AgentKind, SearchMode | None]:
-        return resolve_task_agent(self.agent)
-
     @model_validator(mode="before")
     @classmethod
     def restore_persisted_search_task(cls, value: object) -> object:
-        if not isinstance(value, Mapping) or value.get("agent") != "search":
+        """Resume old tasks as generalists without losing their search mode."""
+
+        if not isinstance(value, Mapping):
             return value
         modes = {
-            "general-web": "search_general_web",
-            "research-publications": "search_research_publications",
+            "search_general_web": "general-web",
+            "search_research_publications": "research-publications",
         }
+        agent = value.get("agent")
+        if not isinstance(agent, str) or (agent != "search" and agent not in modes):
+            return value
+        mode = value.get("search_mode") if agent == "search" else modes[agent]
+        if mode not in modes.values():
+            raise ValueError("persisted search task requires a valid search mode")
         restored = dict(value)
-        restored["agent"] = modes.get(restored.pop("search_mode", None), "search")
+        restored.pop("search_mode", None)
+        restored["agent"] = "general-purpose"
+        task = restored.get("task")
+        if isinstance(task, str) and task:
+            restored["task"] = f"Search mode: {mode}\n\n{task}"
         return restored
-
-
-class AgentTask(AgentTaskBase):
-    agent: TaskAgentKind = Field(
-        default="general-purpose",
-        description=(
-            "Use general-purpose for mixed work, explore or bash-runner for local "
-            "leaf work, and an explicit search form for external research."
-        ),
-    )
-
-
-class LeafAgentTask(AgentTaskBase):
-    agent: LeafTaskAgentKind = Field(
-        default="explore",
-        description=(
-            "Choose a leaf specialization: explore, bash-runner, "
-            "search_general_web, or search_research_publications."
-        ),
-    )
 
 
 _PERSISTED_TASK_SPEC_FIELDS = frozenset(AgentTask.model_fields) | {"search_mode"}
 
 
-def _task_specs_json(specs: Sequence[AgentTaskBase]) -> str:
+def _task_specs_json(specs: Sequence[AgentTask]) -> str:
     return json.dumps(
         [spec.model_dump(mode="json") for spec in specs],
         sort_keys=True,
@@ -774,7 +739,7 @@ class AgentTaskState(BaseModel):
     task_id: str
     key: str | None = None
     status: TaskStatus
-    agent: AgentKind
+    agent: AgentKind | Literal["search"]
     model: ModelTier
     result: str | None = None
     error: str | None = None
@@ -859,7 +824,7 @@ class DelegationRegistry:
         parent_conversation_id: str,
         parent_task_id: str | None,
         depth: int,
-        specs: Sequence[AgentTaskBase],
+        specs: Sequence[AgentTask],
         deadlines: Sequence[float],
     ) -> tuple[list[sqlite3.Row], bool]:
         specs_json = _task_specs_json(specs)
@@ -935,15 +900,14 @@ class DelegationRegistry:
             for task_id, key, spec, deadline in zip(
                 task_ids, keys, specs, deadlines, strict=True
             ):
-                agent, search_mode = spec.resolved_agent()
                 database.execute(
                     """
                     INSERT INTO tasks (
                         task_id, tree_id, parent_conversation_id, parent_task_id,
                         task_key, task,
-                        agent, model, search_mode, depth, deadline_epoch, status,
+                        agent, model, depth, deadline_epoch, status,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
                     """,
                     (
                         task_id,
@@ -952,9 +916,8 @@ class DelegationRegistry:
                         parent_task_id,
                         spec.key,
                         spec.task,
-                        agent,
+                        spec.agent,
                         spec.model,
-                        search_mode,
                         depth,
                         deadline,
                         now,
@@ -1404,7 +1367,7 @@ class _DelegationManager:
         with self.registry.lifecycle():
             self._reconcile(self.registry.active_rows())
 
-    def _validate_spawn(self, tasks: Sequence[AgentTaskBase]) -> None:
+    def _validate_spawn(self, tasks: Sequence[AgentTask]) -> None:
         if not tasks or len(tasks) > MAX_SPAWN_BATCH:
             raise ValueError(f"spawn_agents requires 1 to {MAX_SPAWN_BATCH} tasks")
         if self.config.depth >= MAX_DELEGATION_DEPTH:
@@ -1414,10 +1377,8 @@ class _DelegationManager:
                 raise ValueError("nested delegation requires its current parent task ID")
             if self.config.agent_name != "general-purpose":
                 raise ValueError(
-                    "explore, search, and bash-runner agents are delegation leaves"
+                    "explore and bash-runner agents are delegation leaves"
                 )
-            if any(task.resolved_agent()[0] == "general-purpose" for task in tasks):
-                raise ValueError("depth-2 helpers must be leaf agents")
 
     def spawn(
         self,
@@ -1468,14 +1429,12 @@ class _DelegationManager:
             context = (
                 _model_visible_context(conversation) if task.include_context else ()
             )
-            agent, search_mode = task.resolved_agent()
             request = DelegationRequest(
                 task_id=row["task_id"],
                 parent_conversation_id=parent_id,
                 parent_context=context,
-                agent=agent,
+                agent=task.agent,
                 model=task.model,
-                search_mode=search_mode,
                 tree_id=tree_id,
                 depth=self.config.depth + 1,
                 deadline_epoch=row["deadline_epoch"],
@@ -1668,17 +1627,8 @@ class SpawnAgentsAction(Action):
     )
 
 
-class LeafSpawnAgentsAction(Action):
-    batch_key: str = Field(
-        min_length=1,
-        max_length=128,
-        description="Stable idempotency key; changed specs on replay are rejected.",
-    )
-    tasks: list[LeafAgentTask] = Field(
-        min_length=1,
-        max_length=MAX_SPAWN_BATCH,
-        description="One to eight leaf tasks started without waiting for results.",
-    )
+class LeafSpawnAgentsAction(SpawnAgentsAction):
+    """Legacy event kind; current tools expose only SpawnAgentsAction."""
 
 
 class SpawnAgentsObservation(Observation):
@@ -1992,16 +1942,10 @@ class SpawnAgentsTool(_DelegationTool[SpawnAgentsAction, SpawnAgentsObservation]
         event_db_path=None,
     ) -> Sequence[Self]:
         manager = cls._manager(child_runner_factory, event_sink, event_db_path)
-        action_type = (
-            LeafSpawnAgentsAction
-            if manager.config.depth == 1
-            and manager.config.agent_name == "general-purpose"
-            else SpawnAgentsAction
-        )
         return [
             cls(
                 description="Start one bounded batch of subagents and return task IDs immediately.",
-                action_type=action_type,
+                action_type=SpawnAgentsAction,
                 observation_type=SpawnAgentsObservation,
                 annotations=ToolAnnotations(
                     title="Spawn agents",

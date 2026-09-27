@@ -91,9 +91,9 @@ writes GitHub, W&B, and Exa keys to owner-only files in a fresh private director
 The supervisor consumes and unlinks those files, passes each key through a
 one-use descriptor, and drops its stored credentials after starting the worker.
 The controller keeps Exa authentication in trusted runtime memory. Root agents
-and search children use `exa_search`; terminals and training no longer receive
-`EXA_API_KEY`. All delegated runtimes carry Exa through private descriptors
-so a general-purpose child can still delegate to a search grandchild. The key
+and general-purpose children use `exa_search`; terminals and training no longer
+receive `EXA_API_KEY`. All delegated runtimes carry Exa through private descriptors
+so general-purpose children and grandchildren can use it directly. The key
 never enters tool parameters or conversation secrets. W&B remains available to
 research tools, terminals, training, and tracing. GitHub credentials remain
 private to the controller.
@@ -307,25 +307,24 @@ the tier, agent specialization, and context policy.
 
 | Agent | Best for | Recommended tier |
 |---|---|---|
-| [General Purpose](.agents/agents/general-purpose.md) | Bounded work combining terminal investigation, code editing, task tracking, tests, and one controlled level of leaf delegation. | `smart` for ordinary implementation or review; `frontier` for the high-leverage research and technical judgment defined by the delegation skill. |
+| [General Purpose](.agents/agents/general-purpose.md) | Bounded work combining external research through Exa, terminal investigation, code editing, task tracking, tests, and one controlled level of delegation. | `smart` for ordinary implementation or review; `frontier` for the high-leverage research and technical judgment defined by the delegation skill. |
 | [Explore](.agents/agents/explore.md) | Read-only search across code, data, experiment artifacts, papers, or durable conversation history. It returns conclusions with paths and line numbers rather than dumping source. | `fast` for mechanical exploration; `smart` when relationships are subtle. |
-| [Search](.agents/agents/search.md) | External research through Exa via the explicit `search_general_web` or `search_research_publications` task form, with primary-source links. | `smart`. |
 | [Bash Runner](.agents/agents/bash-runner.md) | Tests, builds, linters, dependency commands, Git inspection, and noisy CLI work. It returns counts and actionable failures rather than raw logs. | `fast`. |
 
 The model tier is independent of the agent specialization. With the default
 `agent=general-purpose`, `model=frontier` launches Claude Opus 5.5 at `max`
-with the general-purpose terminal and code-editing toolset. Pair `frontier`
-with `search_general_web` or `search_research_publications` when the
-high-leverage task is external research.
+with the general-purpose terminal, code-editing, and Exa toolset. External
+research uses the same general-purpose agent with a self-contained assignment;
+the `delegate-subagents` skill explains how to delegate it.
 
 A root spawn batch and its descendants form one delegation tree, which may
 create at most eight children total. A role runs at most eight active tasks
 concurrently across all trees. Root tasks count toward the tree total, so leave
 slots when a General Purpose child needs helpers. Recursion is limited to two
 child edges: the root may spawn any agent, and a depth-one General Purpose
-child may spawn leaf helpers; Explore, Search, Bash Runner, and all depth-two
-children cannot delegate. Each delegated task has an absolute tier deadline,
-and descendants inherit the earlier ancestor deadline. A nested child must
+child may spawn any of the three agent types at depth two. Explore, Bash Runner,
+and all depth-two children cannot delegate. Each delegated task has an absolute
+tier deadline, and descendants inherit the earlier ancestor deadline. A nested child must
 await or cancel all of its helpers before returning.
 Individual tasks are capped at twenty minutes for `fast`, one hour for `smart`,
 and two hours for `frontier`, shortened when an ancestor deadline is nearer.
@@ -360,7 +359,7 @@ or guarantee that a publication result contains the entire paper.
 Every response saves the complete Markdown under the conversation's observations
 directory, outside the target checkout, and returns its file path and character
 count. Responses above 30,000 characters return an explicit preview. Agents can
-read that file in bounded ranges, including after a search child finishes. This
+read that file in bounded ranges, including after a research subagent finishes. This
 keeps large searches retrievable without filling one model request with all the evidence.
 See the [Exa skill](plugins/senpai/skills/exa-search/SKILL.md) for parameters.
 

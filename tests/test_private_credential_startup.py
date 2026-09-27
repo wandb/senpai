@@ -104,7 +104,6 @@ def test_real_child_startup_resolves_private_models_and_preserves_services(
             parent_context=(),
             agent="explore",
             model="fast",
-            search_mode=None,
         ),
     )
     command = child.command

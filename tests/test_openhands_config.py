@@ -103,7 +103,6 @@ def test_reserved_agents_load_from_the_explicit_runtime_directory(
         "bash-runner",
         "general-purpose",
         "explore",
-        "search",
     }
 
 

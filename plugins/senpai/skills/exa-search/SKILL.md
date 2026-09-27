@@ -5,7 +5,7 @@ description: Search the general web or scholarly publications through Exa. Use f
 
 # Exa Search
 
-Call the `exa_search` tool from a root agent or delegated search agent.
+Call the `exa_search` tool from a root agent or general-purpose subagent.
 
 Set `mode="general-web"` for current documentation, source code, release notes,
 news, and technical writing. Set `mode="research-publications"` for papers,

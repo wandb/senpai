@@ -41,7 +41,6 @@ def delegation_request(
     parent_context: tuple[Message, ...] | None = None,
     agent: str = "explore",
     model: str = "fast",
-    search_mode: str | None = None,
 ) -> DelegationRequest:
     return DelegationRequest(
         task_id=str(uuid.uuid4()),
@@ -63,7 +62,6 @@ def delegation_request(
         ),
         agent=agent,
         model=model,
-        search_mode=search_mode,
     )
 
 
@@ -119,17 +117,15 @@ def test_child_prompt_contains_complete_snapshot_and_task():
     ]
 
 
-def test_context_free_search_prompt_contains_mode_and_task():
+def test_context_free_research_prompt_contains_only_the_assignment():
     request = delegation_request(
         parent_context=(),
-        agent="search",
+        agent="general-purpose",
         model="smart",
-        search_mode="research-publications",
     )
 
     prompt = render_child_prompt(request, "Find neural operator papers.")
 
-    assert "Search mode: research-publications" in prompt
     assert "Find neural operator papers." in prompt
     assert "parent_context_json" not in prompt
 
@@ -168,7 +164,7 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
     )
     smart = OpenHandsChildProcess(
         config,
-        delegation_request(agent="search", model="smart", search_mode="general-web"),
+        delegation_request(agent="general-purpose", model="smart"),
     )
     frontier = OpenHandsChildProcess(
         config,
@@ -337,7 +333,7 @@ def test_child_preserves_the_shared_wandb_service_credential(tmp_path):
     assert "EXA_API_KEY" not in environment
 
 
-def test_nested_search_retains_private_exa_credentials_across_execs(
+def test_nested_generalists_can_search_with_private_exa_credentials_across_execs(
     tmp_path, monkeypatch
 ):
     from exa_delegation_support import child_command
@@ -361,9 +357,15 @@ def test_nested_search_retains_private_exa_credentials_across_execs(
         delegation_request(agent="general-purpose"),
     )
 
-    result = json.loads(child.run("Delegate this research to search.", 60))
+    result = json.loads(
+        child.run("Delegate this research to a fresh general-purpose helper.", 60)
+    )
 
-    assert [hop["agent"] for hop in result["hops"]] == ["general-purpose", "search"]
+    assert [hop["agent"] for hop in result["hops"]] == [
+        "general-purpose",
+        "general-purpose",
+    ]
+    assert [hop["depth"] for hop in result["hops"]] == [1, 2]
     assert len({os.getpid(), *(hop["pid"] for hop in result["hops"])}) == 3
     assert "https://example.test/nested" in result["evidence"]
     assert "Evidence returned through both child processes." in result["evidence"]
