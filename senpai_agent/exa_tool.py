@@ -204,6 +204,10 @@ class ExaSearchExecutor(ToolExecutor[ExaSearchAction, ExaSearchObservation]):
     ) -> ExaSearchObservation:
         if _api_key is None:
             raise RuntimeError("Exa search credentials are not configured")
+        if conversation is None or (
+            directory := conversation.state.env_observation_persistence_dir
+        ) is None:
+            raise RuntimeError("Exa responses require conversation persistence")
         response = Exa(_api_key.get_secret_value()).search(
             action.query, **action.search_options()
         )
@@ -253,21 +257,18 @@ class ExaSearchExecutor(ToolExecutor[ExaSearchAction, ExaSearchObservation]):
         if not response.results:
             lines.extend(("", "No results were returned."))
         markdown = "\n".join(lines)
+        output_path = Path(directory) / f"exa-{uuid4().hex}.md"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(markdown, encoding="utf-8")
+        receipt = (
+            f"Complete results saved to: {output_path}\n"
+            f"Characters: {len(markdown)}\n"
+        )
         if len(markdown) > _INLINE_PREVIEW_CHARACTERS:
-            if conversation is None or (
-                directory := conversation.state.env_observation_persistence_dir
-            ) is None:
-                raise RuntimeError("Large Exa responses require conversation persistence")
-            output_path = Path(directory) / f"exa-{uuid4().hex}.md"
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(markdown, encoding="utf-8")
-            markdown = (
-                f"Complete results saved to: {output_path}\n"
-                f"Characters: {len(markdown)}\n"
-                f"Preview: characters 0–{_INLINE_PREVIEW_CHARACTERS}.\n\n"
-                + markdown[:_INLINE_PREVIEW_CHARACTERS]
-            )
-        return ExaSearchObservation(markdown=markdown)
+            receipt += f"Preview: characters 0–{_INLINE_PREVIEW_CHARACTERS}.\n"
+        return ExaSearchObservation(
+            markdown=receipt + "\n" + markdown[:_INLINE_PREVIEW_CHARACTERS]
+        )
 
 
 class ExaSearchTool(ToolDefinition[ExaSearchAction, ExaSearchObservation]):
@@ -280,7 +281,8 @@ class ExaSearchTool(ToolDefinition[ExaSearchAction, ExaSearchObservation]):
                 description=(
                     "Search the web or research publications through Exa, "
                     "including full text when available. "
-                    "Large responses include a preview and a complete local file."
+                    "Every response is saved to a complete local file. "
+                    "Large responses include a preview."
                 ),
                 action_type=ExaSearchAction,
                 observation_type=ExaSearchObservation,

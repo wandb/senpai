@@ -875,13 +875,13 @@ line breaks; missing text is reported. These are Exa's extracted contents, not
 original PDF/HTML files or a guarantee of complete-paper coverage. The legacy
 operator script keeps its original defaults. The root tool remains declared when
 a standalone runtime has no Exa key so persisted conversations can resume.
-Calls without configured credentials fail
-before contacting Exa. Responses above 30,000 characters persist the complete
-Markdown in the conversation's observations directory and return an explicit
-preview with the file path and character count. A failed write fails the
-tool call instead of losing evidence. Local conversation cleanup retains these
-files, so parents can read results from completed search children. The preview
-fits below the pinned SDK's 50,000-character tool-message limit; SDK serializers
+Calls without configured credentials or conversation persistence fail
+before contacting Exa. Every response persists the complete Markdown in the
+conversation's observations directory and returns its file path and character
+count. Responses above 30,000 characters return an explicit preview. A failed
+write fails the tool call instead of losing evidence. Local conversation cleanup
+retains these files, so parents can read results from completed search children.
+The preview fits below the pinned SDK's 50,000-character tool-message limit; SDK serializers
 and other tools retain their existing limits. The legacy terminal path also
 previews at 30,000 characters. Complete evidence is available through bounded
 file reads; it is not sent to a model in one unbounded message.

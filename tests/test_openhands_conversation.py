@@ -3,6 +3,7 @@ import signal
 import threading
 import time
 from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1303,7 +1304,11 @@ def test_conversation_and_credentials_are_cleaned_up_after_failures(
             assert "EXA_API_KEY" not in runner.os.environ
             assert "EXA_API_KEY" not in kwargs["secrets"]
             assert "exa-runtime-sentinel" not in kwargs["agent"].model_dump_json()
-            exa_tool.ExaSearchExecutor()(exa_tool.ExaSearchAction(query="test"))
+            self.state = SimpleNamespace(
+                env_observation_persistence_dir=Path(kwargs["persistence_dir"])
+                / "observations"
+            )
+            exa_tool.ExaSearchExecutor()(exa_tool.ExaSearchAction(query="test"), self)
 
         def send_message(self, _prompt):
             if failure_stage == "send_message":

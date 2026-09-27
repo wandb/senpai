@@ -357,11 +357,11 @@ freshness; `no_content` requests metadata only. Results retain all text returned
 by Exa, including paragraph breaks, alongside summaries, highlights, and metadata.
 Missing text is reported. Exa extraction does not download original PDF/HTML files
 or guarantee that a publication result contains the entire paper.
-Responses above 30,000 characters return an
-explicit preview and save the complete Markdown under the conversation's
-observations directory, outside the target checkout. Agents can read that file
-in bounded ranges, including after a search child finishes. This keeps large
-searches retrievable without filling one model request with all the evidence.
+Every response saves the complete Markdown under the conversation's observations
+directory, outside the target checkout, and returns its file path and character
+count. Responses above 30,000 characters return an explicit preview. Agents can
+read that file in bounded ranges, including after a search child finishes. This
+keeps large searches retrievable without filling one model request with all the evidence.
 See the [Exa skill](plugins/senpai/skills/exa-search/SKILL.md) for parameters.
 
 The standalone script retains its original defaults and remains available to

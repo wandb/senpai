@@ -1,4 +1,5 @@
 import shlex
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
@@ -43,6 +44,27 @@ def exa_service(monkeypatch):
     exa_tool.configure_exa_credentials(SecretStr("runtime-key-sentinel"))
     yield calls, response
     exa_tool.configure_exa_credentials(None)
+
+
+@contextmanager
+def exa_conversation(tmp_path, *, persistence=True):
+    register_senpai_tools()
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    conversation = LocalConversation(
+        agent=Agent(
+            llm=LLM(model="anthropic/claude-haiku-4-5", api_key=SecretStr("test-key")),
+            tools=[Tool(name="senpai_exa")],
+        ),
+        workspace=workspace,
+        persistence_dir=tmp_path / "state" if persistence else None,
+        visualizer=None,
+        delete_on_close=True,
+    )
+    try:
+        yield conversation
+    finally:
+        conversation.close()
 
 
 @pytest.mark.parametrize(
@@ -114,7 +136,7 @@ def exa_service(monkeypatch):
     ids=["web-defaults", "publication-defaults", "search-controls", "metadata-only"],
 )
 def test_search_controls_reach_exa_without_exposing_credentials(
-    exa_service, arguments, options
+    exa_service, tmp_path, arguments, options
 ):
     calls, response = exa_service
     response["results"] = [
@@ -132,13 +154,31 @@ def test_search_controls_reach_exa_without_exposing_credentials(
     ]
     action = exa_tool.ExaSearchAction(query="neural operators", **arguments)
 
-    observation = exa_tool.ExaSearchExecutor()(action)
+    with exa_conversation(tmp_path) as conversation:
+        observation = exa_tool.ExaSearchExecutor()(action, conversation)
+        artifacts = list(
+            Path(conversation.state.env_observation_persistence_dir).rglob("*.md")
+        )
+        assert len(artifacts) == 1, "Every search must save its complete results"
+        artifact = artifacts[0]
+        saved = artifact.read_text()
 
     assert calls == [
         ("runtime-key-sentinel", "/search", {"query": "neural operators", **options})
     ]
     assert "runtime-key-sentinel" not in action.model_dump_json()
     assert "runtime-key-sentinel" not in observation.markdown
+    assert "runtime-key-sentinel" not in saved
+    assert artifact.read_text() == saved
+    assert "## 1. Short result" in saved
+    assert "**URL:** <https://example.test/short>" in saved
+    assert "**Exa ID:** short-result" in saved
+    if arguments.get("no_content"):
+        assert response["results"][0]["text"] not in saved
+        assert "Full text was not returned" not in saved
+    else:
+        assert response["results"][0]["text"] in saved
+        assert "Full text was not returned for this result." in saved
     for serializer in ("chat-list", "chat-string", "responses"):
         output = serialized_tool_text(
             Message(
@@ -149,15 +189,9 @@ def test_search_controls_reach_exa_without_exposing_credentials(
             ),
             serializer,
         )
-        assert "## 1. Short result" in output
-        assert "**URL:** <https://example.test/short>" in output
-        assert "**Exa ID:** short-result" in output
-        if arguments.get("no_content"):
-            assert response["results"][0]["text"] not in output
-            assert "Full text was not returned" not in output
-        else:
-            assert response["results"][0]["text"] in output
-            assert "Full text was not returned for this result." in output
+        assert str(artifact) in output
+        assert str(len(saved)) in output
+        assert saved in output
 
 
 @pytest.mark.parametrize("mode", ["general-web", "research-publications"])
@@ -165,7 +199,7 @@ def test_search_controls_reach_exa_without_exposing_credentials(
     "search_type", ["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"]
 )
 def test_tool_preserves_legacy_search_controls_with_full_text(
-    exa_service, mode, search_type
+    exa_service, tmp_path, mode, search_type
 ):
     calls, _ = exa_service
     legacy = exa_search.SearchArguments(
@@ -189,7 +223,16 @@ def test_tool_preserves_legacy_search_controls_with_full_text(
     legacy.validate()
 
     exa_search.search_exa(legacy, client=exa_search.Exa("runtime-key-sentinel"))
-    exa_tool.ExaSearchExecutor()(exa_tool.ExaSearchAction(**asdict(legacy)))
+    with exa_conversation(tmp_path) as conversation:
+        observation = exa_tool.ExaSearchExecutor()(
+            exa_tool.ExaSearchAction(**asdict(legacy)), conversation
+        )
+        artifacts = list(
+            Path(conversation.state.env_observation_persistence_dir).rglob("*.md")
+        )
+        assert len(artifacts) == 1, "Empty searches must also save their results"
+        assert "No results were returned." in artifacts[0].read_text()
+        assert str(artifacts[0]) in observation.markdown
 
     assert len(calls) == 2
     key, path, options = calls[0]
@@ -206,7 +249,6 @@ def test_tool_preserves_legacy_search_controls_with_full_text(
 def test_search_returns_all_requested_evidence_and_escapes_external_text(
     exa_service, tmp_path
 ):
-    register_senpai_tools()
     _, response = exa_service
     response.update(
         searchTime=123,
@@ -235,19 +277,7 @@ def test_search_returns_all_requested_evidence_and_escapes_external_text(
         ],
     )
 
-    workspace = tmp_path / "target"
-    workspace.mkdir()
-    conversation = LocalConversation(
-        agent=Agent(
-            llm=LLM(model="anthropic/claude-haiku-4-5", api_key=SecretStr("test-key")),
-            tools=[Tool(name="senpai_exa")],
-        ),
-        workspace=workspace,
-        persistence_dir=tmp_path / "state",
-        visualizer=None,
-        delete_on_close=True,
-    )
-    try:
+    with exa_conversation(tmp_path) as conversation:
         tool = resolve_tool(Tool(name="senpai_exa"), conversation.state)[0]
         observation = tool.executor(
             exa_tool.ExaSearchAction(
@@ -295,8 +325,6 @@ def test_search_returns_all_requested_evidence_and_escapes_external_text(
             assert "Full text tail 100." in late_evidence.text
         finally:
             terminal.executor.close()
-    finally:
-        conversation.close()
 
     assert artifact.read_text() == output
     assert "100 returned / 100 requested" in output
@@ -316,6 +344,27 @@ def test_search_returns_all_requested_evidence_and_escapes_external_text(
         assert "More evidence " * 100 + f"Second tail {index}." in output
         assert response["results"][index - 1]["text"] in output
     assert "\n# injected heading" not in output
+
+
+@pytest.mark.parametrize(
+    "has_conversation", [False, True], ids=["no-conversation", "no-persistence"]
+)
+def test_search_requires_persistence_before_contacting_exa(
+    exa_service, tmp_path, has_conversation
+):
+    calls, _ = exa_service
+    context = (
+        exa_conversation(tmp_path, persistence=False)
+        if has_conversation
+        else nullcontext()
+    )
+    with context as conversation:
+        with pytest.raises(RuntimeError, match="persistence"):
+            exa_tool.ExaSearchExecutor()(
+                exa_tool.ExaSearchAction(query="operators"), conversation
+            )
+
+    assert calls == []
 
 
 @pytest.mark.parametrize(
