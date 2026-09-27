@@ -10,9 +10,10 @@ message. It natively loads:
 - `hooks/hooks.json` for early command-policy and lifecycle feedback.
 
 GitHub mutations and training supervision are native typed Senpai tools, not
-skill shell commands. Exa is also a skill/script integration rather than an MCP
-server; launch preflight makes one `instant` publication search with one result
-to validate the key.
+skill shell commands. Exa uses the native `exa_search` tool with skill guidance;
+its key stays outside terminal environments. The standalone search script remains
+available to operators with their own Exa environment. Launch preflight makes
+one `instant` publication search with one result to validate the key.
 
 The Python runtime registers the GitHub tools and exposes only those valid for
 the current role:
