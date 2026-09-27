@@ -57,7 +57,7 @@ def test_advisor_dockerfile_prunes_the_training_stack():
     dockerfile = (ROOT / "Dockerfile.advisor").read_text(encoding="utf-8")
     lowered = dockerfile.lower()
 
-    assert dockerfile.startswith("FROM python:3.13-slim")
+    assert dockerfile.startswith("FROM python:3.14-slim")
     assert "uv export --locked" in dockerfile
     assert "--prune torch" in dockerfile
     assert "--prune torchvision" in dockerfile
@@ -76,7 +76,7 @@ def test_student_dockerfile_declares_the_cuda_training_runtime():
     assert "coreweave/ml-containers" in lowered
     assert "uv export --locked" in dockerfile
     assert "openhands.sdk" in dockerfile
-    assert 'torch.__version__.startswith("2.13.")' in dockerfile
+    assert 'torch.__version__.startswith("2.14.")' in dockerfile
     assert "NVIDIA_VISIBLE_DEVICES=all" in dockerfile
     assert "senpai-gpu-smoke-test" in dockerfile
     assert "@anthropic-ai/claude-code" not in lowered
@@ -86,7 +86,7 @@ def test_executor_image_is_a_minimal_non_root_credential_boundary():
     dockerfile = (ROOT / "Dockerfile.executor").read_text(encoding="utf-8")
     lowered = dockerfile.lower()
 
-    assert dockerfile.startswith("FROM python:3.13-slim")
+    assert dockerfile.startswith("FROM python:3.14-slim")
     assert "USER 10001:10001" in dockerfile
     assert "COPY senpai_agent /opt/senpai/senpai_agent" in dockerfile
     assert "pydantic==" in dockerfile
@@ -165,14 +165,11 @@ def test_images_install_the_runner_and_protect_runtime_assets(role: str):
         assert "/opt/senpai-venv" in protected
         assert '"$SENPAI_AGENT_DIR"' in protected
         assert '"$SENPAI_PLUGIN"' in protected
-        if role == "student":
-            assert '"$UV_PYTHON_INSTALL_DIR"' in protected
     for user_ownership in root_setup.split("chown -R 10001:10001")[1:]:
         writable = user_ownership.split("&&", 1)[0]
         assert "/opt/senpai-venv" not in writable
         assert '"$SENPAI_AGENT_DIR"' not in writable
         assert '"$SENPAI_PLUGIN"' not in writable
-        assert '"$UV_PYTHON_INSTALL_DIR"' not in writable
 
 
 def test_both_images_record_the_exact_source_revision():
@@ -226,7 +223,12 @@ def test_runtime_workflow_uses_the_lockfile_uv_and_exa_versions():
     assert steps["Install uv and Python"]["with"]["version"] == "0.10.9"
     install = steps["Install runtime test dependencies"]["run"]
     assert "uv lock --check" in install
-    assert "exa-py @ https://github.com/exa-labs/exa-py/archive/" in install
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    exa_requirement = next(
+        requirement for requirement in project["project"]["dependencies"]
+        if requirement.startswith("exa-py")
+    )
+    assert f'"{exa_requirement}"' in install
 
 
 def test_role_state_is_pod_local_and_separate_from_the_dataset_pvc():

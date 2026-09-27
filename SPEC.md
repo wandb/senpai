@@ -388,11 +388,11 @@ SDK upgrades must retain the executable plugin-isolation test.
 
 ## Prompt caching
 
-The SDK and tools track the `main` branch of
+The SDK and tools use the same immutable revision of
 [`morganmcg1/software-agent-sdk`](https://github.com/morganmcg1/software-agent-sdk)
-and are based on OpenHands SDK 1.40.0. `uv.lock` records the exact `main` commit
-used for reproducible image builds, while runtime CI installs directly from
-`main` to verify the current fork head.
+and are based on OpenHands SDK 1.49.6. The dependency declarations, `uv.lock`,
+and runtime CI pin that revision so tests and image builds use the same fork
+code.
 
 `prompt_cache_configuration()` sets:
 
@@ -414,6 +414,11 @@ latest `resp_*` ID is recovered from the durable OpenHands event log after
 every process restart, passed as `previous_response_id`, and paired only with
 inputs created after that response. System instructions and tools remain
 explicit on every request.
+
+Stored Responses and Anthropic compaction chains serialize incoming messages
+while an asynchronous model request runs. This keeps unsent messages after the
+persisted response boundary, so the next request includes them. Other modes
+retain upstream OpenHands' ability to receive messages during model requests.
 
 Senpai sets `reasoning_context="all_turns"` and `reasoning_summary="auto"` so
 supported models can reuse server-side private reasoning and return the most

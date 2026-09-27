@@ -14,8 +14,8 @@ def disable_ambient_plugin_discovery() -> None:
 
     from openhands.sdk.conversation.impl import local_conversation
 
-    # OpenHands 1.40.0 has no public switch for ambient plugin discovery. The
-    # container asserts that exact SDK version, so replacing its imported
+    # The pinned OpenHands SDK has no public switch for ambient discovery. The
+    # container asserts that SDK version, so replacing its imported
     # discovery function is a fail-closed boundary until the SDK exposes one.
     if not callable(getattr(local_conversation, "load_available_plugins", None)):
         raise RuntimeError("OpenHands ambient plugin discovery interface is unavailable")

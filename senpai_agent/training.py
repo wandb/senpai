@@ -83,6 +83,8 @@ def record_training_output(
     remaining = None
     with stream, log_path.open("wb") as log:
         os.set_blocking(stream.fileno(), False)
+        poller = select.poll()
+        poller.register(stream, select.POLLIN)
         while True:
             if remaining is None and stop.is_set():
                 # Drain the queued backlog, without allowing escaped
@@ -100,7 +102,7 @@ def record_training_output(
                     else min(_LOG_READ_BYTES, remaining),
                 )
             except BlockingIOError:
-                select.select([stream], [], [], 0.05)
+                poller.poll(50)
                 continue
             if not chunk:
                 break
