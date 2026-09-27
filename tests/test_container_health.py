@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -118,7 +119,7 @@ def test_role_entrypoints_default_openhands_turns_to_two_hours_of_inactivity():
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
 def test_role_startup_isolates_target_uv_commands_from_agent_environment(
-    tmp_path: Path, role: str
+    tmp_path: Path, monkeypatch, role: str
 ):
     entrypoint = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text()
     startup = entrypoint[entrypoint.index("export IS_SANDBOX=1"):]
@@ -134,6 +135,10 @@ def test_role_startup_isolates_target_uv_commands_from_agent_environment(
     )
     python.chmod(0o755)
 
+    executor_socket = tmp_path / "executor.sock"
+    monkeypatch.chdir(tmp_path)
+    with socket.socket(socket.AF_UNIX) as listener:
+        listener.bind(executor_socket.name)
     completed = subprocess.run(
         ["bash", "-c", startup],
         env={
@@ -145,6 +150,7 @@ def test_role_startup_isolates_target_uv_commands_from_agent_environment(
             "GIT_ASKPASS_FILE": str(tmp_path / "askpass"),
             "SENPAI_GITHUB_TOKEN_FILE": str(tmp_path / "token"),
             "NODES_PER_STUDENT": "1",
+            "SENPAI_KUBERNETES_EXECUTOR_SOCKET": str(executor_socket),
             "SENPAI_PYTHON": "/opt/senpai-venv/bin/python",
             "UV_PROJECT_ENVIRONMENT": "/opt/senpai-venv",
             "UV_PYTHON": "/opt/senpai-venv/bin/python",
@@ -167,8 +173,8 @@ def test_role_startup_isolates_target_uv_commands_from_agent_environment(
 def test_kubectl_proxy_uses_agent_python_inside_target_uv_environment(tmp_path: Path):
     entrypoint = (ROOT / "k8s" / "entrypoint-student.sh").read_text()
     proxy_setup = entrypoint[
-        entrypoint.index('    proxy_dir="$LOGDIR/bin"'):
-        entrypoint.index('    export PATH="$proxy_dir:$PATH"')
+        entrypoint.index('proxy_dir="$LOGDIR/bin"'):
+        entrypoint.index('export PATH="$proxy_dir:$PATH"')
     ]
     runner_python = tmp_path / "runner-python"
     runner_python.write_text(

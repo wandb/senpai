@@ -90,7 +90,7 @@ class Args:
     memory_gi_per_gpu: int = 120  # memory Gi requested per student GPU
     controller_node_selector: list[str] = field(
         default_factory=list
-    )  # optional key=value placement selectors for advisor and multi-node controllers
+    )  # optional key=value placement selectors for advisor and student controllers
     capacity_observer: bool = False  # install a credential-isolated cluster capacity observer
     capacity_node_selector: list[str] = field(
         default_factory=list
@@ -107,7 +107,7 @@ class Args:
     )
     advisor_image: str = ""  # advisor source-SHA tag or image digest — REQUIRED
     student_image: str = ""  # student source-SHA tag or image digest — REQUIRED
-    executor_image: str = ""  # immutable broker image; required for multi-node students or the capacity observer
+    executor_image: str = ""  # immutable broker image; required for students or the capacity observer
     kube_context: str = ""  # kubectl context; empty uses the current context
     namespace: str = "default"  # Kubernetes namespace for all launch resources
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
@@ -406,38 +406,10 @@ def encoded_operator_instructions(args: Args) -> str:
     ).decode()
 
 
-def _student_resources(args: Args) -> str:
-    if args.nodes_per_student > 1:
-        return json.dumps(
-            {
-                "requests": {"cpu": "2", "memory": "8Gi"},
-                "limits": {"cpu": "4", "memory": "16Gi"},
-            }
-        )
-    resources = {
-        "cpu": str(args.cpu_per_gpu * args.gpus_per_student_node),
-        "memory": f"{args.memory_gi_per_gpu * args.gpus_per_student_node}Gi",
-        "nvidia.com/gpu": str(args.gpus_per_student_node),
-    }
-    return json.dumps({"requests": resources, "limits": resources})
-
-
 def _yaml_list_insertion(value: dict, indentation: int) -> str:
     return "enabled\n" + textwrap.indent(
         yaml.safe_dump([value], sort_keys=False).rstrip(),
         " " * indentation,
-    )
-
-
-def _executor_socket_mount(args: Args) -> str:
-    if args.nodes_per_student == 1:
-        return ""
-    return _yaml_list_insertion(
-        {
-            "name": "executor-socket",
-            "mountPath": "/var/run/senpai-kubernetes",
-        },
-        8,
     )
 
 
@@ -470,8 +442,6 @@ def _executor_container(
     secret_name: str,
     configmap_name: str,
 ) -> str:
-    if args.nodes_per_student == 1:
-        return ""
     return _yaml_list_insertion(
         {
             "name": "kubernetes-executor",
@@ -531,40 +501,9 @@ def _executor_container(
     )
 
 
-def _executor_volumes(args: Args) -> str:
-    if args.nodes_per_student == 1:
-        return ""
-    volumes = [
-        {"name": "executor-socket", "emptyDir": {}},
-        {"name": "executor-state", "emptyDir": {}},
-        {
-            "name": "executor-token",
-            "projected": {
-                "defaultMode": 0o440,
-                "sources": [
-                    {
-                        "serviceAccountToken": {
-                            "path": "token",
-                            "expirationSeconds": 3600,
-                        }
-                    },
-                    {
-                        "configMap": {
-                            "name": "kube-root-ca.crt",
-                            "items": [{"key": "ca.crt", "path": "ca.crt"}],
-                        }
-                    },
-                ],
-            },
-        },
-    ]
-    return "enabled\n" + textwrap.indent(
-        yaml.safe_dump(volumes, sort_keys=False).rstrip(),
-        " " * 6,
-    )
-
-
-def _student_training_access(student_name: str, tag: str, namespace: str) -> str:
+def _student_training_access(
+    student_name: str, tag: str, namespace: str, nodes_per_student: int,
+) -> str:
     name = f"senpai-training-{tag}-{student_name}"
     labels = {"app": "senpai", "role": "student", "research-tag": tag}
     documents = [
@@ -584,11 +523,11 @@ def _student_training_access(student_name: str, tag: str, namespace: str) -> str
                     "resources": ["jobs"],
                     "verbs": ["create", "get", "patch", "delete"],
                 },
-                {
+                *([{
                     "apiGroups": ["kubeflow.org"],
                     "resources": ["mpijobs"],
                     "verbs": ["create", "get", "patch", "delete"],
-                },
+                }] if nodes_per_student > 1 else []),
                 {
                     "apiGroups": [""],
                     "resources": ["pods"],
@@ -711,35 +650,15 @@ def render_student(
             "PVC_CLAIM_NAME": args.pvc_claim_name,
             "PVC_MOUNT_PATH": args.pvc_mount_path,
             "LAUNCH_SECRET_NAME": secret_name,
-            "STUDENT_SERVICE_ACCOUNT_NAME": (
-                f"senpai-training-{tag}-{student_name}"
-                if args.nodes_per_student > 1
-                else "default"
-            ),
-            "STUDENT_RESOURCES": _student_resources(args),
+            "STUDENT_SERVICE_ACCOUNT_NAME": f"senpai-training-{tag}-{student_name}",
             "STUDENT_NODE_SELECTOR": json.dumps(
                 controller_node_selector(args.controller_node_selector)
-                if args.nodes_per_student > 1
-                else {}
             ),
-            "STUDENT_TOLERATIONS": json.dumps(
-                []
-                if args.nodes_per_student > 1
-                else [
-                    {
-                        "key": "nvidia.com/gpu",
-                        "operator": "Exists",
-                        "effect": "NoSchedule",
-                    }
-                ]
-            ),
-            "EXECUTOR_SOCKET_MOUNT": _executor_socket_mount(args),
             "KUBERNETES_EXECUTOR_CONTAINER": _executor_container(
                 args,
                 secret_name,
                 student_configmap_name,
             ),
-            "KUBERNETES_EXECUTOR_VOLUMES": _executor_volumes(args),
             "CAPACITY_SNAPSHOT_MOUNT": _capacity_snapshot_mount(args),
             "CAPACITY_SNAPSHOT_VOLUME": _capacity_snapshot_volume(args, tag),
             "POD_CONFIG_HASH": pod_template_hash(configmap, launch_secret),
@@ -751,10 +670,11 @@ def render_student(
             ),
         },
     )
-    documents = [configmap]
-    if args.nodes_per_student > 1:
-        documents.append(_student_training_access(student_name, tag, args.namespace))
-    documents.append(deployment)
+    documents = [
+        configmap,
+        _student_training_access(student_name, tag, args.namespace, args.nodes_per_student),
+        deployment,
+    ]
     return "\n---\n".join(documents)
 
 
@@ -900,7 +820,7 @@ def main():
             ("advisor", args.advisor_image),
             ("student", args.student_image),
         ]
-        if args.nodes_per_student > 1 or args.capacity_observer:
+        if args.names or args.n_students > 0 or args.capacity_observer:
             role_images.append(("executor", args.executor_image))
         for role, image in role_images:
             if role == "executor" and not is_digest_image_reference(image):

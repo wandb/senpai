@@ -73,12 +73,14 @@ def test_executor_server_keeps_serving_during_reconcile_outages(capsys):
     assert "reconciliation deferred" in capsys.readouterr().err
 
 
-def executor(tmp_path: Path, client: FakeApi | None = None) -> KubernetesExecutor:
+def executor(
+    tmp_path: Path, client: FakeApi | None = None, *, nodes: int = 2
+) -> KubernetesExecutor:
     return KubernetesExecutor(
         client=client or FakeApi(),
         state_path=tmp_path / "reservation.json",
         namespace="research",
-        nodes=2,
+        nodes=nodes,
         gpus_per_node=8,
         max_timeout_seconds=3600,
         cpu_per_gpu=15,
@@ -95,12 +97,14 @@ def executor(tmp_path: Path, client: FakeApi | None = None) -> KubernetesExecuto
     )
 
 
-def reserve(broker: KubernetesExecutor, commit: str = "a" * 40) -> dict:
+def reserve(
+    broker: KubernetesExecutor, commit: str = "a" * 40, *, kind: str = "MPIJob"
+) -> dict:
     request = {
         "operation": "reserve",
         "training_id": "training-one",
         "spec": {
-            "kind": "MPIJob",
+            "kind": kind,
             "name": "senpai-fred-fern-123",
             "namespace": "research",
             "wandb_run_id": "wandb-one",
@@ -205,6 +209,50 @@ def apply(broker: KubernetesExecutor, document: dict) -> str:
     import yaml
 
     return broker.handle({"operation": "apply", "manifest": yaml.safe_dump(document)})
+
+
+@pytest.mark.parametrize("restart_policy", ["Never", "OnFailure"])
+def test_single_node_job_has_one_bounded_attempt_and_exact_source(tmp_path, restart_policy):
+    api = FakeApi()
+    broker = executor(tmp_path, api, nodes=1)
+    reserve(broker, kind="Job")
+    document = manifest()
+    worker = document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]
+    worker["spec"]["restartPolicy"] = restart_policy
+    document.update({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "spec": {"template": worker, "backoffLimit": 8, "suspend": False},
+    })
+    if restart_policy != "Never":
+        with pytest.raises(ValueError, match="restartPolicy.*Never"):
+            apply(broker, document)
+        assert api.creates == 0
+        return
+
+    assert apply(broker, document) == "job/senpai-fred-fern-123 created\n"
+    created = api.document_value
+    assert api.submitted[0]["spec"]["suspend"] is True
+    assert created["spec"]["suspend"] is False
+    assert created["spec"]["backoffLimit"] == 0
+    assert 0 < created["spec"]["activeDeadlineSeconds"] <= 1800
+    assert api.activated == [KubernetesResourceRef(
+        kind="Job", name="senpai-fred-fern-123", namespace="research",
+        uid="created-uid", nodes=1, gpus_per_node=8,
+    )]
+    assert created["metadata"]["ownerReferences"][0]["uid"] == "student-pod-uid"
+    pod = created["spec"]["template"]["spec"]
+    assert pod["automountServiceAccountToken"] is False
+    assert "affinity" not in pod
+    checkout = pod["initContainers"][0]
+    assert {item["name"]: item["value"] for item in checkout["env"]}[
+        "SENPAI_SOURCE_COMMIT"
+    ] == "a" * 40
+    environment = {item["name"]: item for item in pod["containers"][0]["env"]}
+    assert environment["WANDB_RUN_ID"]["value"] == "wandb-one"
+    assert environment["WANDB_API_KEY"]["valueFrom"]["secretKeyRef"] == {
+        "name": "senpai-launch-secrets-fred", "key": "wandb-api-key",
+    }
 
 
 def test_slow_logs_do_not_block_executor_status_or_cancellation(tmp_path):

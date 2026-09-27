@@ -1,5 +1,7 @@
 import json
 import subprocess
+import sys
+import time
 import threading
 import uuid
 from contextlib import contextmanager
@@ -13,6 +15,8 @@ from pydantic import SecretStr
 
 from github_workflow_support import FakeGitHub, assignment_record, pull_request
 from senpai_agent import tools as training_tools
+from senpai_agent import kubernetes_training
+from training_test_support import FakeCluster, git_workspace
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.github.tools import (
     clear_github_credentials,
@@ -25,6 +29,7 @@ from senpai_agent.state import AssignmentConversationRegistry
 from senpai_agent.tools import (
     CancelTrainingAction,
     CancelTrainingTool,
+    GetTrainingStatusAction,
     MonitorTrainingAction,
     MonitorTrainingTool,
     RunTrainingAction,
@@ -573,41 +578,63 @@ def test_interrupting_run_training_cancels_only_the_in_flight_run(
         monitors.close()
 
 
-def test_registered_training_tools_share_one_runtime(tmp_path: Path):
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
+@pytest.mark.parametrize(("nodes", "kind"), [(1, "Job"), (2, "MPIJob")])
+def test_registered_training_tools_supervise_kubernetes_for_every_topology(
+    tmp_path: Path, monkeypatch, assignment_runtime, nodes, kind,
+):
+    workspace = git_workspace(tmp_path)
+    client = FakeCluster(TrainingState.RUNNING, nodes=nodes)
+    monkeypatch.setattr(kubernetes_training, "KubernetesExecutorClient", lambda _socket: client)
+    for key, value in {
+        "NODES_PER_STUDENT": str(nodes),
+        "GPUS_PER_STUDENT_NODE": "8",
+        "RESEARCH_TAG": "fred",
+        "SENPAI_KUBERNETES_NAMESPACE": "research",
+        "SENPAI_LAUNCH_SECRET_NAME": "launch-secrets",
+        "SENPAI_TRAINING_SNAPSHOT_ROOT": str(tmp_path / "snapshots"),
+    }.items():
+        monkeypatch.setenv(key, value)
     state = SimpleNamespace(workspace=SimpleNamespace(working_dir=workspace))
+    conversation = SimpleNamespace(
+        id=assignment_runtime.conversation_id,
+        state=SimpleNamespace(secret_registry=SimpleNamespace(mask_secrets_in_output=lambda text: text)),
+    )
     register_senpai_tools()
-
     tools = resolve_tool(
         Tool(name="senpai_training", params={"state_dir": str(tmp_path / "state")}),
         state,
     )
     by_name = {tool.name: tool for tool in tools}
-
     try:
-        assert set(by_name) == {
-            "cancel_training",
-            "run_training",
-            "get_training_status",
-            "monitor_training",
-        }
-        assert (
-            by_name["run_training"].executor.training
-            is by_name["get_training_status"].executor.training
+        started = by_name["run_training"].executor(
+            RunTrainingAction(spec=TrainingSpec(
+                argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=30,
+            )), conversation,
         )
-        assert (
-            by_name["run_training"].executor.training
-            is by_name["monitor_training"].executor.training
+        assert client.reservations[0][0] == started.training_id
+        assert client.spec.kind == kind
+        deadline = time.monotonic() + 5
+        while True:
+            status = by_name["get_training_status"].executor(
+                GetTrainingStatusAction(training_id=started.training_id), conversation,
+            )
+            if status.kubernetes_resource is not None:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        assert status.state is TrainingState.RUNNING
+        assert status.kubernetes_resource.kind == kind
+        assert status.kubernetes_resource.nodes == nodes
+        monitors = by_name["monitor_training"].executor.store
+        assert monitors.spec(started.training_id).conversation_id == conversation.id
+        cancelled = by_name["cancel_training"].executor(
+            CancelTrainingAction(training_id=started.training_id), conversation,
         )
-        assert (
-            by_name["run_training"].executor.training
-            is by_name["cancel_training"].executor.training
-        )
-        assert (
-            by_name["run_training"].executor.monitor_store
-            is by_name["monitor_training"].executor.store
-        )
+        assert cancelled.state is TrainingState.CANCELLED
+        assert cancelled.kubernetes_released is True
+        assert client.deletions == [status.kubernetes_resource]
+        assert client.releases == [started.training_id]
+        assert monitors.active() == []
     finally:
         close_training_runtimes()
 

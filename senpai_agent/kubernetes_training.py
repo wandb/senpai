@@ -1435,7 +1435,7 @@ def _training_spec(training_id: str, *, nodes: int) -> KubernetesTrainingSpec:
     prefix_limit = 63 - child_suffix_length - 1 - len(suffix)
     prefix = f"senpai-{research}-{student}"[:prefix_limit].rstrip("-")
     return KubernetesTrainingSpec(
-        kind="MPIJob",
+        kind="Job" if nodes == 1 else "MPIJob",
         name=f"{prefix}-{suffix}",
         namespace=os.environ["SENPAI_KUBERNETES_NAMESPACE"],
         wandb_run_id=uuid.UUID(training_id).hex,

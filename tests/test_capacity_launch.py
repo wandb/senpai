@@ -179,7 +179,7 @@ def test_opt_in_cli_renders_observer_once_and_requires_its_digest_for_single_nod
         "--advisor_image", ADVISOR_IMAGE, "--student_image", STUDENT_IMAGE,
         "--capacity_observer", "--nodes_per_student", "1",
     ]
-    missing = run_launch(*arguments)
+    missing = run_launch(*arguments, "--executor_image", "")
     assert missing.returncode != 0
     assert "--executor_image must use an immutable @sha256 digest" in missing.stderr
 

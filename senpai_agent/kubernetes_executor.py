@@ -429,6 +429,8 @@ class KubernetesExecutor:
                 or int(manifest["spec"].get("completions", 1)) != self.nodes
             ):
                 raise ValueError("Job parallelism and completions must match this allocation")
+            if manifest["spec"]["template"]["spec"].get("restartPolicy") != "Never":
+                raise ValueError("Job restartPolicy must be Never")
             manifest["spec"]["activeDeadlineSeconds"] = remaining
             manifest["spec"]["backoffLimit"] = 0
             manifest["spec"]["suspend"] = True

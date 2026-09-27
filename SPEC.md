@@ -606,24 +606,19 @@ monitor_training(
 ) -> MonitorTrainingObservation
 ```
 
-`TrainingSupervisor` owns one process group, each run's requested timeout,
-TERM/KILL cleanup, restart identity checks using PID/PGID/create-time, a bounded
-8 KiB error tail, streamed 64 KiB log parsing, persisted state, and discovered
-W&B run IDs. Run IDs are persisted while training is still running so metric
-monitoring can begin immediately.
-
-When a student has more than one configured node, `KubernetesTrainingSupervisor`
-keeps the same tool contract while supervising one remote MPIJob. It creates an
+Every student uses `KubernetesTrainingSupervisor` to supervise one remote
+Job for single-node training or MPIJob for multi-node training. It creates an
 atomic Git bundle for the clean `HEAD` on the shared PVC, generates the workload
-and W&B identities, launches the target submitter through the local process
-path, then persists and polls the broker-created UID. The broker replaces
+and W&B identities, runs the target submitter as a local process, then persists
+and polls the broker-created UID. The broker replaces
 target-provided init logic with a fixed local-copy and exact-commit checkout, so
 bundle mutation fails before training starts. Cancellation, timeout, and restart
 recovery remain UID-bound; uncertain deletion retains the broker reservation for
 deadline cleanup rather than releasing ownership early.
 
-The public multi-node tool path reserves an MPIJob. Its target submitter follows
-the [target launcher contract](README.md#multi-node-target-launcher-contract):
+The public tool path reserves a Job when `NODES_PER_STUDENT` is 1 and an MPIJob
+when it is greater than 1. Its target submitter follows
+the [target launcher contract](README.md#target-launcher-contract):
 it uses the generated workload name, namespace, snapshot SHA, and W&B identity,
 and supplies the matching source/run annotations before submission. Worker
 resources must match the configured CPU, memory, and GPU allocation; additional
@@ -636,7 +631,7 @@ Preserved target labels can affect configured admission and network policies
 despite annotation removal. They are not a trust boundary.
 The broker preserves target scheduling constraints, overwrites ownership and
 `senpai-training-role` labels, and adds required hostname anti-affinity between
-this run's workers. The injected term excludes launcher pods from its selector;
+this run's workers for multi-node training. The injected term excludes launcher pods from its selector;
 target affinity terms remain unchanged.
 
 Controller shutdown detaches from a running Kubernetes workload. It terminates
@@ -646,7 +641,7 @@ reservation. A restarted controller in the same Pod reserves the same training
 identity and re-adopts only that UID before it resumes monitoring. Recovery
 requires retained state and the same controller Pod UID; the default state
 volumes do not survive Pod replacement. Ordinary controller Pod deletion or
-replacement also garbage-collects its owned MPIJob and terminates remote
+replacement also garbage-collects its owned Job or MPIJob and terminates remote
 training. Explicit cancellation and
 timeout still delete the remote workload and persist a terminal result before
 releasing ownership.
@@ -662,13 +657,12 @@ a terminal-state monitor bound to the current conversation. `monitor_training`
 is an optional policy upgrade for useful metric gates or staleness detection;
 repeating it replaces the default or previous policy.
 
-Each local run's requested timeout is a total wall-clock ceiling, not merely the
-point at which shutdown begins. TERM is sent early enough that the configured
-grace period ends at the deadline, after which the complete process group is killed.
-For local runs, `cancel_training` follows the same process-group cleanup path.
-It does not return until the supervisor has persisted a terminal state. Target
-training code remains responsible for handling SIGTERM and flushing external
-services such as W&B before the grace period expires.
+Each run's requested timeout covers submission and training. Expiry triggers
+UID-bound workload deletion; the broker independently enforces the launch's
+maximum training deadline. `cancel_training` uses the same deletion path and
+does not return until the supervisor has persisted a terminal state. Target
+training code remains responsible for handling Kubernetes termination and
+flushing external services such as W&B.
 
 The controller polls only monitors that are due. It fetches one latest selected
 metric value from W&B, evaluates deterministic threshold/change/staleness and
@@ -715,8 +709,8 @@ Every OpenHands turn has a controller-configured hard deadline. The deadline
 interrupts the conversation, produces a non-success result, and leaves durable
 events unacknowledged. The controller then retries with bounded exponential
 backoff. Controller termination interrupts and closes the current conversation.
-It cancels active local training, but detaches from active Kubernetes training
-so the next controller can re-adopt the same remote UID. It then closes local
+It detaches from active Kubernetes training so the next controller in the same
+Pod can re-adopt the same remote UID. It then closes local
 stores and flushes Weave before it exits. Standalone and child runners flush
 Weave at runner exit.
 
@@ -808,9 +802,10 @@ launcher never applies over them. A concurrent launch or an orphan from a
 failed launch therefore fails closed and requires explicit operator cleanup
 before retry.
 
-For multi-node students the launcher also creates a namespaced ServiceAccount,
-Role, and RoleBinding that allow creating, getting, patching, and deleting Jobs
-or MPIJobs; getting and listing Pods; reading pod logs; and listing Events.
+For every student the launcher also creates a namespaced ServiceAccount,
+Role, and RoleBinding that allow creating, getting, patching, and deleting Jobs;
+getting and listing Pods; reading pod logs; and listing Events. Multi-node
+students also receive the same workload permissions for MPIJobs.
 The launcher's operator identity needs get access to Deployments, list access
 to Pods and Jobs, API discovery, and create access to the rendered resources.
 Creating the Role and RoleBinding also requires every delegated permission in
@@ -883,7 +878,7 @@ The change is acceptable when:
 
 - unit and local integration tests pass;
 - shell scripts pass `bash -n`;
-- manifests render matching immutable source revisions and scoped multi-node RBAC;
+- manifests render matching immutable source revisions and scoped training RBAC;
 - remote workloads remain suspended until their exact created UID is confirmed;
 - browser smoke succeeds in both image builds;
 - no operational prompt advertises a missing tool or service;

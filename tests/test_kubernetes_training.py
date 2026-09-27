@@ -23,84 +23,7 @@ from senpai_agent.training import (
 )
 
 
-class FakeCluster:
-    def __init__(self, state: TrainingState = TrainingState.FINISHED):
-        self.state_value = state
-        self.spec: KubernetesTrainingSpec | None = None
-        self.resource_value: KubernetesResourceRef | None = None
-        self.reservations: list[tuple[str, str, str]] = []
-        self.adoptions: list[KubernetesResourceRef] = []
-        self.deletions: list[KubernetesResourceRef] = []
-        self.releases: list[str] = []
-        self._lock = threading.Lock()
-
-    def reserve(
-        self,
-        training_id,
-        spec,
-        _deadline_at,
-        source_snapshot,
-        source_commit,
-    ):
-        with self._lock:
-            self.spec = spec
-            self.resource_value = KubernetesResourceRef(
-                kind=spec.kind,
-                name=spec.name,
-                namespace=spec.namespace,
-                uid="remote-uid",
-                nodes=2,
-                gpus_per_node=8,
-            )
-            self.reservations.append((training_id, source_snapshot, source_commit))
-
-    def adopt(self, _training_id, _spec, resource, _deadline_at):
-        self.adoptions.append(resource)
-
-    def resource(self, _spec, *, nodes, gpus_per_node):
-        assert (nodes, gpus_per_node) == (2, 8)
-        return self.resource_value
-
-    def resource_identity(self, _spec):
-        return self.resource_value
-
-    def state(self, _resource):
-        return self.state_value, self.state_value.value
-
-    def delete(self, resource, timeout_seconds=60):
-        assert timeout_seconds <= 60
-        if self.resource_value is not None and self.resource_value.uid != resource.uid:
-            raise RuntimeError("refusing to delete replaced workload")
-        self.deletions.append(resource)
-        self.resource_value = None
-
-    def logs(self, _resource):
-        return "remote worker log"
-
-    def release(self, training_id):
-        self.releases.append(training_id)
-
-
-def git_workspace(tmp_path: Path) -> Path:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=workspace,
-        check=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"],
-        cwd=workspace,
-        check=True,
-    )
-    (workspace / ".gitignore").write_text(".env\n")
-    (workspace / "tracked.txt").write_text("committed\n")
-    subprocess.run(["git", "add", "."], cwd=workspace, check=True)
-    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=workspace, check=True)
-    (workspace / ".env").write_text("WANDB_API_KEY=secret\n")
-    return workspace
+from training_test_support import FakeCluster, git_workspace
 
 
 def supervisor(tmp_path, monkeypatch, client=None, **overrides):
@@ -186,6 +109,53 @@ def test_supervisor_injects_authoritative_identity_and_bundles_clean_head(
     assert client.reservations[0][1:] == (str(snapshot), result.source_commit)
     assert client.releases == [result.training_id]
     assert result.kubernetes_released is True
+
+
+@pytest.mark.parametrize("record", ["sidecar", "corrupt"])
+def test_recovery_reads_only_valid_owned_training_records(tmp_path, monkeypatch, record):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    training_id = "b81440b1-b803-471e-9fe0-6dcabd756b83"
+    path = state_dir / f"{training_id}{'.score' if record == 'sidecar' else ''}.json"
+    contents = '{"metrics": {}, "passed": true, "score": 1.0}'
+    path.write_text(contents)
+    if record == "corrupt":
+        with pytest.raises(ValueError):
+            supervisor(tmp_path, monkeypatch)
+    else:
+        runtime, _, _ = supervisor(tmp_path, monkeypatch)
+        runtime.close()
+    assert path.read_text() == contents
+
+
+def test_submitter_receives_shell_metacharacters_literally(tmp_path, monkeypatch):
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch)
+    literal = "result; $(echo not-a-shell)"
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", "import sys; print(sys.argv[1])", literal),
+        cwd=workspace,
+        timeout_seconds=5,
+    ))
+    runtime.drain()
+    terminal = runtime.get_training_status(started.training_id)
+    assert terminal.state is TrainingState.FINISHED
+    assert Path(terminal.log_path).read_text().splitlines()[0] == literal
+
+
+@pytest.mark.parametrize("invalid", ["working_directory", "timeout"])
+def test_invalid_launch_never_reserves_a_remote_workload(tmp_path, monkeypatch, invalid):
+    client = FakeCluster()
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    try:
+        with pytest.raises(ValueError, match="inside|configured maximum"):
+            runtime.run_training(TrainingSpec(
+                argv=(sys.executable, "-c", "raise AssertionError('must not run')"),
+                cwd=workspace.parent if invalid == "working_directory" else workspace,
+                timeout_seconds=11 if invalid == "timeout" else 5,
+            ))
+        assert client.reservations == []
+    finally:
+        runtime.close()
 
 
 def test_supervisor_retries_transient_status_and_release_failures(

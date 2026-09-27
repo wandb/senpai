@@ -579,6 +579,10 @@ def test_launch_uses_one_scope_for_create_discovery_and_handoff_commands(
             "gpu-cluster",
             "research",
         ),
+        *[
+            ("create", f"student fern {kind} senpai-training-scope-test-fern", "gpu-cluster", "research")
+            for kind in ("ServiceAccount", "Role", "RoleBinding")
+        ],
         (
             "create",
             "student fern Deployment senpai-scope-test-fern",
@@ -727,7 +731,7 @@ def test_reordered_student_manifest_still_creates_the_deployment_last(monkeypatc
 
     launch.main()
 
-    assert created == ["Secret", "ConfigMap", "Deployment"]
+    assert created == ["Secret", "ConfigMap", "ServiceAccount", "Role", "RoleBinding", "Deployment"]
 
 
 @pytest.mark.parametrize(
@@ -789,10 +793,11 @@ def test_dry_run_prints_the_original_validated_student_manifest(monkeypatch, cap
     assert f"--- Student: fern ---\n{manifest}\n" in capsys.readouterr().out
 
 
-def test_multinode_student_resources_are_created_in_dependency_order(monkeypatch):
+@pytest.mark.parametrize("nodes", [1, 2])
+def test_student_resources_are_created_in_dependency_order(monkeypatch, nodes):
     args = launch_args(
         advisor=False,
-        nodes_per_student=2,
+        nodes_per_student=nodes,
         executor_image=f"ghcr.io/wandb/senpai-executor@sha256:{'b' * 64}",
     )
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)

@@ -11,6 +11,7 @@ import launch_helpers  # noqa: E402
 REVISION = "a" * 40
 ADVISOR_IMAGE = f"ghcr.io/wandb/senpai-advisor:sha-{REVISION}"
 STUDENT_IMAGE = f"ghcr.io/wandb/senpai-student:sha-{REVISION}"
+EXECUTOR_IMAGE = f"ghcr.io/wandb/senpai-executor@sha256:{'b' * 64}"
 
 
 def launch_args(**overrides) -> launch.Args:
@@ -21,6 +22,7 @@ def launch_args(**overrides) -> launch.Args:
         "advisor": True,
         "advisor_image": ADVISOR_IMAGE,
         "student_image": STUDENT_IMAGE,
+        "executor_image": EXECUTOR_IMAGE,
         "senpai_repo_revision": REVISION,
     }
     values.update(overrides)
@@ -39,6 +41,10 @@ def run_launch(*arguments: str) -> subprocess.CompletedProcess[str]:
             "https://github.com/example/problem.git",
             "--n_students",
             "1",
+            "--executor_image",
+            EXECUTOR_IMAGE,
+            "--senpai_repo_revision",
+            REVISION,
             *arguments,
         ],
         cwd=ROOT,
@@ -83,5 +89,5 @@ def render_role(role: str, args: launch.Args | None = None) -> tuple[str, str, s
             secret,
             args,
         )
-    configmap, deployment = manifest.split("\n---\n", 1)
-    return configmap, deployment, secret
+    documents = manifest.split("\n---\n")
+    return documents[0], documents[-1], secret

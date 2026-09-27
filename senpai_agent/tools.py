@@ -7,7 +7,7 @@ import os
 import threading
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, Self
+from typing import TYPE_CHECKING, Literal, Self
 
 from openhands.sdk.llm import TextContent
 from openhands.sdk.tool import (
@@ -48,26 +48,13 @@ from senpai_agent.training import (
     TrainingResult,
     TrainingSpec,
     TrainingState,
-    TrainingSupervisor,
 )
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation import ConversationState, LocalConversation
 
 
-class TrainingRuntime(Protocol):
-    workspace: Path
-
-    def run_training(self, spec: TrainingSpec) -> TrainingResult: ...
-
-    def get_training_status(self, training_id: str) -> TrainingResult: ...
-
-    def cancel_training(self, training_id: str) -> TrainingResult: ...
-
-    def close(self) -> None: ...
-
-
-_TRAINING_RUNTIMES: dict[Path, tuple[TrainingRuntime, MonitorStore]] = {}
+_TRAINING_RUNTIMES: dict[Path, tuple[KubernetesTrainingSupervisor, MonitorStore]] = {}
 _BROWSER_ENABLED_STATE_KEY = "senpai.browser_enabled"
 
 
@@ -179,25 +166,17 @@ def training_runtime(
     state_dir: Path,
     *,
     max_timeout_seconds: int | None = None,
-) -> tuple[TrainingRuntime, MonitorStore]:
+) -> tuple[KubernetesTrainingSupervisor, MonitorStore]:
     key = state_dir.resolve()
     runtime = _TRAINING_RUNTIMES.get(key)
     if runtime is None:
-        nodes = int(os.environ.get("NODES_PER_STUDENT", "1"))
-        supervisor: TrainingRuntime
-        if nodes > 1:
-            supervisor = KubernetesTrainingSupervisor(
-                workspace=workspace,
-                state_dir=key,
-                nodes=nodes,
-                gpus_per_node=int(os.environ["GPUS_PER_STUDENT_NODE"]),
-                max_timeout_seconds=max_timeout_seconds,
-            )
-        else:
-            supervisor = TrainingSupervisor(
-                workspace=workspace,
-                state_dir=key,
-            )
+        supervisor = KubernetesTrainingSupervisor(
+            workspace=workspace,
+            state_dir=key,
+            nodes=int(os.environ["NODES_PER_STUDENT"]),
+            gpus_per_node=int(os.environ["GPUS_PER_STUDENT_NODE"]),
+            max_timeout_seconds=max_timeout_seconds,
+        )
         runtime = (supervisor, MonitorStore(key / "monitors.sqlite3"))
         _TRAINING_RUNTIMES[key] = runtime
     return runtime
@@ -213,8 +192,8 @@ def close_training_runtimes() -> None:
 class RunTrainingAction(Action):
     spec: TrainingSpec = Field(
         description=(
-            "Structured process argv, assignment-workspace directory, and hard "
-            "timeout. Do not pass a shell command string."
+            "Target launcher argv, working directory inside the assignment workspace, "
+            "and hard timeout. Submit one Kubernetes workload; do not pass a shell string."
         )
     )
 
@@ -364,7 +343,7 @@ class TrainingResultObservation(Observation):
 class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObservation]):
     def __init__(
         self,
-        training: TrainingRuntime,
+        training: KubernetesTrainingSupervisor,
         monitor_store: MonitorStore,
         assignment_guard: TrainingAssignmentGuard,
     ):
@@ -418,7 +397,7 @@ class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObserva
 class _GetTrainingStatusExecutor(
     ToolExecutor[GetTrainingStatusAction, TrainingResultObservation]
 ):
-    def __init__(self, training: TrainingRuntime):
+    def __init__(self, training: KubernetesTrainingSupervisor):
         self.training = training
 
     def __call__(
@@ -435,7 +414,9 @@ class _GetTrainingStatusExecutor(
 class _CancelTrainingExecutor(
     ToolExecutor[CancelTrainingAction, TrainingResultObservation]
 ):
-    def __init__(self, training: TrainingRuntime, store: MonitorStore):
+    def __init__(
+        self, training: KubernetesTrainingSupervisor, store: MonitorStore,
+    ):
         self.training = training
         self.store = store
 
@@ -465,15 +446,15 @@ class RunTrainingTool(ToolDefinition[RunTrainingAction, TrainingResultObservatio
     @classmethod
     def create(
         cls,
-        training: TrainingRuntime,
+        training: KubernetesTrainingSupervisor,
         monitor_store: MonitorStore,
         assignment_guard: TrainingAssignmentGuard,
     ) -> Sequence[Self]:
         return [
             cls(
                 description=(
-                    "Start one supervised training process without blocking and "
-                    "automatically monitor its terminal state for this conversation. "
+                    "Submit one Kubernetes training workload without blocking. "
+                    "Automatically monitor its terminal state for this conversation. "
                     "Only the current assignment revision conversation may launch. "
                     "Use monitor_training only to add metric gates or staleness "
                     "policy; use get_training_status for a bounded immediate check."
@@ -498,7 +479,7 @@ class GetTrainingStatusTool(
     @classmethod
     def create(
         cls,
-        training: TrainingRuntime,
+        training: KubernetesTrainingSupervisor,
     ) -> Sequence[Self]:
         return [
             cls(
@@ -525,14 +506,14 @@ class CancelTrainingTool(
     @classmethod
     def create(
         cls,
-        training: TrainingRuntime,
+        training: KubernetesTrainingSupervisor,
         monitor_store: MonitorStore,
     ) -> Sequence[Self]:
         return [
             cls(
                 description=(
-                    "Cancel one supervised training process, wait for its durable "
-                    "terminal state, and retire its monitor. Use this after a stop "
+                    "Cancel one Kubernetes training workload and wait for its durable "
+                    "terminal state. Retire its monitor. Use this after a stop "
                     "condition or hard monitor signal instead of killing processes "
                     "through the terminal."
                 ),
@@ -553,7 +534,9 @@ class CancelTrainingTool(
 class _MonitorTrainingExecutor(
     ToolExecutor[MonitorTrainingAction, MonitorTrainingObservation]
 ):
-    def __init__(self, training: TrainingRuntime, store: MonitorStore):
+    def __init__(
+        self, training: KubernetesTrainingSupervisor, store: MonitorStore,
+    ):
         self.training = training
         self.store = store
 
@@ -595,7 +578,7 @@ class MonitorTrainingTool(
     @classmethod
     def create(
         cls,
-        training: TrainingRuntime,
+        training: KubernetesTrainingSupervisor,
         monitor_store: MonitorStore,
     ) -> Sequence[Self]:
         return [
