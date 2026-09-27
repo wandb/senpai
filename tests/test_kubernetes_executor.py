@@ -88,6 +88,7 @@ def executor(tmp_path: Path, client: FakeApi | None = None) -> KubernetesExecuto
         snapshot_root=tmp_path / "snapshots",
         executor_image="executor@sha256:" + "a" * 64,
         launch_secret_name="senpai-launch-secrets-fred",
+        wandb_tags="senpai,schmidhuber,fern",
         research_tag="fred",
         student_name="fern",
         pod_name="senpai-fred-fern-123",
@@ -269,6 +270,9 @@ def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(
             "senpai-training-role": "foreign-role",
         })
     worker = document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]
+    worker["spec"]["containers"][0]["env"].append(
+        {"name": "WANDB_TAGS", "value": "ablation,senpai"}
+    )
     if wandb_key_role == "Launcher":
         key = worker["spec"]["containers"][0]["env"].pop(0)
         launcher = document["spec"]["mpiReplicaSpecs"]["Launcher"]["template"]
@@ -341,6 +345,14 @@ def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(
         for container in pod_spec["containers"]:
             assert [item for item in container["env"] if item["name"] == "WANDB_RUN_ID"] == [
                 {"name": "WANDB_RUN_ID", "value": "wandb-one"}
+            ]
+            assert [item for item in container["env"] if item["name"] == "WANDB_TAGS"] == [
+                {
+                    "name": "WANDB_TAGS",
+                    "value": "senpai,schmidhuber,fern" + (
+                        ",ablation" if role == "Worker" else ""
+                    ),
+                }
             ]
         for container in [*pod_spec["initContainers"], *pod_spec["containers"]]:
             assert container["securityContext"]["allowPrivilegeEscalation"] is False
@@ -553,6 +565,15 @@ def test_executor_rejects_a_dataset_mount_replaced_by_the_workspace(tmp_path):
                 {"name": "WANDB_RUN_ID", "value": "foreign-run"}
             ),
             "W&B run ID does not match reservation",
+        ),
+        (
+            lambda value: value["spec"]["mpiReplicaSpecs"]["Worker"]["template"][
+                "spec"
+            ]["containers"][0]["env"].append({
+                "name": "WANDB_TAGS",
+                "valueFrom": {"configMapKeyRef": {"name": "tags", "key": "tags"}},
+            }),
+            "WANDB_TAGS must use a literal value",
         ),
         (
             lambda value: value["spec"]["mpiReplicaSpecs"]["Worker"]["template"][
