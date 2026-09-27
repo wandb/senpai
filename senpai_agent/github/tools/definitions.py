@@ -23,8 +23,9 @@ from .contracts import (
     CreateAssignmentAction,
     GitHubMutationObservation,
     MergeExperimentAction,
-    PublishAdvisorBranchAction,
     PostAssignmentCommentAction,
+    PublishAdvisorBranchAction,
+    PublishAssignmentBranchAction,
     RepairAssignmentRoutingAction,
     RequestAssignmentRevisionAction,
     RespondToHumanIssueAction,
@@ -34,6 +35,7 @@ from .contracts import (
 from .runtime import (
     GitHubToolRuntime,
     PostAssignmentCommentExecutor,
+    PublishAssignmentBranchExecutor,
     SubmitExperimentResultExecutor,
     tool_annotations,
 )
@@ -105,6 +107,24 @@ class PublishAdvisorBranchTool(
             "Publish the configured advisor branch with force-with-lease. Supply its "
             "current remote SHA and the exact local commit to push.",
             PublishAdvisorBranchExecutor(runtime),
+        )
+
+
+class PublishAssignmentBranchTool(
+    ToolDefinition[PublishAssignmentBranchAction, GitHubMutationObservation]
+):
+    """Publish source for the current student without a terminal result."""
+
+    @classmethod
+    def create(cls, runtime: GitHubToolRuntime) -> Sequence[Self]:
+        return _tool(
+            cls, PublishAssignmentBranchAction, "Publish assignment branch",
+            "Publish the exact clean local commit to this student's current WIP "
+            "assignment branch with a fast-forward lease. Verify its recorded "
+            "research base and assignment revision before and after publication. "
+            "This does not post a comment, submit a result, change PR routing, "
+            "or release a hold. A current-revision terminal result forbids it.",
+            PublishAssignmentBranchExecutor(runtime),
         )
 
 
