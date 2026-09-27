@@ -705,6 +705,20 @@ on `PATH`.
 
 When `WANDB_ENTITY` and `WANDB_PROJECT` are configured, [`weave-openhands`](https://github.com/morganmcg1/weave-openhands) traces advisor, student, and child conversations. Each `OPENHANDS_RUN` record includes a direct Weave Agent Observability URL.
 
+Each model-call span also records the owner, repository, advisor branch and
+delegation depth under `senpai.*`. Child calls include their tree/task IDs,
+parent task/conversation IDs, requested model tier, initial input character count
+and inherited message count. These fields let operators attribute child costs
+before the long-running parent conversation finishes; the existing
+`gen_ai.request.model` identifies the actual model. Sum unique model-call costs,
+not those costs plus rolled-up conversation totals.
+
+Every child log starts with an `OPENHANDS_CHILD_START` JSON record containing its
+lineage, resolved model/effort and input sizes. The parent writes it before
+starting the child, so it survives import failures. Counts describe the rendered
+delegation input, not tokens or the provider's compacted context; no prompt text
+or credentials are added to this record.
+
 ## Operations
 
 Useful launch controls:

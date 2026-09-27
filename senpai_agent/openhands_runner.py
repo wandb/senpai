@@ -53,6 +53,7 @@ from senpai_agent.secrets import (
 from senpai_agent.weave_monitoring import (
     finish_weave_monitoring,
     initialize_weave_monitoring,
+    model_trace_attributes,
     register_trace_secret,
     weave_conversation_url,
 )
@@ -80,6 +81,7 @@ from openhands.tools.preset.default import (
     get_default_tools,
     register_default_tools,
 )
+from opentelemetry import trace
 from pydantic import SecretStr
 from simple_parsing import ArgumentParser, field
 from simple_parsing.helpers import flag
@@ -1699,6 +1701,7 @@ def run_openhands(
 
         @contextmanager
         def model_request() -> Iterator[None]:
+            trace.get_current_span().set_attributes(model_trace_attributes())
             token = retried_provider_errors.set(())
             try:
                 with (

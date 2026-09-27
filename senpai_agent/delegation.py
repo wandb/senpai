@@ -402,6 +402,10 @@ class OpenHandsChildProcess:
                 "GH_REPO": self._config.github_repo,
                 "SENPAI_DELEGATION_DEPTH": str(self._request.depth),
                 "SENPAI_DELEGATION_TREE_ID": self._request.tree_id,
+                "SENPAI_DELEGATION_TASK_ID": self._request.task_id,
+                "SENPAI_DELEGATION_PARENT_TASK_ID": self._request.parent_task_id or "",
+                "SENPAI_PARENT_CONVERSATION_ID": self._request.parent_conversation_id,
+                "SENPAI_DELEGATION_MODEL_TIER": self._request.model,
             }
         )
         if self._request.deadline_epoch is not None:
@@ -419,7 +423,6 @@ class OpenHandsChildProcess:
             environment["SENPAI_DELEGATION_ROOT_STATE_DIR"] = str(
                 self._request.registry_path.parent.parent
             )
-            environment["SENPAI_DELEGATION_TASK_ID"] = self._request.task_id
         if self._request.event_db_path is not None:
             environment["SENPAI_DELEGATION_EVENT_DB_PATH"] = str(
                 self._request.event_db_path
@@ -446,7 +449,35 @@ class OpenHandsChildProcess:
             tempfile.TemporaryFile(mode="w+", encoding="utf-8") as input_stream,
             self.output_path.open("w", encoding="utf-8") as output_stream,
         ):
-            input_stream.write(render_child_prompt(self._request, task))
+            prompt = render_child_prompt(self._request, task)
+            environment = self.environment
+            environment["SENPAI_DELEGATION_INPUT_CHARACTERS"] = str(len(prompt))
+            environment["SENPAI_DELEGATION_PARENT_MESSAGES"] = str(
+                len(self._request.parent_context)
+            )
+            profile = self._config.profile(self._request.model)
+            print(
+                "OPENHANDS_CHILD_START "
+                + json.dumps(
+                    {
+                        "task_id": self._request.task_id,
+                        "parent_task_id": self._request.parent_task_id,
+                        "parent_conversation_id": self._request.parent_conversation_id,
+                        "conversation_id": str(self._conversation_id),
+                        "tree_id": self._request.tree_id,
+                        "depth": self._request.depth,
+                        "model_tier": self._request.model,
+                        "model": profile.model,
+                        "reasoning_effort": profile.reasoning_effort,
+                        "input_characters": len(prompt),
+                        "parent_messages": len(self._request.parent_context),
+                    },
+                    sort_keys=True,
+                ),
+                file=output_stream,
+                flush=True,
+            )
+            input_stream.write(prompt)
             input_stream.seek(0)
             process = subprocess.Popen(
                 self.command,
@@ -454,7 +485,7 @@ class OpenHandsChildProcess:
                 stdout=output_stream,
                 stderr=subprocess.STDOUT,
                 text=True,
-                env=self.environment,
+                env=environment,
                 start_new_session=True,
             )
         try:
