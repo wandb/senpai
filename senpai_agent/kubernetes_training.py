@@ -32,6 +32,7 @@ from senpai_agent.training import (
     TrainingState,
     _mask_output_chunk,
     record_training_output,
+    target_python_environment,
     training_result_paths,
 )
 
@@ -797,6 +798,8 @@ class KubernetesTrainingSupervisor:
                 raise RuntimeError("Kubernetes training supervisor is closed")
             environment = dict(os.environ)
             environment.pop("WANDB_SERVICE", None)
+            environment.pop("PYTHONSAFEPATH", None)
+            environment.update(target_python_environment(environment))
             log_path.touch()
             process = subprocess.Popen(
                 list(spec.argv),

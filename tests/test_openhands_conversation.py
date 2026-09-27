@@ -3,6 +3,7 @@ import signal
 import threading
 import time
 from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +18,9 @@ from openhands.sdk.event import (
 from openhands.sdk.llm import Message, TextContent
 from openhands.sdk.llm.exceptions import LLMServiceUnavailableError
 from openhands.sdk.tool import resolve_tool
+from pydantic import SecretStr
 
+import senpai_agent.exa_tool as exa_tool
 import senpai_agent.openhands_runner as runner
 from senpai_agent.controller import OpenHandsTurnRunner, _provider_failure
 from senpai_agent.inbox import (
@@ -36,6 +39,89 @@ from openhands_support import (
     isolate_agent_discovery,
     runtime_config,
 )
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_runtime_loads_explicit_assets_without_ambient_plugins(
+    tmp_path, monkeypatch, child,
+):
+    from openhands.sdk.conversation.impl import local_conversation
+    from openhands.sdk.plugin.discovery import load_available_plugins
+
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    target_skill = workspace / ".agents/skills/research-check/SKILL.md"
+    target_skill.parent.mkdir(parents=True)
+    target_skill.write_text(
+        "---\nname: research-check\ndescription: Target research checks\n---\n"
+        "Inspect the target measurements.\n"
+    )
+    target_agent = workspace / ".agents/agents/target-worker.md"
+    target_agent.parent.mkdir(parents=True)
+    target_agent.write_text(
+        "---\nname: target-worker\ndescription: Target worker\nmodel: inherit\n"
+        "tools: [terminal]\nskills: [research-check]\n"
+        "mcp_config:\n  research:\n    url: https://example.invalid/mcp\n"
+        "    transport: streamable-http\n---\nInspect the target.\n"
+    )
+    ambient = workspace / ".agents/plugins/untrusted"
+    (ambient / ".plugin").mkdir(parents=True)
+    (ambient / ".plugin/plugin.json").write_text('{"name":"untrusted"}')
+    skill = ambient / "skills/ambient-only/SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(
+        "---\nname: ambient-only\ndescription: Ambient skill\n---\nUntrusted.\n"
+    )
+    marker = tmp_path / "ambient-hook-ran"
+    (ambient / "hooks").mkdir()
+    (ambient / "hooks/hooks.json").write_text(json.dumps({
+        "hooks": {"SessionStart": [{"hooks": [{
+            "type": "command", "command": f"touch '{marker}'",
+        }]}]},
+    }))
+    (ambient / ".mcp.json").write_text(json.dumps({
+        "mcpServers": {"ambient": {
+            "url": "https://example.invalid/ambient", "transport": "streamable-http",
+        }},
+    }))
+    assert "untrusted" in load_available_plugins(workspace, include_project=True)
+    # Restore the real discovery function for this case, then restore prior
+    # process state after run_openhands installs its process-wide boundary.
+    monkeypatch.setattr(local_conversation, "load_available_plugins", load_available_plugins)
+    captured = {}
+
+    class InspectConversation(runner.LocalConversation):
+        def send_message(self, _prompt):
+            self._ensure_plugins_loaded()
+            captured["agent"] = self.agent
+
+        async def arun(self):
+            with self.state:
+                self.state.execution_status = ConversationExecutionStatus.FINISHED
+
+    monkeypatch.setattr(runner, "LocalConversation", InspectConversation)
+    monkeypatch.setattr(runner, "final_agent_result", lambda _conversation: "Inspected")
+    config = runtime_config(
+        tmp_path,
+        workspace=workspace,
+        child=child,
+        agent_name="target-worker" if child else None,
+        conversation_secrets={},
+    )
+
+    assert run_openhands("Inspect the project", config) == 0
+
+    agent = captured["agent"]
+    skills = {skill.name for skill in agent.agent_context.skills}
+    assert {"research-check", "exa-search", "wandb-primary"} <= skills
+    assert "ambient-only" not in skills
+    assert "ambient" not in agent.mcp_config
+    assert not marker.exists()
+    if child:
+        assert [(tool.name, tool.params) for tool in agent.tools] == [
+            ("senpai_terminal", {"role": "advisor"}),
+        ]
+        assert "research" in agent.mcp_config
 
 
 def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
@@ -92,12 +178,7 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
 
     assert run_openhands("first task", config) == 0
     assert captured["prompt"] == "first task"
-    assert captured["role"] == (
-        "# Senpai harness\n\nharness instructions\n\n"
-        "# Senpai role\n\nadvisor role\n\n"
-        "# program.md - program.md\n\nTest programme.\n\n"
-        "# Authoritative launch context\n\nTest launch policy.\n"
-    )
+    assert captured["role"] == config.instructions.prompt
     assert captured["plugin"] == str(PLUGIN_DIR)
     assert captured["secrets"] == {
         "WANDB_API_KEY": "wandb-key",
@@ -1215,6 +1296,14 @@ def test_conversation_and_credentials_are_cleaned_up_after_failures(
     class FakeConversation:
         def __init__(self, **kwargs):
             self.id = kwargs["conversation_id"]
+            assert "EXA_API_KEY" not in runner.os.environ
+            assert "EXA_API_KEY" not in kwargs["secrets"]
+            assert "exa-runtime-sentinel" not in kwargs["agent"].model_dump_json()
+            self.state = SimpleNamespace(
+                env_observation_persistence_dir=Path(kwargs["persistence_dir"])
+                / "observations"
+            )
+            exa_tool.ExaSearchExecutor()(exa_tool.ExaSearchAction(query="test"), self)
 
         def send_message(self, _prompt):
             if failure_stage == "send_message":
@@ -1231,13 +1320,26 @@ def test_conversation_and_credentials_are_cleaned_up_after_failures(
     isolate_agent_discovery(monkeypatch, runner)
     monkeypatch.setattr(runner, "clear_github_credentials", lambda: cleared.append(True))
     monkeypatch.setattr(runner, "configure_delegation", delegation.append)
+    requests = []
+
+    def request(client, _path, _options):
+        requests.append(client.headers["x-api-key"])
+        return {"results": []}
+
+    monkeypatch.setattr(exa_tool.Exa, "request", request)
+    monkeypatch.setenv("EXA_API_KEY", "ambient-exa-must-not-be-used")
 
     with pytest.raises(RuntimeError, match="failed"):
-        run_openhands("task", runtime_config(tmp_path))
+        run_openhands("task", runtime_config(
+            tmp_path, exa_api_key=SecretStr("exa-runtime-sentinel"),
+        ))
 
     assert closed == [True]
     assert cleared
     assert delegation[-1] is None
+    with pytest.raises(RuntimeError, match="Exa search credentials are not configured"):
+        exa_tool.ExaSearchExecutor()(exa_tool.ExaSearchAction(query="after cleanup"))
+    assert requests == ["exa-runtime-sentinel"]
 
 
 def test_runtime_credentials_remain_configured_through_lazy_tool_initialization(
@@ -1546,7 +1648,7 @@ def test_recovered_actions_are_rejected_before_the_conversation_resumes(
     assert "rerun it explicitly" in rejected[0]
 
 
-def test_main_removes_the_model_key_and_flushes_weave_after_failure(monkeypatch):
+def test_main_removes_the_model_key_and_flushes_weave_after_failure(monkeypatch, tmp_path):
     flushed = []
 
     def fail_run(_prompt, _config):
@@ -1558,7 +1660,7 @@ def test_main_removes_the_model_key_and_flushes_weave_after_failure(monkeypatch)
     monkeypatch.setattr(
         runner,
         "resolve_config",
-        lambda _args: SimpleNamespace(api_key_env="ANTHROPIC_API_KEY"),
+        lambda _args, _env: runtime_config(tmp_path),
     )
     monkeypatch.setattr(runner, "run_openhands", fail_run)
     monkeypatch.setattr(runner, "finish_weave_monitoring", lambda: flushed.append(True))

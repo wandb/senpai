@@ -8,6 +8,7 @@ version = "0.1.0"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "numpy",
+    "pandas",
     "PyYAML",
     "torch==2.13.0",
     "torchvision==0.28.0",

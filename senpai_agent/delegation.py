@@ -30,12 +30,16 @@ from openhands.sdk.tool import (
     ToolDefinition,
     ToolExecutor,
 )
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.processes import terminate_process_group
-from senpai_agent.program_context import PROGRAM_PATH_ENV
+from senpai_agent.program_context import (
+    PROGRAM_CONTENT_SHA256_ENV,
+    PROGRAM_PATH_ENV,
+    PROGRAM_SOURCE_COMMIT_ENV,
+)
 from senpai_agent.PROMPTS import (
     AWAIT_AGENTS_SATISFIED_PROMPT,
     AWAIT_AGENTS_TIMEOUT_PROMPT,
@@ -50,8 +54,18 @@ from senpai_agent.PROMPTS import (
 from senpai_agent.secrets import (
     BUILTIN_CONVERSATION_SECRET_ENV_NAMES,
     CUSTOM_SECRET_ENV_NAMES_ENV,
+    MAX_MODEL_CREDENTIAL_BUNDLE_BYTES,
+    MODEL_CREDENTIALS_FD_ENV,
     configured_custom_secret_env_names,
+    scrub_exa_credentials,
     scrub_github_credentials,
+)
+from senpai_agent.system_instructions import (
+    SYSTEM_INSTRUCTIONS_FILE_ENV,
+    SYSTEM_INSTRUCTIONS_SHA256_ENV,
+    SenpaiSystemInstructions,
+    decode_system_instructions,
+    encode_system_instructions,
 )
 
 if TYPE_CHECKING:
@@ -164,8 +178,8 @@ class DelegationConfig:
     enable_browser: bool
     conversation_secrets: Mapping[str, str]
     role: str
-    program_path: str
-    launch_context: str
+    instructions: SenpaiSystemInstructions
+    exa_api_key: SecretStr | None = None
     root_state_dir: Path | None = None
     tree_id: str | None = None
     depth: int = 0
@@ -312,6 +326,7 @@ class OpenHandsChildProcess:
         profile = self._config.profile(self._request.model)
         return (
             str(self._config.python_executable),
+            "-P",
             "-m",
             "senpai_agent.openhands_runner",
             "--child",
@@ -346,6 +361,7 @@ class OpenHandsChildProcess:
         for name in configured_custom_secret_env_names(environment):
             environment.pop(name, None)
         scrub_github_credentials(environment)
+        scrub_exa_credentials(environment)
         for name in tuple(environment):
             if name.endswith("_API_KEY"):
                 environment.pop(name)
@@ -363,9 +379,10 @@ class OpenHandsChildProcess:
         configured_custom_secret_env_names(environment)
         environment.update(self._config.conversation_secrets)
         profiles = self._config.profiles()
-        environment.update(
-            {profile.api_key_env: profile.api_key for profile in profiles}
-        )
+        environment.pop(MODEL_CREDENTIALS_FD_ENV, None)
+        for profile in profiles:
+            if profile.api_key_env not in self._config.conversation_secrets:
+                environment.pop(profile.api_key_env, None)
         selected = self._config.profile(self._request.model)
         environment.update(
             {
@@ -426,11 +443,57 @@ class OpenHandsChildProcess:
             )
         if self._config.github_trusted_actor is not None:
             environment["SENPAI_GITHUB_ACTOR"] = self._config.github_trusted_actor
-        environment[PROGRAM_PATH_ENV] = self._config.program_path
+        instructions = self._config.instructions
+        environment[PROGRAM_PATH_ENV] = instructions.program.program_path
+        environment[PROGRAM_SOURCE_COMMIT_ENV] = instructions.program.source_commit
+        environment[PROGRAM_CONTENT_SHA256_ENV] = instructions.program.content_sha256
         environment[LAUNCH_CONTEXT_ENV] = b64encode(
-            self._config.launch_context.encode()
+            instructions.launch.encode()
         ).decode()
+        system_context = self.state_dir / "system-instructions.b64"
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        if system_context.exists():
+            decode_system_instructions(
+                system_context.read_text(encoding="utf-8").strip(),
+                instructions.content_sha256,
+            )
+        else:
+            temporary = system_context.with_suffix(".tmp")
+            temporary.write_text(
+                f"{encode_system_instructions(instructions)}\n",
+                encoding="utf-8",
+            )
+            temporary.replace(system_context)
+        environment[SYSTEM_INSTRUCTIONS_FILE_ENV] = str(system_context)
+        environment[SYSTEM_INSTRUCTIONS_SHA256_ENV] = instructions.content_sha256
         return environment
+
+    def _child_credentials(self) -> dict[str, str]:
+        """Supply each model profile without putting its key in the child env."""
+
+        credentials: dict[str, str] = {}
+        for profile in self._config.profiles():
+            existing = credentials.setdefault(profile.api_key_env, profile.api_key)
+            if existing != profile.api_key:
+                raise RuntimeError(
+                    "delegation profiles assign conflicting values to "
+                    f"{profile.api_key_env}"
+                )
+        # Intermediate runtimes retain Exa so they can delegate to search.
+        if self._config.exa_api_key is not None:
+            credentials["EXA_API_KEY"] = self._config.exa_api_key.get_secret_value()
+        return credentials
+
+    def _open_model_credentials_fd(self) -> int:
+        payload = json.dumps(
+            self._child_credentials(), separators=(",", ":"), sort_keys=True
+        ).encode()
+        if len(payload) > MAX_MODEL_CREDENTIAL_BUNDLE_BYTES:
+            raise RuntimeError("delegated model credential bundle is too large")
+        with tempfile.TemporaryFile() as stream:
+            stream.write(payload)
+            stream.seek(0)
+            return os.dup(stream.fileno())
 
     def start(
         self,
@@ -448,15 +511,22 @@ class OpenHandsChildProcess:
         ):
             input_stream.write(render_child_prompt(self._request, task))
             input_stream.seek(0)
-            process = subprocess.Popen(
-                self.command,
-                stdin=input_stream,
-                stdout=output_stream,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=self.environment,
-                start_new_session=True,
-            )
+            environment = self.environment
+            credential_fd = self._open_model_credentials_fd()
+            environment[MODEL_CREDENTIALS_FD_ENV] = str(credential_fd)
+            try:
+                process = subprocess.Popen(
+                    self.command,
+                    stdin=input_stream,
+                    stdout=output_stream,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=environment,
+                    start_new_session=True,
+                    pass_fds=(credential_fd,),
+                )
+            finally:
+                os.close(credential_fd)
         try:
             with self._lock:
                 self._process = process

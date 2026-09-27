@@ -6,7 +6,17 @@ from pydantic import SecretStr
 
 from senpai_agent.openhands_runner import RunnerConfig
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV
-from senpai_agent.program_context import ProgramSystemPrompt
+from git_workflow_support import commit_workspace
+from senpai_agent.program_context import (
+    PROGRAM_CONTENT_SHA256_ENV,
+    PROGRAM_CONTEXT_FILE_ENV,
+    PROGRAM_PATH_ENV,
+    PROGRAM_SOURCE_COMMIT_ENV,
+    ProgramSystemPrompt,
+    encode_program_system_prompt,
+    load_program_system_prompt,
+)
+from senpai_agent.supervisor import prepare_system_context_environment
 from senpai_agent.system_instructions import SenpaiSystemInstructions
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -57,7 +67,8 @@ def runtime_config(tmp_path: Path, **updates) -> RunnerConfig:
             role="advisor role",
             program=ProgramSystemPrompt(
                 program_path="program.md",
-                prompt="# program.md - program.md\n\nTest programme.",
+                source_commit="a" * 40,
+                content="Test programme.",
             ),
             launch=TEST_LAUNCH_CONTEXT,
         ),
@@ -66,18 +77,23 @@ def runtime_config(tmp_path: Path, **updates) -> RunnerConfig:
     return RunnerConfig(**values)
 
 
-def runtime_env(
+def launch_env(
     tmp_path: Path,
     *,
     role: str = "advisor",
     program_path: str = "program.md",
     program_content: str = "# Test programme\n\nUse the target contract.\n",
+    launch_context: str = TEST_LAUNCH_CONTEXT,
 ) -> dict[str, str]:
     workspace = tmp_path / "target"
     workspace.mkdir(exist_ok=True)
     program = workspace / program_path
     program.parent.mkdir(parents=True, exist_ok=True)
     program.write_text(program_content, encoding="utf-8")
+    commit_workspace(workspace)
+    snapshot = load_program_system_prompt(workspace, program_path)
+    snapshot_file = tmp_path / "program-context.b64"
+    snapshot_file.write_text(encode_program_system_prompt(snapshot), encoding="utf-8")
     role_file = tmp_path / f"SENPAI-{role.upper()}.md"
     role_file.write_text(f"{role} role", encoding="utf-8")
     harness_file = tmp_path / "SENPAI-HARNESS.md"
@@ -93,8 +109,21 @@ def runtime_env(
         "SENPAI_OPENHANDS_ROLE_FILE": str(role_file),
         "SENPAI_OPENHANDS_HARNESS_FILE": str(harness_file),
         "SENPAI_PLUGIN": str(PLUGIN_DIR),
-        LAUNCH_CONTEXT_ENV: b64encode(TEST_LAUNCH_CONTEXT.encode()).decode(),
+        PROGRAM_PATH_ENV: snapshot.program_path,
+        PROGRAM_SOURCE_COMMIT_ENV: snapshot.source_commit,
+        PROGRAM_CONTENT_SHA256_ENV: snapshot.content_sha256,
+        PROGRAM_CONTEXT_FILE_ENV: str(snapshot_file),
+        LAUNCH_CONTEXT_ENV: b64encode(launch_context.encode()).decode(),
     }
+
+
+def runtime_env(tmp_path: Path, **kwargs) -> dict[str, str]:
+    environment = launch_env(tmp_path, **kwargs)
+    return prepare_system_context_environment(
+        environment["SENPAI_ROLE"],
+        Path(environment["SENPAI_OPENHANDS_STATE_DIR"]),
+        environment,
+    )
 
 
 def isolate_agent_discovery(monkeypatch, runner) -> None:

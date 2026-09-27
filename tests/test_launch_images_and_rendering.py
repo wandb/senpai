@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import yaml
@@ -256,22 +257,34 @@ def test_role_bootstrap_reuses_runner_checkout_without_touching_target(role, tmp
         command.index("askpass=") : command.index("exec bash")
     ]
     bootstrap = bootstrap.replace("/tmp/senpai-git-askpass", str(tmp_path / "askpass"))
-    token_handoff = tmp_path / "github-token"
     bootstrap = bootstrap.replace(
-        "/tmp/senpai-supervisor-github-token", str(token_handoff)
+        "/tmp/senpai-supervisor.", str(tmp_path / "handoff.")
     )
     bootstrap = bootstrap.replace("/workspace", str(workspace_root))
     umask_output = tmp_path / "umask"
-    bootstrap += '\numask > "$UMASK_OUTPUT"\n'
+    handoff_output = tmp_path / "handoffs"
+    bootstrap += '''
+test "${GITHUB_TOKEN+x}${GH_TOKEN+x}${WANDB_API_KEY+x}${EXA_API_KEY+x}" = ""
+printf '%s\\n' "$SENPAI_GITHUB_TOKEN_FILE" "$SENPAI_WANDB_API_KEY_FILE" "$SENPAI_EXA_API_KEY_FILE" >> "$HANDOFF_OUTPUT"
+umask > "$UMASK_OUTPUT"
+'''
     env = os.environ | {
-        "GITHUB_TOKEN": "unused",
+        "GITHUB_TOKEN": "github-fixture",
+        "GH_TOKEN": "github-alias-fixture",
+        "WANDB_API_KEY": "wandb-fixture",
+        "EXA_API_KEY": "exa-fixture",
         "SENPAI_IMAGE_REVISION": revision,
         "SENPAI_REPO_REVISION": revision,
         "SENPAI_REPO_URL": str(source),
         "UMASK_OUTPUT": str(umask_output),
+        "HANDOFF_OUTPUT": str(handoff_output),
     }
 
     subprocess.run(["bash", "-c", bootstrap], check=True, env=env)
+    first_handoffs = [Path(path) for path in handoff_output.read_text().splitlines()]
+    for path in first_handoffs:
+        path.unlink()
+    first_handoffs[0].parent.rmdir()
     target = runner / "target"
     target.mkdir()
     git(target, "init", "--quiet")
@@ -289,7 +302,17 @@ def test_role_bootstrap_reuses_runner_checkout_without_touching_target(role, tmp
     assert (target / "state.txt").read_text() == "in progress\n"
     assert git(runner, "remote", "get-url", "origin") == str(source)
     assert git(runner, "rev-parse", "HEAD") == revision
-    assert token_handoff.stat().st_mode & 0o777 == 0o600
+    new_handoffs = [Path(path) for path in handoff_output.read_text().splitlines()[3:]]
+    assert len(new_handoffs) == 3
+    handoff_dir = new_handoffs[0].parent
+    assert handoff_dir != first_handoffs[0].parent
+    assert handoff_dir.stat().st_mode & 0o777 == 0o700
+    for path, expected in zip(
+        new_handoffs, ("github-fixture", "wandb-fixture", "exa-fixture"), strict=True
+    ):
+        assert path.parent == handoff_dir
+        assert path.read_text() == expected
+        assert path.stat().st_mode & 0o777 == 0o600
     assert int(umask_output.read_text().strip(), 8) == 0o22
 
 
@@ -309,7 +332,7 @@ def test_multinode_kubectl_wrapper_can_be_reinstalled(tmp_path):
     kubectl = tmp_path / "state" / "bin" / "kubectl"
     assert kubectl.stat().st_mode & 0o777 == 0o500
     assert kubectl.read_text() == (
-        '#!/bin/sh\nexec "$SENPAI_PYTHON" -m senpai_agent.kubernetes_executor kubectl "$@"\n'
+        '#!/bin/sh\nexec "$SENPAI_PYTHON" -P -m senpai_agent.kubernetes_executor kubectl "$@"\n'
     )
     assert list(kubectl.parent.glob(".kubectl.*")) == []
 
@@ -348,6 +371,88 @@ def test_launch_rejects_a_program_path_outside_the_target_repo(path):
 
     assert result.returncode != 0
     assert "--program_path" in result.stderr
+
+
+def test_launcher_captures_program_before_the_remote_ref_disappears(
+    tmp_path, monkeypatch
+):
+    workspace, remote, _head = repository(tmp_path)
+    program_path = 'équipe "A"/program.md'
+    (workspace / program_path).parent.mkdir()
+    source_commit = commit_file(
+        workspace, program_path, "Stable launch policy.\n", "add policy"
+    )
+    git(workspace, "push", "origin", f"{source_commit}:refs/heads/research")
+    monkeypatch.setattr(launch, "github_repository_url", lambda _repo: str(remote))
+
+    snapshot = launch.load_launch_program_snapshot(
+        "https://github.com/acme/widgets.git", "research", "", "github-token"
+    )
+    git(remote, "update-ref", "-d", "refs/heads/research")
+
+    assert snapshot.source_commit == source_commit
+    assert snapshot.program_path == program_path
+    assert snapshot.content == "Stable launch policy."
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_program_secret_is_immutable_and_projected_read_only(role):
+    program = launch.ProgramSystemPrompt(
+        program_path="program.md",
+        source_commit=REVISION,
+        content="Test launch research policy.",
+    )
+    name, manifest = launch_helpers.render_program_context_secret(
+        "test-track", launch.encode_program_system_prompt(program)
+    )
+    document = yaml.safe_load(manifest)
+    assert document["immutable"] is True
+    encoded = base64.b64decode(document["data"]["program-context"]).decode()
+    assert launch.decode_program_system_prompt(encoded) == program
+    configmap, deployment, _credentials = render_role(role)
+    config = yaml.safe_load(configmap)["data"]
+    pod_template = yaml.safe_load(deployment)["spec"]["template"]
+    assert pod_template["metadata"]["annotations"][
+        "senpai.wandb.com/program-context-secret"
+    ] == name
+    pod = pod_template["spec"]
+    volume = next(
+        item for item in pod["volumes"] if item["name"] == "program-context"
+    )
+    assert volume["secret"] == {
+        "secretName": name,
+        "items": [{"key": "program-context", "path": "program-context.b64"}],
+    }
+    mount = next(
+        item for item in pod["containers"][0]["volumeMounts"]
+        if item["name"] == "program-context"
+    )
+    assert mount == {
+        "name": "program-context",
+        "mountPath": "/var/run/senpai-context",
+        "readOnly": True,
+    }
+    assert config["SENPAI_PROGRAM_CONTENT_SHA256"] == program.content_sha256
+    assert config["SENPAI_PROGRAM_SOURCE_COMMIT"] == program.source_commit
+
+
+def test_program_secret_payload_and_name_stay_within_kubernetes_limits():
+    program = launch.ProgramSystemPrompt(
+        program_path="program.md",
+        source_commit=REVISION,
+        content="x" * (256 * 1024),
+    )
+    name, manifest = launch_helpers.render_program_context_secret(
+        "t" * 63, launch.encode_program_system_prompt(program)
+    )
+    assert len(name) <= 63
+    assert launch.decode_program_system_prompt(
+        base64.b64decode(yaml.safe_load(manifest)["data"]["program-context"]).decode()
+    ) == program
+    with pytest.raises(ValueError, match="1 MiB"):
+        launch_helpers.render_program_context_secret(
+            "track", "x" * (1024 * 1024 + 1)
+        )
 
 
 def test_launch_secret_contains_each_credential_and_both_roles_reference_it():
@@ -710,4 +815,14 @@ def test_rendered_role_annotation_matches_its_effective_content_hash(role):
         "annotations"
     ]["senpai.wandb.com/content-hash"]
 
-    assert annotation == launch_helpers.pod_template_hash(configmap, secret)
+    program = launch.ProgramSystemPrompt(
+        program_path="program.md",
+        source_commit=REVISION,
+        content="Test launch research policy.",
+    )
+    _name, program_secret = launch_helpers.render_program_context_secret(
+        "test-track", launch.encode_program_system_prompt(program)
+    )
+    assert annotation == launch_helpers.pod_template_hash(
+        configmap, secret, program_secret
+    )

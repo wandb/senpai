@@ -136,7 +136,7 @@ def run_git(
         environment.update(extra_env)
     try:
         completed = subprocess.run(
-            [GIT_EXECUTABLE, *arguments],
+            [GIT_EXECUTABLE, "-c", f"safe.directory={workspace.resolve()}", *arguments],
             cwd=workspace,
             text=True,
             input=input_text,

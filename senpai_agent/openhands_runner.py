@@ -47,8 +47,13 @@ from senpai_agent.secrets import (
     GITHUB_TOKEN_ENV_NAMES,
     GITHUB_TOKEN_FD_ENV,
     GITHUB_TOKEN_FILE_ENV,
+    MODEL_CREDENTIALS_FD_ENV,
+    PROVIDER_API_KEY_ENVS,
     configured_custom_secret_env_names,
+    consume_model_credential_fd,
+    scrub_exa_credentials,
     scrub_github_credentials,
+    set_process_nondumpable,
 )
 from senpai_agent.weave_monitoring import (
     finish_weave_monitoring,
@@ -85,6 +90,7 @@ from simple_parsing import ArgumentParser, field
 from simple_parsing.helpers import flag
 
 from senpai_agent.agent_markdown import read_agent_markdown, strip_spdx_header
+from senpai_agent.exa_tool import configure_exa_credentials
 from senpai_agent.github.tools import (
     clear_github_credentials,
     configure_github_credentials,
@@ -92,16 +98,23 @@ from senpai_agent.github.tools import (
 from senpai_agent.inference_heartbeat import InferenceHeartbeat
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV, decode_launch_context
 from senpai_agent.local_events import LocalEventStore
+from senpai_agent.openhands_security import disable_ambient_plugin_discovery
 from senpai_agent.program_context import (
+    PROGRAM_CONTENT_SHA256_ENV,
     PROGRAM_PATH_ENV,
-    load_program_system_prompt,
+    PROGRAM_SOURCE_COMMIT_ENV,
 )
 from senpai_agent.PROMPTS import (
     DELEGATED_RESULT_SUMMARY_PROMPT,
     RECOVERED_ACTION_PROMPT,
     render_prompt,
 )
-from senpai_agent.system_instructions import SenpaiSystemInstructions
+from senpai_agent.system_instructions import (
+    SYSTEM_INSTRUCTIONS_FILE_ENV,
+    SYSTEM_INSTRUCTIONS_SHA256_ENV,
+    SenpaiSystemInstructions,
+    decode_system_instructions,
+)
 from senpai_agent.tools import register_senpai_tools
 
 DEFAULT_MODEL = "anthropic/claude-opus-5-5"
@@ -123,15 +136,11 @@ REASONING_EFFORTS = (
     "none",
 )
 SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore", "search")
-SENPAI_AGENT_DIR = Path(__file__).resolve().parents[1] / ".agents" / "agents"
+SENPAI_AGENT_DIR_ENV = "SENPAI_AGENT_DIR"
+SOURCE_SENPAI_AGENT_DIR = Path(__file__).resolve().parents[1] / ".agents" / "agents"
 REPOSITORY_INSTRUCTION_FILENAMES = frozenset(
     {"agents.md", "agent.md", "claude.md"}
 )
-PROVIDER_API_KEY_ENVS = {
-    "anthropic": "ANTHROPIC_API_KEY",
-    "openai": "OPENAI_API_KEY",
-    "wandb": "WANDB_API_KEY",
-}
 EVENT_TEXT_LIMIT = 20000
 MAX_INLINE_CHILD_RESULT_TOKENS = 15_000
 DEFAULT_INBOX_MAX_STALLED_ATTEMPTS = 3
@@ -224,6 +233,7 @@ class RunnerConfig:
     student_name: str | None = None
     wandb_entity: str | None = None
     wandb_project: str | None = None
+    exa_api_key: SecretStr | None = None
     timeout_seconds: float = 7200
     llm_timeout_seconds: int = 5400
     llm_num_retries: int = 5
@@ -527,8 +537,11 @@ def sanitized_project_skills(workspace: Path) -> list[Skill]:
 def sanitized_agent_definitions(workspace: Path) -> list[AgentDefinition]:
     """Load Senpai agents first, then unshadowed target and user agents."""
 
+    agent_dir = Path(
+        os.environ.get(SENPAI_AGENT_DIR_ENV, SOURCE_SENPAI_AGENT_DIR)
+    ).resolve()
     reserved = {
-        name: AgentDefinition.load(SENPAI_AGENT_DIR / f"{name}.md")
+        name: AgentDefinition.load(agent_dir / f"{name}.md")
         for name in SENPAI_AGENT_NAMES
     }
     return [
@@ -628,10 +641,27 @@ def resolve_config(
         raise RuntimeError(
             "OpenHands state directory must be outside the target workspace"
         )
-    program = load_program_system_prompt(
-        workspace,
-        env.get(PROGRAM_PATH_ENV, ""),
+    system_context = env.get(SYSTEM_INSTRUCTIONS_FILE_ENV)
+    if not system_context:
+        raise RuntimeError(f"{SYSTEM_INSTRUCTIONS_FILE_ENV} is required")
+    instructions = decode_system_instructions(
+        Path(system_context).read_text(encoding="utf-8").strip(),
+        env.get(SYSTEM_INSTRUCTIONS_SHA256_ENV, ""),
     )
+    program = instructions.program
+    configured_program_path = env.get(PROGRAM_PATH_ENV, "")
+    if configured_program_path != program.program_path:
+        raise RuntimeError(
+            f"{PROGRAM_PATH_ENV} does not match the inherited program snapshot"
+        )
+    if env.get(PROGRAM_SOURCE_COMMIT_ENV, "") != program.source_commit:
+        raise RuntimeError(
+            f"{PROGRAM_SOURCE_COMMIT_ENV} does not match the inherited system snapshot"
+        )
+    if env.get(PROGRAM_CONTENT_SHA256_ENV, "") != program.content_sha256:
+        raise RuntimeError(
+            f"{PROGRAM_CONTENT_SHA256_ENV} does not match the inherited program snapshot"
+        )
     role = env.get("SENPAI_ROLE", "")
     if role not in {"advisor", "student"}:
         raise RuntimeError("SENPAI_ROLE must be advisor or student")
@@ -645,12 +675,21 @@ def resolve_config(
     role_file = find_role_file(
         env_value(args.role_file, env, "SENPAI_OPENHANDS_ROLE_FILE"),
     )
-    instructions = SenpaiSystemInstructions(
-        harness=read_instruction_file(harness_file),
-        role=read_instruction_file(role_file),
-        program=program,
-        launch=decode_launch_context(env.get(LAUNCH_CONTEXT_ENV, "")),
-    )
+    if read_instruction_file(harness_file) != instructions.harness:
+        raise RuntimeError(
+            "OpenHands harness file does not match the controller-held snapshot"
+        )
+    if read_instruction_file(role_file) != instructions.role:
+        raise RuntimeError(
+            "OpenHands role file does not match the controller-held snapshot"
+        )
+    if (
+        decode_launch_context(env.get(LAUNCH_CONTEXT_ENV, ""))
+        != instructions.launch
+    ):
+        raise RuntimeError(
+            f"{LAUNCH_CONTEXT_ENV} does not match the inherited system snapshot"
+        )
     try:
         timeout_seconds = float(env.get("SENPAI_OPENHANDS_TIMEOUT_SECONDS", "7200"))
     except ValueError as error:
@@ -866,6 +905,9 @@ def resolve_config(
     smart_api_key = resolve_api_key(env, smart_api_key_env)
     fast_api_key = resolve_api_key(env, fast_api_key_env)
     frontier_api_key = resolve_api_key(env, frontier_api_key_env)
+    exa_api_key = (
+        SecretStr(value) if (value := env.get("EXA_API_KEY", "").strip()) else None
+    )
     resolved_conversation_secrets = conversation_secrets(
         env,
         model_api_key_env_names=(
@@ -948,6 +990,7 @@ def resolve_config(
         student_name=env.get("STUDENT_NAME") or None,
         wandb_entity=wandb_entity,
         wandb_project=wandb_project,
+        exa_api_key=exa_api_key,
         timeout_seconds=timeout_seconds,
         llm_timeout_seconds=llm_timeout_seconds,
         llm_num_retries=llm_num_retries,
@@ -1147,13 +1190,16 @@ def scrub_model_credentials(
     environment: MutableMapping[str, str],
     config: RunnerConfig,
 ) -> None:
+    scrub_exa_credentials(environment)
     for key_env in {
+        *PROVIDER_API_KEY_ENVS.values(),
         config.api_key_env,
         config.smart_api_key_env,
         config.fast_api_key_env,
         config.frontier_api_key_env,
     }:
-        environment.pop(key_env, None)
+        if key_env not in config.conversation_secrets:
+            environment.pop(key_env, None)
 
 
 def build_main_tools(config: RunnerConfig) -> list[Tool]:
@@ -1189,6 +1235,8 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
         # Keep the persisted spec name stable while its resolver exposes only
         # the lightweight load_browser definition until the model opts in.
         tools.append(Tool(name="browser_tool_set"))
+    # Keep persisted tool specs compatible if an optional standalone key is removed.
+    tools.append(Tool(name="senpai_exa"))
     delegation_params = {"event_db_path": str(local_event_db_path(config))}
     if not config.child:
         tools.append(Tool(name="delegate_agent", params=delegation_params))
@@ -1206,6 +1254,17 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
         training_params = {"state_dir": str(config.state_dir / "training")}
         tools.append(Tool(name="senpai_training", params=training_params))
     return tools
+
+
+def senpai_terminal_tools(tools: Sequence[Tool], role: str) -> list[Tool]:
+    """Route a file-defined agent's terminal through Senpai's policy and target env."""
+
+    return [
+        Tool(name="senpai_terminal", params={"role": role})
+        if tool.name == "terminal"
+        else tool
+        for tool in tools
+    ]
 
 
 def delegation_config(
@@ -1238,8 +1297,8 @@ def delegation_config(
         enable_browser=config.enable_browser,
         conversation_secrets=config.conversation_secrets,
         role=config.role,
-        program_path=config.instructions.program.program_path,
-        launch_context=config.instructions.launch,
+        instructions=config.instructions,
+        exa_api_key=config.exa_api_key,
         root_state_dir=config.delegation_root_state_dir,
         tree_id=config.delegation_tree_id,
         depth=config.delegation_depth,
@@ -1606,6 +1665,7 @@ def run_openhands(
     if run_deadline is not None and run_deadline <= started_at:
         raise TimeoutError("the inherited OpenHands deadline has expired")
     scrub_model_credentials(os.environ, config)
+    disable_ambient_plugin_discovery()
     register_default_tools(enable_browser=False)
     register_senpai_tools()
     file_agents = sanitized_agent_definitions(config.workspace)
@@ -1678,6 +1738,9 @@ def run_openhands(
     cleanup_error: BaseException | None = None
     active_inbox_turn_id = inbox_turn_id
     try:
+        configure_exa_credentials(config.exa_api_key)
+        if config.exa_api_key is not None:
+            register_trace_secret(config.exa_api_key.get_secret_value())
         retried_provider_errors: ContextVar[tuple[BaseException, ...]] = ContextVar(
             "retried_provider_errors",
             default=(),
@@ -1750,6 +1813,7 @@ def run_openhands(
             agent = agent.model_copy(
                 update={
                     "llm": apply_reasoning_profile(agent.llm),
+                    "tools": senpai_terminal_tools(agent.tools, config.role),
                     "agent_context": (
                         agent.agent_context or AgentContext()
                     ).model_copy(update={"skills": resolved_skills}),
@@ -1965,6 +2029,7 @@ def run_openhands(
                     if cleanup_error is None:
                         cleanup_error = error
         clear_github_credentials()
+        configure_exa_credentials(None)
         configure_delegation(None)
         if inference_heartbeat is not None:
             inference_heartbeat.close()
@@ -2009,12 +2074,24 @@ def run_openhands(
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         try:
+            set_process_nondumpable()
+            credential_fd_present = MODEL_CREDENTIALS_FD_ENV in os.environ
+            model_credentials = consume_model_credential_fd(os.environ)
+            for credential in model_credentials.values():
+                register_trace_secret(credential)
+            runtime_environment = {**os.environ, **model_credentials}
             args = parse_runner_args(argv)
+            if args.child and not credential_fd_present:
+                raise RuntimeError(
+                    "delegated OpenHands children require the private model "
+                    "credential handoff"
+                )
             prompt = sys.stdin.read()
             if not prompt:
                 raise RuntimeError("OpenHands runner requires a prompt on stdin")
-            config = resolve_config(args)
-            os.environ.pop(config.api_key_env, None)
+            config = resolve_config(args, runtime_environment)
+            del runtime_environment, model_credentials
+            scrub_model_credentials(os.environ, config)
             return run_openhands(prompt, config)
         except BaseException as error:  # noqa: BLE001
             if task_id := os.environ.get("SENPAI_DELEGATION_TASK_ID"):

@@ -6,9 +6,10 @@ LABEL org.opencontainers.image.revision="${SENPAI_SOURCE_REVISION}"
 
 ENV PATH="/opt/senpai-venv/bin:/home/senpai/.local/bin:${PATH}" \
     PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+    SENPAI_AGENT_DIR=/opt/senpai-agent-definitions \
+    SENPAI_PLUGIN=/opt/senpai-plugin \
     SENPAI_IMAGE_REVISION="${SENPAI_SOURCE_REVISION}" \
     SENPAI_PYTHON=/opt/senpai-venv/bin/python \
-    UV_PROJECT_ENVIRONMENT=/opt/senpai-venv \
     UV_PYTHON=/opt/senpai-venv/bin/python \
     UV_PYTHON_DOWNLOADS=never \
     BROWSER_USE_DISABLE_EXTENSIONS=1
@@ -29,11 +30,14 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y gh && \
     rm -rf /var/lib/apt/lists/*
 
-RUN python -m pip install --no-cache-dir "uv==0.10.9" && \
-    uv venv --python /usr/local/bin/python /opt/senpai-venv
+COPY --from=ghcr.io/astral-sh/uv:0.10.9@sha256:10902f58a1606787602f303954cea099626a4adb02acbac4c69920fe9d278f82 /uv /uvx /usr/local/bin/
+RUN uv venv --python /usr/local/bin/python /opt/senpai-venv
 
 # Export from the project lock while pruning dependencies used only for training.
 COPY pyproject.toml uv.lock /tmp/senpai/
+COPY senpai_agent /tmp/senpai/senpai_agent
+COPY .agents/agents /opt/senpai-agent-definitions
+COPY plugins/senpai /opt/senpai-plugin
 RUN cd /tmp/senpai && \
     uv export --locked --python 3.13 --no-dev --no-emit-project \
       --format requirements.txt \
@@ -42,7 +46,6 @@ RUN cd /tmp/senpai && \
       --prune torch-geometric \
       --prune timm \
       --prune einops \
-      --prune matplotlib \
       > requirements.txt && \
     uv pip install --python "$SENPAI_PYTHON" \
       --only-binary cryptography \
@@ -52,35 +55,36 @@ RUN cd /tmp/senpai && \
       --only-binary pydantic-core \
       --only-binary rpds-py \
       -r requirements.txt && \
-    python -c 'import importlib.metadata, importlib.util, openhands.sdk, sys; assert sys.version_info[:2] == (3, 13); assert importlib.util.find_spec("torch") is None; assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
-    chown -R 10001:10001 /opt/senpai-venv && \
-    rm -rf /root/.cache/uv
+    uv pip install --python "$SENPAI_PYTHON" --no-deps --compile-bytecode /tmp/senpai "pip==25.3" && \
+    python -P -c 'import importlib.metadata, importlib.util, openhands.sdk, senpai_agent, sys; assert sys.version_info[:2] == (3, 13); assert importlib.util.find_spec("torch") is None; assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
+    python -P -m senpai_agent.agent_markdown "$SENPAI_PLUGIN" && \
+    chown -R root:root /opt/senpai-venv "$SENPAI_AGENT_DIR" "$SENPAI_PLUGIN" && \
+    chmod -R a-w /opt/senpai-venv "$SENPAI_AGENT_DIR" "$SENPAI_PLUGIN" && \
+    rm -rf /root/.cache/uv /tmp/senpai
 
 COPY scripts/senpai-browser-smoke-test.py /usr/local/bin/senpai-browser-smoke-test
-COPY scripts/senpai-container-health.sh /usr/local/bin/senpai-container-health
 
-# Expose the pinned browser on PATH because launchers give roles a persistent HOME.
+# Expose the pinned browser on PATH for each role's runtime HOME.
 RUN uvx --from "playwright==${PLAYWRIGHT_VERSION}" \
       playwright install chromium --with-deps --no-shell && \
     chromium_path=$(find "$PLAYWRIGHT_BROWSERS_PATH" \
       -type f -path '*/chrome-linux*/chrome' -print -quit) && \
     test -x "$chromium_path" && \
     ln -s "$chromium_path" /usr/local/bin/chromium && \
-    chmod +x /usr/local/bin/senpai-browser-smoke-test \
-      /usr/local/bin/senpai-container-health && \
-    mkdir -p /workspace /workspaces /var/lib/senpai && \
+    chmod +x /usr/local/bin/senpai-browser-smoke-test && \
+    mkdir -p /workspace/senpai /workspaces /var/lib/senpai && \
     chown -R 10001:10001 \
       /home/senpai /workspace /workspaces /var/lib/senpai && \
     rm -rf /root/.cache/uv /root/.config/browseruse /var/lib/apt/lists/*
 
 ENV HOME=/home/senpai
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10m --retries=5 \
-    CMD senpai-container-health \
-      "/var/lib/senpai/${RESEARCH_TAG}/advisor/openhands_state/controller-lease.json"
-
 WORKDIR /workspaces
 USER 10001:10001
+
+# Verify installed imports and immutable runtime assets as the role user.
+RUN python -P -c 'import os, pathlib, pip, senpai_agent, sys; assert pathlib.Path(senpai_agent.__file__).is_relative_to(sys.prefix); assert all(not os.access(path, os.W_OK) for path in (sys.prefix, os.environ["SENPAI_AGENT_DIR"], os.environ["SENPAI_PLUGIN"]))' && \
+    python -P -c 'import os, sys; sys.path.insert(0, os.environ["SENPAI_PLUGIN"] + "/skills/wandb-primary/scripts"); import curve_plots, training_diagnostics'
 
 # Exercise the browser as the same non-root user used in production.
 RUN HOME=/var/lib/senpai/home senpai-browser-smoke-test
