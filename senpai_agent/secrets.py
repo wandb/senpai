@@ -43,6 +43,7 @@ _RESERVED_CUSTOM_SECRET_ENV_NAMES = frozenset(
         "WANDB_ENTITY",
         "WANDB_MODE",
         "WANDB_PROJECT",
+        "WANDB_TAGS",
         # Custom credentials must not change process startup or executable routing.
         "BASH_ENV",
         "ENV",

@@ -524,6 +524,28 @@ def test_launch_accepts_anthropic_max_for_every_model_profile():
     launch.validate_model_config(args)
 
 
+@pytest.mark.parametrize(
+    ("advisor_branch", "student_name"),
+    [("schmidhuber", "fern"), ("noam", "track-frieren")],
+)
+def test_student_wandb_tags_identify_senpai_and_both_agents(advisor_branch, student_name):
+    rendered = launch.render_student(
+        (ROOT / "k8s" / "student-deployment.yaml").read_text(),
+        student_name,
+        "test-track",
+        "test-secret",
+        "",
+        launch_args(advisor_branch=advisor_branch),
+    )
+    configmap, deployment = yaml.safe_load_all(rendered)
+    student = deployment["spec"]["template"]["spec"]["containers"][0]
+
+    assert configmap["data"]["WANDB_TAGS"].split(",") == [
+        "senpai", advisor_branch, student_name
+    ]
+    assert {"configMapRef": {"name": configmap["metadata"]["name"]}} in student["envFrom"]
+
+
 def test_wandb_gateway_is_rendered_for_every_role():
     model = "wandb/zai-org/GLM-5.2"
     args = launch_args(
