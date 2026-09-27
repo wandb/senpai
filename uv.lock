@@ -2007,7 +2007,7 @@ wheels = [
 [[package]]
 name = "openhands-sdk"
 version = "1.40.0"
-source = { git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-sdk&rev=f69134273ee3a31a233d6201786570eb9c4c141b#f69134273ee3a31a233d6201786570eb9c4c141b" }
+source = { git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-sdk&rev=main#a956c40d1336dd9a761a47738cb8ed9638a9bd18" }
 dependencies = [
     { name = "agent-client-protocol", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "deprecation", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -2030,7 +2030,7 @@ dependencies = [
 [[package]]
 name = "openhands-tools"
 version = "1.40.0"
-source = { git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-tools&rev=f69134273ee3a31a233d6201786570eb9c4c141b#f69134273ee3a31a233d6201786570eb9c4c141b" }
+source = { git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-tools&rev=main#a956c40d1336dd9a761a47738cb8ed9638a9bd18" }
 dependencies = [
     { name = "binaryornot", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "browser-use", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -5281,8 +5281,8 @@ requires-dist = [
     { name = "ipython", marker = "extra == 'dev'" },
     { name = "matplotlib" },
     { name = "numpy" },
-    { name = "openhands-sdk", git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-sdk&rev=f69134273ee3a31a233d6201786570eb9c4c141b" },
-    { name = "openhands-tools", git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-tools&rev=f69134273ee3a31a233d6201786570eb9c4c141b" },
+    { name = "openhands-sdk", git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-sdk&rev=main" },
+    { name = "openhands-tools", git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-tools&rev=main" },
     { name = "psutil" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "python-dotenv" },
