@@ -116,15 +116,13 @@ def test_toolset_rejects_a_runtime_role_mismatch(tmp_path: Path):
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
-def test_both_roles_open_issues_with_configured_audience_and_inferred_mentions(
+def test_both_roles_open_issues_with_configured_audience_and_token_owner_mention(
     monkeypatch, tmp_path, role
 ):
     from senpai_agent.github.workflow import core
 
     fake = FakeGitHub(pull_request())
-    fake.collaborators = [
-        {"login": "ada", "type": "User", "permissions": {"push": True}}
-    ]
+    fake.actor_type = "User"
     monkeypatch.setattr(core, "UrllibTransport", lambda: fake)
     configure_github_credentials(
         "acme/widgets", SecretStr("github-secret"), trusted_actor="senpai-bot"
@@ -160,7 +158,7 @@ def test_both_roles_open_issues_with_configured_audience_and_inferred_mentions(
         "advisor-branch" if role == "advisor" else "student:fern",
     }
     assert f"{role.upper()}: Can we run another seed?" in created["body"]
-    assert created["body"].endswith("\n\n@ada")
+    assert created["body"].endswith("\n\n@senpai-bot")
     assert observation.state == "human_issue_created"
     assert observation.resource_url == "https://github.com/acme/widgets/issues/7"
     assert len(fake.mutations) == 1

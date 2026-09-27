@@ -1,16 +1,19 @@
 """Open research questions and reply to trusted human issue messages."""
 
 import json
+import re
 from hashlib import sha256
 from urllib.parse import quote, urlencode
 
 from senpai_agent.github.workflow.errors import (
+    GitHubAPIError,
+    GitHubTransportError,
     ReconciliationError,
     WorkflowPreconditionError,
 )
 from senpai_agent.github.workflow.responses import (
-    CollaboratorResponse,
     CreatedIssueResponse,
+    GitHubAuthor,
     MutationResult,
     validated_response,
 )
@@ -62,7 +65,7 @@ class HumanIssueMixin:
                     False, existing.html_url, "human_issue_created", issue_id
                 )
 
-            mentions = self._maintainer_mentions()
+            mentions = self._token_owner_mention()
             content = f"{body}\n\n{mentions}" if mentions else body
             rendered = role_prefixed_comment(marker_body(marker, content), self._role)
             labels = {"human", audience_label}
@@ -105,20 +108,22 @@ class HumanIssueMixin:
             )
         return matches[0] if matches else None
 
-    def _maintainer_mentions(self) -> str:
-        collaborators = (
-            validated_response(CollaboratorResponse, item, "repository collaborator")
-            for item in self._objects(
-                f"/repos/{self._repo}/collaborators?affiliation=all&per_page=100"
+    def _token_owner_mention(self) -> str:
+        """Mention a user token's owner; optional discovery never blocks a write."""
+
+        try:
+            response = self._request("GET", "/user", expected_statuses={200})
+            owner = validated_response(
+                GitHubAuthor, response.json_body, "token owner"
             )
-        )
-        # push includes write, maintain, admin, and custom roles with write access.
-        handles = {
-            collaborator.login.casefold()
-            for collaborator in collaborators
-            if collaborator.type == "User" and collaborator.permissions.push
-        }
-        return " ".join(f"@{handle}" for handle in sorted(handles))
+        except (GitHubAPIError, GitHubTransportError, ReconciliationError):
+            return ""
+        if (
+            owner.type != "User"
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,39}", owner.login)
+        ):
+            return ""
+        return f"@{owner.login}"
 
     def _issue_responder_key(self, responder: str) -> str:
         responder = responder.strip()
@@ -193,7 +198,7 @@ class HumanIssueMixin:
         if not senpai_opened:
             first_marker = self._first_issue_reply_marker(number)
             if first_marker == marker:
-                mentions = self._maintainer_mentions()
+                mentions = self._token_owner_mention()
                 if mentions:
                     body = f"{body}\n\n{mentions}"
         comment_body = marker_body(marker, body)
@@ -209,7 +214,7 @@ class HumanIssueMixin:
             and first_marker is None
             and self._first_issue_reply_marker(number) == marker
         ):
-            mentions = self._maintainer_mentions()
+            mentions = self._token_owner_mention()
             if mentions:
                 mentioned, verified = self._upsert_marker_comment(
                     number,

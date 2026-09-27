@@ -37,10 +37,12 @@ Provide a stable `issue_id`, a concise `title`, and the complete `body` without 
 role prefix. Reuse the same ID, title, and body if the call needs a retry. Changed
 content requires a new ID.
 
-The runtime adds `human` and your configured audience label. It infers human
-maintainers from the target repository's GitHub permissions and mentions them in
-the initial issue body. Do not add maintainer mentions yourself. Later replies
-do not repeat these automatic mentions.
+The runtime adds `human` and your configured audience label. It mentions the
+GitHub credential owner in the initial issue body when GitHub identifies that
+owner as a user account. This includes service accounts registered as ordinary
+users. Bot identities, tokens without a user identity, and failed lookups skip
+the mention without blocking issue creation. Do not add notification mentions
+yourself. Later replies do not repeat these automatic mentions.
 
 ```json
 {

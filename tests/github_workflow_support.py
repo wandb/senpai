@@ -184,17 +184,17 @@ class FakeGitHub:
         ignore_draft_mutations: bool = False,
         branch_heads: dict[str, str] | None = None,
         actor_login: str = "senpai-bot",
+        actor_type: str = "Bot",
     ):
         self.pr = pr
         self.comments = list(comments or [])
         self.issue = issue
-        self.collaborators: list[dict[str, object]] = []
-        self.collaborator_page_size = 100
         self.comment_page_size = comment_page_size
         self.ignore_label_mutations = ignore_label_mutations
         self.ignore_draft_mutations = ignore_draft_mutations
         self.branch_heads = branch_heads or {str(pr["base_ref"]): BASE_SHA}
         self.actor_login = actor_login
+        self.actor_type = actor_type
         self.requests: list[tuple[str, str, object | None, dict[str, str]]] = []
 
     @property
@@ -225,17 +225,9 @@ class FakeGitHub:
         labels_path = f"/repos/{REPO}/issues/7/labels"
 
         if method == "GET" and path == "/user":
-            return HttpResponse(200, {"login": self.actor_login})
-
-        if method == "GET" and path == f"/repos/{REPO}/collaborators":
-            page = int(parse_qs(parsed.query).get("page", ["1"])[0])
-            start = (page - 1) * self.collaborator_page_size
-            end = start + self.collaborator_page_size
-            response_headers = ()
-            if end < len(self.collaborators):
-                next_url = f"{API_URL}{path}?per_page=100&page={page + 1}"
-                response_headers = (("Link", f'<{next_url}>; rel="next"'),)
-            return HttpResponse(200, self.collaborators[start:end], response_headers)
+            return HttpResponse(
+                200, {"login": self.actor_login, "type": self.actor_type}
+            )
 
         if method == "GET" and path == pull_path:
             return HttpResponse(200, self._pull_payload())

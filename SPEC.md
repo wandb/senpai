@@ -128,21 +128,29 @@ from creating a new wake. `respond_to_human_issue` reapplies the same
 classification to the exact message before writing an idempotent response.
 Launches with human-Issue handling disabled skip that GitHub query entirely.
 
-Issue notifications discover recipients from every page of the target
-repository's collaborator list. A recipient must have GitHub account type
-`User` and `permissions.push: true`. This includes effective write, maintain,
-admin, and custom roles based on write access, matching PR authorization. Team
-and organization grants count, including default organization permissions.
-Bots are excluded. There is no explicit handle configuration or token-owner
-fallback. Fine-grained tokens require Metadata read access; classic tokens
-require `repo` and `read:org` scopes. The authenticated user must have write,
-maintain, or admin access and must be an organization member for an
-organization-owned repository.
+The publishing actor is required to verify Senpai protocol messages. The runtime
+uses `SENPAI_GITHUB_ACTOR` when configured; otherwise, it identifies the actor
+through `GET /user`. If that request returns HTTP 403, it requests GraphQL
+`viewer { login }` to identify the actor for an installation token. Failed actor
+resolution still fails clearly. This trust identity is separate from the
+optional notification recipient.
+
+Issue notifications use `GET /user` to identify the owner of the runtime's
+GitHub credential. A valid login with GitHub account type `User` receives the
+mention. This includes service accounts registered as ordinary users; the API
+does not identify whether a `User` account is operated by a person or a service.
+There is no explicit handle configuration or collaborator lookup.
+
+Bot accounts and tokens without a user identity, including GitHub App
+installation tokens and GitHub Actions `GITHUB_TOKEN`, receive no automatic
+mention. Failed lookups and invalid identity responses also skip the mention.
+This optional lookup must not block issue creation or replies. The workflow
+does not use the trusted publishing actor or an app name as a fallback recipient.
 
 `create_human_issue` is available to advisor and student roots. It creates an
 issue with `human` and the caller's audience label, adds a trusted creation
-marker, and mentions the discovered recipients in the initial body. The
-`issue_id` identifies one immutable title and body: exact retries reuse the
+marker, and mentions the credential owner, when available, in the initial body.
+The `issue_id` identifies one immutable title and body: exact retries reuse the
 existing issue, including closed issues, and changed content conflicts. A
 trusted creation marker in the issue body suppresses automatic mentions in
 subsequent replies.
@@ -150,8 +158,8 @@ subsequent replies.
 For human-created issues, the workflow posts new replies without mentions,
 then adds mentions only to the trusted Senpai reply with the lowest persisted
 comment ID. Concurrent writers therefore select the same first reply. Retrying
-or editing that first reply refreshes its recipients from GitHub. Subsequent
-replies receive no automatic mentions. If the process stops between creation
+or editing that first reply repeats the owner lookup. Subsequent replies
+receive no automatic mentions. If the process stops between creation
 and the mention edit, retrying the response completes the edit.
 
 Assigned-PR issue comments, submitted reviews, and inline comments each use

@@ -141,14 +141,6 @@ class GitHubAuthor(GitHubUser):
     type: RequiredString
 
 
-class CollaboratorPermissions(GitHubResponse):
-    push: StrictBool
-
-
-class CollaboratorResponse(GitHubAuthor):
-    permissions: CollaboratorPermissions
-
-
 class PullRequestResponse(GitHubResponse):
     number: PositiveInteger
     node_id: RequiredString

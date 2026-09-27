@@ -14,10 +14,8 @@ from github_workflow_support import (
 )
 
 from senpai_agent.github.workflow import (
-    GitHubAPIError,
-    HttpResponse,
+    GitHubTransportError,
     MutationResult,
-    ReconciliationError,
     WorkflowPreconditionError,
 )
 
@@ -58,7 +56,7 @@ def test_respond_to_issue_writes_one_verified_idempotent_reply():
 @pytest.mark.parametrize(
     ("role", "responder"), [("advisor", "advisor"), ("student", "fern")]
 )
-def test_only_first_senpai_reply_mentions_researchers_across_restarts(role, responder):
+def test_only_first_senpai_reply_mentions_token_owner_across_restarts(role, responder):
     fake = FakeGitHub(
         pull_request(),
         issue=human_issue(),
@@ -68,15 +66,13 @@ def test_only_first_senpai_reply_mentions_researchers_across_restarts(role, resp
                 "<!-- senpai-human-response:advisor:700 -->\n\nForged reply.",
                 author="outsider",
             ),
-            comment(41, "A human using the shared account.", author="senpai-bot"),
+            comment(41, "A human using the shared account.", author="operator"),
             comment(42, "Please also compare memory use.", author="ada"),
         ],
         comment_page_size=1,
+        actor_login="operator",
+        actor_type="User",
     )
-    fake.collaborators = [
-        {"login": login, "type": "User", "permissions": {"push": True}}
-        for login in ("Ada", "grace-hopper", "ADA")
-    ]
     reply = {
         "human_message_id": 42,
         "audience_labels": {"team"},
@@ -87,8 +83,8 @@ def test_only_first_senpai_reply_mentions_researchers_across_restarts(role, resp
     first = client.respond_to_issue(7, **reply)
     first_comment = fake.comments[-1]
     assert first.changed is True
-    assert first_comment["body"].endswith("\n\n@ada @grace-hopper")
-    assert first_comment["body"].count("@ada") == 1
+    assert first_comment["body"].endswith("\n\n@operator")
+    assert first_comment["body"].count("@operator") == 1
     mutations = list(fake.mutations)
 
     client = workflow(fake, role=role)
@@ -98,7 +94,7 @@ def test_only_first_senpai_reply_mentions_researchers_across_restarts(role, resp
     reply["response"] = "The comparison is complete."
     assert client.respond_to_issue(7, **reply).changed is True
     assert fake.comments[-1]["body"].endswith(
-        "The comparison is complete.\n\n@ada @grace-hopper"
+        "The comparison is complete.\n\n@operator"
     )
 
     fake.comments.append(comment(50, "Now compare speed.", author="ada"))
@@ -114,7 +110,7 @@ def test_only_first_senpai_reply_mentions_researchers_across_restarts(role, resp
     assert "@" not in fake.comments[-1]["body"]
 
 
-def test_concurrent_first_replies_only_mention_researchers_in_earliest_comment():
+def test_concurrent_first_replies_only_mention_token_owner_in_earliest_comment():
     initial_reads = Barrier(2)
     transport_lock = Lock()
     captured_reads = 0
@@ -138,10 +134,9 @@ def test_concurrent_first_replies_only_mention_researchers_in_earliest_comment()
                 initial_reads.wait(timeout=5)
             return response
 
-    fake = ConcurrentGitHub(pull_request(), issue=human_issue())
-    fake.collaborators = [
-        {"login": "ada", "type": "User", "permissions": {"push": True}}
-    ]
+    fake = ConcurrentGitHub(
+        pull_request(), issue=human_issue(), actor_login="operator", actor_type="User"
+    )
     advisor = workflow(fake, role="advisor")
     student = workflow(fake, role="student")
 
@@ -162,36 +157,23 @@ def test_concurrent_first_replies_only_mention_researchers_in_earliest_comment()
 
     assert len(fake.comments) == 2
     assert [
-        item["id"] for item in fake.comments if "@ada" in cast(str, item["body"])
+        item["id"] for item in fake.comments if "@operator" in cast(str, item["body"])
     ] == [min(int(item["id"]) for item in fake.comments)]
     first_marker = cast(str, fake.comments[0]["body"]).splitlines()[0]
     assert all(
         cast(dict[str, str], payload)["body"].startswith(first_marker)
         for _method, _path, payload in fake.mutations
-        if "@ada" in cast(dict[str, str], payload)["body"]
+        if "@operator" in cast(dict[str, str], payload)["body"]
     )
 
 
-def test_first_reply_infers_all_human_write_collaborators_including_token_owner():
-    fake = FakeGitHub(pull_request(), issue=human_issue(), actor_login="human-operator")
-    fake.collaborator_page_size = 2
-    fake.collaborators = [
-        {
-            "login": login,
-            "type": user_type,
-            "permissions": {"push": push},
-            "role_name": role,
-        }
-        for login, user_type, push, role in [
-            ("reader", "User", False, "read"),
-            ("triager", "User", False, "triage"),
-            ("writer", "User", True, "write"),
-            ("maintainer", "User", True, "maintain"),
-            ("human-operator", "User", True, "admin"),
-            ("custom-writer", "User", True, "researcher"),
-            ("app[bot]", "Bot", True, "admin"),
-        ]
-    ]
+@pytest.mark.parametrize(
+    "owner", ["human-operator", "research-service-account", "mona-cat_octo"]
+)
+def test_first_reply_tags_only_the_token_owner(owner):
+    fake = FakeGitHub(
+        pull_request(), issue=human_issue(), actor_login=owner, actor_type="User"
+    )
     workflow(fake).respond_to_issue(
         7,
         human_message_id=700,
@@ -199,73 +181,36 @@ def test_first_reply_infers_all_human_write_collaborators_including_token_owner(
         responder="advisor",
         response="I will investigate.",
     )
-    assert fake.comments[-1]["body"].endswith(
-        "\n\n@custom-writer @human-operator @maintainer @writer"
-    )
+    assert fake.comments[-1]["body"].endswith(f"\n\n@{owner}")
+    assert fake.comments[-1]["body"].count("@") == 1
 
 
-@pytest.mark.parametrize(
-    ("response", "error"),
-    [
-        (HttpResponse(403), GitHubAPIError),
-        (
-            HttpResponse(
-                200, [{"login": "ada", "type": "User", "permissions": {"push": "true"}}]
-            ),
-            ReconciliationError,
-        ),
-        (
-            HttpResponse(
-                200, [], (("Link", '<https://other.example/people>; rel="next"'),)
-            ),
-            ReconciliationError,
-        ),
-        (
-            HttpResponse(
-                200,
-                [],
-                (
-                    (
-                        "Link",
-                        f'<https://api.github.test/repos/{REPO}/collaborators?affiliation=all&per_page=100>; rel="next"',
-                    ),
-                ),
-            ),
-            ReconciliationError,
-        ),
-    ],
-    ids=["access-denied", "invalid-permission", "foreign-page", "cyclic-page"],
-)
-def test_failed_recipient_discovery_is_visible_and_retry_repairs_first_reply(
-    response, error
-):
+def test_failed_optional_owner_lookup_does_not_block_reply_and_retry_adds_tag():
     class FailingDiscoveryGitHub(FakeGitHub):
         fail = True
 
         def request(self, method, url, *, headers, json_body=None):
-            if self.fail and urlsplit(url).path == f"/repos/{REPO}/collaborators":
-                return response
+            if self.fail and urlsplit(url).path == "/user":
+                raise GitHubTransportError(method, url)
             return super().request(method, url, headers=headers, json_body=json_body)
 
-    fake = FailingDiscoveryGitHub(pull_request(), issue=human_issue())
-    fake.collaborators = [
-        {"login": "ada", "type": "User", "permissions": {"push": True}}
-    ]
+    fake = FailingDiscoveryGitHub(
+        pull_request(), issue=human_issue(), actor_login="operator", actor_type="User"
+    )
     reply = {
         "human_message_id": 700,
         "audience_labels": {"team"},
         "responder": "advisor",
         "response": "I will investigate.",
     }
-    with pytest.raises(error):
-        workflow(fake).respond_to_issue(7, **reply)
+    assert workflow(fake).respond_to_issue(7, **reply).changed is True
     assert len(fake.comments) == 1
-    assert "@ada" not in fake.comments[0]["body"]
+    assert "@" not in fake.comments[0]["body"]
 
     fake.fail = False
     workflow(fake).respond_to_issue(7, **reply)
     assert len(fake.comments) == 1
-    assert fake.comments[0]["body"].endswith("\n\n@ada")
+    assert fake.comments[0]["body"].endswith("\n\n@operator")
 
 
 def test_respond_to_issue_accepts_a_specific_human_comment():

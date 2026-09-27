@@ -64,7 +64,7 @@ WANDB_API_KEY=
 
 | Credential | Required access |
 |---|---|
-| `GITHUB_TOKEN` | Target-repository Contents, Pull requests, and Issues read/write, plus Metadata read. Classic tokens need `repo` and `read:org` scopes. Collaborator discovery requires write, maintain, or admin access; for organization repositories, the authenticated user must also be an organization member. GitHub CLI authentication is the fallback when this value is absent. |
+| `GITHUB_TOKEN` | Target-repository Contents, Pull requests, and Issues read/write. A classic token with `repo` scope also works. GitHub CLI authentication is the fallback when this value is absent. |
 | `ANTHROPIC_API_KEY` | Required when an `anthropic/...` model is configured. Every default profile uses Anthropic. |
 | `OPENAI_API_KEY` | Required when an `openai/...` model is configured. |
 | `EXA_API_KEY` | General-web and publication search through the credential-isolated `exa_search` tool. |
@@ -764,27 +764,39 @@ Useful launch controls:
 - `--extra_instructions` accepts optional human operator guidance as a Markdown file or literal user context.
 - `human_issues: false` disables GitHub Issue polling for isolated launches.
 
-Senpai discovers issue notification recipients from the target repository's
-[GitHub collaborators](https://docs.github.com/en/rest/collaborators/collaborators#list-repository-collaborators).
-It reads every page and selects human users with effective write, maintain, or
-admin access, including custom roles based on write access. This matches the
-write access required for PR authorization. Inherited team and organization
-access counts, so an organization with default write access can have many
-recipients. Bots are excluded. No handle configuration is required, and the
-token owner is not used as a fallback.
+Senpai uses GitHub's `GET /user` endpoint to identify the owner of its GitHub
+credential and mentions that account in issue notifications. It assumes this
+account runs the research. An account with GitHub type `User` qualifies, including
+a service account registered as an ordinary user. GitHub does not distinguish
+those service accounts from personal accounts in this response. No handle
+configuration or collaborator lookup is required.
+GitHub controls alert delivery through your
+[notification settings](https://docs.github.com/en/subscriptions-and-notifications/get-started/configuring-notifications#customizing-your-email-notifications),
+including whether to email you about your own activity.
+
+Bot accounts and tokens without a user identity, such as GitHub App installation
+tokens and GitHub Actions `GITHUB_TOKEN`, receive no automatic mention. If the
+owner lookup fails or returns an invalid identity, Senpai skips the mention and
+continues creating the issue or reply.
+
+Senpai identifies its publishing account separately so it can recognize its
+own protocol messages. It honors `SENPAI_GITHUB_ACTOR` when configured. Otherwise,
+it uses `GET /user`, then GraphQL `viewer { login }` if that request returns
+HTTP 403. This supports publishing with installation tokens without using the
+publishing bot as a notification recipient.
 
 Advisor and student roots can open an issue with
 `create_human_issue(issue_id, title, body)`. The runtime adds the `human` label
-and the caller's audience label, then mentions the discovered recipients in the
-initial issue body. Reusing the same `issue_id` and content returns the existing
-issue, even if it is closed; changed content requires a new ID. Replies to an
-issue with a trusted Senpai creation marker receive no automatic mentions.
+and the caller's audience label, then mentions the credential owner, when
+available, in the initial issue body. Reusing the same `issue_id` and content
+returns the existing issue, even if it is closed; changed content requires a new
+ID. Replies to an issue with a trusted Senpai creation marker receive no
+automatic mentions.
 
 For human-created issues, the runtime adds mentions only to the earliest saved
 Senpai reply. It posts replies first, then selects the lowest comment ID so
 concurrent replies from different pods agree. Retrying or editing that first
-reply refreshes its recipients from GitHub; later replies receive no automatic
-mentions.
+reply repeats the owner lookup; later replies receive no automatic mentions.
 
 All role images are built from the same source revision. The advisor image excludes CUDA and PyTorch; the student image contains the CUDA/PyTorch runtime; the executor image contains only its Python broker; the cutoff image contains only the minimal job runtime and pinned `kubectl`. Advisor and student builds install Chromium and execute an OpenHands browser smoke test.
 
