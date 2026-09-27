@@ -524,26 +524,48 @@ def test_launch_accepts_anthropic_max_for_every_model_profile():
     launch.validate_model_config(args)
 
 
-@pytest.mark.parametrize(
-    ("advisor_branch", "student_name"),
-    [("schmidhuber", "fern"), ("noam", "track-frieren")],
-)
-def test_student_wandb_tags_identify_senpai_and_both_agents(advisor_branch, student_name):
-    rendered = launch.render_student(
-        (ROOT / "k8s" / "student-deployment.yaml").read_text(),
-        student_name,
-        "test-track",
-        "test-secret",
-        "",
-        launch_args(advisor_branch=advisor_branch),
+@pytest.mark.parametrize("nodes_per_student", [1, 2])
+def test_each_student_receives_only_its_own_wandb_tag(nodes_per_student):
+    result = run_launch(
+        "--names", "fern,frieren",
+        "--student_prefix", "track",
+        "--advisor_branch", "noam",
+        "--nodes_per_student", str(nodes_per_student),
+        "--senpai_repo_revision", REVISION,
+        "--advisor_image", ADVISOR_IMAGE,
+        "--student_image", STUDENT_IMAGE,
+        "--executor_image", f"ghcr.io/wandb/senpai-executor@sha256:{'b' * 64}",
     )
-    configmap, deployment = yaml.safe_load_all(rendered)
-    student = deployment["spec"]["template"]["spec"]["containers"][0]
 
-    assert configmap["data"]["WANDB_TAGS"].split(",") == [
-        "senpai", advisor_branch, student_name
+    assert result.returncode == 0, result.stderr
+    rendered = re.sub(r"^--- .+ ---$", "---", result.stdout, flags=re.MULTILINE)
+    documents = [
+        document for document in yaml.safe_load_all(rendered)
+        if isinstance(document, dict)
     ]
-    assert {"configMapRef": {"name": configmap["metadata"]["name"]}} in student["envFrom"]
+    configmaps = {
+        document["metadata"]["name"]: document["data"]
+        for document in documents if document.get("kind") == "ConfigMap"
+    }
+    students = {
+        document["metadata"]["labels"]["student"]: document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document["metadata"]["labels"]["role"] == "student"
+    }
+
+    assert set(students) == {"track-fern", "track-frieren"}
+    for student_name, deployment in students.items():
+        for container in deployment["spec"]["template"]["spec"]["containers"]:
+            environment = {}
+            for source in container["envFrom"]:
+                environment.update(configmaps[source["configMapRef"]["name"]])
+            environment.update({
+                item["name"]: item.get("value") for item in container.get("env", [])
+            })
+            assert environment["WANDB_TAGS"].split(",") == [
+                "senpai", "noam", student_name
+            ]
 
 
 def test_wandb_gateway_is_rendered_for_every_role():
