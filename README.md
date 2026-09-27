@@ -27,9 +27,9 @@ Kubernetes is currently the turnkey deployment path. The GitHub-based coordinati
 - Python 3.13, [uv](https://docs.astral.sh/uv/), Git, and `kubectl`.
 - A Kubernetes context and existing namespace with outbound access to GitHub, Anthropic, Exa, and W&B. Your identity must be able to manage Deployments, ConfigMaps, Secrets, ServiceAccounts, Roles, and RoleBindings there.
 - An existing PVC with enough space for the dataset, plus concurrent mounts from every scheduled node—normally `ReadWriteMany`, unless your storage driver explicitly supports another multi-node topology. The launcher mounts this claim but does not create it; role state stays on each pod's node-local `emptyDir` volume.
-- NVIDIA GPU nodes, the Kubernetes NVIDIA device plugin, and a host driver compatible with CUDA 13 and the shipped student image.
+- NVIDIA GPU nodes, the Kubernetes NVIDIA device plugin, and a host driver compatible with the selected training image (CUDA 13 for the shipped student image).
 - A target GitHub repository that Senpai can clone and modify.
-- Immutable advisor and student images reachable by every cluster node. Multi-node students also require the matching executor image.
+- Immutable advisor and student images reachable by every cluster node. Remote training also requires the matching executor image.
 
 ### 2. Install Senpai
 
@@ -172,9 +172,9 @@ max_epochs: 50
 When upgrading an existing launch configuration, replace `gpus_per_student: N`
 with `nodes_per_student: 1` and `gpus_per_student_node: N`. Replace the
 `--gpus_per_student N` CLI option with `--gpus_per_student_node N` as well. The
-old key and option are no longer accepted. Single-node students continue to
-train in their own GPU pod; more than one node enables remote supervised
-training and requires an executor image.
+old key and option are no longer accepted. Without a custom `training_image`,
+single-node students train in their own GPU pod. More than one node or a custom
+training image enables remote supervised training and requires an executor image.
 
 OpenHands uses LiteLLM, so LLM provider names are required as prefixes. For
 example, configure Claude Opus 5.5 as `anthropic/claude-opus-5-5`. Anthropic
@@ -190,7 +190,7 @@ uses `WANDB_API_KEY` for auth.
 
 The defaults in `senpai.yaml` describe W&B's deployment and should not be copied unchanged into another environment. Every setting can also be overridden on the command line. `--tag` and `--target_repo_url` are required unless your chosen config file supplies them.
 
-Deployments require matching advisor and student image digests, or `sha-<40-character-commit>` tags built from the same SENPAI revision. Multi-node launches require an `executor_image` pinned by `@sha256` digest because that sidecar owns the scoped Kubernetes credential. Digest-pinned images also require the full matching `senpai_repo_revision`. The source commit must be fetchable from `senpai_repo_url`; its public default is read-only and needs no PR permission. Override it only when using images built from another SENPAI repository. `target_repo_url` is the separate, required repository where agents create commits and PRs.
+Deployments require advisor and student images built from the same SENPAI revision, pinned by digest or `sha-<40-character-commit>` tag. Remote training requires an `executor_image` pinned by `@sha256` digest because that sidecar owns the scoped Kubernetes credential. Digest-pinned Senpai images also require the full matching `senpai_repo_revision`. The source commit must be fetchable from `senpai_repo_url`; its public default is read-only and needs no PR permission. Override it only when using images built from another SENPAI repository. `target_repo_url` is the separate, required repository where agents create commits and PRs.
 
 ### 6. Run preflight
 
@@ -242,7 +242,7 @@ a shared writable PVC. Each student controller remains CPU-only and may
 supervise one workload at a time. Before submission, Senpai publishes the clean assignment `HEAD` as a
 per-student Git bundle on the PVC. The target launcher submits one MPIJob using
 the generated identity and configured worker shape. See the
-[target launcher contract](#multi-node-target-launcher-contract) for the exact
+[target launcher contract](#remote-training-launcher-contract) for the exact
 inputs and manifest requirements.
 
 Only the executor sidecar receives a projected Kubernetes token. Its socket
@@ -295,6 +295,70 @@ instead of disappearing silently. These reads stay inside the executor broker;
 students receive neither Kubernetes credentials nor namespace-wide read access.
 When a smoke run stalls before W&B starts, inspect these diagnostics first.
 
+### Bring your own training image
+
+Set `training_image` to run training in your own container while Senpai supplies
+the student agent and executor. Your image keeps its Python, CUDA, and installed
+dependencies; it does not need Senpai, OpenHands, or Git. Use a Linux image that
+supports your worker architecture, GPU driver, and training command. Multi-node
+images must also provide the MPI runtime required by their target launcher.
+
+Any registry reachable by the cluster works, including GitHub Container Registry,
+Docker Hub, and CoreWeave Container Registry. Supply an immutable digest:
+
+```yaml
+# Add to senpai.local.yaml alongside the Senpai role images and source revision.
+training_image: ghcr.io/OWNER/training@sha256:<manifest-digest>
+executor_image: ghcr.io/wandb/senpai-executor@sha256:<manifest-digest>
+image_pull_secrets: [training-registry]
+```
+
+For Docker Hub, use `docker.io/OWNER/training@sha256:<manifest-digest>`.
+For CoreWeave, use the full image repository at your registry endpoint with
+`@sha256:<manifest-digest>`. The training image has no Senpai revision requirement.
+`student_image` still selects the Senpai agent runtime.
+
+Create any private-registry pull secrets in the launch namespace before launch,
+following the [Kubernetes registry credential instructions](https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/).
+`image_pull_secrets` lists their names. Senpai attaches these references to its
+pods and remote training pods; agents cannot select other pull secrets. Omit
+the list for public images or when cluster-managed authentication suffices.
+
+To publish a local Dockerfile, log in to the destination registry with Docker,
+then run:
+
+```bash
+training_image=$(python3.13 scripts/publish-training-image.py \
+  --dockerfile ./training/Dockerfile \
+  --tag ghcr.io/OWNER/training:experiment)
+```
+
+The build context defaults to the Dockerfile's directory; use `--context .`
+when needed. The helper builds for `linux/amd64` by default, pushes the image,
+and prints its digest reference. Set `--platform` to match other worker
+architectures. Docker with Buildx is required.
+
+For a local archive created by `docker image save`, select a tag stored in it:
+
+```bash
+training_image=$(python3.13 scripts/publish-training-image.py \
+  --archive ./training.tar --archive-image training:local \
+  --tag ghcr.io/OWNER/training:experiment)
+```
+
+The archive path requires Docker API 1.48 or later. Both commands use Docker's
+registry credentials and publish to the explicit `--tag` destination. Use the
+returned value as `--training_image "$training_image"`. A cluster cannot pull
+a Dockerfile or archive directly from your laptop.
+
+Custom-image launches use a CPU student controller and separate GPU pods:
+one-node runs submit a Kubernetes Job; multi-node runs submit an MPIJob. The
+student terminal stays in Senpai's environment. `run_training` executes a
+target-owned submitter, which follows the
+[remote training launcher contract](#remote-training-launcher-contract).
+Commit training code before running it; Senpai checks out that exact commit in
+the training pod. An empty `training_image` keeps the existing training behavior.
+
 ### Advisory cluster capacity
 
 Add `--capacity_observer true` to install a dedicated observer. It uses the same
@@ -316,8 +380,9 @@ The observed worker shape comes from `--nodes_per_student`,
 `--capacity_node_selector key=value ...` and
 `--capacity_tolerations '{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}'`
 to describe the intended workers. These options affect observation only; they do
-not change training manifests. Omitted tolerations inherit the single-node
-student's GPU toleration; multi-node observation defaults to no tolerations.
+not change training manifests. Omitted tolerations inherit the GPU toleration
+for local single-node training. Remote training observation defaults to no
+tolerations; configure these to match the submitted workers.
 Explicit tolerations replace these defaults. Use `capacity_tolerations: []` in
 YAML or `--capacity_tolerations` without values for an empty override. Enable
 `--capacity_hpc_verification true` only where the operator confirms CoreWeave's
@@ -370,7 +435,7 @@ uses the last durable record and the existing workload UID. A terminal decision
 that could not be persisted cannot survive process loss, so broker deadlines
 and normal recovery rules still apply.
 
-The launcher creates routing labels, a launch credential Secret, a separate immutable program-context Secret, role ConfigMaps, and Deployments. Multi-node students also receive one namespaced ServiceAccount, Role, and RoleBinding. It does not create the namespace, PVC, Service, or cluster-wide RBAC.
+The launcher creates routing labels, a launch credential Secret, a separate immutable program-context Secret, role ConfigMaps, and Deployments. Students using remote training also receive one namespaced ServiceAccount, Role, and RoleBinding. It does not create the namespace, PVC, Service, or cluster-wide RBAC.
 
 Student launches are create-only. Before the first write, the launcher rejects
 an existing student Deployment, any matching controller Pod, or any matching
@@ -523,11 +588,13 @@ OpenHands browser operations and records the choice in conversation state so a
 resumed conversation restores them. `--no-browser` exposes neither the loader
 nor the browser family.
 
-### Multi-node target launcher contract
+### Remote training launcher contract
 
-With `nodes_per_student > 1`, `run_training` executes a target-owned submitter.
-It must submit one `kubeflow.org/v2beta1` MPIJob through `kubectl apply -f -`
-and exit. The supervisor provides these authoritative environment values:
+With `nodes_per_student > 1` or a configured `training_image`, `run_training`
+executes a target-owned submitter. It must submit one `batch/v1` Job for one node
+or one `kubeflow.org/v2beta1` MPIJob for multiple nodes through
+`kubectl apply -f -`, then exit. A one-node launch does not require the MPIJob API.
+The supervisor provides these authoritative environment values:
 
 | Variable | Use in the target launcher |
 |---|---|
@@ -542,10 +609,16 @@ not automatically become environment variables inside the submitted pods.
 
 | Variables | Manifest requirement |
 |---|---|
-| `NODES_PER_STUDENT`, `GPUS_PER_STUDENT_NODE` | Use one Launcher replica without GPUs, `NODES_PER_STUDENT` Worker replicas, and `slotsPerWorker: GPUS_PER_STUDENT_NODE`. Both roles use `restartPolicy: Never`. |
+| `NODES_PER_STUDENT`, `GPUS_PER_STUDENT_NODE` | A one-node Job uses `parallelism: 1`, `completions: 1`, and pod `restartPolicy: Never`. An MPIJob uses one Launcher replica without GPUs, `NODES_PER_STUDENT` Worker replicas, and `slotsPerWorker: GPUS_PER_STUDENT_NODE`. Both MPI roles use `restartPolicy: Never`. |
 | `CPU_PER_STUDENT_GPU`, `MEMORY_GI_PER_STUDENT_GPU` | Each worker requests exactly GPUs-per-worker times these CPU and memory amounts, plus the configured GPUs. Launcher CPU and memory may not exceed one GPU's share. Every container declares equal CPU/memory requests and limits; worker GPU requests and limits also match. Only `cpu`, `memory`, and `nvidia.com/gpu` resource keys are supported. |
-| `PVC_CLAIM_NAME`, `PVC_MOUNT_PATH` | Both pod templates declare exactly one volume for the configured dataset PVC, which supplies the source bundle to the injected checkout. GPU containers also mount that PVC writable. The snapshot resides beneath the configured mount path. |
+| `PVC_CLAIM_NAME`, `PVC_MOUNT_PATH` | Each pod template declares exactly one volume for the configured dataset PVC, which supplies the source bundle to the injected checkout. GPU containers also mount that PVC writable. The snapshot resides beneath the configured mount path. |
 | `WANDB_ENTITY`, `WANDB_PROJECT` | Pass the configured destination to every container that reports W&B metrics. |
+| `SENPAI_TRAINING_IMAGE` | When set, the executor uses this image for every main container, including the MPI launcher. Otherwise the target selects its images. |
+
+Do not include `imagePullSecrets` in submitted pod specifications. The executor
+injects only the operator-configured names, including for its source-checkout
+init container. Put the training command and working directory in the manifest;
+the source checkout is mounted at `/workspace`.
 
 Declare `WANDB_API_KEY` in reporting main containers, including the MPI
 launcher when it reports metrics. The broker replaces that entry with the
@@ -562,7 +635,7 @@ preserved, except for Senpai ownership labels and the reserved
 and [network policies](https://kubernetes.io/docs/concepts/services-networking/network-policies/#the-networkpolicy-resource).
 Operators must not treat target-controlled labels as a trust boundary.
 Use cluster admission policies to enforce node-pool restrictions.
-The broker adds required hostname anti-affinity
+For multi-node runs, the broker adds required hostname anti-affinity
 that selects only this run's worker pods. Preserved target affinity rules still
 apply and may also constrain launcher placement.
 

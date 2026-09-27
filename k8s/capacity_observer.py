@@ -11,6 +11,7 @@ def render_capacity_observer(
     tag: str,
     namespace: str,
     image: str,
+    image_pull_secrets: list[str],
     revision: str,
     config: dict,
     node_selector: dict[str, str],
@@ -99,6 +100,7 @@ def render_capacity_observer(
                     "spec": {
                         "serviceAccountName": name,
                         "automountServiceAccountToken": False,
+                        "imagePullSecrets": [{"name": name} for name in image_pull_secrets],
                         "nodeSelector": node_selector,
                         "securityContext": {
                             "runAsNonRoot": True,

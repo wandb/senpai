@@ -36,6 +36,7 @@ spec:
     spec:
       serviceAccountName: {{STUDENT_SERVICE_ACCOUNT_NAME}}
       automountServiceAccountToken: false
+      imagePullSecrets: {{IMAGE_PULL_SECRETS}}
       terminationGracePeriodSeconds: 90
       securityContext:
         runAsNonRoot: true

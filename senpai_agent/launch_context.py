@@ -78,6 +78,7 @@ def render_launch_context(
     advisor_branch: str,
     target_base: str,
     students: list[str],
+    training_image: str = "",
 ) -> str:
     """Render authoritative runtime and isolation rules."""
 
@@ -91,6 +92,12 @@ def render_launch_context(
             "BACKEND": backend,
             "NODES_PER_STUDENT": str(nodes_per_student),
             "GPUS_PER_STUDENT_NODE": str(gpus_per_student_node),
+            "TRAINING_EXECUTION": (
+                "remote Kubernetes MPIJob" if nodes_per_student > 1
+                else "remote Kubernetes Job" if training_image
+                else "local process in the student pod"
+            ),
+            "TRAINING_IMAGE": training_image or "default (selected by the target for remote training)",
             "TIMEOUT_MINUTES": f"{timeout_minutes:g}",
             "MAX_EPOCHS": str(max_epochs),
             "TAG": tag,

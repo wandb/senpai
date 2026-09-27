@@ -128,7 +128,11 @@ class Args:
     )
     advisor_image: str = ""  # advisor source-SHA tag or image digest — REQUIRED
     student_image: str = ""  # student source-SHA tag or image digest — REQUIRED
-    executor_image: str = ""  # immutable broker image; required for multi-node students or the capacity observer
+    training_image: str = ""  # optional digest-pinned image for training in separate GPU workers
+    executor_image: str = ""  # immutable broker image; required for remote training or the capacity observer
+    image_pull_secrets: list[str] = field(
+        default_factory=list
+    )  # existing registry credential secrets in the launch namespace
     kube_context: str = ""  # kubectl context; empty uses the current context
     namespace: str = "default"  # Kubernetes namespace for all launch resources
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
@@ -174,6 +178,10 @@ class Args:
     preflight_only: bool = (
         False  # validate credentials/access only: do not render or apply manifests
     )
+
+    @property
+    def remote_training(self) -> bool:
+        return self.nodes_per_student > 1 or bool(self.training_image)
 
 
 MODEL_PROVIDERS = {
@@ -436,6 +444,7 @@ def build_launch_context(
         advisor_branch=args.advisor_branch,
         target_base=args.target_repo_branch,
         students=student_list,
+        training_image=args.training_image,
     )
 
 
@@ -499,7 +508,7 @@ def load_launch_program_snapshot(
 
 
 def _student_resources(args: Args) -> str:
-    if args.nodes_per_student > 1:
+    if args.remote_training:
         return json.dumps(
             {
                 "requests": {"cpu": "2", "memory": "8Gi"},
@@ -515,7 +524,7 @@ def _student_resources(args: Args) -> str:
 
 
 def _student_tolerations(args: Args) -> list[dict]:
-    if args.nodes_per_student > 1:
+    if args.remote_training:
         return []
     return [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}]
 
@@ -528,7 +537,7 @@ def _yaml_list_insertion(value: dict, indentation: int) -> str:
 
 
 def _executor_socket_mount(args: Args) -> str:
-    if args.nodes_per_student == 1:
+    if not args.remote_training:
         return ""
     return _yaml_list_insertion(
         {
@@ -568,7 +577,7 @@ def _executor_container(
     secret_name: str,
     configmap_name: str,
 ) -> str:
-    if args.nodes_per_student == 1:
+    if not args.remote_training:
         return ""
     return _yaml_list_insertion(
         {
@@ -630,7 +639,7 @@ def _executor_container(
 
 
 def _executor_volumes(args: Args) -> str:
-    if args.nodes_per_student == 1:
+    if not args.remote_training:
         return ""
     volumes = [
         {"name": "executor-socket", "emptyDir": {}},
@@ -796,6 +805,8 @@ def render_student(
                 "/var/lib/senpai-executor/reservation.json"
             ),
             "SENPAI_EXECUTOR_IMAGE": args.executor_image,
+            "SENPAI_TRAINING_IMAGE": args.training_image,
+            "SENPAI_IMAGE_PULL_SECRETS": json.dumps(args.image_pull_secrets),
             "SENPAI_MAX_TRAINING_TIMEOUT_SECONDS": str(
                 round(args.timeout_minutes * 60)
             ),
@@ -813,6 +824,9 @@ def render_student(
             "STUDENT_NAME": student_name,
             "RESEARCH_TAG": tag,
             "STUDENT_IMAGE": args.student_image,
+            "IMAGE_PULL_SECRETS": json.dumps(
+                [{"name": name} for name in args.image_pull_secrets]
+            ),
             "EXECUTOR_IMAGE": args.executor_image,
             "ADVISOR_BRANCH": args.advisor_branch,
             "PVC_CLAIM_NAME": args.pvc_claim_name,
@@ -822,13 +836,13 @@ def render_student(
             "PROGRAM_CONTEXT_SECRET_NAME": program_secret_name,
             "STUDENT_SERVICE_ACCOUNT_NAME": (
                 f"senpai-training-{tag}-{student_name}"
-                if args.nodes_per_student > 1
+                if args.remote_training
                 else "default"
             ),
             "STUDENT_RESOURCES": _student_resources(args),
             "STUDENT_NODE_SELECTOR": json.dumps(
                 controller_node_selector(args.controller_node_selector)
-                if args.nodes_per_student > 1
+                if args.remote_training
                 else {}
             ),
             "STUDENT_TOLERATIONS": json.dumps(_student_tolerations(args)),
@@ -853,7 +867,7 @@ def render_student(
         },
     )
     documents = [configmap]
-    if args.nodes_per_student > 1:
+    if args.remote_training:
         documents.append(_student_training_access(student_name, tag, args.namespace))
     documents.append(deployment)
     return "\n---\n".join(documents)
@@ -925,6 +939,9 @@ def render_advisor(
             "ADVISOR_CONFIGMAP_NAME": advisor_configmap_name,
             "RESEARCH_TAG": tag,
             "ADVISOR_IMAGE": args.advisor_image,
+            "IMAGE_PULL_SECRETS": json.dumps(
+                [{"name": name} for name in args.image_pull_secrets]
+            ),
             "PVC_CLAIM_NAME": args.pvc_claim_name,
             "PVC_MOUNT_PATH": json.dumps(args.pvc_mount_path),
             "TARGET_WORKSPACE_MOUNT": json.dumps(target_workspace_mount),
@@ -1010,11 +1027,13 @@ def main():
     except ValueError as error:
         sys.exit(f"ERROR: {error}")
     if not args.preflight_only:
+        if args.training_image and not is_digest_image_reference(args.training_image):
+            sys.exit("ERROR: --training_image must use an immutable @sha256 digest")
         role_images = [
             ("advisor", args.advisor_image),
             ("student", args.student_image),
         ]
-        if args.nodes_per_student > 1 or args.capacity_observer:
+        if args.remote_training or args.capacity_observer:
             role_images.append(("executor", args.executor_image))
         for role, image in role_images:
             if role == "executor" and not is_digest_image_reference(image):
@@ -1274,6 +1293,7 @@ def main():
             tag=args.tag,
             namespace=args.namespace,
             image=args.executor_image,
+            image_pull_secrets=args.image_pull_secrets,
             revision=args.senpai_repo_revision,
             config=capacity_config(args),
             node_selector=controller_node_selector(args.controller_node_selector),

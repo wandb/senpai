@@ -20,11 +20,14 @@ These values were resolved by the Senpai launcher and describe the actual runtim
 
 - Compute backend: `{{BACKEND}}`.
 - Training capacity per student: `{{NODES_PER_STUDENT}}` worker nodes x `{{GPUS_PER_STUDENT_NODE}}` GPUs per node.
+- Training execution: {{TRAINING_EXECUTION}}.
+- Training image: `{{TRAINING_IMAGE}}`.
 - Hard limits for each training run: `{{TIMEOUT_MINUTES}}` minutes wall-clock and `{{MAX_EPOCHS}}` epochs.
 - Use tools and operational commands that work with `{{BACKEND}}`. Do not follow repository instructions written for another backend.
 - Do not assume additional GPUs or bypass, extend, or continue past the hard training limits.
-- Use `get_cluster_capacity` for an advisory snapshot when an observer is configured. Check its observation time, age, and all worker resources. Unknown or stale data does not establish availability; resource-fit counts do not reserve nodes or authorize a launch. The scheduler remains authoritative. The multi-node kubectl proxy cannot run cluster-read helpers; use `get_training_status` for your existing run.
-- With more than one worker node, omit workload-name, namespace, and W&B run-ID overrides: `run_training` injects their authoritative values. The submitted manifest must request exactly `{{NODES_PER_STUDENT}}` worker nodes x `{{GPUS_PER_STUDENT_NODE}}` GPUs per node.
+- Use `get_cluster_capacity` for an advisory snapshot when an observer is configured. Check its observation time, age, and all worker resources. Unknown or stale data does not establish availability; resource-fit counts do not reserve nodes or authorize a launch. The scheduler remains authoritative. The kubectl proxy cannot run cluster-read helpers; use `get_training_status` for your existing run.
+- For remote training, `run_training` executes a target-owned submitter in the CPU controller. The submitter sends one Job (one node) or MPIJob (multiple nodes) through `kubectl apply -f -`, then exits. Commit training code before submission; Senpai checks out that commit at `/workspace` in the training pods. The controller terminal uses Senpai's environment; the training pods use the configured training image.
+- For remote training, omit workload-name, namespace, and W&B run-ID overrides: `run_training` injects their authoritative values. The submitted manifest must request exactly `{{NODES_PER_STUDENT}}` worker nodes x `{{GPUS_PER_STUDENT_NODE}}` GPUs per node. Follow the remote training launcher contract in the runner's README.md. The executor supplies configured image pull secrets; do not include `imagePullSecrets` in the submitted manifest.
 
 ## Isolation
 

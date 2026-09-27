@@ -25,7 +25,8 @@ from senpai_agent.training import (
 
 
 class FakeCluster:
-    def __init__(self, state: TrainingState = TrainingState.FINISHED):
+    def __init__(self, state: TrainingState = TrainingState.FINISHED, *, nodes=2):
+        self.nodes = nodes
         self.state_value = state
         self.spec: KubernetesTrainingSpec | None = None
         self.resource_value: KubernetesResourceRef | None = None
@@ -50,7 +51,7 @@ class FakeCluster:
                 name=spec.name,
                 namespace=spec.namespace,
                 uid="remote-uid",
-                nodes=2,
+                nodes=self.nodes,
                 gpus_per_node=8,
             )
             self.reservations.append((training_id, source_snapshot, source_commit))
@@ -59,7 +60,7 @@ class FakeCluster:
         self.adoptions.append(resource)
 
     def resource(self, _spec, *, nodes, gpus_per_node):
-        assert (nodes, gpus_per_node) == (2, 8)
+        assert (nodes, gpus_per_node) == (self.nodes, 8)
         return self.resource_value
 
     def resource_identity(self, _spec):
@@ -130,12 +131,17 @@ def supervisor(tmp_path, monkeypatch, client=None, **overrides):
     return KubernetesTrainingSupervisor(**values), workspace, snapshot_root
 
 
+@pytest.mark.parametrize(("nodes", "kind"), [(1, "Job"), (2, "MPIJob")])
 def test_supervisor_injects_authoritative_identity_and_bundles_clean_head(
     tmp_path,
     monkeypatch,
+    nodes,
+    kind,
 ):
-    client = FakeCluster()
-    runtime, workspace, snapshot_root = supervisor(tmp_path, monkeypatch, client)
+    client = FakeCluster(nodes=nodes)
+    runtime, workspace, snapshot_root = supervisor(
+        tmp_path, monkeypatch, client, nodes=nodes
+    )
     target_env = tmp_path / "target-env"
     subprocess.run(
         [
@@ -184,7 +190,7 @@ def test_supervisor_injects_authoritative_identity_and_bundles_clean_head(
 
     assert result.state is TrainingState.FINISHED
     assert result.kubernetes_spec is not None
-    assert result.kubernetes_spec.kind == "MPIJob"
+    assert result.kubernetes_spec.kind == kind
     assert result.kubernetes_spec.namespace == "research"
     assert result.kubernetes_spec.wandb_run_id == started.training_id.replace("-", "")
     assert len(result.kubernetes_spec.name) <= 63
