@@ -16,15 +16,20 @@ from pydantic import SecretStr
 from senpai_agent import git_workflow
 from senpai_agent.github.workflow import (
     GitHubWorkflow,
+    GitHubWorkflowError,
     MutationResult,
     PullHeadMismatchError,
+    PullRequestSnapshot,
+    ReconciliationError,
     StaleAssignmentRevisionError,
+    WorkflowPreconditionError,
 )
-from senpai_agent.models import ExperimentResult
+from senpai_agent.models import AssignmentRecord, ExperimentResult
 
 from .contracts import (
     GitHubMutationObservation,
     PostAssignmentCommentAction,
+    PublishAssignmentBranchAction,
     SubmitExperimentResultAction,
 )
 
@@ -144,6 +149,102 @@ class GitHubToolRuntime:
         if self.role == "advisor":
             return "advisor"
         return self.current_student()
+
+
+class PublishAssignmentBranchExecutor(
+    ToolExecutor[PublishAssignmentBranchAction, GitHubMutationObservation]
+):
+    """Publish exact source while retaining the assignment's unfinished state."""
+
+    def __init__(self, runtime: GitHubToolRuntime):
+        self.runtime = runtime
+
+    def __call__(
+        self,
+        action: PublishAssignmentBranchAction,
+        conversation: LocalConversation | None = None,
+    ) -> GitHubMutationObservation:
+        student = self.runtime.current_student()
+        with self.runtime.workflow.serialized_assignment_mutation():
+            try:
+                _, assignment = self._preflight(
+                    action, student, action.assignment.expected_pr_head_sha
+                )
+                git_workflow.require_clean_training_worktree(self.runtime.workspace)
+                git_workflow.require_commit_contains_base(
+                    self.runtime.workspace,
+                    commit_sha=action.local_commit_sha,
+                    base_sha=assignment.base_sha,
+                )
+                pushed = git_workflow.push_assignment_branch(
+                    self.runtime.workspace,
+                    branch=assignment.head_ref,
+                    expected_remote_sha=action.assignment.expected_pr_head_sha,
+                    expected_local_sha=action.local_commit_sha,
+                    remote=(
+                        f"https://github.com/{self.runtime.workflow.repo}.git"
+                        if self.runtime.git_token is not None
+                        else "origin"
+                    ),
+                    token=self.runtime.git_token,
+                )
+                try:
+                    after = self._verify_after_push(action, student, assignment)
+                except GitHubWorkflowError as error:
+                    error_type = (
+                        StaleAssignmentRevisionError
+                        if isinstance(error, StaleAssignmentRevisionError)
+                        else ReconciliationError
+                    )
+                    raise error_type(
+                        f"Source commit {pushed.head_sha} was published to {pushed.branch}, "
+                        f"but assignment verification failed: {error}"
+                    ) from error
+            except StaleAssignmentRevisionError as error:
+                _finish_stale_assignment_turn(error, conversation)
+        return GitHubMutationObservation(
+            changed=pushed.changed,
+            resource_url=after.url,
+            state="assignment_branch_published",
+            version=after.head_sha,
+        )
+
+    def _preflight(
+        self,
+        action: PublishAssignmentBranchAction,
+        student: str,
+        expected_head_sha: str,
+    ) -> tuple[PullRequestSnapshot, AssignmentRecord]:
+        return self.runtime.workflow.preflight_publish_assignment_branch(
+            action.assignment.pr_number,
+            assignment_id=action.assignment.assignment_id,
+            revision_id=action.assignment.revision_id,
+            student=student,
+            expected_head_sha=expected_head_sha,
+            local_commit_sha=action.local_commit_sha,
+        )
+
+    def _verify_after_push(
+        self,
+        action: PublishAssignmentBranchAction,
+        student: str,
+        assignment: AssignmentRecord,
+    ) -> PullRequestSnapshot:
+        for delay in (*_POST_PUSH_HEAD_RETRY_DELAYS, None):
+            try:
+                snapshot, current = self._preflight(
+                    action, student, action.local_commit_sha
+                )
+                break
+            except PullHeadMismatchError:
+                if delay is None:
+                    raise
+                time.sleep(delay)
+        if current != assignment:
+            raise WorkflowPreconditionError(
+                "assignment changed during source publication; refresh before continuing"
+            )
+        return snapshot
 
 
 class SubmitExperimentResultExecutor(
