@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import ctypes
+import json
+import os
 import re
+import sys
 from collections.abc import Mapping, MutableMapping, Sequence
 
 GITHUB_TOKEN_ENV_NAMES = ("GITHUB_TOKEN", "GH_TOKEN")
@@ -15,12 +19,26 @@ GITHUB_CREDENTIAL_ENV_NAMES = (
 )
 CUSTOM_SECRET_ENV_NAMES_ENV = "SENPAI_CUSTOM_SECRET_ENV_NAMES"
 BUILTIN_CONVERSATION_SECRET_ENV_NAMES = ("WANDB_API_KEY", "EXA_API_KEY")
+PROVIDER_API_KEY_ENVS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "wandb": "WANDB_API_KEY",
+}
+MODEL_CREDENTIALS_FD_ENV = "SENPAI_MODEL_CREDENTIALS_FD"
+MAX_MODEL_CREDENTIAL_BUNDLE_BYTES = 64 * 1024
+PRIVATE_CREDENTIAL_FILE_ENVS = {
+    "WANDB_API_KEY": "SENPAI_WANDB_API_KEY_FILE",
+    "EXA_API_KEY": "SENPAI_EXA_API_KEY_FILE",
+}
+PRIVATE_CREDENTIAL_FD_ENVS = {
+    "WANDB_API_KEY": "SENPAI_WANDB_API_KEY_FD",
+    "EXA_API_KEY": "SENPAI_EXA_API_KEY_FD",
+}
 _RESERVED_CUSTOM_SECRET_ENV_NAMES = frozenset(
     {
         # Built-in credentials use separate trust boundaries.
         "GITHUB_TOKEN",
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
+        *PROVIDER_API_KEY_ENVS.values(),
         *BUILTIN_CONVERSATION_SECRET_ENV_NAMES,
         # The launcher and entrypoints own these names in both roles.
         "ADVISOR_BRANCH",
@@ -63,6 +81,57 @@ _RESERVED_CUSTOM_SECRET_ENV_NAMES = frozenset(
 )
 _RESERVED_CUSTOM_SECRET_ENV_PREFIXES = ("GH_", "GITHUB_", "SENPAI_")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_PR_SET_DUMPABLE = 4
+
+
+def set_process_nondumpable() -> None:
+    """Block same-UID process inspection before this process reads credentials."""
+
+    if sys.platform != "linux":
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def consume_model_credential_fd(
+    environment: MutableMapping[str, str],
+) -> dict[str, str]:
+    """Read delegated model credentials after the child is nondumpable."""
+
+    descriptor_value = environment.pop(MODEL_CREDENTIALS_FD_ENV, None)
+    if descriptor_value is None:
+        return {}
+    try:
+        descriptor = int(descriptor_value)
+        if descriptor < 0:
+            raise ValueError
+    except ValueError as error:
+        raise RuntimeError(
+            f"{MODEL_CREDENTIALS_FD_ENV} must be a nonnegative integer"
+        ) from error
+    with os.fdopen(descriptor, "rb") as stream:
+        raw = stream.read(MAX_MODEL_CREDENTIAL_BUNDLE_BYTES + 1)
+    if len(raw) > MAX_MODEL_CREDENTIAL_BUNDLE_BYTES:
+        raise RuntimeError("delegated model credential bundle is too large")
+    try:
+        credentials = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise RuntimeError("delegated model credential bundle is invalid") from error
+    if (
+        not isinstance(credentials, dict)
+        or not credentials
+        or any(
+            not isinstance(name, str)
+            or _ENV_NAME.fullmatch(name) is None
+            or not isinstance(value, str)
+            or not value.strip()
+            for name, value in credentials.items()
+        )
+    ):
+        raise RuntimeError("delegated model credential bundle is invalid")
+    return credentials
 
 
 def validate_custom_secret_env_names(names: Sequence[str]) -> None:
@@ -123,4 +192,16 @@ def scrub_github_credentials(environment: MutableMapping[str, str]) -> None:
     """Remove every GitHub credential handoff from a child environment."""
 
     for name in GITHUB_CREDENTIAL_ENV_NAMES:
+        environment.pop(name, None)
+
+
+def scrub_service_credentials(environment: MutableMapping[str, str]) -> None:
+    """Remove service credentials and stale handoffs before supervisor launch."""
+
+    for name in (
+        *BUILTIN_CONVERSATION_SECRET_ENV_NAMES,
+        *PRIVATE_CREDENTIAL_FILE_ENVS.values(),
+        *PRIVATE_CREDENTIAL_FD_ENVS.values(),
+        MODEL_CREDENTIALS_FD_ENV,
+    ):
         environment.pop(name, None)

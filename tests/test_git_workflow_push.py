@@ -7,7 +7,12 @@ import pytest
 from pydantic import SecretStr
 
 import senpai_agent.git_workflow as git_workflow
-from senpai_agent.git_transport import GIT_EXECUTABLE, git_process_env
+from senpai_agent.git_transport import (
+    GIT_EXECUTABLE,
+    git_process_env,
+    isolated_bare_repository,
+    run_git,
+)
 from senpai_agent.git_workflow import (
     GitWorkflowPreconditionError,
     push_assignment_branch,
@@ -38,6 +43,37 @@ def test_authenticated_git_environment_keeps_only_the_scoped_header(tmp_path: Pa
 
     encoded = result.stdout.strip().removeprefix("Authorization: Basic ")
     assert base64.b64decode(encoded).decode() == "x-access-token:typed-write-token"
+
+
+def test_git_trusts_only_its_resolved_workspace_when_mount_owner_differs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    workspace, remote, _base_sha = repository(tmp_path)
+    alias = tmp_path / "mounted-workspace"
+    alias.symlink_to(workspace, target_is_directory=True)
+    hook_marker = tmp_path / "hook-ran"
+    hook = workspace / ".git" / "hooks" / "post-checkout"
+    hook.write_text(f"#!/bin/sh\ntouch '{hook_marker}'\n")
+    hook.chmod(0o755)
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_text("[safe]\n\tdirectory = *\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    ownership_check = {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}
+
+    run_git(alias, "checkout", "-b", "mounted", extra_env=ownership_check)
+
+    assert git(workspace, "branch", "--show-current") == "mounted"
+    assert not hook_marker.exists()
+    with pytest.raises(GitWorkflowPreconditionError, match="dubious ownership"):
+        run_git(
+            alias, "-C", str(remote), "rev-parse", "--git-dir",
+            extra_env=ownership_check,
+        )
+    with isolated_bare_repository() as staging:
+        assert run_git(
+            staging, "rev-parse", "--is-bare-repository",
+            extra_env=ownership_check,
+        ) == "true"
 
 
 def test_result_commit_must_contain_its_assigned_research_base(tmp_path: Path):
@@ -259,7 +295,7 @@ def test_typed_push_auth_is_confined_to_network_git_processes(
             ),
             None,
         )
-        if command[1] in {"ls-remote", "fetch", "push"}:
+        if {"ls-remote", "fetch", "push"}.intersection(command):
             assert authorization is not None
             encoded = authorization.removeprefix("Authorization: Basic ")
             assert base64.b64decode(encoded).decode() == (

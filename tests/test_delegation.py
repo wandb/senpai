@@ -11,6 +11,7 @@ import pytest
 import psutil
 from openhands.sdk.llm import Message, TextContent
 
+import senpai_agent.delegation as delegation_module
 from senpai_agent.delegation import (
     AgentTask,
     DelegationConfig,
@@ -29,7 +30,7 @@ from senpai_agent.launch_context import (
 from senpai_agent.local_events import LocalEventStore
 from senpai_agent.openhands_runner import delegation_config as runner_delegation_config
 from senpai_agent.program_context import PROGRAM_PATH_ENV
-from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV
+from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV, MODEL_CREDENTIALS_FD_ENV
 from senpai_agent.supervisor import prepare_system_context_environment
 from openhands_support import runtime_config
 
@@ -197,8 +198,8 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
         "OPENAI_API_KEY"
     )
     assert fast.state_dir.parent == config.state_dir / "children"
-    assert fast.environment["ANTHROPIC_API_KEY"] == "anthropic-secret"
-    assert fast.environment["OPENAI_API_KEY"] == "openai-secret"
+    assert "ANTHROPIC_API_KEY" not in fast.environment
+    assert "OPENAI_API_KEY" not in fast.environment
     assert fast.environment["SENPAI_OPENHANDS_API_KEY_ENV"] == "ANTHROPIC_API_KEY"
     assert frontier.environment["SENPAI_OPENHANDS_API_KEY_ENV"] == "OPENAI_API_KEY"
     assert fast.environment["GH_REPO"] == "acme/widgets"
@@ -302,15 +303,71 @@ def test_child_environment_replaces_ambient_model_credentials(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-anthropic-key")
     monkeypatch.setenv("OPENAI_API_KEY", "stale-openai-key")
     monkeypatch.setenv("GEMINI_API_KEY", "unconfigured-model-key")
+    monkeypatch.setenv("SENPAI_MODEL_CREDENTIALS_FD", "999")
+    monkeypatch.setenv("PROVIDER_CREDENTIAL", "stale-provider-key")
 
     environment = OpenHandsChildProcess(
-        delegation_config(tmp_path),
+        delegation_config(
+            tmp_path,
+            frontier_api_key_env="PROVIDER_CREDENTIAL",
+        ),
         delegation_request(model="frontier", agent="general-purpose"),
     ).environment
 
-    assert environment["ANTHROPIC_API_KEY"] == "anthropic-secret"
-    assert environment["OPENAI_API_KEY"] == "openai-secret"
+    assert "ANTHROPIC_API_KEY" not in environment
+    assert "OPENAI_API_KEY" not in environment
     assert "GEMINI_API_KEY" not in environment
+    assert "PROVIDER_CREDENTIAL" not in environment
+    assert MODEL_CREDENTIALS_FD_ENV not in environment
+
+
+def test_child_preserves_the_shared_wandb_service_credential(tmp_path):
+    config = delegation_config(
+        tmp_path,
+        smart_api_key_env="WANDB_API_KEY",
+        smart_api_key="wandb-key",
+        conversation_secrets={"WANDB_API_KEY": "wandb-key", "EXA_API_KEY": "exa-key"},
+    )
+
+    environment = OpenHandsChildProcess(config, delegation_request()).environment
+
+    assert environment["WANDB_API_KEY"] == "wandb-key"
+    assert environment["EXA_API_KEY"] == "exa-key"
+
+
+def test_child_start_closes_credential_fd_if_exec_fails(monkeypatch, tmp_path):
+    descriptors = []
+
+    def failed_popen(_command, **kwargs):
+        descriptor = int(kwargs["env"][MODEL_CREDENTIALS_FD_ENV])
+        descriptors.append(descriptor)
+        assert kwargs["pass_fds"] == (descriptor,)
+        os.fstat(descriptor)
+        raise OSError("exec failed")
+
+    monkeypatch.setattr(delegation_module.subprocess, "Popen", failed_popen)
+    child = OpenHandsChildProcess(delegation_config(tmp_path), delegation_request())
+
+    with pytest.raises(OSError, match="exec failed"):
+        child.start("Inspect the result.", 60, lambda _result, _error: None)
+
+    assert len(descriptors) == 1
+    with pytest.raises(OSError):
+        os.fstat(descriptors[0])
+
+
+def test_child_start_rejects_conflicting_profile_keys_before_exec(monkeypatch, tmp_path):
+    def unexpected_popen(*_args, **_kwargs):
+        pytest.fail("conflicting credential profiles must not start a child")
+
+    monkeypatch.setattr(delegation_module.subprocess, "Popen", unexpected_popen)
+    child = OpenHandsChildProcess(
+        delegation_config(tmp_path, fast_api_key="conflicting-key"),
+        delegation_request(),
+    )
+
+    with pytest.raises(RuntimeError, match="conflicting values.*ANTHROPIC_API_KEY"):
+        child.start("Inspect the result.", 60, lambda _result, _error: None)
 
 
 def test_child_environment_carries_only_configured_custom_secrets(
