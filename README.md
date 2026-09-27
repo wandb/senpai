@@ -172,12 +172,6 @@ uses `WANDB_API_KEY` for auth.
 
 The defaults in `senpai.yaml` describe W&B's deployment and should not be copied unchanged into another environment. Every setting can also be overridden on the command line. `--tag` and `--target_repo_url` are required unless your chosen config file supplies them.
 
-Student environments set `WANDB_TAGS=senpai,<advisor_branch>,<student_name>`.
-[W&B uses this comma-separated list](https://docs.wandb.ai/models/track/environment-variables)
-as the default tags for training runs, so you can filter runs by Senpai,
-advisor, or student in the W&B UI. An explicit `wandb.init(tags=...)` replaces
-these defaults; target code that supplies tags must include the inherited tags.
-
 Deployments require matching advisor and student image digests, or `sha-<40-character-commit>` tags built from the same SENPAI revision. Multi-node launches require an `executor_image` pinned by `@sha256` digest because that sidecar owns the scoped Kubernetes credential. Digest-pinned images also require the full matching `senpai_repo_revision`. The source commit must be fetchable from `senpai_repo_url`; its public default is read-only and needs no PR permission. Override it only when using images built from another SENPAI repository. `target_repo_url` is the separate, required repository where agents create commits and PRs.
 
 ### 6. Run preflight
@@ -535,11 +529,9 @@ not automatically become environment variables inside the submitted pods.
 
 Declare `WANDB_API_KEY` in reporting main containers, including the MPI
 launcher when it reports metrics. The broker replaces that entry with the
-scoped Secret reference and supplies canonical `WANDB_RUN_ID` and the student's
-`WANDB_TAGS` to main containers. It merges any extra tags from a literal
-`WANDB_TAGS` manifest value and removes duplicates. It rejects `valueFrom` for
-tags and a conflicting explicit run ID. It preserves unrelated target
-environment variables.
+scoped Secret reference and supplies canonical `WANDB_RUN_ID` to main
+containers. It rejects a conflicting explicit run ID and preserves unrelated
+target environment variables.
 
 The broker replaces all target `initContainers` with its fixed bundle checkout
 at `/workspace` and removes pod-template annotations. Put required target setup
