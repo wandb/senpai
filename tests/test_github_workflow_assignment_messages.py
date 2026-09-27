@@ -347,18 +347,22 @@ def test_applied_revision_replay_restores_a_result_arriving_during_demotion():
     assert fake.pr["labels"] == {"student:one", "status:review"}
 
 
-def test_request_revision_retargets_the_exact_live_research_base():
+@pytest.mark.parametrize("retain_assigned_base", [False, True])
+def test_request_revision_selects_the_assigned_or_live_research_base(
+    retain_assigned_base,
+):
     current_base_sha = "c" * 40
+    required_base_sha = BASE_SHA if retain_assigned_base else current_base_sha
     fake = FakeGitHub(
         pull_request(labels={"student:one", "status:review"}, draft=False),
         branch_heads={"schmidhuber": current_base_sha},
     )
 
-    request_revision(workflow(fake), required_base_sha=current_base_sha)
+    request_revision(workflow(fake), required_base_sha=required_base_sha)
 
     assignment = parse_assignment_markers(cast(str, fake.pr["body"]))[0]
     assert assignment.revision_id == "revision-2"
-    assert assignment.base_sha == current_base_sha
+    assert assignment.base_sha == required_base_sha
 
 
 def test_request_revision_rejects_an_unapplied_draft_mutation():

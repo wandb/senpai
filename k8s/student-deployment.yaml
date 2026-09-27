@@ -34,6 +34,8 @@ spec:
         student: {{STUDENT_NAME}}
         research-tag: {{RESEARCH_TAG}}
     spec:
+      serviceAccountName: {{STUDENT_SERVICE_ACCOUNT_NAME}}
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 90
       securityContext:
         runAsNonRoot: true
@@ -111,15 +113,7 @@ spec:
               name: {{LAUNCH_SECRET_NAME}}
               key: exa-api-key
 {{CUSTOM_SECRET_ENV_REFS}}
-        resources:
-          requests:
-            cpu: "{{STUDENT_CPU}}"
-            memory: "{{STUDENT_MEMORY}}"
-            nvidia.com/gpu: "{{GPUS_PER_STUDENT}}"
-          limits:
-            cpu: "{{STUDENT_CPU}}"
-            memory: "{{STUDENT_MEMORY}}"
-            nvidia.com/gpu: "{{GPUS_PER_STUDENT}}"
+        resources: {{STUDENT_RESOURCES}}
         startupProbe:
           httpGet:
             path: /healthz
@@ -149,6 +143,9 @@ spec:
         - name: program-context
           mountPath: /var/run/senpai-context
           readOnly: true
+        # {{EXECUTOR_SOCKET_MOUNT}}
+        # {{CAPACITY_SNAPSHOT_MOUNT}}
+      # {{KUBERNETES_EXECUTOR_CONTAINER}}
       volumes:
       - name: dshm
         emptyDir:
@@ -169,7 +166,7 @@ spec:
           items:
           - key: program-context
             path: program-context.b64
-      tolerations:
-      - key: "nvidia.com/gpu"
-        operator: "Exists"
-        effect: "NoSchedule"
+      # {{KUBERNETES_EXECUTOR_VOLUMES}}
+      # {{CAPACITY_SNAPSHOT_VOLUME}}
+      nodeSelector: {{STUDENT_NODE_SELECTOR}}
+      tolerations: {{STUDENT_TOLERATIONS}}

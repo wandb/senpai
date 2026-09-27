@@ -1,11 +1,121 @@
 import base64
 import json
+import os
 import subprocess
 
 import pytest
 import yaml
-
 from launch_test_support import launch, launch_args, launch_helpers
+
+
+@pytest.fixture(autouse=True)
+def block_unmocked_launch_writes(monkeypatch):
+    def fail(*_args, **_kwargs):
+        pytest.fail("launch.main test attempted an unmocked Kubernetes write")
+
+    monkeypatch.setattr(launch, "kubectl_apply", fail)
+    monkeypatch.setattr(launch, "kubectl_create", fail, raising=False)
+
+
+def bypass_program_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        launch, "existing_program_context_secret", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        launch,
+        "load_launch_program_snapshot",
+        lambda *_args: launch.ProgramSystemPrompt(
+            "program.md", "a" * 40, "Test launch research policy."
+        ),
+    )
+
+
+def test_multiple_launch_tags_share_one_wandb_key(tmp_path, monkeypatch):
+    bypass_program_snapshot(monkeypatch)
+    for name in os.environ:
+        if name.startswith("WANDB_API_KEY_") or name == "WANDB_INFERENCE_API_KEY":
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("WANDB_API_KEY", "shared-wandb-key")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-key")
+    monkeypatch.setenv("EXA_API_KEY", "exa-key")
+    monkeypatch.setattr(launch, "DOTENV_PATH", tmp_path / "absent.env")
+    for name in (
+        "preflight_check_target_repo_access",
+        "preflight_check_student_name_availability",
+        "preflight_check_exa_api_key",
+        "ensure_advisor_branch",
+        "ensure_target_repo_labels",
+        "ensure_new_student_slot",
+    ):
+        monkeypatch.setattr(launch, name, lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        launch, "preflight_check_target_repo_branch", lambda *_args: "main"
+    )
+    authenticated = []
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_wandb_api_key",
+        lambda key: authenticated.append(key),
+    )
+    inference_keys = []
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_wandb_inference",
+        lambda key, _entity, _project: inference_keys.append(key),
+    )
+    monkeypatch.setattr(
+        launch, "existing_student_names", lambda *_args, **_kwargs: []
+    )
+    applied = []
+    for name in ("kubectl_apply", "kubectl_create"):
+        monkeypatch.setattr(
+            launch,
+            name,
+            lambda manifest, *_args, **_kwargs: applied.extend(
+                yaml.safe_load_all(manifest)
+            ),
+        )
+    for tag in ("research-one", "research-two"):
+        args = launch_args(
+            tag=tag,
+            advisor_branch=tag,
+            wandb_entity="team",
+            wandb_project="project",
+        )
+        for profile in ("advisor", "student", "smart", "fast", "frontier"):
+            setattr(args, f"{profile}_model", "wandb/zai-org/GLM-5.2")
+            setattr(args, f"{profile}_reasoning_effort", "max")
+        monkeypatch.setattr(
+            launch.sp, "parse", lambda *_args, result=args, **_kwargs: result
+        )
+        launch.main()
+
+    assert authenticated == ["shared-wandb-key", "shared-wandb-key"]
+    assert inference_keys == authenticated
+    secrets = [
+        resource for resource in applied
+        if resource["kind"] == "Secret" and "wandb-api-key" in resource["data"]
+    ]
+    assert len(secrets) == 2
+    assert {
+        resource["metadata"]["labels"]["research-tag"] for resource in secrets
+    } == {"research-one", "research-two"}
+    for resource in secrets:
+        assert {
+            key: base64.b64decode(value).decode()
+            for key, value in resource["data"].items()
+            if "wandb" in key
+        } == {"wandb-api-key": "shared-wandb-key"}
+    deployments = [
+        resource for resource in applied if resource["kind"] == "Deployment"
+    ]
+    assert len(deployments) == 4
+    assert len({resource["metadata"]["name"] for resource in deployments}) == 4
+    for resource in deployments:
+        container = resource["spec"]["template"]["spec"]["containers"][0]
+        assert {
+            value["name"] for value in container["env"] if "WANDB" in value["name"]
+        } == {"WANDB_API_KEY"}
 
 
 def test_kubectl_apply_raises_with_the_resource_and_error_detail(monkeypatch):
@@ -41,6 +151,240 @@ def test_kubectl_apply_raises_with_the_resource_and_error_detail(monkeypatch):
         "-",
     ]
     assert captured["kwargs"]["input"] == "kind: Service"
+
+
+def test_kubectl_create_is_create_only_and_reports_the_resource(monkeypatch):
+    captured = {}
+
+    def run(argv, **kwargs):
+        captured.update(argv=argv, kwargs=kwargs)
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=1,
+            stdout="",
+            stderr="already exists",
+        )
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+
+    with pytest.raises(RuntimeError, match="student Deployment.*already exists"):
+        launch_helpers.kubectl_create(
+            "kind: Deployment",
+            "student Deployment",
+            kube_context="gpu-cluster",
+            namespace="research",
+        )
+
+    assert captured["argv"] == [
+        "kubectl",
+        "--context",
+        "gpu-cluster",
+        "--namespace",
+        "research",
+        "create",
+        "-f",
+        "-",
+    ]
+    assert captured["kwargs"]["input"] == "kind: Deployment"
+
+
+def test_single_node_slot_scan_does_not_query_an_absent_mpijob_api(monkeypatch):
+    commands = []
+
+    def run(argv, **_kwargs):
+        commands.append(argv)
+        arguments = argv[argv.index("default") + 1 :]
+        if arguments[:2] == ["get", "deployment"]:
+            stdout = ""
+        elif arguments[:2] in (["get", "pods"], ["get", "jobs"]):
+            stdout = json.dumps({"items": []})
+        elif arguments[0] == "api-resources":
+            stdout = "jobs.batch\n"
+        else:
+            pytest.fail(f"unexpected kubectl command: {arguments}")
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+
+    launch_helpers.ensure_new_student_slot(
+        "senpai-track-fern",
+        tag="track",
+        student_name="fern",
+        require_mpijob=False,
+    )
+
+    assert not any("mpijobs" in command for command in commands)
+
+
+def test_multinode_slot_scan_requires_the_mpijob_api(monkeypatch):
+    def run(argv, **_kwargs):
+        arguments = argv[argv.index("default") + 1 :]
+        if arguments[:2] == ["get", "deployment"]:
+            stdout = ""
+        elif arguments[:2] in (["get", "pods"], ["get", "jobs"]):
+            stdout = json.dumps({"items": []})
+        elif arguments[0] == "api-resources":
+            stdout = "jobs.batch\n"
+        else:
+            pytest.fail(f"unexpected kubectl command: {arguments}")
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+
+    with pytest.raises(RuntimeError, match="does not provide the MPIJob API"):
+        launch_helpers.ensure_new_student_slot(
+            "senpai-track-fern",
+            tag="track",
+            student_name="fern",
+            require_mpijob=True,
+        )
+
+
+def test_single_node_slot_scan_rejects_an_orphan_mpijob_when_the_api_exists(
+    monkeypatch,
+):
+    responses = iter(
+        [
+            "",
+            json.dumps({"items": []}),
+            json.dumps({"items": []}),
+            "mpijobs.kubeflow.org\n",
+            json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {"name": "active-mpi-training"},
+                            "status": {
+                                "conditions": [
+                                    {"type": "Running", "status": "True"}
+                                ]
+                            },
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+
+    def run(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 0, next(responses), "")
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+
+    with pytest.raises(RuntimeError, match="MPIJob active-mpi-training"):
+        launch_helpers.ensure_new_student_slot(
+            "senpai-track-fern",
+            tag="track",
+            student_name="fern",
+            require_mpijob=False,
+        )
+
+
+def test_slot_scan_rejects_existing_controller_objects(monkeypatch):
+    responses = iter(
+        [
+            "",
+            json.dumps({"items": [{"metadata": {"name": "stale-controller"}}]}),
+        ]
+    )
+
+    def run(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 0, next(responses), "")
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+
+    with pytest.raises(RuntimeError, match="still has controller Pod objects"):
+        launch_helpers.ensure_new_student_slot(
+            "senpai-track-fern",
+            tag="track",
+            student_name="fern",
+            require_mpijob=False,
+        )
+
+
+def test_slot_scan_rejects_an_existing_student_deployment(monkeypatch):
+    monkeypatch.setattr(
+        launch_helpers.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv,
+            0,
+            json.dumps(
+                {
+                    "kind": "Deployment",
+                    "metadata": {"name": "senpai-track-fern"},
+                }
+            ),
+            "",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="will not replace a running controller"):
+        launch_helpers.ensure_new_student_slot(
+            "senpai-track-fern",
+            tag="track",
+            student_name="fern",
+            require_mpijob=False,
+        )
+
+
+def test_slot_scan_rejects_nonterminal_labeled_jobs(monkeypatch):
+    responses = iter(
+        [
+            "",
+            json.dumps({"items": []}),
+            json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {"name": "active-training"},
+                            "status": {"conditions": []},
+                        },
+                        {
+                            "metadata": {"name": "finished-training"},
+                            "status": {
+                                "conditions": [
+                                    {"type": "Complete", "status": "True"}
+                                ]
+                            },
+                        },
+                    ]
+                }
+            ),
+            "jobs.batch\n",
+        ]
+    )
+
+    def run(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 0, next(responses), "")
+
+    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
+
+    with pytest.raises(RuntimeError, match="Job active-training"):
+        launch_helpers.ensure_new_student_slot(
+            "senpai-track-fern",
+            tag="track",
+            student_name="fern",
+            require_mpijob=False,
+        )
+
+
+def test_slot_scan_fails_closed_when_kubernetes_cannot_be_read(monkeypatch):
+    monkeypatch.setattr(
+        launch_helpers.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 1, "", "forbidden"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="safety check failed: forbidden"):
+        launch_helpers.ensure_new_student_slot(
+            "senpai-track-fern",
+            tag="track",
+            student_name="fern",
+            require_mpijob=False,
+        )
 
 
 def test_student_discovery_uses_the_requested_cluster_scope(monkeypatch):
@@ -222,61 +566,63 @@ def bypass_external_preflight(monkeypatch):
         "preflight_check_target_repo_branch",
         lambda *_args: "main",
     )
-    monkeypatch.setattr(
-        launch, "existing_program_context_secret", lambda *_args, **_kwargs: None
-    )
+    bypass_program_snapshot(monkeypatch)
     monkeypatch.setattr(
         launch,
-        "load_launch_program_snapshot",
-        lambda *_args: launch.ProgramSystemPrompt(
-            "program.md", "a" * 40, "Test launch research policy."
-        ),
+        "ensure_new_student_slot",
+        lambda *_args, **_kwargs: None,
+        raising=False,
     )
 
 
-def test_incremental_launch_reuses_original_snapshot_for_both_roles(monkeypatch):
-    args = launch_args()
+@pytest.mark.parametrize("reuse_bound_snapshot", [False, True])
+def test_launch_uses_captured_or_bound_snapshot_for_each_role(
+    monkeypatch, reuse_bound_snapshot
+):
+    args = launch_args(names="" if reuse_bound_snapshot else "fern", n_students=0)
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
-    bound = launch.ProgramSystemPrompt(
+    program = launch.ProgramSystemPrompt(
         "program.md", "b" * 40, "Test launch research policy."
     )
-    bound_name, _manifest = launch_helpers.render_program_context_secret(
-        args.tag, launch.encode_program_system_prompt(bound)
+    program_secret_name, _manifest = launch_helpers.render_program_context_secret(
+        args.tag, launch.encode_program_system_prompt(program)
     )
-    monkeypatch.setattr(
-        launch, "existing_program_context_secret", lambda *_args, **_kwargs: bound_name
-    )
-    monkeypatch.setattr(
-        launch, "read_program_context_secret",
-        lambda *_args, **_kwargs: launch.encode_program_system_prompt(bound),
-    )
+    if reuse_bound_snapshot:
+        monkeypatch.setattr(
+            launch, "existing_program_context_secret",
+            lambda *_args, **_kwargs: program_secret_name,
+        )
+        monkeypatch.setattr(
+            launch, "read_program_context_secret",
+            lambda *_args, **_kwargs: launch.encode_program_system_prompt(program),
+        )
+    else:
+        monkeypatch.setattr(launch, "load_launch_program_snapshot", lambda *_args: program)
     monkeypatch.setattr(
         launch, "existing_student_names", lambda *_args, **_kwargs: []
     )
-    applied = []
-    monkeypatch.setattr(
-        launch, "kubectl_apply",
-        lambda manifest, description, **_kwargs: applied.append((description, manifest)),
-    )
+    documents = []
+
+    def record(manifest, _description, **_kwargs):
+        documents.extend(yaml.safe_load_all(manifest))
+
+    monkeypatch.setattr(launch, "kubectl_apply", record)
+    monkeypatch.setattr(launch, "kubectl_create", record)
 
     launch.main()
 
-    assert [description for description, _manifest in applied] == [
-        "secret senpai-launch-secrets-test-track",
-        f"program context secret {bound_name}",
-        "student fern",
-        "advisor",
-    ]
-    for _description, manifest in applied[2:]:
-        configmap, deployment = list(yaml.safe_load_all(manifest))
-        assert configmap["data"]["SENPAI_PROGRAM_SOURCE_COMMIT"] == "b" * 40
-        assert configmap["data"]["SENPAI_PROGRAM_CONTENT_SHA256"] == (
-            bound.content_sha256
-        )
+    configs = [document for document in documents if document["kind"] == "ConfigMap"]
+    assert {config["metadata"]["labels"]["role"] for config in configs} == (
+        {"advisor"} if reuse_bound_snapshot else {"advisor", "student"}
+    )
+    for config in configs:
+        assert config["data"]["SENPAI_PROGRAM_SOURCE_COMMIT"] == "b" * 40
+        assert config["data"]["SENPAI_PROGRAM_CONTENT_SHA256"] == program.content_sha256
+    for deployment in (doc for doc in documents if doc["kind"] == "Deployment"):
         assert deployment["spec"]["template"]["metadata"]["annotations"][
             "senpai.wandb.com/program-context-secret"
-        ] == bound_name
+        ] == program_secret_name
 
 
 @pytest.mark.parametrize(
@@ -306,8 +652,16 @@ def test_incremental_launch_rejects_policy_or_path_drift_before_apply(
         lambda *_args, **_kwargs: pytest.fail("policy drift must fail before apply"),
     )
 
+    reserved = []
+    monkeypatch.setattr(
+        launch, "kubectl_create",
+        lambda manifest, _name, **_kwargs: reserved.append(yaml.safe_load(manifest)),
+    )
+
     with pytest.raises(SystemExit, match="^ERROR: program.md changed.*new tag"):
         launch.main()
+    assert [document["kind"] for document in reserved] == ["Secret"]
+    assert reserved[0]["metadata"]["name"] == "senpai-launch-secrets-test-track"
 
 
 @pytest.mark.parametrize("failure", ["invalid", "missing"])
@@ -333,8 +687,16 @@ def test_invalid_bound_program_reports_a_clean_launch_error(monkeypatch, failure
         lambda *_args, **_kwargs: pytest.fail("invalid binding must fail before apply"),
     )
 
+    reserved = []
+    monkeypatch.setattr(
+        launch, "kubectl_create",
+        lambda manifest, _name, **_kwargs: reserved.append(yaml.safe_load(manifest)),
+    )
+
     with pytest.raises(SystemExit, match="^ERROR:"):
         launch.main()
+    assert [document["kind"] for document in reserved] == ["Secret"]
+    assert reserved[0]["metadata"]["name"] == "senpai-launch-secrets-test-track"
 
 
 def test_preflight_resolves_custom_secrets(monkeypatch):
@@ -415,6 +777,7 @@ def test_wandb_gateway_uses_the_wandb_key_for_openai_compatible_inference(
         lambda key, entity, project: checked.append((key, entity, project)),
     )
     monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launch, "kubectl_create", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         launch,
         "existing_student_names",
@@ -463,6 +826,7 @@ def test_launch_resolves_and_preflights_only_referenced_model_providers(
             lambda _key, provider=provider: checked.append(provider),
         )
     monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launch, "kubectl_create", lambda *_args, **_kwargs: None)
 
     launch.main()
 
@@ -495,13 +859,14 @@ def test_students_only_launch_ignores_the_inactive_advisor_provider(
             or f"{provider}-key",
         )
     monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launch, "kubectl_create", lambda *_args, **_kwargs: None)
 
     launch.main()
 
     assert resolved == ["anthropic"]
 
 
-def test_launch_uses_one_scope_for_apply_discovery_and_handoff_commands(
+def test_launch_uses_one_scope_for_create_discovery_and_handoff_commands(
     monkeypatch,
     capsys,
 ):
@@ -520,35 +885,44 @@ def test_launch_uses_one_scope_for_apply_discovery_and_handoff_commands(
         return []
 
     monkeypatch.setattr(launch, "existing_student_names", existing)
-    applies = []
+    mutations = []
 
     def apply(_manifest, name, *, kube_context, namespace):
-        applies.append((name, kube_context, namespace))
+        mutations.append(("apply", name, kube_context, namespace))
+
+    def create(_manifest, name, *, kube_context, namespace):
+        mutations.append(("create", name, kube_context, namespace))
 
     monkeypatch.setattr(launch, "kubectl_apply", apply)
+    monkeypatch.setattr(launch, "kubectl_create", create, raising=False)
 
     launch.main()
 
     assert discovery == [("scope-test", "gpu-cluster", "research")]
-    assert len(applies) == 4
+    assert len(mutations) == 5
     assert all(
         (context, namespace) == ("gpu-cluster", "research")
-        for _description, context, namespace in applies
+        for _verb, _description, context, namespace in mutations
     )
-    descriptions = [description for description, _context, _namespace in applies]
-    assert descriptions[0] == "secret senpai-launch-secrets-scope-test"
-    assert descriptions[1].startswith(
+    assert mutations[0][:2] == ("create", "secret senpai-launch-secrets-scope-test")
+    assert mutations[1][0] == "apply"
+    assert mutations[1][1].startswith(
         "program context secret senpai-program-context-scope-test-"
     )
-    assert descriptions[2:] == ["student fern", "advisor"]
+    assert [mutation[:2] for mutation in mutations[2:]] == [
+        ("create", "student fern ConfigMap senpai-config-student-scope-test-fern"),
+        ("create", "student fern Deployment senpai-scope-test-fern"),
+        ("apply", "advisor"),
+    ]
     prefix = "kubectl --context gpu-cluster --namespace research"
     handoff_commands = [
         line.strip()
         for line in capsys.readouterr().out.splitlines()
         if line.strip().startswith("kubectl ")
     ]
-    assert len(handoff_commands) == 4
+    assert len(handoff_commands) == 6
     assert all(command.startswith(prefix) for command in handoff_commands)
+    assert not any("mpijobs" in command for command in handoff_commands)
 
 
 def test_assignment_collision_stops_before_launch_mutation(monkeypatch):
@@ -580,9 +954,307 @@ def test_assignment_collision_stops_before_launch_mutation(monkeypatch):
         "kubectl_apply",
         lambda *_args, **_kwargs: mutations.append("kubernetes"),
     )
+    monkeypatch.setattr(
+        launch,
+        "kubectl_create",
+        lambda *_args, **_kwargs: mutations.append("kubernetes"),
+        raising=False,
+    )
 
     with pytest.raises(SystemExit, match="active assignment"):
         launch.main()
 
     assert checked == ["acceptance-fern"]
     assert mutations == []
+
+
+def test_every_student_is_scanned_before_the_atomic_tag_reservation(monkeypatch):
+    args = launch_args(advisor=False, names="fern,frieren")
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    events = []
+
+    monkeypatch.setattr(
+        launch,
+        "ensure_new_student_slot",
+        lambda deployment, *, student_name, **_kwargs: events.append(
+            ("scan", student_name, deployment)
+        ),
+    )
+    monkeypatch.setattr(
+        launch,
+        "kubectl_create",
+        lambda manifest, name, **_kwargs: events.append(
+            ("create", name, yaml.safe_load(manifest)["kind"])
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        launch,
+        "ensure_advisor_branch",
+        lambda *_args: events.append(("github", "branch")),
+    )
+    monkeypatch.setattr(
+        launch,
+        "ensure_target_repo_labels",
+        lambda *_args: events.append(("github", "labels")),
+    )
+
+    monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+
+    launch.main()
+
+    assert events[:5] == [
+        ("scan", "fern", "senpai-test-track-fern"),
+        ("scan", "frieren", "senpai-test-track-frieren"),
+        ("create", "secret senpai-launch-secrets-test-track", "Secret"),
+        ("github", "branch"),
+        ("github", "labels"),
+    ]
+
+
+def test_student_launch_reservation_is_immutable(monkeypatch):
+    args = launch_args(advisor=False)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    created = []
+
+    def create(manifest, name, **_kwargs):
+        created.append((name, yaml.safe_load(manifest)))
+
+    monkeypatch.setattr(launch, "kubectl_create", create)
+
+    monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+
+    launch.main()
+
+    reservation_name, reservation = created[0]
+    assert reservation_name == "secret senpai-launch-secrets-test-track"
+    assert reservation["immutable"] is True
+
+
+def test_reordered_student_manifest_still_creates_the_deployment_last(monkeypatch):
+    args = launch_args(advisor=False)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    render_student = launch.render_student
+
+    def render_deployment_first(*render_args, **render_kwargs):
+        documents = list(
+            yaml.safe_load_all(render_student(*render_args, **render_kwargs))
+        )
+        documents.sort(key=lambda document: document["kind"] != "Deployment")
+        return yaml.safe_dump_all(documents, sort_keys=False).rstrip()
+
+    monkeypatch.setattr(launch, "render_student", render_deployment_first)
+    created = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_create",
+        lambda manifest, _name, **_kwargs: created.append(
+            yaml.safe_load(manifest)["kind"]
+        ),
+    )
+
+    monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+
+    launch.main()
+
+    assert created == ["Secret", "ConfigMap", "Deployment"]
+
+
+@pytest.mark.parametrize(
+    ("manifest", "message"),
+    [
+        (
+            "kind: ConfigMap\nmetadata:\n  name: config-only\n",
+            "exactly one Deployment; found 0",
+        ),
+        (
+            "kind: Deployment\nmetadata:\n  name: first\n"
+            "---\nkind: Deployment\nmetadata:\n  name: second\n",
+            "exactly one Deployment; found 2",
+        ),
+        ("kind: [\n", "invalid YAML"),
+    ],
+)
+def test_invalid_student_manifest_fails_before_reservation_or_github_writes(
+    monkeypatch,
+    manifest,
+    message,
+):
+    args = launch_args(advisor=False)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(launch, "render_student", lambda *_args, **_kwargs: manifest)
+    writes = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_create",
+        lambda *_args, **_kwargs: writes.append("kubernetes"),
+    )
+    monkeypatch.setattr(
+        launch,
+        "ensure_advisor_branch",
+        lambda *_args: writes.append("github"),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        launch.main()
+
+    assert writes == []
+
+
+def test_dry_run_prints_the_original_validated_student_manifest(monkeypatch, capsys):
+    manifest = (
+        "# deployment intentionally rendered first\n"
+        "kind: Deployment\nmetadata:\n  name: controller\n"
+        "---\n"
+        "# preserve this dry-run comment\n"
+        "kind: ConfigMap\nmetadata:\n  name: config\n"
+    )
+    args = launch_args(advisor=False, dry_run=True)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    monkeypatch.setattr(launch, "render_student", lambda *_args, **_kwargs: manifest)
+
+    launch.main()
+
+    assert f"--- Student: fern ---\n{manifest}\n" in capsys.readouterr().out
+
+
+def test_multinode_student_resources_are_created_in_dependency_order(monkeypatch):
+    args = launch_args(
+        advisor=False,
+        nodes_per_student=2,
+        executor_image=f"ghcr.io/wandb/senpai-executor@sha256:{'b' * 64}",
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    created = []
+
+    def create(manifest, _name, **_kwargs):
+        document = yaml.safe_load(manifest)
+        created.append((document["kind"], document["metadata"]["name"]))
+
+    monkeypatch.setattr(launch, "kubectl_create", create, raising=False)
+
+    monkeypatch.setattr(launch, "kubectl_apply", lambda *_args, **_kwargs: None)
+
+    launch.main()
+
+    assert [kind for kind, _name in created] == [
+        "Secret",
+        "ConfigMap",
+        "ServiceAccount",
+        "Role",
+        "RoleBinding",
+        "Deployment",
+    ]
+
+
+def test_reservation_conflict_stops_before_github_or_controller_mutation(monkeypatch):
+    args = launch_args(advisor=False)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    mutations = []
+
+    def create(_manifest, name, **_kwargs):
+        mutations.append(name)
+        raise RuntimeError("kubectl create failed: already exists")
+
+    monkeypatch.setattr(launch, "kubectl_create", create, raising=False)
+    monkeypatch.setattr(
+        launch,
+        "ensure_advisor_branch",
+        lambda *_args: mutations.append("github branch"),
+    )
+    monkeypatch.setattr(
+        launch,
+        "ensure_target_repo_labels",
+        lambda *_args: mutations.append("github labels"),
+    )
+
+    with pytest.raises(RuntimeError, match="stale reservation.*delete secret"):
+        launch.main()
+
+    assert mutations == ["secret senpai-launch-secrets-test-track"]
+
+
+def test_student_scan_failure_stops_before_every_mutation(monkeypatch):
+    args = launch_args(advisor=False)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    mutations = []
+    monkeypatch.setattr(
+        launch,
+        "ensure_new_student_slot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("active Job")),
+    )
+    monkeypatch.setattr(
+        launch,
+        "kubectl_create",
+        lambda *_args, **_kwargs: mutations.append("kubernetes"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        launch,
+        "ensure_advisor_branch",
+        lambda *_args: mutations.append("github branch"),
+    )
+
+    with pytest.raises(RuntimeError, match="active Job"):
+        launch.main()
+
+    assert mutations == []
+
+
+def test_advisor_only_launch_keeps_apply_semantics(monkeypatch):
+    args = launch_args(advisor=True, names="", n_students=0)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch,
+        "ensure_new_student_slot",
+        lambda *_args, **_kwargs: pytest.fail(
+            "advisor-only launch has no student slot"
+        ),
+    )
+    monkeypatch.setattr(
+        launch,
+        "kubectl_create",
+        lambda *_args, **_kwargs: pytest.fail("advisor-only launch stays apply-based"),
+        raising=False,
+    )
+    monkeypatch.setattr(launch, "existing_student_names", lambda *_args, **_kwargs: [])
+    applied = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda _manifest, name, **_kwargs: applied.append(name),
+    )
+
+    launch.main()
+
+    assert len(applied) == 3
+    assert applied[0] == "secret senpai-launch-secrets-test-track"
+    assert applied[1].startswith("program context secret senpai-program-context-test-track-")
+    assert applied[2] == "advisor"
+
+
+def test_dry_run_does_not_scan_or_reserve_student_slots(monkeypatch):
+    args = launch_args(advisor=False, dry_run=True)
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    monkeypatch.setattr(
+        launch,
+        "ensure_new_student_slot",
+        lambda *_args, **_kwargs: pytest.fail("dry-run must not query Kubernetes"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        launch,
+        "kubectl_create",
+        lambda *_args, **_kwargs: pytest.fail("dry-run must not reserve a tag"),
+        raising=False,
+    )
+
+    launch.main()

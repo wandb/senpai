@@ -248,3 +248,96 @@ def test_incomplete_checkout_fails_without_changing_retained_work(bootstrap_runt
     assert (target / ".git/HEAD").read_text() == original_head
     assert (target / "untracked.txt").read_text() == "untracked recovery work\n"
     assert (target / "staged.txt").read_text() == "staged recovery work\n"
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_role_startup_isolates_target_uv_commands_from_agent_environment(
+    tmp_path: Path, role: str
+):
+    entrypoint = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text()
+    startup = entrypoint[entrypoint.index("export IS_SANDBOX=1"):]
+    uv = shutil.which("uv")
+    assert uv is not None, "the bootstrap contract requires uv"
+    startup = startup.replace("/usr/local/bin/uv", shlex.quote(uv))
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "python").write_text("#!/bin/sh\nexit 99\n")
+    (fake_bin / "python").chmod(0o755)
+    python = tmp_path / "runner-python"
+    # Execute real bootstrap probes and setup, then record the supervisor handoff.
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "if sys.argv[1:4] != ['-P', '-m', 'senpai_agent.supervisor']:\n"
+        "    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])\n"
+        "print(json.dumps({'args': sys.argv[1:], 'environment': "
+        "{key: os.environ.get(key) for key in "
+        "('UV_PROJECT_ENVIRONMENT', 'UV_PYTHON', 'VIRTUAL_ENV', 'SENPAI_PYTHON')}}))\n"
+    )
+    python.chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", "-e", "-c", startup],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HOME": str(tmp_path / "home"),
+            "PYTHONPATH": str(ROOT),
+            "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
+            "LOGDIR": str(tmp_path),
+            "WORKDIR": str(tmp_path),
+            "TARGET_WORKDIR": str(tmp_path / "target"),
+            "GIT_ASKPASS_FILE": str(tmp_path / "askpass"),
+            "SENPAI_GITHUB_TOKEN_FILE": str(tmp_path / "token"),
+            "NODES_PER_STUDENT": "1",
+            "SENPAI_PYTHON": str(python),
+            "UV_PROJECT_ENVIRONMENT": "/opt/senpai-venv",
+            "UV_PYTHON": "/opt/senpai-venv/bin/python",
+            "VIRTUAL_ENV": "/opt/senpai-venv",
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    launched = json.loads(completed.stdout)
+    assert launched["args"] == ["-P", "-m", "senpai_agent.supervisor", role]
+    assert launched["environment"] == {
+        "UV_PROJECT_ENVIRONMENT": None,
+        "UV_PYTHON": None,
+        "VIRTUAL_ENV": None,
+        "SENPAI_PYTHON": str(python),
+    }
+
+
+def test_kubectl_proxy_uses_agent_python_inside_target_uv_environment(tmp_path: Path):
+    entrypoint = (ROOT / "k8s" / "entrypoint-student.sh").read_text()
+    proxy_setup = entrypoint[
+        entrypoint.index('    proxy_dir="$LOGDIR/bin"'):
+        entrypoint.index('    export PATH="$proxy_dir:$PATH"')
+    ]
+    runner_python = tmp_path / "runner-python"
+    runner_python.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        "print(json.dumps(sys.argv[1:]))\n"
+    )
+    runner_python.chmod(0o755)
+    target_bin = tmp_path / "target-venv" / "bin"
+    target_bin.mkdir(parents=True)
+    (target_bin / "python").write_text("#!/bin/sh\nexit 99\n")
+    (target_bin / "python").chmod(0o755)
+    environment = {
+        **os.environ,
+        "LOGDIR": str(tmp_path),
+        "SENPAI_PYTHON": str(runner_python),
+        "PATH": f"{target_bin}:{os.environ['PATH']}",
+    }
+    subprocess.run(["bash", "-c", proxy_setup], env=environment, check=True)
+
+    completed = subprocess.run(
+        [str(tmp_path / "bin" / "kubectl"), "apply", "-f", "-"],
+        env=environment, capture_output=True, text=True, check=True,
+    )
+    assert json.loads(completed.stdout) == [
+        "-P", "-m", "senpai_agent.kubernetes_executor", "kubectl", "apply", "-f", "-",
+    ]

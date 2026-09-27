@@ -11,6 +11,7 @@ import yaml
 from git_workflow_support import commit_file, git, repository
 from launch_test_support import (
     ADVISOR_IMAGE,
+    ROOT,
     REVISION,
     STUDENT_IMAGE,
     launch,
@@ -69,6 +70,13 @@ def test_yaml_config_parses_custom_secret_names_as_a_list(monkeypatch, tmp_path)
     assert args.custom_secret_env_names == ["HF_TOKEN", "DATASET_LICENSE_KEY"]
 
 
+def test_launch_rejects_the_retired_gpu_option_instead_of_abbreviating_it():
+    result = run_launch("--gpus_per_student", "8")
+
+    assert result.returncode == 2
+    assert "unrecognized arguments: --gpus_per_student 8" in result.stderr
+
+
 @pytest.mark.parametrize(
     "image",
     [
@@ -93,6 +101,31 @@ def test_image_reference_accepts_only_full_source_sha_tags_or_digests(image):
 )
 def test_image_reference_rejects_mutable_or_incomplete_pins(image):
     assert not launch_helpers.is_immutable_image_reference(image)
+
+
+def test_digest_image_reference_rejects_source_sha_tags():
+    assert launch_helpers.is_digest_image_reference(
+        f"ghcr.io/wandb/senpai@sha256:{'b' * 64}"
+    )
+    assert not launch_helpers.is_digest_image_reference(
+        f"ghcr.io/wandb/senpai:sha-{REVISION}"
+    )
+
+
+def test_multinode_executor_requires_a_registry_digest():
+    result = run_launch(
+        "--advisor_image",
+        ADVISOR_IMAGE,
+        "--student_image",
+        STUDENT_IMAGE,
+        "--nodes_per_student",
+        "2",
+        "--executor_image",
+        f"ghcr.io/wandb/senpai-executor:sha-{REVISION}",
+    )
+
+    assert result.returncode != 0
+    assert "--executor_image must use an immutable @sha256 digest" in result.stderr
 
 
 def test_source_revision_is_derived_from_a_full_sha_tag():
@@ -281,6 +314,27 @@ umask > "$UMASK_OUTPUT"
         assert path.read_text() == expected
         assert path.stat().st_mode & 0o777 == 0o600
     assert int(umask_output.read_text().strip(), 8) == 0o22
+
+
+def test_multinode_kubectl_wrapper_can_be_reinstalled(tmp_path):
+    entrypoint = (ROOT / "k8s" / "entrypoint-student.sh").read_text()
+    wrapper = entrypoint[
+        entrypoint.index('    proxy_dir="$LOGDIR/bin"') : entrypoint.index(
+            "    for _ in $(seq 1 180)"
+        )
+    ]
+    script = f"set -e\numask 077\n{wrapper}"
+    env = os.environ | {"LOGDIR": str(tmp_path / "state")}
+
+    subprocess.run(["bash", "-c", script], check=True, env=env)
+    subprocess.run(["bash", "-c", script], check=True, env=env)
+
+    kubectl = tmp_path / "state" / "bin" / "kubectl"
+    assert kubectl.stat().st_mode & 0o777 == 0o500
+    assert kubectl.read_text() == (
+        '#!/bin/sh\nexec "$SENPAI_PYTHON" -P -m senpai_agent.kubernetes_executor kubectl "$@"\n'
+    )
+    assert list(kubectl.parent.glob(".kubectl.*")) == []
 
 
 @pytest.mark.parametrize(
@@ -573,6 +627,50 @@ def test_launch_accepts_anthropic_max_for_every_model_profile():
     )
 
     launch.validate_model_config(args)
+
+
+@pytest.mark.parametrize("nodes_per_student", [1, 2])
+def test_each_student_receives_only_its_own_wandb_tag(nodes_per_student):
+    result = run_launch(
+        "--names", "fern,frieren",
+        "--student_prefix", "track",
+        "--advisor_branch", "noam",
+        "--nodes_per_student", str(nodes_per_student),
+        "--senpai_repo_revision", REVISION,
+        "--advisor_image", ADVISOR_IMAGE,
+        "--student_image", STUDENT_IMAGE,
+        "--executor_image", f"ghcr.io/wandb/senpai-executor@sha256:{'b' * 64}",
+    )
+
+    assert result.returncode == 0, result.stderr
+    rendered = re.sub(r"^--- .+ ---$", "---", result.stdout, flags=re.MULTILINE)
+    documents = [
+        document for document in yaml.safe_load_all(rendered)
+        if isinstance(document, dict)
+    ]
+    configmaps = {
+        document["metadata"]["name"]: document["data"]
+        for document in documents if document.get("kind") == "ConfigMap"
+    }
+    students = {
+        document["metadata"]["labels"]["student"]: document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document["metadata"]["labels"]["role"] == "student"
+    }
+
+    assert set(students) == {"track-fern", "track-frieren"}
+    for student_name, deployment in students.items():
+        for container in deployment["spec"]["template"]["spec"]["containers"]:
+            environment = {}
+            for source in container["envFrom"]:
+                environment.update(configmaps[source["configMapRef"]["name"]])
+            environment.update({
+                item["name"]: item.get("value") for item in container.get("env", [])
+            })
+            assert environment["WANDB_TAGS"].split(",") == [
+                "senpai", "noam", student_name
+            ]
 
 
 def test_wandb_gateway_is_rendered_for_every_role():

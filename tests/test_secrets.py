@@ -119,6 +119,7 @@ def test_configured_custom_secret_names_default_to_empty(environment):
         (["GITHUB_APP_TOKEN"], "reserved"),
         (["SENPAI_INTERNAL_KEY"], "reserved"),
         (["RESEARCH_TAG"], "reserved"),
+        (["WANDB_TAGS"], "reserved"),
         (["PATH"], "reserved"),
         (["PYTHONSAFEPATH"], "reserved"),
         (["BASHOPTS"], "reserved"),
@@ -141,6 +142,21 @@ def test_custom_secret_name_validator_rejects_unsafe_names(
 ):
     with pytest.raises(ValueError, match=message):
         validate_custom_secret_env_names(names)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "NODES_PER_STUDENT",
+        "GPUS_PER_STUDENT_NODE",
+        "CPU_PER_STUDENT_GPU",
+        "MEMORY_GI_PER_STUDENT_GPU",
+        "PVC_CLAIM_NAME",
+    ],
+)
+def test_custom_secret_name_validator_rejects_launcher_owned_topology_names(name):
+    with pytest.raises(ValueError, match="reserved"):
+        validate_custom_secret_env_names([name])
 
 
 def test_custom_secret_name_validator_accepts_valid_names():

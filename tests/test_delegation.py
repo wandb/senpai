@@ -245,20 +245,25 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
 
 
 def test_descendants_and_restarts_use_the_complete_parent_snapshot(tmp_path: Path):
-    env = launch_env(tmp_path, program_content="Research policy.\n" * 10_000)
+    env = launch_env(
+        tmp_path,
+        program_path="senpai/program.md",
+        program_content="Research policy.\n" * 10_000,
+    )
     env.update({
         "SENPAI_OPENHANDS_ROLE_FILE": str(INSTRUCTIONS_ROOT / "ADVISOR.md"),
         "ADVISOR_BRANCH": "research",
         "WANDB_ENTITY": "acme",
         "WANDB_PROJECT": "cfd",
         "STUDENT_NAMES": "fern,frieren",
-        "GPUS_PER_STUDENT": "2",
+        "NODES_PER_STUDENT": "2",
+        "GPUS_PER_STUDENT_NODE": "2",
         "GITHUB_TOKEN": "github-secret-sentinel",
         "WANDB_API_KEY": "wandb-secret-sentinel",
     })
     prepared = prepare_system_context_environment("advisor", tmp_path / "state", env)
     parent = resolve_config(parse_runner_args(["--max-turns", "1"]), prepared)
-    (parent.workspace / "program.md").write_text("Later workspace policy.")
+    (parent.workspace / "senpai/program.md").write_text("Later workspace policy.")
     delegated = runner_delegation_config(parent)
     child = OpenHandsChildProcess(delegated, delegation_request())
     child_environment = child.environment
@@ -296,7 +301,8 @@ def test_descendants_and_restarts_use_the_complete_parent_snapshot(tmp_path: Pat
     assert child_config.role_file == parent.role_file
     assert child_config.harness_file == parent.harness_file
     role_prompt = parent.role_file.read_text()
-    assert "Use the `2` GPUs available to each student" in role_prompt
+    assert "## Runtime identity" not in role_prompt
+    assert "Use the `2` worker nodes x `2` GPUs per node available to each student" in role_prompt
     assert PLACEHOLDER.search(role_prompt) is None
     assert "github-secret-sentinel" not in parent.instructions.prompt
     assert "wandb-secret-sentinel" not in parent.instructions.prompt
