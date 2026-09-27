@@ -12,6 +12,16 @@ argument-hint: "<pr-number> <problem-dir>"
 
 # Review an experiment
 
+Use `get_prs` for the complete discussion and the current base and head SHAs.
+For code review, call `get_pr_source` with `number`, `expected_base_sha`, and
+`expected_head_sha`. Its first response lists changed paths. Call it again with
+up to eight selected `paths`, then read the returned artifact. It contains
+complete text diffs and source at the comparison merge base and head. This also
+works for merged PRs and private repositories; no shell credential is needed.
+Pass the artifact to a review subagent when appropriate. If either PR SHA
+changes, refresh the discussion and source before deciding. This read tool does
+not authorize merging an operator PR through a student-assignment workflow.
+
 Retrieve the complete PR with `get_prs`. Verify its assignment, current head
 SHA, terminal structured result, W&B evidence, metric direction, and scientific
 conclusion. Then choose the appropriate next step:
@@ -93,7 +103,7 @@ incomplete run. Do not edit labels, write protocol markers, or close the PR with
     "expected_pr_head_sha": "CURRENT_PR_HEAD_SHA"
   },
   "new_revision_id": "new-revision-id",
-  "required_base_sha": "CURRENT_BASE_SHA",
+  "required_base_sha": "ASSIGNED_OR_LIVE_BASE_SHA",
   "comment": "Exact missing evidence and the bounded next run required."
 }
 ```
@@ -102,6 +112,14 @@ Call `request_assignment_revision`. Use a new stable revision ID and the exact
 research base SHA the next revision must use. State one concrete change or
 experiment and its acceptance evidence; do not close an experiment that can
 still answer the assigned question with one bounded correction.
+
+Pass the assignment's recorded `base_sha` when the revision must preserve the
+tested source, including after the advisor publishes research notes. Select the
+exact live base SHA only when the student must incorporate that base before
+running. Other SHAs are rejected. Prose cannot override the recorded base:
+every submitted result must contain that exact commit. A result on the retained
+base still needs `accept_result_on_current_base` before merging onto a changed
+live base.
 
 ## Record the outcome
 

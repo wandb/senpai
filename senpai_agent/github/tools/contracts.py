@@ -163,7 +163,11 @@ class RequestAssignmentRevisionAction(Action):
     )
     required_base_sha: str = Field(
         min_length=1,
-        description="Exact live base-branch SHA against which the new revision must run.",
+        description=(
+            "Exact research-base SHA for the new revision: retain the current "
+            "assignment's base_sha or select the live base-branch SHA. Retain "
+            "the assigned SHA when the tested source must stay unchanged."
+        ),
     )
     comment: str = Field(
         min_length=1,
