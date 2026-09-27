@@ -993,6 +993,104 @@ def test_close_does_not_override_a_known_launcher_failure(tmp_path, monkeypatch)
     assert client.releases == [started.training_id]
 
 
+def test_close_persists_output_failure_found_while_draining(tmp_path, monkeypatch):
+    client = FakeCluster(state=TrainingState.RUNNING)
+    runtime, workspace, _snapshot_root = supervisor(tmp_path, monkeypatch, client)
+    opening_log = threading.Event()
+    fail_write = threading.Event()
+    original_open = Path.open
+
+    def fail_output_open(path, mode="r", *args, **kwargs):
+        if path.suffix == ".log" and mode == "wb":
+            opening_log.set()
+            assert fail_write.wait(3)
+            raise OSError("fixture disk full")
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_output_open)
+    started = runtime.run_training(
+        TrainingSpec(
+            argv=(sys.executable, "-c", "import time; time.sleep(30)"),
+            cwd=workspace,
+            timeout_seconds=5,
+        )
+    )
+    close_thread = threading.Thread(target=runtime.close)
+    try:
+        assert opening_log.wait(1)
+        close_thread.start()
+        deadline = time.monotonic() + 2
+        while psutil.pid_exists(started.pid):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        fail_write.set()
+        close_thread.join(2)
+        assert not close_thread.is_alive()
+
+        result = runtime.get_training_status(started.training_id)
+        assert result.state is TrainingState.FAILED
+        assert "Training output capture failed (OSError)." in result.error_tail
+        assert result.kubernetes_released is True
+        assert client.deletions[0].uid == "remote-uid"
+        assert client.releases == [started.training_id]
+    finally:
+        fail_write.set()
+        runtime.close()
+        if close_thread.ident is not None:
+            close_thread.join(2)
+
+
+def test_failed_monitor_start_stops_reader_with_detached_writer(tmp_path, monkeypatch):
+    client = FakeCluster(state=TrainingState.RUNNING)
+    runtime, workspace, _snapshot_root = supervisor(tmp_path, monkeypatch, client)
+    child_pid_path = workspace / "detached.pid"
+    child_code = (
+        "import os,pathlib,time; "
+        f"pathlib.Path({str(child_pid_path)!r}).write_text(str(os.getpid())); "
+        "time.sleep(30)"
+    )
+    launcher_code = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable,'-c',{child_code!r}],start_new_session=True); "
+        "time.sleep(30)"
+    )
+    original_start = threading.Thread.start
+    started_threads = []
+
+    def fail_second_start(thread):
+        if started_threads:
+            deadline = time.monotonic() + 2
+            while not child_pid_path.exists():
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            raise RuntimeError("fixture monitor start failed")
+        original_start(thread)
+        started_threads.append(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_second_start)
+    try:
+        with pytest.raises(RuntimeError, match="fixture monitor start failed"):
+            runtime.run_training(
+                TrainingSpec(
+                    argv=(sys.executable, "-c", launcher_code),
+                    cwd=workspace,
+                    timeout_seconds=5,
+                )
+            )
+        assert started_threads
+        assert all(not thread.is_alive() for thread in started_threads)
+        assert client.deletions[0].uid == "remote-uid"
+        assert client.releases == [client.reservations[0][0]]
+    finally:
+        if child_pid_path.exists():
+            child = psutil.Process(int(child_pid_path.read_text()))
+            child.kill()
+            child.wait(timeout=2)
+        runtime.close()
+        for thread in started_threads:
+            thread.join(2)
+
+
 def test_close_defers_a_failed_terminal_release_to_restart(tmp_path, monkeypatch):
     class FailingReleaseCluster(FakeCluster):
         def __init__(self):
@@ -1147,6 +1245,9 @@ def test_supervisor_recovers_an_unconfirmed_terminal_release(tmp_path, monkeypat
 
 
 def test_supervisor_persists_live_diagnostics_before_training_finishes(tmp_path, monkeypatch):
+    key = "shared-wandb-sentinel"
+    monkeypatch.setenv("WANDB_API_KEY", key)
+
     class PendingCluster(FakeCluster):
         def __init__(self):
             super().__init__(state=TrainingState.RUNNING)
@@ -1154,12 +1255,24 @@ def test_supervisor_persists_live_diagnostics_before_training_finishes(tmp_path,
 
         def logs(self, resource):
             self.log_reads += 1
-            return "[pod/worker/checkout] terminated: Error exit=1\nPermission denied"
+            return (
+                "[pod/worker/checkout] terminated: Error exit=1\nPermission denied\n"
+                f"key={key}\npartial key={key[:12]}"
+            )
+
+        def state(self, resource):
+            return self.state_value, f"workload key={key}"
 
     client = PendingCluster()
-    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    runtime, workspace, _ = supervisor(
+        tmp_path, monkeypatch, client,
+    )
     started = runtime.run_training(TrainingSpec(
-        argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5,
+        argv=(sys.executable, "-c", (
+            "import os; print('launcher', os.environ['WANDB_API_KEY'])"
+        )),
+        cwd=workspace,
+        timeout_seconds=5,
     ))
     try:
         deadline = time.monotonic() + 2
@@ -1171,10 +1284,21 @@ def test_supervisor_persists_live_diagnostics_before_training_finishes(tmp_path,
             time.sleep(0.01)
         assert result.state is TrainingState.RUNNING
         assert "Permission denied" in result.kubernetes_diagnostics
-        assert "Permission denied" in Path(result.log_path).read_text()
+        log = Path(result.log_path).read_text()
+        assert "Permission denied" in log
+        assert log.startswith("launcher <secret-hidden>\n")
+        assert key not in log
+        assert "partial key=<secret-hidden>" in log
+        assert key not in result.model_dump_json()
+        assert key not in (runtime.state_dir / f"{started.training_id}.json").read_text()
         assert client.log_reads == 1
     finally:
-        runtime.cancel_training(started.training_id)
+        terminal = runtime.cancel_training(started.training_id)
+    assert terminal.state is TrainingState.CANCELLED
+    assert "key=<secret-hidden>" in terminal.error_tail
+    assert key not in terminal.model_dump_json()
+    assert key not in Path(terminal.log_path).read_text()
+    assert key not in (runtime.state_dir / f"{started.training_id}.json").read_text()
 
 
 def test_supervisor_reports_diagnostics_failure_without_losing_training(tmp_path, monkeypatch):
