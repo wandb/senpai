@@ -5,10 +5,10 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from github_workflow_support import FakeGitHub, pull_request, workflow
 from openhands.sdk.tool import Tool, resolve_tool
 from pydantic import SecretStr
 
-from github_workflow_support import FakeGitHub, pull_request, workflow
 from senpai_agent.github import tools as github_tools_module
 from senpai_agent.github.tools import (
     GetPRsAction,
@@ -22,7 +22,6 @@ from senpai_agent.github.tools import (
 )
 from senpai_agent.github.workflow import MutationResult
 from senpai_agent.tools import register_senpai_tools
-
 
 ADVISOR_GITHUB_TOOLS = {
     "get_prs",
@@ -41,6 +40,7 @@ STUDENT_GITHUB_TOOLS = {
     "get_prs",
     "get_pr_source",
     "post_assignment_comment",
+    "publish_assignment_branch",
     "respond_to_human_issue",
     "submit_experiment_result",
 }

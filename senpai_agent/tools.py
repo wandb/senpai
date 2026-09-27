@@ -645,7 +645,7 @@ class TrainingToolSet(ToolDefinition[RunTrainingAction, TrainingResultObservatio
 
 
 class TargetTerminalExecutor(TerminalExecutor):
-    """Restore target Python settings after each native shell starts."""
+    """Set pager defaults and restore target Python after each shell starts."""
 
     def __init__(
         self,
@@ -659,7 +659,7 @@ class TargetTerminalExecutor(TerminalExecutor):
             working_dir=working_dir,
             no_change_timeout_seconds=no_change_timeout_seconds,
             full_output_save_dir=full_output_save_dir,
-            env=target_python_environment() or None,
+            env={**target_python_environment(), "GIT_PAGER": "cat", "PAGER": "cat"},
         )
 
     def _export_envs(
@@ -676,17 +676,20 @@ class TargetTerminalExecutor(TerminalExecutor):
                     {key: value for key, value in self._env.items() if key != "PATH"},
                     target,
                 )
-                target_bin = self._bash_quote(f"{self._env['VIRTUAL_ENV']}/bin")
-                result = target.execute(TerminalAction(
-                    command=(
+                command = exports
+                if target_env := self._env.get("VIRTUAL_ENV"):
+                    target_bin = self._bash_quote(f"{target_env}/bin")
+                    command = (
                         "unset PYTHONSAFEPATH && "
                         f'{exports} && export PATH={target_bin}:"$PATH"'
-                    ),
+                    )
+                result = target.execute(TerminalAction(
+                    command=command,
                     timeout=10,
                 ))
                 if result.is_error or result.exit_code != 0:
                     raise ValueError(
-                        "Target Python environment setup failed "
+                        "Terminal environment setup failed "
                         f"(exit code {result.exit_code})."
                     )
                 self._target_sessions.add(target)

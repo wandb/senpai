@@ -17,7 +17,11 @@ from senpai_agent.kubernetes_executor import (
     _UnixServer,
     checkout_source_bundle,
 )
-from senpai_agent.kubernetes_training import KubernetesApiClient, KubernetesApiError
+from senpai_agent.kubernetes_training import (
+    KubernetesApiClient,
+    KubernetesApiError,
+    KubernetesExecutorClient,
+)
 from senpai_agent.training import KubernetesResourceRef, TrainingState
 
 
@@ -57,7 +61,12 @@ class FakeApi:
         self.document_value = None
 
     def logs(self, _resource):
-        return "worker log"
+        return {
+            "statuses": ["worker running"],
+            "problems": [],
+            "events": [],
+            "logs": [("[pod/worker/train] ", "worker log")],
+        }
 
 
 def test_executor_server_keeps_serving_during_reconcile_outages(capsys):
@@ -267,7 +276,7 @@ def test_slow_logs_do_not_block_executor_status_or_cancellation(tmp_path):
         def logs(self, resource):
             logs_started.set()
             assert finish_logs.wait(5)
-            return "worker log"
+            return super().logs(resource)
 
     api = SlowLogsApi()
     broker = executor(tmp_path, api)
@@ -1288,6 +1297,18 @@ def test_api_activation_is_uid_bound(kind, suspend_path):
     assert kwargs["content_type"] == "application/json-patch+json"
 
 
+def diagnostics_client(api, monkeypatch):
+    client = KubernetesExecutorClient("unused.sock")
+
+    def request(operation, **values):
+        assert operation == "logs"
+        resource = KubernetesResourceRef.model_validate(values["resource"])
+        return json.loads(json.dumps(api.logs(resource)))
+
+    monkeypatch.setattr(client, "_request", request)
+    return client
+
+
 def test_workload_diagnostics_include_owned_init_and_launcher_logs(monkeypatch):
     client = object.__new__(KubernetesApiClient)
     resource = KubernetesResourceRef(
@@ -1348,7 +1369,7 @@ def test_workload_diagnostics_include_owned_init_and_launcher_logs(monkeypatch):
     monkeypatch.setattr(client, "_request_json", request_json)
     monkeypatch.setattr(client, "_request_text", request_text)
 
-    result = client.logs(resource)
+    result = diagnostics_client(client, monkeypatch).logs(resource)
 
     assert "Insufficient GPUs" in result
     assert "checkout] terminated: Error exit=1" in result
@@ -1412,7 +1433,8 @@ def test_diagnostics_preserve_failed_init_with_noisy_healthy_worker(monkeypatch)
 
     monkeypatch.setattr(client, "_request_text", request_text)
 
-    result = client.logs(resource)
+    reader = diagnostics_client(client, monkeypatch)
+    result = reader.logs(resource)
 
     assert len(result.encode()) <= 8192
     assert "checkout] terminated: Error exit=1" in result
@@ -1425,7 +1447,7 @@ def test_diagnostics_preserve_failed_init_with_noisy_healthy_worker(monkeypatch)
     )
     assert "\ufffd" not in result
     pods.reverse()
-    assert client.logs(resource) == result
+    assert reader.logs(resource) == result
 
 
 def test_diagnostics_show_remaining_gpu_requests_and_every_container(monkeypatch):
@@ -1467,7 +1489,7 @@ def test_diagnostics_show_remaining_gpu_requests_and_every_container(monkeypatch
         return "正常な学習出力\n" * 600
 
     monkeypatch.setattr(client, "_request_text", request_text)
-    result = client.logs(resource)
+    result = diagnostics_client(client, monkeypatch).logs(resource)
 
     assert len(result.encode()) <= 8192
     for index, phase in enumerate(("Running", "Succeeded", "Failed", "Pending")):
@@ -1515,7 +1537,7 @@ def test_diagnostics_report_pre_pod_validation_events_and_reject_foreign_uid(mon
         ]}
 
     monkeypatch.setattr(client, "_request_json", request_json)
-    result = client.logs(resource)
+    result = diagnostics_client(client, monkeypatch).logs(resource)
 
     assert "ValidationError: worker hostname must be no more than 63 characters" in result
     assert "No owned workload pods exist yet" in result
@@ -1525,27 +1547,33 @@ def test_diagnostics_report_pre_pod_validation_events_and_reject_foreign_uid(mon
 
 def test_workload_events_are_bounded_and_surface_rbac_errors(monkeypatch):
     client = object.__new__(KubernetesApiClient)
+    resource = KubernetesResourceRef(
+        kind="MPIJob", name="run", namespace="research", uid="mpi-uid",
+        nodes=2, gpus_per_node=8,
+    )
     events = [{
         "metadata": {"creationTimestamp": f"2026-09-24T08:50:{index:02d}Z"},
-        "involvedObject": {"uid": "pod-uid"},
+        "involvedObject": {"uid": "mpi-uid"},
         "reason": f"Reason{index}", "message": "x" * 5000,
     } for index in range(8)]
+    monkeypatch.setattr(client, "_owned_pods", lambda _resource: [])
     monkeypatch.setattr(client, "_request_json", lambda *args, **kwargs: {"items": events})
+    reader = diagnostics_client(client, monkeypatch)
 
-    result = client._events("research", "pod-uid", "pod/worker", time.monotonic() + 10)
+    result = reader.logs(resource)
+    event_lines = [line for line in result.splitlines() if "/event]" in line]
 
-    assert len(result) == 5
-    assert "Reason3" in result[0]
-    assert "Reason7" in result[-1]
-    assert all(line.count("x") == 1024 for line in result)
+    assert len(result.encode()) <= 8192
+    assert len(event_lines) == 5
+    assert "Reason3" in event_lines[0]
+    assert "Reason7" in event_lines[-1]
+    assert all(len(line) == 1024 for line in event_lines)
 
     def forbidden(*args, **kwargs):
         raise KubernetesApiError("GET", "/events", 403)
 
     monkeypatch.setattr(client, "_request_json", forbidden)
-    assert client._events("research", "pod-uid", "pod/worker", time.monotonic() + 10) == [
-        "[pod/worker/events] unavailable: HTTP 403"
-    ]
+    assert "[MPIJob/run/events] unavailable: HTTP 403" in reader.logs(resource)
 
 
 @pytest.mark.parametrize('operation', ['release', 'delete', 'deadline'])

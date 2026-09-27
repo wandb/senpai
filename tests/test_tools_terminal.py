@@ -1,4 +1,5 @@
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -154,20 +155,24 @@ def test_terminal_tool_bounds_silent_commands(monkeypatch, tmp_path):
 
 
 @pytest.fixture
-def native_target_terminal(monkeypatch, tmp_path):
+def native_target_terminal(monkeypatch, tmp_path, request):
     home = tmp_path / "home"
     home.mkdir()
     (home / ".bashrc").write_text(
         'export PATH="/usr/bin:/bin:$HOME/custom-bin"\n'
         'export SHELL_SENTINEL="from startup"\n'
+        'export GIT_PAGER=less PAGER=less\n'
     )
-    target = tmp_path / "target env's venv"
-    subprocess.run(
-        [sys.executable, "-P", "-m", "venv", "--without-pip", str(target)],
-        check=True,
-    )
+    target = tmp_path / "target env's venv" if getattr(request, "param", True) else None
+    if target is not None:
+        subprocess.run(
+            [sys.executable, "-P", "-m", "venv", "--without-pip", str(target)],
+            check=True,
+        )
+        monkeypatch.setenv("SENPAI_TARGET_PYTHON_ENV", str(target))
+    else:
+        monkeypatch.delenv("SENPAI_TARGET_PYTHON_ENV", raising=False)
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("SENPAI_TARGET_PYTHON_ENV", str(target))
     monkeypatch.setenv("PYTHONSAFEPATH", "1")
     (tmp_path / "project_module.py").write_text("VALUE = 'project import'\n")
     (tmp_path / "check_target.py").write_text(
@@ -194,6 +199,41 @@ def native_target_terminal(monkeypatch, tmp_path):
         yield tool.executor, target
     finally:
         tool.executor.close()
+
+
+@pytest.mark.parametrize("native_target_terminal", [True, False], indirect=True)
+def test_native_terminal_git_log_completes_without_pager_input(
+    native_target_terminal, tmp_path,
+):
+    executor, target = native_target_terminal
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+         "commit", "--allow-empty", "-F", "-"],
+        cwd=tmp_path,
+        input="\n".join(f"History line {index}" for index in range(350)),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    (tmp_path / "pager_python.py").write_text(
+        "import json, sys\nfrom pathlib import Path\n"
+        "Path('pager-python.json').write_text(json.dumps({"
+        "'prefix': sys.prefix, 'safe_path': sys.flags.safe_path}))\n"
+    )
+    python = "python" if target is not None else shlex.quote(sys.executable)
+    for reset in (False, True):
+        result = executor(TerminalAction(
+            command=f"git log --format=%B && {python} pager_python.py",
+            reset=reset,
+            timeout=3,
+        ))
+        assert result.exit_code == 0, result.text
+        observed = json.loads((tmp_path / "pager-python.json").read_text())
+        assert observed == {
+            "prefix": str(target) if target is not None else sys.prefix,
+            "safe_path": target is None,
+        }
 
 
 def test_native_terminal_uses_target_python_and_project_imports(
@@ -240,7 +280,7 @@ def test_native_terminal_uses_target_python_and_project_imports(
 
     with (tmp_path / "home" / ".bashrc").open("a") as startup:
         startup.write("readonly UV_PYTHON\n")
-    with pytest.raises(ValueError, match="Target Python environment setup failed"):
+    with pytest.raises(ValueError, match="Terminal environment setup failed"):
         executor(TerminalAction(command="touch must-not-run", reset=True, timeout=30))
     assert not (tmp_path / "must-not-run").exists()
 
