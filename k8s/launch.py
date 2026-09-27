@@ -37,7 +37,6 @@ from senpai_agent.git_transport import (
     github_repository_url,
     run_git,
 )
-from senpai_agent.github.notifications import normalize_researcher_handles
 from senpai_agent.program_context import (
     PROGRAM_CONTENT_SHA256_ENV,
     PROGRAM_CONTEXT_FILE_ENV,
@@ -148,9 +147,6 @@ class Args:
     human_issues: bool = (
         True  # allow human GitHub issue triage; disable for isolated launches
     )
-    researcher_github_handles: list[str] = field(
-        default_factory=list
-    )  # GitHub users to mention in the first Senpai reply to each human issue
     advisor_branch: str = "schmidhuber"  # branch the advisor works on inside the problem-package repo (students PR into it; created from target_repo_branch if missing)
     gh_history_scope: str = "branch"  # branch=normal track memory, fresh=clean ablation, repo=whole-repo memory
     pvc_claim_name: str = "new-pvc"  # PVC name mounted into pods
@@ -773,9 +769,6 @@ def render_student(
             "ADVISOR_BRANCH": args.advisor_branch,
             "GH_HISTORY_SCOPE": args.gh_history_scope,
             "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
-            "SENPAI_RESEARCHER_GITHUB_HANDLES": ",".join(
-                args.researcher_github_handles
-            ),
             "SENPAI_POLL_INTERVAL_S": str(args.poll_interval_s),
             "SENPAI_POLL_JITTER_S": str(args.poll_jitter_s),
             "SENPAI_CUSTOM_SECRET_ENV_NAMES": ",".join(
@@ -902,9 +895,6 @@ def render_advisor(
         "ADVISOR_BRANCH": args.advisor_branch,
         "GH_HISTORY_SCOPE": args.gh_history_scope,
         "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",
-        "SENPAI_RESEARCHER_GITHUB_HANDLES": ",".join(
-            args.researcher_github_handles
-        ),
         "SENPAI_POLL_INTERVAL_S": str(args.poll_interval_s),
         "SENPAI_POLL_JITTER_S": str(args.poll_jitter_s),
         "SENPAI_STALE_WIP_SECONDS": str(args.stale_wip_seconds),
@@ -1017,9 +1007,6 @@ def main():
         sys.exit(f"ERROR: {error}")
     try:
         validate_custom_secret_env_names(args.custom_secret_env_names)
-        args.researcher_github_handles = list(
-            normalize_researcher_handles(args.researcher_github_handles)
-        )
     except ValueError as error:
         sys.exit(f"ERROR: {error}")
     if not args.preflight_only:

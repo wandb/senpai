@@ -64,7 +64,7 @@ WANDB_API_KEY=
 
 | Credential | Required access |
 |---|---|
-| `GITHUB_TOKEN` | Target-repository Contents, Pull requests, and Issues read/write. A classic token with `repo` scope also works. GitHub CLI authentication is the fallback when this value is absent. |
+| `GITHUB_TOKEN` | Target-repository Contents, Pull requests, and Issues read/write, plus Metadata read. Classic tokens need `repo` and `read:org` scopes. Collaborator discovery requires write, maintain, or admin access; for organization repositories, the authenticated user must also be an organization member. GitHub CLI authentication is the fallback when this value is absent. |
 | `ANTHROPIC_API_KEY` | Required when an `anthropic/...` model is configured. Every default profile uses Anthropic. |
 | `OPENAI_API_KEY` | Required when an `openai/...` model is configured. |
 | `EXA_API_KEY` | General-web and publication search through the credential-isolated `exa_search` tool. |
@@ -764,18 +764,27 @@ Useful launch controls:
 - `--extra_instructions` accepts optional human operator guidance as a Markdown file or literal user context.
 - `human_issues: false` disables GitHub Issue polling for isolated launches.
 
-Set `researcher_github_handles: [ada, grace-hopper]` in `senpai.yaml`, or pass
-`--researcher_github_handles ada grace-hopper`, to mention those researchers in
-the first Senpai reply to each human Issue. An optional leading `@` is accepted;
-handles are normalized to lowercase and duplicates are removed. An empty list
-disables automatic mentions. Senpai uses the configured recipients and does not
-infer them from the GitHub token owner, which may be a service account.
+Senpai discovers issue notification recipients from the target repository's
+[GitHub collaborators](https://docs.github.com/en/rest/collaborators/collaborators#list-repository-collaborators).
+It reads every page and selects human users with effective write, maintain, or
+admin access, including custom roles based on write access. This matches the
+write access required for PR authorization. Inherited team and organization
+access counts, so an organization with default write access can have many
+recipients. Bots are excluded. No handle configuration is required, and the
+token owner is not used as a fallback.
 
-The runtime adds the mentions programmatically. It posts new replies without
-mentions, then adds them only to the earliest saved Senpai reply. This also
-handles concurrent replies from different pods. Retrying or editing that first
-reply retains its mentions; later replies receive no automatic mentions. For
-direct runtime launches, set `SENPAI_RESEARCHER_GITHUB_HANDLES=ada,grace-hopper`.
+Advisor and student roots can open an issue with
+`create_human_issue(issue_id, title, body)`. The runtime adds the `human` label
+and the caller's audience label, then mentions the discovered recipients in the
+initial issue body. Reusing the same `issue_id` and content returns the existing
+issue, even if it is closed; changed content requires a new ID. Replies to an
+issue with a trusted Senpai creation marker receive no automatic mentions.
+
+For human-created issues, the runtime adds mentions only to the earliest saved
+Senpai reply. It posts replies first, then selects the lowest comment ID so
+concurrent replies from different pods agree. Retrying or editing that first
+reply refreshes its recipients from GitHub; later replies receive no automatic
+mentions.
 
 All role images are built from the same source revision. The advisor image excludes CUDA and PyTorch; the student image contains the CUDA/PyTorch runtime; the executor image contains only its Python broker; the cutoff image contains only the minimal job runtime and pinned `kubectl`. Advisor and student builds install Chromium and execute an OpenHands browser smoke test.
 

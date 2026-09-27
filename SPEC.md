@@ -128,16 +128,31 @@ from creating a new wake. `respond_to_human_issue` reapplies the same
 classification to the exact message before writing an idempotent response.
 Launches with human-Issue handling disabled skip that GitHub query entirely.
 
-`researcher_github_handles` selects the GitHub users to mention in the first
-Senpai reply to each human Issue. The launcher validates and normalizes this
-list, then passes it to both roles as comma-separated
-`SENPAI_RESEARCHER_GITHUB_HANDLES`. An empty list disables automatic mentions;
-the authenticated token owner is not used as a recipient default. The workflow
-posts new replies without mentions, then adds mentions only to the trusted
-Senpai reply with the lowest persisted comment ID. Concurrent writers therefore
-select the same first reply. Retrying or editing that first reply retains its
-mentions. Subsequent replies receive no automatic mentions. If the process stops
-between creation and the mention edit, retrying the response completes the edit.
+Issue notifications discover recipients from every page of the target
+repository's collaborator list. A recipient must have GitHub account type
+`User` and `permissions.push: true`. This includes effective write, maintain,
+admin, and custom roles based on write access, matching PR authorization. Team
+and organization grants count, including default organization permissions.
+Bots are excluded. There is no explicit handle configuration or token-owner
+fallback. Fine-grained tokens require Metadata read access; classic tokens
+require `repo` and `read:org` scopes. The authenticated user must have write,
+maintain, or admin access and must be an organization member for an
+organization-owned repository.
+
+`create_human_issue` is available to advisor and student roots. It creates an
+issue with `human` and the caller's audience label, adds a trusted creation
+marker, and mentions the discovered recipients in the initial body. The
+`issue_id` identifies one immutable title and body: exact retries reuse the
+existing issue, including closed issues, and changed content conflicts. A
+trusted creation marker in the issue body suppresses automatic mentions in
+subsequent replies.
+
+For human-created issues, the workflow posts new replies without mentions,
+then adds mentions only to the trusted Senpai reply with the lowest persisted
+comment ID. Concurrent writers therefore select the same first reply. Retrying
+or editing that first reply refreshes its recipients from GitHub. Subsequent
+replies receive no automatic mentions. If the process stops between creation
+and the mention edit, retrying the response completes the edit.
 
 Assigned-PR issue comments, submitted reviews, and inline comments each use
 their immutable GitHub ID as a level-triggered event key. Senpai accepts GitHub
@@ -476,6 +491,7 @@ Assignment-scoped advisor and student operations share this object:
 | `accept_result_on_current_base` | advisor | `expected_current_base_sha`, `reason` |
 | `merge_experiment` | advisor | `expected_current_base_sha`, `merge_method` |
 | `close_experiment` | advisor | `reason` |
+| `create_human_issue` | advisor or student | `issue_id`, `title`, `body` |
 | `respond_to_human_issue` | advisor or student | `issue_number`, `human_message_id`, `response` |
 | `submit_experiment_result` | student | `branch`, `remote_branch_sha_before_push`, `result` |
 

@@ -239,6 +239,32 @@ class CloseExperimentAction(Action):
     )
 
 
+class CreateHumanIssueAction(Action):
+    """Open one issue for human input through the configured role."""
+
+    issue_id: str = Field(
+        min_length=1,
+        max_length=256,
+        description=(
+            "Stable ID for this issue. Reuse it with the same title and body on "
+            "retries; changed content requires a new ID."
+        ),
+    )
+    title: str = Field(
+        min_length=1,
+        max_length=256,
+        description="Concise title describing the question or blocker for humans.",
+    )
+    body: str = Field(
+        min_length=1,
+        max_length=50_000,
+        description=(
+            "Complete message for humans. The runtime adds the role prefix, "
+            "audience labels, and repository maintainer mentions."
+        ),
+    )
+
+
 class RespondToHumanIssueAction(Action):
     """Respond once to one authenticated human-authored issue message."""
 

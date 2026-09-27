@@ -120,6 +120,7 @@ def human_issue(
         "id": issue_id,
         "number": 7,
         "html_url": f"https://github.com/{REPO}/issues/7",
+        "title": "Research question",
         "state": state,
         "body": body,
         "labels": [
@@ -187,6 +188,8 @@ class FakeGitHub:
         self.pr = pr
         self.comments = list(comments or [])
         self.issue = issue
+        self.collaborators: list[dict[str, object]] = []
+        self.collaborator_page_size = 100
         self.comment_page_size = comment_page_size
         self.ignore_label_mutations = ignore_label_mutations
         self.ignore_draft_mutations = ignore_draft_mutations
@@ -224,6 +227,16 @@ class FakeGitHub:
         if method == "GET" and path == "/user":
             return HttpResponse(200, {"login": self.actor_login})
 
+        if method == "GET" and path == f"/repos/{REPO}/collaborators":
+            page = int(parse_qs(parsed.query).get("page", ["1"])[0])
+            start = (page - 1) * self.collaborator_page_size
+            end = start + self.collaborator_page_size
+            response_headers = ()
+            if end < len(self.collaborators):
+                next_url = f"{API_URL}{path}?per_page=100&page={page + 1}"
+                response_headers = (("Link", f'<{next_url}>; rel="next"'),)
+            return HttpResponse(200, self.collaborators[start:end], response_headers)
+
         if method == "GET" and path == pull_path:
             return HttpResponse(200, self._pull_payload())
 
@@ -251,7 +264,8 @@ class FakeGitHub:
             return HttpResponse(200, [self._pull_payload()] if matches else [])
 
         if method == "GET" and path == issues_path:
-            labels = set(parse_qs(parsed.query).get("labels", [""])[0].split(","))
+            query = parse_qs(parsed.query)
+            labels = set(filter(None, query.get("labels", [""])[0].split(",")))
             pr_labels = cast(set[str], self.pr["labels"])
             issues = []
             if labels.issubset(pr_labels):
@@ -262,7 +276,22 @@ class FakeGitHub:
                         "labels": [{"name": label} for label in sorted(pr_labels)],
                     }
                 )
+            if self.issue is not None:
+                issue_labels = {item["name"] for item in self.issue["labels"]}
+                creator = query.get("creator", [self.issue["user"]["login"]])[0]
+                if labels.issubset(issue_labels) and creator == self.issue["user"]["login"]:
+                    issues.append(self.issue)
             return HttpResponse(200, issues)
+
+        if method == "POST" and path == issues_path:
+            payload = cast(dict[str, object], json_body)
+            self.issue = human_issue(
+                author=self.actor_login,
+                body=payload["body"],
+                labels=set(payload["labels"]),
+            )
+            self.issue["title"] = payload["title"]
+            return HttpResponse(201, self.issue)
 
         if method == "POST" and path == pulls_path:
             payload = cast(dict[str, object], json_body)
@@ -292,6 +321,7 @@ class FakeGitHub:
             created = comment(
                 max((int(item["id"]) for item in self.comments), default=0) + 1,
                 body,
+                author=self.actor_login,
             )
             self.comments.append(created)
             return HttpResponse(201, created)
@@ -413,7 +443,6 @@ def workflow(
     fake: FakeGitHub,
     *,
     role: Literal["advisor", "student"] = "advisor",
-    researcher_handles: tuple[str, ...] = (),
 ) -> GitHubWorkflow:
     return GitHubWorkflow(
         REPO,
@@ -421,6 +450,5 @@ def workflow(
         role=role,
         transport=fake,
         api_url=API_URL,
-        trusted_actor="senpai-bot",
-        researcher_handles=researcher_handles,
+        trusted_actor=fake.actor_login,
     )

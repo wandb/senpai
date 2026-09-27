@@ -70,69 +70,6 @@ def test_yaml_config_parses_custom_secret_names_as_a_list(monkeypatch, tmp_path)
     assert args.custom_secret_env_names == ["HF_TOKEN", "DATASET_LICENSE_KEY"]
 
 
-@pytest.mark.parametrize(
-    ("handles", "expected"),
-    [([], ""), ([" @Ada ", "ada", "Grace-Hopper"], "ada,grace-hopper")],
-)
-def test_launch_renders_researcher_handles_from_yaml_for_both_roles(
-    monkeypatch, tmp_path, capsys, handles, expected
-):
-    config_path = tmp_path / "senpai.yaml"
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "tag": "config-test",
-                "target_repo_url": "https://github.com/example/problem.git",
-                "advisor": True,
-                "names": "fern",
-                "advisor_image": ADVISOR_IMAGE,
-                "student_image": STUDENT_IMAGE,
-                "researcher_github_handles": handles,
-            }
-        )
-    )
-    monkeypatch.setattr(launch, "SENPAI_CONFIG", config_path)
-    monkeypatch.setattr(sys, "argv", ["launch.py", "--dry_run"])
-
-    launch.main()
-
-    rendered = re.sub(
-        r"^--- .+ ---$", "---", capsys.readouterr().out, flags=re.MULTILINE
-    )
-    assert {
-        document["metadata"]["labels"]["role"]: document["data"][
-            "SENPAI_RESEARCHER_GITHUB_HANDLES"
-        ]
-        for document in yaml.safe_load_all(rendered)
-        if isinstance(document, dict) and document.get("kind") == "ConfigMap"
-    } == {"advisor": expected, "student": expected}
-
-
-def test_launch_rejects_invalid_researcher_handles_before_credentials(monkeypatch):
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "launch.py",
-            "--tag",
-            "config-test",
-            "--target_repo_url",
-            "https://github.com/example/problem.git",
-            "--preflight_only",
-            "--researcher_github_handles",
-            "team/member",
-        ],
-    )
-
-    def reject_credential_access(*args, **kwargs):
-        raise AssertionError("invalid handles must fail before reading credentials")
-
-    monkeypatch.setattr(launch, "resolve_custom_secrets", reject_credential_access)
-
-    with pytest.raises(SystemExit, match="GitHub"):
-        launch.main()
-
-
 def test_launch_rejects_the_retired_gpu_option_instead_of_abbreviating_it():
     result = run_launch("--gpus_per_student", "8")
 

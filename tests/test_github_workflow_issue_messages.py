@@ -13,7 +13,13 @@ from github_workflow_support import (
     workflow,
 )
 
-from senpai_agent.github.workflow import MutationResult, WorkflowPreconditionError
+from senpai_agent.github.workflow import (
+    GitHubAPIError,
+    HttpResponse,
+    MutationResult,
+    ReconciliationError,
+    WorkflowPreconditionError,
+)
 
 
 def test_respond_to_issue_writes_one_verified_idempotent_reply():
@@ -67,14 +73,17 @@ def test_only_first_senpai_reply_mentions_researchers_across_restarts(role, resp
         ],
         comment_page_size=1,
     )
-    recipients = (" @Ada ", "grace-hopper", "ADA")
+    fake.collaborators = [
+        {"login": login, "type": "User", "permissions": {"push": True}}
+        for login in ("Ada", "grace-hopper", "ADA")
+    ]
     reply = {
         "human_message_id": 42,
         "audience_labels": {"team"},
         "responder": responder,
         "response": "I will compare memory use.",
     }
-    client = workflow(fake, role=role, researcher_handles=recipients)
+    client = workflow(fake, role=role)
     first = client.respond_to_issue(7, **reply)
     first_comment = fake.comments[-1]
     assert first.changed is True
@@ -82,7 +91,7 @@ def test_only_first_senpai_reply_mentions_researchers_across_restarts(role, resp
     assert first_comment["body"].count("@ada") == 1
     mutations = list(fake.mutations)
 
-    client = workflow(fake, role=role, researcher_handles=recipients)
+    client = workflow(fake, role=role)
     assert client.respond_to_issue(7, **reply).changed is False
     assert fake.mutations == mutations
 
@@ -101,9 +110,7 @@ def test_only_first_senpai_reply_mentions_researchers_across_restarts(role, resp
         ("student", "sage") if role == "advisor" else ("advisor", "advisor")
     )
     reply["responder"] = other_responder
-    workflow(fake, role=other_role, researcher_handles=recipients).respond_to_issue(
-        7, **reply
-    )
+    workflow(fake, role=other_role).respond_to_issue(7, **reply)
     assert "@" not in fake.comments[-1]["body"]
 
 
@@ -132,8 +139,11 @@ def test_concurrent_first_replies_only_mention_researchers_in_earliest_comment()
             return response
 
     fake = ConcurrentGitHub(pull_request(), issue=human_issue())
-    advisor = workflow(fake, role="advisor", researcher_handles=("ada",))
-    student = workflow(fake, role="student", researcher_handles=("ada",))
+    fake.collaborators = [
+        {"login": "ada", "type": "User", "permissions": {"push": True}}
+    ]
+    advisor = workflow(fake, role="advisor")
+    student = workflow(fake, role="student")
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         replies = [
@@ -162,24 +172,100 @@ def test_concurrent_first_replies_only_mention_researchers_in_earliest_comment()
     )
 
 
+def test_first_reply_infers_all_human_write_collaborators_including_token_owner():
+    fake = FakeGitHub(pull_request(), issue=human_issue(), actor_login="human-operator")
+    fake.collaborator_page_size = 2
+    fake.collaborators = [
+        {
+            "login": login,
+            "type": user_type,
+            "permissions": {"push": push},
+            "role_name": role,
+        }
+        for login, user_type, push, role in [
+            ("reader", "User", False, "read"),
+            ("triager", "User", False, "triage"),
+            ("writer", "User", True, "write"),
+            ("maintainer", "User", True, "maintain"),
+            ("human-operator", "User", True, "admin"),
+            ("custom-writer", "User", True, "researcher"),
+            ("app[bot]", "Bot", True, "admin"),
+        ]
+    ]
+    workflow(fake).respond_to_issue(
+        7,
+        human_message_id=700,
+        audience_labels={"team"},
+        responder="advisor",
+        response="I will investigate.",
+    )
+    assert fake.comments[-1]["body"].endswith(
+        "\n\n@custom-writer @human-operator @maintainer @writer"
+    )
+
+
 @pytest.mark.parametrize(
-    "handle",
+    ("response", "error"),
     [
-        "@",
-        "org/team",
-        "two names",
-        "alice\n@bob",
-        "-alice",
-        "alice-",
-        "al--ice",
-        "a" * 40,
+        (HttpResponse(403), GitHubAPIError),
+        (
+            HttpResponse(
+                200, [{"login": "ada", "type": "User", "permissions": {"push": "true"}}]
+            ),
+            ReconciliationError,
+        ),
+        (
+            HttpResponse(
+                200, [], (("Link", '<https://other.example/people>; rel="next"'),)
+            ),
+            ReconciliationError,
+        ),
+        (
+            HttpResponse(
+                200,
+                [],
+                (
+                    (
+                        "Link",
+                        f'<https://api.github.test/repos/{REPO}/collaborators?affiliation=all&per_page=100>; rel="next"',
+                    ),
+                ),
+            ),
+            ReconciliationError,
+        ),
     ],
+    ids=["access-denied", "invalid-permission", "foreign-page", "cyclic-page"],
 )
-def test_researcher_configuration_rejects_invalid_user_handles(handle):
-    fake = FakeGitHub(pull_request(), issue=human_issue())
-    with pytest.raises(ValueError, match="invalid researcher GitHub handle"):
-        workflow(fake, researcher_handles=(handle,))
-    assert fake.requests == []
+def test_failed_recipient_discovery_is_visible_and_retry_repairs_first_reply(
+    response, error
+):
+    class FailingDiscoveryGitHub(FakeGitHub):
+        fail = True
+
+        def request(self, method, url, *, headers, json_body=None):
+            if self.fail and urlsplit(url).path == f"/repos/{REPO}/collaborators":
+                return response
+            return super().request(method, url, headers=headers, json_body=json_body)
+
+    fake = FailingDiscoveryGitHub(pull_request(), issue=human_issue())
+    fake.collaborators = [
+        {"login": "ada", "type": "User", "permissions": {"push": True}}
+    ]
+    reply = {
+        "human_message_id": 700,
+        "audience_labels": {"team"},
+        "responder": "advisor",
+        "response": "I will investigate.",
+    }
+    with pytest.raises(error):
+        workflow(fake).respond_to_issue(7, **reply)
+    assert len(fake.comments) == 1
+    assert "@ada" not in fake.comments[0]["body"]
+
+    fake.fail = False
+    workflow(fake).respond_to_issue(7, **reply)
+    assert len(fake.comments) == 1
+    assert fake.comments[0]["body"].endswith("\n\n@ada")
 
 
 def test_respond_to_issue_accepts_a_specific_human_comment():

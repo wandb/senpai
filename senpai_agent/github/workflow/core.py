@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from contextlib import contextmanager
 from threading import RLock
 from typing import TYPE_CHECKING, Literal
@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 from pydantic import SecretStr
 
-from senpai_agent.github.notifications import normalize_researcher_handles
+from senpai_agent.github.http import next_link
 from senpai_agent.github.workflow.errors import (
     GitHubAPIError,
     GitHubTransportError,
@@ -47,7 +47,6 @@ class WorkflowCore:
         "_api_url",
         "_assignment_lifecycle_lock",
         "_repo",
-        "_researcher_handles",
         "_role",
         "_token",
         "_transport",
@@ -63,7 +62,6 @@ class WorkflowCore:
         transport: HttpTransport | None = None,
         api_url: str = "https://api.github.com",
         trusted_actor: str | None = None,
-        researcher_handles: Sequence[str] = (),
     ):
         if len(repo.split("/")) != 2 or not all(repo.split("/")):
             raise ValueError("repo must use owner/name form")
@@ -82,7 +80,6 @@ class WorkflowCore:
         self._transport = transport or UrllibTransport()
         self._api_url = api_url.rstrip("/")
         self._trusted_actor = trusted_actor
-        self._researcher_handles = normalize_researcher_handles(researcher_handles)
         self._assignment_lifecycle_lock = RLock()
 
     def __repr__(self) -> str:
@@ -323,6 +320,27 @@ class WorkflowCore:
             )
         except GitHubTransportError:
             return None
+
+    def _objects(self, path: str) -> Iterator[dict[str, object]]:
+        """Read a complete list from this GitHub origin."""
+
+        url: str | None = self._url(path)
+        visited: set[str] = set()
+        while url is not None:
+            if not url.startswith(f"{self._api_url}/"):
+                raise ReconciliationError(
+                    "GitHub pagination returned an unexpected origin"
+                )
+            if url in visited:
+                raise ReconciliationError("GitHub pagination contains a cycle")
+            visited.add(url)
+            response = self._request("GET", url, expected_statuses={200})
+            if not isinstance(response.json_body, list) or any(
+                not isinstance(item, dict) for item in response.json_body
+            ):
+                raise ReconciliationError("GitHub returned an invalid paginated list")
+            yield from response.json_body
+            url = next_link(response.header("Link"))
 
     def _url(self, value: str) -> str:
         if value.startswith(("https://", "http://")):

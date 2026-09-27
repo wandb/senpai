@@ -494,6 +494,7 @@ def test_file_agent_definitions_keep_bounded_tools_and_no_github_mutations(
         "accept_result_on_current_base",
         "merge_experiment",
         "close_experiment",
+        "create_human_issue",
         "respond_to_human_issue",
         "submit_experiment_result",
     }.isdisjoint(definition.tools)

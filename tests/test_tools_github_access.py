@@ -5,12 +5,13 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from github_workflow_support import FakeGitHub, human_issue, pull_request, workflow
+from github_workflow_support import FakeGitHub, pull_request, workflow
 from openhands.sdk.tool import Tool, resolve_tool
 from pydantic import SecretStr
 
 from senpai_agent.github import tools as github_tools_module
 from senpai_agent.github.tools import (
+    CreateHumanIssueAction,
     GetPRsAction,
     GetPRsTool,
     GitHubToolRuntime,
@@ -26,6 +27,7 @@ from senpai_agent.tools import register_senpai_tools
 ADVISOR_GITHUB_TOOLS = {
     "get_prs",
     "get_pr_source",
+    "create_human_issue",
     "respond_to_human_issue",
     "create_assignment",
     "publish_advisor_branch",
@@ -39,6 +41,7 @@ ADVISOR_GITHUB_TOOLS = {
 STUDENT_GITHUB_TOOLS = {
     "get_prs",
     "get_pr_source",
+    "create_human_issue",
     "post_assignment_comment",
     "publish_assignment_branch",
     "respond_to_human_issue",
@@ -113,14 +116,16 @@ def test_toolset_rejects_a_runtime_role_mismatch(tmp_path: Path):
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
-def test_issue_tool_uses_researchers_from_runtime_environment(
+def test_both_roles_open_issues_with_configured_audience_and_inferred_mentions(
     monkeypatch, tmp_path, role
 ):
     from senpai_agent.github.workflow import core
 
-    fake = FakeGitHub(pull_request(), issue=human_issue())
+    fake = FakeGitHub(pull_request())
+    fake.collaborators = [
+        {"login": "ada", "type": "User", "permissions": {"push": True}}
+    ]
     monkeypatch.setattr(core, "UrllibTransport", lambda: fake)
-    monkeypatch.setenv("SENPAI_RESEARCHER_GITHUB_HANDLES", "@Ada,grace-hopper")
     configure_github_credentials(
         "acme/widgets", SecretStr("github-secret"), trusted_actor="senpai-bot"
     )
@@ -132,18 +137,34 @@ def test_issue_tool_uses_researchers_from_runtime_environment(
             student_names=["fern"],
             student_name="fern",
         )
-        tool = next(tool for tool in tools if tool.name == "respond_to_human_issue")
-        tool(
-            RespondToHumanIssueAction(
-                issue_number=7, human_message_id=700, response="I will investigate."
+        tool = next(tool for tool in tools if tool.name == "create_human_issue")
+        observation = tool(
+            CreateHumanIssueAction(
+                issue_id="confirm-budget",
+                title="Confirm the experiment budget",
+                body="Can we run another seed?",
             )
         )
     finally:
         clear_github_credentials()
 
-    assert fake.comments[-1]["body"].endswith(
-        "I will investigate.\n\n@ada @grace-hopper"
-    )
+    creations = [
+        payload
+        for method, url, payload, _ in fake.requests
+        if method == "POST" and urlsplit(url).path == "/repos/acme/widgets/issues"
+    ]
+    assert len(creations) == 1
+    created = creations[0]
+    assert set(created["labels"]) == {
+        "human",
+        "advisor-branch" if role == "advisor" else "student:fern",
+    }
+    assert f"{role.upper()}: Can we run another seed?" in created["body"]
+    assert created["body"].endswith("\n\n@ada")
+    assert observation.state == "human_issue_created"
+    assert observation.resource_url == "https://github.com/acme/widgets/issues/7"
+    assert len(fake.mutations) == 1
+    assert fake.comments == []
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
