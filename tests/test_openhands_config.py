@@ -1,4 +1,6 @@
+import io
 import os
+from base64 import b64encode
 from pathlib import Path
 
 import pytest
@@ -17,13 +19,58 @@ from senpai_agent.openhands_runner import (
     scrub_model_credentials,
     without_eager_skill_discovery,
 )
-from senpai_agent.program_context import ProgramSystemPrompt
-from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV
-from senpai_agent.system_instructions import SenpaiSystemInstructions
+from senpai_agent.program_context import (
+    PROGRAM_CONTENT_SHA256_ENV,
+    PROGRAM_PATH_ENV,
+    PROGRAM_SOURCE_COMMIT_ENV,
+    ProgramSystemPrompt,
+)
+from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV, MODEL_CREDENTIALS_FD_ENV
+from senpai_agent.system_instructions import (
+    SYSTEM_INSTRUCTIONS_FILE_ENV,
+    SYSTEM_INSTRUCTIONS_SHA256_ENV,
+    SenpaiSystemInstructions,
+)
 from openhands_support import TEST_LAUNCH_CONTEXT, runtime_config, runtime_env
 from test_agent_markdown import HTML_HEADER, PLAIN_HEADER
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("malformed_bundle", [False, True])
+def test_child_handoff_failure_records_the_result_and_finishes_tracing(
+    monkeypatch, malformed_bundle
+):
+    monkeypatch.delenv(MODEL_CREDENTIALS_FD_ENV, raising=False)
+    monkeypatch.setenv("SENPAI_DELEGATION_TASK_ID", "child-task")
+    descriptor = None
+    if malformed_bundle:
+        descriptor, writer = os.pipe()
+        os.write(writer, b"not-json")
+        os.close(writer)
+        monkeypatch.setenv(MODEL_CREDENTIALS_FD_ENV, str(descriptor))
+    events = []
+    monkeypatch.setattr(runner, "set_process_nondumpable", lambda: events.append("private"))
+    monkeypatch.setattr(
+        runner,
+        "record_delegated_task_result",
+        lambda task_id, **result: events.append((task_id, result)),
+    )
+    monkeypatch.setattr(runner, "finish_weave_monitoring", lambda: events.append("finished"))
+    monkeypatch.setattr(runner.sys, "stdin", io.StringIO("Delegated task"))
+    message = "credential bundle is invalid" if malformed_bundle else "private model credential handoff"
+
+    with pytest.raises(RuntimeError, match=message):
+        runner.main(["--max-turns", "1", "--child"])
+
+    assert events[0] == "private"
+    assert events[1][0] == "child-task"
+    assert message in events[1][1]["error"]
+    assert events[2] == "finished"
+    assert MODEL_CREDENTIALS_FD_ENV not in os.environ
+    if descriptor is not None:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_browser_is_enabled_by_default_and_can_be_disabled():
@@ -44,6 +91,32 @@ def test_explicit_role_file_is_loaded(tmp_path: Path):
     assert read_instruction_file(selected) == "student role"
 
 
+def test_reserved_agents_load_from_the_explicit_runtime_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        runner,
+        "SOURCE_SENPAI_AGENT_DIR",
+        tmp_path / "missing-source-tree-agents",
+    )
+    monkeypatch.setenv(
+        runner.SENPAI_AGENT_DIR_ENV,
+        str(ROOT / ".agents" / "agents"),
+    )
+
+    definitions = sanitized_agent_definitions(workspace)
+
+    assert {definition.name for definition in definitions} == {
+        "bash-runner",
+        "general-purpose",
+        "explore",
+        "search",
+    }
+
+
 @pytest.mark.parametrize("explicit", [None, "missing.md"])
 def test_role_file_must_be_explicit_and_exist(tmp_path: Path, explicit: str | None):
     path = None if explicit is None else str(tmp_path / explicit)
@@ -59,18 +132,23 @@ def test_main_agent_context_appends_program_after_harness_and_role():
             role="advisor role",
             program=ProgramSystemPrompt(
                 program_path="senpai/program.md",
-                prompt="# program.md - senpai/program.md\n\nResearch policy.",
+                source_commit="a" * 40,
+                content="Research policy.",
             ),
             launch="# Authoritative launch context\n\nRuntime policy.",
         ),
     )
 
-    assert context.system_message_suffix == (
-        "# Senpai harness\n\nharness instructions\n\n"
-        "# Senpai role\n\nadvisor role\n\n"
-        "# program.md - senpai/program.md\n\nResearch policy.\n\n"
-        "# Authoritative launch context\n\nRuntime policy.\n"
-    )
+    suffix = context.system_message_suffix
+    components = [
+        "# Senpai harness\n\nharness instructions",
+        "# Senpai role\n\nadvisor role",
+        "Research policy.",
+        "# Authoritative launch context\n\nRuntime policy.",
+    ]
+    positions = [suffix.index(component) for component in components]
+    assert positions == sorted(positions)
+    assert f"commit `{'a' * 40}`" in suffix
     assert context.current_datetime is None
     assert context.load_user_skills is False
     assert context.load_project_skills is False
@@ -213,9 +291,9 @@ def test_resolved_config_separates_runtime_credentials_from_conversation_secrets
     assert config.fast_api_key.get_secret_value() == "anthropic-key"
     assert config.frontier_api_key.get_secret_value() == "anthropic-key"
     assert config.github_token.get_secret_value() == "github-key"
+    assert config.exa_api_key.get_secret_value() == "exa-key"
     assert config.conversation_secrets == {
         "WANDB_API_KEY": "wandb-key",
-        "EXA_API_KEY": "exa-key",
         "PRIVATE_AUTH": "private-key",
     }
     assert "ANTHROPIC_API_KEY" not in config.conversation_secrets
@@ -250,7 +328,7 @@ def test_configured_custom_secret_requires_a_nonblank_value(tmp_path: Path):
         resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
-def test_resolved_config_discovers_one_level_program_from_target_workspace(
+def test_resolved_config_uses_launch_snapshot_despite_target_workspace_edits(
     tmp_path: Path,
 ):
     env = runtime_env(
@@ -258,23 +336,54 @@ def test_resolved_config_discovers_one_level_program_from_target_workspace(
         program_path="senpai/program.md",
         program_content="# Mission\n\nImprove the model.\n",
     )
+    (Path(env["SENPAI_OPENHANDS_WORKSPACE"]) / "senpai/program.md").write_text(
+        "Uncommitted replacement policy."
+    )
     config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
     assert config.instructions.program.program_path == "senpai/program.md"
-    assert config.instructions.program.prompt == (
-        "# program.md - senpai/program.md\n\n"
-        "# Mission\n\nImprove the model."
-    )
+    assert config.instructions.program.content == "# Mission\n\nImprove the model."
+    assert config.instructions.program.source_commit == env[PROGRAM_SOURCE_COMMIT_ENV]
     assert config.instructions.launch == TEST_LAUNCH_CONTEXT
-    assert config.instructions.prompt == (
-        "# Senpai harness\n\nharness instructions\n\n"
-        "# Senpai role\n\nadvisor role\n\n"
-        "# program.md - senpai/program.md\n\n"
-        "# Mission\n\nImprove the model.\n\n"
-        f"{TEST_LAUNCH_CONTEXT}\n"
-    )
     delegated = runner.delegation_config(config)
-    assert delegated.program_path == config.instructions.program.program_path
+    assert delegated.instructions is config.instructions
+
+
+@pytest.mark.parametrize(
+    ("key", "replacement", "message"),
+    [
+        (SYSTEM_INSTRUCTIONS_FILE_ENV, None, "is required"),
+        (SYSTEM_INSTRUCTIONS_SHA256_ENV, "0" * 64, "controller-held"),
+        (PROGRAM_PATH_ENV, "other/program.md", "inherited program snapshot"),
+        (PROGRAM_SOURCE_COMMIT_ENV, "b" * 40, "inherited system snapshot"),
+        (PROGRAM_CONTENT_SHA256_ENV, "0" * 64, "inherited program snapshot"),
+        (
+            "SENPAI_LAUNCH_CONTEXT_B64",
+            b64encode(b"Changed launch policy").decode(),
+            "inherited system snapshot",
+        ),
+    ],
+)
+def test_runner_rejects_inherited_snapshot_binding_mismatch(
+    tmp_path: Path, key: str, replacement: str | None, message: str
+):
+    env = runtime_env(tmp_path)
+    if replacement is None:
+        env.pop(key)
+    else:
+        env[key] = replacement
+
+    with pytest.raises((RuntimeError, ValueError), match=message):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+
+@pytest.mark.parametrize("component", ["HARNESS", "ROLE"])
+def test_runner_rejects_changed_instruction_files(tmp_path: Path, component: str):
+    env = runtime_env(tmp_path)
+    Path(env[f"SENPAI_OPENHANDS_{component}_FILE"]).write_text("Changed policy")
+
+    with pytest.raises(RuntimeError, match="controller-held snapshot"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
 def test_resolved_system_instructions_do_not_change_with_source_files(
@@ -718,6 +827,28 @@ def test_model_credentials_are_removed_from_the_agent_environment(tmp_path: Path
     }
 
     scrub_model_credentials(environment, runtime_config(tmp_path))
+
+    assert environment == {"WANDB_API_KEY": "wandb-key"}
+
+
+def test_model_scrubbing_preserves_intentionally_shared_service_credentials(tmp_path):
+    config = runtime_config(
+        tmp_path,
+        api_key_env="WANDB_API_KEY",
+        api_key=SecretStr("wandb-key"),
+        conversation_secrets={"WANDB_API_KEY": "wandb-key"},
+        exa_api_key=SecretStr("exa-key"),
+    )
+    environment = {
+        "ANTHROPIC_API_KEY": "anthropic-key",
+        "OPENAI_API_KEY": "openai-key",
+        "WANDB_API_KEY": "wandb-key",
+        "EXA_API_KEY": "exa-key",
+        "SENPAI_EXA_API_KEY_FILE": "/private/consumed-exa",
+        "SENPAI_EXA_API_KEY_FD": "99",
+    }
+
+    scrub_model_credentials(environment, config)
 
     assert environment == {"WANDB_API_KEY": "wandb-key"}
 

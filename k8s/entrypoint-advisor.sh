@@ -9,21 +9,25 @@ set -o pipefail
 umask "${SENPAI_UMASK:-0022}"
 LOGDIR="/var/lib/senpai/$RESEARCH_TAG/advisor"
 rm -f "$LOGDIR/openhands_state/controller-lease.json"
-date +%s > "${SENPAI_BOOTSTRAP_STARTED_PATH:-/var/lib/senpai/.bootstrap-started}"
 
 WORKDIR="/workspace/senpai"
 GH_HISTORY_SCOPE="${GH_HISTORY_SCOPE:-branch}"
 TARGET_REPO_BRANCH="${TARGET_REPO_BRANCH:-}"
 export SENPAI_ROLE="advisor"
 export TARGET_WORKDIR="$WORKDIR/$PROBLEM_DIR"
-SOURCE_SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
-export SENPAI_PLUGIN="$SOURCE_SENPAI_PLUGIN"
 GIT_ASKPASS_FILE="/tmp/senpai-git-askpass"
 mkdir -p "$LOGDIR"
 if [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
     export GITHUB_TOKEN="$(<"$SENPAI_GITHUB_TOKEN_FILE")"
 fi
 : "${GITHUB_TOKEN:?GitHub bootstrap token is required}"
+: "${SENPAI_PROGRAM_SOURCE_COMMIT:?Launch-pinned program source commit is required}"
+: "${SENPAI_PROGRAM_CONTENT_SHA256:?Launch-pinned program digest is required}"
+: "${SENPAI_PROGRAM_CONTEXT_FILE:?Launch-owned program snapshot file is required}"
+[ -r "$SENPAI_PROGRAM_CONTEXT_FILE" ] || {
+    echo "ERROR: program snapshot file is not readable" >&2
+    exit 1
+}
 export SENPAI_OPENHANDS_STATE_DIR="$LOGDIR/openhands_state"
 export SENPAI_OPENHANDS_ROLE_FILE="$WORKDIR/system_instructions/ADVISOR.md"
 
@@ -37,8 +41,11 @@ echo "GitHub history: $GH_HISTORY_SCOPE"
 
 # Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
-git config --global safe.directory "$WORKDIR"
-source "$SOURCE_SENPAI_PLUGIN/scripts/git-guard.sh"
+git config --global --add safe.directory "$WORKDIR"
+mkdir -p "$TARGET_WORKDIR"
+export TARGET_WORKDIR="$(cd "$TARGET_WORKDIR" && pwd -P)"
+git config --global --add safe.directory "$TARGET_WORKDIR"
+source "$SENPAI_PLUGIN/scripts/git-guard.sh"
 install_senpai_git_guard "$WORKDIR" "$GIT_ASKPASS_FILE"
 
 clone_single_target_branch() {
@@ -57,7 +64,6 @@ clone_target_repo() {
             if [ -z "$TARGET_REPO_BRANCH" ]; then
                 return 1
             fi
-            rm -rf "$PROBLEM_DIR"
             if ! clone_single_target_branch "$TARGET_REPO_BRANCH"; then
                 return 1
             fi
@@ -73,7 +79,10 @@ clone_target_repo() {
 
 # Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
 # agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
-if [ ! -d "$PROBLEM_DIR/.git" ] && ! clone_target_repo; then
+TARGET_CHECKOUT_EXISTS=false
+if [ -d "$PROBLEM_DIR/.git" ]; then
+    TARGET_CHECKOUT_EXISTS=true
+elif ! clone_target_repo; then
     if [ -n "$TARGET_REPO_BRANCH" ]; then
         echo "ERROR: could not clone advisor branch '$ADVISOR_BRANCH' or target base branch '$TARGET_REPO_BRANCH'" >&2
         exit 1
@@ -87,16 +96,11 @@ if [ ! -d "$PROBLEM_DIR/.git" ] && ! clone_target_repo; then
     git push -u origin "$ADVISOR_BRANCH"
     cd "$WORKDIR"
 fi
+if ! git -C "$TARGET_WORKDIR" rev-parse --verify 'HEAD^{commit}' >/dev/null 2>&1; then
+    echo "ERROR: target checkout '$TARGET_WORKDIR' has no valid HEAD commit; inspect and repair the retained checkout before restarting." >&2
+    exit 1
+fi
 git config --global --unset-all credential.helper 2>/dev/null || true
-
-uv pip install --python "$SENPAI_PYTHON" --no-deps -e .
-
-source "$SOURCE_SENPAI_PLUGIN/scripts/agent-context.sh"
-AGENT_CONTEXT_ROOT="$(mktemp -d /tmp/senpai-agent-context.XXXXXX)"
-export SENPAI_PLUGIN="$(
-    install_senpai_agent_context \
-        "$WORKDIR" "$SOURCE_SENPAI_PLUGIN" "$AGENT_CONTEXT_ROOT"
-)"
 
 # --- Git identity (inside the problem-package repo) ---
 cd "$WORKDIR/$PROBLEM_DIR"
@@ -105,30 +109,32 @@ git config user.email "senpai-advisor@senpai"
 gh repo set-default "$GH_REPO"
 install_senpai_target_git_guard "$TARGET_WORKDIR"
 
-# --- Create or checkout advisor branch ---
-if [ "$GH_HISTORY_SCOPE" != "repo" ]; then
-    git remote set-branches origin "$ADVISOR_BRANCH"
-    git config remote.origin.tagOpt --no-tags
-fi
-if git rev-parse --verify "origin/$ADVISOR_BRANCH" >/dev/null 2>&1; then
-    git checkout "$ADVISOR_BRANCH"
-    git pull --ff-only origin "$ADVISOR_BRANCH"
-else
-    if [ -n "$TARGET_REPO_BRANCH" ]; then
-        git fetch origin "$TARGET_REPO_BRANCH"
-        git checkout -B "$ADVISOR_BRANCH" "origin/$TARGET_REPO_BRANCH"
-    else
-        git checkout -b "$ADVISOR_BRANCH"
+# Preserve an existing checkout for controller reconciliation after restart.
+if [ "$TARGET_CHECKOUT_EXISTS" = false ]; then
+    if [ "$GH_HISTORY_SCOPE" != "repo" ]; then
+        git remote set-branches origin "$ADVISOR_BRANCH"
+        git config remote.origin.tagOpt --no-tags
     fi
-    git push -u origin "$ADVISOR_BRANCH"
+    if git rev-parse --verify "origin/$ADVISOR_BRANCH" >/dev/null 2>&1; then
+        git checkout "$ADVISOR_BRANCH"
+        git pull --ff-only origin "$ADVISOR_BRANCH"
+    else
+        if [ -n "$TARGET_REPO_BRANCH" ]; then
+            git fetch origin "$TARGET_REPO_BRANCH"
+            git checkout -B "$ADVISOR_BRANCH" "origin/$TARGET_REPO_BRANCH"
+        else
+            git checkout -b "$ADVISOR_BRANCH"
+        fi
+        git push -u origin "$ADVISOR_BRANCH"
+    fi
 fi
 
 echo "=== Agent config installed ==="
 ls \
-    "$HOME/.agents/agents/bash-runner.md" \
-    "$HOME/.agents/agents/general-purpose.md" \
-    "$HOME/.agents/agents/explore.md" \
-    "$HOME/.agents/agents/search.md" \
+    "$SENPAI_AGENT_DIR/bash-runner.md" \
+    "$SENPAI_AGENT_DIR/general-purpose.md" \
+    "$SENPAI_AGENT_DIR/explore.md" \
+    "$SENPAI_AGENT_DIR/search.md" \
     "$SENPAI_PLUGIN/skills/wandb-primary/SKILL.md"
 
 # --- Hivemind is intentionally disabled pending its OpenHands rewrite. ---
@@ -142,10 +148,38 @@ unset UV_PROJECT_ENVIRONMENT UV_PYTHON VIRTUAL_ENV
 export SENPAI_OPENHANDS_WORKSPACE="$TARGET_WORKDIR"
 export SENPAI_OPENHANDS_HARNESS_FILE="$WORKDIR/system_instructions/SENPAI-HARNESS.md"
 export SENPAI_OPENHANDS_TIMEOUT_SECONDS="${SENPAI_OPENHANDS_TIMEOUT_SECONDS:-7200}"
+CREDENTIAL_HANDOFF_DIR=""
+prepare_credential_handoff_dir() {
+    [ -n "$CREDENTIAL_HANDOFF_DIR" ] && return
+    CREDENTIAL_HANDOFF_DIR="$(mktemp -d /tmp/senpai-supervisor.XXXXXX)"
+    chmod 700 "$CREDENTIAL_HANDOFF_DIR"
+}
 if [ -z "${SENPAI_GITHUB_TOKEN_FILE:-}" ]; then
-    export SENPAI_GITHUB_TOKEN_FILE="/tmp/senpai-supervisor-github-token"
+    prepare_credential_handoff_dir
+    export SENPAI_GITHUB_TOKEN_FILE="$CREDENTIAL_HANDOFF_DIR/github-token"
     (umask 077; printf '%s' "$GITHUB_TOKEN" > "$SENPAI_GITHUB_TOKEN_FILE")
 fi
-unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS
+if [ -z "${SENPAI_WANDB_API_KEY_FILE:-}" ] && [ -n "${WANDB_API_KEY:-}" ]; then
+    prepare_credential_handoff_dir
+    export SENPAI_WANDB_API_KEY_FILE="$CREDENTIAL_HANDOFF_DIR/wandb-api-key"
+    (umask 077; printf '%s' "$WANDB_API_KEY" > "$SENPAI_WANDB_API_KEY_FILE")
+fi
+if [ -z "${SENPAI_EXA_API_KEY_FILE:-}" ] && [ -n "${EXA_API_KEY:-}" ]; then
+    prepare_credential_handoff_dir
+    export SENPAI_EXA_API_KEY_FILE="$CREDENTIAL_HANDOFF_DIR/exa-api-key"
+    (umask 077; printf '%s' "$EXA_API_KEY" > "$SENPAI_EXA_API_KEY_FILE")
+fi
+unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS WANDB_API_KEY EXA_API_KEY
 rm -f "$GIT_ASKPASS_FILE"
-exec python -m senpai_agent.supervisor advisor
+export SENPAI_TARGET_PYTHON_ENV="$HOME/.venvs/senpai-target"
+if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then
+    /usr/local/bin/uv venv --no-project --no-config --no-python-downloads \
+        --python "$SENPAI_PYTHON" --allow-existing "$SENPAI_TARGET_PYTHON_ENV"
+fi
+CONTROLLER_SITE="$("$SENPAI_PYTHON" -P -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+# The target interpreter is agent-writable; never execute it during trusted startup.
+TARGET_SITE="$("$SENPAI_PYTHON" -P -c 'import sys, sysconfig; print(sysconfig.get_path("purelib", vars={"base": sys.argv[1]}))' "$SENPAI_TARGET_PYTHON_ENV")"
+printf '%s\n' "$CONTROLLER_SITE" > "$TARGET_SITE/senpai-runtime.pth"
+"$SENPAI_PYTHON" -P -m senpai_agent.target_environment "$SENPAI_TARGET_PYTHON_ENV"
+cd "$WORKDIR"
+exec "$SENPAI_PYTHON" -P -m senpai_agent.supervisor advisor

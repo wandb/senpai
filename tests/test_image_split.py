@@ -1,5 +1,13 @@
+import json
+import os
 import re
+import shlex
+import shutil
+import subprocess
+import sys
+import sysconfig
 import tomllib
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -35,6 +43,16 @@ def named_items(items: list[dict]) -> dict[str, dict]:
     return {item["name"]: item for item in items}
 
 
+def target_environment_setup(role: str) -> str:
+    entrypoint = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text()
+    setup = entrypoint[entrypoint.index("export SENPAI_TARGET_PYTHON_ENV=") :]
+    setup = setup.split('cd "$WORKDIR"', 1)[0]
+    uv = shutil.which("uv")
+    assert uv is not None, "the bootstrap contract requires uv"
+    # Map the image's fixed binary path to the local test runtime.
+    return setup.replace("/usr/local/bin/uv", shlex.quote(uv))
+
+
 def test_advisor_dockerfile_prunes_the_training_stack():
     dockerfile = (ROOT / "Dockerfile.advisor").read_text(encoding="utf-8")
     lowered = dockerfile.lower()
@@ -57,7 +75,8 @@ def test_student_dockerfile_declares_the_cuda_training_runtime():
 
     assert "coreweave/ml-containers" in lowered
     assert "uv export --locked" in dockerfile
-    assert "import importlib.metadata, openhands.sdk, sys, torch" in dockerfile
+    assert "openhands.sdk" in dockerfile
+    assert 'torch.__version__.startswith("2.13.")' in dockerfile
     assert "NVIDIA_VISIBLE_DEVICES=all" in dockerfile
     assert "senpai-gpu-smoke-test" in dockerfile
     assert "@anthropic-ai/claude-code" not in lowered
@@ -106,7 +125,7 @@ def test_both_role_images_run_as_the_same_explicit_non_root_user():
         assert "HOME=/home/senpai" in dockerfile
         assert "PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright" in dockerfile
         assert 'ln -s "$chromium_path" /usr/local/bin/chromium' in dockerfile
-        assert "mkdir -p /workspace /workspaces /var/lib/senpai" in dockerfile
+        assert "mkdir -p /workspace/senpai /workspaces /var/lib/senpai" in dockerfile
         assert dockerfile.rindex("ENV HOME=/home/senpai") < dockerfile.index(
             "USER 10001:10001"
         )
@@ -115,12 +134,45 @@ def test_both_role_images_run_as_the_same_explicit_non_root_user():
         )
 
 
-def test_both_images_expose_the_controller_lease_as_their_healthcheck():
+def test_both_images_do_not_spawn_credential_bearing_health_processes():
     for role in ("advisor", "student"):
         dockerfile = (ROOT / f"Dockerfile.{role}").read_text(encoding="utf-8")
 
-        assert "HEALTHCHECK" in dockerfile
-        assert "CMD senpai-container-health" in dockerfile
+        assert "HEALTHCHECK" not in dockerfile
+        assert "senpai-container-health" not in dockerfile
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_images_install_the_runner_and_protect_runtime_assets(role: str):
+    dockerfile = (ROOT / f"Dockerfile.{role}").read_text(encoding="utf-8")
+    root_setup = dockerfile.split("USER 10001:10001", 1)[0].replace("\\\n", " ")
+
+    assert (
+        'uv pip install --python "$SENPAI_PYTHON" --no-deps --compile-bytecode /tmp/senpai'
+        in root_setup
+    )
+    assert '"pip==25.3"' in root_setup
+    assert "SENPAI_PYTHON=/opt/senpai-venv/bin/python" in dockerfile
+    assert "UV_PYTHON=/opt/senpai-venv/bin/python" in dockerfile
+    assert "UV_PROJECT_ENVIRONMENT" not in dockerfile
+    for source, destination in (
+        (".agents/agents", "/opt/senpai-agent-definitions"),
+        ("plugins/senpai", "/opt/senpai-plugin"),
+    ):
+        assert f"COPY {source} {destination}" in root_setup
+    for command in ("chown -R root:root", "chmod -R a-w"):
+        protected = root_setup.split(command, 1)[1].split("&&", 1)[0]
+        assert "/opt/senpai-venv" in protected
+        assert '"$SENPAI_AGENT_DIR"' in protected
+        assert '"$SENPAI_PLUGIN"' in protected
+        if role == "student":
+            assert '"$UV_PYTHON_INSTALL_DIR"' in protected
+    for user_ownership in root_setup.split("chown -R 10001:10001")[1:]:
+        writable = user_ownership.split("&&", 1)[0]
+        assert "/opt/senpai-venv" not in writable
+        assert '"$SENPAI_AGENT_DIR"' not in writable
+        assert '"$SENPAI_PLUGIN"' not in writable
+        assert '"$UV_PYTHON_INSTALL_DIR"' not in writable
 
 
 def test_both_images_record_the_exact_source_revision():
@@ -223,22 +275,244 @@ def test_entrypoints_delegate_runtime_lifecycle_to_the_python_supervisor(
         f'SENPAI_OPENHANDS_ROLE_FILE="$WORKDIR/system_instructions/{role.upper()}.md"'
         in entrypoint
     )
-    assert f"exec python -m senpai_agent.supervisor {role}" in entrypoint
+    assert f'exec "$SENPAI_PYTHON" -P -m senpai_agent.supervisor {role}' in entrypoint
+    assert "uv pip install" not in entrypoint
+    assert "agent-context.sh" not in entrypoint
+    assert "PYTHONSAFEPATH" not in entrypoint
     assert "wait_for_senpai_start_gate" not in entrypoint
-    trust_runner = 'git config --global safe.directory "$WORKDIR"'
+    trust_runner = 'git config --global --add safe.directory "$WORKDIR"'
     assert entrypoint.index(trust_runner) < entrypoint.index(
         'install_senpai_git_guard "$WORKDIR"'
     )
     assert "readinessProbe" not in container
-    assert container["livenessProbe"]["exec"]["command"][:2] == [
-        "/bin/sh",
-        "-c",
-    ]
-    assert (
-        "senpai_agent.supervisor health"
-        in container["livenessProbe"]["exec"]["command"][2]
-    )
     assert deployment["spec"]["strategy"] == {"type": "Recreate"}
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+@pytest.mark.parametrize(
+    "target_state",
+    [
+        "fresh", "workspace_module", "workspace_configuration",
+        "path_command", "existing_interpreter", "existing_site",
+    ],
+)
+def test_target_environment_setup_does_not_execute_target_code(
+    tmp_path: Path,
+    role: str,
+    target_state: str,
+):
+    home = tmp_path / "home"
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    target_env = home / ".venvs" / "senpai-target"
+    target_site = Path(
+        sysconfig.get_path("purelib", vars={"base": str(target_env)})
+    )
+    exposure = tmp_path / "target-code-executed"
+    hostile_code = f"from pathlib import Path; Path({str(exposure)!r}).touch()\n"
+    if target_state == "workspace_module":
+        for module in ("venv.py", "sysconfig.py"):
+            (workspace / module).write_text(hostile_code)
+    elif target_state == "workspace_configuration":
+        # Trusted bootstrap must not parse target project or uv settings.
+        for name in ("uv.toml", "pyproject.toml"):
+            (workspace / name).write_text("invalid = [")
+    elif target_state == "path_command":
+        hostile_uv = home / ".local/bin/uv"
+        hostile_uv.parent.mkdir(parents=True)
+        hostile_uv.write_text('#!/bin/sh\ntouch "$EXPOSURE_PATH"\n')
+        hostile_uv.chmod(0o755)
+    elif target_state == "existing_interpreter":
+        target_python = target_env / "bin" / "python"
+        target_python.parent.mkdir(parents=True)
+        target_site.mkdir(parents=True)
+        target_python.write_text('#!/bin/sh\ntouch "$EXPOSURE_PATH"\n')
+        target_python.chmod(0o755)
+    elif target_state == "existing_site":
+        target_site.mkdir(parents=True)
+        (target_site / "untrusted.pth").write_text(
+            f"import pathlib; pathlib.Path({str(exposure)!r}).touch()\n"
+        )
+
+    setup = target_environment_setup(role)
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTHONHOME", "PYTHONPATH", "PYTHONSAFEPATH"}
+    }
+    environment.update(
+        HOME=str(home),
+        SENPAI_PYTHON=sys.executable,
+        EXPOSURE_PATH=str(exposure),
+        PATH=f"{home / '.local/bin'}:{environment['PATH']}",
+        # The image imports an installed package; this source-level harness
+        # explicitly supplies the trusted package under test.
+        PYTHONPATH=str(ROOT),
+    )
+
+    completed = subprocess.run(
+        ["bash", "-e", "-c", setup],
+        cwd=workspace,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert not exposure.exists(), "trusted bootstrap executed target-controlled code"
+    assert completed.returncode == 0, completed.stderr
+    assert (target_site / "senpai-runtime.pth").read_text().strip() == (
+        sysconfig.get_path("purelib")
+    )
+    if target_state != "fresh":
+        return
+
+    wheel = tmp_path / "target_example-0.0.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("target_example.py", "VALUE = 'target dependency'\n")
+        archive.writestr(
+            "target_example-0.0.0.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: target-example\nVersion: 0.0.0\n",
+        )
+        archive.writestr(
+            "target_example-0.0.0.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+        archive.writestr("target_example-0.0.0.dist-info/RECORD", "")
+    target_python = target_env / "bin" / "python"
+    subprocess.run(
+        [
+            "uv", "pip", "install", "--python", str(target_python),
+            "--no-deps", "--no-index", str(wheel),
+        ],
+        env={**environment, "UV_CACHE_DIR": str(tmp_path / "uv-cache")},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result = subprocess.check_output(
+        [
+            str(target_python), "-P", "-c",
+            "import json,pydantic,target_example; "
+            "print(json.dumps([pydantic.__file__, target_example.__file__, "
+            "target_example.VALUE]))",
+        ],
+        cwd=workspace,
+        env=environment,
+        text=True,
+    )
+    runtime_package, target_package, value = json.loads(result)
+    assert Path(runtime_package).is_relative_to(sysconfig.get_path("purelib"))
+    assert Path(target_package).is_relative_to(target_site)
+    assert value == "target dependency"
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_target_packages_and_shared_console_scripts_use_target_environment(
+    tmp_path: Path, role: str,
+):
+    runtime = tmp_path / "runtime's environment"
+    subprocess.run([sys.executable, "-P", "-m", "venv", str(runtime)], check=True)
+    runtime_python = runtime / "bin/python"
+    wheel_dir = tmp_path / "wheels"
+    wheel_dir.mkdir()
+
+    def wheel(name, version, requires=(), module="", console_scripts=()):
+        path = wheel_dir / f"{name}-{version}-py3-none-any.whl"
+        info = f"{name}-{version}.dist-info"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr(f"{name}.py", f"VERSION = {version!r}\n" + module)
+            archive.writestr(
+                f"{info}/METADATA",
+                f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+                + "".join(f"Requires-Dist: {requirement}\n" for requirement in requires),
+            )
+            archive.writestr(
+                f"{info}/WHEEL",
+                "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            )
+            archive.writestr(f"{info}/RECORD", "")
+            if console_scripts:
+                archive.writestr(
+                    f"{info}/entry_points.txt",
+                    "[console_scripts]\n"
+                    + "".join(f"{script} = {name}:main\n" for script in console_scripts),
+                )
+        return path
+
+    shared = wheel(
+        "shared_example", "1.0",
+        module=(
+            "def main():\n"
+            "    import json, subprocess, sys, target_addon\n"
+            "    worker = subprocess.check_output([sys.executable, '-c', "
+            "'import json, sys, target_addon; "
+            "print(json.dumps([sys.prefix, target_addon.VERSION]))'], text=True)\n"
+            "    print(json.dumps([sys.executable, sys.prefix, sys.argv[1:], "
+            "target_addon.VERSION, json.loads(worker)]))\n"
+        ),
+        console_scripts=("shared-example", "existing-tool", "linked-tool"),
+    )
+    subprocess.run(
+        [str(runtime_python), "-m", "pip", "install", "--no-index", str(shared)],
+        check=True, capture_output=True,
+    )
+    home = tmp_path / "user's home"
+    target = home / ".venvs/senpai-target"
+    target_bin = target / "bin"
+    target_bin.mkdir(parents=True)
+    existing_script = target_bin / "existing-tool"
+    existing_script.write_text("#!/bin/sh\nprintf 'retained target script\\n'\n")
+    existing_script.chmod(0o755)
+    existing_link = target_bin / "linked-tool"
+    existing_link.symlink_to("missing-target-tool")
+    setup = target_environment_setup(role)
+    environment = {"PATH": os.environ["PATH"], "HOME": str(home),
+                   "SENPAI_PYTHON": str(runtime_python), "PYTHONPATH": str(ROOT)}
+    subprocess.run(["bash", "-e", "-c", setup], env=environment, check=True)
+    target_python = target / "bin/python"
+    target_site = Path(sysconfig.get_path("purelib", vars={"base": str(target)}))
+    addon = wheel("target_addon", "1.0", ("shared-example>=1.0",))
+    # No index or find-links: resolving the addon's dependency must reuse the
+    # installed shared distribution, not fetch or copy it into the target.
+    subprocess.run(
+        [str(target_python), "-m", "pip", "install", "--no-index", str(addon)],
+        env=environment, check=True, capture_output=True,
+    )
+    assert not (target_site / "shared_example.py").exists()
+    assert (target_site / "target_addon.py").is_file()
+
+    target_environment = {
+        **environment,
+        "PATH": f"{target_bin}:{runtime / 'bin'}:{environment['PATH']}",
+    }
+    arguments = ["two words", "quote'and\"double", "$(printf unsafe); *", ""]
+    result = subprocess.run(
+        ["shared-example", *arguments],
+        env=target_environment, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [
+        str(target_python), str(target), arguments, "1.0", [str(target), "1.0"],
+    ]
+    subprocess.run(["bash", "-e", "-c", setup], env=environment, check=True)
+    assert subprocess.check_output(
+        [str(existing_script)], env=target_environment, text=True,
+    ) == "retained target script\n"
+    assert existing_link.is_symlink()
+    assert existing_link.readlink() == Path("missing-target-tool")
+
+    upgrade = wheel("shared_example", "2.0")
+    subprocess.run(
+        [str(target_python), "-m", "pip", "install", "--no-index", str(upgrade)],
+        env=environment, check=True, capture_output=True,
+    )
+    for python, expected in ((runtime_python, "1.0"), (target_python, "2.0")):
+        version = subprocess.check_output(
+            [str(python), "-P", "-c", "import shared_example; print(shared_example.VERSION)"],
+            env=environment, text=True,
+        ).strip()
+        assert version == expected
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
@@ -250,7 +524,7 @@ def test_roles_clear_a_stale_lease_before_bootstrap(role: str):
     bootstrap = container["args"][0]
     lease = "openhands_state/controller-lease.json"
 
-    assert entrypoint.index(lease) < entrypoint.index("SENPAI_BOOTSTRAP_STARTED_PATH")
+    assert entrypoint.index(lease) < entrypoint.index("git clone")
     assert bootstrap.index(lease) < bootstrap.index("git init /workspace/senpai")
 
 
@@ -267,13 +541,29 @@ def test_bootstrap_git_credentials_are_not_exposed_in_process_arguments():
         assert "unset GITHUB_TOKEN GH_TOKEN" in bootstrap
         assert "exec bash" in bootstrap
 
-    for role in ("advisor", "student"):
-        container = container_for(load_kubernetes_template(f"{role}-deployment.yaml"))
-        assert (
-            "senpai_agent.supervisor health"
-            in container["startupProbe"]["exec"]["command"][2]
-        )
-        assert container["startupProbe"]["failureThreshold"] == 60
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_role_probes_query_http_without_starting_a_process(role: str):
+    container = container_for(load_kubernetes_template(f"{role}-deployment.yaml"))
+    assert container["startupProbe"] == {
+        "httpGet": {"path": "/healthz", "port": 8080},
+        "periodSeconds": 10,
+        "timeoutSeconds": 5,
+        "failureThreshold": 60,
+    }
+    assert container["livenessProbe"] == {
+        "httpGet": {"path": "/healthz", "port": 8080},
+        "periodSeconds": 30,
+        "timeoutSeconds": 5,
+        "failureThreshold": 5,
+        "terminationGracePeriodSeconds": 75,
+    }
+
+
+def test_role_entrypoints_default_openhands_turns_to_two_hours_of_inactivity():
+    for name in ("entrypoint-advisor.sh", "entrypoint-student.sh"):
+        entrypoint = (ROOT / "k8s" / name).read_text()
+        assert 'SENPAI_OPENHANDS_TIMEOUT_SECONDS:-7200' in entrypoint
 
 
 def test_role_pods_enforce_non_root_process_isolation():
@@ -298,7 +588,6 @@ def test_role_pods_enforce_non_root_process_isolation():
             pod["terminationGracePeriodSeconds"]
             > container["livenessProbe"]["terminationGracePeriodSeconds"]
         )
-        assert container["livenessProbe"]["terminationGracePeriodSeconds"] >= 75
 
 
 def test_runtime_git_auth_uses_ephemeral_askpass_not_a_credential_store():
@@ -316,10 +605,6 @@ def test_runtime_git_auth_uses_ephemeral_askpass_not_a_credential_store():
             encoding="utf-8"
         )
         assert 'GIT_ASKPASS_FILE="/tmp/senpai-git-askpass"' in entrypoint
-        assert (
-            'SENPAI_GITHUB_TOKEN_FILE="/tmp/senpai-supervisor-github-token"'
-            in entrypoint
-        )
         assert ".git-credentials" not in entrypoint
         assert 'credential.helper "store' not in entrypoint
 
@@ -335,6 +620,66 @@ def test_entrypoint_umask_is_configurable_but_token_creation_stays_private():
             "(umask 077; printf '%s' \"$GITHUB_TOKEN\" > "
             '"$SENPAI_GITHUB_TOKEN_FILE")'
         ) in entrypoint
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+@pytest.mark.parametrize("services", ["absent", "environment", "files"])
+def test_entrypoint_hands_off_credentials_without_requiring_optional_services(
+    tmp_path: Path, role: str, services: str
+):
+    entrypoint = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text()
+    handoff = entrypoint[
+        entrypoint.index('CREDENTIAL_HANDOFF_DIR=""') : entrypoint.index(
+            'rm -f "$GIT_ASKPASS_FILE"'
+        )
+    ].replace("/tmp/senpai-supervisor.", str(tmp_path / "handoff."))
+    handoff += '''
+test "${GITHUB_TOKEN+x}${GH_TOKEN+x}${WANDB_API_KEY+x}${EXA_API_KEY+x}" = ""
+printf '%s\\n' "$SENPAI_GITHUB_TOKEN_FILE" "${SENPAI_WANDB_API_KEY_FILE:-}" "${SENPAI_EXA_API_KEY_FILE:-}"
+umask > "$UMASK_OUTPUT"
+'''
+    credential_names = ("GITHUB_TOKEN", "WANDB_API_KEY", "EXA_API_KEY")
+    env = {
+        key: value for key, value in os.environ.items()
+        if key not in credential_names
+        and key not in {f"SENPAI_{name}_FILE" for name in credential_names}
+    }
+    env |= {
+        "GITHUB_TOKEN": "github-fixture",
+        "GH_TOKEN": "github-alias-fixture",
+        "UMASK_OUTPUT": str(tmp_path / "umask"),
+    }
+    expected = ["github-fixture"]
+    if services != "absent":
+        expected += ["wandb-fixture", "exa-fixture"]
+    if services == "environment":
+        env |= {"WANDB_API_KEY": "wandb-fixture", "EXA_API_KEY": "exa-fixture"}
+    elif services == "files":
+        existing = tmp_path / "provided"
+        existing.mkdir(mode=0o700)
+        for name, value in zip(credential_names, expected, strict=True):
+            path = existing / name.lower()
+            path.write_text(value)
+            path.chmod(0o600)
+            env[f"SENPAI_{name}_FILE"] = str(path)
+
+    result = subprocess.run(
+        ["bash", "-e", "-c", "umask 0022\n" + handoff],
+        env=env, capture_output=True, text=True, check=True,
+    )
+
+    paths = result.stdout.splitlines()
+    assert len(paths) == 3
+    assert bool(paths[1]) == bool(paths[2]) == (services != "absent")
+    active_paths = [Path(path) for path in paths if path]
+    assert len({path.parent for path in active_paths}) == 1
+    assert active_paths[0].parent.stat().st_mode & 0o777 == 0o700
+    for path, value in zip(active_paths, expected, strict=True):
+        assert path.read_text() == value
+        assert path.stat().st_mode & 0o777 == 0o600
+    if services == "files":
+        assert active_paths[0].parent == existing
+    assert int((tmp_path / "umask").read_text().strip(), 8) == 0o22
 
 
 def test_manifests_expose_no_advisor_service_or_callback_credentials():

@@ -48,8 +48,8 @@ entrypoint
 
 Python supervisor
   start one controller worker process group
-  restart crashes with bounded exponential backoff
-  TERM/KILL a worker whose current phase lease expires
+  forget stored credentials after handoff
+  TERM/KILL descendants and exit when the worker stops or its lease expires
 
 Python controller worker
   poll GitHub + local durable monitor/event state
@@ -63,18 +63,27 @@ The worker publishes an atomic lease containing its PID, current phase, hard
 deadline, completed-turn counter, and active LLM request timestamps. A
 non-model-visible heartbeat updates `llm_request_heartbeat_at` while preserving
 the request's original `llm_request_started_at`. It does not add conversation
-events or renew the hard deadline. The supervisor resets bounded restart
-backoff only after a turn is successfully acknowledged; process uptime and
-idle sleep do not count as progress. The supervisor is independent of
-OpenHands and Kubernetes.
+events or renew the hard deadline. The supervisor starts exactly one worker.
+A worker crash, clean exit, or expired lease causes descendant cleanup and a
+nonzero supervisor exit. An operator stop returns zero. An external process
+manager owns restart and backoff. The supervisor is independent of OpenHands
+and Kubernetes.
 OpenHands events renew the root turn's lease; its configured timeout measures
 inactivity rather than total elapsed time. Provider, tool, training, and child
 deadlines remain hard.
-Kubernetes liveness and Docker health checks inspect the same lease, while the
-supervisor provides the same recovery on a plain host.
+The supervisor serves `/healthz` on all IPv4 interfaces, using port 8080 by
+default. It returns HTTP 200 for a live worker lease and HTTP 503 otherwise.
+Kubernetes startup and liveness probes query this endpoint on fixed port 8080
+without creating a process inside the container. The images have no Docker
+`HEALTHCHECK`. Standalone launchers can set `SENPAI_HEALTH_PORT` and configure
+an external monitor with startup grace and retries. After persistent failure,
+the monitor restarts the container or repeats host bootstrap. Restarting the
+complete entrypoint recreates the one-use credential handoffs.
 
-The core controller imports no Kubernetes API and needs no Service, port, DNS
-record, ServiceAccount, RBAC, cross-node token, or tailnet.
+The health listener monitors one supervisor. Advisor/student communication
+continues through GitHub. The core controller imports no Kubernetes API.
+Cross-node coordination needs no Service, listening port, DNS record,
+ServiceAccount, RBAC, cross-node token, or tailnet.
 
 GitHub state is level-triggered:
 
@@ -226,8 +235,8 @@ The model receives:
 2. One stable system suffix assembled from:
    - `system_instructions/SENPAI-HARNESS.md`; and
    - the rendered advisor or student role charter; and
-   - the selected target-repository `program.md` under
-     `# program.md - <path>`; and
+   - the selected target-repository `program.md` as a research-policy snapshot
+     with its path, exact source commit, and content digest; and
    - the rendered `system_instructions/SENPAI-LAUNCH-CONTEXT.md`, containing
      authoritative runtime identity, limits, and isolation rules after
      `program.md`. A blank
@@ -237,29 +246,57 @@ The model receives:
 3. Explicit project and Senpai skills through OpenHands skill context. Agent Skills bodies are loaded only when invoked. Repository `AGENTS.md`, `AGENT.md`, and `CLAUDE.md` instruction files are not loaded as project context.
 4. User turns containing optional human operator instructions, current state, and current UTC time.
 
-Before constructing a model worker, the supervisor resolves the configured
-program path and renders the role's `{{VARIABLE}}` placeholders once from an
-explicit non-secret allowlist. A missing referenced value fails the launch;
-unrelated environment variables and credentials are never considered. The
-rendered role is persisted in role state and reused across worker restarts.
+Before creating pods, the launcher captures one Git-advertised advisor-branch
+head in an isolated clone. It recomputes the commit, tree, and program blob IDs
+and stores the policy in a separate immutable, content-addressed Secret. Pods
+mount only its program-context key as a read-only file. The ConfigMap supplies
+the selected path, commit, and content SHA-256; the supervisor verifies all
+three against the mounted snapshot before constructing a worker.
+
+The selected path supports printable UTF-8, including spaces and Unicode,
+without backslashes or traversal. The committed program must be a regular file
+of at most 256 KiB of UTF-8 data; the encoded Secret value may not exceed 1 MiB.
+The prompt content omits the SPDX header and outer whitespace.
+
+The supervisor renders the role's `{{VARIABLE}}` placeholders from an explicit
+non-secret allowlist. A missing referenced value fails startup; unrelated
+environment variables and credentials are never considered. It persists the
+rendered role and complete system snapshot. The snapshot digest covers the
+components and the exact rendered suffix, so changed wrapper templates also
+invalidate persisted context.
 
 The launcher renders `timeout_minutes` and `max_epochs` into the launch context
 as agent policy. It does not export dedicated timeout or epoch environment
 variables, and the training supervisor has no launch-wide timeout default or
 ceiling. Each training run supplies its own positive `timeout_seconds` value.
 
-At process startup, the runner loads the harness, rendered role, `program.md`,
-and authoritative launch context into one immutable
-`SenpaiSystemInstructions` value. Its prompt is the stable system suffix for
-that process and is never reread, monitored, or refreshed during the agent
-session. Delegated children inherit the rendered role snapshot, resolved
-repository-relative program path, and exact launch context, then build their
-own immutable value. Runtime identity and `program.md` are not duplicated in
+At process startup, the runner verifies the complete system snapshot against
+the digest held by its supervisor or parent. It also checks the configured
+program path and commit, harness, rendered role, and launch context against
+that snapshot. The resulting `SenpaiSystemInstructions` value stays fixed for
+the session. Delegated children inherit that exact value through a file and
+an independently supplied digest. Restarts verify persisted context against
+trusted launch inputs, without reading the target workspace's current policy.
+Runtime identity and `program.md` are not duplicated in
 ordinary user messages. Optional operator instructions remain user context;
 use GitHub Issues for live human direction. OpenHands includes the system
 suffix on every inference, and current time is rendered for every controller
 wake. Operators must start fresh role state to apply a changed identity,
-program, or role charter.
+program, or role charter. Snapshot integrity does not prohibit publishing
+operator-authored `program.md` changes through advisor synchronization.
+
+Every desired role Deployment and live controller Pod under a tag binds the
+same program Secret. Terminal Pods do not retain a binding; terminating Pods
+retain it until they reach a terminal phase. An advisor-only apply preserves
+the original commit and encoded snapshot when normalized policy path and
+content match. Launches that include students require an unused tag and cannot
+extend an existing launch. Changed policy or legacy roles without a binding
+also require a new tag. Advisor-only applies for one cluster, namespace, and
+tag must be serialized: the program-binding check and subsequent apply are
+not an atomic reservation. A reused program Secret must be immutable, belong
+to the tag, and match its content-addressed name. These checks trust
+operator-controlled Kubernetes resources; they do not defend against a
+Kubernetes administrator replacing the launch inputs.
 
 File-based subagents are discovered from `.agents/agents`. Live advisor and
 student skills come only from `plugins/senpai/skills`; `.agents/skills` is for
@@ -268,6 +305,52 @@ repositories may still supply their own project skills. Skill bodies are not
 concatenated into agent definitions. The OpenHands fork's `main` branch applies
 each agent definition's `reasoning_effort` override after resolving its
 inherited LLM or stored model profile.
+
+The images install the runner as a non-editable package and make its Python
+environment, built-in agent definitions, and plugin assets root-owned and
+read-only. `SENPAI_AGENT_DIR` selects the installed built-in definitions;
+`SENPAI_PLUGIN` selects the installed plugin. The supervisor, controller,
+delegated children, and plugin hooks use trusted Python with `-P`, so a target
+working directory cannot shadow the installed runner. These controls protect
+runtime imports and assets; they do not sandbox target code or freeze the
+operator's system-instruction files.
+
+`SENPAI_TARGET_PYTHON_ENV` selects a writable target venv for terminals and
+training. Its site-packages include the trusted environment through a `.pth`
+path entry. Target packages can override those shared packages without writing
+to the trusted environment. The image includes pip so additive target installs
+can resolve packages on the shared path. uv resolves a separate target package
+set and does not inspect that path. The image compiles runtime bytecode before
+making the environment read-only. The images copy uv from its versioned,
+digest-pinned official image. Bootstrap computes both paths with trusted Python
+and uses `uv venv` with that interpreter, without project/config discovery,
+Python downloads, or pip bootstrapping. It preserves existing target files and
+never executes target Python. Terminal and training environments select the
+target through PATH and uv settings. Training and terminal setup remove inherited
+`PYTHONSAFEPATH` so project imports work normally. File-defined child terminals
+use the same routing.
+Each native terminal session receives target settings after shell startup,
+including new and recovered tmux panes. Later commands can change that
+session's environment. This adapter uses the pinned SDK's environment-export
+callback and preserves native parallel terminal execution.
+Bootstrap also creates missing target launchers for the trusted environment's
+console scripts. Each launcher executes the original read-only script with
+target Python, so shared commands and their Python workers see target packages.
+Bootstrap preserves existing target scripts and never executes target Python.
+
+The bundled plugin remains explicitly loaded for root and child conversations.
+Its skill helpers run in the target environment with `uv run --no-sync`; they
+must not rewrite the read-only installed skill files. Target lock updates and
+dependency syncs are explicit experiment changes, not a side effect of reading
+experiment results.
+
+OpenHands ambient plugin discovery is disabled before root or child
+conversations are created. Only the explicitly supplied trusted plugin loads
+through the plugin loader. Explicit target skills, unreserved target/user
+agents, and their declared MCP configurations remain supported. This removes
+automatic plugin hooks, MCP servers, and skills from writable user/project
+plugin directories. The adapter depends on the pinned SDK's discovery call;
+SDK upgrades must retain the executable plugin-isolation test.
 
 ## Prompt caching
 
@@ -726,9 +809,33 @@ boundaries. Hooks give early model-visible feedback. `senpai_terminal` also
 evaluates the same pure policy in-process and fails closed if policy evaluation
 fails.
 
-Denied patterns include raw GitHub mutations, raw `git push`, direct training
-launches, sleeps, polling loops, `watch`, and `tail -f`, including nested shell
-and `env` wrappers.
+Recognized denied patterns include raw GitHub mutations, raw `git push`, direct
+training launches, sleeps, `watch`, and `tail -f`, including nested shell and
+`env` wrappers.
+
+The terminal policy parses Bash syntax before checking nested commands and
+recognized command runners. It rejects malformed syntax, startup-file loading,
+explicit shell callbacks, aliases, and variable-name reevaluation. Shell startup
+and prompt variables are also reserved against custom-secret injection.
+These checks enforce workflow boundaries without
+prescribing research methods or requiring an allowlist of data formats and
+analysis languages. Heredoc input to ordinary programs remains data. The
+original Bash syntax still exposes expansions in unquoted input for checking;
+input fed to recognized shells receives recursive shell checks. A function
+that overrides the actual consumer, or output routed through an opaque `exec`
+redirect, retains conservative checking. Unrelated functions and process
+substitutions do not disable ordinary program input. Dynamic output paths are
+allowed unless recognized shell execution in the same command makes that
+stream ambiguous. Shell loops, arithmetic, variable executable names, and
+variable timeout durations are allowed. Commands visible inside loop bodies,
+conditions, and substitutions remain checked. The policy does not resolve
+variable contents or prove loop termination; operations selected indirectly
+through variables can fall outside its recognition. Common wrappers inspect
+the child command visible in the submitted syntax and preserve its data
+arguments. Unsupported wrapper grammars and unclear shell streams can still
+reject valid commands. These
+checks do not inspect arbitrary executable files or Python code, reconstruct
+prior terminal state, or establish a shell sandbox.
 
 Every OpenHands turn has a controller-configured hard deadline. The deadline
 interrupts the conversation, produces a non-success result, and leaves durable
@@ -745,10 +852,19 @@ The entrypoint uses the GitHub write token only for bootstrap, writes it to a
 private mode-0600 file under the pod-local `/tmp`, removes the askpass helper,
 clears all raw token environment variables, and execs the supervisor. The
 supervisor consumes and unlinks that bootstrap file into typed in-process
-memory. Before each controller restart it creates a one-shot inherited pipe;
-the worker reads and closes that pipe before tool initialization. No raw token
-is written to conversation/dataset storage. The long-lived PID 1 environment,
-model-facing tool schemas, and agent terminal contain no GitHub token.
+memory. It creates one-use inherited descriptors for one controller, then drops
+its stored credentials and copied worker environment. The worker reads and
+closes the descriptors before tool initialization. Bootstrap also hands off
+W&B and Exa through private files. The controller restores those service keys
+at startup before importing the runner so research access and import-time Weave
+tracing continue to work. Runner configuration retains Exa in trusted runtime
+memory and removes it from the environment before agent tools run. W&B remains
+in the environment for research tools and tracing. Standalone launches may omit
+services they do not use. When a
+service key is set at supervisor startup, its private file handoff is required;
+a raw key without that handoff fails startup. No raw token is written to
+conversation/dataset storage. The long-lived PID 1 environment, model-facing
+tool schemas, and agent terminal contain no GitHub token.
 
 Authenticated Git publication runs `/usr/bin/git` in a disposable bare repository.
 The controller supplies the GitHub URL from its configured repository, disables
@@ -770,6 +886,56 @@ target pre-push hooks remain behavioral guards; typed publication bypasses them
 and applies its own branch and lease checks. Before creating a remote branch,
 the typed assignment tool requires a configured student and a `<student>/`
 branch prefix.
+
+Delegated model credentials use a bounded JSON bundle in an unnamed file. The
+parent passes its descriptor to the child and closes its copy after spawning.
+The child closes the descriptor after reading and resolves configuration from
+an in-memory mapping. The same private bundle carries Exa to every delegated
+runtime so general-purpose children can delegate to search grandchildren.
+Exa stays outside shell environments, tool parameters, and conversation secrets.
+The root and search agents expose `exa_search`; all child runtimes retain the
+key in trusted process memory, including those that can delegate onward. This
+boundary does not protect against compromise of the trusted runtime or a
+privileged host process.
+W&B conversation secrets remain available to child tools. W&B inference still
+shares `WANDB_API_KEY` until the W&B identity
+cutover. No per-student W&B key is required by this handoff change.
+
+The supervisor, controller, and runner disable process dumping on Linux,
+including standalone runner invocations. This also disables core dumps and
+ptrace-based debugging of those processes. After capturing the worker
+environment, the supervisor removes current model-provider values and discards
+its environment copies. Removing an `os.environ` entry does not erase the
+kernel's original startup environment.
+Model values can remain there until process exit. A same-UID process can also
+race a delegated child's inherited descriptor before Python disables dumping.
+These measures reduce exposure; they do not establish complete same-UID secrecy.
+
+The supervisor cleans up the worker and observed descendants under one shared
+60-second grace allowance, below the 75-second liveness termination grace.
+It reserves the smaller of one second or half that allowance for SIGKILL and
+reaping. Worker and adopted-child TERM waits share the earlier cutoff.
+When it runs as container PID 1, it also terminates adopted descendants. On a
+host where it is not PID 1, detached children can become orphans between polls.
+Before restarting the entrypoint, the host process manager must terminate every
+descendant process group, including groups created by detached children, or
+terminate the workload's cgroup.
+Existing post-SIGKILL waits can still depend on kernel process termination.
+Kubernetes or another process manager must restart the complete entrypoint;
+restarting only the Python supervisor cannot recreate consumed handoff files.
+The supplied manifests use separate pod-local `emptyDir` volumes for role state,
+the target checkout at `/workspace/senpai/$PROBLEM_DIR`, and the writable target
+environment at `/home/senpai/.venvs/senpai-target`. A container restart in the
+same Pod retains all three. Bootstrap preserves the existing target branch,
+uncommitted files, unpushed commits, and installed dependencies. It does not
+checkout, pull, or reset an existing advisor checkout. The runner checkout and
+the rest of HOME are recreated. Pod replacement starts fresh role state,
+checkout, and target environment; the dataset PVC follows its own lifetime.
+An existing target without a valid HEAD commit fails bootstrap with an
+operator-repair message. Bootstrap preserves all files and refs instead of
+deleting or resetting an incomplete checkout. Isolated Python Git commands trust
+only their exact resolved working directory through command-scope configuration;
+they continue to ignore global and system Git configuration.
 
 Generic child processes receive no GitHub token and no GitHub tools. Main-role
 GitHub operations remain typed and lease/state guarded. Terminal and hook
@@ -833,14 +999,33 @@ Launch preflight verifies:
 - the presence of every configured custom secret, without attempting
   a service-specific authentication check.
 
-Exa is a progressive skill/script integration, not an always-connected MCP
-server.
+Exa uses a credential-isolated native `exa_search` tool with progressive skill
+guidance. It preserves the standalone script's request controls and web/publication
+counts of 10/30 results, with up to 100 per call. Both modes default to
+`deep-reasoning`. Unless `no_content` is set, the tool requests
+`text={"verbosity": "full"}` without a character limit and defaults to
+`max_age_hours=0` so the extraction setting applies to a fresh crawl. Explicit
+cache-age values remain supported. Returned text is retained with its original
+line breaks; missing text is reported. These are Exa's extracted contents, not
+original PDF/HTML files or a guarantee of complete-paper coverage. The legacy
+operator script keeps its original defaults. The root tool remains declared when
+a standalone runtime has no Exa key so persisted conversations can resume.
+Calls without configured credentials or conversation persistence fail
+before contacting Exa. Every response persists the complete Markdown in the
+conversation's observations directory and returns its file path and character
+count. Responses above 30,000 characters return an explicit preview. A failed
+write fails the tool call instead of losing evidence. Local conversation cleanup
+retains these files, so parents can read results from completed search children.
+The preview fits below the pinned SDK's 50,000-character tool-message limit; SDK serializers
+and other tools retain their existing limits. The legacy terminal path also
+previews at 30,000 characters. Complete evidence is available through bounded
+file reads; it is not sent to a model in one unbounded message.
 
-The Kubernetes launcher creates one Secret, ConfigMaps, and Deployments. A
-student launch first scans every requested name for an existing Deployment,
+The Kubernetes launcher creates a credential Secret, a separate immutable
+program-context Secret, ConfigMaps, and Deployments. A student launch first scans every requested name for an existing Deployment,
 controller Pod, or nonterminal labeled Job. It scans MPIJobs only when the API
 exists and requires that API for multi-node students. After all scans pass, it
-creates the per-tag Secret as an atomic, durable, immutable reservation before
+creates the per-tag credential Secret as an atomic, durable, immutable reservation before
 any GitHub write. An advisor-only apply cannot change the Secret data after a
 student launch wins the reservation race. It then creates each student resource
 separately, with the Deployment last. Student resources are new-only; the
@@ -927,7 +1112,7 @@ Removed:
 - `.claude/` runtime resources;
 - Claude-named and OpenHands shell watchdog/supervisor loops;
 - the Exa MCP configuration;
-- the HTTP advisor service, bearer token, port, probes, and Kubernetes RBAC;
+- the old HTTP advisor service and its bearer token, port, probes, and Kubernetes RBAC;
 - shell GitHub polling and pod-process inspection;
 - cutoff conversation harvesting;
 - obsolete tool-role instructions; and
