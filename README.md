@@ -192,7 +192,7 @@ the configured model profiles. It also verifies GitHub Contents write access,
 resolves the target branch, and rejects student labels already carrying active
 assignments. It deliberately skips image validation and makes no cluster
 changes. A real launch additionally verifies immutable image syntax and that
-both role images identify the same source revision.
+all required role images identify the same source revision.
 
 ### 7. Launch
 
@@ -497,6 +497,13 @@ nor the browser family.
 `run_training` executes a target-owned submitter. It must submit one
 `batch/v1` Job when `nodes_per_student` is 1, or one `kubeflow.org/v2beta1`
 MPIJob when it is greater than 1, through `kubectl apply -f -` and exit.
+
+Each worker starts from a fresh checkout of the committed snapshot. The
+controller's virtual environment and untracked files are not copied into it.
+Provide dependencies in the worker image or main command. Persist checkpoints
+and outputs on the shared PVC or in W&B; files written only to the worker's
+checkout do not return to the controller and are lost when the Pod is removed.
+
 The supervisor provides these authoritative environment values:
 
 | Variable | Use in the target launcher |

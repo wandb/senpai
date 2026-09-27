@@ -13,7 +13,8 @@ program_path: ""
 # Public Senpai runner source, fetched read-only. Override this only when the
 # images were built from a fork or private Senpai repository.
 senpai_repo_url: https://github.com/wandb/senpai.git
-# Required only for digest-pinned images; source-SHA tags derive it automatically.
+# Required for every student launch because the executor image is digest-pinned.
+# Supply the full matching source commit.
 senpai_repo_revision: ""
 
 # problem-package repo is REQUIRED and must be passed on the CLI
