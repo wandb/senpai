@@ -61,11 +61,12 @@ def execute_job(script: Path, env: dict[str, str]):
         env={**os.environ, **env},
     ) as process:
         try:
-            stdout, stderr = process.communicate(timeout=5)
+            # Deadlock guard; exact cutoff times are asserted with the fake clock.
+            stdout, stderr = process.communicate(timeout=15)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             stdout, stderr = process.communicate()
-            pytest.fail(f"cutoff blocked beyond its deadline:\n{stdout}\n{stderr}")
+            pytest.fail(f"cutoff process exceeded its test timeout:\n{stdout}\n{stderr}")
     return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
 

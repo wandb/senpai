@@ -217,7 +217,7 @@ def test_cutoff_readiness_excludes_observer_but_deletion_includes_it(tmp_path: P
 case "$*" in
   *"get pods"*"app=senpai,"*) printf '%s\\n' '{"items":[{"status":{"containerStatuses":[{"ready":true}]}}]}' ;;
   *"get deployments"*"app=senpai,"*) printf '%s\\n' 'senpai-track-a' ;;
-  *"delete deployments,configmaps,secrets"*)
+  *"delete deployments -l"*)
     case "$*" in *"app=senpai"*) exit 9 ;; esac
     printf '%s\\n' "$*" > "$DELETE_LOG" ;;
   *) exit 8 ;;
@@ -232,6 +232,8 @@ esac
             "RUN_SLUG": "capacity", "TAGS_CSV": "track-a", "EXPECTED_PODS": "1",
             "EXPECTED_DEPLOYMENTS": "1", "READINESS_TIMEOUT_SECONDS": "0",
             "BUDGET_SECONDS": "0", "ARM_ID": "capacity-check",
+            "ARMING_DEADLINE_EPOCH": "0", "HARD_KILL_AT_EPOCH": "0",
+            "STATE_AUTH_KEY": "a" * 64,
             "PVC_LOG_ROOT": str(tmp_path / "state"), "NAMESPACE": "test-ns",
         },
     )
