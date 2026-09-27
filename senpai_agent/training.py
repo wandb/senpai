@@ -1,12 +1,16 @@
+import array
+import fcntl
 import os
 import re
+import select
 import signal
 import subprocess
+import termios
 import threading
 import time
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -16,16 +20,40 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from senpai_agent.processes import signal_process_group, terminate_process_group
 
+# A redaction marker can truncate an ID, even when only its '<' has been read.
 _WANDB_RUN_URL_BYTES = re.compile(
-    rb"https?://wandb\.ai/[^/\s]+/[^/\s]+/runs/([A-Za-z0-9_-]+)"
+    rb"https?://wandb\.ai/[^/\s]+/[^/\s]+/runs/"
+    rb"([A-Za-z0-9_-]+)(?![A-Za-z0-9_<-])"
 )
 _WANDB_COMPLETE_RUN_URL_BYTES = re.compile(
     rb"https?://wandb\.ai/[^/\s]+/[^/\s]+/runs/"
-    rb"([A-Za-z0-9_-]+)(?=[^A-Za-z0-9_-])"
+    rb"([A-Za-z0-9_-]+)(?=[^A-Za-z0-9_<-])"
 )
 _LOG_READ_BYTES = 64 * 1024
 _WANDB_SCAN_OVERLAP_BYTES = 4096
 _ERROR_TAIL_BYTES = 8192
+
+
+def _mask_output_chunk(data: bytes, secret: bytes) -> tuple[bytes, bytes]:
+    """Emit complete bytes while retaining a possible split secret prefix."""
+    if not secret:
+        return data, b""
+    pieces = []
+    start = 0
+    while (match := data.find(secret, start)) >= 0:
+        pieces.extend((data[start:match], b"<secret-hidden>"))
+        start = match + len(secret)
+    tail = data[start:]
+    overlap = next(
+        (
+            size
+            for size in range(min(len(tail), len(secret) - 1), 0, -1)
+            if tail.endswith(secret[:size])
+        ),
+        0,
+    )
+    pieces.append(tail[:-overlap] if overlap else tail)
+    return b"".join(pieces), tail[-overlap:] if overlap else b""
 
 
 class TrainingState(StrEnum):
@@ -117,6 +145,9 @@ class _ActiveTraining:
     log_path: Path
     cancelled: bool = False
     thread: threading.Thread | None = None
+    output_thread: threading.Thread | None = None
+    output_stop: threading.Event = field(default_factory=threading.Event)
+    output_error: str | None = None
 
 
 class TrainingSupervisor:
@@ -168,15 +199,18 @@ class TrainingSupervisor:
         training_id = str(uuid.uuid4())
         log_path = self.state_dir / f"{training_id}.log"
         started = time.monotonic()
-        with log_path.open("wb") as log:
-            process = subprocess.Popen(
-                list(spec.argv),
-                cwd=cwd,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                shell=False,
-                start_new_session=True,
-            )
+        log_path.touch()
+        environment = dict(os.environ)
+        environment.pop("WANDB_SERVICE", None)
+        process = subprocess.Popen(
+            list(spec.argv),
+            cwd=cwd,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            shell=False,
+            start_new_session=True,
+        )
         process_start_time = psutil.Process(process.pid).create_time()
         process_group_id = process.pid
 
@@ -205,9 +239,35 @@ class TrainingSupervisor:
             name=f"senpai-training-{training_id}",
         )
         active.thread = thread
+        active.output_thread = threading.Thread(
+            target=self._record_output,
+            args=(active, environment.get("WANDB_API_KEY", "").encode()),
+            name=f"senpai-training-output-{training_id}",
+        )
         with self._lock:
             self._active[training_id] = active
-            thread.start()
+            try:
+                active.output_thread.start()
+                thread.start()
+            except Exception as error:
+                self._active.pop(training_id)
+                self._terminate_process_group(process, process_group_id)
+                active.output_stop.set()
+                if active.output_thread.ident is not None:
+                    active.output_thread.join()
+                else:
+                    assert process.stdout is not None
+                    process.stdout.close()
+                self._write_result(result.model_copy(update={
+                    "state": TrainingState.FAILED,
+                    "exit_code": process.returncode,
+                    "elapsed_seconds": time.monotonic() - started,
+                    "error_tail": (
+                        "Training supervision failed to start "
+                        f"({type(error).__name__})."
+                    ),
+                }))
+                raise
         return result
 
     def get_training_status(self, training_id: str) -> TrainingResult:
@@ -238,6 +298,47 @@ class TrainingSupervisor:
         if thread is not None:
             thread.join()
         return self.get_training_status(training_id)
+
+    def _record_output(self, active: _ActiveTraining, secret: bytes) -> None:
+        """Mask the inherited W&B key before bytes reach the training log."""
+        pending = b""
+        remaining = None
+        assert active.process.stdout is not None
+        try:
+            with active.process.stdout as stream, active.log_path.open("wb") as log:
+                os.set_blocking(stream.fileno(), False)
+                while True:
+                    if remaining is None and active.output_stop.is_set():
+                        # Drain the queued backlog, without allowing escaped
+                        # descendants to extend the training lifecycle.
+                        queued = array.array("i", [0])
+                        fcntl.ioctl(stream.fileno(), termios.FIONREAD, queued, True)
+                        remaining = queued[0]
+                    if remaining == 0:
+                        break
+                    try:
+                        chunk = os.read(
+                            stream.fileno(),
+                            _LOG_READ_BYTES
+                            if remaining is None
+                            else min(_LOG_READ_BYTES, remaining),
+                        )
+                    except BlockingIOError:
+                        select.select([stream], [], [], 0.05)
+                        continue
+                    if not chunk:
+                        break
+                    if remaining is not None:
+                        remaining -= len(chunk)
+                    sanitized, pending = _mask_output_chunk(pending + chunk, secret)
+                    log.write(sanitized)
+                    log.flush()
+                if pending:
+                    log.write(b"<secret-hidden>")
+        except Exception as error:  # noqa: BLE001 - thread failures must fail the run
+            active.output_error = (
+                f"Training output capture failed ({type(error).__name__})."
+            )
 
     def _monitor(self, training_id: str) -> None:
         with self._lock:
@@ -282,8 +383,12 @@ class TrainingSupervisor:
                         )
                     )
                     published_run_ids = discovered_run_ids
-                if active.cancelled:
-                    state = TrainingState.CANCELLED
+                if active.cancelled or active.output_error is not None:
+                    state = (
+                        TrainingState.CANCELLED
+                        if active.cancelled
+                        else TrainingState.FAILED
+                    )
                     self._terminate_process_group(
                         active.process,
                         active.process_group_id,
@@ -318,6 +423,9 @@ class TrainingSupervisor:
                     exit_code = active.process.returncode
                     break
                 time.sleep(0.05)
+            active.output_stop.set()
+            assert active.output_thread is not None
+            active.output_thread.join()
             error_tail, scan_overlap = self._consume_log(
                 log,
                 error_tail,
@@ -333,6 +441,9 @@ class TrainingSupervisor:
                 )
             for match in _WANDB_RUN_URL_BYTES.findall(scan_overlap):
                 run_ids.setdefault(match.decode(), None)
+        if active.output_error is not None:
+            state = TrainingState.FAILED
+            error_tail = active.output_error.encode()
 
         result = TrainingResult(
             training_id=training_id,

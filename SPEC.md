@@ -624,6 +624,12 @@ TERM/KILL cleanup, restart identity checks using PID/PGID/create-time, a bounded
 W&B run IDs. Run IDs are persisted while training is still running so metric
 monitoring can begin immediately.
 
+Multiple Senpai instances may share `WANDB_API_KEY`; no per-student key is required.
+Local supervised training masks the inherited key before persisting stdout/stderr,
+including keys split across reads and incomplete key prefixes at shutdown.
+The output reader drains buffered data without waiting for detached descendants
+to close the pipe. Training clears `WANDB_SERVICE` to start its own W&B connection.
+
 When a student has more than one configured node, `KubernetesTrainingSupervisor`
 keeps the same tool contract while supervising one remote MPIJob. It creates an
 atomic Git bundle for the clean `HEAD` on the shared PVC, generates the workload

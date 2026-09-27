@@ -1,15 +1,14 @@
+import json
+import os
 import signal
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import psutil
-
-from senpai_agent.training import (
-    TrainingResult,
-    TrainingState,
-    TrainingSupervisor,
-)
+import pytest
 from training_test_support import (
     assert_process_stopped,
     make_supervisor,
@@ -18,12 +17,61 @@ from training_test_support import (
     wait_for_terminal,
 )
 
+from senpai_agent.training import (
+    TrainingResult,
+    TrainingState,
+    TrainingSupervisor,
+)
 
 TERM_IGNORING_SLEEP = (
-    "import signal,time;"
-    "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
-    "time.sleep(60)"
+    "import signal,time;signal.signal(signal.SIGTERM, signal.SIG_IGN);time.sleep(60)"
 )
+
+
+@pytest.mark.parametrize("failed_start", [1, 2])
+def test_training_thread_start_failure_cleans_up_process_and_reader(
+    tmp_path, monkeypatch, failed_start
+):
+    workspace, supervisor = make_supervisor(tmp_path, terminate_grace_seconds=0.1)
+    processes = []
+    threads = []
+    original_popen = subprocess.Popen
+    original_start = threading.Thread.start
+
+    def capture_process(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def fail_thread_start(thread):
+        threads.append(thread)
+        if len(threads) == failed_start:
+            raise RuntimeError("thread resources exhausted")
+        original_start(thread)
+
+    monkeypatch.setattr(subprocess, "Popen", capture_process)
+    monkeypatch.setattr(threading.Thread, "start", fail_thread_start)
+    try:
+        with pytest.raises(RuntimeError, match="thread resources exhausted"):
+            run_python(supervisor, workspace, "import time; time.sleep(60)")
+
+        assert len(processes) == 1
+        assert processes[0].poll() is not None
+        assert all(not thread.is_alive() for thread in threads)
+        saved = list((tmp_path / "state").glob("*.json"))
+        assert len(saved) == 1
+        result = TrainingResult.model_validate_json(saved[0].read_text())
+        assert result.state is TrainingState.FAILED
+        assert "failed to start" in result.error_tail
+        supervisor.close()
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=3)
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(timeout=3)
 
 
 def test_training_timeout_honors_the_requested_deadline(tmp_path: Path):
@@ -204,3 +252,195 @@ def test_restart_does_not_signal_a_reused_pid(tmp_path: Path):
     finally:
         unrelated.send_signal(signal.SIGKILL)
         unrelated.wait()
+
+
+def test_training_masks_shared_key_before_log_and_result_persistence(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WANDB_API_KEY", "shared-research-key")
+    monkeypatch.setenv("WANDB_SERVICE", "parent-service")
+    monkeypatch.setenv("WANDB_IDENTITY_TOKEN_FILE", "/parent/identity-token")
+    workspace, supervisor = make_supervisor(
+        tmp_path,
+        terminate_grace_seconds=0.1,
+    )
+    environment_path = workspace / "environment.json"
+    prefix_written = workspace / "prefix-written"
+    continue_output = workspace / "continue-output"
+    running = run_python(
+        supervisor,
+        workspace,
+        "import json,os,pathlib,sys,time;"
+        "values={key: os.environ.get(key) for key in "
+        "['WANDB_API_KEY','WANDB_SERVICE','WANDB_IDENTITY_TOKEN_FILE']};"
+        f"pathlib.Path({str(environment_path)!r}).write_text(json.dumps(values));"
+        "key=os.environ['WANDB_API_KEY'].encode();"
+        "os.write(1,b'failed with key='+key[:7]);"
+        f"pathlib.Path({str(prefix_written)!r}).touch();\n"
+        f"while not pathlib.Path({str(continue_output)!r}).exists(): time.sleep(.01)\n"
+        "os.write(2,key[7:]+b'\\n');"
+        "os.write(1,b'https://wandb.ai/team/project/runs/writer-run\\n');"
+        "sys.exit(1)",
+    )
+    log = Path(running.log_path)
+    try:
+        wait_for_path(prefix_written)
+        deadline = time.monotonic() + 3
+        while log.read_bytes() != b"failed with key=" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        # The reader has consumed the first write, but keeps the possible key
+        # prefix in memory until the next write completes or disproves it.
+        assert log.read_bytes() == b"failed with key="
+        continue_output.touch()
+        result = wait_for_terminal(supervisor, running.training_id)
+    finally:
+        supervisor.close()
+
+    assert result.state is TrainingState.FAILED
+    assert json.loads(environment_path.read_text()) == {
+        "WANDB_API_KEY": "shared-research-key",
+        "WANDB_SERVICE": None,
+        "WANDB_IDENTITY_TOKEN_FILE": "/parent/identity-token",
+    }
+    expected = (
+        "failed with key=<secret-hidden>\n"
+        "https://wandb.ai/team/project/runs/writer-run\n"
+    )
+    assert log.read_text() == expected
+    assert result.error_tail == expected
+    assert result.wandb_run_ids == ("writer-run",)
+    persisted = tmp_path / "state" / f"{running.training_id}.json"
+    assert "shared-research-key" not in persisted.read_text()
+    assert os.environ["WANDB_API_KEY"] == "shared-research-key"
+    assert os.environ["WANDB_SERVICE"] == "parent-service"
+
+
+def test_training_masks_a_partial_key_at_natural_eof(tmp_path, monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "0123456789abcdef0123456789abcdef01234567")
+    workspace, supervisor = make_supervisor(
+        tmp_path,
+        terminate_grace_seconds=0.1,
+    )
+    running = run_python(
+        supervisor,
+        workspace,
+        "import os,sys;"
+        "os.write(1,b'partial writer='+os.environ['WANDB_API_KEY'].encode()[:24]);"
+        "sys.exit(1)",
+    )
+    try:
+        result = wait_for_terminal(supervisor, running.training_id)
+    finally:
+        supervisor.close()
+
+    expected = "partial writer=<secret-hidden>"
+    assert result.state is TrainingState.FAILED
+    assert Path(running.log_path).read_text() == expected
+    assert result.error_tail == expected
+    persisted = tmp_path / "state" / f"{running.training_id}.json"
+    assert json.loads(persisted.read_text())["error_tail"] == expected
+
+
+def test_key_redaction_does_not_create_truncated_wandb_run_ids(tmp_path, monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "0123456789abcdef0123456789abcdef01234567")
+    workspace, supervisor = make_supervisor(
+        tmp_path,
+        terminate_grace_seconds=0.1,
+    )
+    running = run_python(
+        supervisor,
+        workspace,
+        "import os;"
+        "base=b'https://wandb.ai/team/project/runs/';"
+        "os.write(1,base+b'masked'+os.environ['WANDB_API_KEY'].encode()+b'\\n');"
+        "os.write(1,base+b'valid0\\n');"
+        "os.write(1,base+b'abc0')",
+    )
+    try:
+        result = wait_for_terminal(supervisor, running.training_id)
+    finally:
+        supervisor.close()
+
+    assert result.state is TrainingState.FINISHED
+    assert Path(running.log_path).read_text() == (
+        "https://wandb.ai/team/project/runs/masked<secret-hidden>\n"
+        "https://wandb.ai/team/project/runs/valid0\n"
+        "https://wandb.ai/team/project/runs/abc<secret-hidden>"
+    )
+    assert result.wandb_run_ids == ("valid0",)
+
+
+def test_cancel_does_not_wait_for_a_detached_output_writer(tmp_path, monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "shared-research-key")
+    workspace, supervisor = make_supervisor(
+        tmp_path,
+        terminate_grace_seconds=0.1,
+    )
+    child_pid = workspace / "detached.pid"
+    writer = (
+        "import os,threading\n"
+        "def emit():\n"
+        " while True: os.write(1,os.environ['WANDB_API_KEY'].encode()*256)\n"
+        "for _ in range(4): threading.Thread(target=emit,daemon=True).start()\n"
+        "emit()\n"
+    )
+    running = run_python(
+        supervisor,
+        workspace,
+        "import pathlib,subprocess,sys,time;"
+        f"child=subprocess.Popen([sys.executable,'-c',{writer!r}],start_new_session=True);"
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(child.pid));"
+        "time.sleep(60)",
+        timeout_seconds=30,
+    )
+    cancellation = threading.Thread(
+        target=supervisor.cancel_training, args=(running.training_id,)
+    )
+    try:
+        wait_for_path(child_pid)
+        log = Path(running.log_path)
+        deadline = time.monotonic() + 3
+        while log.stat().st_size < 64 * 1024 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert log.stat().st_size >= 64 * 1024
+        cancellation.start()
+        cancellation.join(timeout=3)
+        finished_on_time = not cancellation.is_alive()
+    finally:
+        if child_pid.exists():
+            try:
+                os.killpg(int(child_pid.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        supervisor.close()
+        if cancellation.ident is not None:
+            cancellation.join()
+
+    assert finished_on_time
+    assert (
+        supervisor.get_training_status(running.training_id).state
+        is TrainingState.CANCELLED
+    )
+    output = Path(running.log_path).read_bytes()
+    assert b"shared-research-key" not in output
+    assert output.endswith(b"<secret-hidden>")
+
+
+def test_output_capture_failure_cannot_report_success(tmp_path, monkeypatch):
+    workspace, supervisor = make_supervisor(tmp_path, terminate_grace_seconds=0.1)
+    original_open = Path.open
+
+    def fail_log_write(path, mode="r", *args, **kwargs):
+        if path.suffix == ".log" and mode == "wb":
+            raise OSError("fixture disk full")
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_log_write)
+    running = run_python(supervisor, workspace, "import time;time.sleep(.05)")
+    try:
+        result = wait_for_terminal(supervisor, running.training_id)
+    finally:
+        supervisor.close()
+
+    assert result.state is TrainingState.FAILED
+    assert result.error_tail == "Training output capture failed (OSError)."
