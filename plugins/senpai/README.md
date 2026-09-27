@@ -10,6 +10,30 @@ user message. It natively loads:
 - `skills/` as a progressively disclosed workflow catalog; and
 - `hooks/hooks.json` for early command-policy and lifecycle feedback.
 
+The inclusion path is explicit:
+
+- The [advisor](../../Dockerfile.advisor) and [student](../../Dockerfile.student)
+  Dockerfiles copy `plugins/senpai` to `/opt/senpai-plugin` and set
+  `SENPAI_PLUGIN` to that path.
+- The [runner](../../senpai_agent/openhands_runner.py) selects `--plugin-dir`,
+  then `SENPAI_PLUGIN`, then the source-relative `plugins/senpai` default.
+  `LocalConversation` receives `plugins=[PluginSource(source=str(config.plugin_dir))]`.
+- [Delegation](../../senpai_agent/delegation.py) passes that same directory to
+  each child through `--plugin-dir`.
+
+This selects one bundle; an override replaces it. There is no extra-plugin list
+or automatic loading from target or home plugin directories. To extend the
+standard image, integrate the required assets into this directory and rebuild
+the image. Source edits and local plugin tests do not require a rebuild;
+deploying those edits to the packaged cluster runtime does. Existing agent
+context does not hot-reload plugin changes.
+
+For local tests, keep `SENPAI_PLUGIN` consistent with any `--plugin-dir` override
+because helper examples use that environment variable. The bundled hook
+manifest targets `/opt/senpai-venv/bin/python`; host hook tests need a development
+copy that names the host's trusted interpreter with `-P`. The selector does not
+provide a standalone host launcher. See the [runtime deployment notes](../../README.md#other-deployment-environments).
+
 GitHub mutations and training supervision are native typed Senpai tools, not
 skill shell commands. Exa is also a skill/script integration rather than an MCP
 server; launch preflight makes one `instant` publication search with one result
