@@ -5,10 +5,10 @@
 
 name: check-human-issues
 description: >
-  Check and respond to GitHub Issues from the human researcher team.
+  Open GitHub Issues for human input and respond to the researcher team.
   Use this skill whenever you need to handle a human_issue event, respond to
-  human issues, or check team communications. Also triggers for: "any human
-  messages?", "check issues", "respond to humans".
+  human issues, ask humans a question, or check team communications. Also triggers
+  for: "any human messages?", "check issues", "respond to humans".
 argument-hint: "<name> <ADVISOR|STUDENT>"
 ---
 
@@ -30,6 +30,28 @@ for an advisor, or `student:<student-name>` for a student. Your job is to check
 messages routed to your exact role, respond to new ones, and skip ones you've
 already handled.
 
+## Open an issue for human input
+
+Use `create_human_issue` when you need a research decision or help with a blocker.
+Provide a stable `issue_id`, a concise `title`, and the complete `body` without a
+role prefix. Reuse the same ID, title, and body if the call needs a retry. Changed
+content requires a new ID.
+
+The runtime adds `human` and your configured audience label. It mentions the
+GitHub credential owner in the initial issue body when GitHub identifies that
+owner as a user account. This includes service accounts registered as ordinary
+users. Bot identities, tokens without a user identity, and failed lookups skip
+the mention without blocking issue creation. Do not add notification mentions
+yourself. Later replies do not repeat these automatic mentions.
+
+```json
+{
+  "issue_id": "confirm-next-seed-budget",
+  "title": "Confirm the budget for another seed",
+  "body": "The first two seeds disagree. Can we use the remaining budget for a third seed?"
+}
+```
+
 ## Steps
 
 1. **Read the current `human_issue` event.** The controller supplies the issue
@@ -45,7 +67,7 @@ already handled.
 3. **Respond** through `respond_to_human_issue` with the issue number, the exact
    `human_message_id`, and the response text without a role prefix. This verified,
    idempotent operation refuses closed issues, pull requests, missing `human`
-   labels, stale message IDs, messages authored by the agent identity, and
+   labels, stale message IDs, Senpai protocol messages from the agent identity, and
    issues not addressed to this configured advisor branch or student.
 
 ```json

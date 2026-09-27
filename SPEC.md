@@ -128,6 +128,40 @@ from creating a new wake. `respond_to_human_issue` reapplies the same
 classification to the exact message before writing an idempotent response.
 Launches with human-Issue handling disabled skip that GitHub query entirely.
 
+The publishing actor is required to verify Senpai protocol messages. The runtime
+uses `SENPAI_GITHUB_ACTOR` when configured; otherwise, it identifies the actor
+through `GET /user`. If that request returns HTTP 403, it requests GraphQL
+`viewer { login }` to identify the actor for an installation token. Failed actor
+resolution still fails clearly. This trust identity is separate from the
+optional notification recipient.
+
+Issue notifications use `GET /user` to identify the owner of the runtime's
+GitHub credential. A valid login with GitHub account type `User` receives the
+mention. This includes service accounts registered as ordinary users; the API
+does not identify whether a `User` account is operated by a person or a service.
+There is no explicit handle configuration or collaborator lookup.
+
+Bot accounts and tokens without a user identity, including GitHub App
+installation tokens and GitHub Actions `GITHUB_TOKEN`, receive no automatic
+mention. Failed lookups and invalid identity responses also skip the mention.
+This optional lookup must not block issue creation or replies. The workflow
+does not use the trusted publishing actor or an app name as a fallback recipient.
+
+`create_human_issue` is available to advisor and student roots. It creates an
+issue with `human` and the caller's audience label, adds a trusted creation
+marker, and mentions the credential owner, when available, in the initial body.
+The `issue_id` identifies one immutable title and body: exact retries reuse the
+existing issue, including closed issues, and changed content conflicts. A
+trusted creation marker in the issue body suppresses automatic mentions in
+subsequent replies.
+
+For human-created issues, the workflow posts new replies without mentions,
+then adds mentions only to the trusted Senpai reply with the lowest persisted
+comment ID. Concurrent writers therefore select the same first reply. Retrying
+or editing that first reply repeats the owner lookup. Subsequent replies
+receive no automatic mentions. If the process stops between creation
+and the mention edit, retrying the response completes the edit.
+
 Assigned-PR issue comments, submitted reviews, and inline comments each use
 their immutable GitHub ID as a level-triggered event key. Senpai accepts GitHub
 users associated as repository owners, members, or collaborators. A comment by
@@ -465,6 +499,7 @@ Assignment-scoped advisor and student operations share this object:
 | `accept_result_on_current_base` | advisor | `expected_current_base_sha`, `reason` |
 | `merge_experiment` | advisor | `expected_current_base_sha`, `merge_method` |
 | `close_experiment` | advisor | `reason` |
+| `create_human_issue` | advisor or student | `issue_id`, `title`, `body` |
 | `respond_to_human_issue` | advisor or student | `issue_number`, `human_message_id`, `response` |
 | `submit_experiment_result` | student | `branch`, `remote_branch_sha_before_push`, `result` |
 

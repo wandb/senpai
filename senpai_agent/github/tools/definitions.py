@@ -21,6 +21,7 @@ from .contracts import (
     AcceptResultOnCurrentBaseAction,
     CloseExperimentAction,
     CreateAssignmentAction,
+    CreateHumanIssueAction,
     GitHubMutationObservation,
     MergeExperimentAction,
     PostAssignmentCommentAction,
@@ -56,6 +57,27 @@ def _tool(cls, action_type, title: str, description: str, executor):
             executor=executor,
         )
     ]
+
+
+class CreateHumanIssueExecutor(
+    ToolExecutor[CreateHumanIssueAction, GitHubMutationObservation]
+):
+    def __init__(self, runtime: GitHubToolRuntime):
+        self.runtime = runtime
+
+    def __call__(
+        self,
+        action: CreateHumanIssueAction,
+        conversation: LocalConversation | None = None,
+    ) -> GitHubMutationObservation:
+        result = self.runtime.workflow.create_human_issue(
+            issue_id=action.issue_id,
+            title=action.title,
+            body=action.body,
+            audience_label=self.runtime.human_issue_audience_label(),
+            creator=self.runtime.human_issue_responder(),
+        )
+        return GitHubMutationObservation.from_result(result)
 
 
 class RespondToHumanIssueExecutor(
@@ -218,6 +240,23 @@ class CloseExperimentTool(
             "Close one current experiment without merging it, recording an "
             "evidence-backed reason and preserving the durable result.",
             CloseExperimentExecutor(runtime.workflow),
+        )
+
+
+class CreateHumanIssueTool(
+    ToolDefinition[CreateHumanIssueAction, GitHubMutationObservation]
+):
+    """Open an issue for human input once per stable issue ID."""
+
+    @classmethod
+    def create(cls, runtime: GitHubToolRuntime) -> Sequence[Self]:
+        return _tool(
+            cls, CreateHumanIssueAction, "Create human issue",
+            "Create or exactly replay one issue for human input. Reuse its issue_id "
+            "with unchanged title and body on retries. The backend adds human and "
+            "this role's audience labels, and mentions the GitHub credential "
+            "owner, when available, in the initial issue body.",
+            CreateHumanIssueExecutor(runtime),
         )
 
 
