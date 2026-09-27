@@ -5,12 +5,12 @@
 [project]
 name = "senpai"
 version = "0.1.0"
-requires-python = ">=3.13,<3.14"
+requires-python = ">=3.14.2,<3.15"
 dependencies = [
     "numpy",
     "PyYAML",
-    "torch==2.13.0",
-    "torchvision==0.28.0",
+    "torch==2.14.0",
+    "torchvision==0.29.0",
     "torch_geometric",
     "einops",
     "timm",
@@ -19,7 +19,7 @@ dependencies = [
     "simple-parsing",
     "wandb",
     "weave>=0.53.1,<0.54",
-    "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@c1e9cda697e10ee92e5629b19c7d81cac8bcf54b",
+    "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@b2d1290a914ba42a544bebb9afa835ce01e38f4e",
     "tqdm",
     "matplotlib",
     "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@f69134273ee3a31a233d6201786570eb9c4c141b#subdirectory=openhands-sdk",
@@ -41,8 +41,7 @@ environments = [
     "sys_platform == 'linux'",
     "sys_platform == 'darwin'",
 ]
-exclude-newer = "2026-07-27T20:01:53.448785Z"
-exclude-newer-package = { cryptography = "2026-08-01T00:00:00Z" }
+exclude-newer = "2026-09-27T00:00:00Z"
 constraint-dependencies = [
     "cryptography>=50.0.0", # CVE-2026-69247 / GHSA-g6cj-pr64-35w5
 ]

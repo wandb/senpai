@@ -39,7 +39,7 @@ def test_advisor_dockerfile_prunes_the_training_stack():
     dockerfile = (ROOT / "Dockerfile.advisor").read_text(encoding="utf-8")
     lowered = dockerfile.lower()
 
-    assert dockerfile.startswith("FROM python:3.13-slim")
+    assert dockerfile.startswith("FROM python:3.14-slim")
     assert "uv export --locked" in dockerfile
     assert "--prune torch" in dockerfile
     assert "--prune torchvision" in dockerfile
@@ -67,7 +67,7 @@ def test_executor_image_is_a_minimal_non_root_credential_boundary():
     dockerfile = (ROOT / "Dockerfile.executor").read_text(encoding="utf-8")
     lowered = dockerfile.lower()
 
-    assert dockerfile.startswith("FROM python:3.13-slim")
+    assert dockerfile.startswith("FROM python:3.14-slim")
     assert "USER 10001:10001" in dockerfile
     assert "COPY senpai_agent /opt/senpai/senpai_agent" in dockerfile
     assert "pydantic==" in dockerfile

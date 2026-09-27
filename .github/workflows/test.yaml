@@ -20,13 +20,13 @@ jobs:
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
-          python-version: "3.13"
+          python-version: "3.14"
           version: "0.10.9"
 
       - name: Install runtime test dependencies
         run: |
           uv lock --check
-          uv venv --python 3.13
+          uv venv --python 3.14
           uv pip install --python .venv/bin/python \
             pytest \
             psutil \
@@ -35,7 +35,7 @@ jobs:
             wandb \
             "exa-py @ https://github.com/exa-labs/exa-py/archive/71f315b4be07d474df128c8fafc70cc7d0e47b56.tar.gz" \
             "weave>=0.53.1,<0.54" \
-            "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@c1e9cda697e10ee92e5629b19c7d81cac8bcf54b" \
+            "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@b2d1290a914ba42a544bebb9afa835ce01e38f4e" \
             "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@f69134273ee3a31a233d6201786570eb9c4c141b#subdirectory=openhands-sdk" \
             "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@f69134273ee3a31a233d6201786570eb9c4c141b#subdirectory=openhands-tools"
 

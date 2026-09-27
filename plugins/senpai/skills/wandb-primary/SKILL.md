@@ -22,10 +22,10 @@ Once you know the environment, **write your finding into this skill** by replaci
 
 <!-- AGENT: Replace the content between the ENVIRONMENT markers with the detected environment -->
 <!-- ENVIRONMENT_START -->
-**Detected Python environment:** `uv` project on Python 3.13 (`pyproject.toml`)
+**Detected Python environment:** `uv` project on Python 3.14 (`pyproject.toml`)
 
 ```
-# Run command: uv run --python 3.13 <script.py>
+# Run command: uv run --python 3.14 <script.py>
 # Install command: uv add <package>
 ```
 <!-- ENVIRONMENT_END -->

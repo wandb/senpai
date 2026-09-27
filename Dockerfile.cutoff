@@ -1,4 +1,4 @@
-FROM python:3.13-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 ARG KUBECTL_VERSION=v1.31.0
 ARG SENPAI_SOURCE_REVISION=unknown

@@ -1,6 +1,6 @@
-FROM python:3.13-slim-bookworm
+FROM python:3.14-slim-bookworm
 
-ARG PLAYWRIGHT_VERSION=1.55.0
+ARG PLAYWRIGHT_VERSION=1.63.0
 ARG SENPAI_SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.revision="${SENPAI_SOURCE_REVISION}"
 
@@ -35,7 +35,7 @@ RUN python -m pip install --no-cache-dir "uv==0.10.9" && \
 # Export from the project lock while pruning dependencies used only for training.
 COPY pyproject.toml uv.lock /tmp/senpai/
 RUN cd /tmp/senpai && \
-    uv export --locked --python 3.13 --no-dev --no-emit-project \
+    uv export --locked --python 3.14 --no-dev --no-emit-project \
       --format requirements.txt \
       --prune torch \
       --prune torchvision \
@@ -52,7 +52,7 @@ RUN cd /tmp/senpai && \
       --only-binary pydantic-core \
       --only-binary rpds-py \
       -r requirements.txt && \
-    python -c 'import importlib.metadata, importlib.util, openhands.sdk, sys; assert sys.version_info[:2] == (3, 13); assert importlib.util.find_spec("torch") is None; assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
+    python -c 'import importlib.metadata, importlib.util, openhands.sdk, sys; assert sys.version_info[:2] == (3, 14); assert importlib.util.find_spec("torch") is None; assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
     chown -R 10001:10001 /opt/senpai-venv && \
     rm -rf /root/.cache/uv
 
