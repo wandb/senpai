@@ -495,9 +495,7 @@ def test_system_instructions_refer_to_program_md_by_filename():
     }
 
     assert all("programme" not in prompt.lower() for prompt in prompts.values())
-    harness = " ".join(prompts["SENPAI-HARNESS.md"].split())
-    assert "`program.md` defines research policy" in harness
-    assert "Use the embedded snapshot for the whole launch" in harness
+    assert "program.md" not in prompts["SENPAI-HARNESS.md"]
     advisor = " ".join(prompts["ADVISOR.md"].split())
     assert (
         "NEVER accept results where the primary validation metrics required by "

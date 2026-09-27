@@ -235,10 +235,7 @@ three against the mounted snapshot before constructing a worker.
 The selected path supports printable UTF-8, including spaces and Unicode,
 without backslashes or traversal. The committed program must be a regular file
 of at most 256 KiB of UTF-8 data; the encoded Secret value may not exceed 1 MiB.
-The prompt content omits the SPDX header and outer whitespace. The target
-policy defines research goals and constraints; the harness, role charter,
-launch context, permissions, security boundaries, and operator instructions
-retain their stated authority.
+The prompt content omits the SPDX header and outer whitespace.
 
 The supervisor renders the role's `{{VARIABLE}}` placeholders from an explicit
 non-secret allowlist. A missing referenced value fails startup; unrelated
