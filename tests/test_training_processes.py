@@ -460,7 +460,7 @@ def test_cancel_does_not_wait_for_a_detached_output_writer(tmp_path, monkeypatch
     finally:
         if child_pid.exists():
             try:
-                os.killpg(int(child_pid.read_text()), signal.SIGKILL)
+                os.kill(int(child_pid.read_text()), signal.SIGKILL)
             except ProcessLookupError:
                 pass
         supervisor.close()

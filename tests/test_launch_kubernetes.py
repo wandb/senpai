@@ -17,7 +17,21 @@ def block_unmocked_launch_writes(monkeypatch):
     monkeypatch.setattr(launch, "kubectl_create", fail, raising=False)
 
 
+def bypass_program_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        launch, "existing_program_context_secret", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        launch,
+        "load_launch_program_snapshot",
+        lambda *_args: launch.ProgramSystemPrompt(
+            "program.md", "a" * 40, "Test launch research policy."
+        ),
+    )
+
+
 def test_multiple_launch_tags_share_one_wandb_key(tmp_path, monkeypatch):
+    bypass_program_snapshot(monkeypatch)
     for name in os.environ:
         if name.startswith("WANDB_API_KEY_") or name == "WANDB_INFERENCE_API_KEY":
             monkeypatch.delenv(name)
@@ -78,7 +92,10 @@ def test_multiple_launch_tags_share_one_wandb_key(tmp_path, monkeypatch):
 
     assert authenticated == ["shared-wandb-key", "shared-wandb-key"]
     assert inference_keys == authenticated
-    secrets = [resource for resource in applied if resource["kind"] == "Secret"]
+    secrets = [
+        resource for resource in applied
+        if resource["kind"] == "Secret" and "wandb-api-key" in resource["data"]
+    ]
     assert len(secrets) == 2
     assert {
         resource["metadata"]["labels"]["research-tag"] for resource in secrets
@@ -549,16 +566,7 @@ def bypass_external_preflight(monkeypatch):
         "preflight_check_target_repo_branch",
         lambda *_args: "main",
     )
-    monkeypatch.setattr(
-        launch, "existing_program_context_secret", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(
-        launch,
-        "load_launch_program_snapshot",
-        lambda *_args: launch.ProgramSystemPrompt(
-            "program.md", "a" * 40, "Test launch research policy."
-        ),
-    )
+    bypass_program_snapshot(monkeypatch)
     monkeypatch.setattr(
         launch,
         "ensure_new_student_slot",
