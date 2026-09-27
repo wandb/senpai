@@ -2,7 +2,6 @@
 
 from collections.abc import Callable
 
-from senpai_agent.github.http import next_link
 from senpai_agent.github.workflow.errors import (
     ReconciliationError,
     StaleResearchBaseError,
@@ -282,31 +281,12 @@ class CommentsMixin:
 
     def _comments(self, number: int) -> tuple[IssueComment, ...]:
         number = positive_number(number)
-        url: str | None = f"/repos/{self._repo}/issues/{number}/comments?per_page=100"
-        comments: list[IssueComment] = []
-        visited: set[str] = set()
-        while url is not None:
-            absolute_url = self._url(url)
-            if absolute_url in visited:
-                raise ReconciliationError("GitHub comment pagination contains a cycle")
-            visited.add(absolute_url)
-            response = self._request("GET", absolute_url, expected_statuses={200})
-            if not isinstance(response.json_body, list):
-                raise ReconciliationError("GitHub returned invalid paginated comments")
-            comments.extend(
-                validated_response(
-                    IssueCommentResponse,
-                    raw_comment,
-                    "issue comment",
-                ).comment()
-                for raw_comment in response.json_body
+        return tuple(
+            validated_response(IssueCommentResponse, item, "issue comment").comment()
+            for item in self._objects(
+                f"/repos/{self._repo}/issues/{number}/comments?per_page=100"
             )
-            url = next_link(response.header("Link"))
-            if url is not None and not url.startswith(f"{self._api_url}/"):
-                raise ReconciliationError(
-                    "GitHub pagination returned an unexpected origin"
-                )
-        return tuple(comments)
+        )
 
 
 def _same_result_version(first: ExperimentResult, second: ExperimentResult) -> bool:

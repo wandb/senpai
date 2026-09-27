@@ -260,7 +260,8 @@ class CreateHumanIssueAction(Action):
         max_length=50_000,
         description=(
             "Complete message for humans. The runtime adds the role prefix, "
-            "audience labels, and repository maintainer mentions."
+            "audience labels, and a mention of the GitHub credential owner "
+            "when available."
         ),
     )
 

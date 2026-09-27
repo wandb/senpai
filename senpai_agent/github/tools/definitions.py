@@ -254,8 +254,8 @@ class CreateHumanIssueTool(
             cls, CreateHumanIssueAction, "Create human issue",
             "Create or exactly replay one issue for human input. Reuse its issue_id "
             "with unchanged title and body on retries. The backend adds human and "
-            "this role's audience labels, and mentions repository maintainers in "
-            "the initial issue body.",
+            "this role's audience labels, and mentions the GitHub credential "
+            "owner, when available, in the initial issue body.",
             CreateHumanIssueExecutor(runtime),
         )
 
