@@ -709,10 +709,13 @@ W&B run IDs. Run IDs are persisted while training is still running so metric
 monitoring can begin immediately.
 
 Multiple Senpai instances may share `WANDB_API_KEY`; no per-student key is required.
-Local supervised training masks the inherited key before persisting stdout/stderr,
+Supervised training masks the inherited key before persisting stdout/stderr,
 including keys split across reads and incomplete key prefixes at shutdown.
 The output reader drains buffered data without waiting for detached descendants
 to close the pipe. Training clears `WANDB_SERVICE` to start its own W&B connection.
+The Kubernetes executor returns raw diagnostic components over its private socket.
+The controller masks each component before formatting or truncating it, including
+event messages. The executor does not receive the W&B key.
 
 When a student has more than one configured node, `KubernetesTrainingSupervisor`
 keeps the same tool contract while supervising one remote MPIJob. It creates an

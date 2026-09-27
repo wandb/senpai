@@ -11,8 +11,11 @@ from senpai_agent.github.workflow.responses import (
     SubmitResultPreflight,
 )
 from senpai_agent.github.workflow.validation import (
+    require_active_assignment_routing,
     require_assignment_identity,
     require_assignment_result,
+    require_current_revision,
+    require_head,
     require_label_update,
     require_open,
     require_result_identity,
@@ -22,6 +25,53 @@ from senpai_agent.models import AssignmentRecord, ExperimentResult
 
 class ResultMixin:
     __slots__ = ()
+
+    def preflight_publish_assignment_branch(
+        self,
+        number: int,
+        *,
+        assignment_id: str,
+        revision_id: str,
+        student: str,
+        expected_head_sha: str,
+        local_commit_sha: str,
+    ) -> tuple[PullRequestSnapshot, AssignmentRecord]:
+        """Require an unfinished current assignment before publishing its source."""
+
+        snapshot = self.pull_request(number)
+        require_open(snapshot)
+        assignment = require_assignment_identity(
+            snapshot, repo=self._repo, assignment_id=assignment_id
+        )
+        require_current_revision(assignment, revision_id)
+        if assignment.student != student:
+            raise WorkflowPreconditionError(
+                "assignment student does not match this runtime's student"
+            )
+        if not assignment.head_ref.startswith(f"{student}/"):
+            raise WorkflowPreconditionError(
+                f"assignment branch must belong to student {student!r}"
+            )
+        if assignment.head_ref == assignment.base_ref:
+            raise WorkflowPreconditionError(
+                "assignment branch must differ from its research base branch"
+            )
+        require_active_assignment_routing(snapshot, assignment)
+        for match in self._result_comments(number, assignment_id):
+            result_assignment = match.result.assignment
+            if (
+                result_assignment.repo == self._repo
+                and result_assignment.pr_number == number
+                and result_assignment.revision_id == revision_id
+                and result_assignment.student == student
+            ):
+                raise WorkflowPreconditionError(
+                    "assignment revision already has a terminal result"
+                )
+        # An exact replay may retain the lease from before its successful push.
+        if snapshot.head_sha != local_commit_sha:
+            require_head(snapshot, expected_head_sha)
+        return snapshot, assignment
 
     def preflight_submit_result(
         self,
