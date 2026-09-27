@@ -118,6 +118,7 @@ def test_supported_reasoning_effort_is_preserved(
     [
         ("max", "openai/gpt-5.4"),
         ("max", "openai/gpt-5.60"),
+        ("none", "openai/gpt-6-astra"),
         ("medium", "wandb/zai-org/GLM-5.2"),
         ("extreme", "openai/gpt-5.6-sol"),
         ("ultra", "openai/gpt-5.6-sol"),
@@ -184,20 +185,21 @@ def test_openai_response_configuration_is_accepted_by_the_pinned_sdk():
     assert openai_responses_configuration("anthropic/claude-opus-4-8") == {}
 
 
-def test_openai_max_uses_pro_mode_on_the_wire():
-    configuration = model_runtime_configuration(
-        "openai/gpt-5.6-sol",
-        "max",
-        compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
-    )
+@pytest.mark.parametrize(
+    ("model", "effort"),
+    [("openai/gpt-5.6-sol", "max")]
+    + [("openai/gpt-6-astra", effort) for effort in ("low", "medium", "high", "xhigh", "max")],
+)
+def test_openai_reasoning_effort_reaches_the_provider_request(model, effort):
     llm = LLM(
-        model="openai/gpt-5.6-sol",
+        model=model,
         api_key=SecretStr("test-key"),
-        reasoning_effort=openhands_reasoning_effort(
-            "max",
-            "openai/gpt-5.6-sol",
+        reasoning_effort=openhands_reasoning_effort(effort, model),
+        **model_runtime_configuration(
+            model,
+            effort,
+            compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
         ),
-        **configuration,
     )
     _instructions, _inputs, _tools, call_kwargs, _telemetry = (
         llm._prepare_responses_params(
@@ -209,38 +211,29 @@ def test_openai_max_uses_pro_mode_on_the_wire():
             kwargs={},
         )
     )
-
-    assert llm.reasoning_effort == "max"
-    assert call_kwargs["reasoning"] == {
-        "effort": "max",
-        "summary": "auto",
-        "context": "all_turns",
-    }
-    assert call_kwargs["context_management"] == [
-        {
-            "type": "compaction",
-            "compact_threshold": TEST_COMPACTION_TRIGGER_TOKENS,
-        }
-    ]
-    assert call_kwargs["extra_body"] == {
-        "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
-        "reasoning": {
-            "effort": "max",
-            "mode": "pro",
-            "summary": "auto",
-            "context": "all_turns",
-        },
-    }
     wire_request = {
         key: value for key, value in call_kwargs.items() if key != "extra_body"
     }
-    wire_request.update(call_kwargs["extra_body"])
+    wire_request.update(call_kwargs.get("extra_body", {}))
+
+    assert llm.uses_responses_api()
+    assert llm.reasoning_effort == effort
     assert wire_request["reasoning"] == {
-        "effort": "max",
-        "mode": "pro",
+        "effort": effort,
         "summary": "auto",
         "context": "all_turns",
+        **({"mode": "pro"} if effort == "max" else {}),
     }
+    assert wire_request["context_management"] == [
+        {"type": "compaction", "compact_threshold": TEST_COMPACTION_TRIGGER_TOKENS}
+    ]
+    assert wire_request["prompt_cache_options"] == {"mode": "explicit", "ttl": "30m"}
+    assert not {"temperature", "top_p", "logprobs", "top_logprobs", "prompt_cache_retention"} & wire_request.keys()
+    assert "message.output_text.logprobs" not in wire_request.get("include", [])
+    if model == "openai/gpt-6-astra":
+        assert llm.vision_is_active()
+        assert llm.effective_max_input_tokens == 1_050_000
+        assert wire_request["max_output_tokens"] == 128_000
 
 
 @pytest.mark.parametrize(

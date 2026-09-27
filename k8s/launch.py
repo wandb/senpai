@@ -262,7 +262,9 @@ def deployed_model_providers(args: Args) -> set[str]:
 
 def _supports_openai_pro(model: str) -> bool:
     normalized = model.lower()
-    return normalized == "openai/gpt-5.6" or normalized.startswith("openai/gpt-5.6-")
+    return normalized in {"openai/gpt-5.6", "openai/gpt-6-astra"} or normalized.startswith(
+        "openai/gpt-5.6-"
+    )
 
 
 def validate_model_config(args: Args) -> None:
@@ -285,6 +287,10 @@ def validate_model_config(args: Args) -> None:
             choices = ", ".join(sorted(REASONING_EFFORTS))
             sys.exit(f"ERROR: --{name}_reasoning_effort must be one of: {choices}")
         normalized_model = model.lower()
+        if normalized_model == "openai/gpt-6-astra" and effort == "none":
+            sys.exit(
+                f"ERROR: --{name}_reasoning_effort={effort} is unsupported for {model}"
+            )
         if normalized_model == "wandb/zai-org/glm-5.2":
             if effort not in {"high", "max"}:
                 sys.exit(

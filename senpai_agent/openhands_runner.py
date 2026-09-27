@@ -258,13 +258,18 @@ def parse_runner_args(argv: Sequence[str] | None = None) -> RunnerArgs:
 def openhands_reasoning_effort(reasoning_effort: str, model: str) -> str:
     provider, _, model_name = model.lower().partition("/")
     supports_openai_pro = provider == "openai" and (
-        model_name == "gpt-5.6" or model_name.startswith("gpt-5.6-")
+        model_name in {"gpt-5.6", "gpt-6-astra"}
+        or model_name.startswith("gpt-5.6-")
     )
     if reasoning_effort not in REASONING_EFFORTS:
         choices = ", ".join(REASONING_EFFORTS)
         raise ValueError(
             f"unsupported reasoning effort {reasoning_effort!r}; "
             f"choose one of: {choices}"
+        )
+    if provider == "openai" and model_name == "gpt-6-astra" and reasoning_effort == "none":
+        raise ValueError(
+            f"reasoning effort {reasoning_effort!r} is unsupported for model {model!r}"
         )
     if provider == "wandb" and model_name == "zai-org/glm-5.2":
         if reasoning_effort not in {"high", "max"}:
@@ -281,7 +286,8 @@ def openhands_reasoning_effort(reasoning_effort: str, model: str) -> str:
         raise ValueError(
             f"reasoning effort {reasoning_effort!r} is unsupported for model "
             f"{model!r}; "
-            "use an anthropic model, an openai/gpt-5.6 model, or select a lower effort"
+            "use an anthropic model, openai/gpt-5.6, openai/gpt-6-astra, "
+            "or select a lower effort"
         )
     return reasoning_effort
 
@@ -1072,7 +1078,7 @@ def prompt_cache_configuration(model: str) -> dict[str, object]:
     if provider == "anthropic" and "prompt_cache_ttl" in LLM.model_fields:
         return {"prompt_cache_ttl": "1h"}
     if provider == "openai":
-        if model_name.startswith("gpt-5.6"):
+        if model_name.startswith("gpt-5.6") or model_name == "gpt-6-astra":
             return {
                 "prompt_cache_retention": None,
                 "responses_prompt_cache_breakpoint": True,
@@ -1108,6 +1114,16 @@ def openai_responses_configuration(
         "responses_store": True,
         "responses_use_previous_response_id": True,
     }
+    if model.lower() == "openai/gpt-6-astra":
+        configuration.update(
+            capability_overrides={
+                "supports_reasoning_effort": True,
+                "supports_sampling_params": False,
+                "supports_vision": True,
+            },
+            max_input_tokens=1_050_000,
+            max_output_tokens=128_000,
+        )
     if reasoning := _openai_pro_reasoning(model, reasoning_effort):
         configuration["litellm_extra_body"] = {
             "reasoning": reasoning,
