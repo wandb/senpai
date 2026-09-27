@@ -328,6 +328,8 @@ class TrainingSupervisor:
         try:
             with active.process.stdout as stream, active.log_path.open("wb") as log:
                 os.set_blocking(stream.fileno(), False)
+                poller = select.poll()
+                poller.register(stream, select.POLLIN)
                 while True:
                     if remaining is None and active.output_stop.is_set():
                         # Drain the queued backlog, without allowing escaped
@@ -345,7 +347,7 @@ class TrainingSupervisor:
                             else min(_LOG_READ_BYTES, remaining),
                         )
                     except BlockingIOError:
-                        select.select([stream], [], [], 0.05)
+                        poller.poll(50)
                         continue
                     if not chunk:
                         break
