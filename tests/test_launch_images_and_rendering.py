@@ -296,6 +296,88 @@ def test_launch_rejects_a_program_path_outside_the_target_repo(path):
     assert "--program_path" in result.stderr
 
 
+def test_launcher_captures_program_before_the_remote_ref_disappears(
+    tmp_path, monkeypatch
+):
+    workspace, remote, _head = repository(tmp_path)
+    program_path = 'équipe "A"/program.md'
+    (workspace / program_path).parent.mkdir()
+    source_commit = commit_file(
+        workspace, program_path, "Stable launch policy.\n", "add policy"
+    )
+    git(workspace, "push", "origin", f"{source_commit}:refs/heads/research")
+    monkeypatch.setattr(launch, "github_repository_url", lambda _repo: str(remote))
+
+    snapshot = launch.load_launch_program_snapshot(
+        "https://github.com/acme/widgets.git", "research", "", "github-token"
+    )
+    git(remote, "update-ref", "-d", "refs/heads/research")
+
+    assert snapshot.source_commit == source_commit
+    assert snapshot.program_path == program_path
+    assert snapshot.content == "Stable launch policy."
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_program_secret_is_immutable_and_projected_read_only(role):
+    program = launch.ProgramSystemPrompt(
+        program_path="program.md",
+        source_commit=REVISION,
+        content="Test launch research policy.",
+    )
+    name, manifest = launch_helpers.render_program_context_secret(
+        "test-track", launch.encode_program_system_prompt(program)
+    )
+    document = yaml.safe_load(manifest)
+    assert document["immutable"] is True
+    encoded = base64.b64decode(document["data"]["program-context"]).decode()
+    assert launch.decode_program_system_prompt(encoded) == program
+    configmap, deployment, _credentials = render_role(role)
+    config = yaml.safe_load(configmap)["data"]
+    pod_template = yaml.safe_load(deployment)["spec"]["template"]
+    assert pod_template["metadata"]["annotations"][
+        "senpai.wandb.com/program-context-secret"
+    ] == name
+    pod = pod_template["spec"]
+    volume = next(
+        item for item in pod["volumes"] if item["name"] == "program-context"
+    )
+    assert volume["secret"] == {
+        "secretName": name,
+        "items": [{"key": "program-context", "path": "program-context.b64"}],
+    }
+    mount = next(
+        item for item in pod["containers"][0]["volumeMounts"]
+        if item["name"] == "program-context"
+    )
+    assert mount == {
+        "name": "program-context",
+        "mountPath": "/var/run/senpai-context",
+        "readOnly": True,
+    }
+    assert config["SENPAI_PROGRAM_CONTENT_SHA256"] == program.content_sha256
+    assert config["SENPAI_PROGRAM_SOURCE_COMMIT"] == program.source_commit
+
+
+def test_program_secret_payload_and_name_stay_within_kubernetes_limits():
+    program = launch.ProgramSystemPrompt(
+        program_path="program.md",
+        source_commit=REVISION,
+        content="x" * (256 * 1024),
+    )
+    name, manifest = launch_helpers.render_program_context_secret(
+        "t" * 63, launch.encode_program_system_prompt(program)
+    )
+    assert len(name) <= 63
+    assert launch.decode_program_system_prompt(
+        base64.b64decode(yaml.safe_load(manifest)["data"]["program-context"]).decode()
+    ) == program
+    with pytest.raises(ValueError, match="1 MiB"):
+        launch_helpers.render_program_context_secret(
+            "track", "x" * (1024 * 1024 + 1)
+        )
+
+
 def test_launch_secret_contains_each_credential_and_both_roles_reference_it():
     expected_values = {
         "github-token": "github",
@@ -612,4 +694,14 @@ def test_rendered_role_annotation_matches_its_effective_content_hash(role):
         "annotations"
     ]["senpai.wandb.com/content-hash"]
 
-    assert annotation == launch_helpers.pod_template_hash(configmap, secret)
+    program = launch.ProgramSystemPrompt(
+        program_path="program.md",
+        source_commit=REVISION,
+        content="Test launch research policy.",
+    )
+    _name, program_secret = launch_helpers.render_program_context_secret(
+        "test-track", launch.encode_program_system_prompt(program)
+    )
+    assert annotation == launch_helpers.pod_template_hash(
+        configmap, secret, program_secret
+    )

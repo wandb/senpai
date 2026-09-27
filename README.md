@@ -102,6 +102,36 @@ A useful structure is:
 
 Put it at the repository root. If it lives elsewhere, set `program_path` in `senpai.yaml` or pass `--program_path` at launch. Senpai appends the selected file to every agent's system prompt.
 
+Commit the policy before launching. The launcher captures the advisor branch's
+Git-advertised head in an isolated clone, verifies the commit, tree, and blob
+object IDs, and stores the selected policy in an immutable Secret. A blank
+`program_path` requires exactly one match at the root or one directory below
+it. An explicit path may be deeper. Paths must be normalized, relative,
+printable UTF-8 paths ending in `program.md`, without backslashes. Spaces and
+Unicode names are supported. The selected file must be a regular Git blob,
+not a symlink or submodule, and at most 256 KiB of UTF-8 data. Its encoded
+snapshot must also fit the 1 MiB Secret limit.
+
+Each worker and delegated child receives the same policy path, source commit,
+and normalized content. Normalization removes the SPDX header and outer
+whitespace. The supervisor binds the complete system suffix, including its
+rendering templates, before starting the worker. Workers and children verify
+that binding when they start or resume. Later workspace edits do not change
+the running launch's policy. Advisor synchronization can still publish
+operator-authored policy changes; apply them to research context with a new
+launch tag and fresh role state.
+
+When extending an active tag, the launcher reuses its original snapshot if the
+normalized policy path and content are unchanged, even when the advisor branch
+has advanced. Changed policy requires a new tag. Serialize launches for each
+cluster, namespace, and tag: checking existing bindings and applying resources
+is not an atomic reservation. The launcher needs read access to Deployments,
+Pods, and the bound program Secret in that namespace, as well as apply access.
+Legacy roles without a program binding cannot be extended under the same tag;
+use a new tag. Persisted system context that disagrees with trusted launch
+inputs fails startup. Stop the affected roles and start fresh role state when
+intentionally changing the harness, role charter, or launch identity.
+
 The target repository must be different from the SENPAI runner repository.
 
 ### 5. Configure the launch

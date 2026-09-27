@@ -22,6 +22,10 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from dotenv import dotenv_values
+
+PROGRAM_CONTEXT_ANNOTATION = "senpai.wandb.com/program-context-secret"
+MAX_PROGRAM_SECRET_BYTES = 1024 * 1024
+
 STUDENT_NAMES = [
     "frieren",
     "fern",
@@ -210,6 +214,144 @@ def existing_student_names(
     return [line for line in result.stdout.splitlines() if line]
 
 
+def existing_program_context_secret(
+    tag: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> str | None:
+    """Require one program binding across desired roles and every live Pod."""
+
+    result = subprocess.run(
+        kubectl_command(
+            "get",
+            "deployments,pods",
+            "-l",
+            f"app=senpai,research-tag={tag}",
+            "-o",
+            "json",
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    names: set[str] = set()
+    for resource in json.loads(result.stdout).get("items", []):
+        if resource.get("kind") == "Pod" and resource.get("status", {}).get(
+            "phase"
+        ) in {"Succeeded", "Failed"}:
+            continue
+        metadata = resource.get("metadata", {})
+        if resource.get("kind") == "Deployment":
+            metadata = (
+                resource.get("spec", {}).get("template", {}).get("metadata", {})
+            )
+        name = metadata.get("annotations", {}).get(PROGRAM_CONTEXT_ANNOTATION)
+        if not isinstance(name, str) or not name:
+            raise RuntimeError(
+                "an existing Senpai role lacks a valid program context binding; "
+                "use a new launch tag"
+            )
+        names.add(name)
+    if len(names) > 1:
+        raise RuntimeError(
+            "existing roles use different program snapshots; use a new launch tag"
+        )
+    return next(iter(names), None)
+
+
+def _program_context_secret_name(tag: str, program_context: str) -> str:
+    digest = hashlib.sha256(program_context.encode()).hexdigest()[:16]
+    prefix = "senpai-program-context-"
+    name = f"{prefix}{tag}-{digest}"
+    if len(name) <= 63:
+        return name
+    # Preserve the snapshot digest while bounding the tag's contribution.
+    tag_digest = hashlib.sha256(tag.encode()).hexdigest()[:8]
+    tag_length = 63 - len(prefix) - len(tag_digest) - len(digest) - 2
+    return f"{prefix}{tag[:tag_length].rstrip('-.')}-{tag_digest}-{digest}"
+
+
+def read_program_context_secret(
+    name: str,
+    tag: str,
+    *,
+    kube_context: str = "",
+    namespace: str = "default",
+) -> str:
+    """Verify the immutable, tag-owned Secret before reusing its snapshot."""
+
+    result = subprocess.run(
+        kubectl_command(
+            "get",
+            "secret",
+            name,
+            "-o",
+            "json",
+            kube_context=kube_context,
+            namespace=namespace,
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(result.stdout)
+    metadata = payload.get("metadata", {})
+    labels = metadata.get("labels", {})
+    if (
+        payload.get("immutable") is not True
+        or metadata.get("name") != name
+        or labels.get("research-tag") != tag
+        or labels.get("senpai.wandb.com/secret-role") != "program-context"
+    ):
+        raise RuntimeError(
+            "the bound program context Secret has invalid ownership or immutability"
+        )
+    try:
+        encoded = base64.b64decode(
+            payload.get("data", {}).get("program-context"), validate=True
+        ).decode()
+    except (TypeError, ValueError, UnicodeDecodeError) as error:
+        raise RuntimeError("the bound program context Secret is invalid") from error
+    if not encoded or len(encoded.encode()) > MAX_PROGRAM_SECRET_BYTES:
+        raise RuntimeError("the bound program context Secret is empty or too large")
+    if name != _program_context_secret_name(tag, encoded):
+        raise RuntimeError(
+            "the bound program context Secret name does not match its content"
+        )
+    return encoded
+
+
+def render_program_context_secret(tag: str, program_context: str) -> tuple[str, str]:
+    """Render a separate immutable Secret for one exact program snapshot."""
+
+    if len(program_context.encode()) > MAX_PROGRAM_SECRET_BYTES:
+        raise ValueError(
+            "encoded program context exceeds Kubernetes' 1 MiB Secret limit"
+        )
+    name = _program_context_secret_name(tag, program_context)
+    encoded = base64.b64encode(program_context.encode()).decode()
+    return name, "\n".join(
+        [
+            "apiVersion: v1",
+            "kind: Secret",
+            "metadata:",
+            f"  name: {name}",
+            "  labels:",
+            "    app: senpai",
+            f"    research-tag: {json.dumps(tag)}",
+            "    senpai.wandb.com/secret-role: program-context",
+            "type: Opaque",
+            "immutable: true",
+            "data:",
+            f"  program-context: {encoded}",
+            "",
+        ]
+    )
+
+
 def render_template(template: str, replacements: dict[str, str]) -> str:
     """Replace {{PLACEHOLDER}} tokens in a K8s manifest template."""
     out = template
@@ -231,13 +373,13 @@ def render_configmap(name: str, labels: dict[str, str], data: dict[str, str]) ->
         lines.append(f"    {k}: {v}")
     lines.append("data:")
     for k, v in data.items():
-        lines.append(f'  {k}: "{v}"')
+        lines.append(f"  {k}: {json.dumps(v, ensure_ascii=False)}")
     return "\n".join(lines)
 
 
-def pod_template_hash(configmap: str, launch_secret: str) -> str:
+def pod_template_hash(*resources: str) -> str:
     """Hash the complete pod configuration that must trigger a rollout."""
-    return hashlib.sha256(f"{configmap}\0{launch_secret}".encode()).hexdigest()
+    return hashlib.sha256("\0".join(resources).encode()).hexdigest()
 
 
 def target_repo_slug(url: str) -> str:

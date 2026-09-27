@@ -27,6 +27,7 @@ spec:
     metadata:
       annotations:
         senpai.wandb.com/content-hash: "{{POD_CONFIG_HASH}}"
+        senpai.wandb.com/program-context-secret: "{{PROGRAM_CONTEXT_SECRET_NAME}}"
       labels:
         app: senpai
         role: student
@@ -137,6 +138,9 @@ spec:
           mountPath: {{PVC_MOUNT_PATH}}
         - name: state
           mountPath: /var/lib/senpai
+        - name: program-context
+          mountPath: /var/run/senpai-context
+          readOnly: true
       volumes:
       - name: dshm
         emptyDir:
@@ -147,6 +151,12 @@ spec:
           claimName: {{PVC_CLAIM_NAME}}
       - name: state
         emptyDir: {}
+      - name: program-context
+        secret:
+          secretName: {{PROGRAM_CONTEXT_SECRET_NAME}}
+          items:
+          - key: program-context
+            path: program-context.b64
       tolerations:
       - key: "nvidia.com/gpu"
         operator: "Exists"
