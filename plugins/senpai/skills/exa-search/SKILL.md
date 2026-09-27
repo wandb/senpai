@@ -12,8 +12,16 @@ code do not receive the key.
 Set `mode="general-web"` for current documentation, source code, release notes,
 news, and technical writing. Set `mode="research-publications"` for papers,
 preprints, journals, and literature reviews. Use `num_results` to request 1–100
-results. For general web search, use `include_domains` when the authoritative
-domains are known.
+results per call. For general web search, use `include_domains` when the
+authoritative domains are known.
+
+If more results are useful, increase `num_results` up to 100. This is a per-call
+limit, not a limit for the research task. Search has no page, offset, or cursor;
+repeating the same request does not fetch the next page. For broader coverage,
+make complementary queries or use date/domain filters that fit the task, then
+deduplicate by canonical URL and normalized title. These searches can overlap
+and do not guarantee exhaustive coverage. `additional_queries` broadens a deep
+search within the same result limit.
 
 Results include direct URLs, authors, publication dates, scores, summaries, and
 highlights when Exa supplies them. The response also includes result counts,
