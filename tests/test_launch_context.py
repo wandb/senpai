@@ -65,6 +65,9 @@ def test_launch_context_records_resolved_runtime_facts(backend):
     assert "advisor branch `research-v2`" in context
     assert "base branch `main`" in context
     assert "fern, frieren" in context
+    assert args.student_image in context
+    assert "/opt/senpai-venv/bin/python -P -m pip list" in context
+    assert f"{args.pvc_mount_path}/.senpai/runs/foil-run" in context
     assert "{{" not in context
 
 

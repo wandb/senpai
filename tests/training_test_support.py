@@ -37,6 +37,9 @@ class FakeCluster:
             )
             self.reservations.append((training_id, source_snapshot, source_commit))
 
+    def apply(self, manifest):
+        pass
+
     def adopt(self, _training_id, _spec, resource, _deadline_at):
         self.adoptions.append(resource)
 

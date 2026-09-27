@@ -51,6 +51,8 @@ from senpai_agent.program_context import (
 from senpai_agent.secrets import validate_custom_secret_env_names
 
 from capacity_observer import render_capacity_observer
+from images import resolve_launch_images
+from storage_preflight import validate_storage
 from launch_helpers import (
     ensure_advisor_branch,
     ensure_new_student_slot,
@@ -124,11 +126,11 @@ class Args:
         "https://github.com/wandb/senpai.git"  # public read-only runner source
     )
     senpai_repo_revision: str = (
-        ""  # exact runner commit; derived from :sha-<commit> image tags
+        ""  # exact runner commit; resolved from published defaults or source-SHA tags
     )
-    advisor_image: str = ""  # advisor source-SHA tag or image digest — REQUIRED
-    student_image: str = ""  # student source-SHA tag or image digest — REQUIRED
-    executor_image: str = ""  # immutable broker image; required for students or the capacity observer
+    advisor_image: str = ""  # advisor image override; blank resolves the matching published image
+    student_image: str = ""  # controller and training image; blank resolves the latest published image
+    executor_image: str = ""  # broker image override; blank resolves the matching published digest
     kube_context: str = ""  # kubectl context; empty uses the current context
     namespace: str = "default"  # Kubernetes namespace for all launch resources
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
@@ -172,7 +174,7 @@ class Args:
         False  # render manifests only: do not apply them or validate credentials
     )
     preflight_only: bool = (
-        False  # validate credentials/access only: do not render or apply manifests
+        False  # validate credentials, images, and storage with temporary probe Pods
     )
 
 
@@ -424,6 +426,8 @@ def build_launch_context(
         wandb_entity=args.wandb_entity,
         wandb_project=args.wandb_project,
         backend=backend,
+        training_image=args.student_image,
+        training_output_root=f"{args.pvc_mount_path.rstrip('/')}/.senpai/runs/{tag}",
         nodes_per_student=args.nodes_per_student,
         gpus_per_student_node=args.gpus_per_student_node,
         timeout_minutes=args.timeout_minutes,
@@ -725,6 +729,10 @@ def render_student(
                 "/var/lib/senpai-executor/reservation.json"
             ),
             "SENPAI_EXECUTOR_IMAGE": args.executor_image,
+            "SENPAI_TRAINING_IMAGE": args.student_image,
+            "SENPAI_TRAINING_OUTPUT_ROOT": (
+                f"{args.pvc_mount_path.rstrip('/')}/.senpai/runs/{tag}/{student_name}"
+            ),
             "SENPAI_MAX_TRAINING_TIMEOUT_SECONDS": str(
                 round(args.timeout_minutes * 60)
             ),
@@ -929,33 +937,33 @@ def main():
         validate_custom_secret_env_names(args.custom_secret_env_names)
     except ValueError as error:
         sys.exit(f"ERROR: {error}")
-    if not args.preflight_only:
-        role_images = [
-            ("advisor", args.advisor_image),
-            ("student", args.student_image),
-        ]
-        if args.names or args.n_students > 0 or args.capacity_observer:
-            role_images.append(("executor", args.executor_image))
-        for role, image in role_images:
+    role_images = {
+        "advisor": args.advisor_image,
+        "student": args.student_image,
+    }
+    if args.names or args.n_students > 0 or args.capacity_observer:
+        role_images["executor"] = args.executor_image
+    try:
+        role_images, args.senpai_repo_revision = resolve_launch_images(
+            role_images, args.senpai_repo_revision
+        )
+        for role, image in role_images.items():
+            setattr(args, f"{role}_image", image)
             if role == "executor" and not is_digest_image_reference(image):
-                sys.exit("ERROR: --executor_image must use an immutable @sha256 digest")
+                raise ValueError("--executor_image must use an immutable @sha256 digest")
             if not is_immutable_image_reference(image):
-                sys.exit(
-                    f"ERROR: --{role}_image must be an immutable digest or "
-                    "a :sha-<40-character-commit> tag"
+                raise ValueError(
+                    f"--{role}_image must be an immutable digest or a :sha-<40-character-commit> tag"
                 )
-        try:
-            revisions = {
-                source_revision_for_image(image, args.senpai_repo_revision)
-                for _role, image in role_images
-            }
-        except ValueError as error:
-            sys.exit(f"ERROR: {error}")
+        revisions = {
+            source_revision_for_image(image, args.senpai_repo_revision)
+            for image in role_images.values()
+        }
         if len(revisions) != 1:
-            sys.exit(
-                "ERROR: role images must use the same source revision"
-            )
+            raise ValueError("role images must use the same source revision")
         args.senpai_repo_revision = revisions.pop()
+    except ValueError as error:
+        sys.exit(f"ERROR: {error}")
     if args.gh_history_scope not in {"branch", "repo", "fresh"}:
         sys.exit("ERROR: --gh_history_scope must be one of: branch, repo, fresh")
     if target_repo_slug(args.target_repo_url) == target_repo_slug(
@@ -1013,8 +1021,28 @@ def main():
             )
         preflight_check_exa_api_key(exa_api_key)
         preflight_check_wandb_api_key(wandb_api_key)
+        storage_images = {"student": args.student_image} if student_list else {}
+        if args.advisor:
+            storage_images["advisor"] = args.advisor_image
+        output_root = f"{args.pvc_mount_path.rstrip('/')}/.senpai/runs/{args.tag}"
+        try:
+            if storage_images:
+                validate_storage(
+                    images=storage_images,
+                    pvc_mount_path=args.pvc_mount_path,
+                    pvc_claim_name=args.pvc_claim_name,
+                    output_roots=[f"{output_root}/{name}" for name in student_list] or [output_root],
+                    nodes_per_student=args.nodes_per_student,
+                    kube_context=args.kube_context,
+                    namespace=args.namespace,
+                    controller_node_selector=controller_node_selector(args.controller_node_selector),
+                )
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+            detail = "\n".join([str(error), *getattr(error, "__notes__", [])])
+            sys.exit(f"ERROR: {detail}")
         if args.preflight_only:
-            print("Preflight OK — credentials and target repo access verified.")
+            storage_summary = ", and checkpoint storage" if storage_images else ""
+            print(f"Preflight OK — credentials, matching images{storage_summary} verified.")
             return
 
     # Validate template structure before reserving a launch or writing to GitHub.

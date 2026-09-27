@@ -83,6 +83,7 @@ class TrainingResult(BaseModel):
     exit_code: int | None
     elapsed_seconds: float
     log_path: str
+    output_dir: str | None = None
     wandb_run_ids: tuple[str, ...] = ()
     error_tail: str = ""
     started_at: float | None = Field(default=None, gt=0)

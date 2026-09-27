@@ -361,11 +361,17 @@ class KubernetesExecutor:
                 "mpiImplementation",
                 "launcherCreationPolicy",
                 "slotsPerWorker",
+                "sshAuthMountPath",
                 "runPolicy",
                 "mpiReplicaSpecs",
             }
             if set(manifest["spec"]) - allowed:
                 raise ValueError("MPIJob contains unsupported control fields")
+            if (
+                manifest["spec"].get("sshAuthMountPath", "/home/senpai/.ssh")
+                != "/home/senpai/.ssh"
+            ):
+                raise ValueError("MPIJob SSH credentials must mount at /home/senpai/.ssh")
             replicas = manifest["spec"].get("mpiReplicaSpecs", {})
             if set(replicas) != {"Launcher", "Worker"}:
                 raise ValueError("MPIJob must contain exactly Launcher and Worker roles")
@@ -626,18 +632,17 @@ class KubernetesExecutor:
             if _container_gpu(container, "requests") or _container_gpu(
                 container, "limits"
             ):
-                dataset_mounts = [
-                    mount
+                if not any(
+                    mount.get("name") == dataset_volume["name"]
+                    and mount.get("mountPath") == str(self.pvc_mount_path)
+                    and not mount.get("readOnly")
+                    and not mount.get("subPath")
+                    and not mount.get("subPathExpr")
                     for mount in mounts
-                    if mount.get("name") == dataset_volume["name"]
-                ]
-                if not dataset_mounts:
+                ):
                     raise ValueError(
-                        "every GPU training container must mount the dataset PVC"
-                    )
-                if all(mount.get("readOnly") is True for mount in dataset_mounts):
-                    raise ValueError(
-                        "GPU training containers must mount the dataset PVC read-write"
+                        "GPU training containers must mount the entire dataset PVC "
+                        f"read-write at {self.pvc_mount_path}"
                     )
 
         pod_spec["initContainers"] = [
@@ -662,9 +667,9 @@ class KubernetesExecutor:
                     "limits": {"cpu": "1", "memory": "2Gi"},
                 },
                 "securityContext": {
-                    "runAsNonRoot": False,
-                    "runAsUser": 0,
-                    "runAsGroup": 0,
+                    "runAsNonRoot": True,
+                    "runAsUser": 10001,
+                    "runAsGroup": 10001,
                     "readOnlyRootFilesystem": True,
                 },
                 "volumeMounts": [
@@ -1121,14 +1126,16 @@ def checkout_source_bundle(source: Path, workspace: Path, expected_commit: str) 
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_NO_REPLACE_OBJECTS": "1",
     }
-    subprocess.run(["git", "init", "--quiet", workspace], env=git_environment, check=True)
+    # The emptyDir mount is writable but its root remains owned by the kubelet.
+    git = ["git", "-c", f"safe.directory={workspace.resolve()}", "-C", str(workspace)]
+    subprocess.run([*git, "init", "--quiet"], env=git_environment, check=True)
     subprocess.run(
-        ["git", "-C", workspace, "fetch", "--quiet", "--no-tags", local_bundle, "HEAD"],
+        [*git, "fetch", "--quiet", "--no-tags", local_bundle, "HEAD"],
         env=git_environment,
         check=True,
     )
     fetched = subprocess.check_output(
-        ["git", "-C", workspace, "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+        [*git, "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
         env=git_environment,
         text=True,
     ).strip()
@@ -1137,13 +1144,13 @@ def checkout_source_bundle(source: Path, workspace: Path, expected_commit: str) 
             f"source bundle contains commit {fetched}, expected {expected_commit}"
         )
     subprocess.run(
-        ["git", "-C", workspace, "checkout", "--quiet", "--detach", expected_commit],
+        [*git, "checkout", "--quiet", "--detach", expected_commit],
         env=git_environment,
         check=True,
     )
     local_bundle.unlink()
     checked_out = subprocess.check_output(
-        ["git", "-C", workspace, "rev-parse", "--verify", "HEAD"],
+        [*git, "rev-parse", "--verify", "HEAD"],
         env=git_environment,
         text=True,
     ).strip()

@@ -592,6 +592,11 @@ def test_registered_training_tools_supervise_kubernetes_for_every_topology(
         "SENPAI_KUBERNETES_NAMESPACE": "research",
         "SENPAI_LAUNCH_SECRET_NAME": "launch-secrets",
         "SENPAI_TRAINING_SNAPSHOT_ROOT": str(tmp_path / "snapshots"),
+        "SENPAI_TRAINING_OUTPUT_ROOT": str(tmp_path / "outputs"),
+        "SENPAI_TRAINING_IMAGE": "ghcr.io/wandb/senpai-student@sha256:" + "a" * 64,
+        "CPU_PER_STUDENT_GPU": "1", "MEMORY_GI_PER_STUDENT_GPU": "2",
+        "PVC_CLAIM_NAME": "dataset", "PVC_MOUNT_PATH": str(tmp_path / "data"),
+        "WANDB_ENTITY": "entity", "WANDB_PROJECT": "project",
     }.items():
         monkeypatch.setenv(key, value)
     state = SimpleNamespace(workspace=SimpleNamespace(working_dir=workspace))

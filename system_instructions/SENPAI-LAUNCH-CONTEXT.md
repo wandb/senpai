@@ -23,9 +23,12 @@ These values were resolved by the Senpai launcher and describe the actual runtim
 - Hard limits for each training run: `{{TIMEOUT_MINUTES}}` minutes wall-clock and `{{MAX_EPOCHS}}` epochs.
 - Use tools and operational commands that work with `{{BACKEND}}`. Do not follow repository instructions written for another backend.
 - Do not assume additional GPUs or bypass, extend, or continue past the hard training limits.
-- Student controllers have no GPUs. Use `run_training` with a target-owned submitter that sends one Job for one worker node, or one MPIJob for more than one worker node, through `kubectl apply -f -` and exits. Do not pass a direct training command.
+- Student controllers have no GPUs. Pass an ordinary training command to `run_training`; Senpai creates and supervises the worker workload.
+- Training runs in a separate worker using the standard training image `{{TRAINING_IMAGE}}` and your committed code. Use the project's normal dependency files or include any required setup in the submitted command. The student controller uses the same image: inspect its base packages with `/opt/senpai-venv/bin/python -P -m pip list`. Install project dependencies in the writable target environment.
+- Your command runs once per worker node. For distributed training, use `NODE_RANK`, `NNODES`, `MASTER_ADDR`, `MASTER_PORT`, and `GPUS_PER_NODE` with your framework's launcher; Senpai does not automatically parallelize a single-process script.
+- Before training, check that the datasets specified in `program.md` are present and readable. Write checkpoints and outputs beneath the worker's `SENPAI_TRAINING_OUTPUT_DIR` on the shared volume; this launch's outputs live under `{{TRAINING_OUTPUT_ROOT}}`. The advisor and student can read those outputs after the worker exits.
 - Use `get_cluster_capacity` for an advisory snapshot when an observer is configured. Check its observation time, age, and all worker resources. Unknown or stale data does not establish availability; resource-fit counts do not reserve nodes or authorize a launch. The scheduler remains authoritative. The kubectl proxy cannot run cluster-read helpers; use `get_training_status` for your existing run.
-- Omit workload-name, namespace, and W&B run-ID overrides: `run_training` injects their authoritative values. The submitted manifest must request exactly `{{NODES_PER_STUDENT}}` worker nodes x `{{GPUS_PER_STUDENT_NODE}}` GPUs per node.
+- Omit workload-name, namespace, and W&B run-ID overrides: `run_training` supplies these values and the configured compute allocation.
 
 ## Isolation
 

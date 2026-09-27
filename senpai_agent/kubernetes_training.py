@@ -1,19 +1,16 @@
-"""Supervise target-owned Kubernetes training workloads by durable UID."""
+"""Run training commands in Kubernetes workloads supervised by durable UID."""
 
 from __future__ import annotations
 
-import array
+import base64
 import errno
-import fcntl
 import json
 import os
 import re
-import select
 import socket
 import ssl
 import subprocess
 import sys
-import termios
 import threading
 import time
 import uuid
@@ -21,20 +18,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TypedDict
 
-import psutil
-
-from senpai_agent.processes import terminate_process_group
 from senpai_agent.training import (
     KubernetesResourceRef,
     KubernetesTrainingSpec,
     TrainingResult,
     TrainingSpec,
     TrainingState,
-    target_python_environment,
     training_result_paths,
 )
 
@@ -42,7 +35,6 @@ _ERROR_TAIL_BYTES = 8192
 _POLL_SECONDS = 2.0
 _DIAGNOSTICS_SECONDS = 30.0
 _JOIN_SECONDS = 120.0
-_DETACH_GRACE_SECONDS = 0.1
 EXECUTOR_SOCKET_ENV = "SENPAI_KUBERNETES_EXECUTOR_SOCKET"
 
 
@@ -137,6 +129,8 @@ class KubernetesApiError(RuntimeError):
 
 
 class TrainingClusterClient(Protocol):
+    def apply(self, manifest: str) -> str: ...
+
     def reserve(
         self,
         training_id: str,
@@ -751,16 +745,12 @@ class _ActiveRemoteTraining:
     started_at: float
     deadline_at: float
     log_path: Path
-    process: subprocess.Popen[bytes] | None = None
-    process_group_id: int | None = None
+    manifest: dict | None = None
     resource: KubernetesResourceRef | None = None
     cancelled: bool = False
     thread: threading.Thread | None = None
     next_diagnostics_at: float = 0
     diagnostics_future: Future[str] | None = None
-    output_thread: threading.Thread | None = None
-    output_stop: threading.Event = field(default_factory=threading.Event)
-    output_error: str | None = None
 
 
 class KubernetesTrainingSupervisor:
@@ -774,7 +764,6 @@ class KubernetesTrainingSupervisor:
         nodes: int,
         gpus_per_node: int,
         max_timeout_seconds: int | None = None,
-        terminate_grace_seconds: float = 10,
         poll_seconds: float = _POLL_SECONDS,
         client: TrainingClusterClient | None = None,
     ):
@@ -789,7 +778,6 @@ class KubernetesTrainingSupervisor:
         self.nodes = nodes
         self.gpus_per_node = gpus_per_node
         self.max_timeout_seconds = max_timeout_seconds
-        self.terminate_grace_seconds = terminate_grace_seconds
         self.poll_seconds = poll_seconds
         self._wandb_api_key = os.environ.get("WANDB_API_KEY", "").encode()
         socket_path = os.environ.get(
@@ -818,6 +806,7 @@ class KubernetesTrainingSupervisor:
         cwd = spec.cwd.resolve()
         if cwd != self.workspace and not cwd.is_relative_to(self.workspace):
             raise ValueError("training cwd must be inside the assignment workspace")
+        training_id = str(uuid.uuid4())
         with self._lock:
             if self._shutdown.is_set():
                 raise RuntimeError("Kubernetes training supervisor is closed")
@@ -826,184 +815,74 @@ class KubernetesTrainingSupervisor:
             self._launching = True
             self._launch_complete.clear()
 
-        training_id: str | None = None
-        process: subprocess.Popen[bytes] | None = None
-        active: _ActiveRemoteTraining | None = None
         result: TrainingResult | None = None
         reserved = False
         try:
-            training_id = str(uuid.uuid4())
             kubernetes_spec = _training_spec(training_id, nodes=self.nodes)
-            log_path = self.state_dir / f"{training_id}.log"
             started_at = time.time()
-            deadline_at = started_at + spec.timeout_seconds
-            source_snapshot, source_commit = _materialize_source_snapshot(cwd)
+            source_snapshot, source_commit = _materialize_source_snapshot(self.workspace)
+            output_dir = str(Path(os.environ["SENPAI_TRAINING_OUTPUT_ROOT"]) / training_id)
+            manifest = _training_manifest(
+                spec, kubernetes_spec, source_commit=source_commit,
+                relative_cwd=cwd.relative_to(self.workspace), nodes=self.nodes,
+                gpus_per_node=self.gpus_per_node, output_dir=output_dir,
+            )
             if self._shutdown.is_set():
                 raise RuntimeError("Kubernetes training supervisor is closed")
+            deadline_at = started_at + spec.timeout_seconds
             self.client.reserve(
-                training_id,
-                kubernetes_spec,
-                deadline_at,
-                str(source_snapshot),
-                source_commit,
+                training_id, kubernetes_spec, deadline_at, str(source_snapshot), source_commit,
             )
             reserved = True
-            if self._shutdown.is_set():
-                raise RuntimeError("Kubernetes training supervisor is closed")
-            environment = {
-                **os.environ,
-                "SENPAI_TRAINING_SOURCE_SNAPSHOT": str(source_snapshot),
-                "SENPAI_KUBERNETES_WORKLOAD_NAME": kubernetes_spec.name,
-                "SENPAI_KUBERNETES_NAMESPACE": kubernetes_spec.namespace,
-                "SENPAI_WANDB_RUN_ID": kubernetes_spec.wandb_run_id,
-                "SENPAI_LAUNCH_SECRET_NAME": os.environ["SENPAI_LAUNCH_SECRET_NAME"],
-            }
-            environment.pop("WANDB_SERVICE", None)
-            environment.pop("PYTHONSAFEPATH", None)
-            environment.update(target_python_environment(environment))
-            self._wandb_api_key = environment.get("WANDB_API_KEY", "").encode()
+            log_path = self.state_dir / f"{training_id}.log"
             log_path.touch()
-            process = subprocess.Popen(
-                list(spec.argv),
-                cwd=cwd,
-                env=environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                shell=False,
-                start_new_session=True,
-            )
-            process_group_id = process.pid
             result = TrainingResult(
-                training_id=training_id,
-                state=TrainingState.RUNNING,
-                pid=process.pid,
-                process_group_id=process_group_id,
-                process_start_time=psutil.Process(process.pid).create_time(),
-                exit_code=None,
-                elapsed_seconds=0,
-                log_path=str(log_path),
-                wandb_run_ids=(kubernetes_spec.wandb_run_id,),
-                started_at=started_at,
-                deadline_at=deadline_at,
-                kubernetes_spec=kubernetes_spec,
-                kubernetes_released=False,
-                source_snapshot=str(source_snapshot),
-                source_commit=source_commit,
+                training_id=training_id, state=TrainingState.RUNNING,
+                exit_code=None, elapsed_seconds=0, log_path=str(log_path),
+                output_dir=output_dir, wandb_run_ids=(kubernetes_spec.wandb_run_id,),
+                started_at=started_at, deadline_at=deadline_at,
+                kubernetes_spec=kubernetes_spec, kubernetes_released=False,
+                source_snapshot=str(source_snapshot), source_commit=source_commit,
             )
             active = _ActiveRemoteTraining(
-                spec=kubernetes_spec,
-                started_at=started_at,
-                deadline_at=deadline_at,
-                log_path=log_path,
-                process=process,
-                process_group_id=process_group_id,
+                spec=kubernetes_spec, started_at=started_at, deadline_at=deadline_at,
+                log_path=log_path, manifest=manifest,
             )
             thread = threading.Thread(
-                target=self._monitor,
-                args=(training_id,),
+                target=self._monitor, args=(training_id,),
                 name=f"senpai-kubernetes-training-{training_id}",
             )
             active.thread = thread
-            active.output_thread = threading.Thread(
-                target=self._record_output,
-                args=(active,),
-                name=f"senpai-kubernetes-output-{training_id}",
-            )
             with self._lock:
                 if self._shutdown.is_set():
                     raise RuntimeError("Kubernetes training supervisor is closed")
                 self._write_result(result)
                 self._active[training_id] = active
-                active.output_thread.start()
                 thread.start()
         except BaseException as error:
-            if process is not None and process.poll() is None:
-                terminate_process_group(
-                    process,
-                    process_group_id=process.pid,
-                    grace_seconds=self.terminate_grace_seconds,
-                    wait_full_grace=True,
-                )
-            if active is not None:
-                self._finish_output(active)
-            elif process is not None and process.stdout is not None:
-                process.stdout.close()
             if result is not None:
                 try:
-                    self._write_result(
-                        result.model_copy(update={
-                            "state": TrainingState.FAILED,
-                            "exit_code": process.returncode,
-                            "elapsed_seconds": time.time() - started_at,
-                            "error_tail": (
-                                "Training supervision failed to start "
-                                f"({type(error).__name__})."
-                            ),
-                        })
-                    )
+                    self._write_result(result.model_copy(update={
+                        "state": TrainingState.FAILED,
+                        "elapsed_seconds": time.time() - started_at,
+                        "error_tail": f"Training supervision failed to start ({type(error).__name__}).",
+                    }))
                 except OSError as storage_error:
                     print(
                         f"Kubernetes startup failure persistence deferred: training_id={training_id} "
                         f"path={storage_error.filename} errno={storage_error.errno}",
                         file=sys.stderr, flush=True,
                     )
-            if reserved and training_id is not None:
+            if reserved:
                 self._cleanup_failed_launch(training_id, kubernetes_spec)
             with self._lock:
-                if training_id is not None:
-                    self._active.pop(training_id, None)
+                self._active.pop(training_id, None)
             raise
         finally:
             with self._lock:
                 self._launching = False
                 self._launch_complete.set()
         return result
-
-    def _record_output(self, active: _ActiveRemoteTraining) -> None:
-        """Mask the inherited W&B key before submitter bytes reach disk."""
-        pending = b""
-        remaining = None
-        assert active.process is not None and active.process.stdout is not None
-        try:
-            with active.process.stdout as stream, active.log_path.open("wb") as log:
-                os.set_blocking(stream.fileno(), False)
-                while True:
-                    if remaining is None and active.output_stop.is_set():
-                        # Drain queued output without waiting for escaped descendants.
-                        queued = array.array("i", [0])
-                        fcntl.ioctl(stream.fileno(), termios.FIONREAD, queued, True)
-                        remaining = queued[0]
-                    if remaining == 0:
-                        break
-                    try:
-                        chunk = os.read(
-                            stream.fileno(),
-                            64 * 1024 if remaining is None else min(64 * 1024, remaining),
-                        )
-                    except BlockingIOError:
-                        select.select([stream], [], [], 0.05)
-                        continue
-                    if not chunk:
-                        break
-                    if remaining is not None:
-                        remaining -= len(chunk)
-                    sanitized, pending = _mask_output_chunk(
-                        pending + chunk, self._wandb_api_key,
-                    )
-                    log.write(sanitized)
-                    log.flush()
-                if pending:
-                    log.write(b"<secret-hidden>")
-        except Exception as error:  # a reader failure must fail the remote run
-            active.output_error = f"Training output capture failed ({type(error).__name__})."
-
-    @staticmethod
-    def _finish_output(active: _ActiveRemoteTraining) -> None:
-        active.output_stop.set()
-        if active.output_thread is not None and active.output_thread.ident is not None:
-            active.output_thread.join()
-        elif active.process is not None and active.process.stdout is not None:
-            active.process.stdout.close()
 
     def _redact_output(self, text: str) -> str:
         sanitized, pending = _mask_output_chunk(text.encode(), self._wandb_api_key)
@@ -1210,141 +1089,70 @@ class KubernetesTrainingSupervisor:
     def _monitor(self, training_id: str) -> None:
         with self._lock:
             active = self._active[training_id]
-        if self._should_detach(active):
-            if active.process is None:
-                return
-            launcher_exit = active.process.poll()
-            if launcher_exit is None:
-                terminate_process_group(
-                    active.process,
-                    process_group_id=active.process_group_id,
-                    grace_seconds=_DETACH_GRACE_SECONDS,
-                    wait_full_grace=True,
-                )
-                self._finish_output(active)
-                if self._should_detach(active):
-                    return
-            if launcher_exit == 0:
-                self._finish_output(active)
-                if self._should_detach(active):
-                    return
         state = TrainingState.RUNNING
-        exit_code = None
         detail = ""
         delete_required = False
         try:
-            if active.process is not None:
-                while active.process.poll() is None:
-                    if (
-                        active.cancelled
-                        or active.output_error is not None
-                        or time.time() >= active.deadline_at
-                    ):
-                        terminate_process_group(
-                            active.process,
-                            process_group_id=active.process_group_id,
-                            grace_seconds=self.terminate_grace_seconds,
-                            wait_full_grace=True,
-                        )
-                        break
-                    if self._shutdown.wait(0.1) and self._should_detach(active):
-                        terminate_process_group(
-                            active.process,
-                            process_group_id=active.process_group_id,
-                            grace_seconds=_DETACH_GRACE_SECONDS,
-                            wait_full_grace=True,
-                        )
-                        self._finish_output(active)
-                        if self._should_detach(active):
-                            return
-                        break
-                self._finish_output(active)
-                if active.output_error is not None:
-                    raise RuntimeError(active.output_error)
-                exit_code = active.process.returncode
-                if exit_code in {None, 0} and self._should_detach(active):
-                    return
-                if not active.cancelled and time.time() < active.deadline_at and exit_code == 0:
+            if self._should_detach(active):
+                return
+            if active.manifest is not None:
+                if not active.cancelled and time.time() < active.deadline_at:
+                    self.client.apply(json.dumps(active.manifest))
                     while active.resource is None:
                         try:
                             active.resource = self.client.resource(
-                                active.spec,
-                                nodes=self.nodes,
-                                gpus_per_node=self.gpus_per_node,
+                                active.spec, nodes=self.nodes, gpus_per_node=self.gpus_per_node,
                             )
-                        except Exception as error:  # retry transient broker/API outages
+                        except Exception as error:
                             detail = f"Waiting for Kubernetes ownership: {error}"
                         else:
+                            if active.resource is None:
+                                raise RuntimeError("Kubernetes submission returned without a workload")
                             break
                         if active.cancelled or time.time() >= active.deadline_at:
                             break
-                        if (
-                            self._shutdown.wait(self.poll_seconds)
-                            and self._should_detach(active)
-                        ):
+                        if self._shutdown.wait(self.poll_seconds) and self._should_detach(active):
                             return
-                    if (
-                        active.resource is None
-                        and not active.cancelled
-                        and time.time() < active.deadline_at
-                    ):
-                        raise RuntimeError(
-                            f"submission finished without creating {active.spec.kind} "
-                            f"{active.spec.namespace}/{active.spec.name}"
-                        )
-                    if not self._publish_resource(training_id, active):
-                        if self._should_detach(active):
-                            return
-                elif exit_code not in {None, 0}:
+                    if not self._publish_resource(training_id, active) and self._should_detach(active):
+                        return
+                active.manifest = None
+            while True:
+                if active.cancelled:
+                    state = TrainingState.CANCELLED
                     delete_required = True
-
+                    break
+                if time.time() >= active.deadline_at:
+                    state = TrainingState.TIMED_OUT
+                    delete_required = True
+                    break
+                if self._should_detach(active):
+                    return
+                try:
+                    snapshot = self.client.state(active.resource)
+                except Exception as error:
+                    detail = f"Waiting for Kubernetes status: {error}"
+                    if self._shutdown.wait(self.poll_seconds) and self._should_detach(active):
+                        return
+                    continue
+                if snapshot is None:
+                    state = TrainingState.FAILED
+                    detail = "Remote training resource disappeared before completion."
+                    break
+                state, detail = snapshot
+                if state is not TrainingState.RUNNING:
+                    delete_required = state is not TrainingState.FINISHED
+                    break
+                if time.monotonic() >= active.next_diagnostics_at:
+                    self._capture_diagnostics(training_id, active, detail)
+                if self._shutdown.wait(self.poll_seconds) and self._should_detach(active):
+                    return
+        except Exception as error:
             if active.cancelled:
                 state = TrainingState.CANCELLED
-                delete_required = True
             elif time.time() >= active.deadline_at:
                 state = TrainingState.TIMED_OUT
-                delete_required = True
-            elif exit_code not in {None, 0}:
+            else:
                 state = TrainingState.FAILED
-                detail = f"Kubernetes submission exited with code {exit_code}."
-            elif self._should_detach(active):
-                return
-            elif active.resource is not None:
-                while True:
-                    if active.cancelled:
-                        state = TrainingState.CANCELLED
-                        delete_required = True
-                        break
-                    if time.time() >= active.deadline_at:
-                        state = TrainingState.TIMED_OUT
-                        delete_required = True
-                        break
-                    try:
-                        snapshot = self.client.state(active.resource)
-                    except Exception as error:  # retry transient broker/API outages
-                        detail = f"Waiting for Kubernetes status: {error}"
-                        if (
-                            self._shutdown.wait(self.poll_seconds)
-                            and self._should_detach(active)
-                        ):
-                            return
-                        continue
-                    if snapshot is None:
-                        state = TrainingState.FAILED
-                        detail = "Remote training resource disappeared before completion."
-                        break
-                    state, detail = snapshot
-                    if state is not TrainingState.RUNNING:
-                        break
-                    if time.monotonic() >= active.next_diagnostics_at:
-                        self._capture_diagnostics(training_id, active, detail)
-                    if (
-                        self._shutdown.wait(self.poll_seconds)
-                        and self._should_detach(active)
-                    ):
-                        return
-        except Exception as error:  # noqa: BLE001
-            state = TrainingState.FAILED
             detail = f"{type(error).__name__}: {error}"
             delete_required = True
 
@@ -1379,7 +1187,7 @@ class KubernetesTrainingSupervisor:
         terminal = self.get_training_status(training_id).model_copy(
             update={
                 "state": state,
-                "exit_code": exit_code,
+                "exit_code": 0 if state is TrainingState.FINISHED else None,
                 "elapsed_seconds": time.time() - active.started_at,
                 "error_tail": error_tail,
                 "kubernetes_resource": active.resource,
@@ -1497,7 +1305,6 @@ class KubernetesTrainingSupervisor:
         return (
             self._shutdown.is_set()
             and not active.cancelled
-            and active.output_error is None
             and time.time() < active.deadline_at
         )
 
@@ -1561,6 +1368,99 @@ class KubernetesTrainingSupervisor:
             serialized = serialized.replace(secret, "<secret-hidden>")
         temporary.write_text(serialized)
         temporary.replace(path)
+
+
+def _training_manifest(
+    command: TrainingSpec,
+    spec: KubernetesTrainingSpec,
+    *,
+    source_commit: str,
+    relative_cwd: Path,
+    nodes: int,
+    gpus_per_node: int,
+    output_dir: str,
+) -> dict:
+    cpu = int(os.environ["CPU_PER_STUDENT_GPU"])
+    memory = int(os.environ["MEMORY_GI_PER_STUDENT_GPU"])
+    mount = os.environ["PVC_MOUNT_PATH"]
+    payload = base64.b64encode(json.dumps({
+        "argv": command.argv, "cwd": str(Path("/workspace") / relative_cwd),
+    }).encode()).decode()
+    values = {
+        "SENPAI_TRAINING_COMMAND_B64": payload,
+        "SENPAI_TRAINING_WORKSPACE": "/workspace",
+        "SENPAI_TARGET_PYTHON_ENV": "/home/senpai/.venvs/senpai-target",
+        "SENPAI_TRAINING_OUTPUT_DIR": output_dir,
+        "NNODES": str(nodes), "GPUS_PER_NODE": str(gpus_per_node),
+        "MASTER_ADDR": f"{spec.name}-worker-0.{spec.name}" if nodes > 1 else "127.0.0.1",
+        "MASTER_PORT": "29500",
+        "WANDB_ENTITY": os.environ["WANDB_ENTITY"],
+        "WANDB_PROJECT": os.environ["WANDB_PROJECT"],
+        "WANDB_RUN_ID": spec.wandb_run_id,
+    }
+
+    def template(mode: str, *, worker: bool) -> dict:
+        resources = {
+            "cpu": str(cpu * gpus_per_node) if worker else "1",
+            "memory": f"{memory * gpus_per_node if worker else min(memory, 2)}Gi",
+        }
+        if worker:
+            resources["nvidia.com/gpu"] = str(gpus_per_node)
+        container = {
+            "name": "training",
+            "image": os.environ["SENPAI_TRAINING_IMAGE"],
+            "command": ["/opt/senpai-venv/bin/python", "-P", "-m", "senpai_agent.training_worker", mode],
+            "env": [
+                *({"name": name, "value": value} for name, value in values.items()),
+                {"name": "WANDB_API_KEY", "valueFrom": {"secretKeyRef": {
+                    "name": os.environ["SENPAI_LAUNCH_SECRET_NAME"], "key": "wandb-api-key",
+                }}},
+            ],
+            "resources": {"requests": resources, "limits": dict(resources)},
+            "securityContext": {"runAsNonRoot": True, "runAsUser": 10001, "runAsGroup": 10001},
+            "volumeMounts": [
+                {"name": "dataset", "mountPath": mount},
+                {"name": "home", "mountPath": "/home/senpai"},
+            ],
+        }
+        if mode == "sshd":
+            container["ports"] = [{"name": "ssh", "containerPort": 2222}]
+            container["readinessProbe"] = {"tcpSocket": {"port": 2222}, "periodSeconds": 2}
+        pod = {
+            "restartPolicy": "Never",
+            "containers": [container],
+            "volumes": [
+                {"name": "dataset", "persistentVolumeClaim": {"claimName": os.environ["PVC_CLAIM_NAME"]}},
+                {"name": "home", "emptyDir": {}},
+            ],
+        }
+        if worker:
+            pod["tolerations"] = [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}]
+        return {"spec": pod}
+
+    workload = {
+        "apiVersion": "batch/v1" if nodes == 1 else "kubeflow.org/v2beta1",
+        "kind": spec.kind,
+        "metadata": {
+            "name": spec.name, "namespace": spec.namespace,
+            "annotations": {
+                "senpai.wandb.com/source-commit": source_commit,
+                "senpai.wandb.com/run-id": spec.wandb_run_id,
+            },
+        },
+    }
+    if nodes == 1:
+        workload["spec"] = {"parallelism": 1, "completions": 1, "template": template("run", worker=True)}
+    else:
+        workload["spec"] = {
+            "slotsPerWorker": gpus_per_node, "mpiImplementation": "OpenMPI",
+            "sshAuthMountPath": "/home/senpai/.ssh", "launcherCreationPolicy": "WaitForWorkersReady",
+            "mpiReplicaSpecs": {
+                "Launcher": {"replicas": 1, "restartPolicy": "Never", "template": template("mpi", worker=False)},
+                "Worker": {"replicas": nodes, "restartPolicy": "Never", "template": template("sshd", worker=True)},
+            },
+        }
+    return workload
 
 
 def _materialize_source_snapshot(workspace: Path) -> tuple[Path, str]:

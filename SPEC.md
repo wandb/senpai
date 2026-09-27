@@ -705,7 +705,7 @@ monitor_training(
 Every student uses `KubernetesTrainingSupervisor` to supervise one remote
 Job for single-node training or MPIJob for multi-node training. It creates an
 atomic Git bundle for the clean `HEAD` on the shared PVC, generates the workload
-and W&B identities, runs the target submitter as a local process, then persists
+and W&B identities, constructs the Kubernetes workload for the supplied command, then persists
 and polls the broker-created UID. The broker replaces
 target-provided init logic with a fixed local-copy and exact-commit checkout, so
 bundle mutation fails before training starts. Cancellation, timeout, and restart
@@ -713,32 +713,34 @@ recovery remain UID-bound; uncertain deletion retains the broker reservation for
 deadline cleanup rather than releasing ownership early.
 
 Multiple Senpai instances may share `WANDB_API_KEY`; no per-student key is required.
-The supervisor masks the inherited key before persisting submitter stdout/stderr,
-including keys split across reads and incomplete key prefixes at shutdown.
-The output reader drains buffered data without waiting for detached descendants
-to close the pipe. The supervisor removes `WANDB_SERVICE` from the submitter's
-environment so it can start its own W&B connection.
+The executor returns raw diagnostic components over its private socket. The
+controller redacts each component before formatting, truncating, or persisting
+it. The executor does not receive the W&B key.
 
-The public tool path reserves a Job when `NODES_PER_STUDENT` is 1 and an MPIJob
-when it is greater than 1. Its target submitter follows
-the [target launcher contract](README.md#target-launcher-contract):
-it uses the generated workload name, namespace, snapshot SHA, and W&B identity,
-and supplies the matching source/run annotations before submission. Worker
-resources must match the configured CPU, memory, and GPU allocation; additional
-resource types are rejected. Main containers may receive the scoped W&B key and
-receive canonical `WANDB_RUN_ID`; target code uses the configured W&B entity and
-project. The broker replaces target init containers with the fixed checkout and
-removes pod annotations. The checkout runs as UID/GID 0 and leaves the source
-tree owned by root; Restricted Pod Security namespaces are not supported.
-Preserved target labels can affect configured admission and network policies
-despite annotation removal. They are not a trust boundary.
-The broker preserves target scheduling constraints, overwrites ownership and
-`senpai-training-role` labels, and adds required hostname anti-affinity between
-this run's workers for multi-node training. The injected term excludes launcher pods from its selector;
-target affinity terms remain unchanged.
+`run_training` accepts ordinary command arguments, not a Kubernetes submission
+script. It supplies the selected student image, configured resources and PVC
+mount, W&B identity, and exact committed source. The worker starts a writable
+project environment over the image's read-only runtime. Project setup belongs in
+normal dependency files or the command; Senpai requires no setup manifest.
+The launch context exposes the training image and how to inspect its base
+packages. Multi-node commands run once per node with rank/rendezvous information;
+the target remains responsible for its framework's distributed execution.
 
-Controller shutdown detaches from a running Kubernetes workload. It terminates
-the local launcher process. It leaves the remote workload running, keeps the
+Checkout and default workers use UID/GID 10001. The checkout trusts only its
+exact workspace path for Git ownership checks and retains full commit
+verification. No dataset ownership repair is performed. The full configured
+PVC uses the same mount path in every role. Checkpoints live below the supplied
+`SENPAI_TRAINING_OUTPUT_DIR` and survive worker deletion.
+
+Before agent deployment, storage preflight uses temporary CPU-only Pods in the
+selected role images to exercise checkpoint write/flush/read/rename/delete and
+advisor/student reads of worker output. Multi-node preflight requires distinct
+writer/reader hosts. Failure stops launch before GitHub or controller mutations.
+Probes use unique identities and UID-preconditioned cleanup. Dataset paths remain
+in `program.md` and are verified by the agent before its first training run.
+
+Controller shutdown detaches from a running Kubernetes workload. It leaves
+the remote workload running, keeps the
 durable result in the `RUNNING` state, and retains the workload UID and broker
 reservation. A restarted controller in the same Pod reserves the same training
 identity and re-adopts only that UID before it resumes monitoring. Recovery
@@ -990,9 +992,12 @@ Launch preflight verifies:
 - every model-provider credential referenced by the configured profiles;
 - the Exa key with one `type="instant"`, publication-category, one-result
   search;
-- the W&B key with a minimal viewer query; and
+- the W&B key with a minimal viewer query;
 - the presence of every configured custom secret, without attempting
-  a service-specific authentication check.
+  a service-specific authentication check;
+- a matching published image set, resolved to immutable references; and
+- checkpoint writes and cross-role reads on the configured volume using
+  temporary non-root Pods, with cross-node access for multi-node launches.
 
 Exa uses a credential-isolated native `exa_search` tool with progressive skill
 guidance. It preserves the standalone script's request controls and web/publication

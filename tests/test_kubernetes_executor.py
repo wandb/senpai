@@ -3,12 +3,14 @@ from __future__ import annotations
 from copy import deepcopy
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import threading
 import time
 import urllib.error
 import urllib.request
+import venv
 
 import pytest
 
@@ -95,8 +97,8 @@ def executor(
         cpu_per_gpu=15,
         memory_gi_per_gpu=110,
         pvc_claim_name="amf1-pvc",
-        pvc_mount_path=tmp_path,
-        snapshot_root=tmp_path / "snapshots",
+        pvc_mount_path=Path("/mnt/amf1-pvc"),
+        snapshot_root=Path("/mnt/amf1-pvc/snapshots"),
         executor_image="executor@sha256:" + "a" * 64,
         launch_secret_name="senpai-launch-secrets-fred",
         wandb_tags="senpai,schmidhuber,fern",
@@ -318,6 +320,7 @@ def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(
     reserve(broker)
     document = manifest()
     document["spec"]["runPolicy"]["suspend"] = False
+    document["spec"]["sshAuthMountPath"] = "/home/senpai/.ssh"
     for role in ("Launcher", "Worker"):
         document["spec"]["mpiReplicaSpecs"][role]["template"]["metadata"][
             "labels"
@@ -366,6 +369,7 @@ def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(
         )
     ]
     assert created["spec"]["runPolicy"]["backoffLimit"] == 0
+    assert created["spec"]["sshAuthMountPath"] == "/home/senpai/.ssh"
     assert created["spec"]["runPolicy"]["cleanPodPolicy"] == "Running"
     assert created["spec"]["runPolicy"]["activeDeadlineSeconds"] <= 1800
     assert created["spec"]["runPolicy"]["schedulingPolicy"] == {
@@ -422,6 +426,11 @@ def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(
         assert len(checkout) == 1
         assert checkout[0]["name"] == "senpai-source-checkout"
         assert checkout[0]["image"] == "executor@sha256:" + "a" * 64
+        assert checkout[0]["securityContext"]["runAsNonRoot"] is True
+        assert checkout[0]["securityContext"]["runAsUser"] == 10001
+        assert checkout[0]["securityContext"]["runAsGroup"] == 10001
+        assert checkout[0]["securityContext"]["readOnlyRootFilesystem"] is True
+        assert "fsGroup" not in pod_spec["securityContext"]
         assert checkout[0]["env"][1] == {
             "name": "SENPAI_SOURCE_COMMIT",
             "value": "a" * 40,
@@ -529,32 +538,28 @@ def test_executor_rejects_an_explicitly_read_only_dataset_pvc(tmp_path):
         apply(broker, document)
 
 
-def test_executor_rejects_a_gpu_container_without_the_dataset_pvc_mount(tmp_path):
+@pytest.mark.parametrize("mounts", [
+    [],
+    [{"name": "dataset", "mountPath": "/mnt/amf1-pvc", "readOnly": True}],
+    [{"name": "dataset", "mountPath": "/different-dataset-path"}],
+    [{"name": "dataset", "mountPath": "/mnt/amf1-pvc", "subPath": "subset"}],
+    [{"name": "dataset", "mountPath": "/mnt/amf1-pvc", "subPathExpr": "$(PART)"}],
+])
+def test_executor_requires_the_complete_writable_gpu_dataset_at_configured_path(
+    tmp_path, mounts,
+):
     broker = executor(tmp_path)
     reserve(broker)
     document = manifest()
     worker = document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]["spec"]
-    worker["containers"][0]["volumeMounts"] = []
+    worker["containers"][0]["volumeMounts"] = mounts
 
     with pytest.raises(
         ValueError,
-        match="every GPU training container must mount the dataset PVC",
+        match="GPU training containers must mount the entire dataset PVC read-write at",
     ):
         apply(broker, document)
-
-
-def test_executor_rejects_a_read_only_gpu_dataset_mount(tmp_path):
-    broker = executor(tmp_path)
-    reserve(broker)
-    document = manifest()
-    worker = document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]["spec"]
-    worker["containers"][0]["volumeMounts"][0]["readOnly"] = True
-
-    with pytest.raises(
-        ValueError,
-        match="GPU training containers must mount the dataset PVC read-write",
-    ):
-        apply(broker, document)
+    assert broker.client.creates == 0
 
 
 def test_executor_allows_a_read_only_alias_with_a_writable_dataset_mount(tmp_path):
@@ -582,7 +587,7 @@ def test_executor_rejects_a_dataset_mount_replaced_by_the_workspace(tmp_path):
 
     with pytest.raises(
         ValueError,
-        match="every GPU training container must mount the dataset PVC",
+        match="GPU training containers must mount the entire dataset PVC read-write at",
     ):
         apply(broker, document)
 
@@ -590,6 +595,10 @@ def test_executor_rejects_a_dataset_mount_replaced_by_the_workspace(tmp_path):
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
+        (
+            lambda value: value["spec"].__setitem__("sshAuthMountPath", "/workspace"),
+            "SSH credentials must mount at /home/senpai/.ssh",
+        ),
         (
             lambda value: value["spec"]["mpiReplicaSpecs"]["Worker"].__setitem__(
                 "replicas", 1
@@ -771,7 +780,10 @@ def test_executor_rejects_workspace_shadowing(tmp_path):
         apply(broker, document)
 
 
-def test_exact_commit_checkout_rejects_a_mutated_bundle(tmp_path):
+@pytest.mark.parametrize("different_mount_owner", [False, True])
+def test_exact_commit_checkout_is_writable_and_rejects_a_mutated_bundle(
+    tmp_path, monkeypatch, different_mount_owner,
+):
     repository = tmp_path / "repository"
     repository.mkdir()
     subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True)
@@ -789,12 +801,27 @@ def test_exact_commit_checkout_rejects_a_mutated_bundle(tmp_path):
     ).strip()
     bundle = tmp_path / f"{commit}.bundle"
     subprocess.run(["git", "bundle", "create", bundle, "HEAD"], cwd=repository, check=True)
+    if different_mount_owner:
+        # Exercise Git's real ownership check without requiring a root test process.
+        monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
     workspace = tmp_path / "exact-workspace"
     checkout_source_bundle(bundle, workspace, commit)
     assert (workspace / "source.py").read_text() == "exact = True\n"
+    assert (workspace / "source.py").stat().st_uid == os.geteuid()
+    (workspace / "source.py").write_text("exact = False\n")
+    environment = workspace / ".venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+    subprocess.run([
+        environment / "bin" / "python", "-c",
+        "import pathlib, sysconfig; "
+        "(pathlib.Path(sysconfig.get_path('purelib')) / 'target_dependency.py')"
+        ".write_text('installed = True\\n'); "
+        "import target_dependency; assert target_dependency.installed",
+    ], check=True)
     (workspace / "stale-init-state").write_text("partial")
     checkout_source_bundle(bundle, workspace, commit)
     assert not (workspace / "stale-init-state").exists()
+    assert not environment.exists()
     assert (workspace / "source.py").read_text() == "exact = True\n"
 
     data = bytearray(bundle.read_bytes())

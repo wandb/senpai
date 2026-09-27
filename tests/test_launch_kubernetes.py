@@ -15,6 +15,8 @@ def block_unmocked_launch_writes(monkeypatch):
 
     monkeypatch.setattr(launch, "kubectl_apply", fail)
     monkeypatch.setattr(launch, "kubectl_create", fail, raising=False)
+    # Storage probe behavior has its own subprocess/Pod boundary tests.
+    monkeypatch.setattr(launch, "validate_storage", lambda **kwargs: [])
 
 
 def bypass_program_snapshot(monkeypatch):
@@ -707,6 +709,8 @@ def test_preflight_resolves_custom_secrets(monkeypatch):
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
     resolved = []
+    storage = []
+    monkeypatch.setattr(launch, "validate_storage", lambda **kwargs: storage.append(kwargs))
     monkeypatch.setattr(
         launch,
         "resolve_custom_secrets",
@@ -718,6 +722,39 @@ def test_preflight_resolves_custom_secrets(monkeypatch):
     assert resolved == [
         (launch.DOTENV_PATH, ["HF_TOKEN", "DATASET_LICENSE_KEY"])
     ]
+    assert storage == [{
+        "images": {"student": args.student_image, "advisor": args.advisor_image},
+        "pvc_mount_path": args.pvc_mount_path,
+        "pvc_claim_name": args.pvc_claim_name,
+        "output_roots": [f"{args.pvc_mount_path}/.senpai/runs/{args.tag}/fern"],
+        "nodes_per_student": 1,
+        "kube_context": args.kube_context,
+        "namespace": args.namespace,
+        "controller_node_selector": {},
+    }]
+
+
+def test_failed_storage_preflight_stops_before_launch_or_github_writes(monkeypatch):
+    args = launch_args()
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+
+    def storage_failure(**kwargs):
+        error = RuntimeError("checkpoint directory is not writable")
+        error.add_note("Storage preflight cleanup incomplete: probe Pod remains")
+        raise error
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("failed storage check must prevent launch and GitHub writes")
+
+    monkeypatch.setattr(launch, "validate_storage", storage_failure)
+    monkeypatch.setattr(launch, "ensure_advisor_branch", forbidden)
+    monkeypatch.setattr(launch, "ensure_target_repo_labels", forbidden)
+    monkeypatch.setattr(launch, "kubectl_create", forbidden)
+
+    with pytest.raises(SystemExit, match="checkpoint directory is not writable") as raised:
+        launch.main()
+    assert "cleanup incomplete: probe Pod remains" in str(raised.value)
 
 
 def test_launch_reports_invalid_custom_secret_names_without_a_traceback(monkeypatch):

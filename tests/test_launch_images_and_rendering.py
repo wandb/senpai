@@ -113,7 +113,7 @@ def test_digest_image_reference_rejects_source_sha_tags():
 
 
 @pytest.mark.parametrize("nodes", [1, 2])
-@pytest.mark.parametrize("executor_image", ["", f"ghcr.io/wandb/senpai-executor:sha-{REVISION}"])
+@pytest.mark.parametrize("executor_image", [f"ghcr.io/wandb/senpai-executor:sha-{REVISION}"])
 def test_student_executor_requires_a_registry_digest(nodes, executor_image):
     result = run_launch(
         "--advisor_image",

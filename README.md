@@ -25,11 +25,11 @@ Kubernetes is currently the turnkey deployment path. The GitHub-based coordinati
 ### 1. Prerequisites
 
 - Python 3.13, [uv](https://docs.astral.sh/uv/), Git, and `kubectl`.
-- A Kubernetes context and existing namespace with outbound access to GitHub, Anthropic, Exa, and W&B. Your identity must be able to manage Deployments, ConfigMaps, Secrets, ServiceAccounts, Roles, and RoleBindings there.
+- A Kubernetes context and existing namespace with outbound access to GitHub, Anthropic, Exa, and W&B. Your identity must be able to manage Pods, Deployments, ConfigMaps, Secrets, ServiceAccounts, Roles, and RoleBindings there.
 - An existing PVC with enough space for the dataset, plus concurrent mounts from every scheduled node—normally `ReadWriteMany`, unless your storage driver explicitly supports another multi-node topology. The launcher mounts this claim but does not create it; role state stays on each pod's node-local `emptyDir` volume.
 - NVIDIA GPU nodes, the Kubernetes NVIDIA device plugin, and a host driver compatible with the target's training image.
 - A target GitHub repository that Senpai can clone and modify.
-- Immutable advisor and student images reachable by every cluster node. Every student also requires the matching executor image.
+- Access to the published Senpai images from the launcher and every cluster node. Senpai resolves matching immutable images automatically; explicit image overrides remain available.
 
 ### 2. Install Senpai
 
@@ -173,11 +173,11 @@ When upgrading an existing launch configuration, replace `gpus_per_student: N`
 with `nodes_per_student: 1` and `gpus_per_student_node: N`. Replace the
 `--gpus_per_student N` CLI option with `--gpus_per_student_node N` as well. The
 old key and option are no longer accepted. Every student now uses a CPU
-controller and a credential-isolated executor. Single-node launches also need
-a digest-pinned executor image, its matching source revision, and a PVC shared
-with the training worker. Replace direct training commands with a target-owned
-submitter that creates a Job through `run_training`; multi-node submitters
-create an MPIJob. See the [target launcher contract](#target-launcher-contract).
+controller and a credential-isolated executor. The training worker shares the
+configured writable PVC. `run_training` accepts the actual training command;
+remove target-owned Kubernetes submission wrappers. Senpai constructs the Job
+or MPIJob and supplies the image, mounts, resources, and run identity. See
+[training commands](#training-commands).
 
 OpenHands uses LiteLLM, so LLM provider names are required as prefixes. For
 example, configure Claude Opus 5.5 as `anthropic/claude-opus-5-5`. Anthropic
@@ -193,7 +193,19 @@ uses `WANDB_API_KEY` for auth.
 
 The defaults in `senpai.yaml` describe W&B's deployment and should not be copied unchanged into another environment. Every setting can also be overridden on the command line. `--tag` and `--target_repo_url` are required unless your chosen config file supplies them.
 
-Deployments require matching advisor and student image digests, or `sha-<40-character-commit>` tags built from the same SENPAI revision. Every student launch requires an `executor_image` pinned by `@sha256` digest because that sidecar owns the scoped Kubernetes credential. Digest-pinned images also require the full matching `senpai_repo_revision`. The source commit must be fetchable from `senpai_repo_url`; its public default is read-only and needs no PR permission. Override it only when using images built from another SENPAI repository. `target_repo_url` is the separate, required repository where agents create commits and PRs.
+Leave `advisor_image`, `student_image`, `executor_image`, and
+`senpai_repo_revision` blank to use the latest published student image and the
+matching advisor and executor images. Senpai resolves and verifies their
+registry digests and source revision once per launch. Every experiment in that
+launch uses the selected student image. If a matching build is not available,
+launch stops before creating agents.
+
+For a specific build, supply its full `senpai_repo_revision`; omitted images are
+resolved from that build. Explicit advisor/student overrides accept digests or
+`sha-<full-commit>` tags; the executor override requires a digest. Explicit
+images must match the source revision. The commit must be fetchable from
+`senpai_repo_url`; override that URL only for images built from another runner
+repository. `target_repo_url` is the separate repository where agents work.
 
 ### 6. Run preflight
 
@@ -205,30 +217,30 @@ uv run python k8s/launch.py \
   --preflight_only
 ```
 
-Preflight authenticates GitHub, Exa, W&B, and every model provider referenced by
-the configured model profiles. It also verifies GitHub Contents write access,
-resolves the target branch, and rejects student labels already carrying active
-assignments. It deliberately skips image validation and makes no cluster
-changes. A real launch additionally verifies immutable image syntax and that
-all required role images identify the same source revision.
+Preflight authenticates GitHub, Exa, W&B, and each configured model provider,
+resolves the target branch, and checks for conflicting student assignments.
+It resolves the image set and creates temporary CPU-only storage probe Pods
+using the selected images and runtime user. Those probes write, flush, read,
+rename, and delete a temporary checkpoint beneath each student's output root.
+Advisor and student probes read the worker's checkpoint and write acknowledgments.
+For multi-node launches, the writer runs on a different node from the readers.
+The probes do not change dataset ownership and are removed before preflight
+returns. Failure prevents the launch. A real launch runs these checks too.
+
+Keep dataset paths in `program.md`. These infrastructure checks establish access
+to the configured volume and output directories; the agent verifies the actual
+datasets described by the program before training. Storage preflight does not
+reserve GPUs or prove that every future scheduling location will be available.
 
 ### 7. Launch
 
-For a SENPAI commit whose images have been published:
-
 ```bash
-revision=$(git rev-parse HEAD)
-
 uv run python k8s/launch.py \
   --config_path senpai.local.yaml \
   --tag first-run \
   --target_repo_url https://github.com/OWNER/TARGET.git \
   --advisor \
-  --names frieren \
-  --advisor_image "ghcr.io/wandb/senpai-advisor:sha-$revision" \
-  --student_image "ghcr.io/wandb/senpai-student:sha-$revision" \
-  --senpai_repo_revision "$revision" \
-  --executor_image "ghcr.io/wandb/senpai-executor@sha256:<manifest-digest>"
+  --names frieren
 ```
 
 For supervised two-node training, add:
@@ -244,10 +256,10 @@ Every student needs a shared writable PVC and runs as a CPU-only controller
 that supervises one workload at a time. Single-node training uses a Job;
 multi-node training uses an MPIJob and requires the MPIJob API with
 `runPolicy.suspend` support. Before submission, Senpai publishes the clean
-assignment `HEAD` as a per-student Git bundle on the PVC. The target launcher
-submits the workload using the generated identity and configured worker shape.
-See the [target launcher contract](#target-launcher-contract) for the exact
-inputs and manifest requirements.
+assignment `HEAD` as a per-student Git bundle on the PVC. The tool constructs
+the workload using the generated identity and configured worker shape.
+See [training commands](#training-commands) for dependency setup and distributed
+execution.
 
 Only the executor sidecar receives a projected Kubernetes token. Its socket
 broker accepts the reserved Job or MPIJob, injects ownership, pod hardening, and an
@@ -255,9 +267,9 @@ exact-commit bundle checkout, binds the W&B/source annotations, persists the
 created UID, and uses UID-preconditioned activation and deletion. Workloads are
 created suspended, so a late ambiguous API request cannot start GPU pods. The
 model-facing student has no Kubernetes token or real `kubectl`; its
-`kubectl apply -f -` command is a validated socket proxy. A target launcher must
-submit the manifest and exit; it must not call `kubectl get`, `wait`, or `logs`.
-The supervisor owns polling and cleanup after submission. Generated workload
+`kubectl apply -f -` command is a validated socket proxy. The `run_training` tool
+constructs and submits the manifest. The supervisor owns polling and cleanup
+after submission; agent commands run in the workers. Generated workload
 names reserve space for the MPI launcher's and highest-index worker's suffixes,
 so long research and student names still produce valid Kubernetes DNS labels.
 
@@ -286,6 +298,11 @@ do not overwrite it. The receipt is separate from the 8 KiB diagnostic text.
 with restart counts and termination timestamps. It describes the observed Pods,
 not deleted historical Pods, training-process retries, or scientific quality. Missing
 Pods, partial status and API errors are explicit and never imply zero restarts.
+MPI workers keep SSH servers running while the launcher executes the training
+commands. The MPI operator removes those worker Pods after the launcher exits,
+so a successful MPI run can have an incomplete worker-container receipt.
+The launcher exit and MPIJob condition establish workload completion; the receipt
+does not reconstruct deleted worker statuses.
 Pod-status capture has a 10-second wait limit and a 256-Pod/4-MiB inventory limit.
 Normal release waits for receipt persistence. Forced cancellation, deadline expiry
 and failed activation attempt capture before deletion; their snapshots can still show
@@ -495,7 +512,7 @@ Students do not start GPU work, stream logs, sleep, or poll through the terminal
 
 | Tool | Contract |
 |---|---|
-| `run_training` | Accepts a target submitter's structured `argv`, `cwd`, and a hard timeout. It requires a clean assignment worktree and supervises one broker-owned Kubernetes Job or MPIJob without blocking. It persists identity, logs, bounded errors, W&B run IDs, and terminal-state monitoring. |
+| `run_training` | Accepts the training command's `argv`, `cwd`, and a hard timeout. It requires a clean assignment worktree and constructs and supervises one broker-owned Kubernetes Job or MPIJob without blocking. It persists identity, the output directory, logs, bounded errors, W&B run IDs, and terminal-state monitoring. |
 | `get_training_status` | Performs one bounded read of the latest persisted state, exit code, elapsed time, W&B run IDs, and error tail. |
 | `monitor_training` | Adds a W&B metric, minimize/maximize direction, `lte`, `gte`, `improved_by`, or `regressed_by` gates, a poll interval, and stale-update detection. It cannot disable terminal wakes. |
 | `cancel_training` | Deletes the workload by its UID, waits for a durable terminal state, and retires its monitor. |
@@ -528,61 +545,60 @@ OpenHands browser operations and records the choice in conversation state so a
 resumed conversation restores them. `--no-browser` exposes neither the loader
 nor the browser family.
 
-### Target launcher contract
+### Training commands
 
-`run_training` executes a target-owned submitter. It must submit one
-`batch/v1` Job when `nodes_per_student` is 1, or one `kubeflow.org/v2beta1`
-MPIJob when it is greater than 1, through `kubectl apply -f -` and exit.
+`run_training` accepts ordinary `argv`, a `cwd` inside the student's assignment,
+and a timeout. It runs that command in a separate worker using the selected
+student image and the exact committed source snapshot. Senpai creates a Job for
+one node or an MPIJob for multiple nodes; agents do not write Kubernetes YAML.
+The working directory maps to the same relative path in the worker checkout.
 
-Each worker starts from a fresh checkout of the committed snapshot. The
-controller's virtual environment and untracked files are not copied into it.
-Provide dependencies in the worker image or main command. Persist checkpoints
-and outputs on the shared PVC or in W&B; files written only to the worker's
-checkout do not return to the controller and are lost when the Pod is removed.
+For example, a student can submit:
 
-The supervisor provides these authoritative environment values:
+```json
+{
+  "argv": ["bash", "-lc", "python -m pip install -r requirements.txt && python train.py"],
+  "cwd": "/workspaces/target",
+  "timeout_seconds": 1800
+}
+```
 
-| Variable | Use in the target launcher |
-|---|---|
-| `SENPAI_TRAINING_SOURCE_SNAPSHOT` | Absolute Git bundle path on the PVC. Its filename is `<HEAD-SHA>.bundle`; use the full 40-character SHA for `metadata.annotations["senpai.wandb.com/source-commit"]`. |
-| `SENPAI_KUBERNETES_WORKLOAD_NAME` | Set `metadata.name`. |
-| `SENPAI_KUBERNETES_NAMESPACE` | Set `metadata.namespace`. |
-| `SENPAI_WANDB_RUN_ID` | Set `metadata.annotations["senpai.wandb.com/run-id"]` and any framework-specific run-ID arguments. |
-| `SENPAI_LAUNCH_SECRET_NAME` | W&B credential source; the broker binds `WANDB_API_KEY` to this Secret's `wandb-api-key` entry. |
+The launch context names the exact training image. The controller uses the same
+image, so `/opt/senpai-venv/bin/python -P -m pip list` lists its base Python
+packages. Each worker has a writable target environment that can use or override
+those packages. Normal dependency files and setup commands remain the target
+repository's responsibility; no Senpai-specific setup file is required. Files
+and packages created only in the controller do not transfer to a fresh worker.
 
-The submitter also inherits the launch configuration below. These values do
-not automatically become environment variables inside the submitted pods.
+The source checkout and default workers run as UID/GID 10001. The checkout verifies
+the requested commit, and the installed Senpai runtime remains read-only.
+Senpai does not change ownership of the dataset. The entire configured PVC is
+mounted at the same path in controllers and workers.
 
-| Variables | Manifest requirement |
-|---|---|
-| `NODES_PER_STUDENT`, `GPUS_PER_STUDENT_NODE` | For one node, use a Job with `parallelism: 1`, `completions: 1`, and one worker pod. For more nodes, use one MPI Launcher replica without GPUs, `NODES_PER_STUDENT` Worker replicas, and `slotsPerWorker: GPUS_PER_STUDENT_NODE`. All pod templates use `restartPolicy: Never`. |
-| `CPU_PER_STUDENT_GPU`, `MEMORY_GI_PER_STUDENT_GPU` | Each worker requests exactly GPUs-per-worker times these CPU and memory amounts, plus the configured GPUs. Launcher CPU and memory may not exceed one GPU's share. Every container declares equal CPU/memory requests and limits; worker GPU requests and limits also match. Only `cpu`, `memory`, and `nvidia.com/gpu` resource keys are supported. |
-| `PVC_CLAIM_NAME`, `PVC_MOUNT_PATH` | Each pod template declares exactly one volume for the configured dataset PVC, which supplies the source bundle to the injected checkout. GPU containers also mount that PVC writable. The snapshot resides beneath the configured mount path. |
-| `WANDB_ENTITY`, `WANDB_PROJECT` | Pass the configured destination to every container that reports W&B metrics. |
+Use `SENPAI_TRAINING_OUTPUT_DIR` for checkpoints and other durable outputs. It is
+beneath `<pvc_mount_path>/.senpai/runs/<tag>/<student>/<training_id>` and remains
+available to the advisor and student after the worker exits. Files written only
+to the worker checkout are removed with the Pod. W&B run identity, credentials,
+entity, project, and canonical tags are supplied by Senpai.
 
-Declare `WANDB_API_KEY` in reporting main containers, including the MPI
-launcher when it reports metrics. The broker replaces that entry with the
-scoped Secret reference and supplies canonical `WANDB_RUN_ID` to main
-containers. It rejects a conflicting explicit run ID and preserves unrelated
-target environment variables.
+For multiple nodes, the submitted command runs once on each worker node.
+`NODE_RANK`, `NNODES`, `MASTER_ADDR`, `MASTER_PORT`, and `GPUS_PER_NODE` describe
+the distributed allocation. A target command can use them to start `torchrun`
+or another framework's distributed launcher. Senpai does not turn an arbitrary
+single-process script into distributed training. MPI uses the standard non-root
+SSH transport; agents do not need to configure its keys or ports.
 
-The broker replaces all target `initContainers` with its fixed bundle checkout
-at `/workspace` and removes pod-template annotations. Put required target setup
-in the image or main command. Target pod labels and scheduling constraints are
-preserved, except for Senpai ownership labels and the reserved
-`senpai-training-role` label. Preserved labels can still affect configured
-[admission webhooks](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/#matching-requests-objectselector)
-and [network policies](https://kubernetes.io/docs/concepts/services-networking/network-policies/#the-networkpolicy-resource).
-Operators must not treat target-controlled labels as a trust boundary.
-Use cluster admission policies to enforce node-pool restrictions.
-For multi-node training, the broker adds required hostname anti-affinity
-that selects only this run's worker pods. Preserved target affinity rules still
-apply and may also constrain launcher placement.
+For a PyTorch project, the command can include:
 
-The injected checkout runs as UID/GID 0 and leaves the source tree owned by
-root. Target containers that modify the checkout must use a compatible runtime
-identity and permissions. Namespaces that enforce Restricted Pod Security
-cannot run this checkout.
+```bash
+torchrun --nnodes "$NNODES" --nproc-per-node "$GPUS_PER_NODE" \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" \
+  --master-port "$MASTER_PORT" train.py
+```
+
+The executor still validates source/run identity, resources, mounts, credential
+access, and workload ownership. Cancellation and deadlines clean up the whole
+workload. For multiple nodes, worker placement requires distinct hosts.
 
 ## Subagents
 

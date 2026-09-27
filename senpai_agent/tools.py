@@ -197,8 +197,8 @@ def close_training_runtimes() -> None:
 class RunTrainingAction(Action):
     spec: TrainingSpec = Field(
         description=(
-            "Target launcher argv, working directory inside the assignment workspace, "
-            "and hard timeout. Submit one Kubernetes workload; do not pass a shell string."
+            "Training command argv, working directory inside the assignment workspace, "
+            "and hard timeout. Senpai runs the command on each allocated worker node."
         )
     )
 
@@ -285,6 +285,7 @@ class TrainingResultObservation(Observation):
     exit_code: int | None = None
     elapsed_seconds: float
     log_path: str
+    output_dir: str | None = None
     wandb_run_ids: tuple[str, ...] = ()
     error_tail: str = ""
     started_at: float | None = None
@@ -331,6 +332,8 @@ class TrainingResultObservation(Observation):
             "log_path": self.log_path,
             "wandb_run_ids": self.wandb_run_ids,
         }
+        if self.output_dir is not None:
+            result["output_dir"] = self.output_dir
         if self.kubernetes_resource is not None:
             result["kubernetes_resource"] = self.kubernetes_resource.model_dump()
         if self.kubernetes_released is not None:
