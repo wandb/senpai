@@ -96,6 +96,18 @@ GitHub state is level-triggered:
 - an open Issue labeled `human` plus `team`, the advisor branch, or one student
   label is a human message.
 
+Both roles filter PRs before deriving events or student availability. A PR must
+have a head in the target repository and an author with current effective write
+or admin access, as reported by the collaborator permission API. Repository and
+author names are compared without case sensitivity. Fork heads and missing or
+malformed PR trust metadata are rejected. Rejected PRs contribute no assignment,
+review, or feedback events; unrelated human Issues retain their existing rules.
+Each poll checks each distinct same-repository author once and does not reuse
+permissions across polls. A failed permission request or invalid permission
+response raises `GitHubReadError` and invalidates the whole GitHub snapshot.
+Availability reconciliation therefore leaves queued state unchanged, and
+`CompositeMailbox` continues serving other sources.
+
 Human Issue events use the exact latest human-authored body/comment ID as their
 dedupe key and `human_message_id`. Each controller delivers an exact version
 until one turn processes and acknowledges it, then never delivers that version
