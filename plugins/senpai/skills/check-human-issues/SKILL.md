@@ -30,6 +30,19 @@ for an advisor, or `student:<student-name>` for a student. Your job is to check
 messages routed to your exact role, respond to new ones, and skip ones you've
 already handled.
 
+A new trusted message addressed only to one student resumes its unique valid
+open WIP or review assignment conversation, even when that conversation is
+quarantined. Use `human` and exactly one `student:<student-name>` audience label;
+omit `team`, the advisor branch label, and other student labels. Unrelated labels
+are allowed. Team messages, broader audiences, and missing or ambiguous
+assignments use a separate Issue conversation. Replays and label changes retain
+the original message binding; a new assignment revision needs a new comment or
+message version.
+
+Human reopening preserves the assignment conversation and its history and
+renews the configured retry and context-recovery allowances. Trusted PR
+feedback, monitor events, and restarts cannot reopen quarantine automatically.
+
 ## Steps
 
 1. **Read the current `human_issue` event.** The controller supplies the issue

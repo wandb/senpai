@@ -1,5 +1,5 @@
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -174,9 +174,11 @@ def test_turn_runner_passes_the_inference_state_out_of_band(
     assert observed == [(1_755_000_000.0, 1_755_000_001.0)]
 
 
-def test_running_student_receives_only_feedback_bound_to_its_conversation(
+@pytest.mark.parametrize("kind", ["student_pr_feedback", "human_issue"])
+def test_running_student_receives_only_input_bound_to_its_conversation(
     tmp_path: Path,
     monkeypatch,
+    kind,
 ):
     state_dir = tmp_path / "state"
     registry = AssignmentConversationRegistry(
@@ -185,6 +187,26 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
     conversation_id = registry.for_assignment("assignment-17", "revision-2")
     current = feedback_event("revision-2")
     other_revision = feedback_event("revision-3")
+    if kind == "human_issue":
+        current = replace(
+            human_issue_event(),
+            payload={
+                **human_issue_event().payload,
+                "message": "Feedback for revision-2.",
+                "parent_conversation_id": str(conversation_id),
+            },
+        )
+        other_revision = replace(
+            current,
+            dedupe_key="human_issue:other-revision",
+            payload={
+                **current.payload,
+                "message": "Feedback for revision-3.",
+                "parent_conversation_id": str(
+                    registry.for_assignment("assignment-17", "revision-3")
+                ),
+            },
+        )
     messages = []
 
     def run_openhands(_prompt, config):
@@ -210,7 +232,13 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
     result = OpenHandsTurnRunner(
         Config("student", state_dir, conversation_id),
         full_prompt="student initial controller context",
-        github_mailbox=Mailbox((current, other_revision)),
+        github_mailbox=Mailbox(
+            (
+                current,
+                other_revision,
+                replace(human_issue_event(), dedupe_key="human_issue:unbound"),
+            )
+        ),
         active_poll_interval_seconds=0.001,
     ).run(
         "current student turn",
@@ -221,6 +249,7 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
     assert len(messages) == 1
     assert "Feedback for revision-2." in messages[0]
     assert "Feedback for revision-3." not in messages[0]
+    assert "Stop and inspect" not in messages[0]
     assert str(conversation_id) in messages[0]
     assert result.delivered_event_keys == frozenset({current.dedupe_key})
     with LocalEventStore(state_dir / "student-events.sqlite3") as store:
@@ -238,6 +267,14 @@ def test_observed_student_input_routes_to_the_active_pump_until_it_is_delivered(
         state_dir / "student-conversations.json"
     )
     conversation_id = registry.for_assignment("assignment-17", "revision-2")
+    if incoming.kind == "human_issue":
+        incoming = replace(
+            incoming,
+            payload={
+                **incoming.payload,
+                "parent_conversation_id": str(conversation_id),
+            },
+        )
     store_path = state_dir / "student-events.sqlite3"
 
     def run_openhands(_prompt, _config):

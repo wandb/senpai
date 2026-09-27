@@ -392,11 +392,12 @@ def test_new_events_wait_behind_an_unresolved_delivery(tmp_path: Path):
     assert inbox.pending_count(CONVERSATION_ID) == 1
 
 
-def test_human_steering_joins_the_active_turn_and_resets_its_budget(tmp_path: Path):
+def test_human_steering_joins_active_turn_and_renews_only_attempt_budget(tmp_path: Path):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
     inbox.enqueue(CONVERSATION_ID, "event:first", "first")
     active = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert active is not None
+    active = inbox.recover_turn(active.turn_id, "controller prompt", max_generations=1)
     conversation = Conversation()
     deliver_turn_messages(conversation, inbox, active.turn_id)
     for _ in range(3):
@@ -427,6 +428,8 @@ def test_human_steering_joins_the_active_turn_and_resets_its_budget(tmp_path: Pa
     ]
     deliver_turn_messages(conversation, inbox, active.turn_id)
     assert len(conversation.sent) == 3
+    with pytest.raises(InboxTurnQuarantined, match="recovery budget exhausted"):
+        inbox.recover_turn(active.turn_id, "another recovery", max_generations=1)
 
 
 def test_steer_enqueue_and_attachment_roll_back_together(tmp_path: Path):
@@ -458,17 +461,28 @@ def test_steer_enqueue_and_attachment_roll_back_together(tmp_path: Path):
     assert inbox.pending_count(CONVERSATION_ID) == 0
 
 
+@pytest.mark.parametrize("max_generations", [0, 1, 2])
 def test_only_a_new_human_steer_reopens_the_same_quarantined_turn(
     tmp_path: Path,
     capsys,
+    max_generations: int,
 ):
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
     inbox.enqueue(CONVERSATION_ID, "event:first", "first")
     active = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert active is not None
+    original = active
+    for _ in range(max_generations):
+        deliver_turn_messages(Conversation(), inbox, active.turn_id)
+        active = inbox.recover_turn(
+            active.turn_id, "recovery prompt", max_generations=max_generations
+        )
     deliver_turn_messages(Conversation(), inbox, active.turn_id)
     inbox.record_inference_attempt(active.turn_id)
-    inbox.quarantine(active.turn_id, "recovery budget exhausted")
+    with pytest.raises(InboxTurnQuarantined, match="recovery budget exhausted"):
+        inbox.recover_turn(
+            active.turn_id, "exhausted recovery", max_generations=max_generations
+        )
 
     duplicate = inbox.steer(CONVERSATION_ID, "event:first", "first")
 
@@ -485,6 +499,7 @@ def test_only_a_new_human_steer_reopens_the_same_quarantined_turn(
 
     assert queued is None
     assert inbox.turn(active.turn_id).quarantine_reason == "recovery budget exhausted"
+    assert inbox.turn(active.turn_id).recovery_generation == max_generations
     assert inbox.pending_count(CONVERSATION_ID) == 1
 
     reopened = inbox.steer(
@@ -492,11 +507,13 @@ def test_only_a_new_human_steer_reopens_the_same_quarantined_turn(
         "human:1",
         "change direction",
         priority=STEER_PRIORITY,
+        once=True,
     )
 
     assert reopened == (active.turn_id, DeliveryState.PENDING)
     reopened_turn = inbox.turn(active.turn_id)
     assert reopened_turn.quarantine_reason is None
+    assert reopened_turn.recovery_of == active.recovery_of
     assert [event.event_key for event in reopened_turn.events] == [
         "event:first",
         "human:1",
@@ -508,6 +525,32 @@ def test_only_a_new_human_steer_reopens_the_same_quarantined_turn(
         f"conversation_id={CONVERSATION_ID} turn_id={active.turn_id} "
         "event_key=human:1"
     ) in capsys.readouterr().err
+
+    for _ in range(max_generations):
+        deliver_turn_messages(Conversation(), inbox, active.turn_id)
+        active = inbox.recover_turn(
+            active.turn_id, "renewed recovery", max_generations=max_generations
+        )
+    with pytest.raises(InboxTurnQuarantined, match="recovery budget exhausted"):
+        inbox.recover_turn(
+            active.turn_id, "exhausted renewed recovery", max_generations=max_generations
+        )
+    inbox.steer(
+        CONVERSATION_ID,
+        "human:1",
+        "change direction",
+        priority=STEER_PRIORITY,
+        once=True,
+    )
+    assert inbox.turn(active.turn_id).quarantine_reason == "recovery budget exhausted"
+    assert inbox.ready_conversation_ids() == ()
+
+    assert inbox.turn(original.turn_id).prompt.body == "controller prompt"
+    assert inbox.turn(original.turn_id).events[0].body == "first"
+    assert [event.body for event in inbox.turn(active.turn_id).events] == [
+        "first",
+        "change direction",
+    ]
 
 
 def test_queued_feedback_does_not_refill_an_active_turn_budget(tmp_path: Path):

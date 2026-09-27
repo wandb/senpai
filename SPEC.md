@@ -128,6 +128,16 @@ from creating a new wake. `respond_to_human_issue` reapplies the same
 classification to the exact message before writing an idempotent response.
 Launches with human-Issue handling disabled skip that GitHub query entirely.
 
+For a student, a new trusted human Issue message binds to the unique valid open
+`status:wip` or `status:review` assignment revision only when its audience is
+exactly that student. The Issue must have `human` and that single
+`student:<name>` label, without `team`, the advisor branch label, or another
+student label. Unrelated labels do not affect this choice. This binding includes
+quarantined assignment conversations. Team or broader audiences and missing or
+ambiguous assignments use a separate Issue conversation. Each message version
+retains its original binding across retries, restarts, and label changes; a
+later assignment revision requires a new comment or message version.
+
 Assigned-PR issue comments, submitted reviews, and inline comments each use
 their immutable GitHub ID as a level-triggered event key. Senpai accepts GitHub
 users associated as repository owners, members, or collaborators. A comment by
@@ -142,12 +152,12 @@ batches; immediate post-turn polls drain later batches without dropping them.
 While an OpenHands turn is running, `ActiveGitHubWatcher` polls the same GitHub
 state. It enqueues newly visible GitHub events except student-assignment
 availability, which the foreground poll reconciles before the next turn. For
-students, it maps authenticated human Issues and assignment-bound PR feedback
-into the active UUID. Authenticated humans are the interrupt tier: tools get up
-to 60 seconds to finish before Senpai interrupts and resumes the run, even when
-its inbox batch is full. Student assignments and trusted PR feedback share a
-FIFO queue tier; feedback waits for the next completed agent step without
-cancelling it.
+students, it delivers human Issue messages and PR feedback only to the
+conversation selected for that event. Authenticated humans are the
+interrupt tier: tools get up to 60 seconds to finish before Senpai interrupts
+and resumes the run, even when its inbox batch is full. Student assignments
+and trusted PR feedback share a FIFO queue tier; feedback waits for the next
+completed agent step without cancelling it.
 Ordinary events remain FIFO. Turn formation and non-human attachments are
 bounded to 16 events or 64 KiB; prioritized overflow remains pending to lead
 the next turn.
@@ -167,8 +177,11 @@ conversation history is a separate file-backed per-UUID event log.
 A completed tool observation resets the three-attempt no-progress budget. A
 separate 36-inference-start backstop applies to each turn branch across worker
 restarts without limiting one productive run. Either exhausted budget enters
-bounded fresh-branch recovery and then quarantine. Only authenticated human
-steering can reopen quarantine; trusted PR feedback remains pending.
+bounded fresh-branch recovery and then quarantine. Only new authenticated human
+steering can reopen quarantine. Reopening preserves the conversation UUID and
+history and renews the no-progress, inference-attempt, and configured
+context-recovery allowances. Trusted PR feedback and monitor events remain
+pending; controller or container restarts do not reopen quarantine.
 
 ## State and conversations
 
