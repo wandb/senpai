@@ -102,36 +102,6 @@ A useful structure is:
 
 Put it at the repository root. If it lives elsewhere, set `program_path` in `senpai.yaml` or pass `--program_path` at launch. Senpai appends the selected file to every agent's system prompt.
 
-Commit the policy before launching. The launcher captures the advisor branch's
-Git-advertised head in an isolated clone, verifies the commit, tree, and blob
-object IDs, and stores the selected policy in an immutable Secret. A blank
-`program_path` requires exactly one match at the root or one directory below
-it. An explicit path may be deeper. Paths must be normalized, relative,
-printable UTF-8 paths ending in `program.md`, without backslashes. Spaces and
-Unicode names are supported. The selected file must be a regular Git blob,
-not a symlink or submodule, and at most 256 KiB of UTF-8 data. Its encoded
-snapshot must also fit the 1 MiB Secret limit.
-
-Each worker and delegated child receives the same policy path, source commit,
-and normalized content. Normalization removes the SPDX header and outer
-whitespace. The supervisor binds the complete system suffix, including its
-rendering templates, before starting the worker. Workers and children verify
-that binding when they start or resume. Later workspace edits do not change
-the running launch's policy. Advisor synchronization can still publish
-operator-authored policy changes; apply them to research context with a new
-launch tag and fresh role state.
-
-When extending an active tag, the launcher reuses its original snapshot if the
-normalized policy path and content are unchanged, even when the advisor branch
-has advanced. Changed policy requires a new tag. Serialize launches for each
-cluster, namespace, and tag: checking existing bindings and applying resources
-is not an atomic reservation. The launcher needs read access to Deployments,
-Pods, and the bound program Secret in that namespace, as well as apply access.
-Legacy roles without a program binding cannot be extended under the same tag;
-use a new tag. Persisted system context that disagrees with trusted launch
-inputs fails startup. Stop the affected roles and start fresh role state when
-intentionally changing the harness, role charter, or launch identity.
-
 The target repository must be different from the SENPAI runner repository.
 
 ### 5. Configure the launch
@@ -476,86 +446,9 @@ Pod startup and liveness probes read the supervisor lease. Container restarts re
 
 GitHub coordination works across Docker, cloud VMs, or local hosts without private networking. The current repository does not yet provide a Compose or direct-host launcher: the Kubernetes manifests perform the source clone, environment assembly, skill installation, token handoff, mounts, and entrypoint selection.
 
-The role images install `senpai_agent` into `/opt/senpai-venv` at build time.
-That environment, the built-in agent definitions (`SENPAI_AGENT_DIR`), and the
-Senpai plugin (`SENPAI_PLUGIN`) are root-owned and read-only to the role user.
-Startup uses the installed runner with an absolute Python path and `-P`;
-it does not install the writable runner checkout or execute target Python.
-Deploying changes to these installed assets requires a new image. Editing
-plugin source and running its local tests does not require an image rebuild.
-
-Terminals and supervised training use a separate writable environment at
-`$HOME/.venvs/senpai-target`. Its packages take precedence over the image's
-read-only packages. `python`, `uv pip install`, and `uv run` select that target
-environment through `PATH`, `VIRTUAL_ENV`, `UV_PYTHON`, and
-`UV_PROJECT_ENVIRONMENT`. Senpai applies these settings after shell startup,
-preserves other PATH entries, and allows later commands to change their
-session environment. Shared dependency commands such as `torchrun` receive
-target launchers so they and their Python workers can import target packages.
-Existing commands installed in the target environment take precedence.
-Bootstrap creates it with `uv venv`, using the trusted interpreter and ignoring
-target project configuration. It does not run `ensurepip` or target Python.
-Environment changes belong to the terminal pane that received the command;
-parallel tmux execution can leave several panes with different settings.
-Use uv for environment creation, locked image dependencies, and target project
-dependency management. The images copy pinned uv binaries directly from the
-official uv image. Pod bootstrap uses the Python and uv already in each role
-image; it needs no separate installation on the operator's machine or cluster
-node. For skill scripts and analysis with the installed package set, use
-`uv run --no-sync python script.py` to avoid an incidental sync.
-One package-installation exception remains: the image supplies pip through the
-shared package path, and `python -m pip install` can reuse those shared packages.
-Pinned uv 0.10.9 does not inspect that path when resolving dependencies, so
-`uv pip install` and `uv sync` can install separate copies, including large CUDA
-dependencies. Use `uv pip install --no-deps` only when all required dependencies
-are already available. Sync the target lock when a separate dependency set is
-intended.
-Training retains normal project imports. File-defined child agents use the
-same Senpai terminal policy, timeouts, and target environment as their parent.
-
-Senpai still explicitly loads its bundled plugin, including all ten workflow
-skills and the command-policy and lifecycle hooks. Previously, startup copied
-that plugin into a writable directory; it now loads the read-only image copy.
-The bundled W&B and Exa skills run in the writable target environment and do
-not modify their installed skill files. Both role images include pandas and
-matplotlib for the bundled W&B diagnostics and plotting helpers.
-
-The runner selects one plugin directory: `--plugin-dir` takes precedence over
-`SENPAI_PLUGIN`, then the source-checkout default `plugins/senpai`. It passes
-that directory as one `PluginSource` to OpenHands and passes the same selection
-to children. An override replaces the selected bundle; it does not add another
-plugin. The [plugin README](plugins/senpai/README.md) traces these call sites.
-
-Previously, OpenHands also discovered additional plugins in project and home
-directories and its enabled-plugin store. Senpai now disables that automatic
-discovery. Those extra plugins' hooks, MCP servers, and skills therefore no
-longer appear automatically. Target skills in `.agents/skills`,
-`.openhands/skills`, and `.openhands/microagents` remain supported, as do
-unreserved target/user agents and MCP configuration declared on those agents.
-The bundled Exa and W&B skill integrations, browser tools, and typed GitHub,
-training, and delegation tools remain available. For additional capabilities
-in the standard image, integrate the required assets into `plugins/senpai`,
-then rebuild and deploy the image. There is no separate extra-plugin list.
-Copying a plugin into a target or home directory does not enable it.
-
-Target skills and `program.md` come from the target checkout; the runner's
-`system_instructions/` files come from its checkout at the selected launch
-revision. These files are outside the installed plugin bundle. Existing agent
-context does not hot-reload changes. Start fresh role state to apply changes
-to `program.md`, runtime identity, or role instructions. Runner checkout changes
-must still follow the launch requirement for matching source and image revisions.
-
-The target venv follows the lifetime of HOME. The standard Kubernetes
-Deployments do not persist HOME, so container replacement reinstalls target
-dependencies. Custom launchers must also point the trusted hook manifest at
-their absolute trusted Python interpreter with `-P`; the bundled manifest
-uses `/opt/senpai-venv/bin/python`.
-
 To build another launcher, reproduce [entrypoint-advisor.sh](k8s/entrypoint-advisor.sh) or [entrypoint-student.sh](k8s/entrypoint-student.sh), render `SENPAI-LAUNCH-CONTEXT.md` with runtime identity, limits, and isolation through `render_launch_context`, and provide it as base64 in `SENPAI_LAUNCH_CONTEXT_B64`. Pass the built-in role template and its required non-secret values to the Python supervisor, which renders and persists that role snapshot. Keep optional operator guidance in `EXTRA_INSTRUCTIONS_B64`. Persist `/var/lib/senpai/<tag>/advisor` for the advisor and use the container healthcheck with a restart policy. Student execution requires Linux, an NVIDIA runtime, and compatible CUDA hardware; Docker Desktop on macOS cannot run the GPU student image.
 
 ## Development and reference
-
-These local development commands require uv on the developer's machine:
 
 ```bash
 uv sync --locked --extra dev
