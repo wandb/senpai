@@ -24,7 +24,7 @@ Kubernetes is currently the turnkey deployment path. The GitHub-based coordinati
 
 ### 1. Prerequisites
 
-- Python 3.13 or 3.14 (3.14 preferred; torchvision excludes 3.14.1), [uv](https://docs.astral.sh/uv/), Git, and `kubectl`. The repository's `.python-version` selects 3.14 by default; pass `--python 3.13` to uv to use 3.13.
+- Python 3.13, [uv](https://docs.astral.sh/uv/), Git, and `kubectl`.
 - A Kubernetes context and existing namespace with outbound access to GitHub, Anthropic, Exa, and W&B. Your identity must be able to manage Deployments, ConfigMaps, Secrets, ServiceAccounts, Roles, and RoleBindings there.
 - An existing PVC with enough space for the dataset, plus concurrent mounts from every scheduled node—normally `ReadWriteMany`, unless your storage driver explicitly supports another multi-node topology. The launcher mounts this claim but does not create it; role state stays on each pod's node-local `emptyDir` volume.
 - NVIDIA GPU nodes, the Kubernetes NVIDIA device plugin, and a host driver compatible with CUDA 13 and the shipped student image.
@@ -765,11 +765,6 @@ Useful launch controls:
 - `human_issues: false` disables GitHub Issue polling for isolated launches.
 
 All role images are built from the same source revision. The advisor image excludes CUDA and PyTorch; the student image contains the CUDA/PyTorch runtime; the executor image contains only its Python broker; the cutoff image contains only the minimal job runtime and pinned `kubectl`. Advisor and student builds install Chromium and execute an OpenHands browser smoke test.
-
-All images use Python 3.14. The student uses a digest-pinned CoreWeave image
-with Ubuntu 26.04 and CUDA 13.3.1. Its isolated agent environment installs
-PyTorch 2.14.0 and torchvision 0.29.0 from the project lockfile. The base
-image's NVIDIA driver requirement remains in effect.
 
 The agent runs from the read-only `/opt/senpai-venv`. Both role entrypoints clear inherited `UV_PROJECT_ENVIRONMENT`, `UV_PYTHON`, and `VIRTUAL_ENV` values before starting the controller. Terminals and local supervised training then select the separate writable environment at `$HOME/.venvs/senpai-target` through PATH and uv settings. Install target dependencies there; keep the agent environment unchanged.
 
