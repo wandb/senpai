@@ -1,15 +1,22 @@
+from pathlib import Path
+
 import pytest
 import yaml
 from openhands.sdk import LLM
 from openhands.sdk.llm import Message, TextContent
 
 from launch_test_support import launch, launch_args, render_role
-from openhands_support import runtime_env
+from openhands_support import launch_env
 from senpai_agent.openhands_runner import (
     model_runtime_configuration,
     parse_runner_args,
     resolve_config,
 )
+from senpai_agent.program_context import (
+    PROGRAM_CONTEXT_FILE_ENV,
+    decode_program_system_prompt,
+)
+from senpai_agent.supervisor import prepare_system_context_environment
 
 
 @pytest.mark.parametrize(
@@ -22,9 +29,15 @@ def test_main_yaml_token_trigger_reaches_the_provider_request(tmp_path, model):
         student_model=model,
         compaction_trigger_tokens=project["compaction_trigger_tokens"],
     )
-    configmap, _deployment, _secret = render_role("student", args)
-    environment = runtime_env(tmp_path, role="student")
+    environment = launch_env(tmp_path, role="student")
+    snapshot_file = environment[PROGRAM_CONTEXT_FILE_ENV]
+    program = decode_program_system_prompt(Path(snapshot_file).read_text())
+    configmap, _deployment, _secret = render_role("student", args, program=program)
     environment.update(yaml.safe_load(configmap)["data"])
+    environment[PROGRAM_CONTEXT_FILE_ENV] = snapshot_file
+    environment = prepare_system_context_environment(
+        "student", Path(environment["SENPAI_OPENHANDS_STATE_DIR"]), environment
+    )
     config = resolve_config(
         parse_runner_args(["--max-turns", "1"]),
         environment,
