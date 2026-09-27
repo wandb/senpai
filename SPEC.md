@@ -96,6 +96,18 @@ GitHub state is level-triggered:
 - an open Issue labeled `human` plus `team`, the advisor branch, or one student
   label is a human message.
 
+Both roles filter PRs before deriving events or student availability. A PR must
+have a head in the target repository and an author with current effective write
+or admin access, as reported by the collaborator permission API. Repository and
+author names are compared without case sensitivity. Fork heads and missing or
+malformed PR trust metadata are rejected. Rejected PRs contribute no assignment,
+review, or feedback events; unrelated human Issues retain their existing rules.
+Each poll checks each distinct same-repository author once and does not reuse
+permissions across polls. A failed permission request or invalid permission
+response raises `GitHubReadError` and invalidates the whole GitHub snapshot.
+Availability reconciliation therefore leaves queued state unchanged, and
+`CompositeMailbox` continues serving other sources.
+
 Human Issue events use the exact latest human-authored body/comment ID as their
 dedupe key and `human_message_id`. Each controller delivers an exact version
 until one turn processes and acknowledges it, then never delivers that version
@@ -613,19 +625,63 @@ TERM/KILL cleanup, restart identity checks using PID/PGID/create-time, a bounded
 W&B run IDs. Run IDs are persisted while training is still running so metric
 monitoring can begin immediately.
 
+When a student has more than one configured node, `KubernetesTrainingSupervisor`
+keeps the same tool contract while supervising one remote MPIJob. It creates an
+atomic Git bundle for the clean `HEAD` on the shared PVC, generates the workload
+and W&B identities, launches the target submitter through the local process
+path, then persists and polls the broker-created UID. The broker replaces
+target-provided init logic with a fixed local-copy and exact-commit checkout, so
+bundle mutation fails before training starts. Cancellation, timeout, and restart
+recovery remain UID-bound; uncertain deletion retains the broker reservation for
+deadline cleanup rather than releasing ownership early.
+
+The public multi-node tool path reserves an MPIJob. Its target submitter follows
+the [target launcher contract](README.md#multi-node-target-launcher-contract):
+it uses the generated workload name, namespace, snapshot SHA, and W&B identity,
+and supplies the matching source/run annotations before submission. Worker
+resources must match the configured CPU, memory, and GPU allocation; additional
+resource types are rejected. Main containers may receive the scoped W&B key and
+receive canonical `WANDB_RUN_ID`; target code uses the configured W&B entity and
+project. The broker replaces target init containers with the fixed checkout and
+removes pod annotations. The checkout runs as UID/GID 0 and leaves the source
+tree owned by root; Restricted Pod Security namespaces are not supported.
+Preserved target labels can affect configured admission and network policies
+despite annotation removal. They are not a trust boundary.
+The broker preserves target scheduling constraints, overwrites ownership and
+`senpai-training-role` labels, and adds required hostname anti-affinity between
+this run's workers. The injected term excludes launcher pods from its selector;
+target affinity terms remain unchanged.
+
+Controller shutdown detaches from a running Kubernetes workload. It terminates
+the local launcher process. It leaves the remote workload running, keeps the
+durable result in the `RUNNING` state, and retains the workload UID and broker
+reservation. A restarted controller in the same Pod reserves the same training
+identity and re-adopts only that UID before it resumes monitoring. Recovery
+requires retained state and the same controller Pod UID; the default state
+volumes do not survive Pod replacement. Ordinary controller Pod deletion or
+replacement also garbage-collects its owned MPIJob and terminates remote
+training. Explicit cancellation and
+timeout still delete the remote workload and persist a terminal result before
+releasing ownership.
+
 The student commits the exact implementation and cleans the worktree before an
-expensive launch. Every successful `run_training` launch immediately registers
+expensive launch. Before reserving resources or starting a process, `run_training`
+reads the current open WIP assignment from GitHub and checks that its revision
+maps to this conversation in `student-conversations.json`. Missing, ambiguous,
+unreadable, or superseded assignments prevent a new launch. This admission check
+does not affect monitoring, cancellation, or terminal delivery for existing runs.
+Every successful `run_training` launch immediately registers
 a terminal-state monitor bound to the current conversation. `monitor_training`
 is an optional policy upgrade for useful metric gates or staleness detection;
 repeating it replaces the default or previous policy.
 
-Each run's requested timeout is a total wall-clock ceiling, not merely the
+Each local run's requested timeout is a total wall-clock ceiling, not merely the
 point at which shutdown begins. TERM is sent early enough that the configured
 grace period ends at the deadline, after which the complete process group is killed.
-`cancel_training` follows the same process-group cleanup path and does not
-return until the supervisor has persisted a terminal state. Target training
-code remains responsible for handling SIGTERM and flushing external services
-such as W&B before the grace period expires.
+For local runs, `cancel_training` follows the same process-group cleanup path.
+It does not return until the supervisor has persisted a terminal state. Target
+training code remains responsible for handling SIGTERM and flushing external
+services such as W&B before the grace period expires.
 
 The controller polls only monitors that are due. It fetches one latest selected
 metric value from W&B, evaluates deterministic threshold/change/staleness and
@@ -671,10 +727,11 @@ and `env` wrappers.
 Every OpenHands turn has a controller-configured hard deadline. The deadline
 interrupts the conversation, produces a non-success result, and leaves durable
 events unacknowledged. The controller then retries with bounded exponential
-backoff. Controller termination interrupts and closes the current conversation,
-cancels active supervised training, closes local stores, and flushes Weave
-before the controller exits. Standalone and child runners flush Weave at runner
-exit.
+backoff. Controller termination interrupts and closes the current conversation.
+It cancels active local training, but detaches from active Kubernetes training
+so the next controller can re-adopt the same remote UID. It then closes local
+stores and flushes Weave before it exits. Standalone and child runners flush
+Weave at runner exit.
 
 ## Secrets and Weave
 
@@ -746,11 +803,12 @@ API; `OPENHANDS_RUN.weave_url` links directly to the conversation.
 
 ## Images and launch acceptance
 
-Three images are built from the same exact source commit:
+Four images are built from the same exact source commit:
 
 - advisor: Python/OpenHands, GitHub CLI, and Chromium; no PyTorch, CUDA, or
   Kubernetes tooling;
 - student: the CUDA/PyTorch stack plus the same OpenHands and Chromium runtime;
+- executor: a minimal Python broker with no model runtime or `kubectl`;
 - cutoff: a minimal shell/Python runtime with one checksum-verified, pinned
   `kubectl`.
 
@@ -772,9 +830,61 @@ Launch preflight verifies:
 Exa is a progressive skill/script integration, not an always-connected MCP
 server.
 
-The Kubernetes launcher creates one Secret, ConfigMaps, and Deployments. It
-creates no Service or RBAC. Docker and local hosts need no shared network for
-Senpai communication.
+The Kubernetes launcher creates one Secret, ConfigMaps, and Deployments. A
+student launch first scans every requested name for an existing Deployment,
+controller Pod, or nonterminal labeled Job. It scans MPIJobs only when the API
+exists and requires that API for multi-node students. After all scans pass, it
+creates the per-tag Secret as an atomic, durable, immutable reservation before
+any GitHub write. An advisor-only apply cannot change the Secret data after a
+student launch wins the reservation race. It then creates each student resource
+separately, with the Deployment last. Student resources are new-only; the
+launcher never applies over them. A concurrent launch or an orphan from a
+failed launch therefore fails closed and requires explicit operator cleanup
+before retry.
+
+For multi-node students the launcher also creates a namespaced ServiceAccount,
+Role, and RoleBinding that allow creating, getting, patching, and deleting Jobs
+or MPIJobs; getting and listing Pods; reading pod logs; and listing Events.
+The launcher's operator identity needs get access to Deployments, list access
+to Pods and Jobs, API discovery, and create access to the rendered resources.
+Creating the Role and RoleBinding also requires every delegated permission in
+that namespace, or explicit `escalate` permission for the Role and `bind`
+permission on the referenced Role, respectively.
+When the MPIJob API is installed,
+every launch needs list access to MPIJobs so it can reject orphaned workloads;
+multi-node preflight also requires the API to exist. The controller requests
+CPU and memory without GPUs and has no Kubernetes token. Controller node
+placement is unconstrained unless the operator sets `controller_node_selector`.
+A separate executor sidecar alone mounts a projected token and validates the
+exact node/GPU and CPU/memory allocation, deadline,
+source/W&B evidence, volumes, pod security, and workload ownership across a
+Unix socket. Docker and local hosts need no shared network for Senpai
+communication.
+
+An opt-in capacity observer is separate from the research controllers and
+training executor. It lists Nodes and nonterminal Pods through a dedicated
+credentialed process and updates only its named, precreated snapshot ConfigMap.
+The advisor and students mount that sanitized snapshot read-only and expose
+`get_cluster_capacity` without Kubernetes credentials or mutation inputs.
+The observer needs explicit cluster-scoped read RBAC; namespace-only executor
+permissions stay unchanged. Observation shape, selectors, tolerations, and any
+CoreWeave verification exemption are operator-owned configuration. All three
+worker resources must fit on the same eligible node. Missing, incomplete,
+malformed, or stale snapshots return unknown. This is timestamped advisory
+capacity, never a reservation or assignment transition; scheduling remains
+Kubernetes' responsibility. Raw Pod specifications, environments, logs, and
+unrelated project identifiers never enter the snapshot. Cluster-scoped observer
+RBAC cleanup remains an operator action rather than expanding cutoff authority.
+
+The snapshot includes the complete observation configuration. Optional
+`expected_requirements` compares resource shape, node selectors, tolerations,
+and preemption policy with that configuration. Toleration order and duplicates
+do not affect the comparison. A mismatch returns unknown, preserves the observed
+configuration, and removes capacity counts. Matching requirements do not assess
+affinity, topology, quotas, or PVC placement. Single-node observation inherits
+the generated student pod's GPU toleration by default; multi-node observation
+defaults to empty tolerations. Explicit observation settings override defaults
+without changing target-owned worker placement.
 
 Hivemind startup remains commented with a clear note. The Python controller
 waits for the optional cluster start gate while continuously refreshing a
@@ -784,8 +894,24 @@ file path beneath their shared PVC mount. Cluster cutoff arms as soon as all
 expected resources are Ready or when its bounded readiness window expires,
 whichever comes first, and opens the optional start gate in either case. One
 missing or crash-looping pod therefore cannot prevent the runtime budget from
-starting. At the persisted deadline it deletes launch resources; all
-conversation harvest/archive code is removed.
+starting. The operator fixes the readiness deadline and latest cutoff time
+when arming the Job. The runtime budget begins on readiness or timeout, capped
+by that latest cutoff time across restarts. The Job authenticates persisted
+JSON state with a per-arm key and never sources shared files. It rejects
+symlinks and non-regular state files. State reads and temporary writes use
+nonblocking opens to avoid FIFO hangs. The Job keeps an in-memory deadline
+when state persistence fails. Failed
+start-gate writes retry only until the cutoff deadline.
+
+At the deadline, the Job deletes matching Deployments. It runs as UID/GID
+10001 with a read-only root filesystem, no added capabilities, and no privilege
+escalation. Its namespace Role permits pod observation and Deployment deletion;
+it grants no Secret or ConfigMap access. ConfigMaps, Secrets, PVC data, and
+other launch resources remain for explicit operator cleanup. Use the
+`research-tag` selector to delete retained launch ConfigMaps and Secrets as
+documented in README.md. The cutoff Job, its script ConfigMap, and its shared
+RBAC resources are separate from those launch labels. All conversation
+harvest/archive code is removed.
 
 ## Removed code
 
@@ -817,7 +943,8 @@ The change is acceptable when:
 
 - unit and local integration tests pass;
 - shell scripts pass `bash -n`;
-- manifests render matching immutable source revisions without Service/RBAC;
+- manifests render matching immutable source revisions and scoped multi-node RBAC;
+- remote workloads remain suspended until their exact created UID is confirmed;
 - browser smoke succeeds in both image builds;
 - no operational prompt advertises a missing tool or service;
 - no runtime role requires Claude Code semantics;

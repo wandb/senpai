@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 
 from senpai_agent.monitor import (
+    MetricRunNotFoundError,
     MetricSample,
     MonitorStore,
     TrainingMonitorEngine,
@@ -189,15 +190,16 @@ def test_wandb_source_returns_latest_value_and_timestamp(monkeypatch):
                 {"accuracy": 0.7, "_timestamp": 200},
             ]
 
-    def run(path):
-        if path != "entity/project/run-1":
-            raise AssertionError("wrong W&B run path")
-        return Run()
+    def runs(path, *, filters, per_page):
+        assert path == "entity/project"
+        assert filters == {"name": "run-1"}
+        assert per_page == 1
+        return iter([Run()])
 
     monkeypatch.setitem(
         sys.modules,
         "wandb",
-        SimpleNamespace(Api=lambda **_options: SimpleNamespace(run=run)),
+        SimpleNamespace(Api=lambda **_options: SimpleNamespace(runs=runs)),
     )
 
     sample = WandbMetricSource("entity", "project").latest("run-1", "accuracy")
@@ -206,3 +208,152 @@ def test_wandb_source_returns_latest_value_and_timestamp(monkeypatch):
         value=0.7,
         observed_at=datetime.fromtimestamp(200, UTC),
     )
+
+
+@pytest.mark.parametrize("project_accessible", [True, False])
+def test_wandb_source_distinguishes_absent_run_from_inaccessible_project(
+    monkeypatch, project_accessible
+):
+    import wandb
+    from wandb.apis.public.runs import Runs
+
+    project = {"runs": {"edges": [], "pageInfo": {"hasNextPage": False}}}
+    service = SimpleNamespace(
+        execute_graphql=lambda *_args: {
+            "project": project if project_accessible else None
+        }
+    )
+    monkeypatch.setattr(
+        wandb,
+        "Api",
+        lambda **_options: SimpleNamespace(
+            runs=lambda _path, **options: Runs(
+                service, "entity", "project", **options
+            )
+        ),
+    )
+
+    error = MetricRunNotFoundError if project_accessible else ValueError
+    with pytest.raises(error):
+        WandbMetricSource("entity", "project").latest("run-1", "accuracy")
+
+
+def test_missing_startup_run_recovers_when_first_metric_arrives(tmp_path: Path):
+    spec = monitor(metric="train/global_step").model_copy(
+        update={"stale_after_seconds": 900}
+    )
+    sample = MetricSample(value=1, observed_at=NOW + timedelta(seconds=60))
+
+    class Metrics:
+        def latest(self, _run_id, _metric):
+            if not self.ready:
+                raise MetricRunNotFoundError("W&B run is not initialized")
+            return sample
+
+        ready = False
+
+    metrics = Metrics()
+    training = SimpleNamespace(
+        get_training_status=lambda training_id: result(tmp_path, training_id)
+    )
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(spec)
+        engine = TrainingMonitorEngine(store, training, metrics)
+
+        assert engine.poll(NOW) == ()
+        assert store.baseline_sample(spec.training_id) is None
+        metrics.ready = True
+        assert engine.poll(NOW + timedelta(seconds=60)) == ()
+        assert store.baseline_sample(spec.training_id) == sample
+        assert store.previous_sample(spec.training_id) == sample
+        assert store.pending_signals() == []
+
+
+def test_missing_startup_run_still_emits_stale_signal_at_deadline(tmp_path: Path):
+    spec = monitor(metric="train/global_step").model_copy(
+        update={"stale_after_seconds": 900}
+    )
+
+    class Metrics:
+        def latest(self, _run_id, _metric):
+            raise MetricRunNotFoundError("W&B run is not initialized")
+
+    training = SimpleNamespace(
+        get_training_status=lambda training_id: result(tmp_path, training_id)
+    )
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(spec)
+        engine = TrainingMonitorEngine(store, training, Metrics())
+
+        assert engine.poll(NOW) == ()
+        assert engine.poll(NOW + timedelta(seconds=840)) == ()
+        signals = engine.poll(NOW + timedelta(seconds=900))
+        assert [signal.kind for signal in signals] == ["metric_stale"]
+        assert signals[0].value is None
+        assert signals[0].hard_failure is False
+        assert engine.poll(NOW + timedelta(seconds=960)) == ()
+        assert store.pending_signals() == list(signals)
+
+
+@pytest.mark.parametrize("failure", ["auth", "permission", "network"])
+def test_wandb_startup_backend_errors_remain_hard_failures(
+    tmp_path: Path, monkeypatch, failure: str
+):
+    import wandb
+
+    errors = {
+        "auth": wandb.errors.AuthenticationError("Invalid API key"),
+        "permission": wandb.errors.CommError("HTTP 403: permission denied"),
+        "network": wandb.errors.CommError("Connection timed out"),
+    }
+
+    def runs(*_args, **_options):
+        raise errors[failure]
+
+    monkeypatch.setattr(
+        wandb, "Api", lambda **_options: SimpleNamespace(runs=runs)
+    )
+    spec = monitor(metric="train/global_step")
+    training = SimpleNamespace(
+        get_training_status=lambda training_id: result(tmp_path, training_id)
+    )
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(spec)
+        signals = TrainingMonitorEngine(
+            store, training, WandbMetricSource("entity", "project")
+        ).poll(NOW)
+
+        assert [signal.kind for signal in signals] == ["monitor_error"]
+        assert signals[0].hard_failure is True
+        assert str(errors[failure]) in signals[0].detail
+
+
+def test_run_disappearing_after_metric_is_a_durable_hard_failure(tmp_path: Path):
+    spec = monitor(metric="train/global_step")
+    sample = MetricSample(value=1, observed_at=NOW)
+
+    class Metrics:
+        def latest(self, _run_id, _metric):
+            if self.missing:
+                raise MetricRunNotFoundError("W&B run disappeared")
+            return sample
+
+        missing = False
+
+    metrics = Metrics()
+    training = SimpleNamespace(
+        get_training_status=lambda training_id: result(tmp_path, training_id)
+    )
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(spec)
+        engine = TrainingMonitorEngine(store, training, metrics)
+
+        assert engine.poll(NOW) == ()
+        metrics.missing = True
+        signals = engine.poll(NOW + timedelta(seconds=60))
+        assert [signal.kind for signal in signals] == ["monitor_error"]
+        assert signals[0].hard_failure is True
+        assert store.baseline_sample(spec.training_id) == sample
+        assert store.previous_sample(spec.training_id) == sample
+        assert engine.poll(NOW + timedelta(seconds=120)) == ()
+        assert store.pending_signals() == list(signals)
