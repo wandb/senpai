@@ -115,3 +115,86 @@ def test_worker_propagates_the_training_command_exit_status(worker_run):
     result, *_ = worker_run(["python", "-c", "raise SystemExit(37)"])
 
     assert result.returncode == 37, result.stderr
+
+
+def test_worker_ssh_server_starts_with_operator_key_permissions(tmp_path):
+    import socket
+    import time
+    if not Path("/usr/sbin/sshd").exists():
+        pytest.skip("OpenSSH server is unavailable")
+    home = tmp_path / "home"
+    operator_keys = home / ".ssh"
+    operator_keys.mkdir(parents=True)
+    key = operator_keys / "id_rsa"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ecdsa", "-b", "256", "-N", "", "-f", str(key)],
+        check=True, timeout=10,
+    )
+    key.chmod(0o644)  # MPI operator's nonroot Secret volume permissions.
+    (operator_keys / "authorized_keys").write_bytes(key.with_suffix(".pub").read_bytes())
+    with socket.socket() as port_reservation:
+        port_reservation.bind(("127.0.0.1", 0))
+        port = port_reservation.getsockname()[1]
+    # Only redirect the production SSH listener to a temporary loopback port.
+    check_startup = """
+import os, runpy, sys
+execv = os.execv
+os.execv = lambda executable, argv: execv(executable, [
+    *argv, '-o', 'Port=' + os.environ['TEST_SSH_PORT'], '-o', 'ListenAddress=127.0.0.1',
+])
+sys.argv = ['senpai_agent.training_worker', 'sshd']
+runpy.run_module('senpai_agent.training_worker', run_name='__main__')
+"""
+    server = subprocess.Popen(
+        [sys.executable, "-P", "-c", check_startup],
+        env={**os.environ, "HOME": str(home), "TEST_SSH_PORT": str(port),
+             "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and server.poll() is None:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1) as connection:
+                    connection.settimeout(5)
+                    assert connection.recv(256).startswith(b"SSH-2.0-")
+                    return
+            except ConnectionRefusedError:
+                time.sleep(0.02)
+        server.terminate()
+        _, stderr = server.communicate(timeout=3)
+        pytest.fail(f"worker SSH server failed to start: {stderr}")
+    finally:
+        if server.poll() is None:
+            server.terminate()
+        server.communicate(timeout=3)
+
+
+def test_mpi_launch_keeps_ssh_on_launcher_with_its_known_hosts(tmp_path, monkeypatch):
+    from senpai_agent import training_worker
+
+    home = tmp_path / "home"
+    keys = home / ".ssh"
+    keys.mkdir(parents=True)
+    (keys / "id_rsa").write_text("operator private key")
+    (keys / "id_rsa.pub").write_text("ssh-rsa operator-public-key\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NNODES", "128")
+    read_text = Path.read_text
+
+    def operator_hostfile(path, *args, **kwargs):
+        if path == Path("/etc/mpi/hostfile"):
+            return "".join(f"worker-{rank}.job slots=8\n" for rank in range(128))
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", operator_hostfile)
+    invocations = []
+    monkeypatch.setattr(os, "execv", lambda executable, argv: invocations.append((executable, argv)))
+    training_worker.mpi()
+    executable, argv = invocations.pop()
+    assert executable == "/usr/bin/mpirun"
+    parameters = {argv[index + 1]: argv[index + 2] for index, value in enumerate(argv) if value == "--mca"}
+    # OpenMPI4's default tree launch requires worker-to-worker SSH. Only the
+    # launcher owns the complete known_hosts file, so all SSH starts belong here.
+    assert parameters.get("plm_rsh_no_tree_spawn") == "1"
+    assert argv[argv.index("-np") + 1] == "128"

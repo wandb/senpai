@@ -79,6 +79,7 @@ def mpi() -> None:
         "/usr/bin/mpirun", "--hostfile", "/etc/mpi/hostfile",
         "-np", os.environ["NNODES"], "--map-by", "ppr:1:node", "--bind-to", "none",
         "--prefix", "/usr", "--mca", "plm_rsh_args", ssh_arguments,
+        "--mca", "plm_rsh_no_tree_spawn", "1",
     ]
     for name in (
         "PATH", "LD_LIBRARY_PATH", "NNODES", "GPUS_PER_NODE", "MASTER_ADDR", "MASTER_PORT",
@@ -104,7 +105,7 @@ def sshd() -> None:
         "StrictModes no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n"
         "UsePAM no\nAllowUsers senpai\n"
     )
-    os.execv("/usr/sbin/sshd", ["sshd", "-D", "-e", "-f", str(config)])
+    os.execv("/usr/sbin/sshd", ["/usr/sbin/sshd", "-D", "-e", "-f", str(config)])
 
 
 if __name__ == "__main__":

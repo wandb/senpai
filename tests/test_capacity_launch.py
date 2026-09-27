@@ -178,14 +178,28 @@ def test_observer_cluster_authority_is_scoped_to_namespace_and_tag(
     assert second["ClusterRoleBinding"]["subjects"][0]["namespace"] == second_namespace
 
 
-def test_single_node_observer_requires_its_digest():
-    arguments = [
-        "--advisor_image", ADVISOR_IMAGE, "--student_image", STUDENT_IMAGE,
-        "--capacity_observer", "--nodes_per_student", "1",
-    ]
-    missing = run_launch(*arguments, "--executor_image", "")
-    assert missing.returncode != 0
-    assert "--executor_image must use an immutable @sha256 digest" in missing.stderr
+def test_observer_without_students_resolves_the_matching_executor_digest(monkeypatch, capsys):
+    args = observer_args(
+        nodes_per_student=1, names="", n_students=0, advisor=False,
+        executor_image="", dry_run=True,
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+
+    def published_image(role, reference):
+        assert (role, reference) == ("executor", f"sha-{args.senpai_repo_revision}")
+        return EXECUTOR_IMAGE, args.senpai_repo_revision
+
+    monkeypatch.setattr("images.published_image", published_image)
+
+    launch.main()
+
+    rendered = capsys.readouterr().out.split("--- Capacity observer ---\n", 1)[1]
+    documents = list(yaml.safe_load_all(rendered))
+    deployment, = [item for item in documents if item["kind"] == "Deployment"]
+    container, = deployment["spec"]["template"]["spec"]["containers"]
+    assert container["image"] == EXECUTOR_IMAGE
+    environment = {item["name"]: item["value"] for item in container["env"]}
+    assert environment["SENPAI_REPO_REVISION"] == args.senpai_repo_revision
 
 
 @pytest.mark.parametrize(
