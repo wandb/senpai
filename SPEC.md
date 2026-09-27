@@ -226,8 +226,8 @@ The model receives:
 2. One stable system suffix assembled from:
    - `system_instructions/SENPAI-HARNESS.md`; and
    - the rendered advisor or student role charter; and
-   - the selected target-repository `program.md` under
-     `# program.md - <path>`; and
+   - the selected target-repository `program.md` as a research-policy snapshot
+     with its path, exact source commit, and content digest; and
    - the rendered `system_instructions/SENPAI-LAUNCH-CONTEXT.md`, containing
      authoritative runtime identity, limits, and isolation rules after
      `program.md`. A blank
@@ -237,29 +237,55 @@ The model receives:
 3. Explicit project and Senpai skills through OpenHands skill context. Agent Skills bodies are loaded only when invoked. Repository `AGENTS.md`, `AGENT.md`, and `CLAUDE.md` instruction files are not loaded as project context.
 4. User turns containing optional human operator instructions, current state, and current UTC time.
 
-Before constructing a model worker, the supervisor resolves the configured
-program path and renders the role's `{{VARIABLE}}` placeholders once from an
-explicit non-secret allowlist. A missing referenced value fails the launch;
-unrelated environment variables and credentials are never considered. The
-rendered role is persisted in role state and reused across worker restarts.
+Before creating pods, the launcher captures one Git-advertised advisor-branch
+head in an isolated clone. It recomputes the commit, tree, and program blob IDs
+and stores the policy in a separate immutable, content-addressed Secret. Pods
+mount only its program-context key as a read-only file. The ConfigMap supplies
+the selected path, commit, and content SHA-256; the supervisor verifies all
+three against the mounted snapshot before constructing a worker.
+
+The selected path supports printable UTF-8, including spaces and Unicode,
+without backslashes or traversal. The committed program must be a regular file
+of at most 256 KiB of UTF-8 data; the encoded Secret value may not exceed 1 MiB.
+The prompt content omits the SPDX header and outer whitespace.
+
+The supervisor renders the role's `{{VARIABLE}}` placeholders from an explicit
+non-secret allowlist. A missing referenced value fails startup; unrelated
+environment variables and credentials are never considered. It persists the
+rendered role and complete system snapshot. The snapshot digest covers the
+components and the exact rendered suffix, so changed wrapper templates also
+invalidate persisted context.
 
 The launcher renders `timeout_minutes` and `max_epochs` into the launch context
 as agent policy. It does not export dedicated timeout or epoch environment
 variables, and the training supervisor has no launch-wide timeout default or
 ceiling. Each training run supplies its own positive `timeout_seconds` value.
 
-At process startup, the runner loads the harness, rendered role, `program.md`,
-and authoritative launch context into one immutable
-`SenpaiSystemInstructions` value. Its prompt is the stable system suffix for
-that process and is never reread, monitored, or refreshed during the agent
-session. Delegated children inherit the rendered role snapshot, resolved
-repository-relative program path, and exact launch context, then build their
-own immutable value. Runtime identity and `program.md` are not duplicated in
+At process startup, the runner verifies the complete system snapshot against
+the digest held by its supervisor or parent. It also checks the configured
+program path and commit, harness, rendered role, and launch context against
+that snapshot. The resulting `SenpaiSystemInstructions` value stays fixed for
+the session. Delegated children inherit that exact value through a file and
+an independently supplied digest. Restarts verify persisted context against
+trusted launch inputs, without reading the target workspace's current policy.
+Runtime identity and `program.md` are not duplicated in
 ordinary user messages. Optional operator instructions remain user context;
 use GitHub Issues for live human direction. OpenHands includes the system
 suffix on every inference, and current time is rendered for every controller
 wake. Operators must start fresh role state to apply a changed identity,
-program, or role charter.
+program, or role charter. Snapshot integrity does not prohibit publishing
+operator-authored `program.md` changes through advisor synchronization.
+
+Every desired Deployment and live Pod under a tag binds the same program
+Secret. Terminal Pods do not retain a binding; terminating Pods retain it
+until they reach a terminal phase. An incremental launch preserves the original
+commit and encoded snapshot when normalized policy path and content match.
+Changed policy or legacy resources without a binding require a new tag.
+Launches for one cluster, namespace, and tag must be serialized: the existing
+binding check and subsequent apply are not an atomic reservation. A reused
+Secret must be immutable, belong to the tag, and match its content-addressed
+name. These checks trust operator-controlled Kubernetes resources; they do
+not defend against a Kubernetes administrator replacing the launch inputs.
 
 File-based subagents are discovered from `.agents/agents`. Live advisor and
 student skills come only from `plugins/senpai/skills`; `.agents/skills` is for
@@ -268,6 +294,52 @@ repositories may still supply their own project skills. Skill bodies are not
 concatenated into agent definitions. The OpenHands fork's `main` branch applies
 each agent definition's `reasoning_effort` override after resolving its
 inherited LLM or stored model profile.
+
+The images install the runner as a non-editable package and make its Python
+environment, built-in agent definitions, and plugin assets root-owned and
+read-only. `SENPAI_AGENT_DIR` selects the installed built-in definitions;
+`SENPAI_PLUGIN` selects the installed plugin. The supervisor, controller,
+delegated children, and plugin hooks use trusted Python with `-P`, so a target
+working directory cannot shadow the installed runner. These controls protect
+runtime imports and assets; they do not sandbox target code or freeze the
+operator's system-instruction files.
+
+`SENPAI_TARGET_PYTHON_ENV` selects a writable target venv for terminals and
+training. Its site-packages include the trusted environment through a `.pth`
+path entry. Target packages can override those shared packages without writing
+to the trusted environment. The image includes pip so additive target installs
+can resolve packages on the shared path. uv resolves a separate target package
+set and does not inspect that path. The image compiles runtime bytecode before
+making the environment read-only. The images copy uv from its versioned,
+digest-pinned official image. Bootstrap computes both paths with trusted Python
+and uses `uv venv` with that interpreter, without project/config discovery,
+Python downloads, or pip bootstrapping. It preserves existing target files and
+never executes target Python. Terminal and training environments select the
+target through PATH and uv settings. Training and terminal setup remove inherited
+`PYTHONSAFEPATH` so project imports work normally. File-defined child terminals
+use the same routing.
+Each native terminal session receives target settings after shell startup,
+including new and recovered tmux panes. Later commands can change that
+session's environment. This adapter uses the pinned SDK's environment-export
+callback and preserves native parallel terminal execution.
+Bootstrap also creates missing target launchers for the trusted environment's
+console scripts. Each launcher executes the original read-only script with
+target Python, so shared commands and their Python workers see target packages.
+Bootstrap preserves existing target scripts and never executes target Python.
+
+The bundled plugin remains explicitly loaded for root and child conversations.
+Its skill helpers run in the target environment with `uv run --no-sync`; they
+must not rewrite the read-only installed skill files. Target lock updates and
+dependency syncs are explicit experiment changes, not a side effect of reading
+experiment results.
+
+OpenHands ambient plugin discovery is disabled before root or child
+conversations are created. Only the explicitly supplied trusted plugin loads
+through the plugin loader. Explicit target skills, unreserved target/user
+agents, and their declared MCP configurations remain supported. This removes
+automatic plugin hooks, MCP servers, and skills from writable user/project
+plugin directories. The adapter depends on the pinned SDK's discovery call;
+SDK upgrades must retain the executable plugin-isolation test.
 
 ## Prompt caching
 
@@ -721,9 +793,33 @@ boundaries. Hooks give early model-visible feedback. `senpai_terminal` also
 evaluates the same pure policy in-process and fails closed if policy evaluation
 fails.
 
-Denied patterns include raw GitHub mutations, raw `git push`, direct training
-launches, sleeps, polling loops, `watch`, and `tail -f`, including nested shell
-and `env` wrappers.
+Recognized denied patterns include raw GitHub mutations, raw `git push`, direct
+training launches, sleeps, `watch`, and `tail -f`, including nested shell and
+`env` wrappers.
+
+The terminal policy parses Bash syntax before checking nested commands and
+recognized command runners. It rejects malformed syntax, startup-file loading,
+explicit shell callbacks, aliases, and variable-name reevaluation. Shell startup
+and prompt variables are also reserved against custom-secret injection.
+These checks enforce workflow boundaries without
+prescribing research methods or requiring an allowlist of data formats and
+analysis languages. Heredoc input to ordinary programs remains data. The
+original Bash syntax still exposes expansions in unquoted input for checking;
+input fed to recognized shells receives recursive shell checks. A function
+that overrides the actual consumer, or output routed through an opaque `exec`
+redirect, retains conservative checking. Unrelated functions and process
+substitutions do not disable ordinary program input. Dynamic output paths are
+allowed unless recognized shell execution in the same command makes that
+stream ambiguous. Shell loops, arithmetic, variable executable names, and
+variable timeout durations are allowed. Commands visible inside loop bodies,
+conditions, and substitutions remain checked. The policy does not resolve
+variable contents or prove loop termination; operations selected indirectly
+through variables can fall outside its recognition. Common wrappers inspect
+the child command visible in the submitted syntax and preserve its data
+arguments. Unsupported wrapper grammars and unclear shell streams can still
+reject valid commands. These
+checks do not inspect arbitrary executable files or Python code, reconstruct
+prior terminal state, or establish a shell sandbox.
 
 Every OpenHands turn has a controller-configured hard deadline. The deadline
 interrupts the conversation, produces a non-success result, and leaves durable

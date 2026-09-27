@@ -54,28 +54,53 @@ def supervisor(tmp_path, monkeypatch, client=None, **overrides):
     return KubernetesTrainingSupervisor(**values), workspace, snapshot_root
 
 
+@pytest.mark.parametrize("nodes", [1, 2])
 def test_supervisor_injects_authoritative_identity_and_bundles_clean_head(
     tmp_path,
     monkeypatch,
+    nodes,
 ):
-    client = FakeCluster()
-    runtime, workspace, snapshot_root = supervisor(tmp_path, monkeypatch, client)
+    client = FakeCluster(nodes=nodes)
+    runtime, workspace, snapshot_root = supervisor(tmp_path, monkeypatch, client, nodes=nodes)
+    target_env = tmp_path / "target-env"
+    subprocess.run(
+        [
+            "uv", "venv", "--no-project", "--no-config", "--no-python-downloads",
+            "--python", sys.executable, str(target_env),
+        ],
+        check=True,
+        env={**os.environ, "UV_CACHE_DIR": str(tmp_path / "uv-cache")},
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.setenv("SENPAI_TARGET_PYTHON_ENV", str(target_env))
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    monkeypatch.setenv("PATH", f"{Path(sys.executable).parent}:{os.environ['PATH']}")
+    (workspace / "project_module.py").write_text("VALUE = 'project import'\n")
+    subprocess.run(["git", "add", "project_module.py"], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "-qm", "project module"], cwd=workspace, check=True)
     keys = [
         "SENPAI_TRAINING_SOURCE_SNAPSHOT",
         "SENPAI_KUBERNETES_WORKLOAD_NAME",
         "SENPAI_KUBERNETES_NAMESPACE",
         "SENPAI_WANDB_RUN_ID",
         "SENPAI_LAUNCH_SECRET_NAME",
+        "UV_PYTHON",
+        "UV_PROJECT_ENVIRONMENT",
+        "VIRTUAL_ENV",
     ]
     code = (
-        "import json,os,time; "
-        f"print(json.dumps({{key: os.environ[key] for key in {keys!r}}})); "
+        "import json,os,sys,time; "
+        "from project_module import VALUE; "
+        f"environment = {{key: os.environ[key] for key in {keys!r}}}; "
+        "environment.update(value=VALUE, prefix=sys.prefix, safe_path=sys.flags.safe_path); "
+        "print(json.dumps(environment)); "
         "time.sleep(0.2)"
     )
 
     started = runtime.run_training(
         TrainingSpec(
-            argv=(sys.executable, "-c", code),
+            argv=("python", "-c", code),
             cwd=workspace,
             timeout_seconds=5,
         )
@@ -85,7 +110,7 @@ def test_supervisor_injects_authoritative_identity_and_bundles_clean_head(
 
     assert result.state is TrainingState.FINISHED
     assert result.kubernetes_spec is not None
-    assert result.kubernetes_spec.kind == "MPIJob"
+    assert result.kubernetes_spec.kind == ("Job" if nodes == 1 else "MPIJob")
     assert result.kubernetes_spec.namespace == "research"
     assert result.kubernetes_spec.wandb_run_id == started.training_id.replace("-", "")
     assert len(result.kubernetes_spec.name) <= 63
@@ -107,6 +132,12 @@ def test_supervisor_injects_authoritative_identity_and_bundles_clean_head(
         "SENPAI_KUBERNETES_NAMESPACE": "research",
         "SENPAI_WANDB_RUN_ID": result.kubernetes_spec.wandb_run_id,
         "SENPAI_LAUNCH_SECRET_NAME": "senpai-launch-secrets-fred",
+        "UV_PYTHON": str(target_env / "bin" / "python"),
+        "UV_PROJECT_ENVIRONMENT": str(target_env),
+        "VIRTUAL_ENV": str(target_env),
+        "value": "project import",
+        "prefix": str(target_env),
+        "safe_path": False,
     }
     assert client.reservations[0][1:] == (str(snapshot), result.source_commit)
     assert client.releases == [result.training_id]

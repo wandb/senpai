@@ -4,10 +4,9 @@ import pytest
 import yaml
 
 from launch_test_support import (
-    launch,
     launch_args,
-    launch_helpers,
     render_role,
+    render_role_manifest,
 )
 
 
@@ -19,27 +18,8 @@ def render_student(nodes=2, **overrides):
         memory_gi_per_gpu=110,
         **overrides,
     )
-    secret_name = f"senpai-launch-secrets-{args.tag}"
-    secret = launch_helpers.render_launch_secret(
-        args.tag,
-        "github",
-        "exa",
-        "wandb",
-        openai_api_key="openai",
-        custom_secrets={},
-    )
-    return list(
-        yaml.safe_load_all(
-            launch.render_student(
-                (Path(__file__).parents[1] / "k8s" / "student-deployment.yaml").read_text(),
-                "fern",
-                args.tag,
-                secret_name,
-                secret,
-                args,
-            )
-        )
-    )
+    manifest, _secret = render_role_manifest("student", args)
+    return list(yaml.safe_load_all(manifest))
 
 
 @pytest.mark.parametrize("nodes", [1, 2])
@@ -103,30 +83,8 @@ def test_controller_image_has_only_the_validated_kubectl_socket_proxy():
 
 
 def test_advisor_placement_is_portable_by_default():
-    template = (Path(__file__).parents[1] / "k8s" / "advisor-deployment.yaml").read_text()
-    rendered = launch_helpers.render_template(
-        template,
-        {
-            token: "fixture"
-            for token in (
-                "ADVISOR_DEPLOYMENT_NAME",
-                "ADVISOR_CONFIGMAP_NAME",
-                "RESEARCH_TAG",
-                "ADVISOR_IMAGE",
-                "PVC_CLAIM_NAME",
-                "PVC_MOUNT_PATH",
-                "LAUNCH_SECRET_NAME",
-                "POD_CONFIG_HASH",
-                "CONTROLLER_NODE_SELECTOR",
-            )
-        }
-        | {
-            "MODEL_PROVIDER_ENV": "        - name: MODEL_API_KEY",
-            "CUSTOM_SECRET_ENV_REFS": "",
-            "CONTROLLER_NODE_SELECTOR": "{}",
-        },
-    )
-    pod = yaml.safe_load(rendered)["spec"]["template"]["spec"]
+    _configmap, deployment, _secret = render_role("advisor")
+    pod = yaml.safe_load(deployment)["spec"]["template"]["spec"]
 
     assert pod["nodeSelector"] == {}
 

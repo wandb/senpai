@@ -54,8 +54,21 @@ def run_launch(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def render_role(role: str, args: launch.Args | None = None) -> tuple[str, str, str]:
+def render_role_manifest(
+    role: str,
+    args: launch.Args | None = None,
+    *,
+    program: launch.ProgramSystemPrompt | None = None,
+) -> tuple[str, str]:
     args = launch_args() if args is None else args
+    program = program or launch.ProgramSystemPrompt(
+        program_path=args.program_path or "program.md",
+        source_commit=REVISION,
+        content="Test launch research policy.",
+    )
+    program_secret_name, program_secret = launch_helpers.render_program_context_secret(
+        args.tag, launch.encode_program_system_prompt(program)
+    )
     secret_name = f"senpai-launch-secrets-{args.tag}"
     providers = launch.deployed_model_providers(args)
     secret = launch_helpers.render_launch_secret(
@@ -79,6 +92,9 @@ def render_role(role: str, args: launch.Args | None = None) -> tuple[str, str, s
             secret_name,
             secret,
             args,
+            program=program,
+            program_secret_name=program_secret_name,
+            program_secret=program_secret,
         )
     else:
         manifest = launch.render_advisor(
@@ -88,6 +104,19 @@ def render_role(role: str, args: launch.Args | None = None) -> tuple[str, str, s
             secret_name,
             secret,
             args,
+            program=program,
+            program_secret_name=program_secret_name,
+            program_secret=program_secret,
         )
+    return manifest, secret
+
+
+def render_role(
+    role: str,
+    args: launch.Args | None = None,
+    *,
+    program: launch.ProgramSystemPrompt | None = None,
+) -> tuple[str, str, str]:
+    manifest, secret = render_role_manifest(role, args, program=program)
     documents = manifest.split("\n---\n")
     return documents[0], documents[-1], secret

@@ -34,6 +34,7 @@ from senpai_agent.training import (
     TrainingResult,
     TrainingSpec,
     TrainingState,
+    target_python_environment,
     training_result_paths,
 )
 
@@ -830,6 +831,8 @@ class KubernetesTrainingSupervisor:
                 "SENPAI_LAUNCH_SECRET_NAME": os.environ["SENPAI_LAUNCH_SECRET_NAME"],
             }
             environment.pop("WANDB_SERVICE", None)
+            environment.pop("PYTHONSAFEPATH", None)
+            environment.update(target_python_environment(environment))
             self._wandb_api_key = environment.get("WANDB_API_KEY", "").encode()
             log_path.touch()
             process = subprocess.Popen(

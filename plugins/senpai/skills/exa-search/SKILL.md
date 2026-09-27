@@ -8,15 +8,16 @@ description: Search the general web or scholarly publications through Exa. Use f
 Use the bundled `search_exa.py` script with one explicit mode. It calls the
 official `exa_py` client, loads the nearest `.env` through `python-dotenv`, and
 preserves an `EXA_API_KEY` already set in the environment.
+Use the configured target environment without syncing project dependencies:
 
 ```bash
-python "$SENPAI_PLUGIN/skills/exa-search/scripts/search_exa.py" \
+uv run --no-sync python "$SENPAI_PLUGIN/skills/exa-search/scripts/search_exa.py" \
   general-web \
   "current OpenHands SDK file-based agent documentation"
 ```
 
 ```bash
-python "$SENPAI_PLUGIN/skills/exa-search/scripts/search_exa.py" \
+uv run --no-sync python "$SENPAI_PLUGIN/skills/exa-search/scripts/search_exa.py" \
   research-publications \
   "uncertainty calibration for neural networks"
 ```

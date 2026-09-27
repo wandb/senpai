@@ -1,12 +1,32 @@
 """Shared training inputs, results, and durable workload identities."""
 
+import os
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+
+TARGET_PYTHON_ENV = "SENPAI_TARGET_PYTHON_ENV"
+
+
+def target_python_environment(
+    environment: Mapping[str, str] = os.environ,
+) -> dict[str, str]:
+    """Point interpreter, PATH, and uv project commands at the target venv."""
+
+    target_env = environment.get(TARGET_PYTHON_ENV, "").strip()
+    if not target_env:
+        return {}
+    return {
+        "PATH": f"{target_env}/bin:{environment['PATH']}",
+        "UV_PROJECT_ENVIRONMENT": target_env,
+        "UV_PYTHON": f"{target_env}/bin/python",
+        "VIRTUAL_ENV": target_env,
+    }
 
 
 class TrainingState(StrEnum):
