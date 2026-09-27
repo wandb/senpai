@@ -842,6 +842,16 @@ Kubernetes' responsibility. Raw Pod specifications, environments, logs, and
 unrelated project identifiers never enter the snapshot. Cluster-scoped observer
 RBAC cleanup remains an operator action rather than expanding cutoff authority.
 
+The snapshot includes the complete observation configuration. Optional
+`expected_requirements` compares resource shape, node selectors, tolerations,
+and preemption policy with that configuration. Toleration order and duplicates
+do not affect the comparison. A mismatch returns unknown, preserves the observed
+configuration, and removes capacity counts. Matching requirements do not assess
+affinity, topology, quotas, or PVC placement. Single-node observation inherits
+the generated student pod's GPU toleration by default; multi-node observation
+defaults to empty tolerations. Explicit observation settings override defaults
+without changing target-owned worker placement.
+
 Hivemind startup remains commented with a clear note. The Python controller
 waits for the optional cluster start gate while continuously refreshing a
 `start-gate` lease; readiness therefore cannot deadlock gated launch. Cluster

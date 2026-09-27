@@ -281,16 +281,27 @@ When a smoke run stalls before W&B starts, inspect these diagnostics first.
 
 Add `--capacity_observer true` to install a dedicated observer. It uses the same
 immutable `--executor_image` and source revision, including for single-node
-fleets. Both root roles receive `get_cluster_capacity`, a no-argument tool that
-reads a sanitized ConfigMap snapshot. Without an observer it returns unknown.
+fleets. Both root roles receive `get_cluster_capacity`, which reads a sanitized
+ConfigMap snapshot. Without an observer it returns unknown.
 It never reserves resources, clears an assignment hold, or authorizes a launch.
+
+With no arguments, the tool reports capacity for the complete configuration in
+the snapshot: worker resources, node selectors, tolerations, and preemption policy.
+Supply `expected_requirements` to check that configuration against an intended
+workload. A mismatch returns unknown with the observed requirements and no counts.
+The check compares configuration values; it does not recalculate capacity or
+change the workload. Version 1 snapshots lack the complete configuration and
+return unknown as invalid.
 
 The observed worker shape comes from `--nodes_per_student`,
 `--gpus_per_student_node`, `--cpu_per_gpu`, and `--memory_gi_per_gpu`. Configure
 `--capacity_node_selector key=value ...` and
 `--capacity_tolerations '{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}'`
 to describe the intended workers. These options affect observation only; they do
-not change training manifests. Unspecified tolerations are empty. Enable
+not change training manifests. Omitted tolerations inherit the single-node
+student's GPU toleration; multi-node observation defaults to no tolerations.
+Explicit tolerations replace these defaults. Use `capacity_tolerations: []` in
+YAML or `--capacity_tolerations` without values for an empty override. Enable
 `--capacity_hpc_verification true` only where the operator confirms CoreWeave's
 preemptible HPC-verification policy. That policy requires the verification
 namespace, exact priority class, priority -1, and verification workload name;

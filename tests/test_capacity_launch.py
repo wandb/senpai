@@ -1,7 +1,8 @@
 import json
 import os
-from pathlib import Path
 import subprocess
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 import yaml
@@ -15,6 +16,9 @@ from launch_test_support import (
     run_launch,
 )
 from test_cluster_cutoff import render_cutoff
+from test_cluster_capacity import node
+
+from senpai_agent.cluster_capacity import CapacityConfig, summarize_capacity
 
 
 EXECUTOR_IMAGE = f"ghcr.io/wandb/senpai-executor@sha256:{'b' * 64}"
@@ -174,7 +178,7 @@ def test_observer_cluster_authority_is_scoped_to_namespace_and_tag(
     assert second["ClusterRoleBinding"]["subjects"][0]["namespace"] == second_namespace
 
 
-def test_opt_in_cli_renders_observer_once_and_requires_its_digest_for_single_node():
+def test_single_node_observer_requires_its_digest():
     arguments = [
         "--advisor_image", ADVISOR_IMAGE, "--student_image", STUDENT_IMAGE,
         "--capacity_observer", "--nodes_per_student", "1",
@@ -183,12 +187,41 @@ def test_opt_in_cli_renders_observer_once_and_requires_its_digest_for_single_nod
     assert missing.returncode != 0
     assert "--executor_image must use an immutable @sha256 digest" in missing.stderr
 
-    rendered = run_launch(*arguments, "--executor_image", EXECUTOR_IMAGE, "--senpai_repo_revision", "a" * 40)
+
+@pytest.mark.parametrize(
+    "nodes,placement_args,fit_nodes",
+    [
+        (1, [], 1),
+        (4, [], 0),
+        (1, ["--capacity_tolerations"], 0),
+        (1, ["--capacity_tolerations", '{"key":"other","operator":"Exists"}'], 0),
+    ],
+)
+def test_observer_cli_uses_student_defaults_or_explicit_tolerations(
+    nodes, placement_args, fit_nodes
+):
+    rendered = run_launch(
+        "--advisor_image", ADVISOR_IMAGE, "--student_image", STUDENT_IMAGE,
+        "--capacity_observer", "--nodes_per_student", str(nodes),
+        "--executor_image", EXECUTOR_IMAGE, "--senpai_repo_revision", "a" * 40,
+        *placement_args,
+    )
     assert rendered.returncode == 0, rendered.stderr
     observer = rendered.stdout.split("--- Capacity observer ---\n", 1)[1].split("--- Student:", 1)[0]
     documents = list(yaml.safe_load_all(observer))
     assert sum(document["kind"] == "Deployment" for document in documents) == 1
     assert documents[-1]["spec"]["template"]["spec"]["containers"][0]["image"] == EXECUTOR_IMAGE
+    env = {
+        item["name"]: item["value"]
+        for item in documents[-1]["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    snapshot = summarize_capacity(
+        [node("gpu-worker", taints=[{"key": "nvidia.com/gpu", "effect": "NoSchedule"}])],
+        [],
+        CapacityConfig.model_validate_json(env["SENPAI_CAPACITY_CONFIG"]),
+        observed_at=datetime.now(UTC),
+    )
+    assert snapshot.counts.resource_fit_nodes == fit_nodes
 
 
 @pytest.mark.parametrize(

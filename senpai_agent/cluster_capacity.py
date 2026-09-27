@@ -66,13 +66,13 @@ class CapacityConfig(BaseModel):
     tolerations: list[Toleration] = Field(default_factory=list)
     hpc_verification: bool = False
 
-
-class WorkerShape(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    nodes: int = Field(gt=0)
-    gpus_per_node: int = Field(gt=0)
-    cpu_per_node: float = Field(gt=0, allow_inf_nan=False)
-    memory_gib_per_node: float = Field(gt=0, allow_inf_nan=False)
+    def matches(self, expected: CapacityConfig) -> bool:
+        """Compare the observation basis; toleration order and duplicates do not matter."""
+        return self.model_dump(exclude={"tolerations"}) == expected.model_dump(
+            exclude={"tolerations"}
+        ) and {item.model_dump_json() for item in self.tolerations} == {
+            item.model_dump_json() for item in expected.tolerations
+        }
 
 
 class CapacityCounts(BaseModel):
@@ -99,16 +99,17 @@ class CapacityCounts(BaseModel):
 
 class CapacitySnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     observed_at: datetime
     status: Literal["available", "unknown"]
     reason: (
         Literal[
-            "not_configured", "unavailable", "collection_failed", "invalid", "stale"
+            "not_configured", "unavailable", "collection_failed", "invalid", "stale",
+            "requirements_mismatch",
         ]
         | None
     ) = None
-    requirements: WorkerShape | None = None
+    requirements: CapacityConfig | None = None
     counts: CapacityCounts | None = None
     scope: Literal["all_nodes_and_nonterminal_pods"] = "all_nodes_and_nonterminal_pods"
     limitations: tuple[str, ...] = LIMITATIONS
@@ -352,9 +353,7 @@ def summarize_capacity(
     return CapacitySnapshot(
         observed_at=observed_at,
         status="available",
-        requirements=WorkerShape(
-            **config.model_dump(include=set(WorkerShape.model_fields))
-        ),
+        requirements=config,
         counts=CapacityCounts(**counts),
     )
 
@@ -434,7 +433,10 @@ def _collect_capacity(
 
 
 def read_capacity_snapshot(
-    path: Path | None, *, now: datetime | None = None
+    path: Path | None,
+    *,
+    now: datetime | None = None,
+    expected_requirements: CapacityConfig | None = None,
 ) -> tuple[CapacitySnapshot, float | None]:
     now = now or datetime.now(UTC)
     reason = "not_configured" if path is None else "unavailable"
@@ -461,6 +463,7 @@ def read_capacity_snapshot(
             snapshot.counts is None
             or snapshot.requirements is None
             or snapshot.reason is not None
+            or snapshot.requirements.model_fields_set != set(CapacityConfig.model_fields)
         ):
             raise ValueError("incomplete capacity snapshot")
         if snapshot.status == "unknown":
@@ -468,6 +471,15 @@ def read_capacity_snapshot(
                 observed_at=snapshot.observed_at,
                 status="unknown",
                 reason=snapshot.reason or "unavailable",
+            )
+        elif expected_requirements is not None and not snapshot.requirements.matches(
+            expected_requirements
+        ):
+            snapshot = CapacitySnapshot(
+                observed_at=snapshot.observed_at,
+                status="unknown",
+                reason="requirements_mismatch",
+                requirements=snapshot.requirements,
             )
         return snapshot, max(0, age)
     except OSError:
