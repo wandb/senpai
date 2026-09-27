@@ -563,16 +563,19 @@ The checker still inspects shell expansions in unquoted input and blocks
 restricted commands fed to recognized shells. Unrelated helper functions or
 file comparisons do not change how a data block is checked. Common wrappers
 such as `env`, `timeout`, `nice`, `xargs`, `taskset`, and `flock` preserve the
-wrapped program's data arguments. Literal numeric arithmetic such as
-`echo $((2 + 2))` is supported. Variable-based arithmetic, dynamic executable
-names, startup-variable changes, and shell reevaluation are rejected.
+wrapped program's data arguments. Shell loops, arithmetic, variable executable
+names, and variable timeout durations are supported. The checker inspects
+recognized commands inside loop bodies and command substitutions. It does not
+evaluate variable values or prove that loops terminate. Startup-file loading
+and explicit shell callbacks remain restricted.
 
 Use the target environment already supplied to terminals instead of
 `source .venv/bin/activate`. `source` can load unchecked commands and redefine
 the current shell. Use `bash -c` instead of `bash -lc`; login and interactive
 shells can load unchecked startup files. The policy is a behavioral guardrail,
 not a shell sandbox or a credential-containment boundary. It does not inspect
-arbitrary Python programs or executable files.
+arbitrary Python programs or executable files, and commands selected through
+variables can fall outside its recognition.
 Some unsupported wrapper syntax and unclear shell streams can still reject
 valid commands. The policy does not reconstruct state from previous commands.
 
@@ -792,7 +795,7 @@ The controller owns cadence, durable events, conversation selection, verified Gi
 - Student state may be ephemeral because the branch, PR, typed result, W&B runs, and Weave trace are the durable handoff.
 - Explicit project skills remain available through OpenHands skill context. Repository `AGENTS.md`, `AGENT.md`, and `CLAUDE.md` instruction files are reserved for human-facing development tools and are not loaded as Senpai project context.
 
-The command policy blocks raw GitHub mutations, direct training, `git push`, polling loops, and log streams. Operation-specific typed tools enforce repository, branch, assignment, revision, head-SHA, label, and replay preconditions. This policy keeps routine operations deterministic while leaving high-entropy research work to the agent.
+The command policy blocks recognized raw GitHub mutations, direct training, `git push`, explicit polling commands, and log streams. Operation-specific typed tools enforce repository, branch, assignment, revision, head-SHA, label, and replay preconditions. This policy keeps routine operations deterministic while leaving high-entropy research work to the agent.
 
 Authenticated Git publication uses `/usr/bin/git` in a temporary bare repository.
 It derives the GitHub URL from the configured repository and ignores checkout

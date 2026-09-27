@@ -802,15 +802,15 @@ boundaries. Hooks give early model-visible feedback. `senpai_terminal` also
 evaluates the same pure policy in-process and fails closed if policy evaluation
 fails.
 
-Denied patterns include raw GitHub mutations, raw `git push`, direct training
-launches, sleeps, polling loops, `watch`, and `tail -f`, including nested shell
-and `env` wrappers.
+Recognized denied patterns include raw GitHub mutations, raw `git push`, direct
+training launches, sleeps, `watch`, and `tail -f`, including nested shell and
+`env` wrappers.
 
 The terminal policy parses Bash syntax before checking nested commands and
-recognized command runners. It rejects malformed syntax, dynamic executable
-names, startup-file loading, shell callbacks, aliases, and variable-name
-reevaluation. Shell startup and prompt variables are also reserved against
-custom-secret injection. These checks enforce workflow boundaries without
+recognized command runners. It rejects malformed syntax, startup-file loading,
+explicit shell callbacks, aliases, and variable-name reevaluation. Shell startup
+and prompt variables are also reserved against custom-secret injection.
+These checks enforce workflow boundaries without
 prescribing research methods or requiring an allowlist of data formats and
 analysis languages. Heredoc input to ordinary programs remains data. The
 original Bash syntax still exposes expansions in unquoted input for checking;
@@ -819,10 +819,14 @@ that overrides the actual consumer, or output routed through an opaque `exec`
 redirect, retains conservative checking. Unrelated functions and process
 substitutions do not disable ordinary program input. Dynamic output paths are
 allowed unless recognized shell execution in the same command makes that
-stream ambiguous. Literal numeric arithmetic is allowed, while variable
-arithmetic and C-style polling loops remain rejected. Common wrappers inspect
-the actual child command and preserve its data arguments. Unsupported wrapper
-grammars and unclear shell streams can still reject valid commands. These
+stream ambiguous. Shell loops, arithmetic, variable executable names, and
+variable timeout durations are allowed. Commands visible inside loop bodies,
+conditions, and substitutions remain checked. The policy does not resolve
+variable contents or prove loop termination; operations selected indirectly
+through variables can fall outside its recognition. Common wrappers inspect
+the child command visible in the submitted syntax and preserve its data
+arguments. Unsupported wrapper grammars and unclear shell streams can still
+reject valid commands. These
 checks do not inspect arbitrary executable files or Python code, reconstruct
 prior terminal state, or establish a shell sandbox.
 

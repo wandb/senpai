@@ -434,18 +434,6 @@ def _descendants(root: object) -> list[object]:
     return nodes
 
 
-def _is_literal_arithmetic(node: object) -> bool:
-    numeric_nodes = {
-        "number", "binary_expression", "unary_expression",
-        "parenthesized_expression", "ternary_expression",
-    }
-    return all(
-        child.type in numeric_nodes
-        for child in _descendants(node)[1:]
-        if child.is_named
-    )
-
-
 def _heredoc_runs_shell(owner: object, source: bytes, workspace: Path) -> bool:
     for node in _descendants(owner):
         if node.type != "command":
@@ -478,29 +466,9 @@ def _bash_commands(command: str, workspace: Path) -> list[str] | None:
     if tree.root_node.has_error:
         return None
     nodes = _descendants(tree.root_node)
-    # Bash arithmetic in unquoted heredocs is misclassified as command substitution.
-    # Parse that expansion alone so surrounding Python/JSON remains program input.
-    for node in nodes:
-        if node.type == "command_substitution":
-            expansion = source[node.start_byte : node.end_byte].decode()
-            if expansion.startswith("$((") and _bash_commands(f"echo {expansion}", workspace) is None:
-                return None
     if any(
-        node.type == "c_style_for_statement"
-        or (
-            node.type == "expansion"
-            and source[node.start_byte : node.end_byte].endswith(b"@P}")
-        )
-        or (
-            (
-                node.type == "arithmetic_expansion"
-                or (
-                    node.type == "compound_statement"
-                    and source[node.start_byte : node.end_byte].lstrip().startswith(b"((")
-                )
-            )
-            and not _is_literal_arithmetic(node)
-        )
+        node.type == "expansion"
+        and source[node.start_byte : node.end_byte].endswith(b"@P}")
         for node in nodes
     ):
         return None
@@ -808,10 +776,10 @@ def _declaration_policy(program: str, arguments: list[str]) -> PolicyDecision:
             options += argument[1:]
             continue
         values.append(argument)
-    if {"i", "n"} & set(options):
+    if "n" in options:
         return PolicyDecision(
             False,
-            "Do not use shell arithmetic or nameref variables.",
+            "Do not use shell nameref variables.",
         )
     return _variable_name_policy(program, values)
 
@@ -994,15 +962,14 @@ def _timeout_policy(arguments: list[str], workspace: Path) -> PolicyDecision:
         options, remaining = getopt.getopt(arguments, *_TIMEOUT_OPTIONS)
     except getopt.GetoptError:
         return PolicyDecision(False, "Senpai could not parse `timeout` safely.")
-    timeout_values = [value for _option, value in options] + remaining[:1]
     if any(
         mark in value
-        for value in timeout_values
+        for _option, value in options
         for mark in _SHELL_EXPANSION_MARKS
     ):
         return PolicyDecision(
             False,
-            "Do not construct timeout options or duration with expansion.",
+            "Do not construct timeout options with expansion.",
         )
     return _segment_policy(remaining[1:], workspace)
 
@@ -1155,14 +1122,6 @@ def _segment_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
         return PolicyDecision(True)
     program_token = tokens[index]
     program = "." if program_token == "." else Path(program_token).name
-    if any(mark in program for mark in ("$", "`", "*", "?", "\n", "\r")) or (
-        "[" in program and program not in {"[", "[["}
-    ):
-        return PolicyDecision(
-            False,
-            "Do not construct executable names with shell expansion.",
-        )
-
     arguments = tokens[index + 1 :]
     if program in _SHELL_BODY_PREFIXES or program_token in _FIND_EXEC_ACTIONS:
         return _segment_policy(arguments, workspace)
@@ -1220,8 +1179,6 @@ def _segment_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
             False,
             "Do not use shell constructs that reinterpret commands or arguments.",
         )
-    if program == "let":
-        return PolicyDecision(False, "Do not use shell arithmetic evaluation.")
     if program == "set":
         if _has_dynamic_set_arguments(arguments):
             return PolicyDecision(
@@ -1293,22 +1250,18 @@ def _segment_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
             "Use run_training so timeouts, logs, status, and W&B IDs are supervised.",
         )
 
+    if program == "for" and arguments and arguments[0].startswith("(("):
+        # Bash's arithmetic header is not an ordinary loop variable declaration.
+        # The original tree still checks commands in its expressions and body.
+        return PolicyDecision(True)
     if program in {"for", "select"}:
         decision = _variable_name_policy(program, arguments[:1])
         if not decision.allowed:
             return decision
-    if program == "for":
-        if any("((" in argument for argument in arguments):
-            return PolicyDecision(
-                False,
-                "Do not run potentially unbounded foreground loops; use Senpai "
-                "events or status tools.",
-            )
-        return PolicyDecision(True)
-    if program in {"sleep", "watch", "while", "until"}:
+    if program in {"sleep", "watch"}:
         return PolicyDecision(
             False,
-            "Do not run foreground polling loops; use Senpai events or status tools.",
+            "Do not run foreground polling commands; use Senpai events or status tools.",
         )
     if program == "tail" and any(
         argument == "--follow" or argument.startswith("-") and "f" in argument[1:]
