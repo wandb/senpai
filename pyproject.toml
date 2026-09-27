@@ -20,7 +20,7 @@ dependencies = [
     "simple-parsing",
     "wandb",
     "weave>=0.53.1,<0.54",
-    "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@b2d1290a914ba42a544bebb9afa835ce01e38f4e",
+    "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@49517f08af3996836ecc9c202d8d3ef4130e2a25",
     "tqdm",
     "matplotlib",
     "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@f69134273ee3a31a233d6201786570eb9c4c141b#subdirectory=openhands-sdk",

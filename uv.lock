@@ -5454,7 +5454,7 @@ requires-dist = [
     { name = "tqdm" },
     { name = "wandb" },
     { name = "weave", specifier = ">=0.53.1,<0.54" },
-    { name = "weave-openhands", git = "https://github.com/morganmcg1/weave-openhands.git?rev=b2d1290a914ba42a544bebb9afa835ce01e38f4e" },
+    { name = "weave-openhands", git = "https://github.com/morganmcg1/weave-openhands.git?rev=49517f08af3996836ecc9c202d8d3ef4130e2a25" },
 ]
 provides-extras = ["dev"]
 
@@ -5968,7 +5968,7 @@ wheels = [
 [[package]]
 name = "weave-openhands"
 version = "0.1.0"
-source = { git = "https://github.com/morganmcg1/weave-openhands.git?rev=b2d1290a914ba42a544bebb9afa835ce01e38f4e#b2d1290a914ba42a544bebb9afa835ce01e38f4e" }
+source = { git = "https://github.com/morganmcg1/weave-openhands.git?rev=49517f08af3996836ecc9c202d8d3ef4130e2a25#49517f08af3996836ecc9c202d8d3ef4130e2a25" }
 dependencies = [
     { name = "fastapi", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "openhands-sdk", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
