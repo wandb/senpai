@@ -413,6 +413,7 @@ def workflow(
     fake: FakeGitHub,
     *,
     role: Literal["advisor", "student"] = "advisor",
+    researcher_handles: tuple[str, ...] = (),
 ) -> GitHubWorkflow:
     return GitHubWorkflow(
         REPO,
@@ -421,4 +422,5 @@ def workflow(
         transport=fake,
         api_url=API_URL,
         trusted_actor="senpai-bot",
+        researcher_handles=researcher_handles,
     )

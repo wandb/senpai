@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from threading import RLock
 from typing import TYPE_CHECKING, Literal
@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 from pydantic import SecretStr
 
+from senpai_agent.github.notifications import normalize_researcher_handles
 from senpai_agent.github.workflow.errors import (
     GitHubAPIError,
     GitHubTransportError,
@@ -46,6 +47,7 @@ class WorkflowCore:
         "_api_url",
         "_assignment_lifecycle_lock",
         "_repo",
+        "_researcher_handles",
         "_role",
         "_token",
         "_transport",
@@ -61,6 +63,7 @@ class WorkflowCore:
         transport: HttpTransport | None = None,
         api_url: str = "https://api.github.com",
         trusted_actor: str | None = None,
+        researcher_handles: Sequence[str] = (),
     ):
         if len(repo.split("/")) != 2 or not all(repo.split("/")):
             raise ValueError("repo must use owner/name form")
@@ -79,6 +82,7 @@ class WorkflowCore:
         self._transport = transport or UrllibTransport()
         self._api_url = api_url.rstrip("/")
         self._trusted_actor = trusted_actor
+        self._researcher_handles = normalize_researcher_handles(researcher_handles)
         self._assignment_lifecycle_lock = RLock()
 
     def __repr__(self) -> str:

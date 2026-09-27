@@ -10,6 +10,7 @@ from senpai_agent.github.workflow.validation import (
     require_trusted_human_message,
     validate_labels,
 )
+from senpai_agent.models import authoritative_marker_line
 
 
 class HumanIssueMixin:
@@ -77,12 +78,30 @@ class HumanIssueMixin:
         )
 
         marker = f"<!-- senpai-human-response:{responder_key}:{human_message_id} -->"
+        if self._researcher_handles:
+            mentions = " ".join(f"@{handle}" for handle in self._researcher_handles)
+            first_marker = self._first_issue_reply_marker(number)
+            if first_marker == marker:
+                body = f"{body}\n\n{mentions}"
         comment_body = marker_body(marker, body)
         changed, verified = self._upsert_marker_comment(
             number,
             marker=marker,
             body=comment_body,
         )
+        # Elect the first reply only after GitHub has persisted it. Independent
+        # pods may all observe no replies before posting their own comments.
+        if (
+            self._researcher_handles
+            and first_marker is None
+            and self._first_issue_reply_marker(number) == marker
+        ):
+            mentioned, verified = self._upsert_marker_comment(
+                number,
+                marker=marker,
+                body=marker_body(marker, f"{body}\n\n{mentions}"),
+            )
+            changed = changed or mentioned
         self._human_issue(number, audience_labels=audience_labels)
         return MutationResult(
             changed=changed,
@@ -90,3 +109,19 @@ class HumanIssueMixin:
             state="issue_response_upserted",
             version=str(human_message_id),
         )
+
+    def _first_issue_reply_marker(self, number: int) -> str | None:
+        actor = self._actor().casefold()
+        first = min(
+            (
+                comment
+                for comment in self._comments(number)
+                if comment.author.casefold() == actor
+                and authoritative_marker_line(comment.body).startswith(
+                    "<!-- senpai-human-response:"
+                )
+            ),
+            key=lambda comment: comment.id,
+            default=None,
+        )
+        return authoritative_marker_line(first.body) if first is not None else None

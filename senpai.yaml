@@ -72,6 +72,9 @@ poll_interval_s: 600
 poll_jitter_s: 120
 stale_wip_seconds: 7200
 human_issues: true
+# Explicit GitHub usernames to mention in the first Senpai reply to each human
+# issue. An empty list disables automatic mentions; the token owner is not used.
+researcher_github_handles: []
 
 # students
 n_students: 4

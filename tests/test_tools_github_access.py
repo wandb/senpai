@@ -5,10 +5,10 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from github_workflow_support import FakeGitHub, human_issue, pull_request, workflow
 from openhands.sdk.tool import Tool, resolve_tool
 from pydantic import SecretStr
 
-from github_workflow_support import FakeGitHub, pull_request, workflow
 from senpai_agent.github import tools as github_tools_module
 from senpai_agent.github.tools import (
     GetPRsAction,
@@ -22,7 +22,6 @@ from senpai_agent.github.tools import (
 )
 from senpai_agent.github.workflow import MutationResult
 from senpai_agent.tools import register_senpai_tools
-
 
 ADVISOR_GITHUB_TOOLS = {
     "get_prs",
@@ -110,6 +109,40 @@ def test_toolset_rejects_a_runtime_role_mismatch(tmp_path: Path):
             state_dir=tmp_path / "state",
             workspace=tmp_path,
         )
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_issue_tool_uses_researchers_from_runtime_environment(
+    monkeypatch, tmp_path, role
+):
+    from senpai_agent.github.workflow import core
+
+    fake = FakeGitHub(pull_request(), issue=human_issue())
+    monkeypatch.setattr(core, "UrllibTransport", lambda: fake)
+    monkeypatch.setenv("SENPAI_RESEARCHER_GITHUB_HANDLES", "@Ada,grace-hopper")
+    configure_github_credentials(
+        "acme/widgets", SecretStr("github-secret"), trusted_actor="senpai-bot"
+    )
+    try:
+        tools = GitHubWorkflowToolSet.create(
+            role=role,
+            workspace=tmp_path,
+            advisor_branch="advisor-branch",
+            student_names=["fern"],
+            student_name="fern",
+        )
+        tool = next(tool for tool in tools if tool.name == "respond_to_human_issue")
+        tool(
+            RespondToHumanIssueAction(
+                issue_number=7, human_message_id=700, response="I will investigate."
+            )
+        )
+    finally:
+        clear_github_credentials()
+
+    assert fake.comments[-1]["body"].endswith(
+        "I will investigate.\n\n@ada @grace-hopper"
+    )
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])

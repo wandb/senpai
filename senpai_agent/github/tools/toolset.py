@@ -70,6 +70,9 @@ class GitHubWorkflowToolSet(
                 credentials.token,
                 role=role,
                 trusted_actor=credentials.trusted_actor,
+                researcher_handles=os.environ.get(
+                    "SENPAI_RESEARCHER_GITHUB_HANDLES", ""
+                ).split(","),
             )
             git_token = credentials.token
         elif workflow.role != role:

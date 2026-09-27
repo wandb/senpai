@@ -762,6 +762,19 @@ Useful launch controls:
 - `--extra_instructions` accepts optional human operator guidance as a Markdown file or literal user context.
 - `human_issues: false` disables GitHub Issue polling for isolated launches.
 
+Set `researcher_github_handles: [ada, grace-hopper]` in `senpai.yaml`, or pass
+`--researcher_github_handles ada grace-hopper`, to mention those researchers in
+the first Senpai reply to each human Issue. An optional leading `@` is accepted;
+handles are normalized to lowercase and duplicates are removed. An empty list
+disables automatic mentions. Senpai uses the configured recipients and does not
+infer them from the GitHub token owner, which may be a service account.
+
+The runtime adds the mentions programmatically. It posts new replies without
+mentions, then adds them only to the earliest saved Senpai reply. This also
+handles concurrent replies from different pods. Retrying or editing that first
+reply retains its mentions; later replies receive no automatic mentions. For
+direct runtime launches, set `SENPAI_RESEARCHER_GITHUB_HANDLES=ada,grace-hopper`.
+
 All role images are built from the same source revision. The advisor image excludes CUDA and PyTorch; the student image contains the CUDA/PyTorch runtime; the executor image contains only its Python broker; the cutoff image contains only the minimal job runtime and pinned `kubectl`. Advisor and student builds install Chromium and execute an OpenHands browser smoke test.
 
 The agent runs from the read-only `/opt/senpai-venv`. Both role entrypoints clear inherited `UV_PROJECT_ENVIRONMENT`, `UV_PYTHON`, and `VIRTUAL_ENV` values before starting the controller. Terminals and local supervised training then select the separate writable environment at `$HOME/.venvs/senpai-target` through PATH and uv settings. Install target dependencies there; keep the agent environment unchanged.
