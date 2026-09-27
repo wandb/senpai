@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        role: [advisor, student, cutoff]
+        role: [advisor, student, executor, cutoff]
     env:
       IMAGE_NAME: ${{ github.repository }}-${{ matrix.role }}
     permissions:

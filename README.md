@@ -25,11 +25,11 @@ Kubernetes is currently the turnkey deployment path. The GitHub-based coordinati
 ### 1. Prerequisites
 
 - Python 3.13, [uv](https://docs.astral.sh/uv/), Git, and `kubectl`.
-- A Kubernetes context and existing namespace with outbound access to GitHub, Anthropic, Exa, and W&B. Your identity must be able to get, list, create, update, patch, and delete Deployments, ConfigMaps, and Secrets there.
+- A Kubernetes context and existing namespace with outbound access to GitHub, Anthropic, Exa, and W&B. Your identity must be able to manage Deployments, ConfigMaps, Secrets, ServiceAccounts, Roles, and RoleBindings there.
 - An existing PVC with enough space for the dataset, plus concurrent mounts from every scheduled node—normally `ReadWriteMany`, unless your storage driver explicitly supports another multi-node topology. The launcher mounts this claim but does not create it; role state stays on each pod's node-local `emptyDir` volume.
 - NVIDIA GPU nodes, the Kubernetes NVIDIA device plugin, and a host driver compatible with CUDA 13 and the shipped student image.
 - A target GitHub repository that Senpai can clone and modify.
-- Immutable advisor and student images reachable by every cluster node.
+- Immutable advisor and student images reachable by every cluster node. Multi-node students also require the matching executor image.
 
 ### 2. Install Senpai
 
@@ -141,13 +141,22 @@ pvc_claim_name: your-existing-pvc
 pvc_mount_path: /mnt/data
 
 n_students: 1
-gpus_per_student: 1
+nodes_per_student: 1
+gpus_per_student_node: 1
 cpu_per_gpu: 8
 memory_gi_per_gpu: 64
+controller_node_selector: []  # e.g. [compute.coreweave.com/node-pool=cpu]
 
 timeout_minutes: 30
 max_epochs: 50
 ```
+
+When upgrading an existing launch configuration, replace `gpus_per_student: N`
+with `nodes_per_student: 1` and `gpus_per_student_node: N`. Replace the
+`--gpus_per_student N` CLI option with `--gpus_per_student_node N` as well. The
+old key and option are no longer accepted. Single-node students continue to
+train in their own GPU pod; more than one node enables remote supervised
+training and requires an executor image.
 
 OpenHands uses LiteLLM, so LLM provider names are required as prefixes. For
 example, configure Claude Opus 5.5 as `anthropic/claude-opus-5-5`. Anthropic
@@ -163,7 +172,7 @@ uses `WANDB_API_KEY` for auth.
 
 The defaults in `senpai.yaml` describe W&B's deployment and should not be copied unchanged into another environment. Every setting can also be overridden on the command line. `--tag` and `--target_repo_url` are required unless your chosen config file supplies them.
 
-Deployments require matching advisor and student image digests, or `sha-<40-character-commit>` tags built from the same SENPAI revision. Digest-pinned images also require the full matching `senpai_repo_revision`. The source commit must be fetchable from `senpai_repo_url`; its public default is read-only and needs no PR permission. Override it only when using images built from another SENPAI repository. `target_repo_url` is the separate, required repository where agents create commits and PRs.
+Deployments require matching advisor and student image digests, or `sha-<40-character-commit>` tags built from the same SENPAI revision. Multi-node launches require an `executor_image` pinned by `@sha256` digest because that sidecar owns the scoped Kubernetes credential. Digest-pinned images also require the full matching `senpai_repo_revision`. The source commit must be fetchable from `senpai_repo_url`; its public default is read-only and needs no PR permission. Override it only when using images built from another SENPAI repository. `target_repo_url` is the separate, required repository where agents create commits and PRs.
 
 ### 6. Run preflight
 
@@ -199,15 +208,196 @@ uv run python k8s/launch.py \
   --student_image "ghcr.io/wandb/senpai-student:sha-$revision"
 ```
 
-The launcher creates routing labels, one launch Secret, role ConfigMaps, and Deployments. It does not create the namespace, PVC, Service, or general cluster RBAC.
+For supervised two-node training, add:
+
+```bash
+  --nodes_per_student 2 \
+  --gpus_per_student_node 8 \
+  --cpu_per_gpu 15 \
+  --memory_gi_per_gpu 110 \
+  --senpai_repo_revision "$revision" \
+  --executor_image "ghcr.io/wandb/senpai-executor@sha256:<manifest-digest>"
+```
+
+The cluster must provide the MPIJob API with `runPolicy.suspend` support and
+a shared writable PVC. Each student controller remains CPU-only and may
+supervise one workload at a time. Before submission, Senpai publishes the clean assignment `HEAD` as a
+per-student Git bundle on the PVC. The target launcher submits one MPIJob using
+the generated identity and configured worker shape. See the
+[target launcher contract](#multi-node-target-launcher-contract) for the exact
+inputs and manifest requirements.
+
+Only the executor sidecar receives a projected Kubernetes token. Its socket
+broker accepts the reserved MPIJob, injects ownership, pod hardening, and an
+exact-commit bundle checkout, binds the W&B/source annotations, persists the
+created UID, and uses UID-preconditioned activation and deletion. Workloads are
+created suspended, so a late ambiguous API request cannot start GPU pods. The
+model-facing student has no Kubernetes token or real `kubectl`; its
+`kubectl apply -f -` command is a validated socket proxy. A target launcher must
+submit the manifest and exit; it must not call `kubectl get`, `wait`, or `logs`.
+The supervisor owns polling and cleanup after submission. Generated workload
+names reserve space for the MPI launcher's and highest-index worker's suffixes,
+so long research and student names still produce valid Kubernetes DNS labels.
+
+`get_training_status` includes a bounded `kubernetes_diagnostics` snapshot while
+a workload runs, refreshed at most once every 30 seconds and again at completion.
+Live diagnostic reads run separately from status polling, so slow logs do not
+delay status or deadline checks.
+It includes pod placement, scheduling and container states, recent init and
+training logs, and bounded Kubernetes events for the exact workload and pod UIDs.
+The snapshot preserves each pod and container state before allocating space to
+error messages, events, and log excerpts. Logs from failed and running containers
+come before completed containers. Each excerpt retains its beginning and end.
+The GPU summary distinguishes the original allocation from GPU requests of
+nonterminal pods that are scheduled or still pending. These counts describe
+Kubernetes requests, not GPU utilization. W&B completion does not release a
+workload while evaluation or cleanup processes are still running.
+
+At release, `get_training_status` also includes `kubernetes_pod_receipt`: a structured
+snapshot bound to the training ID, source commit and exact workload UID. It records
+each observed Pod UID, owner, node, phase, and container restart count, current and
+previous states, exit code and timestamps. The executor stores each receipt beside
+its state file in `<state-stem>.receipts/<sha256(training_id)>.json`; later reservations
+do not overwrite it. The receipt is separate from the 8 KiB diagnostic text.
+
+`complete` requires the expected worker/launcher count and terminal container status
+with restart counts and termination timestamps. It describes the observed Pods,
+not deleted historical Pods, training-process retries, or scientific quality. Missing
+Pods, partial status and API errors are explicit and never imply zero restarts.
+Pod-status capture has a 10-second wait limit and a 256-Pod/4-MiB inventory limit.
+Normal release waits for receipt persistence. Forced cancellation, deadline expiry
+and failed activation attempt capture before deletion; their snapshots can still show
+Running containers. If receipt storage fails, the executor reports the failure and
+continues forced cleanup so storage exhaustion cannot retain live GPUs indefinitely.
+
+Workload events expose validation failures before the MPI controller creates any
+pods. A launcher pod owned through a Job is included only when both owner UIDs
+lead to the reserved MPIJob. Log-read failures appear in diagnostics
+instead of disappearing silently. These reads stay inside the executor broker;
+students receive neither Kubernetes credentials nor namespace-wide read access.
+When a smoke run stalls before W&B starts, inspect these diagnostics first.
+
+### Advisory cluster capacity
+
+Add `--capacity_observer true` to install a dedicated observer. It uses the same
+immutable `--executor_image` and source revision, including for single-node
+fleets. Both root roles receive `get_cluster_capacity`, which reads a sanitized
+ConfigMap snapshot. Without an observer it returns unknown.
+It never reserves resources, clears an assignment hold, or authorizes a launch.
+
+With no arguments, the tool reports capacity for the complete configuration in
+the snapshot: worker resources, node selectors, tolerations, and preemption policy.
+Supply `expected_requirements` to check that configuration against an intended
+workload. A mismatch returns unknown with the observed requirements and no counts.
+The check compares configuration values; it does not recalculate capacity or
+change the workload. Version 1 snapshots lack the complete configuration and
+return unknown as invalid.
+
+The observed worker shape comes from `--nodes_per_student`,
+`--gpus_per_student_node`, `--cpu_per_gpu`, and `--memory_gi_per_gpu`. Configure
+`--capacity_node_selector key=value ...` and
+`--capacity_tolerations '{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}'`
+to describe the intended workers. These options affect observation only; they do
+not change training manifests. Omitted tolerations inherit the single-node
+student's GPU toleration; multi-node observation defaults to no tolerations.
+Explicit tolerations replace these defaults. Use `capacity_tolerations: []` in
+YAML or `--capacity_tolerations` without values for an empty override. Enable
+`--capacity_hpc_verification true` only where the operator confirms CoreWeave's
+preemptible HPC-verification policy. That policy requires the verification
+namespace, exact priority class, priority -1, and verification workload name;
+other low-priority workloads remain occupied capacity.
+
+The observer subtracts effective requests for all nonterminal Pods, including
+CPU-only workloads, bound Pending Pods, concurrent init sidecars, Pod overhead,
+and allocated resources during resize. It checks GPU, CPU, and memory on each
+Ready, uncordoned node that matches the configured selector and tolerations.
+It reports physical availability separately from verified preemptible capacity.
+Unbound Pending demand is separate from reservations. Resize accounting retains
+the largest declared, allocated, or actuated request, which can conservatively
+overcount an infeasible resize. Pod slots, affinity, topology, quota, PVC placement,
+launcher overhead, and concurrent submissions remain unassessed. The scheduler
+is authoritative; enough resource-fit nodes do not guarantee admission.
+
+The observer waits 30 seconds between collection attempts. API response sizes
+and pagination are bounded. A process timer limits collection to 25 seconds and
+the full collection/publication attempt to 40 seconds. The tool reports the
+observation time and age. ConfigMap directory
+projection can add delivery delay; snapshots older than 120 seconds, incomplete
+reads, malformed data, and collection failures return unknown without capacity
+counts. The projection uses no `subPath`, so kubelet can refresh it.
+
+Installation requires an operator who can create cluster-scoped RBAC and
+delegate list access to Nodes and Pods across namespaces. Only the observer's
+ServiceAccount receives those permissions, plus get/update access to its one
+precreated snapshot ConfigMap. It cannot read Secrets or mutate training jobs.
+The observer receives no model, GitHub, W&B, or target-repository credentials;
+model containers receive only the read-only sanitized snapshot. Existing
+student executor permissions and the apply-only kubectl proxy stay unchanged.
+
+The cutoff stops the observer with the tagged fleet while counting only
+`app=senpai` controllers for readiness. It does not gain cluster-wide cleanup
+permissions. The launcher prints an operator cleanup command for the observer's
+ClusterRole and ClusterRoleBinding, scoped by application, research tag, and
+namespace labels; remove those after terminating the fleet.
+
+If a controller state write reports disk-space or quota exhaustion, an active
+Kubernetes monitor retries result writes with backoff and reports the pending
+write to container stderr. It keeps an observed terminal outcome until it can persist
+that outcome, release the workload, and persist the release acknowledgement.
+Cancellation and timeout delete the owned workload before waiting for state
+storage to recover. The student slot remains occupied until those writes
+succeed. Optional diagnostic writes can be skipped without failing the workload. Closing the
+controller interrupts storage retries; after storage recovers, restart recovery
+uses the last durable record and the existing workload UID. A terminal decision
+that could not be persisted cannot survive process loss, so broker deadlines
+and normal recovery rules still apply.
+
+The launcher creates routing labels, one launch Secret, role ConfigMaps, and Deployments. Multi-node students also receive one namespaced ServiceAccount, Role, and RoleBinding. It does not create the namespace, PVC, Service, or cluster-wide RBAC.
+
+Student launches are create-only. Before the first write, the launcher rejects
+an existing student Deployment, any matching controller Pod, or any matching
+nonterminal Job. It checks MPIJobs only when the cluster provides that API;
+multi-node students require it. The launcher then creates the per-tag Secret as
+an atomic, durable, immutable reservation before it changes GitHub labels or
+branches. An advisor-only apply cannot change the Secret data after a student
+launch wins the reservation race. It creates each student resource separately
+and creates the Deployment last. It never applies changes over an existing
+student resource.
+
+A launch that contains students requires an unused tag and per-tag Secret. A
+concurrent launch, a tag already used by an advisor-only launch, or an orphaned
+resource fails closed. If a launch fails after it reserves the tag, inspect
+every resource with that `research-tag` before cleanup. Remove the stale
+resources, including `secret/senpai-launch-secrets-<tag>`, only when no
+controller or training workload from that launch is still active. Then use a
+fresh tag or retry the fully cleaned tag. Dry runs do not query or reserve the
+cluster.
+
+The operator's Kubernetes identity must be able to get Deployments; list Pods
+and Jobs; discover namespaced APIs; and create Secrets, ConfigMaps, and
+Deployments. When the MPIJob API is installed, the identity must also list
+MPIJobs so every launch can reject an orphaned workload. Multi-node launches
+require that API and create permission for the rendered ServiceAccount, Role,
+and RoleBinding. The operator must also hold the permissions delegated by the
+Role in that namespace: `create/get/patch/delete` on Jobs and MPIJobs,
+`get/list` on Pods, `get` on `pods/log`, and `list` on Events. Otherwise, Role
+creation requires explicit `escalate` permission and RoleBinding creation
+requires `bind` permission on the referenced Role, in addition to create
+permission. See [Kubernetes RBAC delegation restrictions](https://kubernetes.io/docs/reference/access-authn-authz/rbac/#privilege-escalation-prevention-and-bootstrapping).
+Advisor launch and reconciliation retain their existing apply permissions
+until an immutable student reservation owns the tag.
 
 Inspect and stop the launch:
 
 ```bash
 kubectl get deployments,pods -l research-tag=first-run
-kubectl logs -f deployment/senpai-first-run-frieren
-kubectl delete deployments,configmaps,secrets -l research-tag=first-run
+kubectl logs -f deployment/senpai-first-run-frieren -c student
+kubectl delete deployments -l research-tag=first-run
+kubectl delete jobs -l research-tag=first-run
+kubectl delete configmaps,secrets,serviceaccounts,roles,rolebindings -l research-tag=first-run
 ```
+
+For a multi-node launch, delete `jobs,mpijobs` instead of only `jobs`.
 
 Use `--kube_context` and `--namespace` when the desired cluster is not your current default. Use `--dry_run` to render redacted manifests without checking credentials or writing to the cluster.
 
@@ -237,9 +427,21 @@ flowchart LR
 
 The structured result records its terminal status, exact result commit, W&B run IDs and URLs, bounded conclusion, and baseline/candidate metric comparison when available. Once published for an assignment revision and head, that evidence is immutable: exact duplicate publication is an idempotent replay, while changed evidence requires a new commit or revision. Non-revision feedback continues the same student conversation; a revision request intentionally creates a fresh revision identity and conversation.
 
-A student cannot receive another assignment while an open assignment has `status:wip` or `status:review`. The student becomes available after the advisor merges or closes the PR. Sibling assignment mutations within one worker are serialized end to end, including advisor-base publication and student preflight, push, and result publication. Across advisor and student workers, exact assignment, revision, head, and branch-lease preconditions detect stale work; if a revision wins during result publication, SENPAI restores the current revision's WIP routing before returning the stale-result error.
+Both controllers accept PR events only when the head belongs to the target repository and the PR author currently has write access. Fork PRs and PRs from authors without write access do not route assignments, reviews, or PR feedback. Each poll makes one extra permission request per distinct author of a same-repository PR targeting the advisor branch. Permission results are shared within that poll and refreshed on the next poll. A failed or invalid permission response invalidates the entire GitHub snapshot, including human Issues, so it cannot report a busy student as available. Local child and training-monitor events continue through their independent mailboxes. The added API cost and latency have not been measured in a live launch.
 
-PR comments from verified GitHub owners, members, and collaborators steer the advisor and reach the student. Submitted reviews and inline comments also reach the student. The system ignores untrusted authors, unrecognized bots, and advisor protocol comments. `get_prs` can still retrieve the complete discussion explicitly. If the configured research base changes while an experiment is running, SENPAI emits `research_base_changed` with the assignment's `required_base_sha` and the live `current_base_sha` without cancelling the assignment. When reviewing its terminal result, the advisor either requests a revision on the current base or records why that exact result remains valid with `accept_result_on_current_base`; `merge_experiment` still verifies the live SHA immediately before merging.
+The [GitHub collaborator permission API](https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user) reports effective access across repository, team, organization, and enterprise grants. Senpai accepts `permission: write` or `admin`; GitHub maps the `maintain` role to `write` and `triage` to `read`. The `role_name` field does not authorize a PR. Fine-grained tokens need repository Metadata read access for this endpoint. Keep the configured target owner/repository name current after a repository rename.
+
+An authorized open assignment PR reserves its student while it has `status:wip` or `status:review`. Merging or closing the PR releases that reservation. A successful permission lookup reporting that the author lacks write access makes the mailbox report the student as available. Assignment creation still refuses a new assignment while another open PR has that student's label and `status:wip` or `status:review`; resolve that PR before reassigning the student. Sibling assignment mutations within one worker are serialized end to end, including advisor-base publication and student preflight, push, and result publication. Across advisor and student workers, exact assignment, revision, head, and branch-lease preconditions detect stale work; if a revision wins during result publication, SENPAI restores the current revision's WIP routing before returning the stale-result error.
+
+On authorized PRs, comments from verified GitHub owners, members, and collaborators steer the advisor and reach the student. Submitted reviews and inline comments also reach the student. The system ignores untrusted authors, unrecognized bots, and advisor protocol comments. `get_prs` can still retrieve the complete discussion explicitly. If the configured research base changes while an experiment is running, SENPAI emits `research_base_changed` with the assignment's `required_base_sha` and the live `current_base_sha` without cancelling the assignment. When reviewing its terminal result, the advisor either requests a revision on the current base or records why that exact result remains valid with `accept_result_on_current_base`; `merge_experiment` still verifies the live SHA immediately before merging.
+
+A revision request may retain the assignment's recorded base SHA or select the
+exact live base SHA. Retain the recorded SHA when a follow-up must preserve the
+tested source, including when the advisor only published research notes. This
+does not exempt documentation from source checks: the result must still contain
+the selected base commit, and merging onto a changed live base still requires
+`accept_result_on_current_base`. Selecting a new base requires the student to
+incorporate it before running the revised experiment.
 
 Before each assignment or PR-feedback turn, the student controller authenticates
 and hydrates the exact assignment head and recorded baseline into
@@ -251,51 +453,103 @@ new feedback still do.
 
 `get_prs` returns complete PR bodies and discussions. Up to five PRs are returned in context by default; larger selections become a Markdown artifact outside the target checkout so long histories do not pollute the main conversation.
 
+`get_pr_source` lets advisors and students inspect private PR code using the
+runtime's credentials. Supply the exact PR base and head SHAs from `get_prs` to
+list changed files, then select paths to retrieve complete source and text diffs
+in a private artifact outside the target checkout. The reader supports merged
+PRs, verifies blob identities, and checks that the PR has not moved before
+returning. It accepts at most 100 changed files and eight selected paths, with
+256 KiB per source file and 2 MiB per API response. It reports the comparison
+merge base separately from the PR base tip. Binary and oversized sources fail
+explicitly; the tool does not silently truncate review evidence.
+
 ## Long-running training and monitoring
 
 Students do not start GPU work, stream logs, sleep, or poll through the terminal. Four typed tools make training a durable controller operation:
 
 | Tool | Contract |
 |---|---|
-| `run_training` | Accepts structured `argv`, `cwd`, and a hard timeout. It requires a clean assignment worktree, starts a supervised process group without blocking, persists its identity, full log, and bounded error tail, discovers W&B run IDs, and automatically registers terminal-state monitoring for the current conversation. |
+| `run_training` | Accepts structured `argv`, `cwd`, and a hard timeout. It requires a clean assignment worktree and supervises either a local process group or one broker-owned Kubernetes workload without blocking. It persists identity, logs, bounded errors, W&B run IDs, and terminal-state monitoring. |
 | `get_training_status` | Performs one bounded read of the latest persisted state, exit code, elapsed time, W&B run IDs, and error tail. |
 | `monitor_training` | Adds a W&B metric, minimize/maximize direction, `lte`, `gte`, `improved_by`, or `regressed_by` gates, a poll interval, and stale-update detection. It cannot disable terminal wakes. |
-| `cancel_training` | Stops the complete process group through the supervised TERM/KILL path, waits for a durable terminal state, and retires its monitor. |
+| `cancel_training` | Stops the local process group through TERM/KILL or deletes the remote workload by its UID, waits for a durable terminal state, and retires its monitor. |
+
+Before each launch, Senpai reads the current GitHub assignment and checks its revision against the conversation identity saved by the controller. A superseded or unbound conversation cannot reserve resources or start training. It can still monitor or cancel its existing runs. If GitHub cannot confirm one current WIP assignment, the launch fails without starting work.
 
 After launch, the student can finish its turn. The deterministic controller polls process state and at most one selected W&B metric without consuming model tokens. A threshold crossing, regression, stale metric, terminal state, or monitor error creates one compact durable event and resumes the same student conversation. One broken monitor cannot block other training, GitHub feedback, or child-agent results.
 
+Before the first metric arrives, an absent W&B run in an accessible project
+counts as a missing sample. The monitor keeps polling and emits a stale-metric
+signal after `stale_after_seconds`, measured from monitor registration.
+Authentication, project-access, and network errors remain hard monitor failures.
+A run that disappears after reporting a metric also remains a hard failure.
+
 `improved_by` and `regressed_by` compare with the monitor policy's first observed sample; they do not silently reuse the assignment's documented baseline.
 
-Worker and container restarts preserve completed OpenHands events. Recovered live training is terminated safely rather than being adopted under an unverifiable process identity; the original student conversation receives the persisted terminal outcome.
-
-The terminal policy checks executable shell commands, including nested commands
-and common wrappers. Multiline input to ordinary programs remains data: Python,
-R, JavaScript, JSON, and other research formats do not need a language allowlist.
-The checker still inspects shell expansions in unquoted input and blocks
-restricted commands fed to recognized shells. Unrelated helper functions or
-file comparisons do not change how a data block is checked. Common wrappers
-such as `env`, `timeout`, `nice`, `xargs`, `taskset`, and `flock` preserve the
-wrapped program's data arguments. Shell loops, arithmetic, variable executable
-names, and variable timeout durations are supported. The checker inspects
-recognized commands inside loop bodies and command substitutions. It does not
-evaluate variable values or prove that loops terminate. Startup-file loading
-and explicit shell callbacks remain restricted.
-
-Use the target environment already supplied to terminals instead of
-`source .venv/bin/activate`. `source` can load unchecked commands and redefine
-the current shell. Use `bash -c` instead of `bash -lc`; login and interactive
-shells can load unchecked startup files. The policy is a behavioral guardrail,
-not a shell sandbox or a credential-containment boundary. It does not inspect
-arbitrary Python programs or executable files, and commands selected through
-variables can fall outside its recognition.
-Some unsupported wrapper syntax and unclear shell streams can still reject
-valid commands. The policy does not reconstruct state from previous commands.
+Controller process and container restarts within the same Pod preserve completed
+OpenHands events. Local processes are terminated rather than adopted under
+unverifiable identity. Kubernetes workloads are re-adopted only by their
+persisted UID and broker-injected ownership; the original student conversation
+receives the persisted terminal outcome. Recovery requires retained state and
+the same controller Pod UID. Replacing the Pod is not a supported recovery path;
+the default state volumes do not survive Pod replacement. With Kubernetes'
+[default cascading deletion](https://kubernetes.io/docs/concepts/architecture/garbage-collection/#background-cascading-deletion),
+deleting or replacing the controller Pod also deletes its owned MPIJob and
+terminates remote training.
 
 Interactive browser operations are progressively disclosed. A fresh root
 conversation initially sees only `load_browser`; invoking it adds the fourteen
 OpenHands browser operations and records the choice in conversation state so a
 resumed conversation restores them. `--no-browser` exposes neither the loader
 nor the browser family.
+
+### Multi-node target launcher contract
+
+With `nodes_per_student > 1`, `run_training` executes a target-owned submitter.
+It must submit one `kubeflow.org/v2beta1` MPIJob through `kubectl apply -f -`
+and exit. The supervisor provides these authoritative environment values:
+
+| Variable | Use in the target launcher |
+|---|---|
+| `SENPAI_TRAINING_SOURCE_SNAPSHOT` | Absolute Git bundle path on the PVC. Its filename is `<HEAD-SHA>.bundle`; use the full 40-character SHA for `metadata.annotations["senpai.wandb.com/source-commit"]`. |
+| `SENPAI_KUBERNETES_WORKLOAD_NAME` | Set `metadata.name`. |
+| `SENPAI_KUBERNETES_NAMESPACE` | Set `metadata.namespace`. |
+| `SENPAI_WANDB_RUN_ID` | Set `metadata.annotations["senpai.wandb.com/run-id"]` and any framework-specific run-ID arguments. |
+| `SENPAI_LAUNCH_SECRET_NAME` | W&B credential source; the broker binds `WANDB_API_KEY` to this Secret's `wandb-api-key` entry. |
+
+The submitter also inherits the launch configuration below. These values do
+not automatically become environment variables inside the submitted pods.
+
+| Variables | Manifest requirement |
+|---|---|
+| `NODES_PER_STUDENT`, `GPUS_PER_STUDENT_NODE` | Use one Launcher replica without GPUs, `NODES_PER_STUDENT` Worker replicas, and `slotsPerWorker: GPUS_PER_STUDENT_NODE`. Both roles use `restartPolicy: Never`. |
+| `CPU_PER_STUDENT_GPU`, `MEMORY_GI_PER_STUDENT_GPU` | Each worker requests exactly GPUs-per-worker times these CPU and memory amounts, plus the configured GPUs. Launcher CPU and memory may not exceed one GPU's share. Every container declares equal CPU/memory requests and limits; worker GPU requests and limits also match. Only `cpu`, `memory`, and `nvidia.com/gpu` resource keys are supported. |
+| `PVC_CLAIM_NAME`, `PVC_MOUNT_PATH` | Both pod templates declare exactly one volume for the configured dataset PVC, which supplies the source bundle to the injected checkout. GPU containers also mount that PVC writable. The snapshot resides beneath the configured mount path. |
+| `WANDB_ENTITY`, `WANDB_PROJECT` | Pass the configured destination to every container that reports W&B metrics. |
+
+Declare `WANDB_API_KEY` in reporting main containers, including the MPI
+launcher when it reports metrics. The broker replaces that entry with the
+scoped Secret reference and supplies canonical `WANDB_RUN_ID` to main
+containers. It rejects a conflicting explicit run ID and preserves unrelated
+target environment variables.
+
+The broker replaces all target `initContainers` with its fixed bundle checkout
+at `/workspace` and removes pod-template annotations. Put required target setup
+in the image or main command. Target pod labels and scheduling constraints are
+preserved, except for Senpai ownership labels and the reserved
+`senpai-training-role` label. Preserved labels can still affect configured
+[admission webhooks](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/#matching-requests-objectselector)
+and [network policies](https://kubernetes.io/docs/concepts/services-networking/network-policies/#the-networkpolicy-resource).
+Operators must not treat target-controlled labels as a trust boundary.
+Use cluster admission policies to enforce node-pool restrictions.
+The broker adds required hostname anti-affinity
+that selects only this run's worker pods. Preserved target affinity rules still
+apply and may also constrain launcher placement.
+
+The injected checkout runs as UID/GID 0 and leaves the source tree owned by
+root. Target containers that modify the checkout must use a compatible runtime
+identity and permissions. Namespaces that enforce Restricted Pod Security
+cannot run this checkout.
 
 ## Subagents
 
@@ -433,7 +687,7 @@ The controller owns cadence, durable events, conversation selection, verified Gi
 - Student state may be ephemeral because the branch, PR, typed result, W&B runs, and Weave trace are the durable handoff.
 - Explicit project skills remain available through OpenHands skill context. Repository `AGENTS.md`, `AGENT.md`, and `CLAUDE.md` instruction files are reserved for human-facing development tools and are not loaded as Senpai project context.
 
-The command policy blocks recognized raw GitHub mutations, direct training, `git push`, explicit polling commands, and log streams. Operation-specific typed tools enforce repository, branch, assignment, revision, head-SHA, label, and replay preconditions. This policy keeps routine operations deterministic while leaving high-entropy research work to the agent.
+The command policy blocks raw GitHub mutations, direct training, `git push`, polling loops, and log streams. Operation-specific typed tools enforce repository, branch, assignment, revision, head-SHA, label, and replay preconditions. This policy keeps routine operations deterministic while leaving high-entropy research work to the agent.
 
 Authenticated Git publication uses `/usr/bin/git` in a temporary bare repository.
 It derives the GitHub URL from the configured repository and ignores checkout
@@ -442,8 +696,12 @@ fetches only the base commit and tree; replay fetches one generation of parents
 to verify the existing assignment. The advisor checkout keeps its shallow boundary.
 Publication checks the exact local commit and remote head, then uses a remote
 lease. It publishes that commit even if the worktree has uncommitted changes;
-training still requires a clean worktree. Bootstrap retains the runner and target
-pre-push hooks, but no longer installs a Git executable shim on `PATH`.
+training still requires a clean worktree. After verified publication, it refreshes
+the checkout's local record of the remote branch, so Git status reflects the push.
+This also repairs stale records on retry and preserves concurrent updates to that
+record. The working branch and files stay in the same checkout. Bootstrap retains
+the runner and target pre-push hooks, but no longer installs a Git executable shim
+on `PATH`.
 
 When `WANDB_ENTITY` and `WANDB_PROJECT` are configured, [`weave-openhands`](https://github.com/morganmcg1/weave-openhands) traces advisor, student, and child conversations. Each `OPENHANDS_RUN` record includes a direct Weave Agent Observability URL.
 
@@ -452,16 +710,38 @@ When `WANDB_ENTITY` and `WANDB_PROJECT` are configured, [`weave-openhands`](http
 Useful launch controls:
 
 - `--names frieren,fern` selects stable students; otherwise use `--n_students` and `--student_prefix`.
-- `--gpus_per_student`, `--cpu_per_gpu`, and `--memory_gi_per_gpu` size each student.
-- `--timeout_minutes` and `--max_epochs` set agent-facing launch-context limits; target training receives neither as a dedicated `SENPAI_*` variable.
+- `--nodes_per_student` and `--gpus_per_student_node` set the supervised worker topology; `--cpu_per_gpu` and `--memory_gi_per_gpu` bind its worker resources.
+- `--controller_node_selector key=value` optionally constrains advisor and multi-node controller placement; the portable default leaves placement unconstrained.
+- `--timeout_minutes` sets the launch-context wall-clock policy and the broker's hard ceiling for remote training. Local training enforces the timeout requested in `run_training`. `--max_epochs` sets the agent-facing epoch policy.
 - `--poll_interval_s` and `--poll_jitter_s` control idle GitHub cadence without teaching the model to poll.
 - `--gh_history_scope branch` keeps normal advisor-branch memory, `fresh` creates a shallow ablation checkout, and `repo` exposes full repository history.
 - `--extra_instructions` accepts optional human operator guidance as a Markdown file or literal user context.
 - `human_issues: false` disables GitHub Issue polling for isolated launches.
 
-Advisor and student images are built from the same source revision. The advisor image excludes CUDA and PyTorch; the student image contains the CUDA/PyTorch runtime; the cutoff image contains only the minimal job runtime and pinned `kubectl`. Advisor and student builds install Chromium and execute an OpenHands browser smoke test.
+All role images are built from the same source revision. The advisor image excludes CUDA and PyTorch; the student image contains the CUDA/PyTorch runtime; the executor image contains only its Python broker; the cutoff image contains only the minimal job runtime and pinned `kubectl`. Advisor and student builds install Chromium and execute an OpenHands browser smoke test.
+
+The agent runs from `/opt/senpai-venv`. Before starting the controller, both role entrypoints clear `UV_PROJECT_ENVIRONMENT`, `UV_PYTHON`, and `VIRTUAL_ENV` so target-repository `uv run` and `uv sync` commands use that repository's `.venv`. Do not point target dependency installation at the agent environment: synchronizing it against a target lockfile can remove OpenHands dependencies or PyTorch while the controller is still running. If that happens, redeploy the affected pod from its pinned image to restore the agent environment.
 
 For multi-day fleets, [`arm_senpai_cluster_cutoff.sh`](scripts/arm_senpai_cluster_cutoff.sh) creates a cluster-side hard cutoff that does not depend on an operator laptop remaining online. It can also hold a shared start gate until the expected fleet is ready or its readiness deadline expires.
+
+The cutoff Job runs as UID/GID 10001 and deletes only Deployments with the
+requested `research-tag` labels. Its Role grants no Secret or ConfigMap
+access. The operator fixes the readiness deadline and latest
+cutoff time when arming the Job; restarts and failed gate writes cannot extend
+that limit. Shared cutoff state is authenticated JSON, never executable shell
+input. The shared PVC must support access by UID/GID 10001.
+
+After cutoff, remove retained launch ConfigMaps and Secrets with the existing
+label-based cleanup command. Select the context, namespace, and tags used for
+the launch:
+
+```bash
+kubectl --context "$CONTEXT" -n "$NAMESPACE" delete configmaps,secrets \
+  -l "research-tag in ($TAGS_CSV)" --ignore-not-found=true
+```
+
+This command leaves PVC data and the cutoff Job, script ConfigMap, and shared
+cutoff RBAC resources in place. Operators own their retention and cleanup.
 
 Pod startup and liveness probes read the supervisor lease. Container restarts resume the advisor or student conversation from the pod-local state volume; replacing or rescheduling the pod starts fresh state. Stop a container before copying or snapshotting a live advisor state directory.
 

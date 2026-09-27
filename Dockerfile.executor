@@ -1,0 +1,33 @@
+FROM python:3.13-slim
+
+ARG SENPAI_SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.revision="${SENPAI_SOURCE_REVISION}"
+
+ENV PYTHONPATH=/opt/senpai \
+    SENPAI_IMAGE_REVISION="${SENPAI_SOURCE_REVISION}" \
+    HOME=/home/senpai
+
+RUN groupadd --gid 10001 senpai && \
+    useradd --uid 10001 --gid 10001 --create-home senpai && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install --no-cache-dir \
+      psutil==7.2.2 \
+      pydantic==2.13.4 \
+      PyYAML==6.0.3 && \
+    mkdir -p \
+      /opt/senpai \
+      /var/lib/senpai-executor \
+      /var/lib/senpai-source \
+      /var/run/senpai-kubernetes && \
+    chown -R 10001:10001 \
+      /home/senpai \
+      /var/lib/senpai-executor \
+      /var/lib/senpai-source \
+      /var/run/senpai-kubernetes
+
+COPY senpai_agent /opt/senpai/senpai_agent
+
+USER 10001:10001
+CMD ["python", "-m", "senpai_agent.kubernetes_executor", "serve"]

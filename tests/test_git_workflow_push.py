@@ -78,7 +78,10 @@ def test_result_commit_rejects_an_unrelated_research_base(tmp_path: Path):
         )
 
 
-def test_push_is_lease_guarded_verified_and_idempotent(tmp_path: Path):
+@pytest.mark.parametrize("credentialed", [False, True])
+def test_push_is_lease_guarded_verified_and_idempotent(
+    tmp_path: Path, credentialed: bool
+):
     workspace, remote, previous_sha = repository(tmp_path)
     candidate_sha = commit_file(
         workspace,
@@ -100,11 +103,18 @@ def test_push_is_lease_guarded_verified_and_idempotent(tmp_path: Path):
         workspace,
         branch="experiment-7",
         expected_remote_sha=previous_sha,
+        authenticated_remote=remote.resolve().as_uri(),
+        token=SecretStr("typed-write-token") if credentialed else None,
+    )
+    assert git(workspace, "status", "--short", "--branch") == (
+        "## experiment-7...origin/experiment-7"
     )
     repeated = push_assignment_branch(
         workspace,
         branch="experiment-7",
         expected_remote_sha=previous_sha,
+        authenticated_remote=remote.resolve().as_uri(),
+        token=SecretStr("typed-write-token") if credentialed else None,
     )
 
     assert first.changed is True
@@ -112,9 +122,13 @@ def test_push_is_lease_guarded_verified_and_idempotent(tmp_path: Path):
     assert repeated.changed is False
     assert repeated.head_sha == candidate_sha
     assert git(remote, "rev-parse", "refs/heads/experiment-7") == candidate_sha
+    assert git(workspace, "rev-parse", "origin/experiment-7") == candidate_sha
 
 
-def test_push_publishes_only_the_validated_commit(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("credentialed", [False, True])
+def test_push_publishes_only_the_validated_commit(
+    tmp_path: Path, monkeypatch, credentialed: bool
+):
     workspace, remote, previous_sha = repository(tmp_path)
     validated_sha = commit_file(
         workspace,
@@ -149,14 +163,20 @@ def test_push_publishes_only_the_validated_commit(tmp_path: Path, monkeypatch):
         branch="experiment-7",
         expected_remote_sha=previous_sha,
         expected_local_sha=validated_sha,
+        authenticated_remote=remote.resolve().as_uri(),
+        token=SecretStr("typed-write-token") if credentialed else None,
     )
 
     assert pushed.head_sha == validated_sha
     assert git(workspace, "rev-parse", "HEAD") != validated_sha
     assert git(remote, "rev-parse", "refs/heads/experiment-7") == validated_sha
+    assert git(workspace, "rev-parse", "origin/experiment-7") == validated_sha
 
 
-def test_push_publishes_only_head_when_the_worktree_is_dirty(tmp_path: Path):
+@pytest.mark.parametrize("credentialed", [False, True])
+def test_push_publishes_only_head_when_the_worktree_is_dirty(
+    tmp_path: Path, credentialed: bool
+):
     workspace, remote, remote_sha = repository(tmp_path)
     head_sha = commit_file(workspace, "model.py", "baseline = 2\n", "candidate")
     (workspace / "model.py").write_text("uncommitted = True\n")
@@ -167,13 +187,161 @@ def test_push_publishes_only_head_when_the_worktree_is_dirty(tmp_path: Path):
         branch="experiment-7",
         expected_remote_sha=remote_sha,
         expected_local_sha=head_sha,
+        authenticated_remote=remote.resolve().as_uri(),
+        token=SecretStr("typed-write-token") if credentialed else None,
     )
 
     assert pushed.head_sha == head_sha
     assert git(remote, "rev-parse", "refs/heads/experiment-7") == head_sha
     assert (workspace / "model.py").read_text() == "uncommitted = True\n"
+    assert (workspace / "untracked.txt").read_text() == "dirty"
+    assert git(workspace, "branch", "--show-current") == "experiment-7"
+    assert git(workspace, "rev-parse", "HEAD") == head_sha
+    assert git(workspace, "rev-parse", "origin/experiment-7") == head_sha
 
 
+@pytest.mark.parametrize("tracking_state", ["stale", "missing", "symbolic"])
+def test_credentialed_push_repairs_tracking_on_retry(
+    tmp_path: Path, tracking_state: str
+):
+    workspace, remote, previous_sha = repository(tmp_path)
+    candidate_sha = commit_file(workspace, "model.py", "baseline = 2\n", "candidate")
+    # Simulate a successful push followed by interruption before local bookkeeping.
+    git(workspace, "push", remote.resolve().as_uri(), "HEAD:refs/heads/experiment-7")
+    tracking_ref = "refs/remotes/origin/experiment-7"
+    if tracking_state == "missing":
+        git(workspace, "update-ref", "-d", tracking_ref)
+    elif tracking_state == "symbolic":
+        git(workspace, "branch", "unrelated", previous_sha)
+        git(workspace, "symbolic-ref", tracking_ref, "refs/heads/unrelated")
+    else:
+        git(workspace, "update-ref", tracking_ref, previous_sha)
+
+    result = push_assignment_branch(
+        workspace,
+        branch="experiment-7",
+        expected_remote_sha=previous_sha,
+        expected_local_sha=candidate_sha,
+        authenticated_remote=remote.resolve().as_uri(),
+        token=SecretStr("typed-write-token"),
+    )
+
+    assert result.changed is False
+    assert git(workspace, "rev-parse", tracking_ref) == candidate_sha
+    assert git(workspace, "status", "--short", "--branch") == (
+        "## experiment-7...origin/experiment-7"
+    )
+    if tracking_state == "symbolic":
+        assert git(workspace, "rev-parse", "refs/heads/unrelated") == previous_sha
+
+
+@pytest.mark.parametrize("concurrent_change", ["advance", "create", "delete"])
+def test_credentialed_push_preserves_concurrent_tracking_changes(
+    tmp_path: Path, monkeypatch, concurrent_change: str
+):
+    workspace, remote, previous_sha = repository(tmp_path)
+    candidate_sha = commit_file(workspace, "model.py", "baseline = 2\n", "candidate")
+    newer_sha = detached_commit(workspace, candidate_sha, "another publisher")
+    tracking_ref = "refs/remotes/origin/experiment-7"
+    if concurrent_change == "create":
+        git(workspace, "update-ref", "-d", tracking_ref)
+    real_run = subprocess.run
+    changed = False
+
+    def update_tracking_concurrently(command, **kwargs):
+        nonlocal changed
+        during_network = concurrent_change == "advance" and command[1] == "ls-remote"
+        during_update = (
+            Path(kwargs["cwd"]) == workspace
+            and command[1] == "update-ref"
+            and tracking_ref in command[2:]
+        )
+        if not changed and (during_network or during_update):
+            changed = True
+            if concurrent_change == "delete":
+                git(workspace, "update-ref", "-d", tracking_ref)
+            else:
+                git(workspace, "update-ref", tracking_ref, newer_sha)
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(
+        "senpai_agent.git_transport.subprocess.run",
+        update_tracking_concurrently,
+    )
+    result = push_assignment_branch(
+        workspace,
+        branch="experiment-7",
+        expected_remote_sha=previous_sha,
+        authenticated_remote=remote.resolve().as_uri(),
+        token=SecretStr("typed-write-token"),
+    )
+
+    assert result.changed is True
+    assert git(remote, "rev-parse", "refs/heads/experiment-7") == candidate_sha
+    if concurrent_change == "delete":
+        assert git(workspace, "for-each-ref", tracking_ref) == ""
+    else:
+        assert git(workspace, "rev-parse", tracking_ref) == newer_sha
+
+
+def test_credentialed_push_reports_tracking_failure_and_can_retry(tmp_path: Path):
+    workspace, remote, previous_sha = repository(tmp_path)
+    candidate_sha = commit_file(workspace, "model.py", "baseline = 2\n", "candidate")
+    tracking_ref = "refs/remotes/origin/experiment-7"
+    lock = workspace / ".git" / f"{tracking_ref}.lock"
+    lock.touch()
+
+    with pytest.raises(GitWorkflowPreconditionError, match="was published.*tracking"):
+        push_assignment_branch(
+            workspace,
+            branch="experiment-7",
+            expected_remote_sha=previous_sha,
+            authenticated_remote=remote.resolve().as_uri(),
+            token=SecretStr("typed-write-token"),
+        )
+
+    assert git(remote, "rev-parse", "refs/heads/experiment-7") == candidate_sha
+    assert git(workspace, "rev-parse", tracking_ref) == previous_sha
+    lock.unlink()
+    retried = push_assignment_branch(
+        workspace,
+        branch="experiment-7",
+        expected_remote_sha=previous_sha,
+        authenticated_remote=remote.resolve().as_uri(),
+        token=SecretStr("typed-write-token"),
+    )
+    assert retried.changed is False
+    assert git(workspace, "rev-parse", tracking_ref) == candidate_sha
+
+
+def test_failed_push_verification_leaves_tracking_unchanged(tmp_path: Path, monkeypatch):
+    workspace, remote, previous_sha = repository(tmp_path)
+    candidate_sha = commit_file(workspace, "model.py", "baseline = 2\n", "candidate")
+    real_remote_head = git_workflow._remote_head
+    reads = 0
+
+    def move_remote_before_verification(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            git(remote, "update-ref", "refs/heads/experiment-7", previous_sha)
+        return real_remote_head(*args, **kwargs)
+
+    monkeypatch.setattr(git_workflow, "_remote_head", move_remote_before_verification)
+    with pytest.raises(RuntimeError, match="did not reach the pushed commit"):
+        push_assignment_branch(
+            workspace,
+            branch="experiment-7",
+            expected_remote_sha=previous_sha,
+            authenticated_remote=remote.resolve().as_uri(),
+            token=SecretStr("typed-write-token"),
+        )
+
+    assert git(workspace, "rev-parse", "origin/experiment-7") == previous_sha
+    assert git(workspace, "rev-parse", "HEAD") == candidate_sha
+
+
+@pytest.mark.parametrize("credentialed", [False, True])
 @pytest.mark.parametrize(
     ("lease", "error"),
     [
@@ -185,11 +353,13 @@ def test_push_rejects_remote_divergence_without_publishing(
     tmp_path: Path,
     lease: str,
     error: str,
+    credentialed: bool,
 ):
     workspace, remote, previous_sha = repository(tmp_path)
     remote_sha = detached_commit(workspace, previous_sha, "remote update")
     git(workspace, "push", str(remote), f"{remote_sha}:refs/heads/experiment-7")
     commit_file(workspace, "model.py", "baseline = 3\n", "local update")
+    tracking_sha = git(workspace, "rev-parse", "origin/experiment-7")
 
     expected_remote_sha = previous_sha if lease == "stale" else remote_sha
     with pytest.raises(GitWorkflowPreconditionError, match=error):
@@ -197,9 +367,13 @@ def test_push_rejects_remote_divergence_without_publishing(
             workspace,
             branch="experiment-7",
             expected_remote_sha=expected_remote_sha,
+            authenticated_remote=remote.resolve().as_uri(),
+            token=SecretStr("typed-write-token") if credentialed else None,
         )
 
     assert git(remote, "rev-parse", "refs/heads/experiment-7") == remote_sha
+    if credentialed:
+        assert git(workspace, "rev-parse", "origin/experiment-7") == tracking_sha
 
 
 @pytest.mark.parametrize("mismatch", ["branch", "head"])
@@ -283,9 +457,11 @@ def test_typed_push_auth_is_confined_to_network_git_processes(
     )
 
 
+@pytest.mark.parametrize("hook_name", ["pre-push", "reference-transaction"])
 def test_typed_push_ignores_agent_controlled_path_and_hooks(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    hook_name: str,
 ):
     workspace, remote, previous_sha = repository(tmp_path)
     commit_file(workspace, "model.py", "baseline = 2\n", "candidate")
@@ -299,7 +475,7 @@ def test_typed_push_ignores_agent_controlled_path_and_hooks(
         encoding="utf-8",
     )
     wrapper.chmod(0o755)
-    hook = workspace / ".git" / "hooks" / "pre-push"
+    hook = workspace / ".git" / "hooks" / hook_name
     hook.write_text(
         f"#!/bin/sh\nprintf '%s' \"$GIT_CONFIG_VALUE_0\" > {hook_marker}\nexit 99\n",
         encoding="utf-8",

@@ -1,3 +1,4 @@
+import pytest
 from pydantic import SecretStr
 
 from senpai_agent.github.mailbox import GitHubMailbox
@@ -25,7 +26,7 @@ def issue(
 
 
 def mailbox(*, role="advisor", human_issues_enabled=True):
-    return GitHubMailbox(
+    value = GitHubMailbox(
         repo="acme/widgets",
         token=SecretStr("github-token"),
         role=role,
@@ -34,6 +35,8 @@ def mailbox(*, role="advisor", human_issues_enabled=True):
         trusted_actor="senpai-bot",
         human_issues_enabled=human_issues_enabled,
     )
+    value._has_write_permission = lambda _login: True
+    return value
 
 
 def test_malformed_assignment_does_not_suppress_a_human_issue(monkeypatch):
@@ -44,7 +47,12 @@ def test_malformed_assignment_does_not_suppress_a_human_issue(monkeypatch):
         "html_url": "https://github.test/acme/widgets/pull/17",
         "updated_at": "2026-07-29T18:00:00Z",
         "body": "<!-- senpai-assignment:v1 not-json -->",
-        "head": {"ref": "student/candidate", "sha": "a" * 40},
+        "user": {"login": "senpai-bot"},
+        "head": {
+            "ref": "student/candidate",
+            "sha": "a" * 40,
+            "repo": {"full_name": "acme/widgets"},
+        },
         "labels": [
             {"name": "research"},
             {"name": "student:student-1"},
@@ -76,7 +84,12 @@ def test_malformed_assignment_versions_only_actionable_error_changes(monkeypatch
         "html_url": "https://github.test/acme/widgets/pull/17",
         "updated_at": "2026-07-29T18:00:00Z",
         "body": "<!-- senpai-assignment:v1 not-json -->",
-        "head": {"ref": "student/candidate", "sha": "a" * 40},
+        "user": {"login": "senpai-bot"},
+        "head": {
+            "ref": "student/candidate",
+            "sha": "a" * 40,
+            "repo": {"full_name": "acme/widgets"},
+        },
         "labels": [
             {"name": "research"},
             {"name": "student:student-1"},
@@ -97,6 +110,22 @@ def test_malformed_assignment_versions_only_actionable_error_changes(monkeypatch
     changed = student.poll()[0]
     assert changed.dedupe_key != first.dedupe_key
     assert changed.payload["error"] != first.payload["error"]
+
+
+@pytest.mark.parametrize("head_repo", ["outsider/widgets", "acme/widgets"])
+def test_rejected_pull_does_not_suppress_a_human_issue(monkeypatch, head_repo):
+    student = mailbox(role="student")
+    untrusted = {
+        "number": 17,
+        "user": {"login": "former-maintainer"},
+        "head": {"repo": {"full_name": head_repo}},
+    }
+    monkeypatch.setattr(student, "_pulls", lambda: [untrusted])
+    monkeypatch.setattr(student, "_has_write_permission", lambda _login: False)
+    monkeypatch.setattr(student, "_issues", lambda: [issue()])
+    monkeypatch.setattr(student, "_issue_comments", lambda _issue: [])
+
+    assert [event.kind for event in student.poll()] == ["human_issue"]
 
 
 def test_human_issue_tracks_the_exact_latest_human_message(monkeypatch):

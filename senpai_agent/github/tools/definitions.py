@@ -149,7 +149,8 @@ class RequestAssignmentRevisionTool(
         return _tool(
             cls, RequestAssignmentRevisionAction, "Request assignment revision",
             "Request a scientifically meaningful rerun as a fresh assignment "
-            "revision, bound to the exact live base commit it must evaluate.",
+            "revision. Explicitly retain its assigned base or select the exact "
+            "live base. A result must contain the selected base commit.",
             RequestAssignmentRevisionExecutor(runtime.workflow),
         )
 
