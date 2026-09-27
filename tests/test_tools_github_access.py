@@ -40,6 +40,7 @@ STUDENT_GITHUB_TOOLS = {
     "get_prs",
     "get_pr_source",
     "post_assignment_comment",
+    "publish_assignment_branch",
     "respond_to_human_issue",
     "submit_experiment_result",
 }

@@ -50,6 +50,32 @@ def weave_agent_name(env: Mapping[str, str]) -> str:
     return role
 
 
+def model_trace_attributes(env: Mapping[str, str] = os.environ) -> dict[str, str | int]:
+    """Attribute each priced model call without relying on a completed root span."""
+    attributes: dict[str, str | int] = {
+        "senpai.owner": weave_agent_name(env),
+        "senpai.delegation.depth": int(env.get("SENPAI_DELEGATION_DEPTH", "0")),
+    }
+    for name, variable in (
+        ("repository", "GH_REPO"),
+        ("advisor_branch", "ADVISOR_BRANCH"),
+        ("delegation.tree_id", "SENPAI_DELEGATION_TREE_ID"),
+        ("delegation.task_id", "SENPAI_DELEGATION_TASK_ID"),
+        ("delegation.parent_task_id", "SENPAI_DELEGATION_PARENT_TASK_ID"),
+        ("delegation.parent_conversation_id", "SENPAI_PARENT_CONVERSATION_ID"),
+        ("delegation.model_tier", "SENPAI_DELEGATION_MODEL_TIER"),
+    ):
+        if value := env.get(variable):
+            attributes[f"senpai.{name}"] = value
+    for name, variable in (
+        ("input_characters", "SENPAI_DELEGATION_INPUT_CHARACTERS"),
+        ("parent_messages", "SENPAI_DELEGATION_PARENT_MESSAGES"),
+    ):
+        if value := env.get(variable):
+            attributes[f"senpai.delegation.{name}"] = int(value)
+    return attributes
+
+
 def weave_conversation_url(
     project_name: str | None,
     conversation_id: str | UUID,

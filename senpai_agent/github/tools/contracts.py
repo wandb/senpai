@@ -88,6 +88,21 @@ class PublishAdvisorBranchAction(Action):
     )
 
 
+class PublishAssignmentBranchAction(Action):
+    """Publish the current student's source without submitting a result."""
+
+    assignment: AssignmentVersion = Field(
+        description=(
+            "Current student assignment revision and PR-head lease. Exact replay "
+            "also accepts a head already equal to local_commit_sha."
+        ),
+    )
+    local_commit_sha: str = Field(
+        min_length=1,
+        description="Exact local commit to publish; the clean worktree HEAD must equal it.",
+    )
+
+
 class RepairAssignmentRoutingAction(Action):
     """Restore the desired protocol state for one current assignment revision."""
 

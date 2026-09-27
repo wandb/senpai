@@ -210,3 +210,113 @@ def test_weave_openhands_traces_a_real_openhands_turn(
     finally:
         uninstrument()
         trace_exporter.clear()
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2])
+def test_runner_attributes_real_model_spans_before_conversation_finishes(
+    tmp_path, monkeypatch, trace_exporter, depth
+):
+    from litellm import ModelResponse
+    from openhands.sdk import LLM
+    from openhands_support import isolate_agent_discovery, runtime_config
+
+    import senpai_agent.openhands_runner as runner
+
+    for variable in tuple(monitoring.os.environ):
+        if (
+            variable.startswith("SENPAI_DELEGATION_")
+            or variable == "SENPAI_PARENT_CONVERSATION_ID"
+        ):
+            monkeypatch.delenv(variable)
+    monkeypatch.setenv("SENPAI_ROLE", "student")
+    monkeypatch.setenv("STUDENT_NAME", "charlie")
+    monkeypatch.setenv("GH_REPO", "acme/research")
+    monkeypatch.setenv("ADVISOR_BRANCH", "campaign")
+    if depth:
+        monkeypatch.setenv("SENPAI_DELEGATION_DEPTH", str(depth))
+        monkeypatch.setenv("SENPAI_DELEGATION_TASK_ID", "child-task")
+        monkeypatch.setenv("SENPAI_DELEGATION_TREE_ID", "root-conversation")
+        monkeypatch.setenv("SENPAI_PARENT_CONVERSATION_ID", "parent-conversation")
+        monkeypatch.setenv("SENPAI_DELEGATION_MODEL_TIER", "frontier")
+        monkeypatch.setenv("SENPAI_DELEGATION_INPUT_CHARACTERS", "12345")
+        monkeypatch.setenv("SENPAI_DELEGATION_PARENT_MESSAGES", "12")
+        if depth == 2:
+            monkeypatch.setenv("SENPAI_DELEGATION_PARENT_TASK_ID", "parent-task")
+    isolate_agent_discovery(monkeypatch, runner)
+    monkeypatch.setattr(runner, "build_main_tools", lambda _config: [])
+    monkeypatch.setattr(
+        "openhands.sdk.llm.llm_profile_store._DEFAULT_PROFILE_DIR",
+        tmp_path / "profiles",
+    )
+    observed = []
+
+    async def transport(_self, **_kwargs):
+        observed.append(dict(trace.get_current_span().attributes))
+        assert not trace_exporter.get_finished_spans()
+        return ModelResponse(
+            model="claude-sonnet-4-5",
+            choices=[
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": "Done",
+                        "tool_calls": [
+                            {
+                                "id": "finish-call",
+                                "type": "function",
+                                "function": {
+                                    "name": "finish",
+                                    "arguments": json.dumps(
+                                        {"message": "Task complete"}
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        )
+
+    monkeypatch.setattr(LLM, "_atransport_call", transport)
+    config = runtime_config(
+        tmp_path,
+        model="anthropic/claude-sonnet-4-5",
+        reasoning_effort="high",
+        github_token=None,
+    )
+    uninstrument()
+    trace_exporter.clear()
+    instrument(TracingConfig(agent_name="student-charlie"))
+    try:
+        assert runner.run_openhands("Inspect the result.", config) == 0
+        chats = [
+            s for s in trace_exporter.get_finished_spans() if s.name.startswith("chat ")
+        ]
+        assert len(chats) == len(observed) == 1
+        attributes = chats[0].attributes
+        assert attributes["senpai.owner"] == "student-charlie"
+        assert attributes["senpai.repository"] == "acme/research"
+        assert attributes["senpai.advisor_branch"] == "campaign"
+        assert attributes["senpai.delegation.depth"] == depth
+        assert attributes["gen_ai.request.model"] == "anthropic/claude-sonnet-4-5"
+        assert observed[0]["senpai.delegation.depth"] == depth
+        if depth:
+            assert attributes["senpai.delegation.task_id"] == "child-task"
+            assert (
+                attributes["senpai.delegation.parent_conversation_id"]
+                == "parent-conversation"
+            )
+            assert attributes["senpai.delegation.model_tier"] == "frontier"
+            assert attributes["senpai.delegation.input_characters"] == 12345
+            assert attributes["senpai.delegation.parent_messages"] == 12
+        else:
+            assert "senpai.delegation.task_id" not in attributes
+        if depth == 2:
+            assert attributes["senpai.delegation.parent_task_id"] == "parent-task"
+        else:
+            assert "senpai.delegation.parent_task_id" not in attributes
+    finally:
+        uninstrument()
+        trace_exporter.clear()

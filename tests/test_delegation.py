@@ -2,15 +2,17 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
-from pathlib import Path
 from base64 import b64decode
 from dataclasses import replace
+from pathlib import Path
 
-import pytest
 import psutil
+import pytest
 from openhands.sdk.llm import Message, TextContent
+from openhands_support import launch_env, runtime_config
 from pydantic import SecretStr
 
 import senpai_agent.delegation as delegation_module
@@ -44,7 +46,6 @@ from senpai_agent.system_instructions import (
     decode_system_instructions,
     encode_system_instructions,
 )
-from openhands_support import launch_env, runtime_config
 
 
 def delegation_request(
@@ -484,6 +485,73 @@ def test_child_result_parser_uses_only_terminal_result_record():
 
     with pytest.raises(RuntimeError, match="terminal result"):
         OpenHandsChildProcess.parse_result('OPENHANDS_EVENT {"text":"not enough"}')
+
+
+@pytest.mark.parametrize("depth,parent_task_id", [(1, None), (2, "parent-task")])
+def test_child_start_records_lineage_and_input_before_bootstrap_failure(
+    tmp_path, monkeypatch, depth, parent_task_id
+):
+    class BrokenChild(OpenHandsChildProcess):
+        @property
+        def command(self):
+            return (
+                sys.executable,
+                "-c",
+                (
+                    "import json,os,sys; "
+                    "print(json.dumps({'input_characters':len(sys.stdin.read()), "
+                    "'env':{k:v for k,v in os.environ.items() "
+                    "if k.startswith('SENPAI_DELEGATION_') or "
+                    "k=='SENPAI_PARENT_CONVERSATION_ID'}}),flush=True); "
+                    "raise ImportError('missing child dependency')"
+                ),
+            )
+
+    monkeypatch.setenv("SENPAI_DELEGATION_PARENT_TASK_ID", "stale-ancestor")
+    monkeypatch.setenv("SENPAI_DELEGATION_INPUT_CHARACTERS", "999999")
+    request = replace(
+        delegation_request(),
+        tree_id="tree",
+        depth=depth,
+        parent_task_id=parent_task_id,
+    )
+    child = BrokenChild(delegation_config(tmp_path), request)
+    completed = threading.Event()
+    outcomes = []
+
+    def on_complete(result, error):
+        outcomes.append((result, error))
+        completed.set()
+
+    child.start("Inspect π without publishing it.", 10, on_complete)
+    assert completed.wait(15)
+    lines = child.output_path.read_text().splitlines()
+    assert lines[0].startswith("OPENHANDS_CHILD_START ")
+    record = json.loads(lines[0].split(" ", 1)[1])
+    observed = json.loads(lines[1])
+    assert record["input_characters"] == observed["input_characters"]
+    assert record["parent_messages"] == 2
+    assert record["task_id"] == request.task_id
+    assert record["parent_conversation_id"] == request.parent_conversation_id
+    assert record["parent_task_id"] == parent_task_id
+    assert record["tree_id"] == "tree"
+    assert record["depth"] == depth
+    assert record["model_tier"] == "fast"
+    assert record["model"] == "anthropic/claude-haiku-4-5"
+    assert observed["env"]["SENPAI_DELEGATION_TASK_ID"] == request.task_id
+    assert observed["env"]["SENPAI_DELEGATION_PARENT_TASK_ID"] == (parent_task_id or "")
+    assert (
+        observed["env"]["SENPAI_PARENT_CONVERSATION_ID"]
+        == request.parent_conversation_id
+    )
+    assert (
+        int(observed["env"]["SENPAI_DELEGATION_INPUT_CHARACTERS"])
+        == observed["input_characters"]
+    )
+    assert outcomes[0][0] is None
+    assert isinstance(outcomes[0][1], RuntimeError)
+    assert "secret" not in lines[0]
+    assert "Inspect" not in lines[0]
 
 
 def test_child_monitor_invokes_a_failing_completion_callback_once(tmp_path: Path):

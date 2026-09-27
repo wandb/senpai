@@ -15,8 +15,9 @@ from .definitions import (
     CloseExperimentTool,
     CreateAssignmentTool,
     MergeExperimentTool,
-    PublishAdvisorBranchTool,
     PostAssignmentCommentTool,
+    PublishAdvisorBranchTool,
+    PublishAssignmentBranchTool,
     RepairAssignmentRoutingTool,
     RequestAssignmentRevisionTool,
     RespondToHumanIssueTool,
@@ -24,12 +25,12 @@ from .definitions import (
     SubmitExperimentResultTool,
 )
 from .pull_requests import GetPRsAction, GetPRsObservation, GetPRsTool
-from .source import GetPRSourceTool
 from .runtime import (
     GitHubToolRuntime,
     configured_student_names,
     current_github_credentials,
 )
+from .source import GetPRSourceTool
 
 
 class GitHubWorkflowToolSet(
@@ -107,6 +108,7 @@ class GitHubWorkflowToolSet(
             return (
                 *common,
                 *PostAssignmentCommentTool.create(runtime),
+                *PublishAssignmentBranchTool.create(runtime),
                 *SubmitExperimentResultTool.create(runtime),
             )
         return (
