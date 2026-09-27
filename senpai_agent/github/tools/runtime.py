@@ -152,10 +152,10 @@ class GitHubToolRuntime:
         return self.current_student()
 
 
-class PublishAssignmentBranchExecutor(
+class PushExperimentCommitExecutor(
     ToolExecutor[PublishAssignmentBranchAction, GitHubMutationObservation]
 ):
-    """Publish exact source while retaining the assignment's unfinished state."""
+    """Push the student's commit without changing the experiment workflow."""
 
     def __init__(self, runtime: GitHubToolRuntime):
         self.runtime = runtime
@@ -194,15 +194,15 @@ class PublishAssignmentBranchExecutor(
                         else ReconciliationError
                     )
                     raise error_type(
-                        f"Source commit {pushed.head_sha} was published to {pushed.branch}, "
-                        f"but assignment verification failed: {error}"
+                        f"Commit {pushed.head_sha} was pushed to GitHub branch {pushed.branch}, "
+                        f"but the assignment could not be verified afterward: {error}"
                     ) from error
             except StaleAssignmentRevisionError as error:
                 _finish_stale_assignment_turn(error, conversation)
         return GitHubMutationObservation(
             changed=pushed.changed,
             resource_url=after.url,
-            state="assignment_branch_published",
+            state="experiment_commit_pushed",
             version=after.head_sha,
         )
 
@@ -212,7 +212,7 @@ class PublishAssignmentBranchExecutor(
         student: str,
         expected_head_sha: str,
     ) -> tuple[PullRequestSnapshot, AssignmentRecord]:
-        return self.runtime.workflow.preflight_publish_assignment_branch(
+        return self.runtime.workflow.preflight_push_experiment_commit(
             action.assignment.pr_number,
             assignment_id=action.assignment.assignment_id,
             revision_id=action.assignment.revision_id,
@@ -239,7 +239,8 @@ class PublishAssignmentBranchExecutor(
                 time.sleep(delay)
         if current != assignment:
             raise WorkflowPreconditionError(
-                "assignment changed during source publication; refresh before continuing"
+                "assignment changed while pushing the commit; read the current PR "
+                "and assignment instructions before continuing"
             )
         return snapshot
 

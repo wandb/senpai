@@ -443,7 +443,17 @@ flowchart LR
 5. The student calls `submit_experiment_result`; the tool validates and publishes the branch before changing the PR to `status:review`.
 6. The advisor compares the evidence, then uses the corresponding operation-specific tool to merge a reproducible winner, close a useful negative result, request a new revision, or send non-revision feedback.
 
-When an assignment requires public source before training or review, the student uses `publish_assignment_branch` with the current assignment version and exact clean local HEAD. The tool derives the assigned branch, checks the recorded base and current revision, and publishes with a fast-forward lease. It verifies the published head and unchanged assignment record afterward. Exact replay is safe, including with the original pre-push lease. Publication leaves comments, draft state, labels, and holds unchanged; it does not submit a result or authorize a launch. Closed assignments and revisions with a terminal result cannot use this interim path. Concurrent external assignment changes can make verification fail after a successful push; refresh the assignment instead of rolling back or bypassing the tool.
+When the advisor requires code on GitHub before training or review, use `push_experiment_commit`. It pushes the exact current local commit (HEAD) to the existing GitHub branch for the experiment PR. Commit all changes first. Supply:
+
+- `assignment.pr_number`: the experiment PR number.
+- `assignment.assignment_id`: the assignment ID in the advisor's current assignment record on that PR.
+- `assignment.revision_id`: the revision ID for the current instructions in that record.
+- `assignment.expected_pr_head_sha`: the Git commit identifier (SHA) currently at the head of the GitHub PR.
+- `local_commit_sha`: the identifier of the exact current local commit (HEAD) to push.
+
+The tool checks the assigned student, branch, base commit and current instructions. It requires no uncommitted changes and refuses to overwrite other commits. After pushing, it verifies the new GitHub PR head and checks that the assignment record is unchanged. Retrying the same push is safe, even with the original pre-push PR head SHA.
+
+Pushing does not remove a hold or authorize training. The tool leaves comments, labels and draft state unchanged, and it does not submit a result. It rejects closed PRs and assignment revisions that already have a final experiment result. If the assignment changes during the push, the commit can reach GitHub before the final check fails. Read the current PR and assignment instructions before continuing; do not roll back the push or bypass the tool.
 
 The structured result records its terminal status, exact result commit, W&B run IDs and URLs, bounded conclusion, and baseline/candidate metric comparison when available. Once published for an assignment revision and head, that evidence is immutable: exact duplicate publication is an idempotent replay, while changed evidence requires a new commit or revision. Non-revision feedback continues the same student conversation; a revision request intentionally creates a fresh revision identity and conversation.
 

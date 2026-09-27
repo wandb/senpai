@@ -17,7 +17,7 @@ from .definitions import (
     MergeExperimentTool,
     PostAssignmentCommentTool,
     PublishAdvisorBranchTool,
-    PublishAssignmentBranchTool,
+    PushExperimentCommitTool,
     RepairAssignmentRoutingTool,
     RequestAssignmentRevisionTool,
     RespondToHumanIssueTool,
@@ -105,7 +105,7 @@ class GitHubWorkflowToolSet(
             return (
                 *common,
                 *PostAssignmentCommentTool.create(runtime),
-                *PublishAssignmentBranchTool.create(runtime),
+                *PushExperimentCommitTool.create(runtime),
                 *SubmitExperimentResultTool.create(runtime),
             )
         return (

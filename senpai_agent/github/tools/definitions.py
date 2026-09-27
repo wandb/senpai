@@ -35,7 +35,7 @@ from .contracts import (
 from .runtime import (
     GitHubToolRuntime,
     PostAssignmentCommentExecutor,
-    PublishAssignmentBranchExecutor,
+    PushExperimentCommitExecutor,
     SubmitExperimentResultExecutor,
     tool_annotations,
 )
@@ -110,21 +110,26 @@ class PublishAdvisorBranchTool(
         )
 
 
-class PublishAssignmentBranchTool(
+class PushExperimentCommitTool(
     ToolDefinition[PublishAssignmentBranchAction, GitHubMutationObservation]
 ):
-    """Publish source for the current student without a terminal result."""
+    """Push the student's exact local HEAD to the existing experiment PR branch."""
 
     @classmethod
     def create(cls, runtime: GitHubToolRuntime) -> Sequence[Self]:
         return _tool(
-            cls, PublishAssignmentBranchAction, "Publish assignment branch",
-            "Publish the exact clean local commit to this student's current WIP "
-            "assignment branch with a fast-forward lease. Verify its recorded "
-            "research base and assignment revision before and after publication. "
-            "This does not post a comment, submit a result, change PR routing, "
-            "or release a hold. A current-revision terminal result forbids it.",
-            PublishAssignmentBranchExecutor(runtime),
+            cls, PublishAssignmentBranchAction, "Push experiment commit",
+            "Push the exact current local commit (HEAD) to the existing GitHub branch for "
+            "this student's experiment PR. There must be no uncommitted changes. "
+            "The PR must be open and marked work in progress (status:wip). Supply "
+            "the PR number, assignment ID, current instruction revision ID, "
+            "current GitHub PR head and local Git commit identifiers (SHAs). "
+            "The tool checks "
+            "the assigned student, branch, base commit and current instructions; "
+            "it refuses to overwrite other commits or push after a final experiment "
+            "result. It does not post a comment, submit a result, change PR "
+            "labels or draft state, remove a hold, or authorize training.",
+            PushExperimentCommitExecutor(runtime),
         )
 
 

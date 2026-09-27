@@ -10,7 +10,7 @@ bounded delegation. Python owns operations that should not depend on an LLM
 composing fragile tool calls:
 
 - GitHub polling, workflow operations, and verification;
-- assignment branch publication;
+- pushing experiment commits to their existing GitHub PR branches;
 - training process supervision and W&B metric monitoring;
 - conversation selection and durable local events;
 - command policy and stop checks; and
@@ -443,7 +443,10 @@ the model-facing schema. It also canonicalizes every Senpai-authored comment to
 an `ADVISOR:` or `STUDENT:` prefix from that trusted role; models supply plain
 comment text and cannot impersonate the other role through a payload.
 
-Assignment-scoped advisor and student operations share this object:
+Operations on an existing assignment share these fields. The PR number identifies
+the experiment PR. The assignment ID and revision ID identify the advisor's
+current instructions. The expected PR head is the Git commit identifier (SHA) currently
+on GitHub, so the tool can reject a change made after the student read the PR:
 
 ```json
 {
@@ -460,6 +463,7 @@ Assignment-scoped advisor and student operations share this object:
 | `publish_advisor_branch` | advisor | `remote_branch_sha_before_push`, `local_commit_sha` |
 | `repair_assignment_routing` | advisor | `working_state` (`wip` or `review`) and a `blockers` list containing only `blocked`, `hold`, or `needs-rebase` |
 | `send_assignment_feedback` | advisor | `feedback_id`, `comment` |
+| `push_experiment_commit` | student | `local_commit_sha`, which must identify the current local commit (HEAD), with no uncommitted changes |
 | `post_assignment_comment` | student | `comment_id`, `comment` |
 | `request_assignment_revision` | advisor | `new_revision_id`, `required_base_sha`, `comment` |
 | `accept_result_on_current_base` | advisor | `expected_current_base_sha`, `reason` |
@@ -467,6 +471,15 @@ Assignment-scoped advisor and student operations share this object:
 | `close_experiment` | advisor | `reason` |
 | `respond_to_human_issue` | advisor or student | `issue_number`, `human_message_id`, `response` |
 | `submit_experiment_result` | student | `branch`, `remote_branch_sha_before_push`, `result` |
+
+`push_experiment_commit` pushes the student's exact current local commit (HEAD) to the
+existing GitHub branch for the experiment PR. It checks the assigned student,
+branch, base commit, current instructions and expected GitHub head before pushing.
+It checks the resulting head and unchanged assignment record afterward. It
+refuses to overwrite other commits or push after a final experiment result for the
+current assignment revision. Retrying the same push is safe. Pushing does not
+remove a hold or authorize training; comments, labels, draft state and result
+records stay unchanged.
 
 Interim student communication happens through `post_assignment_comment`. The
 runtime binds the configured student identity and validates the exact open WIP

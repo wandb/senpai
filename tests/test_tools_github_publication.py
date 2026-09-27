@@ -1,3 +1,4 @@
+import json
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,9 @@ from github_workflow_support import (
     workflow,
 )
 from openhands.sdk.conversation import ConversationExecutionStatus
+from openhands.sdk.conversation.event_store import EventLog
+from openhands.sdk.event import ActionEvent
+from openhands.sdk.io import LocalFileStore
 from pydantic import SecretStr
 
 from senpai_agent.git_workflow import GitWorkflowPreconditionError
@@ -82,7 +86,7 @@ def publication_tool(case):
         )
     finally:
         clear_github_credentials()
-    return next(tool for tool in tools if tool.name == "publish_assignment_branch")
+    return next(tool for tool in tools if tool.name == "push_experiment_commit")
 
 
 def publication_action(tool, case):
@@ -99,7 +103,7 @@ def publication_action(tool, case):
     )
 
 
-def test_publish_assignment_source_without_submitting_or_releasing_hold(publication):
+def test_push_experiment_commit_without_submitting_or_releasing_hold(publication):
     case = publication
     before = deepcopy(case.fake.pr)
     tool = publication_tool(case)
@@ -110,7 +114,7 @@ def test_publish_assignment_source_without_submitting_or_releasing_hold(publicat
 
     assert first.changed is True
     assert replay.changed is False
-    assert first.state == replay.state == "assignment_branch_published"
+    assert first.state == replay.state == "experiment_commit_pushed"
     assert first.version == replay.version == case.local_sha
     assert git(case.remote, "rev-parse", f"refs/heads/{case.branch}") == case.local_sha
     assert case.fake.pr == {**before, "head_sha": case.local_sha}
@@ -132,7 +136,7 @@ def test_publish_assignment_source_without_submitting_or_releasing_hold(publicat
         ("base-branch", "branch must differ from"),
     ],
 )
-def test_publish_assignment_rejects_invalid_current_source_before_push(
+def test_push_experiment_commit_rejects_invalid_current_source_before_push(
     publication, guard, message
 ):
     case = publication
@@ -190,7 +194,7 @@ def test_publish_assignment_rejects_invalid_current_source_before_push(
 
 
 @pytest.mark.parametrize("revision", ["revision-1", "older-revision"])
-def test_publish_assignment_respects_trusted_current_revision_terminal_result(
+def test_push_experiment_commit_respects_trusted_current_revision_terminal_result(
     publication, revision
 ):
     case = publication
@@ -208,12 +212,12 @@ def test_publish_assignment_respects_trusted_current_revision_terminal_result(
 
     if revision == "revision-1":
         with pytest.raises(
-            WorkflowPreconditionError, match="already has a terminal result"
+            WorkflowPreconditionError, match="already has a final experiment result"
         ):
             tool(action)
         expected_head = case.base_sha
     else:
-        assert tool(action).state == "assignment_branch_published"
+        assert tool(action).state == "experiment_commit_pushed"
         expected_head = case.local_sha
 
     assert git(case.remote, "rev-parse", f"refs/heads/{case.branch}") == expected_head
@@ -222,7 +226,7 @@ def test_publish_assignment_respects_trusted_current_revision_terminal_result(
 
 
 @pytest.mark.parametrize("race", ["revision", "base", "terminal", "transport"])
-def test_publish_assignment_reports_race_after_push_without_rewriting_workflow(
+def test_push_experiment_commit_reports_race_after_push_without_rewriting_workflow(
     publication, monkeypatch, race
 ):
     case = publication
@@ -263,7 +267,7 @@ def test_publish_assignment_reports_race_after_push_without_rewriting_workflow(
         state=SimpleNamespace(execution_status=ConversationExecutionStatus.RUNNING)
     )
     with pytest.raises(
-        (ValueError, ReconciliationError), match=f"{case.local_sha} was published"
+        (ValueError, ReconciliationError), match=f"{case.local_sha} was pushed"
     ):
         tool(publication_action(tool, case), conversation=conversation)
 
@@ -279,3 +283,48 @@ def test_publish_assignment_reports_race_after_push_without_rewriting_workflow(
         assert (
             conversation.state.execution_status == ConversationExecutionStatus.FINISHED
         )
+
+
+def test_saved_push_action_loads_after_tool_rename(tmp_path):
+    arguments = {
+        "assignment": {
+            "pr_number": 7,
+            "assignment_id": "assignment-one",
+            "revision_id": "revision-1",
+            "expected_pr_head_sha": "a" * 40,
+        },
+        "local_commit_sha": "b" * 40,
+    }
+    saved = json.dumps({
+        "kind": "ActionEvent",
+        "id": "11111111-1111-4111-8111-111111111111",
+        "timestamp": "2026-09-27T12:00:00",
+        "source": "agent",
+        "thought": [],
+        "action": {"kind": "PublishAssignmentBranchAction", **arguments},
+        "tool_name": "publish_assignment_branch",
+        "tool_call_id": "call-old-push",
+        "tool_call": {
+            "id": "call-old-push",
+            "name": "publish_assignment_branch",
+            "arguments": json.dumps(arguments),
+            "origin": "responses",
+        },
+        "llm_response_id": "resp-before-rename",
+    })
+    events_dir = tmp_path / "events"
+    events_dir.mkdir()
+    event_file = events_dir / "event-00000-11111111-1111-4111-8111-111111111111.json"
+    event_file.write_text(saved)
+
+    history = EventLog(LocalFileStore(str(tmp_path)))
+    event = history[0]
+
+    assert isinstance(event, ActionEvent)
+    assert event.action.assignment.assignment_id == "assignment-one"
+    assert event.action.assignment.revision_id == "revision-1"
+    assert event.action.local_commit_sha == "b" * 40
+    assert event.tool_call.name == "publish_assignment_branch"
+    assert event.tool_call.id == "call-old-push"
+    assert event.llm_response_id == "resp-before-rename"
+    assert event_file.read_text() == saved
