@@ -120,7 +120,7 @@ class Args:
     capacity_node_selector: list[str] = field(
         default_factory=list
     )  # key=value selectors for the observed worker shape
-    capacity_tolerations: list[str] | None = None  # JSON worker tolerations; omitted means no tolerations
+    capacity_tolerations: list[str] | None = None  # observer override; omitted matches managed GPU workers
     capacity_hpc_verification: bool = False  # apply the operator-confirmed CoreWeave HPC eligibility policy
     senpai_repo_url: str = (
         "https://github.com/wandb/senpai.git"  # public read-only runner source
@@ -242,7 +242,11 @@ def capacity_config(args: Args) -> dict:
         cpu_per_node=args.cpu_per_gpu * args.gpus_per_student_node,
         memory_gib_per_node=args.memory_gi_per_gpu * args.gpus_per_student_node,
         node_selector=controller_node_selector(args.capacity_node_selector, kind="capacity"),
-        tolerations=[json.loads(value) for value in args.capacity_tolerations or []],
+        tolerations=(
+            [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}]
+            if args.capacity_tolerations is None
+            else [json.loads(value) for value in args.capacity_tolerations]
+        ),
         hpc_verification=args.capacity_hpc_verification,
     ).model_dump(mode="json")
 

@@ -337,11 +337,10 @@ The observed worker shape comes from `--nodes_per_student`,
 `--capacity_node_selector key=value ...` and
 `--capacity_tolerations '{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}'`
 to describe the intended workers. These options affect observation only; they do
-not change training manifests. Observation defaults to no tolerations for every
-topology. Set explicit tolerations to match the target-owned worker manifests;
-CPU student controllers do not define worker placement. Use
-`capacity_tolerations: []` in YAML or `--capacity_tolerations` without values for
-an empty override. Enable
+not change training manifests. Observation defaults to the same
+`nvidia.com/gpu:NoSchedule` toleration as the generated workers. Explicit
+tolerations replace this observation default; `capacity_tolerations: []` in YAML
+or `--capacity_tolerations` without values selects an empty override. Enable
 `--capacity_hpc_verification true` only where the operator confirms CoreWeave's
 preemptible HPC-verification policy. That policy requires the verification
 namespace, exact priority class, priority -1, and verification workload name;
@@ -557,7 +556,7 @@ For example, a student can submit:
 
 ```json
 {
-  "argv": ["bash", "-lc", "python -m pip install -r requirements.txt && python train.py"],
+  "argv": ["bash", "-c", "python -m pip install -r requirements.txt && python train.py"],
   "cwd": "/workspaces/target",
   "timeout_seconds": 1800
 }
@@ -572,8 +571,10 @@ and packages created only in the controller do not transfer to a fresh worker.
 
 The source checkout and default workers run as UID/GID 10001. The checkout verifies
 the requested commit, and the installed Senpai runtime remains read-only.
-Senpai does not change ownership of the dataset. The entire configured PVC is
-mounted at the same path in controllers and workers.
+Preflight and workers do not change dataset ownership. Controllers retain
+`fsGroup: 10001` with `OnRootMismatch`; Kubernetes may adjust volume ownership
+when a controller mounts it. The entire configured PVC is mounted at
+the same path in controllers and workers.
 
 Use `SENPAI_TRAINING_OUTPUT_DIR` for checkpoints and other durable outputs. It is
 beneath `<pvc_mount_path>/.senpai/runs/<tag>/<student>/<training_id>` and remains

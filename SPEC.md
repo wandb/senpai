@@ -728,7 +728,9 @@ the target remains responsible for its framework's distributed execution.
 
 Checkout and default workers use UID/GID 10001. The checkout trusts only its
 exact workspace path for Git ownership checks and retains full commit
-verification. No dataset ownership repair is performed. The full configured
+verification. Checkout, preflight, and training workers do not request dataset
+ownership changes. Controller pods retain their existing `fsGroup: 10001` policy,
+which can affect PVC ownership according to the storage driver. The full configured
 PVC uses the same mount path in every role. Checkpoints live below the supplied
 `SENPAI_TRAINING_OUTPUT_DIR` and survive worker deletion.
 
@@ -1073,10 +1075,10 @@ The snapshot includes the complete observation configuration. Optional
 and preemption policy with that configuration. Toleration order and duplicates
 do not affect the comparison. A mismatch returns unknown, preserves the observed
 configuration, and removes capacity counts. Matching requirements do not assess
-affinity, topology, quotas, or PVC placement. Observation defaults to empty
-tolerations for all topologies. Operators must configure observation tolerations
-to match target-owned worker manifests; CPU student controllers do not define
-worker placement. Explicit observation settings do not change worker placement.
+affinity, topology, quotas, or PVC placement. Observation defaults to the
+`nvidia.com/gpu` NoSchedule toleration used by managed training workers.
+An explicit empty list removes that toleration from observation. Explicit
+observation settings do not change worker placement.
 
 Hivemind startup remains commented with a clear note. The Python controller
 waits for the optional cluster start gate while continuously refreshing a

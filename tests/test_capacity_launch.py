@@ -205,15 +205,15 @@ def test_observer_without_students_resolves_the_matching_executor_digest(monkeyp
 @pytest.mark.parametrize(
     "nodes,placement_args,fit_nodes",
     [
-        (1, [], 0),
-        (4, [], 0),
+        (1, [], 1),
+        (4, [], 1),
         (1, ["--capacity_tolerations"], 0),
         (1, ["--capacity_tolerations", '{"key":"other","operator":"Exists"}'], 0),
         (1, ["--capacity_tolerations", '{"key":"nvidia.com/gpu","operator":"Exists"}'], 1),
         (4, ["--capacity_tolerations", '{"key":"nvidia.com/gpu","operator":"Exists"}'], 1),
     ],
 )
-def test_observer_cli_uses_only_explicit_worker_tolerations(
+def test_observer_cli_uses_default_or_explicit_worker_tolerations(
     nodes, placement_args, fit_nodes
 ):
     rendered = run_launch(

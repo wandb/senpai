@@ -193,7 +193,11 @@ def validate_storage(
             }],
             "volumes": [{"name": "storage", "persistentVolumeClaim": {"claimName": pvc_claim_name}}],
         }
-        if not is_writer and controller_node_selector:
+        if is_writer:
+            spec["tolerations"] = [
+                {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+            ]
+        elif controller_node_selector:
             spec["nodeSelector"] = controller_node_selector
         if is_writer and nodes_per_student > 1:
             spec["affinity"] = {"podAntiAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [{

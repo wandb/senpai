@@ -175,12 +175,17 @@ def test_preflight_uses_role_images_runtime_identity_and_uid_safe_cleanup(monkey
         assert "nvidia.com/gpu" not in container["resources"]["requests"]
         assert container["command"][:2] == ["/opt/senpai-venv/bin/python", "-P"]
         if role == "writer":
+            assert spec.get("tolerations") == [
+                {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+            ]
+            assert "nvidia.com/gpu" not in container["resources"]["limits"]
             assert ("affinity" in spec) is (nodes > 1)
             if nodes > 1:
                 term = spec["affinity"]["podAntiAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"][0]
                 assert term["topologyKey"] == "kubernetes.io/hostname"
                 assert term["labelSelector"]["matchLabels"]["storage-role"] == "reader"
         else:
+            assert not spec.get("tolerations")
             assert spec["nodeSelector"] == {"pool": "cpu"}
 
 
