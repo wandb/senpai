@@ -2,16 +2,20 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
-from pathlib import Path
 from base64 import b64decode
 from dataclasses import replace
+from pathlib import Path
 
-import pytest
 import psutil
+import pytest
 from openhands.sdk.llm import Message, TextContent
+from openhands_support import launch_env, runtime_config
+from pydantic import SecretStr
 
+import senpai_agent.delegation as delegation_module
 from senpai_agent.delegation import (
     AgentTask,
     DelegationConfig,
@@ -34,7 +38,7 @@ from senpai_agent.openhands_runner import (
     resolve_config,
 )
 from senpai_agent.program_context import PROGRAM_PATH_ENV, PROGRAM_SOURCE_COMMIT_ENV
-from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV
+from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV, MODEL_CREDENTIALS_FD_ENV
 from senpai_agent.supervisor import prepare_system_context_environment
 from senpai_agent.system_instructions import (
     SYSTEM_INSTRUCTIONS_FILE_ENV,
@@ -42,7 +46,6 @@ from senpai_agent.system_instructions import (
     decode_system_instructions,
     encode_system_instructions,
 )
-from openhands_support import launch_env, runtime_config
 
 
 def delegation_request(
@@ -100,7 +103,8 @@ def delegation_config(tmp_path: Path, **updates) -> DelegationConfig:
         "harness_file": tmp_path / "SENPAI-HARNESS.md",
         "plugin_dir": tmp_path / "plugin",
         "enable_browser": True,
-        "conversation_secrets": {"EXA_API_KEY": "exa-secret"},
+        "conversation_secrets": {"PRIVATE_AUTH": "private-secret"},
+        "exa_api_key": SecretStr("exa-secret"),
         "role": "advisor",
         "instructions": runtime_config(tmp_path).instructions,
     }
@@ -207,14 +211,14 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
         "OPENAI_API_KEY"
     )
     assert fast.state_dir.parent == config.state_dir / "children"
-    assert fast.environment["ANTHROPIC_API_KEY"] == "anthropic-secret"
-    assert fast.environment["OPENAI_API_KEY"] == "openai-secret"
+    assert "ANTHROPIC_API_KEY" not in fast.environment
+    assert "OPENAI_API_KEY" not in fast.environment
     assert fast.environment["SENPAI_OPENHANDS_API_KEY_ENV"] == "ANTHROPIC_API_KEY"
     assert frontier.environment["SENPAI_OPENHANDS_API_KEY_ENV"] == "OPENAI_API_KEY"
     assert fast.environment["GH_REPO"] == "acme/widgets"
     assert "GITHUB_TOKEN" not in fast.environment
     assert "GH_TOKEN" not in fast.environment
-    assert fast.environment["EXA_API_KEY"] == "exa-secret"
+    assert "EXA_API_KEY" not in fast.environment
     assert fast.environment["SENPAI_OPENHANDS_SMART_MODEL"] == config.smart_model
     assert fast.environment["SENPAI_OPENHANDS_SMART_API_KEY_ENV"] == (
         config.smart_api_key_env
@@ -264,14 +268,24 @@ def test_descendants_and_restarts_use_the_complete_parent_snapshot(tmp_path: Pat
     delegated = runner_delegation_config(parent)
     child = OpenHandsChildProcess(delegated, delegation_request())
     child_environment = child.environment
-    child_config = resolve_config(parse_runner_args(child.command[4:]), child_environment)
+    # The runner adds the private handoff to an in-memory mapping before resolution.
+    model_credentials = {
+        "ANTHROPIC_API_KEY": env["ANTHROPIC_API_KEY"],
+        "OPENAI_API_KEY": env["OPENAI_API_KEY"],
+    }
+    child_config = resolve_config(
+        parse_runner_args(child.command[4:]), child_environment | model_credentials
+    )
     grandchild = OpenHandsChildProcess(
         runner_delegation_config(child_config), delegation_request()
     )
     grandchild_config = resolve_config(
-        parse_runner_args(grandchild.command[4:]), grandchild.environment
+        parse_runner_args(grandchild.command[4:]),
+        grandchild.environment | model_credentials,
     )
-    restarted = resolve_config(parse_runner_args(child.command[4:]), child.environment)
+    restarted = resolve_config(
+        parse_runner_args(child.command[4:]), child.environment | model_credentials
+    )
 
     assert Path(child_environment[SYSTEM_INSTRUCTIONS_FILE_ENV]).stat().st_size > 128 * 1024
     assert all(
@@ -315,15 +329,105 @@ def test_child_environment_replaces_ambient_model_credentials(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-anthropic-key")
     monkeypatch.setenv("OPENAI_API_KEY", "stale-openai-key")
     monkeypatch.setenv("GEMINI_API_KEY", "unconfigured-model-key")
+    monkeypatch.setenv("SENPAI_MODEL_CREDENTIALS_FD", "999")
+    monkeypatch.setenv("PROVIDER_CREDENTIAL", "stale-provider-key")
 
     environment = OpenHandsChildProcess(
-        delegation_config(tmp_path),
+        delegation_config(
+            tmp_path,
+            frontier_api_key_env="PROVIDER_CREDENTIAL",
+        ),
         delegation_request(model="frontier", agent="general-purpose"),
     ).environment
 
-    assert environment["ANTHROPIC_API_KEY"] == "anthropic-secret"
-    assert environment["OPENAI_API_KEY"] == "openai-secret"
+    assert "ANTHROPIC_API_KEY" not in environment
+    assert "OPENAI_API_KEY" not in environment
     assert "GEMINI_API_KEY" not in environment
+    assert "PROVIDER_CREDENTIAL" not in environment
+    assert MODEL_CREDENTIALS_FD_ENV not in environment
+
+
+def test_child_preserves_the_shared_wandb_service_credential(tmp_path):
+    config = delegation_config(
+        tmp_path,
+        smart_api_key_env="WANDB_API_KEY",
+        smart_api_key="wandb-key",
+        conversation_secrets={"WANDB_API_KEY": "wandb-key"},
+    )
+
+    environment = OpenHandsChildProcess(config, delegation_request()).environment
+
+    assert environment["WANDB_API_KEY"] == "wandb-key"
+    assert "EXA_API_KEY" not in environment
+
+
+def test_nested_search_retains_private_exa_credentials_across_execs(
+    tmp_path, monkeypatch
+):
+    from exa_delegation_support import child_command
+
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    (workspace / "program.md").write_text("Find evidence for the research question.")
+    config = runtime_config(
+        tmp_path,
+        workspace=workspace,
+        conversation_secrets={},
+        exa_api_key=SecretStr("nested-exa-key"),
+    )
+    for name in ("WANDB_ENTITY", "WANDB_PROJECT", "SENPAI_AGENT_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("EXA_API_KEY", "ambient-exa-key")
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    monkeypatch.setattr(OpenHandsChildProcess, "command", property(child_command))
+    child = OpenHandsChildProcess(
+        runner_delegation_config(config),
+        delegation_request(agent="general-purpose"),
+    )
+
+    result = json.loads(child.run("Delegate this research to search.", 60))
+
+    assert [hop["agent"] for hop in result["hops"]] == ["general-purpose", "search"]
+    assert len({os.getpid(), *(hop["pid"] for hop in result["hops"])}) == 3
+    assert "https://example.test/nested" in result["evidence"]
+    assert "Evidence returned through both child processes." in result["evidence"]
+    assert "nested-exa-key" not in json.dumps(result)
+    assert "nested-exa-key" not in child.output_path.read_text()
+
+
+def test_child_start_closes_credential_fd_if_exec_fails(monkeypatch, tmp_path):
+    descriptors = []
+
+    def failed_popen(_command, **kwargs):
+        descriptor = int(kwargs["env"][MODEL_CREDENTIALS_FD_ENV])
+        descriptors.append(descriptor)
+        assert kwargs["pass_fds"] == (descriptor,)
+        os.fstat(descriptor)
+        raise OSError("exec failed")
+
+    monkeypatch.setattr(delegation_module.subprocess, "Popen", failed_popen)
+    child = OpenHandsChildProcess(delegation_config(tmp_path), delegation_request())
+
+    with pytest.raises(OSError, match="exec failed"):
+        child.start("Inspect the result.", 60, lambda _result, _error: None)
+
+    assert len(descriptors) == 1
+    with pytest.raises(OSError):
+        os.fstat(descriptors[0])
+
+
+def test_child_start_rejects_conflicting_profile_keys_before_exec(monkeypatch, tmp_path):
+    def unexpected_popen(*_args, **_kwargs):
+        pytest.fail("conflicting credential profiles must not start a child")
+
+    monkeypatch.setattr(delegation_module.subprocess, "Popen", unexpected_popen)
+    child = OpenHandsChildProcess(
+        delegation_config(tmp_path, fast_api_key="conflicting-key"),
+        delegation_request(),
+    )
+
+    with pytest.raises(RuntimeError, match="conflicting values.*ANTHROPIC_API_KEY"):
+        child.start("Inspect the result.", 60, lambda _result, _error: None)
 
 
 def test_child_environment_carries_only_configured_custom_secrets(
@@ -335,7 +439,6 @@ def test_child_environment_carries_only_configured_custom_secrets(
     config = delegation_config(
         tmp_path,
         conversation_secrets={
-            "EXA_API_KEY": "exa-secret",
             "PRIVATE_AUTH": "private-secret",
             "REGISTRY_API_KEY": "registry-secret",
         },
@@ -351,6 +454,7 @@ def test_child_environment_carries_only_configured_custom_secrets(
     )
     assert environment["PRIVATE_AUTH"] == "private-secret"
     assert environment["REGISTRY_API_KEY"] == "registry-secret"
+    assert "EXA_API_KEY" not in environment
     assert "STALE_AUTH" not in environment
 
 
@@ -381,6 +485,73 @@ def test_child_result_parser_uses_only_terminal_result_record():
 
     with pytest.raises(RuntimeError, match="terminal result"):
         OpenHandsChildProcess.parse_result('OPENHANDS_EVENT {"text":"not enough"}')
+
+
+@pytest.mark.parametrize("depth,parent_task_id", [(1, None), (2, "parent-task")])
+def test_child_start_records_lineage_and_input_before_bootstrap_failure(
+    tmp_path, monkeypatch, depth, parent_task_id
+):
+    class BrokenChild(OpenHandsChildProcess):
+        @property
+        def command(self):
+            return (
+                sys.executable,
+                "-c",
+                (
+                    "import json,os,sys; "
+                    "print(json.dumps({'input_characters':len(sys.stdin.read()), "
+                    "'env':{k:v for k,v in os.environ.items() "
+                    "if k.startswith('SENPAI_DELEGATION_') or "
+                    "k=='SENPAI_PARENT_CONVERSATION_ID'}}),flush=True); "
+                    "raise ImportError('missing child dependency')"
+                ),
+            )
+
+    monkeypatch.setenv("SENPAI_DELEGATION_PARENT_TASK_ID", "stale-ancestor")
+    monkeypatch.setenv("SENPAI_DELEGATION_INPUT_CHARACTERS", "999999")
+    request = replace(
+        delegation_request(),
+        tree_id="tree",
+        depth=depth,
+        parent_task_id=parent_task_id,
+    )
+    child = BrokenChild(delegation_config(tmp_path), request)
+    completed = threading.Event()
+    outcomes = []
+
+    def on_complete(result, error):
+        outcomes.append((result, error))
+        completed.set()
+
+    child.start("Inspect π without publishing it.", 10, on_complete)
+    assert completed.wait(15)
+    lines = child.output_path.read_text().splitlines()
+    assert lines[0].startswith("OPENHANDS_CHILD_START ")
+    record = json.loads(lines[0].split(" ", 1)[1])
+    observed = json.loads(lines[1])
+    assert record["input_characters"] == observed["input_characters"]
+    assert record["parent_messages"] == 2
+    assert record["task_id"] == request.task_id
+    assert record["parent_conversation_id"] == request.parent_conversation_id
+    assert record["parent_task_id"] == parent_task_id
+    assert record["tree_id"] == "tree"
+    assert record["depth"] == depth
+    assert record["model_tier"] == "fast"
+    assert record["model"] == "anthropic/claude-haiku-4-5"
+    assert observed["env"]["SENPAI_DELEGATION_TASK_ID"] == request.task_id
+    assert observed["env"]["SENPAI_DELEGATION_PARENT_TASK_ID"] == (parent_task_id or "")
+    assert (
+        observed["env"]["SENPAI_PARENT_CONVERSATION_ID"]
+        == request.parent_conversation_id
+    )
+    assert (
+        int(observed["env"]["SENPAI_DELEGATION_INPUT_CHARACTERS"])
+        == observed["input_characters"]
+    )
+    assert outcomes[0][0] is None
+    assert isinstance(outcomes[0][1], RuntimeError)
+    assert "secret" not in lines[0]
+    assert "Inspect" not in lines[0]
 
 
 def test_child_monitor_invokes_a_failing_completion_callback_once(tmp_path: Path):

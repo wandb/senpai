@@ -78,10 +78,18 @@ spec:
           cd /workspace/senpai
           test "$(git rev-parse HEAD)" = "$SENPAI_REPO_REVISION"
           test "$SENPAI_IMAGE_REVISION" = "$SENPAI_REPO_REVISION"
-          token_handoff=/tmp/senpai-supervisor-github-token
+          handoff_dir=$(mktemp -d /tmp/senpai-supervisor.XXXXXX)
+          chmod 700 "$handoff_dir"
+          token_handoff="$handoff_dir/github-token"
           (umask 077; printf '%s' "$GITHUB_TOKEN" > "$token_handoff")
+          wandb_handoff="$handoff_dir/wandb-api-key"
+          (umask 077; printf '%s' "$WANDB_API_KEY" > "$wandb_handoff")
+          exa_handoff="$handoff_dir/exa-api-key"
+          (umask 077; printf '%s' "$EXA_API_KEY" > "$exa_handoff")
           export SENPAI_GITHUB_TOKEN_FILE="$token_handoff"
-          unset GITHUB_TOKEN GH_TOKEN
+          export SENPAI_WANDB_API_KEY_FILE="$wandb_handoff"
+          export SENPAI_EXA_API_KEY_FILE="$exa_handoff"
+          unset GITHUB_TOKEN GH_TOKEN WANDB_API_KEY EXA_API_KEY
           rm -f "$askpass"
           exec bash k8s/entrypoint-student.sh
         envFrom:
@@ -109,20 +117,16 @@ spec:
           requests: {cpu: "2", memory: 8Gi}
           limits: {cpu: "4", memory: 16Gi}
         startupProbe:
-          exec:
-            command:
-            - /bin/sh
-            - -c
-            - exec "$SENPAI_PYTHON" -P -m senpai_agent.supervisor health "/var/lib/senpai/openhands_state/controller-lease.json"
+          httpGet:
+            path: /healthz
+            port: 8080
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 60
         livenessProbe:
-          exec:
-            command:
-            - /bin/sh
-            - -c
-            - exec "$SENPAI_PYTHON" -P -m senpai_agent.supervisor health "/var/lib/senpai/openhands_state/controller-lease.json"
+          httpGet:
+            path: /healthz
+            port: 8080
           periodSeconds: 30
           timeoutSeconds: 5
           failureThreshold: 5
@@ -136,6 +140,10 @@ spec:
           mountPath: /var/lib/senpai
         - name: executor-socket
           mountPath: /var/run/senpai-kubernetes
+        - name: target
+          mountPath: {{TARGET_WORKSPACE_MOUNT}}
+        - name: target-environment
+          mountPath: /home/senpai/.venvs/senpai-target
         - name: program-context
           mountPath: /var/run/senpai-context
           readOnly: true
@@ -167,6 +175,10 @@ spec:
               items:
               - key: ca.crt
                 path: ca.crt
+      - name: target
+        emptyDir: {}
+      - name: target-environment
+        emptyDir: {}
       - name: program-context
         secret:
           secretName: {{PROGRAM_CONTEXT_SECRET_NAME}}

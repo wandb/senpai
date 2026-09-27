@@ -1,11 +1,86 @@
+import ctypes
+import errno
+import os
+import tempfile
+
 import pytest
+
+import senpai_agent.secrets as secrets_module
 
 from senpai_agent.secrets import (
     CUSTOM_SECRET_ENV_NAMES_ENV,
+    MAX_MODEL_CREDENTIAL_BUNDLE_BYTES,
+    MODEL_CREDENTIALS_FD_ENV,
+    consume_model_credential_fd,
     configured_custom_secret_env_names,
     scrub_github_credentials,
+    set_process_nondumpable,
     validate_custom_secret_env_names,
 )
+
+
+@pytest.mark.parametrize("result", [0, -1])
+def test_linux_credential_holders_disable_process_dumping(monkeypatch, result):
+    calls = []
+
+    class LibC:
+        @staticmethod
+        def prctl(*arguments):
+            calls.append(arguments)
+            ctypes.set_errno(errno.EPERM)
+            return result
+
+    monkeypatch.setattr(secrets_module.sys, "platform", "linux")
+    monkeypatch.setattr(secrets_module.ctypes, "CDLL", lambda *_args, **_kwargs: LibC())
+
+    if result == 0:
+        set_process_nondumpable()
+    else:
+        with pytest.raises(OSError) as raised:
+            set_process_nondumpable()
+        assert raised.value.errno == errno.EPERM
+
+    assert calls == [(4, 0, 0, 0, 0)]
+
+
+def test_model_credential_bundle_is_consumed_once_and_closes_its_fd():
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b'{"OPENAI_API_KEY":"private-key"}')
+    os.close(write_fd)
+    environment = {MODEL_CREDENTIALS_FD_ENV: str(read_fd)}
+
+    assert consume_model_credential_fd(environment) == {"OPENAI_API_KEY": "private-key"}
+    assert environment == {}
+    assert consume_model_credential_fd(environment) == {}
+    with pytest.raises(OSError):
+        os.fstat(read_fd)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"not-json",
+        b"{}",
+        b"[]",
+        b'{"NOT-VALID":"secret"}',
+        b'{"OPENAI_API_KEY":" "}',
+        b'{"OPENAI_API_KEY":1}',
+        b"x" * (MAX_MODEL_CREDENTIAL_BUNDLE_BYTES + 1),
+    ],
+)
+def test_model_credential_bundle_rejects_invalid_payloads_and_closes_its_fd(payload):
+    with tempfile.TemporaryFile() as stream:
+        stream.write(payload)
+        stream.seek(0)
+        descriptor = os.dup(stream.fileno())
+    environment = {MODEL_CREDENTIALS_FD_ENV: str(descriptor)}
+
+    with pytest.raises(RuntimeError, match="credential bundle is"):
+        consume_model_credential_fd(environment)
+
+    assert environment == {}
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
 
 
 def test_scrub_github_credentials_removes_every_handoff():

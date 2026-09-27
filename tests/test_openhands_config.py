@@ -1,3 +1,4 @@
+import io
 import os
 from base64 import b64encode
 from pathlib import Path
@@ -24,7 +25,7 @@ from senpai_agent.program_context import (
     PROGRAM_SOURCE_COMMIT_ENV,
     ProgramSystemPrompt,
 )
-from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV
+from senpai_agent.secrets import CUSTOM_SECRET_ENV_NAMES_ENV, MODEL_CREDENTIALS_FD_ENV
 from senpai_agent.system_instructions import (
     SYSTEM_INSTRUCTIONS_FILE_ENV,
     SYSTEM_INSTRUCTIONS_SHA256_ENV,
@@ -34,6 +35,42 @@ from openhands_support import TEST_LAUNCH_CONTEXT, runtime_config, runtime_env
 from test_agent_markdown import HTML_HEADER, PLAIN_HEADER
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("malformed_bundle", [False, True])
+def test_child_handoff_failure_records_the_result_and_finishes_tracing(
+    monkeypatch, malformed_bundle
+):
+    monkeypatch.delenv(MODEL_CREDENTIALS_FD_ENV, raising=False)
+    monkeypatch.setenv("SENPAI_DELEGATION_TASK_ID", "child-task")
+    descriptor = None
+    if malformed_bundle:
+        descriptor, writer = os.pipe()
+        os.write(writer, b"not-json")
+        os.close(writer)
+        monkeypatch.setenv(MODEL_CREDENTIALS_FD_ENV, str(descriptor))
+    events = []
+    monkeypatch.setattr(runner, "set_process_nondumpable", lambda: events.append("private"))
+    monkeypatch.setattr(
+        runner,
+        "record_delegated_task_result",
+        lambda task_id, **result: events.append((task_id, result)),
+    )
+    monkeypatch.setattr(runner, "finish_weave_monitoring", lambda: events.append("finished"))
+    monkeypatch.setattr(runner.sys, "stdin", io.StringIO("Delegated task"))
+    message = "credential bundle is invalid" if malformed_bundle else "private model credential handoff"
+
+    with pytest.raises(RuntimeError, match=message):
+        runner.main(["--max-turns", "1", "--child"])
+
+    assert events[0] == "private"
+    assert events[1][0] == "child-task"
+    assert message in events[1][1]["error"]
+    assert events[2] == "finished"
+    assert MODEL_CREDENTIALS_FD_ENV not in os.environ
+    if descriptor is not None:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_browser_is_enabled_by_default_and_can_be_disabled():
@@ -254,9 +291,9 @@ def test_resolved_config_separates_runtime_credentials_from_conversation_secrets
     assert config.fast_api_key.get_secret_value() == "anthropic-key"
     assert config.frontier_api_key.get_secret_value() == "anthropic-key"
     assert config.github_token.get_secret_value() == "github-key"
+    assert config.exa_api_key.get_secret_value() == "exa-key"
     assert config.conversation_secrets == {
         "WANDB_API_KEY": "wandb-key",
-        "EXA_API_KEY": "exa-key",
         "PRIVATE_AUTH": "private-key",
     }
     assert "ANTHROPIC_API_KEY" not in config.conversation_secrets
@@ -790,6 +827,28 @@ def test_model_credentials_are_removed_from_the_agent_environment(tmp_path: Path
     }
 
     scrub_model_credentials(environment, runtime_config(tmp_path))
+
+    assert environment == {"WANDB_API_KEY": "wandb-key"}
+
+
+def test_model_scrubbing_preserves_intentionally_shared_service_credentials(tmp_path):
+    config = runtime_config(
+        tmp_path,
+        api_key_env="WANDB_API_KEY",
+        api_key=SecretStr("wandb-key"),
+        conversation_secrets={"WANDB_API_KEY": "wandb-key"},
+        exa_api_key=SecretStr("exa-key"),
+    )
+    environment = {
+        "ANTHROPIC_API_KEY": "anthropic-key",
+        "OPENAI_API_KEY": "openai-key",
+        "WANDB_API_KEY": "wandb-key",
+        "EXA_API_KEY": "exa-key",
+        "SENPAI_EXA_API_KEY_FILE": "/private/consumed-exa",
+        "SENPAI_EXA_API_KEY_FD": "99",
+    }
+
+    scrub_model_credentials(environment, config)
 
     assert environment == {"WANDB_API_KEY": "wandb-key"}
 
