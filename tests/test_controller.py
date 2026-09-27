@@ -27,6 +27,10 @@ from senpai_agent.inbox import (
     PersistentInbox,
     deliver_turn_messages,
 )
+from senpai_agent.anthropic_safety import (
+    AnthropicModelFallbackError,
+    AnthropicSafetyRefusalError,
+)
 from senpai_agent.mailbox import (
     ControllerEvent,
     StudentAssignmentAvailabilityMailbox,
@@ -1086,6 +1090,31 @@ def test_permanent_provider_failure_exits_without_a_controller_retry():
         ).run(max_cycles=2)
 
     assert len(turns.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "safety_error",
+    [
+        AnthropicSafetyRefusalError("Anthropic refused the request"),
+        AnthropicModelFallbackError("Anthropic substituted another model"),
+    ],
+)
+def test_anthropic_safety_failure_quarantines_without_retry(safety_error, capsys):
+    event = review_event()
+    mailbox = Mailbox(((event,), ()))
+    turns = ProviderTurns(
+        [ConversationRunError(CONVERSATION_ID, safety_error)]
+    )
+    runtime = controller(mailbox, turns)
+
+    runtime.run(max_cycles=2)
+
+    assert len(turns.calls) == 1
+    assert mailbox.acknowledged == []
+    quarantined = runtime.inbox.quarantined_turns()
+    assert len(quarantined) == 1
+    assert type(safety_error).__name__ in quarantined[0].quarantine_reason
+    assert "SENPAI_ANTHROPIC_SAFETY_FAILURE" in capsys.readouterr().err
 
 
 def test_provider_cooldown_schedule_honors_retry_after_and_adds_jitter(monkeypatch):

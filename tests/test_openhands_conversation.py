@@ -6,6 +6,7 @@ from io import StringIO
 from types import SimpleNamespace
 
 import pytest
+from openhands.sdk import Agent, LLM as OpenHandsLLM
 from openhands.sdk.conversation import ConversationExecutionStatus
 from openhands.sdk.event import (
     AgentErrorEvent,
@@ -16,7 +17,10 @@ from openhands.sdk.event import (
 )
 from openhands.sdk.llm import Message, TextContent
 from openhands.sdk.llm.exceptions import LLMServiceUnavailableError
+from openhands.sdk.llm.fallback_strategy import FallbackStrategy
+from openhands.sdk.subagent import AgentDefinition
 from openhands.sdk.tool import resolve_tool
+from pydantic import SecretStr
 
 import senpai_agent.openhands_runner as runner
 from senpai_agent.controller import OpenHandsTurnRunner, _provider_failure
@@ -24,6 +28,11 @@ from senpai_agent.inbox import (
     DeliveryState,
     InboxTurnQuarantined,
     PersistentInbox,
+)
+from senpai_agent.anthropic_safety import (
+    AnthropicModelFallbackError,
+    AnthropicSafetyLLM,
+    AnthropicSafetyRefusalError,
 )
 from senpai_agent.openhands_runner import (
     graceful_interrupts,
@@ -108,7 +117,7 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     assert captured["delete_on_close"] is False
     assert captured["llm_timeout"] == 5400
     assert captured["llm_retries"] == (5, 8, 8, 64)
-    assert captured["llm_type"] is runner.LLM
+    assert captured["llm_type"] is AnthropicSafetyLLM
     assert captured["closed"] is True
 
     retried = RuntimeError("provider requested a longer pause")
@@ -120,6 +129,99 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
                 captured["llm"].retry_listener(1, 5, retried)
                 raise exhausted
     assert _provider_failure(exhausted, 1_700_000_000).retry_after == 300
+
+
+def test_explicit_anthropic_profile_preserves_settings_and_rejects_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    captured = {}
+    profile_llm = OpenHandsLLM(
+        model="anthropic/claude-fable-5",
+        api_key=SecretStr("profile-key"),
+        stream=True,
+        fallback_strategy=FallbackStrategy(fallback_llms=["backup-profile"]),
+        litellm_extra_body={"fallbacks": "default"},
+    )
+    profile_agent = Agent(
+        llm=profile_llm,
+        tools=[],
+        condenser=runner.get_default_condenser(
+            profile_llm.model_copy(update={"usage_id": "profile-condenser"})
+        ),
+    )
+
+    class FakeConversation:
+        def __init__(self, agent, **kwargs):
+            captured["agent"] = agent
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                execution_status=ConversationExecutionStatus.FINISHED,
+                active_branch=lambda: [],
+            )
+
+        def reject_pending_actions(self, _reason):
+            pass
+
+        def send_message(self, _prompt):
+            pass
+
+        async def arun(self):
+            pass
+
+        def close(self):
+            pass
+
+    definition = AgentDefinition(name="profile-agent", model="profile")
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(
+        runner,
+        "sanitized_agent_definitions",
+        lambda _workspace: [definition],
+    )
+    monkeypatch.setattr(runner, "sanitized_project_skills", lambda _workspace: [])
+    monkeypatch.setattr(
+        runner,
+        "agent_definition_to_factory",
+        lambda _definition: lambda _parent_llm: profile_agent,
+    )
+
+    assert run_openhands(
+        "task",
+        runtime_config(tmp_path, agent_name="profile-agent"),
+    ) == 0
+
+    agent = captured["agent"]
+    assert type(agent.llm) is AnthropicSafetyLLM
+    assert agent.llm.stream is True
+    assert agent.llm.fallback_strategy == profile_llm.fallback_strategy
+    assert type(agent.condenser.llm) is AnthropicSafetyLLM
+    assert agent.condenser.llm.stream == profile_agent.condenser.llm.stream
+    assert agent.condenser.llm.fallback_strategy == profile_llm.fallback_strategy
+    with pytest.raises(
+        AnthropicModelFallbackError,
+        match="server-side fallback configuration rejected before request",
+    ):
+        agent.llm._prepare_completion_params(
+            [Message(role="user", content=[TextContent(text="Investigate")])],
+            tools=None,
+            add_security_risk_prediction=False,
+            kwargs={},
+        )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        AnthropicSafetyRefusalError("Anthropic refused the request"),
+        AnthropicModelFallbackError("Anthropic substituted another model"),
+    ],
+)
+def test_anthropic_safety_failures_are_permanent_provider_errors(error):
+    failure = _provider_failure(error, 1_700_000_000)
+
+    assert failure is not None
+    assert failure.retryable is False
 
 
 def test_context_reset_preserves_history_and_starts_a_fresh_active_branch(

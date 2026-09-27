@@ -183,6 +183,25 @@ def _provider_failure(error: Exception, now: float) -> ProviderFailure | None:
     return ProviderFailure(retryable=False)
 
 
+def _anthropic_safety_failure(error: Exception) -> BaseException | None:
+    from senpai_agent.anthropic_safety import (
+        AnthropicModelFallbackError,
+        AnthropicSafetyRefusalError,
+    )
+
+    return next(
+        (
+            current
+            for current in _exception_chain(error)
+            if isinstance(
+                current,
+                (AnthropicModelFallbackError, AnthropicSafetyRefusalError),
+            )
+        ),
+        None,
+    )
+
+
 def _provider_retry_delay(failures: int, retry_after: float) -> float:
     base = _LLM_PROVIDER_COOLDOWN_SECONDS[
         min(failures, len(_LLM_PROVIDER_COOLDOWN_SECONDS) - 1)
@@ -532,6 +551,19 @@ class Controller:
                     )
                     continue
                 except Exception as error:  # noqa: BLE001
+                    if safety_failure := _anthropic_safety_failure(error):
+                        reason = f"{type(safety_failure).__name__}: {safety_failure}"
+                        self.inbox.quarantine(turn.turn_id, reason)
+                        turn_failures.pop(conversation_id, None)
+                        served_conversations.add(conversation_id)
+                        print(
+                            "SENPAI_ANTHROPIC_SAFETY_FAILURE "
+                            f"conversation_id={conversation_id} "
+                            f"turn_id={turn.turn_id} error={reason}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
                     now = time.time()
                     provider_failure = _provider_failure(error, now)
                     if provider_failure is not None and provider_failure.retryable:
