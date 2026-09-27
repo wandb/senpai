@@ -4,9 +4,7 @@ import yaml
 
 from launch_test_support import (
     REVISION,
-    launch,
     launch_args,
-    launch_helpers,
     render_role,
 )
 
@@ -20,27 +18,8 @@ def render_student(**overrides):
         executor_image=f"ghcr.io/wandb/senpai-executor:sha-{REVISION}",
         **overrides,
     )
-    secret_name = f"senpai-launch-secrets-{args.tag}"
-    secret = launch_helpers.render_launch_secret(
-        args.tag,
-        "github",
-        "exa",
-        "wandb",
-        openai_api_key="openai",
-        custom_secrets={},
-    )
-    return list(
-        yaml.safe_load_all(
-            launch.render_student(
-                (Path(__file__).parents[1] / "k8s" / "student-deployment.yaml").read_text(),
-                "fern",
-                args.tag,
-                secret_name,
-                secret,
-                args,
-            )
-        )
-    )
+    configmap, resources, _secret = render_role("student", args)
+    return list(yaml.safe_load_all(configmap + "\n---\n" + resources))
 
 
 def test_multinode_controller_is_cpu_only_with_a_credential_isolated_executor():
@@ -88,26 +67,8 @@ def test_multinode_controller_is_cpu_only_with_a_credential_isolated_executor():
 
 def test_single_node_student_keeps_local_gpu_resources_without_executor_rbac():
     args = launch_args(nodes_per_student=1, gpus_per_student_node=2)
-    secret = launch_helpers.render_launch_secret(
-        args.tag,
-        "github",
-        "exa",
-        "wandb",
-        openai_api_key="openai",
-        custom_secrets={},
-    )
-    documents = list(
-        yaml.safe_load_all(
-            launch.render_student(
-                (Path(__file__).parents[1] / "k8s" / "student-deployment.yaml").read_text(),
-                "fern",
-                args.tag,
-                f"senpai-launch-secrets-{args.tag}",
-                secret,
-                args,
-            )
-        )
-    )
+    configmap, deployment, _secret = render_role("student", args)
+    documents = list(yaml.safe_load_all(configmap + "\n---\n" + deployment))
 
     assert [document["kind"] for document in documents] == ["ConfigMap", "Deployment"]
     pod = documents[-1]["spec"]["template"]["spec"]
@@ -130,30 +91,8 @@ def test_controller_image_has_only_the_validated_kubectl_socket_proxy():
 
 
 def test_advisor_placement_is_portable_by_default():
-    template = (Path(__file__).parents[1] / "k8s" / "advisor-deployment.yaml").read_text()
-    rendered = launch_helpers.render_template(
-        template,
-        {
-            token: "fixture"
-            for token in (
-                "ADVISOR_DEPLOYMENT_NAME",
-                "ADVISOR_CONFIGMAP_NAME",
-                "RESEARCH_TAG",
-                "ADVISOR_IMAGE",
-                "PVC_CLAIM_NAME",
-                "PVC_MOUNT_PATH",
-                "LAUNCH_SECRET_NAME",
-                "POD_CONFIG_HASH",
-                "CONTROLLER_NODE_SELECTOR",
-            )
-        }
-        | {
-            "MODEL_PROVIDER_ENV": "        - name: MODEL_API_KEY",
-            "CUSTOM_SECRET_ENV_REFS": "",
-            "CONTROLLER_NODE_SELECTOR": "{}",
-        },
-    )
-    pod = yaml.safe_load(rendered)["spec"]["template"]["spec"]
+    _configmap, deployment, _secret = render_role("advisor")
+    pod = yaml.safe_load(deployment)["spec"]["template"]["spec"]
 
     assert pod["nodeSelector"] == {}
 

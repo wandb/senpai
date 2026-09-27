@@ -1,5 +1,7 @@
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -122,12 +124,20 @@ def test_role_startup_isolates_target_uv_commands_from_agent_environment(
 ):
     entrypoint = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text()
     startup = entrypoint[entrypoint.index("export IS_SANDBOX=1"):]
+    uv = shutil.which("uv")
+    assert uv is not None, "the bootstrap contract requires uv"
+    startup = startup.replace("/usr/local/bin/uv", shlex.quote(uv))
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    python = fake_bin / "python"
+    (fake_bin / "python").write_text("#!/bin/sh\nexit 99\n")
+    (fake_bin / "python").chmod(0o755)
+    python = tmp_path / "runner-python"
+    # Execute real bootstrap probes and setup, then record the supervisor handoff.
     python.write_text(
         f"#!{sys.executable}\n"
         "import json, os, sys\n"
+        "if sys.argv[1:4] != ['-P', '-m', 'senpai_agent.supervisor']:\n"
+        "    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])\n"
         "print(json.dumps({'args': sys.argv[1:], 'environment': "
         "{key: os.environ.get(key) for key in "
         "('UV_PROJECT_ENVIRONMENT', 'UV_PYTHON', 'VIRTUAL_ENV', 'SENPAI_PYTHON')}}))\n"
@@ -135,17 +145,20 @@ def test_role_startup_isolates_target_uv_commands_from_agent_environment(
     python.chmod(0o755)
 
     completed = subprocess.run(
-        ["bash", "-c", startup],
+        ["bash", "-e", "-c", startup],
         env={
             **os.environ,
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HOME": str(tmp_path / "home"),
+            "PYTHONPATH": str(ROOT),
+            "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
             "LOGDIR": str(tmp_path),
             "WORKDIR": str(tmp_path),
             "TARGET_WORKDIR": str(tmp_path / "target"),
             "GIT_ASKPASS_FILE": str(tmp_path / "askpass"),
             "SENPAI_GITHUB_TOKEN_FILE": str(tmp_path / "token"),
             "NODES_PER_STUDENT": "1",
-            "SENPAI_PYTHON": "/opt/senpai-venv/bin/python",
+            "SENPAI_PYTHON": str(python),
             "UV_PROJECT_ENVIRONMENT": "/opt/senpai-venv",
             "UV_PYTHON": "/opt/senpai-venv/bin/python",
             "VIRTUAL_ENV": "/opt/senpai-venv",
@@ -155,12 +168,12 @@ def test_role_startup_isolates_target_uv_commands_from_agent_environment(
         check=True,
     )
     launched = json.loads(completed.stdout)
-    assert launched["args"] == ["-m", "senpai_agent.supervisor", role]
+    assert launched["args"] == ["-P", "-m", "senpai_agent.supervisor", role]
     assert launched["environment"] == {
         "UV_PROJECT_ENVIRONMENT": None,
         "UV_PYTHON": None,
         "VIRTUAL_ENV": None,
-        "SENPAI_PYTHON": "/opt/senpai-venv/bin/python",
+        "SENPAI_PYTHON": str(python),
     }
 
 
@@ -194,5 +207,5 @@ def test_kubectl_proxy_uses_agent_python_inside_target_uv_environment(tmp_path: 
         env=environment, capture_output=True, text=True, check=True,
     )
     assert json.loads(completed.stdout) == [
-        "-m", "senpai_agent.kubernetes_executor", "kubectl", "apply", "-f", "-",
+        "-P", "-m", "senpai_agent.kubernetes_executor", "kubectl", "apply", "-f", "-",
     ]

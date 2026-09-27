@@ -30,6 +30,7 @@ from senpai_agent.training import (
     TrainingResult,
     TrainingSpec,
     TrainingState,
+    target_python_environment,
     training_result_paths,
 )
 
@@ -789,12 +790,15 @@ class KubernetesTrainingSupervisor:
             reserved = True
             if self._shutdown.is_set():
                 raise RuntimeError("Kubernetes training supervisor is closed")
+            environment = dict(os.environ)
+            environment.pop("PYTHONSAFEPATH", None)
+            environment.update(target_python_environment(environment))
             with log_path.open("wb") as log:
                 process = subprocess.Popen(
                     list(spec.argv),
                     cwd=cwd,
                     env={
-                        **os.environ,
+                        **environment,
                         "SENPAI_TRAINING_SOURCE_SNAPSHOT": str(source_snapshot),
                         "SENPAI_KUBERNETES_WORKLOAD_NAME": kubernetes_spec.name,
                         "SENPAI_KUBERNETES_NAMESPACE": kubernetes_spec.namespace,

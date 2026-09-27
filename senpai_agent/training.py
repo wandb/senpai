@@ -9,7 +9,7 @@ import termios
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -32,6 +32,25 @@ _WANDB_COMPLETE_RUN_URL_BYTES = re.compile(
 _LOG_READ_BYTES = 64 * 1024
 _WANDB_SCAN_OVERLAP_BYTES = 4096
 _ERROR_TAIL_BYTES = 8192
+
+
+TARGET_PYTHON_ENV = "SENPAI_TARGET_PYTHON_ENV"
+
+
+def target_python_environment(
+    environment: Mapping[str, str] = os.environ,
+) -> dict[str, str]:
+    """Point interpreter, PATH, and uv project commands at the target venv."""
+
+    target_env = environment.get(TARGET_PYTHON_ENV, "").strip()
+    if not target_env:
+        return {}
+    return {
+        "PATH": f"{target_env}/bin:{environment['PATH']}",
+        "UV_PROJECT_ENVIRONMENT": target_env,
+        "UV_PYTHON": f"{target_env}/bin/python",
+        "VIRTUAL_ENV": target_env,
+    }
 
 
 def _mask_output_chunk(data: bytes, secret: bytes) -> tuple[bytes, bytes]:
@@ -202,6 +221,8 @@ class TrainingSupervisor:
         log_path.touch()
         environment = dict(os.environ)
         environment.pop("WANDB_SERVICE", None)
+        environment.pop("PYTHONSAFEPATH", None)
+        environment.update(target_python_environment(environment))
         process = subprocess.Popen(
             list(spec.argv),
             cwd=cwd,
