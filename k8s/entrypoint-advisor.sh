@@ -39,7 +39,7 @@ echo "GitHub history: $GH_HISTORY_SCOPE"
 cd "$WORKDIR"
 git config --global safe.directory "$WORKDIR"
 source "$SOURCE_SENPAI_PLUGIN/scripts/git-guard.sh"
-install_senpai_git_guard "$WORKDIR" "$TARGET_WORKDIR" "$GIT_ASKPASS_FILE"
+install_senpai_git_guard "$WORKDIR" "$GIT_ASKPASS_FILE"
 
 clone_single_target_branch() {
     local branch="$1"

@@ -61,7 +61,7 @@ class CreateAssignmentAction(Action):
     )
     head_branch: str = Field(
         min_length=1,
-        description="New remote branch dedicated to this student assignment.",
+        description="New remote branch under <student>/ dedicated to this assignment.",
     )
     title: str = Field(
         min_length=1,

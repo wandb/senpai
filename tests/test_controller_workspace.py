@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr
 
-from senpai_agent.git_workflow import git_process_env
+from senpai_agent.git_transport import git_process_env
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.workspace import StudentWorkspaceReconciler, WorkspaceDivergence
 

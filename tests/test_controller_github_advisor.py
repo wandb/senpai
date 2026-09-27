@@ -70,6 +70,12 @@ def mailbox(monkeypatch, pulls, *, students=(), check_author_permissions=False):
     if not check_author_permissions:
         monkeypatch.setattr(value, "_has_write_permission", lambda _login: True)
     monkeypatch.setattr(value._github, "objects", lambda _url: [])
+
+    def get_research_base(path):
+        assert path == "/repos/acme/widgets/git/ref/heads/research"
+        return {"object": {"sha": "b" * 40}}
+
+    monkeypatch.setattr(value._github, "get", get_research_base)
     return value
 
 
