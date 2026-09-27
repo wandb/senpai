@@ -286,10 +286,10 @@ def test_credentialed_push_preserves_concurrent_tracking_changes(
 
     def update_tracking_concurrently(command, **kwargs):
         nonlocal changed
-        during_network = concurrent_change == "advance" and command[1] == "ls-remote"
+        during_network = concurrent_change == "advance" and "ls-remote" in command
         during_update = (
             Path(kwargs["cwd"]) == workspace
-            and command[1] == "update-ref"
+            and "update-ref" in command
             and tracking_ref in command[2:]
         )
         if not changed and (during_network or during_update):
