@@ -95,9 +95,7 @@ class Args:
     capacity_node_selector: list[str] = field(
         default_factory=list
     )  # key=value selectors for the observed worker shape
-    capacity_tolerations: list[str] = field(
-        default_factory=list
-    )  # JSON toleration objects for the observed worker shape
+    capacity_tolerations: list[str] | None = None  # JSON tolerations; inherit single-node student defaults when omitted
     capacity_hpc_verification: bool = False  # apply the operator-confirmed CoreWeave HPC eligibility policy
     senpai_repo_url: str = (
         "https://github.com/wandb/senpai.git"  # public read-only runner source
@@ -213,13 +211,17 @@ def controller_node_selector(
 def capacity_config(args: Args) -> dict:
     from senpai_agent.cluster_capacity import CapacityConfig
 
+    if args.capacity_tolerations is None:
+        tolerations = _student_tolerations(args) if args.nodes_per_student == 1 else []
+    else:
+        tolerations = [json.loads(value) for value in args.capacity_tolerations]
     return CapacityConfig(
         nodes=args.nodes_per_student,
         gpus_per_node=args.gpus_per_student_node,
         cpu_per_node=args.cpu_per_gpu * args.gpus_per_student_node,
         memory_gib_per_node=args.memory_gi_per_gpu * args.gpus_per_student_node,
         node_selector=controller_node_selector(args.capacity_node_selector, kind="capacity"),
-        tolerations=[json.loads(value) for value in args.capacity_tolerations],
+        tolerations=tolerations,
         hpc_verification=args.capacity_hpc_verification,
     ).model_dump(mode="json")
 
@@ -420,6 +422,12 @@ def _student_resources(args: Args) -> str:
         "nvidia.com/gpu": str(args.gpus_per_student_node),
     }
     return json.dumps({"requests": resources, "limits": resources})
+
+
+def _student_tolerations(args: Args) -> list[dict]:
+    if args.nodes_per_student > 1:
+        return []
+    return [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}]
 
 
 def _yaml_list_insertion(value: dict, indentation: int) -> str:
@@ -722,17 +730,7 @@ def render_student(
                 if args.nodes_per_student > 1
                 else {}
             ),
-            "STUDENT_TOLERATIONS": json.dumps(
-                []
-                if args.nodes_per_student > 1
-                else [
-                    {
-                        "key": "nvidia.com/gpu",
-                        "operator": "Exists",
-                        "effect": "NoSchedule",
-                    }
-                ]
-            ),
+            "STUDENT_TOLERATIONS": json.dumps(_student_tolerations(args)),
             "EXECUTOR_SOCKET_MOUNT": _executor_socket_mount(args),
             "KUBERNETES_EXECUTOR_CONTAINER": _executor_container(
                 args,
