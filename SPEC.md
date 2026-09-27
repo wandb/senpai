@@ -1002,8 +1002,7 @@ single-node training and target-selected multi-node images. The executor sets
 the configured image on every main training container and injects only the
 operator's `image_pull_secrets`; agent-supplied pull secrets remain forbidden.
 The trusted executor image still provides the source-checkout init container.
-Local Dockerfiles and Docker-save archives are published to an explicit registry
-destination by `scripts/publish-training-image.py` before launch.
+Operators build and publish training images before launch.
 
 Launch preflight verifies:
 

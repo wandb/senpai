@@ -297,11 +297,12 @@ When a smoke run stalls before W&B starts, inspect these diagnostics first.
 
 ### Bring your own training image
 
-Set `training_image` to run training in your own container while Senpai supplies
-the student agent and executor. Your image keeps its Python, CUDA, and installed
-dependencies; it does not need Senpai, OpenHands, or Git. Use a Linux image that
-supports your worker architecture, GPU driver, and training command. Multi-node
-images must also provide the MPI runtime required by their target launcher.
+Build and publish your training image before launch. Set `training_image` to run
+training in that image while Senpai supplies the student agent and executor.
+Your image keeps its Python, CUDA, and installed dependencies; it does not need
+Senpai, OpenHands, or Git. Use a Linux image that supports your worker
+architecture, GPU driver, and training command. Multi-node images must also
+provide the MPI runtime required by their target launcher.
 
 Any registry reachable by the cluster works, including GitHub Container Registry,
 Docker Hub, and CoreWeave Container Registry. Supply an immutable digest:
@@ -314,42 +315,19 @@ image_pull_secrets: [training-registry]
 ```
 
 For Docker Hub, use `docker.io/OWNER/training@sha256:<manifest-digest>`.
-For CoreWeave, use the full image repository at your registry endpoint with
-`@sha256:<manifest-digest>`. The training image has no Senpai revision requirement.
-`student_image` still selects the Senpai agent runtime.
+For CoreWeave Container Registry, use your namespace's full registry endpoint
+and repository with `@sha256:<manifest-digest>`. See the
+[CWIC registry examples](https://github.com/coreweave/cwic#container-registry)
+for namespace login and digest lookup. The training image has no Senpai
+revision requirement. `student_image` still selects the Senpai agent runtime.
 
 Create any private-registry pull secrets in the launch namespace before launch,
 following the [Kubernetes registry credential instructions](https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/).
-`image_pull_secrets` lists their names. Senpai attaches these references to its
-pods and remote training pods; agents cannot select other pull secrets. Omit
-the list for public images or when cluster-managed authentication suffices.
-
-To publish a local Dockerfile, log in to the destination registry with Docker,
-then run:
-
-```bash
-training_image=$(python3.13 scripts/publish-training-image.py \
-  --dockerfile ./training/Dockerfile \
-  --tag ghcr.io/OWNER/training:experiment)
-```
-
-The build context defaults to the Dockerfile's directory; use `--context .`
-when needed. The helper builds for `linux/amd64` by default, pushes the image,
-and prints its digest reference. Set `--platform` to match other worker
-architectures. Docker with Buildx is required.
-
-For a local archive created by `docker image save`, select a tag stored in it:
-
-```bash
-training_image=$(python3.13 scripts/publish-training-image.py \
-  --archive ./training.tar --archive-image training:local \
-  --tag ghcr.io/OWNER/training:experiment)
-```
-
-The archive path requires Docker API 1.48 or later. Both commands use Docker's
-registry credentials and publish to the explicit `--tag` destination. Use the
-returned value as `--training_image "$training_image"`. A cluster cannot pull
-a Dockerfile or archive directly from your laptop.
+The Secret must contain registry credentials; Kubernetes cannot use a local
+Docker credential helper. `image_pull_secrets` lists the Secret names. Senpai
+attaches these references to its pods and remote training pods; agents cannot
+select other pull secrets. Omit the list for public images or when cluster-managed
+authentication suffices.
 
 Custom-image launches use a CPU student controller and separate GPU pods:
 one-node runs submit a Kubernetes Job; multi-node runs submit an MPIJob. The

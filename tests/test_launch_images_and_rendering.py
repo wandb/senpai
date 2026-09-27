@@ -157,7 +157,7 @@ def test_multinode_executor_requires_a_registry_digest():
 
 @pytest.mark.parametrize(
     "registry",
-    ["ghcr.io/acme", "docker.io/acme", "registry.coreweave.com/acme"],
+    ["ghcr.io/acme", "docker.io/acme", "registry.example:5000/acme/team"],
 )
 def test_custom_training_image_is_independent_of_senpai_revision(registry):
     training_image = f"{registry}/trainer@sha256:{'c' * 64}"

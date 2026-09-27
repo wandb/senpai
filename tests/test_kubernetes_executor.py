@@ -222,7 +222,8 @@ def apply(broker: KubernetesExecutor, document: dict) -> str:
     return broker.handle({"operation": "apply", "manifest": yaml.safe_dump(document)})
 
 
-def test_executor_runs_a_single_node_job_with_the_configured_training_image(tmp_path):
+@pytest.mark.parametrize("restart_policy", ["Never", "OnFailure", "Always", None])
+def test_executor_validates_and_runs_single_node_training_jobs(tmp_path, restart_policy):
     api = FakeApi()
     image = "registry.example/training@sha256:" + "b" * 64
     broker = executor(
@@ -233,6 +234,16 @@ def test_executor_runs_a_single_node_job_with_the_configured_training_image(tmp_
     document = manifest()
     template = document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]
     document.update(apiVersion="batch/v1", kind="Job", spec={"template": template})
+    if restart_policy is None:
+        template["spec"].pop("restartPolicy")
+    else:
+        template["spec"]["restartPolicy"] = restart_policy
+
+    if restart_policy != "Never":
+        with pytest.raises(ValueError, match="Job pods must use restartPolicy Never"):
+            apply(broker, document)
+        assert api.creates == 0
+        return
 
     assert apply(broker, document) == "job/senpai-fred-fern-123 created\n"
 
