@@ -44,6 +44,7 @@ def test_configured_custom_secret_names_default_to_empty(environment):
         (["GITHUB_APP_TOKEN"], "reserved"),
         (["SENPAI_INTERNAL_KEY"], "reserved"),
         (["RESEARCH_TAG"], "reserved"),
+        (["WANDB_TAGS"], "reserved"),
         (["PATH"], "reserved"),
     ],
 )
