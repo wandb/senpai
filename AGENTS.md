@@ -46,7 +46,7 @@ to README.md or SPEC.md as appropriate.
 - You should generate code that is simple and readable. Avoid unnecessary abstractions and complexity. This is a research codebase, so maintainability and clarity matter.
 - Avoid overly defensive coding. No need for lots of `try`/`except` patterns, fallbacks, or backups. Prefer code that fails clearly when something is wrong so it can be fixed.
 - Do not add demo-only flags or placeholder CLI options that gate real functionality (e.g., `--run` just to toggle execution); scripts should run their main logic directly.
-- Adhere to the repository's Python 3.14 runtime.
+- Support Python 3.13 and 3.14; prefer Python 3.14 for development and deployment.
 
 ### Key docs
 

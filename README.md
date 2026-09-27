@@ -24,7 +24,7 @@ Kubernetes is currently the turnkey deployment path. The GitHub-based coordinati
 
 ### 1. Prerequisites
 
-- Python 3.14.2 or later in the 3.14 series, [uv](https://docs.astral.sh/uv/), Git, and `kubectl`.
+- Python 3.13 or 3.14 (3.14 preferred; torchvision excludes 3.14.1), [uv](https://docs.astral.sh/uv/), Git, and `kubectl`. The repository's `.python-version` selects 3.14 by default; pass `--python 3.13` to uv to use 3.13.
 - A Kubernetes context and existing namespace with outbound access to GitHub, Anthropic, Exa, and W&B. Your identity must be able to manage Deployments, ConfigMaps, Secrets, ServiceAccounts, Roles, and RoleBindings there.
 - An existing PVC with enough space for the dataset, plus concurrent mounts from every scheduled node—normally `ReadWriteMany`, unless your storage driver explicitly supports another multi-node topology. The launcher mounts this claim but does not create it; role state stays on each pod's node-local `emptyDir` volume.
 - NVIDIA GPU nodes, the Kubernetes NVIDIA device plugin, and a host driver compatible with CUDA 13 and the shipped student image.
