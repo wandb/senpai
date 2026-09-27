@@ -865,14 +865,20 @@ Launch preflight verifies:
   a service-specific authentication check.
 
 Exa uses a credential-isolated native `exa_search` tool with progressive skill
-guidance. It preserves the standalone script's request controls, web/publication
-defaults of 10/30 results, counts up to 100, and complete requested evidence and
-metadata. The legacy script remains an operator interface outside the agent
-runtime. The root tool remains declared when a standalone runtime has no Exa key
-so persisted conversations can resume. Calls without configured credentials fail
+guidance. It preserves the standalone script's request controls and web/publication
+counts of 10/30 results, with up to 100 per call. Both modes default to
+`deep-reasoning`. Unless `no_content` is set, the tool requests
+`text={"verbosity": "full"}` without a character limit and defaults to
+`max_age_hours=0` so the extraction setting applies to a fresh crawl. Explicit
+cache-age values remain supported. Returned text is retained with its original
+line breaks; missing text is reported. These are Exa's extracted contents, not
+original PDF/HTML files or a guarantee of complete-paper coverage. The legacy
+operator script keeps its original defaults. The root tool remains declared when
+a standalone runtime has no Exa key so persisted conversations can resume.
+Calls without configured credentials fail
 before contacting Exa. Responses above 30,000 characters persist the complete
 Markdown in the conversation's observations directory and return an explicit
-preview with the file path and range-read guidance. A failed write fails the
+preview with the file path and character count. A failed write fails the
 tool call instead of losing evidence. Local conversation cleanup retains these
 files, so parents can read results from completed search children. The preview
 fits below the pinned SDK's 50,000-character tool-message limit; SDK serializers

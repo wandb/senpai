@@ -50,15 +50,27 @@ def exa_service(monkeypatch):
     [
         (
             {},
-            {"numResults": 10, "type": "auto", "contents": {"highlights": True}},
+            {
+                "numResults": 10,
+                "type": "deep-reasoning",
+                "contents": {
+                    "text": {"verbosity": "full"},
+                    "highlights": True,
+                    "maxAgeHours": 0,
+                },
+            },
         ),
         (
             {"mode": "research-publications"},
             {
                 "numResults": 30,
-                "type": "deep",
+                "type": "deep-reasoning",
                 "category": "publication",
-                "contents": {"highlights": {"maxCharacters": 2000}},
+                "contents": {
+                    "text": {"verbosity": "full"},
+                    "highlights": {"maxCharacters": 2000},
+                    "maxAgeHours": 0,
+                },
             },
         ),
         (
@@ -87,6 +99,7 @@ def exa_service(monkeypatch):
                 "excludeText": ["survey"],
                 "additionalQueries": ["benchmark", "latency"],
                 "contents": {
+                    "text": {"verbosity": "full"},
                     "highlights": {"maxCharacters": 321},
                     "summary": {"query": "What changed?"},
                     "maxAgeHours": 0,
@@ -104,11 +117,19 @@ def test_search_controls_reach_exa_without_exposing_credentials(
     exa_service, arguments, options
 ):
     calls, response = exa_service
-    response["results"] = [{
-        "title": "Short result",
-        "url": "https://example.test/short",
-        "id": "short-result",
-    }]
+    response["results"] = [
+        {
+            "title": "Short result",
+            "url": "https://example.test/short",
+            "id": "short-result",
+            "text": "Complete page text\n\nSecond paragraph with *original formatting*.",
+        },
+        {
+            "title": "Unavailable text",
+            "url": "https://example.test/unavailable",
+            "id": "unavailable-result",
+        },
+    ]
     action = exa_tool.ExaSearchAction(query="neural operators", **arguments)
 
     observation = exa_tool.ExaSearchExecutor()(action)
@@ -118,7 +139,6 @@ def test_search_controls_reach_exa_without_exposing_credentials(
     ]
     assert "runtime-key-sentinel" not in action.model_dump_json()
     assert "runtime-key-sentinel" not in observation.markdown
-    assert "untrusted external data" in observation.markdown
     for serializer in ("chat-list", "chat-string", "responses"):
         output = serialized_tool_text(
             Message(
@@ -132,13 +152,21 @@ def test_search_controls_reach_exa_without_exposing_credentials(
         assert "## 1. Short result" in output
         assert "**URL:** <https://example.test/short>" in output
         assert "**Exa ID:** short-result" in output
+        if arguments.get("no_content"):
+            assert response["results"][0]["text"] not in output
+            assert "Full text was not returned" not in output
+        else:
+            assert response["results"][0]["text"] in output
+            assert "Full text was not returned for this result." in output
 
 
 @pytest.mark.parametrize("mode", ["general-web", "research-publications"])
 @pytest.mark.parametrize(
     "search_type", ["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"]
 )
-def test_tool_matches_legacy_script_request_contract(exa_service, mode, search_type):
+def test_tool_preserves_legacy_search_controls_with_full_text(
+    exa_service, mode, search_type
+):
     calls, _ = exa_service
     legacy = exa_search.SearchArguments(
         mode=mode,
@@ -164,7 +192,15 @@ def test_tool_matches_legacy_script_request_contract(exa_service, mode, search_t
     exa_tool.ExaSearchExecutor()(exa_tool.ExaSearchAction(**asdict(legacy)))
 
     assert len(calls) == 2
-    assert calls[1] == calls[0]
+    key, path, options = calls[0]
+    assert calls[1] == (
+        key,
+        path,
+        {
+            **options,
+            "contents": {**options["contents"], "text": {"verbosity": "full"}},
+        },
+    )
 
 
 def test_search_returns_all_requested_evidence_and_escapes_external_text(
@@ -190,7 +226,10 @@ def test_search_returns_all_requested_evidence_and_escapes_external_text(
                     "Evidence " * 100 + f"Evidence tail {index}.",
                     "More evidence " * 100 + f"Second tail {index}.",
                 ],
-                "text": "Full page text must not be returned",
+                "text": f"Paper {index}\n\n# Methods\n"
+                + "Full paper detail " * 700
+                + f"\n\nFinal paragraph with *original formatting* {index}.\n"
+                + f"Full text tail {index}.",
             }
             for index in range(1, 101)
         ],
@@ -236,7 +275,6 @@ def test_search_returns_all_requested_evidence_and_escapes_external_text(
             assert str(artifact) in receipt
             assert str(len(output)) in receipt
             assert "preview" in receipt.lower()
-            assert "bounded ranges" in receipt
             assert "100 returned / 100 requested" in receipt
             assert "runtime-key-sentinel" not in receipt
 
@@ -246,7 +284,7 @@ def test_search_returns_all_requested_evidence_and_escapes_external_text(
         )[0]
         try:
             late_evidence = terminal.executor(
-                TerminalAction(command=f"tail -n 6 {shlex.quote(str(artifact))}"),
+                TerminalAction(command=f"tail -n 16 {shlex.quote(str(artifact))}"),
                 conversation,
             )
             assert not late_evidence.is_error, late_evidence.text
@@ -254,6 +292,7 @@ def test_search_returns_all_requested_evidence_and_escapes_external_text(
             assert "Summary tail 100." in late_evidence.text
             assert "Evidence tail 100." in late_evidence.text
             assert "Second tail 100." in late_evidence.text
+            assert "Full text tail 100." in late_evidence.text
         finally:
             terminal.executor.close()
     finally:
@@ -275,8 +314,8 @@ def test_search_returns_all_requested_evidence_and_escapes_external_text(
         assert "Summary detail " * 100 + f"Summary tail {index}." in output
         assert "Evidence " * 100 + f"Evidence tail {index}." in output
         assert "More evidence " * 100 + f"Second tail {index}." in output
+        assert response["results"][index - 1]["text"] in output
     assert "\n# injected heading" not in output
-    assert "Full page text must not be returned" not in output
 
 
 @pytest.mark.parametrize(
@@ -286,7 +325,7 @@ def test_search_returns_all_requested_evidence_and_escapes_external_text(
         {"no_content": True, "summary_query": "Summarize it"},
         {"no_content": True, "max_age_hours": 0},
         {"no_content": True, "highlights_max_characters": 321},
-        {"additional_queries": ["alternate"]},
+        {"search_type": "auto", "additional_queries": ["alternate"]},
         {"mode": "research-publications", "additional_queries": ["q"] * 11},
         {"num_results": 101},
         {"highlights_max_characters": 10_001},

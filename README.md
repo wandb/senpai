@@ -349,16 +349,23 @@ Children share the parent workspace, so their process and conversation are isola
 
 The Exa tool preserves the standalone script's controls: 1–100 results,
 publication dates, domains, text filters, freshness, six search types, extra
-queries, summaries, and highlight budgets. Web searches default to 10 results;
-publication searches default to 30. Evidence includes every result, summary,
-highlight, and available metadata. Responses above 30,000 characters return an
+queries, summaries, and highlight budgets. Both modes default to `deep-reasoning`.
+Web searches default to 10 results; publication searches default to 30. The tool
+requests full text with no character limit and defaults to a fresh crawl so
+Exa's full extraction setting applies. An explicit `max_age_hours` value overrides
+freshness; `no_content` requests metadata only. Results retain all text returned
+by Exa, including paragraph breaks, alongside summaries, highlights, and metadata.
+Missing text is reported. Exa extraction does not download original PDF/HTML files
+or guarantee that a publication result contains the entire paper.
+Responses above 30,000 characters return an
 explicit preview and save the complete Markdown under the conversation's
 observations directory, outside the target checkout. Agents can read that file
 in bounded ranges, including after a search child finishes. This keeps large
 searches retrievable without filling one model request with all the evidence.
 See the [Exa skill](plugins/senpai/skills/exa-search/SKILL.md) for parameters.
 
-The standalone script remains available to operators outside the agent runtime:
+The standalone script retains its original defaults and remains available to
+operators outside the agent runtime:
 `python plugins/senpai/skills/exa-search/scripts/search_exa.py general-web "query"`.
 It uses the operator's `EXA_API_KEY` environment or dotenv configuration. Within
 Senpai, agents call `exa_search` because terminals receive no Exa key.
