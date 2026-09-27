@@ -67,7 +67,7 @@ WANDB_API_KEY=
 | `GITHUB_TOKEN` | Target-repository Contents, Pull requests, and Issues read/write. A classic token with `repo` scope also works. GitHub CLI authentication is the fallback when this value is absent. |
 | `ANTHROPIC_API_KEY` | Required when an `anthropic/...` model is configured. Every default profile uses Anthropic. |
 | `OPENAI_API_KEY` | Required when an `openai/...` model is configured. |
-| `EXA_API_KEY` | General-web and research-publication search. |
+| `EXA_API_KEY` | General-web and publication search through the credential-isolated `exa_search` tool. |
 | `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. |
 
 To add a credential, put its value in `.env` and list its name in the launch
@@ -86,7 +86,25 @@ its value is redacted from tool output and traces.
 
 `k8s/launch.py` reads shell environment variables first and then the repository-root `.env`; only the GitHub token also falls back to `gh auth token`. Direct Docker or host execution must export or pass credentials explicitly.
 
-The launcher places credentials in a per-launch Kubernetes Secret. During bootstrap, the GitHub write token is removed from the process environment and handed to the controller through a one-use channel; it is not exposed to the model or subagents.
+The launcher places credentials in a per-launch Kubernetes Secret. Bootstrap
+writes GitHub, W&B, and Exa keys to owner-only files in a fresh private directory.
+The supervisor consumes and unlinks those files, passes each key through a
+one-use descriptor, and drops its stored credentials after starting the worker.
+The controller keeps Exa authentication in trusted runtime memory. Root agents
+and search children use `exa_search`; terminals and training no longer receive
+`EXA_API_KEY`. All delegated runtimes carry Exa through private descriptors
+so a general-purpose child can still delegate to a search grandchild. The key
+never enters tool parameters or conversation secrets. W&B remains available to
+research tools, terminals, training, and tracing. GitHub credentials remain
+private to the controller.
+
+Delegated model keys travel through a private descriptor and are resolved in
+memory. They do not enter the child environment, except when the same key is
+also an intentionally available service credential. In particular, W&B inference
+still shares `WANDB_API_KEY` with W&B research and tracing. Separating those
+identities is a later change. Linux credential holders disable process dumping;
+this reduces inspection risk but does not isolate mutually untrusted processes
+that share a UID.
 
 ### 4. Prepare the target repository
 
@@ -352,7 +370,7 @@ uses the last durable record and the existing workload UID. A terminal decision
 that could not be persisted cannot survive process loss, so broker deadlines
 and normal recovery rules still apply.
 
-The launcher creates routing labels, one launch Secret, role ConfigMaps, and Deployments. Multi-node students also receive one namespaced ServiceAccount, Role, and RoleBinding. It does not create the namespace, PVC, Service, or cluster-wide RBAC.
+The launcher creates routing labels, a launch credential Secret, a separate immutable program-context Secret, role ConfigMaps, and Deployments. Multi-node students also receive one namespaced ServiceAccount, Role, and RoleBinding. It does not create the namespace, PVC, Service, or cluster-wide RBAC.
 
 Student launches are create-only. Before the first write, the launcher rejects
 an existing student Deployment, any matching controller Pod, or any matching
@@ -606,6 +624,29 @@ events; nested children may not detach descendants.
 
 Children share the parent workspace, so their process and conversation are isolated but their filesystem is not. They receive only their declared tools and never receive GitHub credentials, GitHub workflow tools, or training tools.
 
+The Exa tool preserves the standalone script's controls: 1–100 results,
+publication dates, domains, text filters, freshness, six search types, extra
+queries, summaries, and highlight budgets. Both modes default to `deep-reasoning`.
+Web searches default to 10 results; publication searches default to 30. The tool
+requests full text with no character limit and defaults to a fresh crawl so
+Exa's full extraction setting applies. An explicit `max_age_hours` value overrides
+freshness; `no_content` requests metadata only. Results retain all text returned
+by Exa, including paragraph breaks, alongside summaries, highlights, and metadata.
+Missing text is reported. Exa extraction does not download original PDF/HTML files
+or guarantee that a publication result contains the entire paper.
+Every response saves the complete Markdown under the conversation's observations
+directory, outside the target checkout, and returns its file path and character
+count. Responses above 30,000 characters return an explicit preview. Agents can
+read that file in bounded ranges, including after a search child finishes. This
+keeps large searches retrievable without filling one model request with all the evidence.
+See the [Exa skill](plugins/senpai/skills/exa-search/SKILL.md) for parameters.
+
+The standalone script retains its original defaults and remains available to
+operators outside the agent runtime:
+`python plugins/senpai/skills/exa-search/scripts/search_exa.py general-web "query"`.
+It uses the operator's `EXA_API_KEY` environment or dotenv configuration. Within
+Senpai, agents call `exa_search` because terminals receive no Exa key.
+
 ## Task guides
 
 Live advisors and students load Senpai-owned skills only from
@@ -666,8 +707,11 @@ entrypoint
   exec supervisor
 
 supervisor
-  restart crashed workers with bounded backoff
-  terminate and restart an overdue phase
+  start one controller and discard stored credentials
+  terminate descendants and exit when the controller stops or wedges
+
+external process manager
+  restart the complete entrypoint to create fresh credential handoffs
 
 controller
   poll -> reconcile -> bounded OpenHands turn -> verify -> acknowledge -> sleep
@@ -678,7 +722,7 @@ The controller owns cadence, durable events, conversation selection, verified Gi
 - The advisor keeps one conversation UUID across restarts, recovery, and quarantine.
 - A student uses one UUID per assignment revision; feedback, monitor events, and child-task results resume that exact conversation.
 - Still-actionable GitHub state is re-delivered on the configured reminder cadence, which defaults to at least ten minutes even when GitHub is polled more frequently. Human Issue and PR comment versions are retained across failed or interrupted turns and are never delivered again after successful acknowledgement. New trusted text creates a new version; a changed Human Issue title also creates a new version. `research_base_changed` and student assignment comments are also delivered once per exact event version. Immediate post-turn polls deliver changed state but not timed reminders, so a successful research-only turn cannot enter a no-sleep reminder loop. `research_base_changed` is keyed by assignment, revision, PR head, and the exact required/current base pair; each identity or base movement requires a new decision. Merge repeats the live-base check immediately before its mutation, while external base writers still require strict up-to-date branch protection or a merge queue for an atomic guarantee.
-- Each model request has a hard 90-minute ceiling. OpenHands uses five attempts with 8/16/32/64-second waits (`SENPAI_LLM_NUM_RETRIES`). Foreground terminal calls return within ten minutes, delegated children retain hard 20/60/120-minute tier limits, and root turns use a two-hour inactivity lease renewed by OpenHands events. Two consecutive failed turns exit to the supervisor for a clean worker restart. Restart backoff grows across failed workers to a five-minute ceiling; only a successfully acknowledged turn resets that streak, not process uptime or idle sleep.
+- Each model request has a hard 90-minute ceiling. OpenHands uses five attempts with 8/16/32/64-second waits (`SENPAI_LLM_NUM_RETRIES`). Foreground terminal calls return within ten minutes, delegated children retain hard 20/60/120-minute tier limits, and root turns use a two-hour inactivity lease renewed by OpenHands events. Two consecutive failed turns end the controller. The supervisor cleans up its descendants and exits. Kubernetes, Docker with a restart policy, or another external process manager must restart the complete entrypoint to recreate the consumed credential handoffs.
 - Every input follows one durable `pending -> delivered -> processed` inbox. Authenticated human Issues and PR comments are the interrupt tier: tools get up to 60 seconds to finish before the active run is interrupted and resumed, even when its inbox batch is full. Student assignments and trusted PR feedback share a FIFO queue tier; feedback waits for the next completed agent step without cancelling it. Ordinary events remain FIFO. Turn formation and non-human attachments are bounded to 16 events or 64 KiB; prioritized overflow leads the next turn.
 - A completed tool observation renews the three-attempt no-progress budget; timeout, error, interruption, state, and delivery events do not. Thirty-six inference starts on one branch are a separate restart backstop and do not limit one productive run. Either exhausted budget triggers bounded canonical fresh-branch recovery; exhausting recovery quarantines the turn and reports it on every controller start. Only an authenticated human instruction reopens quarantine and resets both budgets; trusted PR feedback stays pending. A persisted final response is reconciled even if cancellation left the SDK status paused. `SENPAI_INBOX_MAX_STALLED_ATTEMPTS` and `SENPAI_INBOX_MAX_RECOVERY_GENERATIONS` configure recovery.
 - Typed context/history failures use durable bounded fresh-branch recovery. Exhausted transient provider failures preserve the turn and its budgets behind durable 30/60/120/240/300-second cooldowns with jitter and `Retry-After` while mailbox polling continues; permanent provider errors fail immediately.
@@ -725,7 +769,7 @@ with Ubuntu 26.04 and CUDA 13.3.1. Its isolated agent environment installs
 PyTorch 2.14.0 and torchvision 0.29.0 from the project lockfile. The base
 image's NVIDIA driver requirement remains in effect.
 
-The agent runs from `/opt/senpai-venv`. Before starting the controller, both role entrypoints clear `UV_PROJECT_ENVIRONMENT`, `UV_PYTHON`, and `VIRTUAL_ENV` so target-repository `uv run` and `uv sync` commands use that repository's `.venv`. Do not point target dependency installation at the agent environment: synchronizing it against a target lockfile can remove OpenHands dependencies or PyTorch while the controller is still running. If that happens, redeploy the affected pod from its pinned image to restore the agent environment.
+The agent runs from the read-only `/opt/senpai-venv`. Both role entrypoints clear inherited `UV_PROJECT_ENVIRONMENT`, `UV_PYTHON`, and `VIRTUAL_ENV` values before starting the controller. Terminals and local supervised training then select the separate writable environment at `$HOME/.venvs/senpai-target` through PATH and uv settings. Install target dependencies there; keep the agent environment unchanged.
 
 For multi-day fleets, [`arm_senpai_cluster_cutoff.sh`](scripts/arm_senpai_cluster_cutoff.sh) creates a cluster-side hard cutoff that does not depend on an operator laptop remaining online. It can also hold a shared start gate until the expected fleet is ready or its readiness deadline expires.
 
@@ -748,13 +792,52 @@ kubectl --context "$CONTEXT" -n "$NAMESPACE" delete configmaps,secrets \
 This command leaves PVC data and the cutoff Job, script ConfigMap, and shared
 cutoff RBAC resources in place. Operators own their retention and cleanup.
 
-Pod startup and liveness probes read the supervisor lease. Container restarts resume the advisor or student conversation from the pod-local state volume; replacing or rescheduling the pod starts fresh state. Stop a container before copying or snapshotting a live advisor state directory.
+The supervisor serves `/healthz` on all IPv4 interfaces (`0.0.0.0:8080` by
+default). It returns HTTP 200 for a live controller lease and HTTP 503 when
+the lease is missing, invalid, or expired, or its worker is no longer running.
+Kubernetes startup and liveness probes use `httpGet` on fixed port 8080;
+repeated failures restart the container without spawning a probe process.
+The external process manager restarts the complete entrypoint after the
+supervisor exits.
+Container restarts resume the advisor or student conversation from pod-local
+storage. The supplied manifests also preserve the target checkout and target
+Python environment in separate `emptyDir` volumes. Bootstrap keeps the existing
+branch, uncommitted files, unpushed commits, and installed target dependencies.
+Replacing or rescheduling the Pod starts fresh state, checkout, and target
+environment. Store durable outputs on the mounted PVC and publish experiment
+work through the supported Git workflow. Stop a container before copying or
+snapshotting a live advisor state directory.
+
+`problem_dir` must be a relative child directory outside tracked runner assets
+and Git metadata. The dataset PVC mount must not overlap the target checkout or
+target Python environment. The launcher rejects these overlaps before reading
+credentials.
+
+If the initial clone is interrupted before it records a valid HEAD commit,
+bootstrap stops and preserves the retained checkout. Inspect and repair that
+checkout before restarting. Bootstrap does not delete it or discard local work
+to recover automatically.
 
 ### Other deployment environments
 
 GitHub coordination works across Docker, cloud VMs, or local hosts without private networking. The current repository does not yet provide a Compose or direct-host launcher: the Kubernetes manifests perform the source clone, environment assembly, skill installation, token handoff, mounts, and entrypoint selection.
 
-To build another launcher, reproduce [entrypoint-advisor.sh](k8s/entrypoint-advisor.sh) or [entrypoint-student.sh](k8s/entrypoint-student.sh), render `SENPAI-LAUNCH-CONTEXT.md` with runtime identity, limits, and isolation through `render_launch_context`, and provide it as base64 in `SENPAI_LAUNCH_CONTEXT_B64`. Pass the built-in role template and its required non-secret values to the Python supervisor, which renders and persists that role snapshot. Keep optional operator guidance in `EXTRA_INSTRUCTIONS_B64`. Persist `/var/lib/senpai/<tag>/advisor` for the advisor and use the container healthcheck with a restart policy. Student execution requires Linux, an NVIDIA runtime, and compatible CUDA hardware; Docker Desktop on macOS cannot run the GPU student image.
+Custom launchers must preserve the target checkout and target environment
+alongside role state for equivalent recovery.
+
+To build another launcher, reproduce [entrypoint-advisor.sh](k8s/entrypoint-advisor.sh) or [entrypoint-student.sh](k8s/entrypoint-student.sh), render `SENPAI-LAUNCH-CONTEXT.md` with runtime identity, limits, and isolation through `render_launch_context`, and provide it as base64 in `SENPAI_LAUNCH_CONTEXT_B64`. Pass the built-in role template and its required non-secret values to the Python supervisor, which renders and persists that role snapshot. Keep optional operator guidance in `EXTRA_INSTRUCTIONS_B64`. Persist `/var/lib/senpai/<tag>/advisor` for the advisor. Student execution requires Linux, an NVIDIA runtime, and compatible CUDA hardware; Docker Desktop on macOS cannot run the GPU student image.
+
+The images have no Docker `HEALTHCHECK`. Configure an external monitor to query
+`/healthz`, allow startup grace and repeated failures, and restart the container
+or repeat host bootstrap when recovery fails. Standalone launchers can set
+`SENPAI_HEALTH_PORT`; changing it also requires updating the monitor. Keep port
+8080 with the supplied Kubernetes manifests. This listener monitors one
+supervisor; GitHub remains the cross-node coordination protocol.
+
+Outside container PID 1, the supervisor cleans up only descendants it observed
+before the worker exited. Before restarting the entrypoint, a host process
+manager must terminate every descendant process group, including groups created
+by detached children, or terminate the workload's cgroup.
 
 ## Development and reference
 

@@ -21,7 +21,7 @@ Read the `program.md` identified in your system prompt, plus the assigned PR bod
 
 Inspect the current baseline and command help before changing code. Use existing conventions and keep one clear experiment path.
 
-Follow the instructions in the PR body - note you have liberty to modify the instructions to make them more specific and actionable if you think it will help the experiment based on the delegated research agent's findings.
+Students may use their initiative to extend and tweak the initial assignment instructions based on ongoing research findings.
 
 Run cheap tests when they materially reduce the risk of wasting a full training allocation. PR feedback can arrive while this turn is active; reconcile it before another launch or submission.
 

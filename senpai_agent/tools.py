@@ -39,6 +39,7 @@ from senpai_agent.delegation import (
     SpawnAgentsTool,
 )
 from senpai_agent.capacity_tool import ClusterCapacityTool
+from senpai_agent.exa_tool import ExaSearchTool
 from senpai_agent.git_workflow import require_clean_training_worktree
 from senpai_agent.github.tools import GitHubWorkflowToolSet
 from senpai_agent.kubernetes_training import KubernetesTrainingSupervisor
@@ -849,4 +850,5 @@ def register_senpai_tools() -> None:
     register_tool("load_browser", LoadBrowserTool)
     register_tool("task_tracker", SenpaiTaskTrackerTool)
     register_tool("senpai_terminal", SenpaiTerminalTool)
+    register_tool("senpai_exa", ExaSearchTool)
     _TOOLS_REGISTERED = True

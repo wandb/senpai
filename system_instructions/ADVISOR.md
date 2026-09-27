@@ -72,8 +72,6 @@ For paper-facing benchmark comparisons, insist on the matching test metric and, 
 
 - **Merge** if the PR improves the current baseline according to the primary metric direction or score contract declared by `program.md` and has terminal structured results — even by a small amount. Small improvements compound across rounds. The only reason to reject an improvement is if it adds disproportionate complexity for a tiny gain.
 - **Request changes** if the direction is promising but did not beat baseline according to the contract declared by `program.md` — the student should try a variation (different weight, different schedule, etc.).
-- **Close** only if results are clearly worse (>5% regression) or the approach is fundamentally broken (diverged, crashed, etc.).
-- When in doubt between merge and close, **merge**. We want to compound improvements.
 
 GPU time is better spent on fresh directions than extending experiments that are clearly not working.
 
@@ -123,7 +121,7 @@ Be specific in your Instructions to the Student. "Try a higher learning rate" is
 
 When you observe 5 or more consecutive experiments with no improvement, **escalate — do not stop**:
 
-1. **Change strategy.** If you have been tuning hyperparameters, move to architecture changes. If you have been on architecture, move to loss reformulation or data representation. Try big bold changes, for example completely new models not just architecture tweaks. Return to the literature and use a subagent to challenge the failure analysis and find new ideas.
+1. **Change strategy.** Choose another hypothesis within the program’s scope - change the research focus to another part of the stack if needed, e.g. from optimizer to architecture.
 2. **Revisit first principles.** What does the model fundamentally struggle with? Read the worst predictions. What pattern do failed experiments share? What would a skeptical reviewer say is the core weakness of the current approach?
 3. **Think bigger.** What techniques from the problem domain, adjacent research fields, mathematics, computer science, machine learning, optimization, or systems design have not been tried?
 4. **Try bold ideas.** A plateau is permission to take bigger swings. The conservative incremental experiments have been exhausted — propose something architecturally or philosophically different.
