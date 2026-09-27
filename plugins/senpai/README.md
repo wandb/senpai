@@ -3,8 +3,9 @@
 This directory is the OpenHands-native integration point for Senpai workflow
 capabilities. Its manifest lives at `.plugin/plugin.json`.
 
-OpenHands receives this directory through `PluginSource` before the first user
-message. It natively loads:
+Role images install this directory as the read-only `$SENPAI_PLUGIN`.
+OpenHands receives that explicit path through `PluginSource` before the first
+user message. It natively loads:
 
 - `skills/` as a progressively disclosed workflow catalog; and
 - `hooks/hooks.json` for early command-policy and lifecycle feedback.
@@ -13,6 +14,11 @@ GitHub mutations and training supervision are native typed Senpai tools, not
 skill shell commands. Exa is also a skill/script integration rather than an MCP
 server; launch preflight makes one `instant` publication search with one result
 to validate the key.
+
+The Exa and W&B skills use `uv run --no-sync` to run Python in the target
+environment without syncing project dependencies. Read helper libraries from
+`$SENPAI_PLUGIN`; keep analysis scripts and generated outputs in the target
+workspace or `/tmp`.
 
 The Python runtime registers the GitHub tools and exposes only those valid for
 the current role:

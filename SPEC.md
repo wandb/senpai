@@ -272,10 +272,12 @@ path entry. Target packages can override those shared packages without writing
 to the trusted environment. The image includes pip so additive target installs
 can resolve packages on the shared path. uv resolves a separate target package
 set and does not inspect that path. The image compiles runtime bytecode before
-making the environment read-only. Bootstrap computes both paths with trusted Python
-and creates the target venv without pip bootstrapping, which would execute
-target Python. Terminal and training environments select the target through
-PATH and uv settings. Training and terminal setup remove inherited
+making the environment read-only. The images copy uv from its versioned,
+digest-pinned official image. Bootstrap computes both paths with trusted Python
+and uses `uv venv` with that interpreter, without project/config discovery,
+Python downloads, or pip bootstrapping. It preserves existing target files and
+never executes target Python. Terminal and training environments select the
+target through PATH and uv settings. Training and terminal setup remove inherited
 `PYTHONSAFEPATH` so project imports work normally. File-defined child terminals
 use the same routing.
 Each native terminal session receives target settings after shell startup,
@@ -286,6 +288,12 @@ Bootstrap also creates missing target launchers for the trusted environment's
 console scripts. Each launcher executes the original read-only script with
 target Python, so shared commands and their Python workers see target packages.
 Bootstrap preserves existing target scripts and never executes target Python.
+
+The bundled plugin remains explicitly loaded for root and child conversations.
+Its skill helpers run in the target environment with `uv run --no-sync`; they
+must not rewrite the read-only installed skill files. Target lock updates and
+dependency syncs are explicit experiment changes, not a side effect of reading
+experiment results.
 
 OpenHands ambient plugin discovery is disabled before root or child
 conversations are created. Only the explicitly supplied trusted plugin loads

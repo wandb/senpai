@@ -31,8 +31,8 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 
 # The CoreWeave base currently ships Python 3.12. Use a pinned uv to install
 # CPython 3.13 and make it the image-wide python/python3 runtime.
-RUN python3 -m pip install --no-cache-dir "uv==0.10.9" && \
-    uv python install --install-dir "$UV_PYTHON_INSTALL_DIR" "$PYTHON_VERSION" && \
+COPY --from=ghcr.io/astral-sh/uv:0.10.9@sha256:10902f58a1606787602f303954cea099626a4adb02acbac4c69920fe9d278f82 /uv /uvx /usr/local/bin/
+RUN uv python install --install-dir "$UV_PYTHON_INSTALL_DIR" "$PYTHON_VERSION" && \
     uv venv --python "$PYTHON_VERSION" /opt/senpai-venv && \
     python --version
 
@@ -102,7 +102,8 @@ WORKDIR /workspaces
 USER 10001:10001
 
 # Verify installed imports and immutable runtime assets as the role user.
-RUN python -P -c 'import os, pathlib, pip, senpai_agent, sys; assert pathlib.Path(senpai_agent.__file__).is_relative_to(sys.prefix); assert all(not os.access(path, os.W_OK) for path in (sys.prefix, os.environ["SENPAI_AGENT_DIR"], os.environ["SENPAI_PLUGIN"]))'
+RUN python -P -c 'import os, pathlib, pip, senpai_agent, sys; assert pathlib.Path(senpai_agent.__file__).is_relative_to(sys.prefix); assert all(not os.access(path, os.W_OK) for path in (sys.prefix, os.environ["SENPAI_AGENT_DIR"], os.environ["SENPAI_PLUGIN"]))' && \
+    python -P -c 'import os, sys; sys.path.insert(0, os.environ["SENPAI_PLUGIN"] + "/skills/wandb-primary/scripts"); import curve_plots, training_diagnostics'
 
 # Exercise the browser as the same non-root user used in production.
 RUN HOME=/var/lib/senpai/home senpai-browser-smoke-test
