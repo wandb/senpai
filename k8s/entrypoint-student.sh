@@ -118,12 +118,7 @@ if [ -z "${SENPAI_EXA_API_KEY_FILE:-}" ] && [ -n "${EXA_API_KEY:-}" ]; then
     export SENPAI_EXA_API_KEY_FILE="$CREDENTIAL_HANDOFF_DIR/exa-api-key"
     (umask 077; printf '%s' "$EXA_API_KEY" > "$SENPAI_EXA_API_KEY_FILE")
 fi
-if [ -z "${SENPAI_WANDB_TRAINING_API_KEY_FILE:-}" ] && [ -n "${SENPAI_WANDB_TRAINING_API_KEY:-}" ]; then
-    prepare_credential_handoff_dir
-    export SENPAI_WANDB_TRAINING_API_KEY_FILE="$CREDENTIAL_HANDOFF_DIR/wandb-training-api-key"
-    (umask 077; printf '%s' "$SENPAI_WANDB_TRAINING_API_KEY" > "$SENPAI_WANDB_TRAINING_API_KEY_FILE")
-fi
-unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS WANDB_API_KEY EXA_API_KEY SENPAI_WANDB_TRAINING_API_KEY
+unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS WANDB_API_KEY EXA_API_KEY
 rm -f "$GIT_ASKPASS_FILE"
 if [ "${NODES_PER_STUDENT:-1}" -gt 1 ]; then
     proxy_dir="$LOGDIR/bin"
@@ -147,7 +142,8 @@ if [ "${NODES_PER_STUDENT:-1}" -gt 1 ]; then
 fi
 export SENPAI_TARGET_PYTHON_ENV="$HOME/.venvs/senpai-target"
 if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then
-    "$SENPAI_PYTHON" -P -m venv --without-pip "$SENPAI_TARGET_PYTHON_ENV"
+    /usr/local/bin/uv venv --no-project --no-config --no-python-downloads \
+        --python "$SENPAI_PYTHON" --allow-existing "$SENPAI_TARGET_PYTHON_ENV"
 fi
 CONTROLLER_SITE="$("$SENPAI_PYTHON" -P -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
 # The target interpreter is agent-writable; never execute it during trusted startup.

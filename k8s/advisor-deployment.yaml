@@ -27,13 +27,12 @@ spec:
       annotations:
         senpai.wandb.com/content-hash: "{{POD_CONFIG_HASH}}"
         senpai.wandb.com/program-context-secret: "{{PROGRAM_CONTEXT_SECRET_NAME}}"
-        senpai.wandb.com/controller-wandb-viewer: "{{WANDB_VIEWER}}"
-        senpai.wandb.com/inference-wandb-viewer: "{{INFERENCE_WANDB_VIEWER}}"
       labels:
         app: senpai
         role: advisor
         research-tag: {{RESEARCH_TAG}}
     spec:
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 90
       securityContext:
         runAsNonRoot: true
@@ -145,6 +144,7 @@ spec:
           mountPath: {{TARGET_WORKSPACE_MOUNT}}
         - name: target-environment
           mountPath: /home/senpai/.venvs/senpai-target
+        # {{CAPACITY_SNAPSHOT_MOUNT}}
       volumes:
       - name: dataset
         persistentVolumeClaim:
@@ -161,4 +161,5 @@ spec:
         emptyDir: {}
       - name: target-environment
         emptyDir: {}
+      # {{CAPACITY_SNAPSHOT_VOLUME}}
       nodeSelector: {{CONTROLLER_NODE_SELECTOR}}

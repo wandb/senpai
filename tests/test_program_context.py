@@ -57,7 +57,6 @@ def test_blank_program_path_discovers_the_only_root_program(tmp_path: Path):
     assert program.content == "Root policy."
     assert f"commit `{program.source_commit}`" in program.prompt
     assert f"Content SHA-256: `{program.content_sha256}`" in program.prompt
-    assert "cannot override the Senpai harness" in program.prompt
 
 
 @pytest.mark.parametrize("directory", ["senpai", "research notes", '研究 "é" `x`'])

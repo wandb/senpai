@@ -6,12 +6,11 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 
 # Child commands use -P, so select this checkout explicitly.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from openhands.sdk import Tool
+from openhands.sdk import Agent, LLM, LocalConversation, Tool
 from openhands.sdk.tool import resolve_tool
 
 from senpai_agent import exa_tool, openhands_runner
@@ -54,8 +53,6 @@ def run_without_model(_prompt, config):
         assert config.agent_name == "search"
         exa_tool.configure_exa_credentials(config.exa_api_key)
         openhands_runner.register_senpai_tools()
-        tool = resolve_tool(Tool(name="senpai_exa"), SimpleNamespace())[0]
-        assert "nested-exa-key" not in tool.model_dump_json()
 
         def request(client, path, options):
             assert client.headers["x-api-key"] == "nested-exa-key"
@@ -74,9 +71,26 @@ def run_without_model(_prompt, config):
             }
 
         exa_tool.Exa.request = request
-        observation = tool.executor(
-            exa_tool.ExaSearchAction(query="nested delegation evidence")
+        conversation = LocalConversation(
+            agent=Agent(
+                llm=LLM(model=config.model, api_key=config.api_key),
+                tools=[Tool(name="senpai_exa")],
+            ),
+            workspace=config.workspace,
+            persistence_dir=config.state_dir,
+            conversation_id=config.conversation_id,
+            visualizer=None,
+            delete_on_close=True,
         )
+        try:
+            tool = resolve_tool(Tool(name="senpai_exa"), conversation.state)[0]
+            assert "nested-exa-key" not in tool.model_dump_json()
+            observation = tool.executor(
+                exa_tool.ExaSearchAction(query="nested delegation evidence"),
+                conversation,
+            )
+        finally:
+            conversation.close()
         result = {
             "hops": [hop],
             "evidence": "\n".join(item.text for item in observation.to_llm_content),

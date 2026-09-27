@@ -29,7 +29,7 @@ from openhands.tools.terminal import (
 from openhands.tools.terminal.impl import TerminalExecutor
 from openhands.tools.terminal.terminal.terminal_session import TerminalSession
 from openhands.tools.task_tracker import TaskTrackerTool
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, model_validator
 
 from senpai_agent.delegation import (
     AgentStatusTool,
@@ -38,12 +38,14 @@ from senpai_agent.delegation import (
     DelegateAgentTool,
     SpawnAgentsTool,
 )
+from senpai_agent.capacity_tool import ClusterCapacityTool
 from senpai_agent.exa_tool import ExaSearchTool
 from senpai_agent.git_workflow import require_clean_training_worktree
 from senpai_agent.github.tools import GitHubWorkflowToolSet
 from senpai_agent.kubernetes_training import KubernetesTrainingSupervisor
 from senpai_agent.monitor import MetricGate, MonitorStore, TrainingMonitorSpec
 from senpai_agent.PROMPTS import MONITOR_TRAINING_STARTED_PROMPT, render_prompt
+from senpai_agent.training_assignment import TrainingAssignmentGuard
 from senpai_agent.training import (
     KubernetesResourceRef,
     KubernetesTrainingSpec,
@@ -52,12 +54,6 @@ from senpai_agent.training import (
     TrainingState,
     TrainingSupervisor,
     target_python_environment,
-)
-from senpai_agent.wandb_research import WandbResearchTool
-from senpai_agent.weave_research import (
-    WandbReportDraftTool,
-    WandbViewsTool,
-    WeaveResearchTool,
 )
 
 if TYPE_CHECKING:
@@ -78,13 +74,6 @@ class TrainingRuntime(Protocol):
 
 _TRAINING_RUNTIMES: dict[Path, tuple[TrainingRuntime, MonitorStore]] = {}
 _BROWSER_ENABLED_STATE_KEY = "senpai.browser_enabled"
-_training_wandb_api_key: SecretStr | None = None
-
-
-def configure_training_credentials(api_key: SecretStr | None) -> None:
-    """Hold the student writer outside model-facing tool state."""
-    global _training_wandb_api_key
-    _training_wandb_api_key = api_key
 
 
 class LoadBrowserAction(Action):
@@ -208,13 +197,11 @@ def training_runtime(
                 nodes=nodes,
                 gpus_per_node=int(os.environ["GPUS_PER_STUDENT_NODE"]),
                 max_timeout_seconds=max_timeout_seconds,
-                wandb_api_key=_training_wandb_api_key,
             )
         else:
             supervisor = TrainingSupervisor(
                 workspace=workspace,
                 state_dir=key,
-                wandb_api_key=_training_wandb_api_key,
             )
         runtime = (supervisor, MonitorStore(key / "monitors.sqlite3"))
         _TRAINING_RUNTIMES[key] = runtime
@@ -327,6 +314,7 @@ class TrainingResultObservation(Observation):
     kubernetes_resource: KubernetesResourceRef | None = None
     kubernetes_released: bool | None = None
     kubernetes_diagnostics: str = ""
+    kubernetes_pod_receipt: dict | None = None
     source_snapshot: str | None = None
     source_commit: str | None = None
 
@@ -372,14 +360,22 @@ class TrainingResultObservation(Observation):
             result["error_tail"] = self.error_tail
         if self.kubernetes_diagnostics:
             result["kubernetes_diagnostics"] = self.kubernetes_diagnostics
+        if self.kubernetes_pod_receipt is not None:
+            result["kubernetes_pod_receipt"] = self.kubernetes_pod_receipt
         text = json.dumps(result, separators=(",", ":"), default=str)
         return [TextContent(text=text)]
 
 
 class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObservation]):
-    def __init__(self, training: TrainingRuntime, monitor_store: MonitorStore):
+    def __init__(
+        self,
+        training: TrainingRuntime,
+        monitor_store: MonitorStore,
+        assignment_guard: TrainingAssignmentGuard,
+    ):
         self.training = training
         self.monitor_store = monitor_store
+        self.assignment_guard = assignment_guard
         self._lock = threading.Lock()
         self._in_flight: set[str] = set()
         self._interrupt_generation = 0
@@ -394,6 +390,7 @@ class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObserva
         require_clean_training_worktree(self.training.workspace)
         with self._lock:
             interrupt_generation = self._interrupt_generation
+        self.assignment_guard.require_current(conversation.id)
         result = self.training.run_training(action.spec)
         with self._lock:
             self._in_flight.add(result.training_id)
@@ -475,12 +472,14 @@ class RunTrainingTool(ToolDefinition[RunTrainingAction, TrainingResultObservatio
         cls,
         training: TrainingRuntime,
         monitor_store: MonitorStore,
+        assignment_guard: TrainingAssignmentGuard,
     ) -> Sequence[Self]:
         return [
             cls(
                 description=(
                     "Start one supervised training process without blocking and "
                     "automatically monitor its terminal state for this conversation. "
+                    "Only the current assignment revision conversation may launch. "
                     "Use monitor_training only to add metric gates or staleness "
                     "policy; use get_training_status for a bounded immediate check."
                 ),
@@ -493,7 +492,7 @@ class RunTrainingTool(ToolDefinition[RunTrainingAction, TrainingResultObservatio
                     idempotentHint=False,
                     openWorldHint=False,
                 ),
-                executor=_RunTrainingExecutor(training, monitor_store),
+                executor=_RunTrainingExecutor(training, monitor_store, assignment_guard),
             )
         ]
 
@@ -645,6 +644,10 @@ class TrainingToolSet(ToolDefinition[RunTrainingAction, TrainingResultObservatio
             *RunTrainingTool.create(
                 training=training,
                 monitor_store=monitor_store,
+                assignment_guard=TrainingAssignmentGuard(
+                    Path(state_dir).parent / "student-conversations.json",
+                    os.environ.get("STUDENT_NAME", ""),
+                ),
             ),
             *GetTrainingStatusTool.create(training=training),
             *CancelTrainingTool.create(
@@ -836,6 +839,7 @@ def register_senpai_tools() -> None:
     if _TOOLS_REGISTERED:
         return
     register_tool("senpai_training", TrainingToolSet)
+    register_tool("get_cluster_capacity", ClusterCapacityTool)
     register_tool("senpai_github", GitHubWorkflowToolSet)
     register_tool("spawn_agents", SpawnAgentsTool)
     register_tool("await_agents", AwaitAgentsTool)
@@ -847,8 +851,4 @@ def register_senpai_tools() -> None:
     register_tool("task_tracker", SenpaiTaskTrackerTool)
     register_tool("senpai_terminal", SenpaiTerminalTool)
     register_tool("senpai_exa", ExaSearchTool)
-    register_tool("wandb_research", WandbResearchTool)
-    register_tool("weave_research", WeaveResearchTool)
-    register_tool("wandb_views", WandbViewsTool)
-    register_tool("wandb_report_draft", WandbReportDraftTool)
     _TOOLS_REGISTERED = True

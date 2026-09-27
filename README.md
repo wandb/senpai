@@ -60,10 +60,6 @@ ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
 EXA_API_KEY=
 WANDB_API_KEY=
-# Required only for wandb/... model profiles:
-WANDB_INFERENCE_API_KEY=
-# One distinct writer for each configured student:
-WANDB_API_KEY_FRIEREN=
 ```
 
 | Credential | Required access |
@@ -72,9 +68,7 @@ WANDB_API_KEY_FRIEREN=
 | `ANTHROPIC_API_KEY` | Required when an `anthropic/...` model is configured. Every default profile uses Anthropic. |
 | `OPENAI_API_KEY` | Required when an `openai/...` model is configured. |
 | `EXA_API_KEY` | General-web and publication search through the credential-isolated `exa_search` tool. |
-| `WANDB_API_KEY` | Research, monitoring, and Weave access. Existing authenticated agent research remains available during this staged rollout. |
-| `WANDB_INFERENCE_API_KEY` | Required for `wandb/...` model profiles. Use a viewer distinct from research and training viewers. |
-| `WANDB_API_KEY_<STUDENT>` | One distinct training writer per student. Uppercase the student name and replace punctuation with `_`: `team-fern` becomes `WANDB_API_KEY_TEAM_FERN`. |
+| `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. All roles use this key for research, training, and tracing, and for any `wandb/...` model profiles. |
 
 To add a credential, put its value in `.env` and list its name in the launch
 configuration:
@@ -93,75 +87,32 @@ its value is redacted from tool output and traces.
 `k8s/launch.py` reads shell environment variables first and then the repository-root `.env`; only the GitHub token also falls back to `gh auth token`. Direct Docker or host execution must export or pass credentials explicitly.
 
 The launcher stores shared credentials in one Secret per launch tag. Student
-launches make that Secret immutable and create it as the tag reservation. Each
-student writer has a separate immutable Secret. Bootstrap
-writes GitHub, W&B, and Exa keys to owner-only files in a fresh private directory.
+launches make that Secret immutable and create it as the tag reservation.
+Bootstrap writes GitHub, W&B, and Exa keys to owner-only files in a fresh private
+directory.
 The supervisor consumes and unlinks those files, passes each key through a
 one-use descriptor, and drops its stored credentials after starting the worker.
+The controller restores W&B access before tracing starts. W&B remains available
+to SDK analysis, terminals, training, and tracing.
+
 The controller keeps Exa authentication in trusted runtime memory. Root agents
 and search children use `exa_search`; terminals and training no longer receive
 `EXA_API_KEY`. All delegated runtimes carry Exa through private descriptors
 so a general-purpose child can still delegate to a search grandchild. The key
-never enters tool parameters or conversation secrets. W&B research access
-remains available to research tools, terminals, and tracing. Supervised training uses
-its student writer as `WANDB_API_KEY`, replacing the research key.
-Its stdout and stderr pass through writer-key redaction before reaching the
-training log. Training starts without the controller's `WANDB_SERVICE` connection;
-an explicit writer also replaces any identity-token-file authentication.
+never enters tool parameters or conversation secrets.
 GitHub credentials remain private to the controller.
 
 Delegated model keys travel through a private descriptor and are resolved in
-memory. W&B inference uses its dedicated key. Research access and independent
-child and standalone Weave traces remain available. Linux credential holders disable process dumping;
+memory. They do not enter the child environment, except when the same key is
+also an intentionally available service credential. In particular, W&B inference
+still shares `WANDB_API_KEY` with W&B research and tracing. Separating those
+identities is a later change. Linux credential holders disable process dumping;
 this reduces inspection risk but does not isolate mutually untrusted processes
 that share a UID.
 
-Each student writer must authenticate as a different W&B viewer, including from
-research and inference viewers. Restrict project membership and permissions for
-each viewer; the launcher's viewer query does not verify those permissions or
-bind a run to an assignment. Different keys for the same viewer do not provide
-identity isolation. The existing research credential remains accessible to agent
-code in this staged rollout, so identity separation does not yet contain its use.
-
-The launcher checks desired Deployments and all nonterminal Pods across the
-namespace. Viewer ownership includes the launch tag, so different active tags
-need different research and inference viewers as well as student writers. Old
-Pods retain ownership during a rollout. A partial fleet update cannot change the
-research viewer while unreplaced roles use another viewer. Before the first
-launch with these checks, stop and remove all legacy Senpai role resources in the
-namespace, or migrate their manifests with verified viewer annotations. A new
-tag alone does not bypass missing legacy bindings.
-
-Run one launcher at a time per namespace. The ownership scan and resource writes
-are not atomic; concurrent launchers can both pass the scan. `--preflight_only`
-checks supplied identities but does not reserve them or inspect cluster ownership.
-Writer credentials use content-addressed Secrets. Student launches require an
-unused tag and never rotate a running student in place. Stop the affected launch
-and clean up its resources before reusing its identities. Retain old Secrets
-until no Deployment or nonterminal Pod references them, then delete only those
-unreferenced Secrets by name. The
-label-based cleanup command below tears down the entire launch; use it only when
-stopping that launch.
-
-The additive `wandb_research`, `weave_research`, and `wandb_views` tools export
-private run data, histories, artifacts, Weave records, and workspace/report
-specifications to generated files outside the target checkout. Main agents and
-general-purpose children also receive `wandb_report_draft`, which creates a new
-Report draft from a full JSON specification and verifies it by reading it back.
-Explore children receive the read tools. Tool definitions contain no API keys.
-These tools accept any project accessible to the configured research identity.
-They honor `WANDB_BASE_URL` for W&B requests and `WF_TRACE_SERVER_URL` for Weave
-requests. For self-hosted W&B, Weave defaults to `/traces` under
-`WANDB_PUBLIC_BASE_URL`, or under `WANDB_BASE_URL` when no public URL is set.
-
-The authenticated SDK route remains available. The new tools do not yet prove
-complete research parity or credential containment: live W&B behavior is
-unverified, full system history requires an uploaded `wandb-events.jsonl`, external
-artifact references may require cloud credentials, and the W&B SDK can reuse
-process-wide service state. Keep SDK access and independent tracing until those
-gaps are resolved. Training logging and metric monitoring alone do not provide
-research parity. See the bundled [research workflow](plugins/senpai/skills/wandb-primary/SKILL.md)
-for exporting data and using the existing analysis helpers without credentials.
+Use the bundled [W&B and Weave workflow](plugins/senpai/skills/wandb-primary/SKILL.md)
+for SDK access to runs, histories, artifacts, reports, and traces, and for the
+installed analysis helpers.
 
 ### 4. Prepare the target repository
 
@@ -273,7 +224,7 @@ does not enable OpenAI Pro mode.
 apply it for their models; OpenHands handles compaction for other providers.
 
 If using W&B Inference use `wandb/` provider as the provider. For example `wandb/zai-org/GLM-5.2`, SENPAI
-uses `WANDB_INFERENCE_API_KEY` for auth.
+uses `WANDB_API_KEY` for auth.
 
 The defaults in `senpai.yaml` describe W&B's deployment and should not be copied unchanged into another environment. Every setting can also be overridden on the command line. `--tag` and `--target_repo_url` are required unless your chosen config file supplies them.
 
@@ -357,12 +308,93 @@ The GPU summary distinguishes the original allocation from GPU requests of
 nonterminal pods that are scheduled or still pending. These counts describe
 Kubernetes requests, not GPU utilization. W&B completion does not release a
 workload while evaluation or cleanup processes are still running.
+
+At release, `get_training_status` also includes `kubernetes_pod_receipt`: a structured
+snapshot bound to the training ID, source commit and exact workload UID. It records
+each observed Pod UID, owner, node, phase, and container restart count, current and
+previous states, exit code and timestamps. The executor stores each receipt beside
+its state file in `<state-stem>.receipts/<sha256(training_id)>.json`; later reservations
+do not overwrite it. The receipt is separate from the 8 KiB diagnostic text.
+
+`complete` requires the expected worker/launcher count and terminal container status
+with restart counts and termination timestamps. It describes the observed Pods,
+not deleted historical Pods, training-process retries, or scientific quality. Missing
+Pods, partial status and API errors are explicit and never imply zero restarts.
+Pod-status capture has a 10-second wait limit and a 256-Pod/4-MiB inventory limit.
+Normal release waits for receipt persistence. Forced cancellation, deadline expiry
+and failed activation attempt capture before deletion; their snapshots can still show
+Running containers. If receipt storage fails, the executor reports the failure and
+continues forced cleanup so storage exhaustion cannot retain live GPUs indefinitely.
+
 Workload events expose validation failures before the MPI controller creates any
 pods. A launcher pod owned through a Job is included only when both owner UIDs
 lead to the reserved MPIJob. Log-read failures appear in diagnostics
 instead of disappearing silently. These reads stay inside the executor broker;
 students receive neither Kubernetes credentials nor namespace-wide read access.
 When a smoke run stalls before W&B starts, inspect these diagnostics first.
+
+### Advisory cluster capacity
+
+Add `--capacity_observer true` to install a dedicated observer. It uses the same
+immutable `--executor_image` and source revision, including for single-node
+fleets. Both root roles receive `get_cluster_capacity`, which reads a sanitized
+ConfigMap snapshot. Without an observer it returns unknown.
+It never reserves resources, clears an assignment hold, or authorizes a launch.
+
+With no arguments, the tool reports capacity for the complete configuration in
+the snapshot: worker resources, node selectors, tolerations, and preemption policy.
+Supply `expected_requirements` to check that configuration against an intended
+workload. A mismatch returns unknown with the observed requirements and no counts.
+The check compares configuration values; it does not recalculate capacity or
+change the workload. Version 1 snapshots lack the complete configuration and
+return unknown as invalid.
+
+The observed worker shape comes from `--nodes_per_student`,
+`--gpus_per_student_node`, `--cpu_per_gpu`, and `--memory_gi_per_gpu`. Configure
+`--capacity_node_selector key=value ...` and
+`--capacity_tolerations '{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}'`
+to describe the intended workers. These options affect observation only; they do
+not change training manifests. Omitted tolerations inherit the single-node
+student's GPU toleration; multi-node observation defaults to no tolerations.
+Explicit tolerations replace these defaults. Use `capacity_tolerations: []` in
+YAML or `--capacity_tolerations` without values for an empty override. Enable
+`--capacity_hpc_verification true` only where the operator confirms CoreWeave's
+preemptible HPC-verification policy. That policy requires the verification
+namespace, exact priority class, priority -1, and verification workload name;
+other low-priority workloads remain occupied capacity.
+
+The observer subtracts effective requests for all nonterminal Pods, including
+CPU-only workloads, bound Pending Pods, concurrent init sidecars, Pod overhead,
+and allocated resources during resize. It checks GPU, CPU, and memory on each
+Ready, uncordoned node that matches the configured selector and tolerations.
+It reports physical availability separately from verified preemptible capacity.
+Unbound Pending demand is separate from reservations. Resize accounting retains
+the largest declared, allocated, or actuated request, which can conservatively
+overcount an infeasible resize. Pod slots, affinity, topology, quota, PVC placement,
+launcher overhead, and concurrent submissions remain unassessed. The scheduler
+is authoritative; enough resource-fit nodes do not guarantee admission.
+
+The observer waits 30 seconds between collection attempts. API response sizes
+and pagination are bounded. A process timer limits collection to 25 seconds and
+the full collection/publication attempt to 40 seconds. The tool reports the
+observation time and age. ConfigMap directory
+projection can add delivery delay; snapshots older than 120 seconds, incomplete
+reads, malformed data, and collection failures return unknown without capacity
+counts. The projection uses no `subPath`, so kubelet can refresh it.
+
+Installation requires an operator who can create cluster-scoped RBAC and
+delegate list access to Nodes and Pods across namespaces. Only the observer's
+ServiceAccount receives those permissions, plus get/update access to its one
+precreated snapshot ConfigMap. It cannot read Secrets or mutate training jobs.
+The observer receives no model, GitHub, W&B, or target-repository credentials;
+model containers receive only the read-only sanitized snapshot. Existing
+student executor permissions and the apply-only kubectl proxy stay unchanged.
+
+The cutoff stops the observer with the tagged fleet while counting only
+`app=senpai` controllers for readiness. It does not gain cluster-wide cleanup
+permissions. The launcher prints an operator cleanup command for the observer's
+ClusterRole and ClusterRoleBinding, scoped by application, research tag, and
+namespace labels; remove those after terminating the fleet.
 
 If a controller state write reports disk-space or quota exhaustion, an active
 Kubernetes monitor retries result writes with backoff and reports the pending
@@ -376,7 +408,10 @@ uses the last durable record and the existing workload UID. A terminal decision
 that could not be persisted cannot survive process loss, so broker deadlines
 and normal recovery rules still apply.
 
-The launcher creates routing labels, one shared launch Secret, an immutable program Secret, an immutable writer Secret per student, role ConfigMaps, and Deployments. Multi-node students also receive one namespaced ServiceAccount, Role, and RoleBinding. It does not create the namespace, PVC, Service, or cluster-wide RBAC.
+The launcher creates routing labels, one shared launch Secret, an immutable
+program Secret, role ConfigMaps, and Deployments. Multi-node students also
+receive one namespaced ServiceAccount, Role, and RoleBinding. It does not create
+the namespace, PVC, Service, or cluster-wide RBAC.
 
 Student launches are create-only. Before the first write, the launcher rejects
 an existing student Deployment, any matching controller Pod, or any matching
@@ -477,6 +512,16 @@ new feedback still do.
 
 `get_prs` returns complete PR bodies and discussions. Up to five PRs are returned in context by default; larger selections become a Markdown artifact outside the target checkout so long histories do not pollute the main conversation.
 
+`get_pr_source` lets advisors and students inspect private PR code using the
+runtime's credentials. Supply the exact PR base and head SHAs from `get_prs` to
+list changed files, then select paths to retrieve complete source and text diffs
+in a private artifact outside the target checkout. The reader supports merged
+PRs, verifies blob identities, and checks that the PR has not moved before
+returning. It accepts at most 100 changed files and eight selected paths, with
+256 KiB per source file and 2 MiB per API response. It reports the comparison
+merge base separately from the PR base tip. Binary and oversized sources fail
+explicitly; the tool does not silently truncate review evidence.
+
 ## Long-running training and monitoring
 
 Students do not start GPU work, stream logs, sleep, or poll through the terminal. Four typed tools make training a durable controller operation:
@@ -487,6 +532,8 @@ Students do not start GPU work, stream logs, sleep, or poll through the terminal
 | `get_training_status` | Performs one bounded read of the latest persisted state, exit code, elapsed time, W&B run IDs, and error tail. |
 | `monitor_training` | Adds a W&B metric, minimize/maximize direction, `lte`, `gte`, `improved_by`, or `regressed_by` gates, a poll interval, and stale-update detection. It cannot disable terminal wakes. |
 | `cancel_training` | Stops the local process group through TERM/KILL or deletes the remote workload by its UID, waits for a durable terminal state, and retires its monitor. |
+
+Before each launch, Senpai reads the current GitHub assignment and checks its revision against the conversation identity saved by the controller. A superseded or unbound conversation cannot reserve resources or start training. It can still monitor or cancel its existing runs. If GitHub cannot confirm one current WIP assignment, the launch fails without starting work.
 
 After launch, the student can finish its turn. The deterministic controller polls process state and at most one selected W&B metric without consuming model tokens. A threshold crossing, regression, stale metric, terminal state, or monitor error creates one compact durable event and resumes the same student conversation. One broken monitor cannot block other training, GitHub feedback, or child-agent results.
 
@@ -509,13 +556,14 @@ the default state volumes do not survive Pod replacement. With Kubernetes'
 deleting or replacing the controller Pod also deletes its owned MPIJob and
 terminates remote training.
 
-The terminal policy checks nested shell commands, substitutions, and command
-wrappers. Quoted heredocs passed to Python or known text consumers (`cat`,
-`tee`, `head`, and `grep`) remain data when their output paths are known,
-including `uv run python` after `cd &&`. Commands that combine heredocs with
-process substitutions or unknown inherited output streams receive conservative
-shell checks, which can reject valid data. Other heredoc consumers also receive
-shell checks. Literal numeric arithmetic such as
+The terminal policy checks executable shell commands, including nested commands
+and common wrappers. Multiline input to ordinary programs remains data: Python,
+R, JavaScript, JSON, and other research formats do not need a language allowlist.
+The checker still inspects shell expansions in unquoted input and blocks
+restricted commands fed to recognized shells. Unrelated helper functions or
+file comparisons do not change how a data block is checked. Common wrappers
+such as `env`, `timeout`, `nice`, `xargs`, `taskset`, and `flock` preserve the
+wrapped program's data arguments. Literal numeric arithmetic such as
 `echo $((2 + 2))` is supported. Variable-based arithmetic, dynamic executable
 names, startup-variable changes, and shell reevaluation are rejected.
 
@@ -525,6 +573,8 @@ the current shell. Use `bash -c` instead of `bash -lc`; login and interactive
 shells can load unchecked startup files. The policy is a behavioral guardrail,
 not a shell sandbox or a credential-containment boundary. It does not inspect
 arbitrary Python programs or executable files.
+Some unsupported wrapper syntax and unclear shell streams can still reject
+valid commands. The policy does not reconstruct state from previous commands.
 
 Interactive browser operations are progressively disclosed. A fresh root
 conversation initially sees only `load_browser`; invoking it adds the fourteen
@@ -558,7 +608,7 @@ not automatically become environment variables inside the submitted pods.
 
 Declare `WANDB_API_KEY` in reporting main containers, including the MPI
 launcher when it reports metrics. The broker replaces that entry with the
-scoped Secret reference and supplies canonical `WANDB_RUN_ID` to main
+shared launch Secret reference and supplies canonical `WANDB_RUN_ID` to main
 containers. It rejects a conflicting explicit run ID and preserves unrelated
 target environment variables.
 
@@ -637,16 +687,23 @@ Children share the parent workspace, so their process and conversation are isola
 
 The Exa tool preserves the standalone script's controls: 1–100 results,
 publication dates, domains, text filters, freshness, six search types, extra
-queries, summaries, and highlight budgets. Web searches default to 10 results;
-publication searches default to 30. Evidence includes every result, summary,
-highlight, and available metadata. Responses above 30,000 characters return an
-explicit preview and save the complete Markdown under the conversation's
-observations directory, outside the target checkout. Agents can read that file
-in bounded ranges, including after a search child finishes. This keeps large
-searches retrievable without filling one model request with all the evidence.
+queries, summaries, and highlight budgets. Both modes default to `deep-reasoning`.
+Web searches default to 10 results; publication searches default to 30. The tool
+requests full text with no character limit and defaults to a fresh crawl so
+Exa's full extraction setting applies. An explicit `max_age_hours` value overrides
+freshness; `no_content` requests metadata only. Results retain all text returned
+by Exa, including paragraph breaks, alongside summaries, highlights, and metadata.
+Missing text is reported. Exa extraction does not download original PDF/HTML files
+or guarantee that a publication result contains the entire paper.
+Every response saves the complete Markdown under the conversation's observations
+directory, outside the target checkout, and returns its file path and character
+count. Responses above 30,000 characters return an explicit preview. Agents can
+read that file in bounded ranges, including after a search child finishes. This
+keeps large searches retrievable without filling one model request with all the evidence.
 See the [Exa skill](plugins/senpai/skills/exa-search/SKILL.md) for parameters.
 
-The standalone script remains available to operators outside the agent runtime:
+The standalone script retains its original defaults and remains available to
+operators outside the agent runtime:
 `python plugins/senpai/skills/exa-search/scripts/search_exa.py general-web "query"`.
 It uses the operator's `EXA_API_KEY` environment or dotenv configuration. Within
 Senpai, agents call `exa_search` because terminals receive no Exa key.
@@ -744,8 +801,12 @@ fetches only the base commit and tree; replay fetches one generation of parents
 to verify the existing assignment. The advisor checkout keeps its shallow boundary.
 Publication checks the exact local commit and remote head, then uses a remote
 lease. It publishes that commit even if the worktree has uncommitted changes;
-training still requires a clean worktree. Bootstrap retains the runner and target
-pre-push hooks, but no longer installs a Git executable shim on `PATH`.
+training still requires a clean worktree. After verified publication, it refreshes
+the checkout's local record of the remote branch, so Git status reflects the push.
+This also repairs stale records on retry and preserves concurrent updates to that
+record. The working branch and files stay in the same checkout. Bootstrap retains
+the runner and target pre-push hooks, but no longer installs a Git executable shim
+on `PATH`.
 
 When `WANDB_ENTITY` and `WANDB_PROJECT` are configured, [`weave-openhands`](https://github.com/morganmcg1/weave-openhands) traces advisor, student, and child conversations. Each `OPENHANDS_RUN` record includes a direct Weave Agent Observability URL.
 
@@ -822,7 +883,8 @@ That environment, the built-in agent definitions (`SENPAI_AGENT_DIR`), and the
 Senpai plugin (`SENPAI_PLUGIN`) are root-owned and read-only to the role user.
 Startup uses the installed runner with an absolute Python path and `-P`;
 it does not install the writable runner checkout or execute target Python.
-Changes to these installed assets require a new image.
+Deploying changes to these installed assets requires a new image. Editing
+plugin source and running its local tests does not require an image rebuild.
 
 Terminals and supervised training use a separate writable environment at
 `$HOME/.venvs/senpai-target`. Its packages take precedence over the image's
@@ -833,29 +895,58 @@ preserves other PATH entries, and allows later commands to change their
 session environment. Shared dependency commands such as `torchrun` receive
 target launchers so they and their Python workers can import target packages.
 Existing commands installed in the target environment take precedence.
-Bootstrap creates it without running `ensurepip` or target Python.
+Bootstrap creates it with `uv venv`, using the trusted interpreter and ignoring
+target project configuration. It does not run `ensurepip` or target Python.
 Environment changes belong to the terminal pane that received the command;
 parallel tmux execution can leave several panes with different settings.
-The image supplies pip through the shared package path: use
-`python -m pip install` for additive installs that reuse image packages.
-uv does not inspect packages exposed through that path, so `uv pip install`
-and `uv sync` can install separate copies, including large CUDA dependencies.
-Use `uv pip install --no-deps` when all required dependencies are already
-available, and `uv run --no-sync` to run with the installed package set.
-Sync the target lock when a separate dependency set is intended.
+Use uv for environment creation, locked image dependencies, and target project
+dependency management. The images copy pinned uv binaries directly from the
+official uv image. Pod bootstrap uses the Python and uv already in each role
+image; it needs no separate installation on the operator's machine or cluster
+node. For skill scripts and analysis with the installed package set, use
+`uv run --no-sync python script.py` to avoid an incidental sync.
+One package-installation exception remains: the image supplies pip through the
+shared package path, and `python -m pip install` can reuse those shared packages.
+Pinned uv 0.10.9 does not inspect that path when resolving dependencies, so
+`uv pip install` and `uv sync` can install separate copies, including large CUDA
+dependencies. Use `uv pip install --no-deps` only when all required dependencies
+are already available. Sync the target lock when a separate dependency set is
+intended.
 Training retains normal project imports. File-defined child agents use the
 same Senpai terminal policy, timeouts, and target environment as their parent.
 
-Senpai loads its explicit plugin and explicit target skills and agent
-definitions. It does not auto-load installed, user, or project plugins through
-OpenHands ambient discovery. Those plugins' hooks, MCP servers, and skills
-therefore no longer appear automatically. Target skills in `.agents/skills`,
+Senpai still explicitly loads its bundled plugin, including all ten workflow
+skills and the command-policy and lifecycle hooks. Previously, startup copied
+that plugin into a writable directory; it now loads the read-only image copy.
+Bundled W&B analysis helpers run in the writable target environment without
+modifying their installed skill files. Exa searches use the authenticated
+`exa_search` tool. Both role images include pandas and matplotlib for the
+bundled W&B diagnostics and plotting helpers.
+
+The runner selects one plugin directory: `--plugin-dir` takes precedence over
+`SENPAI_PLUGIN`, then the source-checkout default `plugins/senpai`. It passes
+that directory as one `PluginSource` to OpenHands and passes the same selection
+to children. An override replaces the selected bundle; it does not add another
+plugin. The [plugin README](plugins/senpai/README.md) traces these call sites.
+
+Previously, OpenHands also discovered additional plugins in project and home
+directories and its enabled-plugin store. Senpai now disables that automatic
+discovery. Those extra plugins' hooks, MCP servers, and skills therefore no
+longer appear automatically. Target skills in `.agents/skills`,
 `.openhands/skills`, and `.openhands/microagents` remain supported, as do
 unreserved target/user agents and MCP configuration declared on those agents.
 The bundled Exa and W&B skill integrations, browser tools, and typed GitHub,
-training, and delegation tools remain available. Operators who need an
-additional runtime plugin must review and include it in the trusted image
-plugin; copying it into a target or home plugin directory does not enable it.
+training, and delegation tools remain available. For additional capabilities
+in the standard image, integrate the required assets into `plugins/senpai`,
+then rebuild and deploy the image. There is no separate extra-plugin list.
+Copying a plugin into a target or home directory does not enable it.
+
+Target skills and `program.md` come from the target checkout; the runner's
+`system_instructions/` files come from its checkout at the selected launch
+revision. These files are outside the installed plugin bundle. Existing agent
+context does not hot-reload changes. Start fresh role state to apply changes
+to `program.md`, runtime identity, or role instructions. Runner checkout changes
+must still follow the launch requirement for matching source and image revisions.
 
 The standard Kubernetes Deployments mount only
 `/home/senpai/.venvs/senpai-target` from HOME. Target dependencies survive a
@@ -879,6 +970,8 @@ manager must terminate every descendant process group, including groups created
 by detached children, or terminate the workload's cgroup.
 
 ## Development and reference
+
+These local development commands require uv on the developer's machine:
 
 ```bash
 uv sync --locked --extra dev

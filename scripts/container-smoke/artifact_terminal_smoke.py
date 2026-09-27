@@ -18,7 +18,6 @@ from pydantic import SecretStr
 from openhands.tools.terminal import TerminalAction
 from senpai_agent import exa_tool
 from senpai_agent.tools import SenpaiTerminalTool
-from senpai_agent.research_exports import ResearchExports, export_directory
 
 with tempfile.TemporaryDirectory(prefix="pr3515-cross-artifact-") as tmp:
     directory = Path(tmp).resolve()
@@ -65,19 +64,12 @@ with tempfile.TemporaryDirectory(prefix="pr3515-cross-artifact-") as tmp:
         assert "## 100. Result 100" in exa_path.read_text()
         assert "cross-slice-exa-fixture" not in observation.markdown
 
-        export_root = directory / "research"
-        with export_directory(export_root) as descriptor:
-            exports = ResearchExports(export_root, descriptor)
-            wandb_path, _ = exports.jsonl([
-                {"step": 1, "loss": 0.5}, {"step": 2, "loss": 0.25},
-            ])
         result_path = directory / "readback.json"
         command = "python - <<'PYCODE'\n" + (
             "import json,sys\nfrom pathlib import Path\n"
             f"exa = Path({str(exa_path)!r}).read_text()\n"
-            f"rows = [json.loads(line) for line in Path({wandb_path!r}).read_text().splitlines()]\n"
             f"Path({str(result_path)!r}).write_text(json.dumps({{"
-            "'prefix':sys.prefix,'tail':exa[-2000:],'loss':rows[-1]['loss']}))\n"
+            "'prefix':sys.prefix,'tail':exa[-2000:]}))\n"
         ) + "PYCODE"
         tool = SenpaiTerminalTool.create(state, role="advisor")[0]
         result = tool.executor(TerminalAction(command=command, timeout=30))
@@ -85,12 +77,10 @@ with tempfile.TemporaryDirectory(prefix="pr3515-cross-artifact-") as tmp:
         readback = json.loads(result_path.read_text())
         assert Path(readback["prefix"]).resolve() == target_env
         assert "## 100. Result 100" in readback["tail"]
-        assert readback["loss"] == 0.25
         print(json.dumps({
             "result": "PASS",
             "exa_requested": 100,
             "complete_evidence_retrieved_after_preview": True,
-            "wandb_export_readable": True,
             "uses_target_python": True,
             "pooled_terminal": tool.executor.is_pooled,
         }))

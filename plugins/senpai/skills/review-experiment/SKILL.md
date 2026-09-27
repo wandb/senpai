@@ -12,6 +12,16 @@ argument-hint: "<pr-number> <problem-dir>"
 
 # Review an experiment
 
+Use `get_prs` for the complete discussion and the current base and head SHAs.
+For code review, call `get_pr_source` with `number`, `expected_base_sha`, and
+`expected_head_sha`. Its first response lists changed paths. Call it again with
+up to eight selected `paths`, then read the returned artifact. It contains
+complete text diffs and source at the comparison merge base and head. This also
+works for merged PRs and private repositories; no shell credential is needed.
+Pass the artifact to a review subagent when appropriate. If either PR SHA
+changes, refresh the discussion and source before deciding. This read tool does
+not authorize merging an operator PR through a student-assignment workflow.
+
 Retrieve the complete PR with `get_prs`. Verify its assignment, current head
 SHA, terminal structured result, W&B evidence, metric direction, and scientific
 conclusion. Then choose the appropriate next step:

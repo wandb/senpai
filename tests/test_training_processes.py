@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 import psutil
-from pydantic import SecretStr
+import pytest
 from training_test_support import (
     assert_process_stopped,
     make_supervisor,
@@ -27,6 +27,52 @@ from senpai_agent.training import (
 TERM_IGNORING_SLEEP = (
     "import signal,time;signal.signal(signal.SIGTERM, signal.SIG_IGN);time.sleep(60)"
 )
+
+
+@pytest.mark.parametrize("failed_start", [1, 2])
+def test_training_thread_start_failure_cleans_up_process_and_reader(
+    tmp_path, monkeypatch, failed_start
+):
+    workspace, supervisor = make_supervisor(tmp_path, terminate_grace_seconds=0.1)
+    processes = []
+    threads = []
+    original_popen = subprocess.Popen
+    original_start = threading.Thread.start
+
+    def capture_process(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def fail_thread_start(thread):
+        threads.append(thread)
+        if len(threads) == failed_start:
+            raise RuntimeError("thread resources exhausted")
+        original_start(thread)
+
+    monkeypatch.setattr(subprocess, "Popen", capture_process)
+    monkeypatch.setattr(threading.Thread, "start", fail_thread_start)
+    try:
+        with pytest.raises(RuntimeError, match="thread resources exhausted"):
+            run_python(supervisor, workspace, "import time; time.sleep(60)")
+
+        assert len(processes) == 1
+        assert processes[0].poll() is not None
+        assert all(not thread.is_alive() for thread in threads)
+        saved = list((tmp_path / "state").glob("*.json"))
+        assert len(saved) == 1
+        result = TrainingResult.model_validate_json(saved[0].read_text())
+        assert result.state is TrainingState.FAILED
+        assert "failed to start" in result.error_tail
+        supervisor.close()
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=3)
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(timeout=3)
 
 
 def test_training_preserves_target_python_and_project_imports(
@@ -253,17 +299,14 @@ def test_restart_does_not_signal_a_reused_pid(tmp_path: Path):
         unrelated.wait()
 
 
-def test_training_masks_split_writer_output_before_log_and_result_persistence(
+def test_training_masks_shared_key_before_log_and_result_persistence(
     tmp_path, monkeypatch
 ):
-    monkeypatch.setenv("WANDB_API_KEY", "research-secret")
-    monkeypatch.setenv("WANDB_INFERENCE_API_KEY", "inference-secret")
-    monkeypatch.setenv("SENPAI_WANDB_TRAINING_API_KEY", "stale-writer-secret")
+    monkeypatch.setenv("WANDB_API_KEY", "shared-research-key")
     monkeypatch.setenv("WANDB_SERVICE", "parent-service")
     monkeypatch.setenv("WANDB_IDENTITY_TOKEN_FILE", "/parent/identity-token")
     workspace, supervisor = make_supervisor(
         tmp_path,
-        wandb_api_key=SecretStr("student-writer-secret"),
         terminate_grace_seconds=0.1,
     )
     environment_path = workspace / "environment.json"
@@ -274,8 +317,7 @@ def test_training_masks_split_writer_output_before_log_and_result_persistence(
         workspace,
         "import json,os,pathlib,sys,time;"
         "values={key: os.environ.get(key) for key in "
-        "['WANDB_API_KEY','WANDB_INFERENCE_API_KEY','SENPAI_WANDB_TRAINING_API_KEY',"
-        "'WANDB_SERVICE','WANDB_IDENTITY_TOKEN_FILE']};"
+        "['WANDB_API_KEY','WANDB_SERVICE','WANDB_IDENTITY_TOKEN_FILE']};"
         f"pathlib.Path({str(environment_path)!r}).write_text(json.dumps(values));"
         "key=os.environ['WANDB_API_KEY'].encode();"
         "os.write(1,b'failed with key='+key[:7]);"
@@ -301,11 +343,9 @@ def test_training_masks_split_writer_output_before_log_and_result_persistence(
 
     assert result.state is TrainingState.FAILED
     assert json.loads(environment_path.read_text()) == {
-        "WANDB_API_KEY": "student-writer-secret",
-        "WANDB_INFERENCE_API_KEY": None,
-        "SENPAI_WANDB_TRAINING_API_KEY": None,
+        "WANDB_API_KEY": "shared-research-key",
         "WANDB_SERVICE": None,
-        "WANDB_IDENTITY_TOKEN_FILE": None,
+        "WANDB_IDENTITY_TOKEN_FILE": "/parent/identity-token",
     }
     expected = (
         "failed with key=<secret-hidden>\n"
@@ -315,13 +355,15 @@ def test_training_masks_split_writer_output_before_log_and_result_persistence(
     assert result.error_tail == expected
     assert result.wandb_run_ids == ("writer-run",)
     persisted = tmp_path / "state" / f"{running.training_id}.json"
-    assert "student-writer-secret" not in persisted.read_text()
+    assert "shared-research-key" not in persisted.read_text()
+    assert os.environ["WANDB_API_KEY"] == "shared-research-key"
+    assert os.environ["WANDB_SERVICE"] == "parent-service"
 
 
-def test_training_masks_a_partial_writer_key_at_natural_eof(tmp_path):
+def test_training_masks_a_partial_key_at_natural_eof(tmp_path, monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "0123456789abcdef0123456789abcdef01234567")
     workspace, supervisor = make_supervisor(
         tmp_path,
-        wandb_api_key=SecretStr("0123456789abcdef0123456789abcdef01234567"),
         terminate_grace_seconds=0.1,
     )
     running = run_python(
@@ -344,10 +386,10 @@ def test_training_masks_a_partial_writer_key_at_natural_eof(tmp_path):
     assert json.loads(persisted.read_text())["error_tail"] == expected
 
 
-def test_writer_redaction_does_not_create_truncated_wandb_run_ids(tmp_path):
+def test_key_redaction_does_not_create_truncated_wandb_run_ids(tmp_path, monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "0123456789abcdef0123456789abcdef01234567")
     workspace, supervisor = make_supervisor(
         tmp_path,
-        wandb_api_key=SecretStr("0123456789abcdef0123456789abcdef01234567"),
         terminate_grace_seconds=0.1,
     )
     running = run_python(
@@ -373,10 +415,10 @@ def test_writer_redaction_does_not_create_truncated_wandb_run_ids(tmp_path):
     assert result.wandb_run_ids == ("valid0",)
 
 
-def test_cancel_does_not_wait_for_a_detached_output_writer(tmp_path):
+def test_cancel_does_not_wait_for_a_detached_output_writer(tmp_path, monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "shared-research-key")
     workspace, supervisor = make_supervisor(
         tmp_path,
-        wandb_api_key=SecretStr("student-writer-secret"),
         terminate_grace_seconds=0.1,
     )
     child_pid = workspace / "detached.pid"
@@ -425,7 +467,7 @@ def test_cancel_does_not_wait_for_a_detached_output_writer(tmp_path):
         is TrainingState.CANCELLED
     )
     output = Path(running.log_path).read_bytes()
-    assert b"student-writer-secret" not in output
+    assert b"shared-research-key" not in output
     assert output.endswith(b"<secret-hidden>")
 
 

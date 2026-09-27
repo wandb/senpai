@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import subprocess
 import urllib.error
 
@@ -17,6 +18,99 @@ def block_unmocked_launch_writes(monkeypatch):
 
     monkeypatch.setattr(launch, "kubectl_apply", fail)
     monkeypatch.setattr(launch, "kubectl_create", fail, raising=False)
+
+
+def test_multiple_launch_tags_share_one_wandb_key(tmp_path, monkeypatch):
+    for name in os.environ:
+        if name.startswith("WANDB_API_KEY_") or name == "WANDB_INFERENCE_API_KEY":
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("WANDB_API_KEY", "shared-wandb-key")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-key")
+    monkeypatch.setenv("EXA_API_KEY", "exa-key")
+    monkeypatch.setattr(launch, "DOTENV_PATH", tmp_path / "absent.env")
+    for name in (
+        "preflight_check_target_repo_access",
+        "preflight_check_student_name_availability",
+        "preflight_check_exa_api_key",
+        "ensure_advisor_branch",
+        "ensure_target_repo_labels",
+    ):
+        monkeypatch.setattr(launch, name, lambda *_args: None)
+    monkeypatch.setattr(
+        launch, "preflight_check_target_repo_branch", lambda *_args: "main"
+    )
+    authenticated = []
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_wandb_api_key",
+        lambda key: authenticated.append(key),
+    )
+    inference_keys = []
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_wandb_inference",
+        lambda key, _entity, _project: inference_keys.append(key),
+    )
+    monkeypatch.setattr(
+        launch, "existing_student_names", lambda *_args, **_kwargs: []
+    )
+    monkeypatch.setattr(launch, "ensure_new_student_slot", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launch, "existing_program_context_secret", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        launch, "load_launch_program_snapshot",
+        lambda *_args: launch.ProgramSystemPrompt("program.md", "a" * 40, "Research policy."),
+    )
+    applied = []
+    monkeypatch.setattr(
+        launch,
+        "kubectl_apply",
+        lambda manifest, *_args, **_kwargs: applied.extend(
+            yaml.safe_load_all(manifest)
+        ),
+    )
+    monkeypatch.setattr(
+        launch, "kubectl_create",
+        lambda manifest, *_args, **_kwargs: applied.extend(yaml.safe_load_all(manifest)),
+    )
+    for tag in ("research-one", "research-two"):
+        args = launch_args(
+            tag=tag,
+            advisor_branch=tag,
+            wandb_entity="team",
+            wandb_project="project",
+        )
+        for profile in ("advisor", "student", "smart", "fast", "frontier"):
+            setattr(args, f"{profile}_model", "wandb/zai-org/GLM-5.2")
+            setattr(args, f"{profile}_reasoning_effort", "max")
+        monkeypatch.setattr(
+            launch.sp, "parse", lambda *_args, result=args, **_kwargs: result
+        )
+        launch.main()
+
+    assert authenticated == ["shared-wandb-key", "shared-wandb-key"]
+    assert inference_keys == authenticated
+    secrets = [resource for resource in applied
+               if resource["kind"] == "Secret" and "wandb-api-key" in resource["data"]]
+    assert len(secrets) == 2
+    assert {
+        resource["metadata"]["labels"]["research-tag"] for resource in secrets
+    } == {"research-one", "research-two"}
+    for resource in secrets:
+        assert {
+            key: base64.b64decode(value).decode()
+            for key, value in resource["data"].items()
+            if "wandb" in key
+        } == {"wandb-api-key": "shared-wandb-key"}
+    deployments = [
+        resource for resource in applied if resource["kind"] == "Deployment"
+    ]
+    assert len(deployments) == 4
+    assert len({resource["metadata"]["name"] for resource in deployments}) == 4
+    for resource in deployments:
+        container = resource["spec"]["template"]["spec"]["containers"][0]
+        assert {
+            value["name"] for value in container["env"] if "WANDB" in value["name"]
+        } == {"WANDB_API_KEY"}
 
 
 def test_kubectl_apply_raises_with_the_resource_and_error_detail(monkeypatch):
@@ -526,30 +620,15 @@ def bypass_external_preflight(monkeypatch):
         ("resolve_openai_api_key", "openai"),
         ("resolve_exa_api_key", "exa"),
         ("resolve_wandb_api_key", "wandb"),
-        ("resolve_wandb_inference_api_key", "wandb-inference"),
     ):
         monkeypatch.setattr(launch, name, lambda _path, value=value: value)
-    monkeypatch.setattr(
-        launch,
-        "resolve_student_wandb_api_keys",
-        lambda _path, names: {name: f"wandb-training-{name}" for name in names},
-    )
-    monkeypatch.setattr(
-        launch,
-        "preflight_check_wandb_api_key",
-        lambda key: f"viewer-{key}",
-    )
-    for name in (
-        "existing_controller_wandb_viewers",
-        "existing_wandb_viewer_owners",
-    ):
-        monkeypatch.setattr(launch, name, lambda *_args, **_kwargs: {})
     for name in (
         "preflight_check_target_repo_access",
         "preflight_check_student_name_availability",
         "preflight_check_anthropic_api_key",
         "preflight_check_openai_api_key",
         "preflight_check_exa_api_key",
+        "preflight_check_wandb_api_key",
         "preflight_check_wandb_inference",
         "ensure_advisor_branch",
         "ensure_target_repo_labels",
@@ -617,11 +696,9 @@ def test_incremental_launch_reuses_original_snapshot_for_both_roles(monkeypatch)
     launch.main()
 
     assert branch_commits == ["a" * 40]
-    writer_name = yaml.safe_load(writes[2][2])["metadata"]["name"]
     assert [(operation, description) for operation, description, _ in writes] == [
         ("create", "secret senpai-launch-secrets-test-track"),
         ("apply", f"program context secret {bound_name}"),
-        ("create", f"student fern Secret {writer_name}"),
         ("create", "student fern ConfigMap senpai-config-student-test-track-fern"),
         ("create", "student fern Deployment senpai-test-track-fern"),
         ("apply", "advisor"),
@@ -740,7 +817,7 @@ def test_dry_run_never_reads_custom_secret_values(monkeypatch, capsys):
     assert f"HF_TOKEN: {encoded_placeholder}" in output
 
 
-def test_wandb_gateway_uses_its_dedicated_key_for_openai_compatible_inference(
+def test_wandb_gateway_uses_the_wandb_key_for_openai_compatible_inference(
     monkeypatch,
 ):
     model = "wandb/zai-org/GLM-5.2"
@@ -760,15 +837,11 @@ def test_wandb_gateway_uses_its_dedicated_key_for_openai_compatible_inference(
     )
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
-    monkeypatch.setattr(
-        launch, "resolve_wandb_api_key", lambda _path: "wandb-key"
-    )
+    monkeypatch.setattr(launch, "resolve_wandb_api_key", lambda _path: "wandb-key")
     monkeypatch.setattr(
         launch,
         "resolve_openai_api_key",
-        lambda _path: pytest.fail(
-            "W&B inference must not resolve an OpenAI key"
-        ),
+        lambda _path: pytest.fail("W&B inference must not resolve an OpenAI key"),
     )
     checked = []
     monkeypatch.setattr(
@@ -786,7 +859,7 @@ def test_wandb_gateway_uses_its_dedicated_key_for_openai_compatible_inference(
 
     launch.main()
 
-    assert checked == [("wandb-inference", "research-team", "mlxfast")]
+    assert checked == [("wandb-key", "research-team", "mlxfast")]
 
 
 @pytest.mark.parametrize(
@@ -899,14 +972,11 @@ def test_launch_uses_one_scope_for_create_discovery_and_handoff_commands(
     launch.main()
 
     assert discovery == [("scope-test", "gpu-cluster", "research")]
-    assert len(mutations) == 6
+    assert len(mutations) == 5
     assert mutations[1][0] == "apply"
     assert mutations[1][1].startswith("program context secret senpai-program-context-scope-test-")
     assert mutations[1][2:] == ("gpu-cluster", "research")
-    assert mutations[2][0] == "create"
-    assert mutations[2][1].startswith("student fern Secret senpai-wandb-student-scope-test-fern-")
-    assert mutations[2][2:] == ("gpu-cluster", "research")
-    assert [mutations[0], *mutations[3:]] == [
+    assert [mutations[0], *mutations[2:]] == [
         (
             "create",
             "secret senpai-launch-secrets-scope-test",
@@ -1091,7 +1161,7 @@ def test_reordered_student_manifest_still_creates_the_deployment_last(monkeypatc
     assert program_writes[0][0].startswith("program context secret ")
     assert program_writes[0][1]["immutable"] is True
 
-    assert created == ["Secret", "Secret", "ConfigMap", "Deployment"]
+    assert created == ["Secret", "ConfigMap", "Deployment"]
 
 
 @pytest.mark.parametrize(
@@ -1180,7 +1250,6 @@ def test_multinode_student_resources_are_created_in_dependency_order(monkeypatch
     assert program_writes[0][1]["immutable"] is True
 
     assert [kind for kind, _name in created] == [
-        "Secret",
         "Secret",
         "ConfigMap",
         "ServiceAccount",
@@ -1298,44 +1367,6 @@ def test_dry_run_does_not_scan_or_reserve_student_slots(monkeypatch):
     launch.main()
 
 
-def test_preflight_rejects_wandb_keys_for_the_same_viewer(monkeypatch):
-    args = launch_args(preflight_only=True)
-    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
-    bypass_external_preflight(monkeypatch)
-    monkeypatch.setattr(
-        launch,
-        "preflight_check_wandb_api_key",
-        lambda _api_key: "shared-viewer",
-    )
-
-    with pytest.raises(
-        SystemExit, match="controller.*student 'fern'.*same viewer"
-    ):
-        launch.main()
-
-
-
-def test_partial_update_cannot_change_an_active_controller_viewer(monkeypatch):
-    args = launch_args(advisor=False)
-    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
-    bypass_external_preflight(monkeypatch)
-    monkeypatch.setattr(
-        launch,
-        "existing_controller_wandb_viewers",
-        lambda *_args, **_kwargs: {"student/frieren": {"different-viewer"}},
-    )
-    monkeypatch.setattr(
-        launch,
-        "kubectl_apply",
-        lambda *_args, **_kwargs: pytest.fail(
-            "preflight must fail before mutation"
-        ),
-    )
-
-    with pytest.raises(SystemExit, match="frieren.*stop and clean up"):
-        launch.main()
-
-
 
 @pytest.mark.parametrize(
     ("overrides", "message"),
@@ -1353,249 +1384,3 @@ def test_launch_rejects_invalid_kubernetes_labels_before_preflight(
 
     with pytest.raises(SystemExit, match=message):
         launch.main()
-
-
-
-def role_resource(
-    *,
-    tag="test-track",
-    role="student",
-    student="fern",
-    kind="Deployment",
-    controller="viewer-wandb",
-    writer="viewer-wandb-training-fern",
-    inference="",
-    phase="Running",
-):
-    labels = {"app": "senpai", "research-tag": tag, "role": role}
-    if role == "student":
-        labels["student"] = student
-    annotations = {
-        "senpai.wandb.com/controller-wandb-viewer": base64.b64encode(
-            controller.encode()
-        ).decode(),
-        "senpai.wandb.com/inference-wandb-viewer": base64.b64encode(
-            inference.encode()
-        ).decode(),
-    }
-    if role == "student":
-        annotations["senpai.wandb.com/wandb-viewer"] = base64.b64encode(
-            writer.encode()
-        ).decode()
-    name = f"senpai-advisor-{tag}" if role == "advisor" else f"senpai-{tag}-{student}"
-    resource = {"kind": kind, "metadata": {"name": name, "labels": labels}}
-    if kind == "Deployment":
-        resource["spec"] = {
-            "template": {"metadata": {"annotations": annotations}}
-        }
-    else:
-        resource["metadata"]["annotations"] = annotations
-        resource["metadata"]["deletionTimestamp"] = "2026-09-25T00:00:00Z"
-        resource["status"] = {"phase": phase}
-    return resource
-
-
-
-def launch_with_existing_roles(monkeypatch, resources, **overrides):
-    args = launch_args(advisor=False, **overrides)
-    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
-    bypass_external_preflight(monkeypatch)
-    monkeypatch.setattr(
-        launch,
-        "existing_controller_wandb_viewers",
-        launch_helpers.existing_controller_wandb_viewers,
-    )
-    monkeypatch.setattr(
-        launch,
-        "existing_wandb_viewer_owners",
-        launch_helpers.existing_wandb_viewer_owners,
-    )
-    monkeypatch.setattr(launch, "ensure_new_student_slot", launch_helpers.ensure_new_student_slot)
-    scans = []
-    run_process = subprocess.run
-
-    def run(argv, **kwargs):
-        if argv[0] != "kubectl":
-            return run_process(argv, **kwargs)
-        scans.append(argv)
-        if "api-resources" in argv:
-            return subprocess.CompletedProcess(argv, 0, "", "")
-        kind = argv[argv.index("get") + 1]
-        if kind == "deployment":
-            name = argv[argv.index("get") + 2]
-            selected = next((item for item in resources if item["kind"] == "Deployment"
-                             and item["metadata"]["name"] == name), None)
-            output = json.dumps(selected) if selected is not None else ""
-        else:
-            selector = dict(part.split("=", 1) for part in argv[argv.index("-l") + 1].split(","))
-            selected = [item for item in resources
-                        if (kind == "deployments,pods" or kind == "pods" and item["kind"] == "Pod")
-                        and all(item["metadata"]["labels"].get(key) == value
-                                for key, value in selector.items())]
-            output = json.dumps({"items": selected})
-        return subprocess.CompletedProcess(argv, 0, output, "")
-
-    monkeypatch.setattr(launch_helpers.subprocess, "run", run)
-    applied = []
-    monkeypatch.setattr(
-        launch,
-        "kubectl_apply",
-        lambda manifest, _description, **_kwargs: applied.extend(
-            yaml.safe_load_all(manifest)
-        ),
-    )
-    monkeypatch.setattr(
-        launch, "kubectl_create",
-        lambda manifest, _description, **_kwargs: applied.extend(yaml.safe_load_all(manifest)),
-    )
-    return applied, scans
-
-
-
-@pytest.mark.parametrize(
-    "existing_owner", ["controller", "writer", "inference"]
-)
-@pytest.mark.parametrize("kind", ["Deployment", "Pod"])
-def test_launch_rejects_viewer_reuse_across_tags_before_apply(
-    monkeypatch, existing_owner, kind
-):
-    resource = role_resource(
-        tag="older-track",
-        kind=kind,
-        controller="old-controller",
-        writer="old-writer",
-        inference="old-inference",
-        **{},
-    )
-    annotations = (
-        resource["metadata"]["annotations"]
-        if kind == "Pod"
-        else resource["spec"]["template"]["metadata"]["annotations"]
-    )
-    annotation = {
-        "controller": "controller-wandb-viewer",
-        "writer": "wandb-viewer",
-        "inference": "inference-wandb-viewer",
-    }[existing_owner]
-    annotations[f"senpai.wandb.com/{annotation}"] = base64.b64encode(
-        b"viewer-wandb-training-fern"
-    ).decode()
-    applied, scans = launch_with_existing_roles(monkeypatch, [resource])
-    with pytest.raises(
-        SystemExit, match="older-track.*test-track.*same viewer"
-    ):
-        launch.main()
-    assert applied == []
-    assert any("app=senpai" in command for command in scans)
-
-
-
-@pytest.mark.parametrize("phase", ["Succeeded", "Failed"])
-def test_terminal_pods_release_identity_ownership(monkeypatch, phase):
-    resource = role_resource(tag="older-track", kind="Pod", phase=phase)
-    applied, _scans = launch_with_existing_roles(monkeypatch, [resource])
-    launch.main()
-    assert any(item["kind"] == "Deployment" for item in applied)
-
-
-
-@pytest.mark.parametrize(
-    "annotation",
-    ["controller-wandb-viewer", "inference-wandb-viewer", "wandb-viewer"],
-)
-@pytest.mark.parametrize("value", [None, "not base64!"])
-def test_legacy_namespace_roles_block_launch_until_migrated(
-    monkeypatch, annotation, value
-):
-    resource = role_resource(tag="legacy-track")
-    annotations = resource["spec"]["template"]["metadata"]["annotations"]
-    if value is None:
-        annotations.pop(f"senpai.wandb.com/{annotation}")
-    else:
-        annotations[f"senpai.wandb.com/{annotation}"] = value
-    applied, _scans = launch_with_existing_roles(monkeypatch, [resource])
-    with pytest.raises(SystemExit, match="every active legacy role"):
-        launch.main()
-    assert applied == []
-
-
-
-def test_live_student_blocks_rotation_and_keeps_its_old_writer_reserved(monkeypatch):
-    old_pod = role_resource(kind="Pod", writer="old-viewer")
-    applied, _scans = launch_with_existing_roles(monkeypatch, [old_pod])
-    with pytest.raises(RuntimeError, match="still has controller Pod objects"):
-        launch.main()
-    assert applied == []
-
-    # A terminating student retains its old writer identity until cleanup.
-    applied.clear()
-    monkeypatch.setattr(
-        launch,
-        "resolve_student_wandb_api_keys",
-        lambda _path, _names: {"fern": "new-key"},
-    )
-    monkeypatch.setattr(
-        launch,
-        "preflight_check_wandb_api_key",
-        lambda key: "old-viewer" if key == "wandb" else "new-writer",
-    )
-    with pytest.raises(
-        SystemExit, match="student 'fern'.*controller.*same viewer"
-    ):
-        launch.main()
-    assert applied == []
-
-
-
-@pytest.mark.parametrize("credential_owner", ["controller", "W&B Inference"])
-def test_controller_and_inference_viewers_belong_to_one_tag(
-    monkeypatch, credential_owner
-):
-    overrides = {}
-    if credential_owner == "controller":
-        resource = role_resource(tag="older-track", role="advisor")
-    else:
-        resource = role_resource(
-            tag="older-track",
-            role="advisor",
-            controller="older-controller",
-            inference="viewer-wandb-inference",
-        )
-        overrides = {
-            "student_model": "wandb/zai-org/GLM-5.2",
-            "student_reasoning_effort": "max",
-        }
-    applied, _scans = launch_with_existing_roles(
-        monkeypatch, [resource], **overrides
-    )
-
-    with pytest.raises(
-        SystemExit,
-        match=(
-            f"tag 'older-track' {credential_owner} and "
-            f"tag 'test-track' {credential_owner}.*same viewer"
-        ),
-    ):
-        launch.main()
-
-    assert applied == []
-
-
-
-def test_matching_wandb_owners_do_not_allow_replacing_an_existing_student(
-    monkeypatch,
-):
-    resources = [
-        role_resource(kind=kind, inference="viewer-wandb-inference")
-        for kind in ("Deployment", "Pod")
-    ]
-    applied, _scans = launch_with_existing_roles(
-        monkeypatch,
-        resources,
-        student_model="wandb/zai-org/GLM-5.2",
-        student_reasoning_effort="max",
-    )
-
-    with pytest.raises(RuntimeError, match="student Deployment.*already exists"):
-        launch.main()
-    assert applied == []

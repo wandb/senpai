@@ -256,10 +256,7 @@ three against the mounted snapshot before constructing a worker.
 The selected path supports printable UTF-8, including spaces and Unicode,
 without backslashes or traversal. The committed program must be a regular file
 of at most 256 KiB of UTF-8 data; the encoded Secret value may not exceed 1 MiB.
-The prompt content omits the SPDX header and outer whitespace. The target
-policy defines research goals and constraints; the harness, role charter,
-launch context, permissions, security boundaries, and operator instructions
-retain their stated authority.
+The prompt content omits the SPDX header and outer whitespace.
 
 The supervisor renders the role's `{{VARIABLE}}` placeholders from an explicit
 non-secret allowlist. A missing referenced value fails startup; unrelated
@@ -322,10 +319,12 @@ path entry. Target packages can override those shared packages without writing
 to the trusted environment. The image includes pip so additive target installs
 can resolve packages on the shared path. uv resolves a separate target package
 set and does not inspect that path. The image compiles runtime bytecode before
-making the environment read-only. Bootstrap computes both paths with trusted Python
-and creates the target venv without pip bootstrapping, which would execute
-target Python. Terminal and training environments select the target through
-PATH and uv settings. Training and terminal setup remove inherited
+making the environment read-only. The images copy uv from its versioned,
+digest-pinned official image. Bootstrap computes both paths with trusted Python
+and uses `uv venv` with that interpreter, without project/config discovery,
+Python downloads, or pip bootstrapping. It preserves existing target files and
+never executes target Python. Terminal and training environments select the
+target through PATH and uv settings. Training and terminal setup remove inherited
 `PYTHONSAFEPATH` so project imports work normally. File-defined child terminals
 use the same routing.
 Each native terminal session receives target settings after shell startup,
@@ -336,6 +335,13 @@ Bootstrap also creates missing target launchers for the trusted environment's
 console scripts. Each launcher executes the original read-only script with
 target Python, so shared commands and their Python workers see target packages.
 Bootstrap preserves existing target scripts and never executes target Python.
+
+The bundled plugin remains explicitly loaded for root and child conversations.
+Its W&B analysis helpers run in the target environment with `uv run --no-sync`;
+they must not rewrite the read-only installed skill files. Exa searches use the
+authenticated `exa_search` tool. Target lock updates and
+dependency syncs are explicit experiment changes, not a side effect of reading
+experiment results.
 
 OpenHands ambient plugin discovery is disabled before root or child
 conversations are created. Only the explicitly supplied trusted plugin loads
@@ -716,7 +722,7 @@ the [target launcher contract](README.md#multi-node-target-launcher-contract):
 it uses the generated workload name, namespace, snapshot SHA, and W&B identity,
 and supplies the matching source/run annotations before submission. Worker
 resources must match the configured CPU, memory, and GPU allocation; additional
-resource types are rejected. Main containers may receive the scoped W&B key and
+resource types are rejected. Main containers may receive the shared W&B key and
 receive canonical `WANDB_RUN_ID`; target code uses the configured W&B entity and
 project. The broker replaces target init containers with the fixed checkout and
 removes pod annotations. The checkout runs as UID/GID 0 and leaves the source
@@ -741,7 +747,12 @@ timeout still delete the remote workload and persist a terminal result before
 releasing ownership.
 
 The student commits the exact implementation and cleans the worktree before an
-expensive launch. Every successful `run_training` launch immediately registers
+expensive launch. Before reserving resources or starting a process, `run_training`
+reads the current open WIP assignment from GitHub and checks that its revision
+maps to this conversation in `student-conversations.json`. Missing, ambiguous,
+unreadable, or superseded assignments prevent a new launch. This admission check
+does not affect monitoring, cancellation, or terminal delivery for existing runs.
+Every successful `run_training` launch immediately registers
 a terminal-state monitor bound to the current conversation. `monitor_training`
 is an optional policy upgrade for useful metric gates or staleness detection;
 repeating it replaces the default or previous policy.
@@ -799,17 +810,21 @@ The terminal policy parses Bash syntax before checking nested commands and
 recognized command runners. It rejects malformed syntax, dynamic executable
 names, startup-file loading, shell callbacks, aliases, and variable-name
 reevaluation. Shell startup and prompt variables are also reserved against
-custom-secret injection. Quoted Python and known text-consumer heredocs are
-data when every consumer and output path is recognized. Process substitutions
-anywhere in the command, inherited output redirects to unknown streams, and
-dynamic or device-file destinations disable that exemption. Other heredocs
-receive recursive shell checks, including substitutions inside their bodies.
-These conservative checks can reject valid data. Literal numeric arithmetic is
-allowed, while variable arithmetic and C-style polling loops remain rejected.
-Common argv wrappers preserve the wrapped command's data arguments. Runners
-with more complex grammars retain conservative checks and can reject otherwise
-valid commands. These checks do not inspect arbitrary executable files or
-Python code and do not establish a shell sandbox.
+custom-secret injection. These checks enforce workflow boundaries without
+prescribing research methods or requiring an allowlist of data formats and
+analysis languages. Heredoc input to ordinary programs remains data. The
+original Bash syntax still exposes expansions in unquoted input for checking;
+input fed to recognized shells receives recursive shell checks. A function
+that overrides the actual consumer, or output routed through an opaque `exec`
+redirect, retains conservative checking. Unrelated functions and process
+substitutions do not disable ordinary program input. Dynamic output paths are
+allowed unless recognized shell execution in the same command makes that
+stream ambiguous. Literal numeric arithmetic is allowed, while variable
+arithmetic and C-style polling loops remain rejected. Common wrappers inspect
+the actual child command and preserve its data arguments. Unsupported wrapper
+grammars and unclear shell streams can still reject valid commands. These
+checks do not inspect arbitrary executable files or Python code, reconstruct
+prior terminal state, or establish a shell sandbox.
 
 Every OpenHands turn has a controller-configured hard deadline. The deadline
 interrupts the conversation, produces a non-success result, and leaves durable
@@ -846,7 +861,13 @@ directory and shallow boundaries, then verifies the staged commit SHA.
 Assignment creation fetches the base at depth one; idempotent replay fetches the
 assignment at depth two to verify its parent, tree, and message. These fetches do
 not change the advisor checkout. Pushes retain expected-SHA checks, ancestry
-checks, exact ref leases, and post-push verification. The bootstrap runner and
+checks, exact ref leases, and post-push verification. After verified publication,
+including an idempotent retry, a credential-free local Git command updates
+`refs/remotes/<remote>/<branch>` to the published SHA. It compares the ref with
+its value before network work and preserves concurrent changes. It does not
+follow symbolic refs, run hooks, or move the working branch, HEAD, index, or files.
+Other local update failures report that publication succeeded so a retry can
+repair the tracking ref. The bootstrap runner and
 target pre-push hooks remain behavioral guards; typed publication bypasses them
 and applies its own branch and lease checks. Before creating a remote branch,
 the typed assignment tool requires a configured student and a `<student>/`
@@ -862,34 +883,15 @@ The root and search agents expose `exa_search`; all child runtimes retain the
 key in trusted process memory, including those that can delegate onward. This
 boundary does not protect against compromise of the trusted runtime or a
 privileged host process.
-W&B conversation secrets remain available to child tools. W&B inference uses `WANDB_INFERENCE_API_KEY`. The launcher requires
-one distinct W&B writer per student and transfers it through the private file/
-descriptor handoff as `SENPAI_WANDB_TRAINING_API_KEY`. The controller holds it in
-memory, removes that variable, and supplies it only to supervised training as
-`WANDB_API_KEY`. Supervised output redacts the writer before log persistence,
-including keys split across pipe reads. The output reader drains the buffered
-backlog at shutdown without waiting for an escaped descendant to close its pipe.
-Training clears `WANDB_SERVICE` so it cannot reuse the controller's sidecar, and
-an explicit writer clears `WANDB_IDENTITY_TOKEN_FILE` to avoid conflicting auth.
-Research tools and independent child/standalone traces retain
-the existing research credential until a complete research replacement exists.
 
-Additive research tools use an explicit credential configured by the runner;
-their serialized definitions contain only the export directory. Main agents and
-general-purpose children can query W&B, Weave, and workspace/report views and
-create new Report drafts. Explore children receive the read tools. Results use
-generated JSONL paths outside the target checkout. Export writes reject symlinks;
-artifact downloads use generated filenames and do not execute downloaded data.
-Full run history preserves sparse rows. Reports accept complete specifications,
-including arbitrary blocks, runsets, and panels, and require authenticated
-read-back before reporting a verified draft. Uncertain creation returns a receipt
-or generated name to inspect before any retry.
-
-This is an additive migration. Existing SDK access and child/standalone tracing
-remain available while live API parity and W&B SDK service-state isolation are
-unverified. The replacement explicitly reports unsupported full system histories
-and external artifact-storage credentials; it must not silently substitute sampled
-data or a narrower research workflow.
+W&B conversation secrets remain available to child tools. A model key that also
+serves W&B remains in the environment. All roles share `WANDB_API_KEY` for W&B
+inference, SDK research, training, and tracing.
+Multiple Senpai instances may use the same key; no per-student key is required.
+Supervised training masks the inherited key before persisting stdout/stderr,
+including keys split across reads and incomplete key prefixes at shutdown.
+The output reader drains buffered data without waiting for escaped descendants
+to close the pipe. Training clears `WANDB_SERVICE` to start its own W&B connection.
 
 The supervisor, controller, and runner disable process dumping on Linux,
 including standalone runner invocations. This also disables core dumps and
@@ -934,7 +936,7 @@ policies are behavioral guardrails, not a credential-containment boundary.
 `custom_secret_env_names` is an explicit, shared list of additional
 environment-variable names. Names must be unique and match
 `[A-Za-z_][A-Za-z0-9_]*`. Built-in launch credential names and names beginning
-with `GH_`, `GITHUB_`, `SENPAI_`, or `WANDB_API_KEY_` are reserved. Launcher-owned and
+with `GH_`, `GITHUB_`, or `SENPAI_` are reserved. Launcher-owned and
 process-control environment-variable names are also reserved. The launcher
 resolves each value from the shell and then the repository-root `.env`. It
 reads `.env` values literally without variable interpolation. A missing listed
@@ -985,31 +987,36 @@ Launch preflight verifies:
 - every model-provider credential referenced by the configured profiles;
 - the Exa key with one `type="instant"`, publication-category, one-result
   search;
-- each W&B research, inference, and student writer key with a minimal viewer
-  query, rejecting reuse across owners; and
+- the W&B key with a minimal viewer query; and
 - the presence of every configured custom secret, without attempting
   a service-specific authentication check.
 
 Exa uses a credential-isolated native `exa_search` tool with progressive skill
-guidance. It preserves the standalone script's request controls, web/publication
-defaults of 10/30 results, counts up to 100, and complete requested evidence and
-metadata. The legacy script remains an operator interface outside the agent
-runtime. The root tool remains declared when a standalone runtime has no Exa key
-so persisted conversations can resume. Calls without configured credentials fail
-before contacting Exa. Responses above 30,000 characters persist the complete
-Markdown in the conversation's observations directory and return an explicit
-preview with the file path and range-read guidance. A failed write fails the
-tool call instead of losing evidence. Local conversation cleanup retains these
-files, so parents can read results from completed search children. The preview
-fits below the pinned SDK's 50,000-character tool-message limit; SDK serializers
+guidance. It preserves the standalone script's request controls and web/publication
+counts of 10/30 results, with up to 100 per call. Both modes default to
+`deep-reasoning`. Unless `no_content` is set, the tool requests
+`text={"verbosity": "full"}` without a character limit and defaults to
+`max_age_hours=0` so the extraction setting applies to a fresh crawl. Explicit
+cache-age values remain supported. Returned text is retained with its original
+line breaks; missing text is reported. These are Exa's extracted contents, not
+original PDF/HTML files or a guarantee of complete-paper coverage. The legacy
+operator script keeps its original defaults. The root tool remains declared when
+a standalone runtime has no Exa key so persisted conversations can resume.
+Calls without configured credentials or conversation persistence fail
+before contacting Exa. Every response persists the complete Markdown in the
+conversation's observations directory and returns its file path and character
+count. Responses above 30,000 characters return an explicit preview. A failed
+write fails the tool call instead of losing evidence. Local conversation cleanup
+retains these files, so parents can read results from completed search children.
+The preview fits below the pinned SDK's 50,000-character tool-message limit; SDK serializers
 and other tools retain their existing limits. The legacy terminal path also
 previews at 30,000 characters. Complete evidence is available through bounded
 file reads; it is not sent to a model in one unbounded message.
 
 The Kubernetes launcher creates one shared launch Secret, an immutable
-program Secret, an immutable writer Secret per student, ConfigMaps, and Deployments. A
-student launch first scans every requested name for an existing Deployment,
-controller Pod, or nonterminal labeled Job. It scans MPIJobs only when the API
+program Secret, ConfigMaps, and Deployments. A student launch first scans every
+requested name for an existing Deployment, controller Pod, or nonterminal labeled
+Job. It scans MPIJobs only when the API
 exists and requires that API for multi-node students. After all scans pass, it
 creates the per-tag Secret as an atomic, durable, immutable reservation before
 any GitHub write. An advisor-only apply cannot change the Secret data after a
@@ -1035,8 +1042,35 @@ placement is unconstrained unless the operator sets `controller_node_selector`.
 A separate executor sidecar alone mounts a projected token and validates the
 exact node/GPU and CPU/memory allocation, deadline,
 source/W&B evidence, volumes, pod security, and workload ownership across a
-Unix socket. Docker and local hosts need no shared network for Senpai
-communication.
+Unix socket. The executor receives the shared launch Secret's name and binds
+`WANDB_API_KEY` in reporting main containers to its `wandb-api-key` entry. It does
+not receive the key itself. Docker and local hosts need no shared network for
+Senpai communication.
+
+An opt-in capacity observer is separate from the research controllers and
+training executor. It lists Nodes and nonterminal Pods through a dedicated
+credentialed process and updates only its named, precreated snapshot ConfigMap.
+The advisor and students mount that sanitized snapshot read-only and expose
+`get_cluster_capacity` without Kubernetes credentials or mutation inputs.
+The observer needs explicit cluster-scoped read RBAC; namespace-only executor
+permissions stay unchanged. Observation shape, selectors, tolerations, and any
+CoreWeave verification exemption are operator-owned configuration. All three
+worker resources must fit on the same eligible node. Missing, incomplete,
+malformed, or stale snapshots return unknown. This is timestamped advisory
+capacity, never a reservation or assignment transition; scheduling remains
+Kubernetes' responsibility. Raw Pod specifications, environments, logs, and
+unrelated project identifiers never enter the snapshot. Cluster-scoped observer
+RBAC cleanup remains an operator action rather than expanding cutoff authority.
+
+The snapshot includes the complete observation configuration. Optional
+`expected_requirements` compares resource shape, node selectors, tolerations,
+and preemption policy with that configuration. Toleration order and duplicates
+do not affect the comparison. A mismatch returns unknown, preserves the observed
+configuration, and removes capacity counts. Matching requirements do not assess
+affinity, topology, quotas, or PVC placement. Single-node observation inherits
+the generated student pod's GPU toleration by default; multi-node observation
+defaults to empty tolerations. Explicit observation settings override defaults
+without changing target-owned worker placement.
 
 Hivemind startup remains commented with a clear note. The Python controller
 waits for the optional cluster start gate while continuously refreshing a
@@ -1108,32 +1142,3 @@ The change is acceptable when:
   never becomes Ready; and
 - a live credential preflight plus GitHub read-only smoke succeeds before
   production rollout.
-
-### W&B identity rollout
-
-Shared launch credentials use a stable Secret per tag; student launches create
-it as an immutable reservation. Each student writer uses a separate immutable,
-content-addressed Secret. Existing students cannot be replaced or rotated in
-place. The multi-node executor receives only the writer Secret name and injects
-its reference into training pods; it does not receive the writer credential.
-Desired Deployments and
-nonterminal Pods record research, inference, and writer viewer IDs. The launcher
-checks all Senpai roles in the namespace, including terminating Pods and desired
-Deployments with no replicas. Ownership includes the launch tag for every role.
-Missing legacy bindings fail closed. A partial update cannot change the research
-viewer while unchanged roles retain another viewer.
-
-The ownership scan and apply are not atomic. Operators must serialize launches
-within each namespace. Preflight-only checks authenticate the supplied viewers
-but neither inspect cluster ownership nor reserve viewers. Before migration,
-remove stopped legacy resources or apply verified viewer bindings to all of them.
-A fresh tag does not bypass this namespace-wide check. Viewer checks do not prove
-project roles, assignment ownership, or the integrity of reported metrics.
-
-This staged rollout preserves authenticated W&B research and tracing. The agent
-can still use the research key; separate training writers do not yet isolate
-research privileges from agent-controlled code. A future cutover requires usable
-private discovery/config/summary/full-history/artifact interfaces, workspace and
-Weave research workflows, Reports, and an explicit tracing solution. It must
-preserve complete local data for analysis and must not narrow the research
-contract through arbitrary tool or prompt restrictions.

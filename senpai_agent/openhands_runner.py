@@ -49,7 +49,6 @@ from senpai_agent.secrets import (
     GITHUB_TOKEN_FILE_ENV,
     MODEL_CREDENTIALS_FD_ENV,
     PROVIDER_API_KEY_ENVS,
-    WANDB_TRAINING_API_KEY_ENV,
     configured_custom_secret_env_names,
     consume_model_credential_fd,
     scrub_exa_credentials,
@@ -116,9 +115,7 @@ from senpai_agent.system_instructions import (
     SenpaiSystemInstructions,
     decode_system_instructions,
 )
-from senpai_agent.tools import configure_training_credentials, register_senpai_tools
-from senpai_agent.wandb_research import configure_wandb_credentials
-from senpai_agent.weave_research import configure_weave_credentials
+from senpai_agent.tools import register_senpai_tools
 
 DEFAULT_MODEL = "anthropic/claude-opus-5-5"
 DEFAULT_FAST_MODEL = "anthropic/claude-sonnet-5"
@@ -237,10 +234,6 @@ class RunnerConfig:
     wandb_entity: str | None = None
     wandb_project: str | None = None
     exa_api_key: SecretStr | None = None
-    wandb_api_key: SecretStr | None = None
-    wandb_base_url: str = "https://api.wandb.ai"
-    weave_trace_base_url: str = "https://trace.wandb.ai"
-    training_wandb_api_key: SecretStr | None = None
     timeout_seconds: float = 7200
     llm_timeout_seconds: int = 5400
     llm_num_retries: int = 5
@@ -915,33 +908,6 @@ def resolve_config(
     exa_api_key = (
         SecretStr(value) if (value := env.get("EXA_API_KEY", "").strip()) else None
     )
-    training_wandb_api_key = (
-        SecretStr(value)
-        if (value := env.get(WANDB_TRAINING_API_KEY_ENV, "").strip())
-        else None
-    )
-    if role == "student" and not args.child and training_wandb_api_key is None:
-        raise RuntimeError(
-            f"{WANDB_TRAINING_API_KEY_ENV} is required for student training"
-        )
-    research_key = env.get("WANDB_API_KEY", "").strip()
-    training_key = (
-        training_wandb_api_key.get_secret_value() if training_wandb_api_key else ""
-    )
-    if research_key and research_key == training_key:
-        raise RuntimeError("W&B research and training keys must be distinct")
-    inference_keys = {
-        key.get_secret_value()
-        for profile_model, key in (
-            (model, api_key),
-            (smart_model, smart_api_key),
-            (fast_model, fast_api_key),
-            (frontier_model, frontier_api_key),
-        )
-        if model_provider(profile_model) == "wandb"
-    }
-    if inference_keys & {research_key, training_key}:
-        raise RuntimeError("W&B research, inference, and training keys must be distinct")
     resolved_conversation_secrets = conversation_secrets(
         env,
         model_api_key_env_names=(
@@ -958,14 +924,6 @@ def resolve_config(
         raise RuntimeError(
             "WANDB_ENTITY and WANDB_PROJECT are required for W&B Inference"
         )
-
-    wandb_base_url = (env.get("WANDB_BASE_URL") or "https://api.wandb.ai").rstrip("/")
-    wandb_frontend_url = (env.get("WANDB_PUBLIC_BASE_URL") or wandb_base_url).rstrip("/")
-    weave_trace_base_url = env.get("WF_TRACE_SERVER_URL") or (
-        "https://trace.wandb.ai"
-        if wandb_frontend_url == "https://api.wandb.ai"
-        else f"{wandb_frontend_url}/traces"
-    )
 
     return RunnerConfig(
         max_turns=args.max_turns,
@@ -1033,10 +991,6 @@ def resolve_config(
         wandb_entity=wandb_entity,
         wandb_project=wandb_project,
         exa_api_key=exa_api_key,
-        wandb_api_key=SecretStr(research_key) if research_key else None,
-        wandb_base_url=wandb_base_url,
-        weave_trace_base_url=weave_trace_base_url,
-        training_wandb_api_key=training_wandb_api_key,
         timeout_seconds=timeout_seconds,
         llm_timeout_seconds=llm_timeout_seconds,
         llm_num_retries=llm_num_retries,
@@ -1237,7 +1191,6 @@ def scrub_model_credentials(
     config: RunnerConfig,
 ) -> None:
     scrub_exa_credentials(environment)
-    environment.pop(WANDB_TRAINING_API_KEY_ENV, None)
     for key_env in {
         *PROVIDER_API_KEY_ENVS.values(),
         config.api_key_env,
@@ -1287,6 +1240,7 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
     delegation_params = {"event_db_path": str(local_event_db_path(config))}
     if not config.child:
         tools.append(Tool(name="delegate_agent", params=delegation_params))
+        tools.append(Tool(name="get_cluster_capacity"))
     tools.extend(
         Tool(name=name, params=delegation_params)
         for name in (
@@ -1299,43 +1253,18 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
     if config.role == "student" and not config.child:
         training_params = {"state_dir": str(config.state_dir / "training")}
         tools.append(Tool(name="senpai_training", params=training_params))
-    tools.extend(research_tools(config))
     return tools
 
 
-RESEARCH_TOOL_NAMES = (
-    "wandb_research",
-    "weave_research",
-    "wandb_views",
-    "wandb_report_draft",
-)
+def senpai_terminal_tools(tools: Sequence[Tool], role: str) -> list[Tool]:
+    """Route a file-defined agent's terminal through Senpai's policy and target env."""
 
-
-def research_tools(config: RunnerConfig) -> list[Tool]:
-    """Give each conversation its own export directory without serializing keys."""
-    if config.wandb_api_key is None:
-        return []
     return [
-        Tool(name=name, params={"state_dir": str(config.state_dir / "research")})
-        for name in RESEARCH_TOOL_NAMES
+        Tool(name="senpai_terminal", params={"role": role})
+        if tool.name == "terminal"
+        else tool
+        for tool in tools
     ]
-
-
-def configured_agent_tools(tools: Sequence[Tool], config: RunnerConfig) -> list[Tool]:
-    """Bind declared child tools to trusted runtime configuration."""
-    research = {tool.name: tool for tool in research_tools(config)}
-    configured = []
-    for tool in tools:
-        if tool.name == "terminal":
-            configured.append(
-                Tool(name="senpai_terminal", params={"role": config.role})
-            )
-        elif tool.name in RESEARCH_TOOL_NAMES:
-            if tool.name in research:
-                configured.append(research[tool.name])
-        else:
-            configured.append(tool)
-    return configured
 
 
 def delegation_config(
@@ -1812,13 +1741,6 @@ def run_openhands(
         configure_exa_credentials(config.exa_api_key)
         if config.exa_api_key is not None:
             register_trace_secret(config.exa_api_key.get_secret_value())
-        configure_training_credentials(config.training_wandb_api_key)
-        configure_wandb_credentials(config.wandb_api_key, base_url=config.wandb_base_url)
-        configure_weave_credentials(
-            config.wandb_api_key,
-            trace_base_url=config.weave_trace_base_url,
-            wandb_base_url=config.wandb_base_url,
-        )
         retried_provider_errors: ContextVar[tuple[BaseException, ...]] = ContextVar(
             "retried_provider_errors",
             default=(),
@@ -1891,7 +1813,7 @@ def run_openhands(
             agent = agent.model_copy(
                 update={
                     "llm": apply_reasoning_profile(agent.llm),
-                    "tools": configured_agent_tools(agent.tools, config),
+                    "tools": senpai_terminal_tools(agent.tools, config.role),
                     "agent_context": (
                         agent.agent_context or AgentContext()
                     ).model_copy(update={"skills": resolved_skills}),
@@ -2108,9 +2030,6 @@ def run_openhands(
                         cleanup_error = error
         clear_github_credentials()
         configure_exa_credentials(None)
-        configure_training_credentials(None)
-        configure_wandb_credentials(None)
-        configure_weave_credentials(None)
         configure_delegation(None)
         if inference_heartbeat is not None:
             inference_heartbeat.close()

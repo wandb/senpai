@@ -70,6 +70,11 @@ def mailbox(monkeypatch, pulls, *, students=(), check_author_permissions=False):
     if not check_author_permissions:
         monkeypatch.setattr(value, "_has_write_permission", lambda _login: True)
     monkeypatch.setattr(value._github, "objects", lambda _url: [])
+    monkeypatch.setattr(
+        value._github,
+        "get",
+        lambda _path: {"object": {"sha": "b" * 40}},
+    )
     return value
 
 

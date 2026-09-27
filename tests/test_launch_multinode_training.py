@@ -23,13 +23,6 @@ def program_context(tag):
     }
 
 
-def writer_context(tag):
-    name, secret = launch_helpers.render_student_wandb_secret(
-        tag, "fern", "wandb-training-fern", "viewer-fern"
-    )
-    return name, secret, "viewer-fern", "viewer-controller", None
-
-
 def render_student(**overrides):
     args = launch_args(
         advisor=False,
@@ -56,7 +49,6 @@ def render_student(**overrides):
                 args.tag,
                 secret_name,
                 secret,
-                *writer_context(args.tag),
                 args,
                 **program_context(args.tag),
             )
@@ -125,7 +117,6 @@ def test_single_node_student_keeps_local_gpu_resources_without_executor_rbac():
                 args.tag,
                 f"senpai-launch-secrets-{args.tag}",
                 secret,
-                *writer_context(args.tag),
                 args,
                 **program_context(args.tag),
             )

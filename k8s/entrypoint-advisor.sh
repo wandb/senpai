@@ -173,7 +173,8 @@ unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS WANDB_API_KEY EXA_API_KEY
 rm -f "$GIT_ASKPASS_FILE"
 export SENPAI_TARGET_PYTHON_ENV="$HOME/.venvs/senpai-target"
 if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then
-    "$SENPAI_PYTHON" -P -m venv --without-pip "$SENPAI_TARGET_PYTHON_ENV"
+    /usr/local/bin/uv venv --no-project --no-config --no-python-downloads \
+        --python "$SENPAI_PYTHON" --allow-existing "$SENPAI_TARGET_PYTHON_ENV"
 fi
 CONTROLLER_SITE="$("$SENPAI_PYTHON" -P -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
 # The target interpreter is agent-writable; never execute it during trusted startup.

@@ -13,9 +13,6 @@ permission_mode: never_confirm
 tools:
   - terminal
   - file_editor
-  - wandb_research
-  - weave_research
-  - wandb_views
 ---
 
 You are Senpai's Explore agent.

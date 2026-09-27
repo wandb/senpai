@@ -66,11 +66,29 @@ _ARGV_RUNNER_OPTIONS = {
     "nohup": ("", ["help", "version"]),
     "setsid": ("cfw", ["ctty", "fork", "wait", "help", "version"]),
     "stdbuf": ("i:o:e:", ["input=", "output=", "error=", "help", "version"]),
+    "xargs": (
+        "0a:d:E:I:L:n:P:prts:xo",
+        ["null", "arg-file=", "delimiter=", "eof=", "replace=", "max-lines=",
+         "max-args=", "max-procs=", "interactive", "no-run-if-empty", "verbose",
+         "max-chars=", "exit", "open-tty", "process-slot-var=", "show-limits",
+         "help", "version"],
+    ),
+    "taskset": ("acphV", ["all-tasks", "cpu-list", "pid", "help", "version"]),
+    "flock": (
+        "suxenoFE:w:hV",
+        ["shared", "unlock", "exclusive", "nonblock", "nb", "nonblocking",
+         "close", "no-fork", "conflict-exit-code=", "wait=", "timeout=",
+         "fcntl", "start=", "length=", "verbose", "help", "version"],
+    ),
     "ionice": (
         "c:n:p:P:u:t",
         ["class=", "classdata=", "pid=", "pgid=", "uid=", "ignore", "help", "version"],
     ),
 }
+_TIMEOUT_OPTIONS = (
+    "k:s:v",
+    ["foreground", "preserve-status", "kill-after=", "signal=", "verbose", "help", "version"],
+)
 _FIND_EXEC_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
 _SHELL_REEVALUATORS = {
     ".",
@@ -181,7 +199,7 @@ _GIT_TERMINAL_COMMANDS = {
 
 
 def _without_shell_data(command: str, workspace: Path) -> str:
-    """Mask case patterns and quoted heredoc data before flat tokenization."""
+    """Keep shell syntax separate from case patterns and program input."""
     if not any(mark in command for mark in ("<", ">", "case")):
         return command
 
@@ -192,11 +210,6 @@ def _without_shell_data(command: str, workspace: Path) -> str:
     tree = Parser(Language(tree_sitter_bash.language())).parse(source)
     if tree.root_node.has_error:
         return command
-    has_functions = any(
-        node.type == "function_definition"
-        for node in _descendants(tree.root_node)
-    )
-
     policy_source = bytearray(source)
     spans: list[tuple[int, int]] = []
     nodes = [tree.root_node]
@@ -215,18 +228,13 @@ def _without_shell_data(command: str, workspace: Path) -> str:
             pattern_end = next(child for child in node.children if child.type == ")")
             spans.append((node.start_byte, pattern_end.end_byte))
         if (
-            not has_functions
-            and node.type == "heredoc_redirect"
+            node.type == "heredoc_redirect"
             and _heredoc_feeds_data_sinks(node, source, workspace)
         ):
-            start = next(
-                child for child in node.children if child.type == "heredoc_start"
-            )
-            delimiter = source[start.start_byte : start.end_byte]
-            if any(mark in delimiter for mark in b"'\"\\"):
-                for child in node.children:
-                    if child.type in {"heredoc_body", "heredoc_end"}:
-                        spans.append((child.start_byte, child.end_byte))
+            # The original Bash tree still checks expansions in unquoted input.
+            for child in node.children:
+                if child.type in {"heredoc_body", "heredoc_end"}:
+                    spans.append((child.start_byte, child.end_byte))
         nodes.extend(node.children)
     for start, end in spans:
         for position in range(start, end):
@@ -242,20 +250,21 @@ def _heredoc_feeds_data_sinks(node: object, source: bytes, workspace: Path) -> b
     ancestor = statement.parent
     root = statement
     while ancestor is not None:
-        if ancestor.type in {
-            "pipeline", "command_substitution", "process_substitution", "redirected_statement"
-        }:
+        if ancestor.type in {"pipeline", "command", "redirected_statement"} and (
+            _heredoc_runs_shell(ancestor, source, workspace)
+        ):
             return False
         root = ancestor
         ancestor = ancestor.parent
     # Earlier redirects can replace inherited stdout with an opaque stream.
     if any(
-        child.type == "process_substitution" or _is_opaque_exec_redirect(child, source)
+        _is_opaque_exec_redirect(child, source)
         for child in _descendants(root)
     ):
         return False
+    shell_streams = _heredoc_runs_shell(root, source, workspace)
     for child in _descendants(statement):
-        if child.type == "file_redirect":
+        if shell_streams and child.type == "file_redirect":
             if any(operator.type in {">&", "<&"} for operator in child.children):
                 return False
             if _redirects_stdout(child, source) and not _redirects_stdout_to_literal_file(child, source):
@@ -264,14 +273,30 @@ def _heredoc_feeds_data_sinks(node: object, source: bytes, workspace: Path) -> b
     for child in node.children:
         if child.type == "pipeline":
             consumers.extend(child.named_children)
-    return all(_is_heredoc_data_sink(consumer, source, workspace) for consumer in consumers)
+    functions = {
+        source[name.start_byte : name.end_byte].decode()
+        for child in _descendants(root)
+        if child.type == "function_definition"
+        and (name := child.child_by_field_name("name")) is not None
+    }
+    return all(
+        _is_heredoc_data_sink(consumer, source, workspace, functions, shell_streams)
+        for consumer in consumers
+    )
 
 
-def _is_heredoc_data_sink(node: object, source: bytes, workspace: Path) -> bool:
+def _is_heredoc_data_sink(
+    node: object, source: bytes, workspace: Path, functions: set[str], shell_streams: bool
+) -> bool:
     if node is not None and node.type == "list":
         node = node.named_children[-1]
     if node is not None and node.type == "redirected_statement":
         node = node.child_by_field_name("body")
+    if node is not None and node.type == "pipeline":
+        return all(
+            _is_heredoc_data_sink(child, source, workspace, functions, shell_streams)
+            for child in node.named_children
+        )
     if node is None or node.type != "command":
         return False
     words = _command_words(node)
@@ -282,19 +307,48 @@ def _is_heredoc_data_sink(node: object, source: bytes, workspace: Path) -> bool:
     if any(len(token) != 1 for token in tokens):
         return False
     arguments = [token[0] for token in tokens]
-    if arguments[:2] == ["uv", "run"]:
-        arguments = arguments[2:]
-        words = words[2:]
-    if not arguments or _shell_program(arguments[0], workspace) is not None:
+    while arguments:
+        index = _program_index(arguments)
+        if index is None:
+            return False
+        arguments = arguments[index:]
+        if arguments[0].startswith("-"):
+            return False
+        program = Path(arguments[0]).name
+        if arguments[0] in functions or _shell_program(arguments[0], workspace) is not None:
+            return False
+        if program == "env":
+            arguments = _env_command(arguments[1:])
+        elif program == "exec":
+            arguments = _wrapper_command(arguments[1:], value_options={"-a"})
+        elif program == "time":
+            arguments = _time_command(arguments[1:])
+            if arguments is None:
+                return False
+        elif arguments[:2] == ["uv", "run"]:
+            arguments = _uv_run_command(arguments[2:])
+        elif program == "timeout":
+            try:
+                _options, remaining = getopt.getopt(arguments[1:], *_TIMEOUT_OPTIONS)
+            except getopt.GetoptError:
+                return False
+            arguments = remaining[1:]
+        elif program in _COMMAND_RUNNERS:
+            try:
+                arguments = _argv_runner_command(program, arguments[1:])
+            except getopt.GetoptError:
+                return False
+            if arguments is None:
+                return False
+        else:
+            break
+    else:
         return False
-    program = Path(arguments[0]).name
-    if program == "tee" and not all(
+    if program == "tee" and shell_streams and not all(
         _is_literal_file_argument(word, source) for word in words[1:]
     ):
         return False
-    return program in {"cat", "tee", "head", "grep"} or re.fullmatch(
-        r"python(?:[0-9]+(?:[.][0-9]+)*)?", program
-    ) is not None
+    return program not in _SHELL_REEVALUATORS | {"find"}
 
 
 def _command_words(node: object) -> list[object]:
@@ -317,7 +371,7 @@ def _command_words(node: object) -> list[object]:
 def _is_opaque_exec_redirect(node: object, source: bytes) -> bool:
     if node.type != "file_redirect":
         return False
-    body = node.parent.child_by_field_name("body")
+    body = node.parent if node.parent.type == "command" else node.parent.child_by_field_name("body")
     if body is not None and body.type == "list":
         body = body.named_children[-1]
     if body is None or body.type != "command":
@@ -424,6 +478,13 @@ def _bash_commands(command: str, workspace: Path) -> list[str] | None:
     if tree.root_node.has_error:
         return None
     nodes = _descendants(tree.root_node)
+    # Bash arithmetic in unquoted heredocs is misclassified as command substitution.
+    # Parse that expansion alone so surrounding Python/JSON remains program input.
+    for node in nodes:
+        if node.type == "command_substitution":
+            expansion = source[node.start_byte : node.end_byte].decode()
+            if expansion.startswith("$((") and _bash_commands(f"echo {expansion}", workspace) is None:
+                return None
     if any(
         node.type == "c_style_for_statement"
         or (
@@ -448,7 +509,6 @@ def _bash_commands(command: str, workspace: Path) -> list[str] | None:
         for node in nodes
         if node.type in _POLICY_NODE_TYPES
     ]
-    has_functions = any(node.type == "function_definition" for node in nodes)
     for node in nodes:
         if (
             node.type == "file_redirect"
@@ -465,7 +525,7 @@ def _bash_commands(command: str, workspace: Path) -> list[str] | None:
         owner = node.parent
         if owner is None:
             continue
-        if not has_functions and _heredoc_feeds_data_sinks(node, source, workspace):
+        if _heredoc_feeds_data_sinks(node, source, workspace):
             continue
         body = next((child for child in node.children if child.type == "heredoc_body"), None)
         if body is None:
@@ -624,6 +684,17 @@ def _env_command(arguments: list[str]) -> list[str]:
         else:
             return arguments[position:]
     return []
+
+
+def _uv_run_command(arguments: list[str]) -> list[str]:
+    while arguments:
+        if arguments[0] == "--project":
+            arguments = arguments[2:]
+        elif arguments[0].startswith("--project="):
+            arguments = arguments[1:]
+        else:
+            break
+    return arguments
 
 
 def _shell_command(arguments: list[str]) -> str | None:
@@ -920,19 +991,7 @@ def _timeout_policy(arguments: list[str], workspace: Path) -> PolicyDecision:
     """Separate timeout options and duration from the wrapped command's data."""
 
     try:
-        options, remaining = getopt.getopt(
-            arguments,
-            "k:s:v",
-            [
-                "foreground",
-                "preserve-status",
-                "kill-after=",
-                "signal=",
-                "verbose",
-                "help",
-                "version",
-            ],
-        )
+        options, remaining = getopt.getopt(arguments, *_TIMEOUT_OPTIONS)
     except getopt.GetoptError:
         return PolicyDecision(False, "Senpai could not parse `timeout` safely.")
     timeout_values = [value for _option, value in options] + remaining[:1]
@@ -948,25 +1007,58 @@ def _timeout_policy(arguments: list[str], workspace: Path) -> PolicyDecision:
     return _segment_policy(remaining[1:], workspace)
 
 
+def _argv_runner_command(program: str, arguments: list[str]) -> list[str] | None:
+    """Return a supported wrapper's actual child argv, or None for complex runners."""
+    grammar = _ARGV_RUNNER_OPTIONS.get(program)
+    if grammar is None:
+        return None
+    options, command = getopt.getopt(arguments, *grammar)
+    literal_options = {"-I", "--replace", "-d", "--delimiter", "-E", "--eof"}
+    if any(
+        mark in value
+        for option, value in options
+        if program != "xargs" or option not in literal_options
+        for mark in _SHELL_EXPANSION_MARKS
+    ):
+        raise getopt.GetoptError("Do not construct command-runner options with expansion.")
+    if program == "xargs" and command:
+        replacement = next(
+            (value for option, value in reversed(options) if option in {"-I", "--replace"}),
+            "",
+        )
+        if replacement and replacement in command[0]:
+            raise getopt.GetoptError("Do not construct executable names from xargs input.")
+    if program == "command" and any(option in {"-v", "-V"} for option, _ in options):
+        return []
+    if program == "taskset" and any(option in {"-p", "--pid"} for option, _ in options):
+        return []
+    if program in {"taskset", "flock"}:
+        if command and any(mark in command[0] for mark in _SHELL_EXPANSION_MARKS):
+            raise getopt.GetoptError("Do not construct wrapper operands with expansion.")
+        command = command[1:]  # CPU affinity or lock path/descriptor is not argv[0].
+    if program == "flock":
+        if command[:1] == ["--"]:
+            command = command[1:]
+        if command[:1] in (["-c"], ["--command"]):
+            if len(command) != 2:
+                raise getopt.GetoptError("flock -c requires exactly one shell command")
+            return ["sh", "-c", command[1]]
+        if command and command[0].startswith("--command="):
+            if len(command) != 1:
+                raise getopt.GetoptError("flock --command requires exactly one shell command")
+            return ["sh", "-c", command[0].partition("=")[2]]
+    return command
+
+
 def _runner_policy(
     program: str, arguments: list[str], workspace: Path
 ) -> PolicyDecision:
-    """Parse simple argv wrappers; conservatively inspect complex runners."""
-
-    grammar = _ARGV_RUNNER_OPTIONS.get(program)
-    if grammar is not None:
-        try:
-            options, command = getopt.getopt(arguments, *grammar)
-        except getopt.GetoptError:
-            return PolicyDecision(False, f"Senpai could not parse `{program}` safely.")
-        if any(
-            mark in value
-            for _option, value in options
-            for mark in _SHELL_EXPANSION_MARKS
-        ):
-            return PolicyDecision(False, "Do not construct command-runner options with expansion.")
-        if program == "command" and any(option in {"-v", "-V"} for option, _ in options):
-            return PolicyDecision(True)
+    """Inspect actual child argv; conservatively inspect unsupported runners."""
+    try:
+        command = _argv_runner_command(program, arguments)
+    except getopt.GetoptError as error:
+        return PolicyDecision(False, f"Senpai could not parse `{program}` safely: {error}.")
+    if command is not None:
         return _segment_policy(command, workspace)
 
     command = _shell_command(arguments)
@@ -1187,7 +1279,7 @@ def _segment_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
         return _curl_policy(tokens, index)
 
     if program == "uv" and arguments[:1] == ["run"]:
-        return _segment_policy(tokens[index + 2 :], workspace)
+        return _segment_policy(_uv_run_command(arguments[1:]), workspace)
     if program.startswith("python") and _python_launches_training(tokens, index):
         return PolicyDecision(
             False,

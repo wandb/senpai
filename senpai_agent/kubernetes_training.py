@@ -17,12 +17,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
 import psutil
-from pydantic import SecretStr
 
 from senpai_agent.processes import terminate_process_group
 from senpai_agent.training import (
@@ -32,6 +31,7 @@ from senpai_agent.training import (
     TrainingSpec,
     TrainingState,
     _mask_output_chunk,
+    record_training_output,
     target_python_environment,
     training_result_paths,
 )
@@ -91,7 +91,7 @@ class TrainingClusterClient(Protocol):
 
     def logs(self, resource: KubernetesResourceRef) -> str: ...
 
-    def release(self, training_id: str) -> None: ...
+    def release(self, training_id: str) -> dict: ...
 
 
 class KubernetesExecutorClient:
@@ -168,8 +168,8 @@ class KubernetesExecutorClient:
     def logs(self, resource: KubernetesResourceRef) -> str:
         return str(self._request("logs", resource=resource.model_dump(mode="json")))
 
-    def release(self, training_id: str) -> None:
-        self._request("release", training_id=training_id)
+    def release(self, training_id: str) -> dict:
+        return self._request("release", training_id=training_id)
 
     def apply(self, manifest: str) -> str:
         return str(self._request("apply", manifest=manifest))
@@ -338,7 +338,7 @@ class KubernetesApiClient:
         """Return bounded status and logs for this workload's exact pod owner chain."""
 
         deadline = time.monotonic() + 30
-        pods = self._owned_pods(resource)
+        pods = self._owned_pods(resource)[: resource.nodes + 2]
         events = self._events(
             resource.namespace, resource.uid, f"{resource.kind}/{resource.name}", deadline
         )
@@ -498,19 +498,81 @@ class KubernetesApiClient:
             for event in events[-5:]
         ]
 
-    def _owned_pods(self, resource: KubernetesResourceRef) -> list[dict]:
-        document = self._get(resource.kind, resource.name, resource.namespace)
+    def pod_snapshot(self, resource: KubernetesResourceRef) -> dict:
+        """Capture factual Pod status; container restarts are not elastic restarts."""
+        pods = self._owned_pods(resource, timeout_seconds=10)
+        rows = []
+        for pod in pods:
+            status = pod.get("status", {})
+            containers = []
+            for spec_key, status_key in [
+                ("initContainers", "initContainerStatuses"),
+                ("containers", "containerStatuses"),
+            ]:
+                statuses = {item["name"]: item for item in status.get(status_key, [])}
+                for container in pod["spec"].get(spec_key, []):
+                    value = statuses.get(container["name"], {})
+                    states = {}
+                    for field in ("state", "lastState"):
+                        states[field] = {
+                            state: {key: item[key] for key in (
+                                "reason", "exitCode", "signal", "startedAt", "finishedAt",
+                            ) if key in item}
+                            for state, item in value.get(field, {}).items()
+                        }
+                    containers.append({
+                        "name": container["name"], "init": spec_key == "initContainers",
+                        "restartCount": value.get("restartCount"), **states,
+                    })
+            rows.append({
+                "name": pod["metadata"]["name"], "uid": pod["metadata"]["uid"],
+                "owners": [{key: owner.get(key) for key in ("kind", "name", "uid")}
+                           for owner in pod["metadata"].get("ownerReferences", [])],
+                "node": pod["spec"].get("nodeName"), "phase": status.get("phase"),
+                "created_at": pod["metadata"].get("creationTimestamp"),
+                "role": "worker" if _pod_gpus(pod["spec"]) else "launcher",
+                "containers": containers,
+            })
+        expected = resource.nodes + (resource.kind == "MPIJob")
+        complete = (
+            len(rows) == expected
+            and sum(row["role"] == "worker" for row in rows) == resource.nodes
+            and all(row["phase"] in {"Succeeded", "Failed"} and row["containers"]
+                    and all(c["restartCount"] is not None
+                            and all(c["state"].get("terminated", {}).get(key) is not None
+                                    for key in ("exitCode", "startedAt", "finishedAt"))
+                            for c in row["containers"]) for row in rows)
+        )
+        return {"pods": rows, "expected_pods": expected, "complete": complete,
+                "capture_error": None if complete else "Expected terminal Pod/container coverage is incomplete"}
+
+    def _owned_pods(
+        self, resource: KubernetesResourceRef, *, timeout_seconds: float = 30,
+    ) -> list[dict]:
+        deadline = time.monotonic() + timeout_seconds
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise TimeoutError("Kubernetes Pod inventory exceeded its deadline")
+            return min(value, 5)
+
+        document = self._get(resource.kind, resource.name, resource.namespace,
+                             timeout_seconds=remaining())
         if document is None:
             return []
         if document["metadata"]["uid"] != resource.uid:
             raise RuntimeError("refusing to read pods for a replaced training workload")
         training_id = document["metadata"]["labels"]["senpai-training-id"]
-        query = urllib.parse.urlencode({"labelSelector": f"senpai-training-id={training_id}"})
+        query = urllib.parse.urlencode({"labelSelector": f"senpai-training-id={training_id}", "limit": 256})
         pods = self._request_json(
             "GET",
             f"/api/v1/namespaces/{urllib.parse.quote(resource.namespace, safe='')}/pods?{query}",
-            timeout_seconds=5,
+            timeout_seconds=remaining(),
+            max_response_bytes=4 * 1024 * 1024,
         )
+        if pods.get("metadata", {}).get("continue") or len(pods["items"]) > 256:
+            raise RuntimeError("Kubernetes Pod inventory exceeds the bounded capture limit")
         owned = []
         jobs = {}
         for pod in pods["items"]:
@@ -522,7 +584,7 @@ class KubernetesApiClient:
                     continue
                 name = owner["name"]
                 if name not in jobs:
-                    jobs[name] = self._get("Job", name, resource.namespace)
+                    jobs[name] = self._get("Job", name, resource.namespace, timeout_seconds=remaining())
                 job = jobs[name]
                 if (
                     job is not None
@@ -534,14 +596,16 @@ class KubernetesApiClient:
                 ):
                     owned.append(pod)
                     break
-        return owned[: resource.nodes + 2]
+        return owned
 
-    def _get(self, kind: str, name: str, namespace: str) -> dict | None:
+    def _get(
+        self, kind: str, name: str, namespace: str, *, timeout_seconds: float = 30,
+    ) -> dict | None:
         path = (
             f"{self._collection_path(kind, namespace)}/"
             f"{urllib.parse.quote(name, safe='')}"
         )
-        return self._request_json("GET", path, allow_not_found=True)
+        return self._request_json("GET", path, allow_not_found=True, timeout_seconds=timeout_seconds)
 
     @staticmethod
     def _collection_path(kind: str, namespace: str) -> str:
@@ -561,6 +625,7 @@ class KubernetesApiClient:
         allow_not_found: bool = False,
         content_type: str = "application/json",
         timeout_seconds: float = 30,
+        max_response_bytes: int | None = None,
     ) -> dict | None:
         text = self._request_text(
             method,
@@ -569,6 +634,7 @@ class KubernetesApiClient:
             allow_not_found=allow_not_found,
             content_type=content_type,
             timeout_seconds=timeout_seconds,
+            max_response_bytes=max_response_bytes,
         )
         return json.loads(text) if text else None
 
@@ -581,6 +647,7 @@ class KubernetesApiClient:
         allow_not_found: bool = False,
         content_type: str = "application/json",
         timeout_seconds: float = 30,
+        max_response_bytes: int | None = None,
     ) -> str:
         request = urllib.request.Request(
             f"{self.api_server.rstrip('/')}{path}",
@@ -592,11 +659,15 @@ class KubernetesApiClient:
             },
         )
         try:
-            return urllib.request.urlopen(
+            with urllib.request.urlopen(
                 request,
                 context=self.ssl_context,
                 timeout=timeout_seconds,
-            ).read().decode()
+            ) as response:
+                payload = response.read(max_response_bytes + 1) if max_response_bytes is not None else response.read()
+            if max_response_bytes is not None and len(payload) > max_response_bytes:
+                raise ValueError("Kubernetes response exceeds the configured byte limit")
+            return payload.decode()
         except urllib.error.HTTPError as error:
             if allow_not_found and error.code == 404:
                 return ""
@@ -633,6 +704,9 @@ class _ActiveRemoteTraining:
     resource: KubernetesResourceRef | None = None
     cancelled: bool = False
     thread: threading.Thread | None = None
+    output_thread: threading.Thread | None = None
+    output_stop: threading.Event = field(default_factory=threading.Event)
+    output_error: str | None = None
     next_diagnostics_at: float = 0
     diagnostics_future: Future[str] | None = None
 
@@ -651,7 +725,6 @@ class KubernetesTrainingSupervisor:
         terminate_grace_seconds: float = 10,
         poll_seconds: float = _POLL_SECONDS,
         client: TrainingClusterClient | None = None,
-        wandb_api_key: SecretStr | None = None,
     ):
         if min(nodes, gpus_per_node) < 1:
             raise ValueError("Kubernetes training resources must be positive")
@@ -666,7 +739,6 @@ class KubernetesTrainingSupervisor:
         self.max_timeout_seconds = max_timeout_seconds
         self.terminate_grace_seconds = terminate_grace_seconds
         self.poll_seconds = poll_seconds
-        self.wandb_api_key = wandb_api_key
         socket_path = os.environ.get(
             EXECUTOR_SOCKET_ENV,
             "/var/run/senpai-kubernetes/executor.sock",
@@ -703,6 +775,7 @@ class KubernetesTrainingSupervisor:
 
         training_id: str | None = None
         process: subprocess.Popen[bytes] | None = None
+        active: _ActiveRemoteTraining | None = None
         reserved = False
         try:
             training_id = str(uuid.uuid4())
@@ -726,25 +799,26 @@ class KubernetesTrainingSupervisor:
             environment = dict(os.environ)
             environment.pop("PYTHONSAFEPATH", None)
             environment.update(target_python_environment(environment))
-            with log_path.open("wb") as log:
-                process = subprocess.Popen(
-                    list(spec.argv),
-                    cwd=cwd,
-                    env={
-                        **environment,
-                        "SENPAI_TRAINING_SOURCE_SNAPSHOT": str(source_snapshot),
-                        "SENPAI_KUBERNETES_WORKLOAD_NAME": kubernetes_spec.name,
-                        "SENPAI_KUBERNETES_NAMESPACE": kubernetes_spec.namespace,
-                        "SENPAI_WANDB_RUN_ID": kubernetes_spec.wandb_run_id,
-                        "SENPAI_LAUNCH_SECRET_NAME": os.environ[
-                            "SENPAI_LAUNCH_SECRET_NAME"
-                        ],
-                    },
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    shell=False,
-                    start_new_session=True,
-                )
+            environment.pop("WANDB_SERVICE", None)
+            log_path.touch()
+            process = subprocess.Popen(
+                list(spec.argv),
+                cwd=cwd,
+                env={
+                    **environment,
+                    "SENPAI_TRAINING_SOURCE_SNAPSHOT": str(source_snapshot),
+                    "SENPAI_KUBERNETES_WORKLOAD_NAME": kubernetes_spec.name,
+                    "SENPAI_KUBERNETES_NAMESPACE": kubernetes_spec.namespace,
+                    "SENPAI_WANDB_RUN_ID": kubernetes_spec.wandb_run_id,
+                    "SENPAI_LAUNCH_SECRET_NAME": os.environ[
+                        "SENPAI_LAUNCH_SECRET_NAME"
+                    ],
+                },
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                shell=False,
+                start_new_session=True,
+            )
             process_group_id = process.pid
             result = TrainingResult(
                 training_id=training_id,
@@ -777,11 +851,17 @@ class KubernetesTrainingSupervisor:
                 name=f"senpai-kubernetes-training-{training_id}",
             )
             active.thread = thread
+            active.output_thread = threading.Thread(
+                target=self._record_output,
+                args=(active, environment.get("WANDB_API_KEY", "").encode()),
+                name=f"senpai-kubernetes-output-{training_id}",
+            )
             with self._lock:
                 if self._shutdown.is_set():
                     raise RuntimeError("Kubernetes training supervisor is closed")
                 self._write_result(result)
                 self._active[training_id] = active
+                active.output_thread.start()
                 thread.start()
         except BaseException:
             if process is not None and process.poll() is None:
@@ -791,6 +871,10 @@ class KubernetesTrainingSupervisor:
                     grace_seconds=self.terminate_grace_seconds,
                     wait_full_grace=True,
                 )
+            if active is not None:
+                self._finish_output(active)
+            if process is not None and process.stdout is not None:
+                process.stdout.close()
             if reserved and training_id is not None:
                 self._cleanup_failed_launch(training_id, kubernetes_spec)
             with self._lock:
@@ -1001,31 +1085,56 @@ class KubernetesTrainingSupervisor:
         self._active[result.training_id] = active
         thread.start()
 
+    def _record_output(self, active: _ActiveRemoteTraining, secret: bytes) -> None:
+        assert active.process is not None and active.process.stdout is not None
+        try:
+            record_training_output(
+                active.process.stdout, active.log_path, active.output_stop, secret,
+            )
+        except Exception as error:  # output failures must fail submission
+            active.output_error = f"Training output capture failed ({type(error).__name__})."
+
+    def _finish_output(self, active: _ActiveRemoteTraining) -> None:
+        if active.output_thread is not None and active.output_thread.ident is not None:
+            active.output_stop.set()
+            active.output_thread.join()
+
     def _monitor(self, training_id: str) -> None:
         with self._lock:
             active = self._active[training_id]
-        if self._should_detach(active):
-            if active.process is None:
-                return
-            launcher_exit = active.process.poll()
-            if launcher_exit is None:
-                terminate_process_group(
-                    active.process,
-                    process_group_id=active.process_group_id,
-                    grace_seconds=_DETACH_GRACE_SECONDS,
-                    wait_full_grace=True,
-                )
-                return
-            if launcher_exit == 0:
-                return
+        try:
+            self._monitor_training(training_id, active)
+        finally:
+            self._finish_output(active)
+
+    def _monitor_training(self, training_id: str, active: _ActiveRemoteTraining) -> None:
         state = TrainingState.RUNNING
         exit_code = None
         detail = ""
         delete_required = False
         try:
+            if self._should_detach(active):
+                if active.process is None:
+                    return
+                launcher_exit = active.process.poll()
+                if launcher_exit is None:
+                    terminate_process_group(
+                        active.process,
+                        process_group_id=active.process_group_id,
+                        grace_seconds=_DETACH_GRACE_SECONDS,
+                        wait_full_grace=True,
+                    )
+                self._finish_output(active)
+                if active.output_error:
+                    raise RuntimeError(active.output_error)
+                if launcher_exit in {None, 0}:
+                    return
             if active.process is not None:
                 while active.process.poll() is None:
-                    if active.cancelled or time.time() >= active.deadline_at:
+                    if (
+                        active.cancelled or active.output_error
+                        or time.time() >= active.deadline_at
+                    ):
                         terminate_process_group(
                             active.process,
                             process_group_id=active.process_group_id,
@@ -1040,7 +1149,13 @@ class KubernetesTrainingSupervisor:
                             grace_seconds=_DETACH_GRACE_SECONDS,
                             wait_full_grace=True,
                         )
+                        self._finish_output(active)
+                        if active.output_error:
+                            raise RuntimeError(active.output_error)
                         return
+                self._finish_output(active)
+                if active.output_error:
+                    raise RuntimeError(active.output_error)
                 exit_code = active.process.returncode
                 if exit_code in {None, 0} and self._should_detach(active):
                     return
@@ -1144,11 +1259,11 @@ class KubernetesTrainingSupervisor:
                     if part
                 )
 
-        detail = self._mask_writer_output(detail)
+        detail = self._mask_wandb_output(detail)
         if active.resource is not None:
             self._capture_diagnostics(training_id, active, detail, wait=True)
         try:
-            log_text = self._mask_writer_output(
+            log_text = self._mask_wandb_output(
                 active.log_path.read_bytes().decode(errors="ignore")
             )
             local_tail = log_text.encode()[-_ERROR_TAIL_BYTES:].decode(errors="ignore")
@@ -1169,12 +1284,11 @@ class KubernetesTrainingSupervisor:
         )
         self._release_terminal(terminal, active, delete_required)
 
-    def _mask_writer_output(self, text: str) -> str:
-        if self.wandb_api_key is None:
+    def _mask_wandb_output(self, text: str) -> str:
+        key = os.environ.get("WANDB_API_KEY", "").encode()
+        if not key:
             return text
-        masked, pending = _mask_output_chunk(
-            text.encode(), self.wandb_api_key.get_secret_value().encode(),
-        )
+        masked, pending = _mask_output_chunk(text.encode(), key)
         return (masked + (b"<secret-hidden>" if pending else b"")).decode()
 
     def _capture_diagnostics(
@@ -1207,8 +1321,8 @@ class KubernetesTrainingSupervisor:
             ).start()
         if not wait and not active.diagnostics_future.done():
             return
-        detail = self._mask_writer_output(detail).encode()[:1024].decode(errors="ignore")
-        collected = self._mask_writer_output(active.diagnostics_future.result())
+        detail = self._mask_wandb_output(detail).encode()[:1024].decode(errors="ignore")
+        collected = self._mask_wandb_output(active.diagnostics_future.result())
         diagnostics = "\n".join(
             part for part in (detail, collected) if part
         )
@@ -1270,7 +1384,8 @@ class KubernetesTrainingSupervisor:
                     return
                 terminal_persisted = True
             try:
-                self.client.release(training_id)
+                receipt = self.client.release(training_id)
+                result = result.model_copy(update={"kubernetes_pod_receipt": receipt})
                 break
             except Exception:
                 if active.cancelled:

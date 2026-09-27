@@ -72,9 +72,6 @@ def render_role(
         "wandb",
         anthropic_api_key="anthropic" if "anthropic" in providers else None,
         openai_api_key="openai" if "openai" in providers else None,
-        wandb_inference_api_key="wandb-inference"
-        if "wandb" in providers
-        else None,
         immutable=bool(args.names or args.n_students),
         custom_secrets={
             name: f"{name.lower()}-secret"
@@ -82,22 +79,13 @@ def render_role(
         },
     )
     template = (ROOT / "k8s" / f"{role}-deployment.yaml").read_text()
-    inference_viewer = "viewer-inference" if "wandb" in providers else None
     if role == "student":
-        writer_name, writer_secret = launch_helpers.render_student_wandb_secret(
-            args.tag, "fern", "wandb-training-fern", "viewer-fern"
-        )
         manifest = launch.render_student(
             template,
             "fern",
             args.tag,
             secret_name,
             secret,
-            writer_name,
-            writer_secret,
-            "viewer-fern",
-            "viewer-controller",
-            inference_viewer,
             args,
             program=program,
             program_secret_name=program_secret_name,
@@ -110,8 +98,6 @@ def render_role(
             ["fern"],
             secret_name,
             secret,
-            "viewer-controller",
-            inference_viewer,
             args,
             program=program,
             program_secret_name=program_secret_name,
