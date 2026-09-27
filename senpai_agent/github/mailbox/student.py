@@ -86,6 +86,7 @@ def student_events(
             )
         )
 
+    issue_assignment = None
     for pull in relevant:
         try:
             student_labels = {
@@ -126,6 +127,11 @@ def student_events(
                 )
             )
             continue
+
+        if len(relevant) == 1 and len(
+            {"status:wip", "status:review"} & label_names(pull)
+        ) == 1:
+            issue_assignment = assignment
 
         feedback = student_pr_feedback_events(mailbox, pull, assignment)
         prior_revision_pending = any(
@@ -172,5 +178,5 @@ def student_events(
                 )
             )
         events.extend(feedback)
-    events.extend(human_issue_events(mailbox, issues))
+    events.extend(human_issue_events(mailbox, issues, assignment=issue_assignment))
     return tuple(events)

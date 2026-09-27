@@ -18,12 +18,16 @@ from .values import (
 )
 
 if TYPE_CHECKING:
+    from senpai_agent.models import AssignmentRecord
+
     from .core import GitHubMailbox
 
 
 def human_issue_events(
     mailbox: GitHubMailbox,
     issues: Sequence[dict[str, object]],
+    *,
+    assignment: AssignmentRecord | None = None,
 ) -> list[ControllerEvent]:
     role_labels = {"team"}
     if mailbox.role == "advisor":
@@ -81,13 +85,24 @@ def human_issue_events(
             ),
             "created_at": str(latest["created_at"]),
         }
-        events.append(
-            versioned_event(
-                "human_issue",
-                number,
-                latest["id"],
-                payload_digest({"message": full_message}),
-                payload=payload,
-            )
+        event = versioned_event(
+            "human_issue",
+            number,
+            latest["id"],
+            payload_digest({"message": full_message}),
+            payload=payload,
         )
+        if mailbox.role == "student" and mailbox.student_issue_router is not None:
+            student_labels = {
+                label for label in labels if label.startswith("student:")
+            }
+            exclusive = (
+                student_labels == {f"student:{mailbox.student_name}"}
+                and not {"team", mailbox.advisor_branch} & labels
+            )
+            event = mailbox.student_issue_router(
+                event, assignment if exclusive else None
+            )
+        if event is not None:
+            events.append(event)
     return events

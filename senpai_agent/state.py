@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import UUID
 
+from senpai_agent.inbox import STEER_PRIORITY, PersistentInbox
 from senpai_agent.mailbox import ControllerEvent
+from senpai_agent.models import AssignmentRecord
 
 
 def _replace_json(path: Path, value: object) -> None:
@@ -66,6 +68,48 @@ class AssignmentConversationRegistry:
         ):
             raise RuntimeError(f"invalid conversation registry: {self.path}")
         return value
+
+
+class StudentIssueRouter:
+    """Bind human messages before foreground or live delivery can observe them."""
+
+    def __init__(
+        self, registry: AssignmentConversationRegistry, inbox: PersistentInbox
+    ):
+        self.registry = registry
+        self.inbox = inbox
+
+    def __call__(
+        self, event: ControllerEvent, assignment: AssignmentRecord | None
+    ) -> ControllerEvent | None:
+        conversation_id = (
+            self.registry.for_assignment(
+                assignment.assignment_id, assignment.revision_id
+            )
+            if assignment is not None
+            else self.registry.for_assignment(
+                f"human-issue-{event.payload['number']}", "thread"
+            )
+        )
+        # Bind and steer together: a later poll or delayed watcher event must
+        # neither redirect this message nor grant another quarantine recovery.
+        self.inbox.steer(
+            conversation_id,
+            event.dedupe_key,
+            event.to_prompt(),
+            priority=STEER_PRIORITY,
+            once=True,
+        )
+        owner = self.inbox.event_conversation_id(event.dedupe_key)
+        if owner != str(conversation_id):
+            return None
+        return replace(
+            event,
+            payload={
+                **event.payload,
+                "parent_conversation_id": str(conversation_id),
+            },
+        )
 
 
 class StartedConversationLedger:
@@ -146,14 +190,14 @@ class StudentConversationSelector:
     ) -> tuple[ConversationBatch, ...]:
         grouped: dict[UUID, list[ControllerEvent]] = {}
         for event in events:
-            conversation_id = self._conversation_for(event)
+            conversation_id = self.conversation_for(event)
             grouped.setdefault(conversation_id, []).append(event)
         return tuple(
             ConversationBatch(conversation_id, tuple(batch_events))
             for conversation_id, batch_events in grouped.items()
         )
 
-    def _conversation_for(self, event: ControllerEvent) -> UUID:
+    def conversation_for(self, event: ControllerEvent) -> UUID:
         if event.kind == "training_monitor":
             return UUID(str(event.payload["conversation_id"]))
         parent_id = event.payload.get("parent_conversation_id")

@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import quote, urlencode
 
 from pydantic import SecretStr
@@ -21,6 +21,9 @@ from .values import (
     FeedbackBinding,
     object_value,
 )
+
+if TYPE_CHECKING:
+    from senpai_agent.state import StudentIssueRouter
 
 
 class GitHubMailbox:
@@ -42,6 +45,7 @@ class GitHubMailbox:
         feedback_path: Path | None = None,
         feedback_batch_events: int = DEFAULT_FEEDBACK_BATCH_EVENTS,
         feedback_batch_bytes: int = DEFAULT_FEEDBACK_BATCH_BYTES,
+        student_issue_router: StudentIssueRouter | None = None,
     ):
         if len(repo.split("/")) != 2 or not all(repo.split("/")):
             raise ValueError("repo must use owner/name form")
@@ -59,6 +63,7 @@ class GitHubMailbox:
         self.feedback_path = feedback_path
         self.feedback_batch_events = feedback_batch_events
         self.feedback_batch_bytes = feedback_batch_bytes
+        self.student_issue_router = student_issue_router
         self._memory_feedback: dict[str, FeedbackBinding] = {}
         self._pull_comment_cache: dict[
             int,

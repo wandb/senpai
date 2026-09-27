@@ -55,6 +55,7 @@ from senpai_agent.state import (
     ConversationBatch,
     StartedConversationLedger,
     StudentConversationSelector,
+    StudentIssueRouter,
     WorkspaceDivergenceLedger,
 )
 from senpai_agent.supervisor import LEASE_ENV, ProgressLease
@@ -370,14 +371,10 @@ def _student_live_event(
     conversation_id: UUID,
     registry: AssignmentConversationRegistry,
 ) -> LocalEvent | None:
-    if event.kind == "student_pr_feedback":
-        target = registry.for_assignment(
-            str(event.payload["assignment_id"]),
-            str(event.payload["revision_id"]),
-        )
-        if target != conversation_id:
-            return None
-    elif event.kind != "human_issue":
+    if event.kind not in {"student_pr_feedback", "human_issue"}:
+        return None
+    target = StudentConversationSelector(registry).conversation_for(event)
+    if target != conversation_id:
         return None
     return LocalEvent(
         kind=event.kind,
@@ -1001,6 +998,9 @@ def controller_main(
         runner_config.state_dir / "delivery-inbox.sqlite3",
         legacy_path=runner_config.state_dir / "pending-message-deliveries.json",
     )
+    registry = AssignmentConversationRegistry(
+        runner_config.state_dir / "student-conversations.json"
+    )
     github_mailbox = GitHubMailbox(
         repo=runner_config.github_repo,
         token=runner_config.github_token,
@@ -1015,6 +1015,9 @@ def controller_main(
             runner_config.state_dir / "github-feedback.json"
             if role == "student"
             else None
+        ),
+        student_issue_router=(
+            StudentIssueRouter(registry, inbox) if role == "student" else None
         ),
     )
     mailbox: Mailbox = github_mailbox
@@ -1050,9 +1053,6 @@ def controller_main(
                 TrainingMonitorEngine(monitor_store, training, metrics),
                 monitor_store,
             ),
-        )
-        registry = AssignmentConversationRegistry(
-            runner_config.state_dir / "student-conversations.json"
         )
         conversation_selector = StudentConversationSelector(registry)
         reconcile = StudentWorkspaceReconciler(

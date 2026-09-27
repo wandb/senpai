@@ -391,6 +391,19 @@ class PersistentInbox:
             )
         return int(cursor.lastrowid), None, DeliveryState.PENDING, True
 
+    def event_conversation_id(self, event_key: str) -> str | None:
+        """Return the durable owner of an exact-once event, including receipts."""
+
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT conversation_id FROM inbox_messages
+                WHERE event_key = ? ORDER BY sequence LIMIT 1
+                """,
+                (event_key,),
+            ).fetchone()
+            return str(row["conversation_id"]) if row is not None else None
+
     def steer(
         self,
         conversation_id: UUID | str,
@@ -456,10 +469,12 @@ class PersistentInbox:
                         UPDATE inbox_turns
                         SET stalled_attempts = 0,
                             inference_attempts = 0,
+                            recovery_generation = CASE WHEN ? THEN 0
+                                                       ELSE recovery_generation END,
                             quarantine_reason = NULL
                         WHERE turn_id = ?
                         """,
-                        (turn_id,),
+                        (quarantined_turn, turn_id),
                     )
                     reopened = quarantined_turn
                 self._refresh_turn_state(database, turn_id)
