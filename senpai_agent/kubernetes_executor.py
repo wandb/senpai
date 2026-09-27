@@ -126,7 +126,7 @@ class KubernetesExecutor:
             if operation == "logs":
                 resource = self._require_resource(request["resource"])
                 if not self._verify_current(resource):
-                    return ""
+                    return None
             if operation == "release":
                 return self._release(request["training_id"])
         if operation == "logs":

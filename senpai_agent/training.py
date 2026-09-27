@@ -13,7 +13,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
 
 import psutil
 from pydantic import BaseModel, ConfigDict, Field
@@ -73,6 +73,44 @@ def _mask_output_chunk(data: bytes, secret: bytes) -> tuple[bytes, bytes]:
     )
     pieces.append(tail[:-overlap] if overlap else tail)
     return b"".join(pieces), tail[-overlap:] if overlap else b""
+
+
+def record_training_output(
+    stream: BinaryIO, log_path: Path, stop: threading.Event, secret: bytes,
+) -> None:
+    """Mask output before persistence, draining only queued bytes when stopped."""
+    pending = b""
+    remaining = None
+    with stream, log_path.open("wb") as log:
+        os.set_blocking(stream.fileno(), False)
+        while True:
+            if remaining is None and stop.is_set():
+                # Drain the queued backlog, without allowing escaped
+                # descendants to extend the training lifecycle.
+                queued = array.array("i", [0])
+                fcntl.ioctl(stream.fileno(), termios.FIONREAD, queued, True)
+                remaining = queued[0]
+            if remaining == 0:
+                break
+            try:
+                chunk = os.read(
+                    stream.fileno(),
+                    _LOG_READ_BYTES
+                    if remaining is None
+                    else min(_LOG_READ_BYTES, remaining),
+                )
+            except BlockingIOError:
+                select.select([stream], [], [], 0.05)
+                continue
+            if not chunk:
+                break
+            if remaining is not None:
+                remaining -= len(chunk)
+            sanitized, pending = _mask_output_chunk(pending + chunk, secret)
+            log.write(sanitized)
+            log.flush()
+        if pending:
+            log.write(b"<secret-hidden>")
 
 
 class TrainingState(StrEnum):
@@ -321,41 +359,11 @@ class TrainingSupervisor:
         return self.get_training_status(training_id)
 
     def _record_output(self, active: _ActiveTraining, secret: bytes) -> None:
-        """Mask the inherited W&B key before bytes reach the training log."""
-        pending = b""
-        remaining = None
         assert active.process.stdout is not None
         try:
-            with active.process.stdout as stream, active.log_path.open("wb") as log:
-                os.set_blocking(stream.fileno(), False)
-                while True:
-                    if remaining is None and active.output_stop.is_set():
-                        # Drain the queued backlog, without allowing escaped
-                        # descendants to extend the training lifecycle.
-                        queued = array.array("i", [0])
-                        fcntl.ioctl(stream.fileno(), termios.FIONREAD, queued, True)
-                        remaining = queued[0]
-                    if remaining == 0:
-                        break
-                    try:
-                        chunk = os.read(
-                            stream.fileno(),
-                            _LOG_READ_BYTES
-                            if remaining is None
-                            else min(_LOG_READ_BYTES, remaining),
-                        )
-                    except BlockingIOError:
-                        select.select([stream], [], [], 0.05)
-                        continue
-                    if not chunk:
-                        break
-                    if remaining is not None:
-                        remaining -= len(chunk)
-                    sanitized, pending = _mask_output_chunk(pending + chunk, secret)
-                    log.write(sanitized)
-                    log.flush()
-                if pending:
-                    log.write(b"<secret-hidden>")
+            record_training_output(
+                active.process.stdout, active.log_path, active.output_stop, secret,
+            )
         except Exception as error:  # noqa: BLE001 - thread failures must fail the run
             active.output_error = (
                 f"Training output capture failed ({type(error).__name__})."
