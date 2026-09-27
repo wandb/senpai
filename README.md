@@ -268,13 +268,14 @@ After launch, the student can finish its turn. The deterministic controller poll
 
 Worker and container restarts preserve completed OpenHands events. Recovered live training is terminated safely rather than being adopted under an unverifiable process identity; the original student conversation receives the persisted terminal outcome.
 
-The terminal policy checks nested shell commands, substitutions, and command
-wrappers. Quoted heredocs passed to Python or known text consumers (`cat`,
-`tee`, `head`, and `grep`) remain data when their output paths are known,
-including `uv run python` after `cd &&`. Commands that combine heredocs with
-process substitutions or unknown inherited output streams receive conservative
-shell checks, which can reject valid data. Other heredoc consumers also receive
-shell checks. Literal numeric arithmetic such as
+The terminal policy checks executable shell commands, including nested commands
+and common wrappers. Multiline input to ordinary programs remains data: Python,
+R, JavaScript, JSON, and other research formats do not need a language allowlist.
+The checker still inspects shell expansions in unquoted input and blocks
+restricted commands fed to recognized shells. Unrelated helper functions or
+file comparisons do not change how a data block is checked. Common wrappers
+such as `env`, `timeout`, `nice`, `xargs`, `taskset`, and `flock` preserve the
+wrapped program's data arguments. Literal numeric arithmetic such as
 `echo $((2 + 2))` is supported. Variable-based arithmetic, dynamic executable
 names, startup-variable changes, and shell reevaluation are rejected.
 
@@ -284,6 +285,8 @@ the current shell. Use `bash -c` instead of `bash -lc`; login and interactive
 shells can load unchecked startup files. The policy is a behavioral guardrail,
 not a shell sandbox or a credential-containment boundary. It does not inspect
 arbitrary Python programs or executable files.
+Some unsupported wrapper syntax and unclear shell streams can still reject
+valid commands. The policy does not reconstruct state from previous commands.
 
 Interactive browser operations are progressively disclosed. A fresh root
 conversation initially sees only `load_browser`; invoking it adds the fourteen

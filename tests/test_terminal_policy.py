@@ -163,6 +163,7 @@ EOF
         "cat <<'EOF' | sh\ngit push origin experiment\nEOF",
         "cat > >(sh) <<'EOF'\ngit push origin experiment\nEOF",
         "cat() { sh; }; cat >/tmp/a <<'EOF'\ngit push origin experiment\nEOF",
+        'sh -c "$(cat <<\'SH\'\ngit push origin experiment\nSH\n)"',
     ],
 )
 def test_executable_heredocs_remain_subject_to_policy(command: str):
@@ -228,6 +229,33 @@ def test_quoted_heredocs_preserve_known_data_consumers(command: str):
     assert is_allowed(command) is True
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env OMP_NUM_THREADS=1 python - <<'PY'\nprint(*[1, 2])\nPY",
+        "uv run --project experiments python - <<'PY'\nprint(*[1, 2])\nPY",
+        "timeout 30 python - <<'PY'\nprint(*[1, 2])\nPY",
+        "nice -n 10 python - <<'PY'\nprint(*[1, 2])\nPY",
+        "time python - <<'PY'\nprint(*[1, 2])\nPY",
+        "python - 2>&1 <<'PY'\nprint(*[1, 2])\nPY",
+        'out=summary.txt; python - > "$out" <<\'PY\'\nprint(*[1, 2])\nPY',
+        "diff <(sort baseline.txt) <(sort candidate.txt); python - <<'PY'\nprint(*[1, 2])\nPY",
+        "report() { printf done; }; python - <<'PY'\nprint(*[1, 2])\nPY",
+        'summary="$(python - <<\'PY\'\nprint(*[1, 2])\nPY\n)"; printf "%s" "$summary"',
+        "python - <<PY\nprint(*[1, 2])\nPY",
+        "python - <<PY\nprint($((2 + 2)))\nPY",
+        "jq '[.[].loss] | add / length' <<'JSON'\n[{\"loss\": 0.5}, {\"loss\": 0.4}]\nJSON",
+        "Rscript - <<'R'\nloss <- c(0.5, 0.4)\nprint(mean(loss))\nR",
+        "awk -f - metrics.tsv <<'AWK'\nBEGIN { for (i=0; i<3; i++) print i }\nAWK",
+        "node - <<'JS'\nfor (const [k, v] of Object.entries({lr: 0.001})) console.log(k, v);\nJS",
+        'out=notes.md; tee "$out" <<\'DOC\'\nloss[0] = 0.5\nDOC',
+        "cat <<'JSON' | jq '.[0].loss'\n[{\"loss\": 0.5}]\nJSON",
+    ],
+)
+def test_research_data_stays_data_when_composing_terminal_commands(command: str):
+    assert is_allowed(command) is True
+
+
 def test_python_named_shell_symlink_does_not_hide_executable_heredoc(tmp_path: Path):
     (tmp_path / "python3").symlink_to("/bin/bash")
 
@@ -258,7 +286,12 @@ def test_python_named_shell_symlink_does_not_hide_executable_heredoc(tmp_path: P
         "exec 3> >(bash); tee /dev/fd/3 <<'SH'\necho \"$(git push origin experiment)\"\nSH",
         "exec > >(bash); cat <<'SH'\ngit push origin experiment\nSH",
         "exec &> >(bash); tee notes.md <<'SH'\ngit push origin experiment\nSH",
-        "cd data && tee > /dev/null /dev/fd/3 <<'SH'\ngit push origin experiment\nSH",
+        "> >(bash) exec; cat <<'SH'\ngit push origin experiment\nSH",
+        "exec 3> >(bash); cd data && tee > /dev/null /dev/fd/3 <<'SH'\ngit push origin experiment\nSH",
+        "env -S 'bash -s' <<'SH'\ngit push origin experiment\nSH",
+        "find . -maxdepth 0 -exec bash \\; <<'SH'\ngit push origin experiment\nSH",
+        "time bash <<'SH'\ngit push origin experiment\nSH",
+        "python() { sh; }; python <<'SH'\ngit push origin experiment\nSH",
         "python - <<'PYCODE'\nprint(*xs)\nPYCODE\ngit push origin experiment",
         "git push origin experiment && python - <<'PY'\nprint(*xs)\nPY",
         "cat <<'SH' | head | sh\necho \"$(git push origin experiment)\"\nSH",
@@ -285,7 +318,7 @@ def test_inherited_opaque_stdout_does_not_hide_heredoc_commands(runner: str):
 
 def test_tee_arguments_after_heredoc_delimiter_still_identify_opaque_streams():
     decision = terminal_policy(
-        "tee <<'SH' /dev/fd/3\ngit push origin experiment\nSH",
+        "exec 3> >(bash); tee <<'SH' /dev/fd/3\ngit push origin experiment\nSH",
         "student",
         WORKSPACE,
     )
@@ -307,7 +340,7 @@ def test_tee_arguments_after_heredoc_delimiter_still_identify_opaque_streams():
 )
 def test_tee_heredocs_do_not_hide_commands_sent_to_opaque_streams(destination: str):
     decision = terminal_policy(
-        f"tee {destination} <<'SH'\ngit push origin experiment\nSH",
+        f"exec 3> >(bash); tee {destination} <<'SH'\ngit push origin experiment\nSH",
         "student",
         WORKSPACE,
     )
@@ -400,6 +433,8 @@ def test_alias_expansion_cannot_defer_restricted_command_parsing():
         "[[ -v 'a[$(git push origin experiment)]' ]]",
         "printf -v 'a[$(git push origin experiment)]' x",
         "x='a[$(git push origin experiment)]'; echo $((x))",
+        "x='a[$(git push origin experiment)]'; python - <<PY\nprint($((x)))\nPY",
+        "x='a[$(git push origin experiment)]'; cat <<DATA\n$((x))\nDATA",
         "x='a[$(git push origin experiment)]'; ((x))",
         (
             "x='a[$(git push origin experiment)]'; "
@@ -556,6 +591,7 @@ def test_policy_preserves_safe_shell_variable_builtins(command: str):
         "f() { PROMPT_COMMAND='git push origin experiment'; }; f",
         "case x in x) PROMPT_COMMAND='git push origin experiment';; esac",
         "nice python train.py --epochs 10",
+        "uv run --project experiments python train.py --epochs 10",
         "nice -n 10 python train.py --epochs 10",
         "nice >output -n 10 git push origin experiment",
         "command >output git push origin experiment",
@@ -573,6 +609,8 @@ def test_policy_preserves_safe_shell_variable_builtins(command: str):
         "unshare -r sleep 3600",
         "echo x | xargs git push origin experiment",
         "xargs -n 1 sleep < delays.txt",
+        "xargs -I {} {} --verbose",
+        "flock /tmp/lock --command 'python train.py'",
         "find . -maxdepth 0 -exec python train.py \\;",
         "find . -exec true \\; -exec python train.py \\;",
     ],
@@ -613,6 +651,13 @@ def test_runners_preserve_safe_commands(command: str):
         "stdbuf -oL python -c 'import json; print(json.dumps({\"a\": 1}))'",
         "command printf '%s\\n' source",
         "command -v git",
+        "find results -name '*.json' -print0 | xargs -0 -n 1 python -c 'import sys; print(*sys.argv)'",
+        "taskset 0x1 python -c 'print(*[1, 2, 3])'",
+        "flock /tmp/report.lock python -c 'print(*[1, 2, 3])'",
+        "echo run-a | xargs printf '%s\\n' git push",
+        "taskset 0x1 printf '%s\\n' git push",
+        "flock /tmp/report.lock printf '%s\\n' git push",
+        "xargs -I {} -P 4 python -c 'import sys; print(*sys.argv)' {}",
     ],
 )
 def test_argv_runners_preserve_command_arguments_as_data(command: str):

@@ -710,17 +710,21 @@ The terminal policy parses Bash syntax before checking nested commands and
 recognized command runners. It rejects malformed syntax, dynamic executable
 names, startup-file loading, shell callbacks, aliases, and variable-name
 reevaluation. Shell startup and prompt variables are also reserved against
-custom-secret injection. Quoted Python and known text-consumer heredocs are
-data when every consumer and output path is recognized. Process substitutions
-anywhere in the command, inherited output redirects to unknown streams, and
-dynamic or device-file destinations disable that exemption. Other heredocs
-receive recursive shell checks, including substitutions inside their bodies.
-These conservative checks can reject valid data. Literal numeric arithmetic is
-allowed, while variable arithmetic and C-style polling loops remain rejected.
-Common argv wrappers preserve the wrapped command's data arguments. Runners
-with more complex grammars retain conservative checks and can reject otherwise
-valid commands. These checks do not inspect arbitrary executable files or
-Python code and do not establish a shell sandbox.
+custom-secret injection. These checks enforce workflow boundaries without
+prescribing research methods or requiring an allowlist of data formats and
+analysis languages. Heredoc input to ordinary programs remains data. The
+original Bash syntax still exposes expansions in unquoted input for checking;
+input fed to recognized shells receives recursive shell checks. A function
+that overrides the actual consumer, or output routed through an opaque `exec`
+redirect, retains conservative checking. Unrelated functions and process
+substitutions do not disable ordinary program input. Dynamic output paths are
+allowed unless recognized shell execution in the same command makes that
+stream ambiguous. Literal numeric arithmetic is allowed, while variable
+arithmetic and C-style polling loops remain rejected. Common wrappers inspect
+the actual child command and preserve its data arguments. Unsupported wrapper
+grammars and unclear shell streams can still reject valid commands. These
+checks do not inspect arbitrary executable files or Python code, reconstruct
+prior terminal state, or establish a shell sandbox.
 
 Every OpenHands turn has a controller-configured hard deadline. The deadline
 interrupts the conversation, produces a non-success result, and leaves durable
