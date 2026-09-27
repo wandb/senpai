@@ -19,7 +19,7 @@ import urllib.request
 from concurrent.futures import Future
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypedDict
 
 import psutil
 
@@ -42,6 +42,64 @@ _DIAGNOSTICS_SECONDS = 30.0
 _JOIN_SECONDS = 120.0
 _DETACH_GRACE_SECONDS = 0.1
 EXECUTOR_SOCKET_ENV = "SENPAI_KUBERNETES_EXECUTOR_SOCKET"
+
+
+class KubernetesDiagnostics(TypedDict):
+    statuses: list[str]
+    problems: list[str]
+    events: list[str]
+    logs: list[tuple[str, str]]
+
+
+def _mask_wandb_output(text: str) -> str:
+    key = os.environ.get("WANDB_API_KEY", "").encode()
+    if not key:
+        return text
+    masked, pending = _mask_output_chunk(text.encode(), key)
+    return (masked + (b"<secret-hidden>" if pending else b"")).decode()
+
+
+def _format_diagnostics(diagnostics: KubernetesDiagnostics) -> str:
+    """Redact complete components before any presentation limits split secrets."""
+    statuses = [_mask_wandb_output(text) for text in diagnostics["statuses"]]
+    problems = [_mask_wandb_output(text) for text in diagnostics["problems"]]
+    problems.extend(_mask_wandb_output(text)[:1024] for text in diagnostics["events"])
+    logs = [
+        (_mask_wandb_output(prefix), _mask_wandb_output(text))
+        for prefix, text in diagnostics["logs"]
+    ]
+    # Keep every status identity; one long error must not hide the other pods.
+    summary_budget = _ERROR_TAIL_BYTES // 2 if logs else _ERROR_TAIL_BYTES
+    status_budget = summary_budget * 3 // 4 if problems else summary_budget
+    per_status = max(0, status_budget // len(statuses) - 1)
+    summary = "\n".join(
+        status.encode()[:per_status].decode(errors="ignore") for status in statuses
+    )
+    if problems:
+        problem_budget = summary_budget - len(summary.encode()) - 1
+        summary += "\n" + "\n".join(problems).encode()[:problem_budget].decode(errors="ignore")
+    if not logs:
+        return summary
+    log_budget = (_ERROR_TAIL_BYTES - len(summary.encode()) - len(logs)) // len(logs)
+    output = [summary] if summary else []
+    for prefix, text in logs:
+        text_budget = log_budget - len(prefix.encode())
+        if text_budget <= 0:
+            continue
+        encoded = text.encode()
+        marker = b"\n... truncated ...\n"
+        if len(encoded) > text_budget > len(marker) + 1:
+            # Preserve the first error and final context within the fetched tail.
+            end_budget = (text_budget - len(marker)) // 2
+            excerpt = (
+                encoded[:text_budget - len(marker) - end_budget].decode(errors="ignore")
+                + marker.decode()
+                + encoded[-end_budget:].decode(errors="ignore")
+            )
+        else:
+            excerpt = encoded[:text_budget].decode(errors="ignore")
+        output.append(prefix + excerpt)
+    return "\n".join(output)
 
 
 class KubernetesApiError(RuntimeError):
@@ -166,7 +224,8 @@ class KubernetesExecutorClient:
         )
 
     def logs(self, resource: KubernetesResourceRef) -> str:
-        return str(self._request("logs", resource=resource.model_dump(mode="json")))
+        diagnostics = self._request("logs", resource=resource.model_dump(mode="json"))
+        return _format_diagnostics(diagnostics) if diagnostics is not None else ""
 
     def release(self, training_id: str) -> dict:
         return self._request("release", training_id=training_id)
@@ -334,8 +393,8 @@ class KubernetesApiClient:
                 )
             time.sleep(0.5)
 
-    def logs(self, resource: KubernetesResourceRef) -> str:
-        """Return bounded status and logs for this workload's exact pod owner chain."""
+    def logs(self, resource: KubernetesResourceRef) -> KubernetesDiagnostics:
+        """Collect diagnostics for controller-side redaction before formatting."""
 
         deadline = time.monotonic() + 30
         pods = self._owned_pods(resource)[: resource.nodes + 2]
@@ -432,44 +491,12 @@ class KubernetesApiClient:
                 continue
             if text:
                 container_logs.append((prefix, text))
-        return self._diagnostics_text(statuses, problems + events, container_logs)
-
-    @staticmethod
-    def _diagnostics_text(
-        statuses: list[str], problems: list[str], logs: list[tuple[str, str]]
-    ) -> str:
-        # Keep every status identity; one long error must not hide the other pods.
-        summary_budget = _ERROR_TAIL_BYTES // 2 if logs else _ERROR_TAIL_BYTES
-        status_budget = summary_budget * 3 // 4 if problems else summary_budget
-        per_status = max(0, status_budget // len(statuses) - 1)
-        summary = "\n".join(
-            status.encode()[:per_status].decode(errors="ignore") for status in statuses
-        )
-        if problems:
-            problem_budget = summary_budget - len(summary.encode()) - 1
-            summary += "\n" + "\n".join(problems).encode()[:problem_budget].decode(errors="ignore")
-        if not logs:
-            return summary
-        log_budget = (_ERROR_TAIL_BYTES - len(summary.encode()) - len(logs)) // len(logs)
-        output = [summary] if summary else []
-        for prefix, text in logs:
-            text_budget = log_budget - len(prefix.encode())
-            if text_budget <= 0:
-                continue
-            encoded = text.encode()
-            marker = b"\n... truncated ...\n"
-            if len(encoded) > text_budget > len(marker) + 1:
-                # Preserve the first error and final context within the fetched tail.
-                end_budget = (text_budget - len(marker)) // 2
-                excerpt = (
-                    encoded[:text_budget - len(marker) - end_budget].decode(errors="ignore")
-                    + marker.decode()
-                    + encoded[-end_budget:].decode(errors="ignore")
-                )
-            else:
-                excerpt = encoded[:text_budget].decode(errors="ignore")
-            output.append(prefix + excerpt)
-        return "\n".join(output)
+        return {
+            "statuses": statuses,
+            "problems": problems,
+            "events": events,
+            "logs": container_logs,
+        }
 
     def _events(self, namespace: str, uid: str, owner: str, deadline: float) -> list[str]:
         remaining = deadline - time.monotonic()
@@ -484,6 +511,7 @@ class KubernetesApiClient:
                 "GET",
                 f"/api/v1/namespaces/{urllib.parse.quote(namespace, safe='')}/events?{query}",
                 timeout_seconds=min(3, remaining),
+                max_response_bytes=4 * 1024 * 1024,
             )
         except KubernetesApiError as error:
             return [f"[{owner}/events] unavailable: HTTP {error.status_code}"]
@@ -494,7 +522,7 @@ class KubernetesApiClient:
         events.sort(key=lambda event: event.get("lastTimestamp") or event["metadata"]["creationTimestamp"])
         return [
             f"[{owner}/event] {event.get('type', '')} {event.get('reason', '')}: "
-            f"{event.get('message', '')[:1024]}"
+            f"{event.get('message', '')}"
             for event in events[-5:]
         ]
 
@@ -1259,11 +1287,11 @@ class KubernetesTrainingSupervisor:
                     if part
                 )
 
-        detail = self._mask_wandb_output(detail)
+        detail = _mask_wandb_output(detail)
         if active.resource is not None:
             self._capture_diagnostics(training_id, active, detail, wait=True)
         try:
-            log_text = self._mask_wandb_output(
+            log_text = _mask_wandb_output(
                 active.log_path.read_bytes().decode(errors="ignore")
             )
             local_tail = log_text.encode()[-_ERROR_TAIL_BYTES:].decode(errors="ignore")
@@ -1283,13 +1311,6 @@ class KubernetesTrainingSupervisor:
             }
         )
         self._release_terminal(terminal, active, delete_required)
-
-    def _mask_wandb_output(self, text: str) -> str:
-        key = os.environ.get("WANDB_API_KEY", "").encode()
-        if not key:
-            return text
-        masked, pending = _mask_output_chunk(text.encode(), key)
-        return (masked + (b"<secret-hidden>" if pending else b"")).decode()
 
     def _capture_diagnostics(
         self,
@@ -1321,8 +1342,8 @@ class KubernetesTrainingSupervisor:
             ).start()
         if not wait and not active.diagnostics_future.done():
             return
-        detail = self._mask_wandb_output(detail).encode()[:1024].decode(errors="ignore")
-        collected = self._mask_wandb_output(active.diagnostics_future.result())
+        detail = _mask_wandb_output(detail).encode()[:1024].decode(errors="ignore")
+        collected = _mask_wandb_output(active.diagnostics_future.result())
         diagnostics = "\n".join(
             part for part in (detail, collected) if part
         )

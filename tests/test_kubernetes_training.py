@@ -1331,6 +1331,62 @@ def test_supervisor_persists_live_diagnostics_before_training_finishes(tmp_path,
     assert key not in (runtime.state_dir / f"{started.training_id}.json").read_text()
 
 
+@pytest.mark.parametrize("source", ["container", "event"])
+def test_supervisor_redacts_diagnostics_before_truncation(tmp_path, monkeypatch, source):
+    key = "0123456789abcdef0123456789abcdef012345ab"
+    monkeypatch.setenv("WANDB_API_KEY", key)
+    api = object.__new__(kubernetes_training.KubernetesApiClient)
+    worker = {
+        "metadata": {"name": "worker", "uid": "worker-uid"},
+        "spec": {"containers": [{"name": "train"}]},
+        "status": {
+            "phase": "Running",
+            "containerStatuses": [{"name": "train", "state": {"running": {}}}],
+        },
+    }
+    monkeypatch.setattr(api, "_owned_pods", lambda _resource: [worker])
+
+    def request_json(method, path, **kwargs):
+        uid = "worker-uid" if "worker-uid" in path else "remote-uid"
+        return {"items": [{
+            "metadata": {"creationTimestamp": "2026-09-27T00:00:00Z"},
+            "involvedObject": {"uid": uid},
+            "message": key * 40 if source == "event" else "worker started",
+        }]}
+
+    monkeypatch.setattr(api, "_request_json", request_json)
+    output = (key * 220)[:8192] if source == "container" else "training output"
+    monkeypatch.setattr(
+        api, "_request_text", lambda *args, **kwargs: output,
+    )
+    client = FakeCluster(state=TrainingState.FAILED)
+    transport = kubernetes_training.KubernetesExecutorClient("unused.sock")
+    monkeypatch.setattr(
+        transport, "_request",
+        lambda *args, **kwargs: json.loads(json.dumps(api.logs(client.resource_value))),
+    )
+    monkeypatch.setattr(client, "logs", transport.logs)
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    try:
+        started = runtime.run_training(TrainingSpec(
+            argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5,
+        ))
+        runtime.drain()
+        result = runtime.get_training_status(started.training_id)
+        assert result.state is TrainingState.FAILED
+        for persisted in (
+            Path(result.log_path).read_text(),
+            (runtime.state_dir / f"{started.training_id}.json").read_text(),
+            result.model_dump_json(),
+        ):
+            assert "<secret-hidden>" in persisted
+            assert key[:8] not in persisted
+            assert key[-8:] not in persisted
+        assert len(result.kubernetes_diagnostics.encode()) <= 8192
+    finally:
+        runtime.close()
+
+
 def test_supervisor_reports_diagnostics_failure_without_losing_training(tmp_path, monkeypatch):
     class BrokenLogsCluster(FakeCluster):
         def logs(self, resource):
