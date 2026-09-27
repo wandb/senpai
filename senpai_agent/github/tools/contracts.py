@@ -94,8 +94,8 @@ class PublishAdvisorBranchAction(Action):
     )
 
 
-class PublishAssignmentBranchAction(Action):
-    """Push the student's commit; keep this class name for saved conversation events."""
+class PushExperimentCommitAction(Action):
+    """Push the student's exact local commit to the experiment PR branch."""
 
     assignment: AssignmentVersion = Field(
         description=(

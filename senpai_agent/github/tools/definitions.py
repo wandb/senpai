@@ -25,7 +25,7 @@ from .contracts import (
     MergeExperimentAction,
     PostAssignmentCommentAction,
     PublishAdvisorBranchAction,
-    PublishAssignmentBranchAction,
+    PushExperimentCommitAction,
     RepairAssignmentRoutingAction,
     RequestAssignmentRevisionAction,
     RespondToHumanIssueAction,
@@ -111,14 +111,14 @@ class PublishAdvisorBranchTool(
 
 
 class PushExperimentCommitTool(
-    ToolDefinition[PublishAssignmentBranchAction, GitHubMutationObservation]
+    ToolDefinition[PushExperimentCommitAction, GitHubMutationObservation]
 ):
     """Push the student's exact local HEAD to the existing experiment PR branch."""
 
     @classmethod
     def create(cls, runtime: GitHubToolRuntime) -> Sequence[Self]:
         return _tool(
-            cls, PublishAssignmentBranchAction, "Push experiment commit",
+            cls, PushExperimentCommitAction, "Push experiment commit",
             "Push the exact current local commit (HEAD) to the existing GitHub branch for "
             "this student's experiment PR. There must be no uncommitted changes. "
             "The PR must be open and marked work in progress (status:wip). Supply "

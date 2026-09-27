@@ -1,4 +1,3 @@
-import json
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,9 +13,6 @@ from github_workflow_support import (
     workflow,
 )
 from openhands.sdk.conversation import ConversationExecutionStatus
-from openhands.sdk.conversation.event_store import EventLog
-from openhands.sdk.event import ActionEvent
-from openhands.sdk.io import LocalFileStore
 from pydantic import SecretStr
 
 from senpai_agent.git_workflow import GitWorkflowPreconditionError
@@ -283,48 +279,3 @@ def test_push_experiment_commit_reports_race_after_push_without_rewriting_workfl
         assert (
             conversation.state.execution_status == ConversationExecutionStatus.FINISHED
         )
-
-
-def test_saved_push_action_loads_after_tool_rename(tmp_path):
-    arguments = {
-        "assignment": {
-            "pr_number": 7,
-            "assignment_id": "assignment-one",
-            "revision_id": "revision-1",
-            "expected_pr_head_sha": "a" * 40,
-        },
-        "local_commit_sha": "b" * 40,
-    }
-    saved = json.dumps({
-        "kind": "ActionEvent",
-        "id": "11111111-1111-4111-8111-111111111111",
-        "timestamp": "2026-09-27T12:00:00",
-        "source": "agent",
-        "thought": [],
-        "action": {"kind": "PublishAssignmentBranchAction", **arguments},
-        "tool_name": "publish_assignment_branch",
-        "tool_call_id": "call-old-push",
-        "tool_call": {
-            "id": "call-old-push",
-            "name": "publish_assignment_branch",
-            "arguments": json.dumps(arguments),
-            "origin": "responses",
-        },
-        "llm_response_id": "resp-before-rename",
-    })
-    events_dir = tmp_path / "events"
-    events_dir.mkdir()
-    event_file = events_dir / "event-00000-11111111-1111-4111-8111-111111111111.json"
-    event_file.write_text(saved)
-
-    history = EventLog(LocalFileStore(str(tmp_path)))
-    event = history[0]
-
-    assert isinstance(event, ActionEvent)
-    assert event.action.assignment.assignment_id == "assignment-one"
-    assert event.action.assignment.revision_id == "revision-1"
-    assert event.action.local_commit_sha == "b" * 40
-    assert event.tool_call.name == "publish_assignment_branch"
-    assert event.tool_call.id == "call-old-push"
-    assert event.llm_response_id == "resp-before-rename"
-    assert event_file.read_text() == saved

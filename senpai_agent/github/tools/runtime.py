@@ -30,7 +30,7 @@ from senpai_agent.models import AssignmentRecord, ExperimentResult
 from .contracts import (
     GitHubMutationObservation,
     PostAssignmentCommentAction,
-    PublishAssignmentBranchAction,
+    PushExperimentCommitAction,
     SubmitExperimentResultAction,
 )
 
@@ -153,7 +153,7 @@ class GitHubToolRuntime:
 
 
 class PushExperimentCommitExecutor(
-    ToolExecutor[PublishAssignmentBranchAction, GitHubMutationObservation]
+    ToolExecutor[PushExperimentCommitAction, GitHubMutationObservation]
 ):
     """Push the student's commit without changing the experiment workflow."""
 
@@ -162,7 +162,7 @@ class PushExperimentCommitExecutor(
 
     def __call__(
         self,
-        action: PublishAssignmentBranchAction,
+        action: PushExperimentCommitAction,
         conversation: LocalConversation | None = None,
     ) -> GitHubMutationObservation:
         student = self.runtime.current_student()
@@ -208,7 +208,7 @@ class PushExperimentCommitExecutor(
 
     def _preflight(
         self,
-        action: PublishAssignmentBranchAction,
+        action: PushExperimentCommitAction,
         student: str,
         expected_head_sha: str,
     ) -> tuple[PullRequestSnapshot, AssignmentRecord]:
@@ -223,7 +223,7 @@ class PushExperimentCommitExecutor(
 
     def _verify_after_push(
         self,
-        action: PublishAssignmentBranchAction,
+        action: PushExperimentCommitAction,
         student: str,
         assignment: AssignmentRecord,
     ) -> PullRequestSnapshot:
