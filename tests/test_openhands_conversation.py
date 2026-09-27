@@ -1322,7 +1322,7 @@ def test_conversation_and_credentials_are_cleaned_up_after_failures(
     monkeypatch.setattr(runner, "configure_delegation", delegation.append)
     requests = []
 
-    def request(client, _path, _options):
+    def request(client, _path, _options, *, headers=None):
         requests.append(client.headers["x-api-key"])
         return {"results": []}
 

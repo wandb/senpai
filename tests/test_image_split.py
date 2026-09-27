@@ -223,7 +223,12 @@ def test_runtime_workflow_uses_the_lockfile_uv_and_exa_versions():
     assert steps["Install uv and Python"]["with"]["version"] == "0.10.9"
     install = steps["Install runtime test dependencies"]["run"]
     assert "uv lock --check" in install
-    assert "exa-py @ https://github.com/exa-labs/exa-py/archive/" in install
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    exa_requirement = next(
+        requirement for requirement in project["project"]["dependencies"]
+        if requirement.startswith("exa-py")
+    )
+    assert f'"{exa_requirement}"' in install
 
 
 def test_role_state_is_pod_local_and_separate_from_the_dataset_pvc():

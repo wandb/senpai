@@ -20,14 +20,14 @@ dependencies = [
     "simple-parsing",
     "wandb>=0.30.0",
     "weave>=0.53.11,<0.54",
-    "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@49517f08af3996836ecc9c202d8d3ef4130e2a25",
+    "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@bdc58d4190c3df064fc3fe173de76c510bf15abf",
+    "litellm>=1.102.1",
     "tqdm",
     "matplotlib",
-    "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@f69134273ee3a31a233d6201786570eb9c4c141b#subdirectory=openhands-sdk",
-    "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@f69134273ee3a31a233d6201786570eb9c4c141b#subdirectory=openhands-tools",
+    "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@03b60423725411ad485b665009024b6444694cc7#subdirectory=openhands-sdk",
+    "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@03b60423725411ad485b665009024b6444694cc7#subdirectory=openhands-tools",
     "psutil",
-    # v2.16.2 is tagged upstream but has not been published to PyPI.
-    "exa-py @ https://github.com/exa-labs/exa-py/archive/71f315b4be07d474df128c8fafc70cc7d0e47b56.tar.gz",
+    "exa-py>=2.22.2",
 ]
 
 [tool.setuptools.packages.find]
@@ -44,6 +44,7 @@ environments = [
 ]
 exclude-newer = "2026-09-27T00:00:00Z"
 constraint-dependencies = [
+    "binaryornot==0.4.4", # 0.6 rejects valid CP1251 source as binary.
     "cryptography>=50.0.0", # CVE-2026-69247 / GHSA-g6cj-pr64-35w5
 ]
 

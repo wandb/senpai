@@ -52,7 +52,7 @@ RUN cd /tmp/senpai && \
       --only-binary rpds-py \
       -r requirements.txt && \
     uv pip install --python "$SENPAI_PYTHON" --no-deps --compile-bytecode /tmp/senpai "pip==25.3" && \
-    python -P -c 'import importlib.metadata, openhands.sdk, senpai_agent, sys, torch; assert sys.version_info[:2] == (3, 14); assert torch.__version__.startswith("2.14."); assert torch.version.cuda and torch.version.cuda.startswith("13."); assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
+    python -P -c 'import importlib.metadata, openhands.sdk, senpai_agent, sys, torch; assert sys.version_info[:2] == (3, 14); assert torch.__version__.startswith("2.14."); assert torch.version.cuda and torch.version.cuda.startswith("13."); assert importlib.metadata.version("openhands-sdk") == "1.49.6"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
     python -P -m senpai_agent.agent_markdown "$SENPAI_PLUGIN" && \
     chown -R root:root \
       /opt/senpai-venv "$SENPAI_AGENT_DIR" "$SENPAI_PLUGIN" && \

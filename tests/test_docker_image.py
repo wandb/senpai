@@ -206,7 +206,7 @@ def test_python_runtime_and_training_dependencies(test_pod):
         "assert sys.version_info[:2] == (3, 14)\n"
         "assert torch.__version__.startswith('2.14.')\n"
         "assert torch.version.cuda.startswith('13.')\n"
-        "assert importlib.metadata.version('openhands-sdk') == '1.40.0'\n"
+        "assert importlib.metadata.version('openhands-sdk') == '1.49.6'\n"
         "assert importlib.metadata.version('weave-openhands') == '0.1.0'\n"
         "print('ok')\n"
         "PY"
