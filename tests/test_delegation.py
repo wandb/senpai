@@ -157,7 +157,13 @@ def test_optional_process_deadline_kills_an_uncooperative_group(tmp_path: Path):
 
 
 def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path):
-    config = delegation_config(tmp_path)
+    config = delegation_config(
+        tmp_path,
+        model_base_url="https://gateway.example/v1",
+        model_api_mode="chat",
+        model_extra_headers_env="MODEL_GATEWAY_HEADERS",
+        model_extra_headers={"X-Tenant": "research"},
+    )
 
     fast = OpenHandsChildProcess(
         config,
@@ -226,6 +232,15 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
         config.frontier_reasoning_effort
     )
     assert fast.environment["SENPAI_COMPACTION_TRIGGER_TOKENS"] == "200000"
+    assert fast.environment["SENPAI_OPENHANDS_BASE_URL"] == (
+        "https://gateway.example/v1"
+    )
+    assert fast.environment["SENPAI_OPENHANDS_API_MODE"] == "chat"
+    assert fast.environment["SENPAI_OPENHANDS_EXTRA_HEADERS_ENV"] == (
+        "MODEL_GATEWAY_HEADERS"
+    )
+    assert fast.environment["MODEL_GATEWAY_HEADERS"] == '{"X-Tenant":"research"}'
+    assert "research" not in repr(fast.command)
 
 
 def test_child_environment_carries_the_resolved_program_path(tmp_path: Path):
