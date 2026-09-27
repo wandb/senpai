@@ -18,6 +18,7 @@ from openhands.sdk.tool import (
 
 from senpai_agent.cluster_capacity import (
     SNAPSHOT_ENV,
+    CapacityConfig,
     CapacitySnapshot,
     read_capacity_snapshot,
 )
@@ -25,6 +26,8 @@ from senpai_agent.cluster_capacity import (
 
 class ClusterCapacityAction(Action):
     """Read the configured worker shape's latest advisory resource-fit snapshot."""
+
+    expected_requirements: CapacityConfig | None = None
 
 
 class ClusterCapacityObservation(Observation):
@@ -52,7 +55,10 @@ class _ClusterCapacityExecutor(
         self, action: ClusterCapacityAction, conversation=None
     ) -> ClusterCapacityObservation:
         configured = os.environ.get(SNAPSHOT_ENV)
-        snapshot, age = read_capacity_snapshot(Path(configured) if configured else None)
+        snapshot, age = read_capacity_snapshot(
+            Path(configured) if configured else None,
+            expected_requirements=action.expected_requirements,
+        )
         return ClusterCapacityObservation(snapshot=snapshot, age_seconds=age)
 
 
@@ -69,6 +75,9 @@ class ClusterCapacityTool(
                     "Read the latest sanitized cluster capacity snapshot for the configured worker shape. "
                     "Reports the observation time, age, GPU/CPU/memory resource-fit counts, placement exclusions "
                     "and verified preemptible capacity. Unknown or stale data cannot establish availability. "
+                    "Optionally supply expected_requirements to check the complete resource, placement and "
+                    "preemption configuration. A mismatch returns unknown with the observed requirements "
+                    "and no counts; it does not recalculate capacity or change a workload. "
                     "This is advisory: it never reserves resources, authorizes a launch or guarantees scheduling. "
                     "Use get_training_status for diagnostics of an existing owned run."
                 ),

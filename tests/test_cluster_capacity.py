@@ -113,8 +113,11 @@ def test_resource_fit_accounts_for_cpu_only_pending_and_verified_preemption():
     assert enabled.counts.verified_preemptible_gpus == 8
     assert disabled.counts.resource_fit_nodes == 1
     assert disabled.counts.verified_preemptible_gpus == 0
-    assert "cpu-only" not in enabled.model_dump_json()
-    assert "verification" not in enabled.model_dump_json()  # no project/node names
+    serialized = enabled.model_dump_json()
+    for private_name in [
+        "cpu-only", "verification", "hpc-verification-real", "cw-hpc-verification"
+    ]:
+        assert json.dumps(private_name) not in serialized
 
 
 def test_effective_pod_requests_handle_ordered_sidecars_pod_overrides_and_resize():
@@ -208,8 +211,18 @@ class ObservationApi:
 
 def test_observer_paginates_all_pods_and_publishes_only_sanitized_evidence():
     api = ObservationApi()
-    publish_capacity(api, CONFIG, "default", "capacity")
+    config = CapacityConfig(
+        **CONFIG.model_dump(exclude={"node_selector", "tolerations", "hpc_verification"}),
+        node_selector={"pool": "gpu"},
+        tolerations=[
+            {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}
+        ],
+        hpc_verification=True,
+    )
+    publish_capacity(api, config, "default", "capacity")
     snapshot = json.loads(api.published["data"]["snapshot.json"])
+    assert snapshot["schema_version"] == 2
+    assert snapshot["requirements"] == config.model_dump(mode="json")
     assert snapshot["counts"]["resource_fit_nodes"] == 0
     assert snapshot["status"] == "available"
     assert api.published["metadata"]["resourceVersion"] == "17"
@@ -240,6 +253,10 @@ def test_failed_collection_replaces_old_evidence_with_unknown():
         ("extra", "invalid"),
         ("future", "invalid"),
         ("oversized", "invalid"),
+        ("schema-v1", "invalid"),
+        ("missing-requirement:node_selector", "invalid"),
+        ("missing-requirement:tolerations", "invalid"),
+        ("missing-requirement:hpc_verification", "invalid"),
     ],
 )
 def test_unusable_snapshots_never_report_capacity(tmp_path, scenario, reason):
@@ -254,6 +271,11 @@ def test_unusable_snapshots_never_report_capacity(tmp_path, scenario, reason):
         content["pod_environment"] = "do-not-echo"
     elif scenario == "future":
         content["observed_at"] = (NOW + timedelta(seconds=30)).isoformat()
+    elif scenario == "schema-v1":
+        content["schema_version"] = 1
+    elif scenario.startswith("missing-requirement:"):
+        content["requirements"] = CONFIG.model_dump(mode="json")
+        del content["requirements"][scenario.split(":", 1)[1]]
     if scenario != "missing":
         path.write_text(
             "x" * (64 * 1024 + 1) if scenario == "oversized" else json.dumps(content)
@@ -264,23 +286,64 @@ def test_unusable_snapshots_never_report_capacity(tmp_path, scenario, reason):
     assert "do-not-echo" not in result.model_dump_json()
 
 
-@pytest.mark.parametrize("role", ["advisor", "student"])
-def test_root_role_invokes_capacity_without_cluster_credentials(
-    tmp_path, monkeypatch, role
+@pytest.mark.parametrize(
+    "role,expected_changes,matches",
+    [
+        pytest.param("advisor", None, True, id="advisor-no-argument"),
+        pytest.param("student", None, True, id="student-no-argument"),
+        pytest.param("student", {}, True, id="equivalent-tolerations"),
+        pytest.param("student", {"nodes": 2}, False, id="different-node-count"),
+        pytest.param("student", {"gpus_per_node": 4}, False, id="different-gpus"),
+        pytest.param("student", {"cpu_per_node": 60}, False, id="different-cpu"),
+        pytest.param("student", {"memory_gib_per_node": 440}, False, id="different-memory"),
+        pytest.param("student", {"node_selector": {"pool": "other"}}, False, id="different-selector"),
+        pytest.param("student", {"tolerations": []}, False, id="different-tolerations"),
+        pytest.param("student", {"hpc_verification": False}, False, id="different-preemption-policy"),
+    ],
+)
+def test_root_role_reads_capacity_only_for_the_expected_observation_basis(
+    tmp_path, monkeypatch, role, expected_changes, matches
 ):
+    config = CapacityConfig(
+        **CONFIG.model_dump(exclude={"node_selector", "tolerations", "hpc_verification"}),
+        node_selector={"pool": "gpu"},
+        tolerations=[
+            {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+            {"key": "maintenance", "operator": "Exists", "effect": "NoExecute"},
+        ],
+        hpc_verification=True,
+    )
+    observed_at = datetime.now(UTC) - timedelta(seconds=40)
     path = tmp_path / "snapshot.json"
     path.write_text(
         summarize_capacity(
-            [node("worker")], [], CONFIG, observed_at=datetime.now(UTC)
+            [node("worker")], [], config, observed_at=observed_at
         ).model_dump_json()
     )
     monkeypatch.setenv(SNAPSHOT_ENV, str(path))
     tools = build_main_tools(runtime_config(tmp_path, role=role))
     spec = next(tool for tool in tools if tool.name == "get_cluster_capacity")
     tool = resolve_tool(spec, SimpleNamespace())[0]
-    result = tool(ClusterCapacityAction())
-    assert result.snapshot.counts.resource_fit_nodes == 1
-    assert result.age_seconds < 10
+    action = ClusterCapacityAction()
+    if expected_changes is not None:
+        expected = config.model_dump(mode="json")
+        first, second = expected["tolerations"]
+        expected["tolerations"] = [second, first, first]
+        expected.update(expected_changes)
+        action = ClusterCapacityAction(expected_requirements=expected)
+    result = tool(action)
+    if matches:
+        assert result.snapshot.status == "available"
+        assert result.snapshot.reason is None
+        assert result.snapshot.counts.resource_fit_nodes == 1
+    else:
+        assert result.snapshot.status == "unknown"
+        assert result.snapshot.reason == "requirements_mismatch"
+        assert result.snapshot.counts is None
+    assert result.snapshot.observed_at == observed_at
+    assert 40 <= result.age_seconds < 50
+    delivered = json.loads(result.to_llm_content[0].text)
+    assert delivered["snapshot"]["requirements"] == config.model_dump(mode="json")
     assert "scheduler remains authoritative" in result.to_llm_content[0].text
 
 

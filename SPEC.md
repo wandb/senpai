@@ -96,6 +96,18 @@ GitHub state is level-triggered:
 - an open Issue labeled `human` plus `team`, the advisor branch, or one student
   label is a human message.
 
+Both roles filter PRs before deriving events or student availability. A PR must
+have a head in the target repository and an author with current effective write
+or admin access, as reported by the collaborator permission API. Repository and
+author names are compared without case sensitivity. Fork heads and missing or
+malformed PR trust metadata are rejected. Rejected PRs contribute no assignment,
+review, or feedback events; unrelated human Issues retain their existing rules.
+Each poll checks each distinct same-repository author once and does not reuse
+permissions across polls. A failed permission request or invalid permission
+response raises `GitHubReadError` and invalidates the whole GitHub snapshot.
+Availability reconciliation therefore leaves queued state unchanged, and
+`CompositeMailbox` continues serving other sources.
+
 Human Issue events use the exact latest human-authored body/comment ID as their
 dedupe key and `human_message_id`. Each controller delivers an exact version
 until one turn processes and acknowledges it, then never delivers that version
@@ -837,6 +849,16 @@ Kubernetes' responsibility. Raw Pod specifications, environments, logs, and
 unrelated project identifiers never enter the snapshot. Cluster-scoped observer
 RBAC cleanup remains an operator action rather than expanding cutoff authority.
 
+The snapshot includes the complete observation configuration. Optional
+`expected_requirements` compares resource shape, node selectors, tolerations,
+and preemption policy with that configuration. Toleration order and duplicates
+do not affect the comparison. A mismatch returns unknown, preserves the observed
+configuration, and removes capacity counts. Matching requirements do not assess
+affinity, topology, quotas, or PVC placement. Observation defaults to empty
+tolerations for all topologies. Operators must configure observation tolerations
+to match target-owned worker manifests; CPU student controllers do not define
+worker placement. Explicit observation settings do not change worker placement.
+
 Hivemind startup remains commented with a clear note. The Python controller
 waits for the optional cluster start gate while continuously refreshing a
 `start-gate` lease; readiness therefore cannot deadlock gated launch. Cluster
@@ -845,8 +867,24 @@ file path beneath their shared PVC mount. Cluster cutoff arms as soon as all
 expected resources are Ready or when its bounded readiness window expires,
 whichever comes first, and opens the optional start gate in either case. One
 missing or crash-looping pod therefore cannot prevent the runtime budget from
-starting. At the persisted deadline it deletes launch resources; all
-conversation harvest/archive code is removed.
+starting. The operator fixes the readiness deadline and latest cutoff time
+when arming the Job. The runtime budget begins on readiness or timeout, capped
+by that latest cutoff time across restarts. The Job authenticates persisted
+JSON state with a per-arm key and never sources shared files. It rejects
+symlinks and non-regular state files. State reads and temporary writes use
+nonblocking opens to avoid FIFO hangs. The Job keeps an in-memory deadline
+when state persistence fails. Failed
+start-gate writes retry only until the cutoff deadline.
+
+At the deadline, the Job deletes matching Deployments. It runs as UID/GID
+10001 with a read-only root filesystem, no added capabilities, and no privilege
+escalation. Its namespace Role permits pod observation and Deployment deletion;
+it grants no Secret or ConfigMap access. ConfigMaps, Secrets, PVC data, and
+other launch resources remain for explicit operator cleanup. Use the
+`research-tag` selector to delete retained launch ConfigMaps and Secrets as
+documented in README.md. The cutoff Job, its script ConfigMap, and its shared
+RBAC resources are separate from those launch labels. All conversation
+harvest/archive code is removed.
 
 ## Removed code
 

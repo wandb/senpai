@@ -285,16 +285,28 @@ When a smoke run stalls before W&B starts, inspect these diagnostics first.
 
 Add `--capacity_observer true` to install a dedicated observer. It uses the same
 immutable `--executor_image` and source revision, including for single-node
-fleets. Both root roles receive `get_cluster_capacity`, a no-argument tool that
-reads a sanitized ConfigMap snapshot. Without an observer it returns unknown.
+fleets. Both root roles receive `get_cluster_capacity`, which reads a sanitized
+ConfigMap snapshot. Without an observer it returns unknown.
 It never reserves resources, clears an assignment hold, or authorizes a launch.
+
+With no arguments, the tool reports capacity for the complete configuration in
+the snapshot: worker resources, node selectors, tolerations, and preemption policy.
+Supply `expected_requirements` to check that configuration against an intended
+workload. A mismatch returns unknown with the observed requirements and no counts.
+The check compares configuration values; it does not recalculate capacity or
+change the workload. Version 1 snapshots lack the complete configuration and
+return unknown as invalid.
 
 The observed worker shape comes from `--nodes_per_student`,
 `--gpus_per_student_node`, `--cpu_per_gpu`, and `--memory_gi_per_gpu`. Configure
 `--capacity_node_selector key=value ...` and
 `--capacity_tolerations '{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}'`
 to describe the intended workers. These options affect observation only; they do
-not change training manifests. Unspecified tolerations are empty. Enable
+not change training manifests. Observation defaults to no tolerations for every
+topology. Set explicit tolerations to match the target-owned worker manifests;
+CPU student controllers do not define worker placement. Use
+`capacity_tolerations: []` in YAML or `--capacity_tolerations` without values for
+an empty override. Enable
 `--capacity_hpc_verification true` only where the operator confirms CoreWeave's
 preemptible HPC-verification policy. That policy requires the verification
 namespace, exact priority class, priority -1, and verification workload name;
@@ -421,9 +433,13 @@ flowchart LR
 
 The structured result records its terminal status, exact result commit, W&B run IDs and URLs, bounded conclusion, and baseline/candidate metric comparison when available. Once published for an assignment revision and head, that evidence is immutable: exact duplicate publication is an idempotent replay, while changed evidence requires a new commit or revision. Non-revision feedback continues the same student conversation; a revision request intentionally creates a fresh revision identity and conversation.
 
-A student cannot receive another assignment while an open assignment has `status:wip` or `status:review`. The student becomes available after the advisor merges or closes the PR. Sibling assignment mutations within one worker are serialized end to end, including advisor-base publication and student preflight, push, and result publication. Across advisor and student workers, exact assignment, revision, head, and branch-lease preconditions detect stale work; if a revision wins during result publication, SENPAI restores the current revision's WIP routing before returning the stale-result error.
+Both controllers accept PR events only when the head belongs to the target repository and the PR author currently has write access. Fork PRs and PRs from authors without write access do not route assignments, reviews, or PR feedback. Each poll makes one extra permission request per distinct author of a same-repository PR targeting the advisor branch. Permission results are shared within that poll and refreshed on the next poll. A failed or invalid permission response invalidates the entire GitHub snapshot, including human Issues, so it cannot report a busy student as available. Local child and training-monitor events continue through their independent mailboxes. The added API cost and latency have not been measured in a live launch.
 
-PR comments from verified GitHub owners, members, and collaborators steer the advisor and reach the student. Submitted reviews and inline comments also reach the student. The system ignores untrusted authors, unrecognized bots, and advisor protocol comments. `get_prs` can still retrieve the complete discussion explicitly. If the configured research base changes while an experiment is running, SENPAI emits `research_base_changed` with the assignment's `required_base_sha` and the live `current_base_sha` without cancelling the assignment. When reviewing its terminal result, the advisor either requests a revision on the current base or records why that exact result remains valid with `accept_result_on_current_base`; `merge_experiment` still verifies the live SHA immediately before merging.
+The [GitHub collaborator permission API](https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user) reports effective access across repository, team, organization, and enterprise grants. Senpai accepts `permission: write` or `admin`; GitHub maps the `maintain` role to `write` and `triage` to `read`. The `role_name` field does not authorize a PR. Fine-grained tokens need repository Metadata read access for this endpoint. Keep the configured target owner/repository name current after a repository rename.
+
+An authorized open assignment PR reserves its student while it has `status:wip` or `status:review`. Merging or closing the PR releases that reservation. A successful permission lookup reporting that the author lacks write access makes the mailbox report the student as available. Assignment creation still refuses a new assignment while another open PR has that student's label and `status:wip` or `status:review`; resolve that PR before reassigning the student. Sibling assignment mutations within one worker are serialized end to end, including advisor-base publication and student preflight, push, and result publication. Across advisor and student workers, exact assignment, revision, head, and branch-lease preconditions detect stale work; if a revision wins during result publication, SENPAI restores the current revision's WIP routing before returning the stale-result error.
+
+On authorized PRs, comments from verified GitHub owners, members, and collaborators steer the advisor and reach the student. Submitted reviews and inline comments also reach the student. The system ignores untrusted authors, unrecognized bots, and advisor protocol comments. `get_prs` can still retrieve the complete discussion explicitly. If the configured research base changes while an experiment is running, SENPAI emits `research_base_changed` with the assignment's `required_base_sha` and the live `current_base_sha` without cancelling the assignment. When reviewing its terminal result, the advisor either requests a revision on the current base or records why that exact result remains valid with `accept_result_on_current_base`; `merge_experiment` still verifies the live SHA immediately before merging.
 
 A revision request may retain the assignment's recorded base SHA or select the
 exact live base SHA. Retain the recorded SHA when a follow-up must preserve the
@@ -706,6 +722,25 @@ All role images are built from the same source revision. The advisor image exclu
 The agent runs from `/opt/senpai-venv`. Before starting the controller, both role entrypoints clear `UV_PROJECT_ENVIRONMENT`, `UV_PYTHON`, and `VIRTUAL_ENV` so target-repository `uv run` and `uv sync` commands use that repository's `.venv`. Do not point target dependency installation at the agent environment: synchronizing it against a target lockfile can remove OpenHands dependencies or PyTorch while the controller is still running. If that happens, redeploy the affected pod from its pinned image to restore the agent environment.
 
 For multi-day fleets, [`arm_senpai_cluster_cutoff.sh`](scripts/arm_senpai_cluster_cutoff.sh) creates a cluster-side hard cutoff that does not depend on an operator laptop remaining online. It can also hold a shared start gate until the expected fleet is ready or its readiness deadline expires.
+
+The cutoff Job runs as UID/GID 10001 and deletes only Deployments with the
+requested `research-tag` labels. Its Role grants no Secret or ConfigMap
+access. The operator fixes the readiness deadline and latest
+cutoff time when arming the Job; restarts and failed gate writes cannot extend
+that limit. Shared cutoff state is authenticated JSON, never executable shell
+input. The shared PVC must support access by UID/GID 10001.
+
+After cutoff, remove retained launch ConfigMaps and Secrets with the existing
+label-based cleanup command. Select the context, namespace, and tags used for
+the launch:
+
+```bash
+kubectl --context "$CONTEXT" -n "$NAMESPACE" delete configmaps,secrets \
+  -l "research-tag in ($TAGS_CSV)" --ignore-not-found=true
+```
+
+This command leaves PVC data and the cutoff Job, script ConfigMap, and shared
+cutoff RBAC resources in place. Operators own their retention and cleanup.
 
 Pod startup and liveness probes read the supervisor lease. Container restarts resume the advisor or student conversation from the pod-local state volume; replacing or rescheduling the pod starts fresh state. Stop a container before copying or snapshotting a live advisor state directory.
 
