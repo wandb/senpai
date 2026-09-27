@@ -13,7 +13,7 @@ from pathlib import Path
 
 from pydantic import SecretStr
 
-from senpai_agent.git_workflow import git_process_env
+from senpai_agent.git_transport import GIT_EXECUTABLE, git_process_env
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.PROMPTS import WORKSPACE_DIVERGENCE_PROMPT
 
@@ -375,7 +375,7 @@ class StudentWorkspaceReconciler:
         timeout: int = 30,
     ) -> subprocess.CompletedProcess[str]:
         completed = subprocess.run(
-            ["git", *arguments],
+            [GIT_EXECUTABLE, *arguments],
             cwd=workspace,
             check=False,
             text=True,

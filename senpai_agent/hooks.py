@@ -4,12 +4,12 @@ import json
 import os
 import re
 import shlex
-import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from senpai_agent.git_transport import run_git
 from senpai_agent.training import training_result_paths
 
 
@@ -614,14 +614,7 @@ def _stop_policy(
                 f"{', '.join(sorted(unmonitored))}",
             )
     if require_clean_workspace:
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=working_dir,
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout
-        if status.strip():
+        if run_git(working_dir, "status", "--porcelain", "--untracked-files=all"):
             return PolicyDecision(
                 False,
                 "Commit the exact implementation before training or discard "

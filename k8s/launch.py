@@ -596,6 +596,7 @@ def render_student(
             "WANDB_ENTITY": args.wandb_entity,
             "WANDB_PROJECT": args.wandb_project,
             "WANDB_MODE": "online",
+            "WANDB_TAGS": f"senpai,{args.advisor_branch},{student_name}",
             "ADVISOR_BRANCH": args.advisor_branch,
             "GH_HISTORY_SCOPE": args.gh_history_scope,
             "SENPAI_ENABLE_HUMAN_ISSUES": "true" if args.human_issues else "false",

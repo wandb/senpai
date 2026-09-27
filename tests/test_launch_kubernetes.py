@@ -1,10 +1,10 @@
 import base64
 import json
+import os
 import subprocess
 
 import pytest
 import yaml
-
 from launch_test_support import launch, launch_args, launch_helpers
 
 
@@ -15,6 +15,90 @@ def block_unmocked_launch_writes(monkeypatch):
 
     monkeypatch.setattr(launch, "kubectl_apply", fail)
     monkeypatch.setattr(launch, "kubectl_create", fail, raising=False)
+
+
+def test_multiple_launch_tags_share_one_wandb_key(tmp_path, monkeypatch):
+    for name in os.environ:
+        if name.startswith("WANDB_API_KEY_") or name == "WANDB_INFERENCE_API_KEY":
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("WANDB_API_KEY", "shared-wandb-key")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-key")
+    monkeypatch.setenv("EXA_API_KEY", "exa-key")
+    monkeypatch.setattr(launch, "DOTENV_PATH", tmp_path / "absent.env")
+    for name in (
+        "preflight_check_target_repo_access",
+        "preflight_check_student_name_availability",
+        "preflight_check_exa_api_key",
+        "ensure_advisor_branch",
+        "ensure_target_repo_labels",
+        "ensure_new_student_slot",
+    ):
+        monkeypatch.setattr(launch, name, lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        launch, "preflight_check_target_repo_branch", lambda *_args: "main"
+    )
+    authenticated = []
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_wandb_api_key",
+        lambda key: authenticated.append(key),
+    )
+    inference_keys = []
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_wandb_inference",
+        lambda key, _entity, _project: inference_keys.append(key),
+    )
+    monkeypatch.setattr(
+        launch, "existing_student_names", lambda *_args, **_kwargs: []
+    )
+    applied = []
+    for name in ("kubectl_apply", "kubectl_create"):
+        monkeypatch.setattr(
+            launch,
+            name,
+            lambda manifest, *_args, **_kwargs: applied.extend(
+                yaml.safe_load_all(manifest)
+            ),
+        )
+    for tag in ("research-one", "research-two"):
+        args = launch_args(
+            tag=tag,
+            advisor_branch=tag,
+            wandb_entity="team",
+            wandb_project="project",
+        )
+        for profile in ("advisor", "student", "smart", "fast", "frontier"):
+            setattr(args, f"{profile}_model", "wandb/zai-org/GLM-5.2")
+            setattr(args, f"{profile}_reasoning_effort", "max")
+        monkeypatch.setattr(
+            launch.sp, "parse", lambda *_args, result=args, **_kwargs: result
+        )
+        launch.main()
+
+    assert authenticated == ["shared-wandb-key", "shared-wandb-key"]
+    assert inference_keys == authenticated
+    secrets = [resource for resource in applied if resource["kind"] == "Secret"]
+    assert len(secrets) == 2
+    assert {
+        resource["metadata"]["labels"]["research-tag"] for resource in secrets
+    } == {"research-one", "research-two"}
+    for resource in secrets:
+        assert {
+            key: base64.b64decode(value).decode()
+            for key, value in resource["data"].items()
+            if "wandb" in key
+        } == {"wandb-api-key": "shared-wandb-key"}
+    deployments = [
+        resource for resource in applied if resource["kind"] == "Deployment"
+    ]
+    assert len(deployments) == 4
+    assert len({resource["metadata"]["name"] for resource in deployments}) == 4
+    for resource in deployments:
+        container = resource["spec"]["template"]["spec"]["containers"][0]
+        assert {
+            value["name"] for value in container["env"] if "WANDB" in value["name"]
+        } == {"WANDB_API_KEY"}
 
 
 def test_kubectl_apply_raises_with_the_resource_and_error_detail(monkeypatch):

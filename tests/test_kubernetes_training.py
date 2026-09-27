@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import errno
 import json
+import os
 import re
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -140,6 +142,226 @@ def test_submitter_receives_shell_metacharacters_literally(tmp_path, monkeypatch
     terminal = runtime.get_training_status(started.training_id)
     assert terminal.state is TrainingState.FINISHED
     assert Path(terminal.log_path).read_text().splitlines()[0] == literal
+
+
+def test_submitter_masks_split_key_before_durable_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "shared-research-key")
+    monkeypatch.setenv("WANDB_SERVICE", "parent-service")
+    monkeypatch.setenv("WANDB_IDENTITY_TOKEN_FILE", "/parent/identity-token")
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch)
+    ready, proceed = workspace / "ready", workspace / "proceed"
+    environment = workspace / "environment.json"
+    code = (
+        "import json,os,pathlib,sys,time;"
+        f"pathlib.Path({str(environment)!r}).write_text(json.dumps({{key:os.environ.get(key) "
+        "for key in ['WANDB_API_KEY','WANDB_SERVICE','WANDB_IDENTITY_TOKEN_FILE']}));"
+        "key=os.environ['WANDB_API_KEY'].encode();os.write(1,b'key='+key[:7]);"
+        f"pathlib.Path({str(ready)!r}).touch();\n"
+        f"while not pathlib.Path({str(proceed)!r}).exists():time.sleep(.01)\n"
+        "os.write(2,key[7:]+b'\\n');sys.exit(1)"
+    )
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", code), cwd=workspace, timeout_seconds=5,
+    ))
+    log = Path(started.log_path)
+    try:
+        deadline = time.monotonic() + 3
+        while not ready.exists() or not log.read_bytes():
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        assert log.read_bytes() == b"key="
+        proceed.touch()
+        runtime.drain()
+        result = runtime.get_training_status(started.training_id)
+    finally:
+        proceed.touch()
+        runtime.close()
+    assert result.state is TrainingState.FAILED
+    assert "key=<secret-hidden>" in result.error_tail
+    assert "shared-research-key" not in log.read_text()
+    assert "shared-research-key" not in (tmp_path / "state" / f"{started.training_id}.json").read_text()
+    assert json.loads(environment.read_text()) == {
+        "WANDB_API_KEY": "shared-research-key", "WANDB_SERVICE": None,
+        "WANDB_IDENTITY_TOKEN_FILE": "/parent/identity-token",
+    }
+    assert os.environ["WANDB_SERVICE"] == "parent-service"
+
+
+@pytest.mark.parametrize("stop", ["eof", "detach"])
+def test_partial_submitter_key_is_masked_at_eof_or_recovery(tmp_path, monkeypatch, stop):
+    monkeypatch.setenv("WANDB_API_KEY", "shared-research-key")
+    client = FakeCluster(state=TrainingState.RUNNING)
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    ready = workspace / "ready"
+    code = (
+        "import os,pathlib,time;os.write(1,b'partial='+os.environ['WANDB_API_KEY'].encode()[:10]);"
+        f"pathlib.Path({str(ready)!r}).touch();"
+        + ("time.sleep(30)" if stop == "detach" else "")
+    )
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", code), cwd=workspace, timeout_seconds=5,
+    ))
+    try:
+        deadline = time.monotonic() + 3
+        while not ready.exists():
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        if stop == "eof":
+            client.state_value = TrainingState.FINISHED
+            runtime.drain()
+        runtime.close()
+        assert Path(started.log_path).read_text().startswith("partial=<secret-hidden>")
+        assert "shared-res" not in Path(started.log_path).read_text()
+        if stop == "detach":
+            assert client.deletions == []
+            client.state_value = TrainingState.FINISHED
+            recovered = KubernetesTrainingSupervisor(
+                workspace=workspace, state_dir=tmp_path / "state", nodes=2,
+                gpus_per_node=8, poll_seconds=.01, client=client,
+            )
+            recovered.drain()
+            result = recovered.get_training_status(started.training_id)
+            assert result.state is TrainingState.FINISHED
+            assert client.adoptions == [result.kubernetes_resource]
+            recovered.close()
+    finally:
+        runtime.close()
+
+
+def test_remote_diagnostics_and_receipt_do_not_persist_wandb_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "shared-research-key")
+
+    class LeakyCluster(FakeCluster):
+        def logs(self, resource):
+            return "remote key=shared-research-key"
+
+        def state(self, resource):
+            return TrainingState.FAILED, "failure key=shared-research-key"
+
+        def release(self, training_id):
+            super().release(training_id)
+            return {"capture_error": "key=shared-research-key"}
+
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, LeakyCluster())
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5,
+    ))
+    runtime.drain()
+    result = runtime.get_training_status(started.training_id)
+    assert result.state is TrainingState.FAILED
+    assert "remote key=<secret-hidden>" in result.kubernetes_diagnostics
+    assert "failure key=<secret-hidden>" in result.error_tail
+    assert result.kubernetes_pod_receipt == {"capture_error": "key=<secret-hidden>"}
+    assert "shared-research-key" not in Path(result.log_path).read_text()
+    assert "shared-research-key" not in (tmp_path / "state" / f"{started.training_id}.json").read_text()
+
+
+@pytest.mark.parametrize("failed_start", [1, 2])
+def test_submitter_thread_start_failure_cleans_up_and_recovers_terminal_verdict(
+    tmp_path, monkeypatch, failed_start,
+):
+    client = FakeCluster(state=TrainingState.RUNNING)
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    original_start = threading.Thread.start
+    threads = []
+
+    def fail_start(thread):
+        threads.append(thread)
+        if len(threads) == failed_start:
+            raise RuntimeError("thread resources exhausted")
+        original_start(thread)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(threading.Thread, "start", fail_start)
+        with pytest.raises(RuntimeError, match="thread resources exhausted"):
+            runtime.run_training(TrainingSpec(
+                argv=(sys.executable, "-c", "import time;time.sleep(30)"),
+                cwd=workspace, timeout_seconds=5,
+            ))
+    try:
+        assert all(not thread.is_alive() for thread in threads)
+        saved, = (tmp_path / "state").glob("*.json")
+        result = TrainingResult.model_validate_json(saved.read_text())
+        assert result.state is TrainingState.FAILED
+        assert not psutil.pid_exists(result.pid)
+        assert client.deletions and client.releases == [result.training_id]
+        recovered = KubernetesTrainingSupervisor(
+            workspace=workspace, state_dir=tmp_path / "state", nodes=2,
+            gpus_per_node=8, poll_seconds=.01, client=client,
+        )
+        recovered.drain()
+        assert recovered.get_training_status(result.training_id).state is TrainingState.FAILED
+        assert client.adoptions == []
+        recovered.close()
+    finally:
+        runtime.close()
+
+
+def test_submitter_output_failure_cannot_report_remote_success(tmp_path, monkeypatch, capsys):
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch)
+    original_open = Path.open
+
+    def fail_log_write(path, mode="r", *args, **kwargs):
+        if path.suffix == ".log" and mode in {"wb", "a"}:
+            raise PermissionError(errno.EACCES, "fixture log is not writable", str(path))
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_log_write)
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", "import time;time.sleep(.05)"),
+        cwd=workspace, timeout_seconds=5,
+    ))
+    runtime.drain()
+    result = runtime.get_training_status(started.training_id)
+    assert result.state is TrainingState.FAILED
+    assert "output capture failed" in result.error_tail
+    assert result.kubernetes_released is True
+    assert runtime.client.deletions
+    assert "Kubernetes diagnostics persistence skipped:" in capsys.readouterr().err
+
+
+def test_cancel_does_not_wait_for_detached_submitter_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "shared-research-key")
+    client = FakeCluster(state=TrainingState.RUNNING)
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    child_pid = workspace / "detached.pid"
+    writer = (
+        "import os,time\n"
+        "while True:\n"
+        " os.write(1,os.environ['WANDB_API_KEY'].encode()*256);time.sleep(.001)\n"
+    )
+    code = (
+        "import pathlib,subprocess,sys,time;"
+        f"child=subprocess.Popen([sys.executable,'-c',{writer!r}],start_new_session=True);"
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(child.pid));time.sleep(30)"
+    )
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", code), cwd=workspace, timeout_seconds=5,
+    ))
+    cancelling = threading.Thread(target=runtime.cancel_training, args=(started.training_id,))
+    try:
+        log = Path(started.log_path)
+        deadline = time.monotonic() + 3
+        while not child_pid.exists() or log.stat().st_size < 4096:
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        cancelling.start()
+        cancelling.join(3)
+        assert not cancelling.is_alive()
+        result = runtime.get_training_status(started.training_id)
+        assert result.state is TrainingState.CANCELLED
+        assert result.kubernetes_released is True
+        assert client.deletions
+        assert b"shared-research-key" not in log.read_bytes()
+    finally:
+        if child_pid.exists():
+            try:
+                os.killpg(int(child_pid.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        runtime.close()
+        if cancelling.ident is not None:
+            cancelling.join(3)
 
 
 @pytest.mark.parametrize("invalid", ["working_directory", "timeout"])

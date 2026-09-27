@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import array
 import errno
+import fcntl
 import json
 import os
 import re
+import select
 import socket
 import ssl
 import subprocess
 import sys
+import termios
 import threading
 import time
 import uuid
@@ -17,7 +21,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -39,6 +43,28 @@ _DIAGNOSTICS_SECONDS = 30.0
 _JOIN_SECONDS = 120.0
 _DETACH_GRACE_SECONDS = 0.1
 EXECUTOR_SOCKET_ENV = "SENPAI_KUBERNETES_EXECUTOR_SOCKET"
+
+
+def _mask_output_chunk(data: bytes, secret: bytes) -> tuple[bytes, bytes]:
+    """Emit complete bytes while retaining a possible split secret prefix."""
+    if not secret:
+        return data, b""
+    pieces = []
+    start = 0
+    while (match := data.find(secret, start)) >= 0:
+        pieces.extend((data[start:match], b"<secret-hidden>"))
+        start = match + len(secret)
+    tail = data[start:]
+    overlap = next(
+        (
+            size
+            for size in range(min(len(tail), len(secret) - 1), 0, -1)
+            if tail.endswith(secret[:size])
+        ),
+        0,
+    )
+    pieces.append(tail[:-overlap] if overlap else tail)
+    return b"".join(pieces), tail[-overlap:] if overlap else b""
 
 
 class KubernetesApiError(RuntimeError):
@@ -703,6 +729,9 @@ class _ActiveRemoteTraining:
     thread: threading.Thread | None = None
     next_diagnostics_at: float = 0
     diagnostics_future: Future[str] | None = None
+    output_thread: threading.Thread | None = None
+    output_stop: threading.Event = field(default_factory=threading.Event)
+    output_error: str | None = None
 
 
 class KubernetesTrainingSupervisor:
@@ -733,6 +762,7 @@ class KubernetesTrainingSupervisor:
         self.max_timeout_seconds = max_timeout_seconds
         self.terminate_grace_seconds = terminate_grace_seconds
         self.poll_seconds = poll_seconds
+        self._wandb_api_key = os.environ.get("WANDB_API_KEY", "").encode()
         socket_path = os.environ.get(
             EXECUTOR_SOCKET_ENV,
             "/var/run/senpai-kubernetes/executor.sock",
@@ -769,6 +799,8 @@ class KubernetesTrainingSupervisor:
 
         training_id: str | None = None
         process: subprocess.Popen[bytes] | None = None
+        active: _ActiveRemoteTraining | None = None
+        result: TrainingResult | None = None
         reserved = False
         try:
             training_id = str(uuid.uuid4())
@@ -789,25 +821,26 @@ class KubernetesTrainingSupervisor:
             reserved = True
             if self._shutdown.is_set():
                 raise RuntimeError("Kubernetes training supervisor is closed")
-            with log_path.open("wb") as log:
-                process = subprocess.Popen(
-                    list(spec.argv),
-                    cwd=cwd,
-                    env={
-                        **os.environ,
-                        "SENPAI_TRAINING_SOURCE_SNAPSHOT": str(source_snapshot),
-                        "SENPAI_KUBERNETES_WORKLOAD_NAME": kubernetes_spec.name,
-                        "SENPAI_KUBERNETES_NAMESPACE": kubernetes_spec.namespace,
-                        "SENPAI_WANDB_RUN_ID": kubernetes_spec.wandb_run_id,
-                        "SENPAI_LAUNCH_SECRET_NAME": os.environ[
-                            "SENPAI_LAUNCH_SECRET_NAME"
-                        ],
-                    },
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    shell=False,
-                    start_new_session=True,
-                )
+            environment = {
+                **os.environ,
+                "SENPAI_TRAINING_SOURCE_SNAPSHOT": str(source_snapshot),
+                "SENPAI_KUBERNETES_WORKLOAD_NAME": kubernetes_spec.name,
+                "SENPAI_KUBERNETES_NAMESPACE": kubernetes_spec.namespace,
+                "SENPAI_WANDB_RUN_ID": kubernetes_spec.wandb_run_id,
+                "SENPAI_LAUNCH_SECRET_NAME": os.environ["SENPAI_LAUNCH_SECRET_NAME"],
+            }
+            environment.pop("WANDB_SERVICE", None)
+            self._wandb_api_key = environment.get("WANDB_API_KEY", "").encode()
+            log_path.touch()
+            process = subprocess.Popen(
+                list(spec.argv),
+                cwd=cwd,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                shell=False,
+                start_new_session=True,
+            )
             process_group_id = process.pid
             result = TrainingResult(
                 training_id=training_id,
@@ -840,13 +873,19 @@ class KubernetesTrainingSupervisor:
                 name=f"senpai-kubernetes-training-{training_id}",
             )
             active.thread = thread
+            active.output_thread = threading.Thread(
+                target=self._record_output,
+                args=(active,),
+                name=f"senpai-kubernetes-output-{training_id}",
+            )
             with self._lock:
                 if self._shutdown.is_set():
                     raise RuntimeError("Kubernetes training supervisor is closed")
                 self._write_result(result)
                 self._active[training_id] = active
+                active.output_thread.start()
                 thread.start()
-        except BaseException:
+        except BaseException as error:
             if process is not None and process.poll() is None:
                 terminate_process_group(
                     process,
@@ -854,6 +893,29 @@ class KubernetesTrainingSupervisor:
                     grace_seconds=self.terminate_grace_seconds,
                     wait_full_grace=True,
                 )
+            if active is not None:
+                self._finish_output(active)
+            elif process is not None and process.stdout is not None:
+                process.stdout.close()
+            if result is not None:
+                try:
+                    self._write_result(
+                        result.model_copy(update={
+                            "state": TrainingState.FAILED,
+                            "exit_code": process.returncode,
+                            "elapsed_seconds": time.time() - started_at,
+                            "error_tail": (
+                                "Training supervision failed to start "
+                                f"({type(error).__name__})."
+                            ),
+                        })
+                    )
+                except OSError as storage_error:
+                    print(
+                        f"Kubernetes startup failure persistence deferred: training_id={training_id} "
+                        f"path={storage_error.filename} errno={storage_error.errno}",
+                        file=sys.stderr, flush=True,
+                    )
             if reserved and training_id is not None:
                 self._cleanup_failed_launch(training_id, kubernetes_spec)
             with self._lock:
@@ -865,6 +927,56 @@ class KubernetesTrainingSupervisor:
                 self._launching = False
                 self._launch_complete.set()
         return result
+
+    def _record_output(self, active: _ActiveRemoteTraining) -> None:
+        """Mask the inherited W&B key before submitter bytes reach disk."""
+        pending = b""
+        remaining = None
+        assert active.process is not None and active.process.stdout is not None
+        try:
+            with active.process.stdout as stream, active.log_path.open("wb") as log:
+                os.set_blocking(stream.fileno(), False)
+                while True:
+                    if remaining is None and active.output_stop.is_set():
+                        # Drain queued output without waiting for escaped descendants.
+                        queued = array.array("i", [0])
+                        fcntl.ioctl(stream.fileno(), termios.FIONREAD, queued, True)
+                        remaining = queued[0]
+                    if remaining == 0:
+                        break
+                    try:
+                        chunk = os.read(
+                            stream.fileno(),
+                            64 * 1024 if remaining is None else min(64 * 1024, remaining),
+                        )
+                    except BlockingIOError:
+                        select.select([stream], [], [], 0.05)
+                        continue
+                    if not chunk:
+                        break
+                    if remaining is not None:
+                        remaining -= len(chunk)
+                    sanitized, pending = _mask_output_chunk(
+                        pending + chunk, self._wandb_api_key,
+                    )
+                    log.write(sanitized)
+                    log.flush()
+                if pending:
+                    log.write(b"<secret-hidden>")
+        except Exception as error:  # a reader failure must fail the remote run
+            active.output_error = f"Training output capture failed ({type(error).__name__})."
+
+    @staticmethod
+    def _finish_output(active: _ActiveRemoteTraining) -> None:
+        active.output_stop.set()
+        if active.output_thread is not None and active.output_thread.ident is not None:
+            active.output_thread.join()
+        elif active.process is not None and active.process.stdout is not None:
+            active.process.stdout.close()
+
+    def _redact_output(self, text: str) -> str:
+        sanitized, pending = _mask_output_chunk(text.encode(), self._wandb_api_key)
+        return (sanitized + (b"<secret-hidden>" if pending else b"")).decode()
 
     def get_training_status(self, training_id: str) -> TrainingResult:
         result = TrainingResult.model_validate_json(
@@ -1078,9 +1190,13 @@ class KubernetesTrainingSupervisor:
                     grace_seconds=_DETACH_GRACE_SECONDS,
                     wait_full_grace=True,
                 )
-                return
+                self._finish_output(active)
+                if self._should_detach(active):
+                    return
             if launcher_exit == 0:
-                return
+                self._finish_output(active)
+                if self._should_detach(active):
+                    return
         state = TrainingState.RUNNING
         exit_code = None
         detail = ""
@@ -1088,7 +1204,11 @@ class KubernetesTrainingSupervisor:
         try:
             if active.process is not None:
                 while active.process.poll() is None:
-                    if active.cancelled or time.time() >= active.deadline_at:
+                    if (
+                        active.cancelled
+                        or active.output_error is not None
+                        or time.time() >= active.deadline_at
+                    ):
                         terminate_process_group(
                             active.process,
                             process_group_id=active.process_group_id,
@@ -1103,7 +1223,13 @@ class KubernetesTrainingSupervisor:
                             grace_seconds=_DETACH_GRACE_SECONDS,
                             wait_full_grace=True,
                         )
-                        return
+                        self._finish_output(active)
+                        if self._should_detach(active):
+                            return
+                        break
+                self._finish_output(active)
+                if active.output_error is not None:
+                    raise RuntimeError(active.output_error)
                 exit_code = active.process.returncode
                 if exit_code in {None, 0} and self._should_detach(active):
                     return
@@ -1215,8 +1341,8 @@ class KubernetesTrainingSupervisor:
             )
         except OSError:
             local_tail = ""
-        error_tail = "" if state is TrainingState.FINISHED else "\n".join(
-            part for part in (detail, local_tail) if part
+        error_tail = "" if state is TrainingState.FINISHED else self._redact_output(
+            "\n".join(part for part in (detail, local_tail) if part)
         )[-_ERROR_TAIL_BYTES:]
         terminal = self.get_training_status(training_id).model_copy(
             update={
@@ -1260,9 +1386,11 @@ class KubernetesTrainingSupervisor:
             ).start()
         if not wait and not active.diagnostics_future.done():
             return
-        detail = detail.encode()[:1024].decode(errors="ignore")
+        detail = self._redact_output(detail).encode()[:1024].decode(errors="ignore")
         diagnostics = "\n".join(
-            part for part in (detail, active.diagnostics_future.result()) if part
+            part
+            for part in (detail, self._redact_output(active.diagnostics_future.result()))
+            if part
         )
         summary = diagnostics.encode()[:_ERROR_TAIL_BYTES].decode(errors="ignore")
         result = self.get_training_status(training_id)
@@ -1274,8 +1402,6 @@ class KubernetesTrainingSupervisor:
                     result.model_copy(update={"kubernetes_diagnostics": summary})
                 )
             except OSError as error:
-                if error.errno not in {errno.ENOSPC, errno.EDQUOT}:
-                    raise
                 print(
                     f"Kubernetes diagnostics persistence skipped: training_id={training_id} "
                     f"path={error.filename} errno={error.errno}",
@@ -1339,6 +1465,7 @@ class KubernetesTrainingSupervisor:
         return (
             self._shutdown.is_set()
             and not active.cancelled
+            and active.output_error is None
             and time.time() < active.deadline_at
         )
 
@@ -1395,7 +1522,12 @@ class KubernetesTrainingSupervisor:
     def _write_result(self, result: TrainingResult) -> None:
         path = self.state_dir / f"{result.training_id}.json"
         temporary = path.with_suffix(".tmp")
-        temporary.write_text(result.model_dump_json(indent=2))
+        serialized = result.model_dump_json(indent=2)
+        if self._wandb_api_key:
+            # Receipts can contain provider messages, so protect every persisted field.
+            secret = json.dumps(self._wandb_api_key.decode(), ensure_ascii=False)[1:-1]
+            serialized = serialized.replace(secret, "<secret-hidden>")
+        temporary.write_text(serialized)
         temporary.replace(path)
 
 

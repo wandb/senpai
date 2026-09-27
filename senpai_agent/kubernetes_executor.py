@@ -60,6 +60,7 @@ class KubernetesExecutor:
         snapshot_root: Path,
         executor_image: str,
         launch_secret_name: str,
+        wandb_tags: str,
         research_tag: str,
         student_name: str,
         pod_name: str,
@@ -78,6 +79,7 @@ class KubernetesExecutor:
         self.snapshot_root = snapshot_root
         self.executor_image = executor_image
         self.launch_secret_name = launch_secret_name
+        self.wandb_tags = wandb_tags
         self.research_tag = research_tag
         self.student_name = student_name
         self.pod_name = pod_name
@@ -732,7 +734,7 @@ class KubernetesExecutor:
         allow_wandb: bool,
         wandb_run_id: str,
     ) -> bool:
-        found_key = found_run_id = False
+        found_key = found_run_id = found_tags = False
         forbidden_names = {
             "ANTHROPIC_API_KEY",
             "EXA_API_KEY",
@@ -762,9 +764,19 @@ class KubernetesExecutor:
                 if item.get("value") != wandb_run_id:
                     raise ValueError("training manifest W&B run ID does not match reservation")
                 found_run_id = True
+            if name == "WANDB_TAGS" and allow_wandb:
+                if value_from:
+                    raise ValueError("training WANDB_TAGS must use a literal value")
+                tags = self.wandb_tags.split(",") + item.get("value", "").split(",")
+                item["value"] = ",".join(dict.fromkeys(filter(None, tags)))
+                found_tags = True
         if allow_wandb and not found_run_id:
             container.setdefault("env", []).append(
                 {"name": "WANDB_RUN_ID", "value": wandb_run_id}
+            )
+        if allow_wandb and not found_tags:
+            container.setdefault("env", []).append(
+                {"name": "WANDB_TAGS", "value": self.wandb_tags}
             )
         return found_key
 
@@ -1062,6 +1074,7 @@ def serve() -> None:
         snapshot_root=Path(os.environ["SENPAI_TRAINING_SNAPSHOT_ROOT"]),
         executor_image=os.environ["SENPAI_EXECUTOR_IMAGE"],
         launch_secret_name=os.environ["SENPAI_LAUNCH_SECRET_NAME"],
+        wandb_tags=os.environ["WANDB_TAGS"],
         research_tag=os.environ["RESEARCH_TAG"],
         student_name=os.environ["STUDENT_NAME"],
         pod_name=os.environ["SENPAI_POD_NAME"],
