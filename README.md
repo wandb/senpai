@@ -279,12 +279,36 @@ nonterminal pods that are scheduled or still pending. These counts describe
 Kubernetes requests, not GPU utilization. W&B completion does not release a
 workload while evaluation or cleanup processes are still running.
 
+`get_training_status` also returns `kubernetes_pod_snapshot`, refreshed by the same
+background diagnostic cycle without truncating its structured fields. Each successful
+capture includes its timestamp, training ID, source commit, workload UID and owned
+Pod UIDs.
+For each main and init container, `image` is the image reference in the admitted Pod
+specification; `imageID` is the value reported by the Kubernetes container runtime.
+When `training_image` overrides the target image, `image` records the resulting Pod
+image reference. `imageID` is null when Kubernetes has not reported it. Its format
+and digest semantics
+depend on the container runtime. Do not infer it from the requested image reference
+or assume the two strings use the same digest representation.
+
+This evidence is available to the controller after Pod startup, not to a worker
+before it starts. The snapshot's `terminal_complete` flag describes terminal status
+coverage, so it is normally false while training runs. A successful read has
+`capture_error=null`; a failed capture replaces older live evidence with an empty
+Pod list, a new timestamp and an explicit error. No snapshot means no capture has
+been persisted yet. Check freshness and identity before using it as evidence.
+At completion, the last live snapshot retains its original timestamp; use the
+terminal receipt below for the final capture. Neither observation releases an
+execution hold or authorizes training.
+
 At release, `get_training_status` also includes `kubernetes_pod_receipt`: a structured
 snapshot bound to the training ID, source commit and exact workload UID. It records
-each observed Pod UID, owner, node, phase, and container restart count, current and
-previous states, exit code and timestamps. The executor stores each receipt beside
-its state file in `<state-stem>.receipts/<sha256(training_id)>.json`; later reservations
-do not overwrite it. The receipt is separate from the 8 KiB diagnostic text.
+each observed Pod UID, owner, node, phase, and container image reference, imageID,
+restart count, current and previous states, exit code and timestamps. The executor
+stores each receipt beside its state file in
+`<state-stem>.receipts/<sha256(training_id)>.json`; later reservations do not overwrite
+it. Existing receipts are never backfilled with later observations.
+The receipt and live snapshot are separate from the 8 KiB diagnostic text.
 
 `complete` requires the expected worker/launcher count and terminal container status
 with restart counts and termination timestamps. It describes the observed Pods,

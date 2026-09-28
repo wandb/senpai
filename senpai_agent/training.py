@@ -177,6 +177,7 @@ class TrainingResult(BaseModel):
     kubernetes_resource: KubernetesResourceRef | None = None
     kubernetes_released: bool | None = None
     kubernetes_diagnostics: str = ""
+    kubernetes_pod_snapshot: dict | None = None
     kubernetes_pod_receipt: dict | None = None
     source_snapshot: str | None = None
     source_commit: str | None = None
