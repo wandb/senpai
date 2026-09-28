@@ -30,7 +30,7 @@ from senpai_agent.models import AssignmentRecord, ExperimentResult
 from .contracts import (
     GitHubMutationObservation,
     PostAssignmentCommentAction,
-    PublishAssignmentBranchAction,
+    PushExperimentCommitAction,
     SubmitExperimentResultAction,
 )
 
@@ -157,17 +157,17 @@ class GitHubToolRuntime:
         return self.current_student()
 
 
-class PublishAssignmentBranchExecutor(
-    ToolExecutor[PublishAssignmentBranchAction, GitHubMutationObservation]
+class PushExperimentCommitExecutor(
+    ToolExecutor[PushExperimentCommitAction, GitHubMutationObservation]
 ):
-    """Publish exact source while retaining the assignment's unfinished state."""
+    """Push the student's commit without changing the experiment workflow."""
 
     def __init__(self, runtime: GitHubToolRuntime):
         self.runtime = runtime
 
     def __call__(
         self,
-        action: PublishAssignmentBranchAction,
+        action: PushExperimentCommitAction,
         conversation: LocalConversation | None = None,
     ) -> GitHubMutationObservation:
         student = self.runtime.current_student()
@@ -199,25 +199,25 @@ class PublishAssignmentBranchExecutor(
                         else ReconciliationError
                     )
                     raise error_type(
-                        f"Source commit {pushed.head_sha} was published to {pushed.branch}, "
-                        f"but assignment verification failed: {error}"
+                        f"Commit {pushed.head_sha} was pushed to GitHub branch {pushed.branch}, "
+                        f"but the assignment could not be verified afterward: {error}"
                     ) from error
             except StaleAssignmentRevisionError as error:
                 _finish_stale_assignment_turn(error, conversation)
         return GitHubMutationObservation(
             changed=pushed.changed,
             resource_url=after.url,
-            state="assignment_branch_published",
+            state="experiment_commit_pushed",
             version=after.head_sha,
         )
 
     def _preflight(
         self,
-        action: PublishAssignmentBranchAction,
+        action: PushExperimentCommitAction,
         student: str,
         expected_head_sha: str,
     ) -> tuple[PullRequestSnapshot, AssignmentRecord]:
-        return self.runtime.workflow.preflight_publish_assignment_branch(
+        return self.runtime.workflow.preflight_push_experiment_commit(
             action.assignment.pr_number,
             assignment_id=action.assignment.assignment_id,
             revision_id=action.assignment.revision_id,
@@ -228,7 +228,7 @@ class PublishAssignmentBranchExecutor(
 
     def _verify_after_push(
         self,
-        action: PublishAssignmentBranchAction,
+        action: PushExperimentCommitAction,
         student: str,
         assignment: AssignmentRecord,
     ) -> PullRequestSnapshot:
@@ -244,7 +244,8 @@ class PublishAssignmentBranchExecutor(
                 time.sleep(delay)
         if current != assignment:
             raise WorkflowPreconditionError(
-                "assignment changed during source publication; refresh before continuing"
+                "assignment changed while pushing the commit; read the current PR "
+                "and assignment instructions before continuing"
             )
         return snapshot
 

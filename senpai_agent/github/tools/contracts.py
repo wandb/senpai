@@ -15,25 +15,31 @@ from senpai_agent.models import ExperimentResult
 
 
 class AssignmentVersion(BaseModel):
-    """Exact assignment revision and pull-request head a mutation may change."""
+    """Identify the current assignment instructions and GitHub PR commit."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
 
     pr_number: int = Field(
         gt=0,
-        description="Pull-request number containing the assignment.",
+        description="Number of the existing experiment pull request on GitHub.",
     )
     assignment_id: str = Field(
         min_length=1,
-        description="Stable assignment ID from the trusted assignment marker.",
+        description=(
+            "Stable assignment ID from the advisor's current assignment record "
+            "on the PR."
+        ),
     )
     revision_id: str = Field(
         min_length=1,
-        description="Current revision ID from the trusted assignment marker.",
+        description="Revision ID for the current instructions in that assignment record.",
     )
     expected_pr_head_sha: str = Field(
         min_length=1,
-        description="Current pull-request head SHA. The mutation fails if the PR moved.",
+        description=(
+            "Git commit identifier (SHA) at the head of the GitHub PR when you read it; "
+            "used to detect later changes."
+        ),
     )
 
 
@@ -88,18 +94,23 @@ class PublishAdvisorBranchAction(Action):
     )
 
 
-class PublishAssignmentBranchAction(Action):
-    """Publish the current student's source without submitting a result."""
+class PushExperimentCommitAction(Action):
+    """Push the student's exact local commit to the experiment PR branch."""
 
     assignment: AssignmentVersion = Field(
         description=(
-            "Current student assignment revision and PR-head lease. Exact replay "
-            "also accepts a head already equal to local_commit_sha."
+            "The experiment PR number, assignment ID, current instruction revision ID "
+            "and current GitHub PR head SHA. Read these from the current PR and "
+            "advisor assignment record. Retrying the same push also succeeds if "
+            "the PR already points to local_commit_sha."
         ),
     )
     local_commit_sha: str = Field(
         min_length=1,
-        description="Exact local commit to publish; the clean worktree HEAD must equal it.",
+        description=(
+            "Exact Git commit identifier (SHA) to push. It must equal the current "
+            "local commit (HEAD), and there must be no uncommitted changes."
+        ),
     )
 
 
