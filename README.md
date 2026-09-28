@@ -182,6 +182,14 @@ example, configure Claude Opus 5.5 as `anthropic/claude-opus-5-5`. Anthropic
 Sonnet 5 stays provider-native and is sent as `output_config.effort: max`; it
 does not enable OpenAI Pro mode.
 
+Use `openai/gpt-6-astra` for GPT-6 Astra. Senpai sends tool calls through
+Responses and preserves `low`, `medium`, `high`, `xhigh`, or `max`; Astra rejects
+`none`. As with GPT-5.6, `max` also enables OpenAI Pro mode. Astra uses the
+30-minute explicit cache, provider-native compaction, and its documented
+1,050,000-token total context and 128,000-token output limits. It does not send
+sampling parameters. Change the main and smart/fast/frontier profile models
+independently, retaining each profile's reasoning effort.
+
 `compaction_trigger_tokens` sets the compaction limit. OpenAI and Anthropic
 apply it for their models; OpenHands handles compaction for other providers.
 
