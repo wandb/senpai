@@ -321,13 +321,19 @@ When a smoke run stalls before W&B starts, inspect these diagnostics first.
 
 Build and publish your training image before launch. Set `training_image` to run
 training in that image while Senpai supplies the student agent and executor.
-Your image keeps its Python, CUDA, and installed dependencies; it does not need
-Senpai, OpenHands, or Git. Use a Linux image that supports your worker
+Your image supplies Python, CUDA, and installed dependencies; it does not need
+Senpai, OpenHands, or Git. Senpai overrides its entrypoint and mounts fresh
+directories at `/workspace` and `/home/senpai`. Install required software outside
+those paths and include required startup setup in the submitted command.
+Use a Linux image that supports your worker
 architecture, GPU driver, and training command. It must provide Python 3.9 or newer as `python3` and
 allow the command to run as UID/GID 10001. Multi-node images also need compatible
-OpenMPI 5/PRRTE under `/usr` and OpenSSH server binaries, plus a `senpai` account with UID/GID 10001
-and a writable `/home/senpai`. Senpai supplies the worker bootstrap; no
-Senpai Python package is required in the image.
+OpenMPI 5/PRRTE under `/usr` and OpenSSH server binaries, plus a `senpai` account
+with UID/GID 10001, home `/home/senpai`, and a login shell. The account must allow
+public-key SSH authentication with `UsePAM no`; a locked account cannot log in.
+Senpai supplies the writable home directory, SSH keys, and worker bootstrap.
+Password authentication stays disabled. No Senpai Python package is required
+in the image.
 
 Any registry reachable by the cluster works, including GitHub Container Registry,
 Docker Hub, and CoreWeave Container Registry. Supply an immutable digest:
@@ -886,7 +892,7 @@ reply repeats the owner lookup; later replies receive no automatic mentions.
 
 All role images are built from the same source revision. The advisor image excludes CUDA and PyTorch; the student image contains the CUDA/PyTorch runtime; the executor image contains only its Python broker; the cutoff image contains only the minimal job runtime and pinned `kubectl`. Advisor and student builds install Chromium and execute an OpenHands browser smoke test.
 
-The agent runs from the read-only `/opt/senpai-venv`. Both role entrypoints clear inherited `UV_PROJECT_ENVIRONMENT`, `UV_PYTHON`, and `VIRTUAL_ENV` values before starting the controller. Terminals and local supervised training then select the separate writable environment at `$HOME/.venvs/senpai-target` through PATH and uv settings. Install target dependencies there; keep the agent environment unchanged.
+The agent runs from the read-only `/opt/senpai-venv`. Both role entrypoints clear inherited `UV_PROJECT_ENVIRONMENT`, `UV_PYTHON`, and `VIRTUAL_ENV` values before starting the controller. Controller terminals use the writable environment at `$HOME/.venvs/senpai-target` through PATH and uv settings. Standard training workers create a separate environment at that path; controller-installed dependencies do not transfer. Install target dependencies in the environment that will run them; keep the agent environment unchanged.
 
 For multi-day fleets, [`arm_senpai_cluster_cutoff.sh`](scripts/arm_senpai_cluster_cutoff.sh) creates a cluster-side hard cutoff that does not depend on an operator laptop remaining online. It can also hold a shared start gate until the expected fleet is ready or its readiness deadline expires.
 

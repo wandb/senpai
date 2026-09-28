@@ -350,8 +350,10 @@ working directory cannot shadow the installed runner. These controls protect
 runtime imports and assets; they do not sandbox target code or freeze the
 operator's system-instruction files.
 
-`SENPAI_TARGET_PYTHON_ENV` selects a writable target venv for terminals and
-training. Its site-packages include the trusted environment through a `.pth`
+For standard Senpai images, `SENPAI_TARGET_PYTHON_ENV` selects a writable target
+venv for terminals and training. Controllers and workers create separate venvs;
+controller-installed packages do not transfer to workers. Each venv's
+site-packages include the trusted environment through a `.pth`
 path entry. Target packages can override those shared packages without writing
 to the trusted environment. The image includes pip so additive target installs
 can resolve packages on the shared path. uv resolves a separate target package
