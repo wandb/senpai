@@ -35,7 +35,7 @@ def exa_service(monkeypatch):
     calls = []
     response = {"results": []}
 
-    def request(client, path, options):
+    def request(client, path, options, *, headers=None):
         calls.append((client.headers["x-api-key"], path, options))
         return response
 

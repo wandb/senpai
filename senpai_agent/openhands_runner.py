@@ -1114,16 +1114,6 @@ def openai_responses_configuration(
         "responses_store": True,
         "responses_use_previous_response_id": True,
     }
-    if model.lower() == "openai/gpt-6-astra":
-        configuration.update(
-            capability_overrides={
-                "supports_reasoning_effort": True,
-                "supports_sampling_params": False,
-                "supports_vision": True,
-            },
-            max_input_tokens=1_050_000,
-            max_output_tokens=128_000,
-        )
     if reasoning := _openai_pro_reasoning(model, reasoning_effort):
         configuration["litellm_extra_body"] = {
             "reasoning": reasoning,

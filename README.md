@@ -186,7 +186,7 @@ Use `openai/gpt-6-astra` for GPT-6 Astra. Senpai sends tool calls through
 Responses and preserves `low`, `medium`, `high`, `xhigh`, or `max`; Astra rejects
 `none`. As with GPT-5.6, `max` also enables OpenAI Pro mode. Astra uses the
 30-minute explicit cache, provider-native compaction, and its documented
-1,050,000-token context and 128,000-token output limits. It does not send
+1,050,000-token total context and 128,000-token output limits. It does not send
 sampling parameters. Change the main and smart/fast/frontier profile models
 independently, retaining each profile's reasoning effort.
 
