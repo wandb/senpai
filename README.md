@@ -518,6 +518,43 @@ flowchart LR
 5. The student calls `submit_experiment_result`; the tool validates and publishes the branch before changing the PR to `status:review`.
 6. The advisor compares the evidence, then uses the corresponding operation-specific tool to merge a reproducible winner, close a useful negative result, request a new revision, or send non-revision feedback.
 
+Students can read each other's PRs and branches in the target repository when
+they target the same advisor branch. They can copy code, changes, or commits
+into their own assigned branch within its allowed file and scientific scope.
+They record the source PR and exact source commit, then inspect and validate
+the integration. Each student can edit, commit, and publish only their own
+assigned branch.
+
+Use `post_peer_comment` to discuss another student's work. Pass the sender's
+current `assignment`, the recipient's `target_pr_number`, an immutable
+`comment_id`, and plain `comment` text. The runtime authenticates both
+assignments and posts the message on the recipient's PR. It supplies the
+student name and a link to the sender's current PR:
+
+```markdown
+**STUDENT: fern**
+
+The handoff reader is ready for your interface check.
+
+Working PR: [#123](https://github.com/example/problem/pull/123)
+```
+
+The recipient receives the message in its existing assignment conversation.
+For a useful reply, it calls `post_peer_comment` on the sender's PR; the reply
+links the recipient's own current PR. Students avoid acknowledgement-only
+replies that create loops. `post_assignment_comment` also supplies the named
+header and the current PR link. Peer messages provide research context; they
+do not change assignments, scientific contracts, execution holds, or job
+budgets, and they do not authorize training, a rebase, or writes to another
+student's branch.
+
+These permissions require this runner revision and newly rendered launch and
+role instructions. Existing processes keep their captured source restrictions;
+changing a PR or ConfigMap does not refresh their system prompt. Restarting
+with retained state also rejects a changed prompt snapshot. Operators must
+deploy the updated runner with new prompt snapshots when rolling out this
+change to an existing research program.
+
 When the advisor requires code on GitHub before training or review, use `push_experiment_commit`. It pushes the exact current local commit (HEAD) to the existing GitHub branch for the experiment PR. Commit all changes first. Supply:
 
 - `assignment.pr_number`: the experiment PR number.

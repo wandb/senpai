@@ -110,6 +110,21 @@ class AssignmentCommentRecord(Contract):
     comment_id: _NonEmptyString
 
 
+class StudentPeerCommentRecord(Contract):
+    """One immutable message between two student assignment revisions."""
+
+    schema_version: Literal[1] = 1
+    repo: _NonEmptyString
+    pr_number: int = Field(gt=0)
+    assignment_id: _NonEmptyString
+    revision_id: _NonEmptyString
+    student: _NonEmptyString
+    source_pr_number: int = Field(gt=0)
+    source_assignment_id: _NonEmptyString
+    source_revision_id: _NonEmptyString
+    comment_id: _NonEmptyString
+
+
 class ResearchBaseAcceptanceRecord(Contract):
     """Durable approval of one exact result against a changed research base."""
 
@@ -246,6 +261,11 @@ _ASSIGNMENT_COMMENT_MARKER = re.compile(
     r"<!-- senpai-assignment-comment:v(?P<version>[0-9]+) "
     r"(?P<payload>\{.*\}) -->"
 )
+_STUDENT_PEER_COMMENT_PREFIX = "<!-- senpai-student-peer-comment:"
+_STUDENT_PEER_COMMENT_MARKER = re.compile(
+    r"<!-- senpai-student-peer-comment:v(?P<version>[0-9]+) "
+    r"(?P<payload>\{.*\}) -->"
+)
 _RESEARCH_BASE_ACCEPTANCE_PREFIX = "<!-- senpai-research-base-acceptance:"
 _RESEARCH_BASE_ACCEPTANCE_MARKER = re.compile(
     r"<!-- senpai-research-base-acceptance:v(?P<version>[0-9]+) "
@@ -296,6 +316,10 @@ def render_assignment_feedback_marker(feedback: AssignmentFeedbackRecord) -> str
 
 def render_assignment_comment_marker(comment: AssignmentCommentRecord) -> str:
     return f"<!-- senpai-assignment-comment:v1 {_marker_payload(comment)} -->"
+
+
+def render_student_peer_comment_marker(comment: StudentPeerCommentRecord) -> str:
+    return f"<!-- senpai-student-peer-comment:v1 {_marker_payload(comment)} -->"
 
 
 _MarkerContract = TypeVar("_MarkerContract", bound=Contract)
@@ -349,6 +373,18 @@ def parse_assignment_feedback_markers(
         pattern=_ASSIGNMENT_FEEDBACK_MARKER,
         contract=AssignmentFeedbackRecord,
         name="assignment feedback",
+    )
+
+
+def parse_student_peer_comment_markers(
+    body: str,
+) -> tuple[StudentPeerCommentRecord, ...]:
+    return _parse_contract_markers(
+        body,
+        prefix=_STUDENT_PEER_COMMENT_PREFIX,
+        pattern=_STUDENT_PEER_COMMENT_MARKER,
+        contract=StudentPeerCommentRecord,
+        name="student peer comment",
     )
 
 

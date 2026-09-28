@@ -19,6 +19,8 @@ from senpai_agent.github.tools import (
     MergeExperimentTool,
     PostAssignmentCommentAction,
     PostAssignmentCommentTool,
+    PostPeerCommentAction,
+    PostPeerCommentTool,
     PublishAdvisorBranchAction,
     PublishAdvisorBranchTool,
     RepairAssignmentRoutingAction,
@@ -28,7 +30,11 @@ from senpai_agent.github.tools import (
     SendAssignmentFeedbackAction,
     SendAssignmentFeedbackTool,
 )
-from senpai_agent.github.workflow import MutationResult, StaleAssignmentRevisionError
+from senpai_agent.github.workflow import (
+    MutationResult,
+    ReconciliationError,
+    StaleAssignmentRevisionError,
+)
 from senpai_agent.models import DispositionRecord, render_disposition_marker
 
 
@@ -76,13 +82,14 @@ def student_runtime(
     workspace: Path,
     *,
     student_name: str | None = "student-one",
+    advisor_branch: str | None = "advisor-branch",
 ) -> GitHubToolRuntime:
     return GitHubToolRuntime(
         workflow=workflow,
         workspace=workspace,
         git_token=None,
         role="student",
-        advisor_branch=None,
+        advisor_branch=advisor_branch,
         student_names=frozenset(),
         student_name=student_name,
     )
@@ -97,22 +104,42 @@ def assignment() -> AssignmentVersion:
     )
 
 
-def test_student_comment_binds_runtime_student_and_exact_assignment(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("tool_type", "action_type", "method", "target"),
+    [
+        (
+            PostAssignmentCommentTool,
+            PostAssignmentCommentAction,
+            "post_assignment_comment",
+            {},
+        ),
+        (
+            PostPeerCommentTool,
+            PostPeerCommentAction,
+            "post_peer_comment",
+            {"target_pr_number": 18},
+        ),
+    ],
+)
+def test_student_comment_binds_runtime_student_and_exact_assignment(
+    tmp_path: Path, tool_type, action_type, method, target
+):
     workflow = RecordingWorkflow()
-    tool = PostAssignmentCommentTool.create(student_runtime(workflow, tmp_path))[0]
+    tool = tool_type.create(student_runtime(workflow, tmp_path))[0]
 
     observation = tool(
-        PostAssignmentCommentAction(
+        action_type(
             assignment=assignment(),
             comment_id="paired-run-started",
             comment="The paired run has started.",
+            **target,
         )
     )
 
-    assert observation.state == "post_assignment_comment"
+    assert observation.state == method
     assert workflow.calls == [
         (
-            "post_assignment_comment",
+            method,
             17,
             {
                 "assignment_id": "assignment-17",
@@ -121,23 +148,54 @@ def test_student_comment_binds_runtime_student_and_exact_assignment(tmp_path: Pa
                 "student": "student-one",
                 "comment_id": "paired-run-started",
                 "comment": "The paired run has started.",
+                **target,
+                **({"advisor_branch": "advisor-branch"} if target else {}),
             },
         )
     ]
 
 
-def test_student_comment_requires_configured_student_before_mutation(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("tool_type", "action_type", "target", "runtime_options", "error"),
+    [
+        (
+            PostAssignmentCommentTool,
+            PostAssignmentCommentAction,
+            {},
+            {"student_name": None},
+            "student name",
+        ),
+        (
+            PostPeerCommentTool,
+            PostPeerCommentAction,
+            {"target_pr_number": 18},
+            {"student_name": None},
+            "student name",
+        ),
+        (
+            PostPeerCommentTool,
+            PostPeerCommentAction,
+            {"target_pr_number": 18},
+            {"advisor_branch": None},
+            "advisor branch",
+        ),
+    ],
+)
+def test_student_comment_requires_configured_identity_before_mutation(
+    tmp_path: Path, tool_type, action_type, target, runtime_options, error
+):
     workflow = RecordingWorkflow()
-    tool = PostAssignmentCommentTool.create(
-        student_runtime(workflow, tmp_path, student_name=None)
+    tool = tool_type.create(
+        student_runtime(workflow, tmp_path, **runtime_options)
     )[0]
 
-    with pytest.raises(RuntimeError, match="student name"):
+    with pytest.raises(RuntimeError, match=error):
         tool(
-            PostAssignmentCommentAction(
+            action_type(
                 assignment=assignment(),
                 comment_id="blocked",
                 comment="The experiment is blocked.",
+                **target,
             )
         )
 
@@ -170,6 +228,38 @@ def test_stale_student_comment_finishes_the_obsolete_conversation(tmp_path: Path
 
     assert conversation.state.execution_status is ConversationExecutionStatus.FINISHED
     assert [call[0] for call in workflow.calls] == ["post_assignment_comment"]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (StaleAssignmentRevisionError, ConversationExecutionStatus.FINISHED),
+        (ReconciliationError, ConversationExecutionStatus.RUNNING),
+    ],
+    ids=("sender-reassigned", "recipient-reassigned"),
+)
+def test_peer_comment_only_finishes_a_stale_sender_turn(tmp_path, error, expected_status):
+    class ChangedWorkflow(RecordingWorkflow):
+        def post_peer_comment(self, number, **kwargs):
+            raise error("assignment changed while posting comment")
+
+    tool = PostPeerCommentTool.create(student_runtime(ChangedWorkflow(), tmp_path))[0]
+    conversation = SimpleNamespace(
+        state=SimpleNamespace(execution_status=ConversationExecutionStatus.RUNNING)
+    )
+
+    with pytest.raises(ValueError if error is StaleAssignmentRevisionError else error):
+        tool(
+            PostPeerCommentAction(
+                assignment=assignment(),
+                target_pr_number=18,
+                comment_id="stale-peer-message",
+                comment="This interface question requires the current assignment.",
+            ),
+            conversation,
+        )
+
+    assert conversation.state.execution_status is expected_status
 
 
 def test_create_assignment_uses_the_created_branch_head_for_the_pr(

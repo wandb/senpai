@@ -67,7 +67,9 @@ class HumanIssueMixin:
 
             mentions = self._token_owner_mention()
             content = f"{body}\n\n{mentions}" if mentions else body
-            rendered = role_prefixed_comment(marker_body(marker, content), self._role)
+            rendered = role_prefixed_comment(
+                marker_body(marker, content), self._role, student=creator
+            )
             labels = {"human", audience_label}
             self._mutate(
                 "POST",
@@ -206,6 +208,7 @@ class HumanIssueMixin:
             number,
             marker=marker,
             body=comment_body,
+            student=responder,
         )
         # Elect the first reply only after GitHub has persisted it. Independent
         # pods may all observe no replies before posting their own comments.
@@ -220,6 +223,7 @@ class HumanIssueMixin:
                     number,
                     marker=marker,
                     body=marker_body(marker, f"{body}\n\n{mentions}"),
+                    student=responder,
                 )
                 changed = changed or mentioned
         self._human_issue(number, audience_labels=audience_labels)

@@ -14,6 +14,8 @@ from senpai_agent.github.tools import (
     MergeExperimentTool,
     PostAssignmentCommentAction,
     PostAssignmentCommentTool,
+    PostPeerCommentAction,
+    PostPeerCommentTool,
     PublishAdvisorBranchTool,
     PushExperimentCommitTool,
     RepairAssignmentRoutingTool,
@@ -40,6 +42,7 @@ EXPECTED_FIELDS = {
         "local_commit_sha",
     },
     "post_assignment_comment": {"assignment", "comment_id", "comment"},
+    "post_peer_comment": {"assignment", "target_pr_number", "comment_id", "comment"},
     "push_experiment_commit": {"assignment", "local_commit_sha"},
     "repair_assignment_routing": {"assignment", "working_state", "blockers"},
     "send_assignment_feedback": {"assignment", "feedback_id", "comment"},
@@ -90,6 +93,7 @@ def github_tools(tmp_path: Path):
         PublishAdvisorBranchTool,
         PushExperimentCommitTool,
         PostAssignmentCommentTool,
+        PostPeerCommentTool,
         RepairAssignmentRoutingTool,
         SendAssignmentFeedbackTool,
         RequestAssignmentRevisionTool,
@@ -173,7 +177,11 @@ def test_operation_specific_actions_reject_fields_from_other_tools():
         )
 
 
-def test_student_comment_contract_rejects_empty_and_foreign_fields():
+@pytest.mark.parametrize(
+    ("action", "target"),
+    [(PostAssignmentCommentAction, {}), (PostPeerCommentAction, {"target_pr_number": 18})],
+)
+def test_student_comment_contract_rejects_empty_and_foreign_fields(action, target):
     assignment = {
         "pr_number": 17,
         "assignment_id": "assignment-17",
@@ -181,16 +189,17 @@ def test_student_comment_contract_rejects_empty_and_foreign_fields():
         "expected_pr_head_sha": "a" * 40,
     }
     with pytest.raises(ValidationError, match="comment_id"):
-        PostAssignmentCommentAction.model_validate(
-            {"assignment": assignment, "comment_id": "", "comment": "Progress."}
+        action.model_validate(
+            {"assignment": assignment, "comment_id": "", "comment": "Progress.", **target}
         )
     with pytest.raises(ValidationError, match="student"):
-        PostAssignmentCommentAction.model_validate(
+        action.model_validate(
             {
                 "assignment": assignment,
                 "comment_id": "progress-1",
                 "comment": "Progress.",
                 "student": "student-one",
+                **target,
             }
         )
 
