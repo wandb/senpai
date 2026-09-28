@@ -12,6 +12,10 @@ permissions:
 jobs:
   runtime:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -20,24 +24,26 @@ jobs:
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
           version: "0.10.9"
 
       - name: Install runtime test dependencies
         run: |
-          uv lock --check
-          uv venv --python 3.13
+          uv lock --check --python "${{ matrix.python-version }}"
+          uv venv --python "${{ matrix.python-version }}"
           uv pip install --python .venv/bin/python \
             pytest \
             psutil \
             python-dotenv \
             simple-parsing \
-            wandb \
-            "exa-py @ https://github.com/exa-labs/exa-py/archive/71f315b4be07d474df128c8fafc70cc7d0e47b56.tar.gz" \
-            "weave>=0.53.1,<0.54" \
-            "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@c1e9cda697e10ee92e5629b19c7d81cac8bcf54b" \
-            "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@f69134273ee3a31a233d6201786570eb9c4c141b#subdirectory=openhands-sdk" \
-            "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@f69134273ee3a31a233d6201786570eb9c4c141b#subdirectory=openhands-tools"
+            "wandb>=0.30.0" \
+            "exa-py>=2.22.2" \
+            "litellm>=1.102.1" \
+            "binaryornot==0.4.4" \
+            "weave>=0.53.11,<0.54" \
+            "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@bdc58d4190c3df064fc3fe173de76c510bf15abf" \
+            "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@03b60423725411ad485b665009024b6444694cc7#subdirectory=openhands-sdk" \
+            "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@03b60423725411ad485b665009024b6444694cc7#subdirectory=openhands-tools"
 
       - name: Test the complete control plane (no cluster)
         run: .venv/bin/python -m pytest

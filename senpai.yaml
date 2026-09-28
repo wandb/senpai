@@ -28,6 +28,10 @@ target_repo_branch: ""
 # Overrides must use digests or matching sha-<full-commit> tags.
 advisor_image: ""
 student_image: ""
+# Optional custom training image, pinned by digest. Blank uses student_image.
+training_image: ""
+# Existing registry credential secrets in the launch namespace.
+image_pull_secrets: []
 executor_image: "" # An explicit override must use an immutable @sha256 digest.
 
 # Kubernetes target

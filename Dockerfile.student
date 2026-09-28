@@ -1,7 +1,6 @@
-FROM ghcr.io/coreweave/ml-containers/torch-extras:b1daf4e-base-cuda13.2.1-ubuntu24.04-torch2.12.0-vision0.27.0-audio2.11.0-abi1
+FROM ghcr.io/coreweave/ml-containers/torch-extras:b903737-nccl-cuda13.3.1-ubuntu26.04-nccl2.32.3-1-torch2.14.0-vision0.29.0-audio2.11.0-abi1@sha256:20b767c34e480988d057513edeb503512d7ce0037819a6b49872e2402fc13626
 
-ARG PYTHON_VERSION=3.13
-ARG PLAYWRIGHT_VERSION=1.55.0
+ARG PLAYWRIGHT_VERSION=1.63.0
 ARG SENPAI_SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.revision="${SENPAI_SOURCE_REVISION}"
 
@@ -9,7 +8,6 @@ ENV PATH="/opt/senpai-venv/bin:/home/senpai/.local/bin:${PATH}" \
     PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
     SENPAI_AGENT_DIR=/opt/senpai-agent-definitions \
     SENPAI_PLUGIN=/opt/senpai-plugin \
-    UV_PYTHON_INSTALL_DIR=/opt/uv-python \
     SENPAI_IMAGE_REVISION="${SENPAI_SOURCE_REVISION}" \
     BROWSER_USE_DISABLE_EXTENSIONS=1
 
@@ -31,11 +29,9 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y gh && \
     rm -rf /var/lib/apt/lists/*
 
-# The CoreWeave base currently ships Python 3.12. Use a pinned uv to install
-# CPython 3.13 and make it the image-wide python/python3 runtime.
+# Use the CoreWeave Python 3.14 runtime with isolated agent dependencies.
 COPY --from=ghcr.io/astral-sh/uv:0.10.9@sha256:10902f58a1606787602f303954cea099626a4adb02acbac4c69920fe9d278f82 /uv /uvx /usr/local/bin/
-RUN uv python install --install-dir "$UV_PYTHON_INSTALL_DIR" "$PYTHON_VERSION" && \
-    uv venv --python "$PYTHON_VERSION" /opt/senpai-venv && \
+RUN uv venv --python /usr/bin/python3 /opt/senpai-venv && \
     python --version
 
 ENV SENPAI_PYTHON=/opt/senpai-venv/bin/python \
@@ -47,7 +43,7 @@ COPY senpai_agent /tmp/senpai/senpai_agent
 COPY .agents/agents /opt/senpai-agent-definitions
 COPY plugins/senpai /opt/senpai-plugin
 RUN cd /tmp/senpai && \
-    uv export --locked --python 3.13 --no-dev --no-emit-project \
+    uv export --locked --python 3.14 --no-dev --no-emit-project \
       --format requirements.txt > requirements.txt && \
     uv pip install --python "$SENPAI_PYTHON" --upgrade \
       --only-binary cryptography \
@@ -58,12 +54,12 @@ RUN cd /tmp/senpai && \
       --only-binary rpds-py \
       -r requirements.txt && \
     uv pip install --python "$SENPAI_PYTHON" --no-deps --compile-bytecode /tmp/senpai "pip==25.3" && \
-    python -P -c 'import importlib.metadata, openhands.sdk, senpai_agent, sys, torch; assert sys.version_info[:2] == (3, 13); assert torch.__version__.startswith("2.13."); assert torch.version.cuda and torch.version.cuda.startswith("13."); assert importlib.metadata.version("openhands-sdk") == "1.40.0"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
+    python -P -c 'import importlib.metadata, openhands.sdk, senpai_agent, sys, torch; assert sys.version_info[:2] == (3, 14); assert torch.__version__.startswith("2.14."); assert torch.version.cuda and torch.version.cuda.startswith("13."); assert importlib.metadata.version("openhands-sdk") == "1.49.6"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
     python -P -m senpai_agent.agent_markdown "$SENPAI_PLUGIN" && \
     chown -R root:root \
-      /opt/senpai-venv "$UV_PYTHON_INSTALL_DIR" "$SENPAI_AGENT_DIR" "$SENPAI_PLUGIN" && \
+      /opt/senpai-venv "$SENPAI_AGENT_DIR" "$SENPAI_PLUGIN" && \
     chmod -R a-w \
-      /opt/senpai-venv "$UV_PYTHON_INSTALL_DIR" "$SENPAI_AGENT_DIR" "$SENPAI_PLUGIN" && \
+      /opt/senpai-venv "$SENPAI_AGENT_DIR" "$SENPAI_PLUGIN" && \
     rm -rf /root/.cache/uv /tmp/senpai
 
 COPY scripts/senpai-browser-smoke-test.py /usr/local/bin/senpai-browser-smoke-test
@@ -84,7 +80,6 @@ RUN uvx --from "playwright==${PLAYWRIGHT_VERSION}" \
 # Use the standard NVIDIA Container Toolkit contract on supported x86_64 hosts.
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-    NVIDIA_REQUIRE_CUDA="cuda>=13.0" \
     TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0;10.0;10.3;12.0+PTX"
 
 COPY scripts/senpai-gpu-smoke-test.py /usr/local/bin/senpai-gpu-smoke-test

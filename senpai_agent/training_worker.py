@@ -13,43 +13,42 @@ import sys
 import sysconfig
 import time
 
-from senpai_agent.target_environment import install_shared_console_scripts
-from senpai_agent.training import target_python_environment
-
 
 def run() -> None:
-    workspace = Path(os.environ.get("SENPAI_TRAINING_WORKSPACE", "/workspace")).resolve()
-    command = json.loads(base64.b64decode(os.environ["SENPAI_TRAINING_COMMAND_B64"], validate=True))
+    environment = dict(os.environ)
+    if "OMPI_COMM_WORLD_RANK" in environment and not environment.get("SENPAI_TARGET_PYTHON_ENV"):
+        # SSH replaces the image environment before starting the MPI daemon.
+        environment.update(json.loads((Path.home() / ".senpai-ssh/environment.json").read_text()))
+    workspace = Path(environment.get("SENPAI_TRAINING_WORKSPACE", "/workspace")).resolve()
+    command = json.loads(base64.b64decode(environment["SENPAI_TRAINING_COMMAND_B64"], validate=True))
     cwd = Path(command["cwd"]).resolve()
     if not cwd.is_relative_to(workspace):
         raise ValueError("training directory must be inside the source checkout")
-    target_env = Path(os.environ.get(
-        "SENPAI_TARGET_PYTHON_ENV", "/home/senpai/.venvs/senpai-target",
-    ))
-    output = Path(os.environ["SENPAI_TRAINING_OUTPUT_DIR"])
+    output = Path(environment["SENPAI_TRAINING_OUTPUT_DIR"])
     output.mkdir(parents=True, exist_ok=True)
-    environment = dict(os.environ)
     for key in ("WANDB_SERVICE", "WANDB_IDENTITY_TOKEN_FILE", "PYTHONSAFEPATH"):
         environment.pop(key, None)
-    environment.update({
-        "SENPAI_TARGET_PYTHON_ENV": str(target_env),
-        "UV_CACHE_DIR": str(output.parent / ".uv-cache"),
-        "UV_LINK_MODE": "copy",
-        "NODE_RANK": environment.get("OMPI_COMM_WORLD_RANK", "0"),
-    })
-    subprocess.run(
-        ["uv", "venv", "--no-project", "--no-config", "--no-python-downloads",
-         "--python", sys.executable, str(target_env)],
-        check=True, env=environment,
-    )
-    site = Path(sysconfig.get_path("purelib", vars={"base": str(target_env)}))
-    (site / "senpai-runtime.pth").write_text(sysconfig.get_path("purelib") + "\n")
-    install_shared_console_scripts(target_env)
-    environment.update(target_python_environment(environment))
-    subprocess.run(
-        ["git", "config", "--global", "--add", "safe.directory", str(workspace)],
-        check=True, env=environment,
-    )
+    environment["NODE_RANK"] = os.environ.get("OMPI_COMM_WORLD_RANK", "0")
+    if target_path := environment.get("SENPAI_TARGET_PYTHON_ENV"):
+        # Only the standard Senpai image has an immutable base environment.
+        from senpai_agent.target_environment import install_shared_console_scripts
+        from senpai_agent.training import target_python_environment
+
+        target_env = Path(target_path)
+        environment.update({"UV_CACHE_DIR": str(output.parent / ".uv-cache"), "UV_LINK_MODE": "copy"})
+        subprocess.run(
+            ["uv", "venv", "--no-project", "--no-config", "--no-python-downloads",
+             "--python", sys.executable, str(target_env)],
+            check=True, env=environment,
+        )
+        site = Path(sysconfig.get_path("purelib", vars={"base": str(target_env)}))
+        (site / "senpai-runtime.pth").write_text(sysconfig.get_path("purelib") + "\n")
+        install_shared_console_scripts(target_env)
+        environment.update(target_python_environment(environment))
+        subprocess.run(
+            ["git", "config", "--global", "--add", "safe.directory", str(workspace)],
+            check=True, env=environment,
+        )
     os.chdir(cwd)
     os.execvpe(command["argv"][0], command["argv"], environment)
 
@@ -90,24 +89,45 @@ def mpi() -> None:
     argv = [
         "/usr/bin/mpirun", "--hostfile", "/etc/mpi/hostfile",
         "-np", os.environ["NNODES"], "--map-by", "ppr:1:node", "--bind-to", "none",
-        "--prefix", "/usr", "--mca", "plm_rsh_args", ssh_arguments,
-        "--mca", "plm_rsh_no_tree_spawn", "1",
+        "--prefix", "/usr", "--prtemca", "plm_ssh_args", ssh_arguments,
+        "--prtemca", "plm_ssh_no_tree_spawn", "1",
     ]
     for name in (
-        "PATH", "LD_LIBRARY_PATH", "NNODES", "GPUS_PER_NODE", "MASTER_ADDR", "MASTER_PORT",
+        "NNODES", "GPUS_PER_NODE", "MASTER_ADDR", "MASTER_PORT",
         "SENPAI_TRAINING_COMMAND_B64", "SENPAI_TRAINING_WORKSPACE",
         "SENPAI_TARGET_PYTHON_ENV", "SENPAI_TRAINING_OUTPUT_DIR",
         "WANDB_API_KEY", "WANDB_RUN_ID", "WANDB_ENTITY", "WANDB_PROJECT", "WANDB_TAGS",
     ):
         if name in os.environ:
             argv.extend(("-x", name))
-    argv.extend((sys.executable, "-P", "-m", "senpai_agent.training_worker", "run"))
+    if os.environ.get("SENPAI_TARGET_PYTHON_ENV"):
+        for name in ("PATH", "LD_LIBRARY_PATH"):
+            if name in os.environ:
+                argv.extend(("-x", name))
+        argv.extend((sys.executable, "-P", "-m", "senpai_agent.training_worker", "run"))
+    else:
+        argv.append("/home/senpai/.senpai-run")
     os.execv(argv[0], argv)
 
 
 def sshd() -> None:
     home = Path.home()
     private_key = _private_ssh_key()
+    if not os.environ.get("SENPAI_TARGET_PYTHON_ENV"):
+        environment_path = private_key.parent / "environment.json"
+        with environment_path.open("x") as output:
+            environment_path.chmod(0o600)
+            json.dump(dict(os.environ), output)
+        wrapper = home / ".senpai-run"
+        bootstrap = "".join(
+            f"export {name}={shlex.quote(os.environ[name])}\n"
+            for name in ("PATH", "LD_LIBRARY_PATH", "PYTHONHOME", "PYTHONPATH")
+            if name in os.environ
+        )
+        wrapper.write_text("#!/bin/sh\n" + bootstrap + "exec " + shlex.join([
+            sys.executable, str(Path(__file__).resolve()), "run",
+        ]) + "\n")
+        wrapper.chmod(0o700)
     config = home / ".senpai-sshd-config"
     config.write_text(
         "Port 2222\n"

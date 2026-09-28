@@ -2,7 +2,9 @@
 
 from urllib.parse import urlencode
 
+from senpai_agent.github.http import GitHubReadError, graphql_viewer_login
 from senpai_agent.github.workflow.errors import (
+    GitHubAPIError,
     ReconciliationError,
     WorkflowPreconditionError,
 )
@@ -152,10 +154,25 @@ class LookupMixin:
 
     def _actor(self) -> str:
         if self._trusted_actor is None:
-            response = self._request("GET", "/user", expected_statuses={200})
-            self._trusted_actor = validated_response(
-                GitHubUser,
-                response.json_body,
-                "authenticated user",
-            ).login
+            try:
+                response = self._request("GET", "/user", expected_statuses={200})
+            except GitHubAPIError as error:
+                if error.status_code != 403:
+                    raise
+                response = self._request(
+                    "POST",
+                    "/graphql",
+                    json_body={"query": "query { viewer { login } }"},
+                    expected_statuses={200},
+                )
+                try:
+                    self._trusted_actor = graphql_viewer_login(response.json_body)
+                except GitHubReadError as error:
+                    raise ReconciliationError(str(error)) from error
+            else:
+                self._trusted_actor = validated_response(
+                    GitHubUser,
+                    response.json_body,
+                    "authenticated user",
+                ).login
         return self._trusted_actor

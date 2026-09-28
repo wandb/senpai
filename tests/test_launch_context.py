@@ -96,6 +96,30 @@ def test_launch_context_limits_each_role_to_its_assigned_students():
     assert "stark" in student
 
 
+@pytest.mark.parametrize(
+    ("nodes", "image", "execution"),
+    [
+        (1, "", "remote Kubernetes Job"),
+        (1, f"docker.io/example/training@sha256:{'b' * 64}", "remote Kubernetes Job"),
+        (2, f"ghcr.io/example/training@sha256:{'c' * 64}", "remote Kubernetes MPIJob"),
+    ],
+)
+def test_launch_context_tells_students_where_training_runs(nodes, image, execution):
+    configmap, _deployment, _secret = render_role(
+        "student", launch_args(nodes_per_student=nodes, training_image=image)
+    )
+    context = base64.b64decode(yaml.safe_load(configmap)["data"][launch.LAUNCH_CONTEXT_ENV]).decode()
+
+    assert f"Training execution: {execution}." in context
+    if image:
+        assert f"Training image: `{image}`" in context
+        assert "custom training image" in context
+        assert "python3 -m pip list" in context
+    else:
+        assert "same standard image" in context
+        assert "/opt/senpai-venv/bin/python -P -m pip list" in context
+
+
 @pytest.mark.parametrize("role", ["advisor", "student"])
 def test_each_role_receives_authoritative_launch_context(role):
     args = launch_args(

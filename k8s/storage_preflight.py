@@ -113,6 +113,8 @@ def validate_storage(
     namespace: str = "default",
     controller_node_selector: dict[str, str] | None = None,
     timeout_seconds: int = 600,
+    training_image: str = "",
+    image_pull_secrets: list[str] | None = None,
 ) -> list[dict]:
     """Fail before launch if role users cannot share durable training outputs.
 
@@ -136,6 +138,7 @@ def validate_storage(
 
     token = uuid4().hex
     readers = sorted(images)
+    writer_image = training_image or images.get("student", images[readers[0]])
     roles = [*readers, "writer"]
     names = {role: f"senpai-storage-{token[:12]}-{role}" for role in roles}
     created: dict[str, str] = {}
@@ -181,8 +184,9 @@ def validate_storage(
             "securityContext": {"runAsNonRoot": True, "runAsUser": 10001, "runAsGroup": 10001,
                                 "seccompProfile": {"type": "RuntimeDefault"}},
             "containers": [{
-                "name": "storage", "image": images.get("student", images[readers[0]]) if is_writer else images[role],
-                "command": ["/opt/senpai-venv/bin/python", "-P", "-c", _PROBE],
+                "name": "storage", "image": writer_image if is_writer else images[role],
+                "command": (["python3", "-c", _PROBE] if is_writer and training_image
+                            else ["/opt/senpai-venv/bin/python", "-P", "-c", _PROBE]),
                 "args": [role, token, pvc_mount_path, json.dumps(output_roots), json.dumps(readers), str(timeout_seconds)],
                 "env": [{"name": "POD_NAME", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}},
                         {"name": "NODE_NAME", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}}],
@@ -193,6 +197,8 @@ def validate_storage(
             }],
             "volumes": [{"name": "storage", "persistentVolumeClaim": {"claimName": pvc_claim_name}}],
         }
+        if image_pull_secrets:
+            spec["imagePullSecrets"] = [{"name": name} for name in image_pull_secrets]
         if is_writer:
             spec["tolerations"] = [
                 {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
@@ -258,7 +264,7 @@ def validate_storage(
             if len(records) != 1:
                 raise RuntimeError(f"storage preflight Pod {names[role]} omitted its result")
             receipt = records[0]
-            expected_image = images.get("student", images[readers[0]]) if role == "writer" else images[role]
+            expected_image = writer_image if role == "writer" else images[role]
             if pod["spec"]["containers"][0]["image"] != expected_image:
                 raise RuntimeError(f"storage preflight Pod {names[role]} used a different image")
             if (receipt != {"role": role, "token": token, "uid": 10001, "gid": 10001,

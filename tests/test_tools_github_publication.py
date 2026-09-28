@@ -82,7 +82,7 @@ def publication_tool(case):
         )
     finally:
         clear_github_credentials()
-    return next(tool for tool in tools if tool.name == "publish_assignment_branch")
+    return next(tool for tool in tools if tool.name == "push_experiment_commit")
 
 
 def publication_action(tool, case):
@@ -99,7 +99,7 @@ def publication_action(tool, case):
     )
 
 
-def test_publish_assignment_source_without_submitting_or_releasing_hold(publication):
+def test_push_experiment_commit_without_submitting_or_releasing_hold(publication):
     case = publication
     before = deepcopy(case.fake.pr)
     tool = publication_tool(case)
@@ -110,7 +110,7 @@ def test_publish_assignment_source_without_submitting_or_releasing_hold(publicat
 
     assert first.changed is True
     assert replay.changed is False
-    assert first.state == replay.state == "assignment_branch_published"
+    assert first.state == replay.state == "experiment_commit_pushed"
     assert first.version == replay.version == case.local_sha
     assert git(case.remote, "rev-parse", f"refs/heads/{case.branch}") == case.local_sha
     assert case.fake.pr == {**before, "head_sha": case.local_sha}
@@ -132,7 +132,7 @@ def test_publish_assignment_source_without_submitting_or_releasing_hold(publicat
         ("base-branch", "branch must differ from"),
     ],
 )
-def test_publish_assignment_rejects_invalid_current_source_before_push(
+def test_push_experiment_commit_rejects_invalid_current_source_before_push(
     publication, guard, message
 ):
     case = publication
@@ -190,7 +190,7 @@ def test_publish_assignment_rejects_invalid_current_source_before_push(
 
 
 @pytest.mark.parametrize("revision", ["revision-1", "older-revision"])
-def test_publish_assignment_respects_trusted_current_revision_terminal_result(
+def test_push_experiment_commit_respects_trusted_current_revision_terminal_result(
     publication, revision
 ):
     case = publication
@@ -208,12 +208,12 @@ def test_publish_assignment_respects_trusted_current_revision_terminal_result(
 
     if revision == "revision-1":
         with pytest.raises(
-            WorkflowPreconditionError, match="already has a terminal result"
+            WorkflowPreconditionError, match="already has a final experiment result"
         ):
             tool(action)
         expected_head = case.base_sha
     else:
-        assert tool(action).state == "assignment_branch_published"
+        assert tool(action).state == "experiment_commit_pushed"
         expected_head = case.local_sha
 
     assert git(case.remote, "rev-parse", f"refs/heads/{case.branch}") == expected_head
@@ -222,7 +222,7 @@ def test_publish_assignment_respects_trusted_current_revision_terminal_result(
 
 
 @pytest.mark.parametrize("race", ["revision", "base", "terminal", "transport"])
-def test_publish_assignment_reports_race_after_push_without_rewriting_workflow(
+def test_push_experiment_commit_reports_race_after_push_without_rewriting_workflow(
     publication, monkeypatch, race
 ):
     case = publication
@@ -263,7 +263,7 @@ def test_publish_assignment_reports_race_after_push_without_rewriting_workflow(
         state=SimpleNamespace(execution_status=ConversationExecutionStatus.RUNNING)
     )
     with pytest.raises(
-        (ValueError, ReconciliationError), match=f"{case.local_sha} was published"
+        (ValueError, ReconciliationError), match=f"{case.local_sha} was pushed"
     ):
         tool(publication_action(tool, case), conversation=conversation)
 

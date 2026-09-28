@@ -38,6 +38,9 @@ _TRAINING_RESOURCE_NAMES = {"cpu", "memory", "nvidia.com/gpu"}
 _SOURCE_BUNDLE_MOUNT = "/var/lib/senpai-source/source.bundle"
 _WORKSPACE_MOUNT = "/workspace"
 _WORKSPACE_VOLUME = "senpai-workspace"
+_TRAINING_RUNTIME_VOLUME = "senpai-training-runtime"
+_TRAINING_RUNTIME_MOUNT = "/var/run/senpai-training"
+_TRAINING_WORKER_SCRIPT = f"{_TRAINING_RUNTIME_MOUNT}/worker.py"
 _AMBIGUOUS_CREATE_STATUS_CODES = {409, 499}
 
 
@@ -65,6 +68,9 @@ class KubernetesExecutor:
         student_name: str,
         pod_name: str,
         pod_uid: str,
+        training_image: str = "",
+        training_control_image: str = "",
+        image_pull_secrets: list[str] | None = None,
     ):
         self.client = client
         self.state_path = state_path
@@ -78,6 +84,11 @@ class KubernetesExecutor:
         self.pvc_mount_path = pvc_mount_path
         self.snapshot_root = snapshot_root
         self.executor_image = executor_image
+        self.training_image = training_image
+        self.training_control_image = training_control_image
+        if training_image and not training_control_image:
+            raise ValueError("a configured training image requires the official control image")
+        self.image_pull_secrets = image_pull_secrets or []
         self.launch_secret_name = launch_secret_name
         self.wandb_tags = wandb_tags
         self.research_tag = research_tag
@@ -438,7 +449,7 @@ class KubernetesExecutor:
             ):
                 raise ValueError("Job parallelism and completions must match this allocation")
             if manifest["spec"]["template"]["spec"].get("restartPolicy") != "Never":
-                raise ValueError("Job restartPolicy must be Never")
+                raise ValueError("Job pods must use restartPolicy Never")
             manifest["spec"]["activeDeadlineSeconds"] = remaining
             manifest["spec"]["backoffLimit"] = 0
             manifest["spec"]["suspend"] = True
@@ -506,6 +517,10 @@ class KubernetesExecutor:
         }
         if forbidden_values & pod_spec.keys():
             raise ValueError("training pod requests forbidden workload identity or runtime access")
+        if self.image_pull_secrets:
+            pod_spec["imagePullSecrets"] = [
+                {"name": name} for name in self.image_pull_secrets
+            ]
         if any(pod_spec.get(key) for key in ("hostNetwork", "hostPID", "hostIPC", "shareProcessNamespace")):
             raise ValueError("training pod requests forbidden host namespace access")
         pod_spec["automountServiceAccountToken"] = False
@@ -518,7 +533,13 @@ class KubernetesExecutor:
         containers = pod_spec.get("containers", [])
         if not containers:
             raise ValueError("training pod must contain a main container")
-        self._install_source_checkout(pod_spec, containers, reservation)
+        custom_worker = bool(
+            allow_gpus and self.training_image
+            and self.training_image != self.training_control_image
+        )
+        self._install_source_checkout(
+            pod_spec, containers, reservation, custom_worker=custom_worker,
+        )
 
         for volume in pod_spec["volumes"]:
             volume_types = set(volume) - {"name"}
@@ -539,6 +560,9 @@ class KubernetesExecutor:
                 wandb_run_id=wandb_run_id,
             )
         for container in containers:
+            selected_image = self.training_image if allow_gpus else self.training_control_image
+            if selected_image:
+                container["image"] = selected_image
             self._secure_container(container, allow_gpu=allow_gpus)
             found_key |= self._secure_environment(
                 container,
@@ -587,6 +611,8 @@ class KubernetesExecutor:
         pod_spec: dict,
         containers: list[dict],
         reservation: dict,
+        *,
+        custom_worker: bool,
     ) -> None:
         source_bundle = Path(reservation["source_snapshot"])
         try:
@@ -595,7 +621,8 @@ class KubernetesExecutor:
             raise ValueError("training source bundle is outside the configured PVC") from error
 
         volumes = pod_spec.setdefault("volumes", [])
-        if any(volume.get("name") == _WORKSPACE_VOLUME for volume in volumes):
+        reserved_volumes = {_WORKSPACE_VOLUME, _TRAINING_RUNTIME_VOLUME}
+        if any(volume.get("name") in reserved_volumes for volume in volumes):
             raise ValueError("training manifest uses a reserved Senpai volume name")
         dataset_volumes = [
             volume
@@ -613,11 +640,18 @@ class KubernetesExecutor:
             )
         dataset_claim["readOnly"] = False
         volumes.append({"name": _WORKSPACE_VOLUME, "emptyDir": {}})
+        if custom_worker:
+            volumes.append({"name": _TRAINING_RUNTIME_VOLUME, "emptyDir": {}})
 
         for container in containers:
             mounts = container.setdefault("volumeMounts", [])
-            if any(mount.get("name") == _WORKSPACE_VOLUME for mount in mounts):
+            if any(mount.get("name") in reserved_volumes for mount in mounts):
                 raise ValueError("training container uses a reserved Senpai volume name")
+            if any(
+                Path(str(mount.get("mountPath", ""))).is_relative_to(_TRAINING_RUNTIME_MOUNT)
+                for mount in mounts
+            ):
+                raise ValueError("training containers may not shadow the Senpai training runtime")
             nested_workspace_mounts = [
                 mount
                 for mount in mounts
@@ -629,6 +663,12 @@ class KubernetesExecutor:
                 mount for mount in mounts if mount.get("mountPath") != _WORKSPACE_MOUNT
             ] + [{"name": _WORKSPACE_VOLUME, "mountPath": _WORKSPACE_MOUNT}]
             container["volumeMounts"] = mounts
+            if custom_worker:
+                mounts.append({
+                    "name": _TRAINING_RUNTIME_VOLUME,
+                    "mountPath": _TRAINING_RUNTIME_MOUNT,
+                    "readOnly": True,
+                })
             if _container_gpu(container, "requests") or _container_gpu(
                 container, "limits"
             ):
@@ -683,6 +723,14 @@ class KubernetesExecutor:
                 ],
             }
         ]
+        if custom_worker:
+            checkout = pod_spec["initContainers"][0]
+            checkout["env"].append({
+                "name": "SENPAI_TRAINING_WORKER_SCRIPT", "value": _TRAINING_WORKER_SCRIPT,
+            })
+            checkout["volumeMounts"].append({
+                "name": _TRAINING_RUNTIME_VOLUME, "mountPath": _TRAINING_RUNTIME_MOUNT,
+            })
 
     @staticmethod
     def _secure_container(container: dict, *, allow_gpu: bool) -> None:
@@ -1078,6 +1126,9 @@ def serve() -> None:
         pvc_mount_path=Path(os.environ["PVC_MOUNT_PATH"]),
         snapshot_root=Path(os.environ["SENPAI_TRAINING_SNAPSHOT_ROOT"]),
         executor_image=os.environ["SENPAI_EXECUTOR_IMAGE"],
+        training_image=os.environ.get("SENPAI_TRAINING_IMAGE", ""),
+        training_control_image=os.environ.get("SENPAI_TRAINING_CONTROL_IMAGE", ""),
+        image_pull_secrets=json.loads(os.environ.get("SENPAI_IMAGE_PULL_SECRETS", "[]")),
         launch_secret_name=os.environ["SENPAI_LAUNCH_SECRET_NAME"],
         wandb_tags=os.environ["WANDB_TAGS"],
         research_tag=os.environ["RESEARCH_TAG"],
@@ -1172,6 +1223,10 @@ def main() -> None:
             Path(os.environ["SENPAI_SOURCE_WORKSPACE"]),
             os.environ["SENPAI_SOURCE_COMMIT"],
         )
+        if destination := os.environ.get("SENPAI_TRAINING_WORKER_SCRIPT"):
+            worker = Path(destination)
+            shutil.copyfile(Path(__file__).with_name("training_worker.py"), worker)
+            worker.chmod(0o555)
     else:
         raise SystemExit(
             "usage: python -m senpai_agent.kubernetes_executor serve|kubectl|checkout"

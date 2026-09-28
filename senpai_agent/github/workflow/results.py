@@ -26,7 +26,7 @@ from senpai_agent.models import AssignmentRecord, ExperimentResult
 class ResultMixin:
     __slots__ = ()
 
-    def preflight_publish_assignment_branch(
+    def preflight_push_experiment_commit(
         self,
         number: int,
         *,
@@ -36,7 +36,7 @@ class ResultMixin:
         expected_head_sha: str,
         local_commit_sha: str,
     ) -> tuple[PullRequestSnapshot, AssignmentRecord]:
-        """Require an unfinished current assignment before publishing its source."""
+        """Check the current assignment before pushing the experiment commit."""
 
         snapshot = self.pull_request(number)
         require_open(snapshot)
@@ -46,15 +46,15 @@ class ResultMixin:
         require_current_revision(assignment, revision_id)
         if assignment.student != student:
             raise WorkflowPreconditionError(
-                "assignment student does not match this runtime's student"
+                "the assignment names a different student from this runtime's student"
             )
         if not assignment.head_ref.startswith(f"{student}/"):
             raise WorkflowPreconditionError(
-                f"assignment branch must belong to student {student!r}"
+                f"experiment PR branch must belong to student {student!r}"
             )
         if assignment.head_ref == assignment.base_ref:
             raise WorkflowPreconditionError(
-                "assignment branch must differ from its research base branch"
+                "experiment PR branch must differ from its research base branch"
             )
         require_active_assignment_routing(snapshot, assignment)
         for match in self._result_comments(number, assignment_id):
@@ -66,9 +66,9 @@ class ResultMixin:
                 and result_assignment.student == student
             ):
                 raise WorkflowPreconditionError(
-                    "assignment revision already has a terminal result"
+                    "the current assignment revision already has a final experiment result"
                 )
-        # An exact replay may retain the lease from before its successful push.
+        # A retry may use the PR head SHA recorded before the successful push.
         if snapshot.head_sha != local_commit_sha:
             require_head(snapshot, expected_head_sha)
         return snapshot, assignment

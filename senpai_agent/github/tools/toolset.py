@@ -14,10 +14,11 @@ from .definitions import (
     AcceptResultOnCurrentBaseTool,
     CloseExperimentTool,
     CreateAssignmentTool,
+    CreateHumanIssueTool,
     MergeExperimentTool,
     PostAssignmentCommentTool,
     PublishAdvisorBranchTool,
-    PublishAssignmentBranchTool,
+    PushExperimentCommitTool,
     RepairAssignmentRoutingTool,
     RequestAssignmentRevisionTool,
     RespondToHumanIssueTool,
@@ -99,13 +100,14 @@ class GitHubWorkflowToolSet(
                 state_dir=state_dir,
                 workspace=workspace,
             ),
+            *CreateHumanIssueTool.create(runtime),
             *RespondToHumanIssueTool.create(runtime),
         )
         if role == "student":
             return (
                 *common,
                 *PostAssignmentCommentTool.create(runtime),
-                *PublishAssignmentBranchTool.create(runtime),
+                *PushExperimentCommitTool.create(runtime),
                 *SubmitExperimentResultTool.create(runtime),
             )
         return (

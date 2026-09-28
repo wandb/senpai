@@ -22,9 +22,9 @@ def render_student(nodes=2, **overrides):
     return list(yaml.safe_load_all(manifest))
 
 
-@pytest.mark.parametrize("nodes", [1, 2])
-def test_student_controller_is_cpu_only_with_a_credential_isolated_executor(nodes):
-    configmap, service_account, role, role_binding, deployment = render_student(nodes)
+@pytest.mark.parametrize("nodes,training_image", [(1, ""), (2, ""), (1, f"docker.io/acme/trainer@sha256:{'c' * 64}")])
+def test_student_controller_is_cpu_only_with_a_credential_isolated_executor(nodes, training_image):
+    configmap, service_account, role, role_binding, deployment = render_student(nodes, training_image=training_image)
     pod = deployment["spec"]["template"]["spec"]
     containers = {container["name"]: container for container in pod["containers"]}
     student = containers["student"]
@@ -66,6 +66,8 @@ def test_student_controller_is_cpu_only_with_a_credential_isolated_executor(node
     }
     assert set(workloads) == ({"jobs", "mpijobs"} if nodes > 1 else {"jobs"})
     assert all(verbs == ["create", "get", "patch", "delete"] for verbs in workloads.values())
+    assert configmap["data"]["SENPAI_TRAINING_CONTROL_IMAGE"] == student["image"]
+    assert configmap["data"]["SENPAI_TRAINING_IMAGE"] == (training_image or student["image"])
     assert configmap["data"]["NODES_PER_STUDENT"] == str(nodes)
     assert configmap["data"]["GPUS_PER_STUDENT_NODE"] == "8"
     assert configmap["data"]["CPU_PER_STUDENT_GPU"] == "15"

@@ -1322,7 +1322,7 @@ def test_conversation_and_credentials_are_cleaned_up_after_failures(
     monkeypatch.setattr(runner, "configure_delegation", delegation.append)
     requests = []
 
-    def request(client, _path, _options):
+    def request(client, _path, _options, *, headers=None):
         requests.append(client.headers["x-api-key"])
         return {"results": []}
 
@@ -1392,8 +1392,9 @@ def test_runtime_credentials_remain_configured_through_lazy_tool_initialization(
         "senpai_github": {
             "get_prs",
             "get_pr_source",
+            "create_human_issue",
             "post_assignment_comment",
-            "publish_assignment_branch",
+            "push_experiment_commit",
             "respond_to_human_issue",
             "submit_experiment_result",
         },

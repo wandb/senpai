@@ -8,12 +8,14 @@ from senpai_agent.github.tools import (
     AcceptResultOnCurrentBaseTool,
     CloseExperimentTool,
     CreateAssignmentTool,
+    CreateHumanIssueAction,
+    CreateHumanIssueTool,
     GitHubToolRuntime,
     MergeExperimentTool,
     PostAssignmentCommentAction,
     PostAssignmentCommentTool,
     PublishAdvisorBranchTool,
-    PublishAssignmentBranchTool,
+    PushExperimentCommitTool,
     RepairAssignmentRoutingTool,
     RequestAssignmentRevisionTool,
     RespondToHumanIssueTool,
@@ -38,7 +40,7 @@ EXPECTED_FIELDS = {
         "local_commit_sha",
     },
     "post_assignment_comment": {"assignment", "comment_id", "comment"},
-    "publish_assignment_branch": {"assignment", "local_commit_sha"},
+    "push_experiment_commit": {"assignment", "local_commit_sha"},
     "repair_assignment_routing": {"assignment", "working_state", "blockers"},
     "send_assignment_feedback": {"assignment", "feedback_id", "comment"},
     "request_assignment_revision": {
@@ -58,6 +60,7 @@ EXPECTED_FIELDS = {
         "merge_method",
     },
     "close_experiment": {"assignment", "reason"},
+    "create_human_issue": {"issue_id", "title", "body"},
     "respond_to_human_issue": {"issue_number", "human_message_id", "response"},
     "submit_experiment_result": {
         "branch",
@@ -85,7 +88,7 @@ def github_tools(tmp_path: Path):
     tool_types = (
         CreateAssignmentTool,
         PublishAdvisorBranchTool,
-        PublishAssignmentBranchTool,
+        PushExperimentCommitTool,
         PostAssignmentCommentTool,
         RepairAssignmentRoutingTool,
         SendAssignmentFeedbackTool,
@@ -93,6 +96,7 @@ def github_tools(tmp_path: Path):
         AcceptResultOnCurrentBaseTool,
         MergeExperimentTool,
         CloseExperimentTool,
+        CreateHumanIssueTool,
         RespondToHumanIssueTool,
         SubmitExperimentResultTool,
     )
@@ -156,6 +160,15 @@ def test_operation_specific_actions_reject_fields_from_other_tools():
                 "remote_branch_sha_before_push": "a" * 40,
                 "result": {},
                 "accepted_base_sha": "b" * 40,
+            }
+        )
+    with pytest.raises(ValidationError, match="audience_label"):
+        CreateHumanIssueAction.model_validate(
+            {
+                "issue_id": "confirm-budget",
+                "title": "Confirm the experiment budget",
+                "body": "Can we run another seed?",
+                "audience_label": "another-advisor",
             }
         )
 

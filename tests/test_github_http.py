@@ -111,6 +111,75 @@ def test_reader_errors_do_not_expose_token(monkeypatch):
     assert "/user" in str(raised.value)
 
 
+@pytest.mark.parametrize("trusted_actor", [None, "configured[bot]"])
+def test_reader_resolves_installation_actor_and_caches_it(monkeypatch, trusted_actor):
+    calls = []
+
+    def urlopen(github_request, timeout):
+        calls.append(github_request)
+        assert github_request.headers["Authorization"] == "Bearer github-secret"
+        if github_request.full_url.endswith("/user"):
+            raise HTTPError(github_request.full_url, 403, "forbidden", {}, None)
+        assert github_request.full_url == "https://api.github.test/graphql"
+        assert github_request.get_method() == "POST"
+        assert json.loads(github_request.data) == {"query": "query { viewer { login } }"}
+        return Response({"data": {"viewer": {"login": "research[bot]"}}})
+
+    monkeypatch.setattr(github_http.request, "urlopen", urlopen)
+    reader = GitHubReader(
+        SecretStr("github-secret"),
+        api_url="https://api.github.test",
+        trusted_actor=trusted_actor,
+    )
+
+    assert reader.actor() == (trusted_actor or "research[bot]")
+    assert reader.actor() == (trusted_actor or "research[bot]")
+    assert len(calls) == (0 if trusted_actor else 2)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"data": None},
+        {"data": {"viewer": None}},
+        {"data": {"viewer": {"login": ""}}},
+        {"data": {"viewer": {"login": " "}}},
+        {"data": {"viewer": {"login": 12}}},
+        {
+            "data": {"viewer": {"login": "unverified[bot]"}},
+            "errors": [{"message": "Resource not accessible by integration"}],
+        },
+    ],
+)
+def test_reader_rejects_unverified_installation_actor(monkeypatch, payload):
+    def urlopen(github_request, timeout):
+        if github_request.full_url.endswith("/user"):
+            raise HTTPError(github_request.full_url, 403, "forbidden", {}, None)
+        return Response(payload)
+
+    monkeypatch.setattr(github_http.request, "urlopen", urlopen)
+
+    with pytest.raises(GitHubReadError, match="GraphQL"):
+        GitHubReader(SecretStr("github-secret")).actor()
+
+
+@pytest.mark.parametrize("status", [401, 429, 500])
+def test_reader_actor_preserves_other_http_failures(monkeypatch, status):
+    calls = []
+
+    def urlopen(github_request, timeout):
+        calls.append(github_request.full_url)
+        raise HTTPError(github_request.full_url, status, "failed", {}, None)
+
+    monkeypatch.setattr(github_http.request, "urlopen", urlopen)
+
+    with pytest.raises(GitHubReadError, match=f"HTTP {status}"):
+        GitHubReader(SecretStr("github-secret")).actor()
+    assert calls == ["https://api.github.com/user"]
+
+
 def test_next_link_extracts_only_the_next_relation():
     assert (
         next_link(

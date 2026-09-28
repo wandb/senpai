@@ -10,7 +10,7 @@ bounded delegation. Python owns operations that should not depend on an LLM
 composing fragile tool calls:
 
 - GitHub polling, workflow operations, and verification;
-- assignment branch publication;
+- pushing experiment commits to their existing GitHub PR branches;
 - training process supervision and W&B metric monitoring;
 - conversation selection and durable local events;
 - command policy and stop checks; and
@@ -34,7 +34,8 @@ dependencies.
 7. Conversation and generated artifact state cannot fall back into the target
    checkout.
 8. Senpai does not prune conversation history.
-9. Only the student image carries CUDA, PyTorch, and the training stack.
+9. Among Senpai images, only the student image carries CUDA, PyTorch, and the
+   training stack. Operators may supply a separate training image.
 10. Secret values are passed at narrow executor boundaries and redacted before
     monitored content is attached. Custom secret names are explicit.
 11. Hivemind is disabled, not redesigned, in this change.
@@ -127,6 +128,40 @@ authoritative Senpai protocol marker distinguishes agent output and prevents it
 from creating a new wake. `respond_to_human_issue` reapplies the same
 classification to the exact message before writing an idempotent response.
 Launches with human-Issue handling disabled skip that GitHub query entirely.
+
+The publishing actor is required to verify Senpai protocol messages. The runtime
+uses `SENPAI_GITHUB_ACTOR` when configured; otherwise, it identifies the actor
+through `GET /user`. If that request returns HTTP 403, it requests GraphQL
+`viewer { login }` to identify the actor for an installation token. Failed actor
+resolution still fails clearly. This trust identity is separate from the
+optional notification recipient.
+
+Issue notifications use `GET /user` to identify the owner of the runtime's
+GitHub credential. A valid login with GitHub account type `User` receives the
+mention. This includes service accounts registered as ordinary users; the API
+does not identify whether a `User` account is operated by a person or a service.
+There is no explicit handle configuration or collaborator lookup.
+
+Bot accounts and tokens without a user identity, including GitHub App
+installation tokens and GitHub Actions `GITHUB_TOKEN`, receive no automatic
+mention. Failed lookups and invalid identity responses also skip the mention.
+This optional lookup must not block issue creation or replies. The workflow
+does not use the trusted publishing actor or an app name as a fallback recipient.
+
+`create_human_issue` is available to advisor and student roots. It creates an
+issue with `human` and the caller's audience label, adds a trusted creation
+marker, and mentions the credential owner, when available, in the initial body.
+The `issue_id` identifies one immutable title and body: exact retries reuse the
+existing issue, including closed issues, and changed content conflicts. A
+trusted creation marker in the issue body suppresses automatic mentions in
+subsequent replies.
+
+For human-created issues, the workflow posts new replies without mentions,
+then adds mentions only to the trusted Senpai reply with the lowest persisted
+comment ID. Concurrent writers therefore select the same first reply. Retrying
+or editing that first reply repeats the owner lookup. Subsequent replies
+receive no automatic mentions. If the process stops between creation
+and the mention edit, retrying the response completes the edit.
 
 Assigned-PR issue comments, submitted reviews, and inline comments each use
 their immutable GitHub ID as a level-triggered event key. Senpai accepts GitHub
@@ -354,11 +389,11 @@ SDK upgrades must retain the executable plugin-isolation test.
 
 ## Prompt caching
 
-The SDK and tools track the `main` branch of
+The SDK and tools use the same immutable revision of
 [`morganmcg1/software-agent-sdk`](https://github.com/morganmcg1/software-agent-sdk)
-and are based on OpenHands SDK 1.40.0. `uv.lock` records the exact `main` commit
-used for reproducible image builds, while runtime CI installs directly from
-`main` to verify the current fork head.
+and are based on OpenHands SDK 1.49.6. The dependency declarations, `uv.lock`,
+and runtime CI pin that revision so tests and image builds use the same fork
+code.
 
 `prompt_cache_configuration()` sets:
 
@@ -380,6 +415,11 @@ latest `resp_*` ID is recovered from the durable OpenHands event log after
 every process restart, passed as `previous_response_id`, and paired only with
 inputs created after that response. System instructions and tools remain
 explicit on every request.
+
+Stored Responses and Anthropic compaction chains serialize incoming messages
+while an asynchronous model request runs. This keeps unsent messages after the
+persisted response boundary, so the next request includes them. Other modes
+retain upstream OpenHands' ability to receive messages during model requests.
 
 Senpai sets `reasoning_context="all_turns"` and `reasoning_summary="auto"` so
 supported models can reuse server-side private reasoning and return the most
@@ -443,7 +483,10 @@ the model-facing schema. It also canonicalizes every Senpai-authored comment to
 an `ADVISOR:` or `STUDENT:` prefix from that trusted role; models supply plain
 comment text and cannot impersonate the other role through a payload.
 
-Assignment-scoped advisor and student operations share this object:
+Operations on an existing assignment share these fields. The PR number identifies
+the experiment PR. The assignment ID and revision ID identify the advisor's
+current instructions. The expected PR head is the Git commit identifier (SHA) currently
+on GitHub, so the tool can reject a change made after the student read the PR:
 
 ```json
 {
@@ -460,13 +503,24 @@ Assignment-scoped advisor and student operations share this object:
 | `publish_advisor_branch` | advisor | `remote_branch_sha_before_push`, `local_commit_sha` |
 | `repair_assignment_routing` | advisor | `working_state` (`wip` or `review`) and a `blockers` list containing only `blocked`, `hold`, or `needs-rebase` |
 | `send_assignment_feedback` | advisor | `feedback_id`, `comment` |
+| `push_experiment_commit` | student | `local_commit_sha`, which must identify the current local commit (HEAD), with no uncommitted changes |
 | `post_assignment_comment` | student | `comment_id`, `comment` |
 | `request_assignment_revision` | advisor | `new_revision_id`, `required_base_sha`, `comment` |
 | `accept_result_on_current_base` | advisor | `expected_current_base_sha`, `reason` |
 | `merge_experiment` | advisor | `expected_current_base_sha`, `merge_method` |
 | `close_experiment` | advisor | `reason` |
+| `create_human_issue` | advisor or student | `issue_id`, `title`, `body` |
 | `respond_to_human_issue` | advisor or student | `issue_number`, `human_message_id`, `response` |
 | `submit_experiment_result` | student | `branch`, `remote_branch_sha_before_push`, `result` |
+
+`push_experiment_commit` pushes the student's exact current local commit (HEAD) to the
+existing GitHub branch for the experiment PR. It checks the assigned student,
+branch, base commit, current instructions and expected GitHub head before pushing.
+It checks the resulting head and unchanged assignment record afterward. It
+refuses to overwrite other commits or push after a final experiment result for the
+current assignment revision. Retrying the same push is safe. Pushing does not
+remove a hold or authorize training; comments, labels, draft state and result
+records stay unchanged.
 
 Interim student communication happens through `post_assignment_comment`. The
 runtime binds the configured student identity and validates the exact open WIP
@@ -718,9 +772,9 @@ controller redacts each component before formatting, truncating, or persisting
 it. The executor does not receive the W&B key.
 
 `run_training` accepts ordinary command arguments, not a Kubernetes submission
-script. It supplies the selected student image, configured resources and PVC
-mount, W&B identity, and exact committed source. The worker starts a writable
-project environment over the image's read-only runtime. Project setup belongs in
+script. It supplies the selected training image, configured resources and PVC
+mount, W&B identity, and exact committed source. The standard worker starts a
+writable project environment over the image's read-only runtime. Project setup belongs in
 normal dependency files or the command; Senpai requires no setup manifest.
 The launch context exposes the training image and how to inspect its base
 packages. Multi-node commands run once per node with rank/rendezvous information;
@@ -987,6 +1041,19 @@ Advisor and student build Chromium and run a browser smoke test. The student
 image validates CUDA architecture support. The launcher and cutoff arming
 script accept only matching full source-SHA tags or immutable digests and check
 out that exact revision.
+
+An optional digest-pinned `training_image` selects an independent training
+environment from any reachable registry. It requires no Senpai runtime or source
+revision. The student controller stays in the Senpai image and uses the existing
+executor for one-node Jobs or multi-node MPIJobs. An empty value uses the standard
+student image. The executor sets the selected image on GPU workers and keeps the
+CPU MPI launcher in the standard student image. It injects only the operator's
+`image_pull_secrets`; agent-supplied pull secrets remain forbidden. The trusted
+executor image provides the non-root source checkout and a standalone worker
+bootstrap for custom images. Custom workers retain their Python environment and
+run as UID/GID 10001. Multi-node custom images must provide compatible OpenMPI 5,
+OpenSSH, and the non-root account described in README.md. Operators build and
+publish custom training images before launch.
 
 Launch preflight verifies:
 

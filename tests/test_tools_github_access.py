@@ -11,6 +11,7 @@ from pydantic import SecretStr
 
 from senpai_agent.github import tools as github_tools_module
 from senpai_agent.github.tools import (
+    CreateHumanIssueAction,
     GetPRsAction,
     GetPRsTool,
     GitHubToolRuntime,
@@ -26,6 +27,7 @@ from senpai_agent.tools import register_senpai_tools
 ADVISOR_GITHUB_TOOLS = {
     "get_prs",
     "get_pr_source",
+    "create_human_issue",
     "respond_to_human_issue",
     "create_assignment",
     "publish_advisor_branch",
@@ -39,8 +41,9 @@ ADVISOR_GITHUB_TOOLS = {
 STUDENT_GITHUB_TOOLS = {
     "get_prs",
     "get_pr_source",
+    "create_human_issue",
     "post_assignment_comment",
-    "publish_assignment_branch",
+    "push_experiment_commit",
     "respond_to_human_issue",
     "submit_experiment_result",
 }
@@ -110,6 +113,56 @@ def test_toolset_rejects_a_runtime_role_mismatch(tmp_path: Path):
             state_dir=tmp_path / "state",
             workspace=tmp_path,
         )
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_both_roles_open_issues_with_configured_audience_and_token_owner_mention(
+    monkeypatch, tmp_path, role
+):
+    from senpai_agent.github.workflow import core
+
+    fake = FakeGitHub(pull_request())
+    fake.actor_type = "User"
+    monkeypatch.setattr(core, "UrllibTransport", lambda: fake)
+    configure_github_credentials(
+        "acme/widgets", SecretStr("github-secret"), trusted_actor="senpai-bot"
+    )
+    try:
+        tools = GitHubWorkflowToolSet.create(
+            role=role,
+            workspace=tmp_path,
+            advisor_branch="advisor-branch",
+            student_names=["fern"],
+            student_name="fern",
+        )
+        tool = next(tool for tool in tools if tool.name == "create_human_issue")
+        observation = tool(
+            CreateHumanIssueAction(
+                issue_id="confirm-budget",
+                title="Confirm the experiment budget",
+                body="Can we run another seed?",
+            )
+        )
+    finally:
+        clear_github_credentials()
+
+    creations = [
+        payload
+        for method, url, payload, _ in fake.requests
+        if method == "POST" and urlsplit(url).path == "/repos/acme/widgets/issues"
+    ]
+    assert len(creations) == 1
+    created = creations[0]
+    assert set(created["labels"]) == {
+        "human",
+        "advisor-branch" if role == "advisor" else "student:fern",
+    }
+    assert f"{role.upper()}: Can we run another seed?" in created["body"]
+    assert created["body"].endswith("\n\n@senpai-bot")
+    assert observation.state == "human_issue_created"
+    assert observation.resource_url == "https://github.com/acme/widgets/issues/7"
+    assert len(fake.mutations) == 1
+    assert fake.comments == []
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])

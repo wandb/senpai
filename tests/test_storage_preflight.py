@@ -157,23 +157,33 @@ def validate(**overrides):
 
 
 @pytest.mark.parametrize("nodes", [1, 2])
-def test_preflight_uses_role_images_runtime_identity_and_uid_safe_cleanup(monkeypatch, nodes):
+@pytest.mark.parametrize("training_image,pull_secrets", [
+    ("", []),
+    ("private-training@sha256:pinned", ["training-registry", "controller-registry"]),
+])
+def test_preflight_uses_role_images_runtime_identity_and_uid_safe_cleanup(
+    monkeypatch, nodes, training_image, pull_secrets,
+):
     api = PodApi()
     monkeypatch.setattr(storage_preflight.subprocess, "run", api)
-    receipts = validate(nodes_per_student=nodes)
+    receipts = validate(nodes_per_student=nodes, training_image=training_image, image_pull_secrets=pull_secrets)
     assert len(receipts) == len(api.deletes) == 3 and not api.pods
     for pod in api.manifests:
         spec = pod["spec"]
         container = spec["containers"][0]
         role = container["args"][0]
-        assert container["image"] == ("advisor@sha256:pinned" if role == "advisor" else "student@sha256:pinned")
+        expected_image = (training_image or "student@sha256:pinned") if role == "writer" else f"{role}@sha256:pinned"
+        assert container["image"] == expected_image
+        assert next(receipt["image"] for receipt in receipts if receipt["role"] == role) == expected_image
+        assert spec.get("imagePullSecrets", []) == [{"name": name} for name in pull_secrets]
         assert spec["securityContext"]["runAsUser"] == spec["securityContext"]["runAsGroup"] == 10001
         assert "fsGroup" not in spec["securityContext"]  # No implicit recursive PVC chown.
         assert spec["automountServiceAccountToken"] is False
         assert spec["volumes"] == [{"name": "storage", "persistentVolumeClaim": {"claimName": "training-storage"}}]
         assert container["volumeMounts"] == [{"name": "storage", "mountPath": "/mnt/data"}]
         assert "nvidia.com/gpu" not in container["resources"]["requests"]
-        assert container["command"][:2] == ["/opt/senpai-venv/bin/python", "-P"]
+        expected_command = ["python3", "-c"] if role == "writer" and training_image else ["/opt/senpai-venv/bin/python", "-P", "-c"]
+        assert container["command"][:-1] == expected_command
         if role == "writer":
             assert spec.get("tolerations") == [
                 {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},

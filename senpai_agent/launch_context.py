@@ -71,6 +71,7 @@ def render_launch_context(
     wandb_project: str,
     backend: str,
     training_image: str,
+    training_control_image: str,
     training_output_root: str,
     nodes_per_student: int,
     gpus_per_student_node: int,
@@ -95,6 +96,17 @@ def render_launch_context(
             "TRAINING_OUTPUT_ROOT": training_output_root,
             "NODES_PER_STUDENT": str(nodes_per_student),
             "GPUS_PER_STUDENT_NODE": str(gpus_per_student_node),
+            "TRAINING_EXECUTION": (
+                "remote Kubernetes MPIJob" if nodes_per_student > 1
+                else "remote Kubernetes Job"
+            ),
+            "TRAINING_IMAGE_INSPECTION": (
+                "The controller uses the same standard image. Inspect its base Python packages with "
+                "`/opt/senpai-venv/bin/python -P -m pip list`."
+                if training_image == training_control_image else
+                "This is a custom training image; the controller uses Senpai's standard image. "
+                "Use a short `run_training` command such as `python3 -m pip list` to inspect the worker environment."
+            ),
             "TIMEOUT_MINUTES": f"{timeout_minutes:g}",
             "MAX_EPOCHS": str(max_epochs),
             "TAG": tag,

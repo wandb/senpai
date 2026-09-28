@@ -1383,14 +1383,18 @@ def _training_manifest(
     cpu = int(os.environ["CPU_PER_STUDENT_GPU"])
     memory = int(os.environ["MEMORY_GI_PER_STUDENT_GPU"])
     mount = os.environ["PVC_MOUNT_PATH"]
+    image = os.environ["SENPAI_TRAINING_IMAGE"]
+    control_image = os.environ["SENPAI_TRAINING_CONTROL_IMAGE"]
+    custom_image = image != control_image
     payload = base64.b64encode(json.dumps({
         "argv": command.argv, "cwd": str(Path("/workspace") / relative_cwd),
     }).encode()).decode()
     values = {
         "SENPAI_TRAINING_COMMAND_B64": payload,
         "SENPAI_TRAINING_WORKSPACE": "/workspace",
-        "SENPAI_TARGET_PYTHON_ENV": "/home/senpai/.venvs/senpai-target",
+        "SENPAI_TARGET_PYTHON_ENV": "" if custom_image else "/home/senpai/.venvs/senpai-target",
         "SENPAI_TRAINING_OUTPUT_DIR": output_dir,
+        "HOME": "/home/senpai",
         "NNODES": str(nodes), "GPUS_PER_NODE": str(gpus_per_node),
         "MASTER_ADDR": f"{spec.name}-worker-0.{spec.name}" if nodes > 1 else "127.0.0.1",
         "MASTER_PORT": "29500",
@@ -1408,8 +1412,11 @@ def _training_manifest(
             resources["nvidia.com/gpu"] = str(gpus_per_node)
         container = {
             "name": "training",
-            "image": os.environ["SENPAI_TRAINING_IMAGE"],
-            "command": ["/opt/senpai-venv/bin/python", "-P", "-m", "senpai_agent.training_worker", mode],
+            "image": image if worker else control_image,
+            "command": (
+                ["python3", "/var/run/senpai-training/worker.py", mode] if custom_image and worker
+                else ["/opt/senpai-venv/bin/python", "-P", "-m", "senpai_agent.training_worker", mode]
+            ),
             "env": [
                 *({"name": name, "value": value} for name, value in values.items()),
                 {"name": "WANDB_API_KEY", "valueFrom": {"secretKeyRef": {

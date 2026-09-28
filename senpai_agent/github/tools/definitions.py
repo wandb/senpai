@@ -21,11 +21,12 @@ from .contracts import (
     AcceptResultOnCurrentBaseAction,
     CloseExperimentAction,
     CreateAssignmentAction,
+    CreateHumanIssueAction,
     GitHubMutationObservation,
     MergeExperimentAction,
     PostAssignmentCommentAction,
     PublishAdvisorBranchAction,
-    PublishAssignmentBranchAction,
+    PushExperimentCommitAction,
     RepairAssignmentRoutingAction,
     RequestAssignmentRevisionAction,
     RespondToHumanIssueAction,
@@ -35,7 +36,7 @@ from .contracts import (
 from .runtime import (
     GitHubToolRuntime,
     PostAssignmentCommentExecutor,
-    PublishAssignmentBranchExecutor,
+    PushExperimentCommitExecutor,
     SubmitExperimentResultExecutor,
     tool_annotations,
 )
@@ -56,6 +57,27 @@ def _tool(cls, action_type, title: str, description: str, executor):
             executor=executor,
         )
     ]
+
+
+class CreateHumanIssueExecutor(
+    ToolExecutor[CreateHumanIssueAction, GitHubMutationObservation]
+):
+    def __init__(self, runtime: GitHubToolRuntime):
+        self.runtime = runtime
+
+    def __call__(
+        self,
+        action: CreateHumanIssueAction,
+        conversation: LocalConversation | None = None,
+    ) -> GitHubMutationObservation:
+        result = self.runtime.workflow.create_human_issue(
+            issue_id=action.issue_id,
+            title=action.title,
+            body=action.body,
+            audience_label=self.runtime.human_issue_audience_label(),
+            creator=self.runtime.human_issue_responder(),
+        )
+        return GitHubMutationObservation.from_result(result)
 
 
 class RespondToHumanIssueExecutor(
@@ -110,21 +132,26 @@ class PublishAdvisorBranchTool(
         )
 
 
-class PublishAssignmentBranchTool(
-    ToolDefinition[PublishAssignmentBranchAction, GitHubMutationObservation]
+class PushExperimentCommitTool(
+    ToolDefinition[PushExperimentCommitAction, GitHubMutationObservation]
 ):
-    """Publish source for the current student without a terminal result."""
+    """Push the student's exact local HEAD to the existing experiment PR branch."""
 
     @classmethod
     def create(cls, runtime: GitHubToolRuntime) -> Sequence[Self]:
         return _tool(
-            cls, PublishAssignmentBranchAction, "Publish assignment branch",
-            "Publish the exact clean local commit to this student's current WIP "
-            "assignment branch with a fast-forward lease. Verify its recorded "
-            "research base and assignment revision before and after publication. "
-            "This does not post a comment, submit a result, change PR routing, "
-            "or release a hold. A current-revision terminal result forbids it.",
-            PublishAssignmentBranchExecutor(runtime),
+            cls, PushExperimentCommitAction, "Push experiment commit",
+            "Push the exact current local commit (HEAD) to the existing GitHub branch for "
+            "this student's experiment PR. There must be no uncommitted changes. "
+            "The PR must be open and marked work in progress (status:wip). Supply "
+            "the PR number, assignment ID, current instruction revision ID, "
+            "current GitHub PR head and local Git commit identifiers (SHAs). "
+            "The tool checks "
+            "the assigned student, branch, base commit and current instructions; "
+            "it refuses to overwrite other commits or push after a final experiment "
+            "result. It does not post a comment, submit a result, change PR "
+            "labels or draft state, remove a hold, or authorize training.",
+            PushExperimentCommitExecutor(runtime),
         )
 
 
@@ -218,6 +245,23 @@ class CloseExperimentTool(
             "Close one current experiment without merging it, recording an "
             "evidence-backed reason and preserving the durable result.",
             CloseExperimentExecutor(runtime.workflow),
+        )
+
+
+class CreateHumanIssueTool(
+    ToolDefinition[CreateHumanIssueAction, GitHubMutationObservation]
+):
+    """Open an issue for human input once per stable issue ID."""
+
+    @classmethod
+    def create(cls, runtime: GitHubToolRuntime) -> Sequence[Self]:
+        return _tool(
+            cls, CreateHumanIssueAction, "Create human issue",
+            "Create or exactly replay one issue for human input. Reuse its issue_id "
+            "with unchanged title and body on retries. The backend adds human and "
+            "this role's audience labels, and mentions the GitHub credential "
+            "owner, when available, in the initial issue body.",
+            CreateHumanIssueExecutor(runtime),
         )
 
 

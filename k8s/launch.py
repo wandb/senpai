@@ -129,7 +129,9 @@ class Args:
         ""  # exact runner commit; resolved from published defaults or source-SHA tags
     )
     advisor_image: str = ""  # advisor image override; blank resolves the matching published image
-    student_image: str = ""  # controller and training image; blank resolves the latest published image
+    student_image: str = ""  # controller and default training image; blank resolves the latest published image
+    training_image: str = ""  # optional custom training image, pinned by digest
+    image_pull_secrets: list[str] = field(default_factory=list)  # existing registry secrets in the launch namespace
     executor_image: str = ""  # broker image override; blank resolves the matching published digest
     kube_context: str = ""  # kubectl context; empty uses the current context
     namespace: str = "default"  # Kubernetes namespace for all launch resources
@@ -430,7 +432,8 @@ def build_launch_context(
         wandb_entity=args.wandb_entity,
         wandb_project=args.wandb_project,
         backend=backend,
-        training_image=args.student_image,
+        training_image=args.training_image or args.student_image,
+        training_control_image=args.student_image,
         training_output_root=f"{args.pvc_mount_path.rstrip('/')}/.senpai/runs/{tag}",
         nodes_per_student=args.nodes_per_student,
         gpus_per_student_node=args.gpus_per_student_node,
@@ -733,7 +736,9 @@ def render_student(
                 "/var/lib/senpai-executor/reservation.json"
             ),
             "SENPAI_EXECUTOR_IMAGE": args.executor_image,
-            "SENPAI_TRAINING_IMAGE": args.student_image,
+            "SENPAI_TRAINING_IMAGE": args.training_image or args.student_image,
+            "SENPAI_TRAINING_CONTROL_IMAGE": args.student_image,
+            "SENPAI_IMAGE_PULL_SECRETS": json.dumps(args.image_pull_secrets),
             "SENPAI_TRAINING_OUTPUT_ROOT": (
                 f"{args.pvc_mount_path.rstrip('/')}/.senpai/runs/{tag}/{student_name}"
             ),
@@ -754,6 +759,9 @@ def render_student(
             "STUDENT_NAME": student_name,
             "RESEARCH_TAG": tag,
             "STUDENT_IMAGE": args.student_image,
+            "IMAGE_PULL_SECRETS": json.dumps(
+                [{"name": name} for name in args.image_pull_secrets]
+            ),
             "EXECUTOR_IMAGE": args.executor_image,
             "ADVISOR_BRANCH": args.advisor_branch,
             "PVC_CLAIM_NAME": args.pvc_claim_name,
@@ -857,6 +865,9 @@ def render_advisor(
             "ADVISOR_CONFIGMAP_NAME": advisor_configmap_name,
             "RESEARCH_TAG": tag,
             "ADVISOR_IMAGE": args.advisor_image,
+            "IMAGE_PULL_SECRETS": json.dumps(
+                [{"name": name} for name in args.image_pull_secrets]
+            ),
             "PVC_CLAIM_NAME": args.pvc_claim_name,
             "PVC_MOUNT_PATH": json.dumps(args.pvc_mount_path),
             "TARGET_WORKSPACE_MOUNT": json.dumps(target_workspace_mount),
@@ -941,6 +952,8 @@ def main():
         validate_custom_secret_env_names(args.custom_secret_env_names)
     except ValueError as error:
         sys.exit(f"ERROR: {error}")
+    if args.training_image and not is_digest_image_reference(args.training_image):
+        sys.exit("ERROR: --training_image must use an immutable @sha256 digest")
     role_images = {
         "advisor": args.advisor_image,
         "student": args.student_image,
@@ -1033,6 +1046,8 @@ def main():
             if storage_images:
                 validate_storage(
                     images=storage_images,
+                    training_image=args.training_image,
+                    image_pull_secrets=args.image_pull_secrets,
                     pvc_mount_path=args.pvc_mount_path,
                     pvc_claim_name=args.pvc_claim_name,
                     output_roots=[f"{output_root}/{name}" for name in student_list] or [output_root],
@@ -1226,6 +1241,7 @@ def main():
             tag=args.tag,
             namespace=args.namespace,
             image=args.executor_image,
+            image_pull_secrets=args.image_pull_secrets,
             revision=args.senpai_repo_revision,
             config=capacity_config(args),
             node_selector=controller_node_selector(args.controller_node_selector),

@@ -54,7 +54,7 @@ def run_without_model(_prompt, config):
         exa_tool.configure_exa_credentials(config.exa_api_key)
         openhands_runner.register_senpai_tools()
 
-        def request(client, path, options):
+        def request(client, path, options, *, headers=None):
             assert client.headers["x-api-key"] == "nested-exa-key"
             assert path == "/search"
             assert options["query"] == "nested delegation evidence"

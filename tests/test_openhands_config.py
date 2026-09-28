@@ -167,11 +167,11 @@ def test_student_charter_requires_typed_workflow_and_training_tools():
 
     assert "Use `post_assignment_comment`" in instructions
     assert "When `post_assignment_comment` is present" not in instructions
-    assert "ask the advisor a meaningful interim question" in instructions
+    assert "ask the advisor a meaningful question" in instructions
     assert "fresh `comment_id`" not in instructions
     assert "fresh `comment_id`" in submission_skill
     assert "Keep the PR concise" in submission_skill
-    assert "Use `submit_experiment_result` for the terminal result" in instructions
+    assert "Use `submit_experiment_result` for the final experiment result" in instructions
     assert "must use `run_training`" in instructions
     assert "Never launch training through the terminal" in instructions
     assert "`monitor_training`" in instructions

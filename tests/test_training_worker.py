@@ -148,6 +148,7 @@ runpy.run_module('senpai_agent.training_worker', run_name='__main__')
     server = subprocess.Popen(
         [sys.executable, "-P", "-c", check_startup],
         env={**os.environ, "HOME": str(home), "TEST_SSH_PORT": str(port),
+             "SENPAI_TARGET_PYTHON_ENV": str(home / ".venvs/target"),
              "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
@@ -170,7 +171,8 @@ runpy.run_module('senpai_agent.training_worker', run_name='__main__')
         server.communicate(timeout=3)
 
 
-def test_mpi_launch_keeps_ssh_on_launcher_with_its_known_hosts(tmp_path, monkeypatch):
+@pytest.mark.parametrize("custom", [False, True])
+def test_mpi_launch_keeps_ssh_on_launcher_with_its_known_hosts(tmp_path, monkeypatch, custom):
     import contextlib
     import socket
 
@@ -183,6 +185,7 @@ def test_mpi_launch_keeps_ssh_on_launcher_with_its_known_hosts(tmp_path, monkeyp
     (keys / "id_rsa.pub").write_text("ssh-rsa operator-public-key\n")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("NNODES", "128")
+    monkeypatch.setenv("SENPAI_TARGET_PYTHON_ENV", "" if custom else str(home / ".venvs/target"))
     read_text = Path.read_text
 
     def operator_hostfile(path, *args, **kwargs):
@@ -218,9 +221,62 @@ def test_mpi_launch_keeps_ssh_on_launcher_with_its_known_hosts(tmp_path, monkeyp
     training_worker.mpi()
     executable, argv = invocations.pop()
     assert executable == "/usr/bin/mpirun"
-    parameters = {argv[index + 1]: argv[index + 2] for index, value in enumerate(argv) if value == "--mca"}
-    # OpenMPI4's default tree launch requires worker-to-worker SSH. Only the
+    parameters = {argv[index + 1]: argv[index + 2] for index, value in enumerate(argv) if value == "--prtemca"}
+    # OpenMPI5's default tree launch requires worker-to-worker SSH. Only the
     # launcher owns the complete known_hosts file, so all SSH starts belong here.
-    assert parameters.get("plm_rsh_no_tree_spawn") == "1"
+    assert parameters.get("plm_ssh_no_tree_spawn") == "1"
+    assert "2222" in parameters["plm_ssh_args"]
     assert argv[argv.index("-np") + 1] == "128"
     assert attempts["worker-0.job"] == attempts["worker-1.job"] == 2
+    exports = [argv[index + 1] for index, value in enumerate(argv) if value == "-x"]
+    assert ("PATH" in exports) is not custom
+    assert argv[-1] == ("/home/senpai/.senpai-run" if custom else "run")
+
+
+@pytest.mark.parametrize("through_ssh", [False, True])
+def test_custom_image_runs_without_senpai_git_or_dependency_tools(tmp_path, through_ssh):
+    import venv
+
+    image = tmp_path / "custom-python"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(image)
+    python = image / "bin" / "python3"
+    workspace = tmp_path / "checkout"
+    workspace.mkdir()
+    output = tmp_path / "shared-output"
+    script = tmp_path / "runtime" / "worker.py"
+    script.parent.mkdir()
+    script.write_bytes((Path(__file__).resolve().parents[1] / "senpai_agent/training_worker.py").read_bytes())
+    command = """
+import json, os, pathlib, sys
+record = {'prefix': sys.prefix, 'path': os.environ['PATH'], 'cwd': os.getcwd(),
+          'library_path': os.environ['LD_LIBRARY_PATH'], 'rank': os.environ['NODE_RANK'],
+          'argv': sys.argv[1:], 'safe_path': sys.flags.safe_path}
+pathlib.Path(os.environ['SENPAI_TRAINING_OUTPUT_DIR'], 'custom.json').write_text(json.dumps(record))
+"""
+    environment = {
+        "PATH": str(image / "bin"), "HOME": str(tmp_path), "LD_LIBRARY_PATH": "/custom/lib",
+        "SENPAI_TRAINING_WORKSPACE": str(workspace),
+        "SENPAI_TRAINING_OUTPUT_DIR": str(output),
+        "SENPAI_TRAINING_COMMAND_B64": base64.b64encode(json.dumps({
+            "argv": ["python3", "-c", command, "literal ; argument"], "cwd": str(workspace),
+        }).encode()).decode(),
+    }
+    invocation = [str(python), "-I", str(script), "run"]
+    if through_ssh:
+        keys = tmp_path / ".ssh"
+        keys.mkdir()
+        (keys / "id_rsa").write_text("operator key")
+        # Stop only at the SSH daemon exec boundary; exercise its real bootstrap.
+        bootstrap = "import os,runpy,sys; os.execv=lambda *args: None; sys.argv=[sys.argv[1], 'sshd']; runpy.run_path(sys.argv[0], run_name='__main__')"
+        subprocess.run([str(python), "-I", "-c", bootstrap, str(script)],
+                       env=environment, check=True, capture_output=True, text=True, timeout=30)
+        invocation = [str(tmp_path / ".senpai-run")]
+        environment = {"HOME": str(tmp_path), "PATH": "/usr/bin:/bin", "OMPI_COMM_WORLD_RANK": "1"}
+    result = subprocess.run(invocation, env=environment,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((output / "custom.json").read_text()) == {
+        "prefix": str(image), "path": str(image / "bin"), "cwd": str(workspace),
+        "library_path": "/custom/lib", "rank": "1" if through_ssh else "0", "argv": ["literal ; argument"],
+        "safe_path": False,
+    }

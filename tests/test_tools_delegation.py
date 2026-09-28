@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from openhands.sdk.context.view import View
+from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.event import MessageEvent
 from openhands.sdk.llm import Message, TextContent
 
@@ -279,7 +280,10 @@ def parent_conversation() -> SimpleNamespace:
             ),
         ]
     )
-    return SimpleNamespace(id=uuid.uuid4(), state=SimpleNamespace(view=view))
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        state=SimpleNamespace(view=view, secret_registry=SecretRegistry()),
+    )
 
 
 def config(tmp_path: Path, **updates) -> DelegationConfig:

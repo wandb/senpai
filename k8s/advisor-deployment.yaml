@@ -33,6 +33,7 @@ spec:
         research-tag: {{RESEARCH_TAG}}
     spec:
       automountServiceAccountToken: false
+      imagePullSecrets: {{IMAGE_PULL_SECRETS}}
       terminationGracePeriodSeconds: 90
       securityContext:
         runAsNonRoot: true

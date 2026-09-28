@@ -37,6 +37,7 @@ def supervisor(tmp_path, monkeypatch, client=None, **overrides):
         "SENPAI_TRAINING_SNAPSHOT_ROOT": str(snapshot_root),
         "SENPAI_TRAINING_OUTPUT_ROOT": str(tmp_path / "outputs"),
         "SENPAI_TRAINING_IMAGE": "ghcr.io/wandb/senpai-student@sha256:" + "a" * 64,
+        "SENPAI_TRAINING_CONTROL_IMAGE": "ghcr.io/wandb/senpai-student@sha256:" + "a" * 64,
         "CPU_PER_STUDENT_GPU": "1", "MEMORY_GI_PER_STUDENT_GPU": "2",
         "PVC_CLAIM_NAME": "dataset", "PVC_MOUNT_PATH": str(tmp_path / "data"),
         "WANDB_ENTITY": "entity", "WANDB_PROJECT": "project",
@@ -57,8 +58,9 @@ def supervisor(tmp_path, monkeypatch, client=None, **overrides):
 
 
 @pytest.mark.parametrize("nodes", [1, 2])
+@pytest.mark.parametrize("custom", [False, True])
 def test_training_command_is_submitted_to_workers_without_running_on_controller(
-    tmp_path, monkeypatch, nodes,
+    tmp_path, monkeypatch, nodes, custom,
 ):
     class SubmittedCluster(FakeCluster):
         def __init__(self):
@@ -70,6 +72,8 @@ def test_training_command_is_submitted_to_workers_without_running_on_controller(
 
     client = SubmittedCluster()
     runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client, nodes=nodes)
+    if custom:
+        monkeypatch.setenv("SENPAI_TRAINING_IMAGE", "registry.example/custom@sha256:" + "b" * 64)
     marker = workspace / "must-not-run-here"
     started = runtime.run_training(TrainingSpec(
         argv=(sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"),
@@ -89,6 +93,27 @@ def test_training_command_is_submitted_to_workers_without_running_on_controller(
     payload = json.loads(base64.b64decode(environment["SENPAI_TRAINING_COMMAND_B64"]))
     assert payload["argv"] == [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
     assert payload["cwd"] == "/workspace"
+    templates = (
+        {"Worker": manifest["spec"]["template"]} if nodes == 1
+        else {role: replica["template"] for role, replica in manifest["spec"]["mpiReplicaSpecs"].items()}
+    )
+    for role, template in templates.items():
+        container, = template["spec"]["containers"]
+        worker = role == "Worker"
+        assert container["image"] == os.environ[
+            "SENPAI_TRAINING_IMAGE" if worker else "SENPAI_TRAINING_CONTROL_IMAGE"
+        ]
+        if custom and worker:
+            assert container["command"] == [
+                "python3", "/var/run/senpai-training/worker.py", "run" if nodes == 1 else "sshd",
+            ]
+        else:
+            assert container["command"][:4] == [
+                "/opt/senpai-venv/bin/python", "-P", "-m", "senpai_agent.training_worker",
+            ]
+        image_environment = {entry["name"]: entry.get("value") for entry in container["env"]}
+        assert bool(image_environment["SENPAI_TARGET_PYTHON_ENV"]) is not custom
+        assert image_environment["HOME"] == "/home/senpai"
     result = runtime.get_training_status(started.training_id)
     assert result.kubernetes_released is True
     assert result.source_commit == subprocess.check_output(

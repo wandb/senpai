@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -14,6 +15,7 @@ import venv
 
 import pytest
 
+from senpai_agent import kubernetes_executor
 from senpai_agent.kubernetes_executor import (
     KubernetesExecutor,
     _UnixServer,
@@ -85,7 +87,7 @@ def test_executor_server_keeps_serving_during_reconcile_outages(capsys):
 
 
 def executor(
-    tmp_path: Path, client: FakeApi | None = None, *, nodes: int = 2
+    tmp_path: Path, client: FakeApi | None = None, *, nodes: int = 2, **options
 ) -> KubernetesExecutor:
     return KubernetesExecutor(
         client=client or FakeApi(),
@@ -100,12 +102,14 @@ def executor(
         pvc_mount_path=Path("/mnt/amf1-pvc"),
         snapshot_root=Path("/mnt/amf1-pvc/snapshots"),
         executor_image="executor@sha256:" + "a" * 64,
+        training_control_image="training:immutable",
         launch_secret_name="senpai-launch-secrets-fred",
         wandb_tags="senpai,schmidhuber,fern",
         research_tag="fred",
         student_name="fern",
         pod_name="senpai-fred-fern-123",
         pod_uid="student-pod-uid",
+        **options,
     )
 
 
@@ -223,21 +227,26 @@ def apply(broker: KubernetesExecutor, document: dict) -> str:
     return broker.handle({"operation": "apply", "manifest": yaml.safe_dump(document)})
 
 
-@pytest.mark.parametrize("restart_policy", ["Never", "OnFailure"])
-def test_single_node_job_has_one_bounded_attempt_and_exact_source(tmp_path, restart_policy):
+@pytest.mark.parametrize("restart_policy", ["Never", "OnFailure", "Always", None])
+def test_executor_validates_and_runs_single_node_training_jobs(tmp_path, restart_policy):
     api = FakeApi()
-    broker = executor(tmp_path, api, nodes=1)
-    reserve(broker, kind="Job")
+    image = "registry.example/training@sha256:" + "b" * 64
+    broker = executor(
+        tmp_path, api, nodes=1, training_image=image,
+        image_pull_secrets=["private-training"],
+    )
+    reservation = reserve(broker, kind="Job")
     document = manifest()
-    worker = document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]
-    worker["spec"]["restartPolicy"] = restart_policy
-    document.update({
-        "apiVersion": "batch/v1",
-        "kind": "Job",
-        "spec": {"template": worker, "backoffLimit": 8, "suspend": False},
+    template = document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]
+    document.update(apiVersion="batch/v1", kind="Job", spec={
+        "template": template, "backoffLimit": 8, "suspend": False,
     })
+    if restart_policy is None:
+        template["spec"].pop("restartPolicy")
+    else:
+        template["spec"]["restartPolicy"] = restart_policy
     if restart_policy != "Never":
-        with pytest.raises(ValueError, match="restartPolicy.*Never"):
+        with pytest.raises(ValueError, match="Job pods must use restartPolicy Never"):
             apply(broker, document)
         assert api.creates == 0
         return
@@ -256,7 +265,10 @@ def test_single_node_job_has_one_bounded_attempt_and_exact_source(tmp_path, rest
     pod = created["spec"]["template"]["spec"]
     assert pod["automountServiceAccountToken"] is False
     assert "affinity" not in pod
+    assert pod["containers"][0]["image"] == image
+    assert pod["imagePullSecrets"] == [{"name": "private-training"}]
     checkout = pod["initContainers"][0]
+    assert checkout["image"] == "executor@sha256:" + "a" * 64
     assert {item["name"]: item["value"] for item in checkout["env"]}[
         "SENPAI_SOURCE_COMMIT"
     ] == "a" * 40
@@ -266,6 +278,9 @@ def test_single_node_job_has_one_bounded_attempt_and_exact_source(tmp_path, rest
     assert environment["WANDB_API_KEY"]["valueFrom"]["secretKeyRef"] == {
         "name": "senpai-launch-secrets-fred", "key": "wandb-api-key",
     }
+    resource = broker.handle({"operation": "resource", "spec": reservation["spec"],
+                              "nodes": 1, "gpus_per_node": 8})
+    assert (resource["kind"], resource["nodes"], resource["gpus_per_node"]) == ("Job", 1, 8)
 
 
 def test_slow_logs_do_not_block_executor_status_or_cancellation(tmp_path):
@@ -312,11 +327,16 @@ def test_slow_logs_do_not_block_executor_status_or_cancellation(tmp_path):
 
 
 @pytest.mark.parametrize("wandb_key_role", ["Worker", "Launcher"])
+@pytest.mark.parametrize("custom_image", [False, True])
 def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(
-    tmp_path, wandb_key_role,
+    tmp_path, wandb_key_role, custom_image,
 ):
     api = FakeApi()
-    broker = executor(tmp_path, api)
+    training_image = "registry.example/training@sha256:" + "b" * 64
+    broker = executor(tmp_path, api, **({
+        "training_image": training_image,
+        "image_pull_secrets": ["private-training"],
+    } if custom_image else {}))
     reserve(broker)
     document = manifest()
     document["spec"]["runPolicy"]["suspend"] = False
@@ -403,8 +423,14 @@ def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(
         if role == "Launcher":
             assert "affinity" not in pod_spec
         assert pod_spec["automountServiceAccountToken"] is False
+        assert pod_spec.get("imagePullSecrets", []) == (
+            [{"name": "private-training"}] if custom_image else []
+        )
         assert pod_spec["terminationGracePeriodSeconds"] == 30
         for container in pod_spec["containers"]:
+            assert container["image"] == (
+                training_image if custom_image and role == "Worker" else "training:immutable"
+            )
             assert [item for item in container["env"] if item["name"] == "WANDB_RUN_ID"] == [
                 {"name": "WANDB_RUN_ID", "value": "wandb-one"}
             ]
@@ -426,6 +452,18 @@ def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(
         assert len(checkout) == 1
         assert checkout[0]["name"] == "senpai-source-checkout"
         assert checkout[0]["image"] == "executor@sha256:" + "a" * 64
+        runtime_mounts = [
+            mount for mount in pod_spec["containers"][0]["volumeMounts"]
+            if mount["mountPath"] == "/var/run/senpai-training"
+        ]
+        assert runtime_mounts == ([{
+            "name": "senpai-training-runtime", "mountPath": "/var/run/senpai-training",
+            "readOnly": True,
+        }] if custom_image and role == "Worker" else [])
+        if runtime_mounts:
+            assert {"name": "senpai-training-runtime", "emptyDir": {}} in pod_spec["volumes"]
+            assert {"name": "senpai-training-runtime", "mountPath": "/var/run/senpai-training"} in checkout[0]["volumeMounts"]
+            assert {"name": "SENPAI_TRAINING_WORKER_SCRIPT", "value": "/var/run/senpai-training/worker.py"} in checkout[0]["env"]
         assert checkout[0]["securityContext"]["runAsNonRoot"] is True
         assert checkout[0]["securityContext"]["runAsUser"] == 10001
         assert checkout[0]["securityContext"]["runAsGroup"] == 10001
@@ -596,6 +634,20 @@ def test_executor_rejects_a_dataset_mount_replaced_by_the_workspace(tmp_path):
     ("mutation", "message"),
     [
         (
+            lambda value: value["spec"]["mpiReplicaSpecs"]["Worker"]["template"][
+                "spec"
+            ]["volumes"].append({"name": "senpai-training-runtime", "emptyDir": {}}),
+            "reserved Senpai volume name",
+        ),
+        (
+            lambda value: value["spec"]["mpiReplicaSpecs"]["Worker"]["template"][
+                "spec"
+            ]["containers"][0]["volumeMounts"].append({
+                "name": "dataset", "mountPath": "/var/run/senpai-training/worker.py",
+            }),
+            "shadow the Senpai training runtime",
+        ),
+        (
             lambda value: value["spec"].__setitem__("sshAuthMountPath", "/workspace"),
             "SSH credentials must mount at /home/senpai/.ssh",
         ),
@@ -609,6 +661,12 @@ def test_executor_rejects_a_dataset_mount_replaced_by_the_workspace(tmp_path):
             lambda value: value["spec"]["mpiReplicaSpecs"]["Worker"]["template"][
                 "spec"
             ].__setitem__("serviceAccountName", "admin"),
+            "workload identity",
+        ),
+        (
+            lambda value: value["spec"]["mpiReplicaSpecs"]["Worker"]["template"][
+                "spec"
+            ].__setitem__("imagePullSecrets", [{"name": "unapproved"}]),
             "workload identity",
         ),
         (
@@ -805,7 +863,17 @@ def test_exact_commit_checkout_is_writable_and_rejects_a_mutated_bundle(
         # Exercise Git's real ownership check without requiring a root test process.
         monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
     workspace = tmp_path / "exact-workspace"
-    checkout_source_bundle(bundle, workspace, commit)
+    runtime = tmp_path / "training-runtime"
+    runtime.mkdir()
+    worker = runtime / "worker.py"
+    monkeypatch.setenv("SENPAI_SOURCE_BUNDLE", str(bundle))
+    monkeypatch.setenv("SENPAI_SOURCE_WORKSPACE", str(workspace))
+    monkeypatch.setenv("SENPAI_SOURCE_COMMIT", commit)
+    monkeypatch.setenv("SENPAI_TRAINING_WORKER_SCRIPT", str(worker))
+    monkeypatch.setattr(sys, "argv", ["kubernetes_executor", "checkout"])
+    kubernetes_executor.main()
+    assert worker.read_bytes() == Path(kubernetes_executor.__file__).with_name("training_worker.py").read_bytes()
+    assert worker.stat().st_mode & 0o777 == 0o555
     assert (workspace / "source.py").read_text() == "exact = True\n"
     assert (workspace / "source.py").stat().st_uid == os.geteuid()
     (workspace / "source.py").write_text("exact = False\n")

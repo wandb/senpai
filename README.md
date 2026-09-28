@@ -197,7 +197,8 @@ Leave `advisor_image`, `student_image`, `executor_image`, and
 `senpai_repo_revision` blank to use the latest published student image and the
 matching advisor and executor images. Senpai resolves and verifies their
 registry digests and source revision once per launch. Every experiment in that
-launch uses the selected student image. If a matching build is not available,
+launch uses that image unless `training_image` selects a custom worker image.
+If a matching build is not available,
 launch stops before creating agents.
 
 For a specific build, supply its full `senpai_repo_revision`; omitted images are
@@ -315,6 +316,50 @@ lead to the reserved MPIJob. Log-read failures appear in diagnostics
 instead of disappearing silently. These reads stay inside the executor broker;
 students receive neither Kubernetes credentials nor namespace-wide read access.
 When a smoke run stalls before W&B starts, inspect these diagnostics first.
+
+### Bring your own training image
+
+Build and publish your training image before launch. Set `training_image` to run
+training in that image while Senpai supplies the student agent and executor.
+Your image keeps its Python, CUDA, and installed dependencies; it does not need
+Senpai, OpenHands, or Git. Use a Linux image that supports your worker
+architecture, GPU driver, and training command. It must provide Python 3.9 or newer as `python3` and
+allow the command to run as UID/GID 10001. Multi-node images also need compatible
+OpenMPI 5/PRRTE under `/usr` and OpenSSH server binaries, plus a `senpai` account with UID/GID 10001
+and a writable `/home/senpai`. Senpai supplies the worker bootstrap; no
+Senpai Python package is required in the image.
+
+Any registry reachable by the cluster works, including GitHub Container Registry,
+Docker Hub, and CoreWeave Container Registry. Supply an immutable digest:
+
+```yaml
+# Optional settings in senpai.local.yaml.
+training_image: ghcr.io/OWNER/training@sha256:<manifest-digest>
+image_pull_secrets: [training-registry]
+```
+
+For Docker Hub, use `docker.io/OWNER/training@sha256:<manifest-digest>`.
+For CoreWeave Container Registry, use your namespace's full registry endpoint
+and repository with `@sha256:<manifest-digest>`. See the
+[CWIC registry examples](https://github.com/coreweave/cwic#container-registry)
+for namespace login and digest lookup. The training image has no Senpai
+revision requirement. `student_image` still selects the Senpai agent runtime.
+
+Create any private-registry pull secrets in the launch namespace before launch,
+following the [Kubernetes registry credential instructions](https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/).
+The Secret must contain registry credentials; Kubernetes cannot use a local
+Docker credential helper. `image_pull_secrets` lists the Secret names. Senpai
+attaches these references to its pods and remote training pods; agents cannot
+select other pull secrets. Omit the list for public images or when cluster-managed
+authentication suffices.
+
+All launches use a CPU student controller and separate GPU workers.
+`run_training` accepts the same [ordinary command](#training-commands) with either
+image choice. Commit training code before running it; Senpai checks out that
+exact commit in the training pod. An empty `training_image` uses the standard
+student image automatically. For MPI runs, the CPU launcher always uses the
+standard image; only GPU workers use the custom image. The launch context tells
+the agent which image runs its command and how to inspect its packages.
 
 ### Advisory cluster capacity
 
@@ -465,7 +510,17 @@ flowchart LR
 5. The student calls `submit_experiment_result`; the tool validates and publishes the branch before changing the PR to `status:review`.
 6. The advisor compares the evidence, then uses the corresponding operation-specific tool to merge a reproducible winner, close a useful negative result, request a new revision, or send non-revision feedback.
 
-When an assignment requires public source before training or review, the student uses `publish_assignment_branch` with the current assignment version and exact clean local HEAD. The tool derives the assigned branch, checks the recorded base and current revision, and publishes with a fast-forward lease. It verifies the published head and unchanged assignment record afterward. Exact replay is safe, including with the original pre-push lease. Publication leaves comments, draft state, labels, and holds unchanged; it does not submit a result or authorize a launch. Closed assignments and revisions with a terminal result cannot use this interim path. Concurrent external assignment changes can make verification fail after a successful push; refresh the assignment instead of rolling back or bypassing the tool.
+When the advisor requires code on GitHub before training or review, use `push_experiment_commit`. It pushes the exact current local commit (HEAD) to the existing GitHub branch for the experiment PR. Commit all changes first. Supply:
+
+- `assignment.pr_number`: the experiment PR number.
+- `assignment.assignment_id`: the assignment ID in the advisor's current assignment record on that PR.
+- `assignment.revision_id`: the revision ID for the current instructions in that record.
+- `assignment.expected_pr_head_sha`: the Git commit identifier (SHA) currently at the head of the GitHub PR.
+- `local_commit_sha`: the identifier of the exact current local commit (HEAD) to push.
+
+The tool checks the assigned student, branch, base commit and current instructions. It requires no uncommitted changes and refuses to overwrite other commits. After pushing, it verifies the new GitHub PR head and checks that the assignment record is unchanged. Retrying the same push is safe, even with the original pre-push PR head SHA.
+
+Pushing does not remove a hold or authorize training. The tool leaves comments, labels and draft state unchanged, and it does not submit a result. It rejects closed PRs and assignment revisions that already have a final experiment result. If the assignment changes during the push, the commit can reach GitHub before the final check fails. Read the current PR and assignment instructions before continuing; do not roll back the push or bypass the tool.
 
 The structured result records its terminal status, exact result commit, W&B run IDs and URLs, bounded conclusion, and baseline/candidate metric comparison when available. Once published for an assignment revision and head, that evidence is immutable: exact duplicate publication is an idempotent replay, while changed evidence requires a new commit or revision. Non-revision feedback continues the same student conversation; a revision request intentionally creates a fresh revision identity and conversation.
 
@@ -548,7 +603,7 @@ nor the browser family.
 
 `run_training` accepts ordinary `argv`, a `cwd` inside the student's assignment,
 and a timeout. It runs that command in a separate worker using the selected
-student image and the exact committed source snapshot. Senpai creates a Job for
+training image and the exact committed source snapshot. Senpai creates a Job for
 one node or an MPIJob for multiple nodes; agents do not write Kubernetes YAML.
 The working directory maps to the same relative path in the worker checkout.
 
@@ -562,10 +617,11 @@ For example, a student can submit:
 }
 ```
 
-The launch context names the exact training image. The controller uses the same
-image, so `/opt/senpai-venv/bin/python -P -m pip list` lists its base Python
+The launch context names the exact training image. By default the controller
+uses the same standard image, so `/opt/senpai-venv/bin/python -P -m pip list` lists its base Python
 packages. Each worker has a writable target environment that can use or override
-those packages. Normal dependency files and setup commands remain the target
+those packages. A custom image keeps its own Python environment; inspect it
+with a short `run_training` command such as `python3 -m pip list`. Normal dependency files and setup commands remain the target
 repository's responsibility; no Senpai-specific setup file is required. Files
 and packages created only in the controller do not transfer to a fresh worker.
 
@@ -793,6 +849,40 @@ Useful launch controls:
 - `--gh_history_scope branch` keeps normal advisor-branch memory, `fresh` creates a shallow ablation checkout, and `repo` exposes full repository history.
 - `--extra_instructions` accepts optional human operator guidance as a Markdown file or literal user context.
 - `human_issues: false` disables GitHub Issue polling for isolated launches.
+
+Senpai uses GitHub's `GET /user` endpoint to identify the owner of its GitHub
+credential and mentions that account in issue notifications. It assumes this
+account runs the research. An account with GitHub type `User` qualifies, including
+a service account registered as an ordinary user. GitHub does not distinguish
+those service accounts from personal accounts in this response. No handle
+configuration or collaborator lookup is required.
+GitHub controls alert delivery through your
+[notification settings](https://docs.github.com/en/subscriptions-and-notifications/get-started/configuring-notifications#customizing-your-email-notifications),
+including whether to email you about your own activity.
+
+Bot accounts and tokens without a user identity, such as GitHub App installation
+tokens and GitHub Actions `GITHUB_TOKEN`, receive no automatic mention. If the
+owner lookup fails or returns an invalid identity, Senpai skips the mention and
+continues creating the issue or reply.
+
+Senpai identifies its publishing account separately so it can recognize its
+own protocol messages. It honors `SENPAI_GITHUB_ACTOR` when configured. Otherwise,
+it uses `GET /user`, then GraphQL `viewer { login }` if that request returns
+HTTP 403. This supports publishing with installation tokens without using the
+publishing bot as a notification recipient.
+
+Advisor and student roots can open an issue with
+`create_human_issue(issue_id, title, body)`. The runtime adds the `human` label
+and the caller's audience label, then mentions the credential owner, when
+available, in the initial issue body. Reusing the same `issue_id` and content
+returns the existing issue, even if it is closed; changed content requires a new
+ID. Replies to an issue with a trusted Senpai creation marker receive no
+automatic mentions.
+
+For human-created issues, the runtime adds mentions only to the earliest saved
+Senpai reply. It posts replies first, then selects the lowest comment ID so
+concurrent replies from different pods agree. Retrying or editing that first
+reply repeats the owner lookup; later replies receive no automatic mentions.
 
 All role images are built from the same source revision. The advisor image excludes CUDA and PyTorch; the student image contains the CUDA/PyTorch runtime; the executor image contains only its Python broker; the cutoff image contains only the minimal job runtime and pinned `kubectl`. Advisor and student builds install Chromium and execute an OpenHands browser smoke test.
 

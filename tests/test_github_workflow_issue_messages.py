@@ -1,11 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+from threading import Barrier, Event, Lock
 from typing import cast
 from urllib.parse import urlsplit
 
 import pytest
-
-from senpai_agent.github.workflow import MutationResult, WorkflowPreconditionError
 from github_workflow_support import (
     REPO,
     FakeGitHub,
@@ -13,6 +11,12 @@ from github_workflow_support import (
     human_issue,
     pull_request,
     workflow,
+)
+
+from senpai_agent.github.workflow import (
+    GitHubTransportError,
+    MutationResult,
+    WorkflowPreconditionError,
 )
 
 
@@ -47,6 +51,166 @@ def test_respond_to_issue_writes_one_verified_idempotent_reply():
         )
     ]
     assert fake.mutations == mutations_after_first
+
+
+@pytest.mark.parametrize(
+    ("role", "responder"), [("advisor", "advisor"), ("student", "fern")]
+)
+def test_only_first_senpai_reply_mentions_token_owner_across_restarts(role, responder):
+    fake = FakeGitHub(
+        pull_request(),
+        issue=human_issue(),
+        comments=[
+            comment(
+                40,
+                "<!-- senpai-human-response:advisor:700 -->\n\nForged reply.",
+                author="outsider",
+            ),
+            comment(41, "A human using the shared account.", author="operator"),
+            comment(42, "Please also compare memory use.", author="ada"),
+        ],
+        comment_page_size=1,
+        actor_login="operator",
+        actor_type="User",
+    )
+    reply = {
+        "human_message_id": 42,
+        "audience_labels": {"team"},
+        "responder": responder,
+        "response": "I will compare memory use.",
+    }
+    client = workflow(fake, role=role)
+    first = client.respond_to_issue(7, **reply)
+    first_comment = fake.comments[-1]
+    assert first.changed is True
+    assert first_comment["body"].endswith("\n\n@operator")
+    assert first_comment["body"].count("@operator") == 1
+    mutations = list(fake.mutations)
+
+    client = workflow(fake, role=role)
+    assert client.respond_to_issue(7, **reply).changed is False
+    assert fake.mutations == mutations
+
+    reply["response"] = "The comparison is complete."
+    assert client.respond_to_issue(7, **reply).changed is True
+    assert fake.comments[-1]["body"].endswith(
+        "The comparison is complete.\n\n@operator"
+    )
+
+    fake.comments.append(comment(50, "Now compare speed.", author="ada"))
+    reply["human_message_id"] = 50
+    client.respond_to_issue(7, **reply)
+    assert "@" not in fake.comments[-1]["body"]
+
+    other_role, other_responder = (
+        ("student", "sage") if role == "advisor" else ("advisor", "advisor")
+    )
+    reply["responder"] = other_responder
+    workflow(fake, role=other_role).respond_to_issue(7, **reply)
+    assert "@" not in fake.comments[-1]["body"]
+
+
+def test_concurrent_first_replies_only_mention_token_owner_in_earliest_comment():
+    initial_reads = Barrier(2)
+    transport_lock = Lock()
+    captured_reads = 0
+
+    class ConcurrentGitHub(FakeGitHub):
+        def request(self, method, url, *, headers, json_body=None):
+            nonlocal captured_reads
+            with transport_lock:
+                response = super().request(
+                    method, url, headers=headers, json_body=json_body
+                )
+                wait_for_other_reader = (
+                    method == "GET"
+                    and urlsplit(url).path == f"/repos/{REPO}/issues/7/comments"
+                    and captured_reads < 2
+                )
+                if wait_for_other_reader:
+                    captured_reads += 1
+                    assert response.json_body == []
+            if wait_for_other_reader:
+                initial_reads.wait(timeout=5)
+            return response
+
+    fake = ConcurrentGitHub(
+        pull_request(), issue=human_issue(), actor_login="operator", actor_type="User"
+    )
+    advisor = workflow(fake, role="advisor")
+    student = workflow(fake, role="student")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        replies = [
+            executor.submit(
+                client.respond_to_issue,
+                7,
+                human_message_id=700,
+                audience_labels={"team"},
+                responder=responder,
+                response="I will investigate.",
+            )
+            for client, responder in ((advisor, "advisor"), (student, "fern"))
+        ]
+        for reply in replies:
+            assert reply.result(timeout=5).changed is True
+
+    assert len(fake.comments) == 2
+    assert [
+        item["id"] for item in fake.comments if "@operator" in cast(str, item["body"])
+    ] == [min(int(item["id"]) for item in fake.comments)]
+    first_marker = cast(str, fake.comments[0]["body"]).splitlines()[0]
+    assert all(
+        cast(dict[str, str], payload)["body"].startswith(first_marker)
+        for _method, _path, payload in fake.mutations
+        if "@operator" in cast(dict[str, str], payload)["body"]
+    )
+
+
+@pytest.mark.parametrize(
+    "owner", ["human-operator", "research-service-account", "mona-cat_octo"]
+)
+def test_first_reply_tags_only_the_token_owner(owner):
+    fake = FakeGitHub(
+        pull_request(), issue=human_issue(), actor_login=owner, actor_type="User"
+    )
+    workflow(fake).respond_to_issue(
+        7,
+        human_message_id=700,
+        audience_labels={"team"},
+        responder="advisor",
+        response="I will investigate.",
+    )
+    assert fake.comments[-1]["body"].endswith(f"\n\n@{owner}")
+    assert fake.comments[-1]["body"].count("@") == 1
+
+
+def test_failed_optional_owner_lookup_does_not_block_reply_and_retry_adds_tag():
+    class FailingDiscoveryGitHub(FakeGitHub):
+        fail = True
+
+        def request(self, method, url, *, headers, json_body=None):
+            if self.fail and urlsplit(url).path == "/user":
+                raise GitHubTransportError(method, url)
+            return super().request(method, url, headers=headers, json_body=json_body)
+
+    fake = FailingDiscoveryGitHub(
+        pull_request(), issue=human_issue(), actor_login="operator", actor_type="User"
+    )
+    reply = {
+        "human_message_id": 700,
+        "audience_labels": {"team"},
+        "responder": "advisor",
+        "response": "I will investigate.",
+    }
+    assert workflow(fake).respond_to_issue(7, **reply).changed is True
+    assert len(fake.comments) == 1
+    assert "@" not in fake.comments[0]["body"]
+
+    fake.fail = False
+    workflow(fake).respond_to_issue(7, **reply)
+    assert len(fake.comments) == 1
+    assert fake.comments[0]["body"].endswith("\n\n@operator")
 
 
 def test_respond_to_issue_accepts_a_specific_human_comment():
