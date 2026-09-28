@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import errno
 import io
 import json
 import os
@@ -73,6 +74,190 @@ class FakeApi:
         }
 
 
+
+class ConcurrentApi(FakeApi):
+    """API boundary with independent server objects and UID-bound mutations."""
+
+    def __init__(self):
+        super().__init__()
+        self.documents = {}
+
+    def document(self, spec):
+        return deepcopy(self.documents.get(spec.name))
+
+    def create(self, manifest, namespace):
+        self.creates += 1
+        self.submitted.append(deepcopy(manifest))
+        document = deepcopy(manifest)
+        document["metadata"]["uid"] = f"uid-{document['metadata']['name']}"
+        self.documents[document["metadata"]["name"]] = document
+        return deepcopy(document)
+
+    def activate(self, resource, _timeout_seconds=30):
+        document = self.documents[resource.name]
+        assert document["metadata"]["uid"] == resource.uid
+        document["spec"].get("runPolicy", document["spec"])["suspend"] = False
+        self.activated.append(resource)
+
+    def delete(self, resource, _timeout_seconds=60):
+        assert self.documents[resource.name]["metadata"]["uid"] == resource.uid
+        del self.documents[resource.name]
+        self.deleted.append(resource)
+
+
+def requested_run(broker, training_id, *, nodes, gpus_per_node, deadline_at):
+    request = {
+        "operation": "reserve", "training_id": training_id,
+        "spec": {"kind": "Job" if nodes == 1 else "MPIJob", "name": training_id,
+                 "namespace": "research", "wandb_run_id": training_id},
+        "nodes": nodes, "gpus_per_node": gpus_per_node, "deadline_at": deadline_at,
+        "source_commit": "a" * 40,
+        "source_snapshot": str(broker.snapshot_root / ("a" * 40 + ".bundle")),
+    }
+    document = manifest()
+    document["metadata"].update(name=training_id)
+    document["metadata"]["annotations"]["senpai.wandb.com/run-id"] = training_id
+    replicas = document["spec"]["mpiReplicaSpecs"]
+    worker = replicas["Worker"]["template"]
+    resources = {"cpu": str(15 * gpus_per_node), "memory": f"{110 * gpus_per_node}Gi",
+                 "nvidia.com/gpu": str(gpus_per_node)}
+    worker["spec"]["containers"][0]["resources"] = {
+        "requests": resources, "limits": dict(resources),
+    }
+    if nodes == 1:
+        document.update(apiVersion="batch/v1", kind="Job", spec={"template": worker})
+    else:
+        replicas["Worker"]["replicas"] = nodes
+        document["spec"]["slotsPerWorker"] = gpus_per_node
+    return request, document
+
+
+def test_executor_routes_concurrent_shapes_and_unlimited_run_across_restart(tmp_path, monkeypatch):
+    api = ConcurrentApi()
+    broker = executor(tmp_path, api)
+    deadline = time.time() + 30
+    limited, job = requested_run(broker, "limited", nodes=1, gpus_per_node=4, deadline_at=deadline)
+    unlimited, mpi = requested_run(broker, "unlimited", nodes=2, gpus_per_node=6, deadline_at=None)
+    for request, document in ((limited, job), (unlimited, mpi)):
+        broker.handle(request)
+        apply(broker, document)
+    assert len(api.activated) == 2
+    assert "activeDeadlineSeconds" in api.documents["limited"]["spec"]
+    policy = api.documents["unlimited"]["spec"]["runPolicy"]
+    assert "activeDeadlineSeconds" not in policy
+    assert "scheduleTimeoutSeconds" not in policy["schedulingPolicy"]
+
+    recovered = executor(tmp_path, api)
+    refs = {
+        request["training_id"]: recovered.handle({
+            "operation": "resource", "spec": request["spec"],
+            "nodes": request["nodes"], "gpus_per_node": request["gpus_per_node"],
+        }) for request in (limited, unlimited)
+    }
+    assert refs["limited"]["nodes"] == 1 and refs["limited"]["gpus_per_node"] == 4
+    assert refs["unlimited"]["nodes"] == 2 and refs["unlimited"]["gpus_per_node"] == 6
+    recovered.handle({**unlimited, "operation": "adopt", "resource": refs["unlimited"]})
+    with pytest.raises(PermissionError):
+        recovered.handle({**unlimited, "operation": "adopt", "training_id": "limited", "resource": refs["unlimited"]})
+    with pytest.raises(PermissionError):
+        recovered.handle({"operation": "delete", "resource": {**refs["limited"], "uid": refs["unlimited"]["uid"]}, "timeout_seconds": 1})
+    monkeypatch.setattr(kubernetes_executor.time, "time", lambda: deadline + 1)
+    recovered.reconcile()
+    assert [ref.name for ref in api.deleted] == ["limited"]
+    assert recovered.handle({"operation": "state", "resource": refs["unlimited"]})[0] == "running"
+    replacement, _ = requested_run(recovered, "replacement", nodes=1, gpus_per_node=4, deadline_at=None)
+    recovered.handle(replacement)
+    recovered.handle({"operation": "delete", "resource": refs["unlimited"], "timeout_seconds": 1})
+    receipt = recovered.handle({"operation": "release", "training_id": "unlimited"})
+    assert receipt["training_id"] == "unlimited"
+    assert receipt["resource"]["uid"] == refs["unlimited"]["uid"]
+
+
+def test_executor_reserves_aggregate_gpu_budget_atomically(tmp_path):
+    broker = executor(tmp_path, ConcurrentApi())
+    requests = [requested_run(broker, name, nodes=2, gpus_per_node=6, deadline_at=time.time() + 600)[0]
+                for name in ("alpha", "beta")]
+    barrier = threading.Barrier(2)
+    accepted, failures = [], []
+
+    def reserve_one(request):
+        barrier.wait(timeout=5)
+        try:
+            broker.handle(request)
+        except RuntimeError as error:
+            failures.append(error)
+        else:
+            accepted.append(request)
+
+    threads = [threading.Thread(target=reserve_one, args=(request,)) for request in requests]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    assert len(accepted) == len(failures) == 1
+    failure = failures[0]
+    assert failure.requested_gpus == 12
+    assert failure.available_gpus == 4
+    assert failure.capacity_gpus == 16
+    assert [run["training_id"] for run in failure.active_runs] == [accepted[0]["training_id"]]
+    broker.handle(accepted[0])  # Repeating an identical reservation consumes no extra capacity.
+    recovered = executor(tmp_path, broker.client)
+    with pytest.raises(type(failure)):
+        recovered.handle(next(request for request in requests if request not in accepted))
+
+
+def test_failed_reservation_write_does_not_consume_capacity(tmp_path, monkeypatch):
+    broker = executor(tmp_path, ConcurrentApi())
+    original_replace = Path.replace
+
+    def full_disk(path, target):
+        if target == broker.state_path:
+            raise OSError(errno.ENOSPC, "reservation disk is full")
+        return original_replace(path, target)
+
+    rejected, _ = requested_run(broker, "not-persisted", nodes=2, gpus_per_node=8, deadline_at=None)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "replace", full_disk)
+        with pytest.raises(OSError, match="reservation disk is full"):
+            broker.handle(rejected)
+    assert broker.client.creates == 0
+    accepted, _ = requested_run(broker, "persisted", nodes=2, gpus_per_node=8, deadline_at=None)
+    broker.handle(accepted)
+    assert set(json.loads(broker.state_path.read_text())["reservations"]) == {"persisted"}
+
+
+def test_unaccepted_launch_cleanup_is_idempotent_without_api_reads(tmp_path):
+    class UnavailableApi(FakeApi):
+        def document(self, spec):
+            raise AssertionError("an unreserved identity must not reach Kubernetes")
+
+    broker = executor(tmp_path, UnavailableApi())
+    request, _ = requested_run(broker, "unaccepted", nodes=1, gpus_per_node=1, deadline_at=None)
+    assert broker.handle({"operation": "resource_identity", "spec": request["spec"]}) is None
+    assert broker.handle({"operation": "release", "training_id": request["training_id"]}) == {}
+    assert not broker.state_path.exists()
+
+
+def test_reconciliation_failure_does_not_block_another_workload_deadline(tmp_path, monkeypatch):
+    api = ConcurrentApi()
+    broker = executor(tmp_path, api)
+    deadline = time.time() + 30
+    requests = [requested_run(broker, name, nodes=1, gpus_per_node=8, deadline_at=deadline)
+                for name in ("replaced", "expired")]
+    for request, document in requests:
+        broker.handle(request)
+        apply(broker, document)
+    api.documents["replaced"]["metadata"]["uid"] = "some-other-workload"
+    monkeypatch.setattr(kubernetes_executor.time, "time", lambda: deadline + 1)
+    with pytest.raises(PermissionError, match="not owned"):
+        broker.reconcile()
+    assert [resource.name for resource in api.deleted] == ["expired"]
+    assert "replaced" in api.documents
+    replacement, _ = requested_run(broker, "new", nodes=1, gpus_per_node=8, deadline_at=None)
+    broker.handle(replacement)
+
+
 def test_executor_server_keeps_serving_during_reconcile_outages(capsys):
     class UnavailableExecutor:
         def reconcile(self):
@@ -95,7 +280,6 @@ def executor(
         namespace="research",
         nodes=nodes,
         gpus_per_node=8,
-        max_timeout_seconds=3600,
         cpu_per_gpu=15,
         memory_gi_per_gpu=110,
         pvc_claim_name="amf1-pvc",
@@ -114,16 +298,19 @@ def executor(
 
 
 def reserve(
-    broker: KubernetesExecutor, commit: str = "a" * 40, *, kind: str = "MPIJob"
+    broker: KubernetesExecutor, commit: str = "a" * 40, *, kind: str = "MPIJob",
+    training_id: str = "training-one",
 ) -> dict:
     request = {
         "operation": "reserve",
-        "training_id": "training-one",
+        "training_id": training_id,
+        "nodes": broker.nodes,
+        "gpus_per_node": broker.gpus_per_node,
         "spec": {
             "kind": kind,
-            "name": "senpai-fred-fern-123",
+            "name": "senpai-fred-fern-123" if training_id == "training-one" else training_id,
             "namespace": "research",
-            "wandb_run_id": "wandb-one",
+            "wandb_run_id": "wandb-one" if training_id == "training-one" else training_id,
         },
         "deadline_at": time.time() + 1800,
         "source_snapshot": str(broker.snapshot_root / f"{commit}.bundle"),
@@ -131,6 +318,11 @@ def reserve(
     }
     broker.handle(request)
     return request
+
+
+
+def saved_reservation(tmp_path: Path, training_id: str = "training-one") -> dict:
+    return json.loads((tmp_path / "reservation.json").read_text())["reservations"][training_id]
 
 
 def manifest(commit: str = "a" * 40) -> dict:
@@ -918,7 +1110,7 @@ def test_executor_persists_uid_and_uses_it_for_delete(tmp_path):
 
     assert api.deleted == [KubernetesResourceRef.model_validate(resource)]
     broker.handle({"operation": "release", "training_id": "training-one"})
-    assert json.loads((tmp_path / "reservation.json").read_text())["released"] is True
+    assert saved_reservation(tmp_path)["released"] is True
 
 
 def test_executor_never_activates_after_the_deadline(tmp_path):
@@ -927,7 +1119,7 @@ def test_executor_never_activates_after_the_deadline(tmp_path):
 
         def create(self, manifest, namespace):
             created = super().create(manifest, namespace)
-            self.broker._reservation["deadline_at"] = time.time() - 1
+            self.broker._reservations["training-one"]["deadline_at"] = time.time() - 1
             return created
 
     api = DeadlineExpiresDuringCreate()
@@ -940,7 +1132,7 @@ def test_executor_never_activates_after_the_deadline(tmp_path):
 
     assert api.activated == []
     assert api.deleted[0].uid == "created-uid"
-    persisted = json.loads((tmp_path / "reservation.json").read_text())
+    persisted = saved_reservation(tmp_path)
     assert persisted["activated"] is False
     assert persisted["released"] is True
 
@@ -963,7 +1155,7 @@ def test_executor_recovers_an_authorized_activation_after_restart(tmp_path):
 
     with pytest.raises(TimeoutError, match="temporary activation outage"):
         apply(broker, manifest())
-    persisted = json.loads((tmp_path / "reservation.json").read_text())
+    persisted = saved_reservation(tmp_path)
     assert persisted["activation_authorized"] is True
     assert persisted["activated"] is False
 
@@ -971,28 +1163,25 @@ def test_executor_recovers_an_authorized_activation_after_restart(tmp_path):
 
     assert api.activation_attempts == 2
     assert api.document_value["spec"]["runPolicy"]["suspend"] is False
-    assert json.loads((tmp_path / "reservation.json").read_text())["activated"] is True
+    assert saved_reservation(tmp_path)["activated"] is True
 
 
-def test_executor_reaps_an_activation_request_that_reaches_the_deadline(tmp_path):
+def test_executor_reaps_an_activation_request_that_reaches_the_deadline(tmp_path, monkeypatch):
     class ActivationTimesOutAtDeadline(FakeApi):
-        broker: KubernetesExecutor
-
         def activate(self, resource, timeout_seconds=30):
-            self.broker._reservation["deadline_at"] = time.time() - 1
+            monkeypatch.setattr(kubernetes_executor.time, "time", lambda: request["deadline_at"] + 1)
             raise TimeoutError("activation response was lost at the deadline")
 
     api = ActivationTimesOutAtDeadline()
     broker = executor(tmp_path, api)
-    api.broker = broker
-    reserve(broker)
+    request = reserve(broker)
 
     with pytest.raises(TimeoutError, match="during Kubernetes activation"):
         apply(broker, manifest())
 
     assert api.activated == []
     assert api.deleted[0].uid == "created-uid"
-    assert json.loads((tmp_path / "reservation.json").read_text())["released"] is True
+    assert saved_reservation(tmp_path)["released"] is True
 
 
 def test_executor_recovers_create_before_uid_persist_and_rejects_replacement(tmp_path):
@@ -1001,9 +1190,12 @@ def test_executor_recovers_create_before_uid_persist_and_rejects_replacement(tmp
     request = reserve(broker)
     apply(broker, manifest())
     state_path = tmp_path / "reservation.json"
-    persisted = json.loads(state_path.read_text())
+    persisted = saved_reservation(tmp_path)
     persisted.update(created=False, resource=None)
-    state_path.write_text(json.dumps(persisted))
+    persisted.pop("nodes")
+    persisted.pop("gpus_per_node")
+    state_path.write_text(json.dumps(persisted))  # Legacy single-reservation state.
+
 
     recovered = executor(tmp_path, api)
     resource = recovered.handle(
@@ -1045,7 +1237,7 @@ def test_executor_recovers_a_create_response_failure_before_release(tmp_path):
     assert api.document_value is not None
     with pytest.raises(RuntimeError, match="live Kubernetes workload"):
         broker.handle({"operation": "release", "training_id": "training-one"})
-    persisted = json.loads((tmp_path / "reservation.json").read_text())
+    persisted = saved_reservation(tmp_path)
     assert persisted["resource"]["uid"] == "created-uid"
     assert persisted["released"] is False
 
@@ -1066,13 +1258,13 @@ def test_executor_releases_a_direct_create_rejection(tmp_path, status_code):
     with pytest.raises(KubernetesApiError, match=f"HTTP {status_code}"):
         apply(broker, manifest())
 
-    persisted = json.loads((tmp_path / "reservation.json").read_text())
+    persisted = saved_reservation(tmp_path)
     assert persisted["create_attempted"] is True
     assert persisted["released"] is True
     assert persisted["manifest"] is None
 
-    reserve(broker, "b" * 40)
-    replacement = json.loads((tmp_path / "reservation.json").read_text())
+    reserve(broker, "b" * 40, training_id="training-two")
+    replacement = saved_reservation(tmp_path, "training-two")
     assert replacement["source_commit"] == "b" * 40
     assert replacement["released"] is False
 
@@ -1080,6 +1272,7 @@ def test_executor_releases_a_direct_create_rejection(tmp_path, status_code):
 @pytest.mark.parametrize("retry_operation", ["reconcile", "apply"])
 def test_executor_retains_a_rejected_retry_after_an_ambiguous_create(
     tmp_path,
+    monkeypatch,
     retry_operation,
 ):
     class RejectedRetry(FakeApi):
@@ -1105,7 +1298,9 @@ def test_executor_retains_a_rejected_retry_after_an_ambiguous_create(
 
     with pytest.raises(TimeoutError, match="response was lost"):
         apply(broker, manifest())
-    assert json.loads((tmp_path / "reservation.json").read_text())["released"] is False
+    assert saved_reservation(tmp_path)["released"] is False
+    retry_time = time.time() + 2
+    monkeypatch.setattr(kubernetes_executor.time, "time", lambda: retry_time)
 
     if retry_operation == "reconcile":
         broker.reconcile()
@@ -1113,13 +1308,13 @@ def test_executor_retains_a_rejected_retry_after_an_ambiguous_create(
         with pytest.raises(KubernetesApiError, match="HTTP 422"):
             apply(broker, manifest())
 
-    persisted = json.loads((tmp_path / "reservation.json").read_text())
+    persisted = saved_reservation(tmp_path)
     assert persisted["create_attempted"] is True
     assert persisted["released"] is False
     assert persisted["manifest"] is not None
 
     api.complete_initial_create()
-    broker._reservation["deadline_at"] = time.time() - 1
+    broker._reservations["training-one"]["deadline_at"] = time.time() - 1
     broker._write_state()
     broker.reconcile()
 
@@ -1133,7 +1328,7 @@ def test_executor_retains_a_rejected_retry_after_an_ambiguous_create(
             gpus_per_node=8,
         )
     ]
-    assert json.loads((tmp_path / "reservation.json").read_text())["released"] is True
+    assert saved_reservation(tmp_path)["released"] is True
 
 
 @pytest.mark.parametrize(
@@ -1157,7 +1352,7 @@ def test_executor_retains_an_ambiguous_http_create_response(
     with pytest.raises(KubernetesApiError, match=f"HTTP {status_code}"):
         apply(broker, manifest())
 
-    persisted = json.loads((tmp_path / "reservation.json").read_text())
+    persisted = saved_reservation(tmp_path)
     assert persisted["create_attempted"] is True
     assert persisted["released"] is False
     assert persisted["manifest"] is not None
@@ -1180,17 +1375,17 @@ def test_executor_retains_an_unresolved_create_until_it_becomes_visible(tmp_path
 
     with pytest.raises(TimeoutError, match="response was lost"):
         apply(broker, manifest())
-    persisted = json.loads((tmp_path / "reservation.json").read_text())
+    persisted = saved_reservation(tmp_path)
     assert persisted["create_attempted"] is True
     assert persisted["released"] is False
     assert persisted["manifest"] is not None
     with pytest.raises(RuntimeError, match="unresolved Kubernetes create"):
         broker.handle({"operation": "release", "training_id": "training-one"})
 
-    broker._reservation["deadline_at"] = time.time() - 1
+    broker._reservations["training-one"]["deadline_at"] = time.time() - 1
     broker._write_state()
     broker.reconcile()
-    persisted = json.loads((tmp_path / "reservation.json").read_text())
+    persisted = saved_reservation(tmp_path)
     assert persisted["resource"] is None
     assert persisted["released"] is False
 
@@ -1206,10 +1401,52 @@ def test_executor_retains_an_unresolved_create_until_it_becomes_visible(tmp_path
             gpus_per_node=8,
         )
     ]
-    assert json.loads((tmp_path / "reservation.json").read_text())["released"] is True
+    assert saved_reservation(tmp_path)["released"] is True
 
 
-def test_executor_retries_a_create_that_never_reached_the_api(tmp_path):
+def test_unlimited_ambiguous_create_uses_durable_capped_backoff_without_blocking_other_runs(tmp_path, monkeypatch):
+    now = [100_000.0]
+    monkeypatch.setattr(kubernetes_executor.time, "time", lambda: now[0])
+
+    class UnavailableCreate(ConcurrentApi):
+        def __init__(self):
+            super().__init__()
+            self.attempt_times = []
+
+        def create(self, document, namespace):
+            if document["metadata"]["name"] == "ambiguous":
+                assert document["spec"]["suspend"] is True
+                self.attempt_times.append(now[0])
+                raise TimeoutError("create response lost")
+            return super().create(document, namespace)
+
+    api = UnavailableCreate()
+    broker = executor(tmp_path, api)
+    request, document = requested_run(broker, "ambiguous", nodes=1, gpus_per_node=8, deadline_at=None)
+    broker.handle(request)
+    with pytest.raises(TimeoutError, match="response lost"):
+        apply(broker, document)
+    recovered = executor(tmp_path, api)
+    assert api.attempt_times == [100_000.0], "restart retried before the durable retry time"
+    with pytest.raises(RuntimeError, match="retry"):
+        apply(recovered, document)
+    healthy, healthy_document = requested_run(recovered, "healthy", nodes=1, gpus_per_node=8, deadline_at=None)
+    recovered.handle(healthy)
+    apply(recovered, healthy_document)
+    for attempts, delay in enumerate((1, 2, 4, 8, 16, 30, 30), start=1):
+        now[0] += delay - 0.25
+        recovered.reconcile()
+        assert len(api.attempt_times) == attempts
+        now[0] += 0.25
+        recovered.reconcile()
+        assert len(api.attempt_times) == attempts + 1
+    assert [resource.name for resource in api.activated] == ["healthy"]
+    assert api.deleted == []
+    with pytest.raises(RuntimeError, match="unresolved Kubernetes create"):
+        recovered.handle({"operation": "release", "training_id": "ambiguous"})
+
+
+def test_executor_retries_a_create_that_never_reached_the_api(tmp_path, monkeypatch):
     class LostBeforeApi(FakeApi):
         def __init__(self):
             super().__init__()
@@ -1228,7 +1465,9 @@ def test_executor_retries_a_create_that_never_reached_the_api(tmp_path):
     with pytest.raises(TimeoutError, match="never reached"):
         apply(broker, manifest())
 
-    broker._reservation["deadline_at"] = time.time() - 1
+    retry_time = time.time() + 2
+    monkeypatch.setattr(kubernetes_executor.time, "time", lambda: retry_time)
+    broker._reservations["training-one"]["deadline_at"] = time.time() - 1
     broker._write_state()
     executor(tmp_path, api)
 
@@ -1243,10 +1482,10 @@ def test_executor_retries_a_create_that_never_reached_the_api(tmp_path):
             gpus_per_node=8,
         )
     ]
-    assert json.loads((tmp_path / "reservation.json").read_text())["released"] is True
+    assert saved_reservation(tmp_path)["released"] is True
 
 
-def test_late_initial_create_stays_suspended_after_retry_release(tmp_path):
+def test_late_initial_create_stays_suspended_after_retry_release(tmp_path, monkeypatch):
     class ParkedInitialCreate(FakeApi):
         def __init__(self):
             super().__init__()
@@ -1272,12 +1511,14 @@ def test_late_initial_create_stays_suspended_after_retry_release(tmp_path):
     with pytest.raises(TimeoutError, match="still in flight"):
         apply(broker, manifest())
 
-    broker._reservation["deadline_at"] = time.time() - 1
+    retry_time = time.time() + 2
+    monkeypatch.setattr(kubernetes_executor.time, "time", lambda: retry_time)
+    broker._reservations["training-one"]["deadline_at"] = time.time() - 1
     broker._write_state()
     broker.reconcile()
     assert api.deleted[0].uid == "created-uid"
     assert api.activated == []
-    assert json.loads((tmp_path / "reservation.json").read_text())["released"] is True
+    assert saved_reservation(tmp_path)["released"] is True
 
     api.complete_initial_create()
 
@@ -1678,7 +1919,7 @@ def test_executor_preserves_pod_receipt_before_release_or_cleanup(tmp_path, monk
     request = reserve(broker)
     broker.handle({'operation': 'apply', 'manifest': json.dumps(manifest())})
     client.state_value = (TrainingState.FINISHED, 'done')
-    resource = broker._reservation['resource']
+    resource = broker._reservations["training-one"]['resource']
     observed = {'pods': [{'uid': 'worker-uid', 'restart_count': 2}], 'complete': False,
                 'expected_pods': 3, 'capture_error': None}
     client.pod_snapshot = lambda _resource: deepcopy(observed)
@@ -1691,7 +1932,7 @@ def test_executor_preserves_pod_receipt_before_release_or_cleanup(tmp_path, monk
         return json.loads(files[0].read_text())
 
     def write_state():
-        if broker._reservation.get('released'):
+        if broker._reservations["training-one"].get('released'):
             assert receipt()['pods'] == observed['pods']
         original_write()
 
@@ -1708,14 +1949,16 @@ def test_executor_preserves_pod_receipt_before_release_or_cleanup(tmp_path, monk
         broker.handle({'operation': 'delete', 'resource': resource, 'timeout_seconds': 60})
         broker.handle({'operation': 'release', 'training_id': 'training-one'})
     else:
-        broker._reservation['deadline_at'] = time.time() - 1
+        broker._reservations["training-one"]['deadline_at'] = time.time() - 1
         broker.reconcile()
     saved = receipt()
     assert saved['training_id'] == 'training-one'
     assert saved['source_commit'] == 'a' * 40
     assert saved['resource']['uid'] == 'created-uid'
     broker = executor(tmp_path, client)
-    broker.handle({**request, 'training_id': 'training-two'})
+    broker.handle({**request, 'training_id': 'training-two', 'spec': {
+        **request['spec'], 'name': 'training-two', 'wandb_run_id': 'training-two',
+    }})
     assert receipt() == saved  # New reservations cannot erase a prior run's evidence.
 
 
@@ -1743,17 +1986,17 @@ def test_receipt_storage_failure_blocks_normal_release_but_not_forced_cleanup(
     if operation == 'release':
         with pytest.raises(OSError):
             broker.handle({'operation': 'release', 'training_id': 'training-one'})
-        assert broker._reservation['released'] is False
+        assert broker._reservations["training-one"]['released'] is False
         assert not client.deleted
     elif operation == 'delete':
-        broker.handle({'operation': 'delete', 'resource': broker._reservation['resource'],
+        broker.handle({'operation': 'delete', 'resource': broker._reservations["training-one"]['resource'],
                        'timeout_seconds': 60})
         assert len(client.deleted) == 1
     else:
-        broker._reservation['deadline_at'] = time.time() - 1
+        broker._reservations["training-one"]['deadline_at'] = time.time() - 1
         broker.reconcile()
         assert len(client.deleted) == 1
-        assert broker._reservation['released'] is True
+        assert broker._reservations["training-one"]['released'] is True
     if operation != 'release':
         assert 'Kubernetes Pod receipt persistence failed' in capsys.readouterr().err
 
@@ -1857,7 +2100,7 @@ def test_executor_records_api_failure_as_unknown_and_rejects_receipt_identity_re
     receipt = broker.handle({'operation': 'release', 'training_id': 'training-one'})
     assert receipt['complete'] is False and receipt['pods'] == []
     assert receipt['capture_error'] == 'Pod status read failed: TimeoutError'
-    broker._reservation['source_commit'] = 'b' * 40
+    broker._reservations["training-one"]['source_commit'] = 'b' * 40
     with pytest.raises(RuntimeError, match='different workload'):
         broker.handle({'operation': 'release', 'training_id': 'training-one'})
 
@@ -1884,9 +2127,9 @@ def test_forced_cleanup_survives_receipt_read_failures(tmp_path, monkeypatch, ca
         monkeypatch.setattr(executor_module, '_POD_RECEIPT_TIMEOUT_SECONDS', 0.02)
     try:
         if operation == 'delete':
-            broker.handle({'operation': 'delete', 'resource': broker._reservation['resource'], 'timeout_seconds': 60})
+            broker.handle({'operation': 'delete', 'resource': broker._reservations["training-one"]['resource'], 'timeout_seconds': 60})
         else:
-            broker._reservation['deadline_at'] = time.time() - 1
+            broker._reservations["training-one"]['deadline_at'] = time.time() - 1
             broker.reconcile()
         assert client.deleted, 'forced cleanup must survive receipt read failure'
         if fault == 'stalled_read':

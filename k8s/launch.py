@@ -161,7 +161,6 @@ class Args:
     extra_instructions: str = (
         ""  # shared operator instructions: a .md file path or literal text
     )
-    timeout_minutes: float = 30.0  # wall-clock policy in the launch context
     max_epochs: int = 50  # epoch policy in the launch context
     custom_secret_env_names: list[str] = field(
         default_factory=list
@@ -349,8 +348,6 @@ def model_secret_env_refs(args: Args, role: str) -> list[tuple[str, str]]:
 
 
 def validate_timing_args(args: Args) -> None:
-    if args.timeout_minutes <= 0:
-        sys.exit("ERROR: --timeout_minutes must be positive")
     if args.max_epochs < 1:
         sys.exit("ERROR: --max_epochs must be at least 1")
     if args.poll_interval_s < 1:
@@ -437,7 +434,6 @@ def build_launch_context(
         training_output_root=f"{args.pvc_mount_path.rstrip('/')}/.senpai/runs/{tag}",
         nodes_per_student=args.nodes_per_student,
         gpus_per_student_node=args.gpus_per_student_node,
-        timeout_minutes=args.timeout_minutes,
         max_epochs=args.max_epochs,
         tag=tag,
         advisor_branch=args.advisor_branch,
@@ -741,9 +737,6 @@ def render_student(
             "SENPAI_IMAGE_PULL_SECRETS": json.dumps(args.image_pull_secrets),
             "SENPAI_TRAINING_OUTPUT_ROOT": (
                 f"{args.pvc_mount_path.rstrip('/')}/.senpai/runs/{tag}/{student_name}"
-            ),
-            "SENPAI_MAX_TRAINING_TIMEOUT_SECONDS": str(
-                round(args.timeout_minutes * 60)
             ),
             "PVC_CLAIM_NAME": args.pvc_claim_name,
             "SENPAI_LAUNCH_SECRET_NAME": secret_name,

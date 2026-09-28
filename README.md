@@ -165,14 +165,15 @@ cpu_per_gpu: 8
 memory_gi_per_gpu: 64
 controller_node_selector: []  # e.g. [compute.coreweave.com/node-pool=cpu]
 
-timeout_minutes: 30
 max_epochs: 50
 ```
 
 When upgrading an existing launch configuration, replace `gpus_per_student: N`
 with `nodes_per_student: 1` and `gpus_per_student_node: N`. Replace the
 `--gpus_per_student N` CLI option with `--gpus_per_student_node N` as well. The
-old key and option are no longer accepted. Every student now uses a CPU
+old key and option are no longer accepted. Remove `timeout_minutes` from launch
+configs and commands as well. Each `run_training` call may supply an optional
+`timeout_seconds`; omitting it means no per-run time limit. Every student now uses a CPU
 controller and a credential-isolated executor. The training worker shares the
 configured writable PVC. `run_training` accepts the actual training command;
 remove target-owned Kubernetes submission wrappers. Senpai constructs the Job
@@ -572,18 +573,35 @@ Students do not start GPU work, stream logs, sleep, or poll through the terminal
 
 | Tool | Contract |
 |---|---|
-| `run_training` | Accepts the training command's `argv`, `cwd`, and a hard timeout. It requires a clean assignment worktree and constructs and supervises one broker-owned Kubernetes Job or MPIJob without blocking. It persists identity, the output directory, logs, bounded errors, W&B run IDs, and terminal-state monitoring. |
+| `run_training` | Accepts `argv`, `cwd`, optional `timeout_seconds`, and optional `nodes`/`gpus_per_node`. It requires a clean assignment worktree and supervises a broker-owned Job or MPIJob without blocking. Concurrent runs must fit the student's aggregate GPU capacity. It persists run identity, outputs, bounded logs/errors, W&B run IDs, and terminal monitoring. |
 | `get_training_status` | Performs one bounded read of the latest persisted state, exit code, elapsed time, W&B run IDs, and error tail. |
-| `monitor_training` | Adds a W&B metric, minimize/maximize direction, `lte`, `gte`, `improved_by`, or `regressed_by` gates, a poll interval, and stale-update detection. It cannot disable terminal wakes. |
-| `cancel_training` | Deletes the workload by its UID, waits for a durable terminal state, and retires its monitor. |
+| `monitor_training` | Adds a W&B metric, direction, and `lte`, `gte`, `improved_by`, or `regressed_by` gates for one threshold alert per policy. Staleness alerts are opt-in. It cannot disable terminal wakes. |
+| `cancel_training` | Requests cancellation by workload UID and returns its durable terminal state. Monitoring continues until cleanup releases its GPUs. |
 
-Before each launch, Senpai reads the current GitHub assignment and checks its revision against the conversation identity saved by the controller. A superseded or unbound conversation cannot reserve resources or start training. It can still monitor or cancel its existing runs. If GitHub cannot confirm one current WIP assignment, the launch fails without starting work.
+Before each launch, Senpai reads the current GitHub assignment and checks its revision against the conversation identity saved by the controller. A superseded or unbound conversation cannot reserve resources or start training. The original conversation can still monitor or cancel its runs. The student's current assignment conversation can also cancel an older run from that student, so a predecessor cannot hold its allocation indefinitely. If GitHub cannot confirm one current WIP assignment, the launch fails without starting work.
 
-After launch, the student can finish its turn. The deterministic controller polls process state and at most one selected W&B metric without consuming model tokens. A threshold crossing, regression, stale metric, terminal state, or monitor error creates one compact durable event and resumes the same student conversation. One broken monitor cannot block other training, GitHub feedback, or child-agent results.
+After launch, the student can finish its turn. An independent local collector
+checks lifecycle state every two seconds. A separate W&B collector checks the
+selected metric at its configured interval, which defaults to 60 seconds.
+Neither consumes model tokens, and a slow W&B request does not delay local
+lifecycle checks. Idle controllers check local events every two seconds;
+GitHub keeps its separate, slower polling schedule. During an active turn,
+monitor events wait for a safe agent-step boundary without interrupting tools.
+Events resume the original student conversation, including after its assignment
+has changed; the new-launch assignment check still applies.
+
+The first threshold poll that matches any gates produces one combined alert;
+that policy produces no further threshold alerts. Identical registration and
+restart preserve this latch. A changed policy re-arms it. Each policy can
+produce one optional staleness alert and one monitor-error alert. These alerts
+do not automatically cancel training.
+Normally, one terminal event reports both the outcome and released resources.
+If cleanup remains pending for 30 seconds, the controller reports that state
+once and sends one follow-up when resources are released.
 
 Before the first metric arrives, an absent W&B run in an accessible project
-counts as a missing sample. The monitor keeps polling and emits a stale-metric
-signal after `stale_after_seconds`, measured from monitor registration.
+counts as a missing sample. If staleness checking is enabled, the monitor emits
+a stale-metric signal after `stale_after_seconds`, measured from registration.
 Authentication, project-access, and network errors remain hard monitor failures.
 A run that disappears after reporting a metric also remains a hard failure.
 
@@ -607,9 +625,13 @@ nor the browser family.
 
 ### Training commands
 
-`run_training` accepts ordinary `argv`, a `cwd` inside the student's assignment,
-and a timeout. It runs that command in a separate worker using the selected
-training image and the exact committed source snapshot. Senpai creates a Job for
+`run_training` accepts ordinary `argv` and a `cwd` inside the student's assignment.
+An optional positive `timeout_seconds` covers queue time, setup, and training;
+omitting it means no per-run time limit. An operator-armed fleet cutoff remains
+independent. Optional `nodes` and `gpus_per_node` default to the configured
+topology and may request smaller dimensions. Senpai runs the command in a
+separate worker using the selected training image and exact committed source
+snapshot. Senpai creates a Job for
 one node or an MPIJob for multiple nodes; agents do not write Kubernetes YAML.
 The working directory maps to the same relative path in the worker checkout.
 
@@ -619,9 +641,15 @@ For example, a student can submit:
 {
   "argv": ["bash", "-c", "python -m pip install -r requirements.txt && python train.py"],
   "cwd": "/workspaces/target",
-  "timeout_seconds": 1800
+  "nodes": 1,
+  "gpus_per_node": 1
 }
 ```
+
+Set `timeout_seconds`, for example `1800`, only when that run needs a deadline.
+A student may launch several runs in parallel while their combined GPU requests
+fit its allocation. A capacity rejection reports the active run IDs; wait for
+release, request fewer GPUs, or cancel a selected run by ID.
 
 The launch context names the exact training image. By default the controller
 uses the same standard image, so `/opt/senpai-venv/bin/python -P -m pip list` lists its base Python
@@ -643,6 +671,29 @@ beneath `<pvc_mount_path>/.senpai/runs/<tag>/<student>/<training_id>` and remain
 available to the advisor and student after the worker exits. Files written only
 to the worker checkout are removed with the Pod. W&B run identity, credentials,
 entity, project, and canonical tags are supplied by Senpai.
+
+Senpai captures the target command's combined stdout/stderr under
+`SENPAI_TRAINING_OUTPUT_DIR/.senpai-logs`. Each node has two rotating log files
+and a small metadata file. The 64 MiB budget applies to the whole run, divided
+across its nodes, and applies even without a time limit. Rotation records an
+explicit truncation marker. The known W&B API key is masked before retention
+or live mirroring. The Kubernetes mirror sends at most 64 MiB
+across all nodes, including a truncation notice; recent output continues to
+rotate on the PVC after that limit. A blocked or closed Kubernetes log consumer
+cannot stall the command; lost live output is marked, while bounded PVC capture
+continues.
+Infrastructure bootstrap output remains in Kubernetes diagnostics.
+
+Each student retains at most 512 MiB of completed-run worker logs, pruning the
+oldest eligible logs and recording `worker_logs_pruned` in the run result.
+Release receipts on the shared volume preserve this policy after controller
+state is lost. If old logs exceed the budget but lack release proof, Senpai
+blocks new training until that history is resolved; it does not delete those logs.
+Active logs are not pruned. Since every active run reserves at least one GPU,
+the active-log bound is 64 MiB times the student's configured total GPU count.
+These limits cover Senpai's captured logs; checkpoints and other target outputs
+are never deleted by this retention policy.
+The controller's diagnostic log keeps only its latest 8 KiB snapshot.
 
 For multiple nodes, the submitted command runs once on each worker node.
 `NODE_RANK`, `NNODES`, `MASTER_ADDR`, `MASTER_PORT`, and `GPUS_PER_NODE` describe
@@ -850,7 +901,7 @@ Useful launch controls:
 - `--names frieren,fern` selects stable students; otherwise use `--n_students` and `--student_prefix`.
 - `--nodes_per_student` and `--gpus_per_student_node` set the supervised worker topology; `--cpu_per_gpu` and `--memory_gi_per_gpu` bind its worker resources.
 - `--controller_node_selector key=value` optionally constrains advisor and student controller placement; the portable default leaves placement unconstrained.
-- `--timeout_minutes` sets the launch-context wall-clock policy and the broker's hard ceiling for training. `run_training` may request a shorter timeout. `--max_epochs` sets the agent-facing epoch policy.
+- `--max_epochs` sets the agent-facing epoch policy. Per-run time limits are optional `run_training.timeout_seconds` values; there is no launch-wide training timeout.
 - `--poll_interval_s` and `--poll_jitter_s` control idle GitHub cadence without teaching the model to poll.
 - `--gh_history_scope branch` keeps normal advisor-branch memory, `fresh` creates a shallow ablation checkout, and `repo` exposes full repository history.
 - `--extra_instructions` accepts optional human operator guidance as a Markdown file or literal user context.

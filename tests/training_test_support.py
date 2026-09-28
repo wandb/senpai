@@ -1,8 +1,48 @@
+from copy import deepcopy
 from pathlib import Path
 import subprocess
 import threading
 
 from senpai_agent.training import KubernetesResourceRef, KubernetesTrainingSpec, TrainingState
+
+
+class WorkloadApi:
+    """Independent Kubernetes objects behind the real reservation broker."""
+
+    def __init__(self):
+        self.documents = {}
+        self.deletions = []
+
+    def document(self, spec):
+        return deepcopy(self.documents.get(spec.name))
+
+    def create(self, manifest, namespace):
+        document = deepcopy(manifest)
+        name = document["metadata"]["name"]
+        assert name not in self.documents
+        document["metadata"].update(uid=f"uid-{name}", namespace=namespace)
+        self.documents[name] = document
+        return deepcopy(document)
+
+    def activate(self, resource, timeout_seconds):
+        document = self.documents[resource.name]
+        assert document["metadata"]["uid"] == resource.uid
+        document["spec"].get("runPolicy", document["spec"])["suspend"] = False
+
+    def state(self, resource):
+        assert self.documents[resource.name]["metadata"]["uid"] == resource.uid
+        return TrainingState.RUNNING, "active"
+
+    def delete(self, resource, timeout_seconds):
+        assert self.documents[resource.name]["metadata"]["uid"] == resource.uid
+        del self.documents[resource.name]
+        self.deletions.append(resource)
+
+    def logs(self, resource):
+        return {"statuses": [], "problems": [], "events": [], "logs": []}
+
+    def pod_snapshot(self, resource):
+        return {"complete": False, "capture_error": "fixture API has no Pods", "pods": []}
 
 
 class FakeCluster:
@@ -24,6 +64,9 @@ class FakeCluster:
         _deadline_at,
         source_snapshot,
         source_commit,
+        *,
+        nodes,
+        gpus_per_node,
     ):
         with self._lock:
             self.spec = spec
@@ -32,19 +75,23 @@ class FakeCluster:
                 name=spec.name,
                 namespace=spec.namespace,
                 uid="remote-uid",
-                nodes=self.nodes,
-                gpus_per_node=8,
+                nodes=nodes,
+                gpus_per_node=gpus_per_node,
             )
             self.reservations.append((training_id, source_snapshot, source_commit))
 
     def apply(self, manifest):
         pass
 
-    def adopt(self, _training_id, _spec, resource, _deadline_at):
+    def adopt(self, _training_id, _spec, resource, _deadline_at, *, nodes, gpus_per_node):
+        assert (resource.nodes, resource.gpus_per_node) == (nodes, gpus_per_node)
         self.adoptions.append(resource)
 
     def resource(self, _spec, *, nodes, gpus_per_node):
-        assert (nodes, gpus_per_node) == (self.nodes, 8)
+        if self.resource_value is not None:
+            assert (nodes, gpus_per_node) == (
+                self.resource_value.nodes, self.resource_value.gpus_per_node,
+            )
         return self.resource_value
 
     def resource_identity(self, _spec):

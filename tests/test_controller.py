@@ -29,8 +29,10 @@ from senpai_agent.inbox import (
 )
 from senpai_agent.mailbox import (
     ControllerEvent,
+    LocalStudentMailbox,
     StudentAssignmentAvailabilityMailbox,
 )
+from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.program_context import ProgramSystemPrompt
 from senpai_agent.state import StartedConversationLedger, WorkspaceDivergenceLedger
 from senpai_agent.supervisor import ProgressLease, WorkerLease
@@ -169,11 +171,15 @@ class MultiGenerationRecoveryTurns:
         first = inbox.reset_turn(inbox_turn_id, "first recovery")
         second = inbox.reset_turn(first.turn_id, "second recovery")
         assert first.turn_id != second.turn_id
-        deliver_turn_messages(SimpleNamespace(
-            events=[],
-            state=SimpleNamespace(active_branch=lambda: []),
-            send_message=lambda *_args, **_kwargs: None,
-        ), inbox, second.turn_id)
+        deliver_turn_messages(
+            SimpleNamespace(
+                events=[],
+                state=SimpleNamespace(active_branch=lambda: []),
+                send_message=lambda *_args, **_kwargs: None,
+            ),
+            inbox,
+            second.turn_id,
+        )
         inbox.record_processed(second.turn_id)
         return TurnResult(exit_code=0)
 
@@ -702,6 +708,10 @@ def test_fast_poll_defaults_to_ten_minute_level_trigger_reminders(monkeypatch):
             id="student-comment",
         ),
         pytest.param(human_pr_comment_event(), id="human-pr-comment"),
+        pytest.param(
+            ControllerEvent("training_monitor", "run:threshold", {"summary": "Threshold crossed."}),
+            id="training-monitor",
+        ),
     ],
 )
 def test_edge_triggered_event_does_not_repeat_on_reminder_cadence(
@@ -950,10 +960,10 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
     assert created[0].turns.full_prompt == "programme"
     assert created[0].turns.active_poll_interval_seconds == 75
     assert isinstance(
-        created[0].mailbox.mailboxes[0],
+        created[0].mailbox,
         StudentAssignmentAvailabilityMailbox,
     )
-    assert created[0].turns.github_mailbox is created[0].mailbox.mailboxes[0]
+    assert created[0].turns.github_mailbox is created[0].mailbox
     assert created[0].turn_timeout_seconds == 7260
 
 
@@ -1635,6 +1645,52 @@ def test_restart_continues_a_conversation_after_its_first_success(tmp_path: Path
 
     assert turns.calls[0][1] == conversation_id
     assert "programme" not in turns.calls[0][0]
+
+
+def test_local_monitor_wakes_idle_student_before_the_next_github_poll(tmp_path: Path):
+    mailbox = Mailbox([(), ()])
+    event_path = tmp_path / "events.sqlite3"
+    local = LocalStudentMailbox(event_path)
+    sleeps = []
+
+    class ObservingTurns(Turns):
+        def run(self, *args, **kwargs):
+            assert mailbox.calls == 1
+            assert sum(sleeps) == 2
+            turn = kwargs["inbox"].turn(kwargs["inbox_turn_id"])
+            assert "Training finished and resources are released" in turn.events[0].body
+            return super().run(*args, **kwargs)
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        with LocalEventStore(event_path) as events:
+            events.enqueue(
+                LocalEvent(
+                    kind="training_monitor",
+                    dedupe_key="run:finished",
+                    payload={
+                        "parent_conversation_id": str(CONVERSATION_ID),
+                        "conversation_id": str(CONVERSATION_ID),
+                        "summary": "Training finished and resources are released.",
+                    },
+                )
+            )
+
+    turns = ObservingTurns()
+    Controller(
+        role="student",
+        mailbox=mailbox,
+        local_mailbox=local,
+        turns=turns,
+        conversation_id=CONVERSATION_ID,
+        full_prompt="programme",
+        sleep=sleep,
+        poll_interval_seconds=600,
+        jitter_seconds=0,
+    ).run(max_cycles=2)
+    assert len(turns.calls) == 1
+    with LocalEventStore(event_path) as events:
+        assert events.pending() == []
 
 
 def test_turn_lease_uses_the_configured_hard_deadline(tmp_path: Path):

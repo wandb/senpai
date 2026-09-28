@@ -256,7 +256,7 @@ pathlib.Path(os.environ['SENPAI_TRAINING_OUTPUT_DIR'], 'custom.json').write_text
     environment = {
         "PATH": str(image / "bin"), "HOME": str(tmp_path), "LD_LIBRARY_PATH": "/custom/lib",
         "SENPAI_TRAINING_WORKSPACE": str(workspace),
-        "SENPAI_TRAINING_OUTPUT_DIR": str(output),
+        "SENPAI_TRAINING_OUTPUT_DIR": str(output), "NNODES": "2",
         "SENPAI_TRAINING_COMMAND_B64": base64.b64encode(json.dumps({
             "argv": ["python3", "-c", command, "literal ; argument"], "cwd": str(workspace),
         }).encode()).decode(),
@@ -280,3 +280,224 @@ pathlib.Path(os.environ['SENPAI_TRAINING_OUTPUT_DIR'], 'custom.json').write_text
         "library_path": "/custom/lib", "rank": "1" if through_ssh else "0", "argv": ["literal ; argument"],
         "safe_path": False,
     }
+
+
+@pytest.fixture
+def portable_worker(tmp_path):
+    """Exercise the injected, dependency-free worker as a real process."""
+    workspace = tmp_path / "checkout"
+    workspace.mkdir()
+    output = tmp_path / "output"
+    script = Path(__file__).resolve().parents[1] / "senpai_agent/training_worker.py"
+
+    def start(command, *, rank=0, nodes=1, budget=64 * 1024 * 1024):
+        home = tmp_path / f"home-{rank}"
+        home.mkdir()
+        environment = {
+            "HOME": str(home), "PATH": os.defpath,
+            "SENPAI_TRAINING_WORKSPACE": str(workspace),
+            "SENPAI_TRAINING_OUTPUT_DIR": str(output),
+            "SENPAI_TRAINING_LOG_MAX_BYTES": str(budget), "NNODES": str(nodes),
+            "WANDB_API_KEY": "unique-worker-secret-0123456789",
+            "SENPAI_TRAINING_COMMAND_B64": base64.b64encode(json.dumps({
+                "argv": [sys.executable, "-c", command], "cwd": str(workspace),
+            }).encode()).decode(),
+        }
+        if nodes > 1:
+            saved = home / ".senpai-ssh/environment.json"
+            saved.parent.mkdir()
+            saved.write_text(json.dumps(environment))
+            environment["OMPI_COMM_WORLD_RANK"] = str(rank)
+        return subprocess.Popen(
+            [sys.executable, "-I", str(script), "run"], env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+    return start, output
+
+
+def _wait_for_worker_file(path, process):
+    import time
+
+    deadline = time.monotonic() + 5
+    while not path.exists():
+        assert process.poll() is None, process.communicate(timeout=2)
+        assert time.monotonic() < deadline, str(path)
+        time.sleep(0.01)
+
+
+def test_worker_bounds_combined_logs_across_two_nodes(portable_worker):
+    start, output = portable_worker
+    processes = [start(
+        "import os; rank=os.environ['NODE_RANK']; "
+        "os.write(1,b'A'*12000); os.write(2,b'B'*12000); "
+        "os.write(1,('END-'+rank+'\\n').encode()); raise SystemExit(37)",
+        rank=rank, nodes=2, budget=8192,
+    ) for rank in range(2)]
+    for rank, process in enumerate(processes):
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 37, stderr
+        assert len(stdout) <= 4096
+        assert stdout.startswith(b'A' * 100)
+        assert b'SENPAI_LIVE_LOG_TRUNCATED: lifetime byte limit reached' in stdout
+        assert not stderr
+    logs = output / ".senpai-logs"
+    assert sum(path.stat().st_size for path in logs.iterdir()) <= 8192
+    assert len(list(logs.iterdir())) == 6
+    for rank in range(2):
+        record = json.loads((logs / f"node-{rank}.json").read_text())
+        assert record['truncated'] and record['complete'] and record['exit_code'] == 37
+        assert record['live_output_truncated']
+        assert (logs / f"node-{rank}.log").read_bytes().endswith(f'END-{rank}\n'.encode())
+        assert b'SENPAI_LOG_TRUNCATED' in (logs / f"node-{rank}.log").read_bytes()
+        assert (logs / f"node-{rank}.log.1").stat().st_size > 0
+
+
+@pytest.mark.parametrize("consumer", ["draining", "closed", "blocked"])
+def test_worker_output_consumer_cannot_block_training_or_fill_storage(portable_worker, consumer):
+    start, output = portable_worker
+    process = start("import os; os.write(1,b'x'*2000000); os.write(2,b'LAST-BYTES'); raise SystemExit(23)")
+    if consumer == "closed":
+        process.stdout.close()
+    # A full or closed Kubernetes log pipe must not stop training.
+    try:
+        if consumer == "draining":
+            stdout, stderr = process.communicate(timeout=10)
+            assert stdout == b'x' * 2000000 + b'LAST-BYTES', stderr
+        assert process.wait(timeout=10) == 23
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        if consumer != "closed":
+            process.stdout.close()
+        process.stderr.close()
+    logs = output / '.senpai-logs'
+    assert sum(path.stat().st_size for path in logs.iterdir()) <= 64 * 1024 * 1024
+    assert (logs / 'node-0.log').read_bytes().endswith(b'LAST-BYTES')
+    record = json.loads((logs / 'node-0.json').read_text())
+    assert record['live_output_truncated'] is (consumer != 'draining')
+    assert record['complete']
+
+
+def test_worker_masks_split_secret_before_retaining_or_mirroring(portable_worker):
+    import time
+
+    start, output = portable_worker
+    process = start("""
+import os, pathlib, time
+output = pathlib.Path(os.environ['SENPAI_TRAINING_OUTPUT_DIR'])
+secret = os.environ['WANDB_API_KEY'].encode()
+os.write(1, b'first:' + secret[:9])
+(output / 'prefix-written').touch()
+while not (output / 'continue').exists(): time.sleep(.01)
+os.write(2, secret[9:] + b'|tail:' + secret[:7])
+""")
+    try:
+        _wait_for_worker_file(output / 'prefix-written', process)
+        current = output / '.senpai-logs/node-0.log'
+        _wait_for_worker_file(current, process)
+        deadline = time.monotonic() + 5
+        while b'first:' not in current.read_bytes():
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        assert b'unique-wo' not in current.read_bytes()
+        (output / 'continue').touch()
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, stderr
+        assert stdout == b'first:<secret-hidden>|tail:<secret-hidden>'
+        assert current.read_bytes() == stdout
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=2)
+
+
+@pytest.mark.parametrize('handle_signal', [False, True])
+def test_worker_forwards_sigterm_to_command_and_descendants(portable_worker, handle_signal):
+    import signal
+
+    start, output = portable_worker
+    process = start(f"""
+import os, pathlib, signal, subprocess, sys, time
+output = pathlib.Path(os.environ['SENPAI_TRAINING_OUTPUT_DIR'])
+child = subprocess.Popen([sys.executable, '-c', '''
+import os, pathlib, signal, time
+out = pathlib.Path(os.environ['SENPAI_TRAINING_OUTPUT_DIR'])
+def terminate(signum, frame):
+    (out / 'descendant-terminated').touch()
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, terminate)
+(out / 'descendant-ready').touch()
+while True: time.sleep(.01)
+'''])
+if {handle_signal!r}:
+    def terminate(signum, frame):
+        child.wait(timeout=2)
+        print('handled termination', flush=True)
+        raise SystemExit(41)
+    signal.signal(signal.SIGTERM, terminate)
+(output / 'parent-ready').touch()
+while True: time.sleep(.01)
+""")
+    try:
+        _wait_for_worker_file(output / 'parent-ready', process)
+        _wait_for_worker_file(output / 'descendant-ready', process)
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == (41 if handle_signal else -signal.SIGTERM), stderr
+        assert (output / 'descendant-terminated').exists()
+        record = json.loads((output / '.senpai-logs/node-0.json').read_text())
+        assert record['complete'] and record['exit_code'] == process.returncode
+        if handle_signal:
+            assert stdout == b'handled termination\n'
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=2)
+
+
+@pytest.mark.parametrize('detached', [False, True])
+def test_worker_reaps_inherited_output_after_command_exits(portable_worker, detached):
+    import signal
+
+    start, output = portable_worker
+    process = start(f"""
+import os, pathlib, subprocess, sys, time
+output = pathlib.Path(os.environ['SENPAI_TRAINING_OUTPUT_DIR'])
+print('command complete', flush=True)
+child = subprocess.Popen([sys.executable, '-c', '''
+import os, pathlib, signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if {detached!r}: os.write(1, os.environ['WANDB_API_KEY'].encode()[:9])
+pathlib.Path(os.environ['SENPAI_TRAINING_OUTPUT_DIR'], 'background-ready').touch()
+time.sleep(60)
+'''], start_new_session={detached!r})
+(output / 'command-group').write_text(str(child.pid if {detached!r} else os.getpid()))
+while not (output / 'background-ready').exists(): time.sleep(.01)
+raise SystemExit(37 if {detached!r} else 0)
+""")
+    try:
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == (37 if detached else 0), stderr
+        if detached:
+            assert b'unique-wo' not in stdout
+            assert b'<secret-hidden>' in stdout
+            assert b'inherited output remained open' in stdout
+        else:
+            assert stdout == b'command complete\n'
+        record = json.loads((output / '.senpai-logs/node-0.json').read_text())
+        assert record['complete'] and record['exit_code'] == process.returncode
+        assert record['truncated'] is detached
+        retained = (output / '.senpai-logs/node-0.log').read_bytes()
+        assert retained == stdout
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=2)
+        group = output / 'command-group'
+        if group.exists():
+            try:
+                os.killpg(int(group.read_text()), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass  # macOS can retain a dead, reparented process group briefly.

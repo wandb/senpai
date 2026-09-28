@@ -29,6 +29,7 @@ STEERING_PRIORITIES = {
     "human_issue": STEER_PRIORITY,
     "human_pr_comment": STEER_PRIORITY,
     "student_pr_feedback": QUEUE_PRIORITY,
+    "training_monitor": QUEUE_PRIORITY,
 }
 ADVISOR_ACTIVE_STEERING_PRIORITIES = {
     **STEERING_PRIORITIES,

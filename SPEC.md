@@ -300,10 +300,10 @@ rendered role and complete system snapshot. The snapshot digest covers the
 components and the exact rendered suffix, so changed wrapper templates also
 invalidate persisted context.
 
-The launcher renders `timeout_minutes` and `max_epochs` into the launch context
-as agent policy. It does not export dedicated timeout or epoch environment
-variables, and the training supervisor has no launch-wide timeout default or
-ceiling. Each training run supplies its own positive `timeout_seconds` value.
+The launcher renders `max_epochs` into the launch context as agent policy.
+There is no launch-wide training timeout or timeout environment variable.
+Each training run may supply a positive `timeout_seconds`; omission means no
+per-run time limit. An operator-armed fleet cutoff is independent.
 
 At process startup, the runner verifies the complete system snapshot against
 the digest held by its supervisor or parent. It also checks the configured
@@ -745,7 +745,7 @@ resume the exact advisor or student conversation after its turn.
 Students receive:
 
 ```text
-run_training(spec: TrainingSpec) -> TrainingResult
+run_training(argv, cwd, timeout_seconds=None, nodes=None, gpus_per_node=None) -> TrainingResult
 get_training_status(training_id: str) -> TrainingResult
 cancel_training(training_id: str) -> TrainingResult
 monitor_training(
@@ -754,11 +754,11 @@ monitor_training(
   direction=None,
   gates=(),
   poll_interval_seconds=60,
-  stale_after_seconds=600,
+  stale_after_seconds=None,
 ) -> MonitorTrainingObservation
 ```
 
-Every student uses `KubernetesTrainingSupervisor` to supervise one remote
+Every student uses `KubernetesTrainingSupervisor` to supervise each run in a
 Job for single-node training or MPIJob for multi-node training. It creates an
 atomic Git bundle for the clean `HEAD` on the shared PVC, generates the workload
 and W&B identities, constructs the Kubernetes workload for the supplied command, then persists
@@ -766,15 +766,19 @@ and polls the broker-created UID. The broker replaces
 target-provided init logic with a fixed local-copy and exact-commit checkout, so
 bundle mutation fails before training starts. Cancellation, timeout, and restart
 recovery remain UID-bound; uncertain deletion retains the broker reservation for
-deadline cleanup rather than releasing ownership early.
+cleanup rather than releasing ownership early.
 
 Multiple Senpai instances may share `WANDB_API_KEY`; no per-student key is required.
 The executor returns raw diagnostic components over its private socket. The
 controller redacts each component before formatting, truncating, or persisting
 it. The executor does not receive the W&B key.
 
-`run_training` accepts ordinary command arguments, not a Kubernetes submission
-script. It supplies the selected training image, configured resources and PVC
+`run_training` accepts flat command arguments, not a Kubernetes submission
+script. Optional `nodes` and `gpus_per_node` default to the student's configured
+topology; either can request a smaller dimension. Concurrent runs share its
+aggregate GPU allocation. Each reservation remains charged until workload
+cleanup completes. Capacity rejection reports the active run IDs.
+The runtime supplies the selected training image, requested resources and PVC
 mount, W&B identity, and exact committed source. The standard worker starts a
 writable project environment over the image's read-only runtime. Project setup belongs in
 normal dependency files or the command; Senpai requires no setup manifest.
@@ -789,6 +793,26 @@ ownership changes. Controller pods retain their existing `fsGroup: 10001` policy
 which can affect PVC ownership according to the storage driver. The full configured
 PVC uses the same mount path in every role. Checkpoints live below the supplied
 `SENPAI_TRAINING_OUTPUT_DIR` and survive worker deletion.
+
+The worker captures the target command's combined stdout/stderr in
+`.senpai-logs` beneath that output directory, with two rotating files and fixed-size
+metadata per node. A 64 MiB per-run budget includes all nodes and applies to
+unlimited-duration runs. Rotation records truncation explicitly. A streaming
+masker removes the known W&B key before persistence and live mirroring, including
+keys split across reads and a partial prefix at EOF. The Kubernetes mirror has
+its own lifetime budget of 64 MiB per run, divided
+across nodes, including a final truncation notice. It stops sending command
+output at that limit; the PVC keeps rotating recent output. The mirror is nonblocking; a stalled
+consumer cannot stop the command, and dropped live output is recorded.
+Infrastructure uv/Git bootstrap output stays in Kubernetes
+diagnostics. The wrapper preserves command exit status and forwards termination
+to the command's process group.
+
+Each student prunes only recognized `.senpai-logs` files from its completed,
+released runs to keep that history within 512 MiB. The result records
+`worker_logs_pruned`. Active run logs are not pruned and total at most 64 MiB
+times the configured student GPU count, since each run reserves at least one
+GPU. Checkpoints and other target outputs are outside this retention policy.
 
 Before agent deployment, storage preflight uses temporary CPU-only Pods in the
 selected role images to exercise checkpoint write/flush/read/rename/delete and
@@ -820,23 +844,38 @@ a terminal-state monitor bound to the current conversation. `monitor_training`
 is an optional policy upgrade for useful metric gates or staleness detection;
 repeating it replaces the default or previous policy.
 
-Each run's requested timeout covers submission and training. Expiry triggers
-UID-bound workload deletion; the broker independently enforces the launch's
-maximum training deadline. `cancel_training` uses the same deletion path and
-does not return until the supervisor has persisted a terminal state. Target
+An optional positive timeout establishes an absolute deadline covering
+submission, queue time, setup, and training. Omission leaves the run without a
+per-run deadline. Expiry triggers UID-bound workload deletion; the broker
+independently enforces that same deadline. `cancel_training` uses the same
+deletion path and does not return until the supervisor has persisted a terminal
+state. The launching conversation can cancel its own run. The student's
+current assignment conversation can also cancel an older run from that student.
+Monitoring continues until cleanup releases the reserved GPUs. Target
 training code remains responsible for handling Kubernetes termination and
 flushing external services such as W&B.
 
-The controller polls only monitors that are due. It fetches one latest selected
-metric value from W&B, evaluates deterministic threshold/change/staleness and
-terminal-state rules, and persists deduplicated compact signals. Ordinary
+An independent local collector checks lifecycle state every two seconds.
+A separate collector fetches the selected W&B metric when due, defaulting to
+60 seconds; a slow network request cannot block local lifecycle checks.
+Idle controllers check local events every two seconds without increasing the
+configured GitHub polling rate. During active turns, monitor signals queue at
+an SDK-safe agent-step boundary without interrupting active tools. Ordinary
 polls use no LLM tokens.
 
-Metric samples reject NaN and infinities. A failure in one monitor's training
-status or W&B lookup advances that monitor's schedule and emits one
-deduplicated `monitor_error` hard signal; it cannot block other monitors,
-GitHub events, child results, or an already-pending hard-failure wake. A changed
-monitor policy resets its derived samples and signals to match the new marker.
+The first threshold poll that matches any gates emits one combined signal and
+latches further threshold notifications for that policy. Identical registration
+and restart preserve the latch; a changed policy resets it and its sample
+baseline. Staleness is opt-in and emits once per policy, even if metrics resume
+and later stall again.
+Metric samples reject NaN and infinities. A backend error emits one
+`monitor_error` hard signal per policy; repeated failures do not create chatter.
+Signals do not automatically stop training.
+
+A normal terminal signal includes completed resource release. If release is
+still pending 30 seconds after the first terminal observation, the monitor
+emits one cleanup-pending terminal notice and one later release confirmation.
+The observation time persists across restarts.
 
 Every persisted actionable signal directly creates a compact
 `training_monitor` wake for the signal's original student conversation UUID.

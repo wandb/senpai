@@ -23,7 +23,6 @@ def test_default_fleet_is_four_students_with_one_single_gpu_node_each():
     assert args.nodes_per_student == 1
     assert args.gpus_per_student_node == 1
     assert args.program_path == ""
-    assert args.timeout_minutes == 30
     assert args.max_epochs == 50
 
 
@@ -35,7 +34,6 @@ def test_launch_context_records_resolved_runtime_facts(backend):
         target_repo_branch="main",
         nodes_per_student=2,
         gpus_per_student_node=3,
-        timeout_minutes=12.5,
         max_epochs=7,
     )
 
@@ -58,7 +56,7 @@ def test_launch_context_records_resolved_runtime_facts(backend):
     assert "GitHub repository: `example/problem`" in context
     assert "W&B project: `wandb-applied-ai-team/senpai-v1`" in context
     assert (
-        "Hard limits for each training run: `12.5` minutes wall-clock and `7` epochs"
+        "Epoch limit for each training run: `7` epochs"
         in context
     )
     assert "research tag `foil-run`" in context
@@ -126,7 +124,6 @@ def test_each_role_receives_authoritative_launch_context(role):
         advisor_branch="research",
         nodes_per_student=2,
         gpus_per_student_node=8,
-        timeout_minutes=20,
         max_epochs=9,
         extra_instructions="Prefer small, measurable experiments.",
     )
@@ -151,10 +148,10 @@ def test_each_role_receives_authoritative_launch_context(role):
     assert "W&B project: `wandb-applied-ai-team/senpai-v1`" in context
     assert "Students in scope: `fern`" in context
     assert (
-        "Hard limits for each training run: `20` minutes wall-clock and `9` epochs"
+        "Epoch limit for each training run: `9` epochs"
         in context
     )
-    assert "SENPAI_TIMEOUT_MINUTES" not in data
+    assert "SENPAI_MAX_TRAINING_TIMEOUT_SECONDS" not in data
     assert "SENPAI_MAX_EPOCHS" not in data
     assert data["SENPAI_PROGRAM_SOURCE_COMMIT"] == REVISION
     assert "Prefer small, measurable experiments." not in context

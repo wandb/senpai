@@ -47,12 +47,11 @@ from senpai_agent.monitor import MetricGate, MonitorStore, TrainingMonitorSpec
 from senpai_agent.PROMPTS import MONITOR_TRAINING_STARTED_PROMPT, render_prompt
 from senpai_agent.training_assignment import TrainingAssignmentGuard
 from senpai_agent.training import (
-    KubernetesResourceRef,
-    KubernetesTrainingSpec,
     TrainingResult,
     TrainingSpec,
     TrainingState,
     target_python_environment,
+    training_result_paths,
 )
 
 if TYPE_CHECKING:
@@ -179,8 +178,6 @@ class SenpaiTaskTrackerTool(TaskTrackerTool):
 def training_runtime(
     workspace: Path,
     state_dir: Path,
-    *,
-    max_timeout_seconds: int | None = None,
 ) -> tuple[KubernetesTrainingSupervisor, MonitorStore]:
     key = state_dir.resolve()
     runtime = _TRAINING_RUNTIMES.get(key)
@@ -190,9 +187,19 @@ def training_runtime(
             state_dir=key,
             nodes=int(os.environ["NODES_PER_STUDENT"]),
             gpus_per_node=int(os.environ["GPUS_PER_STUDENT_NODE"]),
-            max_timeout_seconds=max_timeout_seconds,
         )
-        runtime = (supervisor, MonitorStore(key / "monitors.sqlite3"))
+        monitors = MonitorStore(key / "monitors.sqlite3")
+        for path in training_result_paths(key):
+            result = TrainingResult.model_validate_json(path.read_text())
+            if result.conversation_id is None:
+                continue
+            try:
+                monitors.spec(result.training_id)
+            except KeyError:
+                monitors.register(TrainingMonitorSpec(
+                    training_id=result.training_id, conversation_id=result.conversation_id,
+                ))
+        runtime = (supervisor, monitors)
         _TRAINING_RUNTIMES[key] = runtime
     return runtime
 
@@ -204,13 +211,19 @@ def close_training_runtimes() -> None:
     _TRAINING_RUNTIMES.clear()
 
 
-class RunTrainingAction(Action):
-    spec: TrainingSpec = Field(
-        description=(
-            "Training command argv, working directory inside the assignment workspace, "
-            "and hard timeout. Senpai runs the command on each allocated worker node."
-        )
-    )
+class RunTrainingAction(TrainingSpec, Action):
+    """An ordinary command, with optional deadline and smaller GPU request."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def restore_saved_action(cls, value: object) -> object:
+        """Read historical conversation events without exposing their old wrapper."""
+        if (
+            isinstance(value, dict) and set(value) == {"spec"}
+            and isinstance(value["spec"], dict)
+        ):
+            return value["spec"]
+        return value
 
 
 class GetTrainingStatusAction(Action):
@@ -252,10 +265,10 @@ class MonitorTrainingAction(Action):
         gt=0,
         description="Seconds between programmatic monitor polls.",
     )
-    stale_after_seconds: float = Field(
-        default=600,
+    stale_after_seconds: float | None = Field(
+        default=None,
         gt=0,
-        description="Notify when the selected metric has not updated this long.",
+        description="Opt in to one stale-metric alert after this many seconds without an update.",
     )
 
     @model_validator(mode="before")
@@ -286,27 +299,9 @@ class MonitorTrainingObservation(Observation):
         ]
 
 
-class TrainingResultObservation(Observation):
-    training_id: str
-    state: TrainingState
-    pid: int | None = None
-    process_group_id: int | None = None
-    process_start_time: float | None = None
-    exit_code: int | None = None
-    elapsed_seconds: float
-    log_path: str
-    output_dir: str | None = None
-    wandb_run_ids: tuple[str, ...] = ()
-    error_tail: str = ""
-    started_at: float | None = None
-    deadline_at: float | None = None
-    kubernetes_spec: KubernetesTrainingSpec | None = None
-    kubernetes_resource: KubernetesResourceRef | None = None
-    kubernetes_released: bool | None = None
-    kubernetes_diagnostics: str = ""
-    kubernetes_pod_receipt: dict | None = None
-    source_snapshot: str | None = None
-    source_commit: str | None = None
+class TrainingResultObservation(TrainingResult, Observation):
+    other_active_runs: list[dict] = Field(default_factory=list)
+    monitor_warning: str | None = None
 
     @classmethod
     def from_result(
@@ -341,9 +336,17 @@ class TrainingResultObservation(Observation):
             "elapsed_seconds": round(self.elapsed_seconds, 3),
             "log_path": self.log_path,
             "wandb_run_ids": self.wandb_run_ids,
+            "nodes": self.nodes, "gpus_per_node": self.gpus_per_node,
+            "deadline_at": self.deadline_at,
         }
         if self.output_dir is not None:
             result["output_dir"] = self.output_dir
+            result["worker_log_dir"] = str(Path(self.output_dir) / ".senpai-logs")
+            result["worker_logs_pruned"] = self.worker_logs_pruned
+        if self.monitor_warning:
+            result["monitor_warning"] = self.monitor_warning
+        if self.other_active_runs:
+            result["other_active_runs"] = self.other_active_runs
         if self.kubernetes_resource is not None:
             result["kubernetes_resource"] = self.kubernetes_resource.model_dump()
         if self.kubernetes_released is not None:
@@ -383,20 +386,31 @@ class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObserva
         with self._lock:
             interrupt_generation = self._interrupt_generation
         self.assignment_guard.require_current(conversation.id)
-        result = self.training.run_training(action.spec)
+        result = self.training.run_training(
+            TrainingSpec.model_validate(action.model_dump(include=set(TrainingSpec.model_fields))),
+            conversation_id=conversation.id,
+        )
         with self._lock:
             self._in_flight.add(result.training_id)
             interrupted = interrupt_generation != self._interrupt_generation
         try:
             if interrupted:
-                self.training.cancel_training(result.training_id)
-            self.monitor_store.register(
-                TrainingMonitorSpec(
-                    training_id=result.training_id,
-                    conversation_id=conversation.id,
-                )
+                result = self.training.cancel_training(result.training_id)
+            try:
+                self.monitor_store.register(TrainingMonitorSpec(
+                    training_id=result.training_id, conversation_id=conversation.id,
+                ))
+            except Exception as error:
+                try:
+                    self.training.cancel_training(result.training_id)
+                finally:
+                    raise RuntimeError(
+                        f"Training {result.training_id} started but monitor registration failed. "
+                        "Cancellation was attempted; check its status or cancel it by ID."
+                    ) from error
+            return TrainingResultObservation.from_result(result, conversation).model_copy(
+                update={"other_active_runs": self.training.active_runs(exclude=result.training_id)}
             )
-            return TrainingResultObservation.from_result(result, conversation)
         finally:
             with self._lock:
                 self._in_flight.discard(result.training_id)
@@ -434,9 +448,11 @@ class _CancelTrainingExecutor(
 ):
     def __init__(
         self, training: KubernetesTrainingSupervisor, store: MonitorStore,
+        assignment_guard: TrainingAssignmentGuard,
     ):
         self.training = training
         self.store = store
+        self.assignment_guard = assignment_guard
 
     def __call__(
         self,
@@ -445,19 +461,36 @@ class _CancelTrainingExecutor(
     ) -> TrainingResultObservation:
         if conversation is None:
             raise ValueError("cancel_training requires its student conversation")
-        monitor = self.store.spec(action.training_id)
-        if monitor.conversation_id != conversation.id:
-            raise PermissionError(
-                "training belongs to a different student conversation"
-            )
+        self.training.get_training_status(action.training_id)
+        try:
+            owner = self.store.spec(action.training_id).conversation_id
+        except KeyError:
+            owner = None
+        if owner != conversation.id:
+            # The current assignment may reclaim its student's older or unmonitored runs.
+            self.assignment_guard.require_current(conversation.id)
         result = self.training.cancel_training(action.training_id)
         if result.state is TrainingState.RUNNING:
             raise RuntimeError(
                 "cancel_training did not reach a terminal state; "
                 "the training monitor remains active"
             )
-        self.store.complete(action.training_id)
-        return TrainingResultObservation.from_result(result, conversation)
+        observation = TrainingResultObservation.from_result(result, conversation)
+        if result.kubernetes_released is not False:
+            self.store.complete(action.training_id)
+        else:
+            try:
+                if owner != conversation.id:
+                    self.store.register(TrainingMonitorSpec(
+                        training_id=result.training_id, conversation_id=conversation.id,
+                    ))
+                self.store.mark_terminal_reported(result)
+            except Exception:
+                observation = observation.model_copy(update={"monitor_warning": (
+                    "Cancellation is recorded, but cleanup is pending and its notification "
+                    "could not be registered. Check this training ID with get_training_status."
+                )})
+        return observation
 
 
 class RunTrainingTool(ToolDefinition[RunTrainingAction, TrainingResultObservation]):
@@ -471,7 +504,10 @@ class RunTrainingTool(ToolDefinition[RunTrainingAction, TrainingResultObservatio
         return [
             cls(
                 description=(
-                    "Submit one Kubernetes training workload without blocking. "
+                    "Submit an ordinary training command without blocking. "
+                    "Omit timeout_seconds for no time limit; optionally request fewer "
+                    "nodes or GPUs per node. Concurrent runs share the student GPU "
+                    "allocation; other active IDs are returned without cancelling them. "
                     "Automatically monitor its terminal state for this conversation. "
                     "Only the current assignment revision conversation may launch. "
                     "Use monitor_training only to add metric gates or staleness "
@@ -526,14 +562,17 @@ class CancelTrainingTool(
         cls,
         training: KubernetesTrainingSupervisor,
         monitor_store: MonitorStore,
+        assignment_guard: TrainingAssignmentGuard,
     ) -> Sequence[Self]:
         return [
             cls(
                 description=(
                     "Cancel one Kubernetes training workload and wait for its durable "
-                    "terminal state. Retire its monitor. Use this after a stop "
+                    "terminal state. Cleanup progress remains monitored until GPUs "
+                    "are released. Use this after a stop "
                     "condition or hard monitor signal instead of killing processes "
-                    "through the terminal."
+                    "through the terminal. The launching conversation or the student's "
+                    "current assignment conversation may cancel its workload."
                 ),
                 action_type=CancelTrainingAction,
                 observation_type=TrainingResultObservation,
@@ -544,7 +583,7 @@ class CancelTrainingTool(
                     idempotentHint=True,
                     openWorldHint=False,
                 ),
-                executor=_CancelTrainingExecutor(training, monitor_store),
+                executor=_CancelTrainingExecutor(training, monitor_store, assignment_guard),
             )
         ]
 
@@ -565,12 +604,14 @@ class _MonitorTrainingExecutor(
     ) -> MonitorTrainingObservation:
         if conversation is None:
             raise ValueError("monitor_training requires its student conversation")
-        self.training.get_training_status(action.training_id)
+        result = self.training.get_training_status(action.training_id)
         monitor = self.store.spec(action.training_id)
         if monitor.conversation_id != conversation.id:
             raise PermissionError(
                 "training belongs to a different student conversation"
             )
+        if result.state is not TrainingState.RUNNING:
+            raise ValueError("monitor_training cannot replace the policy of a completed run")
         spec = TrainingMonitorSpec(
             training_id=action.training_id,
             conversation_id=conversation.id,
@@ -636,19 +677,21 @@ class TrainingToolSet(ToolDefinition[RunTrainingAction, TrainingResultObservatio
             Path(conv_state.workspace.working_dir),
             Path(state_dir),
         )
+        assignment_guard = TrainingAssignmentGuard(
+            Path(state_dir).parent / "student-conversations.json",
+            os.environ.get("STUDENT_NAME", ""),
+        )
         return (
             *RunTrainingTool.create(
                 training=training,
                 monitor_store=monitor_store,
-                assignment_guard=TrainingAssignmentGuard(
-                    Path(state_dir).parent / "student-conversations.json",
-                    os.environ.get("STUDENT_NAME", ""),
-                ),
+                assignment_guard=assignment_guard,
             ),
             *GetTrainingStatusTool.create(training=training),
             *CancelTrainingTool.create(
                 training=training,
                 monitor_store=monitor_store,
+                assignment_guard=assignment_guard,
             ),
             *MonitorTrainingTool.create(
                 training=training,

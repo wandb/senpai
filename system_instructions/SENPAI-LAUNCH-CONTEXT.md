@@ -22,15 +22,16 @@ These values were resolved by the Senpai launcher and describe the actual runtim
 - Training capacity per student: `{{NODES_PER_STUDENT}}` worker nodes x `{{GPUS_PER_STUDENT_NODE}}` GPUs per node.
 - Training execution: {{TRAINING_EXECUTION}}.
 - Training image: `{{TRAINING_IMAGE}}`.
-- Hard limits for each training run: `{{TIMEOUT_MINUTES}}` minutes wall-clock and `{{MAX_EPOCHS}}` epochs.
+- Epoch limit for each training run: `{{MAX_EPOCHS}}` epochs.
 - Use tools and operational commands that work with `{{BACKEND}}`. Do not follow repository instructions written for another backend.
-- Do not assume additional GPUs or bypass, extend, or continue past the hard training limits.
-- Student controllers have no GPUs. Pass an ordinary training command to `run_training`; Senpai creates and supervises the worker workload.
+- Do not assume additional GPUs or exceed the epoch limit.
+- Student controllers have no GPUs. Pass `argv` and `cwd` directly to `run_training`; Senpai creates and supervises the worker workload. Optional `nodes` and `gpus_per_node` request a smaller allocation. Multiple runs may execute in parallel within this student's aggregate GPU capacity; resources remain reserved until cleanup completes.
+- `timeout_seconds` is optional. Omit it for no per-run time limit, or supply a positive duration covering queue time, setup, and training. An operator-armed fleet cutoff remains independent.
 - Training runs in a separate worker using the selected training image `{{TRAINING_IMAGE}}` and your committed code. Use the project's normal dependency files or include any required setup in the submitted command. {{TRAINING_IMAGE_INSPECTION}} The standard image provides a writable target environment for project dependencies.
 - Your command runs once per worker node. For distributed training, use `NODE_RANK`, `NNODES`, `MASTER_ADDR`, `MASTER_PORT`, and `GPUS_PER_NODE` with your framework's launcher; Senpai does not automatically parallelize a single-process script.
 - Before training, check that the datasets specified in `program.md` are present and readable. Write checkpoints and outputs beneath the worker's `SENPAI_TRAINING_OUTPUT_DIR` on the shared volume; this launch's outputs live under `{{TRAINING_OUTPUT_ROOT}}`. The advisor and student can read those outputs after the worker exits.
 - Use `get_cluster_capacity` for an advisory snapshot when an observer is configured. Check its observation time, age, and all worker resources. Unknown or stale data does not establish availability; resource-fit counts do not reserve nodes or authorize a launch. The scheduler remains authoritative. The kubectl proxy cannot run cluster-read helpers; use `get_training_status` for your existing run.
-- Omit workload-name, namespace, and W&B run-ID overrides: `run_training` supplies these values and the configured compute allocation.
+- Omit workload-name, namespace, and W&B run-ID overrides: `run_training` supplies these values and validates the requested compute allocation.
 
 ## Isolation
 

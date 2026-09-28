@@ -7,23 +7,27 @@ import re
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import uuid
 
 import pytest
 
 import senpai_agent.kubernetes_training as kubernetes_training
-from senpai_agent.kubernetes_training import KubernetesTrainingSupervisor
+from senpai_agent.kubernetes_training import KubernetesExecutorClient, KubernetesTrainingSupervisor
+from senpai_agent.kubernetes_executor import KubernetesExecutor, _UnixServer
 from senpai_agent.training import (
     KubernetesResourceRef,
     KubernetesTrainingSpec,
+    TrainingCapacityError,
     TrainingResult,
     TrainingSpec,
     TrainingState,
 )
 
 
-from training_test_support import FakeCluster, git_workspace
+from training_test_support import FakeCluster, WorkloadApi, git_workspace
 
 
 def supervisor(tmp_path, monkeypatch, client=None, **overrides):
@@ -49,7 +53,6 @@ def supervisor(tmp_path, monkeypatch, client=None, **overrides):
         "state_dir": tmp_path / "state",
         "nodes": 2,
         "gpus_per_node": 8,
-        "max_timeout_seconds": 10,
         "poll_seconds": 0.01,
         "client": client or FakeCluster(),
     }
@@ -211,16 +214,18 @@ def test_monitor_start_failure_cleans_up_and_recovers_terminal_verdict(
         runtime.close()
 
 
-@pytest.mark.parametrize("invalid", ["working_directory", "timeout"])
+@pytest.mark.parametrize("invalid", ["working_directory", "nodes", "gpus_per_node"])
 def test_invalid_launch_never_reserves_a_remote_workload(tmp_path, monkeypatch, invalid):
     client = FakeCluster()
     runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
     try:
-        with pytest.raises(ValueError, match="inside|configured maximum"):
+        with pytest.raises(ValueError, match="inside|configured allocation"):
             runtime.run_training(TrainingSpec(
                 argv=(sys.executable, "-c", "raise AssertionError('must not run')"),
                 cwd=workspace.parent if invalid == "working_directory" else workspace,
-                timeout_seconds=11 if invalid == "timeout" else 5,
+                timeout_seconds=5,
+                nodes=3 if invalid == "nodes" else None,
+                gpus_per_node=9 if invalid == "gpus_per_node" else None,
             ))
         assert client.reservations == []
     finally:
@@ -283,8 +288,8 @@ def test_successful_submission_without_a_workload_fails_promptly(
             super().__init__()
             self.lookups = 0
 
-        def reserve(self, *args):
-            super().reserve(*args)
+        def reserve(self, *args, **kwargs):
+            super().reserve(*args, **kwargs)
             self.pending_resource = self.resource_value
             self.resource_value = None
 
@@ -328,7 +333,7 @@ def test_cancellation_deletes_remote_before_retrying_full_terminal_storage(
 ):
     client = FakeCluster(TrainingState.RUNNING)
     runtime, workspace, _ = supervisor(
-        tmp_path, monkeypatch, client, max_timeout_seconds=60,
+        tmp_path, monkeypatch, client,
     )
     deleted = threading.Event()
     storage_failed = threading.Event()
@@ -381,15 +386,14 @@ def test_cancellation_deletes_remote_before_retrying_full_terminal_storage(
         assert client.resource_value is None
         assert client.releases == []
         assert runtime.get_training_status(started.training_id).state is TrainingState.RUNNING
-        with pytest.raises(RuntimeError, match="already has an active"):
-            runtime.run_training(spec)
+        assert [run["training_id"] for run in runtime.active_runs()] == [started.training_id]
         if restart:
             runtime.close()
             cancelling.join(1)
             reserve = client.reserve
 
-            def preserve_deleted_workload(*args):
-                reserve(*args)
+            def preserve_deleted_workload(*args, **kwargs):
+                reserve(*args, **kwargs)
                 client.resource_value = None
 
             monkeypatch.setattr(client, "reserve", preserve_deleted_workload)
@@ -478,7 +482,7 @@ def test_failed_submission_remains_terminal_after_delete_outage_and_restart(
 
     client = UnavailableDeletion(TrainingState.RUNNING)
     runtime, workspace, _ = supervisor(
-        tmp_path, monkeypatch, client, max_timeout_seconds=60,
+        tmp_path, monkeypatch, client,
     )
     started = runtime.run_training(TrainingSpec(
         argv=(sys.executable, "-c", "raise SystemExit(7)"),
@@ -549,8 +553,7 @@ def test_supervisor_recovers_result_persistence_after_storage_exhaustion(
         assert retried.wait(1), "result persistence stopped after the first storage error"
         assert runtime.get_training_status(started.training_id).kubernetes_released is False
         assert client.releases == ([started.training_id] if write_phase == "release" else [])
-        with pytest.raises(RuntimeError, match="already has an active"):
-            runtime.run_training(spec)
+        assert [run["training_id"] for run in runtime.active_runs()] == [started.training_id]
         if write_phase != "resource":
             client.state_value = TrainingState.FAILED
         storage_restored.set()
@@ -583,7 +586,7 @@ def test_storage_error_in_optional_diagnostics_does_not_fail_training(
     write_text = Path.write_text
 
     def exhausted_log(path, mode="r", *args, **kwargs):
-        if path.parent == runtime.state_dir and path.suffix == ".log" and mode == "a":
+        if path.parent == runtime.state_dir and path.suffix == ".log" and any(flag in mode for flag in "wax+"):
             storage_failed.set()
             raise OSError(storage_errno, "storage exhausted", str(path))
         return open_path(path, mode, *args, **kwargs)
@@ -644,8 +647,8 @@ def test_close_during_terminal_storage_outage_recovers_only_original_workload(
     resource = original.model_copy(update={"uid": "replacement-uid"}) if replacement else original
     reserve = client.reserve
 
-    def preserve_remote_identity(*args):
-        reserve(*args)
+    def preserve_remote_identity(*args, **kwargs):
+        reserve(*args, **kwargs)
         client.resource_value = resource
 
     monkeypatch.setattr(client, "reserve", preserve_remote_identity)
@@ -706,26 +709,148 @@ def test_source_bundle_ignores_replace_refs_and_replaces_poisoned_artifacts(
     assert (checkout / "tracked.txt").read_text() == "committed\n"
 
 
-def test_supervisor_allows_only_one_active_run_and_cancellation_deletes_remote(
-    tmp_path,
-    monkeypatch,
-):
-    client = FakeCluster(state=TrainingState.RUNNING)
-    runtime, workspace, _snapshot_root = supervisor(tmp_path, monkeypatch, client)
-    spec = TrainingSpec(
-        argv=(sys.executable, "-c", "import time; time.sleep(30)"),
-        cwd=workspace,
-        timeout_seconds=5,
+@pytest.fixture
+def broker_runtime(tmp_path, monkeypatch):
+    api = WorkloadApi()
+    with tempfile.TemporaryDirectory(prefix="senpai-broker-", dir="/tmp") as socket_dir:
+        client = KubernetesExecutorClient(Path(socket_dir) / "executor.sock")
+        runtime, workspace, snapshots = supervisor(tmp_path, monkeypatch, client)
+        monkeypatch.setenv("PVC_MOUNT_PATH", str(tmp_path))
+        broker_options = dict(
+            client=api, state_path=tmp_path / "broker.json", namespace="research",
+            nodes=2, gpus_per_node=8, cpu_per_gpu=1, memory_gi_per_gpu=2,
+            pvc_claim_name="dataset", pvc_mount_path=tmp_path, snapshot_root=snapshots,
+            executor_image="executor@sha256:" + "b" * 64,
+            training_control_image=os.environ["SENPAI_TRAINING_CONTROL_IMAGE"],
+            launch_secret_name="senpai-launch-secrets-fred", wandb_tags="test",
+            research_tag="fred", student_name="fern", pod_name="controller", pod_uid="controller-uid",
+        )
+        server = _UnixServer(client.socket_path, KubernetesExecutor(**broker_options))
+        serving = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        serving.start()
+        try:
+            yield runtime, workspace, api, server, broker_options
+        finally:
+            runtime.close()
+            server.shutdown()
+            serving.join(timeout=3)
+            server.server_close()
+
+
+def test_concurrent_jobs_keep_independent_identity_budget_and_deadlines_after_restart(broker_runtime):
+    runtime, workspace, api, server, broker_options = broker_runtime
+    client = runtime.client
+    recovered = None
+    try:
+        spec = TrainingSpec(argv=("python", "train.py"), cwd=workspace, nodes=1, gpus_per_node=8)
+        unlimited = runtime.run_training(spec)
+        limited = runtime.run_training(spec.model_copy(update={"timeout_seconds": 18000}))
+        deadline = time.monotonic() + 3
+        while any(runtime.get_training_status(run.training_id).kubernetes_resource is None
+                  for run in (unlimited, limited)):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        originals = {run.training_id: runtime.get_training_status(run.training_id).kubernetes_resource
+                     for run in (unlimited, limited)}
+        assert len({resource.uid for resource in originals.values()}) == 2
+        assert all(resource.kind == "Job" and resource.nodes == 1 and resource.gpus_per_node == 8
+                   for resource in originals.values())
+        assert unlimited.deadline_at is None
+        assert limited.deadline_at - limited.started_at == 18000
+        assert "activeDeadlineSeconds" not in api.documents[unlimited.kubernetes_spec.name]["spec"]
+        assert api.documents[limited.kubernetes_spec.name]["spec"]["activeDeadlineSeconds"] > 17900
+        with pytest.raises(TrainingCapacityError) as rejected:
+            runtime.run_training(spec.model_copy(update={"gpus_per_node": 1}))
+        assert rejected.value.available_gpus == 0
+        assert {run["training_id"] for run in rejected.value.active_runs} == set(originals)
+
+        runtime.close()
+        assert api.deletions == []
+        server.executor = KubernetesExecutor(**broker_options)
+        recovered = KubernetesTrainingSupervisor(
+            workspace=workspace, state_dir=runtime.state_dir, nodes=2, gpus_per_node=8,
+            poll_seconds=0.01, client=client,
+        )
+        assert {run["training_id"] for run in recovered.active_runs()} == set(originals)
+        for training_id, resource in originals.items():
+            assert recovered.get_training_status(training_id).kubernetes_resource == resource
+        cancelled = recovered.cancel_training(unlimited.training_id)
+        assert cancelled.state is TrainingState.CANCELLED and cancelled.kubernetes_released
+        assert api.deletions == [originals[unlimited.training_id]]
+        assert recovered.get_training_status(limited.training_id).state is TrainingState.RUNNING
+        assert {run["training_id"] for run in recovered.active_runs()} == {limited.training_id}
+        following = recovered.run_training(spec)
+        assert following.deadline_at is None
+        recovered.cancel_training(following.training_id)
+        recovered.cancel_training(limited.training_id)
+        assert recovered.active_runs() == []
+        assert api.documents == {}
+    finally:
+        if recovered is not None:
+            recovered.close()
+
+
+def test_lost_reservation_response_for_unlimited_run_leaves_no_orphan(broker_runtime, monkeypatch):
+    runtime, workspace, api, _server, _options = broker_runtime
+    reserve = runtime.client.reserve
+    observed = []
+
+    def lose_response(training_id, *args, **kwargs):
+        intent = runtime.get_training_status(training_id)
+        assert intent.state is TrainingState.RUNNING and intent.deadline_at is None
+        observed.append(training_id)
+        reserve(training_id, *args, **kwargs)
+        raise TimeoutError("reservation response lost")
+
+    spec = TrainingSpec(argv=("python", "train.py"), cwd=workspace)
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime.client, "reserve", lose_response)
+        with pytest.raises(TimeoutError, match="reservation response lost"):
+            runtime.run_training(spec)
+    failed = runtime.get_training_status(observed[0])
+    assert failed.state is TrainingState.FAILED and failed.kubernetes_released
+    assert api.documents == {}
+    following = runtime.run_training(spec)
+    assert following.deadline_at is None
+    runtime.cancel_training(following.training_id)
+
+
+def test_restart_releases_unreserved_intent_without_competing_for_full_budget(broker_runtime):
+    runtime, workspace, api, _server, _options = broker_runtime
+    running = runtime.run_training(TrainingSpec(argv=("python", "train.py"), cwd=workspace))
+    deadline = time.monotonic() + 3
+    while runtime.get_training_status(running.training_id).kubernetes_resource is None:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    resource = runtime.get_training_status(running.training_id).kubernetes_resource
+    runtime.close()
+    pending_id = str(uuid.uuid4())
+    pending = running.model_copy(update={
+        "training_id": pending_id,
+        "kubernetes_spec": running.kubernetes_spec.model_copy(update={
+            "name": "unreserved-intent", "wandb_run_id": pending_id.replace("-", ""),
+        }),
+        "log_path": str(runtime.state_dir / f"{pending_id}.log"),
+    })
+    Path(pending.log_path).touch()
+    (runtime.state_dir / f"{pending_id}.json").write_text(pending.model_dump_json())
+    recovered = KubernetesTrainingSupervisor(
+        workspace=workspace, state_dir=runtime.state_dir, nodes=2, gpus_per_node=8,
+        poll_seconds=0.01, client=runtime.client,
     )
-    first = runtime.run_training(spec)
-
-    with pytest.raises(RuntimeError, match="already has an active"):
-        runtime.run_training(spec)
-
-    result = runtime.cancel_training(first.training_id)
-    assert result.state is TrainingState.CANCELLED
-    assert len(client.deletions) == 1
-    assert client.releases == [first.training_id]
+    try:
+        deadline = time.monotonic() + 3
+        while not recovered.get_training_status(pending_id).kubernetes_released:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        abandoned = recovered.get_training_status(pending_id)
+        assert abandoned.state is TrainingState.CANCELLED
+        assert recovered.get_training_status(running.training_id).kubernetes_resource == resource
+        assert {item["training_id"] for item in recovered.active_runs()} == {running.training_id}
+        assert api.deletions == []
+        recovered.cancel_training(running.training_id)
+    finally:
+        recovered.close()
 
 
 def test_close_detaches_and_restart_re_adopts_the_same_uid(tmp_path, monkeypatch):
@@ -734,7 +859,6 @@ def test_close_detaches_and_restart_re_adopts_the_same_uid(tmp_path, monkeypatch
         tmp_path,
         monkeypatch,
         client,
-        max_timeout_seconds=60,
         poll_seconds=30,
     )
     started = runtime.run_training(
@@ -777,7 +901,6 @@ def test_close_detaches_and_restart_re_adopts_the_same_uid(tmp_path, monkeypatch
         state_dir=tmp_path / "state",
         nodes=2,
         gpus_per_node=8,
-        max_timeout_seconds=60,
         poll_seconds=0.01,
         client=client,
     )
@@ -883,7 +1006,7 @@ def test_close_persists_a_remote_terminal_result_that_wins_the_race(
     assert client.releases == [started.training_id]
 
 
-def test_close_cannot_split_running_publication_from_active_supervision(
+def test_close_during_launch_intent_persistence_cleans_up_before_returning(
     tmp_path,
     monkeypatch,
 ):
@@ -926,14 +1049,14 @@ def test_close_cannot_split_running_publication_from_active_supervision(
     launch_thread.join(1)
     close_thread.join(1)
 
-    assert errors == []
+    assert len(errors) == 1 and "supervisor is closed" in str(errors[0])
     assert not launch_thread.is_alive()
     assert not close_thread.is_alive()
     result_path = next((tmp_path / "state").glob("*.json"))
     persisted = TrainingResult.model_validate_json(result_path.read_text())
-    assert persisted.state is TrainingState.RUNNING
-    assert client.deletions == []
-    assert client.releases == []
+    assert persisted.state is TrainingState.FAILED and persisted.kubernetes_released
+    assert client.resource_value is None
+    assert client.releases == [persisted.training_id]
 
 
 def test_close_does_not_override_a_selected_timeout(tmp_path, monkeypatch):
@@ -1068,7 +1191,6 @@ def test_supervisor_re_adopts_only_the_persisted_uid(tmp_path, monkeypatch):
         state_dir=state_dir,
         nodes=2,
         gpus_per_node=8,
-        max_timeout_seconds=10,
         poll_seconds=0.01,
         client=client,
     )
@@ -1111,7 +1233,6 @@ def test_supervisor_recovers_an_unconfirmed_terminal_release(tmp_path, monkeypat
         state_dir=state_dir,
         nodes=2,
         gpus_per_node=8,
-        max_timeout_seconds=10,
         poll_seconds=0.01,
         client=client,
     )
@@ -1378,3 +1499,33 @@ def test_supervisor_persists_executor_receipt_with_terminal_acknowledgement(tmp_
     )
     assert saved.kubernetes_released is True
     assert saved.kubernetes_pod_receipt == receipt
+
+
+def test_diagnostic_snapshots_replace_previous_output_with_a_fixed_bound(tmp_path, monkeypatch):
+    class ChangingDiagnostics(FakeCluster):
+        def __init__(self):
+            super().__init__(state=TrainingState.RUNNING)
+            self.snapshots = 0
+
+        def logs(self, resource):
+            self.snapshots += 1
+            return f"snapshot {self.snapshots}\n" + "x" * 16384
+
+        def state(self, resource):
+            state = TrainingState.FINISHED if self.snapshots >= 3 else TrainingState.RUNNING
+            return state, ""
+
+    monkeypatch.setattr(kubernetes_training, "_DIAGNOSTICS_SECONDS", 0)
+    client = ChangingDiagnostics()
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    try:
+        started = runtime.run_training(TrainingSpec(argv=("python", "train.py"), cwd=workspace))
+        runtime.drain()
+        result = runtime.get_training_status(started.training_id)
+        saved = Path(result.log_path).read_bytes()
+        assert result.state is TrainingState.FINISHED
+        assert client.snapshots >= 4
+        assert len(saved) <= 8192
+        assert saved.startswith(f"snapshot {client.snapshots}\n".encode())
+    finally:
+        runtime.close()

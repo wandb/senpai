@@ -75,7 +75,6 @@ def render_launch_context(
     training_output_root: str,
     nodes_per_student: int,
     gpus_per_student_node: int,
-    timeout_minutes: float,
     max_epochs: int,
     tag: str,
     advisor_branch: str,
@@ -107,7 +106,6 @@ def render_launch_context(
                 "This is a custom training image; the controller uses Senpai's standard image. "
                 "Use a short `run_training` command such as `python3 -m pip list` to inspect the worker environment."
             ),
-            "TIMEOUT_MINUTES": f"{timeout_minutes:g}",
             "MAX_EPOCHS": str(max_epochs),
             "TAG": tag,
             "ADVISOR_BRANCH": advisor_branch,

@@ -70,7 +70,6 @@ advisor_branch: schmidhuber
 gh_history_scope: branch
 
 # agent-facing training limits
-timeout_minutes: 30.0
 max_epochs: 50
 
 # responsiveness / polling

@@ -7,8 +7,11 @@ from uuid import uuid4
 import pytest
 
 from senpai_agent.monitor import (
+    MetricGate,
     MetricRunNotFoundError,
     MetricSample,
+    MonitorEvaluation,
+    MonitorSignal,
     MonitorStore,
     TrainingMonitorEngine,
     TrainingMonitorSpec,
@@ -104,6 +107,195 @@ def test_repeated_backend_failure_does_not_duplicate_its_signal(tmp_path: Path):
         assert [item.kind for item in first] == ["monitor_error"]
         assert repeated == ()
         assert store.pending_signals() == [first[0]]
+
+
+@pytest.mark.parametrize("cleanup_seconds,reported", [(4, False), (34, False), (34, True)])
+def test_terminal_notification_waits_for_release_with_durable_bounded_followup(
+    tmp_path: Path,
+    cleanup_seconds: int,
+    reported: bool,
+):
+    spec = monitor(metric="loss")
+    current = result(tmp_path, spec.training_id)
+    metric_reads = []
+    training = SimpleNamespace(get_training_status=lambda _id: current)
+    metrics = SimpleNamespace(latest=lambda *_args: metric_reads.append(True))
+    database = tmp_path / "monitors.sqlite3"
+    with MonitorStore(database) as store:
+        store.register(spec)
+        engine = TrainingMonitorEngine(store, training, metrics)
+        assert engine.poll(NOW) == ()
+        current = current.model_copy(
+            update={
+                "state": TrainingState.FAILED,
+                "kubernetes_released": False,
+            }
+        )
+        assert engine.poll(NOW + timedelta(seconds=2)) == ()
+        if reported:
+            store.mark_terminal_reported(current)
+
+    with MonitorStore(database) as store:
+        engine = TrainingMonitorEngine(store, training, metrics)
+        if cleanup_seconds > 30:
+            assert engine.poll(NOW + timedelta(seconds=31)) == ()
+            pending = engine.poll(NOW + timedelta(seconds=32))
+            if reported:
+                assert pending == ()
+            else:
+                assert len(pending) == 1
+                assert "cleanup is still pending" in pending[0].detail.lower()
+                store.acknowledge(pending[0].dedupe_key)
+            assert engine.poll(NOW + timedelta(seconds=33)) == ()
+        current = current.model_copy(update={"kubernetes_released": True})
+        released = engine.poll(NOW + timedelta(seconds=cleanup_seconds))
+        assert len(released) == 1
+        assert "released" in released[0].detail.lower()
+        assert released[0].state is TrainingState.FAILED
+        assert store.active() == []
+        assert metric_reads == [True]
+
+    with MonitorStore(database) as store:
+        assert (
+            TrainingMonitorEngine(store, training, metrics).poll(
+                NOW + timedelta(seconds=90)
+            )
+            == ()
+        )
+
+
+def test_first_threshold_alert_combines_gates_and_stays_latched_after_restart(
+    tmp_path: Path,
+):
+    spec = monitor(metric="loss").model_copy(
+        update={
+            "gates": (
+                MetricGate(operator="lte", threshold=0.5),
+                MetricGate(operator="lte", threshold=0.4),
+                MetricGate(operator="lte", threshold=0.2),
+            )
+        }
+    )
+    value = 0.3
+    training = SimpleNamespace(
+        get_training_status=lambda _id: result(tmp_path, spec.training_id)
+    )
+    metrics = SimpleNamespace(
+        latest=lambda *_args: MetricSample(
+            value=value,
+            observed_at=NOW,
+        )
+    )
+    database = tmp_path / "monitors.sqlite3"
+    with MonitorStore(database) as store:
+        store.register(spec)
+        signals = TrainingMonitorEngine(store, training, metrics).poll(NOW)
+        assert len(signals) == 1
+        assert signals[0].kind == "metric_gate"
+        assert "0.5" in signals[0].detail and "0.4" in signals[0].detail
+        store.acknowledge(signals[0].dedupe_key)
+    with MonitorStore(database) as store:
+        assert not store.register(
+            spec.model_copy(
+                update={
+                    "registered_at": NOW + timedelta(seconds=60),
+                }
+            )
+        )
+        value = 0.1
+        assert (
+            TrainingMonitorEngine(store, training, metrics).poll(
+                NOW + timedelta(seconds=600)
+            )
+            == ()
+        )
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_replaced_policy_discards_an_inflight_metric_result(
+    tmp_path: Path, failure: bool
+):
+    original = monitor(metric="loss").model_copy(
+        update={
+            "gates": (MetricGate(operator="lte", threshold=0.5),),
+        }
+    )
+    replacement = original.model_copy(
+        update={
+            "gates": (MetricGate(operator="lte", threshold=0.1),),
+            "registered_at": NOW + timedelta(seconds=1),
+        }
+    )
+    database = tmp_path / "monitors.sqlite3"
+
+    class Metrics:
+        def latest(self, *_args):
+            with MonitorStore(database) as other:
+                other.register(replacement)
+            if failure:
+                raise RuntimeError("old policy request failed")
+            return MetricSample(value=0.3, observed_at=NOW)
+
+    training = SimpleNamespace(
+        get_training_status=lambda _id: result(tmp_path, original.training_id)
+    )
+    with MonitorStore(database) as store:
+        store.register(original)
+        assert TrainingMonitorEngine(store, training, Metrics()).poll(NOW) == ()
+        assert store.pending_signals() == []
+        assert store.previous_sample(original.training_id) is None
+        assert store.due(NOW) == [replacement]
+
+
+@pytest.mark.parametrize(
+    "kind,suffix",
+    [
+        ("metric_gate", "gate:0"),
+        ("metric_stale", "stale:2026-07-29T00:00:00+00:00"),
+        ("monitor_error", "monitor_error:RuntimeError"),
+    ],
+)
+def test_legacy_alert_remains_latched_after_monitor_upgrade(
+    tmp_path: Path, kind, suffix
+):
+    spec = monitor(metric="loss").model_copy(
+        update={
+            "gates": (MetricGate(operator="lte", threshold=0.5),)
+            if kind == "metric_gate"
+            else (),
+            "stale_after_seconds": 60 if kind == "metric_stale" else None,
+        }
+    )
+    prior = MonitorSignal(
+        kind=kind,
+        dedupe_key=f"train-1:{suffix}",
+        training_id="train-1",
+        state=TrainingState.RUNNING,
+        detail="Previously notified.",
+    )
+
+    class Metrics:
+        def latest(self, *_args):
+            if kind == "monitor_error":
+                raise ValueError("A different backend error")
+            return MetricSample(value=0.1, observed_at=NOW)
+
+    database = tmp_path / "monitors.sqlite3"
+    with MonitorStore(database) as store:
+        store.register(spec)
+        store.record_poll(spec, MonitorEvaluation(signals=(prior,)), None, now=NOW)
+        store.acknowledge(prior.dedupe_key)
+    with MonitorStore(database) as store:
+        training = SimpleNamespace(
+            get_training_status=lambda name: result(tmp_path, name)
+        )
+        assert (
+            TrainingMonitorEngine(store, training, Metrics()).poll(
+                NOW + timedelta(seconds=60)
+            )
+            == ()
+        )
+        assert store.pending_signals() == []
 
 
 @pytest.mark.parametrize(
@@ -227,9 +419,7 @@ def test_wandb_source_distinguishes_absent_run_from_inaccessible_project(
         wandb,
         "Api",
         lambda **_options: SimpleNamespace(
-            runs=lambda _path, **options: Runs(
-                service, "entity", "project", **options
-            )
+            runs=lambda _path, **options: Runs(service, "entity", "project", **options)
         ),
     )
 
@@ -310,9 +500,7 @@ def test_wandb_startup_backend_errors_remain_hard_failures(
     def runs(*_args, **_options):
         raise errors[failure]
 
-    monkeypatch.setattr(
-        wandb, "Api", lambda **_options: SimpleNamespace(runs=runs)
-    )
+    monkeypatch.setattr(wandb, "Api", lambda **_options: SimpleNamespace(runs=runs))
     spec = monitor(metric="train/global_step")
     training = SimpleNamespace(
         get_training_status=lambda training_id: result(tmp_path, training_id)

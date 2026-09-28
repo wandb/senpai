@@ -22,10 +22,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TypedDict
 
+from senpai_agent.training_worker import WORKER_LOG_MAX_BYTES, mask_output_chunk
+
 from senpai_agent.training import (
     KubernetesResourceRef,
     KubernetesTrainingSpec,
     TrainingResult,
+    TrainingCapacityError,
     TrainingSpec,
     TrainingState,
     training_result_paths,
@@ -35,29 +38,8 @@ _ERROR_TAIL_BYTES = 8192
 _POLL_SECONDS = 2.0
 _DIAGNOSTICS_SECONDS = 30.0
 _JOIN_SECONDS = 120.0
+_WORKER_LOG_HISTORY_BYTES = 512 * 1024 * 1024
 EXECUTOR_SOCKET_ENV = "SENPAI_KUBERNETES_EXECUTOR_SOCKET"
-
-
-def _mask_output_chunk(data: bytes, secret: bytes) -> tuple[bytes, bytes]:
-    """Emit complete bytes while retaining a possible split secret prefix."""
-    if not secret:
-        return data, b""
-    pieces = []
-    start = 0
-    while (match := data.find(secret, start)) >= 0:
-        pieces.extend((data[start:match], b"<secret-hidden>"))
-        start = match + len(secret)
-    tail = data[start:]
-    overlap = next(
-        (
-            size
-            for size in range(min(len(tail), len(secret) - 1), 0, -1)
-            if tail.endswith(secret[:size])
-        ),
-        0,
-    )
-    pieces.append(tail[:-overlap] if overlap else tail)
-    return b"".join(pieces), tail[-overlap:] if overlap else b""
 
 
 class KubernetesDiagnostics(TypedDict):
@@ -71,7 +53,7 @@ def _mask_wandb_output(text: str) -> str:
     key = os.environ.get("WANDB_API_KEY", "").encode()
     if not key:
         return text
-    masked, pending = _mask_output_chunk(text.encode(), key)
+    masked, pending = mask_output_chunk(text.encode(), key)
     return (masked + (b"<secret-hidden>" if pending else b"")).decode()
 
 
@@ -135,9 +117,12 @@ class TrainingClusterClient(Protocol):
         self,
         training_id: str,
         spec: KubernetesTrainingSpec,
-        deadline_at: float,
+        deadline_at: float | None,
         source_snapshot: str,
         source_commit: str,
+        *,
+        nodes: int,
+        gpus_per_node: int,
     ) -> None: ...
 
     def adopt(
@@ -145,7 +130,10 @@ class TrainingClusterClient(Protocol):
         training_id: str,
         spec: KubernetesTrainingSpec,
         resource: KubernetesResourceRef,
-        deadline_at: float,
+        deadline_at: float | None,
+        *,
+        nodes: int,
+        gpus_per_node: int,
     ) -> None: ...
 
     def resource(
@@ -180,9 +168,12 @@ class KubernetesExecutorClient:
         self,
         training_id: str,
         spec: KubernetesTrainingSpec,
-        deadline_at: float,
+        deadline_at: float | None,
         source_snapshot: str,
         source_commit: str,
+        *,
+        nodes: int,
+        gpus_per_node: int,
     ) -> None:
         self._request(
             "reserve",
@@ -191,6 +182,7 @@ class KubernetesExecutorClient:
             deadline_at=deadline_at,
             source_snapshot=source_snapshot,
             source_commit=source_commit,
+            nodes=nodes, gpus_per_node=gpus_per_node,
         )
 
     def adopt(
@@ -198,7 +190,10 @@ class KubernetesExecutorClient:
         training_id: str,
         spec: KubernetesTrainingSpec,
         resource: KubernetesResourceRef,
-        deadline_at: float,
+        deadline_at: float | None,
+        *,
+        nodes: int,
+        gpus_per_node: int,
     ) -> None:
         self._request(
             "adopt",
@@ -206,6 +201,7 @@ class KubernetesExecutorClient:
             spec=spec.model_dump(mode="json"),
             resource=resource.model_dump(mode="json"),
             deadline_at=deadline_at,
+            nodes=nodes, gpus_per_node=gpus_per_node,
         )
 
     def resource(
@@ -259,6 +255,8 @@ class KubernetesExecutorClient:
             connection.sendall(request.encode() + b"\n")
             response = json.loads(connection.makefile("rb").readline())
         if not response["ok"]:
+            if response.get("error_code") == "training_capacity_exceeded":
+                raise TrainingCapacityError(**response["capacity"])
             raise RuntimeError(response["error"])
         return response.get("result")
 
@@ -743,8 +741,10 @@ def _pod_gpus(pod_spec: dict) -> int:
 class _ActiveRemoteTraining:
     spec: KubernetesTrainingSpec
     started_at: float
-    deadline_at: float
+    deadline_at: float | None
     log_path: Path
+    nodes: int
+    gpus_per_node: int
     manifest: dict | None = None
     resource: KubernetesResourceRef | None = None
     cancelled: bool = False
@@ -754,7 +754,7 @@ class _ActiveRemoteTraining:
 
 
 class KubernetesTrainingSupervisor:
-    """Submit once, then supervise one remote Job or MPIJob to terminal state."""
+    """Submit independent workloads and supervise each by durable identity."""
 
     def __init__(
         self,
@@ -763,21 +763,17 @@ class KubernetesTrainingSupervisor:
         state_dir: Path,
         nodes: int,
         gpus_per_node: int,
-        max_timeout_seconds: int | None = None,
         poll_seconds: float = _POLL_SECONDS,
         client: TrainingClusterClient | None = None,
     ):
         if min(nodes, gpus_per_node) < 1:
             raise ValueError("Kubernetes training resources must be positive")
-        if max_timeout_seconds is not None and max_timeout_seconds <= 0:
-            raise ValueError("max_timeout_seconds must be positive")
         if poll_seconds <= 0:
             raise ValueError("poll_seconds must be positive")
         self.workspace = workspace.resolve()
         self.state_dir = state_dir.resolve()
         self.nodes = nodes
         self.gpus_per_node = gpus_per_node
-        self.max_timeout_seconds = max_timeout_seconds
         self.poll_seconds = poll_seconds
         self._wandb_api_key = os.environ.get("WANDB_API_KEY", "").encode()
         socket_path = os.environ.get(
@@ -786,23 +782,24 @@ class KubernetesTrainingSupervisor:
         )
         self.client = client or KubernetesExecutorClient(socket_path)
         self._lock = threading.Lock()
+        self._log_retention_lock = threading.Lock()
         self._shutdown = threading.Event()
         self._launch_complete = threading.Event()
         self._launch_complete.set()
         self._active: dict[str, _ActiveRemoteTraining] = {}
-        self._launching = False
+        self._launching = 0
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._prune_worker_logs()
         self._recover()
 
-    def run_training(self, spec: TrainingSpec) -> TrainingResult:
-        if (
-            self.max_timeout_seconds is not None
-            and spec.timeout_seconds > self.max_timeout_seconds
-        ):
-            raise ValueError(
-                "training timeout exceeds the configured maximum of "
-                f"{self.max_timeout_seconds} seconds"
-            )
+    def run_training(
+        self, spec: TrainingSpec, *, conversation_id: uuid.UUID | None = None,
+    ) -> TrainingResult:
+        self._prune_worker_logs()
+        nodes = spec.nodes if spec.nodes is not None else self.nodes
+        gpus_per_node = spec.gpus_per_node if spec.gpus_per_node is not None else self.gpus_per_node
+        if nodes > self.nodes or gpus_per_node > self.gpus_per_node:
+            raise ValueError("training resources exceed the student's configured allocation")
         cwd = spec.cwd.resolve()
         if cwd != self.workspace and not cwd.is_relative_to(self.workspace):
             raise ValueError("training cwd must be inside the assignment workspace")
@@ -810,43 +807,48 @@ class KubernetesTrainingSupervisor:
         with self._lock:
             if self._shutdown.is_set():
                 raise RuntimeError("Kubernetes training supervisor is closed")
-            if self._active or self._launching:
-                raise RuntimeError("this student already has an active Kubernetes training run")
-            self._launching = True
+            self._launching += 1
             self._launch_complete.clear()
 
         result: TrainingResult | None = None
-        reserved = False
+        reservation_attempted = False
         try:
-            kubernetes_spec = _training_spec(training_id, nodes=self.nodes)
+            kubernetes_spec = _training_spec(training_id, nodes=nodes)
             started_at = time.time()
             source_snapshot, source_commit = _materialize_source_snapshot(self.workspace)
             output_dir = str(Path(os.environ["SENPAI_TRAINING_OUTPUT_ROOT"]) / training_id)
             manifest = _training_manifest(
                 spec, kubernetes_spec, source_commit=source_commit,
-                relative_cwd=cwd.relative_to(self.workspace), nodes=self.nodes,
-                gpus_per_node=self.gpus_per_node, output_dir=output_dir,
+                relative_cwd=cwd.relative_to(self.workspace), nodes=nodes,
+                gpus_per_node=gpus_per_node, output_dir=output_dir,
             )
             if self._shutdown.is_set():
                 raise RuntimeError("Kubernetes training supervisor is closed")
-            deadline_at = started_at + spec.timeout_seconds
-            self.client.reserve(
-                training_id, kubernetes_spec, deadline_at, str(source_snapshot), source_commit,
+            deadline_at = (
+                started_at + spec.timeout_seconds if spec.timeout_seconds is not None else None
             )
-            reserved = True
             log_path = self.state_dir / f"{training_id}.log"
             log_path.touch()
             result = TrainingResult(
-                training_id=training_id, state=TrainingState.RUNNING,
+                training_id=training_id, conversation_id=conversation_id, state=TrainingState.RUNNING,
                 exit_code=None, elapsed_seconds=0, log_path=str(log_path),
                 output_dir=output_dir, wandb_run_ids=(kubernetes_spec.wandb_run_id,),
+                nodes=nodes, gpus_per_node=gpus_per_node,
                 started_at=started_at, deadline_at=deadline_at,
                 kubernetes_spec=kubernetes_spec, kubernetes_released=False,
                 source_snapshot=str(source_snapshot), source_commit=source_commit,
             )
+            # Write the launch intent before RPC: an unlimited reservation must
+            # remain recoverable even if the executor response is lost.
+            self._write_result(result)
+            reservation_attempted = True
+            self.client.reserve(
+                training_id, kubernetes_spec, deadline_at, str(source_snapshot), source_commit,
+                nodes=nodes, gpus_per_node=gpus_per_node,
+            )
             active = _ActiveRemoteTraining(
                 spec=kubernetes_spec, started_at=started_at, deadline_at=deadline_at,
-                log_path=log_path, manifest=manifest,
+                log_path=log_path, manifest=manifest, nodes=nodes, gpus_per_node=gpus_per_node,
             )
             thread = threading.Thread(
                 target=self._monitor, args=(training_id,),
@@ -856,36 +858,39 @@ class KubernetesTrainingSupervisor:
             with self._lock:
                 if self._shutdown.is_set():
                     raise RuntimeError("Kubernetes training supervisor is closed")
-                self._write_result(result)
                 self._active[training_id] = active
                 thread.start()
         except BaseException as error:
+            with self._lock:
+                self._active.pop(training_id, None)
+            released = not reservation_attempted or self._cleanup_failed_launch(training_id, kubernetes_spec)
             if result is not None:
+                failed = result.model_copy(update={
+                    "state": TrainingState.FAILED,
+                    "elapsed_seconds": time.time() - started_at,
+                    "error_tail": f"Training supervision failed to start ({type(error).__name__}).",
+                    "kubernetes_released": released,
+                })
                 try:
-                    self._write_result(result.model_copy(update={
-                        "state": TrainingState.FAILED,
-                        "elapsed_seconds": time.time() - started_at,
-                        "error_tail": f"Training supervision failed to start ({type(error).__name__}).",
-                    }))
+                    self._write_result(failed)
                 except OSError as storage_error:
                     print(
                         f"Kubernetes startup failure persistence deferred: training_id={training_id} "
                         f"path={storage_error.filename} errno={storage_error.errno}",
                         file=sys.stderr, flush=True,
                     )
-            if reserved:
-                self._cleanup_failed_launch(training_id, kubernetes_spec)
-            with self._lock:
-                self._active.pop(training_id, None)
+                if not released:
+                    self._resume_terminal_release(failed)
             raise
         finally:
             with self._lock:
-                self._launching = False
-                self._launch_complete.set()
+                self._launching -= 1
+                if not self._launching:
+                    self._launch_complete.set()
         return result
 
     def _redact_output(self, text: str) -> str:
-        sanitized, pending = _mask_output_chunk(text.encode(), self._wandb_api_key)
+        sanitized, pending = mask_output_chunk(text.encode(), self._wandb_api_key)
         return (sanitized + (b"<secret-hidden>" if pending else b"")).decode()
 
     def get_training_status(self, training_id: str) -> TrainingResult:
@@ -899,6 +904,21 @@ class KubernetesTrainingSupervisor:
                 update={"elapsed_seconds": time.time() - active.started_at}
             )
         return result
+
+    def active_runs(self, *, exclude: str | None = None) -> list[dict]:
+        """Include terminal runs until cleanup releases their GPU reservation."""
+        with self._lock:
+            identifiers = tuple(self._active)
+        return [
+            {
+                "training_id": result.training_id, "state": result.state.value,
+                "nodes": result.nodes, "gpus_per_node": result.gpus_per_node,
+                "deadline_at": result.deadline_at,
+                "cleanup_pending": result.state is not TrainingState.RUNNING,
+            }
+            for identifier in identifiers if identifier != exclude
+            if (result := self.get_training_status(identifier)).kubernetes_released is not True
+        ]
 
     def cancel_training(self, training_id: str) -> TrainingResult:
         result = self.get_training_status(training_id)
@@ -952,17 +972,17 @@ class KubernetesTrainingSupervisor:
         self,
         training_id: str,
         spec: KubernetesTrainingSpec,
-    ) -> None:
-        """Best-effort cleanup without masking the launch error or unsafe release."""
+    ) -> bool:
+        """Try cleanup once; a durable failed record keeps unresolved work recoverable."""
 
         try:
             resource = self.client.resource_identity(spec)
             if resource is not None:
                 self.client.delete(resource)
             self.client.release(training_id)
+            return True
         except Exception:
-            # The broker keeps the reservation and reaps it at its deadline.
-            return
+            return False
 
     def _recover(self) -> None:
         for path in training_result_paths(self.state_dir):
@@ -976,7 +996,7 @@ class KubernetesTrainingSupervisor:
                 continue
             resource = result.kubernetes_resource
             spec = result.kubernetes_spec
-            if spec is None or result.started_at is None or result.deadline_at is None:
+            if spec is None or result.started_at is None:
                 self._write_result(
                     result.model_copy(
                         update={
@@ -988,7 +1008,7 @@ class KubernetesTrainingSupervisor:
                 continue
             if result.source_snapshot is None or result.source_commit is None:
                 raise RuntimeError("remote training record has no source snapshot identity")
-            if result.deadline_at <= time.time():
+            if result.deadline_at is not None and result.deadline_at <= time.time():
                 terminal = result.model_copy(
                     update={
                         "state": TrainingState.TIMED_OUT,
@@ -1002,18 +1022,7 @@ class KubernetesTrainingSupervisor:
                 self._write_result(terminal)
                 self._resume_terminal_release(terminal)
                 continue
-            self.client.reserve(
-                result.training_id,
-                spec,
-                result.deadline_at,
-                result.source_snapshot,
-                result.source_commit,
-            )
-            current = self.client.resource(
-                spec,
-                nodes=self.nodes,
-                gpus_per_node=self.gpus_per_node,
-            )
+            current = self.client.resource_identity(spec)
             if current is None:
                 terminal = result.model_copy(
                     update={
@@ -1025,6 +1034,20 @@ class KubernetesTrainingSupervisor:
                 self._write_result(terminal)
                 self._resume_terminal_release(terminal)
                 continue
+            self.client.reserve(
+                result.training_id,
+                spec,
+                result.deadline_at,
+                result.source_snapshot,
+                result.source_commit,
+                nodes=result.nodes or self.nodes,
+                gpus_per_node=result.gpus_per_node or self.gpus_per_node,
+            )
+            current = self.client.resource(
+                spec,
+                nodes=result.nodes or self.nodes,
+                gpus_per_node=result.gpus_per_node or self.gpus_per_node,
+            )
             if resource is not None and current.uid != resource.uid:
                 terminal = result.model_copy(
                     update={
@@ -1047,12 +1070,14 @@ class KubernetesTrainingSupervisor:
                 deadline_at=result.deadline_at,
                 log_path=Path(result.log_path),
                 resource=current,
+                nodes=current.nodes, gpus_per_node=current.gpus_per_node,
             )
             self.client.adopt(
                 result.training_id,
                 active.spec,
                 current,
                 active.deadline_at,
+                nodes=active.nodes, gpus_per_node=active.gpus_per_node,
             )
             thread = threading.Thread(
                 target=self._monitor,
@@ -1069,9 +1094,11 @@ class KubernetesTrainingSupervisor:
         active = _ActiveRemoteTraining(
             spec=result.kubernetes_spec,
             started_at=result.started_at or time.time(),
-            deadline_at=result.deadline_at or time.time(),
+            deadline_at=result.deadline_at,
             log_path=Path(result.log_path),
             resource=result.kubernetes_resource,
+            nodes=result.nodes or self.nodes,
+            gpus_per_node=result.gpus_per_node or self.gpus_per_node,
         )
         thread = threading.Thread(
             target=self._release_terminal,
@@ -1096,12 +1123,12 @@ class KubernetesTrainingSupervisor:
             if self._should_detach(active):
                 return
             if active.manifest is not None:
-                if not active.cancelled and time.time() < active.deadline_at:
+                if not active.cancelled and not self._deadline_elapsed(active):
                     self.client.apply(json.dumps(active.manifest))
                     while active.resource is None:
                         try:
                             active.resource = self.client.resource(
-                                active.spec, nodes=self.nodes, gpus_per_node=self.gpus_per_node,
+                                active.spec, nodes=active.nodes, gpus_per_node=active.gpus_per_node,
                             )
                         except Exception as error:
                             detail = f"Waiting for Kubernetes ownership: {error}"
@@ -1109,7 +1136,7 @@ class KubernetesTrainingSupervisor:
                             if active.resource is None:
                                 raise RuntimeError("Kubernetes submission returned without a workload")
                             break
-                        if active.cancelled or time.time() >= active.deadline_at:
+                        if active.cancelled or self._deadline_elapsed(active):
                             break
                         if self._shutdown.wait(self.poll_seconds) and self._should_detach(active):
                             return
@@ -1121,7 +1148,7 @@ class KubernetesTrainingSupervisor:
                     state = TrainingState.CANCELLED
                     delete_required = True
                     break
-                if time.time() >= active.deadline_at:
+                if self._deadline_elapsed(active):
                     state = TrainingState.TIMED_OUT
                     delete_required = True
                     break
@@ -1149,7 +1176,7 @@ class KubernetesTrainingSupervisor:
         except Exception as error:
             if active.cancelled:
                 state = TrainingState.CANCELLED
-            elif time.time() >= active.deadline_at:
+            elif self._deadline_elapsed(active):
                 state = TrainingState.TIMED_OUT
             else:
                 state = TrainingState.FAILED
@@ -1236,8 +1263,7 @@ class KubernetesTrainingSupervisor:
         result = self.get_training_status(training_id)
         if summary != result.kubernetes_diagnostics:
             try:
-                with active.log_path.open("a") as log:
-                    log.write("\n=== Kubernetes workload diagnostics ===\n" + diagnostics + "\n")
+                active.log_path.write_text(summary)
                 self._write_result(
                     result.model_copy(update={"kubernetes_diagnostics": summary})
                 )
@@ -1300,12 +1326,105 @@ class KubernetesTrainingSupervisor:
             return
         with self._lock:
             self._active.pop(training_id, None)
+        self._prune_worker_logs()
+
+    @staticmethod
+    def _write_worker_log_receipt(directory: Path, receipt: dict) -> None:
+        temporary = directory / "released.tmp"
+        path = directory / "released.json"
+        if temporary.is_symlink() or path.is_symlink():
+            raise RuntimeError(f"Worker log release receipt must not be a symlink: {directory}")
+        temporary.write_text(json.dumps(receipt, separators=(",", ":")) + "\n")
+        temporary.replace(path)
+
+    def _prune_worker_logs(self) -> None:
+        """Bound PVC log history using durable release proof, never target outputs."""
+        configured_root = os.environ.get("SENPAI_TRAINING_OUTPUT_ROOT")
+        if not configured_root:
+            return
+        root = Path(configured_root).resolve()
+        if not root.is_dir():
+            return
+        with self._log_retention_lock:
+            results = {}
+            for path in training_result_paths(self.state_dir):
+                result = TrainingResult.model_validate_json(path.read_text())
+                results[result.training_id] = result
+            history = []
+            total = 0
+            for output in root.iterdir():
+                try:
+                    identifier = str(uuid.UUID(output.name))
+                except ValueError:
+                    continue
+                directory = output / ".senpai-logs"
+                if (identifier != output.name or output.is_symlink() or not output.is_dir()
+                        or directory.is_symlink() or not directory.is_dir()):
+                    continue
+                result = results.get(identifier)
+                if result is not None and (
+                    not result.output_dir or Path(result.output_dir).resolve() != output
+                ):
+                    result = None
+                if result is not None and result.kubernetes_released is not True:
+                    continue  # Active runs have their separate per-run budget.
+                receipt_path = directory / "released.json"
+                receipt = None
+                if not receipt_path.is_symlink() and not (directory / "released.tmp").is_symlink():
+                    if receipt_path.is_file():
+                        receipt = json.loads(receipt_path.read_text())
+                        if (not isinstance(receipt, dict) or set(receipt) != {"released_at", "pruned"}
+                                or type(receipt["released_at"]) not in (int, float)
+                                or not 0 < receipt["released_at"] < float("inf")
+                                or type(receipt["pruned"]) is not bool):
+                            raise ValueError(f"Invalid worker log release receipt: {receipt_path}")
+                    if result is not None and (
+                        receipt is None or result.worker_logs_pruned and not receipt["pruned"]
+                    ):
+                        if result.started_at is None:
+                            raise ValueError(f"Released worker logs have no terminal timestamp: {identifier}")
+                        receipt = {"released_at": result.started_at + result.elapsed_seconds,
+                                   "pruned": result.worker_logs_pruned}
+                        self._write_worker_log_receipt(directory, receipt)
+                files = [entry for entry in directory.iterdir() if (
+                    (re.fullmatch(r"node-[0-9]+\.(?:log(?:\.1)?|json|tmp)", entry.name)
+                     or entry.name in {"released.json", "released.tmp"})
+                    and not entry.is_symlink() and entry.is_file()
+                )]
+                size = sum(entry.stat().st_size for entry in files)
+                total += size
+                if receipt is not None:
+                    history.append((receipt, result, directory, files, size))
+            for receipt, result, directory, files, size in sorted(
+                history, key=lambda item: (not item[0]["pruned"], item[0]["released_at"]),
+            ):
+                if total <= _WORKER_LOG_HISTORY_BYTES and not receipt["pruned"]:
+                    break
+                # Record the decision on the PVC and locally before deleting any logs.
+                receipt["pruned"] = True
+                self._write_worker_log_receipt(directory, receipt)
+                if result is not None and not result.worker_logs_pruned:
+                    self._write_result(result.model_copy(update={"worker_logs_pruned": True}))
+                for path in files:
+                    if path.name != "released.json":
+                        path.unlink(missing_ok=True)
+                total += (directory / "released.json").stat().st_size - size
+            if total > _WORKER_LOG_HISTORY_BYTES:
+                raise RuntimeError(
+                    f"Worker log history exceeds {_WORKER_LOG_HISTORY_BYTES} bytes under {root}; "
+                    "retained release receipts and logs without release proof cannot be deleted "
+                    "automatically. Review this history before launching more training."
+                )
+
+    @staticmethod
+    def _deadline_elapsed(active: _ActiveRemoteTraining) -> bool:
+        return active.deadline_at is not None and time.time() >= active.deadline_at
 
     def _should_detach(self, active: _ActiveRemoteTraining) -> bool:
         return (
             self._shutdown.is_set()
             and not active.cancelled
-            and time.time() < active.deadline_at
+            and not self._deadline_elapsed(active)
         )
 
     def _publish_resource(
@@ -1330,7 +1449,7 @@ class KubernetesTrainingSupervisor:
         deferred = False
         while True:
             if active is not None and (
-                active.cancelled or time.time() >= active.deadline_at
+                active.cancelled or self._deadline_elapsed(active)
             ):
                 return False
             try:
@@ -1394,6 +1513,7 @@ def _training_manifest(
         "SENPAI_TRAINING_WORKSPACE": "/workspace",
         "SENPAI_TARGET_PYTHON_ENV": "" if custom_image else "/home/senpai/.venvs/senpai-target",
         "SENPAI_TRAINING_OUTPUT_DIR": output_dir,
+        "SENPAI_TRAINING_LOG_MAX_BYTES": str(WORKER_LOG_MAX_BYTES),
         "HOME": "/home/senpai",
         "NNODES": str(nodes), "GPUS_PER_NODE": str(gpus_per_node),
         "MASTER_ADDR": f"{spec.name}-worker-0.{spec.name}" if nodes > 1 else "127.0.0.1",
