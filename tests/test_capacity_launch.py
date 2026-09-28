@@ -45,6 +45,7 @@ def observer_documents(args):
                 tag=args.tag,
                 namespace=args.namespace,
                 image=args.executor_image,
+                image_pull_secrets=args.image_pull_secrets,
                 revision=args.senpai_repo_revision,
                 config=launch.capacity_config(args),
                 node_selector=launch.controller_node_selector(args.controller_node_selector),

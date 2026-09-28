@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import yaml
 
 from launch_test_support import (
@@ -11,19 +12,29 @@ from launch_test_support import (
 
 def render_student(**overrides):
     args = launch_args(
-        advisor=False,
-        nodes_per_student=2,
-        gpus_per_student_node=8,
-        memory_gi_per_gpu=110,
-        executor_image=f"ghcr.io/wandb/senpai-executor:sha-{REVISION}",
-        **overrides,
+        **{
+            "advisor": False,
+            "nodes_per_student": 2,
+            "gpus_per_student_node": 8,
+            "memory_gi_per_gpu": 110,
+            "executor_image": f"ghcr.io/wandb/senpai-executor:sha-{REVISION}",
+            **overrides,
+        }
     )
     configmap, resources, _secret = render_role("student", args)
     return list(yaml.safe_load_all(configmap + "\n---\n" + resources))
 
 
-def test_multinode_controller_is_cpu_only_with_a_credential_isolated_executor():
-    configmap, service_account, role, role_binding, deployment = render_student()
+@pytest.mark.parametrize(
+    "nodes,training_image",
+    [(2, ""), (1, f"docker.io/acme/trainer@sha256:{'c' * 64}")],
+)
+def test_remote_training_controller_is_cpu_only_with_a_credential_isolated_executor(
+    nodes, training_image
+):
+    configmap, service_account, role, role_binding, deployment = render_student(
+        nodes_per_student=nodes, training_image=training_image
+    )
     pod = deployment["spec"]["template"]["spec"]
     containers = {container["name"]: container for container in pod["containers"]}
     student = containers["student"]
@@ -59,7 +70,7 @@ def test_multinode_controller_is_cpu_only_with_a_credential_isolated_executor():
     assert event_rules == [{"apiGroups": [""], "resources": ["events"], "verbs": ["list"]}]
     assert all("list" not in rule["verbs"] for rule in role["rules"][:2])
     assert all("patch" in rule["verbs"] for rule in role["rules"][:2])
-    assert configmap["data"]["NODES_PER_STUDENT"] == "2"
+    assert configmap["data"]["NODES_PER_STUDENT"] == str(nodes)
     assert configmap["data"]["GPUS_PER_STUDENT_NODE"] == "8"
     assert configmap["data"]["CPU_PER_STUDENT_GPU"] == "15"
     assert configmap["data"]["MEMORY_GI_PER_STUDENT_GPU"] == "110"

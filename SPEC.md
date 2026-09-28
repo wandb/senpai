@@ -34,7 +34,8 @@ dependencies.
 7. Conversation and generated artifact state cannot fall back into the target
    checkout.
 8. Senpai does not prune conversation history.
-9. Only the student image carries CUDA, PyTorch, and the training stack.
+9. Among Senpai images, only the student image carries CUDA, PyTorch, and the
+   training stack. Operators may supply a separate training image.
 10. Secret values are passed at narrow executor boundaries and redacted before
     monitored content is attached. Custom secret names are explicit.
 11. Hivemind is disabled, not redesigned, in this change.
@@ -757,8 +758,9 @@ The Kubernetes executor returns raw diagnostic components over its private socke
 The controller masks each component before formatting or truncating it, including
 event messages. The executor does not receive the W&B key.
 
-When a student has more than one configured node, `KubernetesTrainingSupervisor`
-keeps the same tool contract while supervising one remote MPIJob. It creates an
+When a student has more than one configured node or a custom `training_image`,
+`KubernetesTrainingSupervisor` keeps the same tool contract while supervising
+one remote Job (one node) or MPIJob (multiple nodes). It creates an
 atomic Git bundle for the clean `HEAD` on the shared PVC, generates the workload
 and W&B identities, launches the target submitter through the local process
 path, then persists and polls the broker-created UID. The broker replaces
@@ -767,8 +769,8 @@ bundle mutation fails before training starts. Cancellation, timeout, and restart
 recovery remain UID-bound; uncertain deletion retains the broker reservation for
 deadline cleanup rather than releasing ownership early.
 
-The public multi-node tool path reserves an MPIJob. Its target submitter follows
-the [target launcher contract](README.md#multi-node-target-launcher-contract):
+The remote training path reserves the workload. Its target submitter follows
+the [target launcher contract](README.md#remote-training-launcher-contract):
 it uses the generated workload name, namespace, snapshot SHA, and W&B identity,
 and supplies the matching source/run annotations before submission. Worker
 resources must match the configured CPU, memory, and GPU allocation; additional
@@ -779,9 +781,9 @@ removes pod annotations. The checkout runs as UID/GID 0 and leaves the source
 tree owned by root; Restricted Pod Security namespaces are not supported.
 Preserved target labels can affect configured admission and network policies
 despite annotation removal. They are not a trust boundary.
-The broker preserves target scheduling constraints, overwrites ownership and
-`senpai-training-role` labels, and adds required hostname anti-affinity between
-this run's workers. The injected term excludes launcher pods from its selector;
+The broker preserves target scheduling constraints and overwrites ownership and
+`senpai-training-role` labels. For multi-node runs, it adds required hostname
+anti-affinity between this run's workers. The injected term excludes launcher pods from its selector;
 target affinity terms remain unchanged.
 
 Controller shutdown detaches from a running Kubernetes workload. It terminates
@@ -1031,6 +1033,16 @@ Advisor and student build Chromium and run a browser smoke test. The student
 image validates CUDA architecture support. The launcher and cutoff arming
 script accept only matching full source-SHA tags or immutable digests and check
 out that exact revision.
+
+An optional digest-pinned `training_image` selects an independent training
+environment from any reachable registry. It requires no Senpai runtime or source
+revision. The student controller stays in the Senpai image and uses the existing
+executor for one-node Jobs or multi-node MPIJobs. An empty value preserves local
+single-node training and target-selected multi-node images. The executor sets
+the configured image on every main training container and injects only the
+operator's `image_pull_secrets`; agent-supplied pull secrets remain forbidden.
+The trusted executor image still provides the source-checkout init container.
+Operators build and publish training images before launch.
 
 Launch preflight verifies:
 

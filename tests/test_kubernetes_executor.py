@@ -82,12 +82,14 @@ def test_executor_server_keeps_serving_during_reconcile_outages(capsys):
     assert "reconciliation deferred" in capsys.readouterr().err
 
 
-def executor(tmp_path: Path, client: FakeApi | None = None) -> KubernetesExecutor:
+def executor(
+    tmp_path: Path, client: FakeApi | None = None, *, nodes: int = 2, **options
+) -> KubernetesExecutor:
     return KubernetesExecutor(
         client=client or FakeApi(),
         state_path=tmp_path / "reservation.json",
         namespace="research",
-        nodes=2,
+        nodes=nodes,
         gpus_per_node=8,
         max_timeout_seconds=3600,
         cpu_per_gpu=15,
@@ -102,15 +104,18 @@ def executor(tmp_path: Path, client: FakeApi | None = None) -> KubernetesExecuto
         student_name="fern",
         pod_name="senpai-fred-fern-123",
         pod_uid="student-pod-uid",
+        **options,
     )
 
 
-def reserve(broker: KubernetesExecutor, commit: str = "a" * 40) -> dict:
+def reserve(
+    broker: KubernetesExecutor, commit: str = "a" * 40, *, kind: str = "MPIJob"
+) -> dict:
     request = {
         "operation": "reserve",
         "training_id": "training-one",
         "spec": {
-            "kind": "MPIJob",
+            "kind": kind,
             "name": "senpai-fred-fern-123",
             "namespace": "research",
             "wandb_run_id": "wandb-one",
@@ -217,6 +222,43 @@ def apply(broker: KubernetesExecutor, document: dict) -> str:
     return broker.handle({"operation": "apply", "manifest": yaml.safe_dump(document)})
 
 
+@pytest.mark.parametrize("restart_policy", ["Never", "OnFailure", "Always", None])
+def test_executor_validates_and_runs_single_node_training_jobs(tmp_path, restart_policy):
+    api = FakeApi()
+    image = "registry.example/training@sha256:" + "b" * 64
+    broker = executor(
+        tmp_path, api, nodes=1, training_image=image,
+        image_pull_secrets=["private-training"],
+    )
+    reservation = reserve(broker, kind="Job")
+    document = manifest()
+    template = document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]
+    document.update(apiVersion="batch/v1", kind="Job", spec={"template": template})
+    if restart_policy is None:
+        template["spec"].pop("restartPolicy")
+    else:
+        template["spec"]["restartPolicy"] = restart_policy
+
+    if restart_policy != "Never":
+        with pytest.raises(ValueError, match="Job pods must use restartPolicy Never"):
+            apply(broker, document)
+        assert api.creates == 0
+        return
+
+    assert apply(broker, document) == "job/senpai-fred-fern-123 created\n"
+
+    created = api.document_value
+    assert created["spec"]["suspend"] is False
+    pod = created["spec"]["template"]["spec"]
+    assert pod["containers"][0]["image"] == image
+    assert pod["imagePullSecrets"] == [{"name": "private-training"}]
+    assert pod["initContainers"][0]["image"] == "executor@sha256:" + "a" * 64
+    assert "affinity" not in pod
+    resource = broker.handle({"operation": "resource", "spec": reservation["spec"],
+                              "nodes": 1, "gpus_per_node": 8})
+    assert (resource["kind"], resource["nodes"], resource["gpus_per_node"]) == ("Job", 1, 8)
+
+
 def test_slow_logs_do_not_block_executor_status_or_cancellation(tmp_path):
     logs_started = threading.Event()
     finish_logs = threading.Event()
@@ -261,11 +303,16 @@ def test_slow_logs_do_not_block_executor_status_or_cancellation(tmp_path):
 
 
 @pytest.mark.parametrize("wandb_key_role", ["Worker", "Launcher"])
+@pytest.mark.parametrize("custom_image", [False, True])
 def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(
-    tmp_path, wandb_key_role,
+    tmp_path, wandb_key_role, custom_image,
 ):
     api = FakeApi()
-    broker = executor(tmp_path, api)
+    training_image = "registry.example/training@sha256:" + "b" * 64
+    broker = executor(tmp_path, api, **({
+        "training_image": training_image,
+        "image_pull_secrets": ["private-training"],
+    } if custom_image else {}))
     reserve(broker)
     document = manifest()
     document["spec"]["runPolicy"]["suspend"] = False
@@ -350,8 +397,14 @@ def test_executor_injects_ownership_and_allows_exactly_one_2x8_workload(
         if role == "Launcher":
             assert "affinity" not in pod_spec
         assert pod_spec["automountServiceAccountToken"] is False
+        assert pod_spec.get("imagePullSecrets", []) == (
+            [{"name": "private-training"}] if custom_image else []
+        )
         assert pod_spec["terminationGracePeriodSeconds"] == 30
         for container in pod_spec["containers"]:
+            assert container["image"] == (
+                training_image if custom_image else "training:immutable"
+            )
             assert [item for item in container["env"] if item["name"] == "WANDB_RUN_ID"] == [
                 {"name": "WANDB_RUN_ID", "value": "wandb-one"}
             ]
@@ -551,6 +604,12 @@ def test_executor_rejects_a_dataset_mount_replaced_by_the_workspace(tmp_path):
             lambda value: value["spec"]["mpiReplicaSpecs"]["Worker"]["template"][
                 "spec"
             ].__setitem__("serviceAccountName", "admin"),
+            "workload identity",
+        ),
+        (
+            lambda value: value["spec"]["mpiReplicaSpecs"]["Worker"]["template"][
+                "spec"
+            ].__setitem__("imagePullSecrets", [{"name": "unapproved"}]),
             "workload identity",
         ),
         (

@@ -573,7 +573,16 @@ def test_interrupting_run_training_cancels_only_the_in_flight_run(
         monitors.close()
 
 
-def test_registered_training_tools_share_one_runtime(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("nodes", "training_image", "remote"),
+    [(1, "", False), (1, "training@sha256:" + "a" * 64, True), (2, "", True)],
+)
+def test_registered_training_tools_share_one_runtime(
+    tmp_path: Path, monkeypatch, nodes, training_image, remote,
+):
+    monkeypatch.setenv("NODES_PER_STUDENT", str(nodes))
+    monkeypatch.setenv("GPUS_PER_STUDENT_NODE", "1")
+    monkeypatch.setenv("SENPAI_TRAINING_IMAGE", training_image)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     state = SimpleNamespace(workspace=SimpleNamespace(working_dir=workspace))
@@ -586,6 +595,10 @@ def test_registered_training_tools_share_one_runtime(tmp_path: Path):
     by_name = {tool.name: tool for tool in tools}
 
     try:
+        assert isinstance(
+            by_name["run_training"].executor.training,
+            training_tools.KubernetesTrainingSupervisor,
+        ) is remote
         assert set(by_name) == {
             "cancel_training",
             "run_training",
