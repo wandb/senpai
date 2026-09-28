@@ -7,9 +7,11 @@ import json
 import os
 from pathlib import Path
 import shlex
+import socket
 import subprocess
 import sys
 import sysconfig
+import time
 
 from senpai_agent.target_environment import install_shared_console_scripts
 from senpai_agent.training import target_python_environment
@@ -71,6 +73,16 @@ def mpi() -> None:
     hosts = [line.split()[0] for line in Path("/etc/mpi/hostfile").read_text().splitlines() if line]
     known_hosts = home / ".senpai-known-hosts"
     known_hosts.write_text("".join(f"[{host}]:2222 {public_key}\n" for host in hosts))
+    # A suspended MPIJob can create its launcher before any workers exist.
+    # The executor's workload deadline also bounds this readiness wait.
+    for host in hosts:
+        print(f"Waiting for worker SSH on {host}:2222", flush=True)
+        while True:
+            try:
+                with socket.create_connection((host, 2222), timeout=2):
+                    break
+            except OSError:
+                time.sleep(1)
     ssh_arguments = shlex.join([
         "-p", "2222", "-o", "StrictHostKeyChecking=yes", "-o",
         f"UserKnownHostsFile={known_hosts}", "-i", str(private_key),

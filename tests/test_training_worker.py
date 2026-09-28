@@ -171,6 +171,9 @@ runpy.run_module('senpai_agent.training_worker', run_name='__main__')
 
 
 def test_mpi_launch_keeps_ssh_on_launcher_with_its_known_hosts(tmp_path, monkeypatch):
+    import contextlib
+    import socket
+
     from senpai_agent import training_worker
 
     home = tmp_path / "home"
@@ -188,8 +191,30 @@ def test_mpi_launch_keeps_ssh_on_launcher_with_its_known_hosts(tmp_path, monkeyp
         return read_text(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", operator_hostfile)
+    ready_hosts = set()
+    attempts = {}
+
+    @contextlib.contextmanager
+    def connect(address, timeout):
+        host, port = address
+        assert port == 2222
+        assert timeout > 0
+        attempts[host] = attempts.get(host, 0) + 1
+        if host == "worker-0.job" and attempts[host] == 1:
+            raise socket.gaierror(socket.EAI_NONAME, "worker DNS is not published yet")
+        if host == "worker-1.job" and attempts[host] == 1:
+            raise ConnectionRefusedError("worker SSH has not started yet")
+        ready_hosts.add(host)
+        yield
+
+    monkeypatch.setattr(socket, "create_connection", connect)
     invocations = []
-    monkeypatch.setattr(os, "execv", lambda executable, argv: invocations.append((executable, argv)))
+
+    def launch(executable, argv):
+        assert ready_hosts == {f"worker-{rank}.job" for rank in range(128)}
+        invocations.append((executable, argv))
+
+    monkeypatch.setattr(os, "execv", launch)
     training_worker.mpi()
     executable, argv = invocations.pop()
     assert executable == "/usr/bin/mpirun"
@@ -198,3 +223,4 @@ def test_mpi_launch_keeps_ssh_on_launcher_with_its_known_hosts(tmp_path, monkeyp
     # launcher owns the complete known_hosts file, so all SSH starts belong here.
     assert parameters.get("plm_rsh_no_tree_spawn") == "1"
     assert argv[argv.index("-np") + 1] == "128"
+    assert attempts["worker-0.job"] == attempts["worker-1.job"] == 2
