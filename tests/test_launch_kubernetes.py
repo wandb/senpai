@@ -704,6 +704,8 @@ def test_invalid_bound_program_reports_a_clean_launch_error(monkeypatch, failure
 def test_preflight_resolves_custom_secrets(monkeypatch):
     args = launch_args(
         preflight_only=True,
+        training_image="registry.example/training@sha256:" + "c" * 64,
+        image_pull_secrets=["training-registry"],
         custom_secret_env_names=["HF_TOKEN", "DATASET_LICENSE_KEY"],
     )
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
@@ -724,6 +726,8 @@ def test_preflight_resolves_custom_secrets(monkeypatch):
     ]
     assert storage == [{
         "images": {"student": args.student_image, "advisor": args.advisor_image},
+        "training_image": args.training_image,
+        "image_pull_secrets": ["training-registry"],
         "pvc_mount_path": args.pvc_mount_path,
         "pvc_claim_name": args.pvc_claim_name,
         "output_roots": [f"{args.pvc_mount_path}/.senpai/runs/{args.tag}/fern"],
