@@ -26,7 +26,11 @@ target_repo_branch: ""
 # Required: use digests or matching sha-<full-commit> tags.
 advisor_image: ""
 student_image: ""
+# Optional digest-pinned image for training in separate GPU workers.
+training_image: ""
 executor_image: ""
+# Existing Kubernetes secrets with registry credentials, in the launch namespace.
+image_pull_secrets: []
 
 # Kubernetes target
 kube_context: ""

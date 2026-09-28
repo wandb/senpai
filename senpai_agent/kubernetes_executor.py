@@ -65,6 +65,8 @@ class KubernetesExecutor:
         student_name: str,
         pod_name: str,
         pod_uid: str,
+        training_image: str = "",
+        image_pull_secrets: list[str] | None = None,
     ):
         self.client = client
         self.state_path = state_path
@@ -78,6 +80,8 @@ class KubernetesExecutor:
         self.pvc_mount_path = pvc_mount_path
         self.snapshot_root = snapshot_root
         self.executor_image = executor_image
+        self.training_image = training_image
+        self.image_pull_secrets = image_pull_secrets or []
         self.launch_secret_name = launch_secret_name
         self.wandb_tags = wandb_tags
         self.research_tag = research_tag
@@ -431,6 +435,8 @@ class KubernetesExecutor:
                 or int(manifest["spec"].get("completions", 1)) != self.nodes
             ):
                 raise ValueError("Job parallelism and completions must match this allocation")
+            if manifest["spec"]["template"]["spec"].get("restartPolicy") != "Never":
+                raise ValueError("Job pods must use restartPolicy Never")
             manifest["spec"]["activeDeadlineSeconds"] = remaining
             manifest["spec"]["backoffLimit"] = 0
             manifest["spec"]["suspend"] = True
@@ -498,6 +504,10 @@ class KubernetesExecutor:
         }
         if forbidden_values & pod_spec.keys():
             raise ValueError("training pod requests forbidden workload identity or runtime access")
+        if self.image_pull_secrets:
+            pod_spec["imagePullSecrets"] = [
+                {"name": name} for name in self.image_pull_secrets
+            ]
         if any(pod_spec.get(key) for key in ("hostNetwork", "hostPID", "hostIPC", "shareProcessNamespace")):
             raise ValueError("training pod requests forbidden host namespace access")
         pod_spec["automountServiceAccountToken"] = False
@@ -531,6 +541,8 @@ class KubernetesExecutor:
                 wandb_run_id=wandb_run_id,
             )
         for container in containers:
+            if self.training_image:
+                container["image"] = self.training_image
             self._secure_container(container, allow_gpu=allow_gpus)
             found_key |= self._secure_environment(
                 container,
@@ -1071,6 +1083,8 @@ def serve() -> None:
         pvc_mount_path=Path(os.environ["PVC_MOUNT_PATH"]),
         snapshot_root=Path(os.environ["SENPAI_TRAINING_SNAPSHOT_ROOT"]),
         executor_image=os.environ["SENPAI_EXECUTOR_IMAGE"],
+        training_image=os.environ.get("SENPAI_TRAINING_IMAGE", ""),
+        image_pull_secrets=json.loads(os.environ.get("SENPAI_IMAGE_PULL_SECRETS", "[]")),
         launch_secret_name=os.environ["SENPAI_LAUNCH_SECRET_NAME"],
         wandb_tags=os.environ["WANDB_TAGS"],
         research_tag=os.environ["RESEARCH_TAG"],

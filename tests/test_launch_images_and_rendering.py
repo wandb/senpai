@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import re
 import subprocess
@@ -52,7 +53,7 @@ def test_default_config_exposes_every_model_profile_and_effort():
     assert "repo_revision" not in config
 
 
-def test_yaml_config_parses_custom_secret_names_as_a_list(monkeypatch, tmp_path):
+def test_yaml_config_parses_secret_names_as_lists(monkeypatch, tmp_path):
     config_path = tmp_path / "senpai.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -60,6 +61,7 @@ def test_yaml_config_parses_custom_secret_names_as_a_list(monkeypatch, tmp_path)
                 "tag": "config-test",
                 "target_repo_url": "https://github.com/example/problem.git",
                 "custom_secret_env_names": ["HF_TOKEN", "DATASET_LICENSE_KEY"],
+                "image_pull_secrets": ["ghcr", "coreweave"],
             }
         )
     )
@@ -68,6 +70,31 @@ def test_yaml_config_parses_custom_secret_names_as_a_list(monkeypatch, tmp_path)
     args = launch.sp.parse(launch.Args, config_path=str(config_path))
 
     assert args.custom_secret_env_names == ["HF_TOKEN", "DATASET_LICENSE_KEY"]
+    assert args.image_pull_secrets == ["ghcr", "coreweave"]
+
+
+@pytest.mark.parametrize("secret_names", [[], ["ghcr", "docker-hub", "coreweave"]])
+def test_launch_renders_image_pull_secrets_for_every_pod(secret_names):
+    result = run_launch(
+        "--advisor", "--advisor_image", ADVISOR_IMAGE,
+        "--student_image", STUDENT_IMAGE,
+        "--senpai_repo_revision", REVISION,
+        "--capacity_observer",
+        "--executor_image", f"ghcr.io/wandb/senpai-executor@sha256:{'b' * 64}",
+        *(["--image_pull_secrets", *secret_names] if secret_names else []),
+    )
+
+    assert result.returncode == 0, result.stderr
+    rendered = re.sub(r"^--- .+ ---$", "---", result.stdout, flags=re.MULTILINE)
+    deployments = [
+        document for document in yaml.safe_load_all(rendered)
+        if isinstance(document, dict) and document.get("kind") == "Deployment"
+    ]
+    assert len(deployments) == 3
+    for deployment in deployments:
+        assert deployment["spec"]["template"]["spec"]["imagePullSecrets"] == [
+            {"name": name} for name in secret_names
+        ]
 
 
 def test_launch_rejects_the_retired_gpu_option_instead_of_abbreviating_it():
@@ -126,6 +153,50 @@ def test_multinode_executor_requires_a_registry_digest():
 
     assert result.returncode != 0
     assert "--executor_image must use an immutable @sha256 digest" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "registry",
+    ["ghcr.io/acme", "docker.io/acme", "registry.example:5000/acme/team"],
+)
+def test_custom_training_image_is_independent_of_senpai_revision(registry):
+    training_image = f"{registry}/trainer@sha256:{'c' * 64}"
+    result = run_launch(
+        "--advisor_image", ADVISOR_IMAGE, "--student_image", STUDENT_IMAGE,
+        "--senpai_repo_revision", REVISION,
+        "--training_image", training_image,
+        "--executor_image", f"ghcr.io/wandb/senpai-executor@sha256:{'b' * 64}",
+        "--image_pull_secrets", "training-registry",
+    )
+
+    assert result.returncode == 0, result.stderr
+    rendered = re.sub(r"^--- .+ ---$", "---", result.stdout, flags=re.MULTILINE)
+    documents = [doc for doc in yaml.safe_load_all(rendered) if isinstance(doc, dict)]
+    config = next(doc["data"] for doc in documents if doc["kind"] == "ConfigMap")
+    assert config["SENPAI_TRAINING_IMAGE"] == training_image
+    assert config["SENPAI_REPO_REVISION"] == REVISION
+    assert json.loads(config["SENPAI_IMAGE_PULL_SECRETS"]) == ["training-registry"]
+    pod = next(doc for doc in documents if doc["kind"] == "Deployment")["spec"]["template"]["spec"]
+    assert {container["name"] for container in pod["containers"]} == {
+        "student", "kubernetes-executor"
+    }
+
+
+@pytest.mark.parametrize(
+    "training_image,expected_error",
+    [
+        ("docker.io/acme/trainer:latest", "--training_image must use an immutable @sha256 digest"),
+        (f"docker.io/acme/trainer@sha256:{'c' * 64}", "--executor_image must use an immutable @sha256 digest"),
+    ],
+)
+def test_custom_training_requires_pinned_training_and_executor_images(training_image, expected_error):
+    result = run_launch(
+        "--advisor_image", ADVISOR_IMAGE, "--student_image", STUDENT_IMAGE,
+        "--training_image", training_image,
+    )
+
+    assert result.returncode != 0
+    assert expected_error in result.stderr
 
 
 def test_source_revision_is_derived_from_a_full_sha_tag():

@@ -200,7 +200,7 @@ def training_runtime(
     if runtime is None:
         nodes = int(os.environ.get("NODES_PER_STUDENT", "1"))
         supervisor: TrainingRuntime
-        if nodes > 1:
+        if nodes > 1 or os.environ.get("SENPAI_TRAINING_IMAGE"):
             supervisor = KubernetesTrainingSupervisor(
                 workspace=workspace,
                 state_dir=key,

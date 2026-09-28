@@ -130,7 +130,7 @@ CONTROLLER_SITE="$("$SENPAI_PYTHON" -P -c 'import sysconfig; print(sysconfig.get
 TARGET_SITE="$("$SENPAI_PYTHON" -P -c 'import sys, sysconfig; print(sysconfig.get_path("purelib", vars={"base": sys.argv[1]}))' "$SENPAI_TARGET_PYTHON_ENV")"
 printf '%s\n' "$CONTROLLER_SITE" > "$TARGET_SITE/senpai-runtime.pth"
 "$SENPAI_PYTHON" -P -m senpai_agent.target_environment "$SENPAI_TARGET_PYTHON_ENV"
-if [ "${NODES_PER_STUDENT:-1}" -gt 1 ]; then
+if [ "${NODES_PER_STUDENT:-1}" -gt 1 ] || [ -n "${SENPAI_TRAINING_IMAGE:-}" ]; then
     proxy_dir="$LOGDIR/bin"
     mkdir -p "$proxy_dir"
     kubectl_wrapper="$(mktemp "$proxy_dir/.kubectl.XXXXXX")"
