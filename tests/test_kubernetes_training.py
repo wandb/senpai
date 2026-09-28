@@ -79,6 +79,15 @@ class FakeCluster:
     def logs(self, _resource):
         return "remote worker log"
 
+    def pod_snapshot(self, resource):
+        return {
+            "training_id": self.reservations[-1][0],
+            "source_commit": self.reservations[-1][2],
+            "resource": resource.model_dump(mode="json"),
+            "captured_at": time.time(), "pods": [], "terminal_complete": False,
+            "capture_error": None,
+        }
+
     def release(self, training_id):
         self.releases.append(training_id)
 
@@ -1280,7 +1289,7 @@ def test_supervisor_recovers_an_unconfirmed_terminal_release(tmp_path, monkeypat
     assert client.releases == [training_id]
 
 
-def test_supervisor_persists_live_diagnostics_before_training_finishes(tmp_path, monkeypatch):
+def test_supervisor_persists_live_diagnostics_and_replaces_failed_pod_capture(tmp_path, monkeypatch):
     key = "shared-wandb-sentinel"
     monkeypatch.setenv("WANDB_API_KEY", key)
 
@@ -1299,6 +1308,7 @@ def test_supervisor_persists_live_diagnostics_before_training_finishes(tmp_path,
         def state(self, resource):
             return self.state_value, f"workload key={key}"
 
+    monkeypatch.setattr(kubernetes_training, "_DIAGNOSTICS_SECONDS", 0.02)
     client = PendingCluster()
     runtime, workspace, _ = supervisor(
         tmp_path, monkeypatch, client,
@@ -1327,7 +1337,29 @@ def test_supervisor_persists_live_diagnostics_before_training_finishes(tmp_path,
         assert "partial key=<secret-hidden>" in log
         assert key not in result.model_dump_json()
         assert key not in (runtime.state_dir / f"{started.training_id}.json").read_text()
-        assert client.log_reads == 1
+        snapshot = result.kubernetes_pod_snapshot
+        assert snapshot["training_id"] == started.training_id
+        assert snapshot["source_commit"] == result.source_commit
+        assert snapshot["resource"] == result.kubernetes_resource.model_dump(mode="json")
+        assert result.kubernetes_pod_receipt is None
+
+        def unavailable(_resource):
+            raise TimeoutError("Kubernetes is unavailable")
+
+        client.pod_snapshot = unavailable
+        deadline = time.monotonic() + 2
+        while True:
+            result = runtime.get_training_status(started.training_id)
+            if result.kubernetes_pod_snapshot["capture_error"] == "Pod status read failed: TimeoutError":
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert result.state is TrainingState.RUNNING
+        assert result.kubernetes_pod_snapshot["captured_at"] > snapshot["captured_at"]
+        assert result.kubernetes_pod_snapshot["pods"] == []
+        assert result.kubernetes_pod_snapshot["terminal_complete"] is False
+        persisted = json.loads((runtime.state_dir / f"{started.training_id}.json").read_text())
+        assert persisted["kubernetes_pod_snapshot"] == result.kubernetes_pod_snapshot
     finally:
         terminal = runtime.cancel_training(started.training_id)
     assert terminal.state is TrainingState.CANCELLED
@@ -1537,3 +1569,41 @@ def test_supervisor_persists_executor_receipt_with_terminal_acknowledgement(tmp_
     )
     assert saved.kubernetes_released is True
     assert saved.kubernetes_pod_receipt == receipt
+
+
+def test_blocked_live_pod_capture_does_not_delay_cancellation(tmp_path, monkeypatch):
+    capture_started = threading.Event()
+    finish_capture = threading.Event()
+    cancellation_done = threading.Event()
+    results = []
+
+    class SlowSnapshotCluster(FakeCluster):
+        def pod_snapshot(self, resource):
+            capture_started.set()
+            assert finish_capture.wait(5)
+            return super().pod_snapshot(resource)
+
+    client = SlowSnapshotCluster(TrainingState.RUNNING)
+    runtime, workspace, _ = supervisor(tmp_path, monkeypatch, client)
+    started = runtime.run_training(TrainingSpec(
+        argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=5,
+    ))
+
+    def cancel():
+        results.append(runtime.cancel_training(started.training_id))
+        cancellation_done.set()
+
+    cancellation = threading.Thread(target=cancel)
+    try:
+        assert capture_started.wait(2)
+        cancellation.start()
+        assert cancellation_done.wait(2), "optional live Pod capture delayed cancellation"
+        assert results[0].state is TrainingState.CANCELLED
+        assert results[0].kubernetes_released is True
+        assert client.deletions
+        assert client.releases == [started.training_id]
+    finally:
+        finish_capture.set()
+        if cancellation.ident is not None:
+            cancellation.join(5)
+        runtime.close()

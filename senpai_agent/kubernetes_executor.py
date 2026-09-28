@@ -127,15 +127,32 @@ class KubernetesExecutor:
                         min(int(request["timeout_seconds"]), 60),
                     )
                 return None
-            if operation == "logs":
+            if operation in {"logs", "pod_snapshot"}:
                 resource = self._require_resource(request["resource"])
                 if not self._verify_current(resource):
+                    if operation == "pod_snapshot":
+                        raise RuntimeError("owned Kubernetes workload no longer exists")
                     return None
+                if operation == "pod_snapshot":
+                    reservation = self._require_reservation()
+                    identity = {
+                        "training_id": reservation["training_id"],
+                        "source_commit": reservation["source_commit"],
+                        "resource": resource.model_dump(mode="json"),
+                        "captured_at": time.time(),
+                    }
             if operation == "release":
                 return self._release(request["training_id"])
         if operation == "logs":
             # The API client rechecks the UID; slow log reads must not block control.
             return self.client.logs(resource)
+        if operation == "pod_snapshot":
+            snapshot = self.client.pod_snapshot(resource)
+            return {
+                **identity, "pods": snapshot["pods"],
+                "expected_pods": snapshot["expected_pods"],
+                "terminal_complete": snapshot["complete"], "capture_error": None,
+            }
         raise ValueError(f"unsupported executor operation {operation!r}")
 
     def reconcile(self) -> None:

@@ -1673,7 +1673,7 @@ def test_receipt_storage_failure_blocks_normal_release_but_not_forced_cleanup(
         assert 'Kubernetes Pod receipt persistence failed' in capsys.readouterr().err
 
 
-@pytest.mark.parametrize('case', ['complete', 'missing', 'active', 'extra', 'unknown_restart', 'missing_timestamp', 'null_timestamp', 'overflow', 'paginated'])
+@pytest.mark.parametrize('case', ['complete', 'missing', 'active', 'extra', 'unknown_restart', 'missing_timestamp', 'null_timestamp', 'missing_image_id', 'overflow', 'paginated'])
 def test_pod_snapshot_preserves_owned_status_without_text_truncation(monkeypatch, case):
     client = object.__new__(KubernetesApiClient)
     resource = KubernetesResourceRef(kind='MPIJob', name='run', namespace='research',
@@ -1691,10 +1691,12 @@ def test_pod_snapshot_preserves_owned_status_without_text_truncation(monkeypatch
                          'uid': 'uid-' + str(index), 'creationTimestamp': '2026-09-26T01:00:00Z',
                          'ownerReferences': [owner]},
             'spec': {'nodeName': 'gpu-node-' + str(index), 'containers': [
-                {'name': 'train', 'resources': {'limits': {'nvidia.com/gpu': '8' if worker else '0'}}},
+                {'name': 'train', 'image': 'registry/train@sha256:' + 'a' * 64,
+                 'resources': {'limits': {'nvidia.com/gpu': '8' if worker else '0'}}},
             ]},
             'status': {'phase': 'Succeeded', 'containerStatuses': [{
-                'name': 'train', 'restartCount': 2 if index == 0 else 0,
+                'name': 'train', 'imageID': 'containerd://sha256:' + 'b' * 64,
+                'restartCount': 2 if index == 0 else 0,
                 'state': {'terminated': {'exitCode': 0, 'reason': 'Completed',
                                         'startedAt': '2026-09-26T01:00:03Z',
                                         'finishedAt': '2026-09-26T02:00:00Z',
@@ -1705,6 +1707,11 @@ def test_pod_snapshot_preserves_owned_status_without_text_truncation(monkeypatch
         }
 
     pods = [pod(i) for i in range(32)] + [pod(32, worker=False)]
+    pods[0]['spec']['initContainers'] = [{'name': 'checkout', 'image': 'registry/executor@sha256:' + 'c' * 64}]
+    pods[0]['status']['initContainerStatuses'] = [{
+        **deepcopy(pods[0]['status']['containerStatuses'][0]),
+        'name': 'checkout', 'imageID': 'containerd://sha256:' + 'd' * 64,
+    }]
     if case == 'missing':
         pods.pop(3)
     elif case == 'active':
@@ -1718,6 +1725,8 @@ def test_pod_snapshot_preserves_owned_status_without_text_truncation(monkeypatch
         pods[3]['status']['containerStatuses'][0]['state']['terminated'].pop('finishedAt')
     elif case == 'null_timestamp':
         pods[3]['status']['containerStatuses'][0]['state']['terminated']['finishedAt'] = None
+    elif case == 'missing_image_id':
+        pods[3]['status']['containerStatuses'][0].pop('imageID')
     elif case == 'overflow':
         pods.extend(pod(i) for i in range(33, 257))
     foreign = pod(100)
@@ -1743,16 +1752,23 @@ def test_pod_snapshot_preserves_owned_status_without_text_truncation(monkeypatch
             client.pod_snapshot(resource)
         return
     snapshot = client.pod_snapshot(resource)
-    assert snapshot['complete'] is (case == 'complete')
+    assert snapshot['complete'] is (case in {'complete', 'missing_image_id'})
     assert snapshot['expected_pods'] == 33
     assert len(snapshot['pods']) == len(pods)
     assert len(json.dumps(snapshot)) > 8192
     first = snapshot['pods'][0]
     assert first['uid'] == 'uid-0' and first['node'] == 'gpu-node-0'
     assert first['owners'] == [{'kind': 'MPIJob', 'name': 'run', 'uid': 'mpi-uid'}]
-    assert first['containers'][0]['restartCount'] == 2  # Factual, not silently zeroed.
-    assert first['containers'][0]['lastState']['terminated']['exitCode'] == 137
-    assert first['containers'][0]['state']['terminated']['finishedAt'] == '2026-09-26T02:00:00Z'
+    assert first['containers'][0]['init'] is True
+    assert first['containers'][0]['image'] == 'registry/executor@sha256:' + 'c' * 64
+    assert first['containers'][0]['imageID'] == 'containerd://sha256:' + 'd' * 64
+    assert first['containers'][1]['image'] == 'registry/train@sha256:' + 'a' * 64
+    assert first['containers'][1]['imageID'] == 'containerd://sha256:' + 'b' * 64
+    if case == 'missing_image_id':
+        assert snapshot['pods'][3]['containers'][0]['imageID'] is None
+    assert first['containers'][1]['restartCount'] == 2  # Factual, not silently zeroed.
+    assert first['containers'][1]['lastState']['terminated']['exitCode'] == 137
+    assert first['containers'][1]['state']['terminated']['finishedAt'] == '2026-09-26T02:00:00Z'
     assert 'must not enter receipt' not in json.dumps(snapshot)
     if case == 'unknown_restart':
         assert snapshot['pods'][3]['containers'][0]['restartCount'] is None
@@ -1813,3 +1829,53 @@ def test_forced_cleanup_survives_receipt_read_failures(tmp_path, monkeypatch, ca
             assert 'Kubernetes Pod receipt persistence failed' in capsys.readouterr().err
     finally:
         finish.set()
+
+
+@pytest.mark.parametrize("mismatch", [None, "resource", "source", "owner", "replaced", "missing"])
+def test_live_pod_snapshot_is_bound_to_the_owned_reservation(tmp_path, monkeypatch, mismatch):
+    api = FakeApi()
+    broker = executor(tmp_path, api)
+    reserve(broker)
+    apply(broker, manifest())
+    resource = deepcopy(broker._reservation["resource"])
+    reads = []
+
+    def capture(ref):
+        reads.append(ref)
+        return {"pods": [], "complete": False, "expected_pods": 3,
+                "capture_error": "Expected terminal Pod/container coverage is incomplete"}
+
+    api.pod_snapshot = capture
+    client = KubernetesExecutorClient("unused.sock")
+    monkeypatch.setattr(client, "_request", lambda operation, **values: broker.handle({
+        "operation": operation, **values,
+    }))
+    if mismatch == "resource":
+        resource["uid"] = "other-resource"
+    elif mismatch == "source":
+        api.document_value["metadata"]["annotations"]["senpai.wandb.com/source-commit"] = "b" * 40
+    elif mismatch == "owner":
+        api.document_value["metadata"]["ownerReferences"][0]["uid"] = "another-student"
+    elif mismatch == "replaced":
+        api.document_value["metadata"]["uid"] = "new-workload"
+    elif mismatch == "missing":
+        api.document_value = None
+
+    ref = KubernetesResourceRef.model_validate(resource)
+    if mismatch:
+        with pytest.raises((PermissionError, RuntimeError)):
+            client.pod_snapshot(ref)
+        assert reads == []
+        return
+    before = time.time()
+    snapshot = client.pod_snapshot(ref)
+    assert snapshot["training_id"] == "training-one"
+    assert snapshot["source_commit"] == "a" * 40
+    assert snapshot["resource"] == resource
+    assert before <= snapshot["captured_at"] <= time.time()
+    assert snapshot["pods"] == []
+    assert snapshot["terminal_complete"] is False
+    assert snapshot["capture_error"] is None
+    assert len(reads) == 1
+    assert not (tmp_path / "reservation.receipts").exists()
+    assert broker._reservation["released"] is False
