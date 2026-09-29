@@ -24,6 +24,7 @@ from senpai_agent.kubernetes_training import (
     EXECUTOR_SOCKET_ENV,
     KubernetesApiError,
     KubernetesApiClient,
+    KubernetesCreateUnconfirmedError,
     KubernetesExecutorClient,
     _workload_shape,
 )
@@ -286,7 +287,7 @@ class KubernetesExecutor:
         if current is None or current != expected:
             raise RuntimeError("remote Kubernetes workload is missing or was replaced")
         if not reservation["activation_authorized"]:
-            raise RuntimeError("the Kubernetes create outcome was not confirmed")
+            raise KubernetesCreateUnconfirmedError("the Kubernetes create outcome was not confirmed")
         if not reservation["activated"]:
             self._activate(reservation, current)
 
@@ -303,7 +304,7 @@ class KubernetesExecutor:
         current = self._current_resource(reservation)
         if current is not None:
             if not reservation["activation_authorized"]:
-                raise RuntimeError("the Kubernetes create outcome was not confirmed")
+                raise KubernetesCreateUnconfirmedError("the Kubernetes create outcome was not confirmed")
             if not reservation["activated"]:
                 self._activate(reservation, current)
             return f"{current.kind.lower()}/{current.name} unchanged\n"
@@ -1171,6 +1172,8 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                         "capacity_gpus": error.capacity_gpus,
                         "active_runs": error.active_runs,
                     })
+                elif isinstance(error, KubernetesCreateUnconfirmedError):
+                    response["error_code"] = "kubernetes_create_unconfirmed"
         self.wfile.write(json.dumps(response, separators=(",", ":")).encode() + b"\n")
 
 

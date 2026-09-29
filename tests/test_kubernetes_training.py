@@ -4,6 +4,7 @@ import errno
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -737,14 +738,21 @@ def broker_runtime(tmp_path, monkeypatch):
             server.server_close()
 
 
-def test_concurrent_jobs_keep_independent_identity_budget_and_deadlines_after_restart(broker_runtime):
+def test_concurrent_jobs_keep_independent_identity_budget_and_deadlines_after_restart(broker_runtime, monkeypatch):
+    from senpai_agent.monitor import TrainingMonitorEngine
+    from senpai_agent.tools import close_training_runtimes, training_runtime
+
     runtime, workspace, api, server, broker_options = broker_runtime
     client = runtime.client
     recovered = None
+    owner = uuid.uuid4()
+    monkeypatch.setenv("NODES_PER_STUDENT", "2")
+    monkeypatch.setenv("GPUS_PER_STUDENT_NODE", "8")
+    monkeypatch.setenv("SENPAI_KUBERNETES_EXECUTOR_SOCKET", str(client.socket_path))
     try:
         spec = TrainingSpec(argv=("python", "train.py"), cwd=workspace, nodes=1, gpus_per_node=8)
-        unlimited = runtime.run_training(spec)
-        limited = runtime.run_training(spec.model_copy(update={"timeout_seconds": 18000}))
+        unlimited = runtime.run_training(spec, conversation_id=owner)
+        limited = runtime.run_training(spec.model_copy(update={"timeout_seconds": 18000}), conversation_id=owner)
         deadline = time.monotonic() + 3
         while any(runtime.get_training_status(run.training_id).kubernetes_resource is None
                   for run in (unlimited, limited)):
@@ -760,17 +768,16 @@ def test_concurrent_jobs_keep_independent_identity_budget_and_deadlines_after_re
         assert "activeDeadlineSeconds" not in api.documents[unlimited.kubernetes_spec.name]["spec"]
         assert api.documents[limited.kubernetes_spec.name]["spec"]["activeDeadlineSeconds"] > 17900
         with pytest.raises(TrainingCapacityError) as rejected:
-            runtime.run_training(spec.model_copy(update={"gpus_per_node": 1}))
+            runtime.run_training(spec.model_copy(update={"gpus_per_node": 1}), conversation_id=owner)
         assert rejected.value.available_gpus == 0
         assert {run["training_id"] for run in rejected.value.active_runs} == set(originals)
 
         runtime.close()
         assert api.deletions == []
         server.executor = KubernetesExecutor(**broker_options)
-        recovered = KubernetesTrainingSupervisor(
-            workspace=workspace, state_dir=runtime.state_dir, nodes=2, gpus_per_node=8,
-            poll_seconds=0.01, client=client,
-        )
+        recovered, monitors = training_runtime(workspace, runtime.state_dir)
+        assert not TrainingMonitorEngine(monitors, recovered, metrics=None).poll_status()
+        assert {item.training_id for item in monitors.active()} == set(originals)
         assert {run["training_id"] for run in recovered.active_runs()} == set(originals)
         for training_id, resource in originals.items():
             assert recovered.get_training_status(training_id).kubernetes_resource == resource
@@ -786,8 +793,111 @@ def test_concurrent_jobs_keep_independent_identity_budget_and_deadlines_after_re
         assert recovered.active_runs() == []
         assert api.documents == {}
     finally:
+        close_training_runtimes()
+
+
+def test_restart_cleans_unconfirmed_create_and_preserves_a_healthy_run(broker_runtime, monkeypatch):
+    runtime, workspace, api, server, _options = broker_runtime
+    spec = TrainingSpec(argv=("python", "train.py"), cwd=workspace, nodes=1, gpus_per_node=8)
+    healthy = runtime.run_training(spec)
+    deadline = time.monotonic() + 3
+    while runtime.get_training_status(healthy.training_id).kubernetes_resource is None:
+        assert time.monotonic() < deadline
+        time.sleep(.01)
+    healthy_resource = runtime.get_training_status(healthy.training_id).kubernetes_resource
+    create = api.create
+    logs = api.logs
+    diagnostics_started = threading.Event()
+    finish_diagnostics = threading.Event()
+    lost_name = None
+    recovered = None
+
+    def lose_create_response(manifest, namespace):
+        nonlocal lost_name
+        create(manifest, namespace)
+        lost_name = manifest['metadata']['name']
+        raise TimeoutError('create committed but response was lost')
+
+    def hold_failed_diagnostics(resource):
+        if resource.name == lost_name:
+            diagnostics_started.set()
+            assert finish_diagnostics.wait(10)
+        return logs(resource)
+
+    monkeypatch.setattr(api, 'create', lose_create_response)
+    monkeypatch.setattr(api, 'logs', hold_failed_diagnostics)
+    try:
+        lost = runtime.run_training(spec)
+        assert diagnostics_started.wait(3)
+        assert api.documents[lost_name]['spec']['suspend'] is True
+        assert runtime.get_training_status(lost.training_id).state is TrainingState.RUNNING
+        # Preserve the actual launch intent at the crash boundary, before the
+        # old process's blocked diagnostic read can publish a terminal result.
+        restart_state = runtime.state_dir.parent / 'restart-state'
+        shutil.copytree(runtime.state_dir, restart_state)
+        recovered = KubernetesTrainingSupervisor(
+            workspace=workspace, state_dir=restart_state, nodes=2, gpus_per_node=8,
+            poll_seconds=.01, client=runtime.client,
+        )
+        deadline = time.monotonic() + 3
+        while not recovered.get_training_status(lost.training_id).kubernetes_released:
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        failed = recovered.get_training_status(lost.training_id)
+        assert failed.state is TrainingState.FAILED
+        assert 'create outcome was not confirmed' in failed.error_tail
+        assert api.deletions == [failed.kubernetes_resource]
+        assert failed.kubernetes_resource.uid == f'uid-{lost_name}'
+        assert server.executor._reservations[lost.training_id]['activated'] is False
+        assert recovered.get_training_status(healthy.training_id).kubernetes_resource == healthy_resource
+        assert set(api.documents) == {healthy_resource.name}
+        assert {item['training_id'] for item in recovered.active_runs()} == {healthy.training_id}
+    finally:
+        finish_diagnostics.set()
+        runtime.cancel_training(healthy.training_id)
+        runtime.drain()
         if recovered is not None:
             recovered.close()
+
+
+def test_transient_recovery_error_detaches_earlier_monitors_without_deleting_runs(broker_runtime, monkeypatch):
+    runtime, workspace, api, server, _options = broker_runtime
+    spec = TrainingSpec(argv=("python", "train.py"), cwd=workspace, nodes=1, gpus_per_node=8)
+    runs = [runtime.run_training(spec) for _ in range(2)]
+    deadline = time.monotonic() + 3
+    while any(runtime.get_training_status(run.training_id).kubernetes_resource is None for run in runs):
+        assert time.monotonic() < deadline
+        time.sleep(.01)
+    runtime.close()
+    handle = server.executor.handle
+    adopted = []
+
+    def transient_adoption(request):
+        if request['operation'] == 'adopt':
+            adopted.append(request['training_id'])
+            if len(adopted) == 2:
+                raise TimeoutError('temporary API outage during adoption')
+        return handle(request)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(server.executor, 'handle', transient_adoption)
+            with pytest.raises(RuntimeError, match='temporary API outage'):
+                KubernetesTrainingSupervisor(
+                    workspace=workspace, state_dir=runtime.state_dir, nodes=2, gpus_per_node=8,
+                    poll_seconds=.01, client=runtime.client,
+                )
+        assert len(adopted) == 2
+        assert api.deletions == [] and len(api.documents) == 2
+        assert all(runtime.get_training_status(run.training_id).state is TrainingState.RUNNING for run in runs)
+        assert not any(thread.name == f'senpai-kubernetes-training-{adopted[0]}'
+                       for thread in threading.enumerate())
+    finally:
+        # Clean the independently simulated API even on the pre-fix orphan-thread failure.
+        api.documents.clear()
+        for thread in threading.enumerate():
+            if thread.name in {f'senpai-kubernetes-training-{run.training_id}' for run in runs}:
+                thread.join(3)
 
 
 def test_lost_reservation_response_for_unlimited_run_leaves_no_orphan(broker_runtime, monkeypatch):

@@ -100,6 +100,10 @@ def _format_diagnostics(diagnostics: KubernetesDiagnostics) -> str:
     return "\n".join(output)
 
 
+class KubernetesCreateUnconfirmedError(RuntimeError):
+    """The broker cannot authorize activation after an ambiguous create."""
+
+
 class KubernetesApiError(RuntimeError):
     """Kubernetes API response failure with its HTTP status preserved."""
 
@@ -262,6 +266,8 @@ class KubernetesExecutorClient:
         if not response["ok"]:
             if response.get("error_code") == "training_capacity_exceeded":
                 raise TrainingCapacityError(**response["capacity"])
+            if response.get("error_code") == "kubernetes_create_unconfirmed":
+                raise KubernetesCreateUnconfirmedError(response["error"])
             raise RuntimeError(response["error"])
         return response.get("result")
 
@@ -796,12 +802,22 @@ class KubernetesTrainingSupervisor:
         self._launching = 0
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._prune_worker_logs()
-        self._recover()
+        try:
+            self._recover()
+        except BaseException:
+            self.close()
+            raise
 
     def run_training(
         self, spec: TrainingSpec, *, conversation_id: uuid.UUID | None = None,
     ) -> TrainingResult:
-        self._prune_worker_logs()
+        if self._prune_worker_logs() > _WORKER_LOG_HISTORY_BYTES:
+            raise RuntimeError(
+                f"Worker log history exceeds {_WORKER_LOG_HISTORY_BYTES} bytes under "
+                f"{os.environ['SENPAI_TRAINING_OUTPUT_ROOT']}; retained release receipts and "
+                "logs without release proof cannot be deleted automatically. "
+                "Review this history before launching more training."
+            )
         nodes = spec.nodes if spec.nodes is not None else self.nodes
         gpus_per_node = spec.gpus_per_node if spec.gpus_per_node is not None else self.gpus_per_node
         if nodes > self.nodes or gpus_per_node > self.gpus_per_node:
@@ -876,6 +892,9 @@ class KubernetesTrainingSupervisor:
                     "elapsed_seconds": time.time() - started_at,
                     "error_tail": f"Training supervision failed to start ({type(error).__name__}).",
                     "kubernetes_released": released,
+                    "conversation_id": (
+                        None if isinstance(error, TrainingCapacityError) and released else conversation_id
+                    ),
                 })
                 try:
                     self._write_result(failed)
@@ -1078,13 +1097,25 @@ class KubernetesTrainingSupervisor:
                 resource=current,
                 nodes=current.nodes, gpus_per_node=current.gpus_per_node,
             )
-            self.client.adopt(
-                result.training_id,
-                active.spec,
-                current,
-                active.deadline_at,
-                nodes=active.nodes, gpus_per_node=active.gpus_per_node,
-            )
+            try:
+                self.client.adopt(
+                    result.training_id,
+                    active.spec,
+                    current,
+                    active.deadline_at,
+                    nodes=active.nodes, gpus_per_node=active.gpus_per_node,
+                )
+            except KubernetesCreateUnconfirmedError as error:
+                terminal = result.model_copy(update={
+                    "state": TrainingState.FAILED,
+                    "elapsed_seconds": time.time() - result.started_at,
+                    "error_tail": str(error),
+                    "kubernetes_resource": current,
+                    "kubernetes_released": False,
+                })
+                self._write_result(terminal)
+                self._resume_terminal_release(terminal)
+                continue
             thread = threading.Thread(
                 target=self._monitor,
                 args=(result.training_id,),
@@ -1363,14 +1394,14 @@ class KubernetesTrainingSupervisor:
         temporary.write_text(json.dumps(receipt, separators=(",", ":")) + "\n")
         temporary.replace(path)
 
-    def _prune_worker_logs(self) -> None:
-        """Bound PVC log history using durable release proof, never target outputs."""
+    def _prune_worker_logs(self) -> int:
+        """Prune proven released logs and return retained bytes, never target outputs."""
         configured_root = os.environ.get("SENPAI_TRAINING_OUTPUT_ROOT")
         if not configured_root:
-            return
+            return 0
         root = Path(configured_root).resolve()
         if not root.is_dir():
-            return
+            return 0
         with self._log_retention_lock:
             results = {}
             for path in training_result_paths(self.state_dir):
@@ -1435,12 +1466,7 @@ class KubernetesTrainingSupervisor:
                     if path.name != "released.json":
                         path.unlink(missing_ok=True)
                 total += (directory / "released.json").stat().st_size - size
-            if total > _WORKER_LOG_HISTORY_BYTES:
-                raise RuntimeError(
-                    f"Worker log history exceeds {_WORKER_LOG_HISTORY_BYTES} bytes under {root}; "
-                    "retained release receipts and logs without release proof cannot be deleted "
-                    "automatically. Review this history before launching more training."
-                )
+            return total
 
     @staticmethod
     def _deadline_elapsed(active: _ActiveRemoteTraining) -> bool:

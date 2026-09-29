@@ -2,12 +2,14 @@
 
 import json
 from pathlib import Path
+import time
 import uuid
 
 import pytest
 
 from senpai_agent.kubernetes_training import KubernetesTrainingSupervisor
-from senpai_agent.training import TrainingResult, TrainingState
+from senpai_agent.training import KubernetesTrainingSpec, TrainingResult, TrainingSpec, TrainingState
+from training_test_support import FakeCluster
 
 
 def test_completed_log_history_survives_lost_local_state_and_partial_pruning(tmp_path, monkeypatch):
@@ -109,10 +111,31 @@ def test_unproven_history_blocks_growth_without_deleting_logs(tmp_path, monkeypa
         (logs / 'released.json').symlink_to(outside)
     (root / str(uuid.uuid4())).symlink_to(logs.parent, target_is_directory=True)
 
-    with pytest.raises(RuntimeError, match='release receipt'):
-        KubernetesTrainingSupervisor(
-            workspace=tmp_path, state_dir=tmp_path / 'state', nodes=1, gpus_per_node=1,
-        )
+    state = tmp_path / 'state'
+    state.mkdir()
+    identifier = str(uuid.uuid4())
+    spec = KubernetesTrainingSpec(kind='Job', name='active-job', namespace='research', wandb_run_id=identifier)
+    client = FakeCluster(TrainingState.RUNNING, nodes=1)
+    client.reserve(identifier, spec, None, '/snapshot.bundle', 'a' * 40, nodes=1, gpus_per_node=1)
+    active = TrainingResult(
+        training_id=identifier, state=TrainingState.RUNNING, exit_code=None,
+        elapsed_seconds=0, started_at=time.time(), log_path=str(state / f'{identifier}.log'),
+        kubernetes_spec=spec, kubernetes_resource=client.resource_value, kubernetes_released=False,
+        source_snapshot='/snapshot.bundle', source_commit='a' * 40, nodes=1, gpus_per_node=1,
+    )
+    (state / f'{identifier}.json').write_text(active.model_dump_json())
+    runtime = KubernetesTrainingSupervisor(
+        workspace=tmp_path, state_dir=state, nodes=1, gpus_per_node=1, poll_seconds=.01, client=client,
+    )
+    try:
+        assert runtime.get_training_status(identifier).state is TrainingState.RUNNING
+        with pytest.raises(RuntimeError, match='release receipt'):
+            runtime.run_training(TrainingSpec(argv=('python', 'train.py'), cwd=tmp_path))
+        assert client.deletions == []
+        cancelled = runtime.cancel_training(identifier)
+        assert cancelled.state is TrainingState.CANCELLED and cancelled.kubernetes_released
+    finally:
+        runtime.close()
     assert (logs / 'node-0.log').stat().st_size == 512 * 1024 * 1024
     assert (logs / 'released.tmp').read_text() == 'interrupted receipt'
     assert checkpoint.read_bytes() == b'research result'
