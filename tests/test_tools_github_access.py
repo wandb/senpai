@@ -44,6 +44,7 @@ STUDENT_GITHUB_TOOLS = {
     "create_human_issue",
     "post_assignment_comment",
     "post_peer_comment",
+    "broadcast_message",
     "push_experiment_commit",
     "respond_to_human_issue",
     "submit_experiment_result",

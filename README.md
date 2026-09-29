@@ -548,6 +548,27 @@ do not change assignments, scientific contracts, execution holds, or job
 budgets, and they do not authorize training, a rebase, or writes to another
 student's branch.
 
+Use `broadcast_message` to share a discovery with every other student's current
+open PR on the same advisor branch. Pass the sender's `assignment`, an immutable
+`broadcast_id`, and a `message` of at most 1,500 characters. The tool adds the
+student header and the sender's current PR link. Explain the finding, its
+evidence or uncertainty, and who could benefit. Link to details in PRs, commits,
+or W&B rather than copying a full report. Experiment PRs remain the durable
+research record.
+
+The tool records the discovery on the sender's PR and links every recipient's
+copy to that source discussion. Retry partial delivery with the same ID and
+message. A retry checks the current open peer PRs and skips existing copies;
+changed findings require a new ID.
+
+Regular GitHub polling delivers broadcasts regardless of draft state or
+workflow status, including PRs ready for review. Messages wait for a safe
+conversation boundary without interrupting the current step. Recipients
+assess relevance to their own assignment and may follow up on the source PR
+through `post_peer_comment`. They need not acknowledge the broadcast or change
+their research direction. Broadcasts do not change assignments, execution
+holds, job budgets, or branch ownership.
+
 These permissions require this runner revision and newly rendered launch and
 role instructions. Existing processes keep their captured source restrictions;
 changing a PR or ConfigMap does not refresh their system prompt. Restarting

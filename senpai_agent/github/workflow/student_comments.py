@@ -1,17 +1,27 @@
 """Student-authored comments on their own and peers' assignments."""
 
+from urllib.parse import urlencode
+
+from senpai_agent.github.pull_authorization import authorized_pulls
 from senpai_agent.github.workflow.errors import (
     ReconciliationError,
     WorkflowPreconditionError,
 )
-from senpai_agent.github.workflow.responses import MutationResult
+from senpai_agent.github.workflow.responses import (
+    BroadcastResult,
+    MutationResult,
+    NumberedResponse,
+    validated_response,
+)
 from senpai_agent.github.workflow.text import marker_body
 from senpai_agent.github.workflow.validation import (
     require_active_assignment_routing,
     require_assignment_identity,
+    require_assignment_student_label,
     require_open,
 )
 from senpai_agent.models import (
+    MAX_BROADCAST_MESSAGE_CHARS,
     AssignmentCommentRecord,
     StudentPeerCommentRecord,
     authoritative_marker_line,
@@ -114,6 +124,7 @@ class StudentCommentMixin:
         target_pr_number: int,
         comment_id: str,
         comment: str,
+        broadcast_id: str | None = None,
     ) -> MutationResult:
         """Message another assigned student without changing either branch."""
 
@@ -142,9 +153,12 @@ class StudentCommentMixin:
             recipient = require_assignment_identity(
                 target, repo=self._repo, assignment_id=records[0].assignment_id
             )
-            require_active_assignment_routing(
-                target, recipient, allowed_statuses=_COMMENT_STATUSES
-            )
+            if broadcast_id is None:
+                require_active_assignment_routing(
+                    target, recipient, allowed_statuses=_COMMENT_STATUSES
+                )
+            else:
+                require_assignment_student_label(target, recipient)
             if target.number == number or recipient.student == student:
                 raise WorkflowPreconditionError("target must belong to another student")
             if recipient.base_ref != assignment.base_ref:
@@ -163,6 +177,7 @@ class StudentCommentMixin:
                     source_assignment_id=assignment.assignment_id,
                     source_revision_id=assignment.revision_id,
                     comment_id=comment_id,
+                    broadcast_id=broadcast_id,
                 )
             )
             marker = render_student_peer_comment_marker(record)
@@ -192,9 +207,12 @@ class StudentCommentMixin:
             current_recipient = require_assignment_identity(
                 after, repo=self._repo, assignment_id=recipient.assignment_id
             )
-            require_active_assignment_routing(
-                after, current_recipient, allowed_statuses=_COMMENT_STATUSES
-            )
+            if broadcast_id is None:
+                require_active_assignment_routing(
+                    after, current_recipient, allowed_statuses=_COMMENT_STATUSES
+                )
+            else:
+                require_assignment_student_label(after, current_recipient)
             if current_recipient != recipient:
                 raise ReconciliationError("recipient assignment changed while posting comment")
             return MutationResult(
@@ -203,6 +221,112 @@ class StudentCommentMixin:
                 state="peer_comment_posted",
                 version=after.head_sha,
             )
+
+    def broadcast_message(
+        self,
+        number: int,
+        *,
+        assignment_id: str,
+        revision_id: str,
+        expected_head_sha: str,
+        student: str,
+        advisor_branch: str,
+        broadcast_id: str,
+        message: str,
+    ) -> BroadcastResult:
+        """Publish one compact discovery and fan it out to current peer PRs."""
+
+        if self._role != "student":
+            raise PermissionError("broadcast_message requires a student workflow")
+        broadcast_id, message = broadcast_id.strip(), message.strip()
+        if not 1 <= len(broadcast_id) <= 256:
+            raise ValueError("broadcast_id must contain 1 to 256 characters")
+        if not 1 <= len(message) <= MAX_BROADCAST_MESSAGE_CHARS:
+            raise ValueError(
+                f"message must contain 1 to {MAX_BROADCAST_MESSAGE_CHARS} characters"
+            )
+        with self._assignment_lifecycle_lock:
+            _, assignment = self._routed_assignment_at_head(
+                number,
+                assignment_id=assignment_id,
+                revision_id=revision_id,
+                expected_head_sha=expected_head_sha,
+                allowed_statuses=_COMMENT_STATUSES,
+            )
+            if assignment.student != student:
+                raise PermissionError("source assignment does not belong to this student")
+            if assignment.base_ref != advisor_branch:
+                raise WorkflowPreconditionError("source must use the configured advisor base")
+
+            recipients = self._broadcast_recipients(student, advisor_branch)
+            comment_id = f"broadcast:{broadcast_id}"
+            content = f"**Broadcast FYI**\n\n{message}"
+            # The source copy binds the ID to its content even after peers close PRs.
+            source = self.post_assignment_comment(
+                number,
+                assignment_id=assignment_id,
+                revision_id=revision_id,
+                expected_head_sha=expected_head_sha,
+                student=student,
+                comment_id=comment_id,
+                comment=content,
+            )
+            changed = source.changed
+            for target_pr_number in recipients:
+                result = self.post_peer_comment(
+                    number,
+                    assignment_id=assignment_id,
+                    revision_id=revision_id,
+                    expected_head_sha=expected_head_sha,
+                    student=student,
+                    advisor_branch=advisor_branch,
+                    target_pr_number=target_pr_number,
+                    comment_id=comment_id,
+                    comment=(
+                        f"{content}\n\n"
+                        f"Discovery: [source discussion]({source.resource_url})"
+                    ),
+                    broadcast_id=broadcast_id,
+                )
+                changed |= result.changed
+            return BroadcastResult(
+                changed=changed,
+                resource_url=source.resource_url,
+                state="broadcast_posted",
+                version=source.version,
+                delivered_pr_numbers=recipients,
+            )
+
+    def _broadcast_recipients(
+        self, student: str, advisor_branch: str
+    ) -> tuple[int, ...]:
+        query = urlencode({"state": "open", "base": advisor_branch, "per_page": 100})
+        recipients = set()
+        pulls = authorized_pulls(
+            self._objects(f"/repos/{self._repo}/pulls?{query}"),
+            repo=self._repo,
+            get=lambda path: self._request(
+                "GET", path, expected_statuses={200}
+            ).json_body,
+        )
+        for item in pulls:
+            number = validated_response(NumberedResponse, item, "broadcast PR").number
+            target = self.pull_request(number)
+            try:
+                records = parse_assignment_markers(target.body)
+                if len(records) != 1:
+                    continue
+                recipient = require_assignment_identity(
+                    target, repo=self._repo, assignment_id=records[0].assignment_id
+                )
+                require_open(target)
+                require_assignment_student_label(target, recipient)
+            except (ValueError, WorkflowPreconditionError):
+                # Ordinary PRs and assignments with invalid ownership are not peers.
+                continue
+            if recipient.student != student and recipient.base_ref == advisor_branch:
+                recipients.add(number)
+        return tuple(sorted(recipients))
 
     def _peer_comment_binding(
         self, proposed: StudentPeerCommentRecord

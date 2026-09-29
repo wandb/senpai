@@ -93,6 +93,8 @@ GitHub state is level-triggered:
   `status:review` PR wake its exact student assignment conversation;
 - authenticated typed peer comments on that PR wake the recipient's assignment
   conversation with the sender's identity and current PR link;
+- authenticated student broadcasts reach every other current open assignment
+  on the same advisor branch, regardless of draft state or workflow status;
 - `status:review` is a durable advisor wake;
 - a configured student with no open assignment labeled `status:wip` or
   `status:review` emits `student_available_for_assignment`. This event describes
@@ -511,6 +513,7 @@ on GitHub, so the tool can reject a change made after the student read the PR:
 | `push_experiment_commit` | student | `local_commit_sha`, which must identify the current local commit (HEAD), with no uncommitted changes |
 | `post_assignment_comment` | student | `comment_id`, `comment` |
 | `post_peer_comment` | student | `target_pr_number`, `comment_id`, `comment`; `assignment` identifies the sender's own current PR |
+| `broadcast_message` | student | `broadcast_id`, `message` (at most 1,500 characters); `assignment` identifies the sender's own current PR |
 | `request_assignment_revision` | advisor | `new_revision_id`, `required_base_sha`, `comment` |
 | `accept_result_on_current_base` | advisor | `expected_current_base_sha`, `reason` |
 | `merge_experiment` | advisor | `expected_current_base_sha`, `merge_method` |
@@ -563,6 +566,35 @@ and therefore includes the recipient's own current PR link. Peer messages are
 research context, not human or advisor authorization. They do not change
 assignments, scientific contracts, execution holds, or job budgets. Students
 avoid acknowledgement-only reply loops.
+
+`broadcast_message` distributes a compact discovery notice to every other
+student's current open PR on the configured advisor branch. Recipient selection
+does not depend on the launch's student list, PR draft state, or workflow
+status. The message uses the same student header and `Working PR` link as a
+direct peer comment. The runtime rejects messages longer than 1,500 characters;
+the automatically supplied header and link do not count toward that limit.
+
+The tool first records an immutable `broadcast:<broadcast_id>` assignment
+comment on the sender's current open WIP or review PR. Each recipient copy
+links to that source discussion and binds the recipient's assignment revision.
+Retrying the same ID and message checks the current open peer PRs and skips
+existing copies. The source comment preserves the ID's content even after
+recipient PRs close; changed text requires a new ID.
+
+Broadcasts arrive through ordinary GitHub polling as `student_pr_feedback`
+with `feedback_type=student_broadcast` and enter the existing student feedback
+queue. They wait for a safe conversation boundary without interrupting the
+current step. This delivery remains available while a PR is
+ready for review or has another workflow status. The recipient assesses the
+finding against its current assignment and can follow up on the sender's PR
+through `post_peer_comment`. No acknowledgement is required.
+
+Broadcasts state the discovery, evidence or uncertainty, and likely relevance
+in language that other students can understand. They link to the complete
+record in experiment PRs, code, or W&B. They do not create a separate research
+notebook, change assignments or budgets, or require students to adopt the same
+approach. Routine progress, full reports, and repeated broadcasts of the same
+finding do not belong in this channel.
 
 Terminal student publication happens only inside `submit_experiment_result`, which
 derives the PR and proposed local head from the structured result, then validates

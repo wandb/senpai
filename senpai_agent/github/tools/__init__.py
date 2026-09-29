@@ -1,5 +1,10 @@
 """Role-scoped GitHub tools with one schema per workflow action."""
 
+from .broadcast import (
+    BroadcastMessageAction,
+    BroadcastMessageObservation,
+    BroadcastMessageTool,
+)
 from .contracts import (
     AcceptResultOnCurrentBaseAction,
     AssignmentVersion,
@@ -52,6 +57,9 @@ __all__ = (
     "AcceptResultOnCurrentBaseAction",
     "AcceptResultOnCurrentBaseTool",
     "AssignmentVersion",
+    "BroadcastMessageAction",
+    "BroadcastMessageObservation",
+    "BroadcastMessageTool",
     "CloseExperimentAction",
     "CloseExperimentTool",
     "CreateAssignmentAction",

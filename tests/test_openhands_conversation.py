@@ -1395,6 +1395,7 @@ def test_runtime_credentials_remain_configured_through_lazy_tool_initialization(
             "create_human_issue",
             "post_assignment_comment",
             "post_peer_comment",
+            "broadcast_message",
             "push_experiment_commit",
             "respond_to_human_issue",
             "submit_experiment_result",

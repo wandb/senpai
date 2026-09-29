@@ -21,6 +21,7 @@ class Contract(BaseModel):
 
 
 _NonEmptyString = Annotated[str, Field(min_length=1)]
+MAX_BROADCAST_MESSAGE_CHARS = 1_500
 
 
 class AssignmentKey(Contract):
@@ -123,6 +124,7 @@ class StudentPeerCommentRecord(Contract):
     source_assignment_id: _NonEmptyString
     source_revision_id: _NonEmptyString
     comment_id: _NonEmptyString
+    broadcast_id: Annotated[str, Field(min_length=1, max_length=256)] | None = None
 
 
 class ResearchBaseAcceptanceRecord(Contract):
@@ -273,9 +275,9 @@ _RESEARCH_BASE_ACCEPTANCE_MARKER = re.compile(
 )
 
 
-def _marker_payload(value: Contract) -> str:
+def _marker_payload(value: Contract, *, exclude_none: bool = False) -> str:
     return json.dumps(
-        value.model_dump(mode="json"),
+        value.model_dump(mode="json", exclude_none=exclude_none),
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
@@ -319,7 +321,10 @@ def render_assignment_comment_marker(comment: AssignmentCommentRecord) -> str:
 
 
 def render_student_peer_comment_marker(comment: StudentPeerCommentRecord) -> str:
-    return f"<!-- senpai-student-peer-comment:v1 {_marker_payload(comment)} -->"
+    return (
+        "<!-- senpai-student-peer-comment:v1 "
+        f"{_marker_payload(comment, exclude_none=True)} -->"
+    )
 
 
 _MarkerContract = TypeVar("_MarkerContract", bound=Contract)

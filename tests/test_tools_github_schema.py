@@ -6,6 +6,8 @@ from pydantic import ValidationError
 
 from senpai_agent.github.tools import (
     AcceptResultOnCurrentBaseTool,
+    BroadcastMessageAction,
+    BroadcastMessageTool,
     CloseExperimentTool,
     CreateAssignmentTool,
     CreateHumanIssueAction,
@@ -43,6 +45,7 @@ EXPECTED_FIELDS = {
     },
     "post_assignment_comment": {"assignment", "comment_id", "comment"},
     "post_peer_comment": {"assignment", "target_pr_number", "comment_id", "comment"},
+    "broadcast_message": {"assignment", "broadcast_id", "message"},
     "push_experiment_commit": {"assignment", "local_commit_sha"},
     "repair_assignment_routing": {"assignment", "working_state", "blockers"},
     "send_assignment_feedback": {"assignment", "feedback_id", "comment"},
@@ -94,6 +97,7 @@ def github_tools(tmp_path: Path):
         PushExperimentCommitTool,
         PostAssignmentCommentTool,
         PostPeerCommentTool,
+        BroadcastMessageTool,
         RepairAssignmentRoutingTool,
         SendAssignmentFeedbackTool,
         RequestAssignmentRevisionTool,
@@ -225,3 +229,42 @@ def test_submit_result_provider_schema_describes_every_nested_property(
                 assert_described(items, f"{current}[]")
 
     assert_described(function["parameters"], "submit_experiment_result")
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        None,
+        {"broadcast_id": ""},
+        {"message": ""},
+        {"message": "x" * 1501},
+        {"student": "another-student"},
+        {"advisor_branch": "another-advisor"},
+        {"target_pr_number": 42},
+    ],
+    ids=(
+        "limit",
+        "empty-id",
+        "empty-message",
+        "oversized",
+        "spoof-student",
+        "spoof-base",
+        "target",
+    ),
+)
+def test_broadcast_action_bounds_context_and_rejects_foreign_routing_fields(invalid):
+    payload = {
+        "assignment": {
+            "pr_number": 17,
+            "assignment_id": "assignment-17",
+            "revision_id": "revision-1",
+            "expected_pr_head_sha": "a" * 40,
+        },
+        "broadcast_id": "discovery-1",
+        "message": "x" * 1500,
+    }
+    if invalid is None:
+        assert BroadcastMessageAction.model_validate(payload).message == "x" * 1500
+        return
+    with pytest.raises(ValidationError):
+        BroadcastMessageAction.model_validate({**payload, **invalid})
