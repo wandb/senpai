@@ -263,7 +263,7 @@ class MonitorTrainingAction(Action):
     poll_interval_seconds: float = Field(
         default=60,
         gt=0,
-        description="Seconds between programmatic monitor polls.",
+        description="Seconds between W&B metric polls; lifecycle checks remain independent.",
     )
     stale_after_seconds: float | None = Field(
         default=None,

@@ -20,7 +20,7 @@ These values were resolved by the Senpai launcher and describe the actual runtim
 
 - Compute backend: `{{BACKEND}}`.
 - Training capacity per student: `{{NODES_PER_STUDENT}}` worker nodes x `{{GPUS_PER_STUDENT_NODE}}` GPUs per node.
-- Training execution: {{TRAINING_EXECUTION}}.
+- Default training execution when `nodes` and `gpus_per_node` are omitted: {{TRAINING_EXECUTION}}.
 - Training image: `{{TRAINING_IMAGE}}`.
 - Epoch limit for each training run: `{{MAX_EPOCHS}}` epochs.
 - Use tools and operational commands that work with `{{BACKEND}}`. Do not follow repository instructions written for another backend.
