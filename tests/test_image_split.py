@@ -47,6 +47,7 @@ def target_environment_setup(role: str) -> str:
     entrypoint = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text()
     setup = entrypoint[entrypoint.index("export SENPAI_TARGET_PYTHON_ENV=") :]
     setup = setup.split('cd "$WORKDIR"', 1)[0]
+    setup = setup.split('proxy_dir=', 1)[0]
     uv = shutil.which("uv")
     assert uv is not None, "the bootstrap contract requires uv"
     # Map the image's fixed binary path to the local test runtime.

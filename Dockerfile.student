@@ -13,9 +13,11 @@ ENV PATH="/opt/senpai-venv/bin:/home/senpai/.local/bin:${PATH}" \
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      ca-certificates curl git gnupg procps && \
+      ca-certificates curl git gnupg procps openssh-server openmpi-bin && \
+    mkdir -p /var/run/sshd && \
     groupadd --gid 10001 senpai && \
     useradd --uid 10001 --gid 10001 --create-home senpai && \
+    usermod --password '*' senpai && \
     rm -rf /var/lib/apt/lists/*
 
 # Install gh from its architecture-neutral apt repository.

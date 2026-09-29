@@ -9,6 +9,7 @@ import sys
 import time
 from base64 import b64decode
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -38,8 +39,8 @@ from senpai_agent.mailbox import (
     StudentAssignmentAvailabilityMailbox,
 )
 from senpai_agent.monitor import (
-    MonitorMailbox,
-    TrainingMonitorEngine,
+    LOCAL_POLL_SECONDS,
+    TrainingMonitorWatcher,
     WandbMetricSource,
 )
 from senpai_agent.PROMPTS import (
@@ -64,6 +65,7 @@ from senpai_agent.workspace import StudentWorkspaceReconciler, WorkspaceDivergen
 _EDGE_TRIGGERED_EVENT_KINDS = EXACT_ONCE_EVENT_KINDS | {
     "research_base_changed",
     "student_assignment_comment",
+    "training_monitor",
 }
 _ACTIVITY_LEASE_RENEWAL_SECONDS = 30
 _LLM_PROVIDER_COOLDOWN_SECONDS = (30.0, 60.0, 120.0, 240.0, 300.0)
@@ -397,6 +399,7 @@ class Controller:
         *,
         role: Literal["advisor", "student"],
         mailbox: Mailbox,
+        local_mailbox: Mailbox | None = None,
         turns: TurnRunner,
         conversation_id: UUID,
         full_prompt: str,
@@ -429,6 +432,8 @@ class Controller:
             raise ValueError("maximum consecutive turn failures must be positive")
         self.role = role
         self.mailbox = mailbox
+        self.local_mailbox = local_mailbox
+        self._next_remote_poll = 0.0
         self.turns = turns
         self.conversation_id = conversation_id
         self.conversation_for_events = conversation_for_events
@@ -478,7 +483,10 @@ class Controller:
         turn_failures: dict[UUID, int] = {}
         while max_cycles is None or cycles < max_cycles:
             self._acknowledge_processed_turns()
-            self._poll_into_inbox()
+            if self.local_mailbox is None or time.monotonic() >= self._next_remote_poll:
+                self._poll_into_inbox()
+            else:
+                self._poll_local_into_inbox()
             cycle_had_failure = False
             failed_conversations: set[UUID] = set()
             served_conversations: set[UUID] = set()
@@ -633,8 +641,12 @@ class Controller:
 
     def _poll_into_inbox(self, *, allow_reminders: bool = True) -> None:
         self._publish_progress("poll")
+        mailbox = (
+            CompositeMailbox(self.mailbox, self.local_mailbox)
+            if self.local_mailbox is not None else self.mailbox
+        )
         try:
-            polled = self.mailbox.poll()
+            polled = mailbox.poll()
         except Exception as error:  # noqa: BLE001
             if allow_reminders:
                 raise
@@ -644,6 +656,8 @@ class Controller:
                 flush=True,
             )
             return
+        if self.local_mailbox is not None:
+            self._next_remote_poll = time.monotonic() + self.poll_interval_seconds
         for event in polled:
             if event.kind == "student_assignment_comment":
                 self.inbox.require_event_payload(
@@ -656,6 +670,18 @@ class Controller:
             allow_reminders=allow_reminders,
         )
         self._enqueue_events(events)
+
+    def _poll_local_into_inbox(self) -> bool:
+        if self.local_mailbox is None:
+            return False
+        events = tuple(
+            event
+            for event in self.local_mailbox.poll()
+            if event.dedupe_key not in self._visible
+        )
+        self._visible.update((event.dedupe_key, time.monotonic()) for event in events)
+        self._enqueue_events(events)
+        return bool(events)
 
     def _enqueue_events(self, events: Sequence[ControllerEvent]) -> None:
         for batch in self._event_batches(events):
@@ -763,6 +789,8 @@ class Controller:
             if keys:
                 self._publish_progress("acknowledge")
                 self.mailbox.acknowledge(keys)
+                if self.local_mailbox is not None:
+                    self.local_mailbox.acknowledge(keys)
             conversation_id = UUID(turn.conversation_id)
             self._mark_success(conversation_id)
             divergence = next(
@@ -815,7 +843,21 @@ class Controller:
             phase,
             max(seconds + self.operation_timeout_seconds, 1),
         )
-        self.sleep(seconds)
+        if self.local_mailbox is None:
+            self.sleep(seconds)
+            return
+        remaining = seconds
+        while remaining > 0:
+            interval = min(remaining, LOCAL_POLL_SECONDS)
+            self.sleep(interval)
+            remaining -= interval
+            pending = self._poll_local_into_inbox()
+            if (
+                pending
+                and phase == "sleep"
+                and self._provider_cooldown_remaining() is None
+            ):
+                return
 
     def _has_started(self, conversation_id: UUID) -> bool:
         return conversation_id in self._started or (
@@ -1018,6 +1060,8 @@ def controller_main(
         ),
     )
     mailbox: Mailbox = github_mailbox
+    local_mailbox: Mailbox
+    monitor_watcher = nullcontext()
     active_github_mailbox: Mailbox = github_mailbox
     conversation_selector = None
     reconcile = None
@@ -1030,10 +1074,8 @@ def controller_main(
             conversation_id=runner_config.conversation_id,
             event_store_path=advisor_event_store,
         )
-        mailbox = CompositeMailbox(
-            active_github_mailbox,
-            LocalAdvisorMailbox(advisor_event_store),
-        )
+        mailbox = active_github_mailbox
+        local_mailbox = LocalAdvisorMailbox(advisor_event_store)
     else:
         training, monitor_store = training_runtime(
             runner_config.workspace,
@@ -1043,13 +1085,13 @@ def controller_main(
             env["WANDB_ENTITY"],
             env["WANDB_PROJECT"],
         )
-        mailbox = CompositeMailbox(
-            github_mailbox,
-            LocalStudentMailbox(runner_config.state_dir / "student-events.sqlite3"),
-            MonitorMailbox(
-                TrainingMonitorEngine(monitor_store, training, metrics),
-                monitor_store,
-            ),
+        event_path = runner_config.state_dir / "student-events.sqlite3"
+        local_mailbox = LocalStudentMailbox(event_path)
+        monitor_watcher = TrainingMonitorWatcher(
+            monitor_store.path,
+            event_path,
+            training,
+            metrics,
         )
         registry = AssignmentConversationRegistry(
             runner_config.state_dir / "student-conversations.json"
@@ -1082,6 +1124,7 @@ def controller_main(
     controller = Controller(
         role=role,
         mailbox=mailbox,
+        local_mailbox=local_mailbox,
         turns=turns,
         conversation_id=runner_config.conversation_id,
         started_conversations=StartedConversationLedger(
@@ -1144,7 +1187,8 @@ def controller_main(
         for signum in (signal.SIGTERM, signal.SIGINT)
     }
     try:
-        controller.run()
+        with monitor_watcher:
+            controller.run()
     except KeyboardInterrupt:
         return 0
     finally:

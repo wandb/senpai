@@ -13,7 +13,8 @@ program_path: ""
 # Public Senpai runner source, fetched read-only. Override this only when the
 # images were built from a fork or private Senpai repository.
 senpai_repo_url: https://github.com/wandb/senpai.git
-# Required only for digest-pinned images; source-SHA tags derive it automatically.
+# Blank selects the latest published student image and matching role images.
+# Set a full source commit only when selecting a specific build.
 senpai_repo_revision: ""
 
 # problem-package repo is REQUIRED and must be passed on the CLI
@@ -23,14 +24,15 @@ senpai_repo_revision: ""
 target_repo_branch: ""
 
 # docker images
-# Required: use digests or matching sha-<full-commit> tags.
+# Blank uses the published defaults, resolved to immutable digests at launch.
+# Overrides must use digests or matching sha-<full-commit> tags.
 advisor_image: ""
 student_image: ""
-# Optional digest-pinned image for training in separate GPU workers.
+# Optional custom training image, pinned by digest. Blank uses student_image.
 training_image: ""
-executor_image: ""
-# Existing Kubernetes secrets with registry credentials, in the launch namespace.
+# Existing registry credential secrets in the launch namespace.
 image_pull_secrets: []
+executor_image: "" # An explicit override must use an immutable @sha256 digest.
 
 # Kubernetes target
 kube_context: ""
@@ -68,7 +70,6 @@ advisor_branch: schmidhuber
 gh_history_scope: branch
 
 # agent-facing training limits
-timeout_minutes: 30.0
 max_epochs: 50
 
 # responsiveness / polling
@@ -84,7 +85,7 @@ nodes_per_student: 1
 gpus_per_student_node: 1
 cpu_per_gpu: 15
 memory_gi_per_gpu: 120
-# Optional key=value selectors for the advisor and multi-node student controllers.
+# Optional key=value selectors for the advisor and student controllers.
 # controller_node_selector: [compute.coreweave.com/node-pool=cpu]
 controller_node_selector: []
 preflight_only: false

@@ -34,7 +34,7 @@ Consider that the baseline metrics you are trying to beat is already very well t
 
 Ensure experiments can run successfully. For big codebase changes, consider running 1 tiny debug run first to check everything is working. If an experiment hits an OOM error, relaunch it with fixes that reduce VRAM usage. If it crashes for any other reason, investigate the cause, fix the bug and relaunch the experiment. Record the details of the error and timestamp so the advisor knows why an experiment might be delayed. If an idea is fundamentally broken, report that in the results.
 
-Note: Don't try to fix errors or failures that arise from our hard, fixed experiment timeout or epoch count limits cutting in.
+An explicitly requested timeout or the configured epoch limit can end a run normally. Distinguish those limits from a training error.
 
 ### Prune stale experiment paths when assigned
 
@@ -48,11 +48,11 @@ Ensure that you log all relevant metrics and configs to wandb, especially when a
 
 Commit the exact implementation that will run and make the worktree clean before launching an expensive experiment. This makes each W&B result reproducible and lets the controller safely suspend the conversation while the process runs.
 
-Every optimization or GPU execution must use `run_training`, including debug runs and wrappers that train or evaluate a model. Pass an argv list, the exact repository working directory, and a timeout within the launch limit. Never launch training through the terminal.
+Every optimization or GPU execution must use `run_training`, including debug runs and wrappers that train or evaluate a model. Pass `argv` and `cwd` directly, with the exact repository working directory. Set optional `nodes` and `gpus_per_node` when a smaller allocation is sufficient; parallel runs must fit the student's aggregate GPU capacity. Omit `timeout_seconds` for no per-run time limit, or set a positive duration that includes queue time, setup, and training. Never launch training through the terminal.
 
-`run_training` registers terminal-state monitoring automatically. Use `monitor_training` only to add useful primary-metric gates or a stale-update timeout, `get_training_status` for one bounded check, and `cancel_training` for an early stop. Do not kill the process, stream logs, sleep, or create terminal polling loops; finish the turn and let the controller resume the conversation.
+`run_training` registers terminal-state monitoring automatically. Use `monitor_training` only to add a useful one-shot primary-metric threshold alert or opt-in staleness alert, `get_training_status` for one bounded check, and `cancel_training` for an early stop. Do not kill the process, stream logs, sleep, or create terminal polling loops; finish the turn and let the controller resume the conversation.
 
-Every real experiment must log the artifacts required by `program.md` to W&B. Use groups only when the assignment calls for related arms, and run multiple variants only when the assignment requests them. After a run terminates, check for newer advisor or human feedback before spending another allocation.
+Every real experiment must log the artifacts required by `program.md` to W&B. After a run terminates, check for newer advisor or human feedback before spending another allocation.
 
 ## Report and submit
 

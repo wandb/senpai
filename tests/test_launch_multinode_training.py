@@ -4,37 +4,27 @@ import pytest
 import yaml
 
 from launch_test_support import (
-    REVISION,
     launch_args,
     render_role,
+    render_role_manifest,
 )
 
 
-def render_student(**overrides):
+def render_student(nodes=2, **overrides):
     args = launch_args(
-        **{
-            "advisor": False,
-            "nodes_per_student": 2,
-            "gpus_per_student_node": 8,
-            "memory_gi_per_gpu": 110,
-            "executor_image": f"ghcr.io/wandb/senpai-executor:sha-{REVISION}",
-            **overrides,
-        }
+        advisor=False,
+        nodes_per_student=nodes,
+        gpus_per_student_node=8,
+        memory_gi_per_gpu=110,
+        **overrides,
     )
-    configmap, resources, _secret = render_role("student", args)
-    return list(yaml.safe_load_all(configmap + "\n---\n" + resources))
+    manifest, _secret = render_role_manifest("student", args)
+    return list(yaml.safe_load_all(manifest))
 
 
-@pytest.mark.parametrize(
-    "nodes,training_image",
-    [(2, ""), (1, f"docker.io/acme/trainer@sha256:{'c' * 64}")],
-)
-def test_remote_training_controller_is_cpu_only_with_a_credential_isolated_executor(
-    nodes, training_image
-):
-    configmap, service_account, role, role_binding, deployment = render_student(
-        nodes_per_student=nodes, training_image=training_image
-    )
+@pytest.mark.parametrize("nodes,training_image", [(1, ""), (2, ""), (1, f"docker.io/acme/trainer@sha256:{'c' * 64}")])
+def test_student_controller_is_cpu_only_with_a_credential_isolated_executor(nodes, training_image):
+    configmap, service_account, role, role_binding, deployment = render_student(nodes, training_image=training_image)
     pod = deployment["spec"]["template"]["spec"]
     containers = {container["name"]: container for container in pod["containers"]}
     student = containers["student"]
@@ -68,27 +58,20 @@ def test_remote_training_controller_is_cpu_only_with_a_credential_isolated_execu
     assert all("secrets" not in rule["resources"] for rule in role["rules"])
     event_rules = [rule for rule in role["rules"] if "events" in rule["resources"]]
     assert event_rules == [{"apiGroups": [""], "resources": ["events"], "verbs": ["list"]}]
-    assert all("list" not in rule["verbs"] for rule in role["rules"][:2])
-    assert all("patch" in rule["verbs"] for rule in role["rules"][:2])
+    workloads = {
+        resource: rule["verbs"]
+        for rule in role["rules"]
+        for resource in rule["resources"]
+        if rule["apiGroups"] in (["batch"], ["kubeflow.org"])
+    }
+    assert set(workloads) == ({"jobs", "mpijobs"} if nodes > 1 else {"jobs"})
+    assert all(verbs == ["create", "get", "patch", "delete"] for verbs in workloads.values())
+    assert configmap["data"]["SENPAI_TRAINING_CONTROL_IMAGE"] == student["image"]
+    assert configmap["data"]["SENPAI_TRAINING_IMAGE"] == (training_image or student["image"])
     assert configmap["data"]["NODES_PER_STUDENT"] == str(nodes)
     assert configmap["data"]["GPUS_PER_STUDENT_NODE"] == "8"
     assert configmap["data"]["CPU_PER_STUDENT_GPU"] == "15"
     assert configmap["data"]["MEMORY_GI_PER_STUDENT_GPU"] == "110"
-
-
-def test_single_node_student_keeps_local_gpu_resources_without_executor_rbac():
-    args = launch_args(nodes_per_student=1, gpus_per_student_node=2)
-    configmap, deployment, _secret = render_role("student", args)
-    documents = list(yaml.safe_load_all(configmap + "\n---\n" + deployment))
-
-    assert [document["kind"] for document in documents] == ["ConfigMap", "Deployment"]
-    pod = documents[-1]["spec"]["template"]["spec"]
-    assert [container["name"] for container in pod["containers"]] == ["student"]
-    assert pod["serviceAccountName"] == "default"
-    assert pod["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] == "2"
-    assert pod["tolerations"] == [
-        {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}
-    ]
 
 
 def test_controller_image_has_only_the_validated_kubectl_socket_proxy():
@@ -108,9 +91,10 @@ def test_advisor_placement_is_portable_by_default():
     assert pod["nodeSelector"] == {}
 
 
-def test_controller_node_selector_applies_to_cpu_only_roles():
+@pytest.mark.parametrize("nodes", [1, 2])
+def test_controller_node_selector_applies_to_cpu_only_roles(nodes):
     selector = ["compute.coreweave.com/node-pool=cpu"]
-    *_, student = render_student(controller_node_selector=selector)
+    *_, student = render_student(nodes, controller_node_selector=selector)
     assert student["spec"]["template"]["spec"]["nodeSelector"] == {
         "compute.coreweave.com/node-pool": "cpu"
     }

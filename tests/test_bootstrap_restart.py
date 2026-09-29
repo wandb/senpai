@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import sysconfig
@@ -25,7 +26,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
-def bootstrap_runtime(tmp_path, role):
+def executor_socket(tmp_path, monkeypatch):
+    # Bootstrap checks the socket path; broker behavior has its own owner tests.
+    with monkeypatch.context() as context:
+        context.chdir(tmp_path)
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind("executor.sock")
+    return tmp_path / "executor.sock"
+
+
+@pytest.fixture
+def bootstrap_runtime(tmp_path, role, executor_socket):
     container = tmp_path / "container"
     home = container / "home/senpai"
     runner = container / "workspace/senpai"
@@ -110,6 +121,7 @@ with Path(os.environ["START_RECORD"]).open("a") as output:
         "PATH": f"{tools}:{os.environ['PATH']}",
         "PYTHONPATH": str(ROOT),
         "SENPAI_PYTHON": sys.executable,
+        "SENPAI_KUBERNETES_EXECUTOR_SOCKET": str(executor_socket),
         "SENPAI_PLUGIN": str(ROOT / "plugins/senpai"),
         "SENPAI_AGENT_DIR": str(ROOT / ".agents/agents"),
         "SENPAI_PROGRAM_CONTEXT_FILE": str(program_context),
@@ -252,7 +264,7 @@ def test_incomplete_checkout_fails_without_changing_retained_work(bootstrap_runt
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
 def test_role_startup_isolates_target_uv_commands_from_agent_environment(
-    tmp_path: Path, role: str
+    tmp_path: Path, role: str, executor_socket
 ):
     entrypoint = (ROOT / "k8s" / f"entrypoint-{role}.sh").read_text()
     startup = entrypoint[entrypoint.index("export IS_SANDBOX=1"):]
@@ -290,6 +302,7 @@ def test_role_startup_isolates_target_uv_commands_from_agent_environment(
             "GIT_ASKPASS_FILE": str(tmp_path / "askpass"),
             "SENPAI_GITHUB_TOKEN_FILE": str(tmp_path / "token"),
             "NODES_PER_STUDENT": "1",
+            "SENPAI_KUBERNETES_EXECUTOR_SOCKET": str(executor_socket),
             "SENPAI_PYTHON": str(python),
             "UV_PROJECT_ENVIRONMENT": "/opt/senpai-venv",
             "UV_PYTHON": "/opt/senpai-venv/bin/python",
@@ -312,8 +325,8 @@ def test_role_startup_isolates_target_uv_commands_from_agent_environment(
 def test_kubectl_proxy_uses_agent_python_inside_target_uv_environment(tmp_path: Path):
     entrypoint = (ROOT / "k8s" / "entrypoint-student.sh").read_text()
     proxy_setup = entrypoint[
-        entrypoint.index('    proxy_dir="$LOGDIR/bin"'):
-        entrypoint.index('    export PATH="$proxy_dir:$PATH"')
+        entrypoint.index('proxy_dir="$LOGDIR/bin"'):
+        entrypoint.index('export PATH="$proxy_dir:$PATH"')
     ]
     runner_python = tmp_path / "runner-python"
     runner_python.write_text(

@@ -15,6 +15,8 @@ def block_unmocked_launch_writes(monkeypatch):
 
     monkeypatch.setattr(launch, "kubectl_apply", fail)
     monkeypatch.setattr(launch, "kubectl_create", fail, raising=False)
+    # Storage probe behavior has its own subprocess/Pod boundary tests.
+    monkeypatch.setattr(launch, "validate_storage", lambda **kwargs: [])
 
 
 def bypass_program_snapshot(monkeypatch):
@@ -702,11 +704,15 @@ def test_invalid_bound_program_reports_a_clean_launch_error(monkeypatch, failure
 def test_preflight_resolves_custom_secrets(monkeypatch):
     args = launch_args(
         preflight_only=True,
+        training_image="registry.example/training@sha256:" + "c" * 64,
+        image_pull_secrets=["training-registry"],
         custom_secret_env_names=["HF_TOKEN", "DATASET_LICENSE_KEY"],
     )
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
     bypass_external_preflight(monkeypatch)
     resolved = []
+    storage = []
+    monkeypatch.setattr(launch, "validate_storage", lambda **kwargs: storage.append(kwargs))
     monkeypatch.setattr(
         launch,
         "resolve_custom_secrets",
@@ -718,6 +724,41 @@ def test_preflight_resolves_custom_secrets(monkeypatch):
     assert resolved == [
         (launch.DOTENV_PATH, ["HF_TOKEN", "DATASET_LICENSE_KEY"])
     ]
+    assert storage == [{
+        "images": {"student": args.student_image, "advisor": args.advisor_image},
+        "training_image": args.training_image,
+        "image_pull_secrets": ["training-registry"],
+        "pvc_mount_path": args.pvc_mount_path,
+        "pvc_claim_name": args.pvc_claim_name,
+        "output_roots": [f"{args.pvc_mount_path}/.senpai/runs/{args.tag}/fern"],
+        "nodes_per_student": 1,
+        "kube_context": args.kube_context,
+        "namespace": args.namespace,
+        "controller_node_selector": {},
+    }]
+
+
+def test_failed_storage_preflight_stops_before_launch_or_github_writes(monkeypatch):
+    args = launch_args()
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+
+    def storage_failure(**kwargs):
+        error = RuntimeError("checkpoint directory is not writable")
+        error.add_note("Storage preflight cleanup incomplete: probe Pod remains")
+        raise error
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("failed storage check must prevent launch and GitHub writes")
+
+    monkeypatch.setattr(launch, "validate_storage", storage_failure)
+    monkeypatch.setattr(launch, "ensure_advisor_branch", forbidden)
+    monkeypatch.setattr(launch, "ensure_target_repo_labels", forbidden)
+    monkeypatch.setattr(launch, "kubectl_create", forbidden)
+
+    with pytest.raises(SystemExit, match="checkpoint directory is not writable") as raised:
+        launch.main()
+    assert "cleanup incomplete: probe Pod remains" in str(raised.value)
 
 
 def test_launch_reports_invalid_custom_secret_names_without_a_traceback(monkeypatch):
@@ -899,7 +940,7 @@ def test_launch_uses_one_scope_for_create_discovery_and_handoff_commands(
     launch.main()
 
     assert discovery == [("scope-test", "gpu-cluster", "research")]
-    assert len(mutations) == 5
+    assert len(mutations) == 8
     assert all(
         (context, namespace) == ("gpu-cluster", "research")
         for _verb, _description, context, namespace in mutations
@@ -911,6 +952,10 @@ def test_launch_uses_one_scope_for_create_discovery_and_handoff_commands(
     )
     assert [mutation[:2] for mutation in mutations[2:]] == [
         ("create", "student fern ConfigMap senpai-config-student-scope-test-fern"),
+        *[
+            ("create", f"student fern {kind} senpai-training-scope-test-fern")
+            for kind in ("ServiceAccount", "Role", "RoleBinding")
+        ],
         ("create", "student fern Deployment senpai-scope-test-fern"),
         ("apply", "advisor"),
     ]
@@ -1060,7 +1105,7 @@ def test_reordered_student_manifest_still_creates_the_deployment_last(monkeypatc
 
     launch.main()
 
-    assert created == ["Secret", "ConfigMap", "Deployment"]
+    assert created == ["Secret", "ConfigMap", "ServiceAccount", "Role", "RoleBinding", "Deployment"]
 
 
 @pytest.mark.parametrize(
@@ -1122,10 +1167,11 @@ def test_dry_run_prints_the_original_validated_student_manifest(monkeypatch, cap
     assert f"--- Student: fern ---\n{manifest}\n" in capsys.readouterr().out
 
 
-def test_multinode_student_resources_are_created_in_dependency_order(monkeypatch):
+@pytest.mark.parametrize("nodes", [1, 2])
+def test_student_resources_are_created_in_dependency_order(monkeypatch, nodes):
     args = launch_args(
         advisor=False,
-        nodes_per_student=2,
+        nodes_per_student=nodes,
         executor_image=f"ghcr.io/wandb/senpai-executor@sha256:{'b' * 64}",
     )
     monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)

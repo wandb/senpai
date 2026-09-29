@@ -77,6 +77,10 @@ def test_same_policy_reregistration_preserves_derived_state(tmp_path: Path):
         assert store.spec("train-1") == monitor
         assert store.previous_sample("train-1") == sample
         assert store.pending_signals() == [SIGNAL]
+        store.complete(monitor.training_id)
+        assert store.register(repeated) is False
+        assert store.active() == []
+        assert not (store.marker_dir / "train-1.json").exists()
 
 
 def test_changed_policy_reactivates_monitor_and_clears_old_state(tmp_path: Path):

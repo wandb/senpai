@@ -11,6 +11,7 @@ import launch_helpers  # noqa: E402
 REVISION = "a" * 40
 ADVISOR_IMAGE = f"ghcr.io/wandb/senpai-advisor:sha-{REVISION}"
 STUDENT_IMAGE = f"ghcr.io/wandb/senpai-student:sha-{REVISION}"
+EXECUTOR_IMAGE = f"ghcr.io/wandb/senpai-executor@sha256:{'b' * 64}"
 
 
 def launch_args(**overrides) -> launch.Args:
@@ -21,6 +22,7 @@ def launch_args(**overrides) -> launch.Args:
         "advisor": True,
         "advisor_image": ADVISOR_IMAGE,
         "student_image": STUDENT_IMAGE,
+        "executor_image": EXECUTOR_IMAGE,
         "senpai_repo_revision": REVISION,
     }
     values.update(overrides)
@@ -39,6 +41,14 @@ def run_launch(*arguments: str) -> subprocess.CompletedProcess[str]:
             "https://github.com/example/problem.git",
             "--n_students",
             "1",
+            "--advisor_image",
+            ADVISOR_IMAGE,
+            "--student_image",
+            STUDENT_IMAGE,
+            "--executor_image",
+            EXECUTOR_IMAGE,
+            "--senpai_repo_revision",
+            REVISION,
             *arguments,
         ],
         cwd=ROOT,
@@ -48,12 +58,12 @@ def run_launch(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def render_role(
+def render_role_manifest(
     role: str,
     args: launch.Args | None = None,
     *,
     program: launch.ProgramSystemPrompt | None = None,
-) -> tuple[str, str, str]:
+) -> tuple[str, str]:
     args = launch_args() if args is None else args
     program = program or launch.ProgramSystemPrompt(
         program_path=args.program_path or "program.md",
@@ -102,5 +112,15 @@ def render_role(
             program_secret_name=program_secret_name,
             program_secret=program_secret,
         )
-    configmap, deployment = manifest.split("\n---\n", 1)
-    return configmap, deployment, secret
+    return manifest, secret
+
+
+def render_role(
+    role: str,
+    args: launch.Args | None = None,
+    *,
+    program: launch.ProgramSystemPrompt | None = None,
+) -> tuple[str, str, str]:
+    manifest, secret = render_role_manifest(role, args, program=program)
+    documents = manifest.split("\n---\n")
+    return documents[0], documents[-1], secret
