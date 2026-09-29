@@ -2,6 +2,7 @@ from copy import deepcopy
 from pathlib import Path
 import subprocess
 import threading
+import time
 
 from senpai_agent.training import KubernetesResourceRef, KubernetesTrainingSpec, TrainingState
 
@@ -109,6 +110,15 @@ class FakeCluster:
 
     def logs(self, _resource):
         return "remote worker log"
+
+    def pod_snapshot(self, resource):
+        return {
+            "training_id": self.reservations[-1][0],
+            "source_commit": self.reservations[-1][2],
+            "resource": resource.model_dump(mode="json"),
+            "captured_at": time.time(), "pods": [], "terminal_complete": False,
+            "capture_error": None,
+        }
 
     def release(self, training_id):
         self.releases.append(training_id)

@@ -641,7 +641,8 @@ def test_registered_training_tools_supervise_kubernetes_for_every_topology(
         close_training_runtimes()
 
 
-def test_get_training_status_delivers_complete_structured_pod_receipt(tmp_path):
+@pytest.mark.parametrize("field", ["kubernetes_pod_receipt", "kubernetes_pod_snapshot"])
+def test_get_training_status_delivers_complete_structured_pod_evidence(tmp_path, field):
     from senpai_agent.tools import GetTrainingStatusAction, GetTrainingStatusTool
 
     receipt = {
@@ -656,12 +657,12 @@ def test_get_training_status_delivers_complete_structured_pod_receipt(tmp_path):
         } for index in range(32)],
     }
     assert len(json.dumps(receipt)) > 8192
-    result = finished_result(tmp_path).model_copy(update={'kubernetes_pod_receipt': receipt})
+    result = finished_result(tmp_path).model_copy(update={field: receipt})
     training = StubTraining(tmp_path, result)
     tool = GetTrainingStatusTool.create(training)[0]
     observed = tool.executor(GetTrainingStatusAction(training_id='training-17'))
     delivered = json.loads(observed.to_llm_content[0].text)
-    assert delivered['kubernetes_pod_receipt'] == receipt
+    assert delivered[field] == receipt
     assert training.status_checks == ['training-17']
 
 

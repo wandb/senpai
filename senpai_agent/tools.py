@@ -355,6 +355,8 @@ class TrainingResultObservation(TrainingResult, Observation):
             result["error_tail"] = self.error_tail
         if self.kubernetes_diagnostics:
             result["kubernetes_diagnostics"] = self.kubernetes_diagnostics
+        if self.kubernetes_pod_snapshot is not None:
+            result["kubernetes_pod_snapshot"] = self.kubernetes_pod_snapshot
         if self.kubernetes_pod_receipt is not None:
             result["kubernetes_pod_receipt"] = self.kubernetes_pod_receipt
         text = json.dumps(result, separators=(",", ":"), default=str)

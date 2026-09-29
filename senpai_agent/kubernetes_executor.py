@@ -129,11 +129,13 @@ class KubernetesExecutor:
                     raise PermissionError("requested resource shape does not match its reservation")
                 resource = self._current_resource(reservation)
                 return resource.model_dump(mode="json") if resource else None
-            if operation in {"state", "delete", "logs"}:
+            if operation in {"state", "delete", "logs", "pod_snapshot"}:
                 ref = KubernetesResourceRef.model_validate(request["resource"])
                 reservation = self._reservation_for_identity(ref.kind, ref.name, ref.namespace)
                 resource = self._require_resource(reservation, ref)
                 if not self._verify_current(reservation, resource):
+                    if operation == "pod_snapshot":
+                        raise RuntimeError("owned Kubernetes workload no longer exists")
                     return None
                 if operation == "state":
                     state = self.client.state(resource)
@@ -142,12 +144,26 @@ class KubernetesExecutor:
                     self._pod_receipt(reservation, resource, "delete", forced=True)
                     self.client.delete(resource, min(int(request["timeout_seconds"]), 60))
                     return None
+                if operation == "pod_snapshot":
+                    identity = {
+                        "training_id": reservation["training_id"],
+                        "source_commit": reservation["source_commit"],
+                        "resource": resource.model_dump(mode="json"),
+                        "captured_at": time.time(),
+                    }
             if operation == "release":
                 reservation = self._reservations.get(request["training_id"])
                 return self._release(reservation) if reservation is not None else {}
         if operation == "logs":
             # The API client rechecks the UID; slow log reads must not block control.
             return self.client.logs(resource)
+        if operation == "pod_snapshot":
+            snapshot = self.client.pod_snapshot(resource)
+            return {
+                **identity, "pods": snapshot["pods"],
+                "expected_pods": snapshot["expected_pods"],
+                "terminal_complete": snapshot["complete"], "capture_error": None,
+            }
         raise ValueError(f"unsupported executor operation {operation!r}")
 
     def reconcile(self) -> None:

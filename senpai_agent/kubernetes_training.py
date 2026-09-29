@@ -155,6 +155,8 @@ class TrainingClusterClient(Protocol):
 
     def logs(self, resource: KubernetesResourceRef) -> str: ...
 
+    def pod_snapshot(self, resource: KubernetesResourceRef) -> dict: ...
+
     def release(self, training_id: str) -> dict: ...
 
 
@@ -240,6 +242,9 @@ class KubernetesExecutorClient:
     def logs(self, resource: KubernetesResourceRef) -> str:
         diagnostics = self._request("logs", resource=resource.model_dump(mode="json"))
         return _format_diagnostics(diagnostics) if diagnostics is not None else ""
+
+    def pod_snapshot(self, resource: KubernetesResourceRef) -> dict:
+        return self._request("pod_snapshot", resource=resource.model_dump(mode="json"))
 
     def release(self, training_id: str) -> dict:
         return self._request("release", training_id=training_id)
@@ -566,6 +571,7 @@ class KubernetesApiClient:
                         }
                     containers.append({
                         "name": container["name"], "init": spec_key == "initContainers",
+                        "image": container.get("image"), "imageID": value.get("imageID"),
                         "restartCount": value.get("restartCount"), **states,
                     })
             rows.append({
@@ -750,7 +756,7 @@ class _ActiveRemoteTraining:
     cancelled: bool = False
     thread: threading.Thread | None = None
     next_diagnostics_at: float = 0
-    diagnostics_future: Future[str] | None = None
+    diagnostics_future: Future[tuple[str, dict | None]] | None = None
 
 
 class KubernetesTrainingSupervisor:
@@ -1231,9 +1237,9 @@ class KubernetesTrainingSupervisor:
         *,
         wait: bool = False,
     ) -> None:
-        # Terminal refreshes must not reuse a stale in-flight live snapshot.
+        # Terminal log refreshes must not reuse an in-flight live diagnostic read.
         if wait or active.diagnostics_future is None:
-            future: Future[str] = Future()
+            future: Future[tuple[str, dict | None]] = Future()
             resource = active.resource
 
             def collect() -> None:
@@ -1243,7 +1249,17 @@ class KubernetesTrainingSupervisor:
                     diagnostics = (
                         f"Kubernetes diagnostics unavailable: {type(error).__name__}: {error}"
                     )
-                future.set_result(diagnostics)
+                snapshot = None
+                # Release captures the terminal receipt; do not delay cleanup with another inventory.
+                if not wait:
+                    try:
+                        snapshot = self.client.pod_snapshot(resource)
+                    except Exception as error:  # optional evidence must not stop supervision
+                        snapshot = {
+                            "captured_at": time.time(), "pods": [], "terminal_complete": False,
+                            "capture_error": f"Pod status read failed: {type(error).__name__}",
+                        }
+                future.set_result((diagnostics, snapshot))
 
             active.diagnostics_future = future
             threading.Thread(
@@ -1254,18 +1270,28 @@ class KubernetesTrainingSupervisor:
         if not wait and not active.diagnostics_future.done():
             return
         detail = self._redact_output(detail).encode()[:1024].decode(errors="ignore")
+        collected, snapshot = active.diagnostics_future.result()
+        collected = self._redact_output(collected)
         diagnostics = "\n".join(
             part
-            for part in (detail, self._redact_output(active.diagnostics_future.result()))
+            for part in (detail, collected)
             if part
         )
         summary = diagnostics.encode()[:_ERROR_TAIL_BYTES].decode(errors="ignore")
         result = self.get_training_status(training_id)
-        if summary != result.kubernetes_diagnostics:
+        if summary != result.kubernetes_diagnostics or (
+            snapshot is not None and snapshot != result.kubernetes_pod_snapshot
+        ):
             try:
-                active.log_path.write_text(summary)
+                if summary != result.kubernetes_diagnostics:
+                    active.log_path.write_text(summary)
                 self._write_result(
-                    result.model_copy(update={"kubernetes_diagnostics": summary})
+                    result.model_copy(update={
+                        "kubernetes_diagnostics": summary,
+                        "kubernetes_pod_snapshot": (
+                            snapshot if snapshot is not None else result.kubernetes_pod_snapshot
+                        ),
+                    })
                 )
             except OSError as error:
                 print(

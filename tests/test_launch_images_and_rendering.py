@@ -678,17 +678,18 @@ def test_openai_ultra_launch_value_is_rejected():
         launch.validate_model_config(args)
 
 
-def test_launch_accepts_anthropic_max_for_every_model_profile():
+@pytest.mark.parametrize("model", ["anthropic/claude-opus-5-5", "openai/gpt-6-astra"])
+def test_launch_accepts_max_for_every_model_profile(model):
     args = launch_args(
-        advisor_model="anthropic/claude-opus-5-5",
+        advisor_model=model,
         advisor_reasoning_effort="max",
-        student_model="anthropic/claude-opus-5",
+        student_model=model,
         student_reasoning_effort="max",
-        smart_model="anthropic/claude-opus-5",
+        smart_model=model,
         smart_reasoning_effort="max",
-        fast_model="anthropic/claude-sonnet-5",
+        fast_model=model,
         fast_reasoning_effort="max",
-        frontier_model="anthropic/claude-opus-5-5",
+        frontier_model=model,
         frontier_reasoning_effort="max",
     )
 
@@ -770,6 +771,7 @@ def test_wandb_gateway_is_rendered_for_every_role():
     ("overrides", "message"),
     [
         ({"advisor_reasoning_effort": "extreme"}, "must be one of"),
+        ({"student_model": "openai/gpt-6-astra", "student_reasoning_effort": "none"}, "unsupported for"),
         (
             {
                 "advisor_model": "anthropic/claude-opus-4-8",
