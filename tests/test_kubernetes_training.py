@@ -834,7 +834,10 @@ def test_restart_cleans_unconfirmed_create_and_preserves_a_healthy_run(broker_ru
         # Preserve the actual launch intent at the crash boundary, before the
         # old process's blocked diagnostic read can publish a terminal result.
         restart_state = runtime.state_dir.parent / 'restart-state'
-        shutil.copytree(runtime.state_dir, restart_state)
+        restart_state.mkdir()
+        for run in (healthy, lost):
+            name = f'{run.training_id}.json'
+            shutil.copyfile(runtime.state_dir / name, restart_state / name)
         recovered = KubernetesTrainingSupervisor(
             workspace=workspace, state_dir=restart_state, nodes=2, gpus_per_node=8,
             poll_seconds=.01, client=runtime.client,
