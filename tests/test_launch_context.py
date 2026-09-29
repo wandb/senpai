@@ -108,7 +108,10 @@ def test_launch_context_tells_students_where_training_runs(nodes, image, executi
     )
     context = base64.b64decode(yaml.safe_load(configmap)["data"][launch.LAUNCH_CONTEXT_ENV]).decode()
 
-    assert f"Training execution: {execution}." in context
+    assert (
+        f"Default training execution when `nodes` and `gpus_per_node` are omitted: {execution}."
+        in context
+    )
     if image:
         assert f"Training image: `{image}`" in context
         assert "custom training image" in context
