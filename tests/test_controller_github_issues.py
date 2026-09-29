@@ -35,7 +35,7 @@ def mailbox(*, role="advisor", human_issues_enabled=True):
         trusted_actor="senpai-bot",
         human_issues_enabled=human_issues_enabled,
     )
-    value._has_write_permission = lambda _login: True
+    value._github.get = lambda _path: {"permission": "write"}
     return value
 
 
@@ -121,7 +121,7 @@ def test_rejected_pull_does_not_suppress_a_human_issue(monkeypatch, head_repo):
         "head": {"repo": {"full_name": head_repo}},
     }
     monkeypatch.setattr(student, "_pulls", lambda: [untrusted])
-    monkeypatch.setattr(student, "_has_write_permission", lambda _login: False)
+    monkeypatch.setattr(student._github, "get", lambda _path: {"permission": "none"})
     monkeypatch.setattr(student, "_issues", lambda: [issue()])
     monkeypatch.setattr(student, "_issue_comments", lambda _issue: [])
 

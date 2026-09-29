@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -11,6 +12,7 @@ from senpai_agent.models import AssignmentRecord
 from senpai_agent.PROMPTS import TRUNCATED_FEEDBACK_PROMPT
 
 from .ledger import read_feedback_ledger, write_feedback_ledger
+from .student_comments import trusted_peer_comment
 from .values import (
     FEEDBACK_EXCERPT_BYTES,
     FEEDBACK_KEY_PREFIX,
@@ -37,17 +39,20 @@ def student_pr_feedback_events(
     mailbox: GitHubMailbox,
     pull: Mapping[str, object],
     assignment: AssignmentRecord,
+    *,
+    broadcasts_only: bool = False,
 ) -> list[ControllerEvent]:
     number = int(pull["number"])
     sources: list[tuple[str, str]] = []
     if comments_url := pull.get("comments_url"):
         sources.append(("issue_comment", f"{comments_url}?per_page=100"))
-    if pull_url := pull.get("url"):
-        sources.append(
-            ("review", f"{str(pull_url).rstrip('/')}/reviews?per_page=100")
-        )
-    if comments_url := pull.get("review_comments_url"):
-        sources.append(("inline_comment", f"{comments_url}?per_page=100"))
+    if not broadcasts_only:
+        if pull_url := pull.get("url"):
+            sources.append(
+                ("review", f"{str(pull_url).rstrip('/')}/reviews?per_page=100")
+            )
+        if comments_url := pull.get("review_comments_url"):
+            sources.append(("inline_comment", f"{comments_url}?per_page=100"))
     if not sources:
         return []
 
@@ -61,29 +66,48 @@ def student_pr_feedback_events(
         if item.get("submitted_at") is not None
     }
     candidates: list[_FeedbackCandidate] = []
+    peer_candidates: dict[str, _FeedbackCandidate] = {}
+    conflicting_peer_keys: set[str] = set()
     for surface, _url in sources:
         for item in feedback_by_surface[surface]:
             if surface == "review" and item.get("submitted_at") is None:
                 continue
-            if (
-                surface == "inline_comment"
-                and (
-                    item.get("pull_request_review_id") is None
-                    or int(item["pull_request_review_id"])
-                    not in submitted_review_ids
-                )
+            if surface == "inline_comment" and (
+                item.get("pull_request_review_id") is None
+                or int(item["pull_request_review_id"]) not in submitted_review_ids
             ):
                 continue
-            trusted = trusted_feedback(
-                item,
-                actor=actor,
-                repo=mailbox.repo,
-                pr_number=number,
-                assignment=assignment,
-            )
-            if trusted is None:
-                continue
-            binding, feedback_body = trusted
+            peer_record = None
+            if "<!-- senpai-student-peer-comment:" in str(item.get("body") or ""):
+                peer = trusted_peer_comment(
+                    item,
+                    actor=actor,
+                    repo=mailbox.repo,
+                    pr_number=number,
+                    assignment=assignment,
+                )
+                if surface != "issue_comment" or peer is None:
+                    continue
+                peer_record, feedback_body = peer
+                if broadcasts_only and peer_record.broadcast_id is None:
+                    continue
+                binding = FeedbackBinding(
+                    assignment_id=peer_record.assignment_id,
+                    revision_id=peer_record.revision_id,
+                )
+            else:
+                if broadcasts_only:
+                    continue
+                trusted = trusted_feedback(
+                    item,
+                    actor=actor,
+                    repo=mailbox.repo,
+                    pr_number=number,
+                    assignment=assignment,
+                )
+                if trusted is None:
+                    continue
+                binding, feedback_body = trusted
             feedback_id = int(item["id"])
             created_at = str(
                 item["submitted_at"] if surface == "review" else item["created_at"]
@@ -142,15 +166,59 @@ def student_pr_feedback_events(
                     if key in payload
                 }
             )
+            if peer_record is not None:
+                payload.update(
+                    feedback_type=(
+                        "student_broadcast"
+                        if peer_record.broadcast_id is not None
+                        else "student_peer_comment"
+                    ),
+                    student=peer_record.student,
+                    source_pr_number=peer_record.source_pr_number,
+                    source_pr_url=(
+                        str(pull["html_url"]).rsplit("/", 1)[0]
+                        + f"/{peer_record.source_pr_number}"
+                    ),
+                    source_assignment_id=peer_record.source_assignment_id,
+                    source_revision_id=peer_record.source_revision_id,
+                )
+                if peer_record.broadcast_id is not None:
+                    payload["broadcast_id"] = peer_record.broadcast_id
+                source_key = (
+                    f"student_pr_feedback:student_peer_comment:{number}:"
+                    + payload_digest(
+                        peer_record.model_dump(mode="json", exclude_none=True)
+                    )
+                )
+                candidate = _FeedbackCandidate(
+                    source_key=source_key,
+                    content_digest=payload_digest({"body": item["body"]}),
+                    payload=payload,
+                )
+                previous = peer_candidates.get(source_key)
+                if (
+                    previous is not None
+                    and previous.content_digest != candidate.content_digest
+                ):
+                    conflicting_peer_keys.add(source_key)
+                    _report_peer_conflict(source_key)
+                if previous is None or feedback_id < int(
+                    previous.payload["feedback_id"]
+                ):
+                    peer_candidates[source_key] = candidate
+                continue
             candidates.append(
                 _FeedbackCandidate(
-                    source_key=(
-                        f"student_pr_feedback:{surface}:{number}:{feedback_id}"
-                    ),
+                    source_key=f"student_pr_feedback:{surface}:{number}:{feedback_id}",
                     content_digest=payload_digest(content),
                     payload=payload,
                 )
             )
+    candidates.extend(
+        candidate
+        for key, candidate in peer_candidates.items()
+        if key not in conflicting_peer_keys
+    )
     candidates.sort(
         key=lambda candidate: (
             github_datetime(str(candidate.payload["created_at"])),
@@ -159,6 +227,15 @@ def student_pr_feedback_events(
         )
     )
     return _pending_feedback(mailbox, candidates, assignment)
+
+
+def _report_peer_conflict(source_key: str) -> None:
+    print(
+        "SENPAI_STUDENT_PEER_COMMENT_READ_ERROR "
+        f"conflicting bodies for peer comment identity {source_key}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _pending_feedback(
@@ -182,6 +259,16 @@ def _pending_feedback(
                 if key == candidate.source_key
                 or value.source_key == candidate.source_key
             ]
+            if (
+                candidate.payload.get("feedback_type")
+                in {"student_peer_comment", "student_broadcast"}
+                and any(
+                    value.content_digest != candidate.content_digest
+                    for value in prior
+                )
+            ):
+                _report_peer_conflict(candidate.source_key)
+                continue
             identities = {
                 (value.assignment_id, value.revision_id) for value in prior
             }

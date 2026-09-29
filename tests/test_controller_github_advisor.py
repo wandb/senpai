@@ -56,7 +56,14 @@ def pull(
     return value
 
 
-def mailbox(monkeypatch, pulls, *, students=(), check_author_permissions=False):
+def github_get_response(path, *, base_sha="b" * 40):
+    if path.startswith("/repos/acme/widgets/collaborators/"):
+        return {"permission": "write"}
+    assert path.startswith("/repos/acme/widgets/git/ref/heads/")
+    return {"object": {"sha": base_sha}}
+
+
+def mailbox(monkeypatch, pulls, *, students=()):
     value = GitHubMailbox(
         repo="acme/widgets",
         token=SecretStr("github-token"),
@@ -67,15 +74,9 @@ def mailbox(monkeypatch, pulls, *, students=(), check_author_permissions=False):
     )
     monkeypatch.setattr(value, "_pulls", lambda: list(pulls))
     monkeypatch.setattr(value, "_issues", list)
-    if not check_author_permissions:
-        monkeypatch.setattr(value, "_has_write_permission", lambda _login: True)
     monkeypatch.setattr(value._github, "objects", lambda _url: [])
 
-    def get_research_base(path):
-        assert path == "/repos/acme/widgets/git/ref/heads/research"
-        return {"object": {"sha": "b" * 40}}
-
-    monkeypatch.setattr(value._github, "get", get_research_base)
+    monkeypatch.setattr(value._github, "get", github_get_response)
     return value
 
 
@@ -96,7 +97,7 @@ def test_advisor_authorizes_pulls_using_current_base_permission(
     monkeypatch, permission, role_name, accepted
 ):
     candidate = pull(labels=("research", "student:student-1", "status:review"))
-    advisor = mailbox(monkeypatch, [candidate], check_author_permissions=True)
+    advisor = mailbox(monkeypatch, [candidate])
     requests = []
 
     def get(path):
@@ -134,7 +135,7 @@ def test_advisor_rejects_untrusted_pull_metadata_before_permission_lookup(
             }
         }
     candidate.update(metadata)
-    advisor = mailbox(monkeypatch, [candidate], check_author_permissions=True)
+    advisor = mailbox(monkeypatch, [candidate])
 
     def unexpected_get(path):
         pytest.fail(f"Unexpected GitHub request: {path}")
@@ -152,7 +153,7 @@ def test_author_permissions_are_shared_within_a_poll_and_refreshed_next_poll(
         pull(labels=labels, number=17, head_repo="ACME/Widgets", author="Senpai[bot]"),
         pull(labels=labels, number=18, author="senpai[bot]"),
     ]
-    advisor = mailbox(monkeypatch, candidates, check_author_permissions=True)
+    advisor = mailbox(monkeypatch, candidates)
     requests = []
     permission = "write"
 
@@ -193,7 +194,6 @@ def test_permission_failure_invalidates_github_snapshot_and_preserves_local_even
         monkeypatch,
         [candidate],
         students=("student-1", "student-2"),
-        check_author_permissions=True,
     )
 
     def get(path):
@@ -322,11 +322,6 @@ def test_student_assignment_comment_wakes_advisor_once_per_semantic_message(
             assignment_comment(github_id=501),
         ],
     )
-    monkeypatch.setattr(
-        advisor._github,
-        "get",
-        lambda _path: {"object": {"sha": "b" * 40}},
-    )
 
     comments = [
         event for event in advisor.poll() if event.kind == "student_assignment_comment"
@@ -361,11 +356,6 @@ def test_duplicate_comment_retry_metadata_does_not_change_the_event(monkeypatch)
         "objects",
         lambda _url: list(visible_comments),
     )
-    monkeypatch.setattr(
-        advisor._github,
-        "get",
-        lambda _path: {"object": {"sha": "b" * 40}},
-    )
 
     first = next(
         event for event in advisor.poll() if event.kind == "student_assignment_comment"
@@ -392,11 +382,6 @@ def test_advisor_delivers_a_comment_from_an_earlier_revision(monkeypatch):
         "objects",
         lambda _url: [assignment_comment(github_id=502, revision_id="revision-old")],
     )
-    monkeypatch.setattr(
-        advisor._github,
-        "get",
-        lambda _path: {"object": {"sha": "b" * 40}},
-    )
 
     event = next(
         event for event in advisor.poll() if event.kind == "student_assignment_comment"
@@ -421,11 +406,6 @@ def test_advisor_ignores_forged_assignment_comments(monkeypatch):
             assignment_comment(github_id=503, author="mallory"),
         ],
     )
-    monkeypatch.setattr(
-        advisor._github,
-        "get",
-        lambda _path: {"object": {"sha": "b" * 40}},
-    )
 
     assert not any(
         event.kind == "student_assignment_comment" for event in advisor.poll()
@@ -446,11 +426,6 @@ def test_conflicting_student_comment_bodies_fail_closed(monkeypatch, capsys):
             assignment_comment(github_id=501),
             assignment_comment(github_id=502, message="A conflicting update."),
         ],
-    )
-    monkeypatch.setattr(
-        advisor._github,
-        "get",
-        lambda _path: {"object": {"sha": "b" * 40}},
     )
 
     assert not any(
@@ -475,11 +450,6 @@ def test_edited_student_comment_fails_closed(monkeypatch, capsys):
                 message="Edited after publication.",
             )
         ],
-    )
-    monkeypatch.setattr(
-        advisor._github,
-        "get",
-        lambda _path: {"object": {"sha": "b" * 40}},
     )
 
     assert not any(
@@ -549,11 +519,6 @@ def test_advisor_receives_every_trusted_human_pr_comment_and_student_message(
         return list(visible_comments)
 
     monkeypatch.setattr(advisor._github, "objects", objects)
-    monkeypatch.setattr(
-        advisor._github,
-        "get",
-        lambda _path: {"object": {"sha": "b" * 40}},
-    )
 
     events = advisor.poll()
     human_events = [event for event in events if event.kind == "human_pr_comment"]
@@ -590,11 +555,6 @@ def test_student_and_human_parsers_share_a_failed_comment_read(monkeypatch):
         raise GitHubReadError("temporary issue-comment failure")
 
     monkeypatch.setattr(advisor._github, "objects", objects)
-    monkeypatch.setattr(
-        advisor._github,
-        "get",
-        lambda _path: {"object": {"sha": "b" * 40}},
-    )
 
     events = advisor.poll()
 
@@ -645,11 +605,6 @@ def test_malformed_human_pr_comment_is_reported(monkeypatch, capsys):
     malformed["created_at"] = "not-a-timestamp"
     advisor = mailbox(monkeypatch, [assigned])
     monkeypatch.setattr(advisor._github, "objects", lambda _url: [malformed])
-    monkeypatch.setattr(
-        advisor._github,
-        "get",
-        lambda _path: {"object": {"sha": "b" * 40}},
-    )
 
     assert not any(
         event.kind == "human_pr_comment" for event in advisor.poll()
@@ -667,11 +622,6 @@ def test_human_pr_comment_versions_edits_but_not_pull_metadata(monkeypatch):
     comment = human_pr_comment(github_id=621, body="Use the narrow control.")
     advisor = mailbox(monkeypatch, [assigned])
     monkeypatch.setattr(advisor._github, "objects", lambda _url: [comment])
-    monkeypatch.setattr(
-        advisor._github,
-        "get",
-        lambda _path: {"object": {"sha": "b" * 40}},
-    )
 
     first = next(
         event for event in advisor.poll() if event.kind == "human_pr_comment"
@@ -731,11 +681,6 @@ def test_shared_actor_plain_human_comment_is_visible_but_protocol_output_is_not(
                 author="senpai-bot",
             ),
         ],
-    )
-    monkeypatch.setattr(
-        advisor._github,
-        "get",
-        lambda _path: {"object": {"sha": "b" * 40}},
     )
 
     events = [event for event in advisor.poll() if event.kind == "human_pr_comment"]
@@ -992,6 +937,8 @@ def test_research_base_change_uses_the_fresh_live_branch_head_on_each_poll(
     ref_reads = []
 
     def get_ref(path):
+        if path.startswith("/repos/acme/widgets/collaborators/"):
+            return {"permission": "write"}
         ref_reads.append(path)
         return {"object": {"sha": current_sha[0]}}
 
@@ -1031,7 +978,7 @@ def test_research_base_event_ignores_mutable_pull_presentation(monkeypatch):
     monkeypatch.setattr(
         advisor._github,
         "get",
-        lambda _path: {"object": {"sha": "c" * 40}},
+        lambda path: github_get_response(path, base_sha="c" * 40),
     )
     first = next(
         event for event in advisor.poll() if event.kind == "research_base_changed"
@@ -1058,7 +1005,7 @@ def test_research_base_event_versions_a_branch_rename_at_the_same_head(monkeypat
     monkeypatch.setattr(
         advisor._github,
         "get",
-        lambda _path: {"object": {"sha": "c" * 40}},
+        lambda path: github_get_response(path, base_sha="c" * 40),
     )
     first = next(
         event for event in advisor.poll() if event.kind == "research_base_changed"
@@ -1143,7 +1090,7 @@ def test_exact_trusted_acceptance_suppresses_review_restart_redelivery(monkeypat
     monkeypatch.setattr(
         advisor._github,
         "get",
-        lambda _path: {"object": {"sha": "c" * 40}},
+        lambda path: github_get_response(path, base_sha="c" * 40),
     )
     monkeypatch.setattr(advisor._github, "actor", lambda: "senpai-bot")
     monkeypatch.setattr(
@@ -1182,7 +1129,7 @@ def test_acceptance_suppression_tolerates_idempotent_or_malformed_noise(
     monkeypatch.setattr(
         advisor._github,
         "get",
-        lambda _path: {"object": {"sha": "c" * 40}},
+        lambda path: github_get_response(path, base_sha="c" * 40),
     )
     monkeypatch.setattr(advisor._github, "actor", lambda: "senpai-bot")
     acceptance = acceptance_comment()
@@ -1235,7 +1182,7 @@ def test_untrusted_or_stale_acceptance_does_not_suppress_change(
     monkeypatch.setattr(
         advisor._github,
         "get",
-        lambda _path: {"object": {"sha": "c" * 40}},
+        lambda path: github_get_response(path, base_sha="c" * 40),
     )
     monkeypatch.setattr(advisor._github, "actor", lambda: "senpai-bot")
     monkeypatch.setattr(
@@ -1269,7 +1216,7 @@ def test_acceptance_for_different_result_at_same_head_does_not_suppress_change(
     monkeypatch.setattr(
         advisor._github,
         "get",
-        lambda _path: {"object": {"sha": "c" * 40}},
+        lambda path: github_get_response(path, base_sha="c" * 40),
     )
     monkeypatch.setattr(advisor._github, "actor", lambda: "senpai-bot")
     monkeypatch.setattr(
@@ -1302,7 +1249,7 @@ def test_malformed_trusted_acceptance_does_not_suppress_change(monkeypatch):
     monkeypatch.setattr(
         advisor._github,
         "get",
-        lambda _path: {"object": {"sha": "c" * 40}},
+        lambda path: github_get_response(path, base_sha="c" * 40),
     )
     monkeypatch.setattr(advisor._github, "actor", lambda: "senpai-bot")
     monkeypatch.setattr(
@@ -1342,7 +1289,7 @@ def test_embedded_acceptance_marker_is_not_trusted_protocol_evidence(
     monkeypatch.setattr(
         advisor._github,
         "get",
-        lambda _path: {"object": {"sha": "c" * 40}},
+        lambda path: github_get_response(path, base_sha="c" * 40),
     )
     monkeypatch.setattr(advisor._github, "actor", lambda: "senpai-bot")
     embedded = acceptance_comment()
@@ -1377,7 +1324,7 @@ def test_wip_base_change_shares_the_single_student_comment_read(monkeypatch):
     monkeypatch.setattr(
         advisor._github,
         "get",
-        lambda _path: {"object": {"sha": "c" * 40}},
+        lambda path: github_get_response(path, base_sha="c" * 40),
     )
     comment_reads = []
     monkeypatch.setattr(
@@ -1408,7 +1355,7 @@ def test_current_assignment_base_does_not_emit_a_false_change(monkeypatch):
     monkeypatch.setattr(
         advisor._github,
         "get",
-        lambda _path: {"object": {"sha": current_sha}},
+        lambda path: github_get_response(path, base_sha=current_sha),
     )
 
     assert "research_base_changed" not in {
@@ -1439,6 +1386,8 @@ def test_each_assignment_watches_its_own_research_base_ref(monkeypatch):
     reads = []
 
     def get_ref(path):
+        if path.startswith("/repos/acme/widgets/collaborators/"):
+            return {"permission": "write"}
         reads.append(path)
         sha = "c" * 40 if path.endswith("research-a") else "d" * 40
         return {"object": {"sha": sha}}
@@ -1477,7 +1426,9 @@ def test_research_base_ref_failure_does_not_suppress_other_advisor_events(
         students=("student-1", "student-2"),
     )
 
-    def invalid_ref(_path):
+    def invalid_ref(path):
+        if path.startswith("/repos/acme/widgets/collaborators/"):
+            return {"permission": "write"}
         raise TypeError("invalid ref response")
 
     monkeypatch.setattr(advisor._github, "get", invalid_ref)

@@ -1,4 +1,4 @@
-"""Trusted student assignment comments delivered to advisor controllers."""
+"""Trusted student messages for advisor and peer delivery."""
 
 from __future__ import annotations
 
@@ -11,9 +11,12 @@ from senpai_agent.github.http import GitHubReadError
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.models import (
     AssignmentRecord,
+    StudentPeerCommentRecord,
     authoritative_marker_line,
     parse_assignment_comment_markers,
+    parse_student_peer_comment_markers,
     render_assignment_comment_marker,
+    render_student_peer_comment_marker,
 )
 
 from .values import (
@@ -166,6 +169,49 @@ def _comment_candidate(
         created_at=created_at,
         github_comment_id=github_comment_id,
     )
+
+
+def trusted_peer_comment(
+    item: Mapping[str, object],
+    *,
+    actor: str,
+    repo: str,
+    pr_number: int,
+    assignment: AssignmentRecord,
+) -> tuple[StudentPeerCommentRecord, str] | None:
+    user = item.get("user")
+    if (
+        not isinstance(user, dict)
+        or str(user.get("login") or "").casefold() != actor.casefold()
+    ):
+        return None
+    body = str(item.get("body") or "")
+    try:
+        records = parse_student_peer_comment_markers(body)
+    except ValueError:
+        return None
+    protocol_lines = [
+        line for line in body.splitlines() if line.strip().startswith("<!-- senpai-")
+    ]
+    if len(records) != 1 or len(protocol_lines) != 1:
+        return None
+    record = records[0]
+    if (
+        record.repo != repo
+        or record.pr_number != pr_number
+        or record.assignment_id != assignment.assignment_id
+        or record.student == assignment.student
+        or record.source_pr_number == pr_number
+        or record.source_assignment_id == assignment.assignment_id
+        or authoritative_marker_line(body) != render_student_peer_comment_marker(record)
+        or not item.get("created_at")
+        or item.get("updated_at") != item["created_at"]
+    ):
+        return None
+    message = "\n".join(body.splitlines()[1:]).strip()
+    if not message.startswith(f"**STUDENT: {record.student}**\n\n"):
+        return None
+    return record, message
 
 
 def _report_read_error(message: str) -> None:

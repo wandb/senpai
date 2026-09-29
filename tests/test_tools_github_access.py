@@ -43,6 +43,8 @@ STUDENT_GITHUB_TOOLS = {
     "get_pr_source",
     "create_human_issue",
     "post_assignment_comment",
+    "post_peer_comment",
+    "broadcast_message",
     "push_experiment_commit",
     "respond_to_human_issue",
     "submit_experiment_result",
@@ -157,7 +159,12 @@ def test_both_roles_open_issues_with_configured_audience_and_token_owner_mention
         "human",
         "advisor-branch" if role == "advisor" else "student:fern",
     }
-    assert f"{role.upper()}: Can we run another seed?" in created["body"]
+    expected_message = (
+        "ADVISOR: Can we run another seed?"
+        if role == "advisor"
+        else "**STUDENT: fern**\n\nCan we run another seed?"
+    )
+    assert expected_message in created["body"]
     assert created["body"].endswith("\n\n@senpai-bot")
     assert observation.state == "human_issue_created"
     assert observation.resource_url == "https://github.com/acme/widgets/issues/7"

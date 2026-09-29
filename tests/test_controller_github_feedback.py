@@ -12,9 +12,11 @@ from senpai_agent.models import (
     AssignmentCommentRecord,
     AssignmentFeedbackRecord,
     AssignmentRecord,
-    render_assignment_feedback_marker,
+    StudentPeerCommentRecord,
     render_assignment_comment_marker,
+    render_assignment_feedback_marker,
     render_assignment_marker,
+    render_student_peer_comment_marker,
 )
 from senpai_agent.state import (
     AssignmentConversationRegistry,
@@ -99,7 +101,7 @@ def student_mailbox(
         "labels": [
             {"name": "research"},
             {"name": "student:student-1"},
-            {"name": status},
+            *([{"name": status}] if status is not None else []),
         ],
         "url": "https://api.github.test/repos/acme/widgets/pulls/17",
         "comments_url": (
@@ -123,7 +125,7 @@ def student_mailbox(
     )
     monkeypatch.setattr(mailbox, "_pulls", lambda: [assigned_pull])
     monkeypatch.setattr(mailbox, "_issues", list)
-    monkeypatch.setattr(mailbox, "_has_write_permission", lambda _login: True)
+    monkeypatch.setattr(mailbox._github, "get", lambda _path: {"permission": "write"})
     monkeypatch.setattr(mailbox._github, "objects", lambda url: responses[url])
     return mailbox
 
@@ -141,7 +143,9 @@ def test_student_ignores_assignments_from_unauthorized_pulls(
     pull = mailbox._pulls()[0]
     pull["head"]["repo"]["full_name"] = head_repo
     monkeypatch.setattr(
-        mailbox, "_has_write_permission", lambda _login: has_write_permission
+        mailbox._github,
+        "get",
+        lambda _path: {"permission": "write" if has_write_permission else "none"},
     )
 
     assert mailbox.poll() == ()
@@ -570,6 +574,205 @@ def test_student_assignment_comment_is_not_replayed_to_its_student(monkeypatch):
             ]
         ),
     )
+
+    assert not any(event.kind == "student_pr_feedback" for event in mailbox.poll())
+
+
+def peer_comment(**overrides):
+    record = StudentPeerCommentRecord(
+        **{
+            "repo": "acme/widgets",
+            "pr_number": 17,
+            "assignment_id": "assignment-17",
+            "revision_id": "revision-2",
+            "student": "student-2",
+            "source_pr_number": 18,
+            "source_assignment_id": "assignment-18",
+            "source_revision_id": "revision-peer",
+            "comment_id": "handoff-interface",
+            **overrides,
+        }
+    )
+    return (
+        f"{render_student_peer_comment_marker(record)}\n\n"
+        f"**STUDENT: {record.student}**\n\n"
+        "The reviewed handoff interface is ready to copy.\n\n"
+        "Working PR: https://github.test/acme/widgets/pull/18"
+    )
+
+
+@pytest.mark.parametrize("broadcast_id", [None, "handoff-discovery"])
+def test_peer_message_resumes_recipient_revision_once_across_retries_and_restart(
+    monkeypatch,
+    tmp_path,
+    broadcast_id,
+):
+    fields = {"broadcast_id": broadcast_id} if broadcast_id else {}
+    responses = feedback_responses(
+        issue_comments=[
+            feedback(106, peer_comment(**fields)),
+            feedback(107, peer_comment(**fields), created_at="2026-07-29T18:02:00Z"),
+        ]
+    )
+    ledger = tmp_path / "feedback.json"
+    mailbox = student_mailbox(monkeypatch, responses, feedback_path=ledger)
+    events = [event for event in mailbox.poll() if event.kind == "student_pr_feedback"]
+
+    assert len(events) == 1
+    message = events[0]
+    assert message.payload["feedback_type"] == (
+        "student_broadcast" if broadcast_id else "student_peer_comment"
+    )
+    if broadcast_id:
+        assert message.payload["broadcast_id"] == broadcast_id
+    assert message.payload["student"] == "student-2"
+    assert message.payload["source_pr_number"] == 18
+    assert (
+        message.payload["source_pr_url"] == "https://github.test/acme/widgets/pull/18"
+    )
+    assert message.payload["source_assignment_id"] == "assignment-18"
+    assert message.payload["source_revision_id"] == "revision-peer"
+    assert message.payload["pr_url"] == "https://github.test/acme/widgets/pull/17"
+    assert message.payload["message"].startswith("**STUDENT: student-2**\n\n")
+
+    failed_turns = Turns((1,))
+    run_student_controller(tmp_path, mailbox, failed_turns)
+    restarted = student_mailbox(
+        monkeypatch,
+        responses,
+        revision_id="revision-3",
+        feedback_path=ledger,
+    )
+    assert restarted.poll() == (message,)
+    turns = Turns()
+    run_student_controller(tmp_path, restarted, turns)
+    assert message.dedupe_key in turns.calls[0][2]
+    assert turns.calls[0][1] == failed_turns.calls[0][1]
+    assert turns.calls[1][1] != turns.calls[0][1]
+    assert not any(event.kind == "student_pr_feedback" for event in restarted.poll())
+
+
+@pytest.mark.parametrize("draft", [True, False])
+@pytest.mark.parametrize(
+    "status", ["status:wip", "status:review", "status:hold", "status:blocked", None]
+)
+def test_broadcast_is_polled_regardless_of_assigned_pr_routing_status(
+    monkeypatch,
+    draft,
+    status,
+):
+    mailbox = student_mailbox(
+        monkeypatch,
+        feedback_responses(
+            issue_comments=[
+                feedback(106, peer_comment(broadcast_id="handoff-discovery")),
+                feedback(107, peer_comment()),
+                feedback(108, "Please revisit this result."),
+            ]
+        ),
+        status=status,
+    )
+    mailbox._pulls()[0]["draft"] = draft
+
+    events = [
+        event for event in mailbox.poll() if event.kind == "student_pr_feedback"
+    ]
+
+    expected_ids = (
+        [106, 107, 108] if status in {"status:wip", "status:review"} else [106]
+    )
+    assert sorted(event.payload["feedback_id"] for event in events) == expected_ids
+    broadcast = next(event for event in events if event.payload["feedback_id"] == 106)
+    assert broadcast.payload["feedback_type"] == "student_broadcast"
+    assert broadcast.payload["broadcast_id"] == "handoff-discovery"
+    assert (
+        broadcast.payload["source_pr_url"] == "https://github.test/acme/widgets/pull/18"
+    )
+    assert broadcast.payload["assignment_id"] == "assignment-17"
+    assert broadcast.payload["revision_id"] == "revision-2"
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"student": "student-1"},
+        {"source_pr_number": 17},
+        {"source_assignment_id": "assignment-17"},
+        {"repo": "other/widgets"},
+        {"pr_number": 18},
+        {"assignment_id": "another-assignment"},
+        {"updated_at": "2026-07-29T18:02:00Z"},
+        {"author": "impostor"},
+        {"body_prefix": "Copied from elsewhere:\n"},
+        {"body_suffix": "\n<!-- senpai-result:v1 {} -->"},
+        {"wrong_header": True},
+    ],
+    ids=[
+        "self-student",
+        "self-pr",
+        "self-assignment",
+        "foreign-repo",
+        "wrong-pr",
+        "wrong-assignment",
+        "edited",
+        "foreign-actor",
+        "embedded-marker",
+        "extra-protocol",
+        "wrong-header",
+    ],
+)
+def test_peer_messages_require_trusted_immutable_recipient_identity(
+    monkeypatch, invalid
+):
+    invalid = dict(invalid)
+    updated_at = invalid.pop("updated_at", None)
+    author = invalid.pop("author", "morganmcg1")
+    body_prefix = invalid.pop("body_prefix", "")
+    body_suffix = invalid.pop("body_suffix", "")
+    wrong_header = invalid.pop("wrong_header", False)
+    body = body_prefix + peer_comment(**invalid) + body_suffix
+    if wrong_header:
+        body = body.replace("**STUDENT: student-2**", "**STUDENT: student-3**")
+    mailbox = student_mailbox(
+        monkeypatch,
+        feedback_responses(
+            issue_comments=[
+                feedback(
+                    106,
+                    body,
+                    author=author,
+                    association="NONE",
+                    updated_at=updated_at,
+                )
+            ]
+        ),
+    )
+
+    assert not any(event.kind == "student_pr_feedback" for event in mailbox.poll())
+
+
+@pytest.mark.parametrize("after_restart", [False, True])
+@pytest.mark.parametrize("broadcast_id", [None, "handoff-discovery"])
+def test_conflicting_peer_comment_identity_does_not_deliver_changed_body(
+    monkeypatch, tmp_path, after_restart, broadcast_id,
+):
+    fields = {"broadcast_id": broadcast_id} if broadcast_id else {}
+    first = peer_comment(**fields)
+    comments = [feedback(106, first)]
+    responses = feedback_responses(issue_comments=comments)
+    comments = next(iter(responses.values()))
+    ledger = tmp_path / "feedback.json"
+    mailbox = student_mailbox(
+        monkeypatch,
+        responses,
+        feedback_path=ledger,
+    )
+    if after_restart:
+        event = next(event for event in mailbox.poll() if event.kind == "student_pr_feedback")
+        mailbox.acknowledge((event.dedupe_key,))
+        comments.clear()
+        mailbox = student_mailbox(monkeypatch, responses, feedback_path=ledger)
+    comments.append(feedback(107, first.replace("ready to copy", "not ready to copy")))
 
     assert not any(event.kind == "student_pr_feedback" for event in mailbox.poll())
 

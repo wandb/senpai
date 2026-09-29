@@ -177,6 +177,31 @@ class PostAssignmentCommentAction(Action):
     )
 
 
+class PostPeerCommentAction(Action):
+    """Send one message to a peer's current assignment PR."""
+
+    assignment: AssignmentVersion = Field(
+        description="Your own current assignment revision and PR-head precondition.",
+    )
+    target_pr_number: int = Field(
+        gt=0,
+        description="Another student's open assignment PR on the same advisor base.",
+    )
+    comment_id: str = Field(
+        min_length=1,
+        max_length=256,
+        description="Stable message ID. Exact retries are a no-op; use a new ID for new text.",
+    )
+    comment: str = Field(
+        min_length=1,
+        max_length=50_000,
+        description=(
+            "Question, source reference, finding, or reply for the peer. "
+            "The runtime adds your student name and a link to your current PR."
+        ),
+    )
+
+
 class RequestAssignmentRevisionAction(Action):
     """Start a new revision of an existing assignment on an exact research base."""
 

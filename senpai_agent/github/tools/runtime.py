@@ -29,7 +29,6 @@ from senpai_agent.models import AssignmentRecord, ExperimentResult
 
 from .contracts import (
     GitHubMutationObservation,
-    PostAssignmentCommentAction,
     PushExperimentCommitAction,
     SubmitExperimentResultAction,
 )
@@ -314,35 +313,6 @@ class SubmitExperimentResultExecutor(
             expected_head_sha=result.commit_sha,
             result=result,
         )
-
-
-class PostAssignmentCommentExecutor(
-    ToolExecutor[PostAssignmentCommentAction, GitHubMutationObservation]
-):
-    """Post one durable interim message to the student's current assignment."""
-
-    def __init__(self, runtime: GitHubToolRuntime):
-        self.runtime = runtime
-
-    def __call__(
-        self,
-        action: PostAssignmentCommentAction,
-        conversation: LocalConversation | None = None,
-    ) -> GitHubMutationObservation:
-        version = action.assignment
-        try:
-            result = self.runtime.workflow.post_assignment_comment(
-                version.pr_number,
-                assignment_id=version.assignment_id,
-                revision_id=version.revision_id,
-                expected_head_sha=version.expected_pr_head_sha,
-                student=self.runtime.current_student(),
-                comment_id=action.comment_id,
-                comment=action.comment,
-            )
-        except StaleAssignmentRevisionError as error:
-            _finish_stale_assignment_turn(error, conversation)
-        return GitHubMutationObservation.from_result(result)
 
 
 def _finish_stale_assignment_turn(

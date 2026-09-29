@@ -546,6 +546,8 @@ def test_file_agent_definitions_keep_bounded_tools_and_no_github_mutations(
         "create_assignment",
         "publish_advisor_branch",
         "post_assignment_comment",
+        "post_peer_comment",
+        "broadcast_message",
         "repair_assignment_routing",
         "send_assignment_feedback",
         "request_assignment_revision",

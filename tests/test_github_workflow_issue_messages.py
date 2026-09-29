@@ -234,7 +234,7 @@ def test_respond_to_issue_accepts_a_specific_human_comment():
         "<!-- senpai-human-response:student:fern:42 -->"
     )
     assert cast(str, fake.comments[-1]["body"]).endswith(
-        "\n\nSTUDENT: I included memory in the comparison."
+        "\n\n**STUDENT: fern**\n\nI included memory in the comparison."
     )
 
 
