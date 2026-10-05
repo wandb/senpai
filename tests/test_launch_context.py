@@ -68,7 +68,7 @@ def test_launch_context_records_resolved_runtime_facts(backend):
     assert "{{" not in context
 
 
-def test_launch_context_limits_each_role_to_its_assigned_students():
+def test_launch_context_keeps_role_identity_without_blocking_peer_source_access():
     args = launch_args(tag="bounded", advisor_branch="research")
 
     advisor = launch.build_launch_context(
@@ -91,6 +91,9 @@ def test_launch_context_limits_each_role_to_its_assigned_students():
     assert "fern, stark" in advisor
     assert "fern" not in student
     assert "stark" in student
+    assert "Read other students' PRs and branches targeting `research`" in student
+    assert "copy code, changes, or commits into their own assigned branch" in student
+    assert "Students must never modify, commit to, or push another student's branch" in student
 
 
 @pytest.mark.parametrize(

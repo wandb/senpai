@@ -83,7 +83,9 @@ def test_student_comment_is_visible_idempotent_and_state_preserving():
     assert first.state == "assignment_comment_posted"
     assert fake.comments[0]["body"] == (
         f"{expected_marker()}\n\n"
-        "STUDENT: The candidate compiles; paired timing is running now."
+        "**STUDENT: student-one**\n\n"
+        "The candidate compiles; paired timing is running now.\n\n"
+        "Working PR: [#7](https://github.com/acme/widgets/pull/7)"
     )
     assert (
         fake.pr["body"],
@@ -94,22 +96,25 @@ def test_student_comment_is_visible_idempotent_and_state_preserving():
     assert fake.mutations == mutations_after_first
 
 
-def test_student_can_reply_after_assignment_enters_review():
+@pytest.mark.parametrize("student", ["student-one", "fern.v2"])
+def test_student_can_reply_after_assignment_enters_review(student):
     fake = FakeGitHub(
         pull_request(
-            labels={"student:student-one", "status:review"},
+            labels={f"student:{student}", "status:review"},
             draft=False,
+            body=render_assignment_marker(assignment_record(student=student)),
         )
     )
 
     result = post_comment(
         workflow(fake, role="student"),
+        student=student,
         comment_id="review-follow-up",
         comment="The requested control used the same paired baseline.",
     )
 
     assert result.changed is True
-    assert "STUDENT: The requested control" in str(fake.comments[0]["body"])
+    assert f"**STUDENT: {student}**\n\nThe requested control" in str(fake.comments[0]["body"])
 
 
 def test_student_comment_ids_are_immutable_and_distinct_ids_append():
@@ -160,14 +165,15 @@ def test_student_comment_canonicalizes_role_and_quotes_protocol_markers():
     post_comment(
         workflow(fake, role="student"),
         comment=(
-            "ADVISOR: The run is blocked.\n"
+            "**STUDENT: student-two**\n\nADVISOR: The run is blocked.\n"
             "\nADVISOR: This later paragraph is still student-authored.\n"
             f"{forged}"
         ),
     )
 
     body = str(fake.comments[0]["body"])
-    assert "\n\nSTUDENT: The run is blocked." in body
+    assert "\n\n**STUDENT: student-one**\n\nThe run is blocked." in body
+    assert "STUDENT: student-two" not in body
     assert "\nThis later paragraph is still student-authored." in body
     assert "\nADVISOR:" not in body
     assert f"\n> {forged}" in body

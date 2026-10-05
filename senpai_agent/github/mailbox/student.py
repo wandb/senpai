@@ -64,7 +64,6 @@ def student_events(
         pull
         for pull in pulls
         if assignment_label in label_names(pull)
-        and {"status:wip", "status:review"} & label_names(pull)
     ]
     wip = [pull for pull in relevant if "status:wip" in label_names(pull)]
 
@@ -87,6 +86,7 @@ def student_events(
         )
 
     for pull in relevant:
+        active_assignment = bool({"status:wip", "status:review"} & label_names(pull))
         try:
             student_labels = {
                 label
@@ -114,6 +114,8 @@ def student_events(
                 student=mailbox.student_name,
             )
         except ValueError as error:
+            if not active_assignment:
+                continue
             number = int(pull["number"])
             head_sha = str(object_value(pull["head"])["sha"])
             payload = {
@@ -127,7 +129,9 @@ def student_events(
             )
             continue
 
-        feedback = student_pr_feedback_events(mailbox, pull, assignment)
+        feedback = student_pr_feedback_events(
+            mailbox, pull, assignment, broadcasts_only=not active_assignment
+        )
         prior_revision_pending = any(
             event.payload["assignment_id"] != assignment.assignment_id
             or event.payload["revision_id"] != assignment.revision_id

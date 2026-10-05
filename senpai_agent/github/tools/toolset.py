@@ -10,6 +10,7 @@ from openhands.sdk.tool import ToolDefinition
 
 from senpai_agent.github.workflow import GitHubWorkflow
 
+from .broadcast import BroadcastMessageTool
 from .definitions import (
     AcceptResultOnCurrentBaseTool,
     CloseExperimentTool,
@@ -17,6 +18,7 @@ from .definitions import (
     CreateHumanIssueTool,
     MergeExperimentTool,
     PostAssignmentCommentTool,
+    PostPeerCommentTool,
     PublishAdvisorBranchTool,
     PushExperimentCommitTool,
     RepairAssignmentRoutingTool,
@@ -107,6 +109,8 @@ class GitHubWorkflowToolSet(
             return (
                 *common,
                 *PostAssignmentCommentTool.create(runtime),
+                *PostPeerCommentTool.create(runtime),
+                *BroadcastMessageTool.create(runtime),
                 *PushExperimentCommitTool.create(runtime),
                 *SubmitExperimentResultTool.create(runtime),
             )

@@ -22,16 +22,21 @@ the current role:
   `repair_assignment_routing`, `send_assignment_feedback`,
   `request_assignment_revision`, `accept_result_on_current_base`,
   `merge_experiment`, and `close_experiment`;
-- students receive `post_assignment_comment` and `submit_experiment_result`; and
-- both roles receive `get_prs` and `respond_to_human_issue`.
+- students receive `push_experiment_commit`, `post_assignment_comment`,
+  `post_peer_comment`, and `submit_experiment_result`; and
+- both roles receive `get_prs`, `get_pr_source`, `create_human_issue`, and
+  `respond_to_human_issue`.
 
 Each tool has one operation-specific schema without a union wrapper and a
 complete model-facing description. The
 skills in this plugin explain when to use those tools and provide workflow
 examples; they do not implement mutations or carry credentials. The plugin has
-no MCP server. The Python runtime binds the authenticated role and adds the
-canonical `ADVISOR:` or `STUDENT:` prefix to Senpai-authored GitHub comments;
-tool payloads contain only the unprefixed message text.
+no MCP server. The Python runtime binds the authenticated role and adds an
+`ADVISOR:` prefix or a `**STUDENT: <student_name>**` header followed by a blank
+line to Senpai-authored GitHub comments. Tool payloads contain only the
+unprefixed message text. Assignment and peer comments also link the student's
+current PR. Students use `post_peer_comment` to discuss another student's work
+and reply on the sender's PR.
 
 Keep every Senpai-owned skill used by a live advisor or student here rather
 than relying on a provider's user skill directory. Target repositories may

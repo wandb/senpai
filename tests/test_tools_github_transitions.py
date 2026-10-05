@@ -10,6 +10,8 @@ from senpai_agent.github.tools import (
     AcceptResultOnCurrentBaseAction,
     AcceptResultOnCurrentBaseTool,
     AssignmentVersion,
+    BroadcastMessageAction,
+    BroadcastMessageTool,
     CloseExperimentAction,
     CloseExperimentTool,
     CreateAssignmentAction,
@@ -19,6 +21,8 @@ from senpai_agent.github.tools import (
     MergeExperimentTool,
     PostAssignmentCommentAction,
     PostAssignmentCommentTool,
+    PostPeerCommentAction,
+    PostPeerCommentTool,
     PublishAdvisorBranchAction,
     PublishAdvisorBranchTool,
     RepairAssignmentRoutingAction,
@@ -28,7 +32,12 @@ from senpai_agent.github.tools import (
     SendAssignmentFeedbackAction,
     SendAssignmentFeedbackTool,
 )
-from senpai_agent.github.workflow import MutationResult, StaleAssignmentRevisionError
+from senpai_agent.github.workflow import (
+    MutationResult,
+    ReconciliationError,
+    StaleAssignmentRevisionError,
+)
+from senpai_agent.github.workflow.responses import BroadcastResult
 from senpai_agent.models import DispositionRecord, render_disposition_marker
 
 
@@ -76,13 +85,14 @@ def student_runtime(
     workspace: Path,
     *,
     student_name: str | None = "student-one",
+    advisor_branch: str | None = "advisor-branch",
 ) -> GitHubToolRuntime:
     return GitHubToolRuntime(
         workflow=workflow,
         workspace=workspace,
         git_token=None,
         role="student",
-        advisor_branch=None,
+        advisor_branch=advisor_branch,
         student_names=frozenset(),
         student_name=student_name,
     )
@@ -97,22 +107,42 @@ def assignment() -> AssignmentVersion:
     )
 
 
-def test_student_comment_binds_runtime_student_and_exact_assignment(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("tool_type", "action_type", "method", "target"),
+    [
+        (
+            PostAssignmentCommentTool,
+            PostAssignmentCommentAction,
+            "post_assignment_comment",
+            {},
+        ),
+        (
+            PostPeerCommentTool,
+            PostPeerCommentAction,
+            "post_peer_comment",
+            {"target_pr_number": 18},
+        ),
+    ],
+)
+def test_student_comment_binds_runtime_student_and_exact_assignment(
+    tmp_path: Path, tool_type, action_type, method, target
+):
     workflow = RecordingWorkflow()
-    tool = PostAssignmentCommentTool.create(student_runtime(workflow, tmp_path))[0]
+    tool = tool_type.create(student_runtime(workflow, tmp_path))[0]
 
     observation = tool(
-        PostAssignmentCommentAction(
+        action_type(
             assignment=assignment(),
             comment_id="paired-run-started",
             comment="The paired run has started.",
+            **target,
         )
     )
 
-    assert observation.state == "post_assignment_comment"
+    assert observation.state == method
     assert workflow.calls == [
         (
-            "post_assignment_comment",
+            method,
             17,
             {
                 "assignment_id": "assignment-17",
@@ -121,23 +151,54 @@ def test_student_comment_binds_runtime_student_and_exact_assignment(tmp_path: Pa
                 "student": "student-one",
                 "comment_id": "paired-run-started",
                 "comment": "The paired run has started.",
+                **target,
+                **({"advisor_branch": "advisor-branch"} if target else {}),
             },
         )
     ]
 
 
-def test_student_comment_requires_configured_student_before_mutation(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("tool_type", "action_type", "target", "runtime_options", "error"),
+    [
+        (
+            PostAssignmentCommentTool,
+            PostAssignmentCommentAction,
+            {},
+            {"student_name": None},
+            "student name",
+        ),
+        (
+            PostPeerCommentTool,
+            PostPeerCommentAction,
+            {"target_pr_number": 18},
+            {"student_name": None},
+            "student name",
+        ),
+        (
+            PostPeerCommentTool,
+            PostPeerCommentAction,
+            {"target_pr_number": 18},
+            {"advisor_branch": None},
+            "advisor branch",
+        ),
+    ],
+)
+def test_student_comment_requires_configured_identity_before_mutation(
+    tmp_path: Path, tool_type, action_type, target, runtime_options, error
+):
     workflow = RecordingWorkflow()
-    tool = PostAssignmentCommentTool.create(
-        student_runtime(workflow, tmp_path, student_name=None)
+    tool = tool_type.create(
+        student_runtime(workflow, tmp_path, **runtime_options)
     )[0]
 
-    with pytest.raises(RuntimeError, match="student name"):
+    with pytest.raises(RuntimeError, match=error):
         tool(
-            PostAssignmentCommentAction(
+            action_type(
                 assignment=assignment(),
                 comment_id="blocked",
                 comment="The experiment is blocked.",
+                **target,
             )
         )
 
@@ -170,6 +231,54 @@ def test_stale_student_comment_finishes_the_obsolete_conversation(tmp_path: Path
 
     assert conversation.state.execution_status is ConversationExecutionStatus.FINISHED
     assert [call[0] for call in workflow.calls] == ["post_assignment_comment"]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (StaleAssignmentRevisionError, ConversationExecutionStatus.FINISHED),
+        (ReconciliationError, ConversationExecutionStatus.RUNNING),
+    ],
+    ids=("sender-reassigned", "recipient-reassigned"),
+)
+@pytest.mark.parametrize(
+    ("tool_type", "action_type", "fields"),
+    [
+        (
+            PostPeerCommentTool,
+            PostPeerCommentAction,
+            {
+                "target_pr_number": 18,
+                "comment_id": "stale-peer-message",
+                "comment": "This question requires the current assignment.",
+            },
+        ),
+        (
+            BroadcastMessageTool,
+            BroadcastMessageAction,
+            {"broadcast_id": "stale-discovery", "message": "A discovery."},
+        ),
+    ],
+)
+def test_student_peer_tools_only_finish_a_stale_sender_turn(
+    tmp_path, error, expected_status, tool_type, action_type, fields
+):
+    class ChangedWorkflow(RecordingWorkflow):
+        def post_peer_comment(self, number, **kwargs):
+            raise error("assignment changed while posting comment")
+
+        def broadcast_message(self, number, **kwargs):
+            raise error("assignment changed while broadcasting discovery")
+
+    tool = tool_type.create(student_runtime(ChangedWorkflow(), tmp_path))[0]
+    conversation = SimpleNamespace(
+        state=SimpleNamespace(execution_status=ConversationExecutionStatus.RUNNING)
+    )
+
+    with pytest.raises(ValueError if error is StaleAssignmentRevisionError else error):
+        tool(action_type(assignment=assignment(), **fields), conversation)
+
+    assert conversation.state.execution_status is expected_status
 
 
 def test_create_assignment_uses_the_created_branch_head_for_the_pr(
@@ -419,3 +528,68 @@ def test_assignment_tools_forward_one_exact_assignment_version(
         assert fields["revision_id"] == "revision-1"
     for key, value in expected.items():
         assert fields[key] == value
+
+
+class RecordingBroadcastWorkflow(RecordingWorkflow):
+    def broadcast_message(self, number, **kwargs):
+        self.calls.append(("broadcast_message", number, kwargs))
+        return BroadcastResult(
+            changed=True,
+            resource_url=f"https://github.test/pull/{number}#issuecomment-1",
+            state="broadcast_posted",
+            version=kwargs["expected_head_sha"],
+            delivered_pr_numbers=(18, 19),
+        )
+
+
+def test_broadcast_tool_binds_runtime_identity_and_returns_delivery_receipt(tmp_path):
+    workflow = RecordingBroadcastWorkflow()
+    tool = BroadcastMessageTool.create(student_runtime(workflow, tmp_path))[0]
+
+    observation = tool(
+        BroadcastMessageAction(
+            assignment=assignment(),
+            broadcast_id="shared-discovery",
+            message="Checkpoint resumes omit optimizer state. See the working PR.",
+        )
+    )
+
+    assert observation.delivered_pr_numbers == (18, 19)
+    assert observation.changed is True
+    assert observation.resource_url == "https://github.test/pull/17#issuecomment-1"
+    assert workflow.calls == [
+        (
+            "broadcast_message",
+            17,
+            {
+                "assignment_id": "assignment-17",
+                "revision_id": "revision-1",
+                "expected_head_sha": "a" * 40,
+                "student": "student-one",
+                "advisor_branch": "advisor-branch",
+                "broadcast_id": "shared-discovery",
+                "message": "Checkpoint resumes omit optimizer state. See the working PR.",
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("options", "error"),
+    [
+        ({"student_name": None}, "student name"),
+        ({"advisor_branch": None}, "advisor branch"),
+    ],
+)
+def test_broadcast_requires_runtime_identity_before_publication(tmp_path, options, error):
+    workflow = RecordingBroadcastWorkflow()
+    tool = BroadcastMessageTool.create(student_runtime(workflow, tmp_path, **options))[0]
+
+    with pytest.raises(RuntimeError, match=error):
+        tool(
+            BroadcastMessageAction(
+                assignment=assignment(), broadcast_id="discovery", message="A finding."
+            )
+        )
+
+    assert workflow.calls == []

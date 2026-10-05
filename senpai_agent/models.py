@@ -21,6 +21,7 @@ class Contract(BaseModel):
 
 
 _NonEmptyString = Annotated[str, Field(min_length=1)]
+MAX_BROADCAST_MESSAGE_CHARS = 1_500
 
 
 class AssignmentKey(Contract):
@@ -108,6 +109,22 @@ class AssignmentCommentRecord(Contract):
     revision_id: _NonEmptyString
     student: _NonEmptyString
     comment_id: _NonEmptyString
+
+
+class StudentPeerCommentRecord(Contract):
+    """One immutable message between two student assignment revisions."""
+
+    schema_version: Literal[1] = 1
+    repo: _NonEmptyString
+    pr_number: int = Field(gt=0)
+    assignment_id: _NonEmptyString
+    revision_id: _NonEmptyString
+    student: _NonEmptyString
+    source_pr_number: int = Field(gt=0)
+    source_assignment_id: _NonEmptyString
+    source_revision_id: _NonEmptyString
+    comment_id: _NonEmptyString
+    broadcast_id: Annotated[str, Field(min_length=1, max_length=256)] | None = None
 
 
 class ResearchBaseAcceptanceRecord(Contract):
@@ -246,6 +263,11 @@ _ASSIGNMENT_COMMENT_MARKER = re.compile(
     r"<!-- senpai-assignment-comment:v(?P<version>[0-9]+) "
     r"(?P<payload>\{.*\}) -->"
 )
+_STUDENT_PEER_COMMENT_PREFIX = "<!-- senpai-student-peer-comment:"
+_STUDENT_PEER_COMMENT_MARKER = re.compile(
+    r"<!-- senpai-student-peer-comment:v(?P<version>[0-9]+) "
+    r"(?P<payload>\{.*\}) -->"
+)
 _RESEARCH_BASE_ACCEPTANCE_PREFIX = "<!-- senpai-research-base-acceptance:"
 _RESEARCH_BASE_ACCEPTANCE_MARKER = re.compile(
     r"<!-- senpai-research-base-acceptance:v(?P<version>[0-9]+) "
@@ -253,9 +275,9 @@ _RESEARCH_BASE_ACCEPTANCE_MARKER = re.compile(
 )
 
 
-def _marker_payload(value: Contract) -> str:
+def _marker_payload(value: Contract, *, exclude_none: bool = False) -> str:
     return json.dumps(
-        value.model_dump(mode="json"),
+        value.model_dump(mode="json", exclude_none=exclude_none),
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
@@ -296,6 +318,13 @@ def render_assignment_feedback_marker(feedback: AssignmentFeedbackRecord) -> str
 
 def render_assignment_comment_marker(comment: AssignmentCommentRecord) -> str:
     return f"<!-- senpai-assignment-comment:v1 {_marker_payload(comment)} -->"
+
+
+def render_student_peer_comment_marker(comment: StudentPeerCommentRecord) -> str:
+    return (
+        "<!-- senpai-student-peer-comment:v1 "
+        f"{_marker_payload(comment, exclude_none=True)} -->"
+    )
 
 
 _MarkerContract = TypeVar("_MarkerContract", bound=Contract)
@@ -349,6 +378,18 @@ def parse_assignment_feedback_markers(
         pattern=_ASSIGNMENT_FEEDBACK_MARKER,
         contract=AssignmentFeedbackRecord,
         name="assignment feedback",
+    )
+
+
+def parse_student_peer_comment_markers(
+    body: str,
+) -> tuple[StudentPeerCommentRecord, ...]:
+    return _parse_contract_markers(
+        body,
+        prefix=_STUDENT_PEER_COMMENT_PREFIX,
+        pattern=_STUDENT_PEER_COMMENT_MARKER,
+        contract=StudentPeerCommentRecord,
+        name="student peer comment",
     )
 
 

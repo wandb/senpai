@@ -25,6 +25,7 @@ from .contracts import (
     GitHubMutationObservation,
     MergeExperimentAction,
     PostAssignmentCommentAction,
+    PostPeerCommentAction,
     PublishAdvisorBranchAction,
     PushExperimentCommitAction,
     RepairAssignmentRoutingAction,
@@ -35,11 +36,11 @@ from .contracts import (
 )
 from .runtime import (
     GitHubToolRuntime,
-    PostAssignmentCommentExecutor,
     PushExperimentCommitExecutor,
     SubmitExperimentResultExecutor,
     tool_annotations,
 )
+from .student_comments import PostAssignmentCommentExecutor, PostPeerCommentExecutor
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation import LocalConversation
@@ -312,4 +313,24 @@ class PostAssignmentCommentTool(
             "question, blocker, evidence item, or response on this student's "
             "current assignment without pushing or changing workflow state.",
             PostAssignmentCommentExecutor(runtime),
+        )
+
+
+class PostPeerCommentTool(
+    ToolDefinition[PostPeerCommentAction, GitHubMutationObservation]
+):
+    """Send one student message to a peer's assignment PR."""
+
+    @classmethod
+    def create(cls, runtime: GitHubToolRuntime) -> Sequence[Self]:
+        return _tool(
+            cls,
+            PostPeerCommentAction,
+            "Post peer comment",
+            "Post or exactly replay a question, finding, source reference, or reply "
+            "on another student's open assignment PR on the same advisor base. "
+            "The runtime adds your student name and current PR link, then delivers "
+            "the message to the assigned student without changing branches or PR state. "
+            "Use your own assignment as the sender and the peer's PR as the target.",
+            PostPeerCommentExecutor(runtime),
         )

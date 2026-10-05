@@ -44,6 +44,7 @@ class CommentsMixin:
         body: str,
         conflict_message: str | None = None,
         exact_conflict: bool = False,
+        student: str | None = None,
     ) -> tuple[bool, IssueComment]:
         return self._upsert_comment(
             number,
@@ -53,6 +54,7 @@ class CommentsMixin:
             desired_state="marker comment",
             conflict_message=conflict_message,
             exact_conflict=exact_conflict,
+            student=student,
         )
 
     def _upsert_result_comment(
@@ -62,7 +64,9 @@ class CommentsMixin:
         result: ExperimentResult,
     ) -> tuple[bool, IssueComment]:
         assignment_id = result.assignment.assignment_id
-        body = role_prefixed_comment(render_result_comment(result), self._role)
+        body = role_prefixed_comment(
+            render_result_comment(result), self._role, student=result.assignment.student
+        )
         existing = tuple(
             match
             for match in self._result_comments(number, assignment_id)
@@ -142,14 +146,15 @@ class CommentsMixin:
         desired_state: str,
         conflict_message: str | None = None,
         exact_conflict: bool = False,
+        student: str | None = None,
     ) -> tuple[bool, IssueComment]:
-        body = role_prefixed_comment(body, self._role)
+        body = role_prefixed_comment(body, self._role, student=student)
         existing = matches()
         if len(existing) > 1:
             raise ReconciliationError(f"GitHub contains multiple {subject}")
         existing_body = existing[0].body if existing else None
         if existing_body is not None and not exact_conflict:
-            existing_body = role_prefixed_comment(existing_body, self._role)
+            existing_body = role_prefixed_comment(existing_body, self._role, student=student)
         if (
             conflict_message is not None
             and existing
