@@ -100,7 +100,7 @@ def merge_case(tmp_path, monkeypatch):
         tmp_path,
         workspace=workspace,
         child=True,
-        agent_name="explore",
+        agent_name="supervisor",
         model="anthropic/claude-sonnet-5",
         smart_model="openai/gpt-6-astra",
         smart_api_key_env="OPENAI_API_KEY",
@@ -362,8 +362,8 @@ def test_worker_requires_native_structured_review_in_one_private_conversation(
             suffix = agent.agent_context.system_message_suffix
             assert "research/program.md" in suffix
             assert program_content.strip() in suffix
-            assert "target program below instructs the research agents" in suffix
-            assert "not an assignment to conduct experiments or judge scientific validity" in suffix
+            assert "independent Supervisor" in suffix
+            assert "does not assign you the advisor or student role" in suffix
             specs = [tool for tool in agent.tools if tool.name == "FinishTool"]
             assert len(specs) == 1
             assert "FinishTool" not in agent.include_default_tools
@@ -427,7 +427,7 @@ def test_worker_requires_native_structured_review_in_one_private_conversation(
     monkeypatch.setattr(merge_worker, "finish_weave_monitoring", lambda: None)
 
     status = merge_worker.main([
-        "--child", "--agent", "explore", "--max-turns", "1",
+        "--child", "--agent", "supervisor", "--max-turns", "1",
         "--model", "anthropic/claude-opus-5-5", "--reasoning-effort", "xhigh",
         "--workspace", str(merge_case.config.workspace),
         "--state-dir", str(tmp_path / "worker-state"),

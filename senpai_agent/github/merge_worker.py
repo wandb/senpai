@@ -111,8 +111,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             scrub_github_credentials(os.environ)
             runtime_environment = {**os.environ, **credentials}
             args = parse_runner_args(argv)
-            if not args.child or args.agent != "explore":
-                raise RuntimeError("merge worker requires an explore child agent")
+            if not args.child or args.agent != "supervisor":
+                raise RuntimeError("merge worker requires a supervisor child agent")
             config = resolve_config(args, runtime_environment)
             del runtime_environment, credentials
             scrub_model_credentials(os.environ, config)

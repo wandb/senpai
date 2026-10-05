@@ -666,6 +666,19 @@ cannot run this checkout.
 
 ## Subagents
 
+The [Supervisor](.agents/agents/supervisor.md) runs on demand for final merge
+reviews and local repairs. `request_supervisor` routes a repair to the advisor
+or a student through a GitHub Issue. The target controller pauses normal turns,
+starts a fresh `smart` agent, and returns actionable feedback to the requester.
+Context includes the research program, failure details, and selected PR bodies
+and discussions across roles, without inherited conversation history.
+
+Repairs require idle training and no other active subagents. They preserve the
+checkout and check the assignment and PR head before resuming work. Supervisor
+tools have the pod user's local file access, not a filesystem sandbox. No new
+Kubernetes permissions or GitHub credentials are given to the model. A dead
+controller or a Senpai runtime change still requires operational recovery.
+
 `spawn_agents` launches a batch and immediately returns stable task IDs;
 `await_agents` collects them with an `all`, `first`, `quorum`, or any-state
 `change` join; `change` also surfaces an uncollected terminal result

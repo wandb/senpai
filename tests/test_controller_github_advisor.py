@@ -545,6 +545,8 @@ def test_advisor_receives_every_trusted_human_pr_comment_and_student_message(
     reads = []
 
     def objects(url):
+        if "/comments" not in url:
+            return []
         reads.append(url)
         return list(visible_comments)
 
@@ -586,6 +588,8 @@ def test_student_and_human_parsers_share_a_failed_comment_read(monkeypatch):
     reads = []
 
     def objects(url):
+        if "/comments" not in url:
+            return []
         reads.append(url)
         raise GitHubReadError("temporary issue-comment failure")
 
@@ -1383,7 +1387,7 @@ def test_wip_base_change_shares_the_single_student_comment_read(monkeypatch):
     monkeypatch.setattr(
         advisor._github,
         "objects",
-        lambda url: comment_reads.append(url) or [],
+        lambda url: (comment_reads.append(url) or []) if "/comments" in url else [],
     )
 
     assert "research_base_changed" in {event.kind for event in advisor.poll()}

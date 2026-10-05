@@ -11,6 +11,7 @@ from urllib.parse import quote, urlencode
 from pydantic import SecretStr
 
 from senpai_agent.github.http import GitHubReadError, GitHubReader
+from senpai_agent.github.supervision import supervisor_events
 from senpai_agent.mailbox import ControllerEvent
 from .advisor import advisor_events
 from .ledger import acknowledge_feedback
@@ -75,8 +76,10 @@ class GitHubMailbox:
         pulls = self._authorized_pulls(self._pulls())
         issues = self._issues() if self.human_issues_enabled else ()
         if self.role == "advisor":
-            return advisor_events(self, pulls, issues)
-        return student_events(self, pulls, issues)
+            events = advisor_events(self, pulls, issues)
+        else:
+            events = student_events(self, pulls, issues)
+        return (*events, *supervisor_events(self))
 
     def acknowledge(self, dedupe_keys: Sequence[str]) -> None:
         """Mark persisted feedback delivered after a successful controller turn."""

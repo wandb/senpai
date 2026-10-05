@@ -409,6 +409,7 @@ def test_markdown_agents_register_and_construct_with_the_native_loader(tmp_path)
             "general-purpose",
             "explore",
             "search",
+            "supervisor",
         }
         definitions = {
             definition.name: definition
@@ -524,6 +525,13 @@ def test_subagents_receive_skills_from_the_runtime_plugin(
             {"senpai_exa", "terminal", "file_editor"},
             set(),
         ),
+        (
+            "supervisor.md",
+            "supervisor",
+            None,
+            {"terminal", "file_editor", "task_tracker"},
+            set(),
+        ),
     ],
 )
 def test_file_agent_definitions_keep_bounded_tools_and_no_github_mutations(
@@ -555,6 +563,7 @@ def test_file_agent_definitions_keep_bounded_tools_and_no_github_mutations(
         "close_experiment",
         "create_human_issue",
         "respond_to_human_issue",
+        "request_supervisor",
         "submit_experiment_result",
     }.isdisjoint(definition.tools)
 

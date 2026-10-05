@@ -454,10 +454,11 @@ def test_active_watcher_retries_after_a_transient_github_read_error(
     assert "SENPAI_GITHUB_WATCHER_POLL_ERROR" in capsys.readouterr().err
 
 
-def test_active_watcher_does_not_queue_student_availability(tmp_path: Path):
+@pytest.mark.parametrize("kind", ["student_available_for_assignment", "supervisor_requested"])
+def test_active_watcher_leaves_controller_events_for_foreground_poll(tmp_path: Path, kind):
     event = ControllerEvent(
-        kind="student_available_for_assignment",
-        dedupe_key="student_available_for_assignment:Fern",
+        kind=kind,
+        dedupe_key=f"{kind}:Fern",
         payload={"student": "Fern"},
     )
 

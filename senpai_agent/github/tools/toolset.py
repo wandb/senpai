@@ -53,6 +53,8 @@ class GitHubWorkflowToolSet(
         student_name: str | None = None,
         event_db_path: str | Path | None = None,
     ) -> Sequence[ToolDefinition]:
+        from senpai_agent.github.supervision import RequestSupervisorTool
+
         role = role or os.environ.get("SENPAI_ROLE")
         if role not in {"advisor", "student"}:
             raise ValueError("role must be advisor or student")
@@ -100,6 +102,7 @@ class GitHubWorkflowToolSet(
             runtime.current_student()
 
         common = (
+            *RequestSupervisorTool.create(runtime),
             *GetPRSourceTool.create(state_dir=state_dir, workspace=workspace),
             *GetPRsTool.create(
                 conv_state,

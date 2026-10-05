@@ -25,9 +25,9 @@ from senpai_agent.github.workflow.errors import WorkflowPreconditionError
 from senpai_agent.github.workflow.responses import PullRequestSnapshot
 from senpai_agent.PROMPTS import (
     CODE_QUALITY_REVIEW_PROMPT,
-    CODE_QUALITY_REVIEW_ROLE_PROMPT,
     render_prompt,
 )
+from senpai_agent.supervisor_worker import supervisor_config
 
 if TYPE_CHECKING:
     from senpai_agent.openhands_runner import RunnerConfig
@@ -112,16 +112,8 @@ def review_code_quality(
         status = run_openhands(
             prompt,
             replace(
-                config,
+                supervisor_config(config),
                 workspace=repository,
-                instructions=replace(
-                    config.instructions, role=CODE_QUALITY_REVIEW_ROLE_PROMPT,
-                ),
-                model=config.smart_model,
-                api_key_env=config.smart_api_key_env,
-                api_key=config.smart_api_key,
-                reasoning_effort=config.smart_reasoning_effort,
-                github_token=None,
                 delegation_task_id=None,
                 delegation_deadline_epoch=review_deadline,
             ),

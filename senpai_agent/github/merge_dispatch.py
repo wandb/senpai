@@ -14,19 +14,19 @@ from senpai_agent.delegation import (
     AgentTaskState,
     DelegationConfig,
     DelegationRequest,
-    OpenHandsChildProcess,
     SpawnAgentsAction,
     configured_delegation_config,
     configured_delegation_manager,
 )
 from senpai_agent.github.tools.contracts import MergeExperimentAction
 from senpai_agent.github.tools.runtime import current_github_credentials
+from senpai_agent.supervisor_worker import SupervisorProcess
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation import LocalConversation
 
 
-class MergeWorkerProcess(OpenHandsChildProcess):
+class MergeWorkerProcess(SupervisorProcess):
     def __init__(
         self,
         config: DelegationConfig,
@@ -47,7 +47,6 @@ class MergeWorkerProcess(OpenHandsChildProcess):
     @property
     def environment(self) -> dict[str, str]:
         environment = super().environment
-        environment.pop("SENPAI_PARENT_CONVERSATION_HISTORY_DIR", None)
         environment["SENPAI_MERGE_REQUEST_JSON"] = self._action.model_dump_json()
         return environment
 
@@ -92,7 +91,7 @@ def queue_merge(
         SpawnAgentsAction(
             batch_key=f"merge:{digest}:{attempt}",
             tasks=[AgentTask(
-                key="merge", task=task, agent="explore", model="smart",
+                key="merge", task=task, agent="supervisor", model="smart",
             )],
         ),
         conversation,

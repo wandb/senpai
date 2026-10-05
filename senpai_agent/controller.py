@@ -407,6 +407,7 @@ class Controller:
             Callable[[Sequence[ControllerEvent]], Sequence[ConversationBatch]] | None
         ) = None,
         reconcile: Callable[[Sequence[ControllerEvent]], None] | None = None,
+        supervise: Callable[[ControllerEvent], UUID | None] | None = None,
         progress: ProgressLease | None = None,
         operation_timeout_seconds: float = 300,
         turn_timeout_seconds: float = 7260,
@@ -433,6 +434,7 @@ class Controller:
         self.conversation_id = conversation_id
         self.conversation_for_events = conversation_for_events
         self.reconcile = reconcile
+        self.supervise = supervise
         self.progress = progress
         self.operation_timeout_seconds = operation_timeout_seconds
         self.turn_timeout_seconds = turn_timeout_seconds
@@ -644,6 +646,33 @@ class Controller:
                 flush=True,
             )
             return
+        requests = tuple(
+            event for event in polled if event.kind == "supervisor_requested"
+        )
+        if requests:
+            if self.supervise is None:
+                raise RuntimeError(
+                    "supervisor requests require a controller supervisor handler"
+                )
+            for event in requests:
+                try:
+                    recovered = self.supervise(event)
+                except Exception as error:  # Preserve other work and retry the open Issue.
+                    print(
+                        "SENPAI_SUPERVISOR_ERROR "
+                        f"event_key={event.dedupe_key} "
+                        f"{type(error).__name__}: {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                if recovered is not None:
+                    self._deferred_conversations.pop(recovered, None)
+            # Repair may change the checkout or remote state. Discard the old snapshot
+            # before assignment reconciliation or delivering any normal model work.
+            self._publish_progress("poll")
+            polled = self.mailbox.poll()
+        polled = tuple(event for event in polled if event.kind != "supervisor_requested")
         for event in polled:
             if event.kind == "student_assignment_comment":
                 self.inbox.require_event_payload(
@@ -965,6 +994,7 @@ def controller_main(
         close_training_runtimes,
         training_runtime,
     )
+    from senpai_agent.supervision import SupervisorHandler
     from senpai_agent.weave_monitoring import finish_weave_monitoring
 
     parser = argparse.ArgumentParser(
@@ -1021,6 +1051,7 @@ def controller_main(
     active_github_mailbox: Mailbox = github_mailbox
     conversation_selector = None
     reconcile = None
+    training = monitor_store = None
 
     if role == "advisor":
         advisor_event_store = runner_config.state_dir / "advisor-events.sqlite3"
@@ -1097,6 +1128,10 @@ def controller_main(
         ),
         conversation_for_events=conversation_selector,
         reconcile=reconcile,
+        supervise=SupervisorHandler(
+            runner_config, inbox, progress=progress,
+            training=training, monitor_store=monitor_store,
+        ),
         progress=progress,
         operation_timeout_seconds=float(
             env.get("SENPAI_CONTROLLER_OPERATION_TIMEOUT_SECONDS", "300")

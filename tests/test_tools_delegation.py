@@ -22,6 +22,7 @@ from senpai_agent.delegation import (
     CancelAgentsTool,
     DelegateAgentAction,
     DelegationConfig,
+    DelegationManager,
     DelegationRegistry,
     DelegationRequest,
     LeafAgentTask,
@@ -675,7 +676,8 @@ def test_timed_out_await_collects_results_it_already_returned(tmp_path):
     releases[1].set()
 
 
-def test_replayed_batch_reuses_task_ids_and_changed_specs_fail(tmp_path):
+@pytest.mark.parametrize("owner_only", [False, True])
+def test_replayed_batch_reuses_task_ids_and_changed_specs_fail(tmp_path, owner_only):
     release = threading.Event()
     requests: list[DelegationRequest] = []
 
@@ -694,15 +696,21 @@ def test_replayed_batch_reuses_task_ids_and_changed_specs_fail(tmp_path):
         ],
     )
 
-    first = spawn(action, parent)
-    second = spawn(action, parent)
+    if owner_only:
+        manager = DelegationManager(config(tmp_path), factory)
+        invoke = lambda requested: manager.spawn_for_owner(requested, str(parent.id))
+    else:
+        invoke = lambda requested: spawn(requested, parent).tasks
 
-    assert [task.task_id for task in first.tasks] == [
-        task.task_id for task in second.tasks
+    first = invoke(action)
+    second = invoke(action)
+
+    assert [task.task_id for task in first] == [
+        task.task_id for task in second
     ]
     assert len(requests) == 1
     with pytest.raises(ValueError, match="different task specifications"):
-        spawn(
+        invoke(
             SpawnAgentsAction(
                 batch_key="stable-operation",
                 tasks=[
@@ -711,7 +719,6 @@ def test_replayed_batch_reuses_task_ids_and_changed_specs_fail(tmp_path):
                     )
                 ],
             ),
-            parent,
         )
     release.set()
 
@@ -1656,3 +1663,50 @@ def test_context_is_copied_only_for_tasks_that_request_it(tmp_path):
         "assistant",
     ]
     assert requests[1].parent_context == ()
+
+
+def test_owner_dispatch_rejects_history_and_limits_inspection_and_cancellation(tmp_path):
+    release = threading.Event()
+    child = FakeChild(release)
+    manager = DelegationManager(config(tmp_path), lambda _request: child)
+    owner = str(uuid.uuid4())
+    action = SpawnAgentsAction(
+        batch_key="repair",
+        tasks=[AgentTask(task="Repair startup", agent="supervisor", model="smart")],
+    )
+    invalid = SpawnAgentsAction(
+        batch_key="history",
+        tasks=[AgentTask(task="Inspect", model="smart", include_context=True)],
+    )
+    with pytest.raises(ValueError, match="self-contained"):
+        manager.spawn_for_owner(invalid, owner)
+    tasks = manager.spawn_for_owner(action, owner)
+    ids = [task.task_id for task in tasks]
+    other = str(uuid.uuid4())
+    with pytest.raises(ValueError, match="only its own"):
+        manager.states_for_owner(ids, other)
+    with pytest.raises(ValueError, match="only its own"):
+        manager.cancel_for_owner(ids, other)
+    assert manager.states_for_owner(None, owner)[0].status == "running"
+    assert manager.cancel_for_owner(ids, owner)[0].status == "cancelled"
+    assert child.interrupted
+
+
+@pytest.mark.parametrize("depth", [0, 1])
+def test_spawn_cannot_bypass_supervisor_request_coordination(tmp_path, depth):
+    spawned = []
+    spawn, *_ = tools(
+        tmp_path, lambda request: spawned.append(request), depth=depth,
+        agent_name="general-purpose" if depth else None,
+        current_task_id="parent-task" if depth else None,
+    )
+    action = SpawnAgentsAction(
+        batch_key="bypass-request",
+        tasks=[AgentTask(task="Repair startup", agent="supervisor", model="smart")],
+    )
+
+    with pytest.raises(PermissionError, match="request_supervisor"):
+        spawn(action, parent_conversation())
+
+    assert not spawned
+    assert not DelegationRegistry(tmp_path / "state/delegation/tasks.sqlite3").rows()

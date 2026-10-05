@@ -36,6 +36,7 @@ def mailbox(*, role="advisor", human_issues_enabled=True):
         human_issues_enabled=human_issues_enabled,
     )
     value._has_write_permission = lambda _login: True
+    value._github.objects = lambda _endpoint: []
     return value
 
 
