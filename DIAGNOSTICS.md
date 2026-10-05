@@ -227,11 +227,12 @@ Proxy: `tokens(text) = 0` for empty text; otherwise `max(len(text) / 4, lexical 
 counts `[A-Za-z0-9_]+|[^\w\s]` matches. Providers supply no per-fragment counts.
 
 Estimate tokens from compact JSON sent to the provider. Classify a decoded copy, then scale its categories
-to the serialized token estimate. Require a positive raw sum. Multiply by `pre / sum`, round down, and assign
-the remainder to the largest scaled category. Require nonnegative integers totaling `pre`.
-Shares stay estimated; normalization absorbs images, encrypted reasoning,
-role/threading tokens, and serialization overhead. Collapsed system/schema bands suggest counting full tool
-output.
+to the serialized token estimate. For each request, sum all raw category estimates. Require a positive total.
+Multiply each category by `pre / total`. Round each value down. Assign the remainder to the largest scaled
+category. Require nonnegative integers totaling `pre`. Shares stay estimated; normalization absorbs images,
+encrypted reasoning, role and threading tokens, and serialization overhead. If the system or tool-schema
+bands collapse unexpectedly, check whether the analyzer counted complete saved output instead of the clipped
+result shown to the model.
 
 ## 9. Derive parent-visible subagent boundaries
 
@@ -299,8 +300,9 @@ change.
 (default `advisor`), `operation_name=invoke_agent`, `include_details=False`, `started_after`,
 `started_before`, `limit=1000`, `offset`. Page to `total_count` or empty. Normalize `started_at` to UTC (naive
 means UTC); enforce `start <= started_at < end`. Select verified child IDs from private uncommitted
-registry/frozen-state data. Require one non-empty `request_model` per conversation. Count each once, with
-error if any root has `status_code=ERROR`. Select each child's root `invoke_agent` spans first.
+registry/frozen-state data. Require one non-empty `request_model` per conversation. Count each conversation
+once. Count it as an errored conversation if any of its root spans has `status_code=ERROR`.
+Select each child's root `invoke_agent` spans first.
 Then group them by `request_model`. Print only aggregates.
 
 Verify the analyzed revision's `OpenHandsChildProcess` task-ID→conversation-ID rule. Without exact joins,
@@ -355,7 +357,7 @@ retaining prompts. Equal 24-hour windows showed:
 | Fable (configured Frontier provider) | 2 (20%) | 11 (22%) |
 | Finished roots; errors | 10/10; 0 | 50/50; 0 |
 | Median/p95 duration (seconds) | 623/1,182 | 589/1,323 |
-| Recursive decisions/tasks | 1/3 | 8/19 |
+| Recursive decisions; tasks | 1; 3 | 8; 19 |
 | Recursive tiers | 3 smart | 16 smart, 1 fast, 2 frontier |
 | Registry | Missing | 65 tasks: 43 direct/22 recursive; 32 frontier/22 smart/11 fast; 62 finished/3 failed at collection |
 
@@ -385,9 +387,10 @@ external systems prove execution. Report active/proven-off-branch counts separat
 `requested_at`, `student`, `category`, `category_source`, `status_at_cutoff`, `terminal_at`, `pr_number`,
 `resource_url`, `active_branch`, `source_action_event_id`, `source_observation_event_id`.
 
-Deduplicate `assignment_id`. Use action time for `requested_at`; GitHub `createdAt` requires matching PR
-URL/number and trusted marker. Attach feedback, routing repairs, revisions, publications, and submission
-retries to the assignment. Terminal requires successful `experiment_merged`/`experiment_closed` by cutoff;
+Deduplicate `assignment_id`. Use the paired `create_assignment` action time for `requested_at`.
+Replace it with GitHub `createdAt` only when the PR URL or number and the trusted assignment marker both match.
+Attach feedback, routing repairs, revisions, publications, and submission retries to the assignment.
+Terminal requires successful `experiment_merged`/`experiment_closed` by cutoff;
 otherwise active. Merge means completion, not scientific victory. Join typed `ExperimentResult.runs[].run_id`;
 runs are not points.
 
