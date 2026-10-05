@@ -24,10 +24,13 @@ from senpai_agent.kubernetes_training import (
     EXECUTOR_SOCKET_ENV,
     KubernetesApiError,
     KubernetesApiClient,
+    KubernetesCreateUnconfirmedError,
     KubernetesExecutorClient,
     _workload_shape,
 )
-from senpai_agent.training import KubernetesResourceRef, KubernetesTrainingSpec, TrainingState
+from senpai_agent.training import (
+    KubernetesResourceRef, KubernetesTrainingSpec, TrainingCapacityError, TrainingState,
+)
 
 _MAX_REQUEST_BYTES = 2 * 1024 * 1024
 _POD_RECEIPT_TIMEOUT_SECONDS = 10.0
@@ -38,11 +41,14 @@ _TRAINING_RESOURCE_NAMES = {"cpu", "memory", "nvidia.com/gpu"}
 _SOURCE_BUNDLE_MOUNT = "/var/lib/senpai-source/source.bundle"
 _WORKSPACE_MOUNT = "/workspace"
 _WORKSPACE_VOLUME = "senpai-workspace"
+_TRAINING_RUNTIME_VOLUME = "senpai-training-runtime"
+_TRAINING_RUNTIME_MOUNT = "/var/run/senpai-training"
+_TRAINING_WORKER_SCRIPT = f"{_TRAINING_RUNTIME_MOUNT}/worker.py"
 _AMBIGUOUS_CREATE_STATUS_CODES = {409, 499}
 
 
 class KubernetesExecutor:
-    """Validate and own one bounded training workload for one student."""
+    """Validate and own a student's independently reserved training workloads."""
 
     def __init__(
         self,
@@ -52,7 +58,6 @@ class KubernetesExecutor:
         namespace: str,
         nodes: int,
         gpus_per_node: int,
-        max_timeout_seconds: int,
         cpu_per_gpu: int,
         memory_gi_per_gpu: int,
         pvc_claim_name: str,
@@ -66,6 +71,7 @@ class KubernetesExecutor:
         pod_name: str,
         pod_uid: str,
         training_image: str = "",
+        training_control_image: str = "",
         image_pull_secrets: list[str] | None = None,
     ):
         self.client = client
@@ -73,7 +79,6 @@ class KubernetesExecutor:
         self.namespace = namespace
         self.nodes = nodes
         self.gpus_per_node = gpus_per_node
-        self.max_timeout_seconds = max_timeout_seconds
         self.cpu_per_gpu = cpu_per_gpu
         self.memory_gi_per_gpu = memory_gi_per_gpu
         self.pvc_claim_name = pvc_claim_name
@@ -81,6 +86,9 @@ class KubernetesExecutor:
         self.snapshot_root = snapshot_root
         self.executor_image = executor_image
         self.training_image = training_image
+        self.training_control_image = training_control_image
+        if training_image and not training_control_image:
+            raise ValueError("a configured training image requires the official control image")
         self.image_pull_secrets = image_pull_secrets or []
         self.launch_secret_name = launch_secret_name
         self.wandb_tags = wandb_tags
@@ -89,9 +97,13 @@ class KubernetesExecutor:
         self.pod_name = pod_name
         self.pod_uid = pod_uid
         self._lock = threading.Lock()
-        self._reservation = (
-            json.loads(state_path.read_text()) if state_path.exists() else None
-        )
+        saved = json.loads(state_path.read_text()) if state_path.exists() else {}
+        if saved and "training_id" in saved:
+            # Preserve ownership when upgrading a running single-reservation executor.
+            saved = {"reservations": {saved["training_id"]: {
+                **saved, "nodes": self.nodes, "gpus_per_node": self.gpus_per_node,
+            }}}
+        self._reservations = saved.get("reservations", {})
         self.reconcile()
 
     def handle(self, request: dict) -> object:
@@ -105,36 +117,35 @@ class KubernetesExecutor:
                 return self._apply(request["manifest"])
             if operation in {"resource", "resource_identity"}:
                 spec = KubernetesTrainingSpec.model_validate(request["spec"])
-                self._require_spec(spec)
+                if operation == "resource_identity" and not any(
+                    (saved["spec"]["kind"], saved["spec"]["name"], saved["spec"]["namespace"])
+                    == (spec.kind, spec.name, spec.namespace)
+                    for saved in self._reservations.values()
+                ):
+                    return None
+                reservation = self._require_spec(spec)
                 if operation == "resource" and (
                     int(request["nodes"]), int(request["gpus_per_node"])
-                ) != (self.nodes, self.gpus_per_node):
-                    raise PermissionError("requested resource shape exceeds this allocation")
-                resource = self._current_resource()
+                ) != (reservation["nodes"], reservation["gpus_per_node"]):
+                    raise PermissionError("requested resource shape does not match its reservation")
+                resource = self._current_resource(reservation)
                 return resource.model_dump(mode="json") if resource else None
-            if operation == "state":
-                resource = self._require_resource(request["resource"])
-                if not self._verify_current(resource):
-                    return None
-                state = self.client.state(resource)
-                return [state[0].value, state[1]] if state else None
-            if operation == "delete":
-                resource = self._require_resource(request["resource"])
-                if self._verify_current(resource):
-                    self._pod_receipt(resource, "delete", forced=True)
-                    self.client.delete(
-                        resource,
-                        min(int(request["timeout_seconds"]), 60),
-                    )
-                return None
-            if operation in {"logs", "pod_snapshot"}:
-                resource = self._require_resource(request["resource"])
-                if not self._verify_current(resource):
+            if operation in {"state", "delete", "logs", "pod_snapshot"}:
+                ref = KubernetesResourceRef.model_validate(request["resource"])
+                reservation = self._reservation_for_identity(ref.kind, ref.name, ref.namespace)
+                resource = self._require_resource(reservation, ref)
+                if not self._verify_current(reservation, resource):
                     if operation == "pod_snapshot":
                         raise RuntimeError("owned Kubernetes workload no longer exists")
                     return None
+                if operation == "state":
+                    state = self.client.state(resource)
+                    return [state[0].value, state[1]] if state else None
+                if operation == "delete":
+                    self._pod_receipt(reservation, resource, "delete", forced=True)
+                    self.client.delete(resource, min(int(request["timeout_seconds"]), 60))
+                    return None
                 if operation == "pod_snapshot":
-                    reservation = self._require_reservation()
                     identity = {
                         "training_id": reservation["training_id"],
                         "source_commit": reservation["source_commit"],
@@ -142,7 +153,8 @@ class KubernetesExecutor:
                         "captured_at": time.time(),
                     }
             if operation == "release":
-                return self._release(request["training_id"])
+                reservation = self._reservations.get(request["training_id"])
+                return self._release(reservation) if reservation is not None else {}
         if operation == "logs":
             # The API client rechecks the UID; slow log reads must not block control.
             return self.client.logs(resource)
@@ -156,46 +168,66 @@ class KubernetesExecutor:
         raise ValueError(f"unsupported executor operation {operation!r}")
 
     def reconcile(self) -> None:
-        """Recover create/persist races and reap an expired owned workload."""
-
+        """Recover create/persist races and reap each expired owned workload."""
+        failure = None
         with self._lock:
-            if self._reservation is None or self._reservation.get("released"):
-                return
-            resource = self._recorded_resource()
-            if resource is None:
-                resource = self._current_resource()
-            if resource is None and self._reservation.get("create_attempted"):
+            for reservation in self._reservations.values():
+                if reservation["released"]:
+                    continue
                 try:
-                    resource = self._create_reserved_workload(
-                        release_on_rejection=False
-                    )
-                except Exception:
-                    resource = self._current_resource()
-            if (
-                resource is not None
-                and self._reservation["activation_authorized"]
-                and not self._reservation["activated"]
-                and time.time() < self._reservation["deadline_at"]
-            ):
-                self._activate(resource)
-            if time.time() < self._reservation["deadline_at"]:
-                return
-            if resource is None and self._reservation.get("create_attempted"):
-                return
-            self._pod_receipt(resource, "deadline", forced=True)
-            if resource is not None and self._verify_current(resource):
-                self.client.delete(resource, 60)
-            self._reservation["released"] = True
-            self._write_state()
+                    self._reconcile_reservation(reservation)
+                except Exception as error:
+                    # One unavailable/replaced workload must not prevent another's cleanup.
+                    if failure is None:
+                        failure = error
+        if failure is not None:
+            raise failure
+
+    def _reconcile_reservation(self, reservation: dict) -> None:
+        resource = self._recorded_resource(reservation)
+        if resource is None:
+            resource = self._current_resource(reservation)
+        if (
+            resource is None and reservation.get("create_attempted")
+            and time.time() >= reservation.get("create_retry_at", 0)
+        ):
+            try:
+                resource = self._create_reserved_workload(reservation, release_on_rejection=False)
+            except Exception:
+                resource = self._current_resource(reservation)
+        deadline = reservation["deadline_at"]
+        if (
+            resource is not None
+            and reservation["activation_authorized"]
+            and not reservation["activated"]
+            and (deadline is None or time.time() < deadline)
+        ):
+            self._activate(reservation, resource)
+        if deadline is None or time.time() < deadline:
+            return
+        if resource is None and reservation.get("create_attempted"):
+            return
+        self._pod_receipt(reservation, resource, "deadline", forced=True)
+        if resource is not None and self._verify_current(reservation, resource):
+            self.client.delete(resource, 60)
+        reservation["released"] = True
+        self._write_state()
 
     def _reserve(self, request: dict) -> None:
         spec = KubernetesTrainingSpec.model_validate(request["spec"])
         if spec.namespace != self.namespace:
             raise ValueError(f"training namespace must be {self.namespace!r}")
-        deadline_at = float(request["deadline_at"])
-        now = time.time()
-        if not now < deadline_at <= now + self.max_timeout_seconds:
-            raise ValueError("training deadline is outside this student's configured limit")
+        nodes, gpus = int(request["nodes"]), int(request["gpus_per_node"])
+        if not 1 <= nodes <= self.nodes or not 1 <= gpus <= self.gpus_per_node:
+            raise ValueError("requested training shape exceeds this student's allocation")
+        if spec.kind != ("Job" if nodes == 1 else "MPIJob"):
+            raise ValueError("training kind does not match the requested node count")
+        deadline_at = request["deadline_at"]
+        if deadline_at is not None:
+            deadline_at = float(deadline_at)
+            now = time.time()
+            if not math.isfinite(deadline_at) or deadline_at <= now:
+                raise ValueError("training deadline must be finite and in the future")
         source_commit = str(request["source_commit"])
         source_snapshot = Path(str(request["source_snapshot"]))
         if (
@@ -203,69 +235,82 @@ class KubernetesExecutor:
             or source_snapshot != self.snapshot_root / f"{source_commit}.bundle"
         ):
             raise ValueError("training source bundle does not match its full HEAD SHA")
-        candidate = {
-            "training_id": str(request["training_id"]),
-            "spec": spec.model_dump(mode="json"),
-            "deadline_at": deadline_at,
-            "source_snapshot": str(source_snapshot),
-            "source_commit": source_commit,
-            "create_attempted": False,
-            "manifest": None,
-            "created": False,
-            "resource": None,
-            "activation_authorized": False,
-            "activated": False,
-            "released": False,
+        identity = {
+            "training_id": str(request["training_id"]), "spec": spec.model_dump(mode="json"),
+            "nodes": nodes, "gpus_per_node": gpus, "deadline_at": deadline_at,
+            "source_snapshot": str(source_snapshot), "source_commit": source_commit,
         }
-        if self._reservation is not None and not self._reservation.get("released"):
-            comparable = {
-                key: self._reservation[key]
-                for key in (
-                    "training_id",
-                    "spec",
-                    "deadline_at",
-                    "source_snapshot",
-                    "source_commit",
-                )
-            }
-            if comparable != {
-                key: candidate[key]
-                for key in comparable
-            }:
-                raise RuntimeError("this student already has an active Kubernetes training run")
+        previous = self._reservations.get(identity["training_id"])
+        if previous is not None:
+            if any(previous[key] != value for key, value in identity.items()):
+                raise RuntimeError("training ID is already bound to a different reservation")
             return
-        self._reservation = candidate
-        self._write_state()
+        if any(
+            (saved["spec"]["kind"], saved["spec"]["name"], saved["spec"]["namespace"])
+            == (spec.kind, spec.name, spec.namespace)
+            for saved in self._reservations.values()
+        ):
+            raise ValueError("Kubernetes workload identity is already reserved")
+        self._check_capacity(nodes * gpus)
+        self._reservations[identity["training_id"]] = {
+            **identity, "create_attempted": False, "manifest": None, "created": False,
+            "resource": None, "activation_authorized": False, "activated": False, "released": False,
+        }
+        try:
+            self._write_state()
+        except OSError:
+            # No remote create can precede this durable admission acknowledgement.
+            del self._reservations[identity["training_id"]]
+            raise
+
+    def _check_capacity(self, requested_gpus: int) -> None:
+        active = [reservation for reservation in self._reservations.values() if not reservation["released"]]
+        capacity = self.nodes * self.gpus_per_node
+        available = capacity - sum(run["nodes"] * run["gpus_per_node"] for run in active)
+        if requested_gpus > available:
+            raise TrainingCapacityError(
+                requested_gpus=requested_gpus, available_gpus=available, capacity_gpus=capacity,
+                active_runs=[{key: run[key] for key in (
+                    "training_id", "spec", "nodes", "gpus_per_node", "deadline_at",
+                )} for run in active],
+            )
 
     def _adopt(self, request: dict) -> None:
+        reservation = self._require_reservation(request["training_id"], active=True)
         spec = KubernetesTrainingSpec.model_validate(request["spec"])
-        self._require_spec(spec)
+        if self._require_spec(spec) is not reservation or (
+            int(request["nodes"]), int(request["gpus_per_node"])
+        ) != (reservation["nodes"], reservation["gpus_per_node"]):
+            raise PermissionError("adopted workload does not match its reservation")
         expected = KubernetesResourceRef.model_validate(request["resource"])
-        current = self._current_resource()
+        current = self._current_resource(reservation)
         if current is None or current != expected:
             raise RuntimeError("remote Kubernetes workload is missing or was replaced")
-        reservation = self._require_reservation()
         if not reservation["activation_authorized"]:
-            raise RuntimeError("the Kubernetes create outcome was not confirmed")
+            raise KubernetesCreateUnconfirmedError("the Kubernetes create outcome was not confirmed")
         if not reservation["activated"]:
-            self._activate(current)
+            self._activate(reservation, current)
 
     def _apply(self, manifest_text: str) -> str:
-        reservation = self._require_reservation(active=True)
-        current = self._current_resource()
-        if current is not None:
-            if not reservation["activation_authorized"]:
-                raise RuntimeError("the Kubernetes create outcome was not confirmed")
-            if not reservation["activated"]:
-                self._activate(current)
-            return f"{current.kind.lower()}/{current.name} unchanged\n"
-        if reservation["created"]:
-            raise RuntimeError("the reserved Kubernetes workload was already created")
-
         documents = list(yaml.safe_load_all(manifest_text))
         if len(documents) != 1 or not isinstance(documents[0], dict):
             raise ValueError("training submission must contain exactly one Kubernetes object")
         manifest = documents[0]
+        metadata = manifest.get("metadata", {})
+        reservation = self._reservation_for_identity(
+            manifest.get("kind"), metadata.get("name"), metadata.get("namespace", self.namespace),
+        )
+        self._require_reservation(reservation["training_id"], active=True)
+        current = self._current_resource(reservation)
+        if current is not None:
+            if not reservation["activation_authorized"]:
+                raise KubernetesCreateUnconfirmedError("the Kubernetes create outcome was not confirmed")
+            if not reservation["activated"]:
+                self._activate(reservation, current)
+            return f"{current.kind.lower()}/{current.name} unchanged\n"
+        if reservation["created"]:
+            raise RuntimeError("the reserved Kubernetes workload was already created")
+
         spec = KubernetesTrainingSpec.model_validate(reservation["spec"])
         metadata = manifest.get("metadata")
         if not isinstance(metadata, dict) or (
@@ -287,19 +332,28 @@ class KubernetesExecutor:
         reservation["manifest"] = manifest
         self._write_state()
         resource = self._create_reserved_workload(
-            release_on_rejection=release_on_rejection
+            reservation, release_on_rejection=release_on_rejection
         )
         reservation["activation_authorized"] = True
         self._write_state()
-        self._activate(resource)
+        self._activate(reservation, resource)
         return f"{resource.kind.lower()}/{resource.name} created\n"
 
     def _create_reserved_workload(
         self,
+        reservation: dict,
         *,
         release_on_rejection: bool,
     ) -> KubernetesResourceRef:
-        reservation = self._require_reservation(active=True)
+        self._require_reservation(reservation["training_id"], active=True)
+        now = time.time()
+        if now < reservation.get("create_retry_at", 0):
+            raise RuntimeError("Kubernetes create retry is waiting for its scheduled retry time")
+        attempts = reservation.get("create_attempts", 0) + 1
+        reservation["create_attempts"] = attempts
+        reservation["create_retry_at"] = now + min(30, 2 ** min(attempts - 1, 5))
+        # Persist before POST so executor restarts cannot reset outage backoff.
+        self._write_state()
         try:
             created = self.client.create(reservation["manifest"], self.namespace)
         except KubernetesApiError as error:
@@ -310,40 +364,39 @@ class KubernetesExecutor:
                 reservation["released"] = True
                 self._write_state()
             raise
-        return self._record_created(created)
+        return self._record_created(reservation, created)
 
-    def _activate(self, resource: KubernetesResourceRef) -> None:
-        reservation = self._require_reservation()
-        remaining = reservation["deadline_at"] - time.time()
+    def _activate(self, reservation: dict, resource: KubernetesResourceRef) -> None:
+        deadline = reservation["deadline_at"]
+        remaining = deadline - time.time() if deadline is not None else 30
         if remaining <= 0:
-            self._expire_activation(resource, "before")
+            self._expire_activation(reservation, resource, "before")
         try:
             self.client.activate(resource, min(30, remaining))
         except Exception:
-            if time.time() >= reservation["deadline_at"]:
-                self._expire_activation(resource, "during")
+            if deadline is not None and time.time() >= deadline:
+                self._expire_activation(reservation, resource, "during")
             raise
-        if time.time() >= reservation["deadline_at"]:
-            self._expire_activation(resource, "during")
+        if deadline is not None and time.time() >= deadline:
+            self._expire_activation(reservation, resource, "during")
         reservation["activated"] = True
         self._write_state()
 
     def _expire_activation(
         self,
+        reservation: dict,
         resource: KubernetesResourceRef,
         phase: str,
     ) -> Never:
-        self._pod_receipt(resource, "activation_deadline", forced=True)
+        self._pod_receipt(reservation, resource, "activation_deadline", forced=True)
         self.client.delete(resource, 60)
-        reservation = self._require_reservation()
         reservation["released"] = True
         self._write_state()
         raise TimeoutError(f"training deadline elapsed {phase} Kubernetes activation")
 
-    def _record_created(self, document: dict) -> KubernetesResourceRef:
-        self._validate_owned_document(document)
+    def _record_created(self, reservation: dict, document: dict) -> KubernetesResourceRef:
+        self._validate_owned_document(reservation, document)
         resource = self._resource_from_document(document)
-        reservation = self._require_reservation()
         reservation["created"] = True
         reservation["manifest"] = None
         reservation["resource"] = resource.model_dump(mode="json")
@@ -375,18 +428,26 @@ class KubernetesExecutor:
             }
         ]
 
-        remaining = max(1, int(reservation["deadline_at"] - time.time()))
+        deadline = reservation["deadline_at"]
+        remaining = max(1, int(deadline - time.time())) if deadline is not None else None
+        nodes, gpus = reservation["nodes"], reservation["gpus_per_node"]
         pod_specs: list[tuple[bool, dict]]
         if spec.kind == "MPIJob":
             allowed = {
                 "mpiImplementation",
                 "launcherCreationPolicy",
                 "slotsPerWorker",
+                "sshAuthMountPath",
                 "runPolicy",
                 "mpiReplicaSpecs",
             }
             if set(manifest["spec"]) - allowed:
                 raise ValueError("MPIJob contains unsupported control fields")
+            if (
+                manifest["spec"].get("sshAuthMountPath", "/home/senpai/.ssh")
+                != "/home/senpai/.ssh"
+            ):
+                raise ValueError("MPIJob SSH credentials must mount at /home/senpai/.ssh")
             replicas = manifest["spec"].get("mpiReplicaSpecs", {})
             if set(replicas) != {"Launcher", "Worker"}:
                 raise ValueError("MPIJob must contain exactly Launcher and Worker roles")
@@ -399,12 +460,12 @@ class KubernetesExecutor:
                 raise ValueError("MPIJob replica roles contain unsupported control fields")
             if (
                 int(launcher.get("replicas", 0)) != 1
-                or int(worker.get("replicas", 0)) != self.nodes
+                or int(worker.get("replicas", 0)) != nodes
                 or launcher.get("restartPolicy") != "Never"
                 or worker.get("restartPolicy") != "Never"
             ):
                 raise ValueError("MPIJob replica topology does not match this allocation")
-            if int(manifest["spec"].get("slotsPerWorker", 0)) != self.gpus_per_node:
+            if int(manifest["spec"].get("slotsPerWorker", 0)) != gpus:
                 raise ValueError("MPIJob slotsPerWorker must equal GPUs per worker")
             run_policy = manifest["spec"].setdefault("runPolicy", {})
             if set(run_policy) - {
@@ -416,7 +477,10 @@ class KubernetesExecutor:
                 "ttlSecondsAfterFinished",
             }:
                 raise ValueError("MPIJob runPolicy contains unsupported control fields")
-            run_policy["activeDeadlineSeconds"] = remaining
+            if remaining is None:
+                run_policy.pop("activeDeadlineSeconds", None)
+            else:
+                run_policy["activeDeadlineSeconds"] = remaining
             run_policy["backoffLimit"] = 0
             run_policy["cleanPodPolicy"] = "Running"
             run_policy["suspend"] = True
@@ -428,8 +492,11 @@ class KubernetesExecutor:
                 raise ValueError(
                     "MPIJob schedulingPolicy contains unsupported scheduling controls"
                 )
-            scheduling_policy["minAvailable"] = self.nodes + 1
-            scheduling_policy["scheduleTimeoutSeconds"] = remaining
+            scheduling_policy["minAvailable"] = nodes + 1
+            if remaining is None:
+                scheduling_policy.pop("scheduleTimeoutSeconds", None)
+            else:
+                scheduling_policy["scheduleTimeoutSeconds"] = remaining
             pod_specs = [
                 (False, launcher["template"]),
                 (True, worker["template"]),
@@ -448,13 +515,16 @@ class KubernetesExecutor:
             if set(manifest["spec"]) - allowed:
                 raise ValueError("Job contains unsupported control fields")
             if (
-                int(manifest["spec"].get("parallelism", 1)) != self.nodes
-                or int(manifest["spec"].get("completions", 1)) != self.nodes
+                int(manifest["spec"].get("parallelism", 1)) != nodes
+                or int(manifest["spec"].get("completions", 1)) != nodes
             ):
                 raise ValueError("Job parallelism and completions must match this allocation")
             if manifest["spec"]["template"]["spec"].get("restartPolicy") != "Never":
                 raise ValueError("Job pods must use restartPolicy Never")
-            manifest["spec"]["activeDeadlineSeconds"] = remaining
+            if remaining is None:
+                manifest["spec"].pop("activeDeadlineSeconds", None)
+            else:
+                manifest["spec"]["activeDeadlineSeconds"] = remaining
             manifest["spec"]["backoffLimit"] = 0
             manifest["spec"]["suspend"] = True
             pod_specs = [(True, manifest["spec"]["template"])]
@@ -473,7 +543,7 @@ class KubernetesExecutor:
                 labels["app"] = app
             if spec.kind == "Job":
                 labels["job-name"] = spec.name
-            if allow_gpus and self.nodes > 1:
+            if allow_gpus and nodes > 1:
                 anti_affinity = template["spec"].setdefault("affinity", {}).setdefault(
                     "podAntiAffinity", {}
                 )
@@ -494,10 +564,10 @@ class KubernetesExecutor:
             )
         if not found_key:
             raise ValueError("training must bind the launch W&B key")
-        if _workload_shape(manifest) != (self.nodes, self.gpus_per_node):
+        if _workload_shape(manifest) != (nodes, gpus):
             raise ValueError(
-                f"training must request exactly {self.nodes} nodes x "
-                f"{self.gpus_per_node} GPUs"
+                f"training must request exactly {nodes} nodes x "
+                f"{gpus} GPUs"
             )
 
     def _secure_pod_spec(
@@ -508,6 +578,7 @@ class KubernetesExecutor:
         wandb_run_id: str,
         reservation: dict,
     ) -> bool:
+        gpus = reservation["gpus_per_node"]
         forbidden_values = {
             "serviceAccountName",
             "serviceAccount",
@@ -537,7 +608,13 @@ class KubernetesExecutor:
         containers = pod_spec.get("containers", [])
         if not containers:
             raise ValueError("training pod must contain a main container")
-        self._install_source_checkout(pod_spec, containers, reservation)
+        custom_worker = bool(
+            allow_gpus and self.training_image
+            and self.training_image != self.training_control_image
+        )
+        self._install_source_checkout(
+            pod_spec, containers, reservation, custom_worker=custom_worker,
+        )
 
         for volume in pod_spec["volumes"]:
             volume_types = set(volume) - {"name"}
@@ -558,8 +635,9 @@ class KubernetesExecutor:
                 wandb_run_id=wandb_run_id,
             )
         for container in containers:
-            if self.training_image:
-                container["image"] = self.training_image
+            selected_image = self.training_image if allow_gpus else self.training_control_image
+            if selected_image:
+                container["image"] = selected_image
             self._secure_container(container, allow_gpu=allow_gpus)
             found_key |= self._secure_environment(
                 container,
@@ -569,11 +647,11 @@ class KubernetesExecutor:
 
         requested = sum(_container_gpu(container, "requests") for container in containers)
         limited = sum(_container_gpu(container, "limits") for container in containers)
-        expected = self.gpus_per_node if allow_gpus else 0
+        expected = gpus if allow_gpus else 0
         if (requested, limited) != (expected, expected):
             raise ValueError(f"pod must request and limit exactly {expected} GPU(s)")
-        cpu_cap = self.cpu_per_gpu * (self.gpus_per_node if allow_gpus else 1)
-        memory_cap = self.memory_gi_per_gpu * (self.gpus_per_node if allow_gpus else 1)
+        cpu_cap = self.cpu_per_gpu * (gpus if allow_gpus else 1)
+        memory_cap = self.memory_gi_per_gpu * (gpus if allow_gpus else 1)
         cpu_request = max(
             sum(_cpu_quantity(container, "requests") for container in containers),
             max(
@@ -608,6 +686,8 @@ class KubernetesExecutor:
         pod_spec: dict,
         containers: list[dict],
         reservation: dict,
+        *,
+        custom_worker: bool,
     ) -> None:
         source_bundle = Path(reservation["source_snapshot"])
         try:
@@ -616,7 +696,8 @@ class KubernetesExecutor:
             raise ValueError("training source bundle is outside the configured PVC") from error
 
         volumes = pod_spec.setdefault("volumes", [])
-        if any(volume.get("name") == _WORKSPACE_VOLUME for volume in volumes):
+        reserved_volumes = {_WORKSPACE_VOLUME, _TRAINING_RUNTIME_VOLUME}
+        if any(volume.get("name") in reserved_volumes for volume in volumes):
             raise ValueError("training manifest uses a reserved Senpai volume name")
         dataset_volumes = [
             volume
@@ -634,11 +715,18 @@ class KubernetesExecutor:
             )
         dataset_claim["readOnly"] = False
         volumes.append({"name": _WORKSPACE_VOLUME, "emptyDir": {}})
+        if custom_worker:
+            volumes.append({"name": _TRAINING_RUNTIME_VOLUME, "emptyDir": {}})
 
         for container in containers:
             mounts = container.setdefault("volumeMounts", [])
-            if any(mount.get("name") == _WORKSPACE_VOLUME for mount in mounts):
+            if any(mount.get("name") in reserved_volumes for mount in mounts):
                 raise ValueError("training container uses a reserved Senpai volume name")
+            if any(
+                Path(str(mount.get("mountPath", ""))).is_relative_to(_TRAINING_RUNTIME_MOUNT)
+                for mount in mounts
+            ):
+                raise ValueError("training containers may not shadow the Senpai training runtime")
             nested_workspace_mounts = [
                 mount
                 for mount in mounts
@@ -650,21 +738,26 @@ class KubernetesExecutor:
                 mount for mount in mounts if mount.get("mountPath") != _WORKSPACE_MOUNT
             ] + [{"name": _WORKSPACE_VOLUME, "mountPath": _WORKSPACE_MOUNT}]
             container["volumeMounts"] = mounts
+            if custom_worker:
+                mounts.append({
+                    "name": _TRAINING_RUNTIME_VOLUME,
+                    "mountPath": _TRAINING_RUNTIME_MOUNT,
+                    "readOnly": True,
+                })
             if _container_gpu(container, "requests") or _container_gpu(
                 container, "limits"
             ):
-                dataset_mounts = [
-                    mount
+                if not any(
+                    mount.get("name") == dataset_volume["name"]
+                    and mount.get("mountPath") == str(self.pvc_mount_path)
+                    and not mount.get("readOnly")
+                    and not mount.get("subPath")
+                    and not mount.get("subPathExpr")
                     for mount in mounts
-                    if mount.get("name") == dataset_volume["name"]
-                ]
-                if not dataset_mounts:
+                ):
                     raise ValueError(
-                        "every GPU training container must mount the dataset PVC"
-                    )
-                if all(mount.get("readOnly") is True for mount in dataset_mounts):
-                    raise ValueError(
-                        "GPU training containers must mount the dataset PVC read-write"
+                        "GPU training containers must mount the entire dataset PVC "
+                        f"read-write at {self.pvc_mount_path}"
                     )
 
         pod_spec["initContainers"] = [
@@ -689,9 +782,9 @@ class KubernetesExecutor:
                     "limits": {"cpu": "1", "memory": "2Gi"},
                 },
                 "securityContext": {
-                    "runAsNonRoot": False,
-                    "runAsUser": 0,
-                    "runAsGroup": 0,
+                    "runAsNonRoot": True,
+                    "runAsUser": 10001,
+                    "runAsGroup": 10001,
                     "readOnlyRootFilesystem": True,
                 },
                 "volumeMounts": [
@@ -705,6 +798,14 @@ class KubernetesExecutor:
                 ],
             }
         ]
+        if custom_worker:
+            checkout = pod_spec["initContainers"][0]
+            checkout["env"].append({
+                "name": "SENPAI_TRAINING_WORKER_SCRIPT", "value": _TRAINING_WORKER_SCRIPT,
+            })
+            checkout["volumeMounts"].append({
+                "name": _TRAINING_RUNTIME_VOLUME, "mountPath": _TRAINING_RUNTIME_MOUNT,
+            })
 
     @staticmethod
     def _secure_container(container: dict, *, allow_gpu: bool) -> None:
@@ -807,15 +908,14 @@ class KubernetesExecutor:
             )
         return found_key
 
-    def _current_resource(self) -> KubernetesResourceRef | None:
-        reservation = self._require_reservation()
+    def _current_resource(self, reservation: dict) -> KubernetesResourceRef | None:
         spec = KubernetesTrainingSpec.model_validate(reservation["spec"])
         document = self.client.document(spec)
         if document is None:
             return None
-        self._validate_owned_document(document)
+        self._validate_owned_document(reservation, document)
         current = self._resource_from_document(document)
-        recorded = self._recorded_resource()
+        recorded = self._recorded_resource(reservation)
         if recorded is not None and current != recorded:
             raise RuntimeError("remote Kubernetes workload was replaced")
         if recorded is None:
@@ -825,27 +925,27 @@ class KubernetesExecutor:
             self._write_state()
         return current
 
-    def _verify_current(self, resource: KubernetesResourceRef) -> bool:
+    def _verify_current(self, reservation: dict, resource: KubernetesResourceRef) -> bool:
         document = self.client.document(
             KubernetesTrainingSpec(
                 kind=resource.kind,
                 name=resource.name,
                 namespace=resource.namespace,
-                wandb_run_id=self._require_reservation()["spec"]["wandb_run_id"],
+                wandb_run_id=reservation["spec"]["wandb_run_id"],
             )
         )
         if document is None:
             return False
-        self._validate_owned_document(document, expected_uid=resource.uid)
+        self._validate_owned_document(reservation, document, expected_uid=resource.uid)
         return True
 
     def _validate_owned_document(
         self,
+        reservation: dict,
         document: dict,
         *,
         expected_uid: str | None = None,
     ) -> None:
-        reservation = self._require_reservation()
         spec = KubernetesTrainingSpec.model_validate(reservation["spec"])
         metadata = document["metadata"]
         if (
@@ -873,7 +973,7 @@ class KubernetesExecutor:
             for owner in metadata.get("ownerReferences", [])
         ):
             raise PermissionError("Kubernetes resource owner does not match this student pod")
-        if _workload_shape(document) != (self.nodes, self.gpus_per_node):
+        if _workload_shape(document) != (reservation["nodes"], reservation["gpus_per_node"]):
             raise PermissionError("Kubernetes resource shape does not match this allocation")
 
     def _resource_from_document(self, document: dict) -> KubernetesResourceRef:
@@ -887,71 +987,74 @@ class KubernetesExecutor:
             gpus_per_node=gpus,
         )
 
-    def _recorded_resource(self) -> KubernetesResourceRef | None:
-        value = self._require_reservation().get("resource")
+    def _recorded_resource(self, reservation: dict) -> KubernetesResourceRef | None:
+        value = reservation.get("resource")
         return KubernetesResourceRef.model_validate(value) if value else None
 
-    def _require_reservation(self, *, active: bool = False) -> dict:
-        if self._reservation is None:
-            raise RuntimeError("no Kubernetes training run is reserved")
-        if active and self._reservation.get("released"):
+    def _require_reservation(self, training_id: str, *, active: bool = False) -> dict:
+        reservation = self._reservations.get(training_id)
+        if reservation is None:
+            raise RuntimeError("no Kubernetes training run is reserved for this ID")
+        if active and reservation["released"]:
             raise RuntimeError("the Kubernetes training reservation is closed")
-        return self._reservation
+        return reservation
 
-    def _require_spec(self, spec: KubernetesTrainingSpec) -> None:
-        expected = KubernetesTrainingSpec.model_validate(
-            self._require_reservation()["spec"]
-        )
-        if spec != expected:
+    def _reservation_for_identity(self, kind: str, name: str, namespace: str) -> dict:
+        for reservation in self._reservations.values():
+            spec = reservation["spec"]
+            if (spec["kind"], spec["name"], spec["namespace"]) == (kind, name, namespace):
+                return reservation
+        raise PermissionError("resource does not belong to a reserved training run")
+
+    def _require_spec(self, spec: KubernetesTrainingSpec) -> dict:
+        reservation = self._reservation_for_identity(spec.kind, spec.name, spec.namespace)
+        if spec != KubernetesTrainingSpec.model_validate(reservation["spec"]):
             raise PermissionError("resource does not belong to the reserved training run")
+        return reservation
 
-    def _require_resource(self, value: object) -> KubernetesResourceRef:
+    def _require_resource(self, reservation: dict, value: object) -> KubernetesResourceRef:
         resource = KubernetesResourceRef.model_validate(value)
-        recorded = self._recorded_resource()
+        recorded = self._recorded_resource(reservation)
         if recorded is None:
-            recorded = self._current_resource()
+            recorded = self._current_resource(reservation)
         if recorded is None or resource != recorded:
             raise PermissionError("resource does not belong to the reserved training run")
         return resource
 
-    def _release(self, training_id: str) -> dict:
-        reservation = self._require_reservation()
-        if reservation["training_id"] != training_id:
-            raise PermissionError("training reservation belongs to a different run")
+    def _release(self, reservation: dict) -> dict:
         if reservation.get("released"):
-            return self._pod_receipt(self._recorded_resource(), "release")
-        recorded = self._recorded_resource()
-        resource = self._current_resource()
+            return self._pod_receipt(reservation, self._recorded_resource(reservation), "release")
+        recorded = self._recorded_resource(reservation)
+        resource = self._current_resource(reservation)
         if resource is None and recorded is None and reservation.get("create_attempted"):
             raise RuntimeError("cannot release an unresolved Kubernetes create attempt")
-        if resource is not None and self._verify_current(resource):
+        if resource is not None and self._verify_current(reservation, resource):
             state = self.client.state(resource)
             if state is not None and state[0] is TrainingState.RUNNING:
                 raise RuntimeError("cannot release a live Kubernetes workload")
-        receipt = self._pod_receipt(resource or recorded, "release")
+        receipt = self._pod_receipt(reservation, resource or recorded, "release")
         reservation["released"] = True
         self._write_state()
         return receipt
 
     def _pod_receipt(
-        self, resource: KubernetesResourceRef | None, reason: str, *, forced: bool = False,
+        self, reservation: dict, resource: KubernetesResourceRef | None, reason: str, *, forced: bool = False,
     ) -> dict | None:
         try:
-            return self._write_pod_receipt(resource, reason)
+            return self._write_pod_receipt(reservation, resource, reason)
         except Exception as error:
             if not forced:
                 raise
             print(
                 f"Kubernetes Pod receipt persistence failed: "
-                f"training_id={self._require_reservation()['training_id']} "
+                f"training_id={reservation['training_id']} "
                 f"reason={reason} error={type(error).__name__} errno={getattr(error, 'errno', None)}; "
                 "forced cleanup continues without durable proof",
                 file=sys.stderr, flush=True,
             )
             return None
 
-    def _write_pod_receipt(self, resource: KubernetesResourceRef | None, reason: str) -> dict:
-        reservation = self._require_reservation()
+    def _write_pod_receipt(self, reservation: dict, resource: KubernetesResourceRef | None, reason: str) -> dict:
         training_id = reservation["training_id"]
         receipt_dir = self.state_path.with_suffix(".receipts")
         path = receipt_dir / (hashlib.sha256(training_id.encode()).hexdigest() + ".json")
@@ -969,7 +1072,7 @@ class KubernetesExecutor:
             **identity,
             "captured_at": time.time(),
             "capture_reason": reason,
-            "expected_pods": self.nodes + (reservation["spec"]["kind"] == "MPIJob"),
+            "expected_pods": reservation["nodes"] + (reservation["spec"]["kind"] == "MPIJob"),
             "complete": False,
             "capture_error": "No Kubernetes resource was observed",
             "pods": [],
@@ -1005,7 +1108,7 @@ class KubernetesExecutor:
     def _write_state(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.state_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(self._reservation, sort_keys=True))
+        temporary.write_text(json.dumps({"reservations": self._reservations}, sort_keys=True))
         temporary.replace(self.state_path)
 
 
@@ -1062,6 +1165,15 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 response = {"ok": True, "result": result}
             except Exception as error:  # noqa: BLE001
                 response = {"ok": False, "error": f"{type(error).__name__}: {error}"}
+                if isinstance(error, TrainingCapacityError):
+                    response.update(error_code="training_capacity_exceeded", capacity={
+                        "requested_gpus": error.requested_gpus,
+                        "available_gpus": error.available_gpus,
+                        "capacity_gpus": error.capacity_gpus,
+                        "active_runs": error.active_runs,
+                    })
+                elif isinstance(error, KubernetesCreateUnconfirmedError):
+                    response["error_code"] = "kubernetes_create_unconfirmed"
         self.wfile.write(json.dumps(response, separators=(",", ":")).encode() + b"\n")
 
 
@@ -1093,7 +1205,6 @@ def serve() -> None:
         namespace=os.environ["SENPAI_KUBERNETES_NAMESPACE"],
         nodes=int(os.environ["NODES_PER_STUDENT"]),
         gpus_per_node=int(os.environ["GPUS_PER_STUDENT_NODE"]),
-        max_timeout_seconds=int(os.environ["SENPAI_MAX_TRAINING_TIMEOUT_SECONDS"]),
         cpu_per_gpu=int(os.environ["CPU_PER_STUDENT_GPU"]),
         memory_gi_per_gpu=int(os.environ["MEMORY_GI_PER_STUDENT_GPU"]),
         pvc_claim_name=os.environ["PVC_CLAIM_NAME"],
@@ -1101,6 +1212,7 @@ def serve() -> None:
         snapshot_root=Path(os.environ["SENPAI_TRAINING_SNAPSHOT_ROOT"]),
         executor_image=os.environ["SENPAI_EXECUTOR_IMAGE"],
         training_image=os.environ.get("SENPAI_TRAINING_IMAGE", ""),
+        training_control_image=os.environ.get("SENPAI_TRAINING_CONTROL_IMAGE", ""),
         image_pull_secrets=json.loads(os.environ.get("SENPAI_IMAGE_PULL_SECRETS", "[]")),
         launch_secret_name=os.environ["SENPAI_LAUNCH_SECRET_NAME"],
         wandb_tags=os.environ["WANDB_TAGS"],
@@ -1150,14 +1262,16 @@ def checkout_source_bundle(source: Path, workspace: Path, expected_commit: str) 
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_NO_REPLACE_OBJECTS": "1",
     }
-    subprocess.run(["git", "init", "--quiet", workspace], env=git_environment, check=True)
+    # The emptyDir mount is writable but its root remains owned by the kubelet.
+    git = ["git", "-c", f"safe.directory={workspace.resolve()}", "-C", str(workspace)]
+    subprocess.run([*git, "init", "--quiet"], env=git_environment, check=True)
     subprocess.run(
-        ["git", "-C", workspace, "fetch", "--quiet", "--no-tags", local_bundle, "HEAD"],
+        [*git, "fetch", "--quiet", "--no-tags", local_bundle, "HEAD"],
         env=git_environment,
         check=True,
     )
     fetched = subprocess.check_output(
-        ["git", "-C", workspace, "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+        [*git, "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
         env=git_environment,
         text=True,
     ).strip()
@@ -1166,13 +1280,13 @@ def checkout_source_bundle(source: Path, workspace: Path, expected_commit: str) 
             f"source bundle contains commit {fetched}, expected {expected_commit}"
         )
     subprocess.run(
-        ["git", "-C", workspace, "checkout", "--quiet", "--detach", expected_commit],
+        [*git, "checkout", "--quiet", "--detach", expected_commit],
         env=git_environment,
         check=True,
     )
     local_bundle.unlink()
     checked_out = subprocess.check_output(
-        ["git", "-C", workspace, "rev-parse", "--verify", "HEAD"],
+        [*git, "rev-parse", "--verify", "HEAD"],
         env=git_environment,
         text=True,
     ).strip()
@@ -1194,6 +1308,10 @@ def main() -> None:
             Path(os.environ["SENPAI_SOURCE_WORKSPACE"]),
             os.environ["SENPAI_SOURCE_COMMIT"],
         )
+        if destination := os.environ.get("SENPAI_TRAINING_WORKER_SCRIPT"):
+            worker = Path(destination)
+            shutil.copyfile(Path(__file__).with_name("training_worker.py"), worker)
+            worker.chmod(0o555)
     else:
         raise SystemExit(
             "usage: python -m senpai_agent.kubernetes_executor serve|kubectl|checkout"

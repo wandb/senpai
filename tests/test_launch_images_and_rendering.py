@@ -139,16 +139,18 @@ def test_digest_image_reference_rejects_source_sha_tags():
     )
 
 
-def test_multinode_executor_requires_a_registry_digest():
+@pytest.mark.parametrize("nodes", [1, 2])
+@pytest.mark.parametrize("executor_image", [f"ghcr.io/wandb/senpai-executor:sha-{REVISION}"])
+def test_student_executor_requires_a_registry_digest(nodes, executor_image):
     result = run_launch(
         "--advisor_image",
         ADVISOR_IMAGE,
         "--student_image",
         STUDENT_IMAGE,
         "--nodes_per_student",
-        "2",
+        str(nodes),
         "--executor_image",
-        f"ghcr.io/wandb/senpai-executor:sha-{REVISION}",
+        executor_image,
     )
 
     assert result.returncode != 0
@@ -182,21 +184,14 @@ def test_custom_training_image_is_independent_of_senpai_revision(registry):
     }
 
 
-@pytest.mark.parametrize(
-    "training_image,expected_error",
-    [
-        ("docker.io/acme/trainer:latest", "--training_image must use an immutable @sha256 digest"),
-        (f"docker.io/acme/trainer@sha256:{'c' * 64}", "--executor_image must use an immutable @sha256 digest"),
-    ],
-)
-def test_custom_training_requires_pinned_training_and_executor_images(training_image, expected_error):
+def test_custom_training_requires_a_pinned_training_image():
     result = run_launch(
         "--advisor_image", ADVISOR_IMAGE, "--student_image", STUDENT_IMAGE,
-        "--training_image", training_image,
+        "--training_image", "docker.io/acme/trainer:latest",
     )
 
     assert result.returncode != 0
-    assert expected_error in result.stderr
+    assert "--training_image must use an immutable @sha256 digest" in result.stderr
 
 
 def test_source_revision_is_derived_from_a_full_sha_tag():
@@ -277,7 +272,7 @@ def test_launch_rejects_role_images_from_different_source_revisions():
     )
 
     assert result.returncode != 0
-    assert "same source revision" in result.stderr
+    assert "senpai_repo_revision does not match the image source-SHA tag" in result.stderr
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
@@ -387,11 +382,11 @@ umask > "$UMASK_OUTPUT"
     assert int(umask_output.read_text().strip(), 8) == 0o22
 
 
-def test_multinode_kubectl_wrapper_can_be_reinstalled(tmp_path):
+def test_kubectl_wrapper_can_be_reinstalled(tmp_path):
     entrypoint = (ROOT / "k8s" / "entrypoint-student.sh").read_text()
     wrapper = entrypoint[
-        entrypoint.index('    proxy_dir="$LOGDIR/bin"') : entrypoint.index(
-            "    for _ in $(seq 1 180)"
+        entrypoint.index('proxy_dir="$LOGDIR/bin"') : entrypoint.index(
+            "for _ in $(seq 1 180)"
         )
     ]
     script = f"set -e\numask 077\n{wrapper}"

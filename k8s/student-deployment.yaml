@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-PackageName: senpai
 #
-# A student is a long-running worker that polls for PR assignments.
+# A student is a CPU controller that supervises remote training workers.
 # Replace {{STUDENT_NAME}} and {{RESEARCH_TAG}} before applying, or use launch.py.
 
 apiVersion: apps/v1
@@ -114,7 +114,9 @@ spec:
               name: {{LAUNCH_SECRET_NAME}}
               key: exa-api-key
 {{CUSTOM_SECRET_ENV_REFS}}
-        resources: {{STUDENT_RESOURCES}}
+        resources:
+          requests: {cpu: "2", memory: 8Gi}
+          limits: {cpu: "4", memory: 16Gi}
         startupProbe:
           httpGet:
             path: /healthz
@@ -137,6 +139,8 @@ spec:
           mountPath: {{PVC_MOUNT_PATH}}
         - name: state
           mountPath: /var/lib/senpai
+        - name: executor-socket
+          mountPath: /var/run/senpai-kubernetes
         - name: target
           mountPath: {{TARGET_WORKSPACE_MOUNT}}
         - name: target-environment
@@ -144,7 +148,6 @@ spec:
         - name: program-context
           mountPath: /var/run/senpai-context
           readOnly: true
-        # {{EXECUTOR_SOCKET_MOUNT}}
         # {{CAPACITY_SNAPSHOT_MOUNT}}
       # {{KUBERNETES_EXECUTOR_CONTAINER}}
       volumes:
@@ -157,6 +160,22 @@ spec:
           claimName: {{PVC_CLAIM_NAME}}
       - name: state
         emptyDir: {}
+      - name: executor-socket
+        emptyDir: {}
+      - name: executor-state
+        emptyDir: {}
+      - name: executor-token
+        projected:
+          defaultMode: 0440
+          sources:
+          - serviceAccountToken:
+              path: token
+              expirationSeconds: 3600
+          - configMap:
+              name: kube-root-ca.crt
+              items:
+              - key: ca.crt
+                path: ca.crt
       - name: target
         emptyDir: {}
       - name: target-environment
@@ -167,7 +186,6 @@ spec:
           items:
           - key: program-context
             path: program-context.b64
-      # {{KUBERNETES_EXECUTOR_VOLUMES}}
       # {{CAPACITY_SNAPSHOT_VOLUME}}
       nodeSelector: {{STUDENT_NODE_SELECTOR}}
-      tolerations: {{STUDENT_TOLERATIONS}}
+      tolerations: []

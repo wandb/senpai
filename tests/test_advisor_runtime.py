@@ -191,10 +191,13 @@ def test_event_store_discards_absent_level_triggers(tmp_path: Path):
         assert store.enqueue(stale) is True
         assert store.enqueue(retained) is True
         store.acknowledge(stale.dedupe_key)
-        assert store.discard_prefix(
-            "student_available_for_assignment:",
-            retained_keys=(retained.dedupe_key,),
-        ) == 1
+        assert (
+            store.discard_prefix(
+                "student_available_for_assignment:",
+                retained_keys=(retained.dedupe_key,),
+            )
+            == 1
+        )
         assert store.enqueue(stale) is True
         assert store.enqueue(retained) is False
 
@@ -504,12 +507,14 @@ def test_event_pump_drops_an_acknowledged_human_instruction(
         assert inbox.next_turn(STEERING_CONVERSATION_ID, "controller prompt") is None
 
 
+@pytest.mark.parametrize("kind", ["student_pr_feedback", "training_monitor"])
 def test_student_feedback_waits_for_the_step_and_marks_a_clean_unwind(
     tmp_path: Path,
+    kind: str,
 ):
     event = LocalEvent(
-        kind="student_pr_feedback",
-        dedupe_key="student_pr_feedback:1",
+        kind=kind,
+        dedupe_key=f"{kind}:1",
         payload={"message": "Try the narrower experiment next."},
     )
     inbox, active, conversation = active_steering_turn(tmp_path)

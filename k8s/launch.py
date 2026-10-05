@@ -51,6 +51,8 @@ from senpai_agent.program_context import (
 from senpai_agent.secrets import validate_custom_secret_env_names
 
 from capacity_observer import render_capacity_observer
+from images import resolve_launch_images
+from storage_preflight import validate_storage
 from launch_helpers import (
     ensure_advisor_branch,
     ensure_new_student_slot,
@@ -113,26 +115,24 @@ class Args:
     memory_gi_per_gpu: int = 120  # memory Gi requested per student GPU
     controller_node_selector: list[str] = field(
         default_factory=list
-    )  # optional key=value placement selectors for advisor and multi-node controllers
+    )  # optional key=value placement selectors for advisor and student controllers
     capacity_observer: bool = False  # install a credential-isolated cluster capacity observer
     capacity_node_selector: list[str] = field(
         default_factory=list
     )  # key=value selectors for the observed worker shape
-    capacity_tolerations: list[str] | None = None  # JSON tolerations; inherit single-node student defaults when omitted
+    capacity_tolerations: list[str] | None = None  # observer override; omitted matches managed GPU workers
     capacity_hpc_verification: bool = False  # apply the operator-confirmed CoreWeave HPC eligibility policy
     senpai_repo_url: str = (
         "https://github.com/wandb/senpai.git"  # public read-only runner source
     )
     senpai_repo_revision: str = (
-        ""  # exact runner commit; derived from :sha-<commit> image tags
+        ""  # exact runner commit; resolved from published defaults or source-SHA tags
     )
-    advisor_image: str = ""  # advisor source-SHA tag or image digest — REQUIRED
-    student_image: str = ""  # student source-SHA tag or image digest — REQUIRED
-    training_image: str = ""  # optional digest-pinned image for training in separate GPU workers
-    executor_image: str = ""  # immutable broker image; required for remote training or the capacity observer
-    image_pull_secrets: list[str] = field(
-        default_factory=list
-    )  # existing registry credential secrets in the launch namespace
+    advisor_image: str = ""  # advisor image override; blank resolves the matching published image
+    student_image: str = ""  # controller and default training image; blank resolves the latest published image
+    training_image: str = ""  # optional custom training image, pinned by digest
+    image_pull_secrets: list[str] = field(default_factory=list)  # existing registry secrets in the launch namespace
+    executor_image: str = ""  # broker image override; blank resolves the matching published digest
     kube_context: str = ""  # kubectl context; empty uses the current context
     namespace: str = "default"  # Kubernetes namespace for all launch resources
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
@@ -161,7 +161,6 @@ class Args:
     extra_instructions: str = (
         ""  # shared operator instructions: a .md file path or literal text
     )
-    timeout_minutes: float = 30.0  # wall-clock policy in the launch context
     max_epochs: int = 50  # epoch policy in the launch context
     custom_secret_env_names: list[str] = field(
         default_factory=list
@@ -176,12 +175,8 @@ class Args:
         False  # render manifests only: do not apply them or validate credentials
     )
     preflight_only: bool = (
-        False  # validate credentials/access only: do not render or apply manifests
+        False  # validate credentials, images, and storage with temporary probe Pods
     )
-
-    @property
-    def remote_training(self) -> bool:
-        return self.nodes_per_student > 1 or bool(self.training_image)
 
 
 MODEL_PROVIDERS = {
@@ -242,17 +237,17 @@ def controller_node_selector(
 def capacity_config(args: Args) -> dict:
     from senpai_agent.cluster_capacity import CapacityConfig
 
-    if args.capacity_tolerations is None:
-        tolerations = _student_tolerations(args) if args.nodes_per_student == 1 else []
-    else:
-        tolerations = [json.loads(value) for value in args.capacity_tolerations]
     return CapacityConfig(
         nodes=args.nodes_per_student,
         gpus_per_node=args.gpus_per_student_node,
         cpu_per_node=args.cpu_per_gpu * args.gpus_per_student_node,
         memory_gib_per_node=args.memory_gi_per_gpu * args.gpus_per_student_node,
         node_selector=controller_node_selector(args.capacity_node_selector, kind="capacity"),
-        tolerations=tolerations,
+        tolerations=(
+            [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}]
+            if args.capacity_tolerations is None
+            else [json.loads(value) for value in args.capacity_tolerations]
+        ),
         hpc_verification=args.capacity_hpc_verification,
     ).model_dump(mode="json")
 
@@ -359,8 +354,6 @@ def model_secret_env_refs(args: Args, role: str) -> list[tuple[str, str]]:
 
 
 def validate_timing_args(args: Args) -> None:
-    if args.timeout_minutes <= 0:
-        sys.exit("ERROR: --timeout_minutes must be positive")
     if args.max_epochs < 1:
         sys.exit("ERROR: --max_epochs must be at least 1")
     if args.poll_interval_s < 1:
@@ -442,15 +435,16 @@ def build_launch_context(
         wandb_entity=args.wandb_entity,
         wandb_project=args.wandb_project,
         backend=backend,
+        training_image=args.training_image or args.student_image,
+        training_control_image=args.student_image,
+        training_output_root=f"{args.pvc_mount_path.rstrip('/')}/.senpai/runs/{tag}",
         nodes_per_student=args.nodes_per_student,
         gpus_per_student_node=args.gpus_per_student_node,
-        timeout_minutes=args.timeout_minutes,
         max_epochs=args.max_epochs,
         tag=tag,
         advisor_branch=args.advisor_branch,
         target_base=args.target_repo_branch,
         students=student_list,
-        training_image=args.training_image,
     )
 
 
@@ -513,44 +507,10 @@ def load_launch_program_snapshot(
         return load_program_system_prompt(repository, program_path)
 
 
-def _student_resources(args: Args) -> str:
-    if args.remote_training:
-        return json.dumps(
-            {
-                "requests": {"cpu": "2", "memory": "8Gi"},
-                "limits": {"cpu": "4", "memory": "16Gi"},
-            }
-        )
-    resources = {
-        "cpu": str(args.cpu_per_gpu * args.gpus_per_student_node),
-        "memory": f"{args.memory_gi_per_gpu * args.gpus_per_student_node}Gi",
-        "nvidia.com/gpu": str(args.gpus_per_student_node),
-    }
-    return json.dumps({"requests": resources, "limits": resources})
-
-
-def _student_tolerations(args: Args) -> list[dict]:
-    if args.remote_training:
-        return []
-    return [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}]
-
-
 def _yaml_list_insertion(value: dict, indentation: int) -> str:
     return "enabled\n" + textwrap.indent(
         yaml.safe_dump([value], sort_keys=False).rstrip(),
         " " * indentation,
-    )
-
-
-def _executor_socket_mount(args: Args) -> str:
-    if not args.remote_training:
-        return ""
-    return _yaml_list_insertion(
-        {
-            "name": "executor-socket",
-            "mountPath": "/var/run/senpai-kubernetes",
-        },
-        8,
     )
 
 
@@ -583,8 +543,6 @@ def _executor_container(
     secret_name: str,
     configmap_name: str,
 ) -> str:
-    if not args.remote_training:
-        return ""
     return _yaml_list_insertion(
         {
             "name": "kubernetes-executor",
@@ -644,40 +602,9 @@ def _executor_container(
     )
 
 
-def _executor_volumes(args: Args) -> str:
-    if not args.remote_training:
-        return ""
-    volumes = [
-        {"name": "executor-socket", "emptyDir": {}},
-        {"name": "executor-state", "emptyDir": {}},
-        {
-            "name": "executor-token",
-            "projected": {
-                "defaultMode": 0o440,
-                "sources": [
-                    {
-                        "serviceAccountToken": {
-                            "path": "token",
-                            "expirationSeconds": 3600,
-                        }
-                    },
-                    {
-                        "configMap": {
-                            "name": "kube-root-ca.crt",
-                            "items": [{"key": "ca.crt", "path": "ca.crt"}],
-                        }
-                    },
-                ],
-            },
-        },
-    ]
-    return "enabled\n" + textwrap.indent(
-        yaml.safe_dump(volumes, sort_keys=False).rstrip(),
-        " " * 6,
-    )
-
-
-def _student_training_access(student_name: str, tag: str, namespace: str) -> str:
+def _student_training_access(
+    student_name: str, tag: str, namespace: str, nodes_per_student: int,
+) -> str:
     name = f"senpai-training-{tag}-{student_name}"
     labels = {"app": "senpai", "role": "student", "research-tag": tag}
     documents = [
@@ -697,11 +624,11 @@ def _student_training_access(student_name: str, tag: str, namespace: str) -> str
                     "resources": ["jobs"],
                     "verbs": ["create", "get", "patch", "delete"],
                 },
-                {
+                *([{
                     "apiGroups": ["kubeflow.org"],
                     "resources": ["mpijobs"],
                     "verbs": ["create", "get", "patch", "delete"],
-                },
+                }] if nodes_per_student > 1 else []),
                 {
                     "apiGroups": [""],
                     "resources": ["pods"],
@@ -811,10 +738,11 @@ def render_student(
                 "/var/lib/senpai-executor/reservation.json"
             ),
             "SENPAI_EXECUTOR_IMAGE": args.executor_image,
-            "SENPAI_TRAINING_IMAGE": args.training_image,
+            "SENPAI_TRAINING_IMAGE": args.training_image or args.student_image,
+            "SENPAI_TRAINING_CONTROL_IMAGE": args.student_image,
             "SENPAI_IMAGE_PULL_SECRETS": json.dumps(args.image_pull_secrets),
-            "SENPAI_MAX_TRAINING_TIMEOUT_SECONDS": str(
-                round(args.timeout_minutes * 60)
+            "SENPAI_TRAINING_OUTPUT_ROOT": (
+                f"{args.pvc_mount_path.rstrip('/')}/.senpai/runs/{tag}/{student_name}"
             ),
             "PVC_CLAIM_NAME": args.pvc_claim_name,
             "SENPAI_LAUNCH_SECRET_NAME": secret_name,
@@ -840,25 +768,15 @@ def render_student(
             "TARGET_WORKSPACE_MOUNT": json.dumps(target_workspace_mount),
             "LAUNCH_SECRET_NAME": secret_name,
             "PROGRAM_CONTEXT_SECRET_NAME": program_secret_name,
-            "STUDENT_SERVICE_ACCOUNT_NAME": (
-                f"senpai-training-{tag}-{student_name}"
-                if args.remote_training
-                else "default"
-            ),
-            "STUDENT_RESOURCES": _student_resources(args),
+            "STUDENT_SERVICE_ACCOUNT_NAME": f"senpai-training-{tag}-{student_name}",
             "STUDENT_NODE_SELECTOR": json.dumps(
                 controller_node_selector(args.controller_node_selector)
-                if args.remote_training
-                else {}
             ),
-            "STUDENT_TOLERATIONS": json.dumps(_student_tolerations(args)),
-            "EXECUTOR_SOCKET_MOUNT": _executor_socket_mount(args),
             "KUBERNETES_EXECUTOR_CONTAINER": _executor_container(
                 args,
                 secret_name,
                 student_configmap_name,
             ),
-            "KUBERNETES_EXECUTOR_VOLUMES": _executor_volumes(args),
             "CAPACITY_SNAPSHOT_MOUNT": _capacity_snapshot_mount(args),
             "CAPACITY_SNAPSHOT_VOLUME": _capacity_snapshot_volume(args, tag),
             "POD_CONFIG_HASH": pod_template_hash(
@@ -872,10 +790,11 @@ def render_student(
             ),
         },
     )
-    documents = [configmap]
-    if args.remote_training:
-        documents.append(_student_training_access(student_name, tag, args.namespace))
-    documents.append(deployment)
+    documents = [
+        configmap,
+        _student_training_access(student_name, tag, args.namespace, args.nodes_per_student),
+        deployment,
+    ]
     return "\n---\n".join(documents)
 
 
@@ -1032,35 +951,35 @@ def main():
         validate_custom_secret_env_names(args.custom_secret_env_names)
     except ValueError as error:
         sys.exit(f"ERROR: {error}")
-    if not args.preflight_only:
-        if args.training_image and not is_digest_image_reference(args.training_image):
-            sys.exit("ERROR: --training_image must use an immutable @sha256 digest")
-        role_images = [
-            ("advisor", args.advisor_image),
-            ("student", args.student_image),
-        ]
-        if args.remote_training or args.capacity_observer:
-            role_images.append(("executor", args.executor_image))
-        for role, image in role_images:
+    if args.training_image and not is_digest_image_reference(args.training_image):
+        sys.exit("ERROR: --training_image must use an immutable @sha256 digest")
+    role_images = {
+        "advisor": args.advisor_image,
+        "student": args.student_image,
+    }
+    if args.names or args.n_students > 0 or args.capacity_observer:
+        role_images["executor"] = args.executor_image
+    try:
+        role_images, args.senpai_repo_revision = resolve_launch_images(
+            role_images, args.senpai_repo_revision
+        )
+        for role, image in role_images.items():
+            setattr(args, f"{role}_image", image)
             if role == "executor" and not is_digest_image_reference(image):
-                sys.exit("ERROR: --executor_image must use an immutable @sha256 digest")
+                raise ValueError("--executor_image must use an immutable @sha256 digest")
             if not is_immutable_image_reference(image):
-                sys.exit(
-                    f"ERROR: --{role}_image must be an immutable digest or "
-                    "a :sha-<40-character-commit> tag"
+                raise ValueError(
+                    f"--{role}_image must be an immutable digest or a :sha-<40-character-commit> tag"
                 )
-        try:
-            revisions = {
-                source_revision_for_image(image, args.senpai_repo_revision)
-                for _role, image in role_images
-            }
-        except ValueError as error:
-            sys.exit(f"ERROR: {error}")
+        revisions = {
+            source_revision_for_image(image, args.senpai_repo_revision)
+            for image in role_images.values()
+        }
         if len(revisions) != 1:
-            sys.exit(
-                "ERROR: role images must use the same source revision"
-            )
+            raise ValueError("role images must use the same source revision")
         args.senpai_repo_revision = revisions.pop()
+    except ValueError as error:
+        sys.exit(f"ERROR: {error}")
     if args.gh_history_scope not in {"branch", "repo", "fresh"}:
         sys.exit("ERROR: --gh_history_scope must be one of: branch, repo, fresh")
     if target_repo_slug(args.target_repo_url) == target_repo_slug(
@@ -1118,8 +1037,30 @@ def main():
             )
         preflight_check_exa_api_key(exa_api_key)
         preflight_check_wandb_api_key(wandb_api_key)
+        storage_images = {"student": args.student_image} if student_list else {}
+        if args.advisor:
+            storage_images["advisor"] = args.advisor_image
+        output_root = f"{args.pvc_mount_path.rstrip('/')}/.senpai/runs/{args.tag}"
+        try:
+            if storage_images:
+                validate_storage(
+                    images=storage_images,
+                    training_image=args.training_image,
+                    image_pull_secrets=args.image_pull_secrets,
+                    pvc_mount_path=args.pvc_mount_path,
+                    pvc_claim_name=args.pvc_claim_name,
+                    output_roots=[f"{output_root}/{name}" for name in student_list] or [output_root],
+                    nodes_per_student=args.nodes_per_student,
+                    kube_context=args.kube_context,
+                    namespace=args.namespace,
+                    controller_node_selector=controller_node_selector(args.controller_node_selector),
+                )
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+            detail = "\n".join([str(error), *getattr(error, "__notes__", [])])
+            sys.exit(f"ERROR: {detail}")
         if args.preflight_only:
-            print("Preflight OK — credentials and target repo access verified.")
+            storage_summary = ", and checkpoint storage" if storage_images else ""
+            print(f"Preflight OK — credentials, matching images{storage_summary} verified.")
             return
 
     # Validate template structure before reserving a launch or writing to GitHub.

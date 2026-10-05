@@ -1,5 +1,7 @@
 import json
 import subprocess
+import sys
+import time
 import threading
 import uuid
 from contextlib import contextmanager
@@ -13,6 +15,8 @@ from pydantic import SecretStr
 
 from github_workflow_support import FakeGitHub, assignment_record, pull_request
 from senpai_agent import tools as training_tools
+from senpai_agent import kubernetes_training
+from training_test_support import FakeCluster, git_workspace
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.github.tools import (
     clear_github_credentials,
@@ -25,6 +29,7 @@ from senpai_agent.state import AssignmentConversationRegistry
 from senpai_agent.tools import (
     CancelTrainingAction,
     CancelTrainingTool,
+    GetTrainingStatusAction,
     MonitorTrainingAction,
     MonitorTrainingTool,
     RunTrainingAction,
@@ -45,8 +50,9 @@ class StubTraining:
         self.status_checks: list[str] = []
         self.cancelled: list[str] = []
         self.closed = False
+        self.other_runs = []
 
-    def run_training(self, spec: TrainingSpec) -> TrainingResult:
+    def run_training(self, spec: TrainingSpec, *, conversation_id=None) -> TrainingResult:
         self.launched.append(spec)
         return self.result
 
@@ -57,6 +63,9 @@ class StubTraining:
     def cancel_training(self, training_id: str) -> TrainingResult:
         self.cancelled.append(training_id)
         return self.result.model_copy(update={"state": TrainingState.CANCELLED})
+
+    def active_runs(self, *, exclude=None):
+        return self.other_runs
 
     def close(self) -> None:
         self.closed = True
@@ -113,7 +122,7 @@ def test_training_rechecks_live_revision_before_each_launch(
     tmp_path: Path, monkeypatch, assignment_runtime
 ):
     workspace = init_workspace(tmp_path)
-    training = StubTraining(workspace, finished_result(tmp_path))
+    training = StubTraining(workspace, finished_result(tmp_path).model_copy(update={"state": TrainingState.RUNNING}))
     monitors = MonitorStore(tmp_path / "monitors.sqlite3")
     monkeypatch.setattr(
         training_tools, "training_runtime", lambda *args: (training, monitors)
@@ -126,9 +135,7 @@ def test_training_rechecks_live_revision_before_each_launch(
     by_name = {tool.name: tool for tool in tools}
     launch = by_name["run_training"].executor
     action = RunTrainingAction(
-        spec=TrainingSpec(
-            argv=("python", "train.py"), cwd=workspace, timeout_seconds=20
-        )
+        argv=("python", "train.py"), cwd=workspace, timeout_seconds=20
     )
     old_conversation = SimpleNamespace(id=assignment_runtime.conversation_id)
     current_conversation = SimpleNamespace(
@@ -141,7 +148,7 @@ def test_training_rechecks_live_revision_before_each_launch(
         )
         with pytest.raises(PermissionError, match="revision-1.*revision-2"):
             launch(action, old_conversation)
-        assert training.launched == [action.spec]
+        assert training.launched == [TrainingSpec.model_validate(action.model_dump(exclude={"kind"}))]
         assert monitors.spec("training-17").conversation_id == old_conversation.id
         assert len(monitors.active()) == 1
 
@@ -150,14 +157,14 @@ def test_training_rechecks_live_revision_before_each_launch(
             old_conversation,
         )
         by_name["cancel_training"].executor(
-            CancelTrainingAction(training_id="training-17"), old_conversation
+            CancelTrainingAction(training_id="training-17"), current_conversation
         )
         assert training.cancelled == ["training-17"]
         assert monitors.active() == []
 
         training.result = training.result.model_copy(update={"training_id": "training-18"})
         launch(action, current_conversation)
-        assert training.launched == [action.spec, action.spec]
+        assert training.launched == [TrainingSpec.model_validate(action.model_dump(exclude={"kind"})), TrainingSpec.model_validate(action.model_dump(exclude={"kind"}))]
         assert monitors.spec("training-18").conversation_id == current_conversation.id
     finally:
         monitors.close()
@@ -211,9 +218,7 @@ def test_training_denies_launch_when_current_assignment_cannot_be_verified(
         with pytest.raises(error):
             launch.executor(
                 RunTrainingAction(
-                    spec=TrainingSpec(
-                        argv=("python", "train.py"), cwd=workspace, timeout_seconds=20
-                    )
+                    argv=("python", "train.py"), cwd=workspace, timeout_seconds=20
                 ),
                 conversation,
             )
@@ -229,6 +234,8 @@ def test_run_training_registers_a_monitor_for_its_conversation(
 ):
     workspace = init_workspace(tmp_path)
     training = StubTraining(workspace, finished_result(tmp_path))
+    training.other_runs = [{"training_id": "existing-run", "state": "running",
+                            "nodes": 1, "gpus_per_node": 2, "deadline_at": None}]
     monitors = MonitorStore(tmp_path / "monitors.sqlite3")
     tool = RunTrainingTool.create(training, monitors, assignment_runtime.guard)[0]
     conversation_id = assignment_runtime.conversation_id
@@ -240,12 +247,14 @@ def test_run_training_registers_a_monitor_for_its_conversation(
 
     try:
         observation = tool.executor(
-            RunTrainingAction(spec=spec),
+            RunTrainingAction(**spec.model_dump()),
             SimpleNamespace(id=conversation_id),
         )
 
         assert training.launched == [spec]
         assert observation.training_id == "training-17"
+        assert json.loads(observation.to_llm_content[0].text)["other_active_runs"] == training.other_runs
+        assert training.cancelled == []
         assert observation.wandb_run_ids == ("run-abc",)
         monitor = monitors.spec("training-17")
         assert monitor.conversation_id == conversation_id
@@ -280,11 +289,9 @@ def test_training_diagnostics_mask_registered_secrets(
     try:
         observation = tool.executor(
             RunTrainingAction(
-                spec=TrainingSpec(
-                    argv=("python", "train.py"),
-                    cwd=workspace,
-                    timeout_seconds=20,
-                )
+                argv=("python", "train.py"),
+                cwd=workspace,
+                timeout_seconds=20,
             ),
             conversation,
         )
@@ -325,11 +332,9 @@ def test_run_training_requires_a_clean_worktree_before_starting(
         with pytest.raises(RuntimeError, match="clean before training"):
             tool.executor(
                 RunTrainingAction(
-                    spec=TrainingSpec(
-                        argv=("python", "candidate.py"),
-                        cwd=workspace,
-                        timeout_seconds=20,
-                    )
+                    argv=("python", "candidate.py"),
+                    cwd=workspace,
+                    timeout_seconds=20,
                 ),
                 SimpleNamespace(id=uuid.uuid4()),
             )
@@ -352,11 +357,9 @@ def test_run_training_requires_a_conversation_before_starting(
         with pytest.raises(ValueError, match="student conversation"):
             tool.executor(
                 RunTrainingAction(
-                    spec=TrainingSpec(
-                        argv=("python", "train.py"),
-                        cwd=workspace,
-                        timeout_seconds=20,
-                    )
+                    argv=("python", "train.py"),
+                    cwd=workspace,
+                    timeout_seconds=20,
                 )
             )
 
@@ -396,7 +399,7 @@ def test_monitor_training_replaces_the_default_policy(
     tmp_path: Path, assignment_runtime
 ):
     workspace = init_workspace(tmp_path)
-    training = StubTraining(workspace, finished_result(tmp_path))
+    training = StubTraining(workspace, finished_result(tmp_path).model_copy(update={"state": TrainingState.RUNNING}))
     monitors = MonitorStore(tmp_path / "monitors.sqlite3")
     conversation_id = assignment_runtime.conversation_id
     run_tool = RunTrainingTool.create(training, monitors, assignment_runtime.guard)[0]
@@ -405,11 +408,9 @@ def test_monitor_training_replaces_the_default_policy(
     try:
         run_tool.executor(
             RunTrainingAction(
-                spec=TrainingSpec(
-                    argv=("python", "train.py"),
-                    cwd=workspace,
-                    timeout_seconds=20,
-                )
+                argv=("python", "train.py"),
+                cwd=workspace,
+                timeout_seconds=20,
             ),
             SimpleNamespace(id=conversation_id),
         )
@@ -436,29 +437,33 @@ def test_monitor_training_replaces_the_default_policy(
             "the controller will resume this same conversation "
             f"({conversation_id}) when action is needed."
         )
+        training.result = training.result.model_copy(update={"state": TrainingState.FINISHED})
+        with pytest.raises(ValueError, match="completed run"):
+            monitor_tool.executor(action, SimpleNamespace(id=conversation_id))
     finally:
         monitors.close()
 
 
-def test_cancel_training_retires_its_monitor(tmp_path: Path, assignment_runtime):
+@pytest.mark.parametrize("released", [True, False])
+def test_cancel_training_retires_monitor_only_after_cleanup(tmp_path: Path, assignment_runtime, released):
     workspace = init_workspace(tmp_path)
-    training = StubTraining(workspace, finished_result(tmp_path))
+    training = StubTraining(workspace, finished_result(tmp_path).model_copy(
+        update={"kubernetes_released": released},
+    ))
     monitors = MonitorStore(tmp_path / "monitors.sqlite3")
     conversation_id = assignment_runtime.conversation_id
     RunTrainingTool.create(training, monitors, assignment_runtime.guard)[0].executor(
         RunTrainingAction(
-            spec=TrainingSpec(
-                argv=("python", "train.py"),
-                cwd=workspace,
-                timeout_seconds=20,
-            )
+            argv=("python", "train.py"),
+            cwd=workspace,
+            timeout_seconds=20,
         ),
         SimpleNamespace(id=conversation_id),
     )
 
     try:
-        cancel = CancelTrainingTool.create(training, monitors)[0].executor
-        with pytest.raises(PermissionError, match="different student conversation"):
+        cancel = CancelTrainingTool.create(training, monitors, assignment_runtime.guard)[0].executor
+        with pytest.raises(PermissionError, match="training conversation is bound"):
             cancel(
                 CancelTrainingAction(training_id="training-17"),
                 SimpleNamespace(id=uuid.uuid4()),
@@ -471,7 +476,7 @@ def test_cancel_training_retires_its_monitor(tmp_path: Path, assignment_runtime)
 
         assert observation.state is TrainingState.CANCELLED
         assert training.cancelled == ["training-17"]
-        assert monitors.active() == []
+        assert bool(monitors.active()) is (not released)
     finally:
         monitors.close()
 
@@ -491,17 +496,15 @@ def test_cancel_training_keeps_monitor_when_cancellation_is_not_terminal(
     conversation_id = assignment_runtime.conversation_id
     RunTrainingTool.create(training, monitors, assignment_runtime.guard)[0].executor(
         RunTrainingAction(
-            spec=TrainingSpec(
-                argv=("python", "train.py"),
-                cwd=workspace,
-                timeout_seconds=20,
-            )
+            argv=("python", "train.py"),
+            cwd=workspace,
+            timeout_seconds=20,
         ),
         SimpleNamespace(id=conversation_id),
     )
 
     try:
-        cancel = CancelTrainingTool.create(training, monitors)[0].executor
+        cancel = CancelTrainingTool.create(training, monitors, assignment_runtime.guard)[0].executor
 
         with pytest.raises(RuntimeError, match="did not reach a terminal state"):
             cancel(
@@ -536,11 +539,9 @@ def test_interrupting_run_training_cancels_only_the_in_flight_run(
     monitors = BlockingMonitorStore(tmp_path / "monitors.sqlite3")
     executor = RunTrainingTool.create(training, monitors, assignment_runtime.guard)[0].executor
     action = RunTrainingAction(
-        spec=TrainingSpec(
-            argv=("python", "train.py"),
-            cwd=workspace,
-            timeout_seconds=20,
-        )
+        argv=("python", "train.py"),
+        cwd=workspace,
+        timeout_seconds=20,
     )
     conversation = SimpleNamespace(id=assignment_runtime.conversation_id)
     errors = []
@@ -573,54 +574,69 @@ def test_interrupting_run_training_cancels_only_the_in_flight_run(
         monitors.close()
 
 
-@pytest.mark.parametrize(
-    ("nodes", "training_image", "remote"),
-    [(1, "", False), (1, "training@sha256:" + "a" * 64, True), (2, "", True)],
-)
-def test_registered_training_tools_share_one_runtime(
-    tmp_path: Path, monkeypatch, nodes, training_image, remote,
+@pytest.mark.parametrize(("nodes", "kind"), [(1, "Job"), (2, "MPIJob")])
+def test_registered_training_tools_supervise_kubernetes_for_every_topology(
+    tmp_path: Path, monkeypatch, assignment_runtime, nodes, kind,
 ):
-    monkeypatch.setenv("NODES_PER_STUDENT", str(nodes))
-    monkeypatch.setenv("GPUS_PER_STUDENT_NODE", "1")
-    monkeypatch.setenv("SENPAI_TRAINING_IMAGE", training_image)
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    workspace = git_workspace(tmp_path)
+    client = FakeCluster(TrainingState.RUNNING, nodes=nodes)
+    monkeypatch.setattr(kubernetes_training, "KubernetesExecutorClient", lambda _socket: client)
+    for key, value in {
+        "NODES_PER_STUDENT": str(nodes),
+        "GPUS_PER_STUDENT_NODE": "8",
+        "RESEARCH_TAG": "fred",
+        "SENPAI_KUBERNETES_NAMESPACE": "research",
+        "SENPAI_LAUNCH_SECRET_NAME": "launch-secrets",
+        "SENPAI_TRAINING_SNAPSHOT_ROOT": str(tmp_path / "snapshots"),
+        "SENPAI_TRAINING_OUTPUT_ROOT": str(tmp_path / "outputs"),
+        "SENPAI_TRAINING_IMAGE": "ghcr.io/wandb/senpai-student@sha256:" + "a" * 64,
+        "SENPAI_TRAINING_CONTROL_IMAGE": "ghcr.io/wandb/senpai-student@sha256:" + "a" * 64,
+        "CPU_PER_STUDENT_GPU": "1", "MEMORY_GI_PER_STUDENT_GPU": "2",
+        "PVC_CLAIM_NAME": "dataset", "PVC_MOUNT_PATH": str(tmp_path / "data"),
+        "WANDB_ENTITY": "entity", "WANDB_PROJECT": "project",
+    }.items():
+        monkeypatch.setenv(key, value)
     state = SimpleNamespace(workspace=SimpleNamespace(working_dir=workspace))
+    conversation = SimpleNamespace(
+        id=assignment_runtime.conversation_id,
+        state=SimpleNamespace(secret_registry=SimpleNamespace(mask_secrets_in_output=lambda text: text)),
+    )
     register_senpai_tools()
-
     tools = resolve_tool(
         Tool(name="senpai_training", params={"state_dir": str(tmp_path / "state")}),
         state,
     )
     by_name = {tool.name: tool for tool in tools}
-
     try:
-        assert isinstance(
-            by_name["run_training"].executor.training,
-            training_tools.KubernetesTrainingSupervisor,
-        ) is remote
-        assert set(by_name) == {
-            "cancel_training",
-            "run_training",
-            "get_training_status",
-            "monitor_training",
-        }
-        assert (
-            by_name["run_training"].executor.training
-            is by_name["get_training_status"].executor.training
+        started = by_name["run_training"].executor(
+            RunTrainingAction(
+                argv=(sys.executable, "-c", "pass"), cwd=workspace, timeout_seconds=30,
+            ), conversation,
         )
-        assert (
-            by_name["run_training"].executor.training
-            is by_name["monitor_training"].executor.training
+        assert client.reservations[0][0] == started.training_id
+        assert client.spec.kind == kind
+        deadline = time.monotonic() + 5
+        while True:
+            status = by_name["get_training_status"].executor(
+                GetTrainingStatusAction(training_id=started.training_id), conversation,
+            )
+            if status.kubernetes_resource is not None:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        assert status.state is TrainingState.RUNNING
+        assert status.kubernetes_resource.kind == kind
+        assert status.kubernetes_resource.nodes == nodes
+        monitors = by_name["monitor_training"].executor.store
+        assert monitors.spec(started.training_id).conversation_id == conversation.id
+        cancelled = by_name["cancel_training"].executor(
+            CancelTrainingAction(training_id=started.training_id), conversation,
         )
-        assert (
-            by_name["run_training"].executor.training
-            is by_name["cancel_training"].executor.training
-        )
-        assert (
-            by_name["run_training"].executor.monitor_store
-            is by_name["monitor_training"].executor.store
-        )
+        assert cancelled.state is TrainingState.CANCELLED
+        assert cancelled.kubernetes_released is True
+        assert client.deletions == [status.kubernetes_resource]
+        assert client.releases == [started.training_id]
+        assert monitors.active() == []
     finally:
         close_training_runtimes()
 
@@ -648,3 +664,76 @@ def test_get_training_status_delivers_complete_structured_pod_evidence(tmp_path,
     delivered = json.loads(observed.to_llm_content[0].text)
     assert delivered[field] == receipt
     assert training.status_checks == ['training-17']
+
+
+def test_training_tool_accepts_flat_command_and_optional_limits(tmp_path):
+    action = RunTrainingAction.model_validate({
+        "argv": ["python", "train.py"], "cwd": str(tmp_path),
+        "nodes": 1, "gpus_per_node": 2,
+    })
+    assert action.argv == ("python", "train.py")
+    assert action.timeout_seconds is None
+    restored = RunTrainingAction.model_validate({
+        "kind": "RunTrainingAction", "spec": {"argv": ["python"], "cwd": str(tmp_path), "timeout_seconds": 30},
+    })
+    assert restored.argv == ("python",) and restored.timeout_seconds == 30
+    assert "spec" not in restored.model_dump()
+    assert (action.nodes, action.gpus_per_node) == (1, 2)
+    with pytest.raises(ValueError):
+        RunTrainingAction.model_validate({"argv": [], "cwd": str(tmp_path)})
+    with pytest.raises(ValueError):
+        RunTrainingAction.model_validate({
+            "argv": ["python"], "cwd": str(tmp_path), "gpus_per_node": 0,
+        })
+
+
+def test_training_runtime_recovers_missing_monitor_without_rearming_existing(tmp_path, monkeypatch):
+    monkeypatch.setenv("NODES_PER_STUDENT", "1")
+    monkeypatch.setenv("GPUS_PER_STUDENT_NODE", "1")
+    state = tmp_path / "state"
+    state.mkdir()
+    owner = uuid.uuid4()
+    training_id = str(uuid.uuid4())
+    result = finished_result(tmp_path).model_copy(update={
+        "training_id": training_id, "conversation_id": owner, "kubernetes_released": True,
+    })
+    (state / f"{training_id}.json").write_text(result.model_dump_json())
+    try:
+        _, store = training_tools.training_runtime(tmp_path, state)
+        assert store.spec(training_id).conversation_id == owner
+        assert [item.training_id for item in store.active()] == [training_id]
+        store.complete(training_id)
+        close_training_runtimes()
+        _, recovered = training_tools.training_runtime(tmp_path, state)
+        assert recovered.active() == []
+    finally:
+        close_training_runtimes()
+
+
+def test_registration_failure_cancels_run_and_current_assignment_can_reclaim_it(
+    tmp_path, assignment_runtime, monkeypatch,
+):
+    training = StubTraining(init_workspace(tmp_path), finished_result(tmp_path).model_copy(
+        update={"kubernetes_released": False},
+    ))
+    monitors = MonitorStore(tmp_path / "monitors.sqlite3")
+    conversation = SimpleNamespace(id=assignment_runtime.conversation_id)
+
+    def unavailable(_spec):
+        raise OSError("monitor storage unavailable")
+
+    monkeypatch.setattr(monitors, "register", unavailable)
+    try:
+        run = RunTrainingTool.create(training, monitors, assignment_runtime.guard)[0].executor
+        with pytest.raises(RuntimeError, match="Training training-17 started but monitor registration failed"):
+            run(RunTrainingAction(argv=("python", "train.py"), cwd=training.workspace), conversation)
+        assert training.cancelled == ["training-17"]
+        cancel = CancelTrainingTool.create(training, monitors, assignment_runtime.guard)[0].executor
+        with pytest.raises(PermissionError):
+            cancel(CancelTrainingAction(training_id="training-17"), SimpleNamespace(id=uuid.uuid4()))
+        result = cancel(CancelTrainingAction(training_id="training-17"), conversation)
+        assert result.state is TrainingState.CANCELLED
+        assert "cleanup is pending" in result.monitor_warning
+        assert training.cancelled == ["training-17", "training-17"]
+    finally:
+        monitors.close()

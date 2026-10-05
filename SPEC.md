@@ -300,10 +300,10 @@ rendered role and complete system snapshot. The snapshot digest covers the
 components and the exact rendered suffix, so changed wrapper templates also
 invalidate persisted context.
 
-The launcher renders `timeout_minutes` and `max_epochs` into the launch context
-as agent policy. It does not export dedicated timeout or epoch environment
-variables, and the training supervisor has no launch-wide timeout default or
-ceiling. Each training run supplies its own positive `timeout_seconds` value.
+The launcher renders `max_epochs` into the launch context as agent policy.
+There is no launch-wide training timeout or timeout environment variable.
+Each training run may supply a positive `timeout_seconds`; omission means no
+per-run time limit. An operator-armed fleet cutoff is independent.
 
 At process startup, the runner verifies the complete system snapshot against
 the digest held by its supervisor or parent. It also checks the configured
@@ -350,8 +350,10 @@ working directory cannot shadow the installed runner. These controls protect
 runtime imports and assets; they do not sandbox target code or freeze the
 operator's system-instruction files.
 
-`SENPAI_TARGET_PYTHON_ENV` selects a writable target venv for terminals and
-training. Its site-packages include the trusted environment through a `.pth`
+For standard Senpai images, `SENPAI_TARGET_PYTHON_ENV` selects a writable target
+venv for terminals and training. Controllers and workers create separate venvs;
+controller-installed packages do not transfer to workers. Each venv's
+site-packages include the trusted environment through a `.pth`
 path entry. Target packages can override those shared packages without writing
 to the trusted environment. The image includes pip so additive target installs
 can resolve packages on the shared path. uv resolves a separate target package
@@ -743,7 +745,7 @@ resume the exact advisor or student conversation after its turn.
 Students receive:
 
 ```text
-run_training(spec: TrainingSpec) -> TrainingResult
+run_training(argv, cwd, timeout_seconds=None, nodes=None, gpus_per_node=None) -> TrainingResult
 get_training_status(training_id: str) -> TrainingResult
 cancel_training(training_id: str) -> TrainingResult
 monitor_training(
@@ -752,61 +754,81 @@ monitor_training(
   direction=None,
   gates=(),
   poll_interval_seconds=60,
-  stale_after_seconds=600,
+  stale_after_seconds=None,
 ) -> MonitorTrainingObservation
 ```
 
-`TrainingSupervisor` owns one process group, each run's requested timeout,
-TERM/KILL cleanup, restart identity checks using PID/PGID/create-time, a bounded
-8 KiB error tail, streamed 64 KiB log parsing, persisted state, and discovered
-W&B run IDs. Run IDs are persisted while training is still running so metric
-monitoring can begin immediately.
-
-Multiple Senpai instances may share `WANDB_API_KEY`; no per-student key is required.
-Supervised training masks the inherited key before persisting stdout/stderr,
-including keys split across reads and incomplete key prefixes at shutdown.
-The output reader drains buffered data without waiting for detached descendants
-to close the pipe. Training clears `WANDB_SERVICE` to start its own W&B connection.
-The Kubernetes executor returns raw diagnostic components over its private socket.
-The controller masks each component before formatting or truncating it, including
-event messages. The executor does not receive the W&B key.
-
-When a student has more than one configured node or a custom `training_image`,
-`KubernetesTrainingSupervisor` keeps the same tool contract while supervising
-one remote Job (one node) or MPIJob (multiple nodes). It creates an
+Every student uses `KubernetesTrainingSupervisor` to supervise each run in a
+Job for single-node training or MPIJob for multi-node training. It creates an
 atomic Git bundle for the clean `HEAD` on the shared PVC, generates the workload
-and W&B identities, launches the target submitter through the local process
-path, then persists and polls the broker-created UID. The broker replaces
+and W&B identities, constructs the Kubernetes workload for the supplied command, then persists
+and polls the broker-created UID. The broker replaces
 target-provided init logic with a fixed local-copy and exact-commit checkout, so
 bundle mutation fails before training starts. Cancellation, timeout, and restart
 recovery remain UID-bound; uncertain deletion retains the broker reservation for
-deadline cleanup rather than releasing ownership early.
+cleanup rather than releasing ownership early.
 
-The remote training path reserves the workload. Its target submitter follows
-the [target launcher contract](README.md#remote-training-launcher-contract):
-it uses the generated workload name, namespace, snapshot SHA, and W&B identity,
-and supplies the matching source/run annotations before submission. Worker
-resources must match the configured CPU, memory, and GPU allocation; additional
-resource types are rejected. Main containers may receive the scoped W&B key and
-receive canonical `WANDB_RUN_ID`; target code uses the configured W&B entity and
-project. The broker replaces target init containers with the fixed checkout and
-removes pod annotations. The checkout runs as UID/GID 0 and leaves the source
-tree owned by root; Restricted Pod Security namespaces are not supported.
-Preserved target labels can affect configured admission and network policies
-despite annotation removal. They are not a trust boundary.
-The broker preserves target scheduling constraints and overwrites ownership and
-`senpai-training-role` labels. For multi-node runs, it adds required hostname
-anti-affinity between this run's workers. The injected term excludes launcher pods from its selector;
-target affinity terms remain unchanged.
+Multiple Senpai instances may share `WANDB_API_KEY`; no per-student key is required.
+The executor returns raw diagnostic components over its private socket. The
+controller redacts each component before formatting, truncating, or persisting
+it. The executor does not receive the W&B key.
 
-Controller shutdown detaches from a running Kubernetes workload. It terminates
-the local launcher process. It leaves the remote workload running, keeps the
+`run_training` accepts flat command arguments, not a Kubernetes submission
+script. Optional `nodes` and `gpus_per_node` default to the student's configured
+topology; either can request a smaller dimension. Concurrent runs share its
+aggregate GPU allocation. Each reservation remains charged until workload
+cleanup completes. Capacity rejection reports the active run IDs.
+The runtime supplies the selected training image, requested resources and PVC
+mount, W&B identity, and exact committed source. The standard worker starts a
+writable project environment over the image's read-only runtime. Project setup belongs in
+normal dependency files or the command; Senpai requires no setup manifest.
+The launch context exposes the training image and how to inspect its base
+packages. Multi-node commands run once per node with rank/rendezvous information;
+the target remains responsible for its framework's distributed execution.
+
+Checkout and default workers use UID/GID 10001. The checkout trusts only its
+exact workspace path for Git ownership checks and retains full commit
+verification. Checkout, preflight, and training workers do not request dataset
+ownership changes. Controller pods retain their existing `fsGroup: 10001` policy,
+which can affect PVC ownership according to the storage driver. The full configured
+PVC uses the same mount path in every role. Checkpoints live below the supplied
+`SENPAI_TRAINING_OUTPUT_DIR` and survive worker deletion.
+
+The worker captures the target command's combined stdout/stderr in
+`.senpai-logs` beneath that output directory, with two rotating files and fixed-size
+metadata per node. A 64 MiB per-run budget includes all nodes and applies to
+unlimited-duration runs. Rotation records truncation explicitly. A streaming
+masker removes the known W&B key before persistence and live mirroring, including
+keys split across reads and a partial prefix at EOF. The Kubernetes mirror has
+its own lifetime budget of 64 MiB per run, divided
+across nodes, including a final truncation notice. It stops sending command
+output at that limit; the PVC keeps rotating recent output. The mirror is nonblocking; a stalled
+consumer cannot stop the command, and dropped live output is recorded.
+Infrastructure uv/Git bootstrap output stays in Kubernetes
+diagnostics. The wrapper preserves command exit status and forwards termination
+to the command's process group.
+
+Each student prunes only recognized `.senpai-logs` files from its completed,
+released runs to keep that history within 512 MiB. The result records
+`worker_logs_pruned`. Active run logs are not pruned and total at most 64 MiB
+times the configured student GPU count, since each run reserves at least one
+GPU. Checkpoints and other target outputs are outside this retention policy.
+
+Before agent deployment, storage preflight uses temporary CPU-only Pods in the
+selected role images to exercise checkpoint write/flush/read/rename/delete and
+advisor/student reads of worker output. Multi-node preflight requires distinct
+writer/reader hosts. Failure stops launch before GitHub or controller mutations.
+Probes use unique identities and UID-preconditioned cleanup. Dataset paths remain
+in `program.md` and are verified by the agent before its first training run.
+
+Controller shutdown detaches from a running Kubernetes workload. It leaves
+the remote workload running, keeps the
 durable result in the `RUNNING` state, and retains the workload UID and broker
 reservation. A restarted controller in the same Pod reserves the same training
 identity and re-adopts only that UID before it resumes monitoring. Recovery
 requires retained state and the same controller Pod UID; the default state
 volumes do not survive Pod replacement. Ordinary controller Pod deletion or
-replacement also garbage-collects its owned MPIJob and terminates remote
+replacement also garbage-collects its owned Job or MPIJob and terminates remote
 training. Explicit cancellation and
 timeout still delete the remote workload and persist a terminal result before
 releasing ownership.
@@ -822,24 +844,38 @@ a terminal-state monitor bound to the current conversation. `monitor_training`
 is an optional policy upgrade for useful metric gates or staleness detection;
 repeating it replaces the default or previous policy.
 
-Each local run's requested timeout is a total wall-clock ceiling, not merely the
-point at which shutdown begins. TERM is sent early enough that the configured
-grace period ends at the deadline, after which the complete process group is killed.
-For local runs, `cancel_training` follows the same process-group cleanup path.
-It does not return until the supervisor has persisted a terminal state. Target
-training code remains responsible for handling SIGTERM and flushing external
-services such as W&B before the grace period expires.
+An optional positive timeout establishes an absolute deadline covering
+submission, queue time, setup, and training. Omission leaves the run without a
+per-run deadline. Expiry triggers UID-bound workload deletion; the broker
+independently enforces that same deadline. `cancel_training` uses the same
+deletion path and does not return until the supervisor has persisted a terminal
+state. The launching conversation can cancel its own run. The student's
+current assignment conversation can also cancel an older run from that student.
+Monitoring continues until cleanup releases the reserved GPUs. Target
+training code remains responsible for handling Kubernetes termination and
+flushing external services such as W&B.
 
-The controller polls only monitors that are due. It fetches one latest selected
-metric value from W&B, evaluates deterministic threshold/change/staleness and
-terminal-state rules, and persists deduplicated compact signals. Ordinary
+An independent local collector checks lifecycle state every two seconds.
+A separate collector fetches the selected W&B metric when due, defaulting to
+60 seconds; a slow network request cannot block local lifecycle checks.
+Idle controllers check local events every two seconds without increasing the
+configured GitHub polling rate. During active turns, monitor signals queue at
+an SDK-safe agent-step boundary without interrupting active tools. Ordinary
 polls use no LLM tokens.
 
-Metric samples reject NaN and infinities. A failure in one monitor's training
-status or W&B lookup advances that monitor's schedule and emits one
-deduplicated `monitor_error` hard signal; it cannot block other monitors,
-GitHub events, child results, or an already-pending hard-failure wake. A changed
-monitor policy resets its derived samples and signals to match the new marker.
+The first threshold poll that matches any gates emits one combined signal and
+latches further threshold notifications for that policy. Identical registration
+and restart preserve the latch; a changed policy resets it and its sample
+baseline. Staleness is opt-in and emits once per policy, even if metrics resume
+and later stall again.
+Metric samples reject NaN and infinities. A backend error emits one
+`monitor_error` hard signal per policy; repeated failures do not create chatter.
+Signals do not automatically stop training.
+
+A normal terminal signal includes completed resource release. If release is
+still pending 30 seconds after the first terminal observation, the monitor
+emits one cleanup-pending terminal notice and one later release confirmation.
+The observation time persists across restarts.
 
 Every persisted actionable signal directly creates a compact
 `training_monitor` wake for the signal's original student conversation UUID.
@@ -899,8 +935,8 @@ Every OpenHands turn has a controller-configured hard deadline. The deadline
 interrupts the conversation, produces a non-success result, and leaves durable
 events unacknowledged. The controller then retries with bounded exponential
 backoff. Controller termination interrupts and closes the current conversation.
-It cancels active local training, but detaches from active Kubernetes training
-so the next controller can re-adopt the same remote UID. It then closes local
+It detaches from active Kubernetes training so the next controller in the same
+Pod can re-adopt the same remote UID. It then closes local
 stores and flushes Weave before it exits. Standalone and child runners flush
 Weave at runner exit.
 
@@ -1050,12 +1086,15 @@ out that exact revision.
 An optional digest-pinned `training_image` selects an independent training
 environment from any reachable registry. It requires no Senpai runtime or source
 revision. The student controller stays in the Senpai image and uses the existing
-executor for one-node Jobs or multi-node MPIJobs. An empty value preserves local
-single-node training and target-selected multi-node images. The executor sets
-the configured image on every main training container and injects only the
-operator's `image_pull_secrets`; agent-supplied pull secrets remain forbidden.
-The trusted executor image still provides the source-checkout init container.
-Operators build and publish training images before launch.
+executor for one-node Jobs or multi-node MPIJobs. An empty value uses the standard
+student image. The executor sets the selected image on GPU workers and keeps the
+CPU MPI launcher in the standard student image. It injects only the operator's
+`image_pull_secrets`; agent-supplied pull secrets remain forbidden. The trusted
+executor image provides the non-root source checkout and a standalone worker
+bootstrap for custom images. Custom workers retain their Python environment and
+run as UID/GID 10001. Multi-node custom images must provide compatible OpenMPI 5,
+OpenSSH, and the non-root account described in README.md. Operators build and
+publish custom training images before launch.
 
 Launch preflight verifies:
 
@@ -1063,9 +1102,12 @@ Launch preflight verifies:
 - every model-provider credential referenced by the configured profiles;
 - the Exa key with one `type="instant"`, publication-category, one-result
   search;
-- the W&B key with a minimal viewer query; and
+- the W&B key with a minimal viewer query;
 - the presence of every configured custom secret, without attempting
-  a service-specific authentication check.
+  a service-specific authentication check;
+- a matching published image set, resolved to immutable references; and
+- checkpoint writes and cross-role reads on the configured volume using
+  temporary non-root Pods, with cross-node access for multi-node launches.
 
 Exa uses a credential-isolated native `exa_search` tool with progressive skill
 guidance. It preserves the standalone script's request controls and web/publication
@@ -1101,9 +1143,10 @@ launcher never applies over them. A concurrent launch or an orphan from a
 failed launch therefore fails closed and requires explicit operator cleanup
 before retry.
 
-For multi-node students the launcher also creates a namespaced ServiceAccount,
-Role, and RoleBinding that allow creating, getting, patching, and deleting Jobs
-or MPIJobs; getting and listing Pods; reading pod logs; and listing Events.
+For every student the launcher also creates a namespaced ServiceAccount,
+Role, and RoleBinding that allow creating, getting, patching, and deleting Jobs;
+getting and listing Pods; reading pod logs; and listing Events. Multi-node
+students also receive the same workload permissions for MPIJobs.
 The launcher's operator identity needs get access to Deployments, list access
 to Pods and Jobs, API discovery, and create access to the rendered resources.
 Creating the Role and RoleBinding also requires every delegated permission in
@@ -1140,10 +1183,10 @@ The snapshot includes the complete observation configuration. Optional
 and preemption policy with that configuration. Toleration order and duplicates
 do not affect the comparison. A mismatch returns unknown, preserves the observed
 configuration, and removes capacity counts. Matching requirements do not assess
-affinity, topology, quotas, or PVC placement. Single-node observation inherits
-the generated student pod's GPU toleration by default; multi-node observation
-defaults to empty tolerations. Explicit observation settings override defaults
-without changing target-owned worker placement.
+affinity, topology, quotas, or PVC placement. Observation defaults to the
+`nvidia.com/gpu` NoSchedule toleration used by managed training workers.
+An explicit empty list removes that toleration from observation. Explicit
+observation settings do not change worker placement.
 
 Hivemind startup remains commented with a clear note. The Python controller
 waits for the optional cluster start gate while continuously refreshing a
@@ -1202,7 +1245,7 @@ The change is acceptable when:
 
 - unit and local integration tests pass;
 - shell scripts pass `bash -n`;
-- manifests render matching immutable source revisions and scoped multi-node RBAC;
+- manifests render matching immutable source revisions and scoped training RBAC;
 - remote workloads remain suspended until their exact created UID is confirmed;
 - browser smoke succeeds in both image builds;
 - no operational prompt advertises a missing tool or service;

@@ -20,6 +20,7 @@ def result(state=TrainingState.RUNNING):
     return SimpleNamespace(
         state=state,
         exit_code=0 if state is TrainingState.FINISHED else None,
+        kubernetes_released=None,
     )
 
 
@@ -203,7 +204,7 @@ def test_old_metric_sample_emits_one_stale_signal():
     duplicate, _ = evaluate_monitor(
         spec,
         result(),
-        old,
+        MetricSample(value=0.8, observed_at=NOW),
         previous=old,
         emitted=frozenset(stale.dedupe_keys),
         now=NOW + timedelta(minutes=1),
