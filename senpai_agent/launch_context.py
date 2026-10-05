@@ -77,6 +77,7 @@ def render_launch_context(
     tag: str,
     advisor_branch: str,
     target_base: str,
+    gh_history_scope: str,
     students: list[str],
     training_image: str = "",
 ) -> str:
@@ -103,6 +104,7 @@ def render_launch_context(
             "TAG": tag,
             "ADVISOR_BRANCH": advisor_branch,
             "TARGET_BASE": target_base or "<default>",
+            "GH_HISTORY_SCOPE": gh_history_scope,
             "STUDENTS": ", ".join(students),
         },
     )

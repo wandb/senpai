@@ -853,7 +853,7 @@ Useful launch controls:
 - `--controller_node_selector key=value` optionally constrains advisor and multi-node controller placement; the portable default leaves placement unconstrained.
 - `--timeout_minutes` sets the launch-context wall-clock policy and the broker's hard ceiling for remote training. Local training enforces the timeout requested in `run_training`. `--max_epochs` sets the agent-facing epoch policy.
 - `--poll_interval_s` and `--poll_jitter_s` control idle GitHub cadence without teaching the model to poll.
-- `--gh_history_scope branch` keeps normal advisor-branch memory, `fresh` creates a shallow ablation checkout, and `repo` exposes full repository history.
+- `--gh_history_scope branch` keeps normal advisor-branch memory, `fresh` creates a shallow ablation checkout, and `repo` exposes full repository history. The launch prompt records this scope; `repo` permits inspecting and learning from other PRs and branches in the target repository. Writes remain limited to the advisor branch and assigned student PR branches. Unrelated experiment runs and historical results still require an explicit human reference.
 - `--extra_instructions` accepts optional human operator guidance as a Markdown file or literal user context.
 - `human_issues: false` disables GitHub Issue polling for isolated launches.
 

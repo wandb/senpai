@@ -113,13 +113,15 @@ def test_launch_context_tells_students_where_training_runs(nodes, image, executi
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
-def test_each_role_receives_authoritative_launch_context(role):
+@pytest.mark.parametrize("history_scope", ["branch", "fresh", "repo"])
+def test_each_role_receives_authoritative_launch_context(role, history_scope):
     args = launch_args(
         advisor_branch="research",
         nodes_per_student=2,
         gpus_per_student_node=8,
         timeout_minutes=20,
         max_epochs=9,
+        gh_history_scope=history_scope,
         extra_instructions="Prefer small, measurable experiments.",
     )
 
@@ -142,6 +144,11 @@ def test_each_role_receives_authoritative_launch_context(role):
     assert "Advisor branch: `research`" in context
     assert "W&B project: `wandb-applied-ai-team/senpai-v1`" in context
     assert "Students in scope: `fern`" in context
+    assert data["GH_HISTORY_SCOPE"] == history_scope
+    assert f"GitHub history scope: `{history_scope}`" in context
+    assert "Only modify `research` plus PR branches assigned" in context
+    assert "unless the GitHub history scope is `repo`" in context
+    assert "other PRs and branches in `example/problem`" in context
     assert (
         "Hard limits for each training run: `20` minutes wall-clock and `9` epochs"
         in context
