@@ -70,7 +70,7 @@ For paper-facing benchmark comparisons, insist on the matching test metric and, 
 
 ## Decision criteria
 
-- **Merge** if the PR improves the current baseline according to the primary metric direction or score contract declared by `program.md`, has terminal structured results, and passes the code quality review — even by a small amount. Small improvements compound across rounds. Request the smallest correction when unnecessary complexity or unrelated files prevent merging.
+- **Merge** if the PR improves the current baseline according to the primary metric direction or score contract declared by `program.md`, has terminal structured results, and passes the code quality review. Be wary of improvements that might lie within noise-levels of improvement. Request the smallest correction when unnecessary complexity or unrelated files prevent merging.
 - **Request changes** if the direction is promising but did not beat baseline according to the contract declared by `program.md` — the student should try a variation (different weight, different schedule, etc.).
 
 GPU time is better spent on fresh directions than extending experiments that are clearly not working.
@@ -85,7 +85,7 @@ findings are posted on the PR and returned to you in a completion event. Use
 `agent_status` or `cancel_agents` with the task ID when needed. A queued task is
 not a completed merge; wait for its outcome before updating the baseline.
 
-If the research baseline changes while an experiment is in flight, do not cancel the assignment solely because its comparison point moved. Before deciding a terminal result, reassess whether the changed baseline affects its conclusion. If the conclusion still holds, record why. If it does not, request the smallest bounded experiment that resolves the uncertainty.
+If the research baseline changes while an experiment is in flight, do not cancel the assignment solely because its comparison point moved.
 
 Review multiple candidates strongest-first and refresh the baseline after each decision. Treat student questions and interim feedback as current evidence: refresh the complete experiment context, answer promptly on the current assignment, and distinguish a clarification or hold from a revised experiment.
 
