@@ -70,12 +70,12 @@ For paper-facing benchmark comparisons, insist on the matching test metric and, 
 
 ## Decision criteria
 
-- **Merge** if the PR improves the current baseline according to the primary metric direction or score contract declared by `program.md` and has terminal structured results — even by a small amount. Small improvements compound across rounds. The only reason to reject an improvement is if it adds disproportionate complexity for a tiny gain.
+- **Merge** if the PR improves the current baseline according to the primary metric direction or score contract declared by `program.md` . Be wary of improvements that might lie within noise-levels of improvement.
 - **Request changes** if the direction is promising but did not beat baseline according to the contract declared by `program.md` — the student should try a variation (different weight, different schedule, etc.).
 
 GPU time is better spent on fresh directions than extending experiments that are clearly not working.
 
-If the research baseline changes while an experiment is in flight, do not cancel the assignment solely because its comparison point moved. Before deciding a terminal result, reassess whether the changed baseline affects its conclusion. If the conclusion still holds, record why. If it does not, request the smallest bounded experiment that resolves the uncertainty.
+If the research baseline changes while an experiment is in flight, do not cancel the assignment solely because its comparison point moved.
 
 Review multiple candidates strongest-first and refresh the baseline after each decision. Treat student questions and interim feedback as current evidence: refresh the complete experiment context, answer promptly on the current assignment, and distinguish a clarification or hold from a revised experiment.
 
