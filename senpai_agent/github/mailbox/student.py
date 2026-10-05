@@ -127,6 +127,10 @@ def student_events(
             )
             continue
 
+        if mailbox.quarantine_reporter is not None:
+            mailbox.quarantine_reporter.report(
+                int(pull["number"]), assignment, str(object_value(pull["head"])["sha"])
+            )
         feedback = student_pr_feedback_events(mailbox, pull, assignment)
         prior_revision_pending = any(
             event.payload["assignment_id"] != assignment.assignment_id
