@@ -449,6 +449,7 @@ def build_launch_context(
         tag=tag,
         advisor_branch=args.advisor_branch,
         target_base=args.target_repo_branch,
+        gh_history_scope=args.gh_history_scope,
         students=student_list,
         training_image=args.training_image,
     )
