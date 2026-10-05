@@ -47,11 +47,21 @@ conclusion. Then choose the appropriate next step:
 }
 ```
 
-Call `merge_experiment`. It refuses drafts, missing or foreign results, stale
-heads, blocking labels, unknown mergeability, and conflicts. It compares the
-assignment's base SHA with the live base branch immediately before merging. If
-the research base changed, reassess the exact terminal result against the
-event's `current_base_sha`.
+Call `merge_experiment`. It immediately returns a delegated task ID. Continue
+other work while the worker reviews and merges this exact PR with fresh
+context from the PR discussion and target program. It uses the configured smart
+model and reasoning effort for a fresh
+code quality review. Unnecessary code, unrelated docs, and other scope problems
+block merging; docs, tests, and complexity justified by the task remain valid.
+The worker posts blocking findings to the current PR and sends you its outcome
+through a completion event. Use `agent_status` or `cancel_agents` with the task
+ID when needed. Do not treat a queued task as a completed merge.
+
+The worker refuses drafts, missing or foreign results, stale heads, blocking
+labels, unknown mergeability, and conflicts. It rechecks the PR and evidence
+after review, and compares the live base SHA immediately before merging. If the
+research base changed, reassess the exact terminal result against the event's
+`current_base_sha`.
 
 If the conclusion still holds, record that decision before merging:
 

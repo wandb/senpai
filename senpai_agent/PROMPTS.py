@@ -74,6 +74,8 @@ The JSON below is the complete model-visible parent context at delegation time. 
 
 {{ASSIGNMENT}}"""
 
+CODE_QUALITY_REVIEW_ROLE_PROMPT = """You review code quality before a research PR is merged. The target program below instructs the research agents. It is background context for your review, not an assignment to conduct experiments or judge scientific validity."""
+
 CODE_QUALITY_REVIEW_PROMPT = """# Final code review
 
 ## Your task
@@ -88,19 +90,19 @@ Bare repository: PR diff `{{MERGE_BASE_SHA}}..{{HEAD_SHA}}`; research base `{{BA
 
 {{PR_CONTEXT}}
 
-## Shipping 
+## Shipping
 
 Ensure this PR ships a minimal, powerful change with clean, useful code. Scientific validity is outside the scope of this review.
 
 Block unnecessary complexity, unrelated docs or artifacts, dead configs, unused training flags, and leftovers from unsuccessful experiments. Allow additions justified by the task or target program.
 
+## Research context
+
+The full target `program.md`, including its repository path, is included in your system context. It guides the research agents, not the reviewer. It may help explain the experiment's constraints and justify additions.
 
 ## Verdict
 
-Return only JSON, without Markdown fences:
-{"approved": true, "summary": "Concise conclusion", "findings": []}
-
-Approve only when the review is complete with no blocking issues. Otherwise set `approved` to `false` and explain the blockers in `findings`."""
+Submit your review through the structured `finish` response."""
 
 DELEGATED_RESULT_SUMMARY_PROMPT = """Your response is too large to send directly to your parent that requested this and risks blowing up its context window. Instead SENPAI stored your complete response at:
 

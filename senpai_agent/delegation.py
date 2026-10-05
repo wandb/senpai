@@ -225,10 +225,14 @@ def configure_delegation(config: DelegationConfig | None) -> None:
     _DELEGATION_CONFIG = config
 
 
-def configured_child_runner_factory() -> ChildAgentRunnerFactory:
+def configured_delegation_config() -> DelegationConfig:
     if _DELEGATION_CONFIG is None:
         raise RuntimeError("subagent runtime is not configured")
-    config = _DELEGATION_CONFIG
+    return _DELEGATION_CONFIG
+
+
+def configured_child_runner_factory() -> ChildAgentRunnerFactory:
+    config = configured_delegation_config()
     return lambda request: OpenHandsChildProcess(config, request)
 
 
@@ -1253,7 +1257,7 @@ def _pid_matches_task(row: sqlite3.Row) -> bool:
         return False
     try:
         process = psutil.Process(row["pid"])
-        command = " ".join(process.cmdline())
+        command = process.cmdline()
         process_start_time = process.create_time()
         process_group_id = os.getpgid(row["pid"])
     except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
@@ -1261,7 +1265,14 @@ def _pid_matches_task(row: sqlite3.Row) -> bool:
     return (
         process_group_id == row["process_group_id"]
         and process_start_time == row["process_start_time"]
-        and "senpai_agent.openhands_runner" in command
+        and any(
+            command[index:index + 2] == ["-m", module]
+            for index in range(len(command) - 1)
+            for module in (
+                "senpai_agent.openhands_runner",
+                "senpai_agent.github.merge_worker",
+            )
+        )
         and bool(row["state_dir"])
         and row["state_dir"] in command
     )
@@ -1847,15 +1858,13 @@ def _require_unique_task_ids(task_ids: Sequence[str]) -> None:
         raise ValueError("task_ids must not contain duplicates")
 
 
-def _configured_manager(
-    child_runner_factory: ChildAgentRunnerFactory | None,
-    event_sink: LocalEventSink | None,
-    event_db_path: str | Path | None,
+def configured_delegation_manager(
+    child_runner_factory: ChildAgentRunnerFactory | None = None,
+    event_sink: LocalEventSink | None = None,
+    event_db_path: str | Path | None = None,
 ) -> _DelegationManager:
-    if _DELEGATION_CONFIG is None:
-        raise RuntimeError("subagent runtime is not configured")
     return _DelegationManager(
-        _DELEGATION_CONFIG,
+        configured_delegation_config(),
         child_runner_factory or configured_child_runner_factory(),
         event_sink,
         Path(event_db_path) if event_db_path is not None else None,
@@ -2035,7 +2044,7 @@ class _DelegationTool(ToolDefinition):
         event_sink,
         event_db_path,
     ) -> _DelegationManager:
-        return _configured_manager(child_runner_factory, event_sink, event_db_path)
+        return configured_delegation_manager(child_runner_factory, event_sink, event_db_path)
 
 
 class SpawnAgentsTool(_DelegationTool[SpawnAgentsAction, SpawnAgentsObservation]):

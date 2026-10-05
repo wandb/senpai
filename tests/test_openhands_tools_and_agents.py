@@ -266,6 +266,7 @@ def test_main_tools_replace_unsafe_defaults_with_role_scoped_boundaries(
     assert by_name["senpai_github"].params == {
         "role": role,
         "state_dir": str(config.state_dir / "github"),
+        "event_db_path": str(config.state_dir / f"{role}-events.sqlite3"),
         "advisor_branch": "advisor-branch" if role == "advisor" else None,
         "student_names": ("student-one",) if role == "advisor" else None,
         "student_name": "student-one" if role == "student" else None,

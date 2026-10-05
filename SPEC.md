@@ -580,10 +580,35 @@ Git ref for the assignment's base branch and compares it with
 base equals that live SHA or an exact matching acceptance exists. Replay of an
 already verified merge returns before this ref lookup.
 
+The advisor's `merge_experiment` tool queues one background worker through the
+existing subagent dispatcher and immediately returns its delegated task state.
+The worker starts one fresh code review with the configured smart model and
+smart reasoning effort, using an isolated Git snapshot of the exact PR head
+and current research base. It receives no advisor conversation history or
+parent-history directory. Its prompt includes the full PR body, issue comments,
+submitted reviews, and inline review comments. Its system context includes the
+full target program as research-agent guidance, with a separate reviewer role.
+The review checks code quality, minimal scope, and unused code, configs, flags,
+or files left by unsuccessful experiments. Scientific validity and experiment
+selection remain the advisor's
+responsibility. Required docs, useful tests, reproducibility artifacts, and
+justified complexity remain valid exceptions.
+
+Only a valid Pydantic verdict submitted through the agent's structured `finish`
+tool can approve a merge. The worker checks the assignment, PR context, labels,
+mergeability, result evidence, and live base again after review. A rejection or
+incomplete review blocks merging. The worker
+posts the reason through assignment feedback when the exact assignment and head
+still match, and reports the outcome directly through a delegated completion
+event. Comment failures are included in that outcome. The advisor can continue
+other work and use `agent_status` or `cancel_agents` with the returned task ID.
+
 All assignment mutations issued by one workflow instance, plus that worker's
 advisor-branch publication and the student's complete preflight/push/result
-transaction, share one runtime lock. This closes races among sibling tool calls
-in the same process. Separate advisor and student workers still rely on exact
+transaction, share one runtime lock. The advisor and its merge workers also
+share a file lock. Merge releases that lock during code review and reacquires
+it for the final checks and mutation. This closes races among sibling tool
+calls and competing merge workers. Separate advisor and student pods still rely on exact
 GitHub identities, branch leases, immutable result evidence, and post-mutation
 verification; a stale result that loses a revision race restores the current
 revision to WIP before failing. GitHub's merge endpoint can precondition the PR

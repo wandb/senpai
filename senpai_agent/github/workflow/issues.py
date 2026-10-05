@@ -53,7 +53,7 @@ class HumanIssueMixin:
         digest = sha256(json.dumps([title, body]).encode()).hexdigest()
         marker = f"{prefix}{digest} -->"
 
-        with self._assignment_lifecycle_lock:
+        with self.serialized_assignment_mutation():
             existing = self._created_human_issue(prefix)
             if existing is not None:
                 if authoritative_marker_line(existing.body or "") != marker:
@@ -146,7 +146,7 @@ class HumanIssueMixin:
     ) -> MutationResult:
         """Reply once to one verified human-authored GitHub issue message."""
 
-        with self._assignment_lifecycle_lock:
+        with self.serialized_assignment_mutation():
             return self._respond_to_issue(
                 number,
                 human_message_id=human_message_id,

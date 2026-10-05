@@ -87,7 +87,7 @@ from openhands.tools.preset.default import (
     register_default_tools,
 )
 from opentelemetry import trace
-from pydantic import SecretStr
+from pydantic import BaseModel, SecretStr
 from simple_parsing import ArgumentParser, field
 from simple_parsing.helpers import flag
 
@@ -1235,6 +1235,7 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
                     "advisor_branch": config.advisor_branch,
                     "student_names": config.student_names,
                     "student_name": config.student_name,
+                    "event_db_path": str(local_event_db_path(config)),
                 },
             ),
         )
@@ -1646,7 +1647,7 @@ def _latest_completed_tool_event_id(
     return None
 
 
-def run_openhands(
+def run_openhands[ResponseT: BaseModel](
     prompt: str,
     config: RunnerConfig,
     *,
@@ -1655,12 +1656,16 @@ def run_openhands(
     inbox_turn_id: str | None = None,
     recovery_prompt: str | None = None,
     on_activity: Callable[[], None] | None = None,
+    response_schema: type[ResponseT] | None = None,
+    on_structured_result: Callable[[ResponseT], None] | None = None,
     on_inference_state: (
         Callable[[float | None, float | None], None] | None
     ) = None,
 ) -> int:
     if (inbox is None) != (inbox_turn_id is None):
         raise ValueError("inbox and inbox_turn_id must be provided together")
+    if (response_schema is None) != (on_structured_result is None):
+        raise ValueError("response_schema and on_structured_result must be provided together")
     started_at = time.time()
     run_deadline = (
         min(
@@ -1861,6 +1866,16 @@ def run_openhands(
                 condenser=condenser,
                 tool_concurrency_limit=MAX_PARALLEL_AGENTS,
             )
+        if response_schema is not None:
+            agent = agent.model_copy(update={
+                "tools": [
+                    *(tool for tool in agent.tools if tool.name != "FinishTool"),
+                    Tool(name="FinishTool", params={"response_schema": response_schema}),
+                ],
+                "include_default_tools": [
+                    name for name in agent.include_default_tools if name != "FinishTool"
+                ],
+            })
         last_activity = time.monotonic()
 
         def observe_event(event: object) -> None:
@@ -1992,12 +2007,19 @@ def run_openhands(
             and status == ConversationExecutionStatus.FINISHED
         ):
             inbox.record_processed(active_inbox_turn_id)
-        child_result = (
-            final_agent_result(conversation)
-            if config.child and status == ConversationExecutionStatus.FINISHED
-            else None
-        )
-        if child_result is not None:
+        child_result = None
+        structured_result: ResponseT | None = None
+        if status == ConversationExecutionStatus.FINISHED:
+            if response_schema is not None:
+                finish = conversation.agent.tools_map["finish"]
+                response = finish.parse_last_response(conversation.state.view.events)
+                if not isinstance(response, response_schema):
+                    raise RuntimeError("agent finished without the required structured response")
+                structured_result = response
+                child_result = response.model_dump_json() if config.child else None
+            elif config.child:
+                child_result = final_agent_result(conversation)
+        if child_result is not None and response_schema is None:
             child_result = compact_child_result(
                 conversation,
                 agent.llm,
@@ -2057,6 +2079,9 @@ def run_openhands(
                 else f"child execution ended with status {status.value}"
             ),
         )
+
+    if on_structured_result is not None and structured_result is not None:
+        on_structured_result(structured_result)
 
     print(
         "OPENHANDS_RESULT "

@@ -39,7 +39,7 @@ class RevisionMixin:
         required_base_sha: str,
         comment: str,
     ) -> MutationResult:
-        with self._assignment_lifecycle_lock:
+        with self.serialized_assignment_mutation():
             return self._request_revision(
                 number,
                 assignment_id=assignment_id,
@@ -187,7 +187,7 @@ class RevisionMixin:
     ) -> MutationResult:
         """Upsert guidance for the current assignment without starting a revision."""
 
-        with self._assignment_lifecycle_lock:
+        with self.serialized_assignment_mutation():
             return self._send_assignment_feedback(
                 number,
                 assignment_id=assignment_id,
@@ -212,6 +212,7 @@ class RevisionMixin:
             assignment_id=assignment_id,
             revision_id=revision_id,
             expected_head_sha=expected_head_sha,
+            allowed_statuses=frozenset({"status:wip", "status:review"}),
         )
         feedback_id = feedback_id.strip()
         body = comment.strip()
@@ -242,6 +243,7 @@ class RevisionMixin:
             assignment_id=assignment_id,
             revision_id=revision_id,
             expected_head_sha=expected_head_sha,
+            allowed_statuses=frozenset({"status:wip", "status:review"}),
         )
         return MutationResult(
             changed=changed,

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from openhands.sdk.tool import ToolExecutor
 
 from senpai_agent import git_workflow
+from senpai_agent.delegation import SpawnAgentsObservation
 from senpai_agent.git_transport import github_repository_url
 from senpai_agent.models import (
     AssignmentRecord,
@@ -204,26 +205,22 @@ class AcceptResultOnCurrentBaseExecutor(
 
 
 class MergeExperimentExecutor(
-    ToolExecutor[MergeExperimentAction, GitHubMutationObservation]
+    ToolExecutor[MergeExperimentAction, SpawnAgentsObservation]
 ):
-    def __init__(self, workflow: GitHubWorkflow):
-        self.workflow = workflow
+    def __init__(self, runtime: GitHubToolRuntime):
+        self.runtime = runtime
 
     def __call__(
         self,
         action: MergeExperimentAction,
         conversation: LocalConversation | None = None,
-    ) -> GitHubMutationObservation:
-        version = action.assignment
-        result = self.workflow.merge_experiment(
-            version.pr_number,
-            assignment_id=version.assignment_id,
-            current_revision_id=version.revision_id,
-            expected_head_sha=version.expected_pr_head_sha,
-            expected_current_base_sha=action.expected_current_base_sha,
-            merge_method=action.merge_method,
-        )
-        return GitHubMutationObservation.from_result(result)
+    ) -> SpawnAgentsObservation:
+        from senpai_agent.github.merge_dispatch import queue_merge
+
+        if conversation is None or self.runtime.event_db_path is None:
+            raise RuntimeError("merge_experiment requires its advisor conversation and event store")
+        task = queue_merge(action, conversation, event_db_path=self.runtime.event_db_path)
+        return SpawnAgentsObservation(tasks=[task])
 
 
 class CloseExperimentExecutor(

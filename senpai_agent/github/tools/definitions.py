@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Self
 
 from openhands.sdk.tool import ToolDefinition, ToolExecutor
+from senpai_agent.delegation import SpawnAgentsObservation
 
 from .advisor import (
     AcceptResultOnCurrentBaseExecutor,
@@ -218,19 +219,23 @@ class AcceptResultOnCurrentBaseTool(
 
 
 class MergeExperimentTool(
-    ToolDefinition[MergeExperimentAction, GitHubMutationObservation]
+    ToolDefinition[MergeExperimentAction, SpawnAgentsObservation]
 ):
-    """Merge one verified experiment result."""
+    """Queue an independent code review and merge for one exact experiment."""
 
     @classmethod
     def create(cls, runtime: GitHubToolRuntime) -> Sequence[Self]:
-        return _tool(
-            cls, MergeExperimentAction, "Merge experiment",
-            "Merge one review-ready experiment at the expected PR head and current "
-            "research base. Changed-base results require a prior "
-            "accept_result_on_current_base call.",
-            MergeExperimentExecutor(runtime.workflow),
-        )
+        return [cls(
+            description=(
+                "Merge one review-ready experiment, an AI agent will carry out one final "
+                "code review and then merge if satisifed, otherwise it will return with "
+                "review feedback."
+            ),
+            action_type=MergeExperimentAction,
+            observation_type=SpawnAgentsObservation,
+            annotations=tool_annotations("Queue experiment review and merge"),
+            executor=MergeExperimentExecutor(runtime),
+        )]
 
 
 class CloseExperimentTool(

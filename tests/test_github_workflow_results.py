@@ -196,6 +196,7 @@ def test_changed_result_is_allowed_on_a_new_revision_or_head(advance):
         assignment_id=ASSIGNMENT_ID,
         current_revision_id=changed.assignment.revision_id,
         expected_current_base_sha=BASE_SHA,
+        review_code=lambda _snapshot: None,
     ).state == "experiment_merged"
 
 
@@ -665,6 +666,7 @@ def test_submit_result_replays_and_merges_with_marker_text_in_visible_fields():
         assignment_id=ASSIGNMENT_ID,
         current_revision_id="revision-1",
         expected_current_base_sha=BASE_SHA,
+        review_code=lambda _snapshot: None,
     )
 
     assert merged.state == "experiment_merged"
@@ -703,6 +705,7 @@ def test_other_trusted_comments_cannot_smuggle_protocol_markers():
         assignment_id=ASSIGNMENT_ID,
         current_revision_id="revision-1",
         expected_current_base_sha=BASE_SHA,
+        review_code=lambda _snapshot: None,
     ).state == "experiment_merged"
 
 
@@ -753,6 +756,7 @@ def test_submit_result_preserves_a_hold_added_during_label_transition():
             assignment_id=ASSIGNMENT_ID,
             current_revision_id="revision-1",
             expected_current_base_sha=BASE_SHA,
+            review_code=lambda _snapshot: None,
         )
 
     assert fake.mutations == mutations_before_merge

@@ -51,6 +51,7 @@ class GitHubWorkflowToolSet(
         advisor_branch: str | None = None,
         student_names: Sequence[str] | str | None = None,
         student_name: str | None = None,
+        event_db_path: str | Path | None = None,
     ) -> Sequence[ToolDefinition]:
         role = role or os.environ.get("SENPAI_ROLE")
         if role not in {"advisor", "student"}:
@@ -72,6 +73,10 @@ class GitHubWorkflowToolSet(
                 credentials.token,
                 role=role,
                 trusted_actor=credentials.trusted_actor,
+                mutation_lock_path=(
+                    Path(state_dir) / "assignment-mutations.lock"
+                    if state_dir is not None else None
+                ),
             )
             git_token = credentials.token
         elif workflow.role != role:
@@ -85,6 +90,7 @@ class GitHubWorkflowToolSet(
             advisor_branch=advisor_branch or os.environ.get("ADVISOR_BRANCH"),
             student_names=configured_student_names(student_names),
             student_name=student_name or os.environ.get("STUDENT_NAME"),
+            event_db_path=Path(event_db_path) if event_db_path is not None else None,
         )
         if role == "advisor":
             runtime.assignment_base_branch()

@@ -516,7 +516,7 @@ flowchart LR
 3. The assigned student receives one OpenHands conversation for that assignment revision. New PR comments and reviews steer it after the current agent step.
 4. The student commits the exact implementation, launches supervised training, records every referenced run in W&B, and uses `post_assignment_comment` for material progress, questions, blockers, or replies. Each typed comment wakes the advisor without changing the PR head, draft state, or labels.
 5. The student calls `submit_experiment_result`; the tool validates and publishes the branch before changing the PR to `status:review`.
-6. The advisor compares the evidence, then uses the corresponding operation-specific tool to merge a reproducible winner, close a useful negative result, request a new revision, or send non-revision feedback.
+6. The advisor compares the evidence, then uses the corresponding operation-specific tool to queue a review and merge of a reproducible winner, close a useful negative result, request a new revision, or send non-revision feedback.
 
 When the advisor requires code on GitHub before training or review, use `push_experiment_commit`. It pushes the exact current local commit (HEAD) to the existing GitHub branch for the experiment PR. Commit all changes first. Supply:
 

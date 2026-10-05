@@ -563,11 +563,12 @@ def send_feedback(
     )
 
 
-def test_assignment_feedback_replays_without_changing_assignment_state():
+@pytest.mark.parametrize("status", ["wip", "review"])
+def test_assignment_feedback_replays_without_changing_assignment_state(status):
     fake = FakeGitHub(
         pull_request(
-            labels={"student:student-one", "status:wip", "status:hold"},
-            draft=True,
+            labels={"student:student-one", f"status:{status}", "status:hold"},
+            draft=status == "wip",
         )
     )
     original_state = (fake.pr["body"], fake.pr["draft"], frozenset(fake.pr["labels"]))
@@ -701,10 +702,9 @@ def test_assignment_feedback_rejects_stale_identity_before_writing(
     [
         {"student:someone-else", "status:wip"},
         {"student:student-one"},
-        {"student:student-one", "status:review"},
         {"student:student-one", "status:wip", "status:review"},
     ],
-    ids=("wrong-student", "missing-status", "review-ready", "ambiguous-status"),
+    ids=("wrong-student", "missing-status", "ambiguous-status"),
 )
 def test_assignment_feedback_requires_unambiguous_active_routing(labels):
     fake = FakeGitHub(pull_request(labels=labels))
