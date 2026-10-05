@@ -126,7 +126,7 @@ descriptor = int(os.environ["SENPAI_MODEL_CREDENTIALS_FD"])
 import senpai_agent.openhands_runner as runner
 assert Path(runner.__file__).resolve() == Path(os.environ["PYTHONPATH"]) / "senpai_agent/openhands_runner.py"
 
-def inspect_runtime(prompt, config):
+def inspect_runtime(prompt, config, **_kwargs):
     assert "Inspect the private handoff." in prompt
     assert config.child
     assert config.github_token is None

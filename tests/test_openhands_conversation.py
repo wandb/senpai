@@ -1654,7 +1654,7 @@ def test_recovered_actions_are_rejected_before_the_conversation_resumes(
 def test_main_removes_the_model_key_and_flushes_weave_after_failure(monkeypatch, tmp_path):
     flushed = []
 
-    def fail_run(_prompt, _config):
+    def fail_run(_prompt, _config, **_kwargs):
         assert "ANTHROPIC_API_KEY" not in runner.os.environ
         raise RuntimeError("run failed")
 

@@ -80,9 +80,11 @@ def supervisor_case(tmp_path, monkeypatch):
                     raise RuntimeError("assignment changed during repair")
 
             def prepare(self, request):
+                self.validate(request)
                 return "Full PR discussion and explicit repair request."
 
-            def complete(self, number, request, summary, resolved):
+            def complete(self, number, request, summary, resolved, *, delivered_to):
+                assert delivered_to == case.parent_id
                 case.completion_attempts.append((number, summary, resolved))
                 case.collected_on_completion.append(
                     [
@@ -113,18 +115,19 @@ def supervisor_case(tmp_path, monkeypatch):
             case.children.append(child)
             return child
 
-        def manager(config, **_kwargs):
-            return DelegationManager(delegation_config(config), factory)
-
         def finish(_seconds):
             child = case.children[-1]
             child.finished = True
             child.complete(case.result, None)
 
         monkeypatch.setattr(supervision, "SupervisorGateway", lambda _config: Gateway())
-        monkeypatch.setattr(supervision, "make_supervisor_manager", manager)
+        monkeypatch.setattr(
+            supervision,
+            "OpenHandsChildProcess",
+            lambda _config, request: factory(request),
+        )
         monkeypatch.setattr(supervision, "time", SimpleNamespace(sleep=finish))
-        case.manager = manager(config)
+        case.manager = DelegationManager(delegation_config(config), factory)
         case.lease_path = tmp_path / "lease.json"
         case.handler = supervision.SupervisorHandler(
             config,
@@ -207,20 +210,26 @@ def test_request_replay_reuses_child_and_cannot_reset_a_later_quarantine(
     supervisor_case,
     assignment_changed,
 ):
-    case = supervisor_case()
+    case = supervisor_case("student")
     case.completion_failures = 1
     with pytest.raises(RuntimeError, match="GitHub unavailable"):
         case.handler(case.event)
     assert all(value is not None for value in case.collected_on_completion[0])
     assert case.inbox.turn(case.turn.turn_id).quarantine_reason is None
     case.inbox.quarantine(case.turn.turn_id, "a different failure")
-    case.preflight_error = "assignment changed" if assignment_changed else None
+    case.preflight_error = "PR head changed" if assignment_changed else None
 
     restarted = supervision.SupervisorHandler(case.config, case.inbox)
     restarted(case.event)
     assert len(case.children) == 1
     assert case.inbox.turn(case.turn.turn_id).quarantine_reason == "a different failure"
-    assert case.completed[-1][2] is (not assignment_changed)
+    assert case.completed == [(23, "Repaired and checked.", True)]
+    assert case.completion_attempts[0] == case.completion_attempts[1]
+    assert case.inbox.turn(case.turn.turn_id).event_keys == (
+        "original",
+        "supervisor_recovered:23",
+    )
+    assert case.inbox.pending_count(case.parent_id) == 0
 
     # Different requesters may reuse the same request_id; Issues identify attempts.
     case.preflight_error = None

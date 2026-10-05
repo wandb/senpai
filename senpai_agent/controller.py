@@ -633,10 +633,10 @@ class Controller:
         remaining = cooldown.retry_at - time.time()
         return remaining if remaining > 0 else None
 
-    def _poll_into_inbox(self, *, allow_reminders: bool = True) -> None:
+    def _poll_mailbox(self, *, allow_reminders: bool) -> Sequence[ControllerEvent] | None:
         self._publish_progress("poll")
         try:
-            polled = self.mailbox.poll()
+            return self.mailbox.poll()
         except Exception as error:  # noqa: BLE001
             if allow_reminders:
                 raise
@@ -645,6 +645,11 @@ class Controller:
                 file=sys.stderr,
                 flush=True,
             )
+            return None
+
+    def _poll_into_inbox(self, *, allow_reminders: bool = True) -> None:
+        polled = self._poll_mailbox(allow_reminders=allow_reminders)
+        if polled is None:
             return
         requests = tuple(
             event for event in polled if event.kind == "supervisor_requested"
@@ -670,8 +675,9 @@ class Controller:
                     self._deferred_conversations.pop(recovered, None)
             # Repair may change the checkout or remote state. Discard the old snapshot
             # before assignment reconciliation or delivering any normal model work.
-            self._publish_progress("poll")
-            polled = self.mailbox.poll()
+            polled = self._poll_mailbox(allow_reminders=allow_reminders)
+            if polled is None:
+                return
         polled = tuple(event for event in polled if event.kind != "supervisor_requested")
         for event in polled:
             if event.kind == "student_assignment_comment":

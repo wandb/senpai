@@ -289,6 +289,59 @@ def test_successful_turn_repolls_immediately_and_continues_without_full_brief():
     assert mailbox.calls == 3
 
 
+@pytest.mark.parametrize("post_turn", [False, True])
+def test_supervisor_repoll_failure_preserves_the_polling_error_policy(
+    post_turn, capsys,
+):
+    request = ControllerEvent(
+        kind="supervisor_requested",
+        dedupe_key="supervisor_requested:23",
+        payload={"number": 23},
+    )
+    initial, stale, fresh = (review_event(number) for number in (17, 18, 19))
+    snapshots = [
+        (request, stale),
+        RuntimeError("mailbox unavailable"),
+        (fresh,),
+        (),
+    ]
+    if post_turn:
+        snapshots.insert(0, (initial,))
+
+    class FailingMailbox(Mailbox):
+        def poll(self):
+            result = super().poll()
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    turns = Turns()
+    supervised = []
+    reconciled = []
+    runtime = controller(
+        FailingMailbox(snapshots),
+        turns,
+        supervise=supervised.append,
+        reconcile=reconciled.extend,
+    )
+    if post_turn:
+        runtime.run(max_cycles=2)
+        assert [call[2] for call in turns.calls] == [
+            frozenset({initial.dedupe_key}),
+            frozenset({fresh.dedupe_key}),
+        ]
+        assert reconciled == [initial, fresh]
+        assert "SENPAI_POST_TURN_POLL_ERROR RuntimeError: mailbox unavailable" in (
+            capsys.readouterr().err
+        )
+    else:
+        with pytest.raises(RuntimeError, match="mailbox unavailable"):
+            runtime.run(max_cycles=2)
+        assert turns.calls == []
+        assert reconciled == []
+    assert supervised == [request]
+
+
 def test_post_turn_snapshot_retracts_availability_queued_during_active_turn(
     tmp_path: Path,
 ):

@@ -603,18 +603,15 @@ still match, and reports the outcome directly through a delegated completion
 event. Comment failures are included in that outcome. The advisor can continue
 other work and use `agent_status` or `cancel_agents` with the returned task ID.
 
-The same Supervisor role handles explicit `request_supervisor` repairs. A typed
-GitHub Issue binds the request to its repository, advisor branch, recipient,
-and current student assignment where applicable. The recipient controller runs
-one fresh smart-profile child through the existing delegation registry at a
-foreground polling boundary, while ordinary turns and checkout reconciliation
-are paused. Active children, active training, stale assignments, and holds block
-repair. The child can edit the local checkout; it has no GitHub or Kubernetes
-authority. A validated Pydantic result can reopen the original conversation
-once, after the controller rechecks the assignment and head. Failed repairs
-leave quarantine intact. The request Issue records the result and delivers it
-to the requesting conversation. No new pod, remote execution service, or
-automatic repair loop is introduced.
+`request_supervisor` binds a repair Issue to its repository, advisor branch,
+recipient and current student assignment. The target controller pauses turns
+and checkout reconciliation while one fresh `smart` child runs through the
+existing delegation registry. Active children or training, stale assignments
+and holds block repair. A verified Pydantic result resumes the original
+conversation once, after assignment and head checks; failure leaves quarantine
+intact. Saved outcomes survive publication retries. Cross-pod result Issues
+stay open until the requester acknowledges them, so polling covers pending
+work. Repairs add no pods, remote execution service or automatic repair loop.
 
 All assignment mutations issued by one workflow instance, plus that worker's
 advisor-branch publication and the student's complete preflight/push/result

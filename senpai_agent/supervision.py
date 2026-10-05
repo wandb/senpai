@@ -11,16 +11,21 @@ from pydantic import BaseModel, ConfigDict
 from senpai_agent.delegation import (
     TERMINAL_TASK_STATUSES,
     AgentTask,
+    DelegationManager,
+    OpenHandsChildProcess,
     SpawnAgentsAction,
 )
 from senpai_agent.github.mailbox.values import versioned_event
-from senpai_agent.github.supervision import SupervisorGateway, SupervisorRequest
+from senpai_agent.github.supervision import (
+    SupervisorGateway,
+    SupervisorRequest,
+    SupervisorResult,
+)
 from senpai_agent.inbox import STEER_PRIORITY, PersistentInbox
 from senpai_agent.local_events import LocalEventStore
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.state import AssignmentConversationRegistry, _replace_json
 from senpai_agent.supervisor import ProgressLease
-from senpai_agent.supervisor_worker import SupervisorResult, make_supervisor_manager
 from senpai_agent.training import TrainingState
 
 if TYPE_CHECKING:
@@ -55,10 +60,16 @@ class SupervisorHandler:
         self.monitor_store = monitor_store
 
     def __call__(self, event: ControllerEvent) -> UUID | None:
+        from senpai_agent.openhands_runner import delegation_config
+
         request = SupervisorRequest.model_validate(event.payload["request"])
         issue_number = int(event.payload["number"])
         gateway = SupervisorGateway(self.config)
-        manager = make_supervisor_manager(self.config)
+        child_config = delegation_config(self.config)
+        manager = DelegationManager(
+            child_config,
+            lambda request: OpenHandsChildProcess(child_config, request),
+        )
         parent_id = self.config.conversation_id
         if self.config.role == "student":
             assert request.assignment is not None
@@ -98,11 +109,10 @@ class SupervisorHandler:
                     "Supervisor request for the changed task."
                 ),
             )
-        try:
-            if self.progress is not None:
-                self.progress.update("supervisor-prepare", 300)
-            if result is None or result.resolved:
-                gateway.validate(request)
+        if saved is None:
+            try:
+                if self.progress is not None:
+                    self.progress.update("supervisor-prepare", 300)
                 if any(
                     row["task_id"] != task_id for row in manager.registry.active_rows()
                 ):
@@ -116,12 +126,12 @@ class SupervisorHandler:
                             raise RuntimeError(
                                 "Supervisor requires active training to stop first."
                             )
-            if result is None:
                 # Reuse the original snapshot if the controller restarts mid-repair.
-                prompt = (
-                    prior["task"] if prior is not None else gateway.prepare(request)
-                )
-                if prior is None:
+                if prior is not None:
+                    gateway.validate(request)
+                    prompt = prior["task"]
+                else:
+                    prompt = gateway.prepare(request)
                     for turn in self.inbox.quarantined_turns():
                         if turn.conversation_id == str(parent_id):
                             prompt += (
@@ -151,19 +161,19 @@ class SupervisorHandler:
                 if task.status != "finished":
                     raise RuntimeError(task.error or f"Supervisor task {task.status}.")
                 result = SupervisorResult.model_validate_json(task.result or "")
-            if result.resolved:
-                if self.progress is not None:
-                    self.progress.update("supervisor-validate", 300)
-                gateway.validate(request)
-        except BaseException as error:
-            if task_id is not None:
-                manager.cancel_for_owner([task_id], str(parent_id))
-            if not isinstance(error, Exception):
-                raise
-            result = SupervisorResult(
-                resolved=False,
-                repair_summary=f"{type(error).__name__}: {error}",
-            )
+                if result.resolved:
+                    if self.progress is not None:
+                        self.progress.update("supervisor-validate", 300)
+                    gateway.validate(request)
+            except BaseException as error:
+                if task_id is not None:
+                    manager.cancel_for_owner([task_id], str(parent_id))
+                if not isinstance(error, Exception):
+                    raise
+                result = SupervisorResult(
+                    resolved=False,
+                    repair_summary=f"{type(error).__name__}: {error}",
+                )
 
         _replace_json(
             outcome_path,
@@ -215,5 +225,11 @@ class SupervisorHandler:
                 store.acknowledge(f"agent_result:{task_id}")
         if self.progress is not None:
             self.progress.update("supervisor-complete", 300)
-        gateway.complete(issue_number, request, result.repair_summary, result.resolved)
+        gateway.complete(
+            issue_number,
+            request,
+            result.repair_summary,
+            result.resolved,
+            delivered_to=parent_id,
+        )
         return parent_id if result.resolved else None

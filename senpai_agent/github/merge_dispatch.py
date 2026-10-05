@@ -14,19 +14,19 @@ from senpai_agent.delegation import (
     AgentTaskState,
     DelegationConfig,
     DelegationRequest,
+    OpenHandsChildProcess,
     SpawnAgentsAction,
     configured_delegation_config,
     configured_delegation_manager,
 )
 from senpai_agent.github.tools.contracts import MergeExperimentAction
 from senpai_agent.github.tools.runtime import current_github_credentials
-from senpai_agent.supervisor_worker import SupervisorProcess
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation import LocalConversation
 
 
-class MergeWorkerProcess(SupervisorProcess):
+class MergeWorkerProcess(OpenHandsChildProcess):
     def __init__(
         self,
         config: DelegationConfig,

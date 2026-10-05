@@ -125,7 +125,7 @@ def student_mailbox(
     monkeypatch.setattr(mailbox, "_issues", list)
     monkeypatch.setattr(mailbox, "_has_write_permission", lambda _login: True)
     responses.setdefault(
-        "/repos/acme/widgets/issues?state=all&labels=supervisor%2Cresearch&per_page=100",
+        "/repos/acme/widgets/issues?state=open&labels=supervisor%2Cresearch&per_page=100",
         [],
     )
     monkeypatch.setattr(mailbox._github, "objects", lambda url: responses[url])

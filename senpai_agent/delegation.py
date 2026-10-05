@@ -430,6 +430,8 @@ class OpenHandsChildProcess:
                 "SENPAI_DELEGATION_MODEL_TIER": self._request.model,
             }
         )
+        if self._request.agent == "supervisor":
+            environment.pop("SENPAI_PARENT_CONVERSATION_HISTORY_DIR", None)
         if self._request.deadline_epoch is not None:
             remaining = self._request.deadline_epoch - time.time()
             if remaining <= 0:
@@ -1279,7 +1281,6 @@ def _pid_matches_task(row: sqlite3.Row) -> bool:
             for module in (
                 "senpai_agent.openhands_runner",
                 "senpai_agent.github.merge_worker",
-                "senpai_agent.supervisor_worker",
             )
         )
         and bool(row["state_dir"])

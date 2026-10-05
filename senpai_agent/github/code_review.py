@@ -27,7 +27,6 @@ from senpai_agent.PROMPTS import (
     CODE_QUALITY_REVIEW_PROMPT,
     render_prompt,
 )
-from senpai_agent.supervisor_worker import supervisor_config
 
 if TYPE_CHECKING:
     from senpai_agent.openhands_runner import RunnerConfig
@@ -72,7 +71,7 @@ def review_code_quality(
     token: SecretStr,
     config: RunnerConfig,
 ) -> None:
-    from senpai_agent.openhands_runner import run_openhands
+    from senpai_agent.openhands_runner import run_openhands, supervisor_config
 
     started_at = time.time()
     review_deadline = min(

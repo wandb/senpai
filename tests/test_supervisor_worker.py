@@ -12,7 +12,14 @@ from openhands.sdk.tool import resolve_tool
 from openhands_support import runtime_env
 
 import senpai_agent.openhands_runner as runner
-import senpai_agent.supervisor_worker as supervisor
+
+
+def test_supervisor_requires_a_delegated_child(monkeypatch):
+    monkeypatch.delenv("SENPAI_MODEL_CREDENTIALS_FD", raising=False)
+    monkeypatch.setattr(runner, "finish_weave_monitoring", lambda: None)
+
+    with pytest.raises(RuntimeError, match="requires a delegated child"):
+        runner.main(["--agent", "supervisor", "--max-turns", "1"])
 
 
 @pytest.mark.parametrize("outcome", ["repaired", "unfinished", "failed"])
@@ -45,14 +52,18 @@ def test_supervisor_repairs_local_workspace_and_publishes_only_after_cleanup(
     monkeypatch.setenv("SENPAI_MODEL_CREDENTIALS_FD", str(read_fd))
     monkeypatch.setenv("SENPAI_DELEGATION_TASK_ID", "repair-task")
     monkeypatch.setenv(
+        "SENPAI_DELEGATION_REGISTRY_PATH", str(tmp_path / "delegation.sqlite3")
+    )
+    monkeypatch.setenv(
         "SENPAI_PARENT_CONVERSATION_HISTORY_DIR", "/private/advisor/history"
     )
     monkeypatch.setattr("sys.stdin", StringIO(prompt))
     closed = False
     published = []
+    publication_states = []
 
     def record(task_id, **values):
-        assert closed, "parent resumed while Supervisor tools were still open"
+        publication_states.append(closed)
         published.append((task_id, values))
 
     class RepairConversation:
@@ -95,8 +106,6 @@ def test_supervisor_repairs_local_workspace_and_publishes_only_after_cleanup(
             )
             self.editor = next(tool for tool in definitions if tool.name != "finish")
             self.finish = self.agent.tools_map["finish"]
-            schema = self.finish.to_openai_tool()["function"]["parameters"]
-            assert "actionable" in schema["properties"]["repair_summary"]["description"]
 
         def send_message(self, supplied_prompt):
             assert supplied_prompt == prompt
@@ -149,8 +158,7 @@ def test_supervisor_repairs_local_workspace_and_publishes_only_after_cleanup(
 
     monkeypatch.setattr(runner, "LocalConversation", RepairConversation)
     monkeypatch.setattr(runner, "record_delegated_task_result", record)
-    monkeypatch.setattr(supervisor, "record_delegated_task_result", record)
-    monkeypatch.setattr(supervisor, "finish_weave_monitoring", lambda: None)
+    monkeypatch.setattr(runner, "finish_weave_monitoring", lambda: None)
     args = [
         "--child",
         "--agent",
@@ -170,18 +178,23 @@ def test_supervisor_repairs_local_workspace_and_publishes_only_after_cleanup(
     ]
 
     if outcome == "repaired":
-        assert supervisor.main(args) == 0
+        assert runner.main(args) == 0
         assert json.loads(published[0][1]["result"]) == {
             "resolved": True,
             "repair_summary": "Changed workers to 1 and verified the file.",
         }
+    elif outcome == "unfinished":
+        assert runner.main(args) == 1
+        assert "child execution ended with status paused" in published[0][1]["error"]
+        assert broken.read_text() == "workers = 0\n"
     else:
-        reason = (
-            "structured result" if outcome == "unfinished" else "local repair failed"
-        )
+        reason = "local repair failed"
         with pytest.raises(RuntimeError, match=reason):
-            supervisor.main(args)
+            runner.main(args)
         assert reason in published[0][1]["error"]
         assert broken.read_text() == "workers = 0\n"
+    assert all(publication_states), (
+        "parent resumed while Supervisor tools were still open"
+    )
     assert len(published) == 1
     assert published[0][0] == "repair-task"
