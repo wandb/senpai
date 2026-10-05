@@ -30,6 +30,7 @@ from senpai_agent.inbox import (
 from senpai_agent.mailbox import (
     ControllerEvent,
     StudentAssignmentAvailabilityMailbox,
+    SupervisedMailbox,
 )
 from senpai_agent.program_context import ProgramSystemPrompt
 from senpai_agent.state import StartedConversationLedger, WorkspaceDivergenceLedger
@@ -290,56 +291,60 @@ def test_successful_turn_repolls_immediately_and_continues_without_full_brief():
 
 
 @pytest.mark.parametrize("post_turn", [False, True])
-def test_supervisor_repoll_failure_preserves_the_polling_error_policy(
-    post_turn, capsys,
+@pytest.mark.parametrize("failure", ["supervisor", "mailbox"])
+def test_supervised_poll_failure_preserves_the_controller_error_policy(
+    post_turn, failure, capsys,
 ):
-    request = ControllerEvent(
-        kind="supervisor_requested",
-        dedupe_key="supervisor_requested:23",
-        payload={"number": 23},
-    )
-    initial, stale, fresh = (review_event(number) for number in (17, 18, 19))
-    snapshots = [
-        (request, stale),
-        RuntimeError("mailbox unavailable"),
-        (fresh,),
-        (),
-    ]
+    initial, fresh = review_event(17), review_event(19)
+    snapshots = [(fresh,), ()]
+    if failure == "mailbox":
+        snapshots.insert(0, RuntimeError("mailbox unavailable"))
     if post_turn:
         snapshots.insert(0, (initial,))
+    operations = []
+
+    def supervise():
+        operations.append("supervisor")
+        if failure == "supervisor" and operations.count("supervisor") == (
+            2 if post_turn else 1
+        ):
+            raise RuntimeError("Supervisor listing unavailable")
 
     class FailingMailbox(Mailbox):
         def poll(self):
+            operations.append("mailbox")
             result = super().poll()
             if isinstance(result, Exception):
                 raise result
             return result
 
     turns = Turns()
-    supervised = []
     reconciled = []
+    mailbox = FailingMailbox(snapshots)
     runtime = controller(
-        FailingMailbox(snapshots),
+        SupervisedMailbox(mailbox, supervise),
         turns,
-        supervise=supervised.append,
         reconcile=reconciled.extend,
     )
-    if post_turn:
+    if failure == "supervisor" or post_turn:
         runtime.run(max_cycles=2)
+        expected = [initial, fresh] if post_turn else [fresh]
         assert [call[2] for call in turns.calls] == [
-            frozenset({initial.dedupe_key}),
-            frozenset({fresh.dedupe_key}),
+            frozenset({event.dedupe_key}) for event in expected
         ]
-        assert reconciled == [initial, fresh]
-        assert "SENPAI_POST_TURN_POLL_ERROR RuntimeError: mailbox unavailable" in (
-            capsys.readouterr().err
+        assert reconciled == expected
+        error = (
+            "SENPAI_SUPERVISOR_ERROR RuntimeError: Supervisor listing unavailable"
+            if failure == "supervisor"
+            else "SENPAI_POST_TURN_POLL_ERROR RuntimeError: mailbox unavailable"
         )
+        assert error in capsys.readouterr().err
     else:
         with pytest.raises(RuntimeError, match="mailbox unavailable"):
             runtime.run(max_cycles=2)
         assert turns.calls == []
         assert reconciled == []
-    assert supervised == [request]
+    assert operations == ["supervisor", "mailbox"] * mailbox.calls
 
 
 def test_post_turn_snapshot_retracts_availability_queued_during_active_turn(
@@ -1003,10 +1008,10 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
     assert created[0].turns.full_prompt == "programme"
     assert created[0].turns.active_poll_interval_seconds == 75
     assert isinstance(
-        created[0].mailbox.mailboxes[0],
+        created[0].mailbox.mailbox.mailboxes[0],
         StudentAssignmentAvailabilityMailbox,
     )
-    assert created[0].turns.github_mailbox is created[0].mailbox.mailboxes[0]
+    assert created[0].turns.github_mailbox is created[0].mailbox.mailbox.mailboxes[0]
     assert created[0].turn_timeout_seconds == 7260
 
 

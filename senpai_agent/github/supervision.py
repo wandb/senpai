@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Annotated, Self
+from urllib.parse import urlencode
 from uuid import UUID
 
-from openhands.sdk.tool import Action, ToolDefinition, ToolExecutor
+from openhands.sdk.tool import Action, ToolExecutor
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -24,10 +25,10 @@ from senpai_agent.github.tools.contracts import (
     AssignmentVersion,
     GitHubMutationObservation,
 )
-from senpai_agent.github.tools.runtime import GitHubToolRuntime, tool_annotations
+from senpai_agent.github.tools.runtime import GitHubToolRuntime
 from senpai_agent.github.workflow import (
     GitHubWorkflow,
-    ReconciliationError,
+    MutationResult,
     WorkflowPreconditionError,
 )
 from senpai_agent.models import authoritative_marker_line
@@ -82,7 +83,7 @@ class SupervisorResult(BaseModel):
         description="True only when the requested issue is resolved and verified.",
     )
     repair_summary: Annotated[
-        str, StringConstraints(strip_whitespace=True, min_length=1)
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=12_000)
     ] = Field(
         description=(
             "Report the diagnosis, changes and verification. Give actionable feedback "
@@ -98,7 +99,7 @@ class SupervisorEnvelope(BaseModel):
     advisor_branch: str
     requester: str
     request: SupervisorRequest
-    parent_conversation_id: UUID | None = None
+    parent_conversation_id: UUID
     result: SupervisorResult | None = None
 
 
@@ -116,7 +117,8 @@ def _identity(envelope: SupervisorEnvelope) -> str:
 
 
 def render_request(envelope: SupervisorEnvelope) -> str:
-    marker = f"{_PREFIX}{_identity(envelope)}:{envelope.model_dump_json()} -->"
+    encoded = envelope.model_dump_json().replace(">", "\\u003e")
+    marker = f"{_PREFIX}{_identity(envelope)}:{encoded} -->"
     body = f"{marker}\n\n## Supervisor request: {envelope.request.target}\n\n{envelope.request.task}"
     if envelope.result is not None:
         body += f"\n\n## Supervisor result\n\n{envelope.result.repair_summary}"
@@ -133,23 +135,6 @@ def parse_request(body: str) -> SupervisorEnvelope | None:
     except (ValueError, ValidationError):
         return None
     return envelope if identity == _identity(envelope) else None
-
-
-def _trusted_envelope(
-    issue: Mapping[str, object], *, repo: str, advisor_branch: str, actor: str
-) -> SupervisorEnvelope | None:
-    envelope = parse_request(str(issue.get("body") or ""))
-    labels = {label["name"] for label in issue.get("labels", [])}
-    if (
-        "pull_request" in issue
-        or envelope is None
-        or str(issue.get("user", {}).get("login", "")).casefold() != actor.casefold()
-        or envelope.repo != repo
-        or envelope.advisor_branch != advisor_branch
-        or not {"supervisor", advisor_branch}.issubset(labels)
-    ):
-        return None
-    return envelope
 
 
 def _assignment(
@@ -189,6 +174,8 @@ class RequestSupervisorExecutor(
     def __call__(
         self, action: SupervisorRequest, conversation: LocalConversation | None = None
     ) -> GitHubMutationObservation:
+        if conversation is None:
+            raise RuntimeError("Supervisor requests require a conversation")
         runtime = self.runtime
         if not runtime.advisor_branch:
             raise RuntimeError("Supervisor requests require an advisor branch")
@@ -210,73 +197,34 @@ class RequestSupervisorExecutor(
             advisor_branch=runtime.advisor_branch,
             requester=requester,
             request=action,
-            parent_conversation_id=str(conversation.id)
-            if conversation is not None
-            else None,
+            parent_conversation_id=str(conversation.id),
         )
-        workflow = runtime.workflow
-        prefix = f"{_PREFIX}{_identity(envelope)}:"
-        body = render_request(envelope)
-        with workflow.serialized_assignment_mutation():
-            existing = workflow._created_human_issue(prefix)
-            if existing is not None:
-                original = parse_request(existing.body or "")
-                if (
-                    original is None
-                    or original.model_copy(update={"result": None}) != envelope
-                ):
-                    raise WorkflowPreconditionError(
-                        "request_id already belongs to a different Supervisor request"
-                    )
-                return GitHubMutationObservation(
-                    changed=False,
-                    resource_url=existing.html_url,
-                    state="supervisor_requested",
-                    version=action.request_id,
-                )
-            workflow._mutate(
-                "POST",
-                f"/repos/{workflow.repo}/issues",
-                json_body={
-                    "title": f"Supervisor: {action.target} — {action.request_id}",
-                    "body": body,
-                    "labels": ["supervisor", runtime.advisor_branch],
-                },
-                expected_statuses={201},
-            )
-            created = workflow._created_human_issue(prefix)
+
+        def validate_existing(body: str) -> None:
+            original = parse_request(body)
             if (
-                created is None
-                or created.body != body
-                or not {"supervisor", runtime.advisor_branch}.issubset(
-                    label.name for label in created.labels
-                )
+                original is None
+                or original.model_copy(update={"result": None}) != envelope
             ):
-                raise ReconciliationError(
-                    "GitHub did not persist the Supervisor request"
+                raise WorkflowPreconditionError(
+                    "request_id already belongs to a different Supervisor request"
                 )
-            return GitHubMutationObservation(
-                changed=True,
-                resource_url=created.html_url,
-                state="supervisor_requested",
-                version=action.request_id,
-            )
 
-
-class RequestSupervisorTool(
-    ToolDefinition[SupervisorRequest, GitHubMutationObservation]
-):
-    @classmethod
-    def create(cls, runtime: GitHubToolRuntime):
-        return [
-            cls(
-                description="Ask a fresh Supervisor to diagnose and repair the advisor or a student. The target pod handles the request at its next safe boundary and returns feedback; other pods can continue working.",
-                action_type=SupervisorRequest,
-                observation_type=GitHubMutationObservation,
-                annotations=tool_annotations("Request Supervisor"),
-                executor=RequestSupervisorExecutor(runtime),
+        changed, issue = runtime.workflow._create_marked_issue(
+            prefix=f"{_PREFIX}{_identity(envelope)}:",
+            title=f"Supervisor: {action.target} — {action.request_id}",
+            labels={"supervisor", runtime.advisor_branch},
+            render_body=lambda: render_request(envelope),
+            validate_existing=validate_existing,
+        )
+        return GitHubMutationObservation.from_result(
+            MutationResult(
+                changed,
+                issue.html_url,
+                "supervisor_requested",
+                action.request_id,
             )
-        ]
+        )
 
 
 class SupervisorGateway:
@@ -284,6 +232,7 @@ class SupervisorGateway:
         if config.github_token is None or not config.advisor_branch:
             raise RuntimeError("Supervisor requires authenticated controller context")
         self.config = config
+        self.recipient = "advisor" if config.role == "advisor" else config.student_name
         self.workflow = GitHubWorkflow(
             config.github_repo,
             config.github_token,
@@ -291,10 +240,61 @@ class SupervisorGateway:
             trusted_actor=config.github_trusted_actor,
         )
 
+    def _trusted_envelope(
+        self, issue: Mapping[str, object]
+    ) -> SupervisorEnvelope | None:
+        envelope = parse_request(str(issue.get("body") or ""))
+        labels = {label["name"] for label in issue.get("labels", [])}
+        if (
+            "pull_request" in issue
+            or envelope is None
+            or str(issue.get("user", {}).get("login", "")).casefold()
+            != self.workflow._actor().casefold()
+            or envelope.repo != self.workflow.repo
+            or envelope.advisor_branch != self.config.advisor_branch
+            or not {"supervisor", self.config.advisor_branch}.issubset(labels)
+        ):
+            return None
+        return envelope
+
+    def pending(self) -> Iterator[tuple[Mapping[str, object], SupervisorEnvelope]]:
+        query = urlencode(
+            {
+                "state": "open",
+                "labels": f"supervisor,{self.config.advisor_branch}",
+                "per_page": 100,
+            }
+        )
+        for issue in self.workflow._objects(
+            f"/repos/{self.workflow.repo}/issues?{query}"
+        ):
+            envelope = self._trusted_envelope(issue)
+            if envelope is None or issue["state"] != "open":
+                continue
+            if (
+                envelope.result is None
+                and envelope.request.target == self.recipient
+                or envelope.result is not None
+                and envelope.requester == self.recipient
+            ):
+                yield issue, envelope
+
+    def close_reply(self, number: int, original: SupervisorEnvelope) -> None:
+        """Close only the exact trusted reply already stored by its requester."""
+        workflow = self.workflow
+        path = f"/repos/{workflow.repo}/issues/{number}"
+        issue = workflow._request("GET", path, expected_statuses={200}).json_body
+        if (
+            self._trusted_envelope(issue) == original
+            and original.requester == self.recipient
+            and original.result is not None
+            and issue["state"] != "closed"
+        ):
+            workflow._update_issue(number, {"state": "closed"})
+
     def validate(self, request: SupervisorRequest) -> None:
         config = self.config
-        target = "advisor" if config.role == "advisor" else config.student_name
-        if request.target != target:
+        if request.target != self.recipient:
             raise PermissionError("Supervisor request targets a different pod")
         assignment = _assignment(self.workflow, request, config.advisor_branch)
         branch = (
@@ -343,7 +343,7 @@ class SupervisorGateway:
     def complete(
         self,
         issue_number: int,
-        request: SupervisorRequest,
+        original: SupervisorEnvelope,
         result_summary: str,
         resolved: bool,
         *,
@@ -352,13 +352,10 @@ class SupervisorGateway:
         workflow = self.workflow
         path = f"/repos/{workflow.repo}/issues/{issue_number}"
         issue = workflow._request("GET", path, expected_statuses={200}).json_body
-        envelope = _trusted_envelope(
-            issue,
-            repo=workflow.repo,
-            advisor_branch=self.config.advisor_branch,
-            actor=workflow._actor(),
-        )
-        if envelope is None or envelope.request != request:
+        envelope = self._trusted_envelope(issue)
+        if envelope is None or envelope.model_copy(
+            update={"result": None}
+        ) != original.model_copy(update={"result": None}):
             raise WorkflowPreconditionError(
                 "Supervisor request changed before completion"
             )
@@ -369,24 +366,17 @@ class SupervisorGateway:
             )
         body = render_request(envelope.model_copy(update={"result": result}))
         delivered_locally = (
-            envelope.requester == request.target
-            and envelope.parent_conversation_id in {None, delivered_to}
+            envelope.requester == original.request.target
+            and envelope.parent_conversation_id == delivered_to
         )
         if issue.get("body") == body and (
             not delivered_locally or issue["state"] == "closed"
         ):
             return
-        workflow._mutate(
-            "PATCH",
-            path,
-            json_body={
+        workflow._update_issue(
+            issue_number,
+            {
                 "body": body,
                 **({"state": "closed"} if delivered_locally else {}),
             },
-            expected_statuses={200},
         )
-        saved = workflow._request("GET", path, expected_statuses={200}).json_body
-        if saved.get("body") != body or (
-            delivered_locally and saved.get("state") != "closed"
-        ):
-            raise ReconciliationError("GitHub did not persist the Supervisor result")

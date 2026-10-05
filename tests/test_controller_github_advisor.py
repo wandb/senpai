@@ -8,7 +8,7 @@ from senpai_agent.inbox import PersistentInbox
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import (
     CompositeMailbox,
-    LocalAdvisorMailbox,
+    LocalMailbox,
     StudentAssignmentAvailabilityMailbox,
 )
 from senpai_agent.models import (
@@ -216,7 +216,7 @@ def test_permission_failure_invalidates_github_snapshot_and_preserves_local_even
             conversation_id="00000000-0000-0000-0000-000000000123",
             event_store_path=store_path,
         ),
-        LocalAdvisorMailbox(store_path),
+        LocalMailbox(store_path),
     )
 
     with pytest.raises(GitHubReadError):

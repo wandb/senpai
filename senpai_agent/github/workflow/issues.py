@@ -2,6 +2,7 @@
 
 import json
 import re
+from collections.abc import Callable, Mapping
 from hashlib import sha256
 from urllib.parse import quote, urlencode
 
@@ -53,43 +54,68 @@ class HumanIssueMixin:
         digest = sha256(json.dumps([title, body]).encode()).hexdigest()
         marker = f"{prefix}{digest} -->"
 
-        with self.serialized_assignment_mutation():
-            existing = self._created_human_issue(prefix)
-            if existing is not None:
-                if authoritative_marker_line(existing.body or "") != marker:
-                    raise WorkflowPreconditionError(
-                        "issue_id already belongs to a different question; "
-                        "reuse the original content or choose a new issue_id"
-                    )
-                return MutationResult(
-                    False, existing.html_url, "human_issue_created", issue_id
+        def validate_existing(content: str) -> None:
+            if authoritative_marker_line(content) != marker:
+                raise WorkflowPreconditionError(
+                    "issue_id already belongs to a different question; "
+                    "reuse the original content or choose a new issue_id"
                 )
 
+        def render() -> str:
             mentions = self._token_owner_mention()
             content = f"{body}\n\n{mentions}" if mentions else body
-            rendered = role_prefixed_comment(marker_body(marker, content), self._role)
-            labels = {"human", audience_label}
+            return role_prefixed_comment(marker_body(marker, content), self._role)
+
+        changed, issue = self._create_marked_issue(
+            prefix=prefix,
+            title=title,
+            labels={"human", audience_label},
+            render_body=render,
+            validate_existing=validate_existing,
+        )
+        return MutationResult(changed, issue.html_url, "human_issue_created", issue_id)
+
+    def _create_marked_issue(
+        self,
+        *,
+        prefix: str,
+        title: str,
+        labels: set[str],
+        render_body: Callable[[], str],
+        validate_existing: Callable[[str], None],
+    ) -> tuple[bool, CreatedIssueResponse]:
+        with self.serialized_assignment_mutation():
+            existing = self._created_marked_issue(prefix)
+            if existing is not None:
+                validate_existing(existing.body or "")
+                return False, existing
+            body = render_body()
             self._mutate(
                 "POST",
                 f"/repos/{self._repo}/issues",
-                json_body={"title": title, "body": rendered, "labels": sorted(labels)},
+                json_body={"title": title, "body": body, "labels": sorted(labels)},
                 expected_statuses={201},
             )
-            created = self._created_human_issue(prefix)
+            created = self._created_marked_issue(prefix)
             if (
                 created is None
                 or created.title != title
-                or created.body != rendered
+                or created.body != body
                 or not labels.issubset(label.name for label in created.labels)
             ):
-                raise ReconciliationError(
-                    "GitHub did not create the requested human issue"
-                )
-            return MutationResult(
-                True, created.html_url, "human_issue_created", issue_id
+                raise ReconciliationError("GitHub did not create the requested issue")
+            return True, created
+
+    def _update_issue(self, number: int, fields: Mapping[str, object]) -> None:
+        path = f"/repos/{self._repo}/issues/{positive_number(number)}"
+        self._mutate("PATCH", path, json_body=dict(fields), expected_statuses={200})
+        saved = self._request("GET", path, expected_statuses={200}).json_body
+        if any(saved.get(name) != value for name, value in fields.items()):
+            raise ReconciliationError(
+                f"GitHub did not persist requested changes to issue #{number}"
             )
 
-    def _created_human_issue(self, prefix: str) -> CreatedIssueResponse | None:
+    def _created_marked_issue(self, prefix: str) -> CreatedIssueResponse | None:
         actor = self._actor()
         query = urlencode({"state": "all", "creator": actor, "per_page": 100})
         matches = []

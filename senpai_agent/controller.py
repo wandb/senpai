@@ -32,10 +32,11 @@ from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import (
     CompositeMailbox,
     ControllerEvent,
-    LocalAdvisorMailbox,
+    LocalMailbox,
     LocalStudentMailbox,
     Mailbox,
     StudentAssignmentAvailabilityMailbox,
+    SupervisedMailbox,
 )
 from senpai_agent.monitor import (
     MonitorMailbox,
@@ -407,7 +408,6 @@ class Controller:
             Callable[[Sequence[ControllerEvent]], Sequence[ConversationBatch]] | None
         ) = None,
         reconcile: Callable[[Sequence[ControllerEvent]], None] | None = None,
-        supervise: Callable[[ControllerEvent], UUID | None] | None = None,
         progress: ProgressLease | None = None,
         operation_timeout_seconds: float = 300,
         turn_timeout_seconds: float = 7260,
@@ -434,7 +434,6 @@ class Controller:
         self.conversation_id = conversation_id
         self.conversation_for_events = conversation_for_events
         self.reconcile = reconcile
-        self.supervise = supervise
         self.progress = progress
         self.operation_timeout_seconds = operation_timeout_seconds
         self.turn_timeout_seconds = turn_timeout_seconds
@@ -633,10 +632,10 @@ class Controller:
         remaining = cooldown.retry_at - time.time()
         return remaining if remaining > 0 else None
 
-    def _poll_mailbox(self, *, allow_reminders: bool) -> Sequence[ControllerEvent] | None:
+    def _poll_into_inbox(self, *, allow_reminders: bool = True) -> None:
         self._publish_progress("poll")
         try:
-            return self.mailbox.poll()
+            polled = self.mailbox.poll()
         except Exception as error:  # noqa: BLE001
             if allow_reminders:
                 raise
@@ -645,40 +644,7 @@ class Controller:
                 file=sys.stderr,
                 flush=True,
             )
-            return None
-
-    def _poll_into_inbox(self, *, allow_reminders: bool = True) -> None:
-        polled = self._poll_mailbox(allow_reminders=allow_reminders)
-        if polled is None:
             return
-        requests = tuple(
-            event for event in polled if event.kind == "supervisor_requested"
-        )
-        if requests:
-            if self.supervise is None:
-                raise RuntimeError(
-                    "supervisor requests require a controller supervisor handler"
-                )
-            for event in requests:
-                try:
-                    recovered = self.supervise(event)
-                except Exception as error:  # Preserve other work and retry the open Issue.
-                    print(
-                        "SENPAI_SUPERVISOR_ERROR "
-                        f"event_key={event.dedupe_key} "
-                        f"{type(error).__name__}: {error}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    continue
-                if recovered is not None:
-                    self._deferred_conversations.pop(recovered, None)
-            # Repair may change the checkout or remote state. Discard the old snapshot
-            # before assignment reconciliation or delivering any normal model work.
-            polled = self._poll_mailbox(allow_reminders=allow_reminders)
-            if polled is None:
-                return
-        polled = tuple(event for event in polled if event.kind != "supervisor_requested")
         for event in polled:
             if event.kind == "student_assignment_comment":
                 self.inbox.require_event_payload(
@@ -733,6 +699,8 @@ class Controller:
             for event in batch_events:
                 steering_priority = STEERING_PRIORITIES.get(event.kind)
                 if steering_priority is not None:
+                    if event.kind == "supervisor_recovered":
+                        self._deferred_conversations.pop(conversation_id, None)
                     self.inbox.steer(
                         conversation_id,
                         event.dedupe_key,
@@ -1069,7 +1037,7 @@ def controller_main(
         )
         mailbox = CompositeMailbox(
             active_github_mailbox,
-            LocalAdvisorMailbox(advisor_event_store),
+            LocalMailbox(advisor_event_store),
         )
     else:
         training, monitor_store = training_runtime(
@@ -1118,7 +1086,16 @@ def controller_main(
     )
     controller = Controller(
         role=role,
-        mailbox=mailbox,
+        mailbox=SupervisedMailbox(
+            mailbox,
+            SupervisorHandler(
+                runner_config,
+                inbox,
+                progress=progress,
+                training=training,
+                monitor_store=monitor_store,
+            ),
+        ),
         turns=turns,
         conversation_id=runner_config.conversation_id,
         started_conversations=StartedConversationLedger(
@@ -1134,10 +1111,6 @@ def controller_main(
         ),
         conversation_for_events=conversation_selector,
         reconcile=reconcile,
-        supervise=SupervisorHandler(
-            runner_config, inbox, progress=progress,
-            training=training, monitor_store=monitor_store,
-        ),
         progress=progress,
         operation_timeout_seconds=float(
             env.get("SENPAI_CONTROLLER_OPERATION_TIMEOUT_SECONDS", "300")

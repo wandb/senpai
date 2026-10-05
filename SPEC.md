@@ -610,8 +610,9 @@ existing delegation registry. Active children or training, stale assignments
 and holds block repair. A verified Pydantic result resumes the original
 conversation once, after assignment and head checks; failure leaves quarantine
 intact. Saved outcomes survive publication retries. Cross-pod result Issues
-stay open until the requester acknowledges them, so polling covers pending
-work. Repairs add no pods, remote execution service or automatic repair loop.
+close after the requester stores the reply locally; inbox processing and
+acknowledgement need no GitHub access. Polling covers pending work. Repairs add
+no pods, remote execution service or automatic repair loop.
 
 All assignment mutations issued by one workflow instance, plus that worker's
 advisor-branch publication and the student's complete preflight/push/result

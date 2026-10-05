@@ -10,12 +10,11 @@ from typing import TYPE_CHECKING
 from pydantic import SecretStr
 
 from senpai_agent.delegation import (
-    AgentTask,
     AgentTaskState,
     DelegationConfig,
     DelegationRequest,
     OpenHandsChildProcess,
-    SpawnAgentsAction,
+    SupervisorTask,
     configured_delegation_config,
     configured_delegation_manager,
 )
@@ -88,13 +87,9 @@ def queue_merge(
             attempt -= 1
     digest = hashlib.sha256(encoded.encode()).hexdigest()
     return manager.spawn(
-        SpawnAgentsAction(
-            batch_key=f"merge:{digest}:{attempt}",
-            tasks=[AgentTask(
-                key="merge", task=task, agent="supervisor", model="smart",
-            )],
-        ),
-        conversation,
+        f"merge:{digest}:{attempt}",
+        [SupervisorTask(key="merge", task=task)],
+        str(conversation.id),
     )[0]
 
 

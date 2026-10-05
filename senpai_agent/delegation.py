@@ -74,7 +74,6 @@ if TYPE_CHECKING:
 
 AgentKind = Literal["general-purpose", "explore", "search", "bash-runner", "supervisor"]
 TaskAgentKind = Literal[
-    "supervisor",
     "general-purpose",
     "explore",
     "search_general_web",
@@ -725,7 +724,9 @@ class DelegateAgentObservation(Observation):
         ]
 
 
-def resolve_task_agent(agent: TaskAgentKind) -> tuple[AgentKind, SearchMode | None]:
+def resolve_task_agent(
+    agent: TaskAgentKind | Literal["supervisor"],
+) -> tuple[AgentKind, SearchMode | None]:
     if agent == "search_general_web":
         return "search", "general-web"
     if agent == "search_research_publications":
@@ -734,7 +735,7 @@ def resolve_task_agent(agent: TaskAgentKind) -> tuple[AgentKind, SearchMode | No
 
 
 class AgentTaskBase(BaseModel):
-    agent: TaskAgentKind
+    agent: TaskAgentKind | Literal["supervisor"]
     key: str | None = Field(
         default=None,
         min_length=1,
@@ -752,12 +753,6 @@ class AgentTaskBase(BaseModel):
         default=False,
         description="Copy the complete model-visible parent history into this child.",
     )
-
-    @model_validator(mode="after")
-    def require_independent_supervisor(self) -> Self:
-        if self.agent == "supervisor" and (self.model != "smart" or self.include_context):
-            raise ValueError("supervisor tasks require the smart model and clean context")
-        return self
 
     def resolved_agent(self) -> tuple[AgentKind, SearchMode | None]:
         return resolve_task_agent(self.agent)
@@ -781,8 +776,7 @@ class AgentTask(AgentTaskBase):
         default="general-purpose",
         description=(
             "Use general-purpose for mixed work, explore or bash-runner for local "
-            "leaf work, and an explicit search form for external research. "
-            "Supervisor is reserved for request_supervisor and merge review."
+            "leaf work, and an explicit search form for external research."
         ),
     )
 
@@ -795,6 +789,12 @@ class LeafAgentTask(AgentTaskBase):
             "search_general_web, or search_research_publications."
         ),
     )
+
+
+class SupervisorTask(AgentTaskBase):
+    agent: Literal["supervisor"] = "supervisor"
+    model: Literal["smart"] = "smart"
+    include_context: Literal[False] = False
 
 
 _PERSISTED_TASK_SPEC_FIELDS = frozenset(AgentTask.model_fields) | {"search_mode"}
@@ -835,7 +835,10 @@ def _canonical_persisted_task_specs(encoded: str) -> str:
                 "persisted delegation task specifications have an invalid search mode"
             )
         try:
-            specs.append(AgentTask.model_validate(item))
+            task_type = (
+                SupervisorTask if item.get("agent") == "supervisor" else AgentTask
+            )
+            specs.append(task_type.model_validate(item))
         except ValueError as error:
             raise RuntimeError(
                 "persisted delegation task specifications are invalid"
@@ -1501,31 +1504,30 @@ class DelegationManager:
 
     def spawn(
         self,
-        action: SpawnAgentsAction,
-        conversation: LocalConversation,
-    ) -> list[AgentTaskState]:
-        self._validate_spawn(action.tasks)
-        with self.registry.lifecycle():
-            return self._spawn_locked(action, str(conversation.id), conversation)
-
-    def spawn_for_owner(
-        self,
-        action: SpawnAgentsAction,
+        batch_key: str,
+        tasks: Sequence[AgentTaskBase],
         parent_conversation_id: str,
+        *,
+        conversation: LocalConversation | None = None,
     ) -> list[AgentTaskState]:
-        self._validate_spawn(action.tasks)
-        if any(task.include_context for task in action.tasks):
-            raise ValueError("owner-only dispatch requires self-contained tasks")
+        self._validate_spawn(tasks)
+        if any(task.include_context for task in tasks) and (
+            conversation is None or str(conversation.id) != parent_conversation_id
+        ):
+            raise ValueError("parent context requires its owning conversation")
         with self.registry.lifecycle():
-            return self._spawn_locked(action, parent_conversation_id)
+            return self._spawn_locked(
+                batch_key, tasks, parent_conversation_id, conversation
+            )
 
     def _spawn_locked(
         self,
-        action: SpawnAgentsAction,
+        batch_key: str,
+        tasks: Sequence[AgentTaskBase],
         parent_id: str,
         conversation: LocalConversation | None = None,
     ) -> list[AgentTaskState]:
-        operation_key = f"{parent_id}:{action.batch_key}"
+        operation_key = f"{parent_id}:{batch_key}"
         tree_id = self.config.tree_id or str(
             uuid.uuid5(uuid.NAMESPACE_URL, f"senpai-tree:{operation_key}")
         )
@@ -1533,7 +1535,7 @@ class DelegationManager:
         inherited_deadline = self.config.deadline_epoch or float("inf")
         deadlines = [
             min(inherited_deadline, now + MODEL_TIER_TIMEOUT_SECONDS[task.model])
-            for task in action.tasks
+            for task in tasks
         ]
         if any(deadline <= now for deadline in deadlines):
             raise TimeoutError("the inherited delegation deadline has expired")
@@ -1544,12 +1546,12 @@ class DelegationManager:
             parent_conversation_id=parent_id,
             parent_task_id=self.config.current_task_id,
             depth=self.config.depth + 1,
-            specs=action.tasks,
+            specs=tasks,
             deadlines=deadlines,
         )
         self._reconcile(rows)
         rows = self.registry.rows([row["task_id"] for row in rows])
-        for row, task in zip(rows, action.tasks, strict=True):
+        for row, task in zip(rows, tasks, strict=True):
             if not created:
                 continue
             if row["status"] != "queued":
@@ -1659,13 +1661,6 @@ class DelegationManager:
     def states(
         self,
         task_ids: Sequence[str] | None,
-        conversation: LocalConversation,
-    ) -> list[AgentTaskState]:
-        return self.states_for_owner(task_ids, str(conversation.id))
-
-    def states_for_owner(
-        self,
-        task_ids: Sequence[str] | None,
         parent_conversation_id: str,
     ) -> list[AgentTaskState]:
         with self.registry.lifecycle():
@@ -1677,10 +1672,10 @@ class DelegationManager:
     def await_snapshot(
         self,
         task_ids: Sequence[str],
-        conversation: LocalConversation,
+        parent_conversation_id: str,
     ) -> tuple[list[AgentTaskState], frozenset[str]]:
         with self.registry.lifecycle():
-            rows = self._owned_rows_locked(task_ids, str(conversation.id))
+            rows = self._owned_rows_locked(task_ids, parent_conversation_id)
             return (
                 [_row_state(row) for row in rows],
                 frozenset(
@@ -1706,13 +1701,6 @@ class DelegationManager:
         return self.registry.rows([row["task_id"] for row in rows])
 
     def cancel(
-        self,
-        task_ids: Sequence[str],
-        conversation: LocalConversation,
-    ) -> list[AgentTaskState]:
-        return self.cancel_for_owner(task_ids, str(conversation.id))
-
-    def cancel_for_owner(
         self,
         task_ids: Sequence[str],
         parent_conversation_id: str,
@@ -1907,9 +1895,14 @@ class _SpawnAgentsExecutor(ToolExecutor[SpawnAgentsAction, SpawnAgentsObservatio
     def __call__(self, action, conversation=None) -> SpawnAgentsObservation:
         if conversation is None:
             raise ValueError("spawn_agents requires its parent conversation")
-        if any(task.agent == "supervisor" for task in action.tasks):
-            raise PermissionError("Use request_supervisor to coordinate a Supervisor repair")
-        return SpawnAgentsObservation(tasks=self.manager.spawn(action, conversation))
+        return SpawnAgentsObservation(
+            tasks=self.manager.spawn(
+                action.batch_key,
+                action.tasks,
+                str(conversation.id),
+                conversation=conversation,
+            )
+        )
 
 
 class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservation]):
@@ -1926,7 +1919,7 @@ class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservatio
         deadline = min(time.time() + action.timeout_seconds, inherited)
         tasks, uncollected_terminal = self.manager.await_snapshot(
             action.task_ids,
-            conversation,
+            str(conversation.id),
         )
         initial_statuses = {task.task_id: task.status for task in tasks}
         while True:
@@ -1970,7 +1963,7 @@ class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservatio
                 )
             tasks, uncollected_terminal = self.manager.await_snapshot(
                 action.task_ids,
-                conversation,
+                str(conversation.id),
             )
 
     def _acknowledge(self, tasks: Sequence[AgentTaskState]) -> None:
@@ -1996,7 +1989,7 @@ class _AgentStatusExecutor(ToolExecutor[AgentStatusAction, AgentStatusObservatio
         if conversation is None:
             raise ValueError("agent_status requires its parent conversation")
         return AgentStatusObservation(
-            tasks=self.manager.states(action.task_ids, conversation)
+            tasks=self.manager.states(action.task_ids, str(conversation.id))
         )
 
 
@@ -2008,7 +2001,7 @@ class _CancelAgentsExecutor(ToolExecutor[CancelAgentsAction, CancelAgentsObserva
         if conversation is None:
             raise ValueError("cancel_agents requires its parent conversation")
         return CancelAgentsObservation(
-            tasks=self.manager.cancel(action.task_ids, conversation)
+            tasks=self.manager.cancel(action.task_ids, str(conversation.id))
         )
 
 

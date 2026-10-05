@@ -5,11 +5,18 @@ from openhands_support import runtime_config
 from test_controller import Mailbox, Turns, controller
 
 from senpai_agent import supervision
-from senpai_agent.delegation import AgentTask, DelegationManager, SpawnAgentsAction
-from senpai_agent.github.supervision import SupervisorRequest
+from senpai_agent.delegation import AgentTask, DelegationManager
+from senpai_agent.github.supervision import SupervisorEnvelope, SupervisorRequest
 from senpai_agent.github.tools.contracts import AssignmentVersion
 from senpai_agent.inbox import PersistentInbox
-from senpai_agent.mailbox import ControllerEvent
+from senpai_agent.local_events import LocalEventStore
+from senpai_agent.mailbox import (
+    CompositeMailbox,
+    ControllerEvent,
+    LocalMailbox,
+    LocalStudentMailbox,
+    SupervisedMailbox,
+)
 from senpai_agent.openhands_runner import delegation_config
 from senpai_agent.state import (
     AssignmentConversationRegistry,
@@ -62,6 +69,7 @@ def supervisor_case(tmp_path, monkeypatch):
             closed=False,
             completion_failures=0,
             completion_attempts=[],
+            completion_envelopes=[],
             collected_on_completion=[],
             preflight_error=None,
             postflight_error=False,
@@ -69,6 +77,10 @@ def supervisor_case(tmp_path, monkeypatch):
         )
 
         class Gateway:
+            def pending(self):
+                pending, case.pending = case.pending, []
+                return pending
+
             def validate(self, request):
                 if case.preflight_error is not None:
                     raise RuntimeError(case.preflight_error)
@@ -83,9 +95,10 @@ def supervisor_case(tmp_path, monkeypatch):
                 self.validate(request)
                 return "Full PR discussion and explicit repair request."
 
-            def complete(self, number, request, summary, resolved, *, delivered_to):
+            def complete(self, number, envelope, summary, resolved, *, delivered_to):
                 assert delivered_to == case.parent_id
                 case.completion_attempts.append((number, summary, resolved))
+                case.completion_envelopes.append(envelope)
                 case.collected_on_completion.append(
                     [
                         row["collected_at"]
@@ -134,14 +147,26 @@ def supervisor_case(tmp_path, monkeypatch):
             inbox,
             progress=ProgressLease(case.lease_path),
         )
-        case.event = ControllerEvent(
-            kind="supervisor_requested",
-            dedupe_key="supervisor_requested:23",
-            payload={
-                "number": 23,
-                "url": "https://github.com/acme/widgets/issues/23",
-                "request": request.model_dump(mode="json"),
-            },
+        case.issue = {
+            "number": 23,
+            "html_url": "https://github.com/acme/widgets/issues/23",
+        }
+        case.envelope = SupervisorEnvelope(
+            repo=config.github_repo,
+            advisor_branch=config.advisor_branch,
+            requester=request.target,
+            parent_conversation_id=parent_id,
+            request=request,
+        )
+        case.pending = [(case.issue, case.envelope)]
+        mailbox_type = LocalMailbox if role == "advisor" else LocalStudentMailbox
+        case.local_mailbox = mailbox_type(config.state_dir / f"{role}-events.sqlite3")
+        case.delivery = controller(
+            case.local_mailbox,
+            Turns(),
+            role=role,
+            conversation_id=parent_id,
+            inbox=inbox,
         )
         return case
 
@@ -172,13 +197,19 @@ def test_supervisor_repairs_before_resuming_the_original_quarantined_conversatio
         assert all(child.finished for child in case.children)
         reconciled.extend(event.kind for event in events)
 
+    class CurrentSnapshotMailbox(Mailbox):
+        def poll(self):
+            return () if case.closed else (stale,)
+
     runtime = controller(
-        Mailbox(((case.event, stale), (), ())),
+        SupervisedMailbox(
+            CompositeMailbox(CurrentSnapshotMailbox(()), case.local_mailbox),
+            case.handler,
+        ),
         turns,
         role=role,
         conversation_id=case.parent_id,
         inbox=case.inbox,
-        supervise=case.handler,
         reconcile=reconcile,
     )
     runtime.run(max_cycles=1)
@@ -189,12 +220,13 @@ def test_supervisor_repairs_before_resuming_the_original_quarantined_conversatio
     assert "Original assignment" not in case.prompts[0]
     assert "old_assignment" not in reconciled
     assert case.completed[-1][2] is (outcome == "resolved")
+    assert case.completion_envelopes == [case.envelope]
     assert WorkerLease.read(case.lease_path).phase == "supervisor-complete"
     assert not case.manager.registry.active_rows()
     if outcome == "resolved":
         assert len(turns.calls) == 1
         assert turns.calls[0][1] == case.parent_id
-        assert turns.calls[0][2] == frozenset({"original", "supervisor_recovered:23"})
+        assert turns.calls[0][2] == frozenset({"original", "supervisor:23"})
         assert case.inbox.turn(case.turn.turn_id).quarantine_reason is None
     else:
         assert turns.calls == []
@@ -209,38 +241,73 @@ def test_supervisor_repairs_before_resuming_the_original_quarantined_conversatio
 def test_request_replay_reuses_child_and_cannot_reset_a_later_quarantine(
     supervisor_case,
     assignment_changed,
+    capsys,
 ):
     case = supervisor_case("student")
     case.completion_failures = 1
-    with pytest.raises(RuntimeError, match="GitHub unavailable"):
-        case.handler(case.event)
+    turns = Turns()
+    controller(
+        SupervisedMailbox(
+            CompositeMailbox(Mailbox(()), case.local_mailbox),
+            case.handler,
+        ),
+        turns,
+        role="student",
+        conversation_id=case.parent_id,
+        inbox=case.inbox,
+    ).run(max_cycles=1)
+    assert "SENPAI_SUPERVISOR_ERROR" in capsys.readouterr().err
+    assert [call[2] for call in turns.calls] == [
+        frozenset({"original", "supervisor:23"}),
+    ]
+    assert case.completed == []
     assert all(value is not None for value in case.collected_on_completion[0])
-    assert case.inbox.turn(case.turn.turn_id).quarantine_reason is None
-    case.inbox.quarantine(case.turn.turn_id, "a different failure")
+    with LocalEventStore(case.local_mailbox.store_path) as store:
+        assert store.acknowledged(("supervisor:23",)) == {"supervisor:23"}
+        assert store.pending() == []
+
+    case.inbox.enqueue(case.parent_id, "later", "The next assignment step")
+    later_turn = case.inbox.next_turn(case.parent_id, "Continue the assignment")
+    case.inbox.quarantine(later_turn.turn_id, "a different failure")
     case.preflight_error = "PR head changed" if assignment_changed else None
 
     restarted = supervision.SupervisorHandler(case.config, case.inbox)
-    restarted(case.event)
+    case.pending = [(case.issue, case.envelope)]
+    replay_turns = Turns()
+    runtime = controller(
+        SupervisedMailbox(CompositeMailbox(Mailbox(()), case.local_mailbox), restarted),
+        replay_turns,
+        role="student",
+        conversation_id=case.parent_id,
+        inbox=case.inbox,
+    )
+    runtime.run(max_cycles=1)
     assert len(case.children) == 1
-    assert case.inbox.turn(case.turn.turn_id).quarantine_reason == "a different failure"
+    assert (
+        case.inbox.turn(later_turn.turn_id).quarantine_reason == "a different failure"
+    )
+    assert replay_turns.calls == []
     assert case.completed == [(23, "Repaired and checked.", True)]
     assert case.completion_attempts[0] == case.completion_attempts[1]
     assert case.inbox.turn(case.turn.turn_id).event_keys == (
         "original",
-        "supervisor_recovered:23",
+        "supervisor:23",
     )
     assert case.inbox.pending_count(case.parent_id) == 0
 
     # Different requesters may reuse the same request_id; Issues identify attempts.
     case.preflight_error = None
-    next_issue = ControllerEvent(
-        kind="supervisor_requested",
-        dedupe_key="supervisor_requested:24",
-        payload={**case.event.payload, "number": 24},
-    )
-    restarted(next_issue)
+    next_issue = {
+        "number": 24,
+        "html_url": "https://github.com/acme/widgets/issues/24",
+    }
+    case.pending = [(next_issue, case.envelope)]
+    runtime.run(max_cycles=1)
     assert len(case.children) == 2
-    assert case.inbox.turn(case.turn.turn_id).quarantine_reason is None
+    assert case.inbox.turn(later_turn.turn_id).quarantine_reason is None
+    assert [call[2] for call in replay_turns.calls] == [
+        frozenset({"later", "supervisor:24"}),
+    ]
 
 
 def test_blocked_request_keeps_its_outcome_when_issue_completion_must_retry(
@@ -249,13 +316,16 @@ def test_blocked_request_keeps_its_outcome_when_issue_completion_must_retry(
     case = supervisor_case("student")
     case.preflight_error = "assignment is on hold"
     case.completion_failures = 1
-    with pytest.raises(RuntimeError, match="GitHub unavailable"):
-        case.handler(case.event)
+    case.handler()
+    assert case.completed == []
+    case.delivery._poll_into_inbox()
 
     # The restriction is gone, but this request already finished without a repair.
     case.preflight_error = None
     restarted = supervision.SupervisorHandler(case.config, case.inbox)
-    restarted(case.event)
+    case.pending = [(case.issue, case.envelope)]
+    restarted()
+    case.delivery._poll_into_inbox()
     assert case.children == []
     assert case.completion_attempts[0] == case.completion_attempts[1]
     assert case.completed[-1][2] is False
@@ -266,27 +336,100 @@ def test_blocked_request_keeps_its_outcome_when_issue_completion_must_retry(
     )
 
 
+@pytest.mark.parametrize("edit", [None, "task", "assignment", "requester", "parent"])
+def test_unfinished_repair_replay_rejects_changed_requests(
+    supervisor_case,
+    monkeypatch,
+    edit,
+):
+    case = supervisor_case("student")
+
+    def killed(*_args):
+        raise SystemExit("Controller killed before cleanup")
+
+    # An abrupt process exit leaves its independent child and registry row alive.
+    with monkeypatch.context() as crash:
+        crash.setattr(supervision.time, "sleep", killed)
+        crash.setattr(DelegationManager, "cancel", killed)
+        with pytest.raises(SystemExit, match="Controller killed"):
+            case.handler()
+    assert len(case.manager.registry.active_rows()) == 1
+    assert not case.local_mailbox.poll()
+
+    changed = case.envelope
+    registry = AssignmentConversationRegistry(
+        case.config.state_dir / "student-conversations.json"
+    )
+    if edit == "task":
+        request = case.request.model_copy(update={"task": "Repair a different module."})
+        changed = changed.model_copy(update={"request": request})
+    elif edit == "assignment":
+        assignment = case.request.assignment.model_copy(
+            update={"revision_id": "revision-2"}
+        )
+        request = case.request.model_copy(update={"assignment": assignment})
+        changed = changed.model_copy(update={"request": request})
+        case.parent_id = registry.for_assignment(
+            assignment.assignment_id,
+            assignment.revision_id,
+        )
+    elif edit == "requester":
+        changed = changed.model_copy(update={"requester": "advisor"})
+    elif edit == "parent":
+        changed = changed.model_copy(
+            update={"parent_conversation_id": case.config.conversation_id}
+        )
+    case.pending = [(case.issue, changed)]
+    restarted = supervision.SupervisorHandler(case.config, case.inbox)
+    restarted()
+    case.delivery.conversation_for_events = StudentConversationSelector(registry)
+    case.delivery._poll_into_inbox()
+
+    assert len(case.children) == 1
+    assert not case.manager.registry.active_rows()
+    assert all(value is not None for value in case.collected_on_completion[-1])
+    assert case.completed[-1][2] is (edit is None)
+    assert case.completion_envelopes == [changed]
+    if edit is None:
+        assert not case.children[0].interrupted
+        assert case.inbox.turn(case.turn.turn_id).quarantine_reason is None
+    else:
+        assert case.children[0].interrupted
+        assert "new Supervisor request" in case.completed[-1][1]
+        assert (
+            case.inbox.turn(case.turn.turn_id).quarantine_reason
+            == "recovery budget exhausted"
+        )
+
+
 @pytest.mark.parametrize("initially_resolved", [True, False])
+@pytest.mark.parametrize("edit", ["task", "requester", "parent"])
 def test_edited_request_cannot_relaunch_or_prevent_other_controller_work(
     supervisor_case,
     capsys,
     initially_resolved,
+    edit,
 ):
     case = supervisor_case("student")
     if not initially_resolved:
         case.result = '{"resolved":false,"repair_summary":"Repair was unsuccessful."}'
     case.completion_failures = 1
-    with pytest.raises(RuntimeError, match="GitHub unavailable"):
-        case.handler(case.event)
+    case.handler()
+    assert case.completed == []
+    case.delivery._poll_into_inbox()
     if initially_resolved:
         case.inbox.quarantine(case.turn.turn_id, "later failure")
     reason = case.inbox.turn(case.turn.turn_id).quarantine_reason
-    changed = case.request.model_copy(update={"task": "A different repair."})
-    edited = ControllerEvent(
-        kind=case.event.kind,
-        dedupe_key=case.event.dedupe_key,
-        payload={**case.event.payload, "request": changed.model_dump(mode="json")},
-    )
+    if edit == "task":
+        changed = case.request.model_copy(update={"task": "A different repair."})
+        edited = case.envelope.model_copy(update={"request": changed})
+    elif edit == "requester":
+        edited = case.envelope.model_copy(update={"requester": "advisor"})
+    else:
+        edited = case.envelope.model_copy(
+            update={"parent_conversation_id": case.config.conversation_id}
+        )
+    case.pending = [(case.issue, edited)]
     # A transient failure publishing this rejection must not restart the controller.
     case.completion_failures = 1
     other = ControllerEvent(
@@ -299,12 +442,11 @@ def test_edited_request_cannot_relaunch_or_prevent_other_controller_work(
     )
     turns = Turns()
     runtime = controller(
-        Mailbox(((edited,), (other,), ())),
+        SupervisedMailbox(Mailbox(((other,), ())), case.handler),
         turns,
         role="student",
         inbox=case.inbox,
         conversation_id=case.parent_id,
-        supervise=case.handler,
         conversation_for_events=StudentConversationSelector(
             AssignmentConversationRegistry(
                 case.config.state_dir / "student-conversations.json"
@@ -317,20 +459,20 @@ def test_edited_request_cannot_relaunch_or_prevent_other_controller_work(
     assert len(turns.calls) == 1
     assert turns.calls[0][1] == case.config.conversation_id
     assert case.inbox.turn(case.turn.turn_id).quarantine_reason == reason
-    case.handler(edited)
+    case.pending = [(case.issue, edited)]
+    case.handler()
     assert case.completed[-1][2] is False
     assert "new Supervisor request" in case.completed[-1][1]
+    assert case.completion_envelopes == [case.envelope, edited, edited]
 
 
 @pytest.mark.parametrize("busy", ["subagent", "training"])
 def test_supervisor_refuses_a_workspace_with_an_active_writer(supervisor_case, busy):
     case = supervisor_case("student")
     if busy == "subagent":
-        case.manager.spawn_for_owner(
-            SpawnAgentsAction(
-                batch_key="work",
-                tasks=[AgentTask(task="Edit the target", model="smart")],
-            ),
+        case.manager.spawn(
+            "work",
+            [AgentTask(task="Edit the target", model="smart")],
             str(case.parent_id),
         )
     else:
@@ -341,7 +483,7 @@ def test_supervisor_refuses_a_workspace_with_an_active_writer(supervisor_case, b
             get_training_status=lambda _id: SimpleNamespace(state="running"),
         )
     started = len(case.children)
-    case.handler(case.event)
+    case.handler()
     assert len(case.children) == started
     assert case.completed[-1][2] is False
     assert busy in case.completed[-1][1]
@@ -350,7 +492,7 @@ def test_supervisor_refuses_a_workspace_with_an_active_writer(supervisor_case, b
         == "recovery budget exhausted"
     )
     for row in case.manager.registry.active_rows():
-        case.manager.cancel_for_owner([row["task_id"]], str(case.parent_id))
+        case.manager.cancel([row["task_id"]], str(case.parent_id))
 
 
 def test_controller_shutdown_cancels_supervisor_before_returning(
@@ -363,7 +505,8 @@ def test_controller_shutdown_cancels_supervisor_before_returning(
 
     monkeypatch.setattr(supervision.time, "sleep", interrupt)
     with pytest.raises(KeyboardInterrupt):
-        case.handler(case.event)
+        case.handler()
+    case.delivery._poll_into_inbox()
     assert case.children[0].interrupted
     assert not case.manager.registry.active_rows()
     assert not case.completed

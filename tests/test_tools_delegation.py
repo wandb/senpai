@@ -31,6 +31,7 @@ from senpai_agent.delegation import (
     OpenHandsChildProcess,
     SpawnAgentsAction,
     SpawnAgentsTool,
+    SupervisorTask,
     cancel_pending_descendants,
     configure_delegation,
     reconcile_delegated_tasks,
@@ -141,11 +142,21 @@ def test_persisted_search_task_restores_without_exposing_the_old_schema():
                 "search_mode": "research-publications",
             },
         ),
+        (
+            SupervisorTask(key="repair", task="Repair the local workspace"),
+            {
+                "key": "repair",
+                "task": "Repair the local workspace",
+                "agent": "supervisor",
+                "model": "smart",
+                "include_context": False,
+            },
+        ),
     ],
 )
 def test_pre_upgrade_registry_specs_replay_semantically(
     tmp_path: Path,
-    current: AgentTask,
+    current: AgentTask | SupervisorTask,
     legacy: dict,
 ):
     registry = DelegationRegistry(tmp_path / "tasks.sqlite3")
@@ -698,7 +709,9 @@ def test_replayed_batch_reuses_task_ids_and_changed_specs_fail(tmp_path, owner_o
 
     if owner_only:
         manager = DelegationManager(config(tmp_path), factory)
-        invoke = lambda requested: manager.spawn_for_owner(requested, str(parent.id))
+        invoke = lambda requested: manager.spawn(
+            requested.batch_key, requested.tasks, str(parent.id)
+        )
     else:
         invoke = lambda requested: spawn(requested, parent).tasks
 
@@ -1670,43 +1683,41 @@ def test_owner_dispatch_rejects_history_and_limits_inspection_and_cancellation(t
     child = FakeChild(release)
     manager = DelegationManager(config(tmp_path), lambda _request: child)
     owner = str(uuid.uuid4())
-    action = SpawnAgentsAction(
-        batch_key="repair",
-        tasks=[AgentTask(task="Repair startup", agent="supervisor", model="smart")],
-    )
-    invalid = SpawnAgentsAction(
-        batch_key="history",
-        tasks=[AgentTask(task="Inspect", model="smart", include_context=True)],
-    )
-    with pytest.raises(ValueError, match="self-contained"):
-        manager.spawn_for_owner(invalid, owner)
-    tasks = manager.spawn_for_owner(action, owner)
+    invalid = [AgentTask(task="Inspect", model="smart", include_context=True)]
+    with pytest.raises(ValueError, match="owning conversation"):
+        manager.spawn("history", invalid, owner)
+    with pytest.raises(ValueError, match="owning conversation"):
+        manager.spawn("history", invalid, owner, conversation=parent_conversation())
+    tasks = manager.spawn("repair", [SupervisorTask(task="Repair startup")], owner)
     ids = [task.task_id for task in tasks]
     other = str(uuid.uuid4())
     with pytest.raises(ValueError, match="only its own"):
-        manager.states_for_owner(ids, other)
+        manager.states(ids, other)
     with pytest.raises(ValueError, match="only its own"):
-        manager.cancel_for_owner(ids, other)
-    assert manager.states_for_owner(None, owner)[0].status == "running"
-    assert manager.cancel_for_owner(ids, owner)[0].status == "cancelled"
+        manager.cancel(ids, other)
+    assert manager.states(None, owner)[0].status == "running"
+    assert manager.cancel(ids, owner)[0].status == "cancelled"
     assert child.interrupted
 
 
-@pytest.mark.parametrize("depth", [0, 1])
-def test_spawn_cannot_bypass_supervisor_request_coordination(tmp_path, depth):
-    spawned = []
-    spawn, *_ = tools(
-        tmp_path, lambda request: spawned.append(request), depth=depth,
-        agent_name="general-purpose" if depth else None,
-        current_task_id="parent-task" if depth else None,
-    )
-    action = SpawnAgentsAction(
-        batch_key="bypass-request",
-        tasks=[AgentTask(task="Repair startup", agent="supervisor", model="smart")],
-    )
+@pytest.mark.parametrize("action_type", [SpawnAgentsAction, LeafSpawnAgentsAction])
+def test_spawn_schema_cannot_request_a_supervisor(action_type):
+    schema = action_type.model_json_schema()
+    task_name = schema["properties"]["tasks"]["items"]["$ref"].split("/")[-1]
+    task_schema = schema["$defs"][task_name]
+    assert "supervisor" not in task_schema["properties"]["agent"]["enum"]
+    with pytest.raises(ValueError, match=r"tasks\.0\.agent"):
+        action_type.model_validate(
+            {
+                "batch_key": "bypass-request",
+                "tasks": [{"task": "Repair", "agent": "supervisor", "model": "smart"}],
+            }
+        )
 
-    with pytest.raises(PermissionError, match="request_supervisor"):
-        spawn(action, parent_conversation())
 
-    assert not spawned
-    assert not DelegationRegistry(tmp_path / "state/delegation/tasks.sqlite3").rows()
+@pytest.mark.parametrize(
+    "changed", [{"agent": "explore"}, {"model": "fast"}, {"include_context": True}]
+)
+def test_native_supervisor_task_keeps_its_fixed_profile(changed):
+    with pytest.raises(ValueError):
+        SupervisorTask(task="Repair", **changed)

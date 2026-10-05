@@ -60,6 +60,22 @@ def _tool(cls, action_type, title: str, description: str, executor):
     ]
 
 
+class RequestSupervisorTool(ToolDefinition):
+    @classmethod
+    def create(cls, runtime: GitHubToolRuntime) -> Sequence[Self]:
+        from senpai_agent.github import supervision
+
+        return _tool(
+            cls,
+            supervision.SupervisorRequest,
+            "Request Supervisor",
+            "Ask a fresh Supervisor to diagnose and repair the advisor or a student. "
+            "The target pod handles the request at its next safe boundary and returns "
+            "feedback; other pods can continue working.",
+            supervision.RequestSupervisorExecutor(runtime),
+        )
+
+
 class CreateHumanIssueExecutor(
     ToolExecutor[CreateHumanIssueAction, GitHubMutationObservation]
 ):

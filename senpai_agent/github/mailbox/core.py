@@ -10,16 +10,10 @@ from urllib.parse import quote, urlencode
 
 from pydantic import SecretStr
 
-from senpai_agent.github.http import GitHubReader, GitHubReadError
-from senpai_agent.github.workflow import GitHubWorkflow
+from senpai_agent.github.http import GitHubReadError, GitHubReader
 from senpai_agent.mailbox import ControllerEvent
-
 from .advisor import advisor_events
-from .ledger import (
-    acknowledge_feedback,
-    acknowledge_supervisor_results,
-    supervisor_events,
-)
+from .ledger import acknowledge_feedback
 from .student import student_events
 from .values import (
     DEFAULT_FEEDBACK_BATCH_BYTES,
@@ -75,28 +69,18 @@ class GitHubMailbox:
             api_url=api_url,
             trusted_actor=trusted_actor,
         )
-        self._workflow = GitHubWorkflow(
-            repo,
-            token,
-            role=role,
-            api_url=api_url,
-            trusted_actor=trusted_actor,
-        )
 
     def poll(self) -> tuple[ControllerEvent, ...]:
         self._pull_comment_cache.clear()
         pulls = self._authorized_pulls(self._pulls())
         issues = self._issues() if self.human_issues_enabled else ()
         if self.role == "advisor":
-            events = advisor_events(self, pulls, issues)
-        else:
-            events = student_events(self, pulls, issues)
-        return (*events, *supervisor_events(self))
+            return advisor_events(self, pulls, issues)
+        return student_events(self, pulls, issues)
 
     def acknowledge(self, dedupe_keys: Sequence[str]) -> None:
         """Mark persisted feedback delivered after a successful controller turn."""
         acknowledge_feedback(self, dedupe_keys)
-        acknowledge_supervisor_results(self, dedupe_keys)
 
     def _issue_comments(
         self,

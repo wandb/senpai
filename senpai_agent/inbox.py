@@ -24,13 +24,19 @@ MAX_EVENT_BYTES_PER_TURN = 64 * 1024
 MAX_INFERENCE_ATTEMPTS_PER_TURN = 36
 QUEUE_PRIORITY = 1
 STEER_PRIORITY = 2
-EXACT_ONCE_EVENT_KINDS = frozenset({
-    "human_issue", "human_pr_comment", "supervisor_completed",
-})
+EXACT_ONCE_EVENT_KINDS = frozenset(
+    {
+        "human_issue",
+        "human_pr_comment",
+        "supervisor_completed",
+        "supervisor_recovered",
+    }
+)
 STEERING_PRIORITIES = {
     "human_issue": STEER_PRIORITY,
     "human_pr_comment": STEER_PRIORITY,
     "student_pr_feedback": QUEUE_PRIORITY,
+    "supervisor_recovered": STEER_PRIORITY,
 }
 ADVISOR_ACTIVE_STEERING_PRIORITIES = {
     **STEERING_PRIORITIES,
