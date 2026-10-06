@@ -672,9 +672,16 @@ student pod. Stop active training and let other helpers finish first. The
 It receives the research program, failure details and selected PR discussions,
 without inherited conversation history, and returns actionable feedback.
 
-The Supervisor has the pod user's local file access, with no new Kubernetes
-permissions or GitHub credentials. Dead controllers and Senpai runtime changes
-still require operational recovery.
+This LLM agent is separate from the process and training supervisors. A student
+can request a Supervisor that executes code on the advisor's checkout. The
+target controller pauses its own turns during repair, up to the `smart` task
+deadline; other pods continue working. Requests from another role are reports
+to verify within the program's constraints.
+
+The model-facing Supervisor has the pod user's local file access and no GitHub
+credentials or new Kubernetes permissions. Its merge worker holds GitHub
+credentials privately to publish feedback and merge after review. Dead
+controllers and Senpai runtime changes still require operational recovery.
 
 `spawn_agents` launches a batch and immediately returns stable task IDs;
 `await_agents` collects them with an `all`, `first`, `quorum`, or any-state
@@ -727,7 +734,7 @@ also copies the model-visible parent history. The root advisor or student may
 leave useful tasks running and receives their terminal results as durable
 events; nested children may not detach descendants.
 
-Children share the parent workspace, so their process and conversation are isolated but their filesystem is not. They receive only their declared tools and never receive GitHub credentials, GitHub workflow tools, or training tools.
+Children share the parent workspace, so their process and conversation are isolated but their filesystem is not. Their model-facing tools receive no GitHub credentials, GitHub workflow tools, or training tools. The merge worker receives a private credential handoff; its reviewer remains token-free and uses an isolated bare repository.
 
 The Exa tool preserves the standalone script's controls: 1–100 results,
 publication dates, domains, text filters, freshness, six search types, extra
@@ -829,7 +836,7 @@ The controller owns cadence, durable events, conversation selection, verified Gi
 - Still-actionable GitHub state is re-delivered on the configured reminder cadence, which defaults to at least ten minutes even when GitHub is polled more frequently. Human Issue and PR comment versions are retained across failed or interrupted turns and are never delivered again after successful acknowledgement. New trusted text creates a new version; a changed Human Issue title also creates a new version. `research_base_changed` and student assignment comments are also delivered once per exact event version. Immediate post-turn polls deliver changed state but not timed reminders, so a successful research-only turn cannot enter a no-sleep reminder loop. `research_base_changed` is keyed by assignment, revision, PR head, and the exact required/current base pair; each identity or base movement requires a new decision. Merge repeats the live-base check immediately before its mutation, while external base writers still require strict up-to-date branch protection or a merge queue for an atomic guarantee.
 - Each model request has a hard 90-minute ceiling. OpenHands uses five attempts with 8/16/32/64-second waits (`SENPAI_LLM_NUM_RETRIES`). Foreground terminal calls return within ten minutes, delegated children retain hard 20/60/120-minute tier limits, and root turns use a two-hour inactivity lease renewed by OpenHands events. Two consecutive failed turns end the controller. The supervisor cleans up its descendants and exits. Kubernetes, Docker with a restart policy, or another external process manager must restart the complete entrypoint to recreate the consumed credential handoffs.
 - Every input follows one durable `pending -> delivered -> processed` inbox. Authenticated human Issues and PR comments are the interrupt tier: tools get up to 60 seconds to finish before the active run is interrupted and resumed, even when its inbox batch is full. Student assignments and trusted PR feedback share a FIFO queue tier; feedback waits for the next completed agent step without cancelling it. Ordinary events remain FIFO. Turn formation and non-human attachments are bounded to 16 events or 64 KiB; prioritized overflow leads the next turn.
-- A completed tool observation renews the three-attempt no-progress budget; timeout, error, interruption, state, and delivery events do not. Thirty-six inference starts on one branch are a separate restart backstop and do not limit one productive run. Either exhausted budget triggers bounded canonical fresh-branch recovery; exhausting recovery quarantines the turn and reports it on every controller start. Only an authenticated human instruction reopens quarantine and resets both budgets; trusted PR feedback stays pending. A persisted final response is reconciled even if cancellation left the SDK status paused. `SENPAI_INBOX_MAX_STALLED_ATTEMPTS` and `SENPAI_INBOX_MAX_RECOVERY_GENERATIONS` configure recovery.
+- A completed tool observation renews the three-attempt no-progress budget; timeout, error, interruption, state, and delivery events do not. Thirty-six inference starts on one branch are a separate restart backstop and do not limit one productive run. Either exhausted budget triggers bounded canonical fresh-branch recovery; exhausting recovery quarantines the turn and reports it on every controller start. An authenticated human instruction or a verified `supervisor_recovered` event reopens quarantine and resets both budgets; trusted PR feedback stays pending. A persisted final response is reconciled even if cancellation left the SDK status paused. `SENPAI_INBOX_MAX_STALLED_ATTEMPTS` and `SENPAI_INBOX_MAX_RECOVERY_GENERATIONS` configure recovery.
 - Typed context/history failures use durable bounded fresh-branch recovery. Exhausted transient provider failures preserve the turn and its budgets behind durable 30/60/120/240/300-second cooldowns with jitter and `Retry-After` while mailbox polling continues; permanent provider errors fail immediately.
 - On restart, an incomplete persisted tool action is rejected rather than replayed implicitly. A checked-out assignment branch that was deliberately rebased or extended locally is preserved and surfaced to its existing student conversation for explicit reconciliation.
 - The complete OpenHands event log remains locally searchable. Senpai does not prune conversation directories; operators own retention.

@@ -8,6 +8,7 @@ from senpai_agent.github.workflow.errors import (
     WorkflowPreconditionError,
 )
 from senpai_agent.github.workflow.responses import MutationResult, PullRequestSnapshot
+from senpai_agent.github.workflow.text import marker_body
 from senpai_agent.github.workflow.validation import (
     require_assignment_result,
     require_current_revision,
@@ -47,21 +48,8 @@ class MergeMixin:
             )
             assignment = require_assignment_result(before, terminal_result)
             require_current_revision(assignment, current_revision_id)
-            if before.merged:
-                if before.state != "closed":
-                    raise ReconciliationError(
-                        "GitHub returned a merged pull request that is not closed"
-                    )
-                if not before.merge_commit_sha:
-                    raise ReconciliationError(
-                        "GitHub returned a merged pull request without a merge SHA"
-                    )
-                return MutationResult(
-                    changed=False,
-                    resource_url=before.url,
-                    state="experiment_merged",
-                    version=before.merge_commit_sha,
-                )
+            if completed := _already_merged(before):
+                return completed
 
             _require_merge_ready(before)
 
@@ -89,21 +77,21 @@ class MergeMixin:
 
         with self.serialized_assignment_mutation():
             current = self._pull_at_head(number, expected_head_sha)
-            _require_merge_ready(current)
             current_assignment = require_assignment_result(current, terminal_result)
             require_current_revision(current_assignment, current_revision_id)
             if current_assignment != assignment or (current.title, current.body) != (
                 before.title, before.body
             ):
                 raise WorkflowPreconditionError("pull request context changed during code review")
-            if acceptance is not None:
-                self._require_research_base_acceptance(number, acceptance)
-
-            require_exact_research_base(
-                assignment,
-                live_base_sha=self._branch_head_sha(assignment.base_ref),
-                expected_current_base_sha=expected_current_base_sha,
-            )
+            if not current.merged:
+                _require_merge_ready(current)
+                if acceptance is not None:
+                    self._require_research_base_acceptance(number, acceptance)
+                require_exact_research_base(
+                    assignment,
+                    live_base_sha=self._branch_head_sha(assignment.base_ref),
+                    expected_current_base_sha=expected_current_base_sha,
+                )
             require_same_result(
                 terminal_result,
                 self._require_result(
@@ -114,7 +102,8 @@ class MergeMixin:
                 ),
                 phase="immediately before merge",
             )
-
+            if completed := _already_merged(current):
+                return completed
             self._mutate(
                 "PUT",
                 f"/repos/{self._repo}/pulls/{number}/merge",
@@ -158,11 +147,58 @@ class MergeMixin:
                 version=after.merge_commit_sha,
             )
 
+    def post_merge_review(
+        self,
+        number: int,
+        *,
+        assignment_id: str,
+        revision_id: str,
+        expected_head_sha: str,
+        review_id: str,
+        comment: str,
+    ) -> MutationResult:
+        """Record findings without routing feedback to the finished student."""
+        scope = {
+            "assignment_id": assignment_id,
+            "revision_id": revision_id,
+            "expected_head_sha": expected_head_sha,
+            "allowed_statuses": frozenset({"status:review"}),
+        }
+        with self.serialized_assignment_mutation():
+            self._routed_assignment_at_head(number, **scope)
+            marker = f"<!-- senpai-merge-review:{review_id} -->"
+            changed, verified = self._upsert_marker_comment(
+                number,
+                marker=marker,
+                body=marker_body(marker, comment),
+                conflict_message="merge review already identifies different findings",
+            )
+            after, _assignment = self._routed_assignment_at_head(number, **scope)
+            return MutationResult(
+                changed=changed,
+                resource_url=verified.url,
+                state="merge_review_posted",
+                version=after.head_sha,
+            )
+
+
+def _already_merged(pull: PullRequestSnapshot) -> MutationResult | None:
+    if not pull.merged:
+        return None
+    if pull.state != "closed":
+        raise ReconciliationError("GitHub returned a merged pull request that is not closed")
+    if not pull.merge_commit_sha:
+        raise ReconciliationError("GitHub returned a merged pull request without a merge SHA")
+    return MutationResult(
+        changed=False,
+        resource_url=pull.url,
+        state="experiment_merged",
+        version=pull.merge_commit_sha,
+    )
+
 
 def _require_merge_ready(pull: PullRequestSnapshot) -> None:
     require_open(pull)
-    if pull.merged:
-        raise WorkflowPreconditionError("pull request was already merged during code review")
     if pull.draft:
         raise WorkflowPreconditionError("cannot merge a draft pull request")
     require_labels(pull, required={"status:review"}, forbidden=set())

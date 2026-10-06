@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import time
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -14,12 +15,14 @@ from senpai_agent.delegation import (
     OpenHandsChildProcess,
     SupervisorTask,
 )
+from senpai_agent.github.http import GitHubReadError
 from senpai_agent.github.mailbox.values import payload_digest
 from senpai_agent.github.supervision import (
     SupervisorEnvelope,
     SupervisorGateway,
     SupervisorResult,
 )
+from senpai_agent.github.workflow import GitHubAPIError, GitHubTransportError
 from senpai_agent.inbox import PersistentInbox
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.openhands_runner import delegation_config, local_event_db_path
@@ -41,8 +44,12 @@ class SupervisorHandler:
     training: TrainingRuntime | None = None
     monitor_store: MonitorStore | None = None
 
+    @cached_property
+    def gateway(self) -> SupervisorGateway:
+        return SupervisorGateway(self.config)
+
     def __call__(self) -> None:
-        gateway = SupervisorGateway(self.config)
+        gateway = self.gateway
         # Closing Issues changes pagination; finish the snapshot before handling it.
         for issue, envelope in list(gateway.pending()):
             try:
@@ -88,7 +95,7 @@ class SupervisorHandler:
         with LocalEventStore(local_event_db_path(self.config)) as store:
             saved = store.get(key)
             if saved is None:
-                result = self._repair(gateway, envelope, parent_id, key, store)
+                result = self._repair(gateway, envelope, parent_id, key)
                 saved = LocalEvent(
                     kind="supervisor_recovered"
                     if result.resolved
@@ -127,13 +134,13 @@ class SupervisorHandler:
         envelope: SupervisorEnvelope,
         parent_id: UUID,
         key: str,
-        store: LocalEventStore,
     ) -> SupervisorResult:
         request = envelope.request
         child_config = delegation_config(self.config)
         manager = DelegationManager(
             child_config,
             lambda request: OpenHandsChildProcess(child_config, request),
+            event_db_path=local_event_db_path(self.config),
         )
         source = envelope.model_dump(mode="json", exclude={"result"})
         attempt_key = f"{key}:{payload_digest(source)}"
@@ -174,7 +181,7 @@ class SupervisorHandler:
                 gateway.validate(request)
                 prompt = prior["task"]
             else:
-                prompt = gateway.prepare(request)
+                prompt = gateway.prepare(envelope)
                 for turn in self.inbox.quarantined_turns():
                     if turn.conversation_id == str(parent_id):
                         prompt += (
@@ -200,16 +207,26 @@ class SupervisorHandler:
                     self.progress.update("supervisor-validate", 300)
                 gateway.validate(request)
         except BaseException as error:
+            if isinstance(
+                error, (GitHubTransportError, GitHubAPIError, GitHubReadError)
+            ):
+                status = getattr(error, "status_code", None)
+                if status is None or status in {408, 429} or status >= 500:
+                    raise
             if task_id is not None:
-                manager.cancel([task_id], owner)
+                manager.cancel(
+                    [task_id],
+                    owner,
+                    reason="Supervisor repair aborted."
+                    if isinstance(error, Exception)
+                    else "Controller shutdown interrupted the repair. Create a new Supervisor request with a new request_id.",
+                )
             if not isinstance(error, Exception):
                 raise
             result = SupervisorResult(
                 resolved=False,
-                repair_summary=f"{type(error).__name__}: {error}",
+                repair_summary=f"{type(error).__name__}: {str(error)[:2000]}\nCreate a new Supervisor request with a new request_id to retry.",
             )
         if task_id is not None:
             manager.registry.mark_collected([task_id])
-            # Startup reconciliation may have emitted an orphaned-task receipt.
-            store.acknowledge(f"agent_result:{task_id}")
         return result

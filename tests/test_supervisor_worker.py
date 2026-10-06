@@ -22,7 +22,17 @@ def test_supervisor_requires_a_delegated_child(monkeypatch):
         runner.main(["--agent", "supervisor", "--max-turns", "1"])
 
 
-@pytest.mark.parametrize("outcome", ["repaired", "unfinished", "failed"])
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "repaired",
+        "unfinished",
+        "failed",
+        "wrapped_failure",
+        "close_failed",
+        "failed_close",
+    ],
+)
 def test_supervisor_repairs_local_workspace_and_publishes_only_after_cleanup(
     tmp_path,
     monkeypatch,
@@ -111,7 +121,12 @@ def test_supervisor_repairs_local_workspace_and_publishes_only_after_cleanup(
             assert supplied_prompt == prompt
 
         async def arun(self):
-            if outcome == "failed":
+            if outcome == "wrapped_failure":
+                try:
+                    raise OSError("underlying I/O error")
+                except OSError as error:
+                    raise RuntimeError("local repair failed") from error
+            if outcome in {"failed", "failed_close"}:
                 raise RuntimeError("local repair failed")
             if outcome == "unfinished":
                 self.state.execution_status = ConversationExecutionStatus.PAUSED
@@ -155,6 +170,8 @@ def test_supervisor_repairs_local_workspace_and_publishes_only_after_cleanup(
             nonlocal closed
             closed = True
             self.editor.executor.close()
+            if outcome in {"close_failed", "failed_close"}:
+                raise ValueError("tool cleanup failed")
 
     monkeypatch.setattr(runner, "LocalConversation", RepairConversation)
     monkeypatch.setattr(runner, "record_delegated_task_result", record)
@@ -188,11 +205,21 @@ def test_supervisor_repairs_local_workspace_and_publishes_only_after_cleanup(
         assert "child execution ended with status paused" in published[0][1]["error"]
         assert broken.read_text() == "workers = 0\n"
     else:
-        reason = "local repair failed"
-        with pytest.raises(RuntimeError, match=reason):
+        cleanup_failed = outcome == "close_failed"
+        with pytest.raises(
+            ValueError if cleanup_failed else RuntimeError,
+            match="tool cleanup failed" if cleanup_failed else "local repair failed",
+        ):
             runner.main(args)
+        reason = (
+            "tool cleanup failed"
+            if outcome == "close_failed"
+            else "local repair failed"
+        )
         assert reason in published[0][1]["error"]
-        assert broken.read_text() == "workers = 0\n"
+        assert broken.read_text() == (
+            "workers = 1\n" if outcome == "close_failed" else "workers = 0\n"
+        )
     assert all(publication_states), (
         "parent resumed while Supervisor tools were still open"
     )

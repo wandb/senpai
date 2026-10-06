@@ -2042,7 +2042,7 @@ def run_openhands[ResponseT: BaseModel](
                 run_deadline,
             )
     finally:
-        primary_error = sys.exc_info()[1] is not None
+        primary_error = sys.exc_info()[1]
         if config.child and config.delegation_task_id and conversation is not None:
             registry_value = os.environ.get("SENPAI_DELEGATION_REGISTRY_PATH")
             if registry_value:
@@ -2063,11 +2063,18 @@ def run_openhands[ResponseT: BaseModel](
         clear_github_credentials()
         configure_exa_credentials(None)
         configure_delegation(None)
-        if inference_heartbeat is not None:
-            inference_heartbeat.close()
-        if conversation is not None:
-            conversation.close()
-        if cleanup_error is not None and not primary_error:
+        try:
+            if inference_heartbeat is not None:
+                inference_heartbeat.close()
+            if conversation is not None:
+                conversation.close()
+        except BaseException as error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(
+                f"Cleanup also failed: {type(error).__name__}: {error}"
+            )
+        if cleanup_error is not None and primary_error is None:
             raise cleanup_error
 
     if config.child and config.delegation_task_id:

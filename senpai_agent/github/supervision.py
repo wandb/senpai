@@ -31,7 +31,7 @@ from senpai_agent.github.workflow import (
     MutationResult,
     WorkflowPreconditionError,
 )
-from senpai_agent.models import authoritative_marker_line
+from senpai_agent.models import _marker_payload, authoritative_marker_line
 from senpai_agent.PROMPTS import SUPERVISOR_REPAIR_PROMPT, render_prompt
 
 if TYPE_CHECKING:
@@ -48,7 +48,7 @@ class SupervisorRequest(Action):
     request_id: str = Field(
         min_length=1,
         max_length=128,
-        description="Stable ID for one repair attempt. Reuse it only to retry the same request.",
+        description="Stable ID for one repair attempt. Reuse it to retry delivery; after a blocked or failed attempt, use a new request_id.",
     )
     target: str = Field(
         min_length=1,
@@ -91,6 +91,12 @@ class SupervisorResult(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def fit_issue_body(self) -> Self:
+        if len(_marker_payload(self)) + len(self.repair_summary) > 32_000:
+            raise ValueError("Supervisor result is too large; shorten the summary")
+        return self
+
 
 class SupervisorEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -117,11 +123,14 @@ def _identity(envelope: SupervisorEnvelope) -> str:
 
 
 def render_request(envelope: SupervisorEnvelope) -> str:
-    encoded = envelope.model_dump_json().replace(">", "\\u003e")
+    encoded = _marker_payload(envelope)
     marker = f"{_PREFIX}{_identity(envelope)}:{encoded} -->"
     body = f"{marker}\n\n## Supervisor request: {envelope.request.target}\n\n{envelope.request.task}"
     if envelope.result is not None:
         body += f"\n\n## Supervisor result\n\n{envelope.result.repair_summary}"
+    # Reserve half the Issue body for a result, including JSON escape expansion.
+    if len(body) > (65_536 if envelope.result else 32_000):
+        raise ValueError("Supervisor request is too large; shorten the task")
     return body
 
 
@@ -313,7 +322,9 @@ class SupervisorGateway:
                 "HEAD",
             )
 
-    def prepare(self, request: SupervisorRequest) -> str:
+    def prepare(self, envelope: SupervisorEnvelope) -> str:
+        request = envelope.request
+        render_request(envelope)
         self.validate(request)
         numbers = list(request.context_prs)
         if request.assignment is not None:
@@ -329,12 +340,14 @@ class SupervisorGateway:
         head = run_git(self.config.workspace, "rev-parse", "HEAD")
         return render_prompt(
             SUPERVISOR_REPAIR_PROMPT,
+            REQUESTER=envelope.requester,
+            ROLE="advisor" if envelope.requester == "advisor" else "student",
             TASK=request.task,
             TARGET=request.target,
             WORKSPACE=str(self.config.workspace),
             ASSIGNMENT=request.assignment.model_dump_json()
             if request.assignment
-            else "advisor",
+            else "(none; advisor repair)",
             HEAD=head,
             STATUS=status or "(clean)",
             PR_CONTEXT=context,

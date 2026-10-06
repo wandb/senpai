@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 import pytest
 from git_workflow_support import commit_file, detached_commit, git, repository
 from github_retrieval_support import (
@@ -14,24 +16,39 @@ from github_workflow_support import FakeGitHub, assignment_record, pull_request
 from openhands_support import runtime_config
 
 from senpai_agent.git_transport import GitWorkflowPreconditionError
-from senpai_agent.github.supervision import SupervisorGateway, SupervisorRequest
+from senpai_agent.github.supervision import (
+    SupervisorEnvelope,
+    SupervisorGateway,
+    SupervisorRequest,
+)
 from senpai_agent.github.tools.contracts import AssignmentVersion
 from senpai_agent.github.workflow import WorkflowPreconditionError
 from senpai_agent.models import render_assignment_marker
 
 
 @pytest.mark.parametrize(
-    ("case", "error", "message"),
+    ("role", "case", "error", "message"),
     [
-        ("aligned", None, None),
-        ("wrong-pod", PermissionError, "different pod"),
-        ("wrong-branch", WorkflowPreconditionError, "current checkout"),
-        ("diverged", GitWorkflowPreconditionError, "merge-base --is-ancestor failed"),
+        ("student", "aligned", None, None),
+        ("student", "oversized-request", ValueError, "too large"),
+        ("advisor", "aligned", None, None),
+        ("advisor", "student-report", None, None),
+        ("advisor", "wrong-branch", WorkflowPreconditionError, "current checkout"),
+        ("advisor", "wrong-pod", PermissionError, "different pod"),
+        ("student", "wrong-pod", PermissionError, "different pod"),
+        ("student", "wrong-branch", WorkflowPreconditionError, "current checkout"),
+        (
+            "student",
+            "diverged",
+            GitWorkflowPreconditionError,
+            "merge-base --is-ancestor failed",
+        ),
     ],
 )
 def test_gateway_requires_the_target_checkout_and_preserves_unpublished_work(
     tmp_path,
     monkeypatch,
+    role,
     case,
     error,
     message,
@@ -42,6 +59,8 @@ def test_gateway_requires_the_target_checkout_and_preserves_unpublished_work(
     )
     (workspace / "model.py").write_text("baseline = 3\n")
     (workspace / "scratch.py").write_text("preserved = True\n")
+    if role == "advisor":
+        git(workspace, "branch", "-m", "schmidhuber")
     if case == "wrong-branch":
         git(workspace, "branch", "-m", "other-assignment")
     if case == "diverged":
@@ -95,31 +114,52 @@ def test_gateway_requires_the_target_checkout_and_preserves_unpublished_work(
         runtime_config(
             tmp_path,
             workspace=workspace,
-            role="student",
+            role=role,
             student_name="student-one",
             advisor_branch="schmidhuber",
         )
     )
     request = SupervisorRequest(
         request_id="repair-loader",
-        target="student-two" if case == "wrong-pod" else "student-one",
+        target="student-two"
+        if case == "wrong-pod"
+        else "advisor"
+        if role == "advisor"
+        else "student-one",
         assignment=AssignmentVersion(
             pr_number=7,
             assignment_id=assignment.assignment_id,
             revision_id=assignment.revision_id,
             expected_pr_head_sha=published_head,
-        ),
-        task="Repair the local data loader while preserving ongoing work.",
-        context_prs=[8],
+        )
+        if role == "student" or case in {"student-report", "wrong-pod"}
+        else None,
+        task=">" * 5_000
+        if case == "oversized-request"
+        else "Repair the local data loader while preserving ongoing work.",
+        context_prs=[7, 8],
+    )
+    envelope = SupervisorEnvelope(
+        repo=gateway.config.github_repo,
+        advisor_branch="schmidhuber",
+        requester="student-one" if case == "student-report" else "advisor",
+        request=request,
+        parent_conversation_id=uuid4(),
     )
     branch = git(workspace, "branch", "--show-current")
     status = git(workspace, "status", "--short")
 
     if error is not None:
         with pytest.raises(error, match=message):
-            gateway.prepare(request)
+            gateway.prepare(envelope)
     else:
-        prompt = gateway.prepare(request)
+        prompt = gateway.prepare(envelope)
+        assert (
+            f"Requested by: {envelope.requester} ({'student' if case == 'student-report' else 'advisor'})"
+            in prompt
+        )
+        if role == "advisor" and case != "student-report":
+            assert "Assignment: (none; advisor repair)" in prompt
         for text in (request.task, local_head, "model.py", "scratch.py"):
             assert text in prompt
         for discussion in discussions.values():

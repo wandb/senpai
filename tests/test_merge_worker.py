@@ -9,21 +9,9 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from openhands.sdk.conversation import ConversationExecutionStatus
-from openhands.sdk.event import ActionEvent, MessageEvent
-from openhands.sdk.llm import Message, MessageToolCall, TextContent
-from openhands.sdk.tool import resolve_tool
-from pydantic import SecretStr
-
-import senpai_agent.github.code_review as code_review
-import senpai_agent.github.merge_worker as merge_worker
-import senpai_agent.openhands_runner as runner
-from senpai_agent.github import http as github_http
-from senpai_agent.github.tools.contracts import AssignmentVersion, MergeExperimentAction
-from senpai_agent.github.workflow import HttpResponse
-from senpai_agent.models import render_assignment_marker, render_result_comment
 from git_workflow_support import commit_file, git, repository
-from github_retrieval_support import inline_comment, review as review_submission
+from github_retrieval_support import inline_comment
+from github_retrieval_support import review as review_submission
 from github_workflow_support import (
     ASSIGNMENT_ID,
     REPO,
@@ -33,8 +21,26 @@ from github_workflow_support import (
     experiment_result,
     pull_request,
 )
+from openhands.sdk.conversation import ConversationExecutionStatus
+from openhands.sdk.event import ActionEvent, MessageEvent
+from openhands.sdk.llm import Message, MessageToolCall, TextContent
+from openhands.sdk.tool import resolve_tool
 from openhands_support import runtime_config, runtime_env
+from pydantic import SecretStr
 
+import senpai_agent.github.code_review as code_review
+import senpai_agent.github.merge_worker as merge_worker
+import senpai_agent.openhands_runner as runner
+from senpai_agent.github import http as github_http
+from senpai_agent.github.mailbox import GitHubMailbox
+from senpai_agent.github.tools import GitHubWorkflowToolSet
+from senpai_agent.github.tools.contracts import AssignmentVersion, MergeExperimentAction
+from senpai_agent.github.tools.runtime import (
+    clear_github_credentials,
+    configure_github_credentials,
+)
+from senpai_agent.github.workflow import HttpResponse
+from senpai_agent.models import render_assignment_marker, render_result_comment
 
 APPROVED = code_review.CodeQualityVerdict(
     approved=True, review_summary="Focused change.", findings=[],
@@ -108,6 +114,7 @@ def merge_case(tmp_path, monkeypatch):
         smart_reasoning_effort="high",
         github_token=None,
         delegation_task_id="merge-task",
+        delegation_root_state_dir=tmp_path / "advisor-state",
         delegation_deadline_epoch=time.time() + 600,
     )
     action = MergeExperimentAction(
@@ -132,6 +139,46 @@ def execute(case):
         config=case.config,
         token=SecretStr("private-github-key"),
     )
+
+
+@pytest.mark.parametrize("has_root", [True, False])
+def test_merge_worker_requires_the_advisors_shared_lock(
+    merge_case, monkeypatch, has_root,
+):
+    lock_paths = []
+    original_workflow = merge_worker.GitHubWorkflow
+
+    def workflow(*args, **kwargs):
+        lock_paths.append(kwargs["mutation_lock_path"])
+        return original_workflow(*args, **kwargs)
+
+    monkeypatch.setattr(merge_worker, "GitHubWorkflow", workflow)
+    monkeypatch.setattr("senpai_agent.github.tools.toolset.GitHubWorkflow", workflow)
+    configure_github_credentials(REPO, SecretStr("private-github-key"))
+    try:
+        GitHubWorkflowToolSet.create(
+            role="advisor", workspace=merge_case.config.workspace,
+            state_dir=merge_case.config.delegation_root_state_dir / "github",
+            advisor_branch="schmidhuber", student_names=["student-one"],
+        )
+    finally:
+        clear_github_credentials()
+
+    def review(_prompt, _config, *, response_schema, on_structured_result):
+        on_structured_result(APPROVED)
+        return 0
+
+    monkeypatch.setattr(runner, "run_openhands", review)
+    if has_root:
+        assert execute(merge_case)["state"] == "experiment_merged"
+        assert len(lock_paths) == 2
+        assert lock_paths[0] == lock_paths[1]
+    else:
+        merge_case.config = replace(merge_case.config, delegation_root_state_dir=None)
+        with pytest.raises(RuntimeError, match="root state directory"):
+            execute(merge_case)
+        assert merge_case.fake.mutations == []
+        assert len(lock_paths) == 1
 
 
 def test_approval_reviews_pinned_source_with_smart_profile_before_merging(
@@ -221,11 +268,8 @@ def test_missing_or_stale_pr_discussion_blocks_review_and_merge(
     assert reason in result["reason"]
     assert merge_case.fake.pr["merged"] is False
     assert not any(method == "PUT" for method, _path, _body in merge_case.fake.mutations)
-    if failure == "retrieval":
-        assert reason in merge_case.fake.comments[-1]["body"]
-    else:
-        assert merge_case.fake.mutations == []
-        assert "feedback_error" in result
+    assert merge_case.fake.mutations == []
+    assert "feedback_url" not in result
 
 
 @pytest.mark.parametrize(
@@ -238,7 +282,7 @@ def test_missing_or_stale_pr_discussion_blocks_review_and_merge(
     ],
     ids=("rejected", "unfinished", "runtime-failure", "expired"),
 )
-def test_failed_review_posts_findings_and_returns_them_without_merging(
+def test_only_review_findings_are_posted_without_waking_the_student(
     merge_case, monkeypatch, verdict, status, remaining, reason,
 ):
     merge_case.config = replace(
@@ -262,12 +306,34 @@ def test_failed_review_posts_findings_and_returns_them_without_merging(
 
     assert result["state"] in {"merge_blocked", "merge_failed"}
     assert reason in result["reason"]
-    assert reason in merge_case.fake.comments[-1]["body"]
-    assert result["feedback_url"] == merge_case.fake.comments[-1]["html_url"]
     assert merge_case.fake.pr["merged"] is False
-    assert [(method, path) for method, path, _body in merge_case.fake.mutations] == [
-        ("POST", f"/repos/{REPO}/issues/7/comments"),
-    ]
+    if verdict is REJECTED:
+        assert reason in merge_case.fake.comments[-1]["body"]
+        assert result["feedback_url"] == merge_case.fake.comments[-1]["html_url"]
+        assert [(method, path) for method, path, _body in merge_case.fake.mutations] == [
+            ("POST", f"/repos/{REPO}/issues/7/comments"),
+        ]
+        mailbox = GitHubMailbox(
+            repo=REPO, token=SecretStr("private-github-key"), role="student",
+            advisor_branch="schmidhuber", student_name="student-one",
+            trusted_actor="senpai-bot", human_issues_enabled=False,
+        )
+        pull = merge_case.fake.request(
+            "GET", f"https://api.github.com/repos/{REPO}/pulls/7", headers={},
+        ).json_body
+        pull.update(
+            user={"login": "senpai-bot"}, updated_at="2026-07-29T18:00:00Z",
+            comments_url=f"https://api.github.com/repos/{REPO}/issues/7/comments",
+        )
+        pull["head"]["repo"] = {"full_name": REPO}
+        for entry in merge_case.fake.comments:
+            entry["created_at"] = "2026-07-29T18:01:00Z"
+        monkeypatch.setattr(mailbox, "_pulls", lambda: [pull])
+        monkeypatch.setattr(mailbox, "_has_write_permission", lambda _login: True)
+        assert mailbox.poll() == ()
+    else:
+        assert merge_case.fake.mutations == []
+        assert "feedback_url" not in result
 
 
 @pytest.mark.parametrize("feedback_failure", ["permission", "head-moved"])
@@ -333,6 +399,14 @@ def test_worker_requires_native_structured_review_in_one_private_conversation(
         json.dump(credentials, stream)
     monkeypatch.setenv("SENPAI_MODEL_CREDENTIALS_FD", str(read_fd))
     monkeypatch.setenv("SENPAI_DELEGATION_TASK_ID", "merge-task")
+    private_environment = {
+        "SENPAI_DELEGATION_TASK_ID": "merge-task",
+        "SENPAI_DELEGATION_REGISTRY_PATH": str(tmp_path / "tasks.sqlite3"),
+        "SENPAI_DELEGATION_EVENT_DB_PATH": str(tmp_path / "events.sqlite3"),
+    }
+    for name, value in private_environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("SENPAI_DELEGATION_ROOT_STATE_DIR", str(tmp_path / "advisor-state"))
     monkeypatch.setenv("SENPAI_MERGE_REQUEST_JSON", merge_case.action.model_dump_json())
     inherited_stdin = StringIO(ADVISOR_HISTORY_SENTINEL)
     monkeypatch.setattr("sys.stdin", inherited_stdin)
@@ -344,6 +418,7 @@ def test_worker_requires_native_structured_review_in_one_private_conversation(
 
     def record(task_id, **kwargs):
         assert merge_case.fake.pr["merged"] is should_merge
+        assert all(kwargs["env"].get(name) == value for name, value in private_environment.items())
         published.append((task_id, kwargs))
 
     class ReviewConversation:
@@ -356,6 +431,7 @@ def test_worker_requires_native_structured_review_in_one_private_conversation(
             assert "GITHUB_TOKEN" not in kwargs["secrets"]
             assert "GITHUB_TOKEN" not in os.environ
             assert "SENPAI_MODEL_CREDENTIALS_FD" not in os.environ
+            assert not (private_environment.keys() & os.environ.keys())
             assert "senpai_github" not in {tool.name for tool in kwargs["agent"].tools}
             agent = kwargs["agent"]
             inspected.append(agent.llm.model)
@@ -451,8 +527,7 @@ def test_worker_requires_native_structured_review_in_one_private_conversation(
             "inconsistent-finish": "an approval must have no blocking findings",
         }[response_kind]
         assert reason in outcome["reason"]
-        assert reason in merge_case.fake.comments[-1]["body"]
-        assert not any(method == "PUT" for method, _path, _body in merge_case.fake.mutations)
+        assert merge_case.fake.mutations == []
     output = capsys.readouterr().out
     final_record = json.loads(next(
         line.removeprefix("OPENHANDS_RESULT ")

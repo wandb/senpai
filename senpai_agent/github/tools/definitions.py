@@ -244,7 +244,7 @@ class MergeExperimentTool(
         return [cls(
             description=(
                 "Merge one review-ready experiment, an AI agent will carry out one final "
-                "code review and then merge if satisifed, otherwise it will return with "
+                "code review and then merge if satisfied, otherwise it will return with "
                 "review feedback."
             ),
             action_type=MergeExperimentAction,

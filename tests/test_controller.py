@@ -1071,6 +1071,43 @@ def test_exhausted_context_recovery_defers_then_retries_without_failure_streak(
     assert "retry_after_seconds=600" in log
 
 
+@pytest.mark.parametrize("recovered", [False, True])
+def test_only_successful_supervisor_repair_resumes_a_deferred_conversation(
+    monkeypatch,
+    recovered,
+):
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: 0)
+    original = review_event()
+    turns = Turns(
+        [
+            ConversationRecoveryExhausted(
+                CONVERSATION_ID, RuntimeError("context exhausted")
+            ),
+            TurnResult(exit_code=0),
+        ]
+    )
+    mailbox = Mailbox([(original,)])
+    runtime = controller(mailbox, turns)
+    runtime.run(max_cycles=1)
+    receipt = ControllerEvent(
+        kind="supervisor_recovered" if recovered else "supervisor_completed",
+        dedupe_key="supervisor:23",
+        payload={"parent_conversation_id": str(CONVERSATION_ID)},
+    )
+    mailbox.polls.append((receipt,))
+
+    runtime.run(max_cycles=1)
+
+    assert len(turns.calls) == (2 if recovered else 1)
+    if recovered:
+        assert turns.calls[-1][2] == frozenset(
+            {original.dedupe_key, receipt.dedupe_key}
+        )
+        assert mailbox.acknowledged == [(original.dedupe_key, receipt.dedupe_key)]
+    else:
+        assert mailbox.acknowledged == []
+
+
 def test_transient_provider_failure_defers_and_retries_the_same_turn(
     tmp_path: Path,
     monkeypatch,

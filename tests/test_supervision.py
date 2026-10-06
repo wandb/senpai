@@ -6,8 +6,10 @@ from test_controller import Mailbox, Turns, controller
 
 from senpai_agent import supervision
 from senpai_agent.delegation import AgentTask, DelegationManager
+from senpai_agent.github.http import GitHubReadError
 from senpai_agent.github.supervision import SupervisorEnvelope, SupervisorRequest
 from senpai_agent.github.tools.contracts import AssignmentVersion
+from senpai_agent.github.workflow import GitHubAPIError, GitHubTransportError
 from senpai_agent.inbox import PersistentInbox
 from senpai_agent.local_events import LocalEventStore
 from senpai_agent.mailbox import (
@@ -83,16 +85,20 @@ def supervisor_case(tmp_path, monkeypatch):
 
             def validate(self, request):
                 if case.preflight_error is not None:
+                    if isinstance(case.preflight_error, Exception):
+                        raise case.preflight_error
                     raise RuntimeError(case.preflight_error)
                 if (
                     case.postflight_error
                     and case.children
                     and case.children[-1].finished
                 ):
+                    if isinstance(case.postflight_error, Exception):
+                        raise case.postflight_error
                     raise RuntimeError("assignment changed during repair")
 
-            def prepare(self, request):
-                self.validate(request)
+            def prepare(self, envelope):
+                self.validate(envelope.request)
                 return "Full PR discussion and explicit repair request."
 
             def complete(self, number, envelope, summary, resolved, *, delivered_to):
@@ -344,7 +350,7 @@ def test_unfinished_repair_replay_rejects_changed_requests(
 ):
     case = supervisor_case("student")
 
-    def killed(*_args):
+    def killed(*_args, **_kwargs):
         raise SystemExit("Controller killed before cleanup")
 
     # An abrupt process exit leaves its independent child and registry row alive.
@@ -487,6 +493,7 @@ def test_supervisor_refuses_a_workspace_with_an_active_writer(supervisor_case, b
     assert len(case.children) == started
     assert case.completed[-1][2] is False
     assert busy in case.completed[-1][1]
+    assert "new request_id" in case.completed[-1][1]
     assert (
         case.inbox.turn(case.turn.turn_id).quarantine_reason
         == "recovery budget exhausted"
@@ -510,7 +517,42 @@ def test_controller_shutdown_cancels_supervisor_before_returning(
     assert case.children[0].interrupted
     assert not case.manager.registry.active_rows()
     assert not case.completed
+    [saved] = case.manager.registry.rows()
+    assert "Controller shutdown" in saved["error"]
+    assert "new request_id" in saved["error"]
     assert (
         case.inbox.turn(case.turn.turn_id).quarantine_reason
         == "recovery budget exhausted"
     )
+
+
+@pytest.mark.parametrize("stage", ["prepare", "postflight"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        GitHubTransportError(
+            "GET", "https://api.github.com/repos/acme/widgets/pulls/7"
+        ),
+        GitHubAPIError("GET", "https://api.github.com/repos/acme/widgets/pulls/7", 503),
+        GitHubReadError("GitHub is rate-limited", status_code=429),
+    ],
+    ids=["transport", "server", "reader"],
+)
+def test_transient_github_read_retries_without_consuming_the_repair(
+    supervisor_case, stage, error
+):
+    case = supervisor_case()
+    if stage == "prepare":
+        case.preflight_error = error
+    else:
+        case.postflight_error = error
+    case.handler()
+    assert not case.completed
+    assert case.local_mailbox.poll() == ()
+    assert case.inbox.turn(case.turn.turn_id).quarantine_reason
+    case.preflight_error = None
+    case.postflight_error = False
+    case.pending = [(case.issue, case.envelope)]
+    case.handler()
+    assert len(case.children) == 1
+    assert case.completed == [(23, "Repaired and checked.", True)]

@@ -12,8 +12,6 @@ from senpai_agent.github.workflow.text import (
     replace_assignment_marker,
 )
 from senpai_agent.github.workflow.validation import (
-    require_active_assignment_routing,
-    require_current_revision,
     require_open,
 )
 from senpai_agent.models import (
@@ -212,7 +210,6 @@ class RevisionMixin:
             assignment_id=assignment_id,
             revision_id=revision_id,
             expected_head_sha=expected_head_sha,
-            allowed_statuses=frozenset({"status:wip", "status:review"}),
         )
         feedback_id = feedback_id.strip()
         body = comment.strip()
@@ -243,7 +240,6 @@ class RevisionMixin:
             assignment_id=assignment_id,
             revision_id=revision_id,
             expected_head_sha=expected_head_sha,
-            allowed_statuses=frozenset({"status:wip", "status:review"}),
         )
         return MutationResult(
             changed=changed,

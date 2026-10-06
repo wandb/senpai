@@ -144,6 +144,21 @@ def test_merge_requires_successful_code_review_before_writing(review_error):
     assert fake.mutations == []
 
 
+def test_merge_completed_during_review_replays_without_another_write():
+    fake = FakeGitHub(mergeable_pull(), comments=[result_comment()])
+
+    def review_code(_snapshot):
+        fake.pr.update(state="closed", merged=True, merge_commit_sha="external-merge")
+        fake.branch_heads["schmidhuber"] = "external-merge"
+
+    result = merge_experiment(workflow(fake), review_code=review_code)
+
+    assert result.changed is False
+    assert result.state == "experiment_merged"
+    assert result.version == "external-merge"
+    assert fake.mutations == []
+
+
 @pytest.mark.parametrize(
     ("pr_changes", "error_type"),
     [
@@ -151,7 +166,7 @@ def test_merge_requires_successful_code_review_before_writing(review_error):
         ({"labels": {"status:review", "status:hold"}}, WorkflowPreconditionError),
         ({"labels": set()}, WorkflowPreconditionError),
         ({"state": "closed"}, WorkflowPreconditionError),
-        ({"merged": True}, WorkflowPreconditionError),
+        ({"merged": True}, ReconciliationError),
         ({"mergeable": False}, WorkflowPreconditionError),
         ({"head_sha": "c" * 40}, PullHeadMismatchError),
         (

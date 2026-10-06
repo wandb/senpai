@@ -36,6 +36,10 @@ MERGE_COMPLETION_RESERVE_SECONDS = 60
 ReviewText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
+class CodeReviewRejected(WorkflowPreconditionError):
+    """A completed, valid review found actionable code-quality problems."""
+
+
 class CodeQualityVerdict(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -126,7 +130,7 @@ def review_code_quality(
         verdict = results[0]
         if not verdict.approved:
             findings = "\n".join(f"- {finding}" for finding in verdict.findings)
-            raise WorkflowPreconditionError(
+            raise CodeReviewRejected(
                 f"Code quality review blocked PR #{pull.number}: "
                 f"{verdict.review_summary}\n{findings}"
             )

@@ -688,7 +688,9 @@ class DelegateAgentAction(Action):
     """Legacy action schema retained so persisted conversations can resume."""
 
     task: str = Field(min_length=1)
-    agent: AgentKind = "general-purpose"
+    agent: Literal["general-purpose", "explore", "search", "bash-runner"] = (
+        "general-purpose"
+    )
     model: ModelTier = "smart"
     background: bool = False
     include_context: bool = False
@@ -1342,13 +1344,18 @@ def _enqueue_task_event(
     event_sink: LocalEventSink | None,
     event_db_path: Path | None,
 ) -> None:
+    row = registry.rows([str(event.payload["task_id"])])[0]
+    if row["agent"] == "supervisor" and (row["task_key"] or "").startswith(
+        "supervisor:"
+    ):
+        # The repair handler owns its durable result and parent recovery receipt.
+        return
     if event_sink is not None:
         event_sink.enqueue(event)
     elif event_db_path is not None:
         with LocalEventStore(event_db_path) as sink:
             sink.enqueue(event)
-            task_id = str(event.payload["task_id"])
-            if registry.rows([task_id])[0]["collected_at"] is not None:
+            if registry.rows([row["task_id"]])[0]["collected_at"] is not None:
                 sink.acknowledge(event.dedupe_key)
 
 
@@ -1436,11 +1443,7 @@ def record_delegated_task_result(
             and row["depth"] == 1
             and row["status"] in TERMINAL_TASK_STATUSES
         ):
-            with LocalEventStore(Path(event_path)) as sink:
-                event = _task_event(row)
-                sink.enqueue(event)
-                if registry.rows([task_id])[0]["collected_at"] is not None:
-                    sink.acknowledge(event.dedupe_key)
+            _enqueue_task_event(registry, _task_event(row), None, Path(event_path))
     return changed
 
 
@@ -1704,14 +1707,17 @@ class DelegationManager:
         self,
         task_ids: Sequence[str],
         parent_conversation_id: str,
+        *,
+        reason: str = "Cancelled by parent agent",
     ) -> list[AgentTaskState]:
         with self.registry.lifecycle():
-            return self._cancel_locked(task_ids, parent_conversation_id)
+            return self._cancel_locked(task_ids, parent_conversation_id, reason)
 
     def _cancel_locked(
         self,
         task_ids: Sequence[str],
         parent_conversation_id: str,
+        reason: str,
     ) -> list[AgentTaskState]:
         rows = self.registry.rows(task_ids)
         for row in rows:
@@ -1719,7 +1725,7 @@ class DelegationManager:
                 raise ValueError("a caller may cancel only its own subagent tasks")
         targets = self.registry.cancel_tree(
             task_ids,
-            error="Cancelled by parent agent",
+            error=reason,
             collect_roots=True,
         )
         for row in targets:

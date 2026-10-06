@@ -205,7 +205,10 @@ def test_supervisor_request_replays_the_same_durable_issue(
 ):
     case = supervision_case
     action = request(target=target, assignment=with_assignment).model_copy(
-        update={"task": TASK + " The diagnostic contains <!-- a note -->."}
+        update={
+            "task": TASK
+            + " The diagnostic contains <!-- a note -->.\u2028\u2029\x85Done."
+        }
     )
     tool = case.tool(role=role)
 
@@ -239,23 +242,30 @@ def test_supervisor_request_replays_the_same_durable_issue(
 
 
 @pytest.mark.parametrize(
-    "invalid",
+    ("invalid", "error", "message"),
     [
-        "head",
-        "revision",
-        "branch",
-        "student",
-        "hold",
-        "missing-assignment",
-        "student-missing-assignment",
-        "unconfigured-target",
-        "student-targets-peer",
-        "missing-conversation",
+        ("head", WorkflowPreconditionError, "pull request head SHA is"),
+        ("revision", WorkflowPreconditionError, "assignment revision is"),
+        ("branch", WorkflowPreconditionError, "another advisor branch"),
+        ("student", WorkflowPreconditionError, "target does not own"),
+        ("hold", WorkflowPreconditionError, "on hold"),
+        ("missing-assignment", ValueError, "requires its exact assignment"),
+        (
+            "student-missing-assignment",
+            PermissionError,
+            "with their current assignment",
+        ),
+        ("unconfigured-target", PermissionError, "outside this launch"),
+        ("student-targets-peer", PermissionError, "themselves or their advisor"),
+        ("student-advisor-other-assignment", PermissionError, "its own assignment"),
+        ("missing-conversation", RuntimeError, "require a conversation"),
     ],
 )
 def test_supervisor_request_rejects_stale_or_unowned_work_before_posting(
     supervision_case,
     invalid,
+    error,
+    message,
 ):
     case = supervision_case
     action = request()
@@ -272,7 +282,11 @@ def test_supervisor_request_rejects_stale_or_unowned_work_before_posting(
         case.fake.pr["body"] = render_assignment_marker(
             assignment_record(base_ref="other-advisor"),
         )
-    elif invalid == "student":
+    elif invalid in {"student", "student-advisor-other-assignment"}:
+        case.fake.pr["labels"] = {"status:wip", "student:student-two"}
+        if invalid == "student-advisor-other-assignment":
+            action = request(target="advisor")
+            role = "student"
         case.fake.pr["body"] = render_assignment_marker(
             assignment_record(student="student-two"),
         )
@@ -289,12 +303,7 @@ def test_supervisor_request_rejects_stale_or_unowned_work_before_posting(
         action = request(target="student-two")
         role = "student"
 
-    with pytest.raises(
-        RuntimeError
-        if invalid == "missing-conversation"
-        else (WorkflowPreconditionError, PermissionError, ValueError),
-        match="require a conversation" if invalid == "missing-conversation" else None,
-    ):
+    with pytest.raises(error, match=message):
         if request_changes is not None:
             action = request(**request_changes)
         case.tool(role=role)(
@@ -302,6 +311,31 @@ def test_supervisor_request_rejects_stale_or_unowned_work_before_posting(
         )
 
     assert case.fake.mutations == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["a" * 12_000, ">" * 12_000, "🙂" * 12_000],
+    ids=["ascii", "escaped-marker", "unicode"],
+)
+def test_supervisor_request_and_result_fit_the_github_issue_body(
+    supervision_case, text
+):
+    case = supervision_case
+    action = request().model_copy(update={"task": text})
+    if text[0] != "a":
+        with pytest.raises(ValueError, match="too large"):
+            case.tool()(action, case.conversation)
+        assert case.fake.mutations == []
+        with pytest.raises(ValueError, match="too large"):
+            SupervisorResult(resolved=True, repair_summary=text)
+        return
+    case.tool()(action, case.conversation)
+    original = parse_request(case.fake.issue["body"])
+    case.gateway(role="student").complete(7, original, text, True, delivered_to=uuid4())
+    body = case.fake.issue["body"]
+    assert len(body) <= 65_536
+    assert parse_request(body).result.repair_summary == text
 
 
 @pytest.mark.parametrize("target", [STUDENT, "advisor"])
@@ -393,7 +427,7 @@ def test_supervisor_completion_persists_feedback_for_the_requesting_conversation
     original = parse_request(case.fake.issue["body"])
     gateway = case.gateway(role="advisor" if target == "advisor" else "student")
     delivered_to = conversation_id if recipient == "same" else uuid4()
-    summary = "Checked the failure. " + (
+    summary = "Checked the failure.\u2028\u2029\x85 " + (
         "Repaired the configuration." if resolved else "Needs an operator decision."
     )
 
