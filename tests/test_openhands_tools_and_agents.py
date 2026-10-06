@@ -266,6 +266,7 @@ def test_main_tools_replace_unsafe_defaults_with_role_scoped_boundaries(
     assert by_name["senpai_github"].params == {
         "role": role,
         "state_dir": str(config.state_dir / "github"),
+        "event_db_path": str(config.state_dir / f"{role}-events.sqlite3"),
         "advisor_branch": "advisor-branch" if role == "advisor" else None,
         "student_names": ("student-one",) if role == "advisor" else None,
         "student_name": "student-one" if role == "student" else None,
@@ -408,6 +409,7 @@ def test_markdown_agents_register_and_construct_with_the_native_loader(tmp_path)
             "general-purpose",
             "explore",
             "search",
+            "supervisor",
         }
         definitions = {
             definition.name: definition
@@ -523,6 +525,13 @@ def test_subagents_receive_skills_from_the_runtime_plugin(
             {"senpai_exa", "terminal", "file_editor"},
             set(),
         ),
+        (
+            "supervisor.md",
+            "supervisor",
+            None,
+            {"terminal", "file_editor", "task_tracker"},
+            set(),
+        ),
     ],
 )
 def test_file_agent_definitions_keep_bounded_tools_and_no_github_mutations(
@@ -554,6 +563,7 @@ def test_file_agent_definitions_keep_bounded_tools_and_no_github_mutations(
         "close_experiment",
         "create_human_issue",
         "respond_to_human_issue",
+        "request_supervisor",
         "submit_experiment_result",
     }.isdisjoint(definition.tools)
 

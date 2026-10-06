@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
@@ -87,7 +87,7 @@ from openhands.tools.preset.default import (
     register_default_tools,
 )
 from opentelemetry import trace
-from pydantic import SecretStr
+from pydantic import BaseModel, SecretStr
 from simple_parsing import ArgumentParser, field
 from simple_parsing.helpers import flag
 
@@ -109,6 +109,7 @@ from senpai_agent.program_context import (
 from senpai_agent.PROMPTS import (
     DELEGATED_RESULT_SUMMARY_PROMPT,
     RECOVERED_ACTION_PROMPT,
+    SUPERVISOR_ROLE_PROMPT,
     render_prompt,
 )
 from senpai_agent.system_instructions import (
@@ -137,7 +138,7 @@ REASONING_EFFORTS = (
     "max",
     "none",
 )
-SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore", "search")
+SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore", "search", "supervisor")
 SENPAI_AGENT_DIR_ENV = "SENPAI_AGENT_DIR"
 SOURCE_SENPAI_AGENT_DIR = Path(__file__).resolve().parents[1] / ".agents" / "agents"
 REPOSITORY_INSTRUCTION_FILENAMES = frozenset(
@@ -1235,6 +1236,7 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
                     "advisor_branch": config.advisor_branch,
                     "student_names": config.student_names,
                     "student_name": config.student_name,
+                    "event_db_path": str(local_event_db_path(config)),
                 },
             ),
         )
@@ -1273,6 +1275,19 @@ def senpai_terminal_tools(tools: Sequence[Tool], role: str) -> list[Tool]:
         else tool
         for tool in tools
     ]
+
+
+def supervisor_config(config: RunnerConfig) -> RunnerConfig:
+    return replace(
+        config,
+        agent_name="supervisor",
+        instructions=replace(config.instructions, role=SUPERVISOR_ROLE_PROMPT),
+        model=config.smart_model,
+        api_key_env=config.smart_api_key_env,
+        api_key=config.smart_api_key,
+        reasoning_effort=config.smart_reasoning_effort,
+        github_token=None,
+    )
 
 
 def delegation_config(
@@ -1646,7 +1661,7 @@ def _latest_completed_tool_event_id(
     return None
 
 
-def run_openhands(
+def run_openhands[ResponseT: BaseModel](
     prompt: str,
     config: RunnerConfig,
     *,
@@ -1655,12 +1670,16 @@ def run_openhands(
     inbox_turn_id: str | None = None,
     recovery_prompt: str | None = None,
     on_activity: Callable[[], None] | None = None,
+    response_schema: type[ResponseT] | None = None,
+    on_structured_result: Callable[[ResponseT], None] | None = None,
     on_inference_state: (
         Callable[[float | None, float | None], None] | None
     ) = None,
 ) -> int:
     if (inbox is None) != (inbox_turn_id is None):
         raise ValueError("inbox and inbox_turn_id must be provided together")
+    if on_structured_result is not None and response_schema is None:
+        raise ValueError("on_structured_result requires response_schema")
     started_at = time.time()
     run_deadline = (
         min(
@@ -1861,6 +1880,16 @@ def run_openhands(
                 condenser=condenser,
                 tool_concurrency_limit=MAX_PARALLEL_AGENTS,
             )
+        if response_schema is not None:
+            agent = agent.model_copy(update={
+                "tools": [
+                    *(tool for tool in agent.tools if tool.name != "FinishTool"),
+                    Tool(name="FinishTool", params={"response_schema": response_schema}),
+                ],
+                "include_default_tools": [
+                    name for name in agent.include_default_tools if name != "FinishTool"
+                ],
+            })
         last_activity = time.monotonic()
 
         def observe_event(event: object) -> None:
@@ -1992,12 +2021,19 @@ def run_openhands(
             and status == ConversationExecutionStatus.FINISHED
         ):
             inbox.record_processed(active_inbox_turn_id)
-        child_result = (
-            final_agent_result(conversation)
-            if config.child and status == ConversationExecutionStatus.FINISHED
-            else None
-        )
-        if child_result is not None:
+        child_result = None
+        structured_result: ResponseT | None = None
+        if status == ConversationExecutionStatus.FINISHED:
+            if response_schema is not None:
+                finish = conversation.agent.tools_map["finish"]
+                response = finish.parse_last_response(conversation.state.view.events)
+                if not isinstance(response, response_schema):
+                    raise RuntimeError("agent finished without the required structured response")
+                structured_result = response
+                child_result = response.model_dump_json() if config.child else None
+            elif config.child:
+                child_result = final_agent_result(conversation)
+        if child_result is not None and response_schema is None:
             child_result = compact_child_result(
                 conversation,
                 agent.llm,
@@ -2006,20 +2042,11 @@ def run_openhands(
                 run_deadline,
             )
     finally:
-        primary_exception = sys.exc_info()[1]
-        primary_error = primary_exception is not None
+        primary_error = sys.exc_info()[1]
         if config.child and config.delegation_task_id and conversation is not None:
             registry_value = os.environ.get("SENPAI_DELEGATION_REGISTRY_PATH")
             if registry_value:
                 try:
-                    if primary_exception is not None:
-                        record_delegated_task_result(
-                            config.delegation_task_id,
-                            error=(
-                                f"{type(primary_exception).__name__}: "
-                                f"{primary_exception}"
-                            ),
-                        )
                     detached = cancel_pending_descendants(
                         Path(registry_value),
                         str(config.conversation_id),
@@ -2030,21 +2057,24 @@ def run_openhands(
                             "await or cancel every spawned task first: "
                             f"{', '.join(detached)}"
                         )
-                        record_delegated_task_result(
-                            config.delegation_task_id,
-                            error=f"RuntimeError: {cleanup_error}",
-                        )
                 except BaseException as error:  # noqa: BLE001
                     if cleanup_error is None:
                         cleanup_error = error
         clear_github_credentials()
         configure_exa_credentials(None)
         configure_delegation(None)
-        if inference_heartbeat is not None:
-            inference_heartbeat.close()
-        if conversation is not None:
-            conversation.close()
-        if cleanup_error is not None and not primary_error:
+        try:
+            if inference_heartbeat is not None:
+                inference_heartbeat.close()
+            if conversation is not None:
+                conversation.close()
+        except BaseException as error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(
+                f"Cleanup also failed: {type(error).__name__}: {error}"
+            )
+        if cleanup_error is not None and primary_error is None:
             raise cleanup_error
 
     if config.child and config.delegation_task_id:
@@ -2057,6 +2087,9 @@ def run_openhands(
                 else f"child execution ended with status {status.value}"
             ),
         )
+
+    if on_structured_result is not None and structured_result is not None:
+        on_structured_result(structured_result)
 
     print(
         "OPENHANDS_RESULT "
@@ -2095,13 +2128,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "delegated OpenHands children require the private model "
                     "credential handoff"
                 )
+            is_supervisor = (
+                env_value(args.agent, runtime_environment, "SENPAI_OPENHANDS_AGENT")
+                == "supervisor"
+            )
+            if is_supervisor:
+                if not args.child:
+                    raise RuntimeError("Supervisor requires a delegated child agent")
+                scrub_github_credentials(runtime_environment)
+                scrub_github_credentials(os.environ)
+                os.environ.pop("SENPAI_PARENT_CONVERSATION_HISTORY_DIR", None)
             prompt = sys.stdin.read()
-            if not prompt:
+            if not prompt.strip():
                 raise RuntimeError("OpenHands runner requires a prompt on stdin")
             config = resolve_config(args, runtime_environment)
             del runtime_environment, model_credentials
+            response_schema = None
+            if is_supervisor:
+                from senpai_agent.github.supervision import SupervisorResult
+
+                if not config.delegation_task_id:
+                    raise RuntimeError("Supervisor requires a delegation task")
+                config = supervisor_config(config)
+                response_schema = SupervisorResult
             scrub_model_credentials(os.environ, config)
-            return run_openhands(prompt, config)
+            return run_openhands(prompt, config, response_schema=response_schema)
         except BaseException as error:  # noqa: BLE001
             if task_id := os.environ.get("SENPAI_DELEGATION_TASK_ID"):
                 record_delegated_task_result(

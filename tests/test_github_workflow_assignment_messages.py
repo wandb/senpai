@@ -704,7 +704,7 @@ def test_assignment_feedback_rejects_stale_identity_before_writing(
         {"student:student-one", "status:review"},
         {"student:student-one", "status:wip", "status:review"},
     ],
-    ids=("wrong-student", "missing-status", "review-ready", "ambiguous-status"),
+    ids=("wrong-student", "missing-status", "finished-assignment", "ambiguous-status"),
 )
 def test_assignment_feedback_requires_unambiguous_active_routing(labels):
     fake = FakeGitHub(pull_request(labels=labels))

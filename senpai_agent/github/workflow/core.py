@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import fcntl
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING, Literal
 from urllib.parse import quote
@@ -46,6 +48,8 @@ class WorkflowCore:
     __slots__ = (
         "_api_url",
         "_assignment_lifecycle_lock",
+        "_mutation_lock_path",
+        "_mutation_lock_held",
         "_repo",
         "_role",
         "_token",
@@ -62,6 +66,7 @@ class WorkflowCore:
         transport: HttpTransport | None = None,
         api_url: str = "https://api.github.com",
         trusted_actor: str | None = None,
+        mutation_lock_path: Path | None = None,
     ):
         if len(repo.split("/")) != 2 or not all(repo.split("/")):
             raise ValueError("repo must use owner/name form")
@@ -81,6 +86,8 @@ class WorkflowCore:
         self._api_url = api_url.rstrip("/")
         self._trusted_actor = trusted_actor
         self._assignment_lifecycle_lock = RLock()
+        self._mutation_lock_path = mutation_lock_path
+        self._mutation_lock_held = False
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(repo={self._repo!r}, api_url={self._api_url!r})"
@@ -95,14 +102,24 @@ class WorkflowCore:
 
     @contextmanager
     def serialized_assignment_mutation(self) -> Iterator[None]:
-        """Serialize a coupled local mutation with this workflow's transitions.
-        This closes races among Senpai operations sharing this workflow instance.
+        """Serialize mutations across this runtime's threads and merge workers.
         GitHub's merge API has no base-SHA compare-and-swap; external writers still
         require strict branch protection or a merge queue.
         """
 
         with self._assignment_lifecycle_lock:
-            yield
+            if self._mutation_lock_path is None or self._mutation_lock_held:
+                yield
+                return
+            self._mutation_lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._mutation_lock_path.open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                self._mutation_lock_held = True
+                try:
+                    yield
+                finally:
+                    self._mutation_lock_held = False
+                    fcntl.flock(lock, fcntl.LOCK_UN)
 
     def __getstate__(self) -> None:
         raise TypeError("GitHubWorkflow cannot be serialized")

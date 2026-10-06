@@ -11,8 +11,11 @@ from openhands.sdk.context.view import View
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.event import MessageEvent
 from openhands.sdk.llm import Message, TextContent
+from openhands_support import runtime_config
 
+import senpai_agent.delegation as delegation_module
 from senpai_agent.delegation import (
+    MODEL_TIER_TIMEOUT_SECONDS,
     AgentStatusAction,
     AgentStatusTool,
     AgentTask,
@@ -22,20 +25,21 @@ from senpai_agent.delegation import (
     CancelAgentsTool,
     DelegateAgentAction,
     DelegationConfig,
+    DelegationManager,
     DelegationRegistry,
     DelegationRequest,
     LeafAgentTask,
     LeafSpawnAgentsAction,
-    MODEL_TIER_TIMEOUT_SECONDS,
     OpenHandsChildProcess,
     SpawnAgentsAction,
     SpawnAgentsTool,
+    SupervisorTask,
     cancel_pending_descendants,
     configure_delegation,
     reconcile_delegated_tasks,
+    record_delegated_task_result,
 )
 from senpai_agent.local_events import LocalEventStore
-from openhands_support import runtime_config
 
 
 def test_model_tier_runtime_limits():
@@ -48,6 +52,12 @@ def test_model_tier_runtime_limits():
 
 def test_legacy_delegate_action_keeps_its_smart_default():
     assert DelegateAgentAction(task="Inspect persisted work").model == "smart"
+    assert (
+        "supervisor"
+        not in DelegateAgentAction.model_json_schema()["properties"]["agent"]["enum"]
+    )
+    with pytest.raises(ValueError, match="agent"):
+        DelegateAgentAction(task="Inspect persisted work", agent="supervisor")
 
 
 def test_task_schema_requires_an_explicit_model_tier():
@@ -140,11 +150,21 @@ def test_persisted_search_task_restores_without_exposing_the_old_schema():
                 "search_mode": "research-publications",
             },
         ),
+        (
+            SupervisorTask(key="repair", task="Repair the local workspace"),
+            {
+                "key": "repair",
+                "task": "Repair the local workspace",
+                "agent": "supervisor",
+                "model": "smart",
+                "include_context": False,
+            },
+        ),
     ],
 )
 def test_pre_upgrade_registry_specs_replay_semantically(
     tmp_path: Path,
-    current: AgentTask,
+    current: AgentTask | SupervisorTask,
     legacy: dict,
 ):
     registry = DelegationRegistry(tmp_path / "tasks.sqlite3")
@@ -675,7 +695,8 @@ def test_timed_out_await_collects_results_it_already_returned(tmp_path):
     releases[1].set()
 
 
-def test_replayed_batch_reuses_task_ids_and_changed_specs_fail(tmp_path):
+@pytest.mark.parametrize("owner_only", [False, True])
+def test_replayed_batch_reuses_task_ids_and_changed_specs_fail(tmp_path, owner_only):
     release = threading.Event()
     requests: list[DelegationRequest] = []
 
@@ -694,15 +715,23 @@ def test_replayed_batch_reuses_task_ids_and_changed_specs_fail(tmp_path):
         ],
     )
 
-    first = spawn(action, parent)
-    second = spawn(action, parent)
+    if owner_only:
+        manager = DelegationManager(config(tmp_path), factory)
+        invoke = lambda requested: manager.spawn(
+            requested.batch_key, requested.tasks, str(parent.id)
+        )
+    else:
+        invoke = lambda requested: spawn(requested, parent).tasks
 
-    assert [task.task_id for task in first.tasks] == [
-        task.task_id for task in second.tasks
+    first = invoke(action)
+    second = invoke(action)
+
+    assert [task.task_id for task in first] == [
+        task.task_id for task in second
     ]
     assert len(requests) == 1
     with pytest.raises(ValueError, match="different task specifications"):
-        spawn(
+        invoke(
             SpawnAgentsAction(
                 batch_key="stable-operation",
                 tasks=[
@@ -711,7 +740,6 @@ def test_replayed_batch_reuses_task_ids_and_changed_specs_fail(tmp_path):
                     )
                 ],
             ),
-            parent,
         )
     release.set()
 
@@ -781,8 +809,20 @@ def test_dead_replayed_task_becomes_failed_and_is_never_respawned(tmp_path):
     release.set()
 
 
-def test_controller_startup_reconciles_a_dead_background_task_and_enqueues_its_wake(
+@pytest.mark.parametrize(
+    "task",
+    [
+        AgentTask(key="orphan", task="Recover after restart", model="smart"),
+        SupervisorTask(key="supervisor:23:attempt", task="Repair the workspace"),
+        SupervisorTask(key="merge", task="Review and merge the experiment"),
+    ],
+    ids=["ordinary-child", "repair", "merge"],
+)
+@pytest.mark.parametrize("completion", ["restart", "child-result"])
+def test_task_completion_notifies_only_its_owning_parent(
     tmp_path,
+    task,
+    completion,
 ):
     parent = parent_conversation()
     registry = DelegationRegistry(tmp_path / "state" / "delegation" / "tasks.sqlite3")
@@ -792,27 +832,105 @@ def test_controller_startup_reconciles_a_dead_background_task_and_enqueues_its_w
         parent_conversation_id=str(parent.id),
         parent_task_id=None,
         depth=1,
-        specs=[
-            AgentTask(
-                key="orphan", task="Recover after restart", model="smart"
-            )
-        ],
+        specs=[task],
         deadlines=[time.time() + 60],
     )
     task_id = rows[0]["task_id"]
     registry.mark_running(task_id, 999_999_999)
 
-    reconcile_delegated_tasks(
-        tmp_path / "state",
-        tmp_path / "events.sqlite3",
-    )
-
-    failed = registry.rows([task_id])[0]
-    assert failed["status"] == "failed"
-    assert "no longer running" in failed["error"]
+    if completion == "restart":
+        reconcile_delegated_tasks(tmp_path / "state", tmp_path / "events.sqlite3")
+        completed = registry.rows([task_id])[0]
+        assert completed["status"] == "failed"
+        assert "no longer running" in completed["error"]
+    else:
+        record_delegated_task_result(
+            task_id,
+            result="Completed",
+            env={
+                "SENPAI_DELEGATION_REGISTRY_PATH": str(registry.path),
+                "SENPAI_DELEGATION_EVENT_DB_PATH": str(tmp_path / "events.sqlite3"),
+            },
+        )
+        completed = registry.rows([task_id])[0]
+        assert completed["status"] == "finished"
+        assert completed["result"] == "Completed"
     with LocalEventStore(tmp_path / "events.sqlite3") as events:
         pending = events.pending()
-    assert [event.payload["task_id"] for event in pending] == [task_id]
+    assert [event.payload["task_id"] for event in pending] == (
+        [] if task.key == "supervisor:23:attempt" else [task_id]
+    )
+
+
+@pytest.mark.parametrize(
+    "module_args,state_arg,process_group,start_time,alive",
+    [
+        (["-m", "senpai_agent.openhands_runner"], "{state}", 321, 100, True),
+        (["-m", "senpai_agent.github.merge_worker"], "{state}", 321, 100, True),
+        (["-m", "other_module"], "{state}", 321, 100, False),
+        (["-c", "senpai_agent.openhands_runner"], "{state}", 321, 100, False),
+        (["-m senpai_agent.openhands_runner"], "{state}", 321, 100, False),
+        (["-m", "senpai_agent.openhands_runner"], "{state}-other", 321, 100, False),
+        (["-m", "senpai_agent.openhands_runner"], "{state}", 999, 100, False),
+        (["-m", "senpai_agent.openhands_runner"], "{state}", 321, 101, False),
+    ],
+    ids=[
+        "runner",
+        "merge-worker",
+        "other-module",
+        "not-module",
+        "joined-argv",
+        "other-state",
+        "other-group",
+        "reused-pid",
+    ],
+)
+def test_startup_reconciles_only_the_recorded_child_process(
+    tmp_path,
+    monkeypatch,
+    module_args,
+    state_arg,
+    process_group,
+    start_time,
+    alive,
+):
+    state_dir = tmp_path / "child state"
+    registry = DelegationRegistry(tmp_path / "state" / "delegation" / "tasks.sqlite3")
+    rows, _created = registry.reserve(
+        operation_key="conversation:restore",
+        tree_id="restored-tree",
+        parent_conversation_id="conversation",
+        parent_task_id=None,
+        depth=1,
+        specs=[AgentTask(key="child", task="Continue the task", model="smart")],
+        deadlines=[time.time() + 60],
+    )
+    task_id = rows[0]["task_id"]
+    registry.mark_running(task_id, 123, state_dir, 321, 100)
+    process = SimpleNamespace(
+        cmdline=lambda: [
+            "python",
+            *module_args,
+            "--state-dir",
+            state_arg.format(state=state_dir),
+        ],
+        create_time=lambda: start_time,
+    )
+    monkeypatch.setattr(delegation_module.psutil, "Process", lambda _pid: process)
+    monkeypatch.setattr(delegation_module.os, "getpgid", lambda _pid: process_group)
+    signalled = []
+    monkeypatch.setattr(
+        delegation_module.os, "killpg", lambda *args: signalled.append(args)
+    )
+
+    reconcile_delegated_tasks(tmp_path / "state", tmp_path / "events.sqlite3")
+
+    assert registry.rows([task_id])[0]["status"] == ("running" if alive else "failed")
+    assert signalled == [], "reconciliation must not signal an unrelated process"
+    with LocalEventStore(tmp_path / "events.sqlite3") as events:
+        assert [event.payload["task_id"] for event in events.pending()] == (
+            [] if alive else [task_id]
+        )
 
 
 def test_controller_startup_immediately_fails_a_preexisting_queued_task(tmp_path):
@@ -1656,3 +1774,48 @@ def test_context_is_copied_only_for_tasks_that_request_it(tmp_path):
         "assistant",
     ]
     assert requests[1].parent_context == ()
+
+
+def test_owner_dispatch_rejects_history_and_limits_inspection_and_cancellation(tmp_path):
+    release = threading.Event()
+    child = FakeChild(release)
+    manager = DelegationManager(config(tmp_path), lambda _request: child)
+    owner = str(uuid.uuid4())
+    invalid = [AgentTask(task="Inspect", model="smart", include_context=True)]
+    with pytest.raises(ValueError, match="owning conversation"):
+        manager.spawn("history", invalid, owner)
+    with pytest.raises(ValueError, match="owning conversation"):
+        manager.spawn("history", invalid, owner, conversation=parent_conversation())
+    tasks = manager.spawn("repair", [SupervisorTask(task="Repair startup")], owner)
+    ids = [task.task_id for task in tasks]
+    other = str(uuid.uuid4())
+    with pytest.raises(ValueError, match="only its own"):
+        manager.states(ids, other)
+    with pytest.raises(ValueError, match="only its own"):
+        manager.cancel(ids, other)
+    assert manager.states(None, owner)[0].status == "running"
+    assert manager.cancel(ids, owner)[0].status == "cancelled"
+    assert child.interrupted
+
+
+@pytest.mark.parametrize("action_type", [SpawnAgentsAction, LeafSpawnAgentsAction])
+def test_spawn_schema_cannot_request_a_supervisor(action_type):
+    schema = action_type.model_json_schema()
+    task_name = schema["properties"]["tasks"]["items"]["$ref"].split("/")[-1]
+    task_schema = schema["$defs"][task_name]
+    assert "supervisor" not in task_schema["properties"]["agent"]["enum"]
+    with pytest.raises(ValueError, match=r"tasks\.0\.agent"):
+        action_type.model_validate(
+            {
+                "batch_key": "bypass-request",
+                "tasks": [{"task": "Repair", "agent": "supervisor", "model": "smart"}],
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "changed", [{"agent": "explore"}, {"model": "fast"}, {"include_context": True}]
+)
+def test_native_supervisor_task_keeps_its_fixed_profile(changed):
+    with pytest.raises(ValueError):
+        SupervisorTask(task="Repair", **changed)

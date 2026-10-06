@@ -25,7 +25,7 @@ def child_command(child):
     return (*command[:2], str(Path(__file__).resolve()), *command[4:])
 
 
-def run_without_model(_prompt, config):
+def run_without_model(_prompt, config, **_kwargs):
     assert "EXA_API_KEY" not in os.environ
     assert MODEL_CREDENTIALS_FD_ENV not in os.environ
     shell_environment = subprocess.check_output(["/bin/sh", "-c", "env"], text=True)

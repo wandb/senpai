@@ -8,7 +8,7 @@ from senpai_agent.inbox import PersistentInbox
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import (
     CompositeMailbox,
-    LocalAdvisorMailbox,
+    LocalMailbox,
     StudentAssignmentAvailabilityMailbox,
 )
 from senpai_agent.models import (
@@ -216,7 +216,7 @@ def test_permission_failure_invalidates_github_snapshot_and_preserves_local_even
             conversation_id="00000000-0000-0000-0000-000000000123",
             event_store_path=store_path,
         ),
-        LocalAdvisorMailbox(store_path),
+        LocalMailbox(store_path),
     )
 
     with pytest.raises(GitHubReadError):
@@ -545,6 +545,8 @@ def test_advisor_receives_every_trusted_human_pr_comment_and_student_message(
     reads = []
 
     def objects(url):
+        if "/comments" not in url:
+            return []
         reads.append(url)
         return list(visible_comments)
 
@@ -586,6 +588,8 @@ def test_student_and_human_parsers_share_a_failed_comment_read(monkeypatch):
     reads = []
 
     def objects(url):
+        if "/comments" not in url:
+            return []
         reads.append(url)
         raise GitHubReadError("temporary issue-comment failure")
 
@@ -1383,7 +1387,7 @@ def test_wip_base_change_shares_the_single_student_comment_read(monkeypatch):
     monkeypatch.setattr(
         advisor._github,
         "objects",
-        lambda url: comment_reads.append(url) or [],
+        lambda url: (comment_reads.append(url) or []) if "/comments" in url else [],
     )
 
     assert "research_base_changed" in {event.kind for event in advisor.poll()}

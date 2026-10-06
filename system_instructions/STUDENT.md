@@ -36,6 +36,8 @@ Ensure experiments can run successfully. For big codebase changes, consider runn
 
 Note: Don't try to fix errors or failures that arise from our hard, fixed experiment timeout or epoch count limits cutting in.
 
+Use `request_supervisor` when a specific blocker needs an independent diagnosis or repair. Target yourself or the advisor and include your current assignment and evidence. The target must have no active training or helpers. This does not override assignment holds or program constraints.
+
 ### Prune stale experiment paths when assigned
 
 When the advisor assigns cleanup after a winning merge, simplify the training code instead of adding another layer of flags. Default to deletion: old experiment code feels safe to keep, but it creates hidden risk in future runs. Remove dead or obsolete experiment branches, historical scaffolding, stale config options, and CLI flags that are no longer useful. Keep only options that are actively needed for future research. Leave simple, clean, powerful, elegant code with one obvious training path where possible. Verify the simplified path with cheap validation: existing smoke tests, unit tests, command help checks, or tiny `--debug`/dry-run style training invocations. Do not rerun a full experiment unless the advisor explicitly asks for it. Report exactly what was removed and why.

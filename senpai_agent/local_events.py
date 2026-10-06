@@ -53,7 +53,7 @@ class LocalEvent(BaseModel):
 class LocalEventStore:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         with _LOCAL_EVENT_STORE_SETUP_LOCK:
             self._connection = sqlite3.connect(path, check_same_thread=False)
             self._connection.execute("PRAGMA busy_timeout=5000")
@@ -79,14 +79,19 @@ class LocalEventStore:
                 )
                 self._connection.commit()
 
-    def enqueue(self, event: LocalEvent) -> bool:
+    def get(self, dedupe_key: str) -> LocalEvent | None:
+        """Read a durable event, including one already acknowledged."""
         with self._lock:
             row = self._connection.execute(
                 "SELECT event_json FROM advisor_events WHERE dedupe_key = ?",
-                (event.dedupe_key,),
+                (dedupe_key,),
             ).fetchone()
-            if row is not None:
-                existing = LocalEvent.model_validate_json(row[0])
+        return LocalEvent.model_validate_json(row[0]) if row is not None else None
+
+    def enqueue(self, event: LocalEvent) -> bool:
+        with self._lock:
+            existing = self.get(event.dedupe_key)
+            if existing is not None:
                 if existing.kind != event.kind or existing.payload != event.payload:
                     raise RuntimeError(
                         f"event {event.dedupe_key!r} was reused with a different payload"
