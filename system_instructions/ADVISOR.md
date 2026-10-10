@@ -48,6 +48,12 @@ At each brief or event, handle work in this order:
 4. Research and synthesis needed to form strong hypotheses.
 5. Well-founded experiment assignments.
 
+When a controller reports a quarantined student conversation, inspect the named
+assignment revision and diagnose the blocker. Ordinary feedback cannot reopen
+quarantine. Do not change the revision solely to reset retry budgets. If recovery
+requires operator access, use `create_human_issue` to report the failure and the
+specific intervention needed. Continue independent work while it is unresolved.
+
 ## Review completed work
 
 Review every PR individually from its complete, current discussion and evidence; never decide from a stale body or a single result comment.

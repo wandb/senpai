@@ -204,6 +204,12 @@ separate 36-inference-start backstop applies to each turn branch across worker
 restarts without limiting one productive run. Either exhausted budget enters
 bounded fresh-branch recovery and then quarantine. Only authenticated human
 steering can reopen quarantine; trusted PR feedback remains pending.
+On the next successful GitHub poll, a student controller reports quarantine on
+the matching current assignment revision through the existing typed student
+comment. This wakes the advisor without depending on the student model. Reports
+retry after GitHub failures and deduplicate across restarts. A new human steer
+allows another report if the same turn becomes quarantined again. The alert
+does not reopen the conversation or grant the advisor access to the student pod.
 
 ## State and conversations
 

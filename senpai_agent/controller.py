@@ -19,6 +19,8 @@ from uuid import UUID
 
 from senpai_agent.agent_markdown import strip_spdx_header
 from senpai_agent.github.mailbox import ActiveGitHubWatcher, GitHubMailbox
+from senpai_agent.github.quarantine import StudentQuarantineReporter
+from senpai_agent.github.workflow import GitHubWorkflow
 from senpai_agent.inbox import (
     EXACT_ONCE_EVENT_KINDS,
     QUEUE_PRIORITY,
@@ -1001,6 +1003,9 @@ def controller_main(
         runner_config.state_dir / "delivery-inbox.sqlite3",
         legacy_path=runner_config.state_dir / "pending-message-deliveries.json",
     )
+    registry = AssignmentConversationRegistry(
+        runner_config.state_dir / "student-conversations.json"
+    )
     github_mailbox = GitHubMailbox(
         repo=runner_config.github_repo,
         token=runner_config.github_token,
@@ -1013,6 +1018,20 @@ def controller_main(
         human_issues_enabled=human_issues == "true",
         feedback_path=(
             runner_config.state_dir / "github-feedback.json"
+            if role == "student"
+            else None
+        ),
+        quarantine_reporter=(
+            StudentQuarantineReporter(
+                inbox,
+                registry,
+                GitHubWorkflow(
+                    runner_config.github_repo,
+                    runner_config.github_token,
+                    role="student",
+                    trusted_actor=runner_config.github_trusted_actor,
+                ),
+            )
             if role == "student"
             else None
         ),
@@ -1050,9 +1069,6 @@ def controller_main(
                 TrainingMonitorEngine(monitor_store, training, metrics),
                 monitor_store,
             ),
-        )
-        registry = AssignmentConversationRegistry(
-            runner_config.state_dir / "student-conversations.json"
         )
         conversation_selector = StudentConversationSelector(registry)
         reconcile = StudentWorkspaceReconciler(
