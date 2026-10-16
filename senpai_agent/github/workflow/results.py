@@ -106,7 +106,7 @@ class ResultMixin:
         expected_head_sha: str,
         result: ExperimentResult,
     ) -> MutationResult:
-        with self._assignment_lifecycle_lock:
+        with self.serialized_assignment_mutation():
             return self._submit_result(
                 number,
                 expected_head_sha=expected_head_sha,

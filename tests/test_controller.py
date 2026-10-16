@@ -30,6 +30,7 @@ from senpai_agent.inbox import (
 from senpai_agent.mailbox import (
     ControllerEvent,
     StudentAssignmentAvailabilityMailbox,
+    SupervisedMailbox,
 )
 from senpai_agent.program_context import ProgramSystemPrompt
 from senpai_agent.state import StartedConversationLedger, WorkspaceDivergenceLedger
@@ -287,6 +288,63 @@ def test_successful_turn_repolls_immediately_and_continues_without_full_brief():
     assert "programme" in turns.calls[0][0]
     assert "programme" not in turns.calls[1][0]
     assert mailbox.calls == 3
+
+
+@pytest.mark.parametrize("post_turn", [False, True])
+@pytest.mark.parametrize("failure", ["supervisor", "mailbox"])
+def test_supervised_poll_failure_preserves_the_controller_error_policy(
+    post_turn, failure, capsys,
+):
+    initial, fresh = review_event(17), review_event(19)
+    snapshots = [(fresh,), ()]
+    if failure == "mailbox":
+        snapshots.insert(0, RuntimeError("mailbox unavailable"))
+    if post_turn:
+        snapshots.insert(0, (initial,))
+    operations = []
+
+    def supervise():
+        operations.append("supervisor")
+        if failure == "supervisor" and operations.count("supervisor") == (
+            2 if post_turn else 1
+        ):
+            raise RuntimeError("Supervisor listing unavailable")
+
+    class FailingMailbox(Mailbox):
+        def poll(self):
+            operations.append("mailbox")
+            result = super().poll()
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    turns = Turns()
+    reconciled = []
+    mailbox = FailingMailbox(snapshots)
+    runtime = controller(
+        SupervisedMailbox(mailbox, supervise),
+        turns,
+        reconcile=reconciled.extend,
+    )
+    if failure == "supervisor" or post_turn:
+        runtime.run(max_cycles=2)
+        expected = [initial, fresh] if post_turn else [fresh]
+        assert [call[2] for call in turns.calls] == [
+            frozenset({event.dedupe_key}) for event in expected
+        ]
+        assert reconciled == expected
+        error = (
+            "SENPAI_SUPERVISOR_ERROR RuntimeError: Supervisor listing unavailable"
+            if failure == "supervisor"
+            else "SENPAI_POST_TURN_POLL_ERROR RuntimeError: mailbox unavailable"
+        )
+        assert error in capsys.readouterr().err
+    else:
+        with pytest.raises(RuntimeError, match="mailbox unavailable"):
+            runtime.run(max_cycles=2)
+        assert turns.calls == []
+        assert reconciled == []
+    assert operations == ["supervisor", "mailbox"] * mailbox.calls
 
 
 def test_post_turn_snapshot_retracts_availability_queued_during_active_turn(
@@ -950,10 +1008,10 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
     assert created[0].turns.full_prompt == "programme"
     assert created[0].turns.active_poll_interval_seconds == 75
     assert isinstance(
-        created[0].mailbox.mailboxes[0],
+        created[0].mailbox.mailbox.mailboxes[0],
         StudentAssignmentAvailabilityMailbox,
     )
-    assert created[0].turns.github_mailbox is created[0].mailbox.mailboxes[0]
+    assert created[0].turns.github_mailbox is created[0].mailbox.mailbox.mailboxes[0]
     assert created[0].turn_timeout_seconds == 7260
 
 
@@ -1011,6 +1069,43 @@ def test_exhausted_context_recovery_defers_then_retries_without_failure_streak(
     log = capsys.readouterr().err
     assert "SENPAI_TURN_DEFERRED" in log
     assert "retry_after_seconds=600" in log
+
+
+@pytest.mark.parametrize("recovered", [False, True])
+def test_only_successful_supervisor_repair_resumes_a_deferred_conversation(
+    monkeypatch,
+    recovered,
+):
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: 0)
+    original = review_event()
+    turns = Turns(
+        [
+            ConversationRecoveryExhausted(
+                CONVERSATION_ID, RuntimeError("context exhausted")
+            ),
+            TurnResult(exit_code=0),
+        ]
+    )
+    mailbox = Mailbox([(original,)])
+    runtime = controller(mailbox, turns)
+    runtime.run(max_cycles=1)
+    receipt = ControllerEvent(
+        kind="supervisor_recovered" if recovered else "supervisor_completed",
+        dedupe_key="supervisor:23",
+        payload={"parent_conversation_id": str(CONVERSATION_ID)},
+    )
+    mailbox.polls.append((receipt,))
+
+    runtime.run(max_cycles=1)
+
+    assert len(turns.calls) == (2 if recovered else 1)
+    if recovered:
+        assert turns.calls[-1][2] == frozenset(
+            {original.dedupe_key, receipt.dedupe_key}
+        )
+        assert mailbox.acknowledged == [(original.dedupe_key, receipt.dedupe_key)]
+    else:
+        assert mailbox.acknowledged == []
 
 
 def test_transient_provider_failure_defers_and_retries_the_same_turn(

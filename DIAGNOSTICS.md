@@ -206,11 +206,15 @@ Add typed tools explicitly to prevent silent category changes.
 
 GitHub fallback tools: `get_prs`, `create_assignment`, `send_assignment_feedback`,
 `repair_assignment_routing`, `merge_experiment`, `close_experiment`, `accept_result_on_current_base`,
-`request_assignment_revision`, `publish_advisor_branch`, `respond_to_human_issue`.
+`request_assignment_revision`, `publish_advisor_branch`, `respond_to_human_issue`, `request_supervisor`.
 
-PR topics override sources; other text stays in its source band. Disclose precedence. Termination begins at
-the active-branch paired `GitHubMutationObservation` with `experiment_merged`/`experiment_closed`, never
-invocation. Cross-check `action.assignment.pr_number` and `observation.resource_url`. Apply first match:
+PR topics override sources; other text stays in its source band. Disclose precedence. A close becomes
+terminal at the paired `GitHubMutationObservation` with `experiment_closed`. For an asynchronous merge,
+join the task ID returned by `merge_experiment` to its delegated task result or `agent_result` receipt.
+Parse its JSON `result` and require `state=experiment_merged`; a finished task alone does not prove a merge.
+Cross-check the result's `resource_url` against the original action's `assignment.pr_number`. Older
+synchronous merges used paired `GitHubMutationObservation` results. Apply the transition when confirmation
+becomes visible on the parent's active branch, never at invocation. Apply first match:
 
 1. Historical if every referenced PR was terminal before this request.
 2. Current if any referenced PR remained live. Split mixed fragments or classify them current.

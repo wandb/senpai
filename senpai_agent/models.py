@@ -253,7 +253,7 @@ _RESEARCH_BASE_ACCEPTANCE_MARKER = re.compile(
 )
 
 
-def _marker_payload(value: Contract) -> str:
+def _marker_payload(value: BaseModel) -> str:
     return json.dumps(
         value.model_dump(mode="json"),
         sort_keys=True,

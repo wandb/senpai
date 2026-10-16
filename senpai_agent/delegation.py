@@ -72,7 +72,7 @@ if TYPE_CHECKING:
     from openhands.sdk.conversation import LocalConversation
 
 
-AgentKind = Literal["general-purpose", "explore", "search", "bash-runner"]
+AgentKind = Literal["general-purpose", "explore", "search", "bash-runner", "supervisor"]
 TaskAgentKind = Literal[
     "general-purpose",
     "explore",
@@ -225,10 +225,14 @@ def configure_delegation(config: DelegationConfig | None) -> None:
     _DELEGATION_CONFIG = config
 
 
-def configured_child_runner_factory() -> ChildAgentRunnerFactory:
+def configured_delegation_config() -> DelegationConfig:
     if _DELEGATION_CONFIG is None:
         raise RuntimeError("subagent runtime is not configured")
-    config = _DELEGATION_CONFIG
+    return _DELEGATION_CONFIG
+
+
+def configured_child_runner_factory() -> ChildAgentRunnerFactory:
+    config = configured_delegation_config()
     return lambda request: OpenHandsChildProcess(config, request)
 
 
@@ -425,6 +429,8 @@ class OpenHandsChildProcess:
                 "SENPAI_DELEGATION_MODEL_TIER": self._request.model,
             }
         )
+        if self._request.agent == "supervisor":
+            environment.pop("SENPAI_PARENT_CONVERSATION_HISTORY_DIR", None)
         if self._request.deadline_epoch is not None:
             remaining = self._request.deadline_epoch - time.time()
             if remaining <= 0:
@@ -682,7 +688,9 @@ class DelegateAgentAction(Action):
     """Legacy action schema retained so persisted conversations can resume."""
 
     task: str = Field(min_length=1)
-    agent: AgentKind = "general-purpose"
+    agent: Literal["general-purpose", "explore", "search", "bash-runner"] = (
+        "general-purpose"
+    )
     model: ModelTier = "smart"
     background: bool = False
     include_context: bool = False
@@ -718,7 +726,9 @@ class DelegateAgentObservation(Observation):
         ]
 
 
-def resolve_task_agent(agent: TaskAgentKind) -> tuple[AgentKind, SearchMode | None]:
+def resolve_task_agent(
+    agent: TaskAgentKind | Literal["supervisor"],
+) -> tuple[AgentKind, SearchMode | None]:
     if agent == "search_general_web":
         return "search", "general-web"
     if agent == "search_research_publications":
@@ -727,7 +737,7 @@ def resolve_task_agent(agent: TaskAgentKind) -> tuple[AgentKind, SearchMode | No
 
 
 class AgentTaskBase(BaseModel):
-    agent: TaskAgentKind
+    agent: TaskAgentKind | Literal["supervisor"]
     key: str | None = Field(
         default=None,
         min_length=1,
@@ -783,6 +793,12 @@ class LeafAgentTask(AgentTaskBase):
     )
 
 
+class SupervisorTask(AgentTaskBase):
+    agent: Literal["supervisor"] = "supervisor"
+    model: Literal["smart"] = "smart"
+    include_context: Literal[False] = False
+
+
 _PERSISTED_TASK_SPEC_FIELDS = frozenset(AgentTask.model_fields) | {"search_mode"}
 
 
@@ -821,7 +837,10 @@ def _canonical_persisted_task_specs(encoded: str) -> str:
                 "persisted delegation task specifications have an invalid search mode"
             )
         try:
-            specs.append(AgentTask.model_validate(item))
+            task_type = (
+                SupervisorTask if item.get("agent") == "supervisor" else AgentTask
+            )
+            specs.append(task_type.model_validate(item))
         except ValueError as error:
             raise RuntimeError(
                 "persisted delegation task specifications are invalid"
@@ -1253,7 +1272,7 @@ def _pid_matches_task(row: sqlite3.Row) -> bool:
         return False
     try:
         process = psutil.Process(row["pid"])
-        command = " ".join(process.cmdline())
+        command = process.cmdline()
         process_start_time = process.create_time()
         process_group_id = os.getpgid(row["pid"])
     except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
@@ -1261,7 +1280,14 @@ def _pid_matches_task(row: sqlite3.Row) -> bool:
     return (
         process_group_id == row["process_group_id"]
         and process_start_time == row["process_start_time"]
-        and "senpai_agent.openhands_runner" in command
+        and any(
+            command[index:index + 2] == ["-m", module]
+            for index in range(len(command) - 1)
+            for module in (
+                "senpai_agent.openhands_runner",
+                "senpai_agent.github.merge_worker",
+            )
+        )
         and bool(row["state_dir"])
         and row["state_dir"] in command
     )
@@ -1318,13 +1344,18 @@ def _enqueue_task_event(
     event_sink: LocalEventSink | None,
     event_db_path: Path | None,
 ) -> None:
+    row = registry.rows([str(event.payload["task_id"])])[0]
+    if row["agent"] == "supervisor" and (row["task_key"] or "").startswith(
+        "supervisor:"
+    ):
+        # The repair handler owns its durable result and parent recovery receipt.
+        return
     if event_sink is not None:
         event_sink.enqueue(event)
     elif event_db_path is not None:
         with LocalEventStore(event_db_path) as sink:
             sink.enqueue(event)
-            task_id = str(event.payload["task_id"])
-            if registry.rows([task_id])[0]["collected_at"] is not None:
+            if registry.rows([row["task_id"]])[0]["collected_at"] is not None:
                 sink.acknowledge(event.dedupe_key)
 
 
@@ -1412,11 +1443,7 @@ def record_delegated_task_result(
             and row["depth"] == 1
             and row["status"] in TERMINAL_TASK_STATUSES
         ):
-            with LocalEventStore(Path(event_path)) as sink:
-                event = _task_event(row)
-                sink.enqueue(event)
-                if registry.rows([task_id])[0]["collected_at"] is not None:
-                    sink.acknowledge(event.dedupe_key)
+            _enqueue_task_event(registry, _task_event(row), None, Path(event_path))
     return changed
 
 
@@ -1446,13 +1473,13 @@ def cancel_pending_descendants(
         return [row["task_id"] for row in rows]
 
 
-class _DelegationManager:
+class DelegationManager:
     def __init__(
         self,
         config: DelegationConfig,
         child_runner_factory: ChildAgentRunnerFactory,
-        event_sink: LocalEventSink | None,
-        event_db_path: Path | None,
+        event_sink: LocalEventSink | None = None,
+        event_db_path: Path | None = None,
     ):
         root_state = config.root_state_dir or config.state_dir
         self.registry = DelegationRegistry(root_state / "delegation" / "tasks.sqlite3")
@@ -1480,20 +1507,30 @@ class _DelegationManager:
 
     def spawn(
         self,
-        action: SpawnAgentsAction,
-        conversation: LocalConversation,
+        batch_key: str,
+        tasks: Sequence[AgentTaskBase],
+        parent_conversation_id: str,
+        *,
+        conversation: LocalConversation | None = None,
     ) -> list[AgentTaskState]:
-        self._validate_spawn(action.tasks)
+        self._validate_spawn(tasks)
+        if any(task.include_context for task in tasks) and (
+            conversation is None or str(conversation.id) != parent_conversation_id
+        ):
+            raise ValueError("parent context requires its owning conversation")
         with self.registry.lifecycle():
-            return self._spawn_locked(action, conversation)
+            return self._spawn_locked(
+                batch_key, tasks, parent_conversation_id, conversation
+            )
 
     def _spawn_locked(
         self,
-        action: SpawnAgentsAction,
-        conversation: LocalConversation,
+        batch_key: str,
+        tasks: Sequence[AgentTaskBase],
+        parent_id: str,
+        conversation: LocalConversation | None = None,
     ) -> list[AgentTaskState]:
-        parent_id = str(conversation.id)
-        operation_key = f"{parent_id}:{action.batch_key}"
+        operation_key = f"{parent_id}:{batch_key}"
         tree_id = self.config.tree_id or str(
             uuid.uuid5(uuid.NAMESPACE_URL, f"senpai-tree:{operation_key}")
         )
@@ -1501,7 +1538,7 @@ class _DelegationManager:
         inherited_deadline = self.config.deadline_epoch or float("inf")
         deadlines = [
             min(inherited_deadline, now + MODEL_TIER_TIMEOUT_SECONDS[task.model])
-            for task in action.tasks
+            for task in tasks
         ]
         if any(deadline <= now for deadline in deadlines):
             raise TimeoutError("the inherited delegation deadline has expired")
@@ -1512,21 +1549,22 @@ class _DelegationManager:
             parent_conversation_id=parent_id,
             parent_task_id=self.config.current_task_id,
             depth=self.config.depth + 1,
-            specs=action.tasks,
+            specs=tasks,
             deadlines=deadlines,
         )
         self._reconcile(rows)
         rows = self.registry.rows([row["task_id"] for row in rows])
-        for row, task in zip(rows, action.tasks, strict=True):
+        for row, task in zip(rows, tasks, strict=True):
             if not created:
                 continue
             if row["status"] != "queued":
                 continue
             if not self.registry.claim_launch(row["task_id"]):
                 continue
-            context = (
-                _model_visible_context(conversation) if task.include_context else ()
-            )
+            context = ()
+            if task.include_context:
+                assert conversation is not None
+                context = _model_visible_context(conversation)
             agent, search_mode = task.resolved_agent()
             request = DelegationRequest(
                 task_id=row["task_id"],
@@ -1626,18 +1664,21 @@ class _DelegationManager:
     def states(
         self,
         task_ids: Sequence[str] | None,
-        conversation: LocalConversation,
+        parent_conversation_id: str,
     ) -> list[AgentTaskState]:
         with self.registry.lifecycle():
-            return self._states_locked(task_ids, conversation)
+            return [
+                _row_state(row)
+                for row in self._owned_rows_locked(task_ids, parent_conversation_id)
+            ]
 
     def await_snapshot(
         self,
         task_ids: Sequence[str],
-        conversation: LocalConversation,
+        parent_conversation_id: str,
     ) -> tuple[list[AgentTaskState], frozenset[str]]:
         with self.registry.lifecycle():
-            rows = self._owned_rows_locked(task_ids, conversation)
+            rows = self._owned_rows_locked(task_ids, parent_conversation_id)
             return (
                 [_row_state(row) for row in rows],
                 frozenset(
@@ -1648,26 +1689,16 @@ class _DelegationManager:
                 ),
             )
 
-    def _states_locked(
-        self,
-        task_ids: Sequence[str] | None,
-        conversation: LocalConversation,
-    ) -> list[AgentTaskState]:
-        return [
-            _row_state(row)
-            for row in self._owned_rows_locked(task_ids, conversation)
-        ]
-
     def _owned_rows_locked(
         self,
         task_ids: Sequence[str] | None,
-        conversation: LocalConversation,
+        parent_conversation_id: str,
     ) -> list[sqlite3.Row]:
         rows = self.registry.rows(
             task_ids,
-            parent_conversation_id=(str(conversation.id) if task_ids is None else None),
+            parent_conversation_id=(parent_conversation_id if task_ids is None else None),
         )
-        if any(row["parent_conversation_id"] != str(conversation.id) for row in rows):
+        if any(row["parent_conversation_id"] != parent_conversation_id for row in rows):
             raise ValueError("a caller may inspect only its own subagent tasks")
         self._reconcile(rows)
         return self.registry.rows([row["task_id"] for row in rows])
@@ -1675,23 +1706,26 @@ class _DelegationManager:
     def cancel(
         self,
         task_ids: Sequence[str],
-        conversation: LocalConversation,
+        parent_conversation_id: str,
+        *,
+        reason: str = "Cancelled by parent agent",
     ) -> list[AgentTaskState]:
         with self.registry.lifecycle():
-            return self._cancel_locked(task_ids, conversation)
+            return self._cancel_locked(task_ids, parent_conversation_id, reason)
 
     def _cancel_locked(
         self,
         task_ids: Sequence[str],
-        conversation: LocalConversation,
+        parent_conversation_id: str,
+        reason: str,
     ) -> list[AgentTaskState]:
         rows = self.registry.rows(task_ids)
         for row in rows:
-            if row["parent_conversation_id"] != str(conversation.id):
+            if row["parent_conversation_id"] != parent_conversation_id:
                 raise ValueError("a caller may cancel only its own subagent tasks")
         targets = self.registry.cancel_tree(
             task_ids,
-            error="Cancelled by parent agent",
+            error=reason,
             collect_roots=True,
         )
         for row in targets:
@@ -1847,15 +1881,13 @@ def _require_unique_task_ids(task_ids: Sequence[str]) -> None:
         raise ValueError("task_ids must not contain duplicates")
 
 
-def _configured_manager(
-    child_runner_factory: ChildAgentRunnerFactory | None,
-    event_sink: LocalEventSink | None,
-    event_db_path: str | Path | None,
-) -> _DelegationManager:
-    if _DELEGATION_CONFIG is None:
-        raise RuntimeError("subagent runtime is not configured")
-    return _DelegationManager(
-        _DELEGATION_CONFIG,
+def configured_delegation_manager(
+    child_runner_factory: ChildAgentRunnerFactory | None = None,
+    event_sink: LocalEventSink | None = None,
+    event_db_path: str | Path | None = None,
+) -> DelegationManager:
+    return DelegationManager(
+        configured_delegation_config(),
         child_runner_factory or configured_child_runner_factory(),
         event_sink,
         Path(event_db_path) if event_db_path is not None else None,
@@ -1863,17 +1895,24 @@ def _configured_manager(
 
 
 class _SpawnAgentsExecutor(ToolExecutor[SpawnAgentsAction, SpawnAgentsObservation]):
-    def __init__(self, manager: _DelegationManager):
+    def __init__(self, manager: DelegationManager):
         self.manager = manager
 
     def __call__(self, action, conversation=None) -> SpawnAgentsObservation:
         if conversation is None:
             raise ValueError("spawn_agents requires its parent conversation")
-        return SpawnAgentsObservation(tasks=self.manager.spawn(action, conversation))
+        return SpawnAgentsObservation(
+            tasks=self.manager.spawn(
+                action.batch_key,
+                action.tasks,
+                str(conversation.id),
+                conversation=conversation,
+            )
+        )
 
 
 class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservation]):
-    def __init__(self, manager: _DelegationManager):
+    def __init__(self, manager: DelegationManager):
         self.manager = manager
         self._interrupted = threading.Event()
 
@@ -1886,7 +1925,7 @@ class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservatio
         deadline = min(time.time() + action.timeout_seconds, inherited)
         tasks, uncollected_terminal = self.manager.await_snapshot(
             action.task_ids,
-            conversation,
+            str(conversation.id),
         )
         initial_statuses = {task.task_id: task.status for task in tasks}
         while True:
@@ -1930,7 +1969,7 @@ class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservatio
                 )
             tasks, uncollected_terminal = self.manager.await_snapshot(
                 action.task_ids,
-                conversation,
+                str(conversation.id),
             )
 
     def _acknowledge(self, tasks: Sequence[AgentTaskState]) -> None:
@@ -1949,26 +1988,26 @@ class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservatio
 
 
 class _AgentStatusExecutor(ToolExecutor[AgentStatusAction, AgentStatusObservation]):
-    def __init__(self, manager: _DelegationManager):
+    def __init__(self, manager: DelegationManager):
         self.manager = manager
 
     def __call__(self, action, conversation=None) -> AgentStatusObservation:
         if conversation is None:
             raise ValueError("agent_status requires its parent conversation")
         return AgentStatusObservation(
-            tasks=self.manager.states(action.task_ids, conversation)
+            tasks=self.manager.states(action.task_ids, str(conversation.id))
         )
 
 
 class _CancelAgentsExecutor(ToolExecutor[CancelAgentsAction, CancelAgentsObservation]):
-    def __init__(self, manager: _DelegationManager):
+    def __init__(self, manager: DelegationManager):
         self.manager = manager
 
     def __call__(self, action, conversation=None) -> CancelAgentsObservation:
         if conversation is None:
             raise ValueError("cancel_agents requires its parent conversation")
         return CancelAgentsObservation(
-            tasks=self.manager.cancel(action.task_ids, conversation)
+            tasks=self.manager.cancel(action.task_ids, str(conversation.id))
         )
 
 
@@ -2034,8 +2073,8 @@ class _DelegationTool(ToolDefinition):
         child_runner_factory,
         event_sink,
         event_db_path,
-    ) -> _DelegationManager:
-        return _configured_manager(child_runner_factory, event_sink, event_db_path)
+    ) -> DelegationManager:
+        return configured_delegation_manager(child_runner_factory, event_sink, event_db_path)
 
 
 class SpawnAgentsTool(_DelegationTool[SpawnAgentsAction, SpawnAgentsObservation]):

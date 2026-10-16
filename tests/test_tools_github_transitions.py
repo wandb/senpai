@@ -15,8 +15,6 @@ from senpai_agent.github.tools import (
     CreateAssignmentAction,
     CreateAssignmentTool,
     GitHubToolRuntime,
-    MergeExperimentAction,
-    MergeExperimentTool,
     PostAssignmentCommentAction,
     PostAssignmentCommentTool,
     PublishAdvisorBranchAction,
@@ -361,15 +359,6 @@ def test_publish_advisor_branch_uses_configured_branch_and_distinct_shas(
             ),
             "accept_result_on_current_base",
             {"expected_current_base_sha": "b" * 40},
-        ),
-        (
-            MergeExperimentTool,
-            MergeExperimentAction(
-                assignment=assignment(),
-                expected_current_base_sha="b" * 40,
-            ),
-            "merge_experiment",
-            {"expected_current_base_sha": "b" * 40, "merge_method": "squash"},
         ),
         (
             CloseExperimentTool,

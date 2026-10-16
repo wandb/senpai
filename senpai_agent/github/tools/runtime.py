@@ -101,6 +101,7 @@ class GitHubToolRuntime:
     advisor_branch: str | None
     student_names: frozenset[str]
     student_name: str | None
+    event_db_path: Path | None = None
 
     def assignment_base_branch(self) -> str:
         """Return the configured advisor branch or fail before a mutation."""

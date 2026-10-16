@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -65,6 +65,28 @@ class CompositeMailbox:
             mailbox.acknowledge(dedupe_keys)
 
 
+@dataclass
+class SupervisedMailbox:
+    """Handle Supervisor Issues before reading ordinary controller work."""
+
+    mailbox: Mailbox
+    handler: Callable[[], None]
+
+    def poll(self) -> tuple[ControllerEvent, ...]:
+        try:
+            self.handler()
+        except Exception as error:  # noqa: BLE001 - outages must not block local receipts
+            print(
+                f"SENPAI_SUPERVISOR_ERROR {type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return tuple(self.mailbox.poll())
+
+    def acknowledge(self, dedupe_keys: Sequence[str]) -> None:
+        self.mailbox.acknowledge(dedupe_keys)
+
+
 class StudentAssignmentAvailabilityMailbox:
     """Reconcile student availability after each successful GitHub snapshot."""
 
@@ -104,8 +126,8 @@ class StudentAssignmentAvailabilityMailbox:
         self.mailbox.acknowledge(dedupe_keys)
 
 
-class LocalAdvisorMailbox:
-    """Deliver durable local child results directly to the advisor inbox."""
+class LocalMailbox:
+    """Deliver durable local events to the controller inbox."""
 
     def __init__(self, store_path: Path):
         self.store_path = store_path
@@ -128,28 +150,12 @@ class LocalAdvisorMailbox:
                 store.acknowledge(key)
 
 
-class LocalStudentMailbox:
+class LocalStudentMailbox(LocalMailbox):
     """Deliver local child results directly to their parent conversations."""
 
-    def __init__(self, store_path: Path):
-        self.store_path = store_path
-
     def poll(self) -> tuple[ControllerEvent, ...]:
-        with LocalEventStore(self.store_path) as store:
-            pending = store.pending()
-        for event in pending:
+        events = super().poll()
+        for event in events:
             if not isinstance(event.payload.get("parent_conversation_id"), str):
                 raise RuntimeError("student child event has no parent conversation")
-        return tuple(
-            ControllerEvent(
-                kind=event.kind,
-                dedupe_key=event.dedupe_key,
-                payload=event.payload,
-            )
-            for event in pending
-        )
-
-    def acknowledge(self, dedupe_keys: Sequence[str]) -> None:
-        with LocalEventStore(self.store_path) as store:
-            for key in dedupe_keys:
-                store.acknowledge(key)
+        return events

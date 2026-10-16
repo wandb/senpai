@@ -30,7 +30,7 @@ class StudentCommentMixin:
 
         if self._role != "student":
             raise PermissionError("post_assignment_comment requires a student workflow")
-        with self._assignment_lifecycle_lock:
+        with self.serialized_assignment_mutation():
             _before, assignment = self._routed_assignment_at_head(
                 number,
                 assignment_id=assignment_id,

@@ -36,7 +36,7 @@ class ReviewMixin:
     ) -> MutationResult:
         """Durably approve one exact result against the exact live research base."""
 
-        with self._assignment_lifecycle_lock:
+        with self.serialized_assignment_mutation():
             before, assignment = self._assigned_pull_at_head(
                 number,
                 assignment_id=assignment_id,
@@ -116,7 +116,7 @@ class ReviewMixin:
         marker: str,
         reason: str,
     ) -> MutationResult:
-        with self._assignment_lifecycle_lock:
+        with self.serialized_assignment_mutation():
             return self._close_experiment(
                 number,
                 assignment_id=assignment_id,

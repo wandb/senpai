@@ -222,7 +222,7 @@ class AcceptResultOnCurrentBaseAction(Action):
 
 
 class MergeExperimentAction(Action):
-    """Merge one reviewed result after exact head and research-base validation."""
+    """Queue a code review and merge of one exact result and research base."""
 
     assignment: AssignmentVersion = Field(
         description="Submitted result revision and PR-head precondition.",

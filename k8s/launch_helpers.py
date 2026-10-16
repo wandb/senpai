@@ -139,6 +139,7 @@ def routing_labels(
         ),
         "status:wip": (LABEL_COLOR_STATUS_WIP, "Work in progress"),
         "status:review": (LABEL_COLOR_STATUS_REVIEW, "Ready for advisor review"),
+        "supervisor": ("5319e7", "Bounded Supervisor requests and results"),
         **{
             f"student:{name}": (LABEL_COLOR_STUDENT, f"Assigned to student {name}")
             for name in student_names

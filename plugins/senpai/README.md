@@ -23,7 +23,7 @@ the current role:
   `request_assignment_revision`, `accept_result_on_current_base`,
   `merge_experiment`, and `close_experiment`;
 - students receive `post_assignment_comment` and `submit_experiment_result`; and
-- both roles receive `get_prs` and `respond_to_human_issue`.
+- both roles receive `get_prs`, `respond_to_human_issue`, and `request_supervisor`.
 
 Each tool has one operation-specific schema without a union wrapper and a
 complete model-facing description. The

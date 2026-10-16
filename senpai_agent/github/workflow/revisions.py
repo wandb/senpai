@@ -12,8 +12,6 @@ from senpai_agent.github.workflow.text import (
     replace_assignment_marker,
 )
 from senpai_agent.github.workflow.validation import (
-    require_active_assignment_routing,
-    require_current_revision,
     require_open,
 )
 from senpai_agent.models import (
@@ -39,7 +37,7 @@ class RevisionMixin:
         required_base_sha: str,
         comment: str,
     ) -> MutationResult:
-        with self._assignment_lifecycle_lock:
+        with self.serialized_assignment_mutation():
             return self._request_revision(
                 number,
                 assignment_id=assignment_id,
@@ -187,7 +185,7 @@ class RevisionMixin:
     ) -> MutationResult:
         """Upsert guidance for the current assignment without starting a revision."""
 
-        with self._assignment_lifecycle_lock:
+        with self.serialized_assignment_mutation():
             return self._send_assignment_feedback(
                 number,
                 assignment_id=assignment_id,
