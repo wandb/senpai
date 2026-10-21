@@ -826,6 +826,42 @@ def test_typed_actor_feedback_keeps_its_marked_revision_and_hides_other_protocol
     assert events[0].payload["message"] == "Stop revision one."
 
 
+@pytest.mark.parametrize("author", ["human-reviewer", "advisor"])
+@pytest.mark.parametrize("quote", ["`{marker}`", "> {marker}"])
+def test_quoting_a_peer_marker_preserves_trusted_feedback(monkeypatch, author, quote):
+    quoted_marker = quote.format(marker=peer_comment().splitlines()[0])
+    message = f"Check the evidence for this peer finding.\n\n{quoted_marker}"
+    body = message
+    if author == "advisor":
+        marker = render_assignment_feedback_marker(
+            AssignmentFeedbackRecord(
+                repo="acme/widgets",
+                pr_number=17,
+                assignment_id="assignment-17",
+                revision_id="revision-1",
+                feedback_id="check-peer-evidence",
+            )
+        )
+        body = f"{marker}\n\n{message}"
+    mailbox = student_mailbox(
+        monkeypatch,
+        feedback_responses(
+            issue_comments=[
+                feedback(120, body, author="morganmcg1" if author == "advisor" else author)
+            ]
+        ),
+    )
+
+    events = [event for event in mailbox.poll() if event.kind == "student_pr_feedback"]
+
+    assert len(events) == 1
+    assert events[0].payload["message"] == message
+    assert events[0].payload["feedback_type"] == "issue_comment"
+    assert events[0].payload["revision_id"] == (
+        "revision-1" if author == "advisor" else "revision-2"
+    )
+
+
 def test_feedback_stays_pending_and_bound_until_a_student_turn_succeeds(
     monkeypatch,
     tmp_path: Path,

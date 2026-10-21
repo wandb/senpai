@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from senpai_agent.mailbox import ControllerEvent
-from senpai_agent.models import AssignmentRecord
+from senpai_agent.models import AssignmentRecord, authoritative_marker_line
 from senpai_agent.PROMPTS import TRUNCATED_FEEDBACK_PROMPT
 
 from .ledger import read_feedback_ledger, write_feedback_ledger
@@ -78,7 +78,8 @@ def student_pr_feedback_events(
             ):
                 continue
             peer_record = None
-            if "<!-- senpai-student-peer-comment:" in str(item.get("body") or ""):
+            marker = authoritative_marker_line(str(item.get("body") or ""))
+            if marker.startswith("<!-- senpai-student-peer-comment:"):
                 peer = trusted_peer_comment(
                     item,
                     actor=actor,

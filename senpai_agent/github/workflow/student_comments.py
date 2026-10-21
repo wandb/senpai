@@ -142,7 +142,7 @@ class StudentCommentMixin:
                 raise PermissionError("source assignment does not belong to this student")
             if assignment.base_ref != advisor_branch:
                 raise WorkflowPreconditionError("source must use the configured advisor base")
-            target = self.pull_request(target_pr_number)
+            target = self.pull_request(target_pr_number, require_authorized=True)
             require_open(target)
             try:
                 records = parse_assignment_markers(target.body)
@@ -202,7 +202,7 @@ class StudentCommentMixin:
             )
             if current.student != student:
                 raise ReconciliationError("source student changed while posting comment")
-            after = self.pull_request(target.number)
+            after = self.pull_request(target.number, require_authorized=True)
             require_open(after)
             current_recipient = require_assignment_identity(
                 after, repo=self._repo, assignment_id=recipient.assignment_id

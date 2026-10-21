@@ -11,10 +11,12 @@ from urllib.parse import quote
 from pydantic import SecretStr
 
 from senpai_agent.github.http import next_link
+from senpai_agent.github.pull_authorization import authorized_pulls
 from senpai_agent.github.workflow.errors import (
     GitHubAPIError,
     GitHubTransportError,
     ReconciliationError,
+    WorkflowPreconditionError,
 )
 from senpai_agent.github.workflow.responses import (
     DraftMutationResponse,
@@ -107,7 +109,9 @@ class WorkflowCore:
     def __getstate__(self) -> None:
         raise TypeError("GitHubWorkflow cannot be serialized")
 
-    def pull_request(self, number: int) -> PullRequestSnapshot:
+    def pull_request(
+        self, number: int, *, require_authorized: bool = False
+    ) -> PullRequestSnapshot:
         number = positive_number(number)
         response = self._request(
             "GET",
@@ -121,6 +125,16 @@ class WorkflowCore:
         ).snapshot()
         if snapshot.number != number:
             raise ReconciliationError("GitHub returned the wrong pull request")
+        if require_authorized and not authorized_pulls(
+            (response.json_body,),
+            repo=self._repo,
+            get=lambda path: self._request(
+                "GET", path, expected_statuses={200}
+            ).json_body,
+        ):
+            raise WorkflowPreconditionError(
+                "peer PR must use this repository and have an author with write access"
+            )
         return snapshot
 
     def _branch_head_sha(self, branch: str) -> str:

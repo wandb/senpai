@@ -282,6 +282,8 @@ def test_peer_message_requires_the_senders_current_assignment(fields, error):
         "same-student",
         "other-base",
         "other-repo",
+        "fork",
+        "unauthorized-author",
         "closed",
         "unassigned",
         "ambiguous",
@@ -311,6 +313,11 @@ def test_peer_message_rejects_targets_outside_active_peer_assignments(invalid_ta
         )
     elif invalid_target == "closed":
         fake.recipient.pr["state"] = "closed"
+    elif invalid_target == "fork":
+        fake.recipient.pr["head_repo"] = "outsider/widgets"
+    elif invalid_target == "unauthorized-author":
+        fake.recipient.pr["author"] = "former-collaborator"
+        fake.permissions["former-collaborator"] = HttpResponse(200, {"permission": "read"})
     elif invalid_target == "unassigned":
         fake.recipient.pr["body"] = "An ordinary unrelated pull request."
     else:
@@ -533,14 +540,15 @@ def test_broadcast_validates_sender_before_any_publication(role, overrides, erro
     ],
     ids=("invalid-permission", "failed-permission-read"),
 )
-def test_broadcast_aborts_before_any_writes_when_recipient_permissions_are_unknown(
-    response, error
+@pytest.mark.parametrize("send_message", [post_peer, broadcast])
+def test_student_message_aborts_before_any_writes_when_recipient_permissions_are_unknown(
+    response, error, send_message
 ):
     fake = PeerGitHub()
-    fake.add_peer(9, author="another-author")
+    fake.recipient.pr["author"] = "another-author"
     fake.permissions["another-author"] = response
 
     with pytest.raises(error):
-        broadcast(workflow(fake, role="student"))
+        send_message(workflow(fake, role="student"))
 
     assert fake.mutations == []
