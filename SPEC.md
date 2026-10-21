@@ -91,10 +91,8 @@ GitHub state is level-triggered:
 - `status:wip` plus exactly one `student:<name>` label is an assignment;
 - trusted human comments and reviews on one assigned open `status:wip` or
   `status:review` PR wake its exact student assignment conversation;
-- authenticated typed peer comments on that PR wake the recipient's assignment
-  conversation with the sender's identity and current PR link;
-- authenticated student broadcasts reach every other current open assignment
-  on the same advisor branch, regardless of draft state or workflow status;
+- authenticated peer comments and broadcasts resume the recipient's assignment
+  conversation; broadcasts reach all open peer assignments on the same advisor base;
 - `status:review` is a durable advisor wake;
 - a configured student with no open assignment labeled `status:wip` or
   `status:review` emits `student_available_for_assignment`. This event describes
@@ -485,10 +483,8 @@ GitHub mutations are separate, operation-specific tools without a union wrapper.
 There is no operation discriminator or model-supplied repository. The runtime
 binds repository, role, credentials, workspace, and configured branches outside
 the model-facing schema. It also canonicalizes every Senpai-authored comment to
-an `ADVISOR:` prefix or a `**STUDENT: <student_name>**` header followed by a blank
-line. The runtime supplies the trusted role and student name; models supply
-plain comment text and cannot impersonate another role or student through a
-payload.
+an `ADVISOR:` prefix or `**STUDENT: <student_name>**` header plus a blank line.
+The runtime supplies role and identity; models supply plain comment text.
 
 Operations on an existing assignment share these fields. The PR number identifies
 the experiment PR. The assignment ID and revision ID identify the advisor's
@@ -540,61 +536,25 @@ trusted marker wakes the advisor without entering the student's own feedback
 inbox. A comment that races with a revision request retains its original
 revision identity and is still delivered.
 
-Students can read peer PRs and branches in the target repository when they
-target the configured advisor branch. This scope is independent of the
-student list used to identify one role. Students can copy code, changes, or
-commits into their own assigned branch when they fit the assignment's allowed
-files and scientific contract. They record the source PR and exact source
-commit. They cannot modify, commit to, or push another student's branch, and
-source sharing does not authorize a rebase or a training run.
+Students may borrow peer code on the configured advisor branch, including
+outside the launch's student list. Record the source PR and commit; write only
+to the assigned branch within its file and scientific scope.
 
-`post_peer_comment` authenticates the sender's current assignment and the
-recipient's open assignment on the same advisor base. It posts an immutable
-typed message on the recipient's PR without changing either PR's branch,
-head, draft state, labels, or assignment. The runtime prefixes the message
-with the configured student's name and appends a `Working PR` link to the
-sender's current PR. `post_assignment_comment` uses the same header and link.
-Exact replay reuses the existing message; changed text requires a new
-`comment_id`.
+`post_peer_comment` authenticates both assignments on the same advisor base,
+posts on the recipient's PR, and binds both revisions. Assignment and peer
+comments include the sender's `Working PR` link. Exact replay is a no-op;
+changed text requires a new ID.
 
-The recipient receives `student_pr_feedback` with
-`feedback_type=student_peer_comment`, the sender identity, and its source PR
-link. The authenticated peer marker binds both assignment revisions. Existing
-feedback delivery and acknowledgement rules resume the recipient's assignment
-conversation. A useful response uses `post_peer_comment` on the sender's PR
-and therefore includes the recipient's own current PR link. Peer messages are
-research context, not human or advisor authorization. They do not change
-assignments, scientific contracts, execution holds, or job budgets. Students
-avoid acknowledgement-only reply loops.
+`broadcast_message` records `broadcast:<broadcast_id>` on the sender's open WIP
+or review PR, then links copies to that discussion on every other current open
+assignment. Recipients are independent of the launch's student list, draft state,
+and workflow status. The 1,500-character limit excludes runtime headers and links.
+Retries preserve the ID's text, discover current peers, and skip existing copies.
 
-`broadcast_message` distributes a compact discovery notice to every other
-student's current open PR on the configured advisor branch. Recipient selection
-does not depend on the launch's student list, PR draft state, or workflow
-status. The message uses the same student header and `Working PR` link as a
-direct peer comment. The runtime rejects messages longer than 1,500 characters;
-the automatically supplied header and link do not count toward that limit.
-
-The tool first records an immutable `broadcast:<broadcast_id>` assignment
-comment on the sender's current open WIP or review PR. Each recipient copy
-links to that source discussion and binds the recipient's assignment revision.
-Retrying the same ID and message checks the current open peer PRs and skips
-existing copies. The source comment preserves the ID's content even after
-recipient PRs close; changed text requires a new ID.
-
-Broadcasts arrive through ordinary GitHub polling as `student_pr_feedback`
-with `feedback_type=student_broadcast` and enter the existing student feedback
-queue. They wait for a safe conversation boundary without interrupting the
-current step. This delivery remains available while a PR is
-ready for review or has another workflow status. The recipient assesses the
-finding against its current assignment and can follow up on the sender's PR
-through `post_peer_comment`. No acknowledgement is required.
-
-Broadcasts state the discovery, evidence or uncertainty, and likely relevance
-in language that other students can understand. They link to the complete
-record in experiment PRs, code, or W&B. They do not create a separate research
-notebook, change assignments or budgets, or require students to adopt the same
-approach. Routine progress, full reports, and repeated broadcasts of the same
-finding do not belong in this channel.
+Both use `student_pr_feedback`, with `feedback_type=student_peer_comment` or
+`student_broadcast`, and the existing durable feedback queue at safe conversation
+boundaries. Messages do not change PR state, assignments, holds, or budgets and
+grant no training or rebase authority. Broadcasts require no acknowledgement.
 
 Terminal student publication happens only inside `submit_experiment_result`, which
 derives the PR and proposed local head from the structured result, then validates

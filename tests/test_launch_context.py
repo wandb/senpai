@@ -2,8 +2,8 @@ import base64
 
 import pytest
 import yaml
-
 from launch_test_support import REVISION, launch, launch_args, render_role
+
 from senpai_agent.launch_context import (
     INSTRUCTIONS_ROOT,
     PLACEHOLDER,
@@ -91,8 +91,7 @@ def test_launch_context_keeps_role_identity_without_blocking_peer_source_access(
     assert "fern, stark" in advisor
     assert "fern" not in student
     assert "stark" in student
-    assert "Read other students' PRs and branches targeting `research`" in student
-    assert "copy code, changes, or commits into their own assigned branch" in student
+    assert "read other students' PRs and branches targeting `research`" in student
     assert "Students must never modify, commit to, or push another student's branch" in student
 
 
