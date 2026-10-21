@@ -1,8 +1,15 @@
+from collections.abc import Callable
+from queue import Queue
+from threading import Barrier, Event, Thread
 from urllib.parse import urlsplit
 
 import pytest
+from pydantic import SecretStr
 
 from senpai_agent.github.workflow import (
+    GitHubWorkflow,
+    PullHeadMismatchError,
+    PullRequestSnapshot,
     ReconciliationError,
     StaleAssignmentRevisionError,
     StaleResearchBaseError,
@@ -15,6 +22,7 @@ from senpai_agent.models import (
 )
 from github_workflow_support import (
     ASSIGNMENT_ID,
+    API_URL,
     BASE_SHA,
     HEAD_SHA,
     REPO,
@@ -44,6 +52,7 @@ def merge_experiment(
     expected_head_sha: str = HEAD_SHA,
     revision_id: str = "revision-1",
     expected_current_base_sha: str = BASE_SHA,
+    review_code: Callable[[PullRequestSnapshot], None] = lambda _snapshot: None,
 ):
     return client.merge_experiment(
         7,
@@ -51,6 +60,7 @@ def merge_experiment(
         assignment_id=ASSIGNMENT_ID,
         current_revision_id=revision_id,
         expected_current_base_sha=expected_current_base_sha,
+        review_code=review_code,
     )
 
 
@@ -74,18 +84,28 @@ def accept_result(
 def test_merge_sends_the_expected_head_and_replays_without_baseline_reads():
     fake = FakeGitHub(mergeable_pull(), comments=[result_comment()])
     client = workflow(fake)
+    reviewed = []
 
-    first = merge_experiment(client)
+    def review_code(snapshot):
+        assert fake.mutations == []
+        reviewed.append(snapshot)
+
+    first = merge_experiment(client, review_code=review_code)
     mutations_after_first = list(fake.mutations)
     base_reads_after_first = sum(
         method == "GET" and "/git/ref/heads/" in path
         for method, path, _body, _headers in fake.requests
     )
-    second = merge_experiment(client)
+    second = merge_experiment(client, review_code=review_code)
 
     assert first.changed is True
     assert first.version == "merge-sha"
     assert second.changed is False
+    assert len(reviewed) == 1
+    assert reviewed[0].number == 7
+    assert reviewed[0].head_sha == HEAD_SHA
+    assert reviewed[0].title == "Try lower learning rate"
+    assert reviewed[0].body == render_assignment_marker(assignment_record())
     assert fake.pr["state"] == "closed"
     assert fake.pr["merged"] is True
     assert mutations_after_first == [
@@ -100,6 +120,260 @@ def test_merge_sends_the_expected_head_and_replays_without_baseline_reads():
         method == "GET" and "/git/ref/heads/" in path
         for method, path, _body, _headers in fake.requests
     ) == base_reads_after_first
+
+
+@pytest.mark.parametrize(
+    "review_error",
+    [
+        WorkflowPreconditionError("Remove unrelated generated documentation."),
+        RuntimeError("The reviewer invocation failed."),
+    ],
+    ids=("changes-required", "reviewer-failed"),
+)
+def test_merge_requires_successful_code_review_before_writing(review_error):
+    fake = FakeGitHub(mergeable_pull(), comments=[result_comment()])
+
+    def review_code(_snapshot):
+        raise review_error
+
+    with pytest.raises(type(review_error)) as caught:
+        merge_experiment(workflow(fake), review_code=review_code)
+
+    assert caught.value is review_error
+    assert fake.pr["merged"] is False
+    assert fake.mutations == []
+
+
+def test_merge_completed_during_review_replays_without_another_write():
+    fake = FakeGitHub(mergeable_pull(), comments=[result_comment()])
+
+    def review_code(_snapshot):
+        fake.pr.update(state="closed", merged=True, merge_commit_sha="external-merge")
+        fake.branch_heads["schmidhuber"] = "external-merge"
+
+    result = merge_experiment(workflow(fake), review_code=review_code)
+
+    assert result.changed is False
+    assert result.state == "experiment_merged"
+    assert result.version == "external-merge"
+    assert fake.mutations == []
+
+
+@pytest.mark.parametrize(
+    ("pr_changes", "error_type"),
+    [
+        ({"draft": True}, WorkflowPreconditionError),
+        ({"labels": {"status:review", "status:hold"}}, WorkflowPreconditionError),
+        ({"labels": set()}, WorkflowPreconditionError),
+        ({"state": "closed"}, WorkflowPreconditionError),
+        ({"merged": True}, ReconciliationError),
+        ({"mergeable": False}, WorkflowPreconditionError),
+        ({"head_sha": "c" * 40}, PullHeadMismatchError),
+        (
+            {
+                "body": render_assignment_marker(
+                    assignment_record(revision_id="revision-2")
+                )
+            },
+            StaleAssignmentRevisionError,
+        ),
+        ({"title": "A different experiment"}, WorkflowPreconditionError),
+        (
+            {"body": render_assignment_marker(assignment_record()) + "\nNew scope."},
+            WorkflowPreconditionError,
+        ),
+    ],
+    ids=(
+        "draft",
+        "blocking-label",
+        "missing-review-label",
+        "closed",
+        "merged",
+        "conflict",
+        "head",
+        "assignment-revision",
+        "title",
+        "body",
+    ),
+)
+def test_merge_rechecks_pull_request_state_after_code_review(
+    pr_changes, error_type,
+):
+    fake = FakeGitHub(mergeable_pull(), comments=[result_comment()])
+    reviewed = []
+
+    def review_code(snapshot):
+        reviewed.append(snapshot)
+        fake.pr.update(pr_changes)
+
+    with pytest.raises(error_type):
+        merge_experiment(workflow(fake), review_code=review_code)
+
+    assert len(reviewed) == 1
+    assert fake.mutations == []
+
+
+@pytest.mark.parametrize(
+    ("changed_evidence", "error_type"),
+    [
+        ("base", StaleResearchBaseError),
+        ("result", ReconciliationError),
+        ("acceptance", StaleResearchBaseError),
+    ],
+)
+def test_merge_rechecks_evidence_after_code_review(changed_evidence, error_type):
+    current_base_sha = "c" * 40
+    fake = FakeGitHub(
+        mergeable_pull(),
+        comments=[result_comment()],
+        branch_heads={"schmidhuber": current_base_sha},
+    )
+    client = workflow(fake)
+    accept_result(client, expected_current_base_sha=current_base_sha)
+    mutations_before_review = list(fake.mutations)
+    reviewed = []
+
+    def review_code(snapshot):
+        reviewed.append(snapshot)
+        if changed_evidence == "base":
+            fake.branch_heads["schmidhuber"] = "d" * 40
+        elif changed_evidence == "result":
+            changed = experiment_result().model_copy(
+                update={"summary": "New evidence."}
+            )
+            fake.comments[0]["body"] = render_result_comment(changed)
+        else:
+            fake.comments.pop()
+
+    with pytest.raises(error_type):
+        merge_experiment(
+            client,
+            expected_current_base_sha=current_base_sha,
+            review_code=review_code,
+        )
+
+    assert len(reviewed) == 1
+    assert fake.pr["merged"] is False
+    assert fake.mutations == mutations_before_review
+
+
+def test_concurrent_reviews_release_the_lock_then_serialize_merges(tmp_path):
+    branch_heads = {"schmidhuber": BASE_SHA}
+    reviewing = Barrier(2)
+    first_final_read = Event()
+    second_review_finished = Event()
+    second_final_read = Event()
+    finish_first_merge = Event()
+    outcomes = Queue()
+
+    class CompetingMergeGitHub(FakeGitHub):
+        def __init__(self, number):
+            super().__init__(
+                pull_request(
+                    labels={"status:review"},
+                    head_ref=f"student-one/experiment-{number}",
+                ),
+                comments=[comment(1, render_result_comment(
+                    experiment_result(pr_number=number)
+                ))],
+                branch_heads=branch_heads,
+            )
+            self.pr["number"] = number
+            self.number = number
+            self.base_reads = 0
+
+        def request(self, method, url, **kwargs):
+            # Each transport represents a different PR on the same research base.
+            url = url.replace(f"/pulls/{self.number}", "/pulls/7")
+            url = url.replace(f"/issues/{self.number}", "/issues/7")
+            response = super().request(method, url, **kwargs)
+            if method == "GET" and "/git/ref/heads/" in url:
+                self.base_reads += 1
+                if self.base_reads == 2:
+                    if self.number == 7:
+                        first_final_read.set()
+                        assert finish_first_merge.wait(5)
+                    else:
+                        second_final_read.set()
+            if method == "PUT" and url.endswith("/merge"):
+                branch_heads["schmidhuber"] = "c" * 40
+            return response
+
+    fakes = [CompetingMergeGitHub(number) for number in (7, 8)]
+
+    def merge(fake):
+        client = GitHubWorkflow(
+            REPO,
+            SecretStr("github-secret"),
+            role="advisor",
+            transport=fake,
+            api_url=API_URL,
+            trusted_actor="senpai-bot",
+            mutation_lock_path=tmp_path / "mutations.lock",
+        )
+
+        def review_code(_snapshot):
+            reviewing.wait(timeout=5)
+            if fake.number == 8:
+                assert first_final_read.wait(5)
+                second_review_finished.set()
+
+        try:
+            result = client.merge_experiment(
+                fake.number,
+                expected_head_sha=HEAD_SHA,
+                assignment_id=ASSIGNMENT_ID,
+                current_revision_id="revision-1",
+                expected_current_base_sha=BASE_SHA,
+                review_code=review_code,
+            )
+            outcomes.put((fake.number, result))
+        except Exception as error:
+            outcomes.put((fake.number, error))
+
+    threads = [Thread(target=merge, args=(fake,), daemon=True) for fake in fakes]
+    for thread in threads:
+        thread.start()
+    try:
+        assert second_review_finished.wait(5), "review held the mutation lock"
+        assert not second_final_read.wait(0.1), "merge checks ran concurrently"
+    finally:
+        finish_first_merge.set()
+        for thread in threads:
+            thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    results = dict(outcomes.get_nowait() for _ in threads)
+    assert results[7].state == "experiment_merged"
+    assert isinstance(results[8], StaleResearchBaseError)
+    assert fakes[0].pr["merged"] is True
+    assert fakes[1].mutations == []
+
+
+def test_shared_mutation_lock_allows_nested_workflow_calls(tmp_path):
+    fake = FakeGitHub(mergeable_pull(), comments=[result_comment()])
+    client = GitHubWorkflow(
+        REPO,
+        SecretStr("github-secret"),
+        role="advisor",
+        transport=fake,
+        api_url=API_URL,
+        trusted_actor="senpai-bot",
+        mutation_lock_path=tmp_path / "mutations.lock",
+    )
+    outcomes = Queue()
+
+    def merge_with_outer_scope():
+        try:
+            with client.serialized_assignment_mutation():
+                outcomes.put(merge_experiment(client))
+        except Exception as error:
+            outcomes.put(error)
+
+    thread = Thread(target=merge_with_outer_scope, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive(), "nested workflow call deadlocked"
+    assert outcomes.get_nowait().state == "experiment_merged"
 
 
 def test_merge_recovers_when_the_success_response_is_lost():
@@ -544,6 +818,9 @@ def test_merge_rejects_unsafe_state_or_missing_evidence_before_writing(
         merge_experiment(
             workflow(fake),
             expected_head_sha=expected_head_sha,
+            review_code=lambda _snapshot: pytest.fail(
+                "unsafe PR reached code review"
+            ),
         )
 
     assert fake.mutations == []

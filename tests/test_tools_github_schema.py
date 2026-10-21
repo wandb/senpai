@@ -28,6 +28,7 @@ from senpai_agent.github.tools import (
     SubmitExperimentResultAction,
     SubmitExperimentResultTool,
 )
+from senpai_agent.github.tools.definitions import RequestSupervisorTool
 
 EXPECTED_FIELDS = {
     "create_assignment": {
@@ -73,11 +74,13 @@ EXPECTED_FIELDS = {
         "remote_branch_sha_before_push",
         "result",
     },
+    "request_supervisor": {"request_id", "target", "assignment", "task", "context_prs"},
 }
 
 OPTIONAL_FIELDS = {
     "repair_assignment_routing": {"blockers"},
     "merge_experiment": {"merge_method"},
+    "request_supervisor": {"assignment", "context_prs"},
 }
 
 
@@ -107,6 +110,7 @@ def github_tools(tmp_path: Path):
         CreateHumanIssueTool,
         RespondToHumanIssueTool,
         SubmitExperimentResultTool,
+        RequestSupervisorTool,
     )
     return [tool_type.create(runtime)[0] for tool_type in tool_types]
 
@@ -118,7 +122,9 @@ def test_provider_facing_github_schemas_are_single_intent_and_unambiguous(
 ):
     for tool in github_tools(tmp_path):
         advertised = getattr(tool, provider)()
-        function = advertised["function"] if provider == "to_openai_tool" else advertised
+        function = (
+            advertised["function"] if provider == "to_openai_tool" else advertised
+        )
         schema = function["parameters"]
         properties = schema["properties"]
         fields = set(properties) - {"summary"}
@@ -132,6 +138,12 @@ def test_provider_facing_github_schemas_are_single_intent_and_unambiguous(
 
         if "assignment" in fields:
             assignment = properties["assignment"]
+            if "anyOf" in assignment:
+                assignment = next(
+                    option
+                    for option in assignment["anyOf"]
+                    if option.get("type") != "null"
+                )
             assert set(assignment["properties"]) == {
                 "pr_number",
                 "assignment_id",
@@ -140,8 +152,7 @@ def test_provider_facing_github_schemas_are_single_intent_and_unambiguous(
             }
             assert set(assignment["required"]) == set(assignment["properties"])
             assert all(
-                field.get("description")
-                for field in assignment["properties"].values()
+                field.get("description") for field in assignment["properties"].values()
             )
 
 

@@ -30,7 +30,7 @@ class AssignmentMixin:
     ) -> MutationResult:
         """Create or reconcile one typed draft assignment PR."""
 
-        with self._assignment_lifecycle_lock:
+        with self.serialized_assignment_mutation():
             return self._create_assignment(assignment, title=title, body=body)
 
     def _create_assignment(
@@ -146,7 +146,7 @@ class AssignmentMixin:
         working_state: Literal["wip", "review"],
         blockers: set[Literal["blocked", "hold", "needs-rebase"]],
     ) -> MutationResult:
-        with self._assignment_lifecycle_lock:
+        with self.serialized_assignment_mutation():
             return self._repair_assignment_routing(
                 number,
                 assignment_id=assignment_id,

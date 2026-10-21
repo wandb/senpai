@@ -43,6 +43,7 @@ to README.md or SPEC.md as appropriate.
 
 ### Coding guidelines and philosophy
 
+- Never include the coding agent's company, product, or model name in branch, programme, or component names.
 - You should generate code that is simple and readable. Avoid unnecessary abstractions and complexity. This is a research codebase, so maintainability and clarity matter.
 - Avoid overly defensive coding. No need for lots of `try`/`except` patterns, fallbacks, or backups. Prefer code that fails clearly when something is wrong so it can be fixed.
 - Do not add demo-only flags or placeholder CLI options that gate real functionality (e.g., `--run` just to toggle execution); scripts should run their main logic directly.

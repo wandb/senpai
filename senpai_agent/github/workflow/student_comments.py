@@ -52,7 +52,7 @@ class StudentCommentMixin:
 
         if self._role != "student":
             raise PermissionError("post_assignment_comment requires a student workflow")
-        with self._assignment_lifecycle_lock:
+        with self.serialized_assignment_mutation():
             before, assignment = self._routed_assignment_at_head(
                 number,
                 assignment_id=assignment_id,
@@ -130,7 +130,7 @@ class StudentCommentMixin:
 
         if self._role != "student":
             raise PermissionError("post_peer_comment requires a student workflow")
-        with self._assignment_lifecycle_lock:
+        with self.serialized_assignment_mutation():
             source, assignment = self._routed_assignment_at_head(
                 number,
                 assignment_id=assignment_id,
@@ -245,7 +245,7 @@ class StudentCommentMixin:
             raise ValueError(
                 f"message must contain 1 to {MAX_BROADCAST_MESSAGE_CHARS} characters"
             )
-        with self._assignment_lifecycle_lock:
+        with self.serialized_assignment_mutation():
             _, assignment = self._routed_assignment_at_head(
                 number,
                 assignment_id=assignment_id,

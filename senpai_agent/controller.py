@@ -32,10 +32,11 @@ from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import (
     CompositeMailbox,
     ControllerEvent,
-    LocalAdvisorMailbox,
+    LocalMailbox,
     LocalStudentMailbox,
     Mailbox,
     StudentAssignmentAvailabilityMailbox,
+    SupervisedMailbox,
 )
 from senpai_agent.monitor import (
     MonitorMailbox,
@@ -698,6 +699,8 @@ class Controller:
             for event in batch_events:
                 steering_priority = STEERING_PRIORITIES.get(event.kind)
                 if steering_priority is not None:
+                    if event.kind == "supervisor_recovered":
+                        self._deferred_conversations.pop(conversation_id, None)
                     self.inbox.steer(
                         conversation_id,
                         event.dedupe_key,
@@ -965,6 +968,7 @@ def controller_main(
         close_training_runtimes,
         training_runtime,
     )
+    from senpai_agent.supervision import SupervisorHandler
     from senpai_agent.weave_monitoring import finish_weave_monitoring
 
     parser = argparse.ArgumentParser(
@@ -1021,6 +1025,7 @@ def controller_main(
     active_github_mailbox: Mailbox = github_mailbox
     conversation_selector = None
     reconcile = None
+    training = monitor_store = None
 
     if role == "advisor":
         advisor_event_store = runner_config.state_dir / "advisor-events.sqlite3"
@@ -1032,7 +1037,7 @@ def controller_main(
         )
         mailbox = CompositeMailbox(
             active_github_mailbox,
-            LocalAdvisorMailbox(advisor_event_store),
+            LocalMailbox(advisor_event_store),
         )
     else:
         training, monitor_store = training_runtime(
@@ -1081,7 +1086,16 @@ def controller_main(
     )
     controller = Controller(
         role=role,
-        mailbox=mailbox,
+        mailbox=SupervisedMailbox(
+            mailbox,
+            SupervisorHandler(
+                runner_config,
+                inbox,
+                progress=progress,
+                training=training,
+                monitor_store=monitor_store,
+            ),
+        ),
         turns=turns,
         conversation_id=runner_config.conversation_id,
         started_conversations=StartedConversationLedger(

@@ -135,6 +135,7 @@ ls \
     "$SENPAI_AGENT_DIR/general-purpose.md" \
     "$SENPAI_AGENT_DIR/explore.md" \
     "$SENPAI_AGENT_DIR/search.md" \
+    "$SENPAI_AGENT_DIR/supervisor.md" \
     "$SENPAI_PLUGIN/skills/wandb-primary/SKILL.md"
 
 # --- Hivemind is intentionally disabled pending its OpenHands rewrite. ---

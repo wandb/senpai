@@ -29,6 +29,7 @@ ADVISOR_GITHUB_TOOLS = {
     "get_pr_source",
     "create_human_issue",
     "respond_to_human_issue",
+    "request_supervisor",
     "create_assignment",
     "publish_advisor_branch",
     "repair_assignment_routing",
@@ -47,6 +48,7 @@ STUDENT_GITHUB_TOOLS = {
     "broadcast_message",
     "push_experiment_commit",
     "respond_to_human_issue",
+    "request_supervisor",
     "submit_experiment_result",
 }
 

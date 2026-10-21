@@ -275,7 +275,7 @@ _RESEARCH_BASE_ACCEPTANCE_MARKER = re.compile(
 )
 
 
-def _marker_payload(value: Contract, *, exclude_none: bool = False) -> str:
+def _marker_payload(value: BaseModel, *, exclude_none: bool = False) -> str:
     return json.dumps(
         value.model_dump(mode="json", exclude_none=exclude_none),
         sort_keys=True,

@@ -1,3 +1,4 @@
+import fcntl
 import json
 import re
 from copy import deepcopy
@@ -5,18 +6,22 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 import pytest
 from github_workflow_support import (
+    API_URL,
     ASSIGNMENT_ID,
     HEAD_SHA,
+    REPO,
     FakeGitHub,
     assignment_record,
     pull_request,
     workflow,
 )
+from pydantic import SecretStr
 
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.github.workflow import (
     GitHubAPIError,
     GitHubTransportError,
+    GitHubWorkflow,
     HttpResponse,
     PullHeadMismatchError,
     ReconciliationError,
@@ -401,6 +406,32 @@ def broadcast(client, **overrides):
     }
     fields.update(overrides)
     return client.broadcast_message(7, **fields)
+
+
+@pytest.mark.parametrize("publish", [post_peer, broadcast])
+def test_peer_publication_excludes_other_mutation_workers(tmp_path, monkeypatch, publish):
+    fake = PeerGitHub()
+    lock_path = tmp_path / "assignment-mutations.lock"
+    client = GitHubWorkflow(
+        REPO,
+        SecretStr("github-secret"),
+        role="student",
+        transport=fake,
+        api_url=API_URL,
+        trusted_actor=fake.actor_login,
+        mutation_lock_path=lock_path,
+    )
+    original_request = fake.request
+
+    def request(*args, **kwargs):
+        with lock_path.open("a") as competing_worker, pytest.raises(BlockingIOError):
+            fcntl.flock(competing_worker, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return original_request(*args, **kwargs)
+
+    monkeypatch.setattr(fake, "request", request)
+    assert publish(client).changed is True
+    with lock_path.open("a") as competing_worker:
+        fcntl.flock(competing_worker, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 def test_broadcast_reaches_paginated_peer_assignments_regardless_of_workflow_status():
