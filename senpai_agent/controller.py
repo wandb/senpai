@@ -1067,6 +1067,8 @@ def controller_main(
         )
 
     full_prompt = _full_prompt(env)
+    # tmux cannot copy large launch payloads into its session environment.
+    os.environ.pop("EXTRA_INSTRUCTIONS_B64", None)
     turn_lease_seconds = runner_config.timeout_seconds + 60
     turns = OpenHandsTurnRunner(
         runner_config,
