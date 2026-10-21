@@ -2,8 +2,8 @@ import base64
 
 import pytest
 import yaml
-
 from launch_test_support import REVISION, launch, launch_args, render_role
+
 from senpai_agent.launch_context import (
     INSTRUCTIONS_ROOT,
     PLACEHOLDER,
@@ -68,7 +68,7 @@ def test_launch_context_records_resolved_runtime_facts(backend):
     assert "{{" not in context
 
 
-def test_launch_context_limits_each_role_to_its_assigned_students():
+def test_launch_context_keeps_role_identity_without_blocking_peer_source_access():
     args = launch_args(tag="bounded", advisor_branch="research")
 
     advisor = launch.build_launch_context(
@@ -91,6 +91,8 @@ def test_launch_context_limits_each_role_to_its_assigned_students():
     assert "fern, stark" in advisor
     assert "fern" not in student
     assert "stark" in student
+    assert "read other students' PRs and branches targeting `research`" in student
+    assert "Students must never modify, commit to, or push another student's branch" in student
 
 
 @pytest.mark.parametrize(
@@ -146,7 +148,7 @@ def test_each_role_receives_authoritative_launch_context(role, history_scope):
     assert "Students in scope: `fern`" in context
     assert data["GH_HISTORY_SCOPE"] == history_scope
     assert f"GitHub history scope: `{history_scope}`" in context
-    assert "Only modify `research` plus PR branches assigned" in context
+    assert "Advisors may modify only `research` plus PR branches assigned" in context
     assert "unless the GitHub history scope is `repo`" in context
     assert "other PRs and branches in `example/problem`" in context
     assert (

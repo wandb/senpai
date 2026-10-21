@@ -504,13 +504,18 @@ def test_event_pump_drops_an_acknowledged_human_instruction(
         assert inbox.next_turn(STEERING_CONVERSATION_ID, "controller prompt") is None
 
 
+@pytest.mark.parametrize("feedback_type", ["issue_comment", "student_broadcast"])
 def test_student_feedback_waits_for_the_step_and_marks_a_clean_unwind(
     tmp_path: Path,
+    feedback_type: str,
 ):
     event = LocalEvent(
         kind="student_pr_feedback",
         dedupe_key="student_pr_feedback:1",
-        payload={"message": "Try the narrower experiment next."},
+        payload={
+            "feedback_type": feedback_type,
+            "message": "Try the narrower experiment next.",
+        },
     )
     inbox, active, conversation = active_steering_turn(tmp_path)
     marker = queued_feedback_marker(inbox.path.parent)

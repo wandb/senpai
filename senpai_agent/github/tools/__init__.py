@@ -1,5 +1,10 @@
 """Role-scoped GitHub tools with one schema per workflow action."""
 
+from .broadcast import (
+    BroadcastMessageAction,
+    BroadcastMessageObservation,
+    BroadcastMessageTool,
+)
 from .contracts import (
     AcceptResultOnCurrentBaseAction,
     AssignmentVersion,
@@ -9,6 +14,7 @@ from .contracts import (
     GitHubMutationObservation,
     MergeExperimentAction,
     PostAssignmentCommentAction,
+    PostPeerCommentAction,
     PublishAdvisorBranchAction,
     PushExperimentCommitAction,
     RepairAssignmentRoutingAction,
@@ -24,6 +30,7 @@ from .definitions import (
     CreateHumanIssueTool,
     MergeExperimentTool,
     PostAssignmentCommentTool,
+    PostPeerCommentTool,
     PublishAdvisorBranchTool,
     PushExperimentCommitTool,
     RepairAssignmentRoutingTool,
@@ -50,6 +57,9 @@ __all__ = (
     "AcceptResultOnCurrentBaseAction",
     "AcceptResultOnCurrentBaseTool",
     "AssignmentVersion",
+    "BroadcastMessageAction",
+    "BroadcastMessageObservation",
+    "BroadcastMessageTool",
     "CloseExperimentAction",
     "CloseExperimentTool",
     "CreateAssignmentAction",
@@ -68,6 +78,8 @@ __all__ = (
     "PRManifestObservation",
     "PostAssignmentCommentAction",
     "PostAssignmentCommentTool",
+    "PostPeerCommentAction",
+    "PostPeerCommentTool",
     "PublishAdvisorBranchAction",
     "PublishAdvisorBranchTool",
     "PushExperimentCommitAction",

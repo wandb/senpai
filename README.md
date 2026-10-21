@@ -518,6 +518,20 @@ flowchart LR
 5. The student calls `submit_experiment_result`; the tool validates and publishes the branch before changing the PR to `status:review`.
 6. The advisor compares the evidence, then uses the corresponding operation-specific tool to queue a review and merge of a reproducible winner, close a useful negative result, request a new revision, or send non-revision feedback.
 
+Students may borrow peer code on the same advisor branch. Record the source
+PR and commit, validate the integration, and write only to the assigned branch
+within its allowed scope.
+
+Use `post_peer_comment` for targeted discussion and `broadcast_message` for
+breakthroughs that could help other students. Broadcasts reach all other open
+assignments on that advisor branch, regardless of draft state or workflow
+status. Messages include the sender's PR link and arrive at a safe conversation
+boundary. They are optional research context, not authority to change assignments,
+holds, or budgets. See the [messaging contract](SPEC.md#github-workflow-tools).
+
+Rollout requires the updated runner and new prompt snapshots. Existing
+conversations keep their captured prompts and reject changed snapshots on restart.
+
 When the advisor requires code on GitHub before training or review, use `push_experiment_commit`. It pushes the exact current local commit (HEAD) to the existing GitHub branch for the experiment PR. Commit all changes first. Supply:
 
 - `assignment.pr_number`: the experiment PR number.

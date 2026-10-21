@@ -329,7 +329,11 @@ def test_only_review_findings_are_posted_without_waking_the_student(
         for entry in merge_case.fake.comments:
             entry["created_at"] = "2026-07-29T18:01:00Z"
         monkeypatch.setattr(mailbox, "_pulls", lambda: [pull])
-        monkeypatch.setattr(mailbox, "_has_write_permission", lambda _login: True)
+        monkeypatch.setattr(mailbox._github, "get", lambda _path: {"permission": "write"})
+        monkeypatch.setattr(
+            mailbox._github, "objects",
+            lambda url: merge_case.fake.request("GET", url, headers={}).json_body,
+        )
         assert mailbox.poll() == ()
     else:
         assert merge_case.fake.mutations == []

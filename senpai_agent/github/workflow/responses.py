@@ -76,6 +76,11 @@ class MutationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class BroadcastResult(MutationResult):
+    delivered_pr_numbers: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class IssueComment:
     id: int
     body: str

@@ -72,8 +72,7 @@ to README.md or SPEC.md as appropriate.
   monitor events. Single-node students train in their GPU pod. Multi-node
   students use a CPU controller and a credentialed executor sidecar to supervise
   training in separate worker pods.
-- **Cross-node communication** - GitHub PR labels and human-tagged Issues only;
-  Senpai requires no RPC service or cluster-specific network setup.
+- **Cross-node communication** - GitHub PR labels, typed comments, and human-tagged Issues; no RPC service or cluster networking.
 - **GitHub Issues** - human-to-agent communication channel. Agents poll for and respond to these alongside their normal PR workflow.
 - **W&B** - canonical experiment metrics store for training runs, comparisons, and merge decisions.
 

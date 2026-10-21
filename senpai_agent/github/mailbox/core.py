@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 
 from pydantic import SecretStr
 
-from senpai_agent.github.http import GitHubReadError, GitHubReader
+from senpai_agent.github.http import GitHubReader, GitHubReadError
+from senpai_agent.github.pull_authorization import authorized_pulls
 from senpai_agent.mailbox import ControllerEvent
+
 from .advisor import advisor_events
 from .ledger import acknowledge_feedback
 from .student import student_events
@@ -19,7 +20,6 @@ from .values import (
     DEFAULT_FEEDBACK_BATCH_BYTES,
     DEFAULT_FEEDBACK_BATCH_EVENTS,
     FeedbackBinding,
-    object_value,
 )
 
 
@@ -72,7 +72,7 @@ class GitHubMailbox:
 
     def poll(self) -> tuple[ControllerEvent, ...]:
         self._pull_comment_cache.clear()
-        pulls = self._authorized_pulls(self._pulls())
+        pulls = authorized_pulls(self._pulls(), repo=self.repo, get=self._github.get)
         issues = self._issues() if self.human_issues_enabled else ()
         if self.role == "advisor":
             return advisor_events(self, pulls, issues)
@@ -112,52 +112,6 @@ class GitHubMailbox:
             }
         )
         return self._github.objects(f"/repos/{self.repo}/pulls?{query}")
-
-    def _authorized_pulls(
-        self,
-        pulls: Sequence[dict[str, object]],
-    ) -> tuple[dict[str, object], ...]:
-        """Keep same-repository PRs whose authors currently have write access."""
-
-        permissions: dict[str, bool] = {}
-        authorized: list[dict[str, object]] = []
-        for pull in pulls:
-            try:
-                head = object_value(pull["head"])
-                head_repo = object_value(head["repo"])["full_name"]
-                author = object_value(pull["user"])["login"]
-                if not isinstance(head_repo, str) or not isinstance(author, str):
-                    raise TypeError("GitHub pull request has invalid trust metadata")
-            except (KeyError, TypeError) as error:
-                print(
-                    "SENPAI_PULL_AUTHORIZATION_ERROR "
-                    f"pr={pull.get('number')!r} {type(error).__name__}: {error}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                continue
-            if head_repo.casefold() != self.repo.casefold():
-                continue
-            login = author.casefold()
-            if login not in permissions:
-                permissions[login] = self._has_write_permission(author)
-            if permissions[login]:
-                authorized.append(pull)
-        return tuple(authorized)
-
-    def _has_write_permission(self, login: str) -> bool:
-        permission = self._github.get(
-            f"/repos/{self.repo}/collaborators/{quote(login, safe='')}/permission"
-        )
-        if not isinstance(permission, dict) or permission.get("permission") not in (
-            "admin",
-            "write",
-            "read",
-            "none",
-        ):
-            raise GitHubReadError("GitHub returned an invalid collaborator permission")
-        # GitHub maps maintain to write and triage to read in this field.
-        return permission["permission"] in {"admin", "write"}
 
     def _issues(self) -> list[dict[str, object]]:
         query = urlencode(

@@ -91,6 +91,8 @@ GitHub state is level-triggered:
 - `status:wip` plus exactly one `student:<name>` label is an assignment;
 - trusted human comments and reviews on one assigned open `status:wip` or
   `status:review` PR wake its exact student assignment conversation;
+- authenticated peer comments and broadcasts resume the recipient's assignment
+  conversation; broadcasts reach all open peer assignments on the same advisor base;
 - `status:review` is a durable advisor wake;
 - a configured student with no open assignment labeled `status:wip` or
   `status:review` emits `student_available_for_assignment`. This event describes
@@ -167,7 +169,8 @@ Assigned-PR issue comments, submitted reviews, and inline comments each use
 their immutable GitHub ID as a level-triggered event key. Senpai accepts GitHub
 users associated as repository owners, members, or collaborators. A comment by
 the authenticated actor containing a Senpai protocol marker is automation, not
-human feedback, except for the explicit `senpai-assignment-feedback` operation.
+human feedback. Explicit typed advisor feedback and peer comments have their
+own authenticated delivery paths.
 Every accepted event carries its first-seen assignment and revision identity,
 so monitor and feedback events resume one student UUID.
 Successful turns atomically acknowledge immutable feedback keys in a small JSON
@@ -481,8 +484,8 @@ GitHub mutations are separate, operation-specific tools without a union wrapper.
 There is no operation discriminator or model-supplied repository. The runtime
 binds repository, role, credentials, workspace, and configured branches outside
 the model-facing schema. It also canonicalizes every Senpai-authored comment to
-an `ADVISOR:` or `STUDENT:` prefix from that trusted role; models supply plain
-comment text and cannot impersonate the other role through a payload.
+an `ADVISOR:` prefix or `**STUDENT: <student_name>**` header plus a blank line.
+The runtime supplies role and identity; models supply plain comment text.
 
 Operations on an existing assignment share these fields. The PR number identifies
 the experiment PR. The assignment ID and revision ID identify the advisor's
@@ -506,6 +509,8 @@ on GitHub, so the tool can reject a change made after the student read the PR:
 | `send_assignment_feedback` | advisor | `feedback_id`, `comment` |
 | `push_experiment_commit` | student | `local_commit_sha`, which must identify the current local commit (HEAD), with no uncommitted changes |
 | `post_assignment_comment` | student | `comment_id`, `comment` |
+| `post_peer_comment` | student | `target_pr_number`, `comment_id`, `comment`; `assignment` identifies the sender's own current PR |
+| `broadcast_message` | student | `broadcast_id`, `message` (at most 1,500 characters); `assignment` identifies the sender's own current PR |
 | `request_assignment_revision` | advisor | `new_revision_id`, `required_base_sha`, `comment` |
 | `accept_result_on_current_base` | advisor | `expected_current_base_sha`, `reason` |
 | `merge_experiment` | advisor | `expected_current_base_sha`, `merge_method` |
@@ -532,6 +537,26 @@ operation does not push or change the PR head, draft state, or labels, and its
 trusted marker wakes the advisor without entering the student's own feedback
 inbox. A comment that races with a revision request retains its original
 revision identity and is still delivered.
+
+Students may borrow peer code on the configured advisor branch, including
+outside the launch's student list. Record the source PR and commit; write only
+to the assigned branch within its file and scientific scope.
+
+`post_peer_comment` authenticates both assignments on the same advisor base,
+posts on the recipient's PR, and binds both revisions. Assignment and peer
+comments include the sender's `Working PR` link. Exact replay is a no-op;
+changed text requires a new ID.
+
+`broadcast_message` records `broadcast:<broadcast_id>` on the sender's open WIP
+or review PR, then links copies to that discussion on every other current open
+assignment. Recipients are independent of the launch's student list, draft state,
+and workflow status. The 1,500-character limit excludes runtime headers and links.
+Retries preserve the ID's text, discover current peers, and skip existing copies.
+
+Both use `student_pr_feedback`, with `feedback_type=student_peer_comment` or
+`student_broadcast`, and the existing durable feedback queue at safe conversation
+boundaries. Messages do not change PR state, assignments, holds, or budgets and
+grant no training or rebase authority. Broadcasts require no acknowledgement.
 
 Terminal student publication happens only inside `submit_experiment_result`, which
 derives the PR and proposed local head from the structured result, then validates

@@ -33,7 +33,9 @@ These values were resolved by the Senpai launcher and describe the actual runtim
 
 - This launch is scoped to research tag `{{TAG}}`, advisor branch `{{ADVISOR_BRANCH}}`, and base branch `{{TARGET_BASE}}`.
 - GitHub history scope: `{{GH_HISTORY_SCOPE}}`.
-- Only modify `{{ADVISOR_BRANCH}}` plus PR branches assigned to these students in this launch: {{STUDENTS}}.
-- Do not inspect, compare, summarize, cherry-pick, borrow from, or base decisions on any PR or branch outside `{{ADVISOR_BRANCH}}` and the assigned student PR branches for this launch unless the GitHub history scope is `repo`. This exception permits using other PRs and branches in `{{GH_REPO}}`; it does not permit modifying them.
+- You may optionally, occasionally read other students' PRs and branches targeting `{{ADVISOR_BRANCH}}` in `{{GH_REPO}}`, including students outside this role's student list. Record the source PR and exact source commit when borrowing work.
+- Do not inspect or borrow from other PRs and branches in `{{GH_REPO}}` unless the GitHub history scope is `repo`.
+- Advisors may modify only `{{ADVISOR_BRANCH}}` plus PR branches assigned to these students in this launch: {{STUDENTS}}.
+- Students may edit, commit, and publish only their own assigned branch, within the assignment's allowed files. Students must never modify, commit to, or push another student's branch.
 - Do not use unrelated experiment runs or historical results unless the human explicitly names them during this launch.
-- Students branch from `{{ADVISOR_BRANCH}}`. Do not rebase or retarget work onto unrelated branches.
+- Students branch from `{{ADVISOR_BRANCH}}`. Do not rebase or retarget work onto peer or unrelated branches.

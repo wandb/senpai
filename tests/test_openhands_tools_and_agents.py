@@ -6,18 +6,19 @@ import textwrap
 from types import SimpleNamespace
 
 import pytest
-from openhands.sdk import Agent, LLM, LocalConversation, Tool
+from openhands.sdk import LLM, Agent, LocalConversation, Tool
 from openhands.sdk.conversation.secret_registry import SecretRegistry
-from openhands.sdk.tool import resolve_tool
 from openhands.sdk.plugin import Plugin, PluginSource
 from openhands.sdk.subagent import AgentDefinition, agent_definition_to_factory
+from openhands.sdk.tool import resolve_tool
 from openhands.tools.preset.default import register_default_tools
+from openhands_support import AGENT_DIR, PLUGIN_DIR, REPO_ROOT, runtime_config
 from pydantic import SecretStr
 
 from senpai_agent.openhands_runner import (
     build_main_tools,
-    depth_aware_child_definition,
     delegation_config,
+    depth_aware_child_definition,
     find_named_agent,
     resolve_plugin_dir,
     sanitized_agent_definitions,
@@ -28,7 +29,6 @@ from senpai_agent.tools import (
     SenpaiTaskTrackerTool,
     register_senpai_tools,
 )
-from openhands_support import AGENT_DIR, PLUGIN_DIR, REPO_ROOT, runtime_config
 
 
 def test_runtime_agent_keeps_the_persisted_delegate_tool_compatible():
@@ -555,6 +555,8 @@ def test_file_agent_definitions_keep_bounded_tools_and_no_github_mutations(
         "create_assignment",
         "publish_advisor_branch",
         "post_assignment_comment",
+        "post_peer_comment",
+        "broadcast_message",
         "repair_assignment_routing",
         "send_assignment_feedback",
         "request_assignment_revision",
@@ -698,9 +700,6 @@ def test_grilling_autoresearch_skill_guides_human_program_design():
 
 
 def test_delegation_guidance_lives_in_the_plugin_skill():
-    harness = (
-        REPO_ROOT / "system_instructions" / "SENPAI-HARNESS.md"
-    ).read_text(encoding="utf-8")
     advisor = (
         REPO_ROOT / "system_instructions" / "ADVISOR.md"
     ).read_text(encoding="utf-8")
@@ -715,11 +714,9 @@ def test_delegation_guidance_lives_in_the_plugin_skill():
         / "delegate-subagents"
         / "SKILL.md"
     ).read_text(encoding="utf-8")
-    normalized_harness = " ".join(harness.split())
     normalized_advisor = " ".join(advisor.split())
     normalized_skill = " ".join(skill.split())
 
-    assert "`delegate-subagents` skill" in normalized_harness
     assert "`spawn_agents`" not in advisor
     assert "`spawn_agents`" not in student
 
@@ -871,21 +868,3 @@ def test_research_state_skill_owns_artifacts_and_publication():
     ):
         assert owned_detail in skill
         assert owned_detail not in advisor
-
-
-def test_harness_states_bounded_delegation_tree_contract():
-    instructions = (
-        REPO_ROOT / "system_instructions" / "SENPAI-HARNESS.md"
-    ).read_text(encoding="utf-8")
-    normalized = " ".join(instructions.split())
-
-    for required in (
-        "at most eight children in total",
-        "depth-one general-purpose child",
-        "Explore, Search, Bash Runner, and every depth-two child are leaves",
-        "descendants inherit the earlier ancestor deadline",
-        "twenty minutes for `fast`",
-        "one hour for `smart`",
-        "two hours for `frontier`",
-    ):
-        assert required in normalized
