@@ -17,9 +17,10 @@ Read the current baseline. Use the immutable `program.md` snapshot embedded in y
 
 - a falsifiable hypothesis and mechanism;
 - exact files and changes in scope;
-- baseline metrics and W&B evidence;
-- commands, run limits, metrics, and stopping conditions; and
+- baseline metrics and W&B evidence; and
 - one student, one branch, and one experiment.
+
+State commands, run limits, metrics, and stopping conditions. Where the conclusion depends on training duration, scale, or tuning, explain when the test becomes informative and what evidence would justify continuing, stopping, or requesting another allocation. State uncertainty when that requirement is unknown. Existing programme limits still apply.
 
 Fetch the configured advisor branch and record its exact remote SHA. Call
 `create_assignment` with this operation-specific payload; the runtime supplies
