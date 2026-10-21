@@ -1,3 +1,4 @@
+import os
 import time
 from base64 import b64encode
 from collections import Counter
@@ -937,10 +938,14 @@ def test_research_base_change_wakes_again_after_disappearing():
     ]
 
 
-def test_controller_main_does_not_derive_reminders_from_fast_polling(
+@pytest.mark.parametrize("explicit_environment", [False, True])
+def test_controller_main_keeps_large_operator_instructions_out_of_terminal_environment(
     monkeypatch,
     tmp_path: Path,
+    explicit_environment: bool,
 ):
+    from openhands.tools.terminal.env import build_terminal_env
+
     import senpai_agent.openhands_runner as runner_module
     import senpai_agent.tools as tools_module
     import senpai_agent.weave_monitoring as weave_module
@@ -981,12 +986,26 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
         "GitHubMailbox",
         lambda **_kwargs: Mailbox([]),
     )
-    monkeypatch.setattr(controller_module, "_full_prompt", lambda *_: "programme")
-
+    instructions = "# Research review\n" + "Keep all findings.\n" * 4096
+    environment = {
+        "SENPAI_ROLE": "advisor",
+        "ADVISOR_BRANCH": "main",
+        "SENPAI_POLL_INTERVAL_S": "30",
+        "EXTRA_INSTRUCTIONS_B64": b64encode(instructions.encode()).decode(),
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
     created = []
 
     class CapturingController(Controller):
         def run(self, *, max_cycles=None):
+            inherited_names = set(build_terminal_env())
+            assert "EXTRA_INSTRUCTIONS_B64" not in inherited_names
+            assert instructions.strip() in self._prompt((), continuing=False)
+            assert instructions.strip() in controller_module._context_recovery_prompt(
+                self.turns.full_prompt, "Continue the research."
+            )
+            assert instructions.strip() not in config.instructions.prompt
             created.append(self)
 
     monkeypatch.setattr(controller_module, "Controller", CapturingController)
@@ -994,18 +1013,14 @@ def test_controller_main_does_not_derive_reminders_from_fast_polling(
     assert (
         controller_module.controller_main(
             ["advisor"],
-            {
-                "SENPAI_ROLE": "advisor",
-                "ADVISOR_BRANCH": "main",
-                "SENPAI_POLL_INTERVAL_S": "30",
-            },
+            environment if explicit_environment else os.environ,
         )
         == 0
     )
     assert created[0].poll_interval_seconds == 30
     assert created[0].event_reminder_seconds == 600
-    assert created[0].full_prompt == "programme"
-    assert created[0].turns.full_prompt == "programme"
+    assert instructions.strip() in created[0].full_prompt
+    assert created[0].turns.full_prompt == created[0].full_prompt
     assert created[0].turns.active_poll_interval_seconds == 75
     assert isinstance(
         created[0].mailbox.mailbox.mailboxes[0],
