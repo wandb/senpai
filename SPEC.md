@@ -216,12 +216,17 @@ An unresolved conflict holds its conversation before another inference turn and
 pauses an active turn at the next safe agent-step boundary. It does not interrupt
 or cancel an executing tool. It does not count as a failed turn or restart the
 controller. A failure in the pause operation remains a runtime error and uses
-normal failure handling. Valid messages for the held
-conversation still enter its durable queue. Unrelated conversations,
+normal failure handling, including a hard interrupt that can cancel tools.
+Valid messages for the held conversation still enter its durable queue. Unrelated conversations,
 executor supervision, and monitor polling continue. This cannot undo a tool or
 external action already in progress. The progress lease reports
 `delivery_conflicts` separately from process liveness; Ready does not mean every
 conversation can advance.
+
+An inference attempt that started before the hold still counts toward the
+inbox's no-progress and total-attempt budgets. Waiting on a hold starts no new
+attempts. Repeated holds after explicit resolution, without intervening tool
+progress, can exhaust those budgets and enter the existing recovery process.
 
 Local staging acknowledgement means the inbox accepted custody. It does not
 mean the model processed the message. A conflicting candidate gets neither
@@ -255,6 +260,9 @@ python -m senpai_agent.event_conflicts /path/to/training/monitors.sqlite3 \
 The commands require existing, upgraded databases. A rejection retains both bodies and
 the decision; it never edits a message or acknowledges delivery. Repeating the
 same decision is idempotent. A different candidate produces a new conflict. If
+the rejected candidate is presented again, it stays rejected without reopening
+the hold or incrementing the unresolved-conflict count. This does not repair
+its producer; source repair or withdrawal must happen first. If
 local staging discovered the conflict first, inspect and resolve its record in
 `advisor-events.sqlite3` or `student-events.sqlite3` as well as the inbox record.
 Use the conflict ID listed in each store; routing can make the IDs differ.

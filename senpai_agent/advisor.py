@@ -159,6 +159,8 @@ class AdvisorEventPump:
 
     def _hold_at_boundary(self, error: DeliveryBlocked) -> None:
         with self._steer_lock:
+            if self._error is not None or self._stop.is_set():
+                return
             self._error = error
             self._accept_steering = False
             self._steer_generation += 1
