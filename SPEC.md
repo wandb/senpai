@@ -483,9 +483,12 @@ summarizing subagent.
 GitHub mutations are separate, operation-specific tools without a union wrapper.
 There is no operation discriminator or model-supplied repository. The runtime
 binds repository, role, credentials, workspace, and configured branches outside
-the model-facing schema. It also canonicalizes every Senpai-authored comment to
-an `ADVISOR:` prefix or `**STUDENT: <student_name>**` header plus a blank line.
-The runtime supplies role and identity; models supply plain comment text.
+the model-facing schema. It adds a `**Advisor**`, `**Student: <student_name>**`,
+or `**Supervisor**` header followed by a blank line, `---`, and another blank line
+to authored PR bodies, comments, and Issue messages. Hidden protocol markers stay
+on the first line. The runtime supplies identity and the separator; models supply
+the Markdown content below them. Messages omit attribution footers and
+automatic `Working PR` links.
 
 Operations on an existing assignment share these fields. The PR number identifies
 the experiment PR. The assignment ID and revision ID identify the advisor's
@@ -543,9 +546,8 @@ outside the launch's student list. Record the source PR and commit; write only
 to the assigned branch within its file and scientific scope.
 
 `post_peer_comment` authenticates both assignments on the same advisor base,
-posts on the recipient's PR, and binds both revisions. Assignment and peer
-comments include the sender's `Working PR` link. Exact replay is a no-op;
-changed text requires a new ID.
+posts on the recipient's PR, and binds both revisions. The hidden peer marker
+records the sender's PR. Exact replay is a no-op; changed text requires a new ID.
 
 `broadcast_message` records `broadcast:<broadcast_id>` on the sender's open WIP
 or review PR, then links copies to that discussion on every other current open

@@ -125,7 +125,7 @@ The full target `program.md`, including its repository path, is included in your
 
 ## Verdict
 
-Submit your review through the structured `finish` response.
+Submit your review through the structured `finish` response. Use clear Markdown formatting within those text fields.
 
 Keep `review_summary` to one sentence and each finding to a short statement of the location, impact, and required fix. Aim for under 200 words total; include only distinct blocking issues, with no praise, PR recap, repeated reasoning, or investigation narrative."""
 

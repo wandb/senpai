@@ -6,12 +6,6 @@ from typing import Literal
 from senpai_agent.github.workflow.errors import WorkflowPreconditionError
 from senpai_agent.models import AssignmentRecord, render_assignment_marker
 
-_ROLE_COMMENT_PREFIX = re.compile(
-    r"^[ \t]*(?:\*\*(?:ADVISOR|STUDENT):[^\n]*?\*\*[ \t]*\n?|"
-    r"(?:ADVISOR|STUDENT(?: [^:\s]+)?):[ \t]*)",
-    re.MULTILINE,
-)
-
 
 def marker_body(marker: str, content: str) -> str:
     content = _quote_senpai_marker_lines(content.strip())
@@ -31,21 +25,21 @@ def _quote_senpai_marker_lines(content: str) -> str:
 
 def role_prefixed_comment(
     body: str,
-    role: Literal["advisor", "student"],
+    role: Literal["advisor", "student", "supervisor"],
     *,
     student: str | None = None,
 ) -> str:
     marker, separator, content = body.partition("\n\n")
     if not (separator and marker.startswith("<!-- senpai-")):
         marker, separator, content = "", "", body
-    content = _ROLE_COMMENT_PREFIX.sub("", content).strip()
+    content = content.strip()
     if role == "student":
         if not student or not re.fullmatch(r"[A-Za-z0-9_.-]+", student):
             raise ValueError("student comments require a valid student name")
-        prefix = f"**STUDENT: {student}**\n\n"
+        identity = f"Student: {student}"
     else:
-        prefix = "ADVISOR: "
-    return f"{marker}{separator}{prefix}{content}"
+        identity = role.capitalize()
+    return f"{marker}{separator}**{identity}**\n\n---\n\n{content}"
 
 
 def replace_assignment_marker(

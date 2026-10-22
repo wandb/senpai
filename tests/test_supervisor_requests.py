@@ -220,6 +220,11 @@ def test_supervisor_request_replays_the_same_durable_issue(
     assert "supervisor" in {label["name"] for label in case.fake.issue["labels"]}
     issue_body = case.fake.issue["body"]
     assert issue_body.splitlines()[0].count("-->") == 1
+    requester = "Advisor" if role == "advisor" else f"Student: {STUDENT}"
+    assert issue_body.split("\n\n", 1)[1] == (
+        f"**{requester}**\n\n---\n\n"
+        f"## Supervisor request: {target}\n\n{action.task}"
+    )
     assert parse_request(issue_body).request == action
     case.fake.issue["state"] = "closed"
 
@@ -435,7 +440,12 @@ def test_supervisor_completion_persists_feedback_for_the_requesting_conversation
 
     local_receipt = recipient == "same"
     assert case.fake.issue["state"] == ("closed" if local_receipt else "open")
-    assert summary in case.fake.issue["body"]
+    requester = "Advisor" if role == "advisor" else f"Student: {STUDENT}"
+    assert case.fake.issue["body"].split("\n\n", 1)[1] == (
+        f"**{requester}**\n\n---\n\n"
+        f"## Supervisor request: {target}\n\n{action.task}\n\n"
+        f"**Supervisor**\n\n---\n\n## Supervisor result\n\n{summary}"
+    )
     assert parse_request(case.fake.issue["body"]).result == SupervisorResult(
         resolved=resolved,
         repair_summary=summary,
