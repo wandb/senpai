@@ -125,7 +125,9 @@ The full target `program.md`, including its repository path, is included in your
 
 ## Verdict
 
-Submit your review through the structured `finish` response."""
+Submit your review through the structured `finish` response.
+
+Keep `review_summary` to one sentence and each finding to a short statement of the location, impact, and required fix. Aim for under 200 words total; include only distinct blocking issues, with no praise, PR recap, repeated reasoning, or investigation narrative."""
 
 DELEGATED_RESULT_SUMMARY_PROMPT = """Your response is too large to send directly to your parent that requested this and risks blowing up its context window. Instead SENPAI stored your complete response at:
 
