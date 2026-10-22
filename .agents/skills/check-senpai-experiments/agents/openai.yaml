@@ -1,0 +1,4 @@
+interface:
+  display_name: "Check Senpai Experiments"
+  short_description: "Operational and scientific Senpai status checks"
+  default_prompt: "Use $check-senpai-experiments to produce a fresh operational and scientific progress update for this Senpai research program."
