@@ -32,6 +32,7 @@ class MergeMixin:
         current_revision_id: str,
         expected_current_base_sha: str,
         review_code: Callable[[PullRequestSnapshot], None],
+        publish_review: Callable[[], None] | None = None,
         merge_method: Literal["merge", "squash", "rebase"] = "squash",
     ) -> MutationResult:
         if merge_method not in ("merge", "squash", "rebase"):
@@ -104,6 +105,8 @@ class MergeMixin:
             )
             if completed := _already_merged(current):
                 return completed
+            if publish_review is not None:
+                publish_review()
             self._mutate(
                 "PUT",
                 f"/repos/{self._repo}/pulls/{number}/merge",
@@ -157,7 +160,7 @@ class MergeMixin:
         review_id: str,
         comment: str,
     ) -> MutationResult:
-        """Record findings without routing feedback to the finished student."""
+        """Record a review without routing feedback to the finished student."""
         scope = {
             "assignment_id": assignment_id,
             "revision_id": revision_id,

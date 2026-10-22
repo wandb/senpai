@@ -231,7 +231,14 @@ def test_approval_reviews_pinned_source_with_smart_profile_before_merging(
 
     assert result["state"] == "experiment_merged"
     assert case.fake.pr["merged"] is True
+    posted = case.fake.comments[-1]["body"]
+    assert "Senpai Supervisor — merge review" in posted
+    assert "**Verdict: Approved**" in posted
+    assert APPROVED.review_summary in posted
+    assert case.head_sha in posted and case.base_sha in posted
     assert case.fake.mutations == [(
+        "POST", f"/repos/{REPO}/issues/7/comments", {"body": posted},
+    ), (
         "PUT", f"/repos/{REPO}/pulls/7/merge",
         {"sha": case.head_sha, "merge_method": "squash"},
     )]
@@ -270,6 +277,22 @@ def test_missing_or_stale_pr_discussion_blocks_review_and_merge(
     assert not any(method == "PUT" for method, _path, _body in merge_case.fake.mutations)
     assert merge_case.fake.mutations == []
     assert "feedback_url" not in result
+
+
+def test_worker_reconciles_a_merge_completed_during_review(merge_case, monkeypatch):
+    def review(_prompt, _config, *, response_schema, on_structured_result):
+        merge_case.fake.pr.update(merged=True, state="closed", merge_commit_sha="merge-sha")
+        on_structured_result(APPROVED)
+        return 0
+
+    monkeypatch.setattr(runner, "run_openhands", review)
+
+    result = execute(merge_case)
+
+    assert result["state"] == "experiment_merged"
+    assert result["version"] == "merge-sha"
+    assert result["changed"] is False
+    assert merge_case.fake.mutations == []
 
 
 @pytest.mark.parametrize(
@@ -311,6 +334,8 @@ def test_only_review_findings_are_posted_without_waking_the_student(
         body = merge_case.fake.comments[-1]["body"]
         assert reason in body
         assert body.split("\n\n", 1)[1].startswith("**Supervisor**\n\n---\n\n")
+        assert "Senpai Supervisor — merge review" in body
+        assert "**Verdict: Rejected**" in body
         assert result["feedback_url"] == merge_case.fake.comments[-1]["html_url"]
         assert [(method, path) for method, path, _body in merge_case.fake.mutations] == [
             ("POST", f"/repos/{REPO}/issues/7/comments"),
@@ -342,9 +367,10 @@ def test_only_review_findings_are_posted_without_waking_the_student(
         assert "feedback_url" not in result
 
 
+@pytest.mark.parametrize("verdict", [APPROVED, REJECTED], ids=["approved", "rejected"])
 @pytest.mark.parametrize("feedback_failure", ["permission", "head-moved"])
 def test_failed_feedback_preserves_review_reason_and_does_not_comment_on_new_head(
-    merge_case, monkeypatch, feedback_failure,
+    merge_case, monkeypatch, feedback_failure, verdict,
 ):
     original_request = merge_case.fake.request
 
@@ -359,16 +385,17 @@ def test_failed_feedback_preserves_review_reason_and_does_not_comment_on_new_hea
     def review(_prompt, _config, *, response_schema, on_structured_result):
         if feedback_failure == "head-moved":
             merge_case.fake.pr["head_sha"] = "d" * 40
-        on_structured_result(REJECTED)
+        on_structured_result(verdict)
         return 0
 
     monkeypatch.setattr(runner, "run_openhands", review)
 
     result = execute(merge_case)
 
-    assert result["state"] == "merge_blocked"
-    assert FINDING in result["reason"]
-    assert "feedback_error" in result
+    assert result["state"] in {"merge_blocked", "merge_failed"}
+    if verdict is REJECTED:
+        assert FINDING in result["reason"]
+        assert "feedback_error" in result
     assert len(merge_case.fake.comments) == 1
     assert merge_case.fake.pr["merged"] is False
 
@@ -525,6 +552,13 @@ def test_worker_requires_native_structured_review_in_one_private_conversation(
     outcome = json.loads(published[0][1]["result"])
     if should_merge:
         assert outcome["state"] == "experiment_merged"
+        posted = merge_case.fake.comments[-1]["body"]
+        assert "**Verdict: Approved**" in posted
+        assert len(posted) <= 65_536
+        if len(review_summary) > 60_000:
+            assert "[Review text truncated" in posted
+        else:
+            assert review_summary in posted
     else:
         assert outcome["state"] in {"merge_blocked", "merge_failed"}
         reason = {

@@ -626,11 +626,16 @@ justified complexity remain valid exceptions.
 Only a valid Pydantic verdict submitted through the agent's structured `finish`
 tool can approve a merge. The worker checks the assignment, PR context, labels,
 mergeability, result evidence, and live base again after review. A rejection or
-incomplete review blocks merging. For a rejected verdict, the worker posts
-actionable PR feedback when the exact assignment and head still match, using a
-merge-review marker that does not wake the student. Infrastructure failures
-return only to the advisor through the delegated completion event. Comment
-failures are included in that outcome. The advisor can continue
+incomplete review blocks merging. For each completed review of a current, open
+PR, the worker posts a comment labeled "Senpai Supervisor — merge review", with
+the verdict, summary, reviewed head and base, and any rejection findings. It posts only when
+the exact assignment and head still match, using a merge-review marker that
+does not wake the student. The worker publishes approval after the final checks
+and before merging. Publication must succeed. If the PR merged during review,
+the worker reports the completed merge without posting another comment.
+Review text that exceeds 60,000 characters is shortened with an explicit
+truncation notice. Infrastructure failures return only to the advisor through
+the delegated completion event. Comment failures are included in that outcome. The advisor can continue
 other work and use `agent_status` or `cancel_agents` with the returned task ID.
 
 `request_supervisor` binds a repair Issue to its repository, advisor branch,

@@ -6,7 +6,6 @@ import json
 import os
 from collections.abc import Sequence
 from dataclasses import asdict
-from functools import partial
 
 from pydantic import SecretStr
 
@@ -14,6 +13,7 @@ from senpai_agent.delegation import record_delegated_task_result
 from senpai_agent.github.code_review import CodeReviewRejected, review_code_quality
 from senpai_agent.github.tools.contracts import MergeExperimentAction
 from senpai_agent.github.workflow import GitHubWorkflow, WorkflowPreconditionError
+from senpai_agent.github.workflow.responses import MutationResult, PullRequestSnapshot
 from senpai_agent.openhands_runner import (
     RunnerConfig,
     parse_runner_args,
@@ -48,6 +48,39 @@ def merge_with_review(
         mutation_lock_path=config.delegation_root_state_dir
         / "github" / "assignment-mutations.lock",
     )
+
+    def post_review(verdict: str, summary: str) -> MutationResult:
+        if len(summary) > 60_000:
+            summary = summary[:60_000] + "\n\n[Review text truncated to fit a PR comment.]"
+        return workflow.post_merge_review(
+            assignment.pr_number,
+            assignment_id=assignment.assignment_id,
+            revision_id=assignment.revision_id,
+            expected_head_sha=assignment.expected_pr_head_sha,
+            review_id=config.delegation_task_id,
+            comment=(
+                "**Senpai Supervisor — merge review**\n\n"
+                f"**Verdict: {verdict}**\n\n"
+                f"Reviewed PR #{assignment.pr_number} at "
+                f"`{assignment.expected_pr_head_sha}` against research base "
+                f"`{action.expected_current_base_sha}`.\n\n---\n\n{summary}\n\n---\n\n"
+                "*This review covers code quality. Scientific validity and experiment "
+                "selection remain the advisor's responsibility.*"
+            ),
+        )
+
+    review_summary: str
+
+    def review(pull: PullRequestSnapshot) -> None:
+        nonlocal review_summary
+        verdict = review_code_quality(
+            pull, base_sha=action.expected_current_base_sha, token=token, config=config,
+        )
+        review_summary = verdict.review_summary
+
+    def publish_approval() -> None:
+        post_review("Approved", review_summary)
+
     try:
         result = workflow.merge_experiment(
             assignment.pr_number,
@@ -56,12 +89,8 @@ def merge_with_review(
             current_revision_id=assignment.revision_id,
             expected_current_base_sha=action.expected_current_base_sha,
             merge_method=action.merge_method,
-            review_code=partial(
-                review_code_quality,
-                base_sha=action.expected_current_base_sha,
-                token=token,
-                config=config,
-            ),
+            review_code=review,
+            publish_review=publish_approval,
         )
         return asdict(result)
     except Exception as error:  # noqa: BLE001 - Return every worker failure to its advisor.
@@ -76,20 +105,11 @@ def merge_with_review(
         }
         if not isinstance(error, CodeReviewRejected):
             return outcome
-        comment = (
-            f"Merge gate blocked PR #{assignment.pr_number} at "
-            f"`{assignment.expected_pr_head_sha}` against research base "
-            f"`{action.expected_current_base_sha}`.\n\n{error}\n\n"
-            "The advisor must resolve this issue before requesting another merge."
-        )
         try:
-            feedback = workflow.post_merge_review(
-                assignment.pr_number,
-                assignment_id=assignment.assignment_id,
-                revision_id=assignment.revision_id,
-                expected_head_sha=assignment.expected_pr_head_sha,
-                review_id=config.delegation_task_id,
-                comment=comment,
+            feedback = post_review(
+                "Rejected",
+                f"{error}\n\nThe advisor must resolve these findings before requesting "
+                "another merge.",
             )
             outcome["feedback_url"] = feedback.resource_url
         except Exception as feedback_error:  # noqa: BLE001 - Preserve the original rejection.
