@@ -279,6 +279,22 @@ def test_missing_or_stale_pr_discussion_blocks_review_and_merge(
     assert "feedback_url" not in result
 
 
+def test_worker_reconciles_a_merge_completed_during_review(merge_case, monkeypatch):
+    def review(_prompt, _config, *, response_schema, on_structured_result):
+        merge_case.fake.pr.update(merged=True, state="closed", merge_commit_sha="merge-sha")
+        on_structured_result(APPROVED)
+        return 0
+
+    monkeypatch.setattr(runner, "run_openhands", review)
+
+    result = execute(merge_case)
+
+    assert result["state"] == "experiment_merged"
+    assert result["version"] == "merge-sha"
+    assert result["changed"] is False
+    assert merge_case.fake.mutations == []
+
+
 @pytest.mark.parametrize(
     ("verdict", "status", "remaining", "reason"),
     [

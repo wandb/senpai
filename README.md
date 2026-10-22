@@ -685,8 +685,8 @@ student pod. Stop active training and let other helpers finish first. The
 [Supervisor](.agents/agents/supervisor.md) also performs final merge reviews.
 It receives the research program, failure details and selected PR discussions,
 without inherited conversation history, and returns actionable feedback.
-Each completed merge review posts a PR comment labeled "Senpai Supervisor —
-merge review" with its verdict, summary, and reviewed commits. Approval comments
+Each completed merge review of a current, open PR posts a comment labeled
+"Senpai Supervisor — merge review" with its verdict, summary, and reviewed commits. Approval comments
 must publish successfully before merging. Review comments do not wake the student.
 
 This LLM agent is separate from the process and training supervisors. A student

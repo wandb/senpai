@@ -69,11 +69,17 @@ def merge_with_review(
             ),
         )
 
-    def review_and_post(pull: PullRequestSnapshot) -> None:
+    review_summary: str
+
+    def review(pull: PullRequestSnapshot) -> None:
+        nonlocal review_summary
         verdict = review_code_quality(
             pull, base_sha=action.expected_current_base_sha, token=token, config=config,
         )
-        post_review("Approved", verdict.review_summary)
+        review_summary = verdict.review_summary
+
+    def publish_approval() -> None:
+        post_review("Approved", review_summary)
 
     try:
         result = workflow.merge_experiment(
@@ -83,7 +89,8 @@ def merge_with_review(
             current_revision_id=assignment.revision_id,
             expected_current_base_sha=action.expected_current_base_sha,
             merge_method=action.merge_method,
-            review_code=review_and_post,
+            review_code=review,
+            publish_review=publish_approval,
         )
         return asdict(result)
     except Exception as error:  # noqa: BLE001 - Return every worker failure to its advisor.
