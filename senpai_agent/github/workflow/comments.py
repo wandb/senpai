@@ -1,6 +1,7 @@
 """Trusted marker comments and immutable experiment results."""
 
 from collections.abc import Callable
+from typing import Literal
 
 from senpai_agent.github.workflow.errors import (
     ReconciliationError,
@@ -45,6 +46,8 @@ class CommentsMixin:
         conflict_message: str | None = None,
         exact_conflict: bool = False,
         student: str | None = None,
+        comment_role: Literal["supervisor"] | None = None,
+        legacy_body: str | None = None,
     ) -> tuple[bool, IssueComment]:
         return self._upsert_comment(
             number,
@@ -55,6 +58,8 @@ class CommentsMixin:
             conflict_message=conflict_message,
             exact_conflict=exact_conflict,
             student=student,
+            comment_role=comment_role,
+            legacy_body=legacy_body,
         )
 
     def _upsert_result_comment(
@@ -147,14 +152,19 @@ class CommentsMixin:
         conflict_message: str | None = None,
         exact_conflict: bool = False,
         student: str | None = None,
+        comment_role: Literal["supervisor"] | None = None,
+        legacy_body: str | None = None,
     ) -> tuple[bool, IssueComment]:
-        body = role_prefixed_comment(body, self._role, student=student)
+        role = comment_role or self._role
+        body = role_prefixed_comment(body, role, student=student)
         existing = matches()
         if len(existing) > 1:
             raise ReconciliationError(f"GitHub contains multiple {subject}")
         existing_body = existing[0].body if existing else None
+        if existing and existing_body == legacy_body:
+            return False, existing[0]
         if existing_body is not None and not exact_conflict:
-            existing_body = role_prefixed_comment(existing_body, self._role, student=student)
+            existing_body = role_prefixed_comment(existing_body, role, student=student)
         if (
             conflict_message is not None
             and existing

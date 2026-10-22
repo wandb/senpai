@@ -172,7 +172,7 @@ def post_peer(client, **overrides):
     return client.post_peer_comment(7, **fields)
 
 
-def test_peer_message_identifies_sender_and_working_pr_without_changing_assignments():
+def test_peer_message_identifies_sender_without_footer_or_assignment_changes():
     fake = PeerGitHub()
     original = deepcopy((fake.sender.pr, fake.recipient.pr))
     client = workflow(fake, role="student")
@@ -199,9 +199,8 @@ def test_peer_message_identifies_sender_and_working_pr_without_changing_assignme
         "comment_id": "handoff-question",
     }
     assert visible == (
-        "**STUDENT: student-one**\n\n"
-        "Does the handoff preserve optimizer state?\n\n"
-        "Working PR: [#7](https://github.com/acme/widgets/pull/7)"
+        "**Student: student-one**\n\n---\n\n"
+        "Does the handoff preserve optimizer state?"
     )
     assert fake.sender.comments == []
 
@@ -219,9 +218,8 @@ def test_peer_message_identifies_sender_and_working_pr_without_changing_assignme
 
     assert reply.changed is True
     assert fake.sender.comments[0]["body"].split("\n\n", 1)[1] == (
-        "**STUDENT: student-two**\n\n"
-        "The producer saves optimizer state.\n\n"
-        "Working PR: [#8](https://github.com/acme/widgets/pull/8)"
+        "**Student: student-two**\n\n---\n\n"
+        "The producer saves optimizer state."
     )
     assert (fake.sender.pr, fake.recipient.pr) == original
     assert [(method, urlsplit(url).path) for method, url, _ in fake.mutations] == [
@@ -230,10 +228,19 @@ def test_peer_message_identifies_sender_and_working_pr_without_changing_assignme
     ]
 
 
-def test_peer_comment_ids_cannot_rewrite_messages_and_new_ids_append():
+@pytest.mark.parametrize("legacy", [False, True], ids=["current", "legacy"])
+def test_peer_comment_ids_cannot_rewrite_messages_and_new_ids_append(legacy):
     fake = PeerGitHub()
     client = workflow(fake, role="student")
     post_peer(client)
+    if legacy:
+        marker = fake.recipient.comments[0]["body"].split("\n\n", 1)[0]
+        fake.recipient.comments[0]["body"] = (
+            f"{marker}\n\n**STUDENT: student-one**\n\n"
+            "Does the handoff preserve optimizer state?\n\n"
+            "Working PR: [#7](https://github.com/acme/widgets/pull/7)"
+        )
+    original_comment = deepcopy(fake.recipient.comments[0])
 
     fake.recipient.pr["body"] = render_assignment_marker(
         assignment_record(
@@ -246,7 +253,7 @@ def test_peer_comment_ids_cannot_rewrite_messages_and_new_ids_append():
     replay = post_peer(client)
 
     assert replay.changed is False
-    assert len(fake.recipient.comments) == 1
+    assert fake.recipient.comments == [original_comment]
 
     with pytest.raises(WorkflowPreconditionError, match="new comment_id"):
         post_peer(client, comment="A different request.")
@@ -467,10 +474,10 @@ def test_broadcast_reaches_paginated_peer_assignments_regardless_of_workflow_sta
         assert record["broadcast_id"] == "optimizer-state-discovery"
         assert record["pr_number"] == number
         assert record["assignment_id"] == f"assignment-{number}"
-        assert visible.startswith("**STUDENT: student-one**\n\n")
+        assert visible.startswith("**Student: student-one**\n\n---\n\n")
         assert f"Discovery: [source discussion]({first.resource_url})" in visible
         assert "Evidence: https://github.com/acme/widgets/pull/7/files" in visible
-        assert visible.endswith("Working PR: [#7](https://github.com/acme/widgets/pull/7)")
+        assert "Working PR:" not in visible
     assert all(not fake.pulls[number].comments for number in range(12, 19))
     assert len(fake.mutations) == 5
     assert all(

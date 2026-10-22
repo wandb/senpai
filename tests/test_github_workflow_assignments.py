@@ -44,6 +44,7 @@ def test_create_assignment_converges_one_draft_pull_request_and_replays():
     assert second.changed is False
     assert fake.pr["body"] == (
         f"{render_assignment_marker(assignment)}\n\n"
+        "**Advisor**\n\n---\n\n"
         "Run the bounded learning-rate experiment."
     )
     assert fake.pr["draft"] is True

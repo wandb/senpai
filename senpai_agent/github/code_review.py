@@ -131,8 +131,8 @@ def review_code_quality(
         if not verdict.approved:
             findings = "\n".join(f"- {finding}" for finding in verdict.findings)
             raise CodeReviewRejected(
-                f"Code quality review blocked PR #{pull.number}: "
-                f"{verdict.review_summary}\n{findings}"
+                f"Code quality review blocked PR #{pull.number}.\n\n"
+                f"{verdict.review_summary}\n\n{findings}"
             )
 
 

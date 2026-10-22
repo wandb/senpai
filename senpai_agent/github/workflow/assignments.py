@@ -7,7 +7,7 @@ from senpai_agent.github.workflow.errors import (
     WorkflowPreconditionError,
 )
 from senpai_agent.github.workflow.responses import MutationResult
-from senpai_agent.github.workflow.text import marker_body
+from senpai_agent.github.workflow.text import marker_body, role_prefixed_comment
 from senpai_agent.github.workflow.validation import (
     require_assignment_result,
     require_assignment_snapshot,
@@ -48,7 +48,11 @@ class AssignmentMixin:
         body = body.strip()
         if not title or not body:
             raise ValueError("assignment title and body must not be empty")
-        rendered_body = marker_body(render_assignment_marker(assignment), body)
+        rendered_body = role_prefixed_comment(
+            marker_body(render_assignment_marker(assignment), body),
+            self._role,
+            student=assignment.student,
+        )
 
         matches = self._assignment_pull_requests(assignment)
         if len(matches) > 1:

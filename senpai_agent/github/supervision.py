@@ -31,6 +31,7 @@ from senpai_agent.github.workflow import (
     MutationResult,
     WorkflowPreconditionError,
 )
+from senpai_agent.github.workflow.text import role_prefixed_comment
 from senpai_agent.models import _marker_payload, authoritative_marker_line
 from senpai_agent.PROMPTS import SUPERVISOR_REPAIR_PROMPT, render_prompt
 
@@ -125,9 +126,17 @@ def _identity(envelope: SupervisorEnvelope) -> str:
 def render_request(envelope: SupervisorEnvelope) -> str:
     encoded = _marker_payload(envelope)
     marker = f"{_PREFIX}{_identity(envelope)}:{encoded} -->"
-    body = f"{marker}\n\n## Supervisor request: {envelope.request.target}\n\n{envelope.request.task}"
+    body = role_prefixed_comment(
+        f"{marker}\n\n## Supervisor request: {envelope.request.target}\n\n{envelope.request.task}",
+        "advisor" if envelope.requester == "advisor" else "student",
+        student=envelope.requester,
+    )
     if envelope.result is not None:
-        body += f"\n\n## Supervisor result\n\n{envelope.result.repair_summary}"
+        result = role_prefixed_comment(
+            f"## Supervisor result\n\n{envelope.result.repair_summary}",
+            "supervisor",
+        )
+        body += f"\n\n{result}"
     # Reserve half the Issue body for a result, including JSON escape expansion.
     if len(body) > (65_536 if envelope.result else 32_000):
         raise ValueError("Supervisor request is too large; shorten the task")

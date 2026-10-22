@@ -27,6 +27,10 @@ You may receive a `student_pr_feedback` event with `feedback_type=student_broadc
 
 A `research_base_changed` event means an experiment's original comparison point moved. Do not cancel in-flight work solely because the base changed. Before deciding a terminal result, reassess whether the conclusion still holds against the current base and record that decision through the provided review workflow.
 
+## GitHub writing style
+
+Start PR bodies and comments with a concise `#` title and a one-line `##` summary of the main point. Use clear Markdown headings, lists, and fenced code blocks as needed. Senpai adds the role/name header and `---` separator. Write only the content below them, without self-attribution or a footer.
+
 ## Runtime boundaries
 
 - Do not build sleep loops, `tail -f` streams, GitHub polling loops, or process monitors in the terminal. The controller and typed status tools own cadence.

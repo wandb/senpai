@@ -578,7 +578,7 @@ def test_student_assignment_comment_is_not_replayed_to_its_student(monkeypatch):
     assert not any(event.kind == "student_pr_feedback" for event in mailbox.poll())
 
 
-def peer_comment(**overrides):
+def peer_comment(*, header="**Student: {student}**\n\n---\n\n", **overrides):
     record = StudentPeerCommentRecord(
         **{
             "repo": "acme/widgets",
@@ -595,19 +595,24 @@ def peer_comment(**overrides):
     )
     return (
         f"{render_student_peer_comment_marker(record)}\n\n"
-        f"**STUDENT: {record.student}**\n\n"
-        "The reviewed handoff interface is ready to copy.\n\n"
-        "Working PR: https://github.test/acme/widgets/pull/18"
+        + header.format(student=record.student)
+        + "The reviewed handoff interface is ready to copy."
     )
 
 
 @pytest.mark.parametrize("broadcast_id", [None, "handoff-discovery"])
+@pytest.mark.parametrize(
+    "header",
+    ["**Student: {student}**\n\n---\n\n", "**STUDENT: {student}**\n\n"],
+    ids=["current-header", "legacy-header"],
+)
 def test_peer_message_resumes_recipient_revision_once_across_retries_and_restart(
     monkeypatch,
     tmp_path,
     broadcast_id,
+    header,
 ):
-    fields = {"broadcast_id": broadcast_id} if broadcast_id else {}
+    fields = {"header": header, "broadcast_id": broadcast_id}
     responses = feedback_responses(
         issue_comments=[
             feedback(106, peer_comment(**fields)),
@@ -633,7 +638,7 @@ def test_peer_message_resumes_recipient_revision_once_across_retries_and_restart
     assert message.payload["source_assignment_id"] == "assignment-18"
     assert message.payload["source_revision_id"] == "revision-peer"
     assert message.payload["pr_url"] == "https://github.test/acme/widgets/pull/17"
-    assert message.payload["message"].startswith("**STUDENT: student-2**\n\n")
+    assert message.payload["message"].startswith(header.format(student="student-2"))
 
     failed_turns = Turns((1,))
     run_student_controller(tmp_path, mailbox, failed_turns)
@@ -705,7 +710,11 @@ def test_broadcast_is_polled_regardless_of_assigned_pr_routing_status(
         {"author": "impostor"},
         {"body_prefix": "Copied from elsewhere:\n"},
         {"body_suffix": "\n<!-- senpai-result:v1 {} -->"},
-        {"wrong_header": True},
+        {"header": "**Student: student-3**\n\n---\n\n"},
+        {"header": "**STUDENT: student-3**\n\n"},
+        {"header": "**Student: student-2**\n\n"},
+        {"header": "**Supervisor: student-2**\n\n---\n\n"},
+        {"header": ""},
     ],
     ids=[
         "self-student",
@@ -718,7 +727,11 @@ def test_broadcast_is_polled_regardless_of_assigned_pr_routing_status(
         "foreign-actor",
         "embedded-marker",
         "extra-protocol",
-        "wrong-header",
+        "wrong-current-student",
+        "wrong-legacy-student",
+        "missing-divider",
+        "wrong-role",
+        "missing-header",
     ],
 )
 def test_peer_messages_require_trusted_immutable_recipient_identity(
@@ -729,10 +742,7 @@ def test_peer_messages_require_trusted_immutable_recipient_identity(
     author = invalid.pop("author", "morganmcg1")
     body_prefix = invalid.pop("body_prefix", "")
     body_suffix = invalid.pop("body_suffix", "")
-    wrong_header = invalid.pop("wrong_header", False)
     body = body_prefix + peer_comment(**invalid) + body_suffix
-    if wrong_header:
-        body = body.replace("**STUDENT: student-2**", "**STUDENT: student-3**")
     mailbox = student_mailbox(
         monkeypatch,
         feedback_responses(
