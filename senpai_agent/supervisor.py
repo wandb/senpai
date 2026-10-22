@@ -16,6 +16,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from math import isfinite
 from pathlib import Path
 from typing import Literal
 
@@ -23,6 +24,7 @@ import psutil
 from pydantic import SecretStr
 
 from senpai_agent.agent_markdown import read_agent_markdown
+from senpai_agent.inference_heartbeat import INFERENCE_CANCELLATION_GRACE_SECONDS
 from senpai_agent.launch_context import (
     LAUNCH_CONTEXT_ENV,
     decode_launch_context,
@@ -85,6 +87,7 @@ class WorkerLease:
     completed_turns: int = 0
     llm_request_started_at: float | None = None
     llm_request_heartbeat_at: float | None = None
+    llm_request_deadline: float | None = None
 
     @classmethod
     def read(cls, path: Path) -> WorkerLease:
@@ -104,6 +107,11 @@ class WorkerLease:
                 if value.get("llm_request_heartbeat_at") is not None
                 else None
             ),
+            llm_request_deadline=(
+                float(value["llm_request_deadline"])
+                if value.get("llm_request_deadline") is not None
+                else None
+            ),
         )
         if (
             lease.pid <= 0
@@ -111,9 +119,33 @@ class WorkerLease:
             or lease.completed_turns < 0
             or (lease.llm_request_started_at is None)
             != (lease.llm_request_heartbeat_at is None)
+            or (
+                lease.llm_request_deadline is not None
+                and lease.llm_request_started_at is None
+            )
+            or any(
+                not isfinite(timestamp)
+                for timestamp in (
+                    lease.deadline,
+                    lease.llm_request_started_at,
+                    lease.llm_request_heartbeat_at,
+                    lease.llm_request_deadline,
+                )
+                if timestamp is not None
+            )
         ):
             raise ValueError("invalid controller lease")
         return lease
+
+    def overdue_reason(self, now: float) -> str | None:
+        if (
+            self.llm_request_deadline is not None
+            and now > self.llm_request_deadline + INFERENCE_CANCELLATION_GRACE_SECONDS
+        ):
+            return "overdue:llm-request"
+        if now > self.deadline:
+            return f"overdue:{self.phase}"
+        return None
 
 
 class ProgressLease:
@@ -127,6 +159,7 @@ class ProgressLease:
         self._deadline: float | None = None
         self._llm_request_started_at: float | None = None
         self._llm_request_heartbeat_at: float | None = None
+        self._llm_request_deadline: float | None = None
 
     def update(
         self,
@@ -148,14 +181,20 @@ class ProgressLease:
         self,
         started_at: float | None,
         heartbeat_at: float | None,
+        deadline: float | None,
     ) -> None:
-        if (started_at is None) != (heartbeat_at is None):
-            raise ValueError("LLM request timestamps must be set or cleared together")
+        if (started_at is None) != (heartbeat_at is None) or (
+            started_at is None
+        ) != (deadline is None):
+            raise ValueError(
+                "LLM request timestamps and deadline must be set or cleared together"
+            )
         with self._lock:
             if self._phase is None or self._deadline is None:
                 raise RuntimeError("progress lease must be initialized")
             self._llm_request_started_at = started_at
             self._llm_request_heartbeat_at = heartbeat_at
+            self._llm_request_deadline = deadline
             self._write_locked()
 
     def _write_locked(self) -> None:
@@ -172,6 +211,7 @@ class ProgressLease:
                     "completed_turns": self.completed_turns,
                     "llm_request_started_at": self._llm_request_started_at,
                     "llm_request_heartbeat_at": self._llm_request_heartbeat_at,
+                    "llm_request_deadline": self._llm_request_deadline,
                 },
                 sort_keys=True,
             ),
@@ -304,8 +344,8 @@ class WorkerSupervisor:
             now = time.monotonic()
             if lease is not None and lease.pid == process.pid:
                 made_progress = made_progress or lease.completed_turns > 0
-                if now > lease.deadline:
-                    return f"overdue:{lease.phase}", made_progress
+                if reason := lease.overdue_reason(now):
+                    return reason, made_progress
             elif now - started > self.config.startup_timeout_seconds:
                 return "startup-timeout", made_progress
 
@@ -424,7 +464,7 @@ def lease_is_healthy(path: Path) -> bool:
         return (
             process.is_running()
             and process.status() != psutil.STATUS_ZOMBIE
-            and time.monotonic() <= lease.deadline
+            and lease.overdue_reason(time.monotonic()) is None
         )
     except (
         FileNotFoundError,

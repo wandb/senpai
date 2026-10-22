@@ -1,5 +1,7 @@
 import json
 import signal
+import subprocess
+import sys
 import threading
 import time
 from io import StringIO
@@ -27,6 +29,10 @@ from senpai_agent.inbox import (
     DeliveryState,
     InboxTurnQuarantined,
     PersistentInbox,
+)
+from senpai_agent.inference_heartbeat import (
+    InferenceHeartbeat,
+    ModelRequestDeadlineExceeded,
 )
 from senpai_agent.openhands_runner import (
     graceful_interrupts,
@@ -160,7 +166,15 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
             ]
 
         async def arun(self):
-            pass
+            retried = RuntimeError("provider requested a longer pause")
+            retried.headers = {"retry-after": "300"}
+            exhausted = LLMServiceUnavailableError("provider unavailable")
+            with pytest.raises(LLMServiceUnavailableError):
+                with self.agent.llm._request_scope():
+                    with self.agent.llm._request_scope():
+                        self.agent.llm.retry_listener(1, 5, retried)
+                        raise exhausted
+            captured["provider_failure"] = _provider_failure(exhausted, 1_700_000_000)
 
         def close(self):
             captured["closed"] = True
@@ -192,15 +206,7 @@ def test_run_initializes_role_plugin_and_secrets_before_the_first_message(
     assert captured["llm_type"] is runner.LLM
     assert captured["closed"] is True
 
-    retried = RuntimeError("provider requested a longer pause")
-    retried.headers = {"retry-after": "300"}
-    exhausted = LLMServiceUnavailableError("provider unavailable")
-    with pytest.raises(LLMServiceUnavailableError):
-        with captured["llm"]._request_scope():
-            with captured["llm"]._request_scope():
-                captured["llm"].retry_listener(1, 5, retried)
-                raise exhausted
-    assert _provider_failure(exhausted, 1_700_000_000).retry_after == 300
+    assert captured["provider_failure"].retry_after == 300
 
 
 def test_context_reset_preserves_history_and_starts_a_fresh_active_branch(
@@ -1471,6 +1477,106 @@ def test_turn_activity_renews_the_inactivity_deadline():
     )
 
     assert not interrupted
+
+
+@pytest.mark.parametrize("request_delay", [0, 0.02])
+def test_request_deadline_cancels_inference_and_preserves_background_work(request_delay):
+    states = []
+    heartbeat = InferenceHeartbeat(
+        lambda *state: states.append(state), timeout_seconds=0.02,
+    )
+    interrupts = []
+
+    class Conversation:
+        async def arun(self):
+            if request_delay:
+                await runner.asyncio.sleep(request_delay)
+            with heartbeat.request():
+                await runner.asyncio.Event().wait()
+
+        def interrupt(self):
+            interrupts.append(True)
+
+    async def run():
+        with pytest.raises(ModelRequestDeadlineExceeded):
+            await runner.asyncio.wait_for(
+                runner.arun_conversation(
+                    Conversation(), 3600, request_deadline=heartbeat.deadline,
+                ),
+                timeout=3,
+            )
+
+    background = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        started = time.monotonic()
+        runner.asyncio.run(run())
+        assert time.monotonic() - started < 1.5
+        assert interrupts == [True]
+        assert background.poll() is None
+        # Keep the external watchdog armed while the caller closes the conversation.
+        assert heartbeat.deadline() is not None
+    finally:
+        heartbeat.close()
+        background.terminate()
+        background.wait(timeout=5)
+    assert states[-1] == (None, None, None)
+
+
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_request_recovery_keeps_the_watchdog_armed_until_conversation_cleanup(
+    tmp_path, monkeypatch, close_fails,
+):
+    heartbeats = []
+    states = []
+
+    def heartbeat(*args, **kwargs):
+        instance = InferenceHeartbeat(*args, **kwargs)
+        heartbeats.append(instance)
+        return instance
+
+    class Conversation:
+        def __init__(self, agent, **kwargs):
+            self.agent = agent
+            self.id = kwargs["conversation_id"]
+            self.state = SimpleNamespace(
+                execution_status=ConversationExecutionStatus.RUNNING,
+            )
+
+        def send_message(self, _prompt):
+            pass
+
+        async def arun(self):
+            with self.agent.llm._request_scope():
+                await runner.asyncio.Event().wait()
+
+        def interrupt(self):
+            pass
+
+        def close(self):
+            assert heartbeats[0].deadline() is not None
+            if close_fails:
+                raise RuntimeError("executor cleanup failed")
+
+    monkeypatch.setattr(runner, "InferenceHeartbeat", heartbeat)
+    monkeypatch.setattr(runner, "LocalConversation", Conversation)
+    isolate_agent_discovery(monkeypatch, runner)
+    try:
+        expected = SystemExit if close_fails else ModelRequestDeadlineExceeded
+        with pytest.raises(expected):
+            run_openhands(
+                "task", runtime_config(tmp_path, llm_timeout_seconds=1),
+                on_inference_state=lambda *state: states.append(state),
+            )
+        if close_fails:
+            # A fatal exit prevents the controller from retrying with a second
+            # publisher while incomplete cleanup still owns this deadline.
+            assert heartbeats[0].deadline() is not None
+            assert states[-1][2] is not None
+        else:
+            assert states[-1] == (None, None, None)
+    finally:
+        for instance in heartbeats:
+            instance.close()
 
 
 def test_startup_interrupt_is_a_normal_conversation_end():

@@ -28,6 +28,10 @@ from senpai_agent.inbox import (
     InboxTurnQuarantined,
     PersistentInbox,
 )
+from senpai_agent.inference_heartbeat import (
+    InferenceStateCallback,
+    ModelRequestDeadlineExceeded,
+)
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import (
     CompositeMailbox,
@@ -80,6 +84,7 @@ class TurnResult:
 class ProviderFailure:
     retryable: bool
     retry_after: float = 0
+    refund_inference_attempt: bool = True
 
 
 class ConversationRecoveryExhausted(RuntimeError):
@@ -167,6 +172,8 @@ def _provider_failure(error: Exception, now: float) -> ProviderFailure | None:
     from openhands.sdk.llm.exceptions import LLMError
 
     chain = tuple(_exception_chain(error))
+    if any(isinstance(current, ModelRequestDeadlineExceeded) for current in chain):
+        return ProviderFailure(retryable=True, refund_inference_attempt=False)
     if not any(isinstance(current, (LLMError, OpenAIError)) for current in chain):
         return None
     kinds = {
@@ -230,10 +237,14 @@ def _activity_lease(
 
 def _inference_state_lease(
     progress: ProgressLease,
-) -> Callable[[float | None, float | None], None]:
-    def publish(started_at: float | None, heartbeat_at: float | None) -> None:
+) -> InferenceStateCallback:
+    def publish(
+        started_at: float | None,
+        heartbeat_at: float | None,
+        deadline: float | None,
+    ) -> None:
         try:
-            progress.update_llm_request(started_at, heartbeat_at)
+            progress.update_llm_request(started_at, heartbeat_at, deadline)
         except OSError as error:
             print(
                 f"SENPAI_LEASE_UPDATE_ERROR {type(error).__name__}: {error}",
@@ -253,9 +264,7 @@ class OpenHandsTurnRunner:
         github_mailbox: Mailbox | None = None,
         active_poll_interval_seconds: float = 75,
         on_activity: Callable[[], None] | None = None,
-        on_inference_state: (
-            Callable[[float | None, float | None], None] | None
-        ) = None,
+        on_inference_state: InferenceStateCallback | None = None,
     ):
         self.config = config
         self.full_prompt = full_prompt.strip()
@@ -545,6 +554,7 @@ class Controller:
                         cooldown = self.inbox.defer_provider_retry(
                             turn.turn_id,
                             now + delay,
+                            refund_inference_attempt=provider_failure.refund_inference_attempt,
                         )
                         print(
                             "SENPAI_PROVIDER_COOLDOWN "

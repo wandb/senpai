@@ -924,20 +924,23 @@ class PersistentInbox:
         self,
         turn_id: str,
         retry_at: float,
+        *,
+        refund_inference_attempt: bool = True,
     ) -> ProviderCooldown:
         with self._transaction() as database:
             turn = self._latest_turn(database, turn_id)
             if turn.state is not DeliveryState.DELIVERED:
                 raise ValueError("only a delivered turn can wait for its provider")
-            database.execute(
-                """
-                UPDATE inbox_turns
-                SET stalled_attempts = MAX(stalled_attempts - 1, 0),
-                    inference_attempts = MAX(inference_attempts - 1, 0)
-                WHERE turn_id = ?
-                """,
-                (turn.turn_id,),
-            )
+            if refund_inference_attempt:
+                database.execute(
+                    """
+                    UPDATE inbox_turns
+                    SET stalled_attempts = MAX(stalled_attempts - 1, 0),
+                        inference_attempts = MAX(inference_attempts - 1, 0)
+                    WHERE turn_id = ?
+                    """,
+                    (turn.turn_id,),
+                )
             row = database.execute(
                 """
                 INSERT INTO provider_cooldown (id, failure_count, retry_at)

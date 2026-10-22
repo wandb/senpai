@@ -15,7 +15,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
-from contextlib import contextmanager, nullcontext, suppress
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -97,7 +97,11 @@ from senpai_agent.github.tools import (
     clear_github_credentials,
     configure_github_credentials,
 )
-from senpai_agent.inference_heartbeat import InferenceHeartbeat
+from senpai_agent.inference_heartbeat import (
+    InferenceHeartbeat,
+    InferenceStateCallback,
+    ModelRequestDeadlineExceeded,
+)
 from senpai_agent.launch_context import LAUNCH_CONTEXT_ENV, decode_launch_context
 from senpai_agent.local_events import LocalEventStore
 from senpai_agent.openhands_security import disable_ambient_plugin_discovery
@@ -1361,8 +1365,9 @@ async def arun_conversation(
     *,
     started: Callable[[], None] | None = None,
     stop_requested: Callable[[], bool] | None = None,
+    request_deadline: Callable[[], float | None] | None = None,
 ) -> None:
-    """Run until completion or one full timeout passes without activity."""
+    """Bound inactivity and model requests, discovering new requests within 1s."""
 
     task = asyncio.create_task(conversation.arun())
 
@@ -1380,10 +1385,29 @@ async def arun_conversation(
         return
     deadline = time.monotonic() + timeout_seconds
     while True:
+        request_expires = request_deadline() if request_deadline is not None else None
+        now = time.monotonic()
+        if request_expires is not None and now >= request_expires:
+            print("SENPAI_LLM_REQUEST_DEADLINE", file=sys.stderr, flush=True)
+            error = ModelRequestDeadlineExceeded(
+                "model request exceeded its total wall-clock budget"
+            )
+            try:
+                await cancel_run()
+            except Exception as cleanup_error:
+                error.add_note(
+                    f"Request cancellation also failed: {type(cleanup_error).__name__}"
+                )
+            raise error
+        wake_at = deadline
+        if request_deadline is not None:
+            wake_at = min(wake_at, now + 1)
+            if request_expires is not None:
+                wake_at = min(wake_at, request_expires)
         try:
             await asyncio.wait_for(
                 asyncio.shield(task),
-                timeout=max(0, deadline - time.monotonic()),
+                timeout=max(0, wake_at - time.monotonic()),
             )
             return
         except asyncio.CancelledError:
@@ -1394,6 +1418,10 @@ async def arun_conversation(
             if task.done():
                 await task
                 return
+            if request_deadline is not None:
+                request_expires = request_deadline()
+                if request_expires is not None and time.monotonic() >= request_expires:
+                    continue
             renewed = (
                 activity() + timeout_seconds if activity is not None else deadline
             )
@@ -1430,6 +1458,8 @@ async def arun_steerable_conversation(
     timeout_seconds: float,
     activity: Callable[[], float] | None = None,
     stop_requested: Callable[[], bool] | None = None,
+    *,
+    request_deadline: Callable[[], float | None] | None = None,
 ) -> None:
     while stop_requested is None or not stop_requested():
         if not pump.prepare_run():
@@ -1442,6 +1472,7 @@ async def arun_steerable_conversation(
             activity,
             started=pump.run_started,
             stop_requested=stop_requested,
+            request_deadline=request_deadline,
         )
         if not pump.finish_run():
             return
@@ -1453,6 +1484,8 @@ def run_steerable_conversation(
     timeout_seconds: float,
     activity: Callable[[], float] | None = None,
     stop_requested: Callable[[], bool] | None = None,
+    *,
+    request_deadline: Callable[[], float | None] | None = None,
 ) -> None:
     asyncio.run(
         arun_steerable_conversation(
@@ -1461,6 +1494,7 @@ def run_steerable_conversation(
             timeout_seconds,
             activity,
             stop_requested,
+            request_deadline=request_deadline,
         )
     )
 
@@ -1672,9 +1706,7 @@ def run_openhands[ResponseT: BaseModel](
     on_activity: Callable[[], None] | None = None,
     response_schema: type[ResponseT] | None = None,
     on_structured_result: Callable[[ResponseT], None] | None = None,
-    on_inference_state: (
-        Callable[[float | None, float | None], None] | None
-    ) = None,
+    on_inference_state: InferenceStateCallback | None = None,
 ) -> int:
     if (inbox is None) != (inbox_turn_id is None):
         raise ValueError("inbox and inbox_turn_id must be provided together")
@@ -1781,10 +1813,9 @@ def run_openhands[ResponseT: BaseModel](
             if error is not None:
                 retried_provider_errors.set((*retried_provider_errors.get(), error))
 
-        inference_heartbeat = (
-            InferenceHeartbeat(on_inference_state)
-            if on_inference_state is not None
-            else None
+        inference_heartbeat = InferenceHeartbeat(
+            on_inference_state or (lambda *_state: None),
+            timeout_seconds=config.llm_timeout_seconds,
         )
 
         @contextmanager
@@ -1792,11 +1823,7 @@ def run_openhands[ResponseT: BaseModel](
             trace.get_current_span().set_attributes(model_trace_attributes())
             token = retried_provider_errors.set(())
             try:
-                with (
-                    inference_heartbeat.request()
-                    if inference_heartbeat is not None
-                    else nullcontext()
-                ):
+                with inference_heartbeat.request():
                     yield
             except Exception as error:
                 retried = (
@@ -2009,6 +2036,7 @@ def run_openhands[ResponseT: BaseModel](
                                 config.timeout_seconds,
                                 lambda: last_activity,
                                 stop_requested,
+                                request_deadline=inference_heartbeat.deadline,
                             )
                 else:
                     assert run_deadline is not None
@@ -2064,13 +2092,17 @@ def run_openhands[ResponseT: BaseModel](
         configure_exa_credentials(None)
         configure_delegation(None)
         try:
-            if inference_heartbeat is not None:
-                inference_heartbeat.close()
             if conversation is not None:
                 conversation.close()
+            if inference_heartbeat is not None:
+                inference_heartbeat.close()
         except BaseException as error:
             if primary_error is None:
                 raise
+            if isinstance(primary_error, ModelRequestDeadlineExceeded):
+                raise SystemExit(
+                    "request deadline recovery could not close the conversation"
+                ) from error
             primary_error.add_note(
                 f"Cleanup also failed: {type(error).__name__}: {error}"
             )

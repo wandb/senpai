@@ -61,10 +61,22 @@ Python controller worker
 ```
 
 The worker publishes an atomic lease containing its PID, current phase, hard
-deadline, completed-turn counter, and active LLM request timestamps. A
+deadline, completed-turn counter, and active LLM request timestamps and deadline. A
 non-model-visible heartbeat updates `llm_request_heartbeat_at` while preserving
-the request's original `llm_request_started_at`. It does not add conversation
-events or renew the hard deadline. The supervisor starts exactly one worker.
+the request's original `llm_request_started_at` and `llm_request_deadline`.
+The latter uses the monotonic clock and spans the complete logical request,
+including SDK retries, with `SENPAI_LLM_TIMEOUT_SECONDS` as its total budget.
+The heartbeat does not add conversation events or renew either deadline. Local
+heartbeat publication is not evidence of provider progress. The conversation
+runner checks for a newly active request at least once per second while its
+event loop is responsive. Once it observes expiry, it interrupts and cancels
+the active inference and raises `ModelRequestDeadlineExceeded`. Cancellation
+and conversation cleanup retain the expired lease until cleanup completes. A
+request that completes before the watchdog observes its expiry clears normally;
+the discovery interval is not a strict instantaneous cutoff. Successful cleanup
+allows a controller cooldown without terminating background training or delegated
+children. Cleanup that raises ends the worker rather than starting another inference.
+The supervisor starts exactly one worker.
 A worker crash, clean exit, or expired lease causes descendant cleanup and a
 nonzero supervisor exit. An operator stop returns zero. An external process
 manager owns restart and backoff. The supervisor is independent of OpenHands
@@ -73,7 +85,16 @@ OpenHands events renew the root turn's lease; its configured timeout measures
 inactivity rather than total elapsed time. Provider, tool, training, and child
 deadlines remain hard.
 The supervisor serves `/healthz` on all IPv4 interfaces, using port 8080 by
-default. It returns HTTP 200 for a live worker lease and HTTP 503 otherwise.
+default. Both the supervisor and `/healthz` treat an expired phase as unhealthy.
+They allow 60 seconds after the model request deadline for cooperative
+cancellation and cleanup. After that grace, an uncleared request deadline is
+unhealthy even while the phase deadline and heartbeat remain fresh. This backup
+uses the fixed published deadline, so it also covers an unresponsive event loop.
+Old leases without a request deadline retain their phase deadline. The supervisor
+reports `overdue:llm-request` on its next poll after the grace expires and applies
+the existing bounded TERM/KILL cleanup to the worker and its descendants.
+Expiry does not imply instantaneous process termination or remote cancellation.
+The endpoint returns HTTP 200 for a live worker lease and HTTP 503 otherwise.
 Kubernetes startup and liveness probes query this endpoint on fixed port 8080
 without creating a process inside the container. The images have no Docker
 `HEALTHCHECK`. Standalone launchers can set `SENPAI_HEALTH_PORT` and configure
@@ -208,6 +229,18 @@ restarts without limiting one productive run. Either exhausted budget enters
 bounded fresh-branch recovery and then quarantine. Authenticated human steering
 or a verified `supervisor_recovered` event can reopen quarantine; trusted PR
 feedback remains pending.
+
+The inference-start counters are persisted before the SDK run. A typed request
+deadline uses the controller's transient-provider cooldown but does not refund
+those counters. Ordinary transient provider errors retain their existing refund
+behavior. A supervisor termination also leaves the counters intact. Retries and
+restarts therefore retain the existing no-progress and recovery limits. Resume
+first reconciles a persisted final response and rejects unmatched tool actions;
+it does not automatically replay those actions.
+Local termination cannot establish whether a provider completed or billed an
+unobserved response. These guarantees require retaining the saved controller
+state across restarts. Kubernetes container restarts preserve `emptyDir` state;
+Pod replacements do not.
 
 ## State and conversations
 

@@ -24,6 +24,7 @@ from senpai_agent.controller import (
     _provider_retry_delay,
 )
 from senpai_agent.inbox import (
+    DeliveryState,
     InboxTurnQuarantined,
     PersistentInbox,
     deliver_turn_messages,
@@ -1182,6 +1183,37 @@ def test_transient_provider_failure_defers_and_retries_the_same_turn(
     assert "SENPAI_PROVIDER_COOLDOWN" in capsys.readouterr().err
 
 
+def test_request_deadlines_defer_without_refunding_the_recovery_budget(
+    tmp_path, monkeypatch, capsys,
+):
+    from senpai_agent.inference_heartbeat import ModelRequestDeadlineExceeded
+
+    clock = [1_700_000_000.0]
+    monkeypatch.setattr(controller_module.random, "uniform", lambda _low, _high: 0)
+    monkeypatch.setattr(controller_module.time, "time", lambda: clock[0])
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    mailbox = Mailbox([(review_event(),)])
+    turns = ProviderTurns([
+        ConversationRunError(CONVERSATION_ID, ModelRequestDeadlineExceeded("expired"))
+        for _ in range(3)
+    ])
+    runtime = controller(
+        mailbox, turns, inbox=inbox, max_consecutive_turn_failures=1,
+    )
+    for _ in range(3):
+        runtime.run(max_cycles=1)
+        cooldown = inbox.provider_cooldown()
+        assert cooldown is not None
+        clock[0] = cooldown.retry_at
+
+    assert len(set(turns.turn_ids)) == 1
+    turn_id = turns.turn_ids[0]
+    assert inbox.turn(turn_id).state is DeliveryState.DELIVERED
+    assert inbox.terminal_recovery_due(turn_id, max_attempts=3)
+    assert mailbox.acknowledged == []
+    assert capsys.readouterr().err.count("SENPAI_PROVIDER_COOLDOWN") == 3
+
+
 def test_permanent_provider_failure_exits_without_a_controller_retry():
     error = ConversationRunError(
         CONVERSATION_ID,
@@ -1819,14 +1851,14 @@ def test_activity_lease_write_failure_does_not_escape_the_event_path(
 
 
 def test_inference_state_lease_write_failure_does_not_mask_the_model_result(capsys):
-    def update_llm_request(_started_at, _heartbeat_at):
+    def update_llm_request(_started_at, _heartbeat_at, _deadline):
         raise OSError("lease volume unavailable")
 
     publish = _inference_state_lease(
         SimpleNamespace(update_llm_request=update_llm_request)
     )
 
-    publish(1_755_000_000.0, 1_755_000_001.0)
+    publish(1_755_000_000.0, 1_755_000_001.0, 123.0)
 
     assert "SENPAI_LEASE_UPDATE_ERROR OSError: lease volume unavailable" in (
         capsys.readouterr().err

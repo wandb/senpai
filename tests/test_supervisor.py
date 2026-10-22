@@ -71,8 +71,9 @@ def test_inference_heartbeat_is_observational_controller_state(tmp_path: Path):
     progress = ProgressLease(lease_path)
     progress.update("openhands-turn", 300)
     initial = WorkerLease.read(lease_path)
+    request_deadline = time.monotonic() + 60
 
-    progress.update_llm_request(1_755_000_000.0, 1_755_000_001.0)
+    progress.update_llm_request(1_755_000_000.0, 1_755_000_001.0, request_deadline)
     active = WorkerLease.read(lease_path)
 
     assert active.phase == initial.phase
@@ -80,21 +81,28 @@ def test_inference_heartbeat_is_observational_controller_state(tmp_path: Path):
     assert active.completed_turns == initial.completed_turns
     assert active.llm_request_started_at == 1_755_000_000.0
     assert active.llm_request_heartbeat_at == 1_755_000_001.0
+    assert active.llm_request_deadline == request_deadline
 
-    progress.update_llm_request(1_755_000_000.0, 1_755_000_030.0)
+    progress.update_llm_request(1_755_000_000.0, 1_755_000_030.0, request_deadline)
+    progress.update("openhands-turn", 600)
     pulsed = WorkerLease.read(lease_path)
-    assert pulsed.deadline == initial.deadline
+    assert pulsed.deadline > initial.deadline
     assert pulsed.llm_request_started_at == active.llm_request_started_at
     assert pulsed.llm_request_heartbeat_at == 1_755_000_030.0
+    assert pulsed.llm_request_deadline == request_deadline
 
-    progress.update_llm_request(None, None)
+    progress.update_llm_request(None, None, None)
     idle = WorkerLease.read(lease_path)
-    assert idle.deadline == initial.deadline
+    assert idle.deadline == pulsed.deadline
     assert idle.llm_request_started_at is None
     assert idle.llm_request_heartbeat_at is None
+    assert idle.llm_request_deadline is None
 
 
-def test_worker_lease_reads_legacy_state_without_inference_fields(tmp_path: Path):
+@pytest.mark.parametrize("active_request", [False, True])
+def test_worker_lease_reads_legacy_state_without_request_deadline(
+    tmp_path: Path, active_request: bool,
+):
     lease_path = tmp_path / "controller-lease.json"
     lease_path.write_text(
         json.dumps(
@@ -102,14 +110,19 @@ def test_worker_lease_reads_legacy_state_without_inference_fields(tmp_path: Path
                 "pid": 123,
                 "phase": "poll",
                 "deadline": 456.0,
+                **({
+                    "llm_request_started_at": 1_755_000_000.0,
+                    "llm_request_heartbeat_at": 1_755_000_001.0,
+                } if active_request else {}),
             }
         )
     )
 
     lease = WorkerLease.read(lease_path)
 
-    assert lease.llm_request_started_at is None
-    assert lease.llm_request_heartbeat_at is None
+    assert (lease.llm_request_started_at is not None) == active_request
+    assert (lease.llm_request_heartbeat_at is not None) == active_request
+    assert lease.llm_request_deadline is None
 
 
 def test_supervisor_preserves_launch_snapshot_across_restart(
@@ -398,7 +411,11 @@ raise SystemExit(19)
     assert not list(tmp_path.glob(".github-token-*"))
 
 
-def test_overdue_worker_is_killed_without_an_in_container_restart(tmp_path: Path):
+@pytest.mark.parametrize("overdue", ["phase", "llm-request"])
+def test_overdue_worker_is_killed_without_an_in_container_restart(
+    tmp_path: Path, capsys, monkeypatch, overdue: str,
+):
+    monkeypatch.setattr(supervisor_module, "INFERENCE_CANCELLATION_GRACE_SECONDS", 0.05)
     worker = tmp_path / "worker.py"
     worker.write_text(
         """
@@ -410,6 +427,7 @@ import time
 from pathlib import Path
 
 state = Path(sys.argv[1])
+overdue = sys.argv[2]
 count_path = state / "starts"
 count = int(count_path.read_text()) + 1 if count_path.exists() else 1
 count_path.write_text(str(count))
@@ -417,20 +435,30 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 lease = Path(os.environ["SENPAI_CONTROLLER_LEASE_PATH"])
 temporary = lease.with_suffix(".tmp")
-temporary.write_text(json.dumps({
-    "pid": os.getpid(),
-    "phase": "wedged-turn",
-    "deadline": time.monotonic() + 0.05,
-}))
-temporary.replace(lease)
-
-while True:
-    time.sleep(1)
+started = time.monotonic()
+request_started = time.time()
+while time.monotonic() - started < 0.5:
+    value = {
+        "pid": os.getpid(),
+        "phase": "wedged-turn",
+        "deadline": started + 0.05,
+    }
+    if overdue == "llm-request":
+        value.update({
+            "deadline": time.monotonic() + 30,
+            "llm_request_started_at": request_started,
+            "llm_request_heartbeat_at": time.time(),
+            "llm_request_deadline": started + 0.05,
+        })
+    temporary.write_text(json.dumps(value))
+    temporary.replace(lease)
+    time.sleep(0.01)
+raise SystemExit(99)
 """.strip()
     )
     stop = threading.Event()
     supervisor = WorkerSupervisor(
-        command=(sys.executable, str(worker), str(tmp_path)),
+        command=(sys.executable, str(worker), str(tmp_path), overdue),
         lease_path=tmp_path / "controller-lease.json",
         config=SupervisorConfig(
             startup_timeout_seconds=1,
@@ -441,6 +469,62 @@ while True:
 
     assert supervisor.run(stop) == 1
     assert (tmp_path / "starts").read_text() == "1"
+    phase = "llm-request" if overdue == "llm-request" else "wedged-turn"
+    assert f"reason=overdue:{phase}" in capsys.readouterr().err
+
+
+def test_supervisor_catches_cancellation_stuck_after_request_scope_closes(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    monkeypatch.setattr(supervisor_module, "INFERENCE_CANCELLATION_GRACE_SECONDS", 0.1)
+    worker = """
+import asyncio
+import os
+import signal
+from pathlib import Path
+from senpai_agent.supervisor import ProgressLease
+
+lease = ProgressLease(Path(os.environ['SENPAI_CONTROLLER_LEASE_PATH']))
+lease.update('openhands-turn', 30)
+
+from senpai_agent.inference_heartbeat import InferenceHeartbeat
+from senpai_agent.openhands_runner import arun_conversation
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+heartbeat = InferenceHeartbeat(lease.update_llm_request, timeout_seconds=0.05)
+class Conversation:
+    async def arun(self):
+        try:
+            with heartbeat.request():
+                await asyncio.Event().wait()
+        finally:
+            Path(os.environ['SENPAI_CONTROLLER_LEASE_PATH'] + '.cleanup').touch()
+            await asyncio.Event().wait()
+    def interrupt(self):
+        pass
+
+async def run():
+    async def escape():
+        await asyncio.sleep(2)
+        os._exit(99)
+    asyncio.create_task(escape())
+    await arun_conversation(Conversation(), 30, request_deadline=heartbeat.deadline)
+asyncio.run(run())
+"""
+    lease_path = tmp_path / "controller-lease.json"
+    supervisor = WorkerSupervisor(
+        command=(sys.executable, "-c", worker),
+        lease_path=lease_path,
+        config=SupervisorConfig(
+            startup_timeout_seconds=10,
+            check_interval_seconds=0.01,
+            terminate_grace_seconds=0.05,
+        ),
+    )
+
+    assert supervisor.run(threading.Event()) == 1
+    assert Path(str(lease_path) + ".cleanup").exists()
+    assert "reason=overdue:llm-request" in capsys.readouterr().err
 
 
 def test_worker_exit_samples_its_final_completed_turn(tmp_path: Path, monkeypatch):
@@ -538,12 +622,34 @@ def test_http_health_endpoint_tracks_the_worker_lease(tmp_path: Path):
     expired = json.dumps({
         "pid": os.getpid(), "phase": "poll", "deadline": time.monotonic() - 1,
     })
+    request_expired = json.dumps({
+        "pid": os.getpid(), "phase": "openhands-turn",
+        "deadline": time.monotonic() + 30,
+        "llm_request_started_at": time.time() - 60,
+        "llm_request_heartbeat_at": time.time(),
+        "llm_request_deadline": time.monotonic() - 61,
+    })
+    request_live = {
+        **json.loads(request_expired),
+        "llm_request_deadline": time.monotonic() + 30,
+    }
     with serve_lease_health(lease, host="127.0.0.1", port=0) as server:
         url = f"http://127.0.0.1:{server.server_port}/healthz"
         for content, status, body in (
             (None, 503, b"unhealthy\n"),
             (live, 200, b"ok\n"),
+            (json.dumps(request_live), 200, b"ok\n"),
+            (json.dumps({
+                **request_live, "llm_request_deadline": time.monotonic() - 1,
+            }), 200, b"ok\n"),
             (expired, 503, b"unhealthy\n"),
+            (request_expired, 503, b"unhealthy\n"),
+            (json.dumps({
+                **request_live, "deadline": time.monotonic() - 1,
+            }), 503, b"unhealthy\n"),
+            (json.dumps({
+                **request_live, "llm_request_deadline": float("nan"),
+            }), 503, b"unhealthy\n"),
             (live, 200, b"ok\n"),
             ("incomplete lease", 503, b"unhealthy\n"),
         ):
