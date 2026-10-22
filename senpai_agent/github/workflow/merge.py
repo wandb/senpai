@@ -157,7 +157,7 @@ class MergeMixin:
         review_id: str,
         comment: str,
     ) -> MutationResult:
-        """Record findings without routing feedback to the finished student."""
+        """Record a review without routing feedback to the finished student."""
         scope = {
             "assignment_id": assignment_id,
             "revision_id": revision_id,

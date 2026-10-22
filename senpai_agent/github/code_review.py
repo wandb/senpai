@@ -74,7 +74,7 @@ def review_code_quality(
     base_sha: str,
     token: SecretStr,
     config: RunnerConfig,
-) -> None:
+) -> CodeQualityVerdict:
     from senpai_agent.openhands_runner import run_openhands, supervisor_config
 
     started_at = time.time()
@@ -134,6 +134,7 @@ def review_code_quality(
                 f"Code quality review blocked PR #{pull.number}: "
                 f"{verdict.review_summary}\n{findings}"
             )
+        return verdict
 
 
 def review_prompt(
