@@ -125,7 +125,7 @@ The full target `program.md`, including its repository path, is included in your
 
 ## Verdict
 
-Submit your review through the structured `finish` response. The review summary and findings may be posted to GitHub. Use clear Markdown formatting within those text fields."""
+Submit your review through the structured `finish` response. Use clear Markdown formatting within those text fields."""
 
 DELEGATED_RESULT_SUMMARY_PROMPT = """Your response is too large to send directly to your parent that requested this and risks blowing up its context window. Instead SENPAI stored your complete response at:
 
