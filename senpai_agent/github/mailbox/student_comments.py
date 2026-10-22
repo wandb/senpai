@@ -209,12 +209,7 @@ def trusted_peer_comment(
     ):
         return None
     message = "\n".join(body.splitlines()[1:]).strip()
-    if not message.startswith(
-        (
-            f"**Student: {record.student}**\n\n---\n\n",
-            f"**STUDENT: {record.student}**\n\n",
-        )
-    ):
+    if not message.startswith(f"**Student: {record.student}**\n\n---\n\n"):
         return None
     return record, message
 

@@ -34,7 +34,7 @@ examples; they do not implement mutations or carry credentials. The plugin has
 no MCP server. The Python runtime adds a `**Advisor**`,
 `**Student: <student_name>**`, or `**Supervisor**` header followed by a blank line,
 `---`, and another blank line to authored GitHub messages. Tool payloads contain
-only the Markdown content below the separator. New messages omit attribution
+only the Markdown content below the separator. Messages omit attribution
 footers and automatic `Working PR` links. Students use `post_peer_comment` to
 discuss another student's work and reply on the sender's PR, which the hidden
 peer marker identifies.

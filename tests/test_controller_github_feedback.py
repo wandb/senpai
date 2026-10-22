@@ -601,18 +601,12 @@ def peer_comment(*, header="**Student: {student}**\n\n---\n\n", **overrides):
 
 
 @pytest.mark.parametrize("broadcast_id", [None, "handoff-discovery"])
-@pytest.mark.parametrize(
-    "header",
-    ["**Student: {student}**\n\n---\n\n", "**STUDENT: {student}**\n\n"],
-    ids=["current-header", "legacy-header"],
-)
 def test_peer_message_resumes_recipient_revision_once_across_retries_and_restart(
     monkeypatch,
     tmp_path,
     broadcast_id,
-    header,
 ):
-    fields = {"header": header, "broadcast_id": broadcast_id}
+    fields = {"broadcast_id": broadcast_id}
     responses = feedback_responses(
         issue_comments=[
             feedback(106, peer_comment(**fields)),
@@ -638,7 +632,7 @@ def test_peer_message_resumes_recipient_revision_once_across_retries_and_restart
     assert message.payload["source_assignment_id"] == "assignment-18"
     assert message.payload["source_revision_id"] == "revision-peer"
     assert message.payload["pr_url"] == "https://github.test/acme/widgets/pull/17"
-    assert message.payload["message"].startswith(header.format(student="student-2"))
+    assert message.payload["message"].startswith("**Student: student-2**\n\n---\n\n")
 
     failed_turns = Turns((1,))
     run_student_controller(tmp_path, mailbox, failed_turns)
@@ -711,7 +705,7 @@ def test_broadcast_is_polled_regardless_of_assigned_pr_routing_status(
         {"body_prefix": "Copied from elsewhere:\n"},
         {"body_suffix": "\n<!-- senpai-result:v1 {} -->"},
         {"header": "**Student: student-3**\n\n---\n\n"},
-        {"header": "**STUDENT: student-3**\n\n"},
+        {"header": "**STUDENT: student-2**\n\n"},
         {"header": "**Student: student-2**\n\n"},
         {"header": "**Supervisor: student-2**\n\n---\n\n"},
         {"header": ""},
@@ -727,8 +721,8 @@ def test_broadcast_is_polled_regardless_of_assigned_pr_routing_status(
         "foreign-actor",
         "embedded-marker",
         "extra-protocol",
-        "wrong-current-student",
-        "wrong-legacy-student",
+        "wrong-student",
+        "noncanonical-header",
         "missing-divider",
         "wrong-role",
         "missing-header",

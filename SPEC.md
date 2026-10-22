@@ -487,9 +487,8 @@ the model-facing schema. It adds a `**Advisor**`, `**Student: <student_name>**`,
 or `**Supervisor**` header followed by a blank line, `---`, and another blank line
 to authored PR bodies, comments, and Issue messages. Hidden protocol markers stay
 on the first line. The runtime supplies identity and the separator; models supply
-the Markdown content below them. New messages omit attribution footers and
-automatic `Working PR` links. Exact retries of historical student messages
-preserve their original content and timestamps.
+the Markdown content below them. Messages omit attribution footers and
+automatic `Working PR` links.
 
 Operations on an existing assignment share these fields. The PR number identifies
 the experiment PR. The assignment ID and revision ID identify the advisor's

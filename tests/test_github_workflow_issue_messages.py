@@ -225,7 +225,7 @@ def test_respond_to_issue_accepts_a_specific_human_comment():
         human_message_id=42,
         audience_labels={"team"},
         responder="fern",
-        response="STUDENT fern: I included memory in the comparison.",
+        response="I included memory in the comparison.",
     )
 
     assert result.changed is True
@@ -410,7 +410,7 @@ def test_human_issue_responses_share_the_workflow_mutation_lock(monkeypatch):
                 author="senpai-bot",
                 body=(
                     "<!-- senpai-human-response:advisor:700 -->\n\n"
-                    "ADVISOR: Already answered."
+                    "**Advisor**\n\n---\n\nAlready answered."
                 ),
             ),
             [],
@@ -436,7 +436,7 @@ def test_human_issue_responses_share_the_workflow_mutation_lock(monkeypatch):
                 comment(
                     43,
                     "<!-- senpai-human-response:advisor:700 -->\n\n"
-                    "ADVISOR: Already answered.",
+                    "**Advisor**\n\n---\n\nAlready answered.",
                     author="senpai-bot",
                     author_type="User",
                 )
@@ -487,7 +487,7 @@ def test_respond_to_issue_rejects_untrusted_sources_before_writing(
             human_message_id=message_id,
             audience_labels={"team"},
             responder="advisor",
-            response="ADVISOR: bounded response",
+            response="Bounded response.",
         )
 
     assert fake.mutations == []
@@ -518,7 +518,7 @@ def test_respond_to_issue_rechecks_audience_after_writing():
             human_message_id=700,
             audience_labels={"team"},
             responder="advisor",
-            response="ADVISOR: bounded response",
+            response="Bounded response.",
         )
 
     assert len(fake.comments) == 1

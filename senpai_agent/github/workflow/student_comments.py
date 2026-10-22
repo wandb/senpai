@@ -1,6 +1,5 @@
 """Student-authored comments on their own and peers' assignments."""
 
-import re
 from urllib.parse import urlencode
 
 from senpai_agent.github.pull_authorization import authorized_pulls
@@ -33,21 +32,6 @@ from senpai_agent.models import (
 )
 
 _COMMENT_STATUSES = frozenset({"status:wip", "status:review"})
-_LEGACY_ROLE_COMMENT_PREFIX = re.compile(
-    r"^[ \t]*(?:\*\*(?:ADVISOR|STUDENT):[^\n]*?\*\*[ \t]*\n?|"
-    r"(?:ADVISOR|STUDENT(?: [^:\s]+)?):[ \t]*)",
-    re.MULTILINE,
-)
-
-
-def _legacy_student_comment(
-    body: str, *, student: str, source_number: int, source_url: str
-) -> str:
-    """Recognize exact historical retries without editing immutable messages."""
-    marker, separator, content = body.partition("\n\n")
-    content = f"{content}\n\nWorking PR: [#{source_number}]({source_url})"
-    content = _LEGACY_ROLE_COMMENT_PREFIX.sub("", content).strip()
-    return f"{marker}{separator}**STUDENT: {student}**\n\n{content}"
 
 
 class StudentCommentMixin:
@@ -69,7 +53,7 @@ class StudentCommentMixin:
         if self._role != "student":
             raise PermissionError("post_assignment_comment requires a student workflow")
         with self.serialized_assignment_mutation():
-            before, assignment = self._routed_assignment_at_head(
+            _, assignment = self._routed_assignment_at_head(
                 number,
                 assignment_id=assignment_id,
                 revision_id=revision_id,
@@ -96,20 +80,15 @@ class StudentCommentMixin:
                     comment_id=comment_id,
                 )
             )
-            rendered = marker_body(marker, content)
             changed, verified = self._upsert_marker_comment(
                 number,
                 marker=marker,
-                body=rendered,
+                body=marker_body(marker, content),
                 conflict_message=(
                     "comment_id already identifies a different message; "
                     "use a new comment_id"
                 ),
-                exact_conflict=True,
                 student=student,
-                legacy_body=_legacy_student_comment(
-                    rendered, student=student, source_number=number, source_url=before.url
-                ),
             )
             after, current_assignment = self._routed_assignment_at_head(
                 number,
@@ -148,7 +127,7 @@ class StudentCommentMixin:
         if self._role != "student":
             raise PermissionError("post_peer_comment requires a student workflow")
         with self.serialized_assignment_mutation():
-            source, assignment = self._routed_assignment_at_head(
+            _, assignment = self._routed_assignment_at_head(
                 number,
                 assignment_id=assignment_id,
                 revision_id=revision_id,
@@ -198,18 +177,13 @@ class StudentCommentMixin:
                 )
             )
             marker = render_student_peer_comment_marker(record)
-            rendered = marker_body(marker, content)
             changed, verified = self._upsert_marker_comment(
                 target.number,
                 marker=marker,
-                body=rendered,
+                body=marker_body(marker, content),
                 student=student,
                 conflict_message=(
                     "comment_id already identifies a different message; use a new comment_id"
-                ),
-                exact_conflict=True,
-                legacy_body=_legacy_student_comment(
-                    rendered, student=student, source_number=number, source_url=source.url
                 ),
             )
             _, current = self._routed_assignment_at_head(

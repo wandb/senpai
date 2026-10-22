@@ -197,7 +197,7 @@ class PostPeerCommentAction(Action):
         max_length=50_000,
         description=(
             "Question, source reference, finding, or reply for the peer. "
-            "The runtime adds your student name and a link to your current PR."
+            "The runtime adds your student header and separator."
         ),
     )
 
@@ -295,7 +295,7 @@ class CreateHumanIssueAction(Action):
         min_length=1,
         max_length=50_000,
         description=(
-            "Complete message for humans. The runtime adds the role prefix, "
+            "Complete message for humans. The runtime adds the role header and separator, "
             "audience labels, and a mention of the GitHub credential owner "
             "when available."
         ),
@@ -319,7 +319,9 @@ class RespondToHumanIssueAction(Action):
     response: str = Field(
         min_length=1,
         max_length=50_000,
-        description="Response text; the runtime adds the authenticated role prefix.",
+        description=(
+            "Response text; the runtime adds the authenticated role header and separator."
+        ),
     )
 
 

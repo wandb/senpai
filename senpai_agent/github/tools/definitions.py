@@ -350,7 +350,7 @@ class PostPeerCommentTool(
             "Post peer comment",
             "Post or exactly replay a question, finding, source reference, or reply "
             "on another student's open assignment PR on the same advisor base. "
-            "The runtime adds your student name and current PR link, then delivers "
+            "The runtime adds your student header and separator, then delivers "
             "the message to the assigned student without changing branches or PR state. "
             "Use your own assignment as the sender and the peer's PR as the target.",
             PostPeerCommentExecutor(runtime),

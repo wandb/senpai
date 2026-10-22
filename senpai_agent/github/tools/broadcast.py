@@ -36,7 +36,7 @@ class BroadcastMessageAction(Action):
             "Compact FYI: state the discovery, evidence or uncertainty, and which "
             "work it may help. Explain terms for students outside your subproblem. "
             "Link supporting PRs, commits, or runs instead of pasting logs or code. "
-            "The runtime adds your name and current PR link. This is optional "
+            "The runtime adds your student header and separator. This is optional "
             "context for peers' existing assignments, not a request to change focus."
         ),
     )
@@ -100,7 +100,8 @@ class BroadcastMessageTool(
                     "open assignment PRs on the configured advisor base, regardless of "
                     "draft or workflow status. Maximum 1,500 characters; explain the "
                     "finding, relevance, and evidence, and link details. The runtime "
-                    "adds your student name and PR link. Peers receive it through "
+                    "adds your student header and separator. Peer copies link the "
+                    "source discussion. Peers receive it through "
                     "regular GitHub polling without interruption and consider it only "
                     "within their assignment. Use post_peer_comment for a targeted "
                     "question or reply. Retry partial delivery with the same ID and "

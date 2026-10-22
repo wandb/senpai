@@ -228,18 +228,10 @@ def test_peer_message_identifies_sender_without_footer_or_assignment_changes():
     ]
 
 
-@pytest.mark.parametrize("legacy", [False, True], ids=["current", "legacy"])
-def test_peer_comment_ids_cannot_rewrite_messages_and_new_ids_append(legacy):
+def test_peer_comment_ids_cannot_rewrite_messages_and_new_ids_append():
     fake = PeerGitHub()
     client = workflow(fake, role="student")
     post_peer(client)
-    if legacy:
-        marker = fake.recipient.comments[0]["body"].split("\n\n", 1)[0]
-        fake.recipient.comments[0]["body"] = (
-            f"{marker}\n\n**STUDENT: student-one**\n\n"
-            "Does the handoff preserve optimizer state?\n\n"
-            "Working PR: [#7](https://github.com/acme/widgets/pull/7)"
-        )
     original_comment = deepcopy(fake.recipient.comments[0])
 
     fake.recipient.pr["body"] = render_assignment_marker(

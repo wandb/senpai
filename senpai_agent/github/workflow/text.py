@@ -6,13 +6,6 @@ from typing import Literal
 from senpai_agent.github.workflow.errors import WorkflowPreconditionError
 from senpai_agent.models import AssignmentRecord, render_assignment_marker
 
-_ROLE_COMMENT_PREFIX = re.compile(
-    r"^[ \t]*(?:\*\*(?:ADVISOR|STUDENT|SUPERVISOR)(?::[^\n]*?)?\*\*"
-    r"[ \t]*(?:\n[ \t]*)*(?:---[ \t]*(?:\n|$))?|"
-    r"(?:ADVISOR|STUDENT(?: [^:\s]+)?|SUPERVISOR):[ \t]*)",
-    re.MULTILINE | re.IGNORECASE,
-)
-
 
 def marker_body(marker: str, content: str) -> str:
     content = _quote_senpai_marker_lines(content.strip())
@@ -39,7 +32,7 @@ def role_prefixed_comment(
     marker, separator, content = body.partition("\n\n")
     if not (separator and marker.startswith("<!-- senpai-")):
         marker, separator, content = "", "", body
-    content = _ROLE_COMMENT_PREFIX.sub("", content).strip()
+    content = content.strip()
     if role == "student":
         if not student or not re.fullmatch(r"[A-Za-z0-9_.-]+", student):
             raise ValueError("student comments require a valid student name")

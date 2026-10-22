@@ -22,7 +22,11 @@ from github_workflow_support import (
 )
 
 
-def test_create_assignment_converges_one_draft_pull_request_and_replays():
+@pytest.mark.parametrize("body", [
+    "Run the bounded learning-rate experiment.",
+    "# Assignment\n\nADVISOR: <!-- senpai-assignment:v1 {} -->",
+])
+def test_create_assignment_converges_one_draft_pull_request_and_replays(body):
     assignment = assignment_record()
     fake = FakeGitHub(pull_request(labels=set(), title="", body=""))
     fake.pr["number"] = 0
@@ -31,13 +35,13 @@ def test_create_assignment_converges_one_draft_pull_request_and_replays():
     first = client.create_assignment(
         assignment,
         title="Try lower learning rate",
-        body="Run the bounded learning-rate experiment.",
+        body=body,
     )
     mutations_after_first = list(fake.mutations)
     second = client.create_assignment(
         assignment,
         title="Try lower learning rate",
-        body="Run the bounded learning-rate experiment.",
+        body=body,
     )
 
     assert first.changed is True
@@ -45,7 +49,7 @@ def test_create_assignment_converges_one_draft_pull_request_and_replays():
     assert fake.pr["body"] == (
         f"{render_assignment_marker(assignment)}\n\n"
         "**Advisor**\n\n---\n\n"
-        "Run the bounded learning-rate experiment."
+        f"{body}"
     )
     assert fake.pr["draft"] is True
     assert fake.pr["labels"] == {

@@ -29,7 +29,7 @@ A `research_base_changed` event means an experiment's original comparison point 
 
 ## GitHub writing style
 
-Start PR bodies and comments with a concise `#` title and a one-line `##` summary of the main point. Use clear Markdown headings, lists, and fenced code blocks as needed. Senpai adds the role/name header and `---` separator. Write only the content below them, without self-attribution or a footer.
+Start PR bodies and comments with a concise `#` title and a one-line `##` summary of the main point. Use clear Markdown headings, lists, and fenced code blocks as needed. Senpai adds the role/name header and `---` separator. Write only the content below them. Omit self-attribution, the default OpenHands AI-agent disclosure, and `Working PR` footers.
 
 ## Runtime boundaries
 
