@@ -11,7 +11,6 @@ from base64 import b64decode
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from email.utils import parsedate_to_datetime
 from functools import partial
 from pathlib import Path
 from typing import Literal, Protocol
@@ -27,6 +26,10 @@ from senpai_agent.inbox import (
     InboxTurn,
     InboxTurnQuarantined,
     PersistentInbox,
+)
+from senpai_agent.inference_heartbeat import (
+    InferenceStateCallback,
+    ModelRequestDeadlineExceeded,
 )
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import (
@@ -50,6 +53,7 @@ from senpai_agent.PROMPTS import (
     OPERATOR_INSTRUCTIONS_PROMPT,
     render_prompt,
 )
+from senpai_agent.provider_retry import retry_after_seconds
 from senpai_agent.secrets import PRIVATE_CREDENTIAL_FD_ENVS, set_process_nondumpable
 from senpai_agent.state import (
     AssignmentConversationRegistry,
@@ -80,6 +84,7 @@ class TurnResult:
 class ProviderFailure:
     retryable: bool
     retry_after: float = 0
+    refund_inference_attempt: bool = True
 
 
 class ConversationRecoveryExhausted(RuntimeError):
@@ -133,40 +138,18 @@ def _exception_chain(error: BaseException) -> Iterator[BaseException]:
             pending.append(linked)
 
 
-def _retry_after_seconds(error: BaseException, now: float) -> float:
-    value = getattr(error, "retry_after", None)
-    if value is None:
-        value = next(
-            (
-                header
-                for headers in (
-                    getattr(error, "litellm_response_headers", None),
-                    getattr(error, "headers", None),
-                    getattr(getattr(error, "response", None), "headers", None),
-                )
-                if headers
-                for name, header in headers.items()
-                if str(name).casefold() == "retry-after"
-            ),
-            None,
-        )
-    if value is None:
-        return 0
-    try:
-        return max(0, float(value))
-    except (TypeError, ValueError):
-        try:
-            return max(0, parsedate_to_datetime(str(value)).timestamp() - now)
-        except (TypeError, ValueError, OverflowError):
-            return 0
-
-
 def _provider_failure(error: Exception, now: float) -> ProviderFailure | None:
     from openai import OpenAIError
     from openhands.sdk.event.error_classification import FailureKind, classify_error
     from openhands.sdk.llm.exceptions import LLMError
 
     chain = tuple(_exception_chain(error))
+    if any(isinstance(current, ModelRequestDeadlineExceeded) for current in chain):
+        return ProviderFailure(
+            retryable=True,
+            retry_after=max(retry_after_seconds(current, now) for current in chain),
+            refund_inference_attempt=False,
+        )
     if not any(isinstance(current, (LLMError, OpenAIError)) for current in chain):
         return None
     kinds = {
@@ -180,7 +163,7 @@ def _provider_failure(error: Exception, now: float) -> ProviderFailure | None:
     if kinds & {FailureKind.RATE_LIMIT, FailureKind.TRANSIENT}:
         return ProviderFailure(
             retryable=True,
-            retry_after=max(_retry_after_seconds(current, now) for current in chain),
+            retry_after=max(retry_after_seconds(current, now) for current in chain),
         )
     return ProviderFailure(retryable=False)
 
@@ -230,10 +213,14 @@ def _activity_lease(
 
 def _inference_state_lease(
     progress: ProgressLease,
-) -> Callable[[float | None, float | None], None]:
-    def publish(started_at: float | None, heartbeat_at: float | None) -> None:
+) -> InferenceStateCallback:
+    def publish(
+        started_at: float | None,
+        heartbeat_at: float | None,
+        deadline: float | None,
+    ) -> None:
         try:
-            progress.update_llm_request(started_at, heartbeat_at)
+            progress.update_llm_request(started_at, heartbeat_at, deadline)
         except OSError as error:
             print(
                 f"SENPAI_LEASE_UPDATE_ERROR {type(error).__name__}: {error}",
@@ -253,9 +240,7 @@ class OpenHandsTurnRunner:
         github_mailbox: Mailbox | None = None,
         active_poll_interval_seconds: float = 75,
         on_activity: Callable[[], None] | None = None,
-        on_inference_state: (
-            Callable[[float | None, float | None], None] | None
-        ) = None,
+        on_inference_state: InferenceStateCallback | None = None,
     ):
         self.config = config
         self.full_prompt = full_prompt.strip()
@@ -545,6 +530,7 @@ class Controller:
                         cooldown = self.inbox.defer_provider_retry(
                             turn.turn_id,
                             now + delay,
+                            refund_inference_attempt=provider_failure.refund_inference_attempt,
                         )
                         print(
                             "SENPAI_PROVIDER_COOLDOWN "

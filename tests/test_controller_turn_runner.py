@@ -152,11 +152,11 @@ def test_turn_runner_passes_the_inference_state_out_of_band(
     observed = []
 
     def run_openhands(_prompt, _config, *, on_inference_state):
-        on_inference_state(1_755_000_000.0, 1_755_000_001.0)
+        on_inference_state(1_755_000_000.0, 1_755_000_001.0, 123.0)
         return 0
 
-    def publish_state(started_at, heartbeat_at):
-        observed.append((started_at, heartbeat_at))
+    def publish_state(started_at, heartbeat_at, deadline):
+        observed.append((started_at, heartbeat_at, deadline))
 
     monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
 
@@ -171,7 +171,7 @@ def test_turn_runner_passes_the_inference_state_out_of_band(
     )
 
     assert result.exit_code == 0
-    assert observed == [(1_755_000_000.0, 1_755_000_001.0)]
+    assert observed == [(1_755_000_000.0, 1_755_000_001.0, 123.0)]
 
 
 def test_running_student_receives_only_feedback_bound_to_its_conversation(
