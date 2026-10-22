@@ -126,17 +126,13 @@ def _identity(envelope: SupervisorEnvelope) -> str:
 def render_request(envelope: SupervisorEnvelope) -> str:
     encoded = _marker_payload(envelope)
     marker = f"{_PREFIX}{_identity(envelope)}:{encoded} -->"
-    body = role_prefixed_comment(
-        f"{marker}\n\n## Supervisor request: {envelope.request.target}\n\n{envelope.request.task}",
-        "advisor" if envelope.requester == "advisor" else "student",
-        student=envelope.requester,
-    )
+    body = f"{marker}\n\n## Supervisor request: {envelope.request.target}\n\n{envelope.request.task}"
+    role = "advisor" if envelope.requester == "advisor" else "student"
+    body = role_prefixed_comment(body, role, student=envelope.requester)
     if envelope.result is not None:
-        result = role_prefixed_comment(
-            f"## Supervisor result\n\n{envelope.result.repair_summary}",
-            "supervisor",
+        body += "\n\n" + role_prefixed_comment(
+            f"## Supervisor result\n\n{envelope.result.repair_summary}", "supervisor"
         )
-        body += f"\n\n{result}"
     # Reserve half the Issue body for a result, including JSON escape expansion.
     if len(body) > (65_536 if envelope.result else 32_000):
         raise ValueError("Supervisor request is too large; shorten the task")
