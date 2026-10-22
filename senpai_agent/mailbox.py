@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Protocol
 from uuid import UUID
 
+from senpai_agent.event_conflicts import EventIdentityConflict
 from senpai_agent.inbox import PersistentInbox
 from senpai_agent.local_events import LocalEventStore
 from senpai_agent.PROMPTS import render_event_prompt
@@ -22,6 +24,7 @@ class ControllerEvent:
     kind: str
     dedupe_key: str
     payload: dict[str, object]
+    conflict: EventIdentityConflict | None = None
 
     def to_prompt(self) -> str:
         payload = {
@@ -45,7 +48,7 @@ class CompositeMailbox:
         self.mailboxes = mailboxes
 
     def poll(self) -> tuple[ControllerEvent, ...]:
-        by_key: dict[str, ControllerEvent] = {}
+        combined: list[ControllerEvent] = []
         for mailbox in self.mailboxes:
             try:
                 events = mailbox.poll()
@@ -57,8 +60,9 @@ class CompositeMailbox:
                 )
                 continue
             for event in events:
-                by_key.setdefault(event.dedupe_key, event)
-        return tuple(by_key.values())
+                if event not in combined:
+                    combined.append(event)
+        return tuple(combined)
 
     def acknowledge(self, dedupe_keys: Sequence[str]) -> None:
         for mailbox in self.mailboxes:
@@ -135,14 +139,24 @@ class LocalMailbox:
     def poll(self) -> tuple[ControllerEvent, ...]:
         with LocalEventStore(self.store_path) as store:
             pending = store.pending()
-        return tuple(
+            conflicts = store.conflicts()
+        events = [
             ControllerEvent(
-                kind=event.kind,
-                dedupe_key=event.dedupe_key,
-                payload=event.payload,
+                kind=event.kind, dedupe_key=event.dedupe_key, payload=event.payload
             )
             for event in pending
-        )
+        ]
+        for conflict in conflicts:
+            candidate = json.loads(conflict.candidate_body)
+            events.append(
+                ControllerEvent(
+                    kind=candidate["kind"],
+                    dedupe_key=conflict.event_key,
+                    payload=candidate["payload"],
+                    conflict=conflict,
+                )
+            )
+        return tuple(events)
 
     def acknowledge(self, dedupe_keys: Sequence[str]) -> None:
         with LocalEventStore(self.store_path) as store:

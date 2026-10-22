@@ -292,10 +292,16 @@ class MonitorTrainingAction(Action):
 class MonitorTrainingObservation(Observation):
     training_id: str
     conversation_id: str
-    status: Literal["monitoring"] = "monitoring"
+    status: Literal["monitoring", "terminal"] = "monitoring"
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
+        if self.status == "terminal":
+            return [
+                TextContent(
+                    text=f"Training {self.training_id} is terminal; no new monitoring policy was registered."
+                )
+            ]
         return [
             TextContent(
                 text=render_prompt(
@@ -475,7 +481,9 @@ class _CancelTrainingExecutor(
                 "cancel_training did not reach a terminal state; "
                 "the training monitor remains active"
             )
-        self.store.complete(action.training_id)
+        self.store.complete(
+            action.training_id, state=result.state, exit_code=result.exit_code, notify=False
+        )
         return TrainingResultObservation.from_result(result, conversation)
 
 
@@ -582,11 +590,17 @@ class _MonitorTrainingExecutor(
     ) -> MonitorTrainingObservation:
         if conversation is None:
             raise ValueError("monitor_training requires its student conversation")
-        self.training.get_training_status(action.training_id)
+        result = self.training.get_training_status(action.training_id)
         monitor = self.store.spec(action.training_id)
         if monitor.conversation_id != conversation.id:
             raise PermissionError(
                 "training belongs to a different student conversation"
+            )
+        if result.state is not TrainingState.RUNNING:
+            return MonitorTrainingObservation(
+                training_id=action.training_id,
+                conversation_id=str(conversation.id),
+                status="terminal",
             )
         spec = TrainingMonitorSpec(
             training_id=action.training_id,
@@ -601,6 +615,9 @@ class _MonitorTrainingExecutor(
         return MonitorTrainingObservation(
             training_id=spec.training_id,
             conversation_id=str(spec.conversation_id),
+            status="monitoring"
+            if any(active.training_id == spec.training_id for active in self.store.active())
+            else "terminal",
         )
 
     def close(self) -> None:

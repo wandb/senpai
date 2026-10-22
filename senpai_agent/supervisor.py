@@ -83,6 +83,7 @@ class WorkerLease:
     phase: str
     deadline: float
     completed_turns: int = 0
+    delivery_conflicts: int = 0
     llm_request_started_at: float | None = None
     llm_request_heartbeat_at: float | None = None
 
@@ -94,6 +95,7 @@ class WorkerLease:
             phase=str(value["phase"]),
             deadline=float(value["deadline"]),
             completed_turns=int(value.get("completed_turns", 0)),
+            delivery_conflicts=int(value.get("delivery_conflicts", 0)),
             llm_request_started_at=(
                 float(value["llm_request_started_at"])
                 if value.get("llm_request_started_at") is not None
@@ -109,6 +111,7 @@ class WorkerLease:
             lease.pid <= 0
             or not lease.phase
             or lease.completed_turns < 0
+            or lease.delivery_conflicts < 0
             or (lease.llm_request_started_at is None)
             != (lease.llm_request_heartbeat_at is None)
         ):
@@ -122,6 +125,7 @@ class ProgressLease:
     def __init__(self, path: Path):
         self.path = path.resolve()
         self.completed_turns = 0
+        self.delivery_conflicts = 0
         self._lock = threading.Lock()
         self._phase: str | None = None
         self._deadline: float | None = None
@@ -170,6 +174,7 @@ class ProgressLease:
                     "phase": self._phase,
                     "deadline": self._deadline,
                     "completed_turns": self.completed_turns,
+                    "delivery_conflicts": self.delivery_conflicts,
                     "llm_request_started_at": self._llm_request_started_at,
                     "llm_request_heartbeat_at": self._llm_request_heartbeat_at,
                 },

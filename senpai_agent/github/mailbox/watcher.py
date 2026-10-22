@@ -9,6 +9,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
+from senpai_agent.event_conflicts import EventIdentityConflict
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import ControllerEvent, Mailbox
@@ -59,13 +60,20 @@ class ActiveGitHubWatcher:
                         # next turn; staging it here would preserve stale state.
                         if event.kind == "student_available_for_assignment":
                             continue
-                        if event.dedupe_key in self.known_keys:
+                        if (
+                            event.dedupe_key in self.known_keys
+                            and store.get(event.dedupe_key) is None
+                        ):
                             continue
                         local_event = self.map_event(event)
                         if local_event is None:
                             continue
-                        if store.enqueue(local_event):
-                            self.enqueued_keys.add(local_event.dedupe_key)
+                        try:
+                            if store.enqueue(local_event):
+                                self.enqueued_keys.add(local_event.dedupe_key)
+                        except EventIdentityConflict:
+                            # The durable conflict is imported by the event pump/foreground poll.
+                            continue
                     self.known_keys = current
         except BaseException as error:  # noqa: BLE001
             self.error = error

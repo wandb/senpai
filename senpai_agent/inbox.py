@@ -17,6 +17,15 @@ from types import TracebackType
 from typing import Self
 from uuid import UUID
 
+from senpai_agent.event_conflicts import (
+    DeliveryBlocked,
+    EventIdentityConflict,
+    create_conflict_table,
+    record_conflict,
+    resolve_conflict,
+    unresolved_conflicts,
+)
+
 
 MAX_EVENTS_PER_TURN = 16
 MAX_EVENT_BYTES_PER_TURN = 64 * 1024
@@ -204,6 +213,7 @@ class PersistentInbox:
             );
             """
         )
+        create_conflict_table(self._connection)
         turn_columns = {
             str(row[1])
             for row in self._connection.execute("PRAGMA table_info(inbox_turns)")
@@ -325,7 +335,7 @@ class PersistentInbox:
         if not body:
             raise ValueError("event body must not be empty")
         scope = None if once else conversation
-        _require_event_payload(database, scope, event_key, body)
+        _require_event_payload(database, conversation, event_key, body, once=once)
         existing = self._live_event_message(database, scope, event_key)
         if existing is not None:
             if once and existing["conversation_id"] != conversation:
@@ -486,18 +496,40 @@ class PersistentInbox:
         conversation_id: UUID | str,
         event_key: str,
         body: str,
+        *,
+        once: bool = False,
     ) -> None:
         """Reject a polled identity that conflicts with durable inbox history."""
 
         if not event_key or not body:
             raise ValueError("event key and body must not be empty")
-        with self._lock:
+        with self._transaction():
             _require_event_payload(
                 self._connection,
                 str(conversation_id),
                 event_key,
                 body,
+                once=once,
             )
+
+    def record_conflict(self, conflict: EventIdentityConflict) -> None:
+        with self._transaction() as database:
+            record_conflict(database, conflict)
+
+    def conflicts(self) -> tuple[EventIdentityConflict, ...]:
+        with self._lock:
+            return unresolved_conflicts(self._connection)
+
+    def require_delivery_ready(self, conversation_id: UUID | str) -> None:
+        if any(c.conversation_id == str(conversation_id) for c in self.conflicts()):
+            raise DeliveryBlocked(
+                f"conversation {conversation_id} has unresolved event conflicts"
+            )
+
+    def resolve_conflict(self, identity: str, reason: str) -> None:
+        """Record an operator's decision to reject a candidate, without acknowledging it."""
+        with self._transaction() as database:
+            resolve_conflict(database, identity, reason)
 
     def retract_pending_prefix(
         self,
@@ -549,6 +581,11 @@ class PersistentInbox:
             raise ValueError("turn limits must be positive")
         conversation = str(conversation_id)
         with self._transaction() as database:
+            if any(
+                c.conversation_id == conversation
+                for c in unresolved_conflicts(database)
+            ):
+                return None
             active_turn_id = self._active_turn_id(database, conversation)
             if active_turn_id is not None:
                 return self._turn(database, active_turn_id)
@@ -880,6 +917,7 @@ class PersistentInbox:
             turn = self._turn(database, turn_id)
             if turn.state is DeliveryState.PROCESSED:
                 return turn
+            self.require_delivery_ready(turn.conversation_id)
             if any(message.state is DeliveryState.PENDING for message in turn.messages):
                 raise ValueError("cannot process a turn before every message is delivered")
             database.execute(
@@ -1250,6 +1288,8 @@ class PersistentInbox:
                     MIN(sequence) AS first_sequence
                 FROM inbox_messages
                 WHERE conversation_id NOT IN (
+                        SELECT conversation_id FROM event_conflicts WHERE resolution IS NULL
+                    ) AND conversation_id NOT IN (
                         SELECT conversation_id
                         FROM inbox_turns
                         WHERE acknowledged = 0
@@ -1654,6 +1694,9 @@ class _Transaction:
                 self.database.commit()
             else:
                 self.database.rollback()
+                if isinstance(_exc, EventIdentityConflict):
+                    with self.database:
+                        record_conflict(self.database, _exc)
         finally:
             self.lock.release()
 
@@ -1808,13 +1851,16 @@ def _event_call_ids(event: object) -> set[str]:
 
 def _require_event_payload(
     database: sqlite3.Connection,
-    conversation_id: str | None,
+    conversation_id: str,
     event_key: str,
     body: str,
+    *,
+    once: bool = False,
 ) -> None:
+    scope = None if once else conversation_id
     conflict = database.execute(
         """
-        SELECT 1
+        SELECT conversation_id, body
         FROM inbox_messages
         WHERE (? IS NULL OR conversation_id = ?)
           AND event_key = ?
@@ -1822,11 +1868,11 @@ def _require_event_payload(
           AND body != ?
         LIMIT 1
         """,
-        (conversation_id, conversation_id, event_key, body),
+        (scope, scope, event_key, body),
     ).fetchone()
     if conflict is not None:
-        raise RuntimeError(
-            f"event {event_key!r} was reused with a different payload"
+        raise EventIdentityConflict(
+            str(conversation_id), event_key, str(conflict[1]), body
         )
 
 

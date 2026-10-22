@@ -37,7 +37,7 @@ def spec(**changes):
 
 SIGNAL = MonitorSignal(
     kind="metric_gate",
-    dedupe_key="train-1:gate:0",
+    dedupe_key="train-1:r1:gate:0",
     training_id="train-1",
     metric="val/loss",
     value=0.19,
@@ -79,15 +79,9 @@ def test_same_policy_reregistration_preserves_derived_state(tmp_path: Path):
         assert store.pending_signals() == [SIGNAL]
 
 
-def test_changed_policy_reactivates_monitor_and_clears_old_state(tmp_path: Path):
+def test_policy_revisions_preserve_evidence_and_fence_old_polls(tmp_path: Path):
     original = spec()
-    changed = original.model_copy(
-        update={
-            "gates": (MetricGate(operator="lte", threshold=0.1),),
-            "registered_at": NOW + timedelta(minutes=5),
-        }
-    )
-
+    changed = original.model_copy(update={"metric": "other/loss"})
     with MonitorStore(tmp_path / "monitors.sqlite3") as store:
         store.register(original)
         store.record_poll(
@@ -96,17 +90,71 @@ def test_changed_policy_reactivates_monitor_and_clears_old_state(tmp_path: Path)
             MetricSample(value=0.19, observed_at=NOW),
             now=NOW,
         )
-        store.complete(original.training_id)
-
-        assert store.register(changed) is True
-        assert store.active() == [changed]
+        envelope = store.pending_events()[0]
+        assert store.register(changed)
+        assert store.spec("train-1").policy_revision == 2
         assert store.previous_sample("train-1") is None
         assert store.baseline_sample("train-1") is None
-        assert store.pending_signals() == []
-        assert store.emitted("train-1") == frozenset()
-        assert store.due(NOW + timedelta(minutes=5)) == [changed]
-        marker = store.marker_dir / "train-1.json"
-        assert TrainingMonitorSpec.model_validate_json(marker.read_text()) == changed
+        store.record_poll(
+            original,
+            MonitorEvaluation(),
+            MetricSample(value=99, observed_at=NOW),
+            now=NOW,
+        )
+        assert (
+            store.record_poll_error(
+                original, ValueError("old poll"), state=TrainingState.RUNNING
+            )
+            is None
+        )
+        assert store.previous_sample("train-1") is None
+        assert store.pending_events() == (envelope,)
+        assert store.register(original)
+        assert store.spec("train-1").policy_revision == 3
+        assert not store.register(
+            original.model_copy(
+                update={"poll_interval_seconds": 5, "stale_after_seconds": 999}
+            )
+        )
+        assert store.spec("train-1").policy_revision == 3
+        assert store.spec("train-1").poll_interval_seconds == 5
+        assert store.spec("train-1").stale_after_seconds == 999
+        assert store.pending_signals() == [SIGNAL]
+        store.complete("train-1", state=TrainingState.FINISHED)
+        assert not store.register(changed)
+        assert store.active() == []
+        assert not (store.marker_dir / "train-1.json").exists()
+        assert store.pending_signals()[0] == SIGNAL
+        assert store.pending_signals()[1].state is TrainingState.FINISHED
+
+
+def test_terminal_completion_supersedes_only_stale_not_unhandled_evidence(
+    tmp_path: Path,
+):
+    original = spec()
+    stale = SIGNAL.model_copy(
+        update={"kind": "metric_stale", "dedupe_key": "train-1:stale:1"}
+    )
+    failure = SIGNAL.model_copy(
+        update={
+            "kind": "monitor_error",
+            "dedupe_key": "train-1:error",
+            "hard_failure": True,
+        }
+    )
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(original)
+        store.record_poll(
+            original, MonitorEvaluation(signals=(SIGNAL, stale, failure)), None
+        )
+        store.complete("train-1", state=TrainingState.FINISHED)
+        assert store.pending_signals()[:2] == [SIGNAL, failure]
+        assert store.pending_signals()[2].state is TrainingState.FINISHED
+        row = store.connection.execute(
+            "SELECT handled, superseded_reason FROM monitor_signals WHERE dedupe_key = ?",
+            (stale.dedupe_key,),
+        ).fetchone()
+        assert row == (0, "training reached finished")
 
 
 def test_signal_is_durable_deduplicated_and_acknowledged(tmp_path: Path):
@@ -130,9 +178,7 @@ def test_signal_is_durable_deduplicated_and_acknowledged(tmp_path: Path):
 
 
 def test_first_sample_remains_the_change_gate_baseline(tmp_path: Path):
-    monitor = spec(
-        gates=(MetricGate(operator="improved_by", threshold=0.1),)
-    )
+    monitor = spec(gates=(MetricGate(operator="improved_by", threshold=0.1),))
     first = MetricSample(value=0.8, observed_at=NOW)
     later = MetricSample(value=0.75, observed_at=NOW + timedelta(minutes=1))
 
@@ -205,3 +251,26 @@ def test_legacy_schema_promotes_previous_sample_to_change_baseline(
         )
 
         assert [item.kind for item in evaluation.signals] == ["metric_gate"]
+
+
+def test_upgrade_retires_existing_terminal_staleness_without_claiming_delivery(
+    tmp_path: Path,
+):
+    database = tmp_path / "monitors.sqlite3"
+    monitor = spec()
+    stale = SIGNAL.model_copy(
+        update={"dedupe_key": "train-1:stale:old", "kind": "metric_stale"}
+    )
+    with MonitorStore(database) as store:
+        store.register(monitor)
+        store.record_poll(monitor, MonitorEvaluation(signals=(stale, SIGNAL)), None)
+    # The previous implementation persisted active=0 without retiring its pending stale row.
+    with sqlite3.connect(database) as db:
+        db.execute("UPDATE monitors SET active=0")
+    for _ in range(2):
+        with MonitorStore(database) as reopened:
+            assert reopened.pending_signals() == [SIGNAL]
+            assert reopened.connection.execute(
+                "SELECT handled, superseded_reason FROM monitor_signals WHERE dedupe_key=?",
+                (stale.dedupe_key,),
+            ).fetchone() == (0, "monitor was already terminal at upgrade")

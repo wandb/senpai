@@ -18,6 +18,7 @@ from typing import Literal, Protocol
 from uuid import UUID
 
 from senpai_agent.agent_markdown import strip_spdx_header
+from senpai_agent.event_conflicts import DeliveryBlocked, EventIdentityConflict
 from senpai_agent.github.mailbox import ActiveGitHubWatcher, GitHubMailbox
 from senpai_agent.inbox import (
     EXACT_ONCE_EVENT_KINDS,
@@ -533,6 +534,13 @@ class Controller:
                         flush=True,
                     )
                     continue
+                except DeliveryBlocked as error:
+                    turn_failures.pop(conversation_id, None)
+                    served_conversations.add(conversation_id)
+                    print(
+                        f"SENPAI_DELIVERY_BLOCKED {error}", file=sys.stderr, flush=True
+                    )
+                    continue
                 except Exception as error:  # noqa: BLE001
                     now = time.time()
                     provider_failure = _provider_failure(error, now)
@@ -645,15 +653,39 @@ class Controller:
                 flush=True,
             )
             return
-        for event in polled:
-            if event.kind == "student_assignment_comment":
-                self.inbox.require_event_payload(
-                    self.conversation_id,
-                    event.dedupe_key,
-                    event.to_prompt(),
-                )
+        validated: list[ControllerEvent] = []
+        for batch in self._event_batches(polled):
+            seen: dict[str, str] = {}
+            for event in batch.events:
+                body = event.to_prompt()
+                try:
+                    if event.conflict is not None:
+                        conflict = replace(
+                            event.conflict, conversation_id=str(batch.conversation_id)
+                        )
+                        self.inbox.record_conflict(conflict)
+                        continue
+                    if event.dedupe_key in seen and seen[event.dedupe_key] != body:
+                        conflict = EventIdentityConflict(
+                            str(batch.conversation_id),
+                            event.dedupe_key,
+                            seen[event.dedupe_key],
+                            body,
+                        )
+                        self.inbox.record_conflict(conflict)
+                        continue
+                    self.inbox.require_event_payload(
+                        batch.conversation_id,
+                        event.dedupe_key,
+                        body,
+                        once=event.kind in EXACT_ONCE_EVENT_KINDS,
+                    )
+                    seen[event.dedupe_key] = body
+                except EventIdentityConflict:
+                    continue
+                validated.append(event)
         events = self._new_events(
-            polled,
+            validated,
             allow_reminders=allow_reminders,
         )
         self._enqueue_events(events)
@@ -697,29 +729,32 @@ class Controller:
                     ):
                         self._clear_workspace_divergence(conversation_id)
             for event in batch_events:
-                steering_priority = STEERING_PRIORITIES.get(event.kind)
-                if steering_priority is not None:
-                    if event.kind == "supervisor_recovered":
-                        self._deferred_conversations.pop(conversation_id, None)
-                    self.inbox.steer(
-                        conversation_id,
-                        event.dedupe_key,
-                        event.to_prompt(),
-                        priority=steering_priority,
-                        once=event.kind in EXACT_ONCE_EVENT_KINDS,
-                    )
-                else:
-                    self.inbox.enqueue(
-                        conversation_id,
-                        event.dedupe_key,
-                        event.to_prompt(),
-                        priority=(
-                            QUEUE_PRIORITY
-                            if event.kind == "student_assignment"
-                            else 0
-                        ),
-                        once=event.kind in EXACT_ONCE_EVENT_KINDS,
-                    )
+                try:
+                    steering_priority = STEERING_PRIORITIES.get(event.kind)
+                    if steering_priority is not None:
+                        if event.kind == "supervisor_recovered":
+                            self._deferred_conversations.pop(conversation_id, None)
+                        self.inbox.steer(
+                            conversation_id,
+                            event.dedupe_key,
+                            event.to_prompt(),
+                            priority=steering_priority,
+                            once=event.kind in EXACT_ONCE_EVENT_KINDS,
+                        )
+                    else:
+                        self.inbox.enqueue(
+                            conversation_id,
+                            event.dedupe_key,
+                            event.to_prompt(),
+                            priority=(
+                                QUEUE_PRIORITY
+                                if event.kind == "student_assignment"
+                                else 0
+                            ),
+                            once=event.kind in EXACT_ONCE_EVENT_KINDS,
+                        )
+                except EventIdentityConflict:
+                    continue
 
     def _next_ready_turn(
         self,
@@ -807,6 +842,7 @@ class Controller:
         completed_turn: bool = False,
     ) -> None:
         if self.progress is not None:
+            self.progress.delivery_conflicts = len(self.inbox.conflicts())
             self.progress.update(
                 phase,
                 timeout_seconds or self.operation_timeout_seconds,

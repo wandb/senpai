@@ -166,6 +166,10 @@ def test_event_store_deduplicates_and_survives_reopen(tmp_path: Path):
             store.enqueue(event.model_copy(update={"payload": {"pr": 999}}))
 
     with LocalEventStore(database) as reopened:
+        assert reopened.pending() == []
+        assert reopened.get(event.dedupe_key) == event
+        conflict = reopened.conflicts()[0]
+        reopened.resolve_conflict(conflict.identity, "Invalid candidate withdrawn")
         pending = reopened.pending()
         assert pending == [event]
         reopened.acknowledge(event.dedupe_key)

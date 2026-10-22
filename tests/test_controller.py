@@ -902,12 +902,15 @@ def test_visible_event_identity_cannot_change_payload_between_polls(tmp_path: Pa
         payload={"comment_id": "message-1", "message": "STUDENT: Changed."},
     )
 
-    with pytest.raises(RuntimeError, match="reused with a different payload"):
-        controller(
-            Mailbox([(first,), (edited,)]),
-            Turns(),
-            inbox=PersistentInbox(tmp_path / "inbox.sqlite3"),
-        ).run(max_cycles=1)
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    turns = Turns()
+    mailbox = Mailbox([(first,), (edited,)])
+    controller(mailbox, turns, inbox=inbox).run(max_cycles=1)
+    assert len(turns.calls) == 1
+    assert len(inbox.conflicts()) == 1
+    assert inbox.conflicts()[0].candidate_body == edited.to_prompt()
+    assert mailbox.acknowledged == [(first.dedupe_key,)]
+    assert inbox.ready_conversation_ids() == ()
 
 
 def test_changed_research_base_sha_wakes_immediately():

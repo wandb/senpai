@@ -13,6 +13,14 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from senpai_agent.event_conflicts import (
+    EventIdentityConflict,
+    create_conflict_table,
+    record_conflict,
+    resolve_conflict,
+    unresolved_conflicts,
+)
+from senpai_agent.inbox import EXACT_ONCE_EVENT_KINDS
 from senpai_agent.PROMPTS import (
     LOCAL_EVENT_PROMPT,
     render_event_prompt,
@@ -78,6 +86,8 @@ class LocalEventStore:
                     """
                 )
                 self._connection.commit()
+            create_conflict_table(self._connection)
+            self._connection.commit()
 
     def get(self, dedupe_key: str) -> LocalEvent | None:
         """Read a durable event, including one already acknowledged."""
@@ -90,22 +100,37 @@ class LocalEventStore:
 
     def enqueue(self, event: LocalEvent) -> bool:
         with self._lock:
-            existing = self.get(event.dedupe_key)
-            if existing is not None:
-                if existing.kind != event.kind or existing.payload != event.payload:
-                    raise RuntimeError(
-                        f"event {event.dedupe_key!r} was reused with a different payload"
+            try:
+                with self._connection:
+                    self._connection.execute("BEGIN IMMEDIATE")
+                    existing = self.get(event.dedupe_key)
+                    if existing is not None:
+                        if (
+                            existing.kind == event.kind
+                            and event.kind in EXACT_ONCE_EVENT_KINDS
+                            and existing.to_inbox_message() == event.to_inbox_message()
+                        ):
+                            return False
+                        if (
+                            existing.kind != event.kind
+                            or existing.payload != event.payload
+                        ):
+                            raise EventIdentityConflict(
+                                str(event.payload.get("parent_conversation_id", "")),
+                                event.dedupe_key,
+                                existing.model_dump_json(exclude={"observed_at"}),
+                                event.model_dump_json(exclude={"observed_at"}),
+                            )
+                        return False
+                    self._connection.execute(
+                        "INSERT INTO advisor_events (dedupe_key, event_json) VALUES (?, ?)",
+                        (event.dedupe_key, event.model_dump_json()),
                     )
-                return False
-            cursor = self._connection.execute(
-                """
-                INSERT INTO advisor_events (dedupe_key, event_json)
-                VALUES (?, ?)
-                """,
-                (event.dedupe_key, event.model_dump_json()),
-            )
-            self._connection.commit()
-            return cursor.rowcount == 1
+                    return True
+            except EventIdentityConflict as conflict:
+                with self._connection:
+                    record_conflict(self._connection, conflict)
+                raise
 
     def pending(self) -> list[LocalEvent]:
         with self._lock:
@@ -113,22 +138,39 @@ class LocalEventStore:
                 """
                 SELECT event_json
                 FROM advisor_events
-                WHERE acknowledged = 0
+                WHERE acknowledged = 0 AND dedupe_key NOT IN (
+                    SELECT event_key FROM event_conflicts WHERE resolution IS NULL
+                )
                 ORDER BY rowid
                 """
             ).fetchall()
         return [LocalEvent.model_validate_json(row[0]) for row in rows]
 
-    def pending_count(self) -> int:
+    def pending_count(self, parent_conversation_id: str | None = None) -> int:
         with self._lock:
-            row = self._connection.execute(
-                """
-                SELECT COUNT(*)
-                FROM advisor_events
-                WHERE acknowledged = 0
-                """
-            ).fetchone()
-        return int(row[0])
+            pending = self._connection.execute(
+                """SELECT COUNT(*) FROM advisor_events
+                   WHERE acknowledged = 0
+                     AND (? IS NULL OR json_extract(event_json, '$.payload.parent_conversation_id') = ?)
+                     AND dedupe_key NOT IN (
+                         SELECT event_key FROM event_conflicts WHERE resolution IS NULL
+                     )""",
+                (parent_conversation_id, parent_conversation_id),
+            ).fetchone()[0]
+            conflicts = self._connection.execute(
+                """SELECT COUNT(*) FROM event_conflicts WHERE resolution IS NULL
+                   AND (? IS NULL OR conversation_id IN ('', ?))""",
+                (parent_conversation_id, parent_conversation_id),
+            ).fetchone()[0]
+            return pending + conflicts
+
+    def conflicts(self) -> tuple[EventIdentityConflict, ...]:
+        with self._lock:
+            return unresolved_conflicts(self._connection)
+
+    def resolve_conflict(self, identity: str, reason: str) -> None:
+        with self._lock, self._connection:
+            resolve_conflict(self._connection, identity, reason)
 
     def acknowledge(self, dedupe_key: str) -> None:
         with self._lock:
