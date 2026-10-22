@@ -162,9 +162,9 @@ def test_both_roles_open_issues_with_configured_audience_and_token_owner_mention
         "advisor-branch" if role == "advisor" else "student:fern",
     }
     expected_message = (
-        "ADVISOR: Can we run another seed?"
+        "**Advisor**\n\n---\n\nCan we run another seed?"
         if role == "advisor"
-        else "**STUDENT: fern**\n\nCan we run another seed?"
+        else "**Student: fern**\n\n---\n\nCan we run another seed?"
     )
     assert expected_message in created["body"]
     assert created["body"].endswith("\n\n@senpai-bot")
