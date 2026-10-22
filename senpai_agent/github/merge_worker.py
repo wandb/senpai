@@ -63,9 +63,9 @@ def merge_with_review(
                 f"**Verdict: {verdict}**\n\n"
                 f"Reviewed PR #{assignment.pr_number} at "
                 f"`{assignment.expected_pr_head_sha}` against research base "
-                f"`{action.expected_current_base_sha}`.\n\n{summary}\n\n"
-                "This review covers code quality. Scientific validity and experiment "
-                "selection remain the advisor's responsibility."
+                f"`{action.expected_current_base_sha}`.\n\n---\n\n{summary}\n\n---\n\n"
+                "*This review covers code quality. Scientific validity and experiment "
+                "selection remain the advisor's responsibility.*"
             ),
         )
 
