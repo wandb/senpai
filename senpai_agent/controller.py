@@ -11,7 +11,6 @@ from base64 import b64decode
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from email.utils import parsedate_to_datetime
 from functools import partial
 from pathlib import Path
 from typing import Literal, Protocol
@@ -54,6 +53,7 @@ from senpai_agent.PROMPTS import (
     OPERATOR_INSTRUCTIONS_PROMPT,
     render_prompt,
 )
+from senpai_agent.provider_retry import retry_after_seconds
 from senpai_agent.secrets import PRIVATE_CREDENTIAL_FD_ENVS, set_process_nondumpable
 from senpai_agent.state import (
     AssignmentConversationRegistry,
@@ -138,34 +138,6 @@ def _exception_chain(error: BaseException) -> Iterator[BaseException]:
             pending.append(linked)
 
 
-def _retry_after_seconds(error: BaseException, now: float) -> float:
-    value = getattr(error, "retry_after", None)
-    if value is None:
-        value = next(
-            (
-                header
-                for headers in (
-                    getattr(error, "litellm_response_headers", None),
-                    getattr(error, "headers", None),
-                    getattr(getattr(error, "response", None), "headers", None),
-                )
-                if headers
-                for name, header in headers.items()
-                if str(name).casefold() == "retry-after"
-            ),
-            None,
-        )
-    if value is None:
-        return 0
-    try:
-        return max(0, float(value))
-    except (TypeError, ValueError):
-        try:
-            return max(0, parsedate_to_datetime(str(value)).timestamp() - now)
-        except (TypeError, ValueError, OverflowError):
-            return 0
-
-
 def _provider_failure(error: Exception, now: float) -> ProviderFailure | None:
     from openai import OpenAIError
     from openhands.sdk.event.error_classification import FailureKind, classify_error
@@ -173,7 +145,11 @@ def _provider_failure(error: Exception, now: float) -> ProviderFailure | None:
 
     chain = tuple(_exception_chain(error))
     if any(isinstance(current, ModelRequestDeadlineExceeded) for current in chain):
-        return ProviderFailure(retryable=True, refund_inference_attempt=False)
+        return ProviderFailure(
+            retryable=True,
+            retry_after=max(retry_after_seconds(current, now) for current in chain),
+            refund_inference_attempt=False,
+        )
     if not any(isinstance(current, (LLMError, OpenAIError)) for current in chain):
         return None
     kinds = {
@@ -187,7 +163,7 @@ def _provider_failure(error: Exception, now: float) -> ProviderFailure | None:
     if kinds & {FailureKind.RATE_LIMIT, FailureKind.TRANSIENT}:
         return ProviderFailure(
             retryable=True,
-            retry_after=max(_retry_after_seconds(current, now) for current in chain),
+            retry_after=max(retry_after_seconds(current, now) for current in chain),
         )
     return ProviderFailure(retryable=False)
 

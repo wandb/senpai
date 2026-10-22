@@ -232,11 +232,14 @@ feedback remains pending.
 
 The inference-start counters are persisted before the SDK run. A typed request
 deadline uses the controller's transient-provider cooldown but does not refund
-those counters. Ordinary transient provider errors retain their existing refund
-behavior. A supervisor termination also leaves the counters intact. Retries and
-restarts therefore retain the existing no-progress and recovery limits. Resume
-first reconciles a persisted final response and rejects unmatched tool actions;
-it does not automatically replay those actions.
+those counters. Retry-After guidance observed during that request survives
+cancellation as an absolute expiry. Cooldown uses the remaining provider delay.
+Completed requests do not carry their retry guidance into later requests.
+Ordinary transient provider errors retain their existing refund behavior. A
+supervisor termination also leaves the counters intact. Retries and restarts
+therefore retain the existing no-progress and recovery limits. Resume first
+reconciles a persisted final response and rejects unmatched tool actions; it
+does not automatically replay those actions.
 Local termination cannot establish whether a provider completed or billed an
 unobserved response. These guarantees require retaining the saved controller
 state across restarts. Kubernetes container restarts preserve `emptyDir` state;

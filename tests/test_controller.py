@@ -1183,8 +1183,9 @@ def test_transient_provider_failure_defers_and_retries_the_same_turn(
     assert "SENPAI_PROVIDER_COOLDOWN" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("retry_after", [0, 300])
 def test_request_deadlines_defer_without_refunding_the_recovery_budget(
-    tmp_path, monkeypatch, capsys,
+    tmp_path, monkeypatch, capsys, retry_after,
 ):
     from senpai_agent.inference_heartbeat import ModelRequestDeadlineExceeded
 
@@ -1193,17 +1194,23 @@ def test_request_deadlines_defer_without_refunding_the_recovery_budget(
     monkeypatch.setattr(controller_module.time, "time", lambda: clock[0])
     inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
     mailbox = Mailbox([(review_event(),)])
-    turns = ProviderTurns([
-        ConversationRunError(CONVERSATION_ID, ModelRequestDeadlineExceeded("expired"))
-        for _ in range(3)
-    ])
+    retry_at = clock[0] + retry_after if retry_after else 0
+    errors = []
+    for _ in range(3):
+        error = ModelRequestDeadlineExceeded("expired")
+        error.retry_at = retry_at
+        errors.append(error)
+    turns = ProviderTurns(errors)
+    # Time spent cancelling/closing must count against the provider's wait.
+    clock[0] += 20
     runtime = controller(
         mailbox, turns, inbox=inbox, max_consecutive_turn_failures=1,
     )
-    for _ in range(3):
+    for base_delay in (30, 60, 120):
         runtime.run(max_cycles=1)
         cooldown = inbox.provider_cooldown()
         assert cooldown is not None
+        assert cooldown.retry_at == max(retry_at, clock[0] + base_delay)
         clock[0] = cooldown.retry_at
 
     assert len(set(turns.turn_ids)) == 1

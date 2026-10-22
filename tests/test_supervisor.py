@@ -473,14 +473,17 @@ raise SystemExit(99)
     assert f"reason=overdue:{phase}" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("expire_between_reads", [False, True])
 def test_supervisor_catches_cancellation_stuck_after_request_scope_closes(
-    tmp_path: Path, monkeypatch, capsys,
+    tmp_path: Path, monkeypatch, capsys, expire_between_reads,
 ):
     monkeypatch.setattr(supervisor_module, "INFERENCE_CANCELLATION_GRACE_SECONDS", 0.1)
     worker = """
 import asyncio
 import os
 import signal
+import sys
+import time
 from pathlib import Path
 from senpai_agent.supervisor import ProgressLease
 
@@ -503,17 +506,24 @@ class Conversation:
     def interrupt(self):
         pass
 
+def request_deadline():
+    deadline = heartbeat.deadline()
+    if sys.argv[1] == 'True' and deadline is not None:
+        # Model descheduling between the tracker and runner reading one clock.
+        time.sleep(max(0, deadline - time.monotonic()) + 0.005)
+    return deadline
+
 async def run():
     async def escape():
         await asyncio.sleep(2)
         os._exit(99)
     asyncio.create_task(escape())
-    await arun_conversation(Conversation(), 30, request_deadline=heartbeat.deadline)
+    await arun_conversation(Conversation(), 30, request_deadline=request_deadline)
 asyncio.run(run())
 """
     lease_path = tmp_path / "controller-lease.json"
     supervisor = WorkerSupervisor(
-        command=(sys.executable, "-c", worker),
+        command=(sys.executable, "-c", worker, str(expire_between_reads)),
         lease_path=lease_path,
         config=SupervisorConfig(
             startup_timeout_seconds=10,

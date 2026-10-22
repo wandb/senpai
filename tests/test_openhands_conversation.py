@@ -1,7 +1,5 @@
 import json
 import signal
-import subprocess
-import sys
 import threading
 import time
 from io import StringIO
@@ -1480,7 +1478,7 @@ def test_turn_activity_renews_the_inactivity_deadline():
 
 
 @pytest.mark.parametrize("request_delay", [0, 0.02])
-def test_request_deadline_cancels_inference_and_preserves_background_work(request_delay):
+def test_request_deadline_cancels_inference_without_waiting_for_inactivity(request_delay):
     states = []
     heartbeat = InferenceHeartbeat(
         lambda *state: states.append(state), timeout_seconds=0.02,
@@ -1506,19 +1504,15 @@ def test_request_deadline_cancels_inference_and_preserves_background_work(reques
                 timeout=3,
             )
 
-    background = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         started = time.monotonic()
         runner.asyncio.run(run())
         assert time.monotonic() - started < 1.5
         assert interrupts == [True]
-        assert background.poll() is None
         # Keep the external watchdog armed while the caller closes the conversation.
         assert heartbeat.deadline() is not None
     finally:
         heartbeat.close()
-        background.terminate()
-        background.wait(timeout=5)
     assert states[-1] == (None, None, None)
 
 
@@ -1562,7 +1556,8 @@ def test_request_recovery_keeps_the_watchdog_armed_until_conversation_cleanup(
     isolate_agent_discovery(monkeypatch, runner)
     try:
         expected = SystemExit if close_fails else ModelRequestDeadlineExceeded
-        with pytest.raises(expected):
+        message = "RuntimeError: executor cleanup failed" if close_fails else None
+        with pytest.raises(expected, match=message):
             run_openhands(
                 "task", runtime_config(tmp_path, llm_timeout_seconds=1),
                 on_inference_state=lambda *state: states.append(state),

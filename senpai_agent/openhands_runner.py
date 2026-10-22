@@ -1385,8 +1385,9 @@ async def arun_conversation(
         return
     deadline = time.monotonic() + timeout_seconds
     while True:
-        request_expires = request_deadline() if request_deadline is not None else None
+        # The callback latches expiry; cancellation must use an earlier sample.
         now = time.monotonic()
+        request_expires = request_deadline() if request_deadline is not None else None
         if request_expires is not None and now >= request_expires:
             print("SENPAI_LLM_REQUEST_DEADLINE", file=sys.stderr, flush=True)
             error = ModelRequestDeadlineExceeded(
@@ -1812,6 +1813,7 @@ def run_openhands[ResponseT: BaseModel](
         ) -> None:
             if error is not None:
                 retried_provider_errors.set((*retried_provider_errors.get(), error))
+                inference_heartbeat.record_retry(error)
 
         inference_heartbeat = InferenceHeartbeat(
             on_inference_state or (lambda *_state: None),
@@ -2069,6 +2071,9 @@ def run_openhands[ResponseT: BaseModel](
                 child_result,
                 run_deadline,
             )
+    except ModelRequestDeadlineExceeded as error:
+        error.retry_at = inference_heartbeat.expired_retry_at()
+        raise
     finally:
         primary_error = sys.exc_info()[1]
         if config.child and config.delegation_task_id and conversation is not None:
@@ -2101,7 +2106,8 @@ def run_openhands[ResponseT: BaseModel](
                 raise
             if isinstance(primary_error, ModelRequestDeadlineExceeded):
                 raise SystemExit(
-                    "request deadline recovery could not close the conversation"
+                    "request deadline recovery could not close the conversation: "
+                    f"{type(error).__name__}: {error}"
                 ) from error
             primary_error.add_note(
                 f"Cleanup also failed: {type(error).__name__}: {error}"
