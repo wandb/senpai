@@ -2,12 +2,14 @@ import argparse
 import threading
 import uuid
 from collections.abc import Callable, Sequence, Set
+from dataclasses import replace
 from pathlib import Path
 from types import TracebackType
 from typing import Protocol, Self
 
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
 
+from senpai_agent.event_conflicts import DeliveryBlocked, EventIdentityConflict
 from senpai_agent.hooks import queued_feedback_marker
 from senpai_agent.inbox import (
     ADVISOR_ACTIVE_STEERING_PRIORITIES,
@@ -56,6 +58,11 @@ def _deliver_pending_events(
     already_delivered: Set[str] = frozenset(),
     parent_conversation_id: str | None = None,
 ) -> int:
+    if any(
+        parent_conversation_id is None or c.conversation_id in ("", parent_conversation_id)
+        for c in store.conflicts()
+    ):
+        raise DeliveryBlocked("local event delivery has unresolved conflicts")
     delivered = 0
     pending = store.pending()
     if parent_conversation_id is not None:
@@ -142,15 +149,31 @@ class AdvisorEventPump:
     def _run(self) -> None:
         try:
             while not self._stop.is_set():
-                if self._store.pending_count():
+                if self._store.pending_count(self._parent_conversation_id):
                     self._deliver_if_safe()
                 self._stop.wait(self._poll_interval)
+        except DeliveryBlocked as error:
+            self._hold_at_boundary(error)
         except BaseException as error:  # noqa: BLE001
             self._fail(error)
 
+    def _hold_at_boundary(self, error: DeliveryBlocked) -> None:
+        with self._steer_lock:
+            if self._error is not None or self._stop.is_set():
+                return
+            self._error = error
+            self._accept_steering = False
+            self._steer_generation += 1
+            generation = self._steer_generation
+            self._steer_mode = QUEUE_PRIORITY
+            self._steer_ready.clear()
+            active_run = self._run_armed
+        # pause() waits for the current agent step; interrupt() cancels its tools.
+        self._queue_for_steer(active_run, generation)
+
     def _fail(self, error: BaseException) -> None:
         with self._steer_lock:
-            first_failure = self._error is None
+            first_failure = self._error is None or isinstance(self._error, DeliveryBlocked)
             if first_failure:
                 self._error = error
             should_interrupt = (
@@ -188,6 +211,13 @@ class AdvisorEventPump:
             )
 
     def _transfer_to_inbox(self) -> int:
+        for conflict in self._store.conflicts():
+            if conflict.conversation_id not in ("", str(self._conversation_id)):
+                continue
+            self._inbox.record_conflict(
+                replace(conflict, conversation_id=str(self._conversation_id))
+            )
+        self._inbox.require_delivery_ready(self._conversation_id)
         pending = self._store.pending()
         if self._parent_conversation_id is not None:
             pending = [
@@ -201,45 +231,50 @@ class AdvisorEventPump:
         steer_generation = 0
         steer_active_run = False
         for event in pending:
-            mode = ADVISOR_ACTIVE_STEERING_PRIORITIES.get(event.kind)
-            if mode is not None:
-                with self._steer_lock:
-                    if not self._accept_steering:
-                        continue
-                    steering = self._inbox.steer(
+            try:
+                mode = ADVISOR_ACTIVE_STEERING_PRIORITIES.get(event.kind)
+                if mode is not None:
+                    with self._steer_lock:
+                        if not self._accept_steering:
+                            continue
+                        steering = self._inbox.steer(
+                            self._conversation_id,
+                            event.dedupe_key,
+                            event.to_inbox_message(),
+                            priority=mode,
+                            once=event.kind in EXACT_ONCE_EVENT_KINDS,
+                        )
+                        if steering is not None:
+                            turn_id, state = steering
+                            if state == DeliveryState.PENDING:
+                                if self._steer_turn_id is None:
+                                    self._steer_generation += 1
+                                    steer_generation = self._steer_generation
+                                    start_mode = mode
+                                    self._steer_ready.clear()
+                                    self._steer_interrupt_requested = False
+                                    self._steer_interrupt_notice = False
+                                    self._steer_paused = False
+                                    steer_active_run = self._run_armed
+                                    self._steer_mode = mode
+                                elif mode > self._steer_mode:
+                                    steer_generation = self._steer_generation
+                                    start_mode = mode
+                                    self._steer_ready.clear()
+                                    steer_active_run = self._run_armed
+                                    self._steer_mode = mode
+                                self._steer_turn_id = turn_id
+                else:
+                    self._inbox.enqueue(
                         self._conversation_id,
                         event.dedupe_key,
                         event.to_inbox_message(),
-                        priority=mode,
                         once=event.kind in EXACT_ONCE_EVENT_KINDS,
                     )
-                    if steering is not None:
-                        turn_id, state = steering
-                        if state == DeliveryState.PENDING:
-                            if self._steer_turn_id is None:
-                                self._steer_generation += 1
-                                steer_generation = self._steer_generation
-                                start_mode = mode
-                                self._steer_ready.clear()
-                                self._steer_interrupt_requested = False
-                                self._steer_interrupt_notice = False
-                                self._steer_paused = False
-                                steer_active_run = self._run_armed
-                                self._steer_mode = mode
-                            elif mode > self._steer_mode:
-                                steer_generation = self._steer_generation
-                                start_mode = mode
-                                self._steer_ready.clear()
-                                steer_active_run = self._run_armed
-                                self._steer_mode = mode
-                            self._steer_turn_id = turn_id
-            else:
-                self._inbox.enqueue(
-                    self._conversation_id,
-                    event.dedupe_key,
-                    event.to_inbox_message(),
-                    once=event.kind in EXACT_ONCE_EVENT_KINDS,
-                )
+            except EventIdentityConflict:
+                # Hold this conversation after its current agent step finishes.
+                self._inbox.require_delivery_ready(self._conversation_id)
+                continue
             self._store.acknowledge(event.dedupe_key)
             transferred += 1
         if start_mode == STEER_PRIORITY:
@@ -347,13 +382,19 @@ class AdvisorEventPump:
     def run_started(self) -> None:
         with self._steer_lock:
             self._run_started.set()
-            should_interrupt = self._error is not None and self._run_armed
+            should_interrupt = (
+                self._error is not None
+                and not isinstance(self._error, DeliveryBlocked)
+                and self._run_armed
+            )
         if should_interrupt:
             self._conversation.interrupt()
 
     def prepare_run(self) -> bool:
         """Arm one run, or deliver steering that arrived before it started."""
 
+        if self._inbox is not None:
+            self._inbox.require_delivery_ready(self._conversation_id)
         with self._steer_lock:
             if self._error is not None:
                 raise self._error
@@ -369,6 +410,8 @@ class AdvisorEventPump:
 
         with self._steer_lock:
             self._run_armed = False
+            if self._error is not None:
+                raise self._error
             if self._steer_turn_id is None:
                 self._accept_steering = False
                 return False

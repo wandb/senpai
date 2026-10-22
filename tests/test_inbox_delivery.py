@@ -124,6 +124,11 @@ def test_event_identity_cannot_hide_a_changed_payload(tmp_path: Path):
     with pytest.raises(RuntimeError, match="reused with a different payload"):
         inbox.enqueue(CONVERSATION_ID, "event:1", "changed event")
 
+    assert inbox.next_turn(CONVERSATION_ID, "controller prompt") is None
+    conflict = PersistentInbox(inbox.path).conflicts()[0]
+    assert conflict.original_body == "canonical event"
+    assert conflict.candidate_body == "changed event"
+    inbox.resolve_conflict(conflict.identity, "Candidate withdrawn after producer repair")
     turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
     assert turn is not None
     deliver_turn_messages(Conversation(), inbox, turn.turn_id)

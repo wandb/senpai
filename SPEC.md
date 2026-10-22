@@ -196,11 +196,78 @@ Generic child results use a local SQLite WAL event store because parent and
 child run on the same advisor or student instance. That is not an inter-node
 protocol.
 
-The only SQLite databases are `advisor-events.sqlite3`, for unacknowledged
-advisor watcher/child events; `student-events.sqlite3`, for unacknowledged
-student feedback/child events; and `training/monitors.sqlite3`, for student
-monitor policy, samples, and deduplicated actionable signals. OpenHands
-conversation history is a separate file-backed per-UUID event log.
+Controller delivery uses `delivery-inbox.sqlite3`. Local staging uses
+`advisor-events.sqlite3` for advisor watcher/child events and
+`student-events.sqlite3` for student feedback/child events.
+`training/monitors.sqlite3` stores student monitor policies, samples, and
+signals. OpenHands conversation history is a separate file-backed per-UUID
+event log.
+
+### Conflicting notification identities
+
+An event key identifies one immutable message. A changed payload under that key
+is a producer error, not an edited notification. The inbox and local event store
+retain both bodies in `event_conflicts`, with their conversation, key, first
+observation time, and stable conflict identifier. Foreground polling checks
+identity before reminder suppression; composite mailboxes retain conflicting
+candidates instead of selecting one. Active delivery uses the same inbox check.
+
+An unresolved conflict holds its conversation before another inference turn and
+pauses an active turn at the next safe agent-step boundary. It does not interrupt
+or cancel an executing tool. It does not count as a failed turn or restart the
+controller. A failure in the pause operation remains a runtime error and uses
+normal failure handling, including a hard interrupt that can cancel tools.
+Valid messages for the held conversation still enter its durable queue. Unrelated conversations,
+executor supervision, and monitor polling continue. This cannot undo a tool or
+external action already in progress. The progress lease reports
+`delivery_conflicts` separately from process liveness; Ready does not mean every
+conversation can advance.
+
+An inference attempt that started before the hold still counts toward the
+inbox's no-progress and total-attempt budgets. Waiting on a hold starts no new
+attempts. Repeated holds after explicit resolution, without intervening tool
+progress, can exhaust those budgets and enter the existing recovery process.
+
+Local staging acknowledgement means the inbox accepted custody. It does not
+mean the model processed the message. A conflicting candidate gets neither
+receipt. Successful turn processing remains a separate durable transition.
+
+Every new metric notification uses a revision-qualified key, including revision
+one after an upgrade. Existing signal rows keep their original keys and rendered
+text; their slots remain deduplicated. Revision numbering starts with the policy
+retained at upgrade, not a reconstructed history of deleted policies. Existing
+staleness warnings for inactive monitors are superseded with an explicit upgrade
+reason: the previous implementation marked monitors inactive only on completion.
+Other contradictory records are retained and held on first inspection, not
+rewritten or automatically reissued. An operator must inspect both bodies,
+repair or withdraw the producer's invalid candidate, and explicitly reject it:
+
+```bash
+python -m senpai_agent.event_conflicts /path/to/delivery-inbox.sqlite3 list
+python -m senpai_agent.event_conflicts /path/to/delivery-inbox.sqlite3 reject CONFLICT_ID \
+  --reason 'Describe the evidence and the producer repair or withdrawal'
+```
+
+A rejected monitor candidate must also be withdrawn from its source before the
+inbox hold is released. Withdrawal retains the signal and records the reason;
+it does not mark the signal handled or change the training state:
+
+```bash
+python -m senpai_agent.event_conflicts /path/to/training/monitors.sqlite3 \
+  withdraw-monitor ORIGINAL_EVENT_KEY --reason 'Explain why this notification is obsolete'
+```
+
+The commands require existing, upgraded databases. A rejection retains both bodies and
+the decision; it never edits a message or acknowledges delivery. Repeating the
+same decision is idempotent. A different candidate produces a new conflict. If
+the rejected candidate is presented again, it stays rejected without reopening
+the hold or incrementing the unresolved-conflict count. This does not repair
+its producer; source repair or withdrawal must happen first. If
+local staging discovered the conflict first, inspect and resolve its record in
+`advisor-events.sqlite3` or `student-events.sqlite3` as well as the inbox record.
+Use the conflict ID listed in each store; routing can make the IDs differ.
+Resolve staging first and the inbox last. A corrected observation that genuinely
+needs delivery must receive a new identity through its producer.
 
 A completed tool observation resets the three-attempt no-progress budget. A
 separate 36-inference-start backstop applies to each turn branch across worker
@@ -890,13 +957,20 @@ does not affect monitoring, cancellation, or terminal delivery for existing runs
 Every successful `run_training` launch immediately registers
 a terminal-state monitor bound to the current conversation. `monitor_training`
 is an optional policy upgrade for useful metric gates or staleness detection;
-repeating it replaces the default or previous policy.
+changing it creates a new durable policy revision. Repeating the same policy,
+or changing only its polling interval or staleness timeout, retains its revision
+and samples. A shorter polling interval advances the next scheduled poll. Changing
+A → B → A creates three distinct revisions. A run's conversation owner cannot
+change. Terminal monitors cannot be reactivated by registering another policy.
 
 Each local run's requested timeout is a total wall-clock ceiling, not merely the
 point at which shutdown begins. TERM is sent early enough that the configured
 grace period ends at the deadline, after which the complete process group is killed.
 For local runs, `cancel_training` follows the same process-group cleanup path.
-It does not return until the supervisor has persisted a terminal state. Target
+It does not return until the supervisor has persisted a terminal state. The
+student receives that result through the tool, so this explicit cancellation
+retires monitoring without an additional terminal wake. Externally observed
+cancellations still emit a terminal notification. Target
 training code remains responsible for handling SIGTERM and flushing external
 services such as W&B before the grace period expires.
 
@@ -909,13 +983,23 @@ Metric samples reject NaN and infinities. A failure in one monitor's training
 status or W&B lookup advances that monitor's schedule and emits one
 deduplicated `monitor_error` hard signal; it cannot block other monitors,
 GitHub events, child results, or an already-pending hard-failure wake. A changed
-monitor policy resets its derived samples and signals to match the new marker.
+monitor policy resets its derived samples but retains earlier signals. Metric,
+staleness, and monitor-error keys include the policy revision; terminal status
+keys identify the run and terminal state independently of policy. Poll results
+from an obsolete revision cannot update the current policy's samples or signals.
+Terminal status capture and monitor retirement share one transaction, so a
+concurrent policy change cannot lose completion.
 
 Every persisted actionable signal directly creates a compact
 `training_monitor` wake for the signal's original student conversation UUID.
 No intermediate LLM call gates these events: registering the monitor policy is
 the student's request to resume when one of its conditions emits a signal. The
-signal remains pending until that exact conversation successfully handles it.
+signal's routing and payload are frozen on first capture. It remains pending
+until that exact conversation successfully handles it, except that authoritative
+terminal status supersedes outstanding metric-staleness warnings. Superseded
+warnings retain their contents and a reason; they are not marked handled.
+Supersession applies to the monitor outbox; messages already transferred to the
+inbox or conversation history remain unchanged. Unacknowledged metric gates, monitoring errors, and terminal facts remain due.
 
 Controller events are partitioned by their exact conversation UUID before a
 turn. Each partition is acknowledged only after its own successful turn, so a

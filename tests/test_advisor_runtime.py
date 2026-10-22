@@ -17,6 +17,7 @@ from senpai_agent.advisor import (
     deliver_pending_events,
 )
 from senpai_agent.delegation import AgentStatusAction, AgentStatusObservation
+from senpai_agent.event_conflicts import DeliveryBlocked
 from senpai_agent.hooks import queued_feedback_marker
 from senpai_agent.inbox import PersistentInbox, deliver_turn_messages
 from senpai_agent.local_events import LocalEvent, LocalEventStore
@@ -166,6 +167,10 @@ def test_event_store_deduplicates_and_survives_reopen(tmp_path: Path):
             store.enqueue(event.model_copy(update={"payload": {"pr": 999}}))
 
     with LocalEventStore(database) as reopened:
+        assert reopened.pending() == []
+        assert reopened.get(event.dedupe_key) == event
+        conflict = reopened.conflicts()[0]
+        reopened.resolve_conflict(conflict.identity, "Invalid candidate withdrawn")
         pending = reopened.pending()
         assert pending == [event]
         reopened.acknowledge(event.dedupe_key)
@@ -1063,8 +1068,10 @@ def test_event_pump_surfaces_a_mid_batch_failure_without_boundary_timeout(
     assert conversation.interrupts == 1
 
 
+@pytest.mark.parametrize("late_hold", [False, True])
 def test_event_pump_surfaces_a_queue_boundary_failure_and_unwinds_the_run(
     tmp_path: Path,
+    late_hold: bool,
 ):
     event = LocalEvent(
         kind="student_pr_feedback",
@@ -1091,8 +1098,12 @@ def test_event_pump_surfaces_a_queue_boundary_failure_and_unwinds_the_run(
         with pytest.raises(RuntimeError, match="conversation pause failed"):
             with pump:
                 store.enqueue(event)
-                assert pump._stop.wait(1)
+                stopped = pump._stop.wait(1)
+                if late_hold:
+                    # The pump can finish detecting a conflict after the boundary fails.
+                    pump._hold_at_boundary(DeliveryBlocked("concurrent conflict"))
 
+    assert stopped
     assert conversation.interrupts == 1
 
 

@@ -154,6 +154,7 @@ def test_training_rechecks_live_revision_before_each_launch(
         )
         assert training.cancelled == ["training-17"]
         assert monitors.active() == []
+        assert monitors.pending_signals() == []
 
         training.result = training.result.model_copy(update={"training_id": "training-18"})
         launch(action, current_conversation)
@@ -392,11 +393,12 @@ def test_monitor_training_validates_the_training_id_before_registration(
         monitors.close()
 
 
-def test_monitor_training_replaces_the_default_policy(
-    tmp_path: Path, assignment_runtime
+@pytest.mark.parametrize("state", [TrainingState.RUNNING, TrainingState.FINISHED])
+def test_monitor_training_replaces_only_a_running_policy(
+    tmp_path: Path, assignment_runtime, state
 ):
     workspace = init_workspace(tmp_path)
-    training = StubTraining(workspace, finished_result(tmp_path))
+    training = StubTraining(workspace, finished_result(tmp_path).model_copy(update={"state": state, "exit_code": None}))
     monitors = MonitorStore(tmp_path / "monitors.sqlite3")
     conversation_id = assignment_runtime.conversation_id
     run_tool = RunTrainingTool.create(training, monitors, assignment_runtime.guard)[0]
@@ -428,6 +430,11 @@ def test_monitor_training_replaces_the_default_policy(
 
         monitor = monitors.spec("training-17")
         assert training.status_checks == ["training-17", "training-17"]
+        if state is TrainingState.FINISHED:
+            assert monitor.metric is None
+            assert observation.status == "terminal"
+            assert "no new monitoring policy" in observation.to_llm_content[0].text
+            return
         assert monitor.metric == "validation/loss"
         assert monitor.direction == "min"
         assert monitor.stale_after_seconds == 300
@@ -472,6 +479,7 @@ def test_cancel_training_retires_its_monitor(tmp_path: Path, assignment_runtime)
         assert observation.state is TrainingState.CANCELLED
         assert training.cancelled == ["training-17"]
         assert monitors.active() == []
+        assert monitors.pending_signals() == []
     finally:
         monitors.close()
 
