@@ -53,7 +53,7 @@ class StudentCommentMixin:
         if self._role != "student":
             raise PermissionError("post_assignment_comment requires a student workflow")
         with self.serialized_assignment_mutation():
-            before, assignment = self._routed_assignment_at_head(
+            _, assignment = self._routed_assignment_at_head(
                 number,
                 assignment_id=assignment_id,
                 revision_id=revision_id,
@@ -80,18 +80,14 @@ class StudentCommentMixin:
                     comment_id=comment_id,
                 )
             )
-            rendered = marker_body(
-                marker, f"{content}\n\nWorking PR: [#{number}]({before.url})"
-            )
             changed, verified = self._upsert_marker_comment(
                 number,
                 marker=marker,
-                body=rendered,
+                body=marker_body(marker, content),
                 conflict_message=(
                     "comment_id already identifies a different message; "
                     "use a new comment_id"
                 ),
-                exact_conflict=True,
                 student=student,
             )
             after, current_assignment = self._routed_assignment_at_head(
@@ -131,7 +127,7 @@ class StudentCommentMixin:
         if self._role != "student":
             raise PermissionError("post_peer_comment requires a student workflow")
         with self.serialized_assignment_mutation():
-            source, assignment = self._routed_assignment_at_head(
+            _, assignment = self._routed_assignment_at_head(
                 number,
                 assignment_id=assignment_id,
                 revision_id=revision_id,
@@ -184,14 +180,11 @@ class StudentCommentMixin:
             changed, verified = self._upsert_marker_comment(
                 target.number,
                 marker=marker,
-                body=marker_body(
-                    marker, f"{content}\n\nWorking PR: [#{number}]({source.url})"
-                ),
+                body=marker_body(marker, content),
                 student=student,
                 conflict_message=(
                     "comment_id already identifies a different message; use a new comment_id"
                 ),
-                exact_conflict=True,
             )
             _, current = self._routed_assignment_at_head(
                 number,

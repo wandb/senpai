@@ -152,7 +152,7 @@ def test_reply_to_a_senpai_opened_issue_does_not_repeat_owner_mention():
     assert first.changed is True
     assert retry.changed is False
     assert cast(str, fake.comments[-1]["body"]).endswith(
-        "ADVISOR: I will evaluate two more seeds."
+        "**Advisor**\n\n---\n\nI will evaluate two more seeds."
     )
     assert "@operator" not in fake.comments[-1]["body"]
     assert fake.mutations == mutations

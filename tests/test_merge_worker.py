@@ -308,7 +308,9 @@ def test_only_review_findings_are_posted_without_waking_the_student(
     assert reason in result["reason"]
     assert merge_case.fake.pr["merged"] is False
     if verdict is REJECTED:
-        assert reason in merge_case.fake.comments[-1]["body"]
+        body = merge_case.fake.comments[-1]["body"]
+        assert reason in body
+        assert body.split("\n\n", 1)[1].startswith("**Supervisor**\n\n---\n\n")
         assert result["feedback_url"] == merge_case.fake.comments[-1]["html_url"]
         assert [(method, path) for method, path, _body in merge_case.fake.mutations] == [
             ("POST", f"/repos/{REPO}/issues/7/comments"),

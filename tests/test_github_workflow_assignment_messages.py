@@ -83,7 +83,7 @@ def test_request_revision_converges_marker_assignment_state_and_replays():
     )
     assert parse_assignment_markers(cast(str, fake.pr["body"]))[0].base_sha == BASE_SHA
     assert fake.comments == [
-        comment(1, f"{marker}\n\nADVISOR: Run the requested ablation.")
+        comment(1, f"{marker}\n\n**Advisor**\n\n---\n\nRun the requested ablation.")
     ]
     assert fake.pr["draft"] is True
     assert fake.pr["labels"] == {"student:one", "status:wip"}
@@ -119,7 +119,7 @@ def test_applied_revision_replay_restores_guidance_and_preserves_current_result(
         comment(1, render_result_comment(current)),
         comment(
             2,
-            f"{revision_marker()}\n\nADVISOR: Run the requested ablation.",
+            f"{revision_marker()}\n\n**Advisor**\n\n---\n\nRun the requested ablation.",
         ),
     ]
 
@@ -336,7 +336,7 @@ def test_applied_revision_replay_restores_a_result_arriving_during_demotion():
             ),
         ),
         comments=[
-            comment(1, f"{marker}\n\nADVISOR: Run the requested ablation.")
+            comment(1, f"{marker}\n\n**Advisor**\n\n---\n\nRun the requested ablation.")
         ],
     )
 
@@ -404,7 +404,7 @@ def test_request_revision_updates_a_trusted_marker_on_the_final_comment_page():
 
     assert [item["body"] for item in fake.comments] == [
         "unrelated",
-        f"{marker}\n\nADVISOR: Run the requested ablation.",
+        f"{marker}\n\n**Advisor**\n\n---\n\nRun the requested ablation.",
     ]
 
 
@@ -426,7 +426,7 @@ def test_request_revision_does_not_trust_spoofed_or_embedded_markers():
         spoofed,
         f"Documentation example: {marker}",
         f"> {marker}",
-        f"{marker}\n\nADVISOR: Use the trusted revision.",
+        f"{marker}\n\n**Advisor**\n\n---\n\nUse the trusted revision.",
     ]
 
 
@@ -563,7 +563,11 @@ def send_feedback(
     )
 
 
-def test_assignment_feedback_replays_without_changing_assignment_state():
+@pytest.mark.parametrize("guidance", [
+    "Check the cruise split before choosing a default.",
+    "**Advisor** **Supervisor**\n\n# Review\n\nThe change is ready.",
+])
+def test_assignment_feedback_replays_without_changing_assignment_state(guidance):
     fake = FakeGitHub(
         pull_request(
             labels={"student:student-one", "status:wip", "status:hold"},
@@ -576,13 +580,13 @@ def test_assignment_feedback_replays_without_changing_assignment_state():
     first = send_feedback(
         client,
         feedback_id="check-cruise-split",
-        comment="Check the cruise split before choosing a default.",
+        comment=guidance,
     )
     mutations_after_first = list(fake.mutations)
     second = send_feedback(
         client,
         feedback_id="check-cruise-split",
-        comment="Check the cruise split before choosing a default.",
+        comment=guidance,
     )
 
     assert first.changed is True
@@ -592,7 +596,7 @@ def test_assignment_feedback_replays_without_changing_assignment_state():
         comment(
             1,
             f"{feedback_marker()}\n\n"
-            "ADVISOR: Check the cruise split before choosing a default.",
+            f"**Advisor**\n\n---\n\n{guidance}",
         )
     ]
     assert (fake.pr["body"], fake.pr["draft"], fake.pr["labels"]) == original_state
@@ -624,24 +628,6 @@ def test_assignment_feedback_cannot_smuggle_a_terminal_result(indent):
             blockers=set(),
         )
     assert fake.mutations == mutations_after_feedback
-
-
-def test_assignment_feedback_upgrades_a_legacy_unprefixed_comment():
-    marker = feedback_marker()
-    guidance = "Check the cruise split before choosing a default."
-    fake = FakeGitHub(
-        pull_request(labels={"student:student-one", "status:wip"}, draft=True),
-        comments=[comment(1, f"{marker}\n\n{guidance}")],
-    )
-
-    result = send_feedback(
-        workflow(fake),
-        feedback_id="check-cruise-split",
-        comment=f"ADVISOR: {guidance}",
-    )
-
-    assert result.changed is True
-    assert fake.comments == [comment(1, f"{marker}\n\nADVISOR: {guidance}")]
 
 
 def test_assignment_feedback_id_cannot_be_reused_for_different_guidance():

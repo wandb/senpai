@@ -31,12 +31,13 @@ Each tool has one operation-specific schema without a union wrapper and a
 complete model-facing description. The
 skills in this plugin explain when to use those tools and provide workflow
 examples; they do not implement mutations or carry credentials. The plugin has
-no MCP server. The Python runtime binds the authenticated role and adds an
-`ADVISOR:` prefix or a `**STUDENT: <student_name>**` header followed by a blank
-line to Senpai-authored GitHub comments. Tool payloads contain only the
-unprefixed message text. Assignment and peer comments also link the student's
-current PR. Students use `post_peer_comment` to discuss another student's work
-and reply on the sender's PR.
+no MCP server. The Python runtime adds a `**Advisor**`,
+`**Student: <student_name>**`, or `**Supervisor**` header followed by a blank line,
+`---`, and another blank line to authored GitHub messages. Tool payloads contain
+only the Markdown content below the separator. Messages omit attribution
+footers and automatic `Working PR` links. Students use `post_peer_comment` to
+discuss another student's work and reply on the sender's PR, which the hidden
+peer marker identifies.
 
 Keep every Senpai-owned skill used by a live advisor or student here rather
 than relying on a provider's user skill directory. Target repositories may

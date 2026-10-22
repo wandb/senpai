@@ -172,6 +172,7 @@ class MergeMixin:
                 marker=marker,
                 body=marker_body(marker, comment),
                 conflict_message="merge review already identifies different findings",
+                comment_role="supervisor",
             )
             after, _assignment = self._routed_assignment_at_head(number, **scope)
             return MutationResult(
