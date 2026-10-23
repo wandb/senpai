@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from openhands.sdk.conversation.event_store import EventLog
@@ -6,6 +7,16 @@ from openhands.sdk.event import ActionEvent, Event, ObservationEvent, SystemProm
 from openhands.sdk.io import InMemoryFileStore
 from openhands.sdk.llm import MessageToolCall
 
+from senpai_agent.capacity_tool import (
+    ClusterCapacityAction,
+    ClusterCapacityObservation,
+    ClusterCapacityTool,
+)
+from senpai_agent.cluster_capacity import (
+    SNAPSHOT_ENV,
+    CapacityConfig,
+    summarize_capacity,
+)
 from senpai_agent.models import (
     AssignmentKey,
     ExperimentResult,
@@ -155,6 +166,46 @@ def test_running_training_observation_survives_event_log_restore():
     assert isinstance(restored.observation, TrainingResultObservation)
     assert restored.observation.state is TrainingState.RUNNING
     assert restored.observation.exit_code is None
+
+
+@pytest.mark.parametrize("configured", [False, True], ids=["unknown-age", "known-age"])
+def test_capacity_observation_survives_event_log_restore(
+    tmp_path, monkeypatch, configured
+):
+    monkeypatch.delenv(SNAPSHOT_ENV, raising=False)
+    if configured:
+        path = tmp_path / "capacity.json"
+        snapshot = summarize_capacity(
+            [],
+            [],
+            CapacityConfig(
+                nodes=1, gpus_per_node=1, cpu_per_node=1, memory_gib_per_node=1
+            ),
+            observed_at=datetime.now(UTC) - timedelta(seconds=40),
+        )
+        path.write_text(snapshot.model_dump_json())
+        monkeypatch.setenv(SNAPSHOT_ENV, str(path))
+    observation = ClusterCapacityTool.create(None)[0](ClusterCapacityAction())
+    if configured:
+        assert observation.snapshot.status == "available"
+        assert observation.age_seconds > 0
+    else:
+        assert observation.snapshot.reason == "not_configured"
+        assert observation.age_seconds is None
+
+    restored = round_trip(
+        ObservationEvent(
+            tool_name="get_cluster_capacity",
+            tool_call_id="capacity-call",
+            action_id="capacity-action",
+            observation=observation,
+        )
+    )
+
+    assert isinstance(restored.observation, ClusterCapacityObservation)
+    assert restored.observation.snapshot == observation.snapshot
+    assert restored.observation.age_seconds == observation.age_seconds
+    assert restored.observation.to_llm_content == observation.to_llm_content
 
 
 @pytest.mark.parametrize(
