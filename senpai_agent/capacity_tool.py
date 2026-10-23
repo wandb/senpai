@@ -32,7 +32,7 @@ class ClusterCapacityAction(Action):
 
 class ClusterCapacityObservation(Observation):
     snapshot: CapacitySnapshot
-    age_seconds: float | None
+    age_seconds: float | None = None
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
