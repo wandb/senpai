@@ -408,6 +408,34 @@ target-owned submitter, which follows the
 Commit training code before running it; Senpai checks out that exact commit in
 the training pod. An empty `training_image` keeps the existing training behavior.
 
+### Build the student image on your own base image
+
+When target code must run in a specific environment, such as a competition's
+judge image, build the student image on top of it instead. Each single-node
+student pod then keeps its GPU and runs the student's terminal, tests, and
+training in that environment. `Dockerfile.student-on-base` installs Senpai
+beside the base image's software in its own Python 3.14 environment, without
+Senpai's copy of PyTorch. The student's target environment uses the base
+image's interpreter, `/usr/bin/python3` by default, and sees its installed
+packages. Packages a student installs go into a separate environment
+under the student's home directory. The base image must be Debian or Ubuntu
+and must not already define UID or GID 10001.
+
+Build it with the `Build and Push Senpai Images` workflow. Run the workflow
+manually on the Senpai revision you will launch, and set `student_base_image`
+to a digest-pinned image. Set `student_base_python` if the target interpreter
+is not `/usr/bin/python3`. The same run publishes the advisor, student, and
+executor images for that revision. Its summary prints the new image's digest:
+
+```yaml
+student_image: ghcr.io/wandb/senpai-student-on-base@sha256:<manifest-digest>
+senpai_repo_revision: <the 40-character revision the workflow built>
+advisor_image: ghcr.io/wandb/senpai-advisor:sha-<the same revision>
+```
+
+Launch it by digest, because every base image built for one revision shares
+the `sha-<revision>` tag.
+
 ### Advisory cluster capacity
 
 Add `--capacity_observer true` to install a dedicated observer. It uses the same

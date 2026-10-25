@@ -122,15 +122,25 @@ fi
 unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS WANDB_API_KEY EXA_API_KEY
 rm -f "$GIT_ASKPASS_FILE"
 export SENPAI_TARGET_PYTHON_ENV="$HOME/.venvs/senpai-target"
-if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then
-    /usr/local/bin/uv venv --no-project --no-config --no-python-downloads \
-        --python "$SENPAI_PYTHON" --allow-existing "$SENPAI_TARGET_PYTHON_ENV"
+if [ -n "${SENPAI_TARGET_BASE_PYTHON:-}" ]; then
+    # Images built on a target base image keep that image's interpreter and
+    # packages; Senpai's own runtime may use another Python version.
+    if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then
+        /usr/local/bin/uv venv --no-project --no-config --no-python-downloads \
+            --python "$SENPAI_TARGET_BASE_PYTHON" --system-site-packages \
+            --allow-existing "$SENPAI_TARGET_PYTHON_ENV"
+    fi
+else
+    if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then
+        /usr/local/bin/uv venv --no-project --no-config --no-python-downloads \
+            --python "$SENPAI_PYTHON" --allow-existing "$SENPAI_TARGET_PYTHON_ENV"
+    fi
+    CONTROLLER_SITE="$("$SENPAI_PYTHON" -P -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+    # The target interpreter is agent-writable; never execute it during trusted startup.
+    TARGET_SITE="$("$SENPAI_PYTHON" -P -c 'import sys, sysconfig; print(sysconfig.get_path("purelib", vars={"base": sys.argv[1]}))' "$SENPAI_TARGET_PYTHON_ENV")"
+    printf '%s\n' "$CONTROLLER_SITE" > "$TARGET_SITE/senpai-runtime.pth"
+    "$SENPAI_PYTHON" -P -m senpai_agent.target_environment "$SENPAI_TARGET_PYTHON_ENV"
 fi
-CONTROLLER_SITE="$("$SENPAI_PYTHON" -P -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
-# The target interpreter is agent-writable; never execute it during trusted startup.
-TARGET_SITE="$("$SENPAI_PYTHON" -P -c 'import sys, sysconfig; print(sysconfig.get_path("purelib", vars={"base": sys.argv[1]}))' "$SENPAI_TARGET_PYTHON_ENV")"
-printf '%s\n' "$CONTROLLER_SITE" > "$TARGET_SITE/senpai-runtime.pth"
-"$SENPAI_PYTHON" -P -m senpai_agent.target_environment "$SENPAI_TARGET_PYTHON_ENV"
 if [ "${NODES_PER_STUDENT:-1}" -gt 1 ] || [ -n "${SENPAI_TRAINING_IMAGE:-}" ]; then
     proxy_dir="$LOGDIR/bin"
     mkdir -p "$proxy_dir"
