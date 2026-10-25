@@ -810,8 +810,8 @@ execution, and extraction. `model=smart` defaults to
 synthesis, and failure diagnosis. `model=frontier` defaults to
 `anthropic/claude-opus-5-5` at `max` for the hardest quality-first work. The
 provider prefix determines the required credential
-(`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`); model-facing calls never select
-credential names.
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `WANDB_API_KEY`, or
+`CUSTOM_OPENAI_API_KEY`); model-facing calls never select credential names.
 
 Reasoning effort is validated against the selected model. Provider-specific
 request configuration maps GPT-5.6 `max` to Responses Pro mode; invalid

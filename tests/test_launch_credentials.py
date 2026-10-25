@@ -189,6 +189,102 @@ def test_wandb_inference_preflight_routes_to_the_requested_project(monkeypatch):
     assert request.headers["Openai-project"] == "research-team/mlxfast"
 
 
+SERVED_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+
+
+def fake_custom_openai_endpoint(monkeypatch, served, *, rejected_effort=None):
+    """Serve /models and reject one chat effort the way vLLM does."""
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append(request)
+        if request.full_url.endswith("/models"):
+            return JSONResponse({"data": served})
+        effort = json.loads(request.data)["reasoning_effort"]
+        if effort == rejected_effort:
+            body = json.dumps(
+                {"error": {"message": f"unsupported reasoning_effort {effort}"}}
+            ).encode()
+            raise urllib.error.HTTPError(
+                request.full_url, 400, "Bad Request", {}, io.BytesIO(body)
+            )
+        return JSONResponse({"choices": [{"message": {"content": "OK"}}]})
+
+    monkeypatch.setattr(launch_helpers.urllib.request, "urlopen", urlopen)
+    return requests
+
+
+def test_custom_openai_preflight_checks_the_model_window_and_efforts(
+    monkeypatch, capsys
+):
+    requests = fake_custom_openai_endpoint(
+        monkeypatch, [{"id": SERVED_MODEL, "max_model_len": 100_000}]
+    )
+
+    launch_helpers.preflight_check_custom_openai(
+        "endpoint-secret",
+        "https://inference.example.test/v1/",
+        SERVED_MODEL,
+        ["low", "xhigh"],
+        100_000,
+    )
+
+    models, *chats = requests
+    assert models.full_url == "https://inference.example.test/v1/models"
+    assert models.headers["Authorization"] == "Bearer endpoint-secret"
+    assert [
+        (chat.full_url, chat.get_method(), json.loads(chat.data)) for chat in chats
+    ] == [
+        (
+            "https://inference.example.test/v1/chat/completions",
+            "POST",
+            {
+                "model": SERVED_MODEL,
+                "messages": [{"role": "user", "content": "Reply with OK."}],
+                "max_tokens": 1,
+                "reasoning_effort": effort,
+            },
+        )
+        for effort in ("low", "xhigh")
+    ]
+    assert "endpoint-secret" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("served", "message"),
+    [
+        (
+            [{"id": "other/model", "max_model_len": 100_000}],
+            f"does not serve {SERVED_MODEL}; available: other/model",
+        ),
+        (
+            [{"id": SERVED_MODEL, "max_model_len": 65_536}],
+            "exceeds the server's max_model_len=65536",
+        ),
+        (
+            [{"id": SERVED_MODEL, "max_model_len": 100_000}],
+            "reasoning_effort=medium failed: HTTP 400: "
+            "unsupported reasoning_effort medium",
+        ),
+    ],
+)
+def test_custom_openai_preflight_rejects_a_mismatched_server(
+    monkeypatch, served, message
+):
+    fake_custom_openai_endpoint(monkeypatch, served, rejected_effort="medium")
+
+    with pytest.raises(SystemExit) as raised:
+        launch_helpers.preflight_check_custom_openai(
+            "endpoint-secret",
+            "https://inference.example.test/v1",
+            SERVED_MODEL,
+            ["low", "medium"],
+            100_000,
+        )
+
+    assert message in str(raised.value)
+
+
 def test_repo_access_uses_an_impossible_ref_write_probe(monkeypatch):
     captured = {}
 
