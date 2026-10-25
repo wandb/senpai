@@ -12,6 +12,7 @@ import yaml
 from git_workflow_support import commit_file, git, repository
 from launch_test_support import (
     ADVISOR_IMAGE,
+    CUSTOM_OPENAI_MODEL,
     ROOT,
     REVISION,
     STUDENT_IMAGE,
@@ -772,6 +773,91 @@ def test_wandb_gateway_is_rendered_for_every_role():
     launch.validate_model_config(args)
 
 
+def custom_openai_args(**overrides) -> launch.Args:
+    return launch_args(
+        **{
+            "student_model": CUSTOM_OPENAI_MODEL,
+            "student_reasoning_effort": "xhigh",
+            "smart_model": CUSTOM_OPENAI_MODEL,
+            "smart_reasoning_effort": "xhigh",
+            "fast_model": CUSTOM_OPENAI_MODEL,
+            "fast_reasoning_effort": "low",
+            "frontier_model": "anthropic/claude-fable-5-1",
+            "frontier_reasoning_effort": "max",
+            "custom_openai_base_url": "https://inference.example.test/v1",
+            "custom_openai_context_tokens": 100_000,
+            "custom_openai_canonical_model": "deepseek/deepseek-v4.1-flash",
+            **overrides,
+        }
+    )
+
+
+def test_custom_openai_endpoint_is_rendered_for_every_role_that_uses_it():
+    args = custom_openai_args()
+
+    for role in ("advisor", "student"):
+        configmap, deployment, secret = render_role(role, args)
+        config = yaml.safe_load(configmap)["data"]
+        environment = yaml.safe_load(deployment)["spec"]["template"]["spec"][
+            "containers"
+        ][0]["env"]
+        assert {
+            key: value for key, value in config.items() if "CUSTOM_OPENAI" in key
+        } == {
+            "SENPAI_CUSTOM_OPENAI_BASE_URL": "https://inference.example.test/v1",
+            "SENPAI_CUSTOM_OPENAI_CONTEXT_TOKENS": "100000",
+            "SENPAI_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS": "32768",
+            "SENPAI_CUSTOM_OPENAI_CANONICAL_MODEL": "deepseek/deepseek-v4.1-flash",
+        }
+        assert {
+            "name": "CUSTOM_OPENAI_API_KEY",
+            "valueFrom": {
+                "secretKeyRef": {
+                    "name": "senpai-launch-secrets-test-track",
+                    "key": "custom-openai-api-key",
+                }
+            },
+        } in environment
+        assert "custom-openai-api-key" in yaml.safe_load(secret)["data"]
+
+    launch.validate_model_config(args)
+    assert launch.custom_openai_served_models(args) == [
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+    ]
+
+
+def test_roles_without_custom_openai_models_omit_the_endpoint():
+    configmap, _deployment, _secret = render_role(
+        "advisor",
+        custom_openai_args(
+            smart_model="anthropic/claude-opus-5-5",
+            fast_model="anthropic/claude-sonnet-5",
+            fast_reasoning_effort="medium",
+        ),
+    )
+
+    assert not any(
+        "CUSTOM_OPENAI" in key for key in yaml.safe_load(configmap)["data"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"custom_openai_base_url": ""}, "custom_openai_base_url must be an http"),
+        (
+            {"custom_openai_base_url": "inference.example.test/v1"},
+            "custom_openai_base_url must be an http",
+        ),
+        ({"custom_openai_context_tokens": 0}, "context_tokens must exceed"),
+        ({"custom_openai_max_output_tokens": 100_000}, "context_tokens must exceed"),
+    ],
+)
+def test_launch_rejects_an_incomplete_custom_openai_endpoint(overrides, message):
+    with pytest.raises(SystemExit, match=message):
+        launch.validate_model_config(custom_openai_args(**overrides))
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
@@ -804,6 +890,7 @@ def test_launch_rejects_unsupported_reasoning_effort(overrides, message):
         ("anthropic/claude-opus-4-8", "ANTHROPIC_API_KEY", "anthropic-api-key"),
         ("openai/gpt-5.6-sol", "OPENAI_API_KEY", "openai-api-key"),
         ("wandb/zai-org/GLM-5.2", "WANDB_API_KEY", "wandb-api-key"),
+        (CUSTOM_OPENAI_MODEL, "CUSTOM_OPENAI_API_KEY", "custom-openai-api-key"),
     ],
 )
 def test_roles_mount_only_the_provider_used_by_their_models(

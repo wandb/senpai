@@ -11,6 +11,7 @@ from pydantic import SecretStr
 
 from senpai_agent.openhands_runner import (
     EVENT_TEXT_LIMIT,
+    CustomOpenAIEndpoint,
     apply_reasoning_profile,
     compaction_configuration,
     conversation_prompt_cache_key,
@@ -25,6 +26,13 @@ from senpai_agent.inbox import DeliveryState, PersistentInbox, deliver_turn_mess
 from openhands_support import REPO_ROOT, runtime_config
 
 TEST_COMPACTION_TRIGGER_TOKENS = 180_000
+CUSTOM_OPENAI_MODEL = "custom_openai/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+CUSTOM_OPENAI_ENDPOINT = CustomOpenAIEndpoint(
+    base_url="https://inference.example.test/v1",
+    context_tokens=100_000,
+    max_output_tokens=32_768,
+    canonical_model="deepseek/deepseek-v4.1-flash",
+)
 
 
 def test_openhands_fork_revision_is_consistent_across_install_paths():
@@ -100,6 +108,8 @@ def test_openhands_fork_revision_is_consistent_across_install_paths():
         ("max", "anthropic/claude-sonnet-5", "max"),
         ("high", "wandb/zai-org/GLM-5.2", "high"),
         ("max", "wandb/zai-org/GLM-5.2", "max"),
+        ("xhigh", CUSTOM_OPENAI_MODEL, "xhigh"),
+        ("max", CUSTOM_OPENAI_MODEL, "max"),
     ],
 )
 def test_supported_reasoning_effort_is_preserved(
@@ -363,6 +373,100 @@ def test_wandb_gateway_uses_chat_thinking_and_project_routing():
     assert "reasoning_effort" not in call_kwargs
     assert llm._provider_info.name == "wandb"
     assert llm._provider_info.api_base == "https://api.inference.wandb.ai/v1"
+
+
+def test_custom_openai_endpoint_uses_chat_body_effort_and_a_shared_window():
+    configuration = model_runtime_configuration(
+        CUSTOM_OPENAI_MODEL,
+        "xhigh",
+        compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
+        custom_openai=CUSTOM_OPENAI_ENDPOINT,
+    )
+    llm = LLM(
+        model=CUSTOM_OPENAI_MODEL,
+        api_key=SecretStr("test-key"),
+        reasoning_effort="xhigh",
+        **configuration,
+    )
+    messages, _tools, _mocked, call_kwargs, _telemetry = (
+        llm._prepare_completion_params(
+            [
+                Message(
+                    role="assistant",
+                    content=[TextContent(text="Checked the profile")],
+                    reasoning_content="The kernel is memory bound.",
+                ),
+                Message(role="user", content=[TextContent(text="Continue")]),
+            ],
+            tools=None,
+            add_security_risk_prediction=False,
+            kwargs={},
+        )
+    )
+
+    assert configuration == {
+        "api_mode": "chat",
+        "base_url": "https://inference.example.test/v1",
+        "capability_overrides": {
+            "supports_reasoning_effort": False,
+            "supports_responses_api": False,
+        },
+        "litellm_extra_body": {"reasoning_effort": "xhigh"},
+        "max_input_tokens": 67_232,
+        "max_output_tokens": 32_768,
+        "model_canonical_name": "deepseek/deepseek-v4.1-flash",
+    }
+    assert call_kwargs["extra_body"] == {"reasoning_effort": "xhigh"}
+    assert "reasoning_effort" not in call_kwargs
+    assert call_kwargs["max_completion_tokens"] == 32_768
+    assert llm.effective_max_input_tokens == 67_232
+    assert messages[0]["reasoning_content"] == "The kernel is memory bound."
+    assert llm._provider_info.name == "custom_openai"
+    assert llm._provider_info.api_base == "https://inference.example.test/v1"
+
+
+def test_custom_openai_without_a_canonical_model_uses_generic_features():
+    configuration = model_runtime_configuration(
+        CUSTOM_OPENAI_MODEL,
+        "high",
+        compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
+        custom_openai=CustomOpenAIEndpoint(
+            base_url="http://vllm.default.svc:8000/v1",
+            context_tokens=65_536,
+            max_output_tokens=8_192,
+        ),
+    )
+
+    assert "model_canonical_name" not in configuration
+    assert configuration["max_input_tokens"] == 57_344
+
+
+def test_custom_openai_model_requires_an_endpoint():
+    with pytest.raises(ValueError, match="endpoint configuration"):
+        model_runtime_configuration(
+            CUSTOM_OPENAI_MODEL,
+            "high",
+            compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
+        )
+
+
+def test_reasoning_profile_keeps_the_custom_openai_body_effort_in_sync():
+    llm = LLM(
+        model=CUSTOM_OPENAI_MODEL,
+        api_key=SecretStr("test-key"),
+        reasoning_effort="low",
+        **model_runtime_configuration(
+            CUSTOM_OPENAI_MODEL,
+            "xhigh",
+            compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
+            custom_openai=CUSTOM_OPENAI_ENDPOINT,
+        ),
+    )
+
+    profiled = apply_reasoning_profile(llm)
+
+    assert profiled.reasoning_effort == "low"
+    assert profiled.litellm_extra_body == {"reasoning_effort": "low"}
 
 
 @pytest.mark.parametrize(

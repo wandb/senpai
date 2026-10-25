@@ -259,6 +259,51 @@ def test_executor_validates_and_runs_single_node_training_jobs(tmp_path, restart
     assert (resource["kind"], resource["nodes"], resource["gpus_per_node"]) == ("Job", 1, 8)
 
 
+def test_executor_places_gpu_workers_and_bounds_every_training_pod(tmp_path):
+    api = FakeApi()
+    broker = executor(
+        tmp_path,
+        api,
+        gpu_node_selector={"gpu.nvidia.com/class": "H200"},
+        gpu_scheduler_name="binpack-scheduler",
+    )
+    reserve(broker)
+    document = manifest()
+    document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]["spec"][
+        "nodeSelector"
+    ] = {"gpu.nvidia.com/class": "A100", "zone": "a"}
+
+    apply(broker, document)
+
+    created = api.document_value
+    replicas = created["spec"]["mpiReplicaSpecs"]
+    worker = replicas["Worker"]["template"]["spec"]
+    launcher = replicas["Launcher"]["template"]["spec"]
+    deadline = created["spec"]["runPolicy"]["activeDeadlineSeconds"]
+    assert worker["schedulerName"] == "binpack-scheduler"
+    assert worker["nodeSelector"] == {"gpu.nvidia.com/class": "H200", "zone": "a"}
+    assert "schedulerName" not in launcher
+    assert "nodeSelector" not in launcher
+    assert worker["activeDeadlineSeconds"] == launcher["activeDeadlineSeconds"] == deadline
+
+
+def test_executor_leaves_gpu_placement_to_the_cluster_by_default(tmp_path):
+    api = FakeApi()
+    broker = executor(tmp_path, api, nodes=1)
+    reserve(broker, kind="Job")
+    document = manifest()
+    template = document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]
+    document.update(apiVersion="batch/v1", kind="Job", spec={"template": template})
+
+    apply(broker, document)
+
+    created = api.document_value
+    pod = created["spec"]["template"]["spec"]
+    assert "schedulerName" not in pod
+    assert "nodeSelector" not in pod
+    assert pod["activeDeadlineSeconds"] == created["spec"]["activeDeadlineSeconds"]
+
+
 def test_slow_logs_do_not_block_executor_status_or_cancellation(tmp_path):
     logs_started = threading.Event()
     finish_logs = threading.Event()

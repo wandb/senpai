@@ -725,6 +725,7 @@ LAUNCH_CREDENTIAL_ENV_NAMES = (
     "GITHUB_TOKEN",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
+    "CUSTOM_OPENAI_API_KEY",
     "EXA_API_KEY",
     "WANDB_API_KEY",
 )
@@ -817,6 +818,13 @@ def resolve_openai_api_key(dotenv_path: Path) -> str:
     return resolve_required_secret(dotenv_path, "OPENAI_API_KEY", "OpenAI API key")
 
 
+def resolve_custom_openai_api_key(dotenv_path: Path) -> str:
+    """Resolve the custom endpoint key: $CUSTOM_OPENAI_API_KEY → .env → hard error."""
+    return resolve_required_secret(
+        dotenv_path, "CUSTOM_OPENAI_API_KEY", "custom OpenAI-compatible endpoint key"
+    )
+
+
 def resolve_exa_api_key(dotenv_path: Path) -> str:
     """Resolve the Exa API key: $EXA_API_KEY → .env → hard error."""
     return resolve_required_secret(dotenv_path, "EXA_API_KEY", "Exa API key")
@@ -835,6 +843,7 @@ def render_launch_secret(
     *,
     anthropic_api_key: str | None = None,
     openai_api_key: str | None = None,
+    custom_openai_api_key: str | None = None,
     custom_secrets: dict[str, str],
     immutable: bool = False,
 ) -> str:
@@ -848,6 +857,8 @@ def render_launch_secret(
         credentials["anthropic-api-key"] = anthropic_api_key
     if openai_api_key is not None:
         credentials["openai-api-key"] = openai_api_key
+    if custom_openai_api_key is not None:
+        credentials["custom-openai-api-key"] = custom_openai_api_key
     credentials.update(custom_secrets)
     encoded = {
         name: base64.b64encode(value.encode()).decode()
@@ -939,6 +950,46 @@ def preflight_check_openai_api_key(api_key: str) -> None:
         },
     )
     _preflight_http("OpenAI API key", req, api_key, timeout=10)
+
+
+def preflight_check_custom_openai(
+    api_key: str,
+    base_url: str,
+    served_models: Sequence[str],
+    context_tokens: int,
+) -> None:
+    """Verify the endpoint key, the served model IDs, and the server context window."""
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/models",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "senpai-launch-preflight",
+        },
+    )
+    response = _preflight_http(
+        "custom OpenAI-compatible endpoint", req, api_key, timeout=15
+    )
+    if not isinstance(response, dict) or not isinstance(response.get("data"), list):
+        sys.exit("ERROR: custom OpenAI-compatible endpoint returned an invalid models response")
+    served = {
+        entry["id"]: entry
+        for entry in response["data"]
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+    }
+    for model in served_models:
+        if model not in served:
+            available = ", ".join(sorted(served)) or "<none>"
+            sys.exit(
+                f"ERROR: custom OpenAI-compatible endpoint does not serve {model}; "
+                f"available: {available}"
+            )
+        server_limit = served[model].get("max_model_len")
+        if isinstance(server_limit, int) and context_tokens > server_limit:
+            sys.exit(
+                f"ERROR: --custom_openai_context_tokens={context_tokens} exceeds "
+                f"the server's max_model_len={server_limit} for {model}"
+            )
+    print(f"  OK — serves {', '.join(served_models)}")
 
 
 def preflight_check_exa_api_key(api_key: str) -> None:

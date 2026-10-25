@@ -584,6 +584,80 @@ def test_wandb_gateway_configuration_is_explicit_and_uses_max_glm_reasoning(
     assert config.frontier_reasoning_effort == "max"
 
 
+CUSTOM_OPENAI_MODEL = "custom_openai/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+
+
+def custom_openai_env(tmp_path: Path, **overrides: str) -> dict[str, str]:
+    env = runtime_env(tmp_path)
+    env.update(
+        {
+            "CUSTOM_OPENAI_API_KEY": "endpoint-key",
+            "SENPAI_CUSTOM_OPENAI_BASE_URL": "https://inference.example.test/v1/",
+            "SENPAI_CUSTOM_OPENAI_CONTEXT_TOKENS": "100000",
+            "SENPAI_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS": "32768",
+            "SENPAI_CUSTOM_OPENAI_CANONICAL_MODEL": "deepseek/deepseek-v4.1-flash",
+            "SENPAI_OPENHANDS_MODEL": CUSTOM_OPENAI_MODEL,
+            "SENPAI_OPENHANDS_REASONING_EFFORT": "xhigh",
+            "SENPAI_OPENHANDS_SMART_MODEL": CUSTOM_OPENAI_MODEL,
+            "SENPAI_OPENHANDS_SMART_REASONING_EFFORT": "xhigh",
+            "SENPAI_OPENHANDS_FAST_MODEL": CUSTOM_OPENAI_MODEL,
+            "SENPAI_OPENHANDS_FAST_REASONING_EFFORT": "low",
+            **overrides,
+        }
+    )
+    return env
+
+
+def test_custom_openai_profiles_share_one_configured_endpoint(tmp_path: Path):
+    config = resolve_config(
+        parse_runner_args(["--max-turns", "1"]),
+        custom_openai_env(tmp_path),
+    )
+
+    assert config.custom_openai == runner.CustomOpenAIEndpoint(
+        base_url="https://inference.example.test/v1",
+        context_tokens=100_000,
+        max_output_tokens=32_768,
+        canonical_model="deepseek/deepseek-v4.1-flash",
+    )
+    assert config.api_key_env == "CUSTOM_OPENAI_API_KEY"
+    assert config.smart_api_key_env == config.fast_api_key_env == config.api_key_env
+    assert config.api_key.get_secret_value() == "endpoint-key"
+    assert (config.reasoning_effort, config.fast_reasoning_effort) == ("xhigh", "low")
+    assert config.frontier_model == "anthropic/claude-opus-5-5"
+    assert config.frontier_api_key_env == "ANTHROPIC_API_KEY"
+
+
+def test_custom_openai_endpoint_is_unset_for_other_providers(tmp_path: Path):
+    config = resolve_config(
+        parse_runner_args(["--max-turns", "1"]),
+        runtime_env(tmp_path),
+    )
+
+    assert config.custom_openai is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"SENPAI_CUSTOM_OPENAI_BASE_URL": ""}, "must be an http"),
+        ({"SENPAI_CUSTOM_OPENAI_BASE_URL": "inference.example.test/v1"}, "must be an http"),
+        ({"SENPAI_CUSTOM_OPENAI_CONTEXT_TOKENS": ""}, "must be integers"),
+        ({"SENPAI_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS": "100000"}, "smaller than"),
+    ],
+)
+def test_custom_openai_endpoint_settings_fail_clearly(
+    tmp_path: Path,
+    overrides: dict[str, str],
+    message: str,
+):
+    with pytest.raises(RuntimeError, match=message):
+        resolve_config(
+            parse_runner_args(["--max-turns", "1"]),
+            custom_openai_env(tmp_path, **overrides),
+        )
+
+
 def test_fast_model_inherits_an_openai_main_profile(tmp_path: Path):
     env = runtime_env(tmp_path)
     env.update(

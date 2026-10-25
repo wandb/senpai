@@ -19,6 +19,7 @@ from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
+from urllib.parse import urlparse
 
 os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
 
@@ -133,6 +134,7 @@ DEFAULT_SMART_REASONING_EFFORT = "xhigh"
 DEFAULT_FAST_REASONING_EFFORT = "medium"
 DEFAULT_FRONTIER_REASONING_EFFORT = "max"
 DEFAULT_COMPACTION_TRIGGER_TOKENS = 200_000
+DEFAULT_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS = 32_768
 WANDB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
 REASONING_EFFORTS = (
     "low",
@@ -202,6 +204,21 @@ class RunnerArgs:
 
 
 @dataclass(frozen=True)
+class CustomOpenAIEndpoint:
+    """A self-hosted OpenAI-compatible chat-completions server."""
+
+    base_url: str
+    context_tokens: int
+    max_output_tokens: int
+    canonical_model: str | None = None
+
+    @property
+    def max_input_tokens(self) -> int:
+        # vLLM-style servers reject input plus requested output beyond the window.
+        return self.context_tokens - self.max_output_tokens
+
+
+@dataclass(frozen=True)
 class RunnerConfig:
     max_turns: int
     model: str
@@ -241,6 +258,7 @@ class RunnerConfig:
     wandb_entity: str | None = None
     wandb_project: str | None = None
     exa_api_key: SecretStr | None = None
+    custom_openai: CustomOpenAIEndpoint | None = None
     timeout_seconds: float = 7200
     llm_timeout_seconds: int = 5400
     llm_num_retries: int = 5
@@ -282,6 +300,9 @@ def openhands_reasoning_effort(reasoning_effort: str, model: str) -> str:
                 f"reasoning effort {reasoning_effort!r} is unsupported for "
                 f"model {model!r}; use 'high' or 'max'"
             )
+        return reasoning_effort
+    if provider == "custom_openai":
+        # The self-hosted server owns its effort vocabulary and rejects unknown values.
         return reasoning_effort
     if (
         reasoning_effort == "max"
@@ -331,6 +352,8 @@ def apply_reasoning_profile(llm: LLM) -> LLM:
         extra_body["reasoning"] = reasoning
     else:
         extra_body.pop("reasoning", None)
+    if model_provider(llm.model) == "custom_openai":
+        extra_body["reasoning_effort"] = reasoning_effort
     return llm.model_copy(
         update={
             "reasoning_effort": reasoning_effort,
@@ -390,6 +413,41 @@ def resolve_api_key(env: Mapping[str, str], key_env: str) -> SecretStr:
     if not value:
         raise RuntimeError(f"{key_env} is required for the OpenHands runtime")
     return SecretStr(value)
+
+
+def custom_openai_endpoint(env: Mapping[str, str]) -> CustomOpenAIEndpoint:
+    base_url = env.get("SENPAI_CUSTOM_OPENAI_BASE_URL", "").strip()
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError(
+            "SENPAI_CUSTOM_OPENAI_BASE_URL must be an http(s) URL for custom_openai models"
+        )
+    try:
+        context_tokens = int(env.get("SENPAI_CUSTOM_OPENAI_CONTEXT_TOKENS", ""))
+        max_output_tokens = int(
+            env.get(
+                "SENPAI_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS",
+                str(DEFAULT_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS),
+            )
+        )
+    except ValueError as error:
+        raise RuntimeError(
+            "SENPAI_CUSTOM_OPENAI_CONTEXT_TOKENS and "
+            "SENPAI_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS must be integers"
+        ) from error
+    if not 0 < max_output_tokens < context_tokens:
+        raise RuntimeError(
+            "SENPAI_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS must be positive and smaller "
+            "than SENPAI_CUSTOM_OPENAI_CONTEXT_TOKENS"
+        )
+    return CustomOpenAIEndpoint(
+        base_url=base_url.rstrip("/"),
+        context_tokens=context_tokens,
+        max_output_tokens=max_output_tokens,
+        canonical_model=(
+            env.get("SENPAI_CUSTOM_OPENAI_CANONICAL_MODEL", "").strip() or None
+        ),
+    )
 
 
 def conversation_secrets(
@@ -937,6 +995,11 @@ def resolve_config(
         raise RuntimeError(
             "WANDB_ENTITY and WANDB_PROJECT are required for W&B Inference"
         )
+    custom_openai = (
+        custom_openai_endpoint(env)
+        if any(model_provider(profile) == "custom_openai" for profile in models)
+        else None
+    )
 
     return RunnerConfig(
         max_turns=args.max_turns,
@@ -1004,6 +1067,7 @@ def resolve_config(
         wandb_entity=wandb_entity,
         wandb_project=wandb_project,
         exa_api_key=exa_api_key,
+        custom_openai=custom_openai,
         timeout_seconds=timeout_seconds,
         llm_timeout_seconds=llm_timeout_seconds,
         llm_num_retries=llm_num_retries,
@@ -1142,6 +1206,28 @@ def compaction_configuration(
     return {}
 
 
+def custom_openai_configuration(
+    endpoint: CustomOpenAIEndpoint,
+    reasoning_effort: str,
+) -> dict[str, object]:
+    configuration: dict[str, object] = {
+        "api_mode": "chat",
+        "base_url": endpoint.base_url,
+        # LiteLLM drops a top-level effort for custom_openai, so send it in the body.
+        "capability_overrides": {
+            "supports_reasoning_effort": False,
+            "supports_responses_api": False,
+        },
+        "litellm_extra_body": {"reasoning_effort": reasoning_effort},
+        "max_input_tokens": endpoint.max_input_tokens,
+        "max_output_tokens": endpoint.max_output_tokens,
+    }
+    if endpoint.canonical_model:
+        # Selects OpenHands model features such as replaying reasoning_content.
+        configuration["model_canonical_name"] = endpoint.canonical_model
+    return configuration
+
+
 def model_runtime_configuration(
     model: str,
     reasoning_effort: str,
@@ -1149,8 +1235,13 @@ def model_runtime_configuration(
     compaction_trigger_tokens: int,
     wandb_entity: str | None = None,
     wandb_project: str | None = None,
+    custom_openai: CustomOpenAIEndpoint | None = None,
 ) -> dict[str, object]:
     """Merge provider options, including nested LiteLLM request fields."""
+    if model_provider(model) == "custom_openai":
+        if custom_openai is None:
+            raise ValueError("custom_openai models require an endpoint configuration")
+        return custom_openai_configuration(custom_openai, reasoning_effort)
     if model_provider(model) == "wandb":
         if not (wandb_entity and wandb_project):
             raise ValueError(
@@ -1854,6 +1945,7 @@ def run_openhands[ResponseT: BaseModel](
                 compaction_trigger_tokens=config.compaction_trigger_tokens,
                 wandb_entity=config.wandb_entity,
                 wandb_project=config.wandb_project,
+                custom_openai=config.custom_openai,
             ),
         )
         llm.set_request_scope(model_request)

@@ -189,6 +189,57 @@ def test_wandb_inference_preflight_routes_to_the_requested_project(monkeypatch):
     assert request.headers["Openai-project"] == "research-team/mlxfast"
 
 
+SERVED_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+
+
+def test_custom_openai_preflight_checks_served_models(monkeypatch, capsys):
+    captured = capture_request(
+        monkeypatch,
+        {"data": [{"id": SERVED_MODEL, "max_model_len": 100_000}]},
+    )
+
+    launch_helpers.preflight_check_custom_openai(
+        "endpoint-secret",
+        "https://inference.example.test/v1/",
+        [SERVED_MODEL],
+        100_000,
+    )
+
+    request = captured["request"]
+    assert request.full_url == "https://inference.example.test/v1/models"
+    assert request.headers["Authorization"] == "Bearer endpoint-secret"
+    assert "endpoint-secret" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("served", "message"),
+    [
+        (
+            [{"id": "other/model", "max_model_len": 100_000}],
+            f"does not serve {SERVED_MODEL}; available: other/model",
+        ),
+        (
+            [{"id": SERVED_MODEL, "max_model_len": 65_536}],
+            "exceeds the server's max_model_len=65536",
+        ),
+    ],
+)
+def test_custom_openai_preflight_rejects_a_mismatched_server(
+    monkeypatch, served, message
+):
+    capture_request(monkeypatch, {"data": served})
+
+    with pytest.raises(SystemExit) as raised:
+        launch_helpers.preflight_check_custom_openai(
+            "endpoint-secret",
+            "https://inference.example.test/v1",
+            [SERVED_MODEL],
+            100_000,
+        )
+
+    assert message in str(raised.value)
+
+
 def test_repo_access_uses_an_impossible_ref_write_probe(monkeypatch):
     captured = {}
 

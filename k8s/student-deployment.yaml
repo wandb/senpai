@@ -33,7 +33,10 @@ spec:
         role: student
         student: {{STUDENT_NAME}}
         research-tag: {{RESEARCH_TAG}}
+        # {{AGENT_POD_LABELS}}
     spec:
+      # {{STUDENT_SCHEDULER_NAME}}
+      # {{AGENT_HOST_ALIASES}}
       serviceAccountName: {{STUDENT_SERVICE_ACCOUNT_NAME}}
       automountServiceAccountToken: false
       imagePullSecrets: {{IMAGE_PULL_SECRETS}}

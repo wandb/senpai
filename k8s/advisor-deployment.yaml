@@ -31,7 +31,9 @@ spec:
         app: senpai
         role: advisor
         research-tag: {{RESEARCH_TAG}}
+        # {{AGENT_POD_LABELS}}
     spec:
+      # {{AGENT_HOST_ALIASES}}
       automountServiceAccountToken: false
       imagePullSecrets: {{IMAGE_PULL_SECRETS}}
       terminationGracePeriodSeconds: 90

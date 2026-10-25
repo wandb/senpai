@@ -67,6 +67,8 @@ class KubernetesExecutor:
         pod_uid: str,
         training_image: str = "",
         image_pull_secrets: list[str] | None = None,
+        gpu_node_selector: dict[str, str] | None = None,
+        gpu_scheduler_name: str = "",
     ):
         self.client = client
         self.state_path = state_path
@@ -82,6 +84,8 @@ class KubernetesExecutor:
         self.executor_image = executor_image
         self.training_image = training_image
         self.image_pull_secrets = image_pull_secrets or []
+        self.gpu_node_selector = gpu_node_selector or {}
+        self.gpu_scheduler_name = gpu_scheduler_name
         self.launch_secret_name = launch_secret_name
         self.wandb_tags = wandb_tags
         self.research_tag = research_tag
@@ -461,6 +465,8 @@ class KubernetesExecutor:
 
         found_key = False
         for allow_gpus, template in pod_specs:
+            # Some clusters admit standalone GPU pods only with their own deadline.
+            template["spec"]["activeDeadlineSeconds"] = remaining
             template_metadata = template.setdefault("metadata", {})
             if set(template_metadata) - {"annotations", "labels"}:
                 raise ValueError("pod template metadata contains unsupported control fields")
@@ -529,6 +535,14 @@ class KubernetesExecutor:
             raise ValueError("training pod requests forbidden host namespace access")
         pod_spec["automountServiceAccountToken"] = False
         pod_spec["terminationGracePeriodSeconds"] = 30
+        if allow_gpus:
+            if self.gpu_scheduler_name:
+                pod_spec["schedulerName"] = self.gpu_scheduler_name
+            if self.gpu_node_selector:
+                pod_spec["nodeSelector"] = {
+                    **pod_spec.get("nodeSelector", {}),
+                    **self.gpu_node_selector,
+                }
         pod_security = pod_spec.setdefault("securityContext", {})
         if pod_security.get("seccompProfile", {}).get("type") == "Unconfined":
             raise ValueError("training pods may not disable seccomp")
@@ -764,6 +778,7 @@ class KubernetesExecutor:
         found_key = found_run_id = found_tags = False
         forbidden_names = {
             "ANTHROPIC_API_KEY",
+            "CUSTOM_OPENAI_API_KEY",
             "EXA_API_KEY",
             "GITHUB_TOKEN",
             "GH_TOKEN",
@@ -1102,6 +1117,10 @@ def serve() -> None:
         executor_image=os.environ["SENPAI_EXECUTOR_IMAGE"],
         training_image=os.environ.get("SENPAI_TRAINING_IMAGE", ""),
         image_pull_secrets=json.loads(os.environ.get("SENPAI_IMAGE_PULL_SECRETS", "[]")),
+        gpu_node_selector=json.loads(
+            os.environ.get("SENPAI_STUDENT_NODE_SELECTOR", "{}")
+        ),
+        gpu_scheduler_name=os.environ.get("SENPAI_STUDENT_SCHEDULER_NAME", ""),
         launch_secret_name=os.environ["SENPAI_LAUNCH_SECRET_NAME"],
         wandb_tags=os.environ["WANDB_TAGS"],
         research_tag=os.environ["RESEARCH_TAG"],
