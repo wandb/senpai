@@ -127,9 +127,14 @@ if [ -n "${SENPAI_TARGET_BASE_PYTHON:-}" ]; then
     # packages; Senpai's own runtime may use another Python version.
     if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then
         /usr/local/bin/uv venv --no-project --no-config --no-python-downloads \
-            --python "$SENPAI_TARGET_BASE_PYTHON" --system-site-packages \
-            --allow-existing "$SENPAI_TARGET_PYTHON_ENV"
+            --python "$SENPAI_TARGET_BASE_PYTHON" --allow-existing "$SENPAI_TARGET_PYTHON_ENV"
     fi
+    # The base interpreter belongs to the image; -I keeps target files off its path.
+    TARGET_SITE="$("$SENPAI_TARGET_BASE_PYTHON" -I -c 'import sys; print("{}/lib/python{}.{}/site-packages".format(sys.argv[1], *sys.version_info[:2]))' "$SENPAI_TARGET_PYTHON_ENV")"
+    # The base may itself be a virtual environment, whose packages a new venv's
+    # system site would miss. addsitedir also runs its .pth files, such as editable installs.
+    "$SENPAI_TARGET_BASE_PYTHON" -I -c 'import site; print("import site; [site.addsitedir(path) for path in %r]" % site.getsitepackages())' \
+        > "$TARGET_SITE/senpai-base-image.pth"
 else
     if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then
         /usr/local/bin/uv venv --no-project --no-config --no-python-downloads \

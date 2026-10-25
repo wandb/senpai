@@ -416,10 +416,15 @@ student pod then keeps its GPU and runs the student's terminal, tests, and
 training in that environment. `Dockerfile.student-on-base` installs Senpai
 beside the base image's software in its own Python 3.14 environment, without
 Senpai's copy of PyTorch. The student's target environment uses the base
-image's interpreter, `/usr/bin/python3` by default, and sees its installed
-packages. Packages a student installs go into a separate environment
-under the student's home directory. The base image must be Debian or Ubuntu
-and must not already define UID or GID 10001.
+image's interpreter, `/usr/bin/python3` by default, and sees every package
+installed for it, including editable installs. When the base image keeps its
+packages in a virtual environment, point `student_base_python` at that
+environment's interpreter, for example `/opt/sglang/bin/python3` in SGLang's
+images. Packages a student installs go into a separate environment under the
+student's home directory. Install them with `python -m pip`, which reuses the
+base image's packages; `uv pip` cannot see those packages and installs
+duplicates. The base image must be Debian or Ubuntu and must not already
+define UID or GID 10001.
 
 Build it with the `Build and Push Senpai Images` workflow. Run the workflow
 manually on the Senpai revision you will launch, and set `student_base_image`

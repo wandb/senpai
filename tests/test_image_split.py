@@ -448,28 +448,58 @@ def test_target_environment_setup_does_not_execute_target_code(
     assert value == "target dependency"
 
 
-def test_student_target_environment_uses_the_base_image_python(tmp_path: Path):
+def test_student_target_environment_sees_a_virtualenv_base_and_its_editable_installs(
+    tmp_path: Path,
+):
+    # Mirror a judge image whose packages live in a virtual environment.
+    base = tmp_path / "base image env"
+    subprocess.run([sys.executable, "-P", "-m", "venv", str(base)], check=True)
+    base_python = base / "bin" / "python"
+    base_site = Path(subprocess.check_output(
+        [str(base_python), "-I", "-c", "import site; print(site.getsitepackages()[0])"],
+        text=True,
+    ).strip())
+    (base_site / "base_package.py").write_text("VALUE = 'from the base image'\n")
+    editable_source = tmp_path / "editable source"
+    editable_source.mkdir()
+    (editable_source / "editable_package.py").write_text("VALUE = 'editable'\n")
+    (base_site / "__editable__.editable_package.pth").write_text(f"{editable_source}\n")
+
     home = tmp_path / "home"
     target = home / ".venvs" / "senpai-target"
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    exposure = tmp_path / "target-code-executed"
+    (workspace / "site.py").write_text(
+        f"from pathlib import Path; Path({str(exposure)!r}).touch()\n"
+    )
     setup = target_environment_setup("student")
     environment = {
         "PATH": os.environ["PATH"],
         "HOME": str(home),
         # The base-image branch must not need Senpai's own interpreter.
         "SENPAI_PYTHON": str(tmp_path / "missing-senpai-python"),
-        "SENPAI_TARGET_BASE_PYTHON": sys.executable,
+        "SENPAI_TARGET_BASE_PYTHON": str(base_python),
     }
 
     for _ in range(2):  # A restarted container keeps the existing environment.
-        subprocess.run(["bash", "-e", "-c", setup], env=environment, check=True)
+        subprocess.run(
+            ["bash", "-e", "-c", setup], cwd=workspace, env=environment, check=True
+        )
 
-    configuration = (target / "pyvenv.cfg").read_text()
-    assert "include-system-site-packages = true" in configuration
-    target_version = subprocess.check_output(
-        [str(target / "bin" / "python"), "-c", "import sys; print(sys.version_info[:2])"],
+    assert not exposure.exists(), "trusted bootstrap executed target-controlled code"
+    result = subprocess.check_output(
+        [
+            str(target / "bin" / "python"), "-c",
+            "import json, sys, base_package, editable_package; "
+            "print(json.dumps([sys.prefix, base_package.VALUE, editable_package.VALUE]))",
+        ],
+        cwd=tmp_path,
         text=True,
     )
-    assert target_version.strip() == str(sys.version_info[:2])
+    prefix, base_value, editable_value = json.loads(result)
+    assert Path(prefix).resolve() == target.resolve()
+    assert (base_value, editable_value) == ("from the base image", "editable")
     assert not list(target.rglob("senpai-runtime.pth"))
 
 
