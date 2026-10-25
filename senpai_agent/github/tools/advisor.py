@@ -25,6 +25,7 @@ from .contracts import (
     RepairAssignmentRoutingAction,
     RequestAssignmentRevisionAction,
     SendAssignmentFeedbackAction,
+    SyncAdvisorBranchAction,
 )
 from .runtime import GitHubToolRuntime
 
@@ -79,6 +80,37 @@ class CreateAssignmentExecutor(
         return GitHubMutationObservation.from_result(result)
 
 
+class SyncAdvisorBranchExecutor(
+    ToolExecutor[SyncAdvisorBranchAction, GitHubMutationObservation]
+):
+    def __init__(self, runtime: GitHubToolRuntime):
+        self.runtime = runtime
+
+    def __call__(
+        self,
+        action: SyncAdvisorBranchAction,
+        conversation: LocalConversation | None = None,
+    ) -> GitHubMutationObservation:
+        head_sha = _sync_advisor_branch(self.runtime)
+        return GitHubMutationObservation(
+            changed=True,
+            resource_url=f"git:origin/{self.runtime.advisor_branch}",
+            state="refs_synchronized",
+            version=head_sha,
+        )
+
+
+def _sync_advisor_branch(runtime: GitHubToolRuntime) -> str:
+    if not runtime.advisor_branch:
+        raise RuntimeError("the advisor branch is not configured")
+    return git_workflow.sync_remote_branch(
+        runtime.workspace,
+        branch=runtime.advisor_branch,
+        authenticated_remote=github_repository_url(runtime.workflow.repo),
+        token=runtime.git_token,
+    )
+
+
 class PublishAdvisorBranchExecutor(
     ToolExecutor[PublishAdvisorBranchAction, GitHubMutationObservation]
 ):
@@ -92,6 +124,9 @@ class PublishAdvisorBranchExecutor(
     ) -> GitHubMutationObservation:
         if not self.runtime.advisor_branch:
             raise RuntimeError("publish_advisor_branch requires an advisor branch")
+        # Merges land through the GitHub API, so the checkout can hold a stale
+        # view of its own branch. Refresh it before the lease is checked.
+        _sync_advisor_branch(self.runtime)
         with self.runtime.workflow.serialized_assignment_mutation():
             pushed = git_workflow.push_assignment_branch(
                 self.runtime.workspace,

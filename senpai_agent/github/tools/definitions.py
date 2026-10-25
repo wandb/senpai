@@ -14,6 +14,7 @@ from .advisor import (
     CreateAssignmentExecutor,
     MergeExperimentExecutor,
     PublishAdvisorBranchExecutor,
+    SyncAdvisorBranchExecutor,
     RepairAssignmentRoutingExecutor,
     RequestAssignmentRevisionExecutor,
     SendAssignmentFeedbackExecutor,
@@ -28,6 +29,7 @@ from .contracts import (
     PostAssignmentCommentAction,
     PostPeerCommentAction,
     PublishAdvisorBranchAction,
+    SyncAdvisorBranchAction,
     PushExperimentCommitAction,
     RepairAssignmentRoutingAction,
     RequestAssignmentRevisionAction,
@@ -132,6 +134,23 @@ class CreateAssignmentTool(
             "the configured advisor branch and a lease-checked base commit. The "
             "student must belong to this launch.",
             CreateAssignmentExecutor(runtime),
+        )
+
+
+class SyncAdvisorBranchTool(
+    ToolDefinition[SyncAdvisorBranchAction, GitHubMutationObservation]
+):
+    """Refresh the checkout's view of the advisor branch."""
+
+    @classmethod
+    def create(cls, runtime: GitHubToolRuntime) -> Sequence[Self]:
+        return _tool(
+            cls, SyncAdvisorBranchAction, "Sync advisor branch",
+            "Fetch the current advisor branch into this checkout, so it can see "
+            "commits merged through GitHub. Returns the remote head SHA. Run it "
+            "before rebasing local research commits or publishing, whenever the "
+            "branch may have moved.",
+            SyncAdvisorBranchExecutor(runtime),
         )
 
 

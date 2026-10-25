@@ -37,8 +37,15 @@ Maintain these advisor-owned artifacts:
 - Save rigorous dataset analysis and durable future dataset insights in
   `research/DATASET_ANALYSIS.md`.
 
-Commit only advisor-owned changes. Read the current remote advisor-branch SHA
-and the local commit SHA, then call `publish_advisor_branch`:
+Commit only advisor-owned changes. The advisor branch moves whenever an
+experiment merges, and those merges happen through the GitHub API rather than
+through this checkout, so call `sync_advisor_branch` first. It fetches the
+branch, returns its current remote head and leaves your work in place; rebase
+local research commits onto `refs/remotes/origin/<advisor branch>` when it has
+moved.
+
+Then read the current remote advisor-branch SHA and the local commit SHA, and
+call `publish_advisor_branch`:
 
 ```json
 {

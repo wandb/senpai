@@ -81,6 +81,10 @@ class CreateAssignmentAction(Action):
     )
 
 
+class SyncAdvisorBranchAction(Action):
+    """Refresh the local view of the advisor branch from the remote."""
+
+
 class PublishAdvisorBranchAction(Action):
     """Lease-publish the configured advisor branch at one exact local commit."""
 

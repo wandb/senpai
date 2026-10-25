@@ -10,6 +10,7 @@ from pydantic import SecretStr
 
 from senpai_agent.git_transport import (
     GitWorkflowPreconditionError,
+    fetch_refs as _fetch_refs,
     isolated_bare_repository as _isolated_bare_repository,
     remote_head as _remote_head,
     run_git as _git,
@@ -54,6 +55,42 @@ def require_commit_contains_base(
         raise GitWorkflowPreconditionError(
             f"result commit {commit} does not contain assigned research base {base}"
         ) from error
+
+
+def sync_remote_branch(
+    workspace: Path,
+    *,
+    branch: str,
+    remote: str = "origin",
+    authenticated_remote: str | None = None,
+    token: SecretStr | None = None,
+) -> str:
+    """Refresh one remote-tracking ref and its objects, and return the remote head.
+
+    Authenticated Git runs only in a throwaway repository, so a checkout holding
+    no credential can still observe commits it did not push itself. Without this
+    a long-lived checkout never learns about merges made through the GitHub API,
+    and every later lease-checked publication from it fails.
+    """
+
+    workspace = Path(workspace).resolve()
+    _validate_token(token)
+    _git(workspace, "rev-parse", "--is-inside-work-tree")
+    _git(workspace, "check-ref-format", "--branch", branch)
+    tracking_ref = f"refs/remotes/{remote}/{branch}"
+    _git(workspace, "check-ref-format", tracking_ref)
+    network_remote = remote
+    if token is not None:
+        if authenticated_remote is None:
+            raise ValueError("authenticated_remote is required for a credentialed fetch")
+        network_remote = authenticated_remote
+    _fetch_refs(
+        workspace,
+        remote=network_remote,
+        refs=((f"refs/heads/{branch}", tracking_ref),),
+        token=token,
+    )
+    return _local_ref_head(workspace, tracking_ref)
 
 
 def push_assignment_branch(

@@ -23,6 +23,8 @@ from senpai_agent.github.tools import (
     PostPeerCommentTool,
     PublishAdvisorBranchAction,
     PublishAdvisorBranchTool,
+    SyncAdvisorBranchAction,
+    SyncAdvisorBranchTool,
     RepairAssignmentRoutingAction,
     RepairAssignmentRoutingTool,
     RequestAssignmentRevisionAction,
@@ -375,13 +377,55 @@ def test_create_assignment_rejects_unowned_students_or_branches_before_mutation(
     assert workflow.calls == []
 
 
+def test_sync_advisor_branch_refreshes_the_configured_branch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    syncs = []
+    workflow = RecordingWorkflow()
+
+    def sync(workspace, **kwargs):
+        syncs.append((workspace, kwargs))
+        return "c" * 40
+
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.advisor.git_workflow.sync_remote_branch",
+        sync,
+    )
+    tool = SyncAdvisorBranchTool.create(runtime(workflow, tmp_path))[0]
+
+    observation = tool(SyncAdvisorBranchAction())
+
+    assert observation.state == "refs_synchronized"
+    assert observation.version == "c" * 40
+    assert observation.resource_url == "git:origin/advisor-branch"
+    # Reading refs takes no assignment lock; only publication is serialized.
+    assert workflow.calls == []
+    assert syncs == [
+        (
+            tmp_path,
+            {
+                "branch": "advisor-branch",
+                "authenticated_remote": "https://github.com/acme/widgets.git",
+                "token": None,
+            },
+        )
+    ]
+
+
 def test_publish_advisor_branch_uses_configured_branch_and_distinct_shas(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
     pushes = []
+    syncs = []
 
     workflow = RecordingWorkflow()
+
+    def sync(workspace, **kwargs):
+        workflow.calls.append(("sync", None, {}))
+        syncs.append((workspace, kwargs))
+        return "c" * 40
 
     def push(workspace, **kwargs):
         workflow.calls.append(("push", None, {}))
@@ -396,6 +440,10 @@ def test_publish_advisor_branch_uses_configured_branch_and_distinct_shas(
         "senpai_agent.github.tools.advisor.git_workflow.push_assignment_branch",
         push,
     )
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.advisor.git_workflow.sync_remote_branch",
+        sync,
+    )
     tool = PublishAdvisorBranchTool.create(
         runtime(workflow, tmp_path)
     )[0]
@@ -407,7 +455,24 @@ def test_publish_advisor_branch_uses_configured_branch_and_distinct_shas(
     )
 
     assert observation.state == "branch_pushed"
-    assert [call[0] for call in workflow.calls] == ["lock_enter", "push", "lock_exit"]
+    # The branch may have moved through the GitHub API since this checkout last
+    # pushed, so the local view is refreshed before the lease is checked.
+    assert [call[0] for call in workflow.calls] == [
+        "sync",
+        "lock_enter",
+        "push",
+        "lock_exit",
+    ]
+    assert syncs == [
+        (
+            tmp_path,
+            {
+                "branch": "advisor-branch",
+                "authenticated_remote": "https://github.com/acme/widgets.git",
+                "token": None,
+            },
+        )
+    ]
     assert pushes == [
         (
             tmp_path,

@@ -8,7 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -130,8 +130,12 @@ def run_git(
     input_text: str | None = None,
     token: SecretStr | None = None,
     extra_env: dict[str, str] | None = None,
+    environment: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> str:
-    environment = git_process_env(token)
+    environment = (
+        dict(environment) if environment is not None else git_process_env(token)
+    )
     if extra_env:
         environment.update(extra_env)
     try:
@@ -143,6 +147,7 @@ def run_git(
             capture_output=True,
             env=environment,
             check=False,
+            timeout=timeout,
         )
     except FileNotFoundError as error:
         raise GitWorkflowPreconditionError(
@@ -205,6 +210,137 @@ def git_process_env(token: SecretStr | None) -> dict[str, str]:
         environment[f"GIT_CONFIG_KEY_{index}"] = key
         environment[f"GIT_CONFIG_VALUE_{index}"] = value
     return environment
+
+
+def isolated_git_environment() -> dict[str, str]:
+    """Build a Git environment with no inherited transport, proxy or config."""
+
+    environment = git_process_env(None)
+    for name in tuple(environment):
+        if name.startswith("GIT_") or name in PROXY_ENVIRONMENT:
+            environment.pop(name)
+    for name in _GIT_TRANSPORT_ENVIRONMENT:
+        environment.pop(name, None)
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return environment
+
+
+def authenticated_git_environment(token: SecretStr) -> dict[str, str]:
+    """Carry the GitHub header over https only, never over a local path."""
+
+    authorization = git_process_env(token)["GIT_CONFIG_VALUE_0"]
+    environment = isolated_git_environment()
+    configuration = (
+        ("credential.helper", ""),
+        ("http.proxy", ""),
+        ("http.https://github.com/.proxy", ""),
+        ("http.sslVerify", "true"),
+        ("http.https://github.com/.sslVerify", "true"),
+        ("http.followRedirects", "false"),
+        ("http.https://github.com/.followRedirects", "false"),
+        ("http.extraHeader", ""),
+        ("http.https://github.com/.extraHeader", authorization),
+    )
+    environment.update(
+        {
+            "GIT_ALLOW_PROTOCOL": "https",
+            "GIT_CONFIG_COUNT": str(len(configuration)),
+        }
+    )
+    for index, (key, value) in enumerate(configuration):
+        environment[f"GIT_CONFIG_KEY_{index}"] = key
+        environment[f"GIT_CONFIG_VALUE_{index}"] = value
+    return environment
+
+
+def file_git_environment() -> dict[str, str]:
+    """Carry no credential and reach nothing but the local filesystem."""
+
+    environment = isolated_git_environment()
+    environment.update(
+        {
+            "GIT_ALLOW_PROTOCOL": "file",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": os.devnull,
+        }
+    )
+    return environment
+
+
+def fetch_refs(
+    workspace: Path,
+    *,
+    remote: str,
+    refs: Sequence[tuple[str, str]],
+    token: SecretStr | None,
+    timeout: float = 300,
+) -> None:
+    """Copy remote refs into a checkout without handing that checkout the token.
+
+    An authenticated copy runs in two hops: an https-only fetch into a throwaway
+    bare repository that holds the Authorization header, then a file-only fetch
+    from that repository into the checkout. The checkout's Git is never given a
+    credential and can never reach the network, so it cannot become a token
+    oracle for whatever reads the worktree.
+    """
+
+    if not refs:
+        raise ValueError("fetch_refs requires at least one ref")
+    _validate_token(token)
+    if token is None:
+        run_git(
+            workspace,
+            "fetch",
+            "--no-tags",
+            "--atomic",
+            remote,
+            *(f"+{source}:{destination}" for source, destination in refs),
+            timeout=timeout,
+        )
+        return
+
+    with tempfile.TemporaryDirectory(prefix="senpai-git-fetch-") as directory:
+        staging = Path(directory) / "objects.git"
+        run_git(
+            Path(directory),
+            "init",
+            "--bare",
+            str(staging),
+            environment=isolated_git_environment(),
+            timeout=timeout,
+        )
+        staged = tuple(
+            (source, f"refs/senpai/transfer/{index}", destination)
+            for index, (source, destination) in enumerate(refs)
+        )
+        run_git(
+            staging,
+            "fetch",
+            "--no-tags",
+            "--atomic",
+            remote,
+            *(f"+{source}:{transfer}" for source, transfer, _ in staged),
+            environment=authenticated_git_environment(token),
+            timeout=timeout,
+        )
+        run_git(
+            workspace,
+            "fetch",
+            "--no-tags",
+            "--atomic",
+            str(staging),
+            *(f"+{transfer}:{destination}" for _, transfer, destination in staged),
+            environment=file_git_environment(),
+            timeout=timeout,
+        )
 
 
 def _validate_token(token: SecretStr | None) -> None:

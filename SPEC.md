@@ -543,6 +543,7 @@ on GitHub, so the tool can reject a change made after the student read the PR:
 | Tool | Role | Input beyond the shared `assignment` object |
 |---|---|---|
 | `create_assignment` | advisor | `assignment_id`, `revision_id`, `student`, `expected_base_sha`, `head_branch`, `title`, `body`; the base is the configured advisor branch |
+| `sync_advisor_branch` | advisor | none; fetches the configured advisor branch into the checkout and returns its remote head SHA |
 | `publish_advisor_branch` | advisor | `remote_branch_sha_before_push`, `local_commit_sha` |
 | `repair_assignment_routing` | advisor | `working_state` (`wip` or `review`) and a `blockers` list containing only `blocked`, `hold`, or `needs-rebase` |
 | `send_assignment_feedback` | advisor | `feedback_id`, `comment` |
@@ -1052,7 +1053,20 @@ including an idempotent retry, a credential-free local Git command updates
 its value before network work and preserves concurrent changes. It does not
 follow symbolic refs, run hooks, or move the working branch, HEAD, index, or files.
 Other local update failures report that publication succeeded so a retry can
-repair the tracking ref. The bootstrap runner and
+repair the tracking ref.
+
+That post-push update covers only commits the checkout pushed itself. Merges
+land through the GitHub API, so a long-lived checkout otherwise never observes
+them, and every later lease-checked publication from it fails because its local
+history does not descend from the live branch. `sync_advisor_branch` closes
+that gap, and `publish_advisor_branch` runs the same refresh before it takes a
+lease. The refresh copies refs in two hops: an https-only fetch into a
+disposable bare repository that holds the Authorization header, then a
+file-only fetch from that repository into the checkout. The checkout's Git
+receives no credential and cannot reach the network, so it never becomes a
+token oracle. The same two-hop path hydrates student assignments. The refresh
+updates only `refs/remotes/<remote>/<branch>`; it does not move the working
+branch, HEAD, the index, or files. The bootstrap runner and
 target pre-push hooks remain behavioral guards; typed publication bypasses them
 and applies its own branch and lease checks. Before creating a remote branch,
 the typed assignment tool requires a configured student and a `<student>/`
