@@ -7,8 +7,10 @@ from uuid import UUID
 import pytest
 from openhands.sdk import Agent, LLM, LocalConversation
 from openhands.sdk.llm import Message, TextContent
+from openhands.sdk.llm.llm import MIN_CONTEXT_WINDOW_TOKENS
 from pydantic import SecretStr
 
+from senpai_agent.custom_openai import MIN_INPUT_TOKENS
 from senpai_agent.openhands_runner import (
     EVENT_TEXT_LIMIT,
     CustomOpenAIEndpoint,
@@ -448,6 +450,10 @@ def test_custom_openai_model_requires_an_endpoint():
             "high",
             compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
         )
+
+
+def test_custom_openai_input_floor_matches_openhands():
+    assert MIN_INPUT_TOKENS == MIN_CONTEXT_WINDOW_TOKENS
 
 
 def test_reasoning_profile_keeps_the_custom_openai_body_effort_in_sync():

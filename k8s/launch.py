@@ -7,9 +7,11 @@
 """Launch senpai advisor and student agents as K8s resources."""
 
 import base64
+import ipaddress
 import json
 import os
 import posixpath
+import re
 import shlex
 import subprocess
 import sys
@@ -18,7 +20,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Literal
-from urllib.parse import urlparse
 
 import simple_parsing as sp
 import yaml
@@ -48,6 +49,11 @@ from senpai_agent.program_context import (
     encode_program_system_prompt,
     load_program_system_prompt,
     normalize_program_path,
+)
+from senpai_agent.custom_openai import (
+    DEFAULT_MAX_OUTPUT_TOKENS as DEFAULT_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS,
+    CustomOpenAIEndpoint,
+    served_model,
 )
 from senpai_agent.secrets import validate_custom_secret_env_names
 
@@ -163,7 +169,7 @@ class Args:
     compaction_trigger_tokens: int = 200_000
     custom_openai_base_url: str = ""  # OpenAI-compatible chat-completions base URL for custom_openai/ models
     custom_openai_context_tokens: int = 0  # server window shared by input and output, e.g. vLLM --max-model-len
-    custom_openai_max_output_tokens: int = 32_768  # per-request output budget, including reasoning
+    custom_openai_max_output_tokens: int = DEFAULT_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS  # per-request output budget, including reasoning
     custom_openai_canonical_model: str = ""  # optional OpenHands capability name, e.g. deepseek/deepseek-v4.1-flash
     human_issues: bool = (
         True  # allow human GitHub issue triage; disable for isolated launches
@@ -208,6 +214,9 @@ MODEL_PROVIDERS = {
     "custom_openai": ("CUSTOM_OPENAI_API_KEY", "custom-openai-api-key"),
 }
 SENPAI_POD_LABEL_KEYS = {"app", "role", "student", "research-tag"}
+# Kubernetes label names and values, and DNS subdomains for prefixes and hostnames.
+LABEL_NAME = re.compile(r"[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?")
+DNS_SUBDOMAIN = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*")
 REASONING_EFFORTS = {
     "low",
     "medium",
@@ -291,34 +300,63 @@ def deployed_model_providers(args: Args) -> set[str]:
     return providers
 
 
-def custom_openai_served_models(args: Args) -> list[str]:
-    roles = ("student", "advisor") if args.advisor else ("student",)
+def deployed_model_profiles(args: Args) -> dict[str, tuple[str, str]]:
+    profiles = {
+        "student": (args.student_model, args.student_reasoning_effort),
+        "smart": (args.smart_model, args.smart_reasoning_effort),
+        "fast": (args.fast_model, args.fast_reasoning_effort),
+        "frontier": (args.frontier_model, args.frontier_reasoning_effort),
+    }
+    if args.advisor:
+        profiles["advisor"] = (
+            args.advisor_model,
+            args.advisor_reasoning_effort,
+        )
+    return profiles
+
+
+def custom_openai_served_model(args: Args) -> str | None:
+    return served_model(model for model, _effort in deployed_model_profiles(args).values())
+
+
+def custom_openai_efforts(args: Args) -> list[str]:
     return sorted(
         {
-            model.partition("/")[2]
-            for role in roles
-            for model in configured_models(args, role)
+            effort
+            for model, effort in deployed_model_profiles(args).values()
             if model_provider(model) == "custom_openai"
         }
     )
 
 
 def validate_custom_openai_endpoint(args: Args) -> None:
-    parsed = urlparse(args.custom_openai_base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        sys.exit(
-            "ERROR: --custom_openai_base_url must be an http(s) URL "
-            "when a custom_openai/ model is configured"
+    try:
+        custom_openai_served_model(args)
+        CustomOpenAIEndpoint(
+            base_url=args.custom_openai_base_url,
+            context_tokens=args.custom_openai_context_tokens,
+            max_output_tokens=args.custom_openai_max_output_tokens,
         )
-    if not 0 < args.custom_openai_max_output_tokens < args.custom_openai_context_tokens:
-        sys.exit(
-            "ERROR: --custom_openai_context_tokens must exceed a positive "
-            "--custom_openai_max_output_tokens"
-        )
+    except ValueError as error:
+        sys.exit(f"ERROR: {error}")
+
+
+def is_dns_subdomain(value: str) -> bool:
+    return len(value) <= 253 and DNS_SUBDOMAIN.fullmatch(value) is not None
+
+
+def is_label_key(key: str) -> bool:
+    prefix, separator, name = key.rpartition("/")
+    return LABEL_NAME.fullmatch(name) is not None and (
+        not separator or is_dns_subdomain(prefix)
+    )
 
 
 def agent_pod_labels(args: Args) -> dict[str, str]:
     labels = key_value_mapping(args.agent_pod_labels, kind="agent pod label")
+    for key, value in labels.items():
+        if not is_label_key(key) or LABEL_NAME.fullmatch(value) is None:
+            raise ValueError(f"invalid Kubernetes agent pod label: {key}={value}")
     if reserved := sorted(SENPAI_POD_LABEL_KEYS & labels.keys()):
         raise ValueError(f"agent pod labels cannot replace: {', '.join(reserved)}")
     return labels
@@ -330,6 +368,9 @@ def agent_host_aliases(args: Args) -> list[dict]:
         ip, separator, hostname = item.partition("=")
         if not separator or not ip or not hostname:
             raise ValueError("agent host aliases must use ip=hostname")
+        ipaddress.ip_address(ip)
+        if not is_dns_subdomain(hostname):
+            raise ValueError(f"agent host alias hostname is invalid: {hostname}")
         hostnames_by_ip.setdefault(ip, []).append(hostname)
     return [
         {"ip": ip, "hostnames": hostnames}
@@ -361,24 +402,13 @@ def _supports_openai_pro(model: str) -> bool:
 def validate_model_config(args: Args) -> None:
     if args.compaction_trigger_tokens < 50_000:
         sys.exit("ERROR: --compaction_trigger_tokens must be at least 50000")
-    profiles = {
-        "student": (args.student_model, args.student_reasoning_effort),
-        "smart": (args.smart_model, args.smart_reasoning_effort),
-        "fast": (args.fast_model, args.fast_reasoning_effort),
-        "frontier": (args.frontier_model, args.frontier_reasoning_effort),
-    }
-    if args.advisor:
-        profiles["advisor"] = (
-            args.advisor_model,
-            args.advisor_reasoning_effort,
-        )
-    for name, (model, effort) in profiles.items():
+    for name, (model, effort) in deployed_model_profiles(args).items():
         provider = model_provider(model)
         if effort not in REASONING_EFFORTS:
             choices = ", ".join(sorted(REASONING_EFFORTS))
             sys.exit(f"ERROR: --{name}_reasoning_effort must be one of: {choices}")
         if provider == "custom_openai":
-            # The self-hosted server owns its effort vocabulary and rejects unknown values.
+            # The self-hosted server owns its effort vocabulary; preflight checks each value.
             continue
         normalized_model = model.lower()
         if normalized_model == "openai/gpt-6-astra" and effort == "none":
@@ -640,27 +670,25 @@ def _student_tolerations(args: Args) -> list[dict]:
     return [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}]
 
 
-def _yaml_list_insertion(value: dict, indentation: int) -> str:
-    return "enabled\n" + textwrap.indent(
-        yaml.safe_dump([value], sort_keys=False).rstrip(),
-        " " * indentation,
-    )
-
-
-def _yaml_fields_insertion(fields: dict, indentation: int) -> str:
-    if not fields:
+def _yaml_insertion(value: dict | list, indentation: int) -> str:
+    """Render YAML that replaces a commented placeholder line, or nothing."""
+    if not value:
         return ""
     return "enabled\n" + textwrap.indent(
-        yaml.safe_dump(fields, sort_keys=False).rstrip(),
+        yaml.safe_dump(value, sort_keys=False).rstrip(),
         " " * indentation,
     )
+
+
+def _yaml_list_insertion(value: dict, indentation: int) -> str:
+    return _yaml_insertion([value], indentation)
 
 
 def _agent_pod_fields(args: Args) -> dict[str, str]:
     aliases = agent_host_aliases(args)
     return {
-        "AGENT_POD_LABELS": _yaml_fields_insertion(agent_pod_labels(args), 8),
-        "AGENT_HOST_ALIASES": _yaml_fields_insertion(
+        "AGENT_POD_LABELS": _yaml_insertion(agent_pod_labels(args), 8),
+        "AGENT_HOST_ALIASES": _yaml_insertion(
             {"hostAliases": aliases} if aliases else {}, 6
         ),
     }
@@ -795,10 +823,7 @@ def _executor_volumes(args: Args) -> str:
             },
         },
     ]
-    return "enabled\n" + textwrap.indent(
-        yaml.safe_dump(volumes, sort_keys=False).rstrip(),
-        " " * 6,
-    )
+    return _yaml_insertion(volumes, 6)
 
 
 def _student_training_access(student_name: str, tag: str, namespace: str) -> str:
@@ -976,7 +1001,7 @@ def render_student(
                 if args.remote_training
                 else student_gpu_node_selector(args)
             ),
-            "STUDENT_SCHEDULER_NAME": _yaml_fields_insertion(
+            "STUDENT_SCHEDULER_NAME": _yaml_insertion(
                 {"schedulerName": args.student_scheduler_name}
                 if args.student_scheduler_name and not args.remote_training
                 else {},
@@ -1254,7 +1279,8 @@ def main():
             preflight_check_custom_openai(
                 custom_openai_api_key,
                 args.custom_openai_base_url,
-                custom_openai_served_models(args),
+                custom_openai_served_model(args),
+                custom_openai_efforts(args),
                 args.custom_openai_context_tokens,
             )
         if "wandb" in model_providers:

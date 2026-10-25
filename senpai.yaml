@@ -65,7 +65,7 @@ compaction_trigger_tokens: 200000
 # Self-hosted OpenAI-compatible endpoint for custom_openai/<served-model-id> profiles.
 # custom_openai_base_url: https://inference.example.ts.net/v1
 # custom_openai_context_tokens: 100000  # the server's --max-model-len
-# custom_openai_max_output_tokens: 32768
+# custom_openai_max_output_tokens: 32768  # default 65536; leave at least 16384 for input
 # custom_openai_canonical_model: deepseek/deepseek-v4.1-flash
 
 # advisor — the integration branch inside the problem-package repo that advisor PRs merge into

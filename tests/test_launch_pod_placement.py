@@ -108,6 +108,9 @@ def test_agent_pod_labels_and_host_aliases_apply_to_both_roles():
         ({"agent_pod_labels": ["role=gpu"]}, "cannot replace: role"),
         ({"agent_pod_labels": ["enabled"]}, "agent pod labels must use key=value"),
         ({"agent_pod_labels": ["a=b", "a=c"]}, "duplicate agent pod label: a"),
+        ({"agent_pod_labels": ["access=deepseek/v41"]}, "invalid Kubernetes"),
+        ({"agent_pod_labels": ["Access.Example/model=on"]}, "invalid Kubernetes"),
+        ({"agent_pod_labels": [f"access={'x' * 64}"]}, "invalid Kubernetes"),
     ],
 )
 def test_agent_pod_labels_fail_clearly(overrides, message):
@@ -115,6 +118,14 @@ def test_agent_pod_labels_fail_clearly(overrides, message):
         launch.agent_pod_labels(launch_args(**overrides))
 
 
-def test_agent_host_aliases_require_an_ip_and_hostname():
-    with pytest.raises(ValueError, match="ip=hostname"):
-        launch.agent_host_aliases(launch_args(agent_host_aliases=["192.0.2.10"]))
+@pytest.mark.parametrize(
+    ("alias", "message"),
+    [
+        ("192.0.2.10", "ip=hostname"),
+        ("dsv41=192.0.2.10", "does not appear to be an IPv4 or IPv6 address"),
+        ("192.0.2.10=Inference_Host", "hostname is invalid"),
+    ],
+)
+def test_agent_host_aliases_fail_clearly(alias, message):
+    with pytest.raises(ValueError, match=message):
+        launch.agent_host_aliases(launch_args(agent_host_aliases=[alias]))

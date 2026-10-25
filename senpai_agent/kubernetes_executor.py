@@ -466,7 +466,10 @@ class KubernetesExecutor:
         found_key = False
         for allow_gpus, template in pod_specs:
             # Some clusters admit standalone GPU pods only with their own deadline.
-            template["spec"]["activeDeadlineSeconds"] = remaining
+            template["spec"]["activeDeadlineSeconds"] = min(
+                remaining,
+                int(template["spec"].get("activeDeadlineSeconds") or remaining),
+            )
             template_metadata = template.setdefault("metadata", {})
             if set(template_metadata) - {"annotations", "labels"}:
                 raise ValueError("pod template metadata contains unsupported control fields")
@@ -540,7 +543,7 @@ class KubernetesExecutor:
                 pod_spec["schedulerName"] = self.gpu_scheduler_name
             if self.gpu_node_selector:
                 pod_spec["nodeSelector"] = {
-                    **pod_spec.get("nodeSelector", {}),
+                    **(pod_spec.get("nodeSelector") or {}),
                     **self.gpu_node_selector,
                 }
         pod_security = pod_spec.setdefault("securityContext", {})

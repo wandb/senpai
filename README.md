@@ -200,7 +200,8 @@ uses `WANDB_API_KEY` for auth.
 
 For a self-hosted OpenAI-compatible chat-completions server, such as vLLM or
 SGLang, prefix the served model ID with `custom_openai/`. Every
-`custom_openai/` profile uses the same endpoint and `CUSTOM_OPENAI_API_KEY`:
+`custom_openai/` profile uses the same endpoint, served model, and
+`CUSTOM_OPENAI_API_KEY`:
 
 ```yaml
 student_model: custom_openai/deepseek-ai/DeepSeek-V4.1-Flash-1017
@@ -209,7 +210,7 @@ fast_model: custom_openai/deepseek-ai/DeepSeek-V4.1-Flash-1017
 fast_reasoning_effort: low
 custom_openai_base_url: https://inference.example.ts.net/v1
 custom_openai_context_tokens: 100000      # the server's --max-model-len
-custom_openai_max_output_tokens: 32768    # per request, including reasoning
+custom_openai_max_output_tokens: 32768    # per request, including reasoning; default 65536
 custom_openai_canonical_model: deepseek/deepseek-v4.1-flash
 ```
 
@@ -218,13 +219,17 @@ and passes it through unchanged, so use values the server accepts. For example,
 DeepSeek V4.1 rejects `medium`. vLLM-style servers reject a request when its
 input plus `max_tokens` exceeds the context window. Senpai therefore limits
 input to `custom_openai_context_tokens - custom_openai_max_output_tokens` and
-condenses history before reaching that limit. `custom_openai_canonical_model`
+condenses history before reaching that limit. That input limit must be at least
+16,384 tokens, the smallest window OpenHands accepts. Lower the default output
+budget of 65,536 for a server with a small window. `custom_openai_canonical_model`
 is optional. It selects OpenHands model features for the served model. For
 DeepSeek V4.1, `deepseek/deepseek-v4.1-flash` returns each turn's
 `reasoning_content` to the server between tool calls. Preflight lists the
-endpoint's `/models` from the launch machine. It checks that every configured
+endpoint's `/models` from the launch machine. It checks that the configured
 model is served and, when the server reports `max_model_len`, that the context
-setting does not exceed it.
+setting does not exceed it. It then sends a one-token chat request for each
+configured `custom_openai/` effort, so an effort the server rejects stops the
+launch.
 
 The defaults in `senpai.yaml` describe W&B's deployment and should not be copied unchanged into another environment. Every setting can also be overridden on the command line. `--tag` and `--target_repo_url` are required unless your chosen config file supplies them.
 
@@ -286,8 +291,8 @@ inputs and manifest requirements.
 Only the executor sidecar receives a projected Kubernetes token. Its socket
 broker accepts the reserved MPIJob, injects ownership, pod hardening, and an
 exact-commit bundle checkout, binds the W&B/source annotations, persists the
-created UID, and uses UID-preconditioned activation and deletion. It sets every
-pod template's `activeDeadlineSeconds` to the workload's remaining time, because
+created UID, and uses UID-preconditioned activation and deletion. It caps every
+pod template's `activeDeadlineSeconds` at the workload's remaining time, because
 some clusters admit GPU pods outside a ReplicaSet only with a pod deadline. It
 also applies `--student_scheduler_name` and `--student_node_selector` to GPU
 worker pods. Workloads are
@@ -701,7 +706,8 @@ preserved, except for Senpai ownership labels and the reserved
 `senpai-training-role` label. On GPU worker pods, a configured
 `--student_scheduler_name` replaces the target's scheduler and
 `--student_node_selector` keys replace the target's values for those keys.
-Every pod template's `activeDeadlineSeconds` is set to the workload deadline.
+Every pod template's `activeDeadlineSeconds` is capped at the workload deadline;
+a shorter target value is kept.
 Preserved labels can still affect configured
 [admission webhooks](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/#matching-requests-objectselector)
 and [network policies](https://kubernetes.io/docs/concepts/services-networking/network-policies/#the-networkpolicy-resource).

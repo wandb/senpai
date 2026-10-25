@@ -19,13 +19,17 @@ from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
-from urllib.parse import urlparse
 
 os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
 
 from senpai_agent.advisor import (
     AdvisorEventPump,
     advisor_conversation_id,
+)
+from senpai_agent.custom_openai import (
+    DEFAULT_MAX_OUTPUT_TOKENS as DEFAULT_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS,
+    CustomOpenAIEndpoint,
+    served_model,
 )
 from senpai_agent.delegation import (
     MAX_DELEGATION_DEPTH,
@@ -134,7 +138,6 @@ DEFAULT_SMART_REASONING_EFFORT = "xhigh"
 DEFAULT_FAST_REASONING_EFFORT = "medium"
 DEFAULT_FRONTIER_REASONING_EFFORT = "max"
 DEFAULT_COMPACTION_TRIGGER_TOKENS = 200_000
-DEFAULT_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS = 32_768
 WANDB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
 REASONING_EFFORTS = (
     "low",
@@ -201,21 +204,6 @@ class RunnerArgs:
         negative_option="--no-browser",
     )
     child: bool = flag(default=False, alias="--child")
-
-
-@dataclass(frozen=True)
-class CustomOpenAIEndpoint:
-    """A self-hosted OpenAI-compatible chat-completions server."""
-
-    base_url: str
-    context_tokens: int
-    max_output_tokens: int
-    canonical_model: str | None = None
-
-    @property
-    def max_input_tokens(self) -> int:
-        # vLLM-style servers reject input plus requested output beyond the window.
-        return self.context_tokens - self.max_output_tokens
 
 
 @dataclass(frozen=True)
@@ -353,6 +341,7 @@ def apply_reasoning_profile(llm: LLM) -> LLM:
     else:
         extra_body.pop("reasoning", None)
     if model_provider(llm.model) == "custom_openai":
+        # Agent definitions can override the effort the endpoint configuration sent.
         extra_body["reasoning_effort"] = reasoning_effort
     return llm.model_copy(
         update={
@@ -416,12 +405,6 @@ def resolve_api_key(env: Mapping[str, str], key_env: str) -> SecretStr:
 
 
 def custom_openai_endpoint(env: Mapping[str, str]) -> CustomOpenAIEndpoint:
-    base_url = env.get("SENPAI_CUSTOM_OPENAI_BASE_URL", "").strip()
-    parsed = urlparse(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise RuntimeError(
-            "SENPAI_CUSTOM_OPENAI_BASE_URL must be an http(s) URL for custom_openai models"
-        )
     try:
         context_tokens = int(env.get("SENPAI_CUSTOM_OPENAI_CONTEXT_TOKENS", ""))
         max_output_tokens = int(
@@ -435,19 +418,17 @@ def custom_openai_endpoint(env: Mapping[str, str]) -> CustomOpenAIEndpoint:
             "SENPAI_CUSTOM_OPENAI_CONTEXT_TOKENS and "
             "SENPAI_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS must be integers"
         ) from error
-    if not 0 < max_output_tokens < context_tokens:
-        raise RuntimeError(
-            "SENPAI_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS must be positive and smaller "
-            "than SENPAI_CUSTOM_OPENAI_CONTEXT_TOKENS"
+    try:
+        return CustomOpenAIEndpoint(
+            base_url=env.get("SENPAI_CUSTOM_OPENAI_BASE_URL", "").strip().rstrip("/"),
+            context_tokens=context_tokens,
+            max_output_tokens=max_output_tokens,
+            canonical_model=(
+                env.get("SENPAI_CUSTOM_OPENAI_CANONICAL_MODEL", "").strip() or None
+            ),
         )
-    return CustomOpenAIEndpoint(
-        base_url=base_url.rstrip("/"),
-        context_tokens=context_tokens,
-        max_output_tokens=max_output_tokens,
-        canonical_model=(
-            env.get("SENPAI_CUSTOM_OPENAI_CANONICAL_MODEL", "").strip() or None
-        ),
-    )
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
 
 
 def conversation_secrets(
@@ -995,11 +976,11 @@ def resolve_config(
         raise RuntimeError(
             "WANDB_ENTITY and WANDB_PROJECT are required for W&B Inference"
         )
-    custom_openai = (
-        custom_openai_endpoint(env)
-        if any(model_provider(profile) == "custom_openai" for profile in models)
-        else None
-    )
+    try:
+        uses_custom_openai = served_model(models) is not None
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
+    custom_openai = custom_openai_endpoint(env) if uses_custom_openai else None
 
     return RunnerConfig(
         max_turns=args.max_turns,

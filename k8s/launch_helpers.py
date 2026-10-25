@@ -955,19 +955,21 @@ def preflight_check_openai_api_key(api_key: str) -> None:
 def preflight_check_custom_openai(
     api_key: str,
     base_url: str,
-    served_models: Sequence[str],
+    served_model: str,
+    reasoning_efforts: Sequence[str],
     context_tokens: int,
 ) -> None:
-    """Verify the endpoint key, the served model IDs, and the server context window."""
-    req = urllib.request.Request(
-        f"{base_url.rstrip('/')}/models",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "senpai-launch-preflight",
-        },
-    )
+    """Verify the endpoint key, served model, context window, and effort values."""
+    base_url = base_url.rstrip("/")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "senpai-launch-preflight",
+    }
     response = _preflight_http(
-        "custom OpenAI-compatible endpoint", req, api_key, timeout=15
+        "custom OpenAI-compatible endpoint",
+        urllib.request.Request(f"{base_url}/models", headers=headers),
+        api_key,
+        timeout=15,
     )
     if not isinstance(response, dict) or not isinstance(response.get("data"), list):
         sys.exit("ERROR: custom OpenAI-compatible endpoint returned an invalid models response")
@@ -976,20 +978,38 @@ def preflight_check_custom_openai(
         for entry in response["data"]
         if isinstance(entry, dict) and isinstance(entry.get("id"), str)
     }
-    for model in served_models:
-        if model not in served:
-            available = ", ".join(sorted(served)) or "<none>"
-            sys.exit(
-                f"ERROR: custom OpenAI-compatible endpoint does not serve {model}; "
-                f"available: {available}"
-            )
-        server_limit = served[model].get("max_model_len")
-        if isinstance(server_limit, int) and context_tokens > server_limit:
-            sys.exit(
-                f"ERROR: --custom_openai_context_tokens={context_tokens} exceeds "
-                f"the server's max_model_len={server_limit} for {model}"
-            )
-    print(f"  OK — serves {', '.join(served_models)}")
+    if served_model not in served:
+        available = ", ".join(sorted(served)) or "<none>"
+        sys.exit(
+            f"ERROR: custom OpenAI-compatible endpoint does not serve {served_model}; "
+            f"available: {available}"
+        )
+    server_limit = served[served_model].get("max_model_len")
+    if isinstance(server_limit, int) and context_tokens > server_limit:
+        sys.exit(
+            f"ERROR: --custom_openai_context_tokens={context_tokens} exceeds "
+            f"the server's max_model_len={server_limit} for {served_model}"
+        )
+    # The server owns its effort vocabulary, so send each configured value once.
+    for effort in reasoning_efforts:
+        payload = {
+            "model": served_model,
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+            "max_tokens": 1,
+            "reasoning_effort": effort,
+        }
+        _preflight_http(
+            f"custom OpenAI-compatible reasoning_effort={effort}",
+            urllib.request.Request(
+                f"{base_url}/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={**headers, "Content-Type": "application/json"},
+                method="POST",
+            ),
+            api_key,
+            timeout=60,
+        )
+    print(f"  OK — serves {served_model}")
 
 
 def preflight_check_exa_api_key(api_key: str) -> None:

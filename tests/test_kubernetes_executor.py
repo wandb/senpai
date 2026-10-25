@@ -272,6 +272,9 @@ def test_executor_places_gpu_workers_and_bounds_every_training_pod(tmp_path):
     document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]["spec"][
         "nodeSelector"
     ] = {"gpu.nvidia.com/class": "A100", "zone": "a"}
+    document["spec"]["mpiReplicaSpecs"]["Launcher"]["template"]["spec"][
+        "activeDeadlineSeconds"
+    ] = 60
 
     apply(broker, document)
 
@@ -284,7 +287,28 @@ def test_executor_places_gpu_workers_and_bounds_every_training_pod(tmp_path):
     assert worker["nodeSelector"] == {"gpu.nvidia.com/class": "H200", "zone": "a"}
     assert "schedulerName" not in launcher
     assert "nodeSelector" not in launcher
-    assert worker["activeDeadlineSeconds"] == launcher["activeDeadlineSeconds"] == deadline
+    assert worker["activeDeadlineSeconds"] == deadline
+    assert launcher["activeDeadlineSeconds"] == 60
+
+
+def test_executor_places_gpu_workers_with_an_empty_node_selector(tmp_path):
+    api = FakeApi()
+    broker = executor(
+        tmp_path,
+        api,
+        nodes=1,
+        gpu_node_selector={"gpu.nvidia.com/class": "H200"},
+    )
+    reserve(broker, kind="Job")
+    document = manifest()
+    template = document["spec"]["mpiReplicaSpecs"]["Worker"]["template"]
+    template["spec"]["nodeSelector"] = None
+    document.update(apiVersion="batch/v1", kind="Job", spec={"template": template})
+
+    apply(broker, document)
+
+    pod = api.document_value["spec"]["template"]["spec"]
+    assert pod["nodeSelector"] == {"gpu.nvidia.com/class": "H200"}
 
 
 def test_executor_leaves_gpu_placement_to_the_cluster_by_default(tmp_path):

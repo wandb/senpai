@@ -839,7 +839,8 @@ def test_custom_openai_launch_resolves_and_preflights_its_endpoint(monkeypatch):
         (
             "endpoint-key",
             "https://inference.example.test/v1",
-            ["deepseek-ai/DeepSeek-V4.1-Flash-1017"],
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            ["low", "xhigh"],
             100_000,
         )
     ]

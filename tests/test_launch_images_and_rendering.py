@@ -806,7 +806,7 @@ def test_custom_openai_endpoint_is_rendered_for_every_role_that_uses_it():
         } == {
             "SENPAI_CUSTOM_OPENAI_BASE_URL": "https://inference.example.test/v1",
             "SENPAI_CUSTOM_OPENAI_CONTEXT_TOKENS": "100000",
-            "SENPAI_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS": "32768",
+            "SENPAI_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS": "65536",
             "SENPAI_CUSTOM_OPENAI_CANONICAL_MODEL": "deepseek/deepseek-v4.1-flash",
         }
         assert {
@@ -821,9 +821,10 @@ def test_custom_openai_endpoint_is_rendered_for_every_role_that_uses_it():
         assert "custom-openai-api-key" in yaml.safe_load(secret)["data"]
 
     launch.validate_model_config(args)
-    assert launch.custom_openai_served_models(args) == [
+    assert launch.custom_openai_served_model(args) == (
         "deepseek-ai/DeepSeek-V4.1-Flash-1017"
-    ]
+    )
+    assert launch.custom_openai_efforts(args) == ["low", "xhigh"]
 
 
 def test_roles_without_custom_openai_models_omit_the_endpoint():
@@ -850,7 +851,19 @@ def test_roles_without_custom_openai_models_omit_the_endpoint():
             "custom_openai_base_url must be an http",
         ),
         ({"custom_openai_context_tokens": 0}, "context_tokens must exceed"),
+        ({"custom_openai_max_output_tokens": 0}, "must be positive"),
         ({"custom_openai_max_output_tokens": 100_000}, "context_tokens must exceed"),
+        (
+            {
+                "custom_openai_context_tokens": 40_000,
+                "custom_openai_max_output_tokens": 32_768,
+            },
+            "by at least 16384",
+        ),
+        (
+            {"fast_model": "custom_openai/Qwen/Qwen3-Coder"},
+            "share one served model",
+        ),
     ],
 )
 def test_launch_rejects_an_incomplete_custom_openai_endpoint(overrides, message):

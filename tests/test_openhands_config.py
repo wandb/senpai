@@ -643,7 +643,11 @@ def test_custom_openai_endpoint_is_unset_for_other_providers(tmp_path: Path):
         ({"SENPAI_CUSTOM_OPENAI_BASE_URL": ""}, "must be an http"),
         ({"SENPAI_CUSTOM_OPENAI_BASE_URL": "inference.example.test/v1"}, "must be an http"),
         ({"SENPAI_CUSTOM_OPENAI_CONTEXT_TOKENS": ""}, "must be integers"),
-        ({"SENPAI_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS": "100000"}, "smaller than"),
+        ({"SENPAI_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS": "100000"}, "by at least 16384"),
+        (
+            {"SENPAI_OPENHANDS_FAST_MODEL": "custom_openai/Qwen/Qwen3-Coder"},
+            "share one served model",
+        ),
     ],
 )
 def test_custom_openai_endpoint_settings_fail_clearly(
