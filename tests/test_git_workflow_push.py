@@ -620,6 +620,42 @@ def test_credentialed_push_does_not_run_checkout_status_helpers(tmp_path: Path):
     assert not filter_marker.exists()
 
 
+def test_credentialed_push_runs_no_git_inside_the_checkout_with_the_header(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    workspace, remote, previous_sha = repository(tmp_path)
+    candidate_sha = commit_file(workspace, "model.py", "baseline = 2\n", "candidate")
+    trace = tmp_path / "authenticated-git.trace"
+    real_run = subprocess.run
+
+    def traced_run(command, **kwargs):
+        if any("Authorization:" in value for value in kwargs["env"].values()):
+            kwargs["env"] = {**kwargs["env"], "GIT_TRACE": str(trace)}
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr("senpai_agent.git_transport.subprocess.run", traced_run)
+
+    pushed = push_assignment_branch(
+        workspace,
+        branch="experiment-7",
+        expected_remote_sha=previous_sha,
+        expected_local_sha=candidate_sha,
+        authenticated_remote=remote.resolve().as_uri(),
+        token=SecretStr("typed-write-token"),
+    )
+
+    assert pushed.head_sha == candidate_sha
+    # Staging borrows the checkout's objects; listing its refs as alternates
+    # would start Git in the checkout, reading its config, under the header.
+    checkout_git_dir = str((workspace / ".git").resolve())
+    assert not [
+        line
+        for line in trace.read_text().splitlines()
+        if checkout_git_dir in line and "for-each-ref" in line
+    ]
+
+
 def test_push_from_a_shallow_checkout_keeps_the_history_boundary(tmp_path: Path):
     origin = tmp_path / "origin.git"
     seed = tmp_path / "seed"

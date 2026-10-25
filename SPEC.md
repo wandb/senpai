@@ -1043,7 +1043,8 @@ The controller supplies the GitHub URL from its configured repository, disables
 hooks and credential helpers, ignores global and system Git configuration, and
 clears inherited Git and proxy settings. The network process never reads the
 checkout's Git configuration. Push staging shares only the checkout's object
-directory and shallow boundaries, then verifies the staged commit SHA.
+directory and shallow boundaries, disables the alternate-refs command so no Git
+process starts inside the checkout, then verifies the staged commit SHA.
 Assignment creation fetches the base at depth one; idempotent replay fetches the
 assignment at depth two to verify its parent, tree, and message. These fetches do
 not change the advisor checkout. Pushes retain expected-SHA checks, ancestry

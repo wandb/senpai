@@ -180,6 +180,9 @@ def git_process_env(token: SecretStr | None) -> dict[str, str]:
         )
     configuration.extend(
         (
+            # Push staging borrows the checkout's objects; never start Git in
+            # the checkout to list them as alternate refs.
+            ("core.alternateRefsCommand", "true"),
             ("credential.helper", ""),
             ("core.fsmonitor", "false"),
             ("core.hooksPath", os.devnull),
