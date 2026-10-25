@@ -133,6 +133,8 @@ def run_git(
     environment: dict[str, str] | None = None,
     timeout: float | None = None,
 ) -> str:
+    if token is not None and environment is not None:
+        raise ValueError("pass a token or a complete environment, not both")
     environment = (
         dict(environment) if environment is not None else git_process_env(token)
     )
@@ -153,6 +155,10 @@ def run_git(
         raise GitWorkflowPreconditionError(
             f"git is not installed at {GIT_EXECUTABLE}"
         ) from error
+    except subprocess.TimeoutExpired as error:
+        raise GitWorkflowPreconditionError(
+            f"git {' '.join(arguments[:2])} timed out after {timeout:g} s"
+        ) from error
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise GitWorkflowPreconditionError(
@@ -165,24 +171,12 @@ def git_process_env(token: SecretStr | None) -> dict[str, str]:
     """Build an isolated Git environment with optional in-memory GitHub auth."""
 
     _validate_token(token)
-    environment = dict(os.environ)
-    scrub_github_credentials(environment)
-    for name in tuple(environment):
-        if name.startswith("GIT_") or name in PROXY_ENVIRONMENT:
-            environment.pop(name)
-    for name in _GIT_TRANSPORT_ENVIRONMENT:
-        environment.pop(name, None)
+    environment = _scrubbed_environment()
 
     configuration: list[tuple[str, str]] = []
     if token is not None:
-        credential = base64.b64encode(
-            f"x-access-token:{token.get_secret_value()}".encode()
-        ).decode()
         configuration.append(
-            (
-                "http.https://github.com/.extraHeader",
-                f"Authorization: Basic {credential}",
-            )
+            ("http.https://github.com/.extraHeader", _authorization_header(token))
         )
     configuration.extend(
         (
@@ -215,12 +209,7 @@ def git_process_env(token: SecretStr | None) -> dict[str, str]:
 def isolated_git_environment() -> dict[str, str]:
     """Build a Git environment with no inherited transport, proxy or config."""
 
-    environment = git_process_env(None)
-    for name in tuple(environment):
-        if name.startswith("GIT_") or name in PROXY_ENVIRONMENT:
-            environment.pop(name)
-    for name in _GIT_TRANSPORT_ENVIRONMENT:
-        environment.pop(name, None)
+    environment = _scrubbed_environment()
     environment.update(
         {
             "GIT_CONFIG_GLOBAL": os.devnull,
@@ -235,9 +224,12 @@ def isolated_git_environment() -> dict[str, str]:
 def authenticated_git_environment(token: SecretStr) -> dict[str, str]:
     """Carry the GitHub header over https only, never over a local path."""
 
-    authorization = git_process_env(token)["GIT_CONFIG_VALUE_0"]
+    _validate_token(token)
     environment = isolated_git_environment()
     configuration = (
+        # Borrowed checkout objects must not make Git run for-each-ref inside
+        # the checkout while this environment holds the header.
+        ("core.alternateRefsCommand", "true"),
         ("credential.helper", ""),
         ("http.proxy", ""),
         ("http.https://github.com/.proxy", ""),
@@ -246,7 +238,7 @@ def authenticated_git_environment(token: SecretStr) -> dict[str, str]:
         ("http.followRedirects", "false"),
         ("http.https://github.com/.followRedirects", "false"),
         ("http.extraHeader", ""),
-        ("http.https://github.com/.extraHeader", authorization),
+        ("http.https://github.com/.extraHeader", _authorization_header(token)),
     )
     environment.update(
         {
@@ -281,6 +273,7 @@ def fetch_refs(
     remote: str,
     refs: Sequence[tuple[str, str]],
     token: SecretStr | None,
+    have: str | None = None,
     timeout: float = 300,
 ) -> None:
     """Copy remote refs into a checkout without handing that checkout the token.
@@ -290,6 +283,10 @@ def fetch_refs(
     from that repository into the checkout. The checkout's Git is never given a
     credential and can never reach the network, so it cannot become a token
     oracle for whatever reads the worktree.
+
+    ``have`` names a commit the checkout already holds. The throwaway repository
+    then borrows the checkout's objects and negotiates from that commit, so only
+    the missing history crosses the network.
     """
 
     if not refs:
@@ -307,16 +304,10 @@ def fetch_refs(
         )
         return
 
-    with tempfile.TemporaryDirectory(prefix="senpai-git-fetch-") as directory:
-        staging = Path(directory) / "objects.git"
-        run_git(
-            Path(directory),
-            "init",
-            "--bare",
-            str(staging),
-            environment=isolated_git_environment(),
-            timeout=timeout,
-        )
+    repository = (
+        staged_commit(workspace, have) if have else isolated_bare_repository()
+    )
+    with repository as staging:
         staged = tuple(
             (source, f"refs/senpai/transfer/{index}", destination)
             for index, (source, destination) in enumerate(refs)
@@ -341,6 +332,24 @@ def fetch_refs(
             environment=file_git_environment(),
             timeout=timeout,
         )
+
+
+def _scrubbed_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    scrub_github_credentials(environment)
+    for name in tuple(environment):
+        if name.startswith("GIT_") or name in PROXY_ENVIRONMENT:
+            environment.pop(name)
+    for name in _GIT_TRANSPORT_ENVIRONMENT:
+        environment.pop(name, None)
+    return environment
+
+
+def _authorization_header(token: SecretStr) -> str:
+    credential = base64.b64encode(
+        f"x-access-token:{token.get_secret_value()}".encode()
+    ).decode()
+    return f"Authorization: Basic {credential}"
 
 
 def _validate_token(token: SecretStr | None) -> None:

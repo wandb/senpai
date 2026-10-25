@@ -76,6 +76,28 @@ def test_git_trusts_only_its_resolved_workspace_when_mount_owner_differs(
         ) == "true"
 
 
+def test_git_timeout_is_a_precondition_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    def stalled(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr("senpai_agent.git_transport.subprocess.run", stalled)
+
+    with pytest.raises(GitWorkflowPreconditionError, match="timed out after 300 s"):
+        run_git(tmp_path, "fetch", "origin", timeout=300)
+
+
+def test_git_rejects_a_token_beside_a_complete_environment(tmp_path: Path):
+    with pytest.raises(ValueError, match="not both"):
+        run_git(
+            tmp_path,
+            "status",
+            token=SecretStr("typed-token"),
+            environment=git_process_env(None),
+        )
+
+
 def test_result_commit_must_contain_its_assigned_research_base(tmp_path: Path):
     workspace, _remote, base_sha = repository(tmp_path)
     result_sha = commit_file(

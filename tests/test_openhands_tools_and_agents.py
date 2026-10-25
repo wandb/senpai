@@ -553,6 +553,7 @@ def test_file_agent_definitions_keep_bounded_tools_and_no_github_mutations(
         "senpai_github",
         "get_prs",
         "create_assignment",
+        "sync_advisor_branch",
         "publish_advisor_branch",
         "post_assignment_comment",
         "post_peer_comment",

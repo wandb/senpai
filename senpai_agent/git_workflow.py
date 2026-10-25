@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,13 +65,13 @@ def sync_remote_branch(
     remote: str = "origin",
     authenticated_remote: str | None = None,
     token: SecretStr | None = None,
-) -> str:
-    """Refresh one remote-tracking ref and its objects, and return the remote head.
+) -> PushResult:
+    """Refresh one remote-tracking ref and its objects from the remote.
 
     Authenticated Git runs only in a throwaway repository, so a checkout holding
     no credential can still observe commits it did not push itself. Without this
     a long-lived checkout never learns about merges made through the GitHub API,
-    and every later lease-checked publication from it fails.
+    and cannot rebase local work onto them.
     """
 
     workspace = Path(workspace).resolve()
@@ -79,18 +80,38 @@ def sync_remote_branch(
     _git(workspace, "check-ref-format", "--branch", branch)
     tracking_ref = f"refs/remotes/{remote}/{branch}"
     _git(workspace, "check-ref-format", tracking_ref)
-    network_remote = remote
-    if token is not None:
-        if authenticated_remote is None:
-            raise ValueError("authenticated_remote is required for a credentialed fetch")
-        network_remote = authenticated_remote
+    network_remote = _network_remote(
+        remote, authenticated_remote, token, "a credentialed fetch"
+    )
+    tracking_sha = _local_ref_head(workspace, tracking_ref)
+    # A fetch follows a checkout-controlled symbolic ref into whatever branch it
+    # names, so fetch into a private ref and move the tracking ref ourselves.
+    transfer_ref = f"refs/senpai/sync/{uuid.uuid4().hex}"
     _fetch_refs(
         workspace,
         remote=network_remote,
-        refs=((f"refs/heads/{branch}", tracking_ref),),
+        refs=((f"refs/heads/{branch}", transfer_ref),),
         token=token,
+        have=tracking_sha or None,
     )
-    return _local_ref_head(workspace, tracking_ref)
+    head_sha = _local_ref_head(workspace, transfer_ref)
+    _git(workspace, "update-ref", "--no-deref", "-d", transfer_ref)
+    try:
+        _git(
+            workspace,
+            "update-ref",
+            "--no-deref",
+            tracking_ref,
+            head_sha,
+            tracking_sha,
+        )
+    except GitWorkflowPreconditionError as error:
+        # A concurrent publication owns a newer observation; do not overwrite it.
+        if _local_ref_head(workspace, tracking_ref) != head_sha:
+            raise GitWorkflowPreconditionError(
+                f"{tracking_ref} moved during the sync; sync again"
+            ) from error
+    return PushResult(head_sha != tracking_sha, branch, head_sha)
 
 
 def push_assignment_branch(
@@ -119,11 +140,10 @@ def push_assignment_branch(
         raise GitWorkflowPreconditionError(
             f"local head is {local_sha}, expected {expected_local_sha}"
         )
-    network_remote = remote
+    network_remote = _network_remote(
+        remote, authenticated_remote, token, "a credentialed push"
+    )
     if token is not None:
-        if authenticated_remote is None:
-            raise ValueError("authenticated_remote is required for a credentialed push")
-        network_remote = authenticated_remote
         tracking_ref = f"refs/remotes/{remote}/{branch}"
         _git(workspace, "check-ref-format", tracking_ref)
         tracking_sha = _local_ref_head(workspace, tracking_ref)
@@ -162,6 +182,19 @@ def push_assignment_branch(
     return result
 
 
+def _network_remote(
+    remote: str,
+    authenticated_remote: str | None,
+    token: SecretStr | None,
+    operation: str,
+) -> str:
+    if token is None:
+        return remote
+    if authenticated_remote is None:
+        raise ValueError(f"authenticated_remote is required for {operation}")
+    return authenticated_remote
+
+
 def _local_ref_head(workspace: Path, ref: str) -> str:
     refs = _git(workspace, "for-each-ref", "--format=%(refname) %(objectname)", ref)
     for line in refs.splitlines():
@@ -196,13 +229,9 @@ def create_assignment_branch(
     if not assignment_id.strip():
         raise ValueError("assignment_id must not be empty")
 
-    network_remote = remote
-    if token is not None:
-        if authenticated_remote is None:
-            raise ValueError(
-                "authenticated_remote is required for credentialed branch creation"
-            )
-        network_remote = authenticated_remote
+    network_remote = _network_remote(
+        remote, authenticated_remote, token, "credentialed branch creation"
+    )
     repository = (
         _isolated_bare_repository() if token is not None else nullcontext(workspace)
     )

@@ -386,7 +386,7 @@ def test_sync_advisor_branch_refreshes_the_configured_branch(
 
     def sync(workspace, **kwargs):
         syncs.append((workspace, kwargs))
-        return "c" * 40
+        return PushResult(changed=False, branch=kwargs["branch"], head_sha="c" * 40)
 
     monkeypatch.setattr(
         "senpai_agent.github.tools.advisor.git_workflow.sync_remote_branch",
@@ -397,6 +397,7 @@ def test_sync_advisor_branch_refreshes_the_configured_branch(
     observation = tool(SyncAdvisorBranchAction())
 
     assert observation.state == "refs_synchronized"
+    assert observation.changed is False
     assert observation.version == "c" * 40
     assert observation.resource_url == "git:origin/advisor-branch"
     # Reading refs takes no assignment lock; only publication is serialized.
@@ -418,14 +419,8 @@ def test_publish_advisor_branch_uses_configured_branch_and_distinct_shas(
     tmp_path: Path,
 ):
     pushes = []
-    syncs = []
 
     workflow = RecordingWorkflow()
-
-    def sync(workspace, **kwargs):
-        workflow.calls.append(("sync", None, {}))
-        syncs.append((workspace, kwargs))
-        return "c" * 40
 
     def push(workspace, **kwargs):
         workflow.calls.append(("push", None, {}))
@@ -440,10 +435,6 @@ def test_publish_advisor_branch_uses_configured_branch_and_distinct_shas(
         "senpai_agent.github.tools.advisor.git_workflow.push_assignment_branch",
         push,
     )
-    monkeypatch.setattr(
-        "senpai_agent.github.tools.advisor.git_workflow.sync_remote_branch",
-        sync,
-    )
     tool = PublishAdvisorBranchTool.create(
         runtime(workflow, tmp_path)
     )[0]
@@ -455,24 +446,7 @@ def test_publish_advisor_branch_uses_configured_branch_and_distinct_shas(
     )
 
     assert observation.state == "branch_pushed"
-    # The branch may have moved through the GitHub API since this checkout last
-    # pushed, so the local view is refreshed before the lease is checked.
-    assert [call[0] for call in workflow.calls] == [
-        "sync",
-        "lock_enter",
-        "push",
-        "lock_exit",
-    ]
-    assert syncs == [
-        (
-            tmp_path,
-            {
-                "branch": "advisor-branch",
-                "authenticated_remote": "https://github.com/acme/widgets.git",
-                "token": None,
-            },
-        )
-    ]
+    assert [call[0] for call in workflow.calls] == ["lock_enter", "push", "lock_exit"]
     assert pushes == [
         (
             tmp_path,

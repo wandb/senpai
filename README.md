@@ -511,7 +511,7 @@ flowchart LR
     D -->|revision| I
 ```
 
-0. `sync_advisor_branch` fetches the advisor branch into the advisor checkout. Merges happen through the GitHub API, so the checkout holds no credential and does not observe them on its own; the advisor runs this before basing an assignment on the branch or publishing to it, and `publish_advisor_branch` runs it too. Authenticated Git stays in a disposable repository: the checkout receives the objects over a local file fetch and never a token.
+0. `sync_advisor_branch` fetches the advisor branch into the advisor checkout. Merges happen through the GitHub API, so the checkout holds no credential and does not observe them on its own; the advisor runs this before basing an assignment on the branch, and before publishing so it can rebase local commits onto merged work. Authenticated Git stays in a disposable repository: the checkout receives the objects over a local file fetch and never a token.
 1. The advisor creates a falsifiable assignment with the exact required research-base SHA, baseline metrics, expected mechanism, implementation scope, and stopping rules.
 2. `create_assignment` creates the student branch and draft PR, embeds a typed assignment record, and applies the routing labels.
 3. The assigned student receives one OpenHands conversation for that assignment revision. New PR comments and reviews steer it after the current agent step.

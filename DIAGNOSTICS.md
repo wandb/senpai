@@ -204,7 +204,7 @@ Add typed tools explicitly to prevent silent category changes.
 | `subagent_io` | `spawn_agents`, `await_agents`, `agent_status`, `cancel_agents`, `delegate_agent` | Subagent prompts/results |
 | `controller_user_events` | Human/controller/idle/research-base `MessageEvent` text | Human/controller |
 
-GitHub fallback tools: `get_prs`, `create_assignment`, `send_assignment_feedback`,
+GitHub fallback tools: `get_prs`, `create_assignment`, `sync_advisor_branch`, `send_assignment_feedback`,
 `repair_assignment_routing`, `merge_experiment`, `close_experiment`, `accept_result_on_current_base`,
 `request_assignment_revision`, `publish_advisor_branch`, `respond_to_human_issue`, `request_supervisor`.
 

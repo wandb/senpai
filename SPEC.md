@@ -1059,14 +1059,20 @@ That post-push update covers only commits the checkout pushed itself. Merges
 land through the GitHub API, so a long-lived checkout otherwise never observes
 them, and every later lease-checked publication from it fails because its local
 history does not descend from the live branch. `sync_advisor_branch` closes
-that gap, and `publish_advisor_branch` runs the same refresh before it takes a
-lease. The refresh copies refs in two hops: an https-only fetch into a
-disposable bare repository that holds the Authorization header, then a
-file-only fetch from that repository into the checkout. The checkout's Git
-receives no credential and cannot reach the network, so it never becomes a
-token oracle. The same two-hop path hydrates student assignments. The refresh
-updates only `refs/remotes/<remote>/<branch>`; it does not move the working
-branch, HEAD, the index, or files. The bootstrap runner and
+that gap; the advisor runs it, then rebases, before publishing. Publication does
+not refresh on its own, because its lease is the remote SHA the advisor read.
+The refresh copies refs in two hops: an https-only fetch into a disposable bare
+repository that holds the Authorization header, then a file-only fetch from that
+repository into the checkout. The checkout's Git receives no credential and
+cannot reach the network, so it never becomes a token oracle. The disposable
+repository borrows the checkout's objects and shallow boundaries and negotiates
+from the current tracking SHA, so only missing history crosses the network; it
+does not run Git inside the checkout to list alternate refs. The same two-hop
+path hydrates student assignments. The checkout receives the remote head under a
+private ref, and a credential-free compare-and-swap then moves
+`refs/remotes/<remote>/<branch>`. Like the post-push update, it preserves a
+concurrent newer value, does not follow symbolic refs, and does not move the
+working branch, HEAD, the index, or files. The bootstrap runner and
 target pre-push hooks remain behavioral guards; typed publication bypasses them
 and applies its own branch and lease checks. Before creating a remote branch,
 the typed assignment tool requires a configured student and a `<student>/`
