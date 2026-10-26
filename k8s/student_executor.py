@@ -11,7 +11,7 @@ Unix socket shared with the student container.
 
 import yaml
 
-from launch_helpers import yaml_list_insertion
+from launch_helpers import yaml_insertion
 
 EXECUTOR_SOCKET_DIR = "/var/run/senpai-kubernetes"
 EXECUTOR_SOCKET_PATH = f"{EXECUTOR_SOCKET_DIR}/executor.sock"
@@ -24,13 +24,13 @@ def training_access_name(tag: str, student_name: str) -> str:
 
 
 def executor_socket_mount() -> str:
-    return yaml_list_insertion(
+    return yaml_insertion(
         [{"name": "executor-socket", "mountPath": EXECUTOR_SOCKET_DIR}], 8
     )
 
 
 def executor_container(image: str, secret_name: str, configmap_name: str) -> str:
-    return yaml_list_insertion(
+    return yaml_insertion(
         [
             {
                 "name": "kubernetes-executor",
@@ -84,7 +84,7 @@ def executor_container(image: str, secret_name: str, configmap_name: str) -> str
 
 
 def executor_volumes() -> str:
-    return yaml_list_insertion(
+    return yaml_insertion(
         [
             {"name": "executor-socket", "emptyDir": {}},
             {"name": "executor-state", "emptyDir": {}},

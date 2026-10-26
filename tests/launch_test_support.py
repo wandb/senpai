@@ -11,6 +11,7 @@ import launch_helpers  # noqa: E402
 REVISION = "a" * 40
 ADVISOR_IMAGE = f"ghcr.io/wandb/senpai-advisor:sha-{REVISION}"
 STUDENT_IMAGE = f"ghcr.io/wandb/senpai-student:sha-{REVISION}"
+CUSTOM_OPENAI_MODEL = "custom_openai/deepseek-ai/DeepSeek-V4.1-Flash-1017"
 
 
 def launch_args(**overrides) -> launch.Args:
@@ -72,6 +73,9 @@ def render_role(
         "wandb",
         anthropic_api_key="anthropic" if "anthropic" in providers else None,
         openai_api_key="openai" if "openai" in providers else None,
+        custom_openai_api_key=(
+            "custom-openai" if "custom_openai" in providers else None
+        ),
         custom_secrets={
             name: f"{name.lower()}-secret"
             for name in args.custom_secret_env_names

@@ -545,6 +545,7 @@ def bypass_external_preflight(monkeypatch):
     for name, value in (
         ("resolve_anthropic_api_key", "anthropic"),
         ("resolve_openai_api_key", "openai"),
+        ("resolve_custom_openai_api_key", "custom-openai"),
         ("resolve_exa_api_key", "exa"),
         ("resolve_wandb_api_key", "wandb"),
     ):
@@ -554,6 +555,7 @@ def bypass_external_preflight(monkeypatch):
         "preflight_check_student_name_availability",
         "preflight_check_anthropic_api_key",
         "preflight_check_openai_api_key",
+        "preflight_check_custom_openai",
         "preflight_check_exa_api_key",
         "preflight_check_wandb_api_key",
         "preflight_check_wandb_inference",
@@ -787,6 +789,66 @@ def test_wandb_gateway_uses_the_wandb_key_for_openai_compatible_inference(
     launch.main()
 
     assert checked == [("wandb-key", "research-team", "mlxfast")]
+
+
+def test_custom_openai_launch_resolves_and_preflights_its_endpoint(monkeypatch):
+    model = "custom_openai/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+    args = launch_args(
+        advisor_model="anthropic/claude-opus-5-5",
+        advisor_reasoning_effort="max",
+        student_model=model,
+        student_reasoning_effort="xhigh",
+        smart_model=model,
+        smart_reasoning_effort="xhigh",
+        fast_model=model,
+        fast_reasoning_effort="low",
+        frontier_model="anthropic/claude-fable-5-1",
+        frontier_reasoning_effort="max",
+        custom_openai_base_url="https://inference.example.test/v1",
+        custom_openai_context_tokens=100_000,
+    )
+    monkeypatch.setattr(launch.sp, "parse", lambda *_args, **_kwargs: args)
+    bypass_external_preflight(monkeypatch)
+    monkeypatch.setattr(
+        launch, "resolve_custom_openai_api_key", lambda _path: "endpoint-key"
+    )
+    checked = []
+    monkeypatch.setattr(
+        launch,
+        "preflight_check_custom_openai",
+        lambda *arguments: checked.append(arguments),
+    )
+    applied = []
+    for name in ("kubectl_apply", "kubectl_create"):
+        monkeypatch.setattr(
+            launch,
+            name,
+            lambda manifest, *_args, **_kwargs: applied.extend(
+                yaml.safe_load_all(manifest)
+            ),
+        )
+    monkeypatch.setattr(
+        launch,
+        "existing_student_names",
+        lambda *_args, **_kwargs: [],
+    )
+
+    launch.main()
+
+    assert checked == [
+        (
+            "endpoint-key",
+            "https://inference.example.test/v1",
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            ["low", "xhigh"],
+            100_000,
+        )
+    ]
+    [secret] = [
+        resource for resource in applied
+        if resource["kind"] == "Secret" and "github-token" in resource["data"]
+    ]
+    assert base64.b64decode(secret["data"]["custom-openai-api-key"]) == b"endpoint-key"
 
 
 @pytest.mark.parametrize(

@@ -62,6 +62,11 @@ frontier_model: anthropic/claude-opus-5-5
 frontier_reasoning_effort: max
 # Provider-native rendered/input-token trigger for supported compaction APIs.
 compaction_trigger_tokens: 200000
+# Self-hosted OpenAI-compatible endpoint for custom_openai/<served-model-id> profiles.
+# custom_openai_base_url: https://inference.example.ts.net/v1
+# custom_openai_context_tokens: 100000  # the server's --max-model-len
+# custom_openai_max_output_tokens: 32768  # default 65536; leave at least 16384 for input
+# custom_openai_canonical_model: deepseek/deepseek-v4.1-flash
 
 # advisor — the integration branch inside the problem-package repo that advisor PRs merge into
 advisor_branch: schmidhuber
@@ -87,4 +92,10 @@ memory_gi_per_gpu: 120
 # Optional key=value selectors for the advisor and multi-node student controllers.
 # controller_node_selector: [compute.coreweave.com/node-pool=cpu]
 controller_node_selector: []
+# Optional placement for single-node GPU students.
+# student_node_selector: [gpu.nvidia.com/class=H200]
+# student_scheduler_name: binpack-scheduler
+# Optional advisor and student pod labels and /etc/hosts entries, e.g. for endpoint access.
+# agent_pod_labels: [access.example/model=enabled]
+# agent_host_aliases: [10.0.0.10=inference.example.ts.net]
 preflight_only: false

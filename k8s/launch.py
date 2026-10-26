@@ -7,9 +7,11 @@
 """Launch senpai advisor and student agents as K8s resources."""
 
 import base64
+import ipaddress
 import json
 import os
 import posixpath
+import re
 import shlex
 import subprocess
 import sys
@@ -47,6 +49,11 @@ from senpai_agent.program_context import (
     load_program_system_prompt,
     normalize_program_path,
 )
+from senpai_agent.custom_openai import (
+    DEFAULT_MAX_OUTPUT_TOKENS as DEFAULT_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS,
+    CustomOpenAIEndpoint,
+    served_model,
+)
 from senpai_agent.reasoning_effort import openhands_reasoning_effort
 from senpai_agent.secrets import validate_custom_secret_env_names
 
@@ -70,6 +77,7 @@ from launch_helpers import (
     kubectl_create,
     pod_template_hash,
     preflight_check_anthropic_api_key,
+    preflight_check_custom_openai,
     preflight_check_exa_api_key,
     preflight_check_openai_api_key,
     preflight_check_student_name_availability,
@@ -83,6 +91,7 @@ from launch_helpers import (
     render_program_context_secret,
     render_template,
     resolve_anthropic_api_key,
+    resolve_custom_openai_api_key,
     resolve_custom_secrets,
     resolve_exa_api_key,
     resolve_github_token,
@@ -91,6 +100,7 @@ from launch_helpers import (
     routing_labels,
     source_revision_for_image,
     target_repo_slug,
+    yaml_insertion,
 )
 from student_executor import (
     EXECUTOR_SOCKET_PATH,
@@ -128,6 +138,16 @@ class Args:
     controller_node_selector: list[str] = field(
         default_factory=list
     )  # optional key=value placement selectors for advisor and multi-node controllers
+    student_node_selector: list[str] = field(
+        default_factory=list
+    )  # optional key=value selectors for the GPU pods students train in (their own pod, or remote workers)
+    student_scheduler_name: str = ""  # Kubernetes scheduler for those GPU pods; empty uses the cluster default
+    agent_pod_labels: list[str] = field(
+        default_factory=list
+    )  # extra key=value labels on advisor and student pods, e.g. for NetworkPolicy access
+    agent_host_aliases: list[str] = field(
+        default_factory=list
+    )  # ip=hostname entries added to advisor and student pods' /etc/hosts
     capacity_observer: bool = False  # install a credential-isolated cluster capacity observer
     capacity_node_selector: list[str] = field(
         default_factory=list
@@ -162,6 +182,10 @@ class Args:
     frontier_model: str = "anthropic/claude-opus-5-5"
     frontier_reasoning_effort: str = "max"
     compaction_trigger_tokens: int = 200_000
+    custom_openai_base_url: str = ""  # OpenAI-compatible chat-completions base URL for custom_openai/ models
+    custom_openai_context_tokens: int = 0  # server window shared by input and output, e.g. vLLM --max-model-len
+    custom_openai_max_output_tokens: int = DEFAULT_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS  # per-request output budget, including reasoning
+    custom_openai_canonical_model: str = ""  # optional OpenHands capability name, e.g. deepseek/deepseek-v4.1-flash
     human_issues: bool = (
         True  # allow human GitHub issue triage; disable for isolated launches
     )
@@ -202,8 +226,13 @@ MODEL_PROVIDERS = {
     "anthropic": ("ANTHROPIC_API_KEY", "anthropic-api-key"),
     "openai": ("OPENAI_API_KEY", "openai-api-key"),
     "wandb": ("WANDB_API_KEY", "wandb-api-key"),
+    "custom_openai": ("CUSTOM_OPENAI_API_KEY", "custom-openai-api-key"),
 }
 SHARED_MODEL_PROFILES = ("smart", "fast", "frontier")
+SENPAI_POD_LABEL_KEYS = {"app", "role", "student", "research-tag"}
+# Kubernetes label names and values, and DNS subdomains for prefixes and hostnames.
+LABEL_NAME = re.compile(r"[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?")
+DNS_SUBDOMAIN = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*")
 
 
 # --- Model configuration -----------------------------------------------------
@@ -246,23 +275,56 @@ def deployed_model_providers(args: Args) -> set[str]:
     return providers
 
 
-def validate_model_config(args: Args) -> None:
-    if args.compaction_trigger_tokens < 50_000:
-        sys.exit("ERROR: --compaction_trigger_tokens must be at least 50000")
+def deployed_model_profiles(args: Args) -> dict[str, tuple[str, str]]:
+    """Profiles the launched roles use; the advisor's only when it is deployed."""
     profiles = model_profiles(args)
     if not args.advisor:
         del profiles["advisor"]
-    for name, (model, effort) in profiles.items():
+    return profiles
+
+
+def custom_openai_served_model(args: Args) -> str | None:
+    return served_model(model for model, _effort in deployed_model_profiles(args).values())
+
+
+def custom_openai_efforts(args: Args) -> list[str]:
+    return sorted(
+        {
+            effort
+            for model, effort in deployed_model_profiles(args).values()
+            if model_provider(model) == "custom_openai"
+        }
+    )
+
+
+def validate_custom_openai_endpoint(args: Args) -> None:
+    try:
+        custom_openai_served_model(args)
+        CustomOpenAIEndpoint(
+            base_url=args.custom_openai_base_url,
+            context_tokens=args.custom_openai_context_tokens,
+            max_output_tokens=args.custom_openai_max_output_tokens,
+        )
+    except ValueError as error:
+        sys.exit(f"ERROR: {error}")
+
+
+def validate_model_config(args: Args) -> None:
+    if args.compaction_trigger_tokens < 50_000:
+        sys.exit("ERROR: --compaction_trigger_tokens must be at least 50000")
+    for name, (model, effort) in deployed_model_profiles(args).items():
         model_provider(model)
         try:
             openhands_reasoning_effort(effort, model)
         except ValueError as error:
             sys.exit(f"ERROR: --{name}_reasoning_effort: {error}")
+    if "custom_openai" in deployed_model_providers(args):
+        validate_custom_openai_endpoint(args)
 
 
 def role_model_config(args: Args, role: str) -> dict[str, str]:
     model, reasoning_effort = model_profiles(args)[role]
-    return {
+    config = {
         "SENPAI_OPENHANDS_MODEL": model,
         "SENPAI_OPENHANDS_REASONING_EFFORT": reasoning_effort,
         "SENPAI_OPENHANDS_SMART_MODEL": args.smart_model,
@@ -273,23 +335,94 @@ def role_model_config(args: Args, role: str) -> dict[str, str]:
         "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": args.frontier_reasoning_effort,
         "SENPAI_COMPACTION_TRIGGER_TOKENS": str(args.compaction_trigger_tokens),
     }
+    if "custom_openai" in role_model_providers(args, role):
+        config.update(
+            {
+                "SENPAI_CUSTOM_OPENAI_BASE_URL": args.custom_openai_base_url,
+                "SENPAI_CUSTOM_OPENAI_CONTEXT_TOKENS": str(
+                    args.custom_openai_context_tokens
+                ),
+                "SENPAI_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS": str(
+                    args.custom_openai_max_output_tokens
+                ),
+                "SENPAI_CUSTOM_OPENAI_CANONICAL_MODEL": (
+                    args.custom_openai_canonical_model
+                ),
+            }
+        )
+    return config
 
 
 # --- Placement and capacity --------------------------------------------------
 
 
-def controller_node_selector(
-    values: list[str], *, kind: str = "controller"
-) -> dict[str, str]:
-    selector: dict[str, str] = {}
+def key_value_mapping(values: list[str], *, kind: str) -> dict[str, str]:
+    mapping: dict[str, str] = {}
     for item in values:
         key, separator, value = item.partition("=")
         if not separator or not key or not value:
-            raise ValueError(f"{kind} node selectors must use key=value")
-        if key in selector:
-            raise ValueError(f"duplicate {kind} node selector: {key}")
-        selector[key] = value
-    return selector
+            raise ValueError(f"{kind}s must use key=value")
+        if key in mapping:
+            raise ValueError(f"duplicate {kind}: {key}")
+        mapping[key] = value
+    return mapping
+
+
+def controller_node_selector(
+    values: list[str], *, kind: str = "controller"
+) -> dict[str, str]:
+    return key_value_mapping(values, kind=f"{kind} node selector")
+
+
+def student_gpu_node_selector(args: Args) -> dict[str, str]:
+    return controller_node_selector(args.student_node_selector, kind="student")
+
+
+def student_gpu_placement_config(args: Args) -> dict[str, str]:
+    """Let the executor place remote training GPU pods like local student pods."""
+    if not args.remote_training:
+        return {}
+    return {
+        "SENPAI_STUDENT_NODE_SELECTOR": json.dumps(student_gpu_node_selector(args)),
+        "SENPAI_STUDENT_SCHEDULER_NAME": args.student_scheduler_name,
+    }
+
+
+def is_dns_subdomain(value: str) -> bool:
+    return len(value) <= 253 and DNS_SUBDOMAIN.fullmatch(value) is not None
+
+
+def is_label_key(key: str) -> bool:
+    prefix, separator, name = key.rpartition("/")
+    return LABEL_NAME.fullmatch(name) is not None and (
+        not separator or is_dns_subdomain(prefix)
+    )
+
+
+def agent_pod_labels(args: Args) -> dict[str, str]:
+    labels = key_value_mapping(args.agent_pod_labels, kind="agent pod label")
+    for key, value in labels.items():
+        if not is_label_key(key) or LABEL_NAME.fullmatch(value) is None:
+            raise ValueError(f"invalid Kubernetes agent pod label: {key}={value}")
+    if reserved := sorted(SENPAI_POD_LABEL_KEYS & labels.keys()):
+        raise ValueError(f"agent pod labels cannot replace: {', '.join(reserved)}")
+    return labels
+
+
+def agent_host_aliases(args: Args) -> list[dict]:
+    hostnames_by_ip: dict[str, list[str]] = {}
+    for item in args.agent_host_aliases:
+        ip, separator, hostname = item.partition("=")
+        if not separator or not ip or not hostname:
+            raise ValueError("agent host aliases must use ip=hostname")
+        ipaddress.ip_address(ip)
+        if not is_dns_subdomain(hostname):
+            raise ValueError(f"agent host alias hostname is invalid: {hostname}")
+        hostnames_by_ip.setdefault(ip, []).append(hostname)
+    return [
+        {"ip": ip, "hostnames": hostnames}
+        for ip, hostnames in hostnames_by_ip.items()
+    ]
 
 
 def capacity_config(args: Args) -> dict:
@@ -448,6 +581,9 @@ def validate_args(args: Args) -> None:
     validate_model_config(args)
     try:
         controller_node_selector(args.controller_node_selector)
+        student_gpu_node_selector(args)
+        agent_pod_labels(args)
+        agent_host_aliases(args)
         if args.capacity_observer:
             capacity_config(args)
         validate_custom_secret_env_names(args.custom_secret_env_names)
@@ -590,6 +726,16 @@ def role_labels(role: str, tag: str) -> dict[str, str]:
     return {"app": "senpai", "role": role, "research-tag": tag}
 
 
+def _agent_pod_fields(args: Args) -> dict[str, str]:
+    aliases = agent_host_aliases(args)
+    return {
+        "AGENT_POD_LABELS": yaml_insertion(agent_pod_labels(args), 8),
+        "AGENT_HOST_ALIASES": yaml_insertion(
+            {"hostAliases": aliases} if aliases else {}, 6
+        ),
+    }
+
+
 def shared_configmap_data(
     args: Args, tag: str, role: str, program: ProgramSystemPrompt
 ) -> dict[str, str]:
@@ -664,6 +810,7 @@ def shared_template_values(
         "CAPACITY_SNAPSHOT_VOLUME": (
             capacity_snapshot_volume(tag) if args.capacity_observer else ""
         ),
+        **_agent_pod_fields(args),
     }
 
 
@@ -709,6 +856,7 @@ def render_student(
             ),
             "PVC_CLAIM_NAME": args.pvc_claim_name,
             "SENPAI_LAUNCH_SECRET_NAME": secret_name,
+            **student_gpu_placement_config(args),
         },
     )
     deployment = render_template(
@@ -734,7 +882,15 @@ def render_student(
             ),
             "STUDENT_RESOURCES": _student_resources(args),
             "STUDENT_NODE_SELECTOR": json.dumps(
-                controller_node_selector(args.controller_node_selector) if remote else {}
+                controller_node_selector(args.controller_node_selector)
+                if remote
+                else student_gpu_node_selector(args)
+            ),
+            "STUDENT_SCHEDULER_NAME": yaml_insertion(
+                {"schedulerName": args.student_scheduler_name}
+                if args.student_scheduler_name and not remote
+                else {},
+                6,
             ),
             "STUDENT_TOLERATIONS": json.dumps(_student_tolerations(args)),
             "EXECUTOR_SOCKET_MOUNT": executor_socket_mount() if remote else "",
@@ -889,6 +1045,8 @@ def resolve_credentials(
         provider_api_keys["anthropic"] = resolve_anthropic_api_key(DOTENV_PATH)
     if "openai" in model_providers:
         provider_api_keys["openai"] = resolve_openai_api_key(DOTENV_PATH)
+    if "custom_openai" in model_providers:
+        provider_api_keys["custom_openai"] = resolve_custom_openai_api_key(DOTENV_PATH)
     credentials = LaunchCredentials(
         github_token=github_token,
         exa_api_key=resolve_exa_api_key(DOTENV_PATH),
@@ -907,6 +1065,14 @@ def resolve_credentials(
         preflight_check_anthropic_api_key(anthropic_api_key)
     if openai_api_key := provider_api_keys.get("openai"):
         preflight_check_openai_api_key(openai_api_key)
+    if custom_openai_api_key := provider_api_keys.get("custom_openai"):
+        preflight_check_custom_openai(
+            custom_openai_api_key,
+            args.custom_openai_base_url,
+            custom_openai_served_model(args),
+            custom_openai_efforts(args),
+            args.custom_openai_context_tokens,
+        )
     if "wandb" in model_providers:
         preflight_check_wandb_inference(
             credentials.wandb_api_key, args.wandb_entity, args.wandb_project
@@ -1077,6 +1243,7 @@ def main():
         credentials.wandb_api_key,
         anthropic_api_key=credentials.provider_api_keys.get("anthropic"),
         openai_api_key=credentials.provider_api_keys.get("openai"),
+        custom_openai_api_key=credentials.provider_api_keys.get("custom_openai"),
         custom_secrets=credentials.custom_secrets,
         immutable=bool(student_list),
     )

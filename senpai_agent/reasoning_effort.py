@@ -37,6 +37,9 @@ def openhands_reasoning_effort(reasoning_effort: str, model: str) -> str:
                 f"model {model!r}; use 'high' or 'max'"
             )
         return reasoning_effort
+    if provider == "custom_openai":
+        # The self-hosted server owns its effort vocabulary and rejects unknown values.
+        return reasoning_effort
     if (
         reasoning_effort == "max"
         and provider != "anthropic"

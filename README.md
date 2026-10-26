@@ -58,6 +58,7 @@ required when any configured model uses that provider:
 GITHUB_TOKEN=
 ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
+CUSTOM_OPENAI_API_KEY=
 EXA_API_KEY=
 WANDB_API_KEY=
 ```
@@ -67,6 +68,7 @@ WANDB_API_KEY=
 | `GITHUB_TOKEN` | Target-repository Contents, Pull requests, and Issues read/write. A classic token with `repo` scope also works. GitHub CLI authentication is the fallback when this value is absent. |
 | `ANTHROPIC_API_KEY` | Required when an `anthropic/...` model is configured. Every default profile uses Anthropic. |
 | `OPENAI_API_KEY` | Required when an `openai/...` model is configured. |
+| `CUSTOM_OPENAI_API_KEY` | Required when a `custom_openai/...` model is configured. Senpai sends it as the bearer token to `custom_openai_base_url`. |
 | `EXA_API_KEY` | General-web and publication search through the credential-isolated `exa_search` tool. |
 | `WANDB_API_KEY` | Read/write access to the configured W&B entity and project. |
 
@@ -196,6 +198,39 @@ apply it for their models; OpenHands handles compaction for other providers.
 If using W&B Inference use `wandb/` provider as the provider. For example `wandb/zai-org/GLM-5.2`, SENPAI
 uses `WANDB_API_KEY` for auth.
 
+For a self-hosted OpenAI-compatible chat-completions server, such as vLLM or
+SGLang, prefix the served model ID with `custom_openai/`. Every
+`custom_openai/` profile uses the same endpoint, served model, and
+`CUSTOM_OPENAI_API_KEY`:
+
+```yaml
+student_model: custom_openai/deepseek-ai/DeepSeek-V4.1-Flash-1017
+student_reasoning_effort: xhigh
+fast_model: custom_openai/deepseek-ai/DeepSeek-V4.1-Flash-1017
+fast_reasoning_effort: low
+custom_openai_base_url: https://inference.example.ts.net/v1
+custom_openai_context_tokens: 100000      # the server's --max-model-len
+custom_openai_max_output_tokens: 32768    # per request, including reasoning; default 65536
+custom_openai_canonical_model: deepseek/deepseek-v4.1-flash
+```
+
+Senpai sends the profile's effort as the request's top-level `reasoning_effort`
+and passes it through unchanged, so use values the server accepts. For example,
+DeepSeek V4.1 rejects `medium`. vLLM-style servers reject a request when its
+input plus `max_tokens` exceeds the context window. Senpai therefore limits
+input to `custom_openai_context_tokens - custom_openai_max_output_tokens` and
+condenses history before reaching that limit. That input limit must be at least
+16,384 tokens, the smallest window OpenHands accepts. Lower the default output
+budget of 65,536 for a server with a small window. `custom_openai_canonical_model`
+is optional. It selects OpenHands model features for the served model. For
+DeepSeek V4.1, `deepseek/deepseek-v4.1-flash` returns each turn's
+`reasoning_content` to the server between tool calls. Preflight lists the
+endpoint's `/models` from the launch machine. It checks that the configured
+model is served and, when the server reports `max_model_len`, that the context
+setting does not exceed it. It then sends a one-token chat request for each
+configured `custom_openai/` effort, so an effort the server rejects stops the
+launch.
+
 The defaults in `senpai.yaml` describe W&B's deployment and should not be copied unchanged into another environment. Every setting can also be overridden on the command line. `--tag` and `--target_repo_url` are required unless your chosen config file supplies them.
 
 Deployments require advisor and student images built from the same SENPAI revision, pinned by digest or `sha-<40-character-commit>` tag. Remote training requires an `executor_image` pinned by `@sha256` digest because that sidecar owns the scoped Kubernetes credential. Digest-pinned Senpai images also require the full matching `senpai_repo_revision`. The source commit must be fetchable from `senpai_repo_url`; its public default is read-only and needs no PR permission. Override it only when using images built from another SENPAI repository. `target_repo_url` is the separate, required repository where agents create commits and PRs.
@@ -256,7 +291,11 @@ inputs and manifest requirements.
 Only the executor sidecar receives a projected Kubernetes token. Its socket
 broker accepts the reserved MPIJob, injects ownership, pod hardening, and an
 exact-commit bundle checkout, binds the W&B/source annotations, persists the
-created UID, and uses UID-preconditioned activation and deletion. Workloads are
+created UID, and uses UID-preconditioned activation and deletion. It caps every
+pod template's `activeDeadlineSeconds` at the workload's remaining time, because
+some clusters admit GPU pods outside a ReplicaSet only with a pod deadline. It
+also applies `--student_scheduler_name` and `--student_node_selector` to GPU
+worker pods. Workloads are
 created suspended, so a late ambiguous API request cannot start GPU pods. The
 model-facing student has no Kubernetes token or real `kubectl`; its
 `kubectl apply -f -` command is a validated socket proxy. A target launcher must
@@ -664,7 +703,12 @@ The broker replaces all target `initContainers` with its fixed bundle checkout
 at `/workspace` and removes pod-template annotations. Put required target setup
 in the image or main command. Target pod labels and scheduling constraints are
 preserved, except for Senpai ownership labels and the reserved
-`senpai-training-role` label. Preserved labels can still affect configured
+`senpai-training-role` label. On GPU worker pods, a configured
+`--student_scheduler_name` replaces the target's scheduler and
+`--student_node_selector` keys replace the target's values for those keys.
+Every pod template's `activeDeadlineSeconds` is capped at the workload deadline;
+a shorter target value is kept.
+Preserved labels can still affect configured
 [admission webhooks](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/#matching-requests-objectselector)
 and [network policies](https://kubernetes.io/docs/concepts/services-networking/network-policies/#the-networkpolicy-resource).
 Operators must not treat target-controlled labels as a trust boundary.
@@ -887,6 +931,8 @@ Useful launch controls:
 - `--names frieren,fern` selects stable students; otherwise use `--n_students` and `--student_prefix`.
 - `--nodes_per_student` and `--gpus_per_student_node` set the supervised worker topology; `--cpu_per_gpu` and `--memory_gi_per_gpu` bind its worker resources.
 - `--controller_node_selector key=value` optionally constrains advisor and multi-node controller placement; the portable default leaves placement unconstrained.
+- `--student_node_selector key=value` and `--student_scheduler_name NAME` place the GPU pods students train in, for example `gpu.nvidia.com/class=H200` and `binpack-scheduler`. Single-node students apply them to their own pod. With remote training, the executor applies them to every GPU worker pod, and the CPU controller keeps `--controller_node_selector` and the default scheduler. The capacity observer does not inherit them; set `--capacity_node_selector` to the same values.
+- `--agent_pod_labels key=value` adds labels to advisor and student pods, for example to match a NetworkPolicy that admits model-endpoint callers. `--agent_host_aliases ip=hostname` adds `/etc/hosts` entries to the same pods, for example to route a private endpoint's hostname to an in-cluster relay while TLS still verifies that hostname.
 - `--timeout_minutes` sets the launch-context wall-clock policy and the broker's hard ceiling for remote training. Local training enforces the timeout requested in `run_training`. `--max_epochs` sets the agent-facing epoch policy.
 - `--poll_interval_s` and `--poll_jitter_s` control idle GitHub cadence without teaching the model to poll.
 - `--gh_history_scope branch` keeps normal advisor-branch memory, `fresh` creates a shallow ablation checkout, and `repo` exposes full repository history. The launch prompt records this scope; `repo` permits inspecting and learning from other PRs and branches in the target repository. Writes remain limited to the advisor branch and assigned student PR branches. Unrelated experiment runs and historical results still require an explicit human reference.

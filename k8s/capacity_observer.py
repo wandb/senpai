@@ -5,7 +5,7 @@ import json
 
 import yaml
 
-from launch_helpers import yaml_list_insertion
+from launch_helpers import yaml_insertion
 
 CAPACITY_SNAPSHOT_DIR = "/var/run/senpai-capacity"
 CAPACITY_SNAPSHOT_PATH = f"{CAPACITY_SNAPSHOT_DIR}/snapshot.json"
@@ -17,14 +17,14 @@ def capacity_configmap_name(tag: str) -> str:
 
 def capacity_snapshot_mount() -> str:
     """Read-only snapshot mount for an advisor or student container."""
-    return yaml_list_insertion(
+    return yaml_insertion(
         [{"name": "capacity-snapshot", "mountPath": CAPACITY_SNAPSHOT_DIR, "readOnly": True}],
         8,
     )
 
 
 def capacity_snapshot_volume(tag: str) -> str:
-    return yaml_list_insertion(
+    return yaml_insertion(
         [
             {
                 "name": "capacity-snapshot",
