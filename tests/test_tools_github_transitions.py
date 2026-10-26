@@ -23,6 +23,8 @@ from senpai_agent.github.tools import (
     PostPeerCommentTool,
     PublishAdvisorBranchAction,
     PublishAdvisorBranchTool,
+    SyncAdvisorBranchAction,
+    SyncAdvisorBranchTool,
     RepairAssignmentRoutingAction,
     RepairAssignmentRoutingTool,
     RequestAssignmentRevisionAction,
@@ -373,6 +375,43 @@ def test_create_assignment_rejects_unowned_students_or_branches_before_mutation(
         tool(action)
 
     assert workflow.calls == []
+
+
+def test_sync_advisor_branch_refreshes_the_configured_branch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    syncs = []
+    workflow = RecordingWorkflow()
+
+    def sync(workspace, **kwargs):
+        syncs.append((workspace, kwargs))
+        return PushResult(changed=False, branch=kwargs["branch"], head_sha="c" * 40)
+
+    monkeypatch.setattr(
+        "senpai_agent.github.tools.advisor.git_workflow.sync_remote_branch",
+        sync,
+    )
+    tool = SyncAdvisorBranchTool.create(runtime(workflow, tmp_path))[0]
+
+    observation = tool(SyncAdvisorBranchAction())
+
+    assert observation.state == "refs_synchronized"
+    assert observation.changed is False
+    assert observation.version == "c" * 40
+    assert observation.resource_url == "git:origin/advisor-branch"
+    # Reading refs takes no assignment lock; only publication is serialized.
+    assert workflow.calls == []
+    assert syncs == [
+        (
+            tmp_path,
+            {
+                "branch": "advisor-branch",
+                "authenticated_remote": "https://github.com/acme/widgets.git",
+                "token": None,
+            },
+        )
+    ]
 
 
 def test_publish_advisor_branch_uses_configured_branch_and_distinct_shas(

@@ -31,6 +31,7 @@ ADVISOR_GITHUB_TOOLS = {
     "respond_to_human_issue",
     "request_supervisor",
     "create_assignment",
+    "sync_advisor_branch",
     "publish_advisor_branch",
     "repair_assignment_routing",
     "send_assignment_feedback",

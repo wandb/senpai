@@ -20,6 +20,7 @@ from .definitions import (
     PostAssignmentCommentTool,
     PostPeerCommentTool,
     PublishAdvisorBranchTool,
+    SyncAdvisorBranchTool,
     PushExperimentCommitTool,
     RepairAssignmentRoutingTool,
     RequestAssignmentRevisionTool,
@@ -125,6 +126,7 @@ class GitHubWorkflowToolSet(
         return (
             *common,
             *CreateAssignmentTool.create(runtime),
+            *SyncAdvisorBranchTool.create(runtime),
             *PublishAdvisorBranchTool.create(runtime),
             *RepairAssignmentRoutingTool.create(runtime),
             *SendAssignmentFeedbackTool.create(runtime),

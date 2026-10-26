@@ -27,6 +27,7 @@ from senpai_agent.github.tools import (
     SendAssignmentFeedbackTool,
     SubmitExperimentResultAction,
     SubmitExperimentResultTool,
+    SyncAdvisorBranchTool,
 )
 from senpai_agent.github.tools.definitions import RequestSupervisorTool
 
@@ -40,6 +41,7 @@ EXPECTED_FIELDS = {
         "title",
         "body",
     },
+    "sync_advisor_branch": set(),
     "publish_advisor_branch": {
         "remote_branch_sha_before_push",
         "local_commit_sha",
@@ -96,6 +98,7 @@ def github_tools(tmp_path: Path):
     )
     tool_types = (
         CreateAssignmentTool,
+        SyncAdvisorBranchTool,
         PublishAdvisorBranchTool,
         PushExperimentCommitTool,
         PostAssignmentCommentTool,
@@ -130,7 +133,10 @@ def test_provider_facing_github_schemas_are_single_intent_and_unambiguous(
         fields = set(properties) - {"summary"}
 
         assert fields == EXPECTED_FIELDS[tool.name]
-        assert set(schema["required"]) == fields - OPTIONAL_FIELDS.get(tool.name, set())
+        # A field-less action omits "required" rather than sending an empty list.
+        assert set(schema.get("required", ())) == (
+            fields - OPTIONAL_FIELDS.get(tool.name, set())
+        )
         assert "transition" not in properties
         assert "operation" not in properties
         assert all(properties[field].get("description") for field in fields)

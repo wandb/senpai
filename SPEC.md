@@ -543,6 +543,7 @@ on GitHub, so the tool can reject a change made after the student read the PR:
 | Tool | Role | Input beyond the shared `assignment` object |
 |---|---|---|
 | `create_assignment` | advisor | `assignment_id`, `revision_id`, `student`, `expected_base_sha`, `head_branch`, `title`, `body`; the base is the configured advisor branch |
+| `sync_advisor_branch` | advisor | none; fetches the configured advisor branch into the checkout and returns its remote head SHA |
 | `publish_advisor_branch` | advisor | `remote_branch_sha_before_push`, `local_commit_sha` |
 | `repair_assignment_routing` | advisor | `working_state` (`wip` or `review`) and a `blockers` list containing only `blocked`, `hold`, or `needs-rebase` |
 | `send_assignment_feedback` | advisor | `feedback_id`, `comment` |
@@ -1042,7 +1043,8 @@ The controller supplies the GitHub URL from its configured repository, disables
 hooks and credential helpers, ignores global and system Git configuration, and
 clears inherited Git and proxy settings. The network process never reads the
 checkout's Git configuration. Push staging shares only the checkout's object
-directory and shallow boundaries, then verifies the staged commit SHA.
+directory and shallow boundaries, disables the alternate-refs command so no Git
+process starts inside the checkout, then verifies the staged commit SHA.
 Assignment creation fetches the base at depth one; idempotent replay fetches the
 assignment at depth two to verify its parent, tree, and message. These fetches do
 not change the advisor checkout. Pushes retain expected-SHA checks, ancestry
@@ -1052,7 +1054,26 @@ including an idempotent retry, a credential-free local Git command updates
 its value before network work and preserves concurrent changes. It does not
 follow symbolic refs, run hooks, or move the working branch, HEAD, index, or files.
 Other local update failures report that publication succeeded so a retry can
-repair the tracking ref. The bootstrap runner and
+repair the tracking ref.
+
+That post-push update covers only commits the checkout pushed itself. Merges
+land through the GitHub API, so a long-lived checkout otherwise never observes
+them, and every later lease-checked publication from it fails because its local
+history does not descend from the live branch. `sync_advisor_branch` closes
+that gap; the advisor runs it, then rebases, before publishing. Publication does
+not refresh on its own, because its lease is the remote SHA the advisor read.
+The refresh copies refs in two hops: an https-only fetch into a disposable bare
+repository that holds the Authorization header, then a file-only fetch from that
+repository into the checkout. The checkout's Git receives no credential and
+cannot reach the network, so it never becomes a token oracle. The disposable
+repository borrows the checkout's objects and shallow boundaries and negotiates
+from the current tracking SHA, so only missing history crosses the network; it
+does not run Git inside the checkout to list alternate refs. The same two-hop
+path hydrates student assignments. The checkout receives the remote head under a
+private ref, and a credential-free compare-and-swap then moves
+`refs/remotes/<remote>/<branch>`. Like the post-push update, it preserves a
+concurrent newer value, does not follow symbolic refs, and does not move the
+working branch, HEAD, the index, or files. The bootstrap runner and
 target pre-push hooks remain behavioral guards; typed publication bypasses them
 and applies its own branch and lease checks. Before creating a remote branch,
 the typed assignment tool requires a configured student and a `<student>/`

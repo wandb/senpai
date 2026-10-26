@@ -25,6 +25,7 @@ from .contracts import (
     RepairAssignmentRoutingAction,
     RequestAssignmentRevisionAction,
     SendAssignmentFeedbackAction,
+    SyncAdvisorBranchAction,
 )
 from .runtime import GitHubToolRuntime
 
@@ -77,6 +78,33 @@ class CreateAssignmentExecutor(
                 body=action.body,
             )
         return GitHubMutationObservation.from_result(result)
+
+
+class SyncAdvisorBranchExecutor(
+    ToolExecutor[SyncAdvisorBranchAction, GitHubMutationObservation]
+):
+    def __init__(self, runtime: GitHubToolRuntime):
+        self.runtime = runtime
+
+    def __call__(
+        self,
+        action: SyncAdvisorBranchAction,
+        conversation: LocalConversation | None = None,
+    ) -> GitHubMutationObservation:
+        if not self.runtime.advisor_branch:
+            raise RuntimeError("sync_advisor_branch requires an advisor branch")
+        synced = git_workflow.sync_remote_branch(
+            self.runtime.workspace,
+            branch=self.runtime.advisor_branch,
+            authenticated_remote=github_repository_url(self.runtime.workflow.repo),
+            token=self.runtime.git_token,
+        )
+        return GitHubMutationObservation(
+            changed=synced.changed,
+            resource_url=f"git:origin/{synced.branch}",
+            state="refs_synchronized",
+            version=synced.head_sha,
+        )
 
 
 class PublishAdvisorBranchExecutor(

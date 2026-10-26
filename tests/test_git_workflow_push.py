@@ -76,6 +76,28 @@ def test_git_trusts_only_its_resolved_workspace_when_mount_owner_differs(
         ) == "true"
 
 
+def test_git_timeout_is_a_precondition_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    def stalled(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr("senpai_agent.git_transport.subprocess.run", stalled)
+
+    with pytest.raises(GitWorkflowPreconditionError, match="timed out after 300 s"):
+        run_git(tmp_path, "fetch", "origin", timeout=300)
+
+
+def test_git_rejects_a_token_beside_a_complete_environment(tmp_path: Path):
+    with pytest.raises(ValueError, match="not both"):
+        run_git(
+            tmp_path,
+            "status",
+            token=SecretStr("typed-token"),
+            environment=git_process_env(None),
+        )
+
+
 def test_result_commit_must_contain_its_assigned_research_base(tmp_path: Path):
     workspace, _remote, base_sha = repository(tmp_path)
     result_sha = commit_file(
@@ -596,6 +618,42 @@ def test_credentialed_push_does_not_run_checkout_status_helpers(tmp_path: Path):
     assert pushed.head_sha == candidate_sha
     assert not fsmonitor_marker.exists()
     assert not filter_marker.exists()
+
+
+def test_credentialed_push_runs_no_git_inside_the_checkout_with_the_header(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    workspace, remote, previous_sha = repository(tmp_path)
+    candidate_sha = commit_file(workspace, "model.py", "baseline = 2\n", "candidate")
+    trace = tmp_path / "authenticated-git.trace"
+    real_run = subprocess.run
+
+    def traced_run(command, **kwargs):
+        if any("Authorization:" in value for value in kwargs["env"].values()):
+            kwargs["env"] = {**kwargs["env"], "GIT_TRACE": str(trace)}
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr("senpai_agent.git_transport.subprocess.run", traced_run)
+
+    pushed = push_assignment_branch(
+        workspace,
+        branch="experiment-7",
+        expected_remote_sha=previous_sha,
+        expected_local_sha=candidate_sha,
+        authenticated_remote=remote.resolve().as_uri(),
+        token=SecretStr("typed-write-token"),
+    )
+
+    assert pushed.head_sha == candidate_sha
+    # Staging borrows the checkout's objects; listing its refs as alternates
+    # would start Git in the checkout, reading its config, under the header.
+    checkout_git_dir = str((workspace / ".git").resolve())
+    assert not [
+        line
+        for line in trace.read_text().splitlines()
+        if checkout_git_dir in line and "for-each-ref" in line
+    ]
 
 
 def test_push_from_a_shallow_checkout_keeps_the_history_boundary(tmp_path: Path):

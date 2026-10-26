@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import subprocess
-import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import SecretStr
 
-from senpai_agent.git_transport import GIT_EXECUTABLE, git_process_env
+from senpai_agent.git_transport import GIT_EXECUTABLE, fetch_refs, git_process_env
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.PROMPTS import WORKSPACE_DIVERGENCE_PROMPT
 
@@ -24,25 +22,6 @@ _BASE_TIP_REF = "refs/senpai/assignment/base-tip"
 _OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 _UNTRACKED_CONTENT_BUDGET = 1_048_576
 _UNTRACKED_FILE_LIMIT = 1_024
-_PROXY_ENVIRONMENT = (
-    "ALL_PROXY",
-    "HTTPS_PROXY",
-    "HTTP_PROXY",
-    "NO_PROXY",
-    "all_proxy",
-    "https_proxy",
-    "http_proxy",
-    "no_proxy",
-)
-_GIT_TRANSPORT_ENVIRONMENT = (
-    "GIT_ASKPASS",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_PROXY_COMMAND",
-    "GIT_SSL_CAINFO",
-    "GIT_SSL_CAPATH",
-    "GIT_SSL_NO_VERIFY",
-    "SSH_ASKPASS",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,49 +222,12 @@ class StudentWorkspaceReconciler:
         )
 
     def _fetch_refs(self, *refs: tuple[str, str]) -> None:
-        if self.token is None:
-            self._run(
-                "fetch",
-                "--no-tags",
-                "--atomic",
-                self.remote,
-                *(f"+{source}:{destination}" for source, destination in refs),
-                timeout=300,
-            )
-            return
-
-        with tempfile.TemporaryDirectory(prefix="senpai-git-fetch-") as directory:
-            staging = Path(directory) / "objects.git"
-            self._run_at(
-                Path(directory),
-                "init",
-                "--bare",
-                str(staging),
-                environment=self._isolated_git_environment(),
-            )
-            staged_refs = tuple(
-                (source, f"refs/senpai/transfer/{index}", destination)
-                for index, (source, destination) in enumerate(refs)
-            )
-            self._run_at(
-                staging,
-                "fetch",
-                "--no-tags",
-                "--atomic",
-                self.remote,
-                *(f"+{source}:{staged}" for source, staged, _ in staged_refs),
-                environment=self._authenticated_git_environment(),
-                timeout=300,
-            )
-            self._run(
-                "fetch",
-                "--no-tags",
-                "--atomic",
-                str(staging),
-                *(f"+{staged}:{destination}" for _, staged, destination in staged_refs),
-                environment=self._file_git_environment(),
-                timeout=300,
-            )
+        fetch_refs(
+            self.workspace,
+            remote=self.remote,
+            refs=refs,
+            token=self.token,
+        )
 
     def _commit_exists(self, sha: str) -> bool:
         return self._run(
@@ -390,58 +332,3 @@ class StudentWorkspaceReconciler:
             )
         return completed
 
-    @staticmethod
-    def _isolated_git_environment() -> dict[str, str]:
-        environment = git_process_env(None)
-        for name in tuple(environment):
-            if name.startswith("GIT_") or name in _PROXY_ENVIRONMENT:
-                environment.pop(name)
-        for name in _GIT_TRANSPORT_ENVIRONMENT:
-            environment.pop(name, None)
-        environment.update(
-            {
-                "GIT_CONFIG_GLOBAL": os.devnull,
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_SYSTEM": os.devnull,
-                "GIT_TERMINAL_PROMPT": "0",
-            }
-        )
-        return environment
-
-    def _authenticated_git_environment(self) -> dict[str, str]:
-        authenticated = git_process_env(self.token)
-        authorization = authenticated["GIT_CONFIG_VALUE_0"]
-        environment = self._isolated_git_environment()
-        configuration = (
-            ("credential.helper", ""),
-            ("http.proxy", ""),
-            ("http.https://github.com/.proxy", ""),
-            ("http.sslVerify", "true"),
-            ("http.https://github.com/.sslVerify", "true"),
-            ("http.followRedirects", "false"),
-            ("http.https://github.com/.followRedirects", "false"),
-            ("http.extraHeader", ""),
-            ("http.https://github.com/.extraHeader", authorization),
-        )
-        environment.update(
-            {
-                "GIT_ALLOW_PROTOCOL": "https",
-                "GIT_CONFIG_COUNT": str(len(configuration)),
-            }
-        )
-        for index, (key, value) in enumerate(configuration):
-            environment[f"GIT_CONFIG_KEY_{index}"] = key
-            environment[f"GIT_CONFIG_VALUE_{index}"] = value
-        return environment
-
-    def _file_git_environment(self) -> dict[str, str]:
-        environment = self._isolated_git_environment()
-        environment.update(
-            {
-                "GIT_ALLOW_PROTOCOL": "file",
-                "GIT_CONFIG_COUNT": "1",
-                "GIT_CONFIG_KEY_0": "core.hooksPath",
-                "GIT_CONFIG_VALUE_0": os.devnull,
-            }
-        )
-        return environment

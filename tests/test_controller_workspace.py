@@ -463,7 +463,7 @@ def test_reconciliation_isolates_typed_auth_from_hostile_git_configuration(
             }
         return real_run(command, **kwargs)
 
-    monkeypatch.setattr("senpai_agent.workspace.subprocess.run", guarded_run)
+    monkeypatch.setattr("senpai_agent.git_transport.subprocess.run", guarded_run)
     monkeypatch.setenv("GITHUB_TOKEN", "ambient-token")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(system_config))

@@ -22,9 +22,10 @@ Read the current baseline. Use the immutable `program.md` snapshot embedded in y
 
 State commands, metrics, run limits, and stop conditions. Explain when results become informative, including required training, scale, or tuning. State uncertainty and evidence needed to continue. Follow programme limits.
 
-Fetch the configured advisor branch and record its exact remote SHA. Call
-`create_assignment` with this operation-specific payload; the runtime supplies
-and enforces the configured advisor branch and student allowlist:
+Call `sync_advisor_branch` to fetch the configured advisor branch and record
+the exact remote SHA it returns; this checkout does not see merges on its own.
+Then call `create_assignment` with this operation-specific payload; the runtime
+supplies and enforces the configured advisor branch and student allowlist:
 
 ```json
 {

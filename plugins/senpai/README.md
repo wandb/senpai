@@ -18,8 +18,8 @@ one `instant` publication search with one result to validate the key.
 The Python runtime registers the GitHub tools and exposes only those valid for
 the current role:
 
-- advisors receive `create_assignment`, `publish_advisor_branch`,
-  `repair_assignment_routing`, `send_assignment_feedback`,
+- advisors receive `create_assignment`, `sync_advisor_branch`,
+  `publish_advisor_branch`, `repair_assignment_routing`, `send_assignment_feedback`,
   `request_assignment_revision`, `accept_result_on_current_base`,
   `merge_experiment`, and `close_experiment`;
 - students receive `push_experiment_commit`, `post_assignment_comment`,
