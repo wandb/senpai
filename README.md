@@ -420,9 +420,9 @@ beside the base image's software in its own Python 3.14 environment, without
 Senpai's copy of PyTorch. The student's target environment uses the base
 image's interpreter, `/usr/bin/python3` by default, and sees every package
 installed for it, including editable installs. When the base image keeps its
-packages in a virtual environment, point `student_base_python` at that
-environment's interpreter, for example `/opt/sglang/bin/python3` in SGLang's
-images. Packages a student installs go into a separate environment under the
+packages in a virtual environment, set the `TARGET_PYTHON` build argument to
+that environment's interpreter, for example `/opt/sglang/bin/python3` in
+SGLang's images. Packages a student installs go into a separate environment under the
 student's home directory, where they take precedence over the base image's
 copies. Install them with `pip` or `python -m pip`; both reuse the base image's
 packages, while `uv pip` cannot see those packages and installs duplicates. When
@@ -430,20 +430,32 @@ target code must match the base image exactly, as a judge's does, do not
 install a different version of a package the base image provides. The base
 image must be Debian or Ubuntu and must not already define UID or GID 10001.
 
-Build it with the `Build and Push Senpai Images` workflow. Run the workflow
-manually on the Senpai revision you will launch, and set `student_base_image`
-to a digest-pinned image. Set `student_base_python` if the target interpreter
-is not `/usr/bin/python3`. The same run publishes the advisor, student, and
-executor images for that revision. Its summary prints the new image's digest:
+Build and publish the image yourself, from the Senpai revision you will
+launch, and keep it in your own registry: it is your target's image, not
+Senpai's. Senpai's CI builds `Dockerfile.student-on-base` on a small Debian
+base so it keeps working, but publishes nothing from it.
 
-```yaml
-student_image: ghcr.io/wandb/senpai-student-on-base@sha256:<manifest-digest>
-senpai_repo_revision: <the 40-character revision the workflow built>
-advisor_image: ghcr.io/wandb/senpai-advisor:sha-<the same revision>
+```bash
+git clone https://github.com/wandb/senpai.git && cd senpai
+git checkout <the 40-character revision you will launch>
+docker build --file Dockerfile.student-on-base \
+  --build-arg BASE_IMAGE=<registry>/<image>@sha256:<base-digest> \
+  --build-arg TARGET_PYTHON=/usr/bin/python3 \
+  --build-arg SENPAI_SOURCE_REVISION="$(git rev-parse HEAD)" \
+  --tag <your-registry>/<your-image>:<tag> .
+docker push <your-registry>/<your-image>:<tag>
 ```
 
-Launch it by digest, because every base image built for one revision shares
-the `sha-<revision>` tag.
+`SENPAI_SOURCE_REVISION` must be the revision you launch; a student pod
+refuses to start when the image's revision differs from `senpai_repo_revision`.
+Launch by digest, and name private registries in `image_pull_secrets` as for
+`training_image`:
+
+```yaml
+student_image: <your-registry>/<your-image>@sha256:<manifest-digest>
+senpai_repo_revision: <the 40-character revision you built from>
+advisor_image: ghcr.io/wandb/senpai-advisor:sha-<the same revision>
+```
 
 ### Advisory cluster capacity
 
