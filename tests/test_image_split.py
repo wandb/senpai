@@ -82,6 +82,47 @@ def test_student_dockerfile_declares_the_cuda_training_runtime():
     assert "@anthropic-ai/claude-code" not in lowered
 
 
+def test_student_on_base_dockerfile_keeps_the_base_training_stack():
+    dockerfile = (ROOT / "Dockerfile.student-on-base").read_text(encoding="utf-8")
+    lowered = dockerfile.lower()
+
+    assert "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}" in dockerfile
+    assert 'SENPAI_TARGET_BASE_PYTHON="${TARGET_PYTHON}"' in dockerfile
+    # The base image is digest-pinned, so the runtime interpreter is pinned too.
+    assert re.search(r"uv python install 3\.14\.\d+ ", dockerfile)
+    assert "\nENTRYPOINT []\n" in dockerfile
+    for package in ("torch", "torchvision", "torch-geometric", "timm", "einops"):
+        assert f"--prune {package} \\\n" in dockerfile
+    assert 'importlib.util.find_spec("torch") is None' in dockerfile
+    assert "coreweave/ml-containers" not in lowered
+    assert "senpai-gpu-smoke-test" not in lowered
+    assert "torch_cuda_arch_list" not in lowered
+    assert "nvidia_visible_devices" not in lowered
+
+
+def test_student_on_base_image_builds_only_on_explicit_dispatch():
+    source = (ROOT / ".github" / "workflows" / "build.yaml").read_text(encoding="utf-8")
+    workflow = yaml.safe_load(source)
+    events = yaml.load(source, Loader=yaml.BaseLoader)["on"]
+    job = workflow["jobs"]["build-student-on-base"]
+    steps = {step["name"]: step for step in job["steps"]}
+
+    assert set(events["workflow_dispatch"]["inputs"]) == {
+        "student_base_image",
+        "student_base_python",
+    }
+    assert job["if"] == (
+        "github.event_name == 'workflow_dispatch' && inputs.student_base_image != ''"
+    )
+    assert "*@sha256:*" in steps["Require a digest-pinned base image"]["run"]
+    build = steps["Build and push"]["with"]
+    assert build["file"] == "Dockerfile.student-on-base"
+    assert build["push"] is True
+    assert "BASE_IMAGE=${{ env.STUDENT_BASE_IMAGE }}" in build["build-args"]
+    assert "TARGET_PYTHON=${{ env.STUDENT_BASE_PYTHON }}" in build["build-args"]
+    assert steps["Checkout"]["with"]["ref"] == "${{ env.SOURCE_REVISION }}"
+
+
 def test_executor_image_is_a_minimal_non_root_credential_boundary():
     dockerfile = (ROOT / "Dockerfile.executor").read_text(encoding="utf-8")
     lowered = dockerfile.lower()
@@ -110,7 +151,7 @@ def test_lock_targets_linux_and_macos_without_the_unused_notebook_stack():
 
 
 def test_role_images_refuse_source_builds_for_flagged_registry_packages():
-    for role in ("advisor", "student"):
+    for role in ("advisor", "student", "student-on-base"):
         dockerfile = (ROOT / f"Dockerfile.{role}").read_text(encoding="utf-8")
 
         for package in BINARY_ONLY_RUNTIME_PACKAGES:
@@ -118,7 +159,7 @@ def test_role_images_refuse_source_builds_for_flagged_registry_packages():
 
 
 def test_both_role_images_run_as_the_same_explicit_non_root_user():
-    for role in ("advisor", "student"):
+    for role in ("advisor", "student", "student-on-base"):
         dockerfile = (ROOT / f"Dockerfile.{role}").read_text(encoding="utf-8")
 
         assert "USER 10001:10001" in dockerfile
@@ -135,14 +176,14 @@ def test_both_role_images_run_as_the_same_explicit_non_root_user():
 
 
 def test_both_images_do_not_spawn_credential_bearing_health_processes():
-    for role in ("advisor", "student"):
+    for role in ("advisor", "student", "student-on-base"):
         dockerfile = (ROOT / f"Dockerfile.{role}").read_text(encoding="utf-8")
 
         assert "HEALTHCHECK" not in dockerfile
         assert "senpai-container-health" not in dockerfile
 
 
-@pytest.mark.parametrize("role", ["advisor", "student"])
+@pytest.mark.parametrize("role", ["advisor", "student", "student-on-base"])
 def test_images_install_the_runner_and_protect_runtime_assets(role: str):
     dockerfile = (ROOT / f"Dockerfile.{role}").read_text(encoding="utf-8")
     root_setup = dockerfile.split("USER 10001:10001", 1)[0].replace("\\\n", " ")
@@ -173,7 +214,7 @@ def test_images_install_the_runner_and_protect_runtime_assets(role: str):
 
 
 def test_both_images_record_the_exact_source_revision():
-    for role in ("advisor", "student"):
+    for role in ("advisor", "student", "student-on-base"):
         dockerfile = (ROOT / f"Dockerfile.{role}").read_text(encoding="utf-8")
 
         assert "ARG SENPAI_SOURCE_REVISION=unknown" in dockerfile
@@ -407,6 +448,78 @@ def test_target_environment_setup_does_not_execute_target_code(
     assert Path(runtime_package).is_relative_to(sysconfig.get_path("purelib"))
     assert Path(target_package).is_relative_to(target_site)
     assert value == "target dependency"
+
+
+def test_student_target_environment_sees_a_virtualenv_base_and_its_editable_installs(
+    tmp_path: Path,
+):
+    # Mirror a judge image whose packages live in a virtual environment.
+    base = tmp_path / "base image env"
+    subprocess.run([sys.executable, "-P", "-m", "venv", str(base)], check=True)
+    base_python = base / "bin" / "python"
+    base_site = Path(subprocess.check_output(
+        [str(base_python), "-I", "-c", "import site; print(site.getsitepackages()[0])"],
+        text=True,
+    ).strip())
+    (base_site / "base_package.py").write_text("VALUE = 'from the base image'\n")
+    editable_source = tmp_path / "editable source"
+    editable_source.mkdir()
+    (editable_source / "editable_package.py").write_text("VALUE = 'editable'\n")
+    (base_site / "__editable__.editable_package.pth").write_text(f"{editable_source}\n")
+
+    home = tmp_path / "home"
+    target = home / ".venvs" / "senpai-target"
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    exposure = tmp_path / "target-code-executed"
+    (workspace / "site.py").write_text(
+        f"from pathlib import Path; Path({str(exposure)!r}).touch()\n"
+    )
+    setup = target_environment_setup("student")
+    environment = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(home),
+        # The base-image branch must not need Senpai's own interpreter.
+        "SENPAI_PYTHON": str(tmp_path / "missing-senpai-python"),
+        "SENPAI_TARGET_BASE_PYTHON": str(base_python),
+    }
+
+    target_pip = target / "bin" / "pip"
+    for _ in range(2):  # A restarted container keeps the existing environment.
+        subprocess.run(
+            ["bash", "-e", "-c", setup], cwd=workspace, env=environment, check=True
+        )
+        # A launcher the target already has, here marked after the first run, is kept.
+        if "# kept" not in target_pip.read_text():
+            target_pip.write_text(target_pip.read_text() + "# kept\n")
+
+    assert not exposure.exists(), "trusted bootstrap executed target-controlled code"
+    result = subprocess.check_output(
+        [
+            str(target / "bin" / "python"), "-c",
+            "import json, sys, base_package, editable_package; "
+            "print(json.dumps([sys.prefix, base_package.VALUE, editable_package.VALUE]))",
+        ],
+        cwd=tmp_path,
+        text=True,
+    )
+    prefix, base_value, editable_value = json.loads(result)
+    assert Path(prefix).resolve() == target.resolve()
+    assert (base_value, editable_value) == ("from the base image", "editable")
+    assert not list(target.rglob("senpai-runtime.pth"))
+
+    # A bare pip runs the target interpreter, which finds the base image's pip
+    # and installs into the target environment rather than the trusted runtime.
+    launcher = target_pip.read_text()
+    assert launcher.startswith("#!/bin/sh\n") and '"$(dirname "$0")/python" -m pip' in launcher
+    assert launcher.endswith("# kept\n")
+    assert os.access(target_pip, os.X_OK)
+    version = subprocess.check_output(
+        [str(target_pip), "--version"], cwd=tmp_path, text=True,
+        env={"PATH": os.environ["PATH"], "HOME": str(home)},
+    )
+    assert version.startswith("pip ")
+    assert str(base_site.resolve()) in str(Path(version.split(" from ", 1)[1].split(" (", 1)[0]).resolve())
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])

@@ -122,15 +122,38 @@ fi
 unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS WANDB_API_KEY EXA_API_KEY
 rm -f "$GIT_ASKPASS_FILE"
 export SENPAI_TARGET_PYTHON_ENV="$HOME/.venvs/senpai-target"
-if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then
-    /usr/local/bin/uv venv --no-project --no-config --no-python-downloads \
-        --python "$SENPAI_PYTHON" --allow-existing "$SENPAI_TARGET_PYTHON_ENV"
+if [ -n "${SENPAI_TARGET_BASE_PYTHON:-}" ]; then
+    # Images built on a target base image keep that image's interpreter and
+    # packages; Senpai's own runtime may use another Python version.
+    if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then
+        /usr/local/bin/uv venv --no-project --no-config --no-python-downloads \
+            --python "$SENPAI_TARGET_BASE_PYTHON" --allow-existing "$SENPAI_TARGET_PYTHON_ENV"
+    fi
+    # The base interpreter belongs to the image; -I keeps target files off its path.
+    TARGET_SITE="$("$SENPAI_TARGET_BASE_PYTHON" -I -c 'import sys; print("{}/lib/python{}.{}/site-packages".format(sys.argv[1], *sys.version_info[:2]))' "$SENPAI_TARGET_PYTHON_ENV")"
+    # The base may itself be a virtual environment, whose packages a new venv's
+    # system site would miss. addsitedir also runs its .pth files, such as editable installs.
+    "$SENPAI_TARGET_BASE_PYTHON" -I -c 'import site; print("import site; [site.addsitedir(path) for path in %r]" % site.getsitepackages())' \
+        > "$TARGET_SITE/senpai-base-image.pth"
+    # uv seeds no pip and the trusted runtime's console scripts are not shared
+    # here, so without this a bare pip would resolve to the read-only runtime's.
+    # The launcher runs the target interpreter, which finds pip in the base image.
+    target_pip="$SENPAI_TARGET_PYTHON_ENV/bin/pip"
+    if [ ! -e "$target_pip" ] && [ ! -L "$target_pip" ]; then
+        printf '%s\n' '#!/bin/sh' 'exec "$(dirname "$0")/python" -m pip "$@"' > "$target_pip"
+        chmod 755 "$target_pip"
+    fi
+else
+    if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then
+        /usr/local/bin/uv venv --no-project --no-config --no-python-downloads \
+            --python "$SENPAI_PYTHON" --allow-existing "$SENPAI_TARGET_PYTHON_ENV"
+    fi
+    CONTROLLER_SITE="$("$SENPAI_PYTHON" -P -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+    # The target interpreter is agent-writable; never execute it during trusted startup.
+    TARGET_SITE="$("$SENPAI_PYTHON" -P -c 'import sys, sysconfig; print(sysconfig.get_path("purelib", vars={"base": sys.argv[1]}))' "$SENPAI_TARGET_PYTHON_ENV")"
+    printf '%s\n' "$CONTROLLER_SITE" > "$TARGET_SITE/senpai-runtime.pth"
+    "$SENPAI_PYTHON" -P -m senpai_agent.target_environment "$SENPAI_TARGET_PYTHON_ENV"
 fi
-CONTROLLER_SITE="$("$SENPAI_PYTHON" -P -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
-# The target interpreter is agent-writable; never execute it during trusted startup.
-TARGET_SITE="$("$SENPAI_PYTHON" -P -c 'import sys, sysconfig; print(sysconfig.get_path("purelib", vars={"base": sys.argv[1]}))' "$SENPAI_TARGET_PYTHON_ENV")"
-printf '%s\n' "$CONTROLLER_SITE" > "$TARGET_SITE/senpai-runtime.pth"
-"$SENPAI_PYTHON" -P -m senpai_agent.target_environment "$SENPAI_TARGET_PYTHON_ENV"
 if [ "${NODES_PER_STUDENT:-1}" -gt 1 ] || [ -n "${SENPAI_TRAINING_IMAGE:-}" ]; then
     proxy_dir="$LOGDIR/bin"
     mkdir -p "$proxy_dir"

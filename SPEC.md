@@ -408,6 +408,22 @@ Each native terminal session receives target settings after shell startup,
 including new and recovered tmux panes. Later commands can change that
 session's environment. This adapter uses the pinned SDK's environment-export
 callback and preserves native parallel terminal execution.
+
+`SENPAI_TARGET_BASE_PYTHON` marks a student image built on a target base image
+with `Dockerfile.student-on-base`. There the trusted runtime keeps its own
+interpreter, and bootstrap creates the target venv from the base image's
+interpreter instead. A `.pth` entry adds that interpreter's site directories,
+including those of a base that is itself a virtual environment, and runs their
+`.pth` files, so editable installs in the base resolve. Target code then sees
+the base image's packages, not the trusted environment's: runtime packages such
+as wandb and weave are not shared, and bootstrap writes no `senpai-runtime.pth`
+and no shared console scripts. pip comes from the base image, so
+`python -m pip` installs into the target venv and resolves packages on the base
+path, and bootstrap writes a `pip` launcher into the target venv that runs the
+target interpreter with `-m pip`, so a bare `pip` does the same. An existing
+`pip` there is kept. Bootstrap runs the base interpreter isolated (`-I`) so
+target files cannot load during startup, and it never runs Senpai's interpreter
+for target setup.
 Bootstrap also creates missing target launchers for the trusted environment's
 console scripts. Each launcher executes the original read-only script with
 target Python, so shared commands and their Python workers see target packages.

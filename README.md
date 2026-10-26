@@ -408,6 +408,43 @@ target-owned submitter, which follows the
 Commit training code before running it; Senpai checks out that exact commit in
 the training pod. An empty `training_image` keeps the existing training behavior.
 
+### Build the student image on your own base image
+
+Use this image for many short GPU tasks in a specific environment. An example
+is kernel work against a competition's judge image. Each single-node student
+pod keeps its GPU. The student's terminal, tests, and training run in that
+environment. Use `training_image` for long training runs. Each run then starts
+in a new GPU pod, and other work can use the GPU between runs.
+`Dockerfile.student-on-base` installs Senpai
+beside the base image's software in its own Python 3.14 environment, without
+Senpai's copy of PyTorch. The student's target environment uses the base
+image's interpreter, `/usr/bin/python3` by default, and sees every package
+installed for it, including editable installs. When the base image keeps its
+packages in a virtual environment, point `student_base_python` at that
+environment's interpreter, for example `/opt/sglang/bin/python3` in SGLang's
+images. Packages a student installs go into a separate environment under the
+student's home directory, where they take precedence over the base image's
+copies. Install them with `pip` or `python -m pip`; both reuse the base image's
+packages, while `uv pip` cannot see those packages and installs duplicates. When
+target code must match the base image exactly, as a judge's does, do not
+install a different version of a package the base image provides. The base
+image must be Debian or Ubuntu and must not already define UID or GID 10001.
+
+Build it with the `Build and Push Senpai Images` workflow. Run the workflow
+manually on the Senpai revision you will launch, and set `student_base_image`
+to a digest-pinned image. Set `student_base_python` if the target interpreter
+is not `/usr/bin/python3`. The same run publishes the advisor, student, and
+executor images for that revision. Its summary prints the new image's digest:
+
+```yaml
+student_image: ghcr.io/wandb/senpai-student-on-base@sha256:<manifest-digest>
+senpai_repo_revision: <the 40-character revision the workflow built>
+advisor_image: ghcr.io/wandb/senpai-advisor:sha-<the same revision>
+```
+
+Launch it by digest, because every base image built for one revision shares
+the `sha-<revision>` tag.
+
 ### Advisory cluster capacity
 
 Add `--capacity_observer true` to install a dedicated observer. It uses the same
