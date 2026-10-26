@@ -5,6 +5,39 @@ import json
 
 import yaml
 
+from launch_helpers import yaml_insertion
+
+CAPACITY_SNAPSHOT_DIR = "/var/run/senpai-capacity"
+CAPACITY_SNAPSHOT_PATH = f"{CAPACITY_SNAPSHOT_DIR}/snapshot.json"
+
+
+def capacity_configmap_name(tag: str) -> str:
+    return f"senpai-capacity-{tag}"
+
+
+def capacity_snapshot_mount() -> str:
+    """Read-only snapshot mount for an advisor or student container."""
+    return yaml_insertion(
+        [{"name": "capacity-snapshot", "mountPath": CAPACITY_SNAPSHOT_DIR, "readOnly": True}],
+        8,
+    )
+
+
+def capacity_snapshot_volume(tag: str) -> str:
+    return yaml_insertion(
+        [
+            {
+                "name": "capacity-snapshot",
+                "configMap": {
+                    "name": capacity_configmap_name(tag),
+                    "items": [{"key": "snapshot.json", "path": "snapshot.json"}],
+                },
+            }
+        ],
+        6,
+    )
+
+
 
 def render_capacity_observer(
     *,
@@ -16,7 +49,7 @@ def render_capacity_observer(
     config: dict,
     node_selector: dict[str, str],
 ) -> str:
-    name = f"senpai-capacity-{tag}"
+    name = capacity_configmap_name(tag)
     scope_hash = hashlib.sha256(f"{namespace}/{tag}".encode()).hexdigest()[:16]
     cluster_name = f"senpai-capacity-{scope_hash}"
     labels = {
