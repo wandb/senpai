@@ -679,7 +679,7 @@ def test_openai_ultra_launch_value_is_rejected():
         frontier_reasoning_effort="ultra",
     )
 
-    with pytest.raises(SystemExit, match="must be one of"):
+    with pytest.raises(SystemExit, match="choose one of"):
         launch.validate_model_config(args)
 
 
@@ -775,14 +775,14 @@ def test_wandb_gateway_is_rendered_for_every_role():
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"advisor_reasoning_effort": "extreme"}, "must be one of"),
+        ({"advisor_reasoning_effort": "extreme"}, "choose one of"),
         ({"student_model": "openai/gpt-6-astra", "student_reasoning_effort": "none"}, "unsupported for"),
         (
             {
                 "advisor_model": "anthropic/claude-opus-4-8",
                 "advisor_reasoning_effort": "ultra",
             },
-            "must be one of",
+            "choose one of",
         ),
         (
             {

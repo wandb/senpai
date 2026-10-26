@@ -15,12 +15,14 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 
+import yaml
 from dotenv import dotenv_values
 
 PROGRAM_CONTEXT_ANNOTATION = "senpai.wandb.com/program-context-secret"
@@ -533,6 +535,18 @@ def render_template(template: str, replacements: dict[str, str]) -> str:
         r"\{\{(\w+)\}\}",
         lambda match: replacements.get(match[1], match[0]),
         template,
+    )
+
+
+def yaml_list_insertion(items: list[dict], indentation: int) -> str:
+    """Render optional list items for a ``# {{PLACEHOLDER}}`` template comment.
+
+    The comment line becomes ``# enabled`` and the serialized items follow it at
+    the indentation of the surrounding YAML list, so an empty replacement leaves
+    the template's commented placeholder inert.
+    """
+    return "enabled\n" + textwrap.indent(
+        yaml.safe_dump(items, sort_keys=False).rstrip(), " " * indentation
     )
 
 

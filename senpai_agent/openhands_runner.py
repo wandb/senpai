@@ -110,6 +110,7 @@ from senpai_agent.program_context import (
     PROGRAM_PATH_ENV,
     PROGRAM_SOURCE_COMMIT_ENV,
 )
+from senpai_agent.reasoning_effort import REASONING_EFFORTS, openhands_reasoning_effort
 from senpai_agent.PROMPTS import (
     DELEGATED_RESULT_SUMMARY_PROMPT,
     RECOVERED_ACTION_PROMPT,
@@ -134,14 +135,6 @@ DEFAULT_FAST_REASONING_EFFORT = "medium"
 DEFAULT_FRONTIER_REASONING_EFFORT = "max"
 DEFAULT_COMPACTION_TRIGGER_TOKENS = 200_000
 WANDB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
-REASONING_EFFORTS = (
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-    "none",
-)
 SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore", "search", "supervisor")
 SENPAI_AGENT_DIR_ENV = "SENPAI_AGENT_DIR"
 SOURCE_SENPAI_AGENT_DIR = Path(__file__).resolve().parents[1] / ".agents" / "agents"
@@ -258,43 +251,6 @@ def parse_runner_args(argv: Sequence[str] | None = None) -> RunnerArgs:
     parser = ArgumentParser(description="Run a Senpai OpenHands agent.")
     parser.add_arguments(RunnerArgs, dest="args")
     return parser.parse_args(argv).args
-
-
-def openhands_reasoning_effort(reasoning_effort: str, model: str) -> str:
-    provider, _, model_name = model.lower().partition("/")
-    supports_openai_pro = provider == "openai" and (
-        model_name in {"gpt-5.6", "gpt-6-astra"}
-        or model_name.startswith("gpt-5.6-")
-    )
-    if reasoning_effort not in REASONING_EFFORTS:
-        choices = ", ".join(REASONING_EFFORTS)
-        raise ValueError(
-            f"unsupported reasoning effort {reasoning_effort!r}; "
-            f"choose one of: {choices}"
-        )
-    if provider == "openai" and model_name == "gpt-6-astra" and reasoning_effort == "none":
-        raise ValueError(
-            f"reasoning effort {reasoning_effort!r} is unsupported for model {model!r}"
-        )
-    if provider == "wandb" and model_name == "zai-org/glm-5.2":
-        if reasoning_effort not in {"high", "max"}:
-            raise ValueError(
-                f"reasoning effort {reasoning_effort!r} is unsupported for "
-                f"model {model!r}; use 'high' or 'max'"
-            )
-        return reasoning_effort
-    if (
-        reasoning_effort == "max"
-        and provider != "anthropic"
-        and not supports_openai_pro
-    ):
-        raise ValueError(
-            f"reasoning effort {reasoning_effort!r} is unsupported for model "
-            f"{model!r}; "
-            "use an anthropic model, openai/gpt-5.6, openai/gpt-6-astra, "
-            "or select a lower effort"
-        )
-    return reasoning_effort
 
 
 def _uses_openai_pro_mode(model: str, reasoning_effort: str | None) -> bool:
