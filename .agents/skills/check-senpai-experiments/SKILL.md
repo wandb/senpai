@@ -63,8 +63,9 @@ checks. Collect independent read-only sources in parallel when safe:
   runs, decisions, lineage, integrated changes, and evaluation records.
 - **Runtime and controllers:** readiness, restarts, warnings, placement,
   resource pressure, leases/state, recent actions, supervised processes,
-  provider errors, and bounded logs. Use `$cluster-gpu-availability` when a
-  cluster-wide capacity check is also needed and that skill is available.
+  provider errors, and bounded logs. For cluster-wide GPU capacity, use the
+  operator's own capacity tooling when available; it complements, not replaces,
+  launch-specific checks.
 - **W&B or the configured metric store:** bounded metadata, configs, summaries,
   selected histories, artifacts, heartbeats, and stable run links.
 - **External evaluator:** authoritative results when the programme defines one
