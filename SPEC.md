@@ -447,7 +447,7 @@ SDK upgrades must retain the executable plugin-isolation test.
 
 The SDK and tools use the same immutable revision of
 [`morganmcg1/software-agent-sdk`](https://github.com/morganmcg1/software-agent-sdk)
-and are based on OpenHands SDK 1.49.6. The dependency declarations, `uv.lock`,
+and are based on OpenHands SDK 1.58.2. The dependency declarations, `uv.lock`,
 and runtime CI pin that revision so tests and image builds use the same fork
 code.
 
