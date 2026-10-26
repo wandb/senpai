@@ -46,8 +46,8 @@ dumps. Inspect:
 - requested GPUs, CPU, and memory, plus current pressure or OOM evidence; and
 - active processes or bounded recent logs when activity matters.
 
-Use `$cluster-gpu-availability` for cluster-wide GPU and job accounting when it
-is available. Its capacity snapshot complements this workflow; it does not
+For cluster-wide GPU and job accounting, use the operator's own capacity
+tooling when available. Its snapshot complements this workflow; it does not
 replace launch-specific health checks.
 
 Interpret states precisely:
