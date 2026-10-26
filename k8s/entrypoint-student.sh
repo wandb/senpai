@@ -135,6 +135,14 @@ if [ -n "${SENPAI_TARGET_BASE_PYTHON:-}" ]; then
     # system site would miss. addsitedir also runs its .pth files, such as editable installs.
     "$SENPAI_TARGET_BASE_PYTHON" -I -c 'import site; print("import site; [site.addsitedir(path) for path in %r]" % site.getsitepackages())' \
         > "$TARGET_SITE/senpai-base-image.pth"
+    # uv seeds no pip and the trusted runtime's console scripts are not shared
+    # here, so without this a bare pip would resolve to the read-only runtime's.
+    # The launcher runs the target interpreter, which finds pip in the base image.
+    target_pip="$SENPAI_TARGET_PYTHON_ENV/bin/pip"
+    if [ ! -e "$target_pip" ] && [ ! -L "$target_pip" ]; then
+        printf '%s\n' '#!/bin/sh' 'exec "$(dirname "$0")/python" -m pip "$@"' > "$target_pip"
+        chmod 755 "$target_pip"
+    fi
 else
     if [ ! -x "$SENPAI_TARGET_PYTHON_ENV/bin/python" ]; then
         /usr/local/bin/uv venv --no-project --no-config --no-python-downloads \

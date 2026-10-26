@@ -424,8 +424,8 @@ packages in a virtual environment, point `student_base_python` at that
 environment's interpreter, for example `/opt/sglang/bin/python3` in SGLang's
 images. Packages a student installs go into a separate environment under the
 student's home directory, where they take precedence over the base image's
-copies. Install them with `python -m pip`, which reuses the base image's
-packages; `uv pip` cannot see those packages and installs duplicates. When
+copies. Install them with `pip` or `python -m pip`; both reuse the base image's
+packages, while `uv pip` cannot see those packages and installs duplicates. When
 target code must match the base image exactly, as a judge's does, do not
 install a different version of a package the base image provides. The base
 image must be Debian or Ubuntu and must not already define UID or GID 10001.

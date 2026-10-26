@@ -88,7 +88,9 @@ def test_student_on_base_dockerfile_keeps_the_base_training_stack():
 
     assert "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}" in dockerfile
     assert 'SENPAI_TARGET_BASE_PYTHON="${TARGET_PYTHON}"' in dockerfile
-    assert "uv python install 3.14" in dockerfile
+    # The base image is digest-pinned, so the runtime interpreter is pinned too.
+    assert re.search(r"uv python install 3\.14\.\d+ ", dockerfile)
+    assert "\nENTRYPOINT []\n" in dockerfile
     for package in ("torch", "torchvision", "torch-geometric", "timm", "einops"):
         assert f"--prune {package} \\\n" in dockerfile
     assert 'importlib.util.find_spec("torch") is None' in dockerfile
@@ -482,10 +484,14 @@ def test_student_target_environment_sees_a_virtualenv_base_and_its_editable_inst
         "SENPAI_TARGET_BASE_PYTHON": str(base_python),
     }
 
+    target_pip = target / "bin" / "pip"
     for _ in range(2):  # A restarted container keeps the existing environment.
         subprocess.run(
             ["bash", "-e", "-c", setup], cwd=workspace, env=environment, check=True
         )
+        # A launcher the target already has, here marked after the first run, is kept.
+        if "# kept" not in target_pip.read_text():
+            target_pip.write_text(target_pip.read_text() + "# kept\n")
 
     assert not exposure.exists(), "trusted bootstrap executed target-controlled code"
     result = subprocess.check_output(
@@ -501,6 +507,19 @@ def test_student_target_environment_sees_a_virtualenv_base_and_its_editable_inst
     assert Path(prefix).resolve() == target.resolve()
     assert (base_value, editable_value) == ("from the base image", "editable")
     assert not list(target.rglob("senpai-runtime.pth"))
+
+    # A bare pip runs the target interpreter, which finds the base image's pip
+    # and installs into the target environment rather than the trusted runtime.
+    launcher = target_pip.read_text()
+    assert launcher.startswith("#!/bin/sh\n") and '"$(dirname "$0")/python" -m pip' in launcher
+    assert launcher.endswith("# kept\n")
+    assert os.access(target_pip, os.X_OK)
+    version = subprocess.check_output(
+        [str(target_pip), "--version"], cwd=tmp_path, text=True,
+        env={"PATH": os.environ["PATH"], "HOME": str(home)},
+    )
+    assert version.startswith("pip ")
+    assert str(base_site.resolve()) in str(Path(version.split(" from ", 1)[1].split(" (", 1)[0]).resolve())
 
 
 @pytest.mark.parametrize("role", ["advisor", "student"])
