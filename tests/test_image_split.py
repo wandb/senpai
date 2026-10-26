@@ -100,26 +100,24 @@ def test_student_on_base_dockerfile_keeps_the_base_training_stack():
     assert "nvidia_visible_devices" not in lowered
 
 
-def test_student_on_base_image_builds_only_on_explicit_dispatch():
+def test_student_on_base_image_is_built_in_ci_but_never_published():
     source = (ROOT / ".github" / "workflows" / "build.yaml").read_text(encoding="utf-8")
     workflow = yaml.safe_load(source)
     events = yaml.load(source, Loader=yaml.BaseLoader)["on"]
     job = workflow["jobs"]["build-student-on-base"]
     steps = {step["name"]: step for step in job["steps"]}
 
-    assert set(events["workflow_dispatch"]["inputs"]) == {
-        "student_base_image",
-        "student_base_python",
-    }
-    assert job["if"] == (
-        "github.event_name == 'workflow_dispatch' && inputs.student_base_image != ''"
-    )
-    assert "*@sha256:*" in steps["Require a digest-pinned base image"]["run"]
-    build = steps["Build and push"]["with"]
+    # Targets publish their own base-image students; Senpai takes no inputs for one.
+    assert events["workflow_dispatch"] in (None, "", {})
+    assert "if" not in job
+    assert job["permissions"] == {"contents": "read"}
+    assert not any("login" in step.get("uses", "") for step in job["steps"])
+    assert re.fullmatch(r"python:3\.12-slim-bookworm@sha256:[0-9a-f]{64}", job["env"]["CHECK_BASE_IMAGE"])
+    build = steps["Build without publishing"]["with"]
     assert build["file"] == "Dockerfile.student-on-base"
-    assert build["push"] is True
-    assert "BASE_IMAGE=${{ env.STUDENT_BASE_IMAGE }}" in build["build-args"]
-    assert "TARGET_PYTHON=${{ env.STUDENT_BASE_PYTHON }}" in build["build-args"]
+    assert build["push"] is False
+    assert "BASE_IMAGE=${{ env.CHECK_BASE_IMAGE }}" in build["build-args"]
+    assert "TARGET_PYTHON=${{ env.CHECK_TARGET_PYTHON }}" in build["build-args"]
     assert steps["Checkout"]["with"]["ref"] == "${{ env.SOURCE_REVISION }}"
 
 

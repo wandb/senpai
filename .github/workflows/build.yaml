@@ -5,17 +5,6 @@ on:
     branches: [main, docker]
   pull_request: {}
   workflow_dispatch:
-    inputs:
-      student_base_image:
-        description: >-
-          Optional digest-pinned Debian or Ubuntu image to build an extra
-          student image on with Dockerfile.student-on-base
-        type: string
-        default: ""
-      student_base_python:
-        description: Interpreter in student_base_image that target code uses
-        type: string
-        default: /usr/bin/python3
 
 env:
   REGISTRY: ghcr.io
@@ -85,84 +74,45 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
+  # Targets build Dockerfile.student-on-base on their own base image and publish
+  # the result themselves (see README). This job only keeps the Dockerfile
+  # building, on a small Debian base whose Python differs from Senpai's.
   build-student-on-base:
-    if: github.event_name == 'workflow_dispatch' && inputs.student_base_image != ''
     runs-on: ubuntu-latest
     env:
-      IMAGE_NAME: ${{ github.repository }}-student-on-base
-      STUDENT_BASE_IMAGE: ${{ inputs.student_base_image }}
-      STUDENT_BASE_PYTHON: ${{ inputs.student_base_python }}
+      CHECK_BASE_IMAGE: python:3.12-slim-bookworm@sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70
+      CHECK_TARGET_PYTHON: /usr/local/bin/python3
     permissions:
       contents: read
-      packages: write
 
     steps:
-      - name: Require a digest-pinned base image
+      - name: Free disk space
         run: |
-          case "$STUDENT_BASE_IMAGE" in
-            *@sha256:*) ;;
-            *) echo "student_base_image must be pinned by @sha256 digest" >&2; exit 1 ;;
-          esac
-
-      # Base images such as SGLang's are tens of gigabytes once extracted.
-      - name: Free disk space and move Docker to the larger disk
-        run: |
-          df -h / /mnt
-          sudo rm -rf /usr/lib/jvm /usr/local/.ghcup /usr/local/lib/android \
-            /usr/local/share/powershell /usr/share/dotnet /usr/share/swift \
-            "$AGENT_TOOLSDIRECTORY"
+          df -h /
+          sudo rm -rf /usr/lib/jvm
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
           sudo docker image prune -af
-          sudo systemctl stop docker docker.socket
-          sudo mkdir -p /mnt/docker
-          config=$( (sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}') \
-            | jq '. + {"data-root": "/mnt/docker"}')
-          echo "$config" | sudo tee /etc/docker/daemon.json
-          sudo systemctl start docker
-          docker info --format '{{.DockerRootDir}}'
-          df -h / /mnt
+          df -h /
 
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ env.SOURCE_REVISION }}
 
-      - name: Log in to Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=sha-${{ env.SOURCE_REVISION }}
-          labels: |
-            org.opencontainers.image.revision=${{ env.SOURCE_REVISION }}
-            org.opencontainers.image.base.name=${{ env.STUDENT_BASE_IMAGE }}
-
-      - name: Build and push
-        id: build
+      - name: Build without publishing
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile.student-on-base
-          push: true
+          push: false
           pull: true
           no-cache: true
           build-args: |
-            BASE_IMAGE=${{ env.STUDENT_BASE_IMAGE }}
-            TARGET_PYTHON=${{ env.STUDENT_BASE_PYTHON }}
+            BASE_IMAGE=${{ env.CHECK_BASE_IMAGE }}
+            TARGET_PYTHON=${{ env.CHECK_TARGET_PYTHON }}
             SENPAI_SOURCE_REVISION=${{ env.SOURCE_REVISION }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-
-      - name: Report the pinned image
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          echo "student_image: $REGISTRY/$IMAGE_NAME@$DIGEST" | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "senpai_repo_revision: $SOURCE_REVISION" | tee -a "$GITHUB_STEP_SUMMARY"
