@@ -70,8 +70,11 @@ to README.md or SPEC.md as appropriate.
 - **Student pods** - use one OpenHands conversation per assignment revision,
   implement one assigned PR, and resume the same conversation for actionable
   monitor events. Single-node students train in their GPU pod. Multi-node
-  students use a CPU controller and a credentialed executor sidecar to supervise
-  training in separate worker pods.
+  students and students with a `training_image` use a CPU controller and a
+  credentialed executor sidecar to supervise training in separate worker pods.
+  Use these worker pods for long training runs. A student image built on a
+  target base image keeps the GPU in the student pod. Use it for many short GPU
+  tasks in that environment, such as kernel work.
 - **Cross-node communication** - GitHub PR labels, typed comments, and human-tagged Issues; no RPC service or cluster networking.
 - **GitHub Issues** - human-to-agent communication channel. Agents poll for and respond to these alongside their normal PR workflow.
 - **W&B** - canonical experiment metrics store for training runs, comparisons, and merge decisions.

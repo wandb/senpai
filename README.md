@@ -410,10 +410,12 @@ the training pod. An empty `training_image` keeps the existing training behavior
 
 ### Build the student image on your own base image
 
-When target code must run in a specific environment, such as a competition's
-judge image, build the student image on top of it instead. Each single-node
-student pod then keeps its GPU and runs the student's terminal, tests, and
-training in that environment. `Dockerfile.student-on-base` installs Senpai
+Use this image for many short GPU tasks in a specific environment. An example
+is kernel work against a competition's judge image. Each single-node student
+pod keeps its GPU. The student's terminal, tests, and training run in that
+environment. Use `training_image` for long training runs. Each run then starts
+in a new GPU pod, and other work can use the GPU between runs.
+`Dockerfile.student-on-base` installs Senpai
 beside the base image's software in its own Python 3.14 environment, without
 Senpai's copy of PyTorch. The student's target environment uses the base
 image's interpreter, `/usr/bin/python3` by default, and sees every package
