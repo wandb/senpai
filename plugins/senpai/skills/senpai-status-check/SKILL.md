@@ -33,13 +33,15 @@ Use the immutable `program.md` snapshot embedded in your system prompt for its g
 
 1. **Metrics:** use the `wandb-primary` skill against
    `$WANDB_ENTITY/$WANDB_PROJECT`. Start with run IDs linked from active PRs,
-   then inspect only the recent runs needed to establish the test frontier.
+   then inspect only the recent runs needed to establish the metric frontier.
 2. **GitHub:** use `get_prs` for the configured `$GH_REPO` and
    `$ADVISOR_BRANCH`. Check assignment, workflow state, update time, linked W&B
    runs, and results. Keep the query bounded to relevant open and recently
    completed work.
 3. **Current controller and training:** inspect
-   `$SENPAI_OPENHANDS_STATE_DIR/training/*.json` for supervised training state.
+   `$SENPAI_OPENHANDS_STATE_DIR/training/*.json` for supervised training state,
+   `$SENPAI_OPENHANDS_STATE_DIR/training/monitors/*.json` for monitor state, and
+   the current branch and head of the target checkout at `$TARGET_WORKDIR`.
    Treat this as local evidence for the current advisor or student only. Do not
    infer another node's process state; its GitHub transitions and W&B run state
    are the portable evidence boundary.
@@ -59,8 +61,9 @@ Return a compact report with:
 1. **Scope and evidence gaps:** exact repo, branch, research tag, W&B project,
    collection time, and anything unavailable.
 2. **Executive read:** the scientific frontier and the main operational risk.
-3. **Test metric frontier:** metric contract, best verified test value,
-   benchmark or target, gap, W&B run, PR, and evaluation caveat.
+3. **Metric frontier:** the deciding metric and split from `program.md`, best
+   verified value, benchmark or target, gap, W&B run, PR, and evaluation
+   caveat.
 4. **PR queue and routing:** active work, assignment integrity, stale work, and
    evidence-backed blockers.
 5. **Runtime health:** current assignment, persisted local training and monitor
@@ -71,16 +74,10 @@ Return a compact report with:
 7. **Next actions:** the one to three highest-value actions, clearly labeled as
    recommendations rather than changes already made.
 
-Put paper-facing test metrics before validation metrics unless `program.md`
-defines a different publication contract. Pair every claimed result with its
-source and caveat; never promote a validation-only or partial-evaluation result
-to a test result.
+Lead with the metric and split that `program.md` uses to decide success. Pair
+every claimed result with its source and caveat; never present a result from a
+non-deciding split or a partial evaluation as the deciding result.
 
-If `program.md` permits a repository status artifact and the user requested
-one, write:
-
-```text
-analysis/STATUS_<YYYY-MM-DD-HHMM>_<branch>_fleet.md
-```
-
-Otherwise, return the report in the conversation without creating files.
+Write a status file only when the user requested one and `program.md` permits
+it, at the path `program.md` defines. Otherwise, return the report in the
+conversation without creating files.
