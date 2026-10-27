@@ -1,3 +1,4 @@
+import importlib
 import os
 import shutil
 import subprocess
@@ -6,7 +7,8 @@ import textwrap
 from types import SimpleNamespace
 
 import pytest
-from openhands.sdk import LLM, Agent, LocalConversation, Tool
+from litellm import token_counter
+from openhands.sdk import LLM, Action, Agent, LocalConversation, Tool
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.plugin import Plugin, PluginSource
 from openhands.sdk.subagent import AgentDefinition, agent_definition_to_factory
@@ -375,6 +377,66 @@ def test_senpai_task_tracker_description_is_concise_and_parallel_safe(tmp_path):
     assert "genuinely parallel" in tool.description
     assert "Limit active work to ONE" not in tool.description
     assert len(tool.description) < 700
+
+
+ACTION_MODULES = (
+    "senpai_agent.capacity_tool",
+    "senpai_agent.delegation",
+    "senpai_agent.exa_tool",
+    "senpai_agent.github.supervision",
+    "senpai_agent.github.tools.broadcast",
+    "senpai_agent.github.tools.contracts",
+    "senpai_agent.github.tools.pull_requests",
+    "senpai_agent.github.tools.source",
+    "senpai_agent.tools",
+)
+
+
+def senpai_actions(base: type[Action]) -> set[type[Action]]:
+    actions = set()
+    for action in base.__subclasses__():
+        if action.__module__.startswith("senpai_agent."):
+            actions.add(action)
+        actions |= senpai_actions(action)
+    return actions
+
+
+def test_every_advertised_array_names_its_item_type():
+    # OpenHands advertises an array's element type only through "items", so a
+    # fixed-length tuple field (JSON Schema "prefixItems") reaches the model as
+    # a bare array, and LiteLLM's token counter then fails on the tool list.
+    for module in ACTION_MODULES:
+        importlib.import_module(module)
+    actions = sorted(senpai_actions(Action), key=lambda action: action.__name__)
+
+    def bare_arrays(node: object, path: str) -> list[str]:
+        if isinstance(node, list):
+            return [
+                found
+                for index, item in enumerate(node)
+                for found in bare_arrays(item, f"{path}[{index}]")
+            ]
+        if not isinstance(node, dict):
+            return []
+        found = [path] if node.get("type") == "array" and "items" not in node else []
+        for key, value in node.items():
+            found += bare_arrays(value, f"{path}.{key}")
+        return found
+
+    schemas = {action.__name__: action.to_mcp_schema() for action in actions}
+    assert "GetPRsAction" in schemas
+    assert [
+        path for name, schema in schemas.items() for path in bare_arrays(schema, name)
+    ] == []
+    tools = [
+        {"type": "function", "function": {"name": name, "parameters": schema}}
+        for name, schema in schemas.items()
+    ]
+    assert token_counter(
+        model="custom_openai/served-model",
+        messages=[{"role": "user", "content": "hello"}],
+        tools=tools,
+    ) > 0
 
 
 def test_markdown_agents_register_and_construct_with_the_native_loader(tmp_path):
