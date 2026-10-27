@@ -18,8 +18,8 @@ dependencies = [
     "rich",
     "python-dotenv",
     "simple-parsing",
-    "wandb>=0.30.0",
-    "weave>=0.53.12,<0.54", # 0.53.12 lifts the OTLP exporter cap that blocks GHSA-xcq7-p3pf-p88h
+    "wandb>=0.31.0",
+    "weave>=0.54.0,<0.55",
     "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@bdc58d4190c3df064fc3fe173de76c510bf15abf",
     "litellm>=1.102.1",
     "tqdm",
@@ -43,6 +43,9 @@ environments = [
     "sys_platform == 'darwin'",
 ]
 exclude-newer = "2026-09-27T00:00:00Z"
+override-dependencies = [
+    "weave>=0.54.0,<0.55", # weave-openhands still declares weave<0.54
+]
 constraint-dependencies = [
     "cryptography>=50.0.0", # CVE-2026-69247 / GHSA-g6cj-pr64-35w5
     # Transitive floors for open Dependabot advisories.
@@ -64,6 +67,10 @@ constraint-dependencies = [
 
 [tool.uv.exclude-newer-package]
 certifi = "2026-10-21T00:00:00Z" # openhands-sdk 1.58.2 requires the eMudhra CA distrust fix (GHSA-6q48-6c7w-9gw2)
+# Latest wandb and weave releases.
+cwevals = "2026-10-24T00:00:00Z"
+wandb = "2026-10-24T00:00:00Z"
+weave = "2026-10-24T00:00:00Z"
 # Security fixes released after the global cutoff; see constraint-dependencies.
 aiohttp = "2026-10-22T00:00:00Z"
 fastmcp = "2026-10-22T00:00:00Z"
@@ -79,7 +86,6 @@ opentelemetry-semantic-conventions = "2026-10-22T00:00:00Z"
 pillow = "2026-10-22T00:00:00Z"
 pypdf = "2026-10-22T00:00:00Z"
 setuptools = "2026-10-22T00:00:00Z"
-weave = "2026-10-22T00:00:00Z"
 
 [project.optional-dependencies]
 dev = [
