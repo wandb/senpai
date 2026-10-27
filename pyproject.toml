@@ -18,8 +18,8 @@ dependencies = [
     "rich",
     "python-dotenv",
     "simple-parsing",
-    "wandb>=0.30.0",
-    "weave>=0.53.11,<0.54",
+    "wandb>=0.31.0",
+    "weave>=0.54.0,<0.55",
     "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@bdc58d4190c3df064fc3fe173de76c510bf15abf",
     "litellm>=1.102.1",
     "tqdm",
@@ -43,10 +43,49 @@ environments = [
     "sys_platform == 'darwin'",
 ]
 exclude-newer = "2026-09-27T00:00:00Z"
-exclude-newer-package = { certifi = "2026-10-21T00:00:00Z" } # openhands-sdk 1.58.2 requires the eMudhra CA distrust fix (GHSA-6q48-6c7w-9gw2)
+override-dependencies = [
+    "weave>=0.54.0,<0.55", # weave-openhands still declares weave<0.54
+]
 constraint-dependencies = [
     "cryptography>=50.0.0", # CVE-2026-69247 / GHSA-g6cj-pr64-35w5
+    # Transitive floors for open Dependabot advisories.
+    "aiohttp>=3.14.4", # request smuggling, header timeout, memory DoS
+    "fastmcp>=3.4.10", # GHSA-7xgj-8392-5q4r
+    "fastmcp-slim>=3.4.10", # GHSA-7xgj-8392-5q4r
+    "filelock>=4.2.1", # GHSA-v4x8-3wr5-3wq8 and two Windows-only advisories
+    "graphql-core>=3.2.12", # GHSA-r77w-qph3-7vf8, GHSA-vj8h-fx38-h3vc
+    "mcp>=1.30.0", # GHSA-84m7-p3x7-pcfv
+    "multidict>=6.9.1", # GHSA-54p9-h82j-f925
+    "oauthlib>=4.0.0", # GHSA-hj66-6f7g-4r5v, GHSA-xpv3-w29h-x7cv
+    "opentelemetry-api>=1.45.1", # GHSA-xcq7-p3pf-p88h
+    "pillow>=13.0.0", # heap overflows, Ghostscript argument injection, decoder DoS
+    "pyjwt>=2.15.0", # HMAC key confusion, JWK parsing, and token forgery advisories
+    "pypdf>=6.21.2", # parser memory and runtime DoS advisories
+    "setuptools>=84.1.0", # GHSA-xmj3-9gf7-h52w
+    "urllib3>=2.8.0", # GHSA-8988-9cw3-xx77, GHSA-gh4c-6fx4-qh6g, GHSA-vxq7-64xx-v4gw
 ]
+
+[tool.uv.exclude-newer-package]
+certifi = "2026-10-21T00:00:00Z" # openhands-sdk 1.58.2 requires the eMudhra CA distrust fix (GHSA-6q48-6c7w-9gw2)
+# Latest wandb and weave releases.
+cwevals = "2026-10-24T00:00:00Z"
+wandb = "2026-10-24T00:00:00Z"
+weave = "2026-10-24T00:00:00Z"
+# Security fixes released after the global cutoff; see constraint-dependencies.
+aiohttp = "2026-10-22T00:00:00Z"
+fastmcp = "2026-10-22T00:00:00Z"
+fastmcp-slim = "2026-10-22T00:00:00Z"
+filelock = "2026-10-22T00:00:00Z"
+oauthlib = "2026-10-22T00:00:00Z"
+opentelemetry-api = "2026-10-22T00:00:00Z"
+opentelemetry-exporter-otlp-proto-common = "2026-10-22T00:00:00Z"
+opentelemetry-exporter-otlp-proto-http = "2026-10-22T00:00:00Z"
+opentelemetry-proto = "2026-10-22T00:00:00Z"
+opentelemetry-sdk = "2026-10-22T00:00:00Z"
+opentelemetry-semantic-conventions = "2026-10-22T00:00:00Z"
+pillow = "2026-10-22T00:00:00Z"
+pypdf = "2026-10-22T00:00:00Z"
+setuptools = "2026-10-22T00:00:00Z"
 
 [project.optional-dependencies]
 dev = [
