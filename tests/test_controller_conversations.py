@@ -1,6 +1,8 @@
 from pathlib import Path
 from uuid import UUID
 
+import pytest
+
 from senpai_agent.controller import Controller, TurnResult
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import ControllerEvent, LocalStudentMailbox
@@ -237,11 +239,18 @@ def test_bounded_backlog_yields_to_another_ready_conversation(tmp_path: Path):
     assert [len(call[2]) for call in turns.calls] == [16, 1, 4]
 
 
-def test_new_revision_takes_over_training_from_its_superseded_revision(
+@pytest.mark.parametrize(
+    ("assignment_id", "revision_id"),
+    [("assignment-17", "revision-3"), ("assignment-21", "revision-1")],
+    ids=["new-revision", "new-pull-request"],
+)
+def test_current_assignment_takes_over_training_from_a_superseded_one(
     tmp_path: Path,
+    assignment_id: str,
+    revision_id: str,
 ):
     registry = AssignmentConversationRegistry(tmp_path / "students.json")
-    previous = registry.for_assignment("assignment-17", "revision-2")
+    previous = registry.assign("assignment-17", "revision-2")
     monitors = MonitorStore(tmp_path / "training" / "monitors.sqlite3")
     monitors.register(
         TrainingMonitorSpec(training_id="training-5", conversation_id=previous)
@@ -257,8 +266,8 @@ def test_new_revision_takes_over_training_from_its_superseded_revision(
     )
     assignment = ControllerEvent(
         kind="student_assignment",
-        dedupe_key="student_assignment:v2:17:assignment-17:revision-3:abc",
-        payload={"assignment_id": "assignment-17", "revision_id": "revision-3"},
+        dedupe_key=f"student_assignment:v2:21:{assignment_id}:{revision_id}:abc",
+        payload={"assignment_id": assignment_id, "revision_id": revision_id},
     )
     turns = Turns()
 
@@ -275,7 +284,7 @@ def test_new_revision_takes_over_training_from_its_superseded_revision(
             jitter_seconds=0,
         ).run(max_cycles=1)
 
-        current = registry.for_assignment("assignment-17", "revision-3")
+        current = registry.for_assignment(assignment_id, revision_id)
         assert [call[1] for call in turns.calls] == [current]
         assert turns.calls[0][2] == frozenset(
             {
@@ -285,8 +294,20 @@ def test_new_revision_takes_over_training_from_its_superseded_revision(
             }
         )
         assert monitors.spec("training-5").conversation_id == current
+        assert registry.assigned() == [
+            "assignment-17:revision-2",
+            f"{assignment_id}:{revision_id}",
+        ]
 
-        repeated = StudentConversationSelector(registry, monitors)((assignment,))
+        # A signal emitted later for the old run still reaches the current one.
+        late = ControllerEvent(
+            kind="training_monitor",
+            dedupe_key="training-5:metrics:late",
+            payload={"conversation_id": str(previous), "training_id": "training-5"},
+        )
+        selector = StudentConversationSelector(registry, monitors)
+        assert [batch.conversation_id for batch in selector((late,))] == [current]
+        repeated = selector((assignment,))
         assert [(batch.conversation_id, batch.events) for batch in repeated] == [
             (current, (assignment,))
         ]
@@ -294,16 +315,18 @@ def test_new_revision_takes_over_training_from_its_superseded_revision(
         monitors.close()
 
 
-def test_training_handover_names_the_run_and_its_previous_revision(
+def test_training_handover_names_the_run_and_its_previous_assignment(
     tmp_path: Path,
 ):
     registry = AssignmentConversationRegistry(tmp_path / "students.json")
-    previous = registry.for_assignment("assignment-17", "revision-2")
-    other_assignment = registry.for_assignment("assignment-18", "revision-1")
+    other_assignment = registry.assign("assignment-18", "revision-1")
+    previous = registry.assign("assignment-17", "revision-2")
+    current = registry.for_assignment("assignment-17", "revision-3")
     monitors = MonitorStore(tmp_path / "training" / "monitors.sqlite3")
     for training_id, conversation_id in (
         ("training-5", previous),
         ("training-6", other_assignment),
+        ("training-7", current),
     ):
         monitors.register(
             TrainingMonitorSpec(
@@ -311,11 +334,6 @@ def test_training_handover_names_the_run_and_its_previous_revision(
                 conversation_id=conversation_id,
             )
         )
-    finished = ControllerEvent(
-        kind="training_monitor",
-        dedupe_key="training-5:status:finished",
-        payload={"conversation_id": str(previous), "training_id": "training-5"},
-    )
     assignment = ControllerEvent(
         kind="student_assignment",
         dedupe_key="student_assignment:v2:17:assignment-17:revision-3:abc",
@@ -323,20 +341,24 @@ def test_training_handover_names_the_run_and_its_previous_revision(
     )
 
     try:
-        (batch,) = StudentConversationSelector(registry, monitors)(
-            (finished, assignment)
-        )
+        (batch,) = StudentConversationSelector(registry, monitors)((assignment,))
 
-        current = registry.for_assignment("assignment-17", "revision-3")
         assert batch.conversation_id == current
-        moved, routed_assignment, handover = batch.events
-        assert moved.payload["conversation_id"] == str(current)
+        routed_assignment, *handovers = batch.events
         assert routed_assignment == assignment
-        assert handover.kind == "training_handover"
-        assert handover.payload["training_id"] == "training-5"
-        assert handover.payload["previous_revision_id"] == "revision-2"
-        assert handover.payload["revision_id"] == "revision-3"
-        assert "cancel_training" in handover.to_prompt()
-        assert monitors.spec("training-6").conversation_id == other_assignment
+        assert {
+            event.payload["training_id"]: event.payload["previous_assignment_revision"]
+            for event in handovers
+        } == {
+            "training-5": "assignment-17:revision-2",
+            "training-6": "assignment-18:revision-1",
+        }
+        for handover in handovers:
+            assert handover.kind == "training_handover"
+            assert handover.payload["assignment_revision"] == (
+                "assignment-17:revision-3"
+            )
+            assert "cancel_training" in handover.to_prompt()
+        assert {spec.conversation_id for spec in monitors.active()} == {current}
     finally:
         monitors.close()

@@ -320,6 +320,7 @@ class OpenHandsTurnRunner:
 
         store_path = local_event_db_path(config)
         map_event = None
+        notice = None
         if config.role == "student":
             registry = AssignmentConversationRegistry(
                 config.state_dir / "student-conversations.json"
@@ -329,6 +330,14 @@ class OpenHandsTurnRunner:
                 conversation_id=conversation_id,
                 registry=registry,
             )
+            assigned = registry.assigned()
+            superseded = registry.key_of(conversation_id)
+            # Stale feedback or monitor signals can resume a superseded
+            # conversation long after its replacement was routed.
+            if superseded in assigned[:-1]:
+                notice = _superseded_notice(
+                    conversation_id, superseded, assigned[-1]
+                )
 
         # A late watcher event may still be pending locally when the next
         # controller prompt carries that same GitHub event. The prompt is the
@@ -336,6 +345,8 @@ class OpenHandsTurnRunner:
         with LocalEventStore(store_path) as store:
             for event_key in event_keys:
                 store.acknowledge(event_key)
+            if notice is not None:
+                store.enqueue(notice)
         with ActiveGitHubWatcher(
             self.github_mailbox,
             store_path,
@@ -346,12 +357,27 @@ class OpenHandsTurnRunner:
             exit_code = run_turn()
         with LocalEventStore(store_path) as store:
             delivered = store.acknowledged(tuple(watcher.enqueued_keys))
-            # A superseded-revision notice only steers the turn that was running.
+            # A superseded-assignment notice only steers the turn that was running.
             store.discard_prefix(_SUPERSEDED_NOTICE_PREFIX)
         return TurnResult(
             exit_code=exit_code,
             delivered_event_keys=frozenset(delivered),
         )
+
+
+def _superseded_notice(
+    conversation_id: UUID, superseded: str, current: str
+) -> LocalEvent:
+    return LocalEvent(
+        kind="assignment_superseded",
+        dedupe_key=f"{_SUPERSEDED_NOTICE_PREFIX}{conversation_id}:{current}",
+        payload={
+            "superseded_assignment_revision": superseded,
+            "current_assignment_revision": current,
+            "instruction": ASSIGNMENT_SUPERSEDED_PROMPT,
+            "parent_conversation_id": str(conversation_id),
+        },
+    )
 
 
 def _student_live_event(
@@ -361,29 +387,13 @@ def _student_live_event(
     registry: AssignmentConversationRegistry,
 ) -> LocalEvent | None:
     if event.kind == "student_assignment":
-        # The new revision runs in its own conversation after this turn ends;
-        # tell an older revision's running turn to stop instead of acting on it.
-        assignment_id = str(event.payload["assignment_id"])
-        revision_id = str(event.payload["revision_id"])
-        running_revision = registry.revision_of(conversation_id, assignment_id)
-        if running_revision in (None, revision_id):
+        # The new assignment runs in its own conversation after this turn ends;
+        # tell a superseded assignment's running turn to stop instead of acting on it.
+        current = f"{event.payload['assignment_id']}:{event.payload['revision_id']}"
+        running = registry.key_of(conversation_id)
+        if running == current or running not in registry.assigned():
             return None
-        return LocalEvent(
-            kind="assignment_superseded",
-            dedupe_key=(
-                f"{_SUPERSEDED_NOTICE_PREFIX}{conversation_id}:"
-                f"{assignment_id}:{revision_id}"
-            ),
-            payload={
-                "number": event.payload["number"],
-                "url": event.payload["url"],
-                "assignment_id": assignment_id,
-                "superseded_revision_id": running_revision,
-                "current_revision_id": revision_id,
-                "instruction": ASSIGNMENT_SUPERSEDED_PROMPT,
-                "parent_conversation_id": str(conversation_id),
-            },
-        )
+        return _superseded_notice(conversation_id, running, current)
     if event.kind == "student_pr_feedback":
         target = registry.for_assignment(
             str(event.payload["assignment_id"]),

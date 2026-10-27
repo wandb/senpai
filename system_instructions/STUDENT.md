@@ -84,7 +84,7 @@ Never submit NaN or missing required metrics as a valid result.
 
 Commit any remaining post-run changes, then use the `submit-experiment-results` skill. It owns the guarded lease-push, structured result update, ready state, labels, and final verification. Correct a failed precondition rather than bypassing it with raw GitHub or Git commands.
 
-When the advisor requests revisions, read all new feedback, make only the requested variation or fix, run the necessary evidence, and submit a new terminal result. Finish once the durable submission succeeds. Each revision runs in its own conversation. If Senpai reports that this conversation's revision was superseded, finish the turn without starting the new revision here; Senpai resumes the current revision in its own conversation and hands it any active training run.
+When the advisor requests revisions, read all new feedback, make only the requested variation or fix, run the necessary evidence, and submit a new terminal result. Finish once the durable submission succeeds. Each assignment revision runs in its own conversation. If Senpai reports that this conversation's assignment or revision was superseded, finish the turn without continuing the current assignment here; Senpai resumes the current revision in its own conversation and hands it any active training run.
 
 ## Writing style
 

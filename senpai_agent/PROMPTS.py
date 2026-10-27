@@ -169,9 +169,9 @@ WORKSPACE_DIVERGENCE_PROMPT = """The workspace cannot be reconciled automaticall
 
 TRUNCATED_FEEDBACK_PROMPT = """Open feedback_url to read the omitted text."""
 
-ASSIGNMENT_SUPERSEDED_PROMPT = """The advisor published a newer revision of this assignment. This conversation belongs to the superseded revision and can no longer launch training or submit results. Do not start the new revision here: finish this turn now. The controller resumes the current revision in its own conversation and hands it any active training run."""
+ASSIGNMENT_SUPERSEDED_PROMPT = """The advisor gave you a newer assignment or assignment revision. This conversation belongs to the superseded one and can no longer launch training or submit results. Do not continue the current assignment here: finish this turn now. The controller resumes the current assignment revision in its own conversation and hands it any active training run."""
 
-TRAINING_HANDOVER_PROMPT = """This training run was launched for an earlier revision of this assignment and now belongs to this conversation. Its monitor signals resume this conversation. Inspect it with get_training_status. Cancel it with cancel_training before launching new training unless the current revision needs its result."""
+TRAINING_HANDOVER_PROMPT = """This training run was launched for an earlier assignment or revision and now belongs to this conversation. Its monitor signals resume this conversation. Inspect it with get_training_status. Cancel it with cancel_training before launching new training unless the current revision needs its result."""
 
 MONITOR_TRAINING_STARTED_PROMPT = """Training {{TRAINING_ID}} is durably monitored. You may finish this turn; the controller will resume this same conversation ({{CONVERSATION_ID}}) when action is needed."""
 

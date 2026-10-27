@@ -30,8 +30,8 @@ dependencies.
 5. GitHub mutations are typed, preconditioned, convergent on replay, and
    verified against remote state.
 6. The advisor uses one durable conversation UUID. A student uses one UUID per
-   assignment revision, and monitor wakes continue it. A new revision takes
-   over active training from the revision it supersedes.
+   assignment revision, and monitor wakes continue it. A new assignment
+   revision takes over active training from the one it supersedes.
 7. Conversation and generated artifact state cannot fall back into the target
    checkout.
 8. Senpai does not prune conversation history.
@@ -283,7 +283,7 @@ Student state:
 
 `student-conversations.json` maps one `(assignment_id, revision_id)` to one UUID. `started-conversations.json` records the UUIDs that successfully received their initial controller context. A `training_monitor` event carries its original conversation UUID and therefore resumes, rather than replaces, the student conversation.
 
-Routing a new assignment revision moves each active training monitor from an earlier revision of that assignment to the new revision's conversation and adds a `training_handover` event naming the run. Only the current revision may launch, and only a run's owner may cancel it or receive its monitor signals, so the run follows the revision that can act on it. If an earlier revision's turn is running when the new revision appears, it receives an `assignment_superseded` notice telling it to finish; the notice is discarded if that turn ends first.
+Routing a `student_assignment` records its revision as the student's current one in `student-conversations-assigned.json`. It also moves every active training monitor that another conversation owns, whether from an earlier revision or from an assignment PR the advisor closed or replaced, to the current revision's conversation, and adds a `training_handover` event naming the run. Only the current revision may launch, and only a run's owner may cancel it or receive its monitor signals, so the run follows the revision that can act on it. A conversation for a superseded assignment revision receives an `assignment_superseded` notice telling it to finish: while its turn is running when the newer assignment appears, and at the start of any later turn, such as one resumed by stale feedback or monitor signals. The notice is discarded when that turn ends.
 
 `github-feedback.json` records every immutable PR feedback key's first-seen
 assignment revision, then marks it acknowledged only after its student turn

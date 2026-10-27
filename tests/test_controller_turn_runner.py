@@ -61,14 +61,16 @@ def feedback_event(revision_id="revision-2"):
     )
 
 
-def assignment_event(revision_id):
+def assignment_event(revision_id, assignment_id="assignment-17", number=17):
     return ControllerEvent(
         kind="student_assignment",
-        dedupe_key=f"student_assignment:v2:17:assignment-17:{revision_id}:abc",
+        dedupe_key=(
+            f"student_assignment:v2:{number}:{assignment_id}:{revision_id}:abc"
+        ),
         payload={
-            "number": 17,
-            "url": "https://github.test/acme/widgets/pull/17",
-            "assignment_id": "assignment-17",
+            "number": number,
+            "url": f"https://github.test/acme/widgets/pull/{number}",
+            "assignment_id": assignment_id,
             "revision_id": revision_id,
         },
     )
@@ -240,15 +242,25 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
         assert store.pending() == []
 
 
-def test_running_student_is_told_when_a_new_revision_supersedes_it(
+@pytest.mark.parametrize(
+    "incoming",
+    [
+        assignment_event("revision-3"),
+        assignment_event("revision-1", assignment_id="assignment-21", number=21),
+    ],
+    ids=["new-revision", "new-pull-request"],
+)
+def test_running_student_is_told_when_a_new_assignment_supersedes_it(
     tmp_path: Path,
     monkeypatch,
+    incoming,
 ):
     state_dir = tmp_path / "state"
     registry = AssignmentConversationRegistry(
         state_dir / "student-conversations.json"
     )
-    conversation_id = registry.for_assignment("assignment-17", "revision-2")
+    conversation_id = registry.assign("assignment-17", "revision-2")
+    current = f"{incoming.payload['assignment_id']}:{incoming.payload['revision_id']}"
     messages = []
 
     def run_openhands(_prompt, config):
@@ -274,9 +286,7 @@ def test_running_student_is_told_when_a_new_revision_supersedes_it(
     result = OpenHandsTurnRunner(
         Config("student", state_dir, conversation_id),
         full_prompt="student initial controller context",
-        github_mailbox=Mailbox(
-            (assignment_event("revision-2"), assignment_event("revision-3"))
-        ),
+        github_mailbox=Mailbox((assignment_event("revision-2"), incoming)),
         active_poll_interval_seconds=0.001,
     ).run(
         "current student turn",
@@ -286,12 +296,66 @@ def test_running_student_is_told_when_a_new_revision_supersedes_it(
 
     assert len(messages) == 1
     assert "assignment_superseded" in messages[0]
-    assert '"superseded_revision_id": "revision-2"' in messages[0]
-    assert '"current_revision_id": "revision-3"' in messages[0]
+    assert (
+        '"superseded_assignment_revision": "assignment-17:revision-2"'
+        in messages[0]
+    )
+    assert f'"current_assignment_revision": "{current}"' in messages[0]
     assert "finish this turn" in messages[0]
     assert result.delivered_event_keys == frozenset(
-        {f"assignment_superseded:{conversation_id}:assignment-17:revision-3"}
+        {f"assignment_superseded:{conversation_id}:{current}"}
     )
+
+
+def test_resumed_superseded_conversation_is_told_to_finish(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    registry = AssignmentConversationRegistry(
+        state_dir / "student-conversations.json"
+    )
+    superseded = registry.assign("assignment-17", "revision-2")
+    current = registry.assign("assignment-21", "revision-1")
+    human_thread = registry.for_assignment("human-issue-4", "thread")
+    store_path = state_dir / "student-events.sqlite3"
+    routed = assignment_event("revision-1", assignment_id="assignment-21", number=21)
+    pending_at_start = {}
+
+    def run_openhands(_prompt, config):
+        with LocalEventStore(store_path) as store:
+            pending_at_start[config.conversation_id] = store.pending()
+        return 0
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+    runner = OpenHandsTurnRunner(
+        Config("student", state_dir, superseded),
+        full_prompt="student initial controller context",
+        github_mailbox=Mailbox((routed,)),
+        active_poll_interval_seconds=0.001,
+    )
+
+    # A stale monitor signal resumes the superseded conversation after the
+    # current assignment was already routed and is no longer a new event.
+    for conversation_id in (superseded, current, human_thread):
+        runner.run(
+            "training monitor signal",
+            conversation_id=conversation_id,
+            event_keys=frozenset(),
+            visible_event_keys=frozenset({routed.dedupe_key}),
+        )
+
+    (notice,) = pending_at_start[superseded]
+    assert notice.kind == "assignment_superseded"
+    assert notice.payload["superseded_assignment_revision"] == (
+        "assignment-17:revision-2"
+    )
+    assert notice.payload["current_assignment_revision"] == "assignment-21:revision-1"
+    assert notice.payload["parent_conversation_id"] == str(superseded)
+    assert pending_at_start[current] == []
+    assert pending_at_start[human_thread] == []
+    with LocalEventStore(store_path) as store:
+        assert store.pending() == []
 
 
 def test_superseded_notice_does_not_outlive_the_running_turn(
@@ -302,7 +366,7 @@ def test_superseded_notice_does_not_outlive_the_running_turn(
     registry = AssignmentConversationRegistry(
         state_dir / "student-conversations.json"
     )
-    conversation_id = registry.for_assignment("assignment-17", "revision-2")
+    conversation_id = registry.assign("assignment-17", "revision-2")
     store_path = state_dir / "student-events.sqlite3"
 
     def run_openhands(_prompt, _config):
@@ -342,7 +406,7 @@ def test_observed_student_input_routes_to_the_active_pump_until_it_is_delivered(
     registry = AssignmentConversationRegistry(
         state_dir / "student-conversations.json"
     )
-    conversation_id = registry.for_assignment("assignment-17", "revision-2")
+    conversation_id = registry.assign("assignment-17", "revision-2")
     store_path = state_dir / "student-events.sqlite3"
 
     def run_openhands(_prompt, _config):

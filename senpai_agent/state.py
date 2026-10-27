@@ -32,6 +32,8 @@ class AssignmentConversationRegistry:
 
     def __init__(self, path: Path):
         self.path = path
+        # Assignment revisions the student was given, oldest first.
+        self.assigned_path = path.with_name(f"{path.stem}-assigned.json")
 
     def for_assignment(self, assignment_id: str, revision_id: str) -> UUID:
         key = f"{assignment_id}:{revision_id}"
@@ -44,15 +46,36 @@ class AssignmentConversationRegistry:
     def has_assignment(self, assignment_id: str, revision_id: str) -> bool:
         return f"{assignment_id}:{revision_id}" in self._read()
 
-    def revision_of(self, conversation_id: UUID, assignment_id: str) -> str | None:
-        """Return the revision of this assignment that owns the conversation."""
+    def assign(self, assignment_id: str, revision_id: str) -> UUID:
+        """Record the student's current assignment revision and return its conversation."""
 
-        prefix = f"{assignment_id}:"
+        key = f"{assignment_id}:{revision_id}"
+        assigned = self.assigned()
+        if assigned[-1:] != [key]:
+            _replace_json(
+                self.assigned_path,
+                [*(item for item in assigned if item != key), key],
+            )
+        return self.for_assignment(assignment_id, revision_id)
+
+    def assigned(self) -> list[str]:
+        if not self.assigned_path.exists():
+            return []
+        value = json.loads(self.assigned_path.read_text(encoding="utf-8"))
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value
+        ):
+            raise RuntimeError(f"invalid assignment history: {self.assigned_path}")
+        return value
+
+    def key_of(self, conversation_id: UUID) -> str | None:
+        """Return the assignment revision or thread key bound to the conversation."""
+
         return next(
             (
-                key.removeprefix(prefix)
+                key
                 for key, value in self._read().items()
-                if value == str(conversation_id) and key.startswith(prefix)
+                if value == str(conversation_id)
             ),
             None,
         )
@@ -62,22 +85,18 @@ class AssignmentConversationRegistry:
     ) -> None:
         """Reject a conversation that is not bound to this assignment revision."""
 
-        values = self._read()
         current = f"{assignment_id}:{revision_id}"
-        if values.get(current) == str(conversation_id):
+        if self._read().get(current) == str(conversation_id):
             return
-        bound = next(
-            (key for key, value in values.items() if value == str(conversation_id)),
-            None,
-        )
+        bound = self.key_of(conversation_id)
         raise PermissionError(
             f"training conversation is bound to assignment revision {bound!r}; "
             f"current assignment revision is {current!r}. "
             "Only the current revision's conversation may launch training. If "
-            "this conversation belongs to an earlier revision, do not continue "
-            "the assignment here: finish this turn. The controller resumes the "
-            "current revision in its own conversation and hands it any active "
-            "training run."
+            "this conversation belongs to an earlier assignment or revision, do "
+            "not continue the current assignment here: finish this turn. The "
+            "controller resumes the current revision in its own conversation and "
+            "hands it any active training run."
         )
 
     def _read(self) -> dict[str, str]:
@@ -179,7 +198,7 @@ class StudentConversationSelector:
             handover
             for event in events
             if event.kind == "student_assignment"
-            for handover in self._hand_over_training(event)
+            for handover in self._assign(event)
         ]
         grouped: dict[UUID, list[ControllerEvent]] = {}
         for event in (*events, *handovers):
@@ -191,26 +210,25 @@ class StudentConversationSelector:
             for conversation_id, batch_events in grouped.items()
         )
 
-    def _hand_over_training(self, event: ControllerEvent) -> list[ControllerEvent]:
-        """Give runs from superseded revisions to the current revision.
+    def _assign(self, event: ControllerEvent) -> list[ControllerEvent]:
+        """Record the current assignment and give it runs from superseded ones.
 
-        Only the current revision may launch, and only a run's owner may
-        cancel it or receive its monitor signals, so a run left with an old
-        revision would keep resuming that revision and block the new one.
+        Only the current assignment revision may launch, and only a run's owner
+        may cancel it or receive its monitor signals, so a run left with an
+        earlier assignment or revision would keep resuming that conversation
+        and block the current one.
         """
 
-        if self.monitor_store is None:
-            return []
         assignment_id = str(event.payload["assignment_id"])
         revision_id = str(event.payload["revision_id"])
-        current = self.registry.for_assignment(assignment_id, revision_id)
+        current = self.registry.assign(assignment_id, revision_id)
+        if self.monitor_store is None:
+            return []
         handovers: list[ControllerEvent] = []
         for spec in self.monitor_store.active():
-            previous_revision = self.registry.revision_of(
-                spec.conversation_id, assignment_id
-            )
-            if previous_revision in (None, revision_id):
+            if spec.conversation_id == current:
                 continue
+            previous = self.registry.key_of(spec.conversation_id)
             self.monitor_store.reassign(spec.training_id, current)
             handovers.append(
                 ControllerEvent(
@@ -218,9 +236,8 @@ class StudentConversationSelector:
                     dedupe_key=f"training_handover:{spec.training_id}:{current}",
                     payload={
                         "training_id": spec.training_id,
-                        "assignment_id": assignment_id,
-                        "previous_revision_id": previous_revision,
-                        "revision_id": revision_id,
+                        "previous_assignment_revision": previous,
+                        "assignment_revision": f"{assignment_id}:{revision_id}",
                         "instruction": TRAINING_HANDOVER_PROMPT,
                         "parent_conversation_id": str(current),
                     },
