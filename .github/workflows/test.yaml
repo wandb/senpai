@@ -41,8 +41,8 @@ jobs:
             "litellm>=1.102.1" \
             "weave>=0.53.11,<0.54" \
             "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git@bdc58d4190c3df064fc3fe173de76c510bf15abf" \
-            "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@20e08f61fc3f4ea5fd197ca88f3d6a7cb566e038#subdirectory=openhands-sdk" \
-            "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@20e08f61fc3f4ea5fd197ca88f3d6a7cb566e038#subdirectory=openhands-tools"
+            "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@ae5b302a6711981fd7aa3ed62179f131d67a741e#subdirectory=openhands-sdk" \
+            "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@ae5b302a6711981fd7aa3ed62179f131d67a741e#subdirectory=openhands-tools"
 
       - name: Test the complete control plane (no cluster)
         run: .venv/bin/python -m pytest

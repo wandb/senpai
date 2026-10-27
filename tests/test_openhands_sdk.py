@@ -5,8 +5,13 @@ from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
 import pytest
+from litellm.exceptions import BadRequestError
 from openhands.sdk import Agent, LLM, LocalConversation
 from openhands.sdk.llm import Message, TextContent
+from openhands.sdk.llm.exceptions import (
+    LLMContextWindowExceedError,
+    map_provider_exception,
+)
 from openhands.sdk.llm.llm import MIN_CONTEXT_WINDOW_TOKENS
 from pydantic import SecretStr
 
@@ -40,7 +45,7 @@ CUSTOM_OPENAI_ENDPOINT = CustomOpenAIEndpoint(
 def test_openhands_fork_revision_is_consistent_across_install_paths():
     package_names = {"openhands-sdk", "openhands-tools"}
     fork_url = "git+https://github.com/morganmcg1/software-agent-sdk.git"
-    fork_revision = "20e08f61fc3f4ea5fd197ca88f3d6a7cb566e038"
+    fork_revision = "ae5b302a6711981fd7aa3ed62179f131d67a741e"
     expected_requirements = {
         f"{name} @ {fork_url}@{fork_revision}#subdirectory={name}"
         for name in package_names
@@ -450,6 +455,25 @@ def test_custom_openai_model_requires_an_endpoint():
             "high",
             compaction_trigger_tokens=TEST_COMPACTION_TRIGGER_TOKENS,
         )
+
+
+def test_sglang_context_overflow_is_a_context_window_error():
+    # SGLang rejects input plus max_tokens beyond the window, where vLLM
+    # shrinks max_tokens; the agent must condense instead of failing the run.
+    error = BadRequestError(
+        message=(
+            "Custom_openaiException - Requested token count exceeds the "
+            "model's maximum context length of 262144 tokens. You requested "
+            "a total of 263708 tokens: 198172 tokens from the input messages "
+            "and 65536 tokens for the completion. Please reduce the number of "
+            "tokens in the input messages or the completion to fit within the "
+            "limit."
+        ),
+        model=CUSTOM_OPENAI_MODEL,
+        llm_provider="custom_openai",
+    )
+
+    assert isinstance(map_provider_exception(error), LLMContextWindowExceedError)
 
 
 def test_custom_openai_input_floor_matches_openhands():

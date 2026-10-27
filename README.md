@@ -216,11 +216,14 @@ custom_openai_canonical_model: deepseek/deepseek-v4.1-flash
 
 Senpai sends the profile's effort as the request's top-level `reasoning_effort`
 and passes it through unchanged, so use values the server accepts. For example,
-DeepSeek V4.1 rejects `medium`. vLLM-style servers reject a request when its
-input plus `max_tokens` exceeds the context window. Senpai therefore limits
-input to `custom_openai_context_tokens - custom_openai_max_output_tokens` and
-condenses history before reaching that limit. That input limit must be at least
-16,384 tokens, the smallest window OpenHands accepts. Lower the default output
+DeepSeek V4.1 rejects `medium`. SGLang rejects a request when its input plus
+`max_tokens` exceeds the context window; vLLM shrinks `max_tokens` to fit.
+Senpai therefore limits input to
+`custom_openai_context_tokens - custom_openai_max_output_tokens`. OpenHands
+condenses history when its local token count passes that limit or the view
+passes 80 events, and again when the server rejects a request as too long,
+because the local count can differ from the server's. That input limit must be
+at least 16,384 tokens, the smallest window OpenHands accepts. Lower the default output
 budget of 65,536 for a server with a small window. `custom_openai_canonical_model`
 is optional. It selects OpenHands model features for the served model. For
 DeepSeek V4.1, `deepseek/deepseek-v4.1-flash` returns each turn's
