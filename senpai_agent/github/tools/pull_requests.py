@@ -35,9 +35,12 @@ class GetPRsAction(Action):
         default=(),
         description="Explicit positive PR numbers to include.",
     )
-    date_range: tuple[str | date, str | date] | None = Field(
+    # A variadic tuple advertises "items"; a fixed-length one would not.
+    date_range: tuple[str | date, ...] | None = Field(
         default=None,
-        description="Optional inclusive PR creation-date range.",
+        min_length=2,
+        max_length=2,
+        description="Optional inclusive PR creation-date range as [start, end].",
     )
     search: str | None = Field(
         default=None,
