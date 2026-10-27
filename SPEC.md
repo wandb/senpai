@@ -30,7 +30,8 @@ dependencies.
 5. GitHub mutations are typed, preconditioned, convergent on replay, and
    verified against remote state.
 6. The advisor uses one durable conversation UUID. A student uses one UUID per
-   assignment revision, and monitor wakes continue it.
+   assignment revision, and monitor wakes continue it. A new revision takes
+   over active training from the revision it supersedes.
 7. Conversation and generated artifact state cannot fall back into the target
    checkout.
 8. Senpai does not prune conversation history.
@@ -282,10 +283,16 @@ Student state:
 
 `student-conversations.json` maps one `(assignment_id, revision_id)` to one UUID. `started-conversations.json` records the UUIDs that successfully received their initial controller context. A `training_monitor` event carries its original conversation UUID and therefore resumes, rather than replaces, the student conversation.
 
+Routing a new assignment revision moves each active training monitor from an earlier revision of that assignment to the new revision's conversation and adds a `training_handover` event naming the run. Only the current revision may launch, and only a run's owner may cancel it or receive its monitor signals, so the run follows the revision that can act on it. If an earlier revision's turn is running when the new revision appears, it receives an `assignment_superseded` notice telling it to finish; the notice is discarded if that turn ends first.
+
 `github-feedback.json` records every immutable PR feedback key's first-seen
 assignment revision, then marks it acknowledged only after its student turn
 succeeds. This prevents pending or completed feedback from replaying or
 rebinding to a later assignment revision after a restart.
+Feedback first seen for an earlier revision that has no conversation in
+`student-conversations.json` is recorded as acknowledged (superseded): no
+conversation exists to receive it, and opening one would replay a stale
+revision before the current one could start.
 
 OpenHands stores base state and individual events beneath that UUID. A killed
 worker resumes from the last persisted event. An in-flight response or tool
@@ -296,7 +303,8 @@ The controller marks a conversation's initial controller context delivered only 
 Role state uses pod-local storage and survives controller or container restarts
 within the same pod. Replacing or rescheduling a pod starts fresh local state;
 the PR, branch, typed result, W&B runs, and Weave trace remain the durable
-handoff.
+handoff. A replaced student therefore starts the PR's current assignment
+revision directly and records earlier revisions' feedback as superseded.
 
 No default path may be relative to the current workspace. Senpai removes only
 its generated PR Markdown artifacts after 24 hours. It does not delete

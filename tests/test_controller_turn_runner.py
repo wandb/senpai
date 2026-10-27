@@ -61,6 +61,19 @@ def feedback_event(revision_id="revision-2"):
     )
 
 
+def assignment_event(revision_id):
+    return ControllerEvent(
+        kind="student_assignment",
+        dedupe_key=f"student_assignment:v2:17:assignment-17:{revision_id}:abc",
+        payload={
+            "number": 17,
+            "url": "https://github.test/acme/widgets/pull/17",
+            "assignment_id": "assignment-17",
+            "revision_id": revision_id,
+        },
+    )
+
+
 def human_issue_event():
     return ControllerEvent(
         kind="human_issue",
@@ -224,6 +237,98 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
     assert str(conversation_id) in messages[0]
     assert result.delivered_event_keys == frozenset({current.dedupe_key})
     with LocalEventStore(state_dir / "student-events.sqlite3") as store:
+        assert store.pending() == []
+
+
+def test_running_student_is_told_when_a_new_revision_supersedes_it(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    registry = AssignmentConversationRegistry(
+        state_dir / "student-conversations.json"
+    )
+    conversation_id = registry.for_assignment("assignment-17", "revision-2")
+    messages = []
+
+    def run_openhands(_prompt, config):
+        class Conversation:
+            def send_message(self, message):
+                messages.append(message)
+
+        with LocalEventStore(
+            state_dir / "student-events.sqlite3"
+        ) as store, AdvisorEventPump(
+            store,
+            Conversation(),
+            poll_interval=0.001,
+            parent_conversation_id=str(config.conversation_id),
+        ):
+            deadline = time.monotonic() + 1
+            while not messages and time.monotonic() < deadline:
+                time.sleep(0.001)
+        return 0
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+
+    result = OpenHandsTurnRunner(
+        Config("student", state_dir, conversation_id),
+        full_prompt="student initial controller context",
+        github_mailbox=Mailbox(
+            (assignment_event("revision-2"), assignment_event("revision-3"))
+        ),
+        active_poll_interval_seconds=0.001,
+    ).run(
+        "current student turn",
+        conversation_id=conversation_id,
+        event_keys=frozenset(),
+    )
+
+    assert len(messages) == 1
+    assert "assignment_superseded" in messages[0]
+    assert '"superseded_revision_id": "revision-2"' in messages[0]
+    assert '"current_revision_id": "revision-3"' in messages[0]
+    assert "finish this turn" in messages[0]
+    assert result.delivered_event_keys == frozenset(
+        {f"assignment_superseded:{conversation_id}:assignment-17:revision-3"}
+    )
+
+
+def test_superseded_notice_does_not_outlive_the_running_turn(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    registry = AssignmentConversationRegistry(
+        state_dir / "student-conversations.json"
+    )
+    conversation_id = registry.for_assignment("assignment-17", "revision-2")
+    store_path = state_dir / "student-events.sqlite3"
+
+    def run_openhands(_prompt, _config):
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            with LocalEventStore(store_path) as store:
+                if store.pending_count():
+                    break
+            time.sleep(0.001)
+        return 0
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+
+    result = OpenHandsTurnRunner(
+        Config("student", state_dir, conversation_id),
+        full_prompt="student initial controller context",
+        github_mailbox=Mailbox((assignment_event("revision-3"),)),
+        active_poll_interval_seconds=0.001,
+    ).run(
+        "student turn",
+        conversation_id=conversation_id,
+        event_keys=frozenset(),
+    )
+
+    assert result.delivered_event_keys == frozenset()
+    with LocalEventStore(store_path) as store:
         assert store.pending() == []
 
 

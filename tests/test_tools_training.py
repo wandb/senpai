@@ -139,8 +139,9 @@ def test_training_rechecks_live_revision_before_each_launch(
         assignment_runtime.github.pr["body"] = render_assignment_marker(
             assignment_record(revision_id="revision-2")
         )
-        with pytest.raises(PermissionError, match="revision-1.*revision-2"):
+        with pytest.raises(PermissionError, match="revision-1.*revision-2") as refused:
             launch(action, old_conversation)
+        assert "finish this turn" in str(refused.value)
         assert training.launched == [action.spec]
         assert monitors.spec("training-17").conversation_id == old_conversation.id
         assert len(monitors.active()) == 1
@@ -436,6 +437,45 @@ def test_monitor_training_replaces_the_default_policy(
             "the controller will resume this same conversation "
             f"({conversation_id}) when action is needed."
         )
+    finally:
+        monitors.close()
+
+
+def test_handed_over_training_is_cancelled_by_the_current_revision(
+    tmp_path: Path, assignment_runtime
+):
+    workspace = init_workspace(tmp_path)
+    training = StubTraining(workspace, finished_result(tmp_path))
+    monitors = MonitorStore(tmp_path / "monitors.sqlite3")
+    previous = assignment_runtime.conversation_id
+    current = assignment_runtime.registry.for_assignment("assignment-7", "revision-2")
+    RunTrainingTool.create(training, monitors, assignment_runtime.guard)[0].executor(
+        RunTrainingAction(
+            spec=TrainingSpec(
+                argv=("python", "train.py"),
+                cwd=workspace,
+                timeout_seconds=20,
+            )
+        ),
+        SimpleNamespace(id=previous),
+    )
+
+    try:
+        monitors.reassign("training-17", current)
+        cancel = CancelTrainingTool.create(training, monitors)[0].executor
+        with pytest.raises(PermissionError, match="different student conversation"):
+            cancel(
+                CancelTrainingAction(training_id="training-17"),
+                SimpleNamespace(id=previous),
+            )
+
+        cancel(
+            CancelTrainingAction(training_id="training-17"),
+            SimpleNamespace(id=current),
+        )
+
+        assert training.cancelled == ["training-17"]
+        assert monitors.active() == []
     finally:
         monitors.close()
 

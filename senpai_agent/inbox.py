@@ -33,6 +33,7 @@ EXACT_ONCE_EVENT_KINDS = frozenset(
     }
 )
 STEERING_PRIORITIES = {
+    "assignment_superseded": QUEUE_PRIORITY,
     "human_issue": STEER_PRIORITY,
     "human_pr_comment": STEER_PRIORITY,
     "student_pr_feedback": QUEUE_PRIORITY,

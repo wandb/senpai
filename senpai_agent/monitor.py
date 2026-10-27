@@ -321,6 +321,19 @@ class MonitorStore:
             self._write_marker(effective)
             return not unchanged
 
+    def reassign(self, training_id: str, conversation_id: UUID) -> None:
+        """Move one monitor to another conversation, keeping its progress."""
+
+        spec = self.spec(training_id).model_copy(
+            update={"conversation_id": conversation_id}
+        )
+        with self._lock, self.connection:
+            self.connection.execute(
+                "UPDATE monitors SET spec_json = ? WHERE training_id = ?",
+                (spec.model_dump_json(), training_id),
+            )
+        self._write_marker(spec)
+
     def _write_marker(self, spec: TrainingMonitorSpec) -> None:
         marker = self.marker_dir / f"{spec.training_id}.json"
         temporary = marker.with_suffix(".tmp")

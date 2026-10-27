@@ -47,6 +47,7 @@ from senpai_agent.monitor import (
     WandbMetricSource,
 )
 from senpai_agent.PROMPTS import (
+    ASSIGNMENT_SUPERSEDED_PROMPT,
     CONTEXT_RECOVERY_PROMPT,
     CONTINUATION_CONTROLLER_PROMPT,
     INITIAL_CONTROLLER_PROMPT,
@@ -70,6 +71,7 @@ _EDGE_TRIGGERED_EVENT_KINDS = EXACT_ONCE_EVENT_KINDS | {
     "research_base_changed",
     "student_assignment_comment",
 }
+_SUPERSEDED_NOTICE_PREFIX = "assignment_superseded:"
 _ACTIVITY_LEASE_RENEWAL_SECONDS = 30
 _LLM_PROVIDER_COOLDOWN_SECONDS = (30.0, 60.0, 120.0, 240.0, 300.0)
 
@@ -344,6 +346,8 @@ class OpenHandsTurnRunner:
             exit_code = run_turn()
         with LocalEventStore(store_path) as store:
             delivered = store.acknowledged(tuple(watcher.enqueued_keys))
+            # A superseded-revision notice only steers the turn that was running.
+            store.discard_prefix(_SUPERSEDED_NOTICE_PREFIX)
         return TurnResult(
             exit_code=exit_code,
             delivered_event_keys=frozenset(delivered),
@@ -356,6 +360,30 @@ def _student_live_event(
     conversation_id: UUID,
     registry: AssignmentConversationRegistry,
 ) -> LocalEvent | None:
+    if event.kind == "student_assignment":
+        # The new revision runs in its own conversation after this turn ends;
+        # tell an older revision's running turn to stop instead of acting on it.
+        assignment_id = str(event.payload["assignment_id"])
+        revision_id = str(event.payload["revision_id"])
+        running_revision = registry.revision_of(conversation_id, assignment_id)
+        if running_revision in (None, revision_id):
+            return None
+        return LocalEvent(
+            kind="assignment_superseded",
+            dedupe_key=(
+                f"{_SUPERSEDED_NOTICE_PREFIX}{conversation_id}:"
+                f"{assignment_id}:{revision_id}"
+            ),
+            payload={
+                "number": event.payload["number"],
+                "url": event.payload["url"],
+                "assignment_id": assignment_id,
+                "superseded_revision_id": running_revision,
+                "current_revision_id": revision_id,
+                "instruction": ASSIGNMENT_SUPERSEDED_PROMPT,
+                "parent_conversation_id": str(conversation_id),
+            },
+        )
     if event.kind == "student_pr_feedback":
         target = registry.for_assignment(
             str(event.payload["assignment_id"]),
@@ -991,6 +1019,13 @@ def controller_main(
         runner_config.state_dir / "delivery-inbox.sqlite3",
         legacy_path=runner_config.state_dir / "pending-message-deliveries.json",
     )
+    registry = (
+        AssignmentConversationRegistry(
+            runner_config.state_dir / "student-conversations.json"
+        )
+        if role == "student"
+        else None
+    )
     github_mailbox = GitHubMailbox(
         repo=runner_config.github_repo,
         token=runner_config.github_token,
@@ -1006,6 +1041,7 @@ def controller_main(
             if role == "student"
             else None
         ),
+        conversation_registry=registry,
     )
     mailbox: Mailbox = github_mailbox
     active_github_mailbox: Mailbox = github_mailbox
@@ -1042,10 +1078,7 @@ def controller_main(
                 monitor_store,
             ),
         )
-        registry = AssignmentConversationRegistry(
-            runner_config.state_dir / "student-conversations.json"
-        )
-        conversation_selector = StudentConversationSelector(registry)
+        conversation_selector = StudentConversationSelector(registry, monitor_store)
         reconcile = StudentWorkspaceReconciler(
             runner_config.workspace,
             repo=runner_config.github_repo,

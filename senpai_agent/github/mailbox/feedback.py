@@ -246,6 +246,7 @@ def _pending_feedback(
 ) -> list[ControllerEvent]:
     ledger = read_feedback_ledger(mailbox)
     ledger_changed = False
+    superseded_revisions: set[str] = set()
     bound_events: list[ControllerEvent] = []
     for candidate in candidates:
         event_key = (
@@ -295,6 +296,11 @@ def _pending_feedback(
                 and not versioned_prior
                 and all(value.acknowledged for value in prior)
             )
+            if not prior and _superseded(
+                mailbox, assignment, assignment_id, revision_id
+            ):
+                acknowledged = True
+                superseded_revisions.add(revision_id)
             binding = FeedbackBinding(
                 assignment_id=assignment_id,
                 revision_id=revision_id,
@@ -324,6 +330,14 @@ def _pending_feedback(
         )
     if ledger_changed:
         write_feedback_ledger(mailbox, ledger)
+    if superseded_revisions:
+        print(
+            f"SENPAI_FEEDBACK_SUPERSEDED assignment_id={assignment.assignment_id} "
+            f"current_revision_id={assignment.revision_id} "
+            f"superseded_revision_ids={','.join(sorted(superseded_revisions))}",
+            file=sys.stderr,
+            flush=True,
+        )
     pending = [
         event
         for event in bound_events
@@ -336,6 +350,24 @@ def _pending_feedback(
         or event.payload["revision_id"] != assignment.revision_id
     ]
     return feedback_batch(mailbox, prior_revision or pending)
+
+
+def _superseded(
+    mailbox: GitHubMailbox,
+    assignment: AssignmentRecord,
+    assignment_id: str,
+    revision_id: str,
+) -> bool:
+    """Whether new feedback targets an earlier revision with no conversation,
+    as after a pod replacement, where replaying it would delay the current one."""
+    return (
+        mailbox.conversation_registry is not None
+        and (assignment_id, revision_id)
+        != (assignment.assignment_id, assignment.revision_id)
+        and not mailbox.conversation_registry.has_assignment(
+            assignment_id, revision_id
+        )
+    )
 
 
 def feedback_batch(

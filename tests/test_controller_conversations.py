@@ -4,6 +4,7 @@ from uuid import UUID
 from senpai_agent.controller import Controller, TurnResult
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import ControllerEvent, LocalStudentMailbox
+from senpai_agent.monitor import MonitorStore, TrainingMonitorSpec
 from senpai_agent.state import (
     AssignmentConversationRegistry,
     StudentConversationSelector,
@@ -234,3 +235,108 @@ def test_bounded_backlog_yields_to_another_ready_conversation(tmp_path: Path):
 
     assert [call[1] for call in turns.calls] == [first, second, first]
     assert [len(call[2]) for call in turns.calls] == [16, 1, 4]
+
+
+def test_new_revision_takes_over_training_from_its_superseded_revision(
+    tmp_path: Path,
+):
+    registry = AssignmentConversationRegistry(tmp_path / "students.json")
+    previous = registry.for_assignment("assignment-17", "revision-2")
+    monitors = MonitorStore(tmp_path / "training" / "monitors.sqlite3")
+    monitors.register(
+        TrainingMonitorSpec(training_id="training-5", conversation_id=previous)
+    )
+    finished = ControllerEvent(
+        kind="training_monitor",
+        dedupe_key="training-5:status:finished",
+        payload={
+            "conversation_id": str(previous),
+            "training_id": "training-5",
+            "summary": "Training reached terminal state finished.",
+        },
+    )
+    assignment = ControllerEvent(
+        kind="student_assignment",
+        dedupe_key="student_assignment:v2:17:assignment-17:revision-3:abc",
+        payload={"assignment_id": "assignment-17", "revision_id": "revision-3"},
+    )
+    turns = Turns()
+
+    try:
+        Controller(
+            role="student",
+            mailbox=Mailbox((finished, assignment)),
+            turns=turns,
+            conversation_id=UUID("00000000-0000-0000-0000-000000000001"),
+            full_prompt="programme",
+            conversation_for_events=StudentConversationSelector(registry, monitors),
+            sleep=lambda _seconds: None,
+            poll_interval_seconds=600,
+            jitter_seconds=0,
+        ).run(max_cycles=1)
+
+        current = registry.for_assignment("assignment-17", "revision-3")
+        assert [call[1] for call in turns.calls] == [current]
+        assert turns.calls[0][2] == frozenset(
+            {
+                finished.dedupe_key,
+                assignment.dedupe_key,
+                f"training_handover:training-5:{current}",
+            }
+        )
+        assert monitors.spec("training-5").conversation_id == current
+
+        repeated = StudentConversationSelector(registry, monitors)((assignment,))
+        assert [(batch.conversation_id, batch.events) for batch in repeated] == [
+            (current, (assignment,))
+        ]
+    finally:
+        monitors.close()
+
+
+def test_training_handover_names_the_run_and_its_previous_revision(
+    tmp_path: Path,
+):
+    registry = AssignmentConversationRegistry(tmp_path / "students.json")
+    previous = registry.for_assignment("assignment-17", "revision-2")
+    other_assignment = registry.for_assignment("assignment-18", "revision-1")
+    monitors = MonitorStore(tmp_path / "training" / "monitors.sqlite3")
+    for training_id, conversation_id in (
+        ("training-5", previous),
+        ("training-6", other_assignment),
+    ):
+        monitors.register(
+            TrainingMonitorSpec(
+                training_id=training_id,
+                conversation_id=conversation_id,
+            )
+        )
+    finished = ControllerEvent(
+        kind="training_monitor",
+        dedupe_key="training-5:status:finished",
+        payload={"conversation_id": str(previous), "training_id": "training-5"},
+    )
+    assignment = ControllerEvent(
+        kind="student_assignment",
+        dedupe_key="student_assignment:v2:17:assignment-17:revision-3:abc",
+        payload={"assignment_id": "assignment-17", "revision_id": "revision-3"},
+    )
+
+    try:
+        (batch,) = StudentConversationSelector(registry, monitors)(
+            (finished, assignment)
+        )
+
+        current = registry.for_assignment("assignment-17", "revision-3")
+        assert batch.conversation_id == current
+        moved, routed_assignment, handover = batch.events
+        assert moved.payload["conversation_id"] == str(current)
+        assert routed_assignment == assignment
+        assert handover.kind == "training_handover"
+        assert handover.payload["training_id"] == "training-5"
+        assert handover.payload["previous_revision_id"] == "revision-2"
+        assert handover.payload["revision_id"] == "revision-3"
+        assert "cancel_training" in handover.to_prompt()
+        assert monitors.spec("training-6").conversation_id == other_assignment
+    finally:
+        monitors.close()
