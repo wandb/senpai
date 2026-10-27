@@ -44,6 +44,7 @@ def test_default_config_exposes_every_model_profile_and_effort():
         "frontier_model": "anthropic/claude-opus-5-5",
         "frontier_reasoning_effort": "max",
         "compaction_trigger_tokens": 200_000,
+        "compaction_trigger_events": 400,
     }.items() <= config.items()
     assert config["program_path"] == ""
     assert "custom_secret_env_names" not in config
@@ -646,6 +647,7 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         frontier_model="openai/gpt-5.6-sol",
         frontier_reasoning_effort="max",
         compaction_trigger_tokens=180_000,
+        compaction_trigger_events=600,
     )
 
     advisor_config, _deployment, _secret = render_role("advisor", args)
@@ -665,12 +667,20 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         assert config["SENPAI_OPENHANDS_FRONTIER_MODEL"] == args.frontier_model
         assert config["SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT"] == "max"
         assert config["SENPAI_COMPACTION_TRIGGER_TOKENS"] == "180000"
+        assert config["SENPAI_COMPACTION_TRIGGER_EVENTS"] == "600"
 
 
 def test_launch_rejects_a_compaction_trigger_below_provider_minimum():
     args = launch_args(compaction_trigger_tokens=49_999)
 
     with pytest.raises(SystemExit, match="must be at least 50000"):
+        launch.validate_model_config(args)
+
+
+def test_launch_rejects_an_event_trigger_the_condenser_cannot_split():
+    args = launch_args(compaction_trigger_events=11)
+
+    with pytest.raises(SystemExit, match="must be at least 12"):
         launch.validate_model_config(args)
 
 

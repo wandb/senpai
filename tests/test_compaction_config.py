@@ -3,11 +3,18 @@ from pathlib import Path
 import pytest
 import yaml
 from openhands.sdk import LLM
+from openhands.sdk.context.condenser import LLMSummarizingCondenser
+from openhands.sdk.context.condenser.base import CondensationRequirement
+from openhands.sdk.context.view import View
+from openhands.sdk.event import MessageEvent
 from openhands.sdk.llm import Message, TextContent
+from pydantic import SecretStr
 
 from launch_test_support import launch, launch_args, render_role
 from openhands_support import launch_env
+from senpai_agent.custom_openai import CustomOpenAIEndpoint
 from senpai_agent.openhands_runner import (
+    local_condenser,
     model_runtime_configuration,
     parse_runner_args,
     resolve_config,
@@ -82,3 +89,90 @@ def test_main_yaml_token_trigger_reaches_the_provider_request(tmp_path, model):
 
     assert config.compaction_trigger_tokens == 200_000
     assert trigger == 200_000
+
+
+def test_main_yaml_event_trigger_reaches_the_runner_config(tmp_path):
+    project = yaml.safe_load(launch.SENPAI_CONFIG.read_text())
+    args = launch_args(
+        compaction_trigger_events=project["compaction_trigger_events"],
+    )
+    environment = launch_env(tmp_path, role="student")
+    snapshot_file = environment[PROGRAM_CONTEXT_FILE_ENV]
+    program = decode_program_system_prompt(Path(snapshot_file).read_text())
+    configmap, _deployment, _secret = render_role("student", args, program=program)
+    environment.update(yaml.safe_load(configmap)["data"])
+    environment[PROGRAM_CONTEXT_FILE_ENV] = snapshot_file
+    environment = prepare_system_context_environment(
+        "student", Path(environment["SENPAI_OPENHANDS_STATE_DIR"]), environment
+    )
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), environment)
+
+    assert project["compaction_trigger_events"] == 400
+    assert config.compaction_trigger_events == 400
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["openai/gpt-5.6-sol", "anthropic/claude-opus-4-8"],
+)
+def test_native_compaction_models_run_without_a_local_condenser(model):
+    llm = LLM(
+        model=model,
+        api_key=SecretStr("test-key"),
+        **model_runtime_configuration(
+            model, "high", compaction_trigger_tokens=200_000
+        ),
+    )
+
+    assert local_condenser(llm, trigger_tokens=200_000, trigger_events=400) is None
+
+
+def user_message(text: str) -> MessageEvent:
+    return MessageEvent(
+        source="user",
+        llm_message=Message(role="user", content=[TextContent(text=text)]),
+    )
+
+
+def test_custom_openai_condenser_compacts_on_the_launch_triggers():
+    model = "custom_openai/served-model"
+    endpoint = CustomOpenAIEndpoint(
+        base_url="https://inference.example.test/v1",
+        context_tokens=262_144,
+        max_output_tokens=65_536,
+    )
+    llm = LLM(
+        model=model,
+        api_key=SecretStr("test-key"),
+        usage_id="senpai",
+        **model_runtime_configuration(
+            model, "high", compaction_trigger_tokens=50_000, custom_openai=endpoint
+        ),
+    )
+
+    condenser = local_condenser(llm, trigger_tokens=50_000, trigger_events=400)
+
+    assert isinstance(condenser, LLMSummarizingCondenser)
+    assert condenser.max_size == 400
+    assert condenser.max_tokens == 50_000
+    assert condenser.keep_first == 4
+    assert condenser.llm.model == model
+    assert condenser.llm.usage_id == "senpai-condenser"
+
+    # OpenHands' own default compacted at 80 events; 400 short events stay put.
+    full_window = View(events=[user_message(f"step {i}") for i in range(400)])
+    assert condenser.condensation_requirement(full_window, agent_llm=llm) is None
+
+    one_over = View(events=[user_message(f"step {i}") for i in range(401)])
+    assert (
+        condenser.condensation_requirement(one_over, agent_llm=llm)
+        is CondensationRequirement.SOFT
+    )
+
+    # Token pressure fires first on long events and must be handled at once.
+    heavy = View(events=[user_message("token " * 1_000) for _ in range(120)])
+    assert (
+        condenser.condensation_requirement(heavy, agent_llm=llm)
+        is CondensationRequirement.HARD
+    )

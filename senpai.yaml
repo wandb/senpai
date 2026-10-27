@@ -60,8 +60,10 @@ fast_model: anthropic/claude-sonnet-5
 fast_reasoning_effort: medium
 frontier_model: anthropic/claude-opus-5-5
 frontier_reasoning_effort: max
-# Provider-native rendered/input-token trigger for supported compaction APIs.
+# Input-token trigger for provider-native compaction and for the OpenHands condenser.
 compaction_trigger_tokens: 200000
+# OpenHands condenser event trigger: compact past this many model-visible events.
+compaction_trigger_events: 400
 # Self-hosted OpenAI-compatible endpoint for custom_openai/<served-model-id> profiles.
 # custom_openai_base_url: https://inference.example.ts.net/v1
 # custom_openai_context_tokens: 100000  # the server's --max-model-len

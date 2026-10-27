@@ -156,6 +156,7 @@ fast_reasoning_effort: medium
 frontier_model: anthropic/claude-opus-5-5
 frontier_reasoning_effort: max
 compaction_trigger_tokens: 200000
+compaction_trigger_events: 400
 
 pvc_claim_name: your-existing-pvc
 pvc_mount_path: /mnt/data
@@ -193,7 +194,16 @@ sampling parameters. Change the main and smart/fast/frontier profile models
 independently, retaining each profile's reasoning effort.
 
 `compaction_trigger_tokens` sets the compaction limit. OpenAI and Anthropic
-apply it for their models; OpenHands handles compaction for other providers.
+apply it natively for their models. Every other model, including `wandb/` and
+`custom_openai/` ones, uses the OpenHands summarizing condenser, which compacts
+when the counted input exceeds `compaction_trigger_tokens` (or the model's
+input limit, if that is smaller) or when the conversation view holds more than
+`compaction_trigger_events` events (default 400). The view holds what the model
+sees: the system prompt, messages, actions and observations; hook executions
+do not count. A condensation keeps the first four events and the most recent
+half of the window. Set `compaction_trigger_tokens` below the model's input
+limit so LiteLLM's approximate token count has room to err, for example
+160000 on a 196,608-token input limit.
 
 If using W&B Inference use `wandb/` provider as the provider. For example `wandb/zai-org/GLM-5.2`, SENPAI
 uses `WANDB_API_KEY` for auth.
