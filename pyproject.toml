@@ -24,8 +24,8 @@ dependencies = [
     "litellm>=1.102.1",
     "tqdm",
     "matplotlib",
-    "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@ae5b302a6711981fd7aa3ed62179f131d67a741e#subdirectory=openhands-sdk",
-    "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@ae5b302a6711981fd7aa3ed62179f131d67a741e#subdirectory=openhands-tools",
+    "openhands-sdk @ git+https://github.com/morganmcg1/software-agent-sdk.git@e899135f98444f7bfe08441311a6f5e565d97b39#subdirectory=openhands-sdk",
+    "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@e899135f98444f7bfe08441311a6f5e565d97b39#subdirectory=openhands-tools",
     "psutil",
     "exa-py>=2.22.2",
 ]

@@ -45,7 +45,7 @@ CUSTOM_OPENAI_ENDPOINT = CustomOpenAIEndpoint(
 def test_openhands_fork_revision_is_consistent_across_install_paths():
     package_names = {"openhands-sdk", "openhands-tools"}
     fork_url = "git+https://github.com/morganmcg1/software-agent-sdk.git"
-    fork_revision = "ae5b302a6711981fd7aa3ed62179f131d67a741e"
+    fork_revision = "e899135f98444f7bfe08441311a6f5e565d97b39"
     expected_requirements = {
         f"{name} @ {fork_url}@{fork_revision}#subdirectory={name}"
         for name in package_names
