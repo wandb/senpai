@@ -1050,6 +1050,7 @@ def controller_main(
             runner_config.workspace,
             repo=runner_config.github_repo,
             token=runner_config.github_token,
+            progress=progress,
         )
 
     full_prompt = _full_prompt(env)

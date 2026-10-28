@@ -711,7 +711,11 @@ A run that disappears after reporting a metric also remains a hard failure.
 
 Controller process and container restarts within the same Pod preserve completed
 OpenHands events. Local processes are terminated rather than adopted under
-unverifiable identity. Kubernetes workloads are re-adopted only by their
+unverifiable identity. A local run that ended with its controller is recorded
+as `failed` with an unknown exit code, its log tail, and the elapsed time from
+its last running record, which is refreshed every 30 seconds. A run still
+alive under its verified identity is stopped and recorded as `cancelled`.
+Kubernetes workloads are re-adopted only by their
 persisted UID and broker-injected ownership; the original student conversation
 receives the persisted terminal outcome. Recovery requires retained state and
 the same controller Pod UID. Replacing the Pod is not a supported recovery path;

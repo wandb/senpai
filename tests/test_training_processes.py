@@ -249,6 +249,7 @@ def test_restart_stops_a_verified_orphaned_process_group(tmp_path: Path):
         elapsed_seconds=12,
         log_path=str(state_dir / "orphan.log"),
     )
+    (state_dir / "orphan.log").write_text("step 41 loss 0.3\n")
     (state_dir / f"{orphan.training_id}.json").write_text(orphan.model_dump_json())
     sidecar = state_dir / f"{orphan.training_id}.score.json"
     sidecar.write_text('{"metrics": {}, "passed": true, "score": 1.0}')
@@ -262,7 +263,9 @@ def test_restart_stops_a_verified_orphaned_process_group(tmp_path: Path):
 
         recovered = supervisor.get_training_status(orphan.training_id)
         assert recovered.state is TrainingState.CANCELLED
-        assert "supervisor restarted" in recovered.error_tail
+        assert 0 < recovered.elapsed_seconds < 12
+        assert recovered.error_tail.startswith("step 41 loss 0.3\n")
+        assert recovered.error_tail.endswith("so recovery stopped it.")
         assert sidecar.exists()
         assert process.wait(timeout=3) is not None
         assert_process_stopped(int(child_pid_path.read_text()))
@@ -270,6 +273,44 @@ def test_restart_stops_a_verified_orphaned_process_group(tmp_path: Path):
         if process.is_running():
             process.kill()
             process.wait()
+
+
+def test_restart_keeps_the_record_of_a_run_that_died_with_its_supervisor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr("senpai_agent.training._RUNNING_RECORD_REFRESH_SECONDS", 0.1)
+    workspace, supervisor = make_supervisor(tmp_path, terminate_grace_seconds=0.1)
+    started = run_python(
+        supervisor,
+        workspace,
+        "import time; print('epoch 3 val_loss 0.41', flush=True); time.sleep(60)",
+    )
+    record = tmp_path / "state" / f"{started.training_id}.json"
+    deadline = time.monotonic() + 5
+    while TrainingResult.model_validate_json(record.read_text()).elapsed_seconds < 0.5:
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    # A container restart takes the run and its supervisor down together, so
+    # the record that survives is the last refreshed running one.
+    restarted_state = tmp_path / "restarted-state"
+    restarted_state.mkdir()
+    (restarted_state / record.name).write_text(record.read_text())
+    assert started.process_group_id is not None
+    os.killpg(started.process_group_id, signal.SIGKILL)
+    wait_for_terminal(supervisor, started.training_id)
+
+    recovered = TrainingSupervisor(
+        workspace=workspace,
+        state_dir=restarted_state,
+    ).get_training_status(started.training_id)
+
+    assert recovered.state is TrainingState.FAILED
+    assert recovered.exit_code is None
+    assert recovered.elapsed_seconds >= 0.5
+    assert recovered.error_tail.startswith("epoch 3 val_loss 0.41\n")
+    assert "stopped when its supervisor restarted" in recovered.error_tail
+    assert "exit status is unknown" in recovered.error_tail
 
 
 def test_restart_does_not_signal_a_reused_pid(tmp_path: Path):
@@ -291,13 +332,14 @@ def test_restart_does_not_signal_a_reused_pid(tmp_path: Path):
         elapsed_seconds=12,
         log_path=str(state_dir / "orphan.log"),
     )
+    (state_dir / "orphan.log").touch()
     (state_dir / f"{orphan.training_id}.json").write_text(orphan.model_dump_json())
 
     try:
         supervisor = TrainingSupervisor(workspace=workspace, state_dir=state_dir)
 
         recovered = supervisor.get_training_status(orphan.training_id)
-        assert recovered.state is TrainingState.CANCELLED
+        assert recovered.state is TrainingState.FAILED
         assert "no signal was sent" in recovered.error_tail
         assert unrelated.is_running()
     finally:

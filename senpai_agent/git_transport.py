@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,6 +19,7 @@ from senpai_agent.secrets import scrub_github_credentials
 
 
 GIT_EXECUTABLE = "/usr/bin/git"
+FETCH_TIMEOUT_SECONDS = 300
 _GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 PROXY_ENVIRONMENT = (
     "ALL_PROXY",
@@ -277,7 +279,7 @@ def fetch_refs(
     refs: Sequence[tuple[str, str]],
     token: SecretStr | None,
     have: str | None = None,
-    timeout: float = 300,
+    timeout: float = FETCH_TIMEOUT_SECONDS,
 ) -> None:
     """Copy remote refs into a checkout without handing that checkout the token.
 
@@ -290,6 +292,9 @@ def fetch_refs(
     ``have`` names a commit the checkout already holds. The throwaway repository
     then borrows the checkout's objects and negotiates from that commit, so only
     the missing history crosses the network.
+
+    ``timeout`` bounds the whole copy, so callers can budget one fetch as one
+    operation however many hops it takes.
     """
 
     if not refs:
@@ -307,6 +312,7 @@ def fetch_refs(
         )
         return
 
+    deadline = time.monotonic() + timeout
     repository = (
         staged_commit(workspace, have) if have else isolated_bare_repository()
     )
@@ -323,7 +329,7 @@ def fetch_refs(
             remote,
             *(f"+{source}:{transfer}" for source, transfer, _ in staged),
             environment=authenticated_git_environment(token),
-            timeout=timeout,
+            timeout=max(deadline - time.monotonic(), 0),
         )
         run_git(
             workspace,
@@ -333,7 +339,7 @@ def fetch_refs(
             str(staging),
             *(f"+{transfer}:{destination}" for _, transfer, destination in staged),
             environment=file_git_environment(),
-            timeout=timeout,
+            timeout=max(deadline - time.monotonic(), 0),
         )
 
 

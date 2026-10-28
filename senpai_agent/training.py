@@ -32,6 +32,8 @@ _WANDB_COMPLETE_RUN_URL_BYTES = re.compile(
 _LOG_READ_BYTES = 64 * 1024
 _WANDB_SCAN_OVERLAP_BYTES = 4096
 _ERROR_TAIL_BYTES = 8192
+# How stale a running record's elapsed time can be when its supervisor dies.
+_RUNNING_RECORD_REFRESH_SECONDS = 30
 
 
 TARGET_PYTHON_ENV = "SENPAI_TARGET_PYTHON_ENV"
@@ -113,6 +115,12 @@ def record_training_output(
             log.flush()
         if pending:
             log.write(b"<secret-hidden>")
+
+
+def _read_tail(path: Path, size: int) -> str:
+    with path.open("rb") as file:
+        file.seek(max(0, os.fstat(file.fileno()).st_size - size))
+        return file.read().decode(errors="ignore")
 
 
 class TrainingState(StrEnum):
@@ -224,30 +232,42 @@ class TrainingSupervisor:
         self._lock = threading.Lock()
         self._active: dict[str, _ActiveTraining] = {}
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self._cancel_orphaned_runs()
+        self._recover_orphaned_runs()
 
-    def _cancel_orphaned_runs(self) -> None:
+    def _recover_orphaned_runs(self) -> None:
         for path in training_result_paths(self.state_dir):
             result = TrainingResult.model_validate_json(path.read_text())
-            if result.state is TrainingState.RUNNING:
-                process_was_terminated = self._terminate_recovered_process(result)
-                recovered = result.model_copy(
+            if result.state is not TrainingState.RUNNING:
+                continue
+            if self._terminate_recovered_process(result):
+                assert result.process_start_time is not None
+                state = TrainingState.CANCELLED
+                elapsed_seconds = time.time() - result.process_start_time
+                note = (
+                    "Training was still running after its supervisor "
+                    "restarted, so recovery stopped it."
+                )
+            else:
+                # The run ended with its supervisor, usually in a container
+                # restart. Its exit status died with it; its last refreshed
+                # record says how long it had been running.
+                state = TrainingState.FAILED
+                elapsed_seconds = result.elapsed_seconds
+                note = (
+                    "Training stopped when its supervisor restarted. It was "
+                    f"last recorded running {elapsed_seconds:.0f} s after it "
+                    "started; its exit status is unknown and no signal was sent."
+                )
+            log_tail = _read_tail(Path(result.log_path), _ERROR_TAIL_BYTES).rstrip()
+            self._write_result(
+                result.model_copy(
                     update={
-                        "state": TrainingState.CANCELLED,
-                        "error_tail": (
-                            "Training state was recovered after its "
-                            "supervisor restarted."
-                            if process_was_terminated
-                            else (
-                                "Training state was recovered after its "
-                                "supervisor restarted; its persisted process "
-                                "identity was no longer live, so no signal "
-                                "was sent."
-                            )
-                        ),
+                        "state": state,
+                        "elapsed_seconds": elapsed_seconds,
+                        "error_tail": f"{log_tail}\n{note}" if log_tail else note,
                     }
                 )
-                self._write_result(recovered)
+            )
 
     def run_training(self, spec: TrainingSpec) -> TrainingResult:
         if isinstance(spec.argv, str) or not spec.argv:
@@ -377,6 +397,7 @@ class TrainingSupervisor:
             active = self._active[training_id]
         run_ids: dict[str, None] = {}
         published_run_ids: tuple[str, ...] = ()
+        published_at = active.started
         error_tail = b""
         scan_overlap = b""
         deadline = active.started + active.timeout_seconds
@@ -400,7 +421,11 @@ class TrainingSupervisor:
                     run_ids,
                 )
                 discovered_run_ids = tuple(run_ids)
-                if discovered_run_ids != published_run_ids:
+                now = time.monotonic()
+                if (
+                    discovered_run_ids != published_run_ids
+                    or now - published_at >= _RUNNING_RECORD_REFRESH_SECONDS
+                ):
                     self._write_result(
                         TrainingResult(
                             training_id=training_id,
@@ -409,12 +434,13 @@ class TrainingSupervisor:
                             process_group_id=active.process_group_id,
                             process_start_time=active.process_start_time,
                             exit_code=None,
-                            elapsed_seconds=time.monotonic() - active.started,
+                            elapsed_seconds=now - active.started,
                             log_path=str(active.log_path),
                             wandb_run_ids=discovered_run_ids,
                         )
                     )
                     published_run_ids = discovered_run_ids
+                    published_at = now
                 if active.cancelled or active.output_error is not None:
                     state = (
                         TrainingState.CANCELLED
