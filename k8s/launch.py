@@ -306,13 +306,26 @@ def custom_openai_efforts(args: Args) -> list[str]:
 def validate_custom_openai_endpoint(args: Args) -> None:
     try:
         custom_openai_served_model(args)
-        CustomOpenAIEndpoint(
+        endpoint = CustomOpenAIEndpoint(
             base_url=args.custom_openai_base_url,
             context_tokens=args.custom_openai_context_tokens,
             max_output_tokens=args.custom_openai_max_output_tokens,
         )
     except ValueError as error:
         sys.exit(f"ERROR: {error}")
+    if args.compaction_trigger_tokens >= endpoint.max_input_tokens:
+        # The OpenHands condenser caps its token trigger at the model's input
+        # limit, so a trigger at or above it compacts only once the counted
+        # input already fills the server's window.
+        print(
+            f"WARNING: --compaction_trigger_tokens {args.compaction_trigger_tokens} "
+            "is not below the custom_openai input limit of "
+            f"{endpoint.max_input_tokens} tokens (custom_openai_context_tokens minus "
+            "custom_openai_max_output_tokens); the condenser compacts only when the "
+            "counted input already exceeds the window. Set it lower, for example "
+            "160000 on a 196608-token limit, so the token count has room to err.",
+            file=sys.stderr,
+        )
 
 
 def validate_model_config(args: Args) -> None:

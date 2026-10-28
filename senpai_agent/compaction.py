@@ -16,6 +16,6 @@ DEFAULT_COMPACTION_TRIGGER_EVENTS = 400
 # The condenser never summarizes the leading events: the system prompt and the
 # task that opened the conversation.
 CONDENSER_KEEP_FIRST = 4
-# A condensation keeps half the window, which must hold the kept events and
-# the summary.
+# An event-triggered condensation keeps half the window, which must hold the
+# kept events and the summary.
 MIN_COMPACTION_TRIGGER_EVENTS = 2 * (CONDENSER_KEEP_FIRST + 2)

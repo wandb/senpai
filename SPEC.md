@@ -509,9 +509,10 @@ from the launch configuration: it compacts when the counted input exceeds
 `compaction_trigger_tokens` (capped at the model's input limit) or when the
 conversation view holds more than `compaction_trigger_events` events, 400 by
 default. The view holds only LLM-convertible events, so hook executions do not
-count. Each condensation keeps the first four events and the most recent half
-of the window. The same settings apply to agents built from markdown
-definitions, replacing the SDK's 80-event default, and to delegated children.
+count. Each condensation keeps the first four events and the most recent
+events that fit in half of whichever limit fired, the event window or the
+token cap. The same settings apply to agents built from markdown definitions,
+replacing the SDK's 80-event default, and to delegated children.
 
 The complete durable transcript remains available as plain event JSON under
 `$SENPAI_OPENHANDS_STATE_DIR/$SENPAI_CONVERSATION_ID/events/`. The harness

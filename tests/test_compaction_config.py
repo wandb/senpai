@@ -5,6 +5,7 @@ import yaml
 from openhands.sdk import LLM
 from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.context.condenser.base import CondensationRequirement
+from openhands.sdk.context.condenser.utils import get_total_token_count
 from openhands.sdk.context.view import View
 from openhands.sdk.event import MessageEvent
 from openhands.sdk.llm import Message, TextContent
@@ -135,21 +136,31 @@ def user_message(text: str) -> MessageEvent:
     )
 
 
-def test_custom_openai_condenser_compacts_on_the_launch_triggers():
-    model = "custom_openai/served-model"
-    endpoint = CustomOpenAIEndpoint(
-        base_url="https://inference.example.test/v1",
-        context_tokens=262_144,
-        max_output_tokens=65_536,
-    )
-    llm = LLM(
-        model=model,
+SERVED_MODEL = "custom_openai/served-model"
+# A 262,144-token window less 65,536 output tokens leaves a 196,608-token input limit.
+ENDPOINT = CustomOpenAIEndpoint(
+    base_url="https://inference.example.test/v1",
+    context_tokens=262_144,
+    max_output_tokens=65_536,
+)
+
+
+def served_model_llm(compaction_trigger_tokens: int) -> LLM:
+    return LLM(
+        model=SERVED_MODEL,
         api_key=SecretStr("test-key"),
         usage_id="senpai",
         **model_runtime_configuration(
-            model, "high", compaction_trigger_tokens=50_000, custom_openai=endpoint
+            SERVED_MODEL,
+            "high",
+            compaction_trigger_tokens=compaction_trigger_tokens,
+            custom_openai=ENDPOINT,
         ),
     )
+
+
+def test_custom_openai_condenser_compacts_on_the_launch_triggers():
+    llm = served_model_llm(compaction_trigger_tokens=50_000)
 
     condenser = local_condenser(llm, trigger_tokens=50_000, trigger_events=400)
 
@@ -157,7 +168,7 @@ def test_custom_openai_condenser_compacts_on_the_launch_triggers():
     assert condenser.max_size == 400
     assert condenser.max_tokens == 50_000
     assert condenser.keep_first == 4
-    assert condenser.llm.model == model
+    assert condenser.llm.model == SERVED_MODEL
     assert condenser.llm.usage_id == "senpai-condenser"
 
     # OpenHands' own default compacted at 80 events; 400 short events stay put.
@@ -174,5 +185,21 @@ def test_custom_openai_condenser_compacts_on_the_launch_triggers():
     heavy = View(events=[user_message("token " * 1_000) for _ in range(120)])
     assert (
         condenser.condensation_requirement(heavy, agent_llm=llm)
+        is CondensationRequirement.HARD
+    )
+
+
+def test_custom_openai_condenser_caps_the_token_trigger_at_the_input_limit():
+    llm = served_model_llm(compaction_trigger_tokens=200_000)
+    condenser = local_condenser(llm, trigger_tokens=200_000, trigger_events=400)
+    assert condenser is not None
+
+    # 197 events of 1,000 words count to about 198,600 tokens: under the launch
+    # trigger but over the endpoint's input limit, which the SDK applies instead.
+    between = View(events=[user_message("token " * 1_000) for _ in range(197)])
+    counted = get_total_token_count(between.events, llm)
+    assert ENDPOINT.max_input_tokens < counted < 200_000
+    assert (
+        condenser.condensation_requirement(between, agent_llm=llm)
         is CondensationRequirement.HARD
     )

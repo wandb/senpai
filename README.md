@@ -201,9 +201,11 @@ input limit, if that is smaller) or when the conversation view holds more than
 `compaction_trigger_events` events (default 400). The view holds what the model
 sees: the system prompt, messages, actions and observations; hook executions
 do not count. A condensation keeps the first four events and the most recent
-half of the window. Set `compaction_trigger_tokens` below the model's input
-limit so LiteLLM's approximate token count has room to err, for example
-160000 on a 196,608-token input limit.
+events that fit in half of whichever limit fired, the event window or the
+token cap. Set `compaction_trigger_tokens` below the model's input limit so
+LiteLLM's approximate token count has room to err, for example 160000 on a
+196,608-token input limit; the launcher warns when it is not below a
+`custom_openai/` endpoint's limit.
 
 If using W&B Inference use `wandb/` provider as the provider. For example `wandb/zai-org/GLM-5.2`, SENPAI
 uses `WANDB_API_KEY` for auth.
