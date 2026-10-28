@@ -6,9 +6,11 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr
 
+import senpai_agent.git_transport as git_transport
 import senpai_agent.git_workflow as git_workflow
 from senpai_agent.git_transport import (
     GIT_EXECUTABLE,
+    fetch_refs,
     git_process_env,
     isolated_bare_repository,
     run_git,
@@ -86,6 +88,34 @@ def test_git_timeout_is_a_precondition_failure(
 
     with pytest.raises(GitWorkflowPreconditionError, match="timed out after 300 s"):
         run_git(tmp_path, "fetch", "origin", timeout=300)
+
+
+def test_authenticated_fetch_hops_share_one_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    clock = [1000.0]
+    fetch_timeouts = []
+    real_run = subprocess.run
+
+    def slow_fetch(command, **kwargs):
+        if "fetch" not in command:
+            return real_run(command, **kwargs)
+        fetch_timeouts.append(kwargs["timeout"])
+        clock[0] += 200
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(git_transport.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr("senpai_agent.git_transport.subprocess.run", slow_fetch)
+
+    fetch_refs(
+        tmp_path,
+        remote="https://github.com/acme/widgets.git",
+        refs=(("refs/heads/main", "refs/senpai/main"),),
+        token=SecretStr("typed-token"),
+        timeout=300,
+    )
+
+    assert fetch_timeouts == [300, 100]
 
 
 def test_git_rejects_a_token_beside_a_complete_environment(tmp_path: Path):

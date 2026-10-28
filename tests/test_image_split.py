@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from senpai_agent.supervisor import SupervisorConfig
+
 ROOT = Path(__file__).parents[1]
 TEMPLATE_TOKEN = re.compile(r"\{\{[A-Z0-9_]+\}\}")
 BINARY_ONLY_RUNTIME_PACKAGES = (
@@ -671,6 +673,24 @@ def test_role_probes_query_http_without_starting_a_process(role: str):
         "failureThreshold": 5,
         "terminationGracePeriodSeconds": 75,
     }
+
+
+@pytest.mark.parametrize("role", ["advisor", "student"])
+def test_liveness_probe_cannot_preempt_the_supervisor_lease(role: str):
+    probe = container_for(load_kubernetes_template(f"{role}-deployment.yaml"))[
+        "livenessProbe"
+    ]
+    supervisor = SupervisorConfig()
+    # /healthz fails only once the controller lease is overdue, and the
+    # supervisor stops an overdue worker itself. The kubelet must restart the
+    # container only when that bounded, logged cleanup did not finish.
+    earliest_kubelet_restart = probe["periodSeconds"] * (probe["failureThreshold"] - 1)
+    supervisor_exit = (
+        supervisor.check_interval_seconds + supervisor.terminate_grace_seconds
+    )
+
+    assert earliest_kubelet_restart > supervisor_exit
+    assert probe["terminationGracePeriodSeconds"] > supervisor.terminate_grace_seconds
 
 
 def test_role_entrypoints_default_openhands_turns_to_two_hours_of_inactivity():

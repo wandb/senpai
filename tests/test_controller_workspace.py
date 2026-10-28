@@ -1,6 +1,7 @@
 import base64
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,12 @@ from pydantic import SecretStr
 
 from senpai_agent.git_transport import git_process_env
 from senpai_agent.mailbox import ControllerEvent
-from senpai_agent.workspace import StudentWorkspaceReconciler, WorkspaceDivergence
+from senpai_agent.supervisor import ProgressLease, WorkerLease
+from senpai_agent.workspace import (
+    RECONCILE_LEASE_GRACE_SECONDS,
+    StudentWorkspaceReconciler,
+    WorkspaceDivergence,
+)
 
 
 def git(*arguments: str, cwd: Path | None = None) -> str:
@@ -100,6 +106,35 @@ def test_reconciliation_preserves_unpushed_commits_and_dirty_files(
     assert git("rev-parse", "HEAD", cwd=workspace) == local_head
     assert (workspace / "notes.txt").read_text() == "dirty but recoverable\n"
     assert not hook_marker.exists()
+
+
+def test_reconcile_lease_outlasts_every_git_command_it_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _remote, _seed, workspace, base_sha, assigned_head = assigned_workspace(tmp_path)
+    lease_path = tmp_path / "controller-lease.json"
+    commands = []
+    real_run = subprocess.run
+
+    def covered_run(command, **kwargs):
+        lease = WorkerLease.read(lease_path)
+        spare = lease.deadline - time.monotonic() - kwargs["timeout"]
+        commands.append((command[3], lease.phase, spare))
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr("senpai_agent.workspace.subprocess.run", covered_run)
+    StudentWorkspaceReconciler(workspace, progress=ProgressLease(lease_path))(
+        (assignment_event(assigned_head, base_sha),)
+    )
+
+    assert "fetch" in {command for command, _, _ in commands}
+    assert {phase for _, phase, _ in commands} == {"reconcile"}
+    # Each command's own timeout fires, and its error reaches the controller,
+    # before the supervisor could see the lease as overdue.
+    assert all(
+        spare > RECONCILE_LEASE_GRACE_SECONDS - 5 for _, _, spare in commands
+    )
 
 
 def test_reconciliation_surfaces_a_remote_head_not_present_locally(

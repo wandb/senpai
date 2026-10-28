@@ -84,7 +84,10 @@ manager owns restart and backoff. The supervisor is independent of OpenHands
 and Kubernetes.
 OpenHands events renew the root turn's lease; its configured timeout measures
 inactivity rather than total elapsed time. Provider, tool, training, and child
-deadlines remain hard.
+deadlines remain hard. Workspace reconciliation renews its lease before each
+Git command for that command's timeout plus 30 seconds, so a slow fetch ends on
+its own timeout with a Git error rather than an expired lease. The two hops of
+an authenticated fetch share one timeout.
 The supervisor serves `/healthz` on all IPv4 interfaces, using port 8080 by
 default. Both the supervisor and `/healthz` treat an expired phase as unhealthy.
 They allow 60 seconds after the model request deadline for cooperative
@@ -97,7 +100,10 @@ the existing bounded TERM/KILL cleanup to the worker and its descendants.
 Expiry does not imply instantaneous process termination or remote cancellation.
 The endpoint returns HTTP 200 for a live worker lease and HTTP 503 otherwise.
 Kubernetes startup and liveness probes query this endpoint on fixed port 8080
-without creating a process inside the container. The images have no Docker
+without creating a process inside the container. Because `/healthz` fails only
+after the lease expires, the liveness probe's failure window must exceed the
+supervisor's check interval plus its TERM/KILL grace. The kubelet then restarts
+the container only when the supervisor could not stop the worker itself. The images have no Docker
 `HEALTHCHECK`. Standalone launchers can set `SENPAI_HEALTH_PORT` and configure
 an external monitor with startup grace and retries. After persistent failure,
 the monitor restarts the container or repeats host bootstrap. Restarting the

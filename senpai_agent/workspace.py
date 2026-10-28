@@ -11,11 +11,20 @@ from pathlib import Path
 
 from pydantic import SecretStr
 
-from senpai_agent.git_transport import GIT_EXECUTABLE, fetch_refs, git_process_env
+from senpai_agent.git_transport import (
+    FETCH_TIMEOUT_SECONDS,
+    GIT_EXECUTABLE,
+    fetch_refs,
+    git_process_env,
+)
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.PROMPTS import WORKSPACE_DIVERGENCE_PROMPT
+from senpai_agent.supervisor import ProgressLease
 
 
+# Time for a timed-out Git command to be killed and its error raised before
+# the supervisor would treat the reconcile lease as overdue.
+RECONCILE_LEASE_GRACE_SECONDS = 30
 _HEAD_REF = "refs/senpai/assignment/head"
 _BASE_REF = "refs/senpai/assignment/base"
 _BASE_TIP_REF = "refs/senpai/assignment/base-tip"
@@ -98,7 +107,13 @@ class WorkspaceDivergence(RuntimeError):
 
 
 class StudentWorkspaceReconciler:
-    """Hydrate an assignment and check it out without discarding local work."""
+    """Hydrate an assignment and check it out without discarding local work.
+
+    With a progress lease, each Git command renews the ``reconcile`` lease for
+    its own timeout. A slow fetch is then bounded by that timeout, however many
+    commands the reconcile runs, and the lease still expires if the controller
+    hangs between commands.
+    """
 
     def __init__(
         self,
@@ -106,6 +121,7 @@ class StudentWorkspaceReconciler:
         *,
         repo: str | None = None,
         token: SecretStr | None = None,
+        progress: ProgressLease | None = None,
     ):
         if token is not None and repo is None:
             raise ValueError("authenticated reconciliation requires a GitHub repo")
@@ -115,6 +131,7 @@ class StudentWorkspaceReconciler:
             raise ValueError("repo must use owner/name form")
         self.workspace = workspace
         self.token = token
+        self.progress = progress
         self.remote = f"https://github.com/{repo}.git" if repo else "origin"
 
     def __call__(self, events: Sequence[ControllerEvent]) -> None:
@@ -222,12 +239,21 @@ class StudentWorkspaceReconciler:
         )
 
     def _fetch_refs(self, *refs: tuple[str, str]) -> None:
+        self._renew_lease(FETCH_TIMEOUT_SECONDS)
         fetch_refs(
             self.workspace,
             remote=self.remote,
             refs=refs,
             token=self.token,
+            timeout=FETCH_TIMEOUT_SECONDS,
         )
+
+    def _renew_lease(self, timeout: float) -> None:
+        if self.progress is not None:
+            self.progress.update(
+                "reconcile",
+                timeout + RECONCILE_LEASE_GRACE_SECONDS,
+            )
 
     def _commit_exists(self, sha: str) -> bool:
         return self._run(
@@ -300,6 +326,7 @@ class StudentWorkspaceReconciler:
         environment: dict[str, str] | None = None,
         timeout: int = 30,
     ) -> subprocess.CompletedProcess[str]:
+        self._renew_lease(timeout)
         return self._run_at(
             self.workspace,
             *arguments,
