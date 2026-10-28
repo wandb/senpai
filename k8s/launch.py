@@ -49,6 +49,11 @@ from senpai_agent.program_context import (
     load_program_system_prompt,
     normalize_program_path,
 )
+from senpai_agent.compaction import (
+    DEFAULT_COMPACTION_TRIGGER_EVENTS,
+    DEFAULT_COMPACTION_TRIGGER_TOKENS,
+    MIN_COMPACTION_TRIGGER_EVENTS,
+)
 from senpai_agent.custom_openai import (
     DEFAULT_MAX_OUTPUT_TOKENS as DEFAULT_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS,
     CustomOpenAIEndpoint,
@@ -181,7 +186,8 @@ class Args:
     fast_reasoning_effort: str = "medium"
     frontier_model: str = "anthropic/claude-opus-5-5"
     frontier_reasoning_effort: str = "max"
-    compaction_trigger_tokens: int = 200_000
+    compaction_trigger_tokens: int = DEFAULT_COMPACTION_TRIGGER_TOKENS  # input tokens that start provider-native or OpenHands compaction
+    compaction_trigger_events: int = DEFAULT_COMPACTION_TRIGGER_EVENTS  # model-visible events that start OpenHands compaction
     custom_openai_base_url: str = ""  # OpenAI-compatible chat-completions base URL for custom_openai/ models
     custom_openai_context_tokens: int = 0  # server window shared by input and output, e.g. vLLM --max-model-len
     custom_openai_max_output_tokens: int = DEFAULT_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS  # per-request output budget, including reasoning
@@ -300,18 +306,36 @@ def custom_openai_efforts(args: Args) -> list[str]:
 def validate_custom_openai_endpoint(args: Args) -> None:
     try:
         custom_openai_served_model(args)
-        CustomOpenAIEndpoint(
+        endpoint = CustomOpenAIEndpoint(
             base_url=args.custom_openai_base_url,
             context_tokens=args.custom_openai_context_tokens,
             max_output_tokens=args.custom_openai_max_output_tokens,
         )
     except ValueError as error:
         sys.exit(f"ERROR: {error}")
+    if args.compaction_trigger_tokens >= endpoint.max_input_tokens:
+        # The OpenHands condenser caps its token trigger at the model's input
+        # limit, so a trigger at or above it compacts only once the counted
+        # input already fills the server's window.
+        print(
+            f"WARNING: --compaction_trigger_tokens {args.compaction_trigger_tokens} "
+            "is not below the custom_openai input limit of "
+            f"{endpoint.max_input_tokens} tokens (custom_openai_context_tokens minus "
+            "custom_openai_max_output_tokens); the condenser compacts only when the "
+            "counted input already exceeds the window. Set it lower, for example "
+            "160000 on a 196608-token limit, so the token count has room to err.",
+            file=sys.stderr,
+        )
 
 
 def validate_model_config(args: Args) -> None:
     if args.compaction_trigger_tokens < 50_000:
         sys.exit("ERROR: --compaction_trigger_tokens must be at least 50000")
+    if args.compaction_trigger_events < MIN_COMPACTION_TRIGGER_EVENTS:
+        sys.exit(
+            "ERROR: --compaction_trigger_events must be at least "
+            f"{MIN_COMPACTION_TRIGGER_EVENTS}"
+        )
     for name, (model, effort) in deployed_model_profiles(args).items():
         model_provider(model)
         try:
@@ -334,6 +358,7 @@ def role_model_config(args: Args, role: str) -> dict[str, str]:
         "SENPAI_OPENHANDS_FRONTIER_MODEL": args.frontier_model,
         "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": args.frontier_reasoning_effort,
         "SENPAI_COMPACTION_TRIGGER_TOKENS": str(args.compaction_trigger_tokens),
+        "SENPAI_COMPACTION_TRIGGER_EVENTS": str(args.compaction_trigger_events),
     }
     if "custom_openai" in role_model_providers(args, role):
         config.update(

@@ -44,6 +44,7 @@ def test_default_config_exposes_every_model_profile_and_effort():
         "frontier_model": "anthropic/claude-opus-5-5",
         "frontier_reasoning_effort": "max",
         "compaction_trigger_tokens": 200_000,
+        "compaction_trigger_events": 400,
     }.items() <= config.items()
     assert config["program_path"] == ""
     assert "custom_secret_env_names" not in config
@@ -646,6 +647,7 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         frontier_model="openai/gpt-5.6-sol",
         frontier_reasoning_effort="max",
         compaction_trigger_tokens=180_000,
+        compaction_trigger_events=600,
     )
 
     advisor_config, _deployment, _secret = render_role("advisor", args)
@@ -665,6 +667,7 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         assert config["SENPAI_OPENHANDS_FRONTIER_MODEL"] == args.frontier_model
         assert config["SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT"] == "max"
         assert config["SENPAI_COMPACTION_TRIGGER_TOKENS"] == "180000"
+        assert config["SENPAI_COMPACTION_TRIGGER_EVENTS"] == "600"
 
 
 def test_launch_rejects_a_compaction_trigger_below_provider_minimum():
@@ -672,6 +675,50 @@ def test_launch_rejects_a_compaction_trigger_below_provider_minimum():
 
     with pytest.raises(SystemExit, match="must be at least 50000"):
         launch.validate_model_config(args)
+
+
+def test_launch_rejects_an_event_trigger_the_condenser_cannot_split():
+    args = launch_args(compaction_trigger_events=11)
+
+    with pytest.raises(SystemExit, match="must be at least 12"):
+        launch.validate_model_config(args)
+
+
+def custom_openai_launch_args(**overrides) -> launch.Args:
+    model = "custom_openai/served-model"
+    values = {
+        "student_model": model,
+        "student_reasoning_effort": "xhigh",
+        "smart_model": model,
+        "smart_reasoning_effort": "xhigh",
+        "fast_model": model,
+        "fast_reasoning_effort": "low",
+        "custom_openai_base_url": "https://inference.example.test/v1",
+        "custom_openai_context_tokens": 262_144,
+        "custom_openai_max_output_tokens": 65_536,
+    }
+    values.update(overrides)
+    return launch_args(**values)
+
+
+def test_launch_warns_when_the_token_trigger_is_not_below_the_input_limit(capsys):
+    # The SDK caps the condenser's trigger at the 196,608-token input limit, so
+    # the default 200000 would leave no headroom for token-count error.
+    launch.validate_model_config(
+        custom_openai_launch_args(compaction_trigger_tokens=200_000)
+    )
+
+    warning = capsys.readouterr().err
+    assert "WARNING: --compaction_trigger_tokens 200000" in warning
+    assert "input limit of 196608 tokens" in warning
+
+
+def test_launch_stays_quiet_when_the_token_trigger_leaves_headroom(capsys):
+    launch.validate_model_config(
+        custom_openai_launch_args(compaction_trigger_tokens=160_000)
+    )
+
+    assert capsys.readouterr().err == ""
 
 
 def test_openai_ultra_launch_value_is_rejected():

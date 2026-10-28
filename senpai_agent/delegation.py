@@ -170,6 +170,7 @@ class DelegationConfig:
     frontier_api_key_env: str
     frontier_api_key: str
     compaction_trigger_tokens: int
+    compaction_trigger_events: int
     github_repo: str
     github_trusted_actor: str | None
     role_file: Path
@@ -414,6 +415,9 @@ class OpenHandsChildProcess:
                 ),
                 "SENPAI_COMPACTION_TRIGGER_TOKENS": str(
                     self._config.compaction_trigger_tokens
+                ),
+                "SENPAI_COMPACTION_TRIGGER_EVENTS": str(
+                    self._config.compaction_trigger_events
                 ),
                 "SENPAI_PARENT_CONVERSATION_HISTORY_DIR": str(
                     self._config.state_dir

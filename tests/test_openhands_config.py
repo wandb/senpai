@@ -487,6 +487,42 @@ def test_compaction_trigger_tokens_reject_invalid_environment_values(
         resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
+def test_compaction_trigger_events_are_explicit_and_configurable(tmp_path):
+    default = resolve_config(
+        parse_runner_args(["--max-turns", "1"]),
+        runtime_env(tmp_path),
+    )
+    from_option = resolve_config(
+        parse_runner_args(
+            ["--max-turns", "1", "--compaction-trigger-events", "600"]
+        ),
+        runtime_env(tmp_path),
+    )
+    env = runtime_env(tmp_path)
+    env["SENPAI_COMPACTION_TRIGGER_EVENTS"] = "300"
+    from_env = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert default.compaction_trigger_events == 400
+    assert from_option.compaction_trigger_events == 600
+    assert from_env.compaction_trigger_events == 300
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [("eighty", "must be an integer"), ("11", "at least 12")],
+)
+def test_compaction_trigger_events_reject_invalid_environment_values(
+    tmp_path,
+    value,
+    message,
+):
+    env = runtime_env(tmp_path)
+    env["SENPAI_COMPACTION_TRIGGER_EVENTS"] = value
+
+    with pytest.raises(RuntimeError, match=message):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [

@@ -97,6 +97,7 @@ def delegation_config(tmp_path: Path, **updates) -> DelegationConfig:
         "frontier_api_key_env": "OPENAI_API_KEY",
         "frontier_api_key": "openai-secret",
         "compaction_trigger_tokens": 200_000,
+        "compaction_trigger_events": 400,
         "github_repo": "acme/widgets",
         "github_trusted_actor": None,
         "role_file": tmp_path / "ADVISOR.md",
@@ -243,6 +244,7 @@ def test_child_command_selects_agent_model_effort_and_credential(tmp_path: Path)
         config.frontier_reasoning_effort
     )
     assert fast.environment["SENPAI_COMPACTION_TRIGGER_TOKENS"] == "200000"
+    assert fast.environment["SENPAI_COMPACTION_TRIGGER_EVENTS"] == "400"
 
 
 def test_descendants_and_restarts_use_the_complete_parent_snapshot(tmp_path: Path):

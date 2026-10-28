@@ -72,6 +72,7 @@ WEAVE_PROJECT = initialize_weave_monitoring()
 
 from openhands.sdk import LLM, Agent, AgentContext, LocalConversation, Tool
 from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
+from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
 from openhands.sdk.event import ActionEvent, MessageEvent, ObservationEvent
 from openhands.sdk.llm import Message, TextContent
@@ -87,7 +88,6 @@ from openhands.sdk.subagent import (
     discover_agents,
 )
 from openhands.tools.preset.default import (
-    get_default_condenser,
     get_default_tools,
     register_default_tools,
 )
@@ -97,6 +97,12 @@ from simple_parsing import ArgumentParser, field
 from simple_parsing.helpers import flag
 
 from senpai_agent.agent_markdown import read_agent_markdown, strip_spdx_header
+from senpai_agent.compaction import (
+    CONDENSER_KEEP_FIRST,
+    DEFAULT_COMPACTION_TRIGGER_EVENTS,
+    DEFAULT_COMPACTION_TRIGGER_TOKENS,
+    MIN_COMPACTION_TRIGGER_EVENTS,
+)
 from senpai_agent.exa_tool import configure_exa_credentials
 from senpai_agent.github.tools import (
     clear_github_credentials,
@@ -138,7 +144,6 @@ DEFAULT_STUDENT_REASONING_EFFORT = "high"
 DEFAULT_SMART_REASONING_EFFORT = "xhigh"
 DEFAULT_FAST_REASONING_EFFORT = "medium"
 DEFAULT_FRONTIER_REASONING_EFFORT = "max"
-DEFAULT_COMPACTION_TRIGGER_TOKENS = 200_000
 WANDB_INFERENCE_BASE_URL = "https://api.inference.wandb.ai/v1"
 SENPAI_AGENT_NAMES = ("bash-runner", "general-purpose", "explore", "search", "supervisor")
 SENPAI_AGENT_DIR_ENV = "SENPAI_AGENT_DIR"
@@ -184,6 +189,10 @@ class RunnerArgs:
         default=None,
         alias="--compaction-trigger-tokens",
     )
+    compaction_trigger_events: int | None = field(
+        default=None,
+        alias="--compaction-trigger-events",
+    )
     workspace: str | None = field(default=None, alias="--workspace")
     state_dir: str | None = field(default=None, alias="--state-dir")
     conversation_id: str | None = field(default=None, alias="--conversation-id")
@@ -223,6 +232,7 @@ class RunnerConfig:
     frontier_api_key: SecretStr
     frontier_reasoning_effort: str
     compaction_trigger_tokens: int
+    compaction_trigger_events: int
     workspace: Path
     state_dir: Path
     conversation_id: uuid.UUID
@@ -728,6 +738,24 @@ def resolve_config(
             "SENPAI_COMPACTION_TRIGGER_TOKENS must be at least 50000"
         )
     try:
+        compaction_trigger_events = int(
+            args.compaction_trigger_events
+            if args.compaction_trigger_events is not None
+            else env.get(
+                "SENPAI_COMPACTION_TRIGGER_EVENTS",
+                str(DEFAULT_COMPACTION_TRIGGER_EVENTS),
+            )
+        )
+    except ValueError as error:
+        raise RuntimeError(
+            "SENPAI_COMPACTION_TRIGGER_EVENTS must be an integer"
+        ) from error
+    if compaction_trigger_events < MIN_COMPACTION_TRIGGER_EVENTS:
+        raise RuntimeError(
+            "SENPAI_COMPACTION_TRIGGER_EVENTS must be at least "
+            f"{MIN_COMPACTION_TRIGGER_EVENTS}"
+        )
+    try:
         inbox_max_stalled_attempts = int(
             env.get(
                 "SENPAI_INBOX_MAX_STALLED_ATTEMPTS",
@@ -958,6 +986,7 @@ def resolve_config(
         frontier_api_key=frontier_api_key,
         frontier_reasoning_effort=frontier_reasoning_effort,
         compaction_trigger_tokens=compaction_trigger_tokens,
+        compaction_trigger_events=compaction_trigger_events,
         workspace=workspace,
         state_dir=state_dir,
         conversation_id=(
@@ -1138,6 +1167,31 @@ def compaction_configuration(
             "anthropic_compaction_instructions": None,
         }
     return {}
+
+
+def local_condenser(
+    llm: LLM,
+    *,
+    trigger_tokens: int,
+    trigger_events: int,
+) -> LLMSummarizingCondenser | None:
+    """The OpenHands condenser for a model without provider-native compaction.
+
+    OpenAI stored Responses and Anthropic compaction manage context on the
+    server, so those agents run without a condenser. Every other model gets
+    the summarizing condenser, which compacts when the counted input exceeds
+    the token trigger (or the model's input limit, if that is smaller) or
+    when the conversation view holds more than the event trigger. The view
+    holds only what the model sees; hook executions do not count.
+    """
+    if llm.responses_use_previous_response_id or llm.uses_anthropic_compaction():
+        return None
+    return LLMSummarizingCondenser(
+        llm=llm.model_copy(update={"usage_id": "senpai-condenser"}),
+        max_tokens=trigger_tokens,
+        max_size=trigger_events,
+        keep_first=CONDENSER_KEEP_FIRST,
+    )
 
 
 def custom_openai_configuration(
@@ -1341,6 +1395,7 @@ def delegation_config(
         frontier_api_key_env=config.frontier_api_key_env,
         frontier_api_key=config.frontier_api_key.get_secret_value(),
         compaction_trigger_tokens=config.compaction_trigger_tokens,
+        compaction_trigger_events=config.compaction_trigger_events,
         github_repo=config.github_repo,
         github_trusted_actor=config.github_trusted_actor,
         role_file=config.role_file,
@@ -1774,6 +1829,7 @@ def run_openhands[ResponseT: BaseModel](
                 "frontier_model": config.frontier_model,
                 "frontier_reasoning_effort": config.frontier_reasoning_effort,
                 "compaction_trigger_tokens": config.compaction_trigger_tokens,
+                "compaction_trigger_events": config.compaction_trigger_events,
                 "prompt_cache": (
                     prompt_cache_configuration(config.model)
                     or {"provider_default": True}
@@ -1908,21 +1964,21 @@ def run_openhands[ResponseT: BaseModel](
                 project_skills,
             )
             agent = with_tool_concurrency(agent, MAX_PARALLEL_AGENTS)
-            if (
-                agent.llm.responses_use_previous_response_id
-                or agent.llm.uses_anthropic_compaction()
-            ):
-                agent = agent.model_copy(update={"condenser": None})
+            # The native loader attaches OpenHands' own small condenser.
+            agent = agent.model_copy(
+                update={
+                    "condenser": local_condenser(
+                        agent.llm,
+                        trigger_tokens=config.compaction_trigger_tokens,
+                        trigger_events=config.compaction_trigger_events,
+                    )
+                }
+            )
         else:
-            condenser = (
-                None
-                if (
-                    llm.responses_use_previous_response_id
-                    or llm.uses_anthropic_compaction()
-                )
-                else get_default_condenser(
-                    llm.model_copy(update={"usage_id": "senpai-condenser"})
-                )
+            condenser = local_condenser(
+                llm,
+                trigger_tokens=config.compaction_trigger_tokens,
+                trigger_events=config.compaction_trigger_events,
             )
             agent = Agent(
                 llm=llm,
