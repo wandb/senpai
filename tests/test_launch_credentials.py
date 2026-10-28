@@ -515,3 +515,183 @@ def test_student_name_preflight_checks_every_issue_page(monkeypatch):
 
     assert any("page=1" in request for request in requests)
     assert any("page=2" in request for request in requests)
+
+
+def scripted_urlopen(monkeypatch, *outcomes):
+    """Serve each urlopen call the next outcome: raise an exception, return anything else.
+
+    Sleeps between attempts are recorded instead of waited for.
+    """
+    calls = []
+    sleeps = []
+    remaining = list(outcomes)
+
+    def urlopen(request, timeout):
+        calls.append(request)
+        outcome = remaining.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(launch_helpers.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(launch_helpers.time, "sleep", sleeps.append)
+    return calls, sleeps
+
+
+def connect_timeout():
+    return urllib.error.URLError(TimeoutError("timed out"))
+
+
+def test_github_api_retries_a_connect_timeout_and_reports_it(monkeypatch, capsys):
+    calls, sleeps = scripted_urlopen(
+        monkeypatch, connect_timeout(), JSONResponse({"default_branch": "main"})
+    )
+
+    branch = launch_helpers.resolve_target_repo_branch(
+        "https://github.com/example/problem.git", "github-secret", ""
+    )
+
+    assert branch == "main"
+    assert len(calls) == 2
+    assert sleeps == [1.0]
+    out = capsys.readouterr().out
+    assert (
+        "GitHub API GET /repos/example/problem: timed out; "
+        "retrying in 1s (attempt 2 of 3)"
+    ) in out
+    assert "github-secret" not in out
+
+
+def test_github_api_gives_up_after_three_attempts(monkeypatch):
+    calls, sleeps = scripted_urlopen(
+        monkeypatch, connect_timeout(), connect_timeout(), connect_timeout()
+    )
+
+    with pytest.raises(urllib.error.URLError, match="timed out"):
+        launch_helpers.resolve_target_repo_branch(
+            "https://github.com/example/problem.git", "github-secret", ""
+        )
+
+    assert len(calls) == 3
+    assert sleeps == [1.0, 2.0]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        urllib.error.HTTPError(
+            "https://api.github.com/repos/example/problem",
+            404,
+            "Not Found",
+            {},
+            io.BytesIO(b'{"message":"Not Found"}'),
+        ),
+        urllib.error.URLError("unknown url type: example"),
+    ],
+    ids=["http-error-response", "url-error-without-a-socket-reason"],
+)
+def test_github_api_does_not_retry_answers_or_non_network_errors(monkeypatch, error):
+    calls, sleeps = scripted_urlopen(monkeypatch, error)
+
+    with pytest.raises(type(error)):
+        launch_helpers.resolve_target_repo_branch(
+            "https://github.com/example/problem.git", "github-secret", ""
+        )
+
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_github_api_does_not_retry_a_dropped_label_creation(monkeypatch):
+    missing_label = urllib.error.HTTPError(
+        "https://api.github.com/repos/example/problem/labels/status%3Awip",
+        404,
+        "Not Found",
+        {},
+        io.BytesIO(b'{"message":"Not Found"}'),
+    )
+    calls, sleeps = scripted_urlopen(monkeypatch, missing_label, connect_timeout())
+
+    with pytest.raises(urllib.error.URLError, match="timed out"):
+        launch_helpers.ensure_target_repo_labels(
+            "https://github.com/example/problem.git",
+            "github-secret",
+            {"status:wip": ("ededed", "work in progress")},
+        )
+
+    assert [call.get_method() for call in calls] == ["GET", "POST"]
+    assert sleeps == []
+
+
+def test_repo_access_write_probe_retries_a_dropped_connection(monkeypatch, capsys):
+    validation_error = urllib.error.HTTPError(
+        "https://api.github.com/repos/example/problem/git/refs",
+        422,
+        "Unprocessable Entity",
+        {},
+        io.BytesIO(b'{"message":"Object does not exist"}'),
+    )
+    calls, sleeps = scripted_urlopen(
+        monkeypatch,
+        urllib.error.URLError(ConnectionResetError(54, "Connection reset by peer")),
+        validation_error,
+    )
+
+    launch_helpers.preflight_check_target_repo_access(
+        "https://github.com/example/problem.git", "github-secret"
+    )
+
+    assert [call.get_method() for call in calls] == ["POST", "POST"]
+    assert sleeps == [1.0]
+    out = capsys.readouterr().out
+    assert "Connection reset by peer; retrying in 1s (attempt 2 of 3)" in out
+    assert "OK — token has Contents write access to example/problem" in out
+
+
+def test_api_key_preflight_retries_a_read_timeout_then_authenticates(
+    monkeypatch, capsys
+):
+    calls, sleeps = scripted_urlopen(
+        monkeypatch, TimeoutError("timed out"), JSONResponse({"data": []})
+    )
+
+    launch_helpers.preflight_check_openai_api_key("openai-secret")
+
+    assert len(calls) == 2
+    assert sleeps == [1.0]
+    out = capsys.readouterr().out
+    assert "OpenAI API key: timed out; retrying in 1s (attempt 2 of 3)" in out
+    assert "OK — OpenAI API key authenticated" in out
+    assert "openai-secret" not in out
+
+
+def test_api_key_preflight_keeps_its_exit_message_after_exhausting_retries(
+    monkeypatch,
+):
+    calls, sleeps = scripted_urlopen(
+        monkeypatch, connect_timeout(), connect_timeout(), connect_timeout()
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        launch_helpers.preflight_check_anthropic_api_key("anthropic-secret")
+
+    assert str(raised.value) == "ERROR: Anthropic API key failed: timed out"
+    assert len(calls) == 3
+    assert sleeps == [1.0, 2.0]
+
+
+def test_wandb_preflight_retries_a_refused_connection(monkeypatch, capsys):
+    calls, sleeps = scripted_urlopen(
+        monkeypatch,
+        urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")),
+        JSONResponse({"data": {"viewer": {"id": "viewer-id"}}}),
+    )
+
+    launch_helpers.preflight_check_wandb_api_key("wandb-secret")
+
+    assert len(calls) == 2
+    assert sleeps == [1.0]
+    out = capsys.readouterr().out
+    assert "W&B API key: [Errno 61] Connection refused; retrying in 1s" in out
+    assert "OK — W&B API key authenticated" in out
+    assert "wandb-secret" not in out
