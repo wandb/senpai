@@ -84,6 +84,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The default docker driver exports the finished image into the daemon's
+      # store before pushing. With a base image this large that export died
+      # silently twice on 2026-10-28, so BuildKit pushes straight to GHCR.
+      - name: Set up a BuildKit builder
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -93,6 +99,9 @@ jobs:
           push: true
           pull: true
           no-cache: true
+          # Keep the published image a plain manifest, as earlier builds were.
+          provenance: false
+          sbom: false
           build-args: |
             BASE_IMAGE=${{ env.BASE_IMAGE }}
             TARGET_PYTHON=${{ env.BASE_PYTHON }}
