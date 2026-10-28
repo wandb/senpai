@@ -2418,7 +2418,7 @@ wheels = [
 [[package]]
 name = "openhands-sdk"
 version = "1.58.2"
-source = { git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-sdk&rev=20e08f61fc3f4ea5fd197ca88f3d6a7cb566e038#20e08f61fc3f4ea5fd197ca88f3d6a7cb566e038" }
+source = { git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-sdk&rev=e899135f98444f7bfe08441311a6f5e565d97b39#e899135f98444f7bfe08441311a6f5e565d97b39" }
 dependencies = [
     { name = "agent-client-protocol", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "certifi", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -2443,7 +2443,7 @@ dependencies = [
 [[package]]
 name = "openhands-tools"
 version = "1.58.2"
-source = { git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-tools&rev=20e08f61fc3f4ea5fd197ca88f3d6a7cb566e038#20e08f61fc3f4ea5fd197ca88f3d6a7cb566e038" }
+source = { git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-tools&rev=e899135f98444f7bfe08441311a6f5e565d97b39#e899135f98444f7bfe08441311a6f5e565d97b39" }
 dependencies = [
     { name = "binaryornot", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "browser-use", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -6095,8 +6095,8 @@ requires-dist = [
     { name = "litellm", specifier = ">=1.102.1" },
     { name = "matplotlib" },
     { name = "numpy" },
-    { name = "openhands-sdk", git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-sdk&rev=20e08f61fc3f4ea5fd197ca88f3d6a7cb566e038" },
-    { name = "openhands-tools", git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-tools&rev=20e08f61fc3f4ea5fd197ca88f3d6a7cb566e038" },
+    { name = "openhands-sdk", git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-sdk&rev=e899135f98444f7bfe08441311a6f5e565d97b39" },
+    { name = "openhands-tools", git = "https://github.com/morganmcg1/software-agent-sdk.git?subdirectory=openhands-tools&rev=e899135f98444f7bfe08441311a6f5e565d97b39" },
     { name = "pandas" },
     { name = "psutil" },
     { name = "pytest", marker = "extra == 'dev'" },
