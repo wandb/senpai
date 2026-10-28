@@ -313,6 +313,28 @@ def test_restart_keeps_the_record_of_a_run_that_died_with_its_supervisor(
     assert "exit status is unknown" in recovered.error_tail
 
 
+def test_restart_recovers_a_run_whose_log_is_gone(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    state_dir = tmp_path / "state"
+    workspace.mkdir()
+    state_dir.mkdir()
+    orphan = TrainingResult(
+        training_id="5b0c1f3e-7d2a-4e8b-9c6d-1f2a3b4c5d6e",
+        state=TrainingState.RUNNING,
+        exit_code=None,
+        elapsed_seconds=12,
+        log_path=str(state_dir / "orphan.log"),
+    )
+    (state_dir / f"{orphan.training_id}.json").write_text(orphan.model_dump_json())
+
+    supervisor = TrainingSupervisor(workspace=workspace, state_dir=state_dir)
+
+    recovered = supervisor.get_training_status(orphan.training_id)
+    assert recovered.state is TrainingState.FAILED
+    assert recovered.elapsed_seconds == 12
+    assert recovered.error_tail.startswith("Training stopped when its supervisor")
+
+
 def test_restart_does_not_signal_a_reused_pid(tmp_path: Path):
     workspace = tmp_path / "workspace"
     state_dir = tmp_path / "state"

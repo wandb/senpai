@@ -258,7 +258,11 @@ class TrainingSupervisor:
                     f"last recorded running {elapsed_seconds:.0f} s after it "
                     "started; its exit status is unknown and no signal was sent."
                 )
-            log_tail = _read_tail(Path(result.log_path), _ERROR_TAIL_BYTES).rstrip()
+            try:
+                log_tail = _read_tail(Path(result.log_path), _ERROR_TAIL_BYTES).rstrip()
+            except OSError:
+                # A lost log must not keep the supervisor from starting.
+                log_tail = ""
             self._write_result(
                 result.model_copy(
                     update={
