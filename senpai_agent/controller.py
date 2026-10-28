@@ -47,6 +47,7 @@ from senpai_agent.monitor import (
     WandbMetricSource,
 )
 from senpai_agent.PROMPTS import (
+    ASSIGNMENT_SUPERSEDED_PROMPT,
     CONTEXT_RECOVERY_PROMPT,
     CONTINUATION_CONTROLLER_PROMPT,
     INITIAL_CONTROLLER_PROMPT,
@@ -70,6 +71,7 @@ _EDGE_TRIGGERED_EVENT_KINDS = EXACT_ONCE_EVENT_KINDS | {
     "research_base_changed",
     "student_assignment_comment",
 }
+_SUPERSEDED_NOTICE_PREFIX = "assignment_superseded:"
 _ACTIVITY_LEASE_RENEWAL_SECONDS = 30
 _LLM_PROVIDER_COOLDOWN_SECONDS = (30.0, 60.0, 120.0, 240.0, 300.0)
 
@@ -318,6 +320,7 @@ class OpenHandsTurnRunner:
 
         store_path = local_event_db_path(config)
         map_event = None
+        notice = None
         if config.role == "student":
             registry = AssignmentConversationRegistry(
                 config.state_dir / "student-conversations.json"
@@ -327,6 +330,14 @@ class OpenHandsTurnRunner:
                 conversation_id=conversation_id,
                 registry=registry,
             )
+            assigned = registry.assigned()
+            superseded = registry.key_of(conversation_id)
+            # Stale feedback or monitor signals can resume a superseded
+            # conversation long after its replacement was routed.
+            if superseded in assigned[:-1]:
+                notice = _superseded_notice(
+                    conversation_id, superseded, assigned[-1]
+                )
 
         # A late watcher event may still be pending locally when the next
         # controller prompt carries that same GitHub event. The prompt is the
@@ -334,20 +345,58 @@ class OpenHandsTurnRunner:
         with LocalEventStore(store_path) as store:
             for event_key in event_keys:
                 store.acknowledge(event_key)
-        with ActiveGitHubWatcher(
-            self.github_mailbox,
-            store_path,
-            known_keys=visible_event_keys | event_keys,
-            poll_interval_seconds=self.active_poll_interval_seconds,
-            map_event=map_event,
-        ) as watcher:
-            exit_code = run_turn()
-        with LocalEventStore(store_path) as store:
-            delivered = store.acknowledged(tuple(watcher.enqueued_keys))
+            if notice is not None:
+                store.enqueue(notice)
+        try:
+            with ActiveGitHubWatcher(
+                self.github_mailbox,
+                store_path,
+                known_keys=visible_event_keys | event_keys,
+                poll_interval_seconds=self.active_poll_interval_seconds,
+                map_event=map_event,
+            ) as watcher:
+                exit_code = run_turn()
+            with LocalEventStore(store_path) as store:
+                delivered = store.acknowledged(tuple(watcher.enqueued_keys))
+        finally:
+            _discard_superseded_notices(store_path, inbox, conversation_id)
         return TurnResult(
             exit_code=exit_code,
             delivered_event_keys=frozenset(delivered),
         )
+
+
+def _superseded_notice(
+    conversation_id: UUID, superseded: str, current: str
+) -> LocalEvent:
+    return LocalEvent(
+        kind="assignment_superseded",
+        dedupe_key=f"{_SUPERSEDED_NOTICE_PREFIX}{conversation_id}:{current}",
+        payload={
+            "superseded_assignment_revision": superseded,
+            "current_assignment_revision": current,
+            "instruction": ASSIGNMENT_SUPERSEDED_PROMPT,
+            "parent_conversation_id": str(conversation_id),
+        },
+    )
+
+
+def _discard_superseded_notices(
+    store_path: Path,
+    inbox: PersistentInbox | None,
+    conversation_id: UUID,
+) -> None:
+    """Drop superseded-assignment notices once the turn they steered has ended.
+
+    The event pump moves a notice into the persistent inbox and attaches it to
+    the running turn. One it could not attach, because that turn was already
+    full, must not start a turn of its own later.
+    """
+
+    with LocalEventStore(store_path) as store:
+        store.discard_prefix(_SUPERSEDED_NOTICE_PREFIX)
+    if inbox is not None:
+        inbox.retract_pending_prefix(conversation_id, _SUPERSEDED_NOTICE_PREFIX)
 
 
 def _student_live_event(
@@ -356,6 +405,14 @@ def _student_live_event(
     conversation_id: UUID,
     registry: AssignmentConversationRegistry,
 ) -> LocalEvent | None:
+    if event.kind == "student_assignment":
+        # The new assignment runs in its own conversation after this turn ends;
+        # tell a superseded assignment's running turn to stop instead of acting on it.
+        current = f"{event.payload['assignment_id']}:{event.payload['revision_id']}"
+        running = registry.key_of(conversation_id)
+        if running == current or running not in registry.assigned():
+            return None
+        return _superseded_notice(conversation_id, running, current)
     if event.kind == "student_pr_feedback":
         target = registry.for_assignment(
             str(event.payload["assignment_id"]),
@@ -991,6 +1048,13 @@ def controller_main(
         runner_config.state_dir / "delivery-inbox.sqlite3",
         legacy_path=runner_config.state_dir / "pending-message-deliveries.json",
     )
+    registry = (
+        AssignmentConversationRegistry(
+            runner_config.state_dir / "student-conversations.json"
+        )
+        if role == "student"
+        else None
+    )
     github_mailbox = GitHubMailbox(
         repo=runner_config.github_repo,
         token=runner_config.github_token,
@@ -1006,6 +1070,7 @@ def controller_main(
             if role == "student"
             else None
         ),
+        conversation_registry=registry,
     )
     mailbox: Mailbox = github_mailbox
     active_github_mailbox: Mailbox = github_mailbox
@@ -1042,10 +1107,7 @@ def controller_main(
                 monitor_store,
             ),
         )
-        registry = AssignmentConversationRegistry(
-            runner_config.state_dir / "student-conversations.json"
-        )
-        conversation_selector = StudentConversationSelector(registry)
+        conversation_selector = StudentConversationSelector(registry, monitor_store)
         reconcile = StudentWorkspaceReconciler(
             runner_config.workspace,
             repo=runner_config.github_repo,

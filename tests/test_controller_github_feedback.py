@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from uuid import UUID
 
@@ -6,6 +7,7 @@ from pydantic import SecretStr
 
 from senpai_agent.controller import Controller, TurnResult
 from senpai_agent.github.mailbox import GitHubMailbox
+from senpai_agent.github.mailbox.ledger import read_feedback_ledger
 from senpai_agent.inbox import PersistentInbox
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.models import (
@@ -74,6 +76,7 @@ def student_mailbox(
     feedback_batch_events=8,
     feedback_batch_bytes=32_000,
     trusted_actor="morganmcg1",
+    conversation_registry=None,
 ):
     assignment = AssignmentRecord(
         repo="acme/widgets",
@@ -122,6 +125,7 @@ def student_mailbox(
         feedback_path=feedback_path,
         feedback_batch_events=feedback_batch_events,
         feedback_batch_bytes=feedback_batch_bytes,
+        conversation_registry=conversation_registry,
     )
     monkeypatch.setattr(mailbox, "_pulls", lambda: [assigned_pull])
     monkeypatch.setattr(mailbox, "_issues", list)
@@ -995,4 +999,113 @@ def test_long_feedback_keeps_actionable_head_tail_and_source_link(monkeypatch):
     assert event.payload["message_truncated"] is True
     assert event.payload["full_message_instruction"] == (
         "Open feedback_url to read the omitted text."
+    )
+
+
+def revision_feedback(feedback_id, revision_id, message):
+    marker = render_assignment_feedback_marker(
+        AssignmentFeedbackRecord(
+            repo="acme/widgets",
+            pr_number=17,
+            assignment_id="assignment-17",
+            revision_id=revision_id,
+            feedback_id=f"guidance-{feedback_id}",
+        )
+    )
+    return feedback(
+        feedback_id,
+        f"{marker}\n\n{message}",
+        association="NONE",
+        user_type="Bot",
+        created_at=f"2026-07-29T18:{feedback_id % 60:02d}:00Z",
+    )
+
+
+def revision_history_responses():
+    return feedback_responses(
+        issue_comments=[
+            revision_feedback(201, "revision-1", "Revision one guidance."),
+            revision_feedback(202, "revision-1", "More revision one guidance."),
+            revision_feedback(203, "revision-2", "Revision two guidance."),
+            revision_feedback(204, "revision-3", "Revision three guidance."),
+        ]
+    )
+
+
+def test_replaced_student_resumes_the_current_revision_without_replaying_history(
+    monkeypatch,
+    tmp_path: Path,
+):
+    registry = AssignmentConversationRegistry(tmp_path / "students.json")
+    mailbox = student_mailbox(
+        monkeypatch,
+        revision_history_responses(),
+        revision_id="revision-3",
+        feedback_path=tmp_path / "github-feedback.json",
+        trusted_actor="MorganMcG1",
+        conversation_registry=registry,
+    )
+
+    events = mailbox.poll()
+
+    assert [event.kind for event in events] == [
+        "student_assignment",
+        "student_pr_feedback",
+    ]
+    assert events[1].payload["message"] == "Revision three guidance."
+    ledger = read_feedback_ledger(mailbox)
+    assert sorted(
+        (binding.revision_id, binding.acknowledged) for binding in ledger.values()
+    ) == [
+        ("revision-1", True),
+        ("revision-1", True),
+        ("revision-2", True),
+        ("revision-3", False),
+    ]
+
+    turns = Turns()
+    run_student_controller(tmp_path, mailbox, turns)
+
+    current = registry.for_assignment("assignment-17", "revision-3")
+    assert [call[1] for call in turns.calls] == [current]
+    assert json.loads(registry.path.read_text()) == {
+        "assignment-17:revision-3": str(current)
+    }
+
+
+def test_student_with_state_delivers_prior_feedback_only_to_revisions_it_ran(
+    monkeypatch,
+    tmp_path: Path,
+):
+    registry = AssignmentConversationRegistry(tmp_path / "students.json")
+    previous = registry.for_assignment("assignment-17", "revision-2")
+    mailbox = student_mailbox(
+        monkeypatch,
+        revision_history_responses(),
+        revision_id="revision-3",
+        feedback_path=tmp_path / "github-feedback.json",
+        trusted_actor="MorganMcG1",
+        conversation_registry=registry,
+    )
+
+    events = mailbox.poll()
+
+    assert [
+        (event.kind, event.payload["revision_id"]) for event in events
+    ] == [("student_pr_feedback", "revision-2")]
+
+    turns = Turns()
+    run_student_controller(tmp_path, mailbox, turns)
+
+    current = registry.for_assignment("assignment-17", "revision-3")
+    assert [call[1] for call in turns.calls] == [previous, current]
+    assert [
+        sorted(key.split(":", 1)[0] for key in event_keys)
+        for _, _, event_keys, _ in turns.calls
+    ] == [
+        ["student_pr_feedback"],
+        ["student_assignment", "student_pr_feedback"],
+    ]
+    assert not any(
+        event.kind == "student_pr_feedback" for event in mailbox.poll()
     )

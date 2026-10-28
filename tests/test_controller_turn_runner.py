@@ -27,7 +27,12 @@ from senpai_agent.controller import (
 )
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.github.mailbox import ActiveGitHubWatcher
-from senpai_agent.inbox import DeliveryState, PersistentInbox, deliver_turn_messages
+from senpai_agent.inbox import (
+    MAX_EVENTS_PER_TURN,
+    DeliveryState,
+    PersistentInbox,
+    deliver_turn_messages,
+)
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.state import AssignmentConversationRegistry
@@ -57,6 +62,21 @@ def feedback_event(revision_id="revision-2"):
             "assignment_id": "assignment-17",
             "revision_id": revision_id,
             "message": f"Feedback for {revision_id}.",
+        },
+    )
+
+
+def assignment_event(revision_id, assignment_id="assignment-17", number=17):
+    return ControllerEvent(
+        kind="student_assignment",
+        dedupe_key=(
+            f"student_assignment:v2:{number}:{assignment_id}:{revision_id}:abc"
+        ),
+        payload={
+            "number": number,
+            "url": f"https://github.test/acme/widgets/pull/{number}",
+            "assignment_id": assignment_id,
+            "revision_id": revision_id,
         },
     )
 
@@ -227,6 +247,289 @@ def test_running_student_receives_only_feedback_bound_to_its_conversation(
         assert store.pending() == []
 
 
+@pytest.mark.parametrize(
+    "incoming",
+    [
+        assignment_event("revision-3"),
+        assignment_event("revision-1", assignment_id="assignment-21", number=21),
+    ],
+    ids=["new-revision", "new-pull-request"],
+)
+def test_running_student_is_told_when_a_new_assignment_supersedes_it(
+    tmp_path: Path,
+    monkeypatch,
+    incoming,
+):
+    state_dir = tmp_path / "state"
+    registry = AssignmentConversationRegistry(
+        state_dir / "student-conversations.json"
+    )
+    conversation_id = registry.assign("assignment-17", "revision-2")
+    current = f"{incoming.payload['assignment_id']}:{incoming.payload['revision_id']}"
+    messages = []
+
+    def run_openhands(_prompt, config):
+        class Conversation:
+            def send_message(self, message):
+                messages.append(message)
+
+        with LocalEventStore(
+            state_dir / "student-events.sqlite3"
+        ) as store, AdvisorEventPump(
+            store,
+            Conversation(),
+            poll_interval=0.001,
+            parent_conversation_id=str(config.conversation_id),
+        ):
+            deadline = time.monotonic() + 1
+            while not messages and time.monotonic() < deadline:
+                time.sleep(0.001)
+        return 0
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+
+    result = OpenHandsTurnRunner(
+        Config("student", state_dir, conversation_id),
+        full_prompt="student initial controller context",
+        github_mailbox=Mailbox((assignment_event("revision-2"), incoming)),
+        active_poll_interval_seconds=0.001,
+    ).run(
+        "current student turn",
+        conversation_id=conversation_id,
+        event_keys=frozenset(),
+    )
+
+    assert len(messages) == 1
+    assert "assignment_superseded" in messages[0]
+    assert (
+        '"superseded_assignment_revision": "assignment-17:revision-2"'
+        in messages[0]
+    )
+    assert f'"current_assignment_revision": "{current}"' in messages[0]
+    assert "finish this turn" in messages[0]
+    assert result.delivered_event_keys == frozenset(
+        {f"assignment_superseded:{conversation_id}:{current}"}
+    )
+
+
+def test_resumed_superseded_conversation_is_told_to_finish(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    registry = AssignmentConversationRegistry(
+        state_dir / "student-conversations.json"
+    )
+    superseded = registry.assign("assignment-17", "revision-2")
+    current = registry.assign("assignment-21", "revision-1")
+    human_thread = registry.for_assignment("human-issue-4", "thread")
+    store_path = state_dir / "student-events.sqlite3"
+    routed = assignment_event("revision-1", assignment_id="assignment-21", number=21)
+    pending_at_start = {}
+
+    def run_openhands(_prompt, config):
+        with LocalEventStore(store_path) as store:
+            pending_at_start[config.conversation_id] = store.pending()
+        return 0
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+    runner = OpenHandsTurnRunner(
+        Config("student", state_dir, superseded),
+        full_prompt="student initial controller context",
+        github_mailbox=Mailbox((routed,)),
+        active_poll_interval_seconds=0.001,
+    )
+
+    # A stale monitor signal resumes the superseded conversation after the
+    # current assignment was already routed and is no longer a new event.
+    for conversation_id in (superseded, current, human_thread):
+        runner.run(
+            "training monitor signal",
+            conversation_id=conversation_id,
+            event_keys=frozenset(),
+            visible_event_keys=frozenset({routed.dedupe_key}),
+        )
+
+    (notice,) = pending_at_start[superseded]
+    assert notice.kind == "assignment_superseded"
+    assert notice.payload["superseded_assignment_revision"] == (
+        "assignment-17:revision-2"
+    )
+    assert notice.payload["current_assignment_revision"] == "assignment-21:revision-1"
+    assert notice.payload["parent_conversation_id"] == str(superseded)
+    assert pending_at_start[current] == []
+    assert pending_at_start[human_thread] == []
+    with LocalEventStore(store_path) as store:
+        assert store.pending() == []
+
+
+def test_superseded_notice_does_not_outlive_the_running_turn(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    registry = AssignmentConversationRegistry(
+        state_dir / "student-conversations.json"
+    )
+    conversation_id = registry.assign("assignment-17", "revision-2")
+    store_path = state_dir / "student-events.sqlite3"
+
+    def run_openhands(_prompt, _config):
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            with LocalEventStore(store_path) as store:
+                if store.pending_count():
+                    break
+            time.sleep(0.001)
+        return 0
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+
+    result = OpenHandsTurnRunner(
+        Config("student", state_dir, conversation_id),
+        full_prompt="student initial controller context",
+        github_mailbox=Mailbox((assignment_event("revision-3"),)),
+        active_poll_interval_seconds=0.001,
+    ).run(
+        "student turn",
+        conversation_id=conversation_id,
+        event_keys=frozenset(),
+    )
+
+    assert result.delivered_event_keys == frozenset()
+    with LocalEventStore(store_path) as store:
+        assert store.pending() == []
+
+
+def superseded_inbox_turn(tmp_path: Path, *, queued_events: int):
+    """A superseded conversation's turn, built the way the controller builds it."""
+
+    state_dir = tmp_path / "state"
+    registry = AssignmentConversationRegistry(
+        state_dir / "student-conversations.json"
+    )
+    superseded = registry.assign("assignment-17", "revision-2")
+    registry.assign("assignment-21", "revision-1")
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    for index in range(queued_events):
+        inbox.enqueue(superseded, f"event:{index}", f"queued event {index}")
+    turn = inbox.next_turn(superseded, "student controller prompt")
+    assert turn is not None
+    return state_dir, superseded, inbox, turn
+
+
+def run_turn_through_inbox_pump(monkeypatch, state_dir, inbox, *, until):
+    """Stand in for run_openhands with the production inbox-backed event pump."""
+
+    seen = {}
+
+    def run_openhands(_prompt, config, **kwargs):
+        turn_id = kwargs["inbox_turn_id"]
+        with LocalEventStore(
+            state_dir / "student-events.sqlite3"
+        ) as store, AdvisorEventPump(
+            store,
+            SimpleNamespace(),
+            poll_interval=0.001,
+            parent_conversation_id=str(config.conversation_id),
+            inbox=inbox,
+            conversation_id=config.conversation_id,
+        ):
+            deadline = time.monotonic() + 1
+            while not until(turn_id) and time.monotonic() < deadline:
+                time.sleep(0.001)
+        seen["attached"] = inbox.turn(turn_id).event_keys
+        seen["unattached"] = inbox.pending_count(config.conversation_id)
+        for message in inbox.turn(turn_id).messages:
+            if message.state is DeliveryState.PENDING:
+                inbox.record_delivered(message.delivery_id, message.body)
+        inbox.record_processed(turn_id)
+        return 0
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+    return seen
+
+
+def test_superseded_notice_steers_the_running_turn_through_the_inbox(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir, superseded, inbox, turn = superseded_inbox_turn(
+        tmp_path, queued_events=1
+    )
+    notice_key = f"assignment_superseded:{superseded}:assignment-21:revision-1"
+    seen = run_turn_through_inbox_pump(
+        monkeypatch,
+        state_dir,
+        inbox,
+        until=lambda turn_id: notice_key in inbox.turn(turn_id).event_keys,
+    )
+
+    result = OpenHandsTurnRunner(
+        Config("student", state_dir, superseded),
+        full_prompt="student initial controller context",
+        github_mailbox=Mailbox(()),
+        active_poll_interval_seconds=0.001,
+    ).run(
+        turn.prompt.body,
+        conversation_id=superseded,
+        event_keys=frozenset(turn.event_keys),
+        inbox=inbox,
+        inbox_turn_id=turn.turn_id,
+    )
+
+    assert result.exit_code == 0
+    assert seen["attached"] == ("event:0", notice_key)
+    assert seen["unattached"] == 0
+    processed = inbox.turn(turn.turn_id)
+    assert processed.state is DeliveryState.PROCESSED
+    notice = next(
+        message for message in processed.events if message.event_key == notice_key
+    )
+    assert "finish this turn" in notice.body
+    assert inbox.pending_count(superseded) == 0
+    with LocalEventStore(state_dir / "student-events.sqlite3") as store:
+        assert store.pending() == []
+
+
+def test_superseded_notice_a_full_turn_cannot_take_is_retracted_with_it(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir, superseded, inbox, turn = superseded_inbox_turn(
+        tmp_path, queued_events=MAX_EVENTS_PER_TURN
+    )
+    notice_key = f"assignment_superseded:{superseded}:assignment-21:revision-1"
+    seen = run_turn_through_inbox_pump(
+        monkeypatch,
+        state_dir,
+        inbox,
+        until=lambda _turn_id: inbox.pending_count(superseded) == 1,
+    )
+
+    result = OpenHandsTurnRunner(
+        Config("student", state_dir, superseded),
+        full_prompt="student initial controller context",
+        github_mailbox=Mailbox(()),
+        active_poll_interval_seconds=0.001,
+    ).run(
+        turn.prompt.body,
+        conversation_id=superseded,
+        event_keys=frozenset(turn.event_keys),
+        inbox=inbox,
+        inbox_turn_id=turn.turn_id,
+    )
+
+    assert result.exit_code == 0
+    # The pump moved the notice into the inbox, but the full turn could not take it.
+    assert notice_key not in seen["attached"]
+    assert seen["unattached"] == 1
+    # It must not become this superseded conversation's next turn.
+    assert inbox.pending_count(superseded) == 0
+    inbox.acknowledge(turn.turn_id)
+    assert inbox.next_turn(superseded, "student continuation prompt") is None
+
+
 @pytest.mark.parametrize("incoming", [feedback_event(), human_issue_event()])
 def test_observed_student_input_routes_to_the_active_pump_until_it_is_delivered(
     tmp_path: Path,
@@ -237,7 +540,7 @@ def test_observed_student_input_routes_to_the_active_pump_until_it_is_delivered(
     registry = AssignmentConversationRegistry(
         state_dir / "student-conversations.json"
     )
-    conversation_id = registry.for_assignment("assignment-17", "revision-2")
+    conversation_id = registry.assign("assignment-17", "revision-2")
     store_path = state_dir / "student-events.sqlite3"
 
     def run_openhands(_prompt, _config):
