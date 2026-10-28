@@ -152,16 +152,23 @@ def parse_request(body: str) -> SupervisorEnvelope | None:
 
 
 def _assignment(
-    workflow: GitHubWorkflow, request: SupervisorRequest, advisor_branch: str
+    workflow: GitHubWorkflow,
+    request: SupervisorRequest,
+    advisor_branch: str,
+    *,
+    allow_newer_head: bool = False,
 ):
     if request.assignment is None:
         return None
     version = request.assignment
+    head_sha = version.expected_pr_head_sha
+    if allow_newer_head:
+        head_sha = workflow._pull_head_containing(version.pr_number, head_sha)
     pull, assignment = workflow._routed_assignment_at_head(
         version.pr_number,
         assignment_id=version.assignment_id,
         revision_id=version.revision_id,
-        expected_head_sha=version.expected_pr_head_sha,
+        expected_head_sha=head_sha,
         allowed_statuses=frozenset({"status:wip", "status:review"}),
     )
     if pull.base_ref != advisor_branch:
@@ -310,7 +317,10 @@ class SupervisorGateway:
         config = self.config
         if request.target != self.recipient:
             raise PermissionError("Supervisor request targets a different pod")
-        assignment = _assignment(self.workflow, request, config.advisor_branch)
+        # A queued repair accepts commits pushed after its request.
+        assignment = _assignment(
+            self.workflow, request, config.advisor_branch, allow_newer_head=True
+        )
         branch = (
             assignment.head_ref if config.role == "student" else config.advisor_branch
         )
@@ -319,13 +329,8 @@ class SupervisorGateway:
                 "Supervisor repair requires the target's current checkout; no branch will be switched"
             )
         if config.role == "student":
-            run_git(
-                config.workspace,
-                "merge-base",
-                "--is-ancestor",
-                request.assignment.expected_pr_head_sha,
-                "HEAD",
-            )
+            requested = request.assignment.expected_pr_head_sha
+            run_git(config.workspace, "merge-base", "--is-ancestor", requested, "HEAD")
 
     def prepare(self, envelope: SupervisorEnvelope) -> str:
         request = envelope.request
@@ -391,10 +396,5 @@ class SupervisorGateway:
             not delivered_locally or issue["state"] == "closed"
         ):
             return
-        workflow._update_issue(
-            issue_number,
-            {
-                "body": body,
-                **({"state": "closed"} if delivered_locally else {}),
-            },
-        )
+        closed = {"state": "closed"} if delivered_locally else {}
+        workflow._update_issue(issue_number, {"body": body, **closed})

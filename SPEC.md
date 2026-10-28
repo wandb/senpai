@@ -708,11 +708,16 @@ the delegated completion event. Comment failures are included in that outcome. T
 other work and use `agent_status` or `cancel_agents` with the returned task ID.
 
 `request_supervisor` binds a repair Issue to its repository, advisor branch,
-recipient and current student assignment. The target controller pauses turns
-and checkout reconciliation while one fresh `smart` child runs through the
-existing delegation registry. Active children or training, stale assignments
-and holds block repair. A verified Pydantic result resumes the original
-conversation once, after assignment and head checks; failure leaves quarantine
+recipient and current student assignment, including the exact PR head at
+request time. The target controller pauses turns and checkout reconciliation
+while one fresh `smart` child runs through the existing delegation registry.
+Active children or training, stale assignments and holds block repair. Before
+the repair and again before resuming, the PR head may only have moved forward:
+GitHub's compare API must show that it contains the requested head, because an
+advisor checkout may lack the student's commits. Routing, revision and status
+are checked at that live head, and a student checkout must still contain the
+requested head. Any other head change fails the repair. A verified Pydantic
+result resumes the original conversation once; failure leaves quarantine
 intact. Saved outcomes survive publication retries. Cross-pod result Issues
 close after the requester stores the reply locally; inbox processing and
 acknowledgement need no GitHub access. Polling covers pending work. Repairs add

@@ -17,6 +17,7 @@ from senpai_agent.github.pull_authorization import authorized_pulls
 from senpai_agent.github.workflow.errors import (
     GitHubAPIError,
     GitHubTransportError,
+    PullHeadMismatchError,
     ReconciliationError,
     WorkflowPreconditionError,
 )
@@ -181,6 +182,21 @@ class WorkflowCore:
         snapshot = self.pull_request(number)
         require_head(snapshot, expected_head_sha)
         return snapshot
+
+    def _pull_head_containing(self, number: int, sha: str) -> str:
+        """Return the live PR head after GitHub proves it descends from ``sha``."""
+        head_sha = self.pull_request(number).head_sha
+        if head_sha != sha:
+            comparison = self._request(
+                "GET",
+                f"/repos/{self._repo}/compare/{sha}...{head_sha}?per_page=1",
+                expected_statuses={200},
+            ).json_body
+            if comparison["status"] != "ahead":
+                raise PullHeadMismatchError(
+                    f"pull request head SHA {head_sha} does not contain {sha}"
+                )
+        return head_sha
 
     def _assigned_pull_at_head(
         self,
