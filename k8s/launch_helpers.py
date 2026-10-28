@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -579,6 +580,57 @@ def target_repo_slug(url: str) -> str:
     return url.split("github.com", 1)[-1].lstrip(":/").removesuffix(".git")
 
 
+PREFLIGHT_HTTP_ATTEMPTS = 3
+PREFLIGHT_RETRY_DELAY_SECONDS = 1.0
+
+
+def _transient_network_reason(error: OSError) -> str:
+    """Describe a retryable connection-level failure, or return "" otherwise.
+
+    Connect and read timeouts and socket errors (refused, reset, DNS) are
+    transient. An HTTP error response is an answer, not a network failure, and
+    a URLError without an OSError reason (an unknown URL type, say) is a bug.
+    """
+    if isinstance(error, urllib.error.HTTPError):
+        return ""
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(reason, OSError):
+        return str(reason) or type(reason).__name__
+    return ""
+
+
+def _read_with_retries(
+    req: urllib.request.Request,
+    timeout: float,
+    label: str,
+    *,
+    attempts: int = PREFLIGHT_HTTP_ATTEMPTS,
+) -> bytes:
+    """Open req and read its body, retrying transient network failures.
+
+    Every attempt opens a fresh connection, so one dropped connect no longer
+    fails the whole preflight. The last failure is re-raised unchanged so
+    callers keep their existing error messages.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except OSError as error:
+            reason = _transient_network_reason(error)
+            if not reason or attempt >= attempts:
+                raise
+        delay = PREFLIGHT_RETRY_DELAY_SECONDS * attempt
+        print(
+            f"  {label}: {reason}; retrying in {delay:g}s "
+            f"(attempt {attempt + 1} of {attempts})",
+            flush=True,
+        )
+        time.sleep(delay)
+
+
 def _github_api(
     path: str,
     token: str,
@@ -586,7 +638,9 @@ def _github_api(
     method: str = "GET",
     data: bytes | None = None,
     timeout: int = 10,
+    idempotent: bool = False,
 ) -> dict:
+    """Call the GitHub REST API. GETs and idempotent writes retry network failures."""
     req = urllib.request.Request(
         f"https://api.github.com{path}",
         data=data,
@@ -598,9 +652,11 @@ def _github_api(
             "User-Agent": "senpai-launch-preflight",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read()
-        return json.loads(body or b"{}")
+    attempts = PREFLIGHT_HTTP_ATTEMPTS if idempotent or method == "GET" else 1
+    body = _read_with_retries(
+        req, timeout, f"GitHub API {method} {path}", attempts=attempts
+    )
+    return json.loads(body or b"{}")
 
 
 def _branch_api_path(slug: str, branch: str) -> str:
@@ -931,14 +987,16 @@ def _preflight_http(
 ) -> object:
     print(f"Preflight: checking {name}", flush=True)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read())
+        payload = json.loads(_read_with_retries(req, timeout, name))
     except urllib.error.HTTPError as e:
         sys.exit(
             f"ERROR: {name} failed: HTTP {e.code}: {_api_error_summary(e, secret)}"
         )
     except urllib.error.URLError as e:
         sys.exit(f"ERROR: {name} failed: {e.reason}")
+    except OSError as e:
+        # The connection opened, then the read timed out or was reset.
+        sys.exit(f"ERROR: {name} failed: {e}")
     print(f"  OK — {name} authenticated")
     return payload
 
@@ -1072,8 +1130,7 @@ def preflight_check_wandb_api_key(api_key: str) -> None:
     )
     print("Preflight: checking W&B API key", flush=True)
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            payload = json.loads(resp.read())
+        payload = json.loads(_read_with_retries(req, 10, "W&B API key"))
     except urllib.error.HTTPError as error:
         sys.exit(
             "ERROR: W&B API key failed: "
@@ -1081,6 +1138,8 @@ def preflight_check_wandb_api_key(api_key: str) -> None:
         )
     except urllib.error.URLError as error:
         sys.exit(f"ERROR: W&B API key failed: {error.reason}")
+    except OSError as error:
+        sys.exit(f"ERROR: W&B API key failed: {error}")
     if not payload.get("data", {}).get("viewer"):
         errors = json.dumps(payload.get("errors", []), sort_keys=True)
         errors = _redact_secrets(errors, api_key, basic_auth)
@@ -1118,7 +1177,14 @@ def preflight_check_target_repo_access(target_repo_url: str, token: str) -> None
         }
     ).encode()
     try:
-        _github_api(f"/repos/{slug}/git/refs", token, method="POST", data=payload)
+        # The impossible sha makes this probe idempotent: it can never create a ref.
+        _github_api(
+            f"/repos/{slug}/git/refs",
+            token,
+            method="POST",
+            data=payload,
+            idempotent=True,
+        )
     except urllib.error.HTTPError as error:
         if error.code == 422:
             print(f"  OK — token has Contents write access to {slug}")
