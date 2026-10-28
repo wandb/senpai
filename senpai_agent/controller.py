@@ -347,18 +347,19 @@ class OpenHandsTurnRunner:
                 store.acknowledge(event_key)
             if notice is not None:
                 store.enqueue(notice)
-        with ActiveGitHubWatcher(
-            self.github_mailbox,
-            store_path,
-            known_keys=visible_event_keys | event_keys,
-            poll_interval_seconds=self.active_poll_interval_seconds,
-            map_event=map_event,
-        ) as watcher:
-            exit_code = run_turn()
-        with LocalEventStore(store_path) as store:
-            delivered = store.acknowledged(tuple(watcher.enqueued_keys))
-            # A superseded-assignment notice only steers the turn that was running.
-            store.discard_prefix(_SUPERSEDED_NOTICE_PREFIX)
+        try:
+            with ActiveGitHubWatcher(
+                self.github_mailbox,
+                store_path,
+                known_keys=visible_event_keys | event_keys,
+                poll_interval_seconds=self.active_poll_interval_seconds,
+                map_event=map_event,
+            ) as watcher:
+                exit_code = run_turn()
+            with LocalEventStore(store_path) as store:
+                delivered = store.acknowledged(tuple(watcher.enqueued_keys))
+        finally:
+            _discard_superseded_notices(store_path, inbox, conversation_id)
         return TurnResult(
             exit_code=exit_code,
             delivered_event_keys=frozenset(delivered),
@@ -378,6 +379,24 @@ def _superseded_notice(
             "parent_conversation_id": str(conversation_id),
         },
     )
+
+
+def _discard_superseded_notices(
+    store_path: Path,
+    inbox: PersistentInbox | None,
+    conversation_id: UUID,
+) -> None:
+    """Drop superseded-assignment notices once the turn they steered has ended.
+
+    The event pump moves a notice into the persistent inbox and attaches it to
+    the running turn. One it could not attach, because that turn was already
+    full, must not start a turn of its own later.
+    """
+
+    with LocalEventStore(store_path) as store:
+        store.discard_prefix(_SUPERSEDED_NOTICE_PREFIX)
+    if inbox is not None:
+        inbox.retract_pending_prefix(conversation_id, _SUPERSEDED_NOTICE_PREFIX)
 
 
 def _student_live_event(

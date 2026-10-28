@@ -27,7 +27,12 @@ from senpai_agent.controller import (
 )
 from senpai_agent.github.http import GitHubReadError
 from senpai_agent.github.mailbox import ActiveGitHubWatcher
-from senpai_agent.inbox import DeliveryState, PersistentInbox, deliver_turn_messages
+from senpai_agent.inbox import (
+    MAX_EVENTS_PER_TURN,
+    DeliveryState,
+    PersistentInbox,
+    deliver_turn_messages,
+)
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import ControllerEvent
 from senpai_agent.state import AssignmentConversationRegistry
@@ -394,6 +399,135 @@ def test_superseded_notice_does_not_outlive_the_running_turn(
     assert result.delivered_event_keys == frozenset()
     with LocalEventStore(store_path) as store:
         assert store.pending() == []
+
+
+def superseded_inbox_turn(tmp_path: Path, *, queued_events: int):
+    """A superseded conversation's turn, built the way the controller builds it."""
+
+    state_dir = tmp_path / "state"
+    registry = AssignmentConversationRegistry(
+        state_dir / "student-conversations.json"
+    )
+    superseded = registry.assign("assignment-17", "revision-2")
+    registry.assign("assignment-21", "revision-1")
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    for index in range(queued_events):
+        inbox.enqueue(superseded, f"event:{index}", f"queued event {index}")
+    turn = inbox.next_turn(superseded, "student controller prompt")
+    assert turn is not None
+    return state_dir, superseded, inbox, turn
+
+
+def run_turn_through_inbox_pump(monkeypatch, state_dir, inbox, *, until):
+    """Stand in for run_openhands with the production inbox-backed event pump."""
+
+    seen = {}
+
+    def run_openhands(_prompt, config, **kwargs):
+        turn_id = kwargs["inbox_turn_id"]
+        with LocalEventStore(
+            state_dir / "student-events.sqlite3"
+        ) as store, AdvisorEventPump(
+            store,
+            SimpleNamespace(),
+            poll_interval=0.001,
+            parent_conversation_id=str(config.conversation_id),
+            inbox=inbox,
+            conversation_id=config.conversation_id,
+        ):
+            deadline = time.monotonic() + 1
+            while not until(turn_id) and time.monotonic() < deadline:
+                time.sleep(0.001)
+        seen["attached"] = inbox.turn(turn_id).event_keys
+        seen["unattached"] = inbox.pending_count(config.conversation_id)
+        for message in inbox.turn(turn_id).messages:
+            if message.state is DeliveryState.PENDING:
+                inbox.record_delivered(message.delivery_id, message.body)
+        inbox.record_processed(turn_id)
+        return 0
+
+    monkeypatch.setattr("senpai_agent.openhands_runner.run_openhands", run_openhands)
+    return seen
+
+
+def test_superseded_notice_steers_the_running_turn_through_the_inbox(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir, superseded, inbox, turn = superseded_inbox_turn(
+        tmp_path, queued_events=1
+    )
+    notice_key = f"assignment_superseded:{superseded}:assignment-21:revision-1"
+    seen = run_turn_through_inbox_pump(
+        monkeypatch,
+        state_dir,
+        inbox,
+        until=lambda turn_id: notice_key in inbox.turn(turn_id).event_keys,
+    )
+
+    result = OpenHandsTurnRunner(
+        Config("student", state_dir, superseded),
+        full_prompt="student initial controller context",
+        github_mailbox=Mailbox(()),
+        active_poll_interval_seconds=0.001,
+    ).run(
+        turn.prompt.body,
+        conversation_id=superseded,
+        event_keys=frozenset(turn.event_keys),
+        inbox=inbox,
+        inbox_turn_id=turn.turn_id,
+    )
+
+    assert result.exit_code == 0
+    assert seen["attached"] == ("event:0", notice_key)
+    assert seen["unattached"] == 0
+    processed = inbox.turn(turn.turn_id)
+    assert processed.state is DeliveryState.PROCESSED
+    notice = next(
+        message for message in processed.events if message.event_key == notice_key
+    )
+    assert "finish this turn" in notice.body
+    assert inbox.pending_count(superseded) == 0
+    with LocalEventStore(state_dir / "student-events.sqlite3") as store:
+        assert store.pending() == []
+
+
+def test_superseded_notice_a_full_turn_cannot_take_is_retracted_with_it(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state_dir, superseded, inbox, turn = superseded_inbox_turn(
+        tmp_path, queued_events=MAX_EVENTS_PER_TURN
+    )
+    notice_key = f"assignment_superseded:{superseded}:assignment-21:revision-1"
+    seen = run_turn_through_inbox_pump(
+        monkeypatch,
+        state_dir,
+        inbox,
+        until=lambda _turn_id: inbox.pending_count(superseded) == 1,
+    )
+
+    result = OpenHandsTurnRunner(
+        Config("student", state_dir, superseded),
+        full_prompt="student initial controller context",
+        github_mailbox=Mailbox(()),
+        active_poll_interval_seconds=0.001,
+    ).run(
+        turn.prompt.body,
+        conversation_id=superseded,
+        event_keys=frozenset(turn.event_keys),
+        inbox=inbox,
+        inbox_turn_id=turn.turn_id,
+    )
+
+    assert result.exit_code == 0
+    # The pump moved the notice into the inbox, but the full turn could not take it.
+    assert notice_key not in seen["attached"]
+    assert seen["unattached"] == 1
+    # It must not become this superseded conversation's next turn.
+    assert inbox.pending_count(superseded) == 0
+    inbox.acknowledge(turn.turn_id)
+    assert inbox.next_turn(superseded, "student continuation prompt") is None
 
 
 @pytest.mark.parametrize("incoming", [feedback_event(), human_issue_event()])
