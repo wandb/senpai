@@ -40,6 +40,13 @@ COPY pyproject.toml uv.lock /tmp/senpai/
 COPY senpai_agent /tmp/senpai/senpai_agent
 COPY .agents/agents /opt/senpai-agent-definitions
 COPY plugins/senpai /opt/senpai-plugin
+# A standalone BuildKit daemon (docker buildx's docker-container driver) hands
+# every RUN step OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, its trace socket, unless the
+# build sets the variable itself. openhands-sdk reads that as tracing being on
+# and imports the optional lmnr package, which is not installed, so the checks
+# below would fail. Empty means no endpoint, at build time and at runtime; a
+# launch can still set it per pod.
+ENV OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=
 RUN cd /tmp/senpai && \
     uv export --locked --python 3.14 --no-dev --no-emit-project \
       --format requirements.txt > requirements.txt && \
