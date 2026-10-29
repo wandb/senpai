@@ -53,6 +53,7 @@ from senpai_agent.training import (
     TrainingSpec,
     TrainingState,
     TrainingSupervisor,
+    log_stall_seconds,
     target_python_environment,
 )
 
@@ -214,6 +215,7 @@ def training_runtime(
             supervisor = TrainingSupervisor(
                 workspace=workspace,
                 state_dir=key,
+                log_stall_seconds=log_stall_seconds(),
             )
         runtime = (supervisor, MonitorStore(key / "monitors.sqlite3"))
         _TRAINING_RUNTIMES[key] = runtime
@@ -309,6 +311,10 @@ class MonitorTrainingObservation(Observation):
         ]
 
 
+# Result fields copied from the run's output, which may carry registered secrets.
+_TRAINING_OUTPUT_FIELDS = ("error_tail", "kubernetes_diagnostics", "last_log_line")
+
+
 class TrainingResultObservation(Observation):
     training_id: str
     state: TrainingState
@@ -320,6 +326,8 @@ class TrainingResultObservation(Observation):
     log_path: str
     wandb_run_ids: tuple[str, ...] = ()
     error_tail: str = ""
+    log_stalled_since: float | None = None
+    last_log_line: str = ""
     started_at: float | None = None
     deadline_at: float | None = None
     kubernetes_spec: KubernetesTrainingSpec | None = None
@@ -338,7 +346,7 @@ class TrainingResultObservation(Observation):
         conversation: LocalConversation | None,
     ) -> Self:
         observation = cls.model_validate(result.model_dump())
-        if not observation.error_tail and not observation.kubernetes_diagnostics:
+        if not any(getattr(observation, field) for field in _TRAINING_OUTPUT_FIELDS):
             return observation
 
         state = getattr(conversation, "state", None)
@@ -350,7 +358,7 @@ class TrainingResultObservation(Observation):
         return observation.model_copy(
             update={
                 field: secret_registry.mask_secrets_in_output(getattr(observation, field))
-                for field in ("error_tail", "kubernetes_diagnostics")
+                for field in _TRAINING_OUTPUT_FIELDS
             }
         )
 
@@ -365,6 +373,10 @@ class TrainingResultObservation(Observation):
             "log_path": self.log_path,
             "wandb_run_ids": self.wandb_run_ids,
         }
+        if self.log_stalled_since is not None:
+            result["log_stalled_since"] = self.log_stalled_since
+        if self.last_log_line:
+            result["last_log_line"] = self.last_log_line
         if self.kubernetes_resource is not None:
             result["kubernetes_resource"] = self.kubernetes_resource.model_dump()
         if self.kubernetes_released is not None:

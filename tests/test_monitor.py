@@ -16,10 +16,14 @@ from senpai_agent.training import TrainingState
 NOW = datetime(2026, 7, 30, tzinfo=UTC)
 
 
-def result(state=TrainingState.RUNNING):
+def result(state=TrainingState.RUNNING, *, log_stalled_since=None, last_log_line=""):
     return SimpleNamespace(
+        training_id="train-1",
         state=state,
         exit_code=0 if state is TrainingState.FINISHED else None,
+        wandb_run_ids=(),
+        log_stalled_since=log_stalled_since,
+        last_log_line=last_log_line,
     )
 
 
@@ -230,3 +234,47 @@ def test_status_only_monitor_never_emits_metric_staleness():
     )
 
     assert evaluation.signals == ()
+
+
+def test_stalled_log_emits_one_signal_naming_the_last_line():
+    spec = TrainingMonitorSpec(training_id="train-1", conversation_id=uuid4())
+    stalled = result(
+        log_stalled_since=(NOW - timedelta(minutes=12)).timestamp(),
+        last_log_line="step 40/100 loss 0.31",
+    )
+
+    fired, _ = evaluate_monitor(
+        spec, stalled, None, previous=None, emitted=frozenset(), now=NOW
+    )
+
+    (signal,) = fired.signals
+    assert signal.kind == "log_stalled"
+    assert signal.hard_failure is False
+    assert signal.state is TrainingState.RUNNING
+    assert "720 s" in signal.detail
+    assert "'step 40/100 loss 0.31'" in signal.detail
+    assert "cancel_training" in signal.detail
+
+    quiet, _ = evaluate_monitor(
+        spec,
+        stalled,
+        None,
+        previous=None,
+        emitted=frozenset({signal.dedupe_key}),
+        now=NOW + timedelta(minutes=1),
+    )
+    assert quiet.signals == ()
+
+    # Output resumed and stopped again: a new stall gets a new signal.
+    again, _ = evaluate_monitor(
+        spec,
+        result(log_stalled_since=(NOW + timedelta(minutes=5)).timestamp()),
+        None,
+        previous=None,
+        emitted=frozenset({signal.dedupe_key}),
+        now=NOW + timedelta(minutes=20),
+    )
+    (repeated,) = again.signals
+    assert repeated.kind == "log_stalled"
+    assert repeated.dedupe_key != signal.dedupe_key
+    assert "The log is still empty." in repeated.detail

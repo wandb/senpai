@@ -1,5 +1,6 @@
 import array
 import fcntl
+import math
 import os
 import re
 import select
@@ -39,11 +40,28 @@ _WANDB_COMPLETE_RUN_URL_BYTES = re.compile(
 _LOG_READ_BYTES = 64 * 1024
 _WANDB_SCAN_OVERLAP_BYTES = 4096
 _ERROR_TAIL_BYTES = 8192
+_LAST_LINE_CHARS = 300
 # How stale a running record's elapsed time can be when its supervisor dies.
 _RUNNING_RECORD_REFRESH_SECONDS = 30
 
 
 TARGET_PYTHON_ENV = "SENPAI_TARGET_PYTHON_ENV"
+# How long a run's log may stop growing before its record flags a stall.
+LOG_STALL_ENV = "SENPAI_TRAINING_LOG_STALL_SECONDS"
+DEFAULT_LOG_STALL_SECONDS = 600.0
+
+
+def log_stall_seconds(environment: Mapping[str, str] = os.environ) -> float:
+    """Read the watchdog interval after which a quiet log is reported."""
+
+    value = environment.get(LOG_STALL_ENV, "").strip()
+    try:
+        seconds = float(value) if value else DEFAULT_LOG_STALL_SECONDS
+    except ValueError as error:
+        raise RuntimeError(f"{LOG_STALL_ENV} must be a number of seconds") from error
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise RuntimeError(f"{LOG_STALL_ENV} must be a positive number of seconds")
+    return seconds
 
 
 def target_python_environment(
@@ -130,6 +148,13 @@ def _read_tail(path: Path, size: int) -> str:
         return file.read().decode(errors="ignore")
 
 
+def _last_log_line(tail: bytes) -> str:
+    for line in reversed(tail.decode(errors="ignore").splitlines()):
+        if line.strip():
+            return line.strip()[-_LAST_LINE_CHARS:]
+    return ""
+
+
 class TrainingState(StrEnum):
     RUNNING = "running"
     FINISHED = "finished"
@@ -186,6 +211,10 @@ class TrainingResult(BaseModel):
     log_path: str
     wandb_run_ids: tuple[str, ...] = ()
     error_tail: str = ""
+    # Epoch seconds of the log's last growth, set only while a running run's
+    # log has stopped growing for the supervisor's stall interval.
+    log_stalled_since: float | None = Field(default=None, gt=0)
+    last_log_line: str = ""
     started_at: float | None = Field(default=None, gt=0)
     deadline_at: float | None = Field(default=None, gt=0)
     kubernetes_spec: KubernetesTrainingSpec | None = None
@@ -232,10 +261,14 @@ class TrainingSupervisor:
         workspace: Path,
         state_dir: Path,
         terminate_grace_seconds: float = 10,
+        log_stall_seconds: float = DEFAULT_LOG_STALL_SECONDS,
     ):
+        if log_stall_seconds <= 0:
+            raise ValueError("log_stall_seconds must be positive")
         self.workspace = workspace.resolve()
         self.state_dir = state_dir.resolve()
         self.terminate_grace_seconds = terminate_grace_seconds
+        self.log_stall_seconds = log_stall_seconds
         self._lock = threading.Lock()
         self._active: dict[str, _ActiveTraining] = {}
         # Set whenever a run's record changes in a way the student should hear
@@ -413,6 +446,9 @@ class TrainingSupervisor:
         run_ids: dict[str, None] = {}
         published_run_ids: tuple[str, ...] = ()
         published_at = active.started
+        published_stalled_since: float | None = None
+        last_growth_at = active.started
+        last_growth_epoch = time.time()
         error_tail = b""
         scan_overlap = b""
         deadline = active.started + active.timeout_seconds
@@ -429,16 +465,28 @@ class TrainingSupervisor:
 
         with active.log_path.open("rb") as log:
             while True:
+                consumed = log.tell()
                 error_tail, scan_overlap = self._consume_log(
                     log,
                     error_tail,
                     scan_overlap,
                     run_ids,
                 )
-                discovered_run_ids = tuple(run_ids)
                 now = time.monotonic()
+                if log.tell() != consumed:
+                    last_growth_at = now
+                    last_growth_epoch = time.time()
+                # Watchdog: a log that has stopped growing is reported with its
+                # last line, so a hung process is named instead of guessed at.
+                stalled_since = (
+                    last_growth_epoch
+                    if now - last_growth_at >= self.log_stall_seconds
+                    else None
+                )
+                discovered_run_ids = tuple(run_ids)
                 if (
                     discovered_run_ids != published_run_ids
+                    or stalled_since != published_stalled_since
                     or now - published_at >= _RUNNING_RECORD_REFRESH_SECONDS
                 ):
                     self._write_result(
@@ -452,9 +500,14 @@ class TrainingSupervisor:
                             elapsed_seconds=now - active.started,
                             log_path=str(active.log_path),
                             wandb_run_ids=discovered_run_ids,
+                            log_stalled_since=stalled_since,
+                            last_log_line=_last_log_line(error_tail),
                         )
                     )
+                    if stalled_since is not None and stalled_since != published_stalled_since:
+                        self.wake.set()
                     published_run_ids = discovered_run_ids
+                    published_stalled_since = stalled_since
                     published_at = now
                 if active.cancelled or active.output_error is not None:
                     state = (
@@ -533,6 +586,7 @@ class TrainingSupervisor:
                 if state is not TrainingState.FINISHED
                 else ""
             ),
+            last_log_line=_last_log_line(error_tail),
         )
         self._write_result(result)
         with self._lock:

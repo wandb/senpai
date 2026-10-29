@@ -985,7 +985,10 @@ services such as W&B before the grace period expires.
 The controller samples metrics only for monitors that are due, but evaluates
 a run's terminal record as soon as it polls. The training supervisor wakes
 the controller from its idle sleep when a run ends, so the student resumes
-within seconds of the terminal state instead of at the next poll tick. The
+within seconds of the terminal state instead of at the next poll tick. A
+local run whose log stops growing for the supervisor's stall interval is
+flagged in its record with its last log line, wakes the controller the same
+way, and raises one `log_stalled` signal per stall. The
 controller fetches one latest selected metric value from W&B, evaluates
 deterministic threshold/change/staleness and terminal-state rules, and
 persists deduplicated compact signals. Ordinary polls use no LLM tokens.
