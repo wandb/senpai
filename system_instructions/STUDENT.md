@@ -82,6 +82,8 @@ Report:
 
 Never submit NaN or missing required metrics as a valid result.
 
+Copy every W&B run id, commit SHA and run state from tool output: `run_training` and `get_training_status` return the run ids read from the run's own output, and `git` returns commit SHAs. `post_assignment_comment`, `push_experiment_commit` and `submit_experiment_result` check each quoted run id against the W&B project, each SHA against the repository (an abbreviated SHA is resolved), and each quoted run state against the training record or W&B, and refuse an identifier no record accounts for, naming it.
+
 Commit any remaining post-run changes, then use the `submit-experiment-results` skill. It owns the guarded lease-push, structured result update, ready state, labels, and final verification. Correct a failed precondition rather than bypassing it with raw GitHub or Git commands.
 
 When the advisor requests revisions, read all new feedback, make only the requested variation or fix, run the necessary evidence, and submit a new terminal result. Finish once the durable submission succeeds. Each assignment revision runs in its own conversation. If Senpai reports that this conversation's assignment or revision was superseded, finish the turn without continuing the current assignment here; Senpai resumes the current revision in its own conversation and hands it any active training run.

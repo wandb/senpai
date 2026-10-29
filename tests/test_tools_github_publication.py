@@ -279,3 +279,30 @@ def test_push_experiment_commit_reports_race_after_push_without_rewriting_workfl
         assert (
             conversation.state.execution_status == ConversationExecutionStatus.FINISHED
         )
+
+
+def test_push_experiment_commit_resolves_an_abbreviated_local_sha(publication):
+    case = publication
+    tool = publication_tool(case)
+    action = publication_action(tool, case).model_copy(
+        update={"local_commit_sha": case.local_sha[:9]}
+    )
+
+    pushed = tool(action)
+
+    assert pushed.state == "experiment_commit_pushed"
+    assert pushed.version == case.local_sha
+    assert git(case.remote, "rev-parse", f"refs/heads/{case.branch}") == case.local_sha
+
+
+def test_push_experiment_commit_refuses_a_sha_that_is_not_a_commit(publication):
+    case = publication
+    tool = publication_tool(case)
+    action = publication_action(tool, case).model_copy(
+        update={"local_commit_sha": "0747eaaf8"}
+    )
+
+    with pytest.raises(ValueError, match="local_commit_sha does not resolve"):
+        tool(action)
+
+    assert git(case.remote, "rev-parse", f"refs/heads/{case.branch}") == case.base_sha

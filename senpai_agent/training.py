@@ -20,14 +20,21 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from senpai_agent.processes import signal_process_group, terminate_process_group
 
-# A redaction marker can truncate an ID, even when only its '<' has been read.
+# W&B prints a run's page as <host>/<entity>/<project>/runs/<id>, on wandb.ai
+# or a self-hosted instance, so only the path shape is checked; GitHub Actions
+# pages also end in /runs/<number>, so the project segment must not be
+# "actions". W&B also names the run's local directory
+# wandb/run-<date>_<time>-<id>. A redaction marker can truncate an ID, even
+# when only its '<' has been read.
+_WANDB_RUN_PREFIX_BYTES = (
+    rb"(?:https?://[^\s/]+(?:/[^\s/]+)*?/[^\s/]+/(?!actions/)[^\s/]+/runs/"
+    rb"|wandb/(?:offline-)?run-[0-9]{8}_[0-9]{6}-)"
+)
 _WANDB_RUN_URL_BYTES = re.compile(
-    rb"https?://wandb\.ai/[^/\s]+/[^/\s]+/runs/"
-    rb"([A-Za-z0-9_-]+)(?![A-Za-z0-9_<-])"
+    _WANDB_RUN_PREFIX_BYTES + rb"([A-Za-z0-9_-]+)(?![A-Za-z0-9_<-])"
 )
 _WANDB_COMPLETE_RUN_URL_BYTES = re.compile(
-    rb"https?://wandb\.ai/[^/\s]+/[^/\s]+/runs/"
-    rb"([A-Za-z0-9_-]+)(?=[^A-Za-z0-9_<-])"
+    _WANDB_RUN_PREFIX_BYTES + rb"([A-Za-z0-9_-]+)(?=[^A-Za-z0-9_<-])"
 )
 _LOG_READ_BYTES = 64 * 1024
 _WANDB_SCAN_OVERLAP_BYTES = 4096

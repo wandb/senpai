@@ -97,3 +97,38 @@ def test_wandb_url_can_span_log_read_chunks(tmp_path: Path):
 
     assert terminal.state is TrainingState.FINISHED
     assert terminal.wandb_run_ids == ("split-run",)
+
+
+@pytest.mark.parametrize(
+    ("line", "run_ids"),
+    [
+        (
+            "W&B run: https://forge.example.com/wandb/acme/cfd/runs/0123456789abcdef",
+            ("0123456789abcdef",),
+        ),
+        (
+            "wandb: 🚀 View run bold-sky-7 at: "
+            "https://wandb.example.net/acme/cfd/runs/ab12cd34?nw=nwuserx",
+            ("ab12cd34",),
+        ),
+        (
+            "wandb: Run data is saved locally in /w/wandb/run-20261028_120000-ab12cd34",
+            ("ab12cd34",),
+        ),
+        ("see https://github.com/acme/cfd/actions/runs/123456 for CI", ()),
+    ],
+)
+def test_run_ids_are_read_from_any_wandb_host_and_run_directory(
+    tmp_path: Path, line: str, run_ids: tuple[str, ...]
+):
+    workspace, supervisor = make_supervisor(tmp_path)
+    running = run_python(
+        supervisor,
+        workspace,
+        f"print({line!r}, flush=True)",
+    )
+
+    terminal = wait_for_terminal(supervisor, running.training_id)
+
+    assert terminal.state is TrainingState.FINISHED
+    assert terminal.wandb_run_ids == run_ids
