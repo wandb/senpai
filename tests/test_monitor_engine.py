@@ -357,3 +357,62 @@ def test_run_disappearing_after_metric_is_a_durable_hard_failure(tmp_path: Path)
         assert store.previous_sample(spec.training_id) == sample
         assert engine.poll(NOW + timedelta(seconds=120)) == ()
         assert store.pending_signals() == list(signals)
+
+
+def test_terminal_result_is_evaluated_before_its_next_due_poll(tmp_path: Path):
+    spec = monitor(metric="val/loss")
+    current = {"state": TrainingState.RUNNING}
+    metric_calls = []
+
+    class Training:
+        def get_training_status(self, training_id):
+            return result(tmp_path, training_id, current["state"])
+
+    class Metrics:
+        def latest(self, run_id, metric):
+            metric_calls.append((run_id, metric))
+            return MetricSample(value=0.2, observed_at=NOW)
+
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(spec)
+        engine = TrainingMonitorEngine(store, Training(), Metrics())
+
+        assert engine.poll(NOW) == ()
+        # A running monitor keeps its own schedule: no sample and no reschedule
+        # before it is due.
+        assert engine.poll(NOW + timedelta(seconds=10)) == ()
+        assert metric_calls == [("run-train-1", "val/loss")]
+        assert store.due(NOW + timedelta(seconds=59)) == []
+        assert store.due(NOW + timedelta(seconds=60)) == [spec]
+
+        current["state"] = TrainingState.FINISHED
+        produced = engine.poll(NOW + timedelta(seconds=20))
+
+        assert [item.kind for item in produced] == ["training_status"]
+        assert produced[0].state is TrainingState.FINISHED
+        assert metric_calls == [("run-train-1", "val/loss")]
+        assert store.active() == []
+
+
+def test_status_failure_of_a_monitor_that_is_not_due_waits_for_its_poll(
+    tmp_path: Path,
+):
+    spec = monitor()
+    failures = {"count": 0}
+
+    class Training:
+        def get_training_status(self, _training_id):
+            failures["count"] += 1
+            raise RuntimeError("status backend unavailable")
+
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(spec)
+        engine = TrainingMonitorEngine(store, Training(), SimpleNamespace())
+
+        first = engine.poll(NOW)
+        early = engine.poll(NOW + timedelta(seconds=10))
+
+        assert [item.kind for item in first] == ["monitor_error"]
+        assert early == ()
+        assert failures["count"] == 2
+        assert store.due(NOW + timedelta(seconds=59)) == []

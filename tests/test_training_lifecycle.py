@@ -171,3 +171,33 @@ def test_supervisor_drain_waits_for_training_to_finish(tmp_path: Path):
     assert supervisor.get_training_status(running.training_id).state is (
         TrainingState.FINISHED
     )
+
+
+def test_terminal_records_set_the_wake_event_and_running_records_do_not(
+    tmp_path: Path,
+):
+    workspace, supervisor = make_supervisor(
+        tmp_path,
+        terminate_grace_seconds=0.1,
+    )
+    try:
+        running = run_python(
+            supervisor,
+            workspace,
+            "import time; time.sleep(60)",
+            timeout_seconds=60,
+        )
+
+        assert supervisor.wake.is_set() is False
+
+        supervisor.cancel_training(running.training_id)
+
+        assert supervisor.wake.is_set() is True
+
+        supervisor.wake.clear()
+        finished = run_python(supervisor, workspace, "print('done')")
+        wait_for_terminal(supervisor, finished.training_id)
+
+        assert supervisor.wake.is_set() is True
+    finally:
+        supervisor.close()

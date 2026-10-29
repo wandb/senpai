@@ -595,12 +595,24 @@ class TrainingMonitorEngine:
         self.metrics = metrics
 
     def poll(self, now: datetime | None = None) -> tuple[MonitorSignal, ...]:
+        """Evaluate due monitors, and every run that reached a terminal state.
+
+        Metric sampling keeps each monitor's own poll interval. A terminal
+        record is evaluated as soon as the controller polls, because the
+        supervisor wakes the controller for it; waiting for the monitor's next
+        due time would resume the student one poll interval late.
+        """
+
         now = now or datetime.now(UTC)
         produced: list[MonitorSignal] = []
-        for spec in self.store.due(now):
+        due = {spec.training_id for spec in self.store.due(now)}
+        for spec in self.store.active():
+            is_due = spec.training_id in due
             try:
                 result = self.training.get_training_status(spec.training_id)
             except Exception as error:  # noqa: BLE001
+                if not is_due:
+                    continue
                 signal = self.store.record_poll_error(
                     spec,
                     error,
@@ -609,6 +621,8 @@ class TrainingMonitorEngine:
                 )
                 if signal is not None:
                     produced.append(signal)
+                continue
+            if not is_due and result.state is TrainingState.RUNNING:
                 continue
             sample = None
             try:

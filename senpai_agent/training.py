@@ -231,6 +231,10 @@ class TrainingSupervisor:
         self.terminate_grace_seconds = terminate_grace_seconds
         self._lock = threading.Lock()
         self._active: dict[str, _ActiveTraining] = {}
+        # Set whenever a run's record changes in a way the student should hear
+        # about now. The controller waits on it instead of sleeping through its
+        # poll interval, and clears it before each poll.
+        self.wake = threading.Event()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._recover_orphaned_runs()
 
@@ -615,3 +619,5 @@ class TrainingSupervisor:
         temporary = path.with_suffix(".tmp")
         temporary.write_text(result.model_dump_json(indent=2))
         temporary.replace(path)
+        if result.state is not TrainingState.RUNNING:
+            self.wake.set()

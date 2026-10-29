@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 from base64 import b64encode
 from collections import Counter
@@ -1902,3 +1903,48 @@ def test_failed_acknowledgement_does_not_advance_supervisor_progress(tmp_path: P
         ).run(max_cycles=1)
 
     assert WorkerLease.read(lease_path).completed_turns == 0
+
+
+def test_idle_sleep_ends_as_soon_as_training_wakes_the_controller():
+    wake = threading.Event()
+    mailbox = Mailbox([(), ()])
+    sleeps = []
+    threading.Timer(0.05, wake.set).start()
+
+    started = time.monotonic()
+    Controller(
+        role="student",
+        mailbox=mailbox,
+        turns=Turns(),
+        conversation_id=CONVERSATION_ID,
+        full_prompt="programme",
+        sleep=sleeps.append,
+        poll_interval_seconds=600,
+        jitter_seconds=0,
+        wake=wake,
+    ).run(max_cycles=2)
+
+    assert time.monotonic() - started < 5
+    assert sleeps == []
+    assert mailbox.calls == 2
+    # The second cycle cleared the wake before polling, so a signal that
+    # arrives after that poll is caught by the next wait.
+    assert wake.is_set() is False
+
+
+def test_idle_sleep_without_a_wake_event_uses_the_configured_sleep():
+    sleeps = []
+    mailbox = Mailbox([(), ()])
+
+    Controller(
+        role="student",
+        mailbox=mailbox,
+        turns=Turns(),
+        conversation_id=CONVERSATION_ID,
+        full_prompt="programme",
+        sleep=sleeps.append,
+        poll_interval_seconds=600,
+        jitter_seconds=0,
+    ).run(max_cycles=2)
+
+    assert sleeps == [600]

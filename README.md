@@ -692,7 +692,7 @@ Students do not start GPU work, stream logs, sleep, or poll through the terminal
 
 | Tool | Contract |
 |---|---|
-| `run_training` | Accepts structured `argv`, `cwd`, and a hard timeout. It requires a clean assignment worktree and supervises either a local process group or one broker-owned Kubernetes workload without blocking. It persists identity, logs, bounded errors, W&B run IDs, and terminal-state monitoring. |
+| `run_training` | Accepts structured `argv`, `cwd`, and a hard timeout. It requires a clean assignment worktree and supervises either a local process group or one broker-owned Kubernetes workload without blocking. It persists identity, logs, bounded errors, W&B run IDs, and terminal-state monitoring. A run's terminal state wakes the student's controller at once instead of at its next poll tick. |
 | `get_training_status` | Performs one bounded read of the latest persisted state, exit code, elapsed time, W&B run IDs, and error tail. |
 | `monitor_training` | Adds a W&B metric, minimize/maximize direction, `lte`, `gte`, `improved_by`, or `regressed_by` gates, a poll interval, and stale-update detection. It cannot disable terminal wakes. |
 | `cancel_training` | Stops the local process group through TERM/KILL or deletes the remote workload by its UID, waits for a durable terminal state, and retires its monitor. |

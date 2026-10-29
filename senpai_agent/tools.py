@@ -62,6 +62,8 @@ if TYPE_CHECKING:
 
 class TrainingRuntime(Protocol):
     workspace: Path
+    # Set when a run needs the student's attention; the controller waits on it.
+    wake: threading.Event
 
     def run_training(self, spec: TrainingSpec) -> TrainingResult: ...
 

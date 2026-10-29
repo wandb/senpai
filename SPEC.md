@@ -982,10 +982,13 @@ It does not return until the supervisor has persisted a terminal state. Target
 training code remains responsible for handling SIGTERM and flushing external
 services such as W&B before the grace period expires.
 
-The controller polls only monitors that are due. It fetches one latest selected
-metric value from W&B, evaluates deterministic threshold/change/staleness and
-terminal-state rules, and persists deduplicated compact signals. Ordinary
-polls use no LLM tokens.
+The controller samples metrics only for monitors that are due, but evaluates
+a run's terminal record as soon as it polls. The training supervisor wakes
+the controller from its idle sleep when a run ends, so the student resumes
+within seconds of the terminal state instead of at the next poll tick. The
+controller fetches one latest selected metric value from W&B, evaluates
+deterministic threshold/change/staleness and terminal-state rules, and
+persists deduplicated compact signals. Ordinary polls use no LLM tokens.
 
 Metric samples reject NaN and infinities. A failure in one monitor's training
 status or W&B lookup advances that monitor's schedule and emits one
