@@ -236,7 +236,7 @@ def test_status_only_monitor_never_emits_metric_staleness():
     assert evaluation.signals == ()
 
 
-def test_stalled_log_emits_one_signal_naming_the_last_line():
+def test_stalled_log_emits_one_signal_without_raw_log_output():
     spec = TrainingMonitorSpec(training_id="train-1", conversation_id=uuid4())
     stalled = result(
         log_stalled_since=(NOW - timedelta(minutes=12)).timestamp(),
@@ -252,7 +252,9 @@ def test_stalled_log_emits_one_signal_naming_the_last_line():
     assert signal.hard_failure is False
     assert signal.state is TrainingState.RUNNING
     assert "720 s" in signal.detail
-    assert "'step 40/100 loss 0.31'" in signal.detail
+    # Raw output reaches the conversation only through the masked status tool.
+    assert "step 40" not in signal.detail
+    assert "get_training_status returns its last log line" in signal.detail
     assert "cancel_training" in signal.detail
 
     quiet, _ = evaluate_monitor(

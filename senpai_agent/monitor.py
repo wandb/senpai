@@ -210,8 +210,10 @@ def _log_stall_detail(result: TrainingResult, now: datetime) -> str:
     since = datetime.fromtimestamp(result.log_stalled_since, UTC)
     age = max(0, round((now - since).total_seconds()))
     run = f" (W&B run {result.wandb_run_ids[-1]})" if result.wandb_run_ids else ""
+    # The last log line is raw run output; get_training_status returns it with
+    # the conversation's secrets masked, so the signal only points there.
     last_line = (
-        f"Last log line: {result.last_log_line!r}."
+        "get_training_status returns its last log line."
         if result.last_log_line
         else "The log is still empty."
     )

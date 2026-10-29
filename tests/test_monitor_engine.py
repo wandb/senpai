@@ -449,7 +449,7 @@ def test_stalled_run_is_reported_before_its_next_due_poll_without_sampling(
         produced = engine.poll(NOW + timedelta(seconds=10))
 
         assert [item.kind for item in produced] == ["log_stalled"]
-        assert "'step 3'" in produced[0].detail
+        assert "step 3" not in produced[0].detail
         assert len(metric_calls) == 1
         assert store.due(NOW + timedelta(seconds=59)) == []
         assert store.pending_signals() == list(produced)
