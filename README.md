@@ -688,7 +688,7 @@ explicitly; the tool does not silently truncate review evidence.
 
 ## Long-running training and monitoring
 
-Students do not start GPU work, stream logs, sleep, or poll through the terminal. Four typed tools make training a durable controller operation:
+Students do not start GPU work, stream logs, sleep, or poll through the terminal, and the terminal policy denies a GPU job detached with `nohup`, `setsid` or a trailing `&`. Four typed tools make training a durable controller operation:
 
 | Tool | Contract |
 |---|---|

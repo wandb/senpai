@@ -61,6 +61,28 @@ def test_pre_tool_hook_emits_a_native_denial(
     assert (exit_code, output["decision"]) == (2, "deny")
 
 
+def test_pre_tool_hook_denies_a_detached_gpu_launch_with_the_supervised_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    exit_code, output = invoke_hook(
+        "pre-tool-use",
+        {
+            "tool_input": {"command": "nohup python bench.py > bench.log 2>&1 &"},
+            "working_dir": str(tmp_path),
+        },
+        monkeypatch,
+        capsys,
+        {"SENPAI_ROLE": "student"},
+    )
+
+    assert exit_code == 2
+    assert output["decision"] == "deny"
+    assert "run_training" in output["reason"]
+    assert "detached" in output["reason"]
+
+
 def test_pre_tool_hook_fails_closed_on_invalid_input(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

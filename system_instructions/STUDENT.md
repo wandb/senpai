@@ -63,7 +63,7 @@ Commit the exact implementation that will run and make the worktree clean before
 
 Every optimization or GPU execution must use `run_training`, including debug runs and wrappers that train or evaluate a model. Pass an argv list, the exact repository working directory, and a timeout within the launch limit. Never launch training through the terminal.
 
-`run_training` registers terminal-state monitoring automatically. Use `monitor_training` only to add useful primary-metric gates or a stale-update timeout, `get_training_status` for one bounded check, and `cancel_training` for an early stop. Do not kill the process, stream logs, sleep, or create terminal polling loops; finish the turn and let the controller resume the conversation.
+`run_training` registers terminal-state monitoring automatically. Use `monitor_training` only to add useful primary-metric gates or a stale-update timeout, `get_training_status` for one bounded check, and `cancel_training` for an early stop. Do not kill the process, stream logs, sleep, or create terminal polling loops; finish the turn and let the controller resume the conversation. Finishing the turn is the fast path: the controller resumes this conversation as soon as a supervised run reaches a terminal state or its log stops growing, so polling gains nothing. A GPU job launched detached from the terminal (`nohup`, `setsid`, or a trailing `&`) escapes that supervision and is denied.
 
 Every real experiment must log the artifacts required by `program.md` to W&B. Use groups only when the assignment calls for related arms, and run multiple variants only when the assignment requests them. After a run terminates, check for newer advisor or human feedback before spending another allocation.
 

@@ -671,3 +671,53 @@ def test_runners_preserve_safe_commands(command: str):
 )
 def test_argv_runners_preserve_command_arguments_as_data(command: str):
     assert is_allowed(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python bench.py &",
+        "nohup python bench.py > bench.log 2>&1 &",
+        "nohup kernel-bench run --case d32 > out.log 2>&1 &",
+        "setsid python bench.py",
+        "cd kernels && nohup ncu --set full python bench.py > ncu.log 2>&1 &",
+        "nvcc -O3 kernel.cu -o kernel &",
+        "(python bench.py &)",
+        "python bench.py & disown",
+        "python a.py & python b.py",
+        "uv run --no-sync python bench.py &",
+        "uv run -m bench &",
+        "env CUDA_VISIBLE_DEVICES=0 python3 bench.py &",
+        "timeout 600 python bench.py &",
+        "while true; do python bench.py; done &",
+        "python bench.py | tee bench.log &",
+        "bash -c 'python bench.py &'",
+        "bash -c 'cd kernels && python bench.py' &",
+        "nohup sh -c 'python bench.py' > bench.log 2>&1 &",
+    ],
+)
+def test_policy_denies_detached_gpu_launches_and_points_at_run_training(command: str):
+    decision = terminal_policy(command, "student", WORKSPACE)
+
+    assert decision.allowed is False
+    assert "detached" in decision.reason
+    assert "run_training" in decision.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python bench.py",
+        "python bench.py 2>&1 | tee bench.log",
+        "python bench.py && python summarize.py",
+        "sort big.txt > sorted.txt &",
+        "nohup rsync -a data/ backup/ > rsync.log 2>&1 &",
+        "nohup date -u",
+        "echo done &",
+        "grep -c '&' notes.txt",
+        "python -c 'print(\"a & b\")'",
+        "bash -c 'sort big.txt > sorted.txt' &",
+    ],
+)
+def test_policy_allows_foreground_gpu_work_and_detached_non_gpu_jobs(command: str):
+    assert is_allowed(command) is True
