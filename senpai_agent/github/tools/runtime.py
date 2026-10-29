@@ -276,9 +276,9 @@ class SubmitExperimentResultExecutor(
         conversation: LocalConversation | None = None,
     ) -> GitHubMutationObservation:
         result = action.result
+        self.runtime.require_current_student(result.assignment.student)
         if self.runtime.provenance is not None:
             result = self.runtime.provenance.check_result(result)
-        self.runtime.require_current_student(result.assignment.student)
         number = result.assignment.pr_number
         commit_sha = result.commit_sha
         with self.runtime.workflow.serialized_assignment_mutation():

@@ -82,7 +82,7 @@ Report:
 
 Never submit NaN or missing required metrics as a valid result.
 
-Copy every W&B run id, commit SHA and run state from tool output: `run_training` and `get_training_status` return the run ids read from the run's own output, and `git` returns commit SHAs. `post_assignment_comment`, `push_experiment_commit` and `submit_experiment_result` check each quoted run id against the W&B project, each SHA against the repository (an abbreviated SHA is resolved), and each quoted run state against the training record or W&B, and refuse an identifier no record accounts for, naming it.
+Copy every W&B run id, commit SHA and run state from tool output: `run_training` and `get_training_status` return the run ids read from the run's own output, and `git` returns commit SHAs. `post_assignment_comment` and `submit_experiment_result` check each run id that follows a run word or sits in a run column against the W&B project, each SHA that follows a commit word against the repository, and each state word in the same clause as a run id against the training record or W&B, and refuse an identifier no record accounts for, naming it. Cite a run from another W&B project, or a commit from another repository or an unfetched branch, by its URL. `push_experiment_commit` and `submit_experiment_result` resolve an abbreviated SHA to the full commit.
 
 Commit any remaining post-run changes, then use the `submit-experiment-results` skill. It owns the guarded lease-push, structured result update, ready state, labels, and final verification. Correct a failed precondition rather than bypassing it with raw GitHub or Git commands.
 

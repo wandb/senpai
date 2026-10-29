@@ -263,3 +263,121 @@ def test_resolve_commit_accepts_only_hexadecimal_shas(case):
 
     with pytest.raises(ProvenanceError, match="local_commit_sha must be a commit SHA"):
         provenance.resolve_commit("HEAD", field="local_commit_sha")
+
+
+def test_numbers_after_commit_words_are_not_shas(case):
+    provenance, lookup, _ = case
+
+    provenance.check_text(
+        "Base batch 1048576 tokens; merged 20261028 after the push of 3145728 rows.",
+        source="comment",
+    )
+
+    assert lookup.calls == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Each run took about twelve minutes with bf16gemm tiles.",
+        "That run finished. bf16gemm is next.",
+        "The commit message explains why; deadbeef0 stays a constant.",
+    ],
+)
+def test_a_context_word_outside_the_tokens_clause_or_reach_is_ignored(case, text):
+    provenance, lookup, _ = case
+
+    provenance.check_text(text, source="comment")
+
+    assert lookup.calls == []
+
+
+def test_every_id_in_a_list_after_a_run_word_is_checked(case):
+    provenance, lookup, _ = case
+
+    with pytest.raises(ProvenanceError, match="'58vh6sck'.*full run URL.*reword"):
+        provenance.check_text("runs ab12cd34, cd34ef56 and 58vh6sck", source="comment")
+
+    assert [call[2] for call in lookup.calls] == ["ab12cd34", "cd34ef56", "58vh6sck"]
+
+
+def test_unresolved_commit_names_the_url_escape(case):
+    provenance, _, _ = case
+
+    with pytest.raises(ProvenanceError, match="'0747eaa'.*by its URL"):
+        provenance.check_text("commit 0747eaa adds the twin", source="comment")
+
+
+def test_recorded_states_compare_by_class(case):
+    provenance, lookup, _ = case
+    write_record(
+        provenance.training_dir,
+        state=TrainingState.TIMED_OUT,
+        run_ids=("0123456789abcdef",),
+    )
+
+    provenance.check_text(f"training {TRAINING_ID} was killed at the limit", source="comment")
+    provenance.check_text("W&B run 0123456789abcdef crashed at step 3", source="comment")
+
+    assert lookup.calls == []
+
+
+def test_a_state_in_another_clause_is_not_the_runs_state(case):
+    provenance, _, _ = case
+
+    provenance.check_text(
+        "W&B run ab12cd34 is the new baseline. An earlier attempt failed.",
+        source="comment",
+    )
+
+    with pytest.raises(ProvenanceError, match="ab12cd34 is finished in W&B.*own sentence"):
+        provenance.check_text("W&B run ab12cd34 failed at step 3.", source="comment")
+
+
+@pytest.mark.parametrize(
+    ("state", "run_ids"),
+    [
+        (TrainingState.RUNNING, ("ab12cd34",)),
+        (TrainingState.FAILED, ("ab12cd34", "cd34ef56")),
+    ],
+)
+def test_state_of_a_run_the_record_cannot_vouch_for_comes_from_wandb(
+    case, state, run_ids
+):
+    provenance, lookup, _ = case
+    write_record(provenance.training_dir, state=state, run_ids=run_ids)
+
+    provenance.check_text("run ab12cd34 finished", source="comment")
+    provenance.check_text("run ab12cd34 is in the sweep", source="comment")
+
+    assert lookup.calls == [("acme", "cfd", "ab12cd34")]
+
+
+def test_recorded_run_missing_from_wandb_is_still_accounted_for(case):
+    provenance, lookup, _ = case
+    write_record(provenance.training_dir, state=TrainingState.RUNNING, run_ids=("zz11yy22",))
+
+    provenance.check_text("offline run zz11yy22 is running", source="comment")
+
+    assert lookup.calls == [("acme", "cfd", "zz11yy22")]
+
+
+def test_failed_wandb_lookup_is_reported_as_unchecked(case):
+    provenance, _, _ = case
+
+    class Unreachable:
+        def run_state(self, entity: str, project: str, run_id: str) -> str | None:
+            raise ConnectionError("api.wandb.ai timed out")
+
+    unreachable = IdentifierProvenance(
+        workspace=provenance.workspace,
+        wandb_entity="acme",
+        wandb_project="cfd",
+        lookup=Unreachable(),
+    )
+
+    with pytest.raises(
+        ProvenanceError,
+        match="Could not check W&B run 'ab12cd34'.*ConnectionError.*Nothing was published",
+    ):
+        unreachable.check_text("run ab12cd34 finished", source="comment")

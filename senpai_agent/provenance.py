@@ -17,7 +17,7 @@ from typing import Protocol
 
 from senpai_agent.git_transport import GitWorkflowPreconditionError, run_git
 from senpai_agent.models import ExperimentResult, WandbRunRef
-from senpai_agent.training import TrainingResult, training_result_paths
+from senpai_agent.training import TrainingResult, TrainingState, training_result_paths
 
 
 class ProvenanceError(ValueError):
@@ -67,6 +67,11 @@ _COMMIT_CONTEXT = re.compile(
 _STATE_WORDS = re.compile(
     r"(?i)\b(running|finished|failed|timed[ _-]?out|cancell?ed|crashed|killed)\b"
 )
+# A context word names the identifier only within a few words of it, in the
+# same clause; other identifiers in a list between them do not count.
+_CONTEXT_WORDS = 3
+_WORD = re.compile(r"[A-Za-z0-9_'-]+")
+_CLAUSE_END = re.compile(r"[.;!?](?=\s|$)")
 _TABLE_SEPARATOR = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)*\s*:?-{3,}:?\s*\|?\s*$")
 _SHA = re.compile(r"[0-9a-fA-F]{4,40}")
 _CONTEXT_CHARS = 48
@@ -74,6 +79,21 @@ _STATE_CHARS = 64
 _FROM_TOOL_OUTPUT = (
     "Copy identifiers from tool output (run_training, get_training_status, "
     "git) or from a page you opened; do not type them from memory."
+)
+_NOT_A_RUN_ID = (
+    "Cite a run from another W&B project by its full run URL. If {token!r} is "
+    "not a W&B run id, reword so it does not directly follow 'run', 'W&B' or "
+    "'wandb'."
+)
+_NOT_A_COMMIT = (
+    "Cite a commit from another repository, or one this worktree has not "
+    "fetched, by its URL. If {token!r} is not a commit, reword so it does not "
+    "directly follow 'commit', 'SHA', 'HEAD' or a similar word."
+)
+_STATE_HINT = (
+    "A state word in the same clause as a run id is read as that run's state; "
+    "correct the state, or move the word to its own sentence if it describes "
+    "something else."
 )
 
 
@@ -118,17 +138,23 @@ class IdentifierProvenance:
             start, end = match.span()
             if any(start < span_end and span_start < end for span_start, span_end in spans):
                 continue
-            kind = _identifier_kind(match.group(), _context_before(text, start))
+            token = match.group()
+            kind = _identifier_kind(token, _context_before(text, start))
             if kind == "wandb":
                 self._check_run(
-                    match.group(),
+                    token,
                     quoted=_quoted_states(text, start, end),
                     source=source,
                     records=records,
                     states=states,
+                    hint=_NOT_A_RUN_ID.format(token=token),
                 )
             elif kind == "commit":
-                self.resolve_commit(match.group(), field=f"commit {match.group()!r} in the {source}")
+                self.resolve_commit(
+                    token,
+                    field=f"commit {token!r} in the {source}",
+                    hint=_NOT_A_COMMIT.format(token=token),
+                )
 
     def check_result(self, result: ExperimentResult) -> ExperimentResult:
         """Resolve a result's commit SHAs and account for its runs and text."""
@@ -158,7 +184,7 @@ class IdentifierProvenance:
             }
         )
 
-    def resolve_commit(self, sha: str, *, field: str) -> str:
+    def resolve_commit(self, sha: str, *, field: str, hint: str = "") -> str:
         """Return the full SHA of an exact or abbreviated commit, or refuse."""
 
         if _SHA.fullmatch(sha) is None:
@@ -171,7 +197,7 @@ class IdentifierProvenance:
         except GitWorkflowPreconditionError as error:
             raise ProvenanceError(
                 f"{field} does not resolve to a commit in the assignment "
-                f"repository ({error}). {_FROM_TOOL_OUTPUT}"
+                f"repository ({error}). {_FROM_TOOL_OUTPUT} {hint}".rstrip()
             ) from error
 
     def _check_run_ref(
@@ -204,17 +230,27 @@ class IdentifierProvenance:
         records: dict[str, TrainingResult],
         states: dict[tuple[str, str, str], str | None],
         project: tuple[str, str] | None = None,
+        hint: str = "",
     ) -> None:
         record = records.get(run_id)
         if record is not None:
-            # The harness read this id from the run's own output.
-            _require_state(
-                f"W&B run {run_id} (training {record.training_id})",
-                record.state.value,
-                quoted,
-                source=source,
-            )
-            return
+            # The harness read this id from the run's own output, so it exists.
+            # The process state is the run's state only for the last run of a
+            # finished process: an earlier run of the same process, or the run
+            # of a process still running, may already have ended in W&B.
+            if not quoted:
+                return
+            if (
+                record.state is not TrainingState.RUNNING
+                and record.wandb_run_ids[-1:] == (run_id,)
+            ):
+                _require_state(
+                    f"W&B run {run_id} (training {record.training_id})",
+                    record.state.value,
+                    quoted,
+                    source=source,
+                )
+                return
         if project is None:
             if self.wandb_entity is None or self.wandb_project is None:
                 return
@@ -222,18 +258,30 @@ class IdentifierProvenance:
         entity, project_name = project
         key = (entity, project_name, run_id)
         if key not in states:
-            states[key] = self.lookup.run_state(entity, project_name, run_id)
+            try:
+                states[key] = self.lookup.run_state(entity, project_name, run_id)
+            except Exception as error:
+                raise ProvenanceError(
+                    f"Could not check W&B run {run_id!r} in the {source} against "
+                    f"W&B project {entity}/{project_name}: the W&B lookup failed "
+                    f"({type(error).__name__}: {error}). Nothing was published; "
+                    "retry the call once W&B answers."
+                ) from error
         state = states[key]
         if state is None:
+            if record is not None:
+                # Recorded from the run's output but not in this project, such
+                # as an offline run: its existence is accounted for.
+                return
             raise ProvenanceError(
                 f"W&B run id {run_id!r} in the {source} is not in W&B project "
-                f"{entity}/{project_name}. {_FROM_TOOL_OUTPUT}"
+                f"{entity}/{project_name}. {_FROM_TOOL_OUTPUT} {hint}".rstrip()
             )
         quoted_classes = {_state_class(value) for value in quoted}
         if quoted_classes and _state_class(state) not in quoted_classes:
             raise ProvenanceError(
                 f"W&B run {run_id} is {state} in W&B, but the {source} calls it "
-                f"{', '.join(sorted(quoted))}. {_FROM_TOOL_OUTPUT}"
+                f"{', '.join(sorted(quoted))}. {_FROM_TOOL_OUTPUT} {_STATE_HINT}"
             )
 
     def _training_records(self) -> dict[str, TrainingResult]:
@@ -255,10 +303,12 @@ def _require_state(
     *,
     source: str,
 ) -> None:
-    if quoted and recorded not in quoted:
+    # Compare finished, running and stopped: "crashed" or "killed" is a fair
+    # description of a failed, timed-out or cancelled run.
+    if quoted and _state_class(recorded) not in {_state_class(value) for value in quoted}:
         raise ProvenanceError(
             f"{label} is recorded as {recorded}, but the {source} calls it "
-            f"{', '.join(sorted(quoted))}. {_FROM_TOOL_OUTPUT}"
+            f"{', '.join(sorted(quoted))}. {_FROM_TOOL_OUTPUT} {_STATE_HINT}"
         )
 
 
@@ -266,6 +316,9 @@ def _identifier_kind(token: str, context: str) -> str | None:
     hexadecimal = all(char in "0123456789abcdef" for char in token)
     if hexadecimal and len(token) == 40:
         return "commit"
+    if token.isdigit():
+        # A count, size or date ("base batch 1048576"), not an abbreviated SHA.
+        return None
     run_shape = (
         any(char.isalpha() for char in token)
         and any(char.isdigit() for char in token)
@@ -281,10 +334,15 @@ def _identifier_kind(token: str, context: str) -> str | None:
 
 
 def _last_match_end(pattern: re.Pattern[str], text: str) -> int:
+    """Return where the last context word ends, if it is close to the token."""
+
     end = -1
     for match in pattern.finditer(text):
         end = match.end()
-    return end
+    if end < 0:
+        return end
+    words = [word for word in _WORD.findall(text[end:]) if _TOKEN.fullmatch(word) is None]
+    return end if len(words) <= _CONTEXT_WORDS else -1
 
 
 def _line_bounds(text: str, position: int) -> tuple[int, int]:
@@ -294,12 +352,14 @@ def _line_bounds(text: str, position: int) -> tuple[int, int]:
 
 
 def _context_before(text: str, start: int) -> str:
-    """Return the words before a token: its line, or its table column header."""
+    """Return the words before a token in its clause, or its table cell and header."""
 
     line_start, _ = _line_bounds(text, start)
     before = text[max(line_start, start - _CONTEXT_CHARS) : start]
     header = _table_header_cell(text, start)
-    return before if header is None else f"{header} | {before}"
+    if header is not None:
+        return f"{header} | {before.rsplit('|', 1)[-1]}"
+    return _CLAUSE_END.split(before)[-1]
 
 
 def _table_header_cell(text: str, position: int) -> str | None:
@@ -321,8 +381,12 @@ def _table_header_cell(text: str, position: int) -> str | None:
 
 def _quoted_states(text: str, start: int, end: int) -> set[str]:
     line_start, line_end = _line_bounds(text, start)
-    window = text[max(line_start, start - _STATE_CHARS) : min(line_end, end + _STATE_CHARS)]
-    return {_normalize_state(match.group(1)) for match in _STATE_WORDS.finditer(window)}
+    before = _CLAUSE_END.split(text[max(line_start, start - _STATE_CHARS) : start])[-1]
+    after = _CLAUSE_END.split(text[end : min(line_end, end + _STATE_CHARS)])[0]
+    return {
+        _normalize_state(match.group(1))
+        for match in _STATE_WORDS.finditer(f"{before} {after}")
+    }
 
 
 def _normalize_state(state: str) -> str:
