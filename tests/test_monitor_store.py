@@ -196,6 +196,7 @@ def test_legacy_schema_promotes_previous_sample_to_change_baseline(
             SimpleNamespace(
                 state=TrainingState.RUNNING,
                 exit_code=None,
+                log_stalled_since=None,
             ),
             current,
             previous=store.previous_sample("train-1"),

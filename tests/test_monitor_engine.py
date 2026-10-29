@@ -20,7 +20,7 @@ from senpai_agent.training import TrainingResult, TrainingState
 NOW = datetime(2026, 7, 30, tzinfo=UTC)
 
 
-def result(tmp_path: Path, training_id: str, state=TrainingState.RUNNING):
+def result(tmp_path: Path, training_id: str, state=TrainingState.RUNNING, **fields):
     return TrainingResult(
         training_id=training_id,
         state=state,
@@ -28,6 +28,7 @@ def result(tmp_path: Path, training_id: str, state=TrainingState.RUNNING):
         elapsed_seconds=20,
         log_path=str(tmp_path / f"{training_id}.log"),
         wandb_run_ids=(f"run-{training_id}",),
+        **fields,
     )
 
 
@@ -357,3 +358,100 @@ def test_run_disappearing_after_metric_is_a_durable_hard_failure(tmp_path: Path)
         assert store.previous_sample(spec.training_id) == sample
         assert engine.poll(NOW + timedelta(seconds=120)) == ()
         assert store.pending_signals() == list(signals)
+
+
+def test_terminal_result_is_evaluated_before_its_next_due_poll(tmp_path: Path):
+    spec = monitor(metric="val/loss")
+    current = {"state": TrainingState.RUNNING}
+    metric_calls = []
+
+    class Training:
+        def get_training_status(self, training_id):
+            return result(tmp_path, training_id, current["state"])
+
+    class Metrics:
+        def latest(self, run_id, metric):
+            metric_calls.append((run_id, metric))
+            return MetricSample(value=0.2, observed_at=NOW)
+
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(spec)
+        engine = TrainingMonitorEngine(store, Training(), Metrics())
+
+        assert engine.poll(NOW) == ()
+        # A running monitor keeps its own schedule: no sample and no reschedule
+        # before it is due.
+        assert engine.poll(NOW + timedelta(seconds=10)) == ()
+        assert metric_calls == [("run-train-1", "val/loss")]
+        assert store.due(NOW + timedelta(seconds=59)) == []
+        assert store.due(NOW + timedelta(seconds=60)) == [spec]
+
+        current["state"] = TrainingState.FINISHED
+        produced = engine.poll(NOW + timedelta(seconds=20))
+
+        assert [item.kind for item in produced] == ["training_status"]
+        assert produced[0].state is TrainingState.FINISHED
+        assert metric_calls == [("run-train-1", "val/loss")]
+        assert store.active() == []
+
+
+def test_status_failure_of_a_monitor_that_is_not_due_waits_for_its_poll(
+    tmp_path: Path,
+):
+    spec = monitor()
+    failures = {"count": 0}
+
+    class Training:
+        def get_training_status(self, _training_id):
+            failures["count"] += 1
+            raise RuntimeError("status backend unavailable")
+
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(spec)
+        engine = TrainingMonitorEngine(store, Training(), SimpleNamespace())
+
+        first = engine.poll(NOW)
+        early = engine.poll(NOW + timedelta(seconds=10))
+
+        assert [item.kind for item in first] == ["monitor_error"]
+        assert early == ()
+        assert failures["count"] == 2
+        assert store.due(NOW + timedelta(seconds=59)) == []
+
+
+def test_stalled_run_is_reported_before_its_next_due_poll_without_sampling(
+    tmp_path: Path,
+):
+    spec = monitor(metric="val/loss")
+    current = {"stalled_since": None}
+    metric_calls = []
+
+    class Training:
+        def get_training_status(self, training_id):
+            return result(
+                tmp_path,
+                training_id,
+                log_stalled_since=current["stalled_since"],
+                last_log_line="step 3",
+            )
+
+    class Metrics:
+        def latest(self, run_id, metric):
+            metric_calls.append((run_id, metric))
+            return MetricSample(value=0.2, observed_at=NOW)
+
+    with MonitorStore(tmp_path / "monitors.sqlite3") as store:
+        store.register(spec)
+        engine = TrainingMonitorEngine(store, Training(), Metrics())
+        assert engine.poll(NOW) == ()
+
+        current["stalled_since"] = (NOW - timedelta(minutes=10)).timestamp()
+        produced = engine.poll(NOW + timedelta(seconds=10))
+
+        assert [item.kind for item in produced] == ["log_stalled"]
+        assert "step 3" not in produced[0].detail
+        assert len(metric_calls) == 1
+        assert store.due(NOW + timedelta(seconds=59)) == []
+        assert store.pending_signals() == list(produced)
+        assert store.active() == [spec]
+        assert engine.poll(NOW + timedelta(seconds=20)) == ()

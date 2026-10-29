@@ -71,6 +71,7 @@ class MonitorSignal(Contract):
     """Compact event handed back to the student conversation."""
 
     kind: Literal[
+        "log_stalled",
         "metric_gate",
         "metric_stale",
         "monitor_error",
@@ -139,6 +140,21 @@ def evaluate_monitor(
     if result.state is not TrainingState.RUNNING:
         return MonitorEvaluation(signals=tuple(signals)), sample or previous
 
+    if result.log_stalled_since is not None:
+        # One signal per stall: a log that grows again and stops again starts
+        # a new stall with a new timestamp.
+        key = f"{spec.training_id}:log_stall:{int(result.log_stalled_since)}"
+        if key not in emitted:
+            signals.append(
+                MonitorSignal(
+                    kind="log_stalled",
+                    dedupe_key=key,
+                    training_id=spec.training_id,
+                    state=result.state,
+                    detail=_log_stall_detail(result, now),
+                )
+            )
+
     if sample is not None:
         for index, gate in enumerate(spec.gates):
             key = f"{spec.training_id}:gate:{index}"
@@ -187,6 +203,28 @@ def evaluate_monitor(
             )
 
     return MonitorEvaluation(signals=tuple(signals)), sample or previous
+
+
+def _log_stall_detail(result: TrainingResult, now: datetime) -> str:
+    assert result.log_stalled_since is not None
+    since = datetime.fromtimestamp(result.log_stalled_since, UTC)
+    age = max(0, round((now - since).total_seconds()))
+    run = f" (W&B run {result.wandb_run_ids[-1]})" if result.wandb_run_ids else ""
+    # The last log line is raw run output; get_training_status returns it with
+    # the conversation's secrets masked, so the signal only points there.
+    last_line = (
+        "get_training_status returns its last log line."
+        if result.last_log_line
+        else "The log is still empty."
+    )
+    detail = (
+        f"Training {result.training_id}{run} has written nothing to its log for "
+        f"{age} s, since {since.strftime('%Y-%m-%dT%H:%M:%SZ')}. {last_line} "
+        "If the process is hung, cancel it with cancel_training. A run that is "
+        "expected to stay quiet needs no action; this signal repeats only after "
+        "the log grows and stalls again."
+    )
+    return detail[:1_000]
 
 
 def _gate_crossed(
@@ -409,19 +447,7 @@ class MonitorStore:
         now: datetime | None = None,
     ) -> None:
         now = now or datetime.now(UTC)
-        for signal in evaluation.signals:
-            self.connection.execute(
-                """
-                INSERT OR IGNORE INTO monitor_signals
-                (dedupe_key, training_id, signal_json)
-                VALUES (?, ?, ?)
-                """,
-                (
-                    signal.dedupe_key,
-                    spec.training_id,
-                    signal.model_dump_json(),
-                ),
-            )
+        self._insert_signals(spec, evaluation)
         self.connection.execute(
             """
             UPDATE monitors
@@ -438,6 +464,35 @@ class MonitorStore:
             ),
         )
         self.connection.commit()
+
+    def record_signals(
+        self,
+        spec: TrainingMonitorSpec,
+        evaluation: MonitorEvaluation,
+    ) -> None:
+        """Persist signals from an off-schedule evaluation; keep the schedule."""
+
+        self._insert_signals(spec, evaluation)
+        self.connection.commit()
+
+    def _insert_signals(
+        self,
+        spec: TrainingMonitorSpec,
+        evaluation: MonitorEvaluation,
+    ) -> None:
+        for signal in evaluation.signals:
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO monitor_signals
+                (dedupe_key, training_id, signal_json)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    signal.dedupe_key,
+                    spec.training_id,
+                    signal.model_dump_json(),
+                ),
+            )
 
     def record_poll_error(
         self,
@@ -595,12 +650,24 @@ class TrainingMonitorEngine:
         self.metrics = metrics
 
     def poll(self, now: datetime | None = None) -> tuple[MonitorSignal, ...]:
+        """Evaluate due monitors, and every run that needs attention now.
+
+        Metric sampling keeps each monitor's own poll interval. A terminal or
+        stalled record is evaluated as soon as the controller polls, because
+        the supervisor wakes the controller for it; waiting for the monitor's
+        next due time would resume the student one poll interval late.
+        """
+
         now = now or datetime.now(UTC)
         produced: list[MonitorSignal] = []
-        for spec in self.store.due(now):
+        due = {spec.training_id for spec in self.store.due(now)}
+        for spec in self.store.active():
+            is_due = spec.training_id in due
             try:
                 result = self.training.get_training_status(spec.training_id)
             except Exception as error:  # noqa: BLE001
+                if not is_due:
+                    continue
                 signal = self.store.record_poll_error(
                     spec,
                     error,
@@ -610,10 +677,17 @@ class TrainingMonitorEngine:
                 if signal is not None:
                     produced.append(signal)
                 continue
+            if (
+                not is_due
+                and result.state is TrainingState.RUNNING
+                and result.log_stalled_since is None
+            ):
+                continue
             sample = None
             try:
                 if (
-                    result.state is TrainingState.RUNNING
+                    is_due
+                    and result.state is TrainingState.RUNNING
                     and spec.metric
                     and result.wandb_run_ids
                 ):
@@ -655,7 +729,10 @@ class TrainingMonitorEngine:
                     baseline=baseline,
                     now=now,
                 )
-                self.store.record_poll(spec, evaluation, latest, now=now)
+                if is_due:
+                    self.store.record_poll(spec, evaluation, latest, now=now)
+                else:
+                    self.store.record_signals(spec, evaluation)
                 if result.state is not TrainingState.RUNNING:
                     self.store.complete(spec.training_id)
             except Exception as error:  # noqa: BLE001

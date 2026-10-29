@@ -26,6 +26,7 @@ from senpai_agent.github.workflow import (
     WorkflowPreconditionError,
 )
 from senpai_agent.models import AssignmentRecord, ExperimentResult
+from senpai_agent.provenance import IdentifierProvenance
 
 from .contracts import (
     GitHubMutationObservation,
@@ -101,6 +102,8 @@ class GitHubToolRuntime:
     student_names: frozenset[str]
     student_name: str | None
     event_db_path: Path | None = None
+    # Checks the identifiers a student quotes; None skips the checks.
+    provenance: IdentifierProvenance | None = None
 
     def assignment_base_branch(self) -> str:
         """Return the configured advisor branch or fail before a mutation."""
@@ -171,6 +174,15 @@ class PushExperimentCommitExecutor(
         conversation: LocalConversation | None = None,
     ) -> GitHubMutationObservation:
         student = self.runtime.current_student()
+        if self.runtime.provenance is not None:
+            # An abbreviated SHA is resolved; one that is not a commit is refused.
+            action = action.model_copy(
+                update={
+                    "local_commit_sha": self.runtime.provenance.resolve_commit(
+                        action.local_commit_sha, field="local_commit_sha"
+                    )
+                }
+            )
         with self.runtime.workflow.serialized_assignment_mutation():
             try:
                 _, assignment = self._preflight(
@@ -263,9 +275,12 @@ class SubmitExperimentResultExecutor(
         action: SubmitExperimentResultAction,
         conversation: LocalConversation | None = None,
     ) -> GitHubMutationObservation:
-        self.runtime.require_current_student(action.result.assignment.student)
-        number = action.result.assignment.pr_number
-        commit_sha = action.result.commit_sha
+        result = action.result
+        self.runtime.require_current_student(result.assignment.student)
+        if self.runtime.provenance is not None:
+            result = self.runtime.provenance.check_result(result)
+        number = result.assignment.pr_number
+        commit_sha = result.commit_sha
         with self.runtime.workflow.serialized_assignment_mutation():
             try:
                 preflight = self.runtime.workflow.preflight_submit_result(
@@ -273,7 +288,7 @@ class SubmitExperimentResultExecutor(
                     branch=action.branch,
                     current_head_sha=action.remote_branch_sha_before_push,
                     expected_result_head_sha=commit_sha,
-                    result=action.result,
+                    result=result,
                 )
                 git_workflow.require_commit_contains_base(
                     self.runtime.workspace,
@@ -290,10 +305,10 @@ class SubmitExperimentResultExecutor(
                     ),
                     token=self.runtime.git_token,
                 )
-                result = self._submit_after_push(number, action.result)
+                submitted = self._submit_after_push(number, result)
             except StaleAssignmentRevisionError as error:
                 _finish_stale_assignment_turn(error, conversation)
-            return GitHubMutationObservation.from_result(result)
+            return GitHubMutationObservation.from_result(submitted)
 
     def _submit_after_push(
         self,

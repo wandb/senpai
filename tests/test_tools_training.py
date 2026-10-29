@@ -688,3 +688,49 @@ def test_get_training_status_delivers_complete_structured_pod_evidence(tmp_path,
     delivered = json.loads(observed.to_llm_content[0].text)
     assert delivered[field] == receipt
     assert training.status_checks == ['training-17']
+
+
+def test_training_runtime_reads_the_log_stall_interval_from_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv("NODES_PER_STUDENT", raising=False)
+    monkeypatch.delenv("SENPAI_TRAINING_IMAGE", raising=False)
+    monkeypatch.setenv("SENPAI_TRAINING_LOG_STALL_SECONDS", "90")
+    workspace = init_workspace(tmp_path)
+
+    try:
+        supervisor, _ = training_tools.training_runtime(workspace, tmp_path / "state")
+        assert supervisor.log_stall_seconds == 90
+    finally:
+        close_training_runtimes()
+
+    monkeypatch.setenv("SENPAI_TRAINING_LOG_STALL_SECONDS", "0")
+    with pytest.raises(RuntimeError, match="positive"):
+        training_tools.training_runtime(workspace, tmp_path / "other-state")
+
+
+def test_training_observation_reports_a_stalled_log(tmp_path: Path):
+    result = finished_result(tmp_path).model_copy(
+        update={
+            "state": TrainingState.RUNNING,
+            "exit_code": None,
+            "log_stalled_since": 1_700_000_000.0,
+            "last_log_line": "step 3 of 100",
+        }
+    )
+    conversation = SimpleNamespace(
+        state=SimpleNamespace(
+            secret_registry=SimpleNamespace(
+                mask_secrets_in_output=lambda text: text.replace("100", "<n>")
+            )
+        )
+    )
+
+    observed = TrainingResultObservation.from_result(result, conversation)
+    delivered = json.loads(observed.to_llm_content[0].text)
+
+    assert delivered["log_stalled_since"] == 1_700_000_000.0
+    assert delivered["last_log_line"] == "step 3 of <n>"
+
+    with pytest.raises(RuntimeError, match="secret registry"):
+        TrainingResultObservation.from_result(result, None)

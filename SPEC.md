@@ -641,6 +641,22 @@ repository, assignment, revision, student, and current remote head before it can
 push. Marker comments are trusted only when authored by the authenticated token
 actor.
 
+Before posting, `post_assignment_comment` and `submit_experiment_result` check
+the identifiers the student quotes. A W&B run id counts when it is in a run
+page URL, in a table column whose header names runs, or within a few words of
+`run`, `W&B` or `wandb` in the same clause; it must be in the student's
+training records or in the run's W&B project. A commit SHA counts when it is
+40 hexadecimal characters, or an abbreviated SHA near a commit word; it must
+resolve in the assignment worktree. A state word in the same clause as a run
+id must match the run's state class (running, finished, or stopped). The
+record vouches for the state only of the last W&B run of a terminal process;
+otherwise W&B does. Bare numbers are never SHAs. A refusal names the
+identifier and how to cite one the checks cannot see, by URL. A failed W&B
+lookup refuses the call as unchecked, so nothing unverified is published.
+`push_experiment_commit` and `submit_experiment_result` resolve abbreviated
+SHAs to the full commit before their other checks, and push and report the
+full SHA. `post_peer_comment` and `broadcast_message` are not checked.
+
 Assignment creation checks the remote base SHA, creates an isolated empty
 assignment commit with `git commit-tree`, publishes with force-with-lease,
 refuses a second active assignment for the student, creates or reconciles one
@@ -982,10 +998,16 @@ It does not return until the supervisor has persisted a terminal state. Target
 training code remains responsible for handling SIGTERM and flushing external
 services such as W&B before the grace period expires.
 
-The controller polls only monitors that are due. It fetches one latest selected
-metric value from W&B, evaluates deterministic threshold/change/staleness and
-terminal-state rules, and persists deduplicated compact signals. Ordinary
-polls use no LLM tokens.
+The controller samples metrics only for monitors that are due, but evaluates
+a run's terminal record as soon as it polls. The training supervisor wakes
+the controller from its idle sleep when a run ends, so the student resumes
+within seconds of the terminal state instead of at the next poll tick. A
+local run whose log stops growing for the supervisor's stall interval is
+flagged in its record with its last log line, wakes the controller the same
+way, and raises one `log_stalled` signal per stall. The
+controller fetches one latest selected metric value from W&B, evaluates
+deterministic threshold/change/staleness and terminal-state rules, and
+persists deduplicated compact signals. Ordinary polls use no LLM tokens.
 
 Metric samples reject NaN and infinities. A failure in one monitor's training
 status or W&B lookup advances that monitor's schedule and emits one

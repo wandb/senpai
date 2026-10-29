@@ -124,6 +124,28 @@ _GH_READ_ONLY = {
 }
 _TRAIN_LAUNCHERS = {"accelerate", "deepspeed", "torchrun"}
 _TRAIN_SCRIPT = re.compile(r"^train[^/]*[.]py$")
+# Programs whose detached launch hides GPU work from run_training's supervision:
+# no timeout, no log or W&B record, no clean-worktree check, no wake on exit.
+_GPU_PROGRAMS = {"compute-sanitizer", "kernel-bench", "ncu", "nsys", "nvcc"} | _TRAIN_LAUNCHERS
+_DETACHED_LAUNCHERS = {"nohup", "setsid"}
+_DETACHED_GPU_REASON = (
+    "Do not launch GPU jobs detached from the terminal (nohup, setsid, or a "
+    "trailing &); use run_training. It supervises the process, records its log "
+    "and W&B run ids, keeps the clean-worktree check, and resumes this "
+    "conversation as soon as the run ends or its log stalls, so there is "
+    "nothing to poll for."
+)
+# `uv run` options that take a separate value before the program.
+_UV_RUN_VALUE_OPTIONS = {
+    "--allow-insecure-host", "--cache-dir", "--color", "--config-file",
+    "--default-index", "--directory", "--env-file", "--exclude-newer", "--extra",
+    "--extra-index-url", "--find-links", "--fork-strategy", "--group", "--index",
+    "--index-strategy", "--index-url", "--keyring-provider", "--link-mode",
+    "--no-group", "--only-group", "--package", "--prerelease", "--project",
+    "--python", "--python-preference", "--refresh-package", "--reinstall-package",
+    "--resolution", "--upgrade-package", "--with", "--with-editable",
+    "--with-requirements", "-p",
+}
 _HELP_FLAGS = {"-h", "--help"}
 _REDIRECTION_OPERATORS = {
     "<",
@@ -457,7 +479,29 @@ def _heredoc_runs_shell(owner: object, source: bytes, workspace: Path) -> bool:
     return False
 
 
-def _bash_commands(command: str, workspace: Path) -> list[str] | None:
+def _backgrounded_nodes(nodes: list[object]) -> set[int]:
+    """Return the ids of statements the shell would run in the background."""
+
+    backgrounded: set[int] = set()
+    for node in nodes:
+        children = node.children
+        for index, child in enumerate(children[:-1]):
+            if children[index + 1].type == "&":
+                backgrounded.add(child.id)
+    return backgrounded
+
+
+def _is_backgrounded(node: object, backgrounded: set[int]) -> bool:
+    while node is not None:
+        if node.id in backgrounded:
+            return True
+        node = node.parent
+    return False
+
+
+def _bash_commands(command: str, workspace: Path) -> list[tuple[str, bool]] | None:
+    """Return each policy-relevant statement and whether it runs detached."""
+
     import tree_sitter_bash
     from tree_sitter import Language, Parser
 
@@ -472,8 +516,12 @@ def _bash_commands(command: str, workspace: Path) -> list[str] | None:
         for node in nodes
     ):
         return None
+    backgrounded = _backgrounded_nodes(nodes)
     commands = [
-        source[node.start_byte : node.end_byte].decode()
+        (
+            source[node.start_byte : node.end_byte].decode(),
+            _is_backgrounded(node, backgrounded),
+        )
         for node in nodes
         if node.type in _POLICY_NODE_TYPES
     ]
@@ -1017,6 +1065,83 @@ def _argv_runner_command(program: str, arguments: list[str]) -> list[str] | None
     return command
 
 
+def _launched_command(tokens: list[str]) -> list[str] | None:
+    """Return the command a segment finally runs, seen through known wrappers."""
+
+    while tokens:
+        index = _program_index(tokens)
+        if index is None:
+            return None
+        tokens = tokens[index:]
+        program_token = tokens[0]
+        program = Path(program_token).name
+        arguments = tokens[1:]
+        if program in _SHELL_BODY_PREFIXES or program_token in _FIND_EXEC_ACTIONS:
+            tokens = arguments
+        elif program == "env":
+            tokens = _env_command(arguments)
+        elif program == "exec":
+            tokens = _wrapper_command(arguments, value_options={"-a"})
+        elif program == "time":
+            tokens = _time_command(arguments) or []
+        elif program == "timeout":
+            try:
+                _options, remaining = getopt.getopt(arguments, *_TIMEOUT_OPTIONS)
+            except getopt.GetoptError:
+                return None
+            tokens = remaining[1:]
+        elif program in _COMMAND_RUNNERS:
+            try:
+                tokens = _argv_runner_command(program, arguments) or []
+            except getopt.GetoptError:
+                return None
+        elif program == "uv" and arguments[:1] == ["run"]:
+            tokens = _uv_run_program(arguments[1:])
+        else:
+            return tokens
+    return None
+
+
+def _uv_run_program(arguments: list[str]) -> list[str]:
+    """Skip `uv run` options; `-m` and `--module` mean the target interpreter."""
+
+    position = 0
+    while position < len(arguments):
+        argument = arguments[position]
+        if argument == "--":
+            return arguments[position + 1 :]
+        if argument in {"-m", "--module"}:
+            return ["python", *arguments[position:]]
+        if argument in _UV_RUN_VALUE_OPTIONS:
+            position += 2
+            continue
+        if argument.startswith("-"):
+            position += 1
+            continue
+        return arguments[position:]
+    return []
+
+
+def _detached_launch_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
+    """Deny a GPU program that would run outside run_training's supervision."""
+
+    command = _launched_command(tokens)
+    if command is None:
+        return PolicyDecision(True)
+    program = Path(command[0]).name
+    if program.startswith("python") or program in _GPU_PROGRAMS:
+        return PolicyDecision(False, _DETACHED_GPU_REASON)
+    if _shell_program(command[0], workspace) is not None:
+        # A detached shell detaches every command in its -c string.
+        script = _shell_command(_without_redirections(command[1:]))
+        if script is not None:
+            for segment in _command_segments(script, workspace):
+                decision = _detached_launch_policy(segment, workspace)
+                if not decision.allowed:
+                    return decision
+    return PolicyDecision(True)
+
+
 def _runner_policy(
     program: str, arguments: list[str], workspace: Path
 ) -> PolicyDecision:
@@ -1026,6 +1151,10 @@ def _runner_policy(
     except getopt.GetoptError as error:
         return PolicyDecision(False, f"Senpai could not parse `{program}` safely: {error}.")
     if command is not None:
+        if program in _DETACHED_LAUNCHERS:
+            decision = _detached_launch_policy(command, workspace)
+            if not decision.allowed:
+                return decision
         return _segment_policy(command, workspace)
 
     command = _shell_command(arguments)
@@ -1286,11 +1415,15 @@ def terminal_policy(
             False,
             "Senpai could not parse this shell command safely.",
         )
-    for nested_command in nested_commands:
+    for nested_command, background in nested_commands:
         for segment in _command_segments(nested_command, workspace):
             decision = _segment_policy(segment, workspace)
             if not decision.allowed:
                 return decision
+            if background:
+                decision = _detached_launch_policy(segment, workspace)
+                if not decision.allowed:
+                    return decision
     for segment in _command_segments(command, workspace):
         decision = _segment_policy(segment, workspace)
         if not decision.allowed:

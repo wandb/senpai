@@ -6,6 +6,7 @@ import os
 import random
 import signal
 import sys
+import threading
 import time
 from base64 import b64decode
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
@@ -461,6 +462,7 @@ class Controller:
         sleep: Callable[[float], None] = time.sleep,
         poll_interval_seconds: float = 600,
         jitter_seconds: float = 120,
+        wake: threading.Event | None = None,
     ):
         if min(poll_interval_seconds, jitter_seconds) < 0:
             raise ValueError("poll and jitter intervals must not be negative")
@@ -489,6 +491,9 @@ class Controller:
         self.inbox = inbox or PersistentInbox()
         self.workspace_divergence_state = workspace_divergence_state
         self.sleep = sleep
+        # A local signal, such as a training run reaching a terminal state,
+        # ends the idle sleep early so the next poll delivers it at once.
+        self.wake = wake
         self.poll_interval_seconds = poll_interval_seconds
         self.jitter_seconds = jitter_seconds
         self.event_reminder_seconds = (
@@ -520,6 +525,10 @@ class Controller:
         cycles = 0
         turn_failures: dict[UUID, int] = {}
         while max_cycles is None or cycles < max_cycles:
+            if self.wake is not None:
+                # Anything signalled from here on is caught by the next wait;
+                # anything signalled before is in the records this poll reads.
+                self.wake.clear()
             self._acknowledge_processed_turns()
             self._poll_into_inbox()
             cycle_had_failure = False
@@ -666,7 +675,7 @@ class Controller:
             ):
                 self._sleep("provider-cooldown", provider_delay)
             else:
-                self._sleep("sleep", normal_delay)
+                self._sleep("sleep", normal_delay, until_woken=True)
 
     def _provider_cooldown_remaining(self) -> float | None:
         cooldown = self.inbox.provider_cooldown()
@@ -856,11 +865,19 @@ class Controller:
                 completed_turn=completed_turn,
             )
 
-    def _sleep(self, phase: str, seconds: float) -> None:
+    def _sleep(self, phase: str, seconds: float, *, until_woken: bool = False) -> None:
         self._publish_progress(
             phase,
             max(seconds + self.operation_timeout_seconds, 1),
         )
+        if until_woken and self.wake is not None:
+            if self.wake.wait(seconds):
+                print(
+                    f"SENPAI_WAKE phase={phase} reason=training_record",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return
         self.sleep(seconds)
 
     def _has_started(self, conversation_id: UUID) -> bool:
@@ -1199,6 +1216,7 @@ def controller_main(
             "POLL_JITTER_S",
             120,
         ),
+        wake=training.wake if training is not None else None,
     )
 
     def interrupt(_signum: int, _frame: object) -> None:

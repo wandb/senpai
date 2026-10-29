@@ -97,3 +97,117 @@ def test_wandb_url_can_span_log_read_chunks(tmp_path: Path):
 
     assert terminal.state is TrainingState.FINISHED
     assert terminal.wandb_run_ids == ("split-run",)
+
+
+@pytest.mark.parametrize(
+    ("line", "run_ids"),
+    [
+        (
+            "W&B run: https://forge.example.com/wandb/acme/cfd/runs/0123456789abcdef",
+            ("0123456789abcdef",),
+        ),
+        (
+            "wandb: 🚀 View run bold-sky-7 at: "
+            "https://wandb.example.net/acme/cfd/runs/ab12cd34?nw=nwuserx",
+            ("ab12cd34",),
+        ),
+        (
+            "wandb: Run data is saved locally in /w/wandb/run-20261028_120000-ab12cd34",
+            ("ab12cd34",),
+        ),
+        ("see https://github.com/acme/cfd/actions/runs/123456 for CI", ()),
+    ],
+)
+def test_run_ids_are_read_from_any_wandb_host_and_run_directory(
+    tmp_path: Path, line: str, run_ids: tuple[str, ...]
+):
+    workspace, supervisor = make_supervisor(tmp_path)
+    running = run_python(
+        supervisor,
+        workspace,
+        f"print({line!r}, flush=True)",
+    )
+
+    terminal = wait_for_terminal(supervisor, running.training_id)
+
+    assert terminal.state is TrainingState.FINISHED
+    assert terminal.wandb_run_ids == run_ids
+
+
+def wait_for_status(supervisor, training_id, predicate, *, timeout: float = 3):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = supervisor.get_training_status(training_id)
+        if predicate(status):
+            return status
+        time.sleep(0.02)
+    raise AssertionError(f"training never reached the expected status: {status}")
+
+
+def test_quiet_log_is_flagged_as_stalled_until_output_resumes(tmp_path: Path):
+    workspace, supervisor = make_supervisor(
+        tmp_path,
+        terminate_grace_seconds=0.1,
+        log_stall_seconds=0.3,
+    )
+    running = run_python(
+        supervisor,
+        workspace,
+        (
+            "import time; "
+            "print('phase one', flush=True); "
+            "time.sleep(1.0); "
+            "print('phase two', flush=True); "
+            "time.sleep(60)"
+        ),
+        timeout_seconds=60,
+    )
+
+    try:
+        stalled = wait_for_status(
+            supervisor,
+            running.training_id,
+            lambda status: status.log_stalled_since is not None,
+        )
+        assert stalled.state is TrainingState.RUNNING
+        assert stalled.last_log_line == "phase one"
+        assert running.process_start_time is not None
+        assert stalled.log_stalled_since >= running.process_start_time - 1
+        assert supervisor.wake.is_set() is True
+
+        recovered = wait_for_status(
+            supervisor,
+            running.training_id,
+            lambda status: status.last_log_line == "phase two",
+        )
+        assert recovered.log_stalled_since is None
+
+        terminal = supervisor.cancel_training(running.training_id)
+        assert terminal.state is TrainingState.CANCELLED
+        assert terminal.last_log_line == "phase two"
+    finally:
+        supervisor.close()
+
+
+def test_a_log_that_keeps_growing_is_never_flagged(tmp_path: Path):
+    workspace, supervisor = make_supervisor(
+        tmp_path,
+        terminate_grace_seconds=0.1,
+        log_stall_seconds=0.3,
+    )
+    running = run_python(
+        supervisor,
+        workspace,
+        "import time\nfor step in range(40):\n    print('step', step, flush=True)\n    time.sleep(0.05)",
+        timeout_seconds=60,
+    )
+
+    try:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            status = supervisor.get_training_status(running.training_id)
+            assert status.log_stalled_since is None
+            time.sleep(0.02)
+        assert supervisor.wake.is_set() is False
+    finally:
+        supervisor.close()

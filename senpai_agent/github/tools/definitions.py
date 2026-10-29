@@ -186,8 +186,10 @@ class PushExperimentCommitTool(
             "The tool checks "
             "the assigned student, branch, base commit and current instructions; "
             "it refuses to overwrite other commits or push after a final experiment "
-            "result. It does not post a comment, submit a result, change PR "
-            "labels or draft state, remove a hold, or authorize training.",
+            "result. An abbreviated local_commit_sha is resolved in the worktree; "
+            "one that is not a commit is refused. It does not post a comment, "
+            "submit a result, change PR labels or draft state, remove a hold, or "
+            "authorize training.",
             PushExperimentCommitExecutor(runtime),
         )
 
@@ -333,7 +335,10 @@ class SubmitExperimentResultTool(
             cls, SubmitExperimentResultAction, "Submit experiment result",
             "Validate one terminal result against its current assignment and research "
             "base, lease-push result.commit_sha, then publish the typed result and "
-            "make the PR review-ready.",
+            "make the PR review-ready. Abbreviated SHAs are resolved in the worktree. "
+            "Every W&B run id, commit SHA and run state quoted in the result is "
+            "checked against W&B, the repository and the training records, and an "
+            "identifier no record accounts for is refused by name.",
             SubmitExperimentResultExecutor(runtime),
         )
 
@@ -351,7 +356,11 @@ class PostAssignmentCommentTool(
             "Post assignment comment",
             "Post or exactly replay one meaningful interim progress update, "
             "question, blocker, evidence item, or response on this student's "
-            "current assignment without pushing or changing workflow state.",
+            "current assignment without pushing or changing workflow state. "
+            "Every W&B run id, commit SHA and run state quoted in the comment is "
+            "checked against W&B, the repository and the training records; copy "
+            "identifiers from tool output, because one no record accounts for is "
+            "refused by name.",
             PostAssignmentCommentExecutor(runtime),
         )
 

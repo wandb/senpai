@@ -784,6 +784,9 @@ class KubernetesTrainingSupervisor:
         self._launch_complete.set()
         self._active: dict[str, _ActiveRemoteTraining] = {}
         self._launching = False
+        # Set whenever a run's record reaches a state the student should hear
+        # about now; the controller waits on it instead of its poll interval.
+        self.wake = threading.Event()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._recover()
 
@@ -1505,6 +1508,8 @@ class KubernetesTrainingSupervisor:
         temporary = path.with_suffix(".tmp")
         temporary.write_text(result.model_dump_json(indent=2))
         temporary.replace(path)
+        if result.state is not TrainingState.RUNNING:
+            self.wake.set()
 
 
 def _materialize_source_snapshot(workspace: Path) -> tuple[Path, str]:

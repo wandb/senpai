@@ -9,6 +9,7 @@ from pathlib import Path
 from openhands.sdk.tool import ToolDefinition
 
 from senpai_agent.github.workflow import GitHubWorkflow
+from senpai_agent.provenance import IdentifierProvenance
 
 from .broadcast import BroadcastMessageTool
 from .definitions import (
@@ -86,6 +87,19 @@ class GitHubWorkflowToolSet(
         elif workflow.role != role:
             raise ValueError("workflow role must match the GitHub tool role")
 
+        provenance = None
+        if role == "student":
+            # The training records live beside the GitHub state directory.
+            provenance = IdentifierProvenance(
+                workspace=Path(workspace),
+                training_dir=(
+                    Path(state_dir).parent / "training"
+                    if state_dir is not None
+                    else None
+                ),
+                wandb_entity=os.environ.get("WANDB_ENTITY", "").strip() or None,
+                wandb_project=os.environ.get("WANDB_PROJECT", "").strip() or None,
+            )
         runtime = GitHubToolRuntime(
             workflow=workflow,
             workspace=Path(workspace),
@@ -95,6 +109,7 @@ class GitHubWorkflowToolSet(
             student_names=configured_student_names(student_names),
             student_name=student_name or os.environ.get("STUDENT_NAME"),
             event_db_path=Path(event_db_path) if event_db_path is not None else None,
+            provenance=provenance,
         )
         if role == "advisor":
             runtime.assignment_base_branch()
