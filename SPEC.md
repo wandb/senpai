@@ -737,8 +737,8 @@ Active children or training, stale assignments and holds block repair. Before
 the repair and again before resuming, the PR head may only have moved forward:
 GitHub's compare API must show that it contains the requested head, because an
 advisor checkout may lack the student's commits. Routing, revision and status
-are checked at that live head, and a student checkout must still contain the
-requested head. Any other head change fails the repair. A verified Pydantic
+are checked at that live head, and a student checkout must contain the live
+head. Any other head change fails the repair. A verified Pydantic
 result resumes the original conversation once; failure leaves quarantine
 intact. Saved outcomes survive publication retries. Cross-pod result Issues
 close after the requester stores the reply locally; inbox processing and
