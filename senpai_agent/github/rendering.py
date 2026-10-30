@@ -9,6 +9,9 @@ if TYPE_CHECKING:
     from senpai_agent.github.pull_requests import PullRequest
 
 
+CLIPPED_NOTICE = "\n\n[Truncated to fit the review budget.]"
+
+
 def render_pull_requests(repo: str, pull_requests: Sequence[PullRequest]) -> str:
     parts = [
         "# GitHub pull requests",
@@ -70,6 +73,54 @@ def _render_pull_request(pull_request: PullRequest) -> str:
         ),
     ]
     return "\n".join(sections)
+
+
+def render_review_context(pull_request: PullRequest, max_chars: int) -> str:
+    """Render one PR's body and newest discussion in at most ``max_chars``.
+
+    The body and each entry keep at most a quarter of the budget. The newest
+    entries that fit follow the body in chronological order.
+    """
+    part_chars = max_chars // 4
+    details = pull_request.details
+    head = "\n".join((
+        f"## PR #{pull_request.number} — {details.get('title') or ''}",
+        "",
+        f"- URL: {details.get('html_url') or ''}",
+        "",
+        "### PR body",
+        "",
+        clip_text(_body(details.get("body")), part_chars, CLIPPED_NOTICE),
+    ))
+    entries = sorted(
+        (key(entry), render(entry, index))
+        for records, key, render in (
+            (pull_request.issue_comments, _created_key, _render_issue_comment),
+            (pull_request.reviews, _review_key, _render_review),
+            (pull_request.inline_comments, _created_key, _render_inline_comment),
+        )
+        for index, entry in enumerate(sorted(records, key=key), 1)
+    )
+    total = len(entries)
+    heading = "### Recent discussion ({} of {} entries; {} older omitted)"
+    remaining = max_chars - len(head) - len(heading.format(total, total, total)) - 2
+    recent: list[str] = []
+    for _key, text in reversed(entries):
+        text = clip_text(text, part_chars, CLIPPED_NOTICE)
+        remaining -= len(text) + 2
+        if remaining < 0:
+            break
+        recent.insert(0, text)
+    heading = heading.format(len(recent), total, total - len(recent))
+    return "\n\n".join((head, heading, *recent))
+
+
+def clip_text(text: str, limit: int, notice: str) -> str:
+    """Return ``text``, or its start and ``notice`` in at most ``limit`` characters."""
+
+    if len(text) <= limit:
+        return text
+    return text[:max(0, limit - len(notice))] + notice
 
 
 def _render_entries(

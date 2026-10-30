@@ -33,6 +33,7 @@ import senpai_agent.github.merge_worker as merge_worker
 import senpai_agent.openhands_runner as runner
 from senpai_agent.github import http as github_http
 from senpai_agent.github.mailbox import GitHubMailbox
+from senpai_agent.github.pull_requests import PullRequest
 from senpai_agent.github.tools import GitHubWorkflowToolSet
 from senpai_agent.github.tools.contracts import AssignmentVersion, MergeExperimentAction
 from senpai_agent.github.tools.runtime import (
@@ -40,15 +41,19 @@ from senpai_agent.github.tools.runtime import (
     configure_github_credentials,
 )
 from senpai_agent.github.workflow import HttpResponse
+from senpai_agent.github.workflow.responses import PullRequestSnapshot
 from senpai_agent.models import render_assignment_marker, render_result_comment
+from senpai_agent.PROMPTS import CODE_QUALITY_REVIEW_PROMPT
 
 APPROVED = code_review.CodeQualityVerdict(
-    approved=True, review_summary="Focused change.", findings=[],
+    approved=True, review_summary="Focused change.", findings=[], notes=[],
 )
 FINDING = "model.py:1: Remove the unused fallback; callers already require a value."
 REJECTED = code_review.CodeQualityVerdict(
     approved=False, review_summary="Unnecessary complexity.", findings=[FINDING],
+    notes=[],
 )
+NOTE = "README.md: The experiment notes could be shorter."
 ADVISOR_HISTORY_SENTINEL = "Advisor-only history: the experiment improved the held-out metric."
 
 
@@ -221,6 +226,8 @@ def test_approval_reviews_pinned_source_with_smart_profile_before_merging(
         for entry in (*case.fake.comments, *case.reviews, *case.inline_comments):
             assert entry["body"] in prompt
         assert "model.py:1" in prompt and "model.py:2" in prompt
+        assert "model.py | 2" in prompt and "+baseline = 2" in prompt
+        assert "Report everything else as non-blocking notes and approve" in prompt
         reviewed_workspaces.append(config.workspace)
         on_structured_result(APPROVED)
         return 0
@@ -277,6 +284,117 @@ def test_missing_or_stale_pr_discussion_blocks_review_and_merge(
     assert not any(method == "PUT" for method, _path, _body in merge_case.fake.mutations)
     assert merge_case.fake.mutations == []
     assert "feedback_url" not in result
+
+
+def test_large_pr_review_prompt_stays_within_its_context_budget():
+    head_sha = "b" * 40
+    pull = PullRequestSnapshot(
+        number=7, node_id="PR_7", url=f"https://github.com/{REPO}/pull/7",
+        title="Large experiment", body="", base_ref="schmidhuber",
+        head_ref="experiment-7", head_sha=head_sha, labels=(), draft=False,
+        state="open", merged=False, mergeable=True, merge_commit_sha=None,
+    )
+    discussion = tuple(
+        {**comment(index, f"Discussion entry {index}. " + "x" * 5_000),
+         "created_at": f"2026-10-29T{index // 60:02d}:{index % 60:02d}:00Z"}
+        for index in range(1, 63)
+    )
+    record = PullRequest(
+        details={
+            "number": 7, "title": "Large experiment",
+            "html_url": f"https://github.com/{REPO}/pull/7",
+            "body": "Assignment details. " * 20_000,
+        },
+        issue_comments=discussion, reviews=(), inline_comments=(),
+    )
+    diff = (
+        " kernel.py | 2886 ++++++++++\n 1 file changed, 2886 insertions(+)\n\n"
+        + "".join(f"+line {index} of the kernel\n" for index in range(2886 * 3))
+    )
+    context_chars = 160_000
+
+    prompt = code_review.review_prompt(
+        pull, base_sha="a" * 40, merge_base="a" * 40, record=record, diff=diff,
+        context_chars=context_chars, minutes=39, retry=False,
+    )
+
+    # The template, its three commit SHAs, and the context budget.
+    assert len(prompt) <= len(CODE_QUALITY_REVIEW_PROMPT) + 3 * 40 + context_chars
+    assert len(diff) + len(record.details["body"]) > 2 * context_chars
+    assert " kernel.py | 2886" in prompt
+    assert "Diff truncated to fit the review budget" in prompt
+    assert "Truncated to fit the review budget" in prompt
+    assert "Discussion entry 62." in prompt
+    assert "Discussion entry 1." not in prompt
+    assert "### Recent discussion (5 of 62 entries; 57 older omitted)" in prompt
+    assert "within about 39 minutes" in prompt
+    assert "ran out of time" not in prompt
+
+
+@pytest.mark.parametrize("retry_succeeds", [True, False], ids=["verdict", "no-verdict"])
+def test_unfinished_review_retries_once_with_a_compact_prompt(
+    merge_case, monkeypatch, capsys, retry_succeeds,
+):
+    large_comment = "Earlier benchmark log. " + "y" * 8_000
+    merge_case.fake.comments.append(comment(2, large_comment))
+    attempts = []
+
+    def review(prompt, config, *, response_schema, on_structured_result):
+        attempts.append((prompt, config.delegation_deadline_epoch, config.conversation_id))
+        if len(attempts) == 2 and retry_succeeds:
+            on_structured_result(APPROVED)
+            return 0
+        return 1
+
+    monkeypatch.setattr(runner, "run_openhands", review)
+    started_at = time.time()
+
+    result = execute(merge_case)
+
+    (first_prompt, first_deadline, first_id), (retry_prompt, retry_deadline, retry_id) = (
+        attempts
+    )
+    window = merge_case.config.delegation_deadline_epoch - 60 - started_at
+    assert first_deadline - started_at == pytest.approx(window * 2 / 3, abs=5)
+    assert first_deadline < retry_deadline <= started_at + window
+    assert first_id == merge_case.config.conversation_id != retry_id
+    assert large_comment in first_prompt and large_comment not in retry_prompt
+    assert "ran out of time" not in first_prompt and "ran out of time" in retry_prompt
+    assert "SENPAI_CODE_REVIEW_RETRY pr=7" in capsys.readouterr().err
+    if retry_succeeds:
+        assert result["state"] == "experiment_merged"
+        assert merge_case.fake.pr["merged"] is True
+    else:
+        assert result["state"] == "merge_blocked"
+        assert "did not complete with a verdict" in result["reason"]
+        assert "compact retry" in result["reason"]
+        assert merge_case.fake.mutations == []
+
+
+def test_non_blocking_notes_merge_and_are_published_with_the_approval(
+    merge_case, monkeypatch,
+):
+    noted = code_review.CodeQualityVerdict(
+        approved=True, review_summary="Focused change.", findings=[], notes=[NOTE],
+    )
+
+    def review(_prompt, _config, *, response_schema, on_structured_result):
+        on_structured_result(noted)
+        return 0
+
+    monkeypatch.setattr(runner, "run_openhands", review)
+
+    result = execute(merge_case)
+
+    assert result["state"] == "experiment_merged"
+    assert merge_case.fake.pr["merged"] is True
+    posted = merge_case.fake.comments[-1]["body"]
+    assert "**Verdict: Approved**" in posted
+    assert f"**Non-blocking notes**\n\n- {NOTE}" in posted
+    with pytest.raises(ValueError, match="at least one blocking finding"):
+        code_review.CodeQualityVerdict(
+            approved=False, review_summary="Only nits.", findings=[], notes=[NOTE],
+        )
 
 
 def test_worker_reconciles_a_merge_completed_during_review(merge_case, monkeypatch):
@@ -478,12 +596,15 @@ def test_worker_requires_native_structured_review_in_one_private_conversation(
             assert "FinishTool" not in agent.include_default_tools
             self.finish = resolve_tool(specs[0], self.state)[0]
             schema = self.finish.to_openai_tool()["function"]["parameters"]
-            assert {"approved", "review_summary", "findings"} <= set(schema["required"])
+            assert {"approved", "review_summary", "findings", "notes"} <= set(
+                schema["required"]
+            )
             fields = schema["properties"]
             assert fields["approved"]["type"] == "boolean"
             assert "complete" in fields["approved"]["description"]
             assert "actionable" in fields["review_summary"]["description"]
             assert "file or line" in fields["findings"]["description"]
+            assert "Non-blocking" in fields["notes"]["description"]
             self.agent = SimpleNamespace(tools_map={self.finish.name: self.finish})
 
         def send_message(self, prompt):

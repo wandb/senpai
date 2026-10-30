@@ -705,21 +705,38 @@ existing subagent dispatcher and immediately returns its delegated task state.
 The worker starts one fresh code review with the configured smart model and
 smart reasoning effort, using an isolated Git snapshot of the exact PR head
 and current research base. It receives no advisor conversation history or
-parent-history directory. Its prompt includes the full PR body, issue comments,
-submitted reviews, and inline review comments. Its system context includes the
-full target program as research-agent guidance, with a separate reviewer role.
-The review checks code quality, minimal scope, and unused code, configs, flags,
-or files left by unsuccessful experiments. Scientific validity and experiment
-selection remain the advisor's
-responsibility. Required docs, useful tests, reproducibility artifacts, and
-justified complexity remain valid exceptions.
+parent-history directory. Its prompt includes the PR diff, which starts with a
+summary of every changed file, and the PR body with its newest issue comments,
+submitted reviews, and inline review comments. The embedded context holds as
+many characters as the compaction trigger has tokens, about a third of the
+usable window. Discussion gets a quarter of it and the diff the rest; the body
+and each entry keep at most a quarter of the discussion share, older entries are
+omitted, and the reviewer inspects the rest of the snapshot with Git. Its system
+context includes the full target program as research-agent guidance, with a
+separate reviewer role.
+
+The review blocks only incorrect or unsafe code, violations of the target
+program's rules or file boundaries, generated artifacts or files unrelated to
+the task, and dead code, configs, or substantial unnecessary complexity left by
+the experiment. Documentation length or wording, naming, CLI flags, formatting,
+and minor simplifications are non-blocking notes on an approval. Scientific
+validity and experiment selection remain the advisor's responsibility.
+Required docs, useful tests, reproducibility artifacts, and justified
+complexity remain valid exceptions.
+
+The first review attempt has two thirds of the worker's review time. If it ends
+without a verdict, the worker starts one fresh retry with a quarter of the
+context and a note that the earlier attempt ran out of time, and gives it the
+remaining time. If the retry also ends without a verdict, the merge is blocked
+with the elapsed time in its reason.
 
 Only a valid Pydantic verdict submitted through the agent's structured `finish`
 tool can approve a merge. The worker checks the assignment, PR context, labels,
 mergeability, result evidence, and live base again after review. A rejection or
 incomplete review blocks merging. For each completed review of a current, open
 PR, the worker posts a comment labeled "Senpai Supervisor — merge review", with
-the verdict, summary, reviewed head and base, and any rejection findings. It posts only when
+the verdict, summary, reviewed head and base, blocking findings, and non-blocking
+notes. It posts only when
 the exact assignment and head still match, using a merge-review marker that
 does not wake the student. The worker publishes approval after the final checks
 and before merging. Publication must succeed. If the PR merged during review,
