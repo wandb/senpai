@@ -183,6 +183,7 @@ class FakeGitHub:
         ignore_label_mutations: bool = False,
         ignore_draft_mutations: bool = False,
         branch_heads: dict[str, str] | None = None,
+        comparisons: dict[str, str] | None = None,
         actor_login: str = "senpai-bot",
         actor_type: str = "Bot",
     ):
@@ -193,6 +194,7 @@ class FakeGitHub:
         self.ignore_label_mutations = ignore_label_mutations
         self.ignore_draft_mutations = ignore_draft_mutations
         self.branch_heads = branch_heads or {str(pr["base_ref"]): BASE_SHA}
+        self.comparisons = comparisons or {}
         self.actor_login = actor_login
         self.actor_type = actor_type
         self.requests: list[tuple[str, str, object | None, dict[str, str]]] = []
@@ -242,6 +244,11 @@ class FakeGitHub:
                     "object": {"sha": self.branch_heads[branch]},
                 },
             )
+
+        compare_prefix = f"/repos/{REPO}/compare/"
+        if method == "GET" and path.startswith(compare_prefix):
+            status = self.comparisons[path.removeprefix(compare_prefix)]
+            return HttpResponse(200, {"status": status})
 
         if method == "GET" and path == issue_path and self.issue is not None:
             return HttpResponse(200, self.issue)

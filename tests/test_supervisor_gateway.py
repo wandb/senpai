@@ -22,7 +22,10 @@ from senpai_agent.github.supervision import (
     SupervisorRequest,
 )
 from senpai_agent.github.tools.contracts import AssignmentVersion
-from senpai_agent.github.workflow import WorkflowPreconditionError
+from senpai_agent.github.workflow import (
+    PullHeadMismatchError,
+    WorkflowPreconditionError,
+)
 from senpai_agent.models import render_assignment_marker
 
 
@@ -43,6 +46,9 @@ from senpai_agent.models import render_assignment_marker
             GitWorkflowPreconditionError,
             "merge-base --is-ancestor failed",
         ),
+        ("student", "advanced", None, None),
+        ("advisor", "advanced", None, None),
+        ("student", "rewritten", PullHeadMismatchError, "does not contain"),
     ],
 )
 def test_gateway_requires_the_target_checkout_and_preserves_unpublished_work(
@@ -65,7 +71,13 @@ def test_gateway_requires_the_target_checkout_and_preserves_unpublished_work(
         git(workspace, "branch", "-m", "other-assignment")
     if case == "diverged":
         published_head = detached_commit(workspace, published_head, "published sibling")
-    assignment = assignment_record(head_ref="experiment-7", head_sha=published_head)
+    requested_head = published_head
+    if case == "advanced":
+        # The PR moved forward after the request, beyond the advisor's checkout.
+        published_head = local_head if role == "student" else "c" * 40
+    if case == "rewritten":
+        published_head = "d" * 40
+    assignment = assignment_record(head_ref="experiment-7", head_sha=requested_head)
     body = (
         render_assignment_marker(assignment)
         + "\n\nAssignment PR: preserve the data loader."
@@ -76,7 +88,12 @@ def test_gateway_requires_the_target_checkout_and_preserves_unpublished_work(
             body=body,
             head_ref="experiment-7",
             head_sha=published_head,
-        )
+        ),
+        comparisons={
+            f"{requested_head}...{published_head}": "diverged"
+            if case == "rewritten"
+            else "ahead"
+        },
     )
     monkeypatch.setattr(
         "senpai_agent.github.workflow.core.UrllibTransport", lambda: github
@@ -130,9 +147,9 @@ def test_gateway_requires_the_target_checkout_and_preserves_unpublished_work(
             pr_number=7,
             assignment_id=assignment.assignment_id,
             revision_id=assignment.revision_id,
-            expected_pr_head_sha=published_head,
+            expected_pr_head_sha=requested_head,
         )
-        if role == "student" or case in {"student-report", "wrong-pod"}
+        if role == "student" or case in {"student-report", "wrong-pod", "advanced"}
         else None,
         task=">" * 5_000
         if case == "oversized-request"
@@ -158,9 +175,13 @@ def test_gateway_requires_the_target_checkout_and_preserves_unpublished_work(
             f"Requested by: {envelope.requester} ({'student' if case == 'student-report' else 'advisor'})"
             in prompt
         )
-        if role == "advisor" and case != "student-report":
+        texts = [request.task, local_head, "model.py", "scratch.py"]
+        if request.assignment is None:
             assert "Assignment: (none; advisor repair)" in prompt
-        for text in (request.task, local_head, "model.py", "scratch.py"):
+        else:
+            # The prompt names both the requested and the live PR head.
+            texts += [requested_head, published_head]
+        for text in texts:
             assert text in prompt
         for discussion in discussions.values():
             for text in discussion.values():
