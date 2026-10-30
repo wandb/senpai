@@ -23,6 +23,7 @@ from senpai_agent.github.supervision import (
 )
 from senpai_agent.github.tools.contracts import AssignmentVersion
 from senpai_agent.github.workflow import (
+    GitHubAPIError,
     PullHeadMismatchError,
     WorkflowPreconditionError,
 )
@@ -49,6 +50,20 @@ from senpai_agent.models import render_assignment_marker
         ("student", "advanced", None, None),
         ("advisor", "advanced", None, None),
         ("student", "rewritten", PullHeadMismatchError, "does not contain"),
+        ("student", "behind", PullHeadMismatchError, "does not contain"),
+        ("student", "unknown", GitHubAPIError, "HTTP 404"),
+        (
+            "student",
+            "stale-sibling",
+            GitWorkflowPreconditionError,
+            "merge-base --is-ancestor failed",
+        ),
+        (
+            "student",
+            "stale-missing",
+            GitWorkflowPreconditionError,
+            "merge-base --is-ancestor failed",
+        ),
     ],
 )
 def test_gateway_requires_the_target_checkout_and_preserves_unpublished_work(
@@ -75,8 +90,12 @@ def test_gateway_requires_the_target_checkout_and_preserves_unpublished_work(
     if case == "advanced":
         # The PR moved forward after the request, beyond the advisor's checkout.
         published_head = local_head if role == "student" else "c" * 40
-    if case == "rewritten":
+    if case == "stale-sibling":
+        # Another writer moved the PR forward to a commit this checkout lacks.
+        published_head = detached_commit(workspace, requested_head, "pushed elsewhere")
+    if case in {"rewritten", "behind", "unknown", "stale-missing"}:
         published_head = "d" * 40
+    comparison = {"rewritten": "diverged", "behind": "behind"}.get(case, "ahead")
     assignment = assignment_record(head_ref="experiment-7", head_sha=requested_head)
     body = (
         render_assignment_marker(assignment)
@@ -89,11 +108,10 @@ def test_gateway_requires_the_target_checkout_and_preserves_unpublished_work(
             head_ref="experiment-7",
             head_sha=published_head,
         ),
-        comparisons={
-            f"{requested_head}...{published_head}": "diverged"
-            if case == "rewritten"
-            else "ahead"
-        },
+        # GitHub cannot compare against an unknown requested commit.
+        comparisons={}
+        if case == "unknown"
+        else {f"{requested_head}...{published_head}": comparison},
     )
     monkeypatch.setattr(
         "senpai_agent.github.workflow.core.UrllibTransport", lambda: github
