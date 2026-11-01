@@ -831,7 +831,12 @@ waits for the requested number, and `change` returns when any selected task
 changes state or immediately when one has an uncollected terminal result. Its
 timeout is required and capped at 300 seconds; expiry returns
 `satisfied=false`, current records, elapsed time, and next-step guidance without
-cancelling unfinished work. Any terminal results included in that response are
+cancelling unfinished work. The guidance of a timed-out wait reports the
+wall-clock time, the wait's place in the run of consecutive timeouts on the
+same tasks, the total time waited, and each task's state, age, last record
+change and last log growth, so no two timeout observations are alike; the SDK
+reads a repeated identical action and observation as a stuck agent and ends
+the turn. Any terminal results included in that response are
 marked collected so a later event does not repeat them. `agent_status` is a
 non-blocking snapshot. With no
 task IDs, it returns up to eight direct tasks that are active or have an

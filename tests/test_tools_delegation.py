@@ -651,6 +651,62 @@ def test_repeated_await_change_ignores_a_collected_terminal_sibling(tmp_path):
     releases[1].set()
 
 
+def test_consecutive_timed_out_waits_report_differently(tmp_path):
+    releases = [threading.Event(), threading.Event()]
+    children = []
+
+    def factory(_request):
+        child = FakeChild(releases[len(children)])
+        children.append(child)
+        return child
+
+    spawn, await_tool, _status, _cancel = tools(tmp_path, factory)
+    parent = parent_conversation()
+    spawned = spawn(
+        SpawnAgentsAction(
+            batch_key="long-wait",
+            tasks=[
+                AgentTask(task="First", model="smart"),
+                AgentTask(task="Second", model="smart"),
+            ],
+        ),
+        parent,
+    )
+    task_ids = [task.task_id for task in spawned.tasks]
+    action = AwaitAgentsAction(task_ids=task_ids, timeout_seconds=0.05)
+
+    first = await_tool(action, parent)
+    second = await_tool(action, parent)
+
+    assert first.timed_out is True and second.timed_out is True
+    # The stuck detector compares whole observations: these must not match.
+    assert first.guidance != second.guidance
+    assert first.model_dump(exclude={"waited_seconds"}) != second.model_dump(
+        exclude={"waited_seconds"}
+    )
+    assert "keep running" in second.guidance
+    assert "timed-out wait 1 in a row" in first.guidance
+    assert "timed-out wait 2 in a row" in second.guidance
+    for task_id in task_ids:
+        assert f"{task_id} running for " in second.guidance
+    assert "record changed" in second.guidance
+    assert "log grew" in second.guidance or "bytes" not in second.guidance
+    assert "done" not in second.guidance  # no child output is quoted
+
+    releases[0].set()
+    satisfied = await_tool(
+        AwaitAgentsAction(task_ids=task_ids[:1], timeout_seconds=2), parent
+    )
+    assert satisfied.satisfied is True
+    assert "timed-out wait" not in satisfied.guidance
+
+    # A satisfied wait ends the run; the next timeout counts from one again.
+    third = await_tool(action, parent)
+    assert "timed-out wait 1 in a row" in third.guidance
+    assert f"{task_ids[0]} finished, record changed" in third.guidance
+    releases[1].set()
+
+
 def test_timed_out_await_collects_results_it_already_returned(tmp_path):
     releases = [threading.Event(), threading.Event()]
     children = []
