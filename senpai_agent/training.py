@@ -46,9 +46,11 @@ _RUNNING_RECORD_REFRESH_SECONDS = 30
 
 
 TARGET_PYTHON_ENV = "SENPAI_TARGET_PYTHON_ENV"
-# How long a run's log may stop growing before its record flags a stall.
+# How long a run's log may stop growing before its record flags a stall. A
+# paired A/B or null measurement session prints nothing for ten to twenty
+# minutes, so the default is half an hour; a launch sets its own value.
 LOG_STALL_ENV = "SENPAI_TRAINING_LOG_STALL_SECONDS"
-DEFAULT_LOG_STALL_SECONDS = 600.0
+DEFAULT_LOG_STALL_SECONDS = 1800.0
 
 
 def log_stall_seconds(environment: Mapping[str, str] = os.environ) -> float:

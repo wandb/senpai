@@ -220,9 +220,12 @@ def _log_stall_detail(result: TrainingResult, now: datetime) -> str:
     detail = (
         f"Training {result.training_id}{run} has written nothing to its log for "
         f"{age} s, since {since.strftime('%Y-%m-%dT%H:%M:%SZ')}. {last_line} "
-        "If the process is hung, cancel it with cancel_training. A run that is "
-        "expected to stay quiet needs no action; this signal repeats only after "
-        "the log grows and stalls again."
+        "A quiet log is normal during a measurement session: paired A/B and "
+        "null sessions print nothing for ten to twenty minutes, so this is "
+        "information, not a verdict. Before cancelling, check GPU utilisation "
+        "on the run's device and compare its elapsed time with its expected "
+        "duration; cancel it with cancel_training only if it is hung. This "
+        "signal repeats only after the log grows and stalls again."
     )
     return detail[:1_000]
 

@@ -1019,9 +1019,13 @@ The controller samples metrics only for monitors that are due, but evaluates
 a run's terminal record as soon as it polls. The training supervisor wakes
 the controller from its idle sleep when a run ends, so the student resumes
 within seconds of the terminal state instead of at the next poll tick. A
-local run whose log stops growing for the supervisor's stall interval is
-flagged in its record with its last log line, wakes the controller the same
-way, and raises one `log_stalled` signal per stall. The
+local run whose log stops growing for the supervisor's stall interval
+(`SENPAI_TRAINING_LOG_STALL_SECONDS`, 1800 s by default, set per launch with
+`--training_log_stall_seconds`) is flagged in its record with its last log
+line, wakes the controller the same way, and raises one informational
+`log_stalled` signal per stall, which says that a quiet measurement session is
+normal and asks the student to check GPU utilisation and the run's expected
+duration before cancelling. The
 controller fetches one latest selected metric value from W&B, evaluates
 deterministic threshold/change/staleness and terminal-state rules, and
 persists deduplicated compact signals. Ordinary polls use no LLM tokens.
