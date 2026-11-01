@@ -5,7 +5,9 @@ results. Typed from memory, a few percent of them name runs that never
 existed, commits that do not resolve, or a state the record contradicts. Each
 identifier found in student text is checked against its own source: W&B for
 run ids, the assignment repository for commits, and the training records for
-the state of a supervised run.
+the state of a supervised run. File digests and the ids of a judge or job
+system look like those identifiers, so the words before a token also say what
+it is not.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from pathlib import Path
 from typing import Protocol
 
 from senpai_agent.git_transport import GitWorkflowPreconditionError, run_git
+from senpai_agent.github.http import GitHubReader, GitHubReadError
 from senpai_agent.models import ExperimentResult, WandbRunRef
 from senpai_agent.training import TrainingResult, TrainingState, training_result_paths
 
@@ -46,6 +49,40 @@ class WandbApiRunLookup:
         return None if run is None else str(run.state)
 
 
+class CommitLookup(Protocol):
+    def commit_sha(self, sha: str) -> str | None: ...
+
+
+class GitHubCommitLookup:
+    """Resolve a commit in the repository on GitHub; None when it has none.
+
+    The student's worktree holds only the history it has fetched, so a commit
+    on another branch, such as a peer's PR head, resolves only at the remote.
+    """
+
+    def __init__(self, repo: str, reader: GitHubReader):
+        if len(repo.split("/")) != 2 or not all(repo.split("/")):
+            raise ValueError("repo must use owner/name form")
+        self.repo = repo
+        self.reader = reader
+
+    def commit_sha(self, sha: str) -> str | None:
+        if _SHA.fullmatch(sha) is None:
+            raise ValueError("sha must be hexadecimal")
+        try:
+            payload = self.reader.get(f"/repos/{self.repo}/commits/{sha}")
+        except GitHubReadError as error:
+            # 404 is an unknown ref; 422 is a SHA no commit has.
+            if error.status_code in {404, 422}:
+                return None
+            raise
+        full = payload.get("sha") if isinstance(payload, dict) else None
+        if not isinstance(full, str) or not full.lower().startswith(sha.lower()):
+            # A ref that happens to be named like a SHA is not that commit.
+            return None
+        return full
+
+
 # A W&B run page is <host>/<entity>/<project>/runs/<id>, on wandb.ai or a
 # self-hosted instance. GitHub Actions pages also end in /runs/<number>.
 _WANDB_RUN_URL = re.compile(
@@ -60,9 +97,22 @@ _TRAINING_ID = re.compile(
 # before a token decide which one it is.
 _TOKEN = re.compile(r"(?<![A-Za-z0-9_/.-])(?:[0-9a-f]{7,40}|[a-z0-9]{8})(?![A-Za-z0-9_/.-])")
 _WANDB_CONTEXT = re.compile(r"(?i)\bw&b\b|\bwandb\b|\bruns?\b|\brun[ _-]?ids?\b")
+# "SHA" names a commit, but the "SHA" of "SHA-256" names a digest algorithm.
 _COMMIT_CONTEXT = re.compile(
-    r"(?i)\bcommits?\b|\bshas?\b|\bhead\b|\bbase\b|\bgit\b|\bcheckout\b"
+    r"(?i)\bcommits?\b|\bshas?\b(?!-\d)|\bhead\b|\bbase\b|\bgit\b|\bcheckout\b"
     r"|\bmerged?\b|\bpush(?:ed)?\b|\brev-parse\b|@$"
+)
+# A file digest ("file SHA-256 `391730cf…`", "sha256 digest", "checksum") is
+# neither a commit nor a run; no record checks it, and its prefixes are hex.
+_DIGEST_CONTEXT = re.compile(
+    r"(?i)\bsha-?\d{1,3}\b|\bmd5\b|\bblake\d\w*\b|\bdigests?\b|\bchecksums?\b"
+    r"|\bfiles?\b"
+)
+# A judge or job system issues run-shaped ids too ("official run", "scored
+# run", "check", "job", "submission"); a job word within reach names one.
+_JOB_CONTEXT = re.compile(
+    r"(?i)\bjobs?\b|\bchecks?\b|\bscored\b|\bofficial\b|\bsubmissions?\b"
+    r"|\bjudge\b"
 )
 _STATE_WORDS = re.compile(
     r"(?i)\b(running|finished|failed|timed[ _-]?out|cancell?ed|crashed|killed)\b"
@@ -83,12 +133,14 @@ _FROM_TOOL_OUTPUT = (
 _NOT_A_RUN_ID = (
     "Cite a run from another W&B project by its full run URL. If {token!r} is "
     "not a W&B run id, reword so it does not directly follow 'run', 'W&B' or "
-    "'wandb'."
+    "'wandb'; a judge's or job system's id is recognised after 'job', 'check', "
+    "'official', 'scored' or 'submission'."
 )
 _NOT_A_COMMIT = (
-    "Cite a commit from another repository, or one this worktree has not "
-    "fetched, by its URL. If {token!r} is not a commit, reword so it does not "
-    "directly follow 'commit', 'SHA', 'HEAD' or a similar word."
+    "Cite a commit from another repository by its URL. If {token!r} is not a "
+    "commit, reword so it does not directly follow 'commit', 'SHA', 'HEAD' or "
+    "a similar word; a file digest is recognised after 'SHA-256', 'sha256', "
+    "'digest', 'checksum' or 'file'."
 )
 _STATE_HINT = (
     "A state word in the same clause as a run id is read as that run's state; "
@@ -106,6 +158,8 @@ class IdentifierProvenance:
     wandb_entity: str | None = None
     wandb_project: str | None = None
     lookup: WandbRunLookup = field(default_factory=WandbApiRunLookup)
+    # Resolves commits the worktree has not fetched; None asks only the worktree.
+    commit_lookup: CommitLookup | None = None
 
     def check_text(self, text: str, *, source: str) -> None:
         """Refuse text that quotes an identifier no record accounts for."""
@@ -185,7 +239,12 @@ class IdentifierProvenance:
         )
 
     def resolve_commit(self, sha: str, *, field: str, hint: str = "") -> str:
-        """Return the full SHA of an exact or abbreviated commit, or refuse."""
+        """Return the full SHA of an exact or abbreviated commit, or refuse.
+
+        The worktree answers first. A commit it has not fetched, such as a
+        peer's PR head or an older branch tip, is then looked up in the
+        repository itself when a commit lookup is configured.
+        """
 
         if _SHA.fullmatch(sha) is None:
             raise ProvenanceError(
@@ -195,10 +254,22 @@ class IdentifierProvenance:
         try:
             return run_git(self.workspace, "rev-parse", "--verify", f"{sha}^{{commit}}")
         except GitWorkflowPreconditionError as error:
-            raise ProvenanceError(
-                f"{field} does not resolve to a commit in the assignment "
-                f"repository ({error}). {_FROM_TOOL_OUTPUT} {hint}".rstrip()
-            ) from error
+            local_error = error
+        if self.commit_lookup is not None:
+            try:
+                resolved = self.commit_lookup.commit_sha(sha)
+            except Exception as error:
+                raise ProvenanceError(
+                    f"Could not check {field}: it is not in the worktree and the "
+                    f"repository lookup failed ({type(error).__name__}: {error}). "
+                    "Nothing was published; retry the call once GitHub answers."
+                ) from error
+            if resolved is not None:
+                return resolved
+        raise ProvenanceError(
+            f"{field} does not resolve to a commit in the assignment "
+            f"repository ({local_error}). {_FROM_TOOL_OUTPUT} {hint}".rstrip()
+        ) from local_error
 
     def _check_run_ref(
         self,
@@ -314,8 +385,10 @@ def _require_state(
 
 def _identifier_kind(token: str, context: str) -> str | None:
     hexadecimal = all(char in "0123456789abcdef" for char in token)
+    digest_at = _last_match_end(_DIGEST_CONTEXT, context)
     if hexadecimal and len(token) == 40:
-        return "commit"
+        # A full SHA needs no context word, unless the nearest one names a digest.
+        return None if digest_at > _last_match_end(_COMMIT_CONTEXT, context) else "commit"
     if token.isdigit():
         # A count, size or date ("base batch 1048576"), not an abbreviated SHA.
         return None
@@ -326,8 +399,13 @@ def _identifier_kind(token: str, context: str) -> str | None:
     )
     wandb_at = _last_match_end(_WANDB_CONTEXT, context) if run_shape else -1
     commit_at = _last_match_end(_COMMIT_CONTEXT, context) if hexadecimal else -1
+    if digest_at > max(wandb_at, commit_at):
+        # The nearest context word names a file digest, which no record checks.
+        return None
     if wandb_at > commit_at:
-        return "wandb"
+        # "official run", "scored run", "check run": the run belongs to a judge
+        # or job system, not to W&B, when a job word is also within reach.
+        return None if _last_match_end(_JOB_CONTEXT, context) >= 0 else "wandb"
     if commit_at >= 0:
         return "commit"
     return None

@@ -8,8 +8,9 @@ from pathlib import Path
 
 from openhands.sdk.tool import ToolDefinition
 
+from senpai_agent.github.http import GitHubReader
 from senpai_agent.github.workflow import GitHubWorkflow
-from senpai_agent.provenance import IdentifierProvenance
+from senpai_agent.provenance import GitHubCommitLookup, IdentifierProvenance
 
 from .broadcast import BroadcastMessageTool
 from .definitions import (
@@ -99,6 +100,12 @@ class GitHubWorkflowToolSet(
                 ),
                 wandb_entity=os.environ.get("WANDB_ENTITY", "").strip() or None,
                 wandb_project=os.environ.get("WANDB_PROJECT", "").strip() or None,
+                # Commits the worktree has not fetched resolve at the repository.
+                commit_lookup=(
+                    GitHubCommitLookup(workflow.repo, GitHubReader(git_token))
+                    if git_token is not None
+                    else None
+                ),
             )
         runtime = GitHubToolRuntime(
             workflow=workflow,
