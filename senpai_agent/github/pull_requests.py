@@ -129,6 +129,13 @@ def get_prs(
     return PRRetrievalResult(manifest=manifest, markdown=None, path=path)
 
 
+def fetch_pull_request(repo: str, number: int, *, token: SecretStr) -> PullRequest:
+    """Retrieve one complete pull-request record for a caller to render."""
+
+    _validate_repo(repo)
+    return _fetch_pull_request(GitHubReader(token), repo, number)
+
+
 def _validate_repo(repo: str) -> None:
     parts = repo.split("/")
     if len(parts) != 2 or not all(parts):

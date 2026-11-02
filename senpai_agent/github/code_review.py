@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import sys
 import time
+import uuid
 from dataclasses import replace
 from typing import TYPE_CHECKING, Annotated, Self
 
@@ -20,11 +22,13 @@ from senpai_agent.git_transport import (
     isolated_bare_repository,
     run_git,
 )
-from senpai_agent.github.pull_requests import get_prs
+from senpai_agent.github.pull_requests import PullRequest, fetch_pull_request
+from senpai_agent.github.rendering import clip_text, render_review_context
 from senpai_agent.github.workflow.errors import WorkflowPreconditionError
 from senpai_agent.github.workflow.responses import PullRequestSnapshot
 from senpai_agent.PROMPTS import (
     CODE_QUALITY_REVIEW_PROMPT,
+    CODE_QUALITY_REVIEW_RETRY_PROMPT,
     render_prompt,
 )
 
@@ -33,6 +37,16 @@ if TYPE_CHECKING:
 
 
 MERGE_COMPLETION_RESERVE_SECONDS = 60
+# The first review gets this share of its window; a compact retry gets the rest.
+FULL_REVIEW_TIME_SHARE = 2 / 3
+# A compact retry sees this share of the first review's context.
+COMPACT_REVIEW_CONTEXT_SHARE = 1 / 4
+# PR discussion gets this share of a review's context; the diff gets the rest.
+DISCUSSION_CONTEXT_SHARE = 1 / 4
+DIFF_CLIPPED_NOTICE = (
+    "\n[Diff truncated to fit the review budget. The summary above lists every "
+    "changed file; inspect the rest with git.]"
+)
 ReviewText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
@@ -44,7 +58,10 @@ class CodeQualityVerdict(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     approved: bool = Field(
-        description="Approve only when the review is complete with no blocking issues.",
+        description=(
+            "Approve when the review is complete and no blocking finding remains. "
+            "Notes never block."
+        ),
     )
     review_summary: ReviewText = Field(
         description=(
@@ -54,8 +71,15 @@ class CodeQualityVerdict(BaseModel):
     )
     findings: list[ReviewText] = Field(
         description=(
-            "Blocking issues and actionable fixes, with file or line references where "
-            "useful. Include any reason the review is incomplete. Empty on approval."
+            "Blocking issues only, each with an actionable fix and file or line "
+            "references where useful. Include any reason the review is incomplete. "
+            "Empty on approval."
+        ),
+    )
+    notes: list[ReviewText] = Field(
+        description=(
+            "Non-blocking suggestions, such as documentation length or wording, "
+            "naming, CLI flags, formatting, or minor simplifications."
         ),
     )
 
@@ -66,6 +90,18 @@ class CodeQualityVerdict(BaseModel):
         if not self.approved and not self.findings:
             raise ValueError("a rejection must explain at least one blocking finding")
         return self
+
+    def report(self) -> str:
+        sections = [self.review_summary]
+        for title, items in (
+            ("Blocking findings", self.findings),
+            ("Non-blocking notes", self.notes),
+        ):
+            if items:
+                sections.append(
+                    f"**{title}**\n\n" + "\n".join(f"- {item}" for item in items)
+                )
+        return "\n\n".join(sections)
 
 
 def review_code_quality(
@@ -87,12 +123,11 @@ def review_code_quality(
             "insufficient time remains for code quality review and merge feedback"
         )
 
-    context = get_prs(config.github_repo, numbers=(pull.number,), token=token)
-    if context.manifest[0].head_sha != pull.head_sha:
+    record = fetch_pull_request(config.github_repo, pull.number, token=token)
+    if record.manifest_entry.head_sha != pull.head_sha:
         raise WorkflowPreconditionError(
             "PR head changed while loading code review context"
         )
-    assert context.markdown is not None  # A single PR is always returned inline.
 
     with isolated_bare_repository() as repository:
         run_git(
@@ -107,43 +142,89 @@ def review_code_quality(
                     "review source does not match the requested commits"
                 )
         merge_base = run_git(repository, "merge-base", base_sha, pull.head_sha)
-        prompt = review_prompt(
-            pull, base_sha=base_sha, merge_base=merge_base,
-            pr_context=context.markdown,
+        diff = run_git(
+            repository, "diff", "--stat=200", "--patch", merge_base, pull.head_sha,
         )
-        results: list[CodeQualityVerdict] = []
-        status = run_openhands(
-            prompt,
-            replace(
-                supervisor_config(config),
-                workspace=repository,
-                delegation_task_id=None,
-                delegation_deadline_epoch=review_deadline,
-            ),
-            response_schema=CodeQualityVerdict,
-            on_structured_result=results.append,
+        reviewer = replace(
+            supervisor_config(config), workspace=repository, delegation_task_id=None,
         )
-        if status != 0 or not results:
-            raise WorkflowPreconditionError(
-                "code quality reviewer did not complete with a verdict"
+
+        def attempt(
+            context_chars: int, deadline: float, *, retry: bool,
+        ) -> CodeQualityVerdict | None:
+            prompt = review_prompt(
+                pull, base_sha=base_sha, merge_base=merge_base, record=record,
+                diff=diff, context_chars=context_chars,
+                minutes=max(1, int((deadline - time.time()) // 60)), retry=retry,
             )
-        verdict = results[0]
+            results: list[CodeQualityVerdict] = []
+            status = run_openhands(
+                prompt,
+                replace(
+                    reviewer,
+                    delegation_deadline_epoch=deadline,
+                    conversation_id=uuid.uuid4() if retry else reviewer.conversation_id,
+                ),
+                response_schema=CodeQualityVerdict,
+                on_structured_result=results.append,
+            )
+            return results[0] if status == 0 and results else None
+
+        # The compaction trigger bounds the model's usable window in tokens; a
+        # matching character budget keeps the embedded context to about a third.
+        context_chars = config.compaction_trigger_tokens
+        first_deadline = (
+            started_at + (review_deadline - started_at) * FULL_REVIEW_TIME_SHARE
+        )
+        verdict = attempt(context_chars, first_deadline, retry=False)
+        if verdict is None:
+            print(
+                "SENPAI_CODE_REVIEW_RETRY "
+                f"pr={pull.number} elapsed_seconds={time.time() - started_at:.0f}",
+                file=sys.stderr,
+                flush=True,
+            )
+            verdict = attempt(
+                int(context_chars * COMPACT_REVIEW_CONTEXT_SHARE),
+                review_deadline,
+                retry=True,
+            )
+        if verdict is None:
+            raise WorkflowPreconditionError(
+                "code quality reviewer did not complete with a verdict in "
+                f"{(time.time() - started_at) / 60:.0f} minutes, including a "
+                "compact retry"
+            )
         if not verdict.approved:
-            findings = "\n".join(f"- {finding}" for finding in verdict.findings)
             raise CodeReviewRejected(
-                f"Code quality review blocked PR #{pull.number}.\n\n"
-                f"{verdict.review_summary}\n\n{findings}"
+                f"Code quality review blocked PR #{pull.number}.\n\n{verdict.report()}"
             )
         return verdict
 
 
 def review_prompt(
-    pull: PullRequestSnapshot, *, base_sha: str, merge_base: str, pr_context: str,
+    pull: PullRequestSnapshot,
+    *,
+    base_sha: str,
+    merge_base: str,
+    record: PullRequest,
+    diff: str,
+    context_chars: int,
+    minutes: int,
+    retry: bool,
 ) -> str:
-    return render_prompt(
+    discussion = render_review_context(
+        record, int(context_chars * DISCUSSION_CONTEXT_SHARE),
+    )
+    prompt = render_prompt(
         CODE_QUALITY_REVIEW_PROMPT,
         BASE_SHA=base_sha,
         HEAD_SHA=pull.head_sha,
         MERGE_BASE_SHA=merge_base,
-        PR_CONTEXT=pr_context,
-    ) + "\n"
+        DIFF=clip_text(diff, context_chars - len(discussion), DIFF_CLIPPED_NOTICE),
+        PR_CONTEXT=discussion,
+        MINUTES=str(minutes),
+    )
+    if retry:
+        prompt += "\n\n" + CODE_QUALITY_REVIEW_RETRY_PROMPT
+    return prompt + "\n"

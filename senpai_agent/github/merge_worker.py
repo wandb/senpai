@@ -69,17 +69,17 @@ def merge_with_review(
             ),
         )
 
-    review_summary: str
+    review_report: str
 
     def review(pull: PullRequestSnapshot) -> None:
-        nonlocal review_summary
+        nonlocal review_report
         verdict = review_code_quality(
             pull, base_sha=action.expected_current_base_sha, token=token, config=config,
         )
-        review_summary = verdict.review_summary
+        review_report = verdict.report()
 
     def publish_approval() -> None:
-        post_review("Approved", review_summary)
+        post_review("Approved", review_report)
 
     try:
         result = workflow.merge_experiment(
