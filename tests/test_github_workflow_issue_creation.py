@@ -158,6 +158,63 @@ def test_reply_to_a_senpai_opened_issue_does_not_repeat_owner_mention():
     assert fake.mutations == mutations
 
 
+def test_issue_creation_succeeds_when_the_listing_lags_behind_the_write():
+    """Every first create_human_issue and request_supervisor call failed on the
+    read-back listing, and the retry with the same issue_id succeeded."""
+
+    class LaggingListGitHub(FakeGitHub):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.lagging_reads = 0
+
+        def request(self, method, url, *, headers, json_body=None):
+            response = super().request(method, url, headers=headers, json_body=json_body)
+            if (
+                method == "GET"
+                and urlsplit(url).path == f"/repos/{REPO}/issues"
+                and any(m == "POST" for m, _p, _b in self.mutations)
+                and self.lagging_reads < 2
+            ):
+                self.lagging_reads += 1
+                return HttpResponse(200, [])
+            return response
+
+    fake = LaggingListGitHub(pull_request())
+
+    created = workflow(fake).create_human_issue(
+        **QUESTION, audience_label="schmidhuber", creator="advisor"
+    )
+
+    assert created.changed is True
+    assert created.resource_url == fake.issue["html_url"]
+    assert [m for m, _p, _b in fake.mutations] == ["POST"]
+    assert fake.lagging_reads == 0, "the creation response was the proof"
+
+    fake.lagging_reads = 2  # the listing has caught up by the time of a retry
+    retry = workflow(fake).create_human_issue(
+        **QUESTION, audience_label="schmidhuber", creator="advisor"
+    )
+
+    assert retry.changed is False
+    assert [m for m, _p, _b in fake.mutations] == ["POST"]
+
+
+def test_issue_creation_rejects_a_creation_response_for_another_request():
+    class ForeignResponseGitHub(FakeGitHub):
+        def request(self, method, url, *, headers, json_body=None):
+            response = super().request(method, url, headers=headers, json_body=json_body)
+            if method == "POST" and urlsplit(url).path == f"/repos/{REPO}/issues":
+                foreign = dict(response.json_body)
+                foreign["body"] = "<!-- senpai-human-issue:other:advisor:x:0 -->\n\nother"
+                return HttpResponse(201, foreign)
+            return response
+
+    with pytest.raises(ReconciliationError, match="does not match the request"):
+        workflow(ForeignResponseGitHub(pull_request())).create_human_issue(
+            **QUESTION, audience_label="schmidhuber", creator="advisor"
+        )
+
+
 def test_issue_creation_recovers_when_github_applies_post_but_loses_response():
     fake = AmbiguousMutationGitHub(
         pull_request(), fail_method="POST", fail_path=f"/repos/{REPO}/issues"

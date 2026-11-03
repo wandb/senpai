@@ -34,6 +34,7 @@ from senpai_agent.github.tools import (
 )
 from senpai_agent.github.workflow import (
     MutationResult,
+    PullHeadMismatchError,
     ReconciliationError,
     StaleAssignmentRevisionError,
 )
@@ -556,6 +557,75 @@ def test_assignment_tools_forward_one_exact_assignment_version(
         assert fields["revision_id"] == "revision-1"
     for key, value in expected.items():
         assert fields[key] == value
+
+
+class MovedHeadWorkflow(RecordingWorkflow):
+    """The student pushed between the advisor's get_prs and its feedback."""
+
+    def __init__(self, live_head_sha: str):
+        super().__init__()
+        self.live_head_sha = live_head_sha
+
+    def pull_request(self, number):
+        self.calls.append(("pull_request", number, {}))
+        return SimpleNamespace(head_sha=self.live_head_sha)
+
+    def send_assignment_feedback(self, number, **kwargs):
+        self.calls.append(("send_assignment_feedback", number, kwargs))
+        if kwargs["expected_head_sha"] != self.live_head_sha:
+            raise PullHeadMismatchError(
+                f"pull request head SHA is {self.live_head_sha}, "
+                f"expected {kwargs['expected_head_sha']}"
+            )
+        return MutationResult(
+            changed=True,
+            resource_url=f"https://github.test/pull/{number}#issuecomment-1",
+            state="assignment_feedback_upserted",
+            version=self.live_head_sha,
+        )
+
+
+def test_feedback_refreshes_a_moved_head_once_and_reports_both_heads(tmp_path):
+    """send_assignment_feedback failed 10 times on a stale head SHA in one campaign."""
+
+    workflow = MovedHeadWorkflow(live_head_sha="b" * 40)
+    tool = SendAssignmentFeedbackTool.create(runtime(workflow, tmp_path))[0]
+
+    observation = tool(SendAssignmentFeedbackAction(
+        assignment=assignment(),
+        feedback_id="inspect-seed",
+        comment="Inspect the failed seed.",
+    ))
+
+    assert observation.changed is True
+    assert observation.version == "b" * 40
+    assert observation.stale_head_sha == "a" * 40
+    heads = [
+        kwargs["expected_head_sha"]
+        for name, _number, kwargs in workflow.calls
+        if name == "send_assignment_feedback"
+    ]
+    assert heads == ["a" * 40, "b" * 40]
+    assert "stale_head_sha" in observation.to_llm_content[0].text
+
+
+def test_feedback_does_not_retry_when_the_head_did_not_move(tmp_path):
+    class FlappingWorkflow(MovedHeadWorkflow):
+        def send_assignment_feedback(self, number, **kwargs):
+            self.calls.append(("send_assignment_feedback", number, kwargs))
+            raise PullHeadMismatchError("pull request head SHA is transient")
+
+    workflow = FlappingWorkflow(live_head_sha="a" * 40)
+    tool = SendAssignmentFeedbackTool.create(runtime(workflow, tmp_path))[0]
+
+    with pytest.raises(PullHeadMismatchError):
+        tool(SendAssignmentFeedbackAction(
+            assignment=assignment(),
+            feedback_id="inspect-seed",
+            comment="Inspect the failed seed.",
+        ))
+
+    assert [name for name, _n, _k in workflow.calls].count("send_assignment_feedback") == 1
 
 
 class RecordingBroadcastWorkflow(RecordingWorkflow):

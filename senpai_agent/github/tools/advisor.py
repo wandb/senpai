@@ -9,6 +9,7 @@ from openhands.sdk.tool import ToolExecutor
 from senpai_agent import git_workflow
 from senpai_agent.delegation import SpawnAgentsObservation
 from senpai_agent.git_transport import github_repository_url
+from senpai_agent.github.workflow.errors import PullHeadMismatchError
 from senpai_agent.models import (
     AssignmentRecord,
     DispositionRecord,
@@ -174,15 +175,32 @@ class SendAssignmentFeedbackExecutor(
         conversation: LocalConversation | None = None,
     ) -> GitHubMutationObservation:
         version = action.assignment
-        result = self.workflow.send_assignment_feedback(
-            version.pr_number,
-            assignment_id=version.assignment_id,
-            revision_id=version.revision_id,
-            expected_head_sha=version.expected_pr_head_sha,
-            feedback_id=action.feedback_id,
-            comment=action.comment,
+
+        def send(expected_head_sha: str):
+            return self.workflow.send_assignment_feedback(
+                version.pr_number,
+                assignment_id=version.assignment_id,
+                revision_id=version.revision_id,
+                expected_head_sha=expected_head_sha,
+                feedback_id=action.feedback_id,
+                comment=action.comment,
+            )
+
+        try:
+            return GitHubMutationObservation.from_result(
+                send(version.expected_pr_head_sha)
+            )
+        except PullHeadMismatchError:
+            # Guidance does not change the assignment, so a head the student
+            # moved while the advisor was writing it is refreshed once rather
+            # than failing the turn; the observation names both heads.
+            live_head_sha = self.workflow.pull_request(version.pr_number).head_sha
+            if live_head_sha == version.expected_pr_head_sha:
+                raise
+        observation = GitHubMutationObservation.from_result(send(live_head_sha))
+        return observation.model_copy(
+            update={"stale_head_sha": version.expected_pr_head_sha}
         )
-        return GitHubMutationObservation.from_result(result)
 
 
 class RequestAssignmentRevisionExecutor(
