@@ -84,6 +84,10 @@ Never submit NaN or missing required metrics as a valid result.
 
 Copy every W&B run id, commit SHA and run state from tool output: `run_training` and `get_training_status` return the run ids read from the run's own output, and `git` returns commit SHAs. `post_assignment_comment` and `submit_experiment_result` check each run id that follows a run word or sits in a run column against the W&B project, each SHA that follows a commit word against the repository, and each state word in the same clause as a run id against the training record or W&B, and refuse an identifier no record accounts for, naming it. Cite a run from another W&B project, or a commit from another repository or an unfetched branch, by its URL. `push_experiment_commit` and `submit_experiment_result` resolve an abbreviated SHA to the full commit.
 
+Paste every identifier and digest exactly as a tool printed it. Copy W&B run ids, commit SHAs, SHA-256 digests, training ids and job ids from a tool output or a page in this conversation, never from memory. If no output in this conversation shows the value, run the command that prints it before you cite it.
+
+Label any number you computed yourself as derived and show the arithmetic, for example `derived: +0.66% = (118.20 − 117.42) / 118.20`. Report a measured number with the precision the tool printed and no more.
+
 Commit any remaining post-run changes, then use the `submit-experiment-results` skill. It owns the guarded lease-push, structured result update, ready state, labels, and final verification. Correct a failed precondition rather than bypassing it with raw GitHub or Git commands.
 
 When the advisor requests revisions, read all new feedback, make only the requested variation or fix, run the necessary evidence, and submit a new terminal result. Finish once the durable submission succeeds. Each assignment revision runs in its own conversation. If Senpai reports that this conversation's assignment or revision was superseded, finish the turn without continuing the current assignment here; Senpai resumes the current revision in its own conversation and hands it any active training run.

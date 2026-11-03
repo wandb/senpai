@@ -155,6 +155,18 @@ def test_main_agent_context_appends_program_after_harness_and_role():
     assert context.load_project_skills is False
 
 
+def test_student_charter_requires_pasted_identifiers_and_labelled_derived_numbers():
+    instructions = (ROOT / "system_instructions" / "STUDENT.md").read_text()
+    report = instructions.split("## Report and submit", 1)[1].split("## Writing style", 1)[0]
+
+    assert "Paste every identifier and digest exactly as a tool printed it." in report
+    assert "never from memory" in report
+    assert "run the command that prints it before you cite it" in report
+    assert "Label any number you computed yourself as derived and show the arithmetic" in report
+    assert "derived: +0.66% = (118.20 − 117.42) / 118.20" in report
+    assert "precision the tool printed and no more" in report
+
+
 def test_student_charter_requires_typed_workflow_and_training_tools():
     instructions = (ROOT / "system_instructions" / "STUDENT.md").read_text()
     submission_skill = (
