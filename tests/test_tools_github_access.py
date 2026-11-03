@@ -44,6 +44,7 @@ STUDENT_GITHUB_TOOLS = {
     "get_prs",
     "get_pr_source",
     "create_human_issue",
+    "fetch_branch",
     "post_assignment_comment",
     "post_peer_comment",
     "broadcast_message",

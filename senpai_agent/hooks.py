@@ -135,6 +135,12 @@ _DETACHED_GPU_REASON = (
     "conversation as soon as the run ends or its log stalls, so there is "
     "nothing to poll for."
 )
+_GIT_FETCH_REASON = (
+    "This shell holds no GitHub credential, so `git fetch` and `git pull` cannot "
+    "reach the assignment repository. Call fetch_branch(branch=...) (students) "
+    "or sync_advisor_branch (advisor) to fetch a branch read-only into "
+    "refs/remotes/origin/<branch>, then inspect it with git log, diff or show."
+)
 # `uv run` options that take a separate value before the program.
 _UV_RUN_VALUE_OPTIONS = {
     "--allow-insecure-host", "--cache-dir", "--color", "--config-file",
@@ -177,7 +183,6 @@ _GIT_TERMINAL_COMMANDS = {
     "describe",
     "diff",
     "diff-tree",
-    "fetch",
     "for-each-ref",
     "gc",
     "grep",
@@ -1214,6 +1219,8 @@ def _git_policy(arguments: list[str]) -> PolicyDecision:
         )
         if operation in {None, "get-url", "show"}:
             return PolicyDecision(True)
+    elif command in {"fetch", "pull"}:
+        return PolicyDecision(False, _GIT_FETCH_REASON)
     elif command in _GIT_TERMINAL_COMMANDS:
         return PolicyDecision(True)
     return PolicyDecision(

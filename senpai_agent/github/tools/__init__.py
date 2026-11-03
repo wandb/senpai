@@ -24,6 +24,7 @@ from .contracts import (
     SendAssignmentFeedbackAction,
     SubmitExperimentResultAction,
 )
+from .fetch import FetchBranchAction, FetchBranchObservation, FetchBranchTool
 from .definitions import (
     AcceptResultOnCurrentBaseTool,
     CloseExperimentTool,
@@ -68,6 +69,9 @@ __all__ = (
     "CreateAssignmentTool",
     "CreateHumanIssueAction",
     "CreateHumanIssueTool",
+    "FetchBranchAction",
+    "FetchBranchObservation",
+    "FetchBranchTool",
     "GetPRsAction",
     "GetPRsObservation",
     "GetPRsTool",
