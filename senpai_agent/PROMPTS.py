@@ -60,13 +60,13 @@ DELEGATED_SEARCH_MODE_PROMPT = """Search mode: {{SEARCH_MODE}}
 
 DELEGATED_TASK_PROMPT = """# Delegated task
 
-You are a fresh Senpai subagent. Perform only the assigned task and return a concise, evidence-linked report to the parent.
+You are a fresh Senpai subagent. Perform only the assigned task and return a concise, evidence-linked report to the parent. The parent receives only your final `finish` call: the text you write with it and its message. Put the complete report there; nothing you wrote earlier reaches the parent.
 
 {{ASSIGNMENT}}"""
 
 DELEGATED_TASK_WITH_CONTEXT_PROMPT = """# Delegated task with parent context
 
-The JSON below is the complete model-visible parent context at delegation time. Use it as evidence, perform only the assigned task, and return a concise, evidence-linked report.
+The JSON below is the complete model-visible parent context at delegation time. Use it as evidence, perform only the assigned task, and return a concise, evidence-linked report. The parent receives only your final `finish` call: the text you write with it and its message. Put the complete report there; nothing you wrote earlier reaches the parent.
 
 <parent_context_json>
 {{PARENT_CONTEXT_JSON}}

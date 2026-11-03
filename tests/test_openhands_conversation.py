@@ -1011,6 +1011,98 @@ def _child_result_conversation(reports, captured, *, rebuild_before_second=False
     return FakeConversation
 
 
+def _finish_event(report: str, message: str):
+    from openhands.sdk.event import ActionEvent
+    from openhands.sdk.llm import MessageToolCall
+    from openhands.sdk.tool.builtins import FinishAction
+
+    action = FinishAction(message=message)
+    return ActionEvent(
+        thought=[TextContent(text=report)] if report else [],
+        action=action,
+        tool_name="finish",
+        tool_call_id="finish-1",
+        tool_call=MessageToolCall(
+            id="finish-1",
+            name="finish",
+            arguments=json.dumps(action.model_dump(mode="json")),
+            origin="completion",
+        ),
+        llm_response_id="response-1",
+    )
+
+
+REPORT = (
+    "## Critique\n\nThe ceiling rests on twins of the old structure.\n"
+    "Recommend one cheap measurement before any verdict."
+)
+
+
+@pytest.mark.parametrize(
+    ("thought", "message", "expected"),
+    [
+        (REPORT, "Report delivered above.", f"{REPORT}\n\nReport delivered above."),
+        (REPORT, REPORT, REPORT),
+        (REPORT, f"{REPORT}\n\nDone.", f"{REPORT}\n\nDone."),
+        ("", "Short answer only.", "Short answer only."),
+    ],
+    ids=["report-in-thought", "repeated", "message-extends-thought", "no-thought"],
+)
+def test_final_result_includes_the_text_written_with_the_finish_call(
+    thought, message, expected,
+):
+    conversation = SimpleNamespace(
+        state=SimpleNamespace(view=SimpleNamespace(events=[
+            runner.MessageEvent(
+                source="user",
+                llm_message=Message(role="user", content=[TextContent(text="task")]),
+            ),
+            _finish_event(thought, message),
+        ])),
+    )
+
+    assert runner.final_agent_result(conversation) == expected
+
+
+def test_child_report_written_before_the_finish_call_reaches_the_parent(
+    tmp_path, monkeypatch, capsys,
+):
+    """Nine delegated reports were lost because only the finish message returned."""
+
+    captured = {}
+
+    class FakeConversation:
+        def __init__(self, **kwargs):
+            self.id = kwargs["conversation_id"]
+            captured["delete_on_close"] = kwargs["delete_on_close"]
+            self.state = SimpleNamespace(
+                execution_status=ConversationExecutionStatus.IDLE,
+                view=SimpleNamespace(events=[]),
+            )
+
+        def send_message(self, prompt):
+            captured.setdefault("prompts", []).append(prompt)
+
+        async def arun(self):
+            self.state.view.events.append(
+                _finish_event(REPORT, "Report delivered above.")
+            )
+            self.state.execution_status = ConversationExecutionStatus.FINISHED
+
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr(runner, "LocalConversation", FakeConversation)
+    monkeypatch.setattr(runner.LLM, "get_token_count", lambda *_args, **_kwargs: 100)
+    isolate_agent_discovery(monkeypatch, runner)
+    config = runtime_config(tmp_path, child=True)
+
+    assert run_openhands("critique the plan", config) == 0
+
+    result = _output_record(capsys.readouterr().out, "OPENHANDS_RESULT ")
+    assert result["result"] == f"{REPORT}\n\nReport delivered above."
+
+
 def _output_record(output, prefix):
     return json.loads(
         next(

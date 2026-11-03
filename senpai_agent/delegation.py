@@ -1809,7 +1809,11 @@ class AwaitAgentsAction(Action):
     timeout_seconds: float = Field(
         gt=0,
         le=MAX_AWAIT_SECONDS,
-        description="Bounded wait; timeout leaves unfinished tasks running.",
+        description=(
+            f"Bounded wait of at most {MAX_AWAIT_SECONDS} seconds; a larger value "
+            "is rejected. A timeout leaves unfinished tasks running: continue "
+            "other work and wait again, or use agent_status."
+        ),
     )
 
     @model_validator(mode="after")
@@ -2207,8 +2211,10 @@ class AwaitAgentsTool(_DelegationTool[AwaitAgentsAction, AwaitAgentsObservation]
                 description=(
                     "Wait for all, the first, a quorum, or any state change among "
                     "spawned agents. The change join also immediately surfaces an "
-                    "uncollected terminal result. A timeout returns live state and "
-                    "practical next-step feedback without cancelling work."
+                    "uncollected terminal result. One wait lasts at most "
+                    f"{MAX_AWAIT_SECONDS} seconds so that steering can reach the "
+                    "turn; a timeout returns live state and practical next-step "
+                    "feedback without cancelling work."
                 ),
                 action_type=AwaitAgentsAction,
                 observation_type=AwaitAgentsObservation,
