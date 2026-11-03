@@ -203,14 +203,14 @@ def test_student_stop_ignores_non_training_json_sidecars(
     assert (exit_code, output["decision"]) == (0, "allow")
 
 
-def test_student_stop_denies_a_dirty_assignment_workspace(
+def test_student_stop_denies_a_modified_tracked_file_and_names_it(
     assignment_workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ):
     monkeypatch.setattr(
         "senpai_agent.hooks.run_git",
-        lambda *_args, **_kwargs: " M model.py\n",
+        lambda *_args, **_kwargs: " M model.py\nA  helper.py\n",
     )
 
     exit_code, output = invoke_hook(
@@ -222,6 +222,35 @@ def test_student_stop_denies_a_dirty_assignment_workspace(
     )
 
     assert (exit_code, output["decision"]) == (2, "deny")
+    assert "model.py, helper.py" in output["reason"]
+    assert "Untracked files may stay" in output["reason"]
+
+
+def test_student_stop_allows_untracked_lane_output(
+    assignment_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    calls = []
+
+    def run_git(_workspace, *arguments, **_kwargs):
+        calls.append(arguments)
+        # git itself hides untracked files from this query; a plain status
+        # would still list them.
+        return "" if "--untracked-files=no" in arguments else "?? lane/plot.png\n"
+
+    monkeypatch.setattr("senpai_agent.hooks.run_git", run_git)
+
+    exit_code, output = invoke_hook(
+        "stop",
+        {"working_dir": str(assignment_workspace)},
+        monkeypatch,
+        capsys,
+        {"SENPAI_ROLE": "student"},
+    )
+
+    assert (exit_code, output["decision"]) == (0, "allow")
+    assert calls == [("status", "--porcelain", "--untracked-files=no")]
 
 
 def test_queued_feedback_temporarily_allows_a_clean_unwind(

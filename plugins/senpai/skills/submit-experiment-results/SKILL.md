@@ -19,7 +19,7 @@ experiment is blocked or materially delayed. Use a fresh `comment_id` for each
 new message and reuse that ID only for an exact retry. Keep the PR concise
 rather than mirroring routine internal narration.
 
-First make the repository worktree clean by committing only the assigned change.
+First commit only the assigned change, so no tracked file differs from `HEAD`; untracked lane output may stay.
 Collect the current local commit SHA and the current remote assignment-branch
 SHA. Build the strict `ExperimentResult` required by
 `submit_experiment_result`:

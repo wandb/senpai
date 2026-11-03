@@ -125,13 +125,13 @@ _GH_READ_ONLY = {
 _TRAIN_LAUNCHERS = {"accelerate", "deepspeed", "torchrun"}
 _TRAIN_SCRIPT = re.compile(r"^train[^/]*[.]py$")
 # Programs whose detached launch hides GPU work from run_training's supervision:
-# no timeout, no log or W&B record, no clean-worktree check, no wake on exit.
+# no timeout, no log or W&B record, no worktree check, no wake on exit.
 _GPU_PROGRAMS = {"compute-sanitizer", "kernel-bench", "ncu", "nsys", "nvcc"} | _TRAIN_LAUNCHERS
 _DETACHED_LAUNCHERS = {"nohup", "setsid"}
 _DETACHED_GPU_REASON = (
     "Do not launch GPU jobs detached from the terminal (nohup, setsid, or a "
     "trailing &); use run_training. It supervises the process, records its log "
-    "and W&B run ids, keeps the clean-worktree check, and resumes this "
+    "and W&B run ids, keeps the worktree check, and resumes this "
     "conversation as soon as the run ends or its log stalls, so there is "
     "nothing to poll for."
 )
@@ -1493,11 +1493,18 @@ def _stop_policy(
                 f"{', '.join(sorted(unmonitored))}",
             )
     if require_clean_workspace:
-        if run_git(working_dir, "status", "--porcelain", "--untracked-files=all"):
+        # Untracked files, such as results and scratch scripts, may stay; a
+        # modified tracked file means no commit reproduces the work.
+        status = run_git(working_dir, "status", "--porcelain", "--untracked-files=no")
+        if status:
+            paths = [line.split(maxsplit=1)[-1] for line in status.splitlines()]
             return PolicyDecision(
                 False,
-                "Commit the exact implementation before training or discard "
-                "incidental assignment changes before finishing.",
+                "Uncommitted changes to tracked files: "
+                f"{', '.join(paths[:20])}. Commit the exact implementation "
+                "before training, or discard an incidental change with "
+                "`git checkout -- <path>`, before finishing. Untracked files "
+                "may stay.",
             )
     return PolicyDecision(True)
 

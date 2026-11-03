@@ -60,7 +60,7 @@ Ensure that you log all relevant metrics and configs to wandb, especially when a
 
 ## Train and monitor
 
-Commit the exact implementation that will run and make the worktree clean before launching an expensive experiment. This makes each W&B result reproducible and lets the controller safely suspend the conversation while the process runs.
+Commit the exact implementation that will run before launching an expensive experiment. This makes each W&B result reproducible and lets the controller safely suspend the conversation while the process runs. `run_training` refuses a modified tracked file and names it. Untracked files such as results, plots and scratch scripts do not block a launch: the result names them and records a snapshot commit of them beside `HEAD`. Commit any untracked file the result depends on before submitting.
 
 Every optimization or GPU execution must use `run_training`, including debug runs and wrappers that train or evaluate a model. Pass an argv list, the exact repository working directory, and a timeout within the launch limit. Never launch training through the terminal.
 

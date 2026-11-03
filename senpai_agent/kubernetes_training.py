@@ -24,6 +24,7 @@ from typing import Protocol, TypedDict
 import psutil
 
 from senpai_agent.processes import terminate_process_group
+from senpai_agent.worktree_snapshot import WorktreeSnapshot
 from senpai_agent.training import (
     KubernetesResourceRef,
     KubernetesTrainingSpec,
@@ -790,7 +791,12 @@ class KubernetesTrainingSupervisor:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._recover()
 
-    def run_training(self, spec: TrainingSpec) -> TrainingResult:
+    def run_training(
+        self,
+        spec: TrainingSpec,
+        *,
+        worktree: WorktreeSnapshot | None = None,
+    ) -> TrainingResult:
         if (
             self.max_timeout_seconds is not None
             and spec.timeout_seconds > self.max_timeout_seconds
@@ -873,6 +879,9 @@ class KubernetesTrainingSupervisor:
                 kubernetes_released=False,
                 source_snapshot=str(source_snapshot),
                 source_commit=source_commit,
+                # The bundle carries HEAD only; a worker never sees these files.
+                worktree_snapshot=worktree.snapshot_sha if worktree else None,
+                untracked_paths=worktree.untracked_paths if worktree else (),
             )
             active = _ActiveRemoteTraining(
                 spec=kubernetes_spec,

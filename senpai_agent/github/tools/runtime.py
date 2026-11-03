@@ -27,6 +27,7 @@ from senpai_agent.github.workflow import (
 )
 from senpai_agent.models import AssignmentRecord, ExperimentResult
 from senpai_agent.provenance import IdentifierProvenance
+from senpai_agent.worktree_snapshot import require_tracked_changes_committed
 
 from .contracts import (
     GitHubMutationObservation,
@@ -188,7 +189,7 @@ class PushExperimentCommitExecutor(
                 _, assignment = self._preflight(
                     action, student, action.assignment.expected_pr_head_sha
                 )
-                git_workflow.require_clean_training_worktree(self.runtime.workspace)
+                require_tracked_changes_committed(self.runtime.workspace)
                 git_workflow.require_commit_contains_base(
                     self.runtime.workspace,
                     commit_sha=action.local_commit_sha,

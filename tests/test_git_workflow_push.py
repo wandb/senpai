@@ -18,9 +18,9 @@ from senpai_agent.git_transport import (
 from senpai_agent.git_workflow import (
     GitWorkflowPreconditionError,
     push_assignment_branch,
-    require_clean_training_worktree,
     require_commit_contains_base,
 )
+from senpai_agent.worktree_snapshot import require_tracked_changes_committed
 
 from git_workflow_support import commit_file, detached_commit, git, repository
 
@@ -734,5 +734,7 @@ def test_clean_worktree_check_ignores_a_lying_fsmonitor_hook(tmp_path: Path):
     git(workspace, "status", "--porcelain")
     (workspace / "model.py").write_text("baseline = 2\n")
 
-    with pytest.raises(GitWorkflowPreconditionError, match="clean before training"):
-        require_clean_training_worktree(workspace)
+    with pytest.raises(
+        GitWorkflowPreconditionError, match="uncommitted changes to tracked files"
+    ):
+        require_tracked_changes_committed(workspace)
