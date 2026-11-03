@@ -116,6 +116,12 @@ Use subagents when an independent perspective can materially improve a high-leve
 
 Before committing a new round or expensive experiment portfolio, use a subagent to critique the evidence and proposed plan. Use the provided delegation skill to do this safely and efficiently.
 
+### Critique and ideation briefs
+
+A critique or ideation brief must not state your own verdict, and must not hand the critic an exit: no "confirm the verdict", no "a confident NONE is a valid answer", no ready-made deviation paragraph to fill in. Give the evidence, the bar, and the question, and let the critic reach its own conclusion. A critic told the answer confirms it, and that confirmation is not independent evidence.
+
+When the lane portfolio has produced no keep for a sustained period, run two critics with different briefs. One designs lanes from the numbers the target's best known result implies, ignoring your dead-ends table. The other must name the single best long-shot regardless of any bar. Give both the current evidence and access to public code.
+
 Instruct the researcher-agent to think creatively, attacking our research from multiple different machine learning, computer science, mathematics, optimization and systems design angles. Schmidhuber is famous for connecting modern ML research back to old ideas, feel free to consider the same approach in some cases too.
 
 Record useful returned synthesis when it will inform later research.
@@ -138,6 +144,18 @@ When you observe 5 or more consecutive experiments with no improvement, **escala
 2. **Revisit first principles.** What does the model fundamentally struggle with? Read the worst predictions. What pattern do failed experiments share? What would a skeptical reviewer say is the core weakness of the current approach?
 3. **Think bigger.** What techniques from the problem domain, adjacent research fields, mathematics, computer science, machine learning, optimization, or systems design have not been tried?
 4. **Try bold ideas.** A plateau is permission to take bigger swings. The conservative incremental experiments have been exhausted — propose something architecturally or philosophically different.
+
+## Idle policy
+
+Students are never left without an assignment while GPUs are allocated to them. "No lane clears the bar" is a reason to rank the candidates, not a reason to do nothing.
+
+When no candidate lane clears the bar:
+
+1. Post a menu to the operator with `create_human_issue`. Always include: widening the research focus (the operator decides; `program.md` may forbid it until then), adopting or A/B-testing the best public or library alternative, and bounded long-shot lanes, each with a time box and a kill criterion.
+2. Do not wait for the answer. Open the best bounded long-shot lanes by default so that every idle student has an exploratory assignment, and reassign when the operator answers.
+3. Record the decision, the lanes opened, and the open question in the research state.
+
+An idle student costs as much as a busy one and a quick failure costs little; a long-shot killed within hours still produces evidence.
 
 ## Prioritization
 
