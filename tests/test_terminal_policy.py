@@ -153,6 +153,24 @@ def test_policy_denies_foreground_polling(command: str):
     assert is_allowed(command) is False
 
 
+@pytest.mark.parametrize("command", ["sleep 30", "watch -n 5 nvidia-smi"])
+def test_polling_denial_names_the_wait_tool_and_the_turn_boundary(command: str):
+    decision = terminal_policy(command, "student", WORKSPACE)
+
+    assert decision.allowed is False
+    assert "get_training_status" in decision.reason
+    assert "wait_seconds" in decision.reason
+    assert "Finish the turn" in decision.reason
+
+
+def test_log_stream_denial_names_a_bounded_read_and_the_wait_tool():
+    decision = terminal_policy("tail -f training.log", "student", WORKSPACE)
+
+    assert decision.allowed is False
+    assert "tail -n 50" in decision.reason
+    assert "get_training_status(training_id, wait_seconds)" in decision.reason
+
+
 @pytest.mark.parametrize("destination", ["/tmp/notes.txt", "sh"])
 def test_quoted_file_heredoc_treats_restricted_words_as_literal_data(destination: str):
     command = f"""cat > {destination} <<'EOF'

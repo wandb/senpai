@@ -140,6 +140,17 @@ _GIT_FETCH_REASON = (
     "a branch read-only into refs/remotes/origin/<branch>, then inspect it with "
     "git log, diff or show; sync_advisor_branch refreshes the advisor's own branch."
 )
+_POLLING_REASON = (
+    "Do not sleep or poll in the terminal. Finish the turn: Senpai resumes this "
+    "conversation as soon as a supervised run ends or its log stalls. To wait "
+    "inside this turn, call get_training_status with the run's training_id and "
+    "wait_seconds (up to 600)."
+)
+_LOG_STREAM_REASON = (
+    "Do not stream logs. Read a bounded slice with `tail -n 50 <log_path>`, and "
+    "wait for the run with get_training_status(training_id, wait_seconds) or by "
+    "finishing the turn; Senpai resumes this conversation when the run ends."
+)
 # `uv run` options that take a separate value before the program.
 _UV_RUN_VALUE_OPTIONS = {
     "--allow-insecure-host", "--cache-dir", "--color", "--config-file",
@@ -1394,18 +1405,12 @@ def _segment_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
         if not decision.allowed:
             return decision
     if program in {"sleep", "watch"}:
-        return PolicyDecision(
-            False,
-            "Do not run foreground polling commands; use Senpai events or status tools.",
-        )
+        return PolicyDecision(False, _POLLING_REASON)
     if program == "tail" and any(
         argument == "--follow" or argument.startswith("-") and "f" in argument[1:]
         for argument in tokens[index + 1 :]
     ):
-        return PolicyDecision(
-            False,
-            "Do not stream logs; use get_training_status for bounded updates.",
-        )
+        return PolicyDecision(False, _LOG_STREAM_REASON)
     return PolicyDecision(True)
 
 
