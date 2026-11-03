@@ -21,6 +21,7 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.browser_use import BrowserToolSet
+from openhands.tools.file_editor import FileEditorTool
 from openhands.tools.terminal import (
     TerminalAction,
     TerminalObservation,
@@ -46,6 +47,7 @@ from senpai_agent.kubernetes_training import KubernetesTrainingSupervisor
 from senpai_agent.monitor import MetricGate, MonitorStore, TrainingMonitorSpec
 from senpai_agent.PROMPTS import MONITOR_TRAINING_STARTED_PROMPT, render_prompt
 from senpai_agent.research_state import UpdateResearchStateTool
+from senpai_agent.schema_help import explaining_validation_errors
 from senpai_agent.training_assignment import TrainingAssignmentGuard
 from senpai_agent.training import (
     KubernetesResourceRef,
@@ -869,18 +871,26 @@ def register_senpai_tools() -> None:
     global _TOOLS_REGISTERED
     if _TOOLS_REGISTERED:
         return
-    register_tool("senpai_training", TrainingToolSet)
-    register_tool("get_cluster_capacity", ClusterCapacityTool)
-    register_tool("update_research_state", UpdateResearchStateTool)
-    register_tool("senpai_github", GitHubWorkflowToolSet)
-    register_tool("spawn_agents", SpawnAgentsTool)
-    register_tool("await_agents", AwaitAgentsTool)
-    register_tool("agent_status", AgentStatusTool)
-    register_tool("cancel_agents", CancelAgentsTool)
-    register_tool("delegate_agent", DelegateAgentTool)
-    register_tool("browser_tool_set", LoadBrowserTool)
-    register_tool("load_browser", LoadBrowserTool)
-    register_tool("task_tracker", SenpaiTaskTrackerTool)
-    register_tool("senpai_terminal", SenpaiTerminalTool)
-    register_tool("senpai_exa", ExaSearchTool)
+    # Every tool explains a call that fails validation with the failing field,
+    # its schema and a valid example; the SDK's file editor is re-registered
+    # under its own name so the same holds for it.
+    registrations = (
+        ("senpai_training", TrainingToolSet),
+        ("get_cluster_capacity", ClusterCapacityTool),
+        ("update_research_state", UpdateResearchStateTool),
+        ("senpai_github", GitHubWorkflowToolSet),
+        ("spawn_agents", SpawnAgentsTool),
+        ("await_agents", AwaitAgentsTool),
+        ("agent_status", AgentStatusTool),
+        ("cancel_agents", CancelAgentsTool),
+        ("delegate_agent", DelegateAgentTool),
+        ("browser_tool_set", LoadBrowserTool),
+        ("load_browser", LoadBrowserTool),
+        ("task_tracker", SenpaiTaskTrackerTool),
+        ("senpai_terminal", SenpaiTerminalTool),
+        ("senpai_exa", ExaSearchTool),
+        (FileEditorTool.name, FileEditorTool),
+    )
+    for name, tool_class in registrations:
+        register_tool(name, explaining_validation_errors(tool_class))
     _TOOLS_REGISTERED = True
