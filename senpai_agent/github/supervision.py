@@ -159,7 +159,7 @@ def _assignment(
     allow_newer_head: bool = False,
 ):
     if request.assignment is None:
-        return None
+        return None, None
     version = request.assignment
     head_sha = version.expected_pr_head_sha
     if allow_newer_head:
@@ -183,7 +183,7 @@ def _assignment(
         raise WorkflowPreconditionError(
             "Supervisor target does not own this assignment"
         )
-    return assignment
+    return pull, assignment
 
 
 class RequestSupervisorExecutor(
@@ -210,7 +210,7 @@ class RequestSupervisorExecutor(
                 )
         elif action.target != "advisor":
             runtime.require_configured_student(action.target)
-        assignment = _assignment(runtime.workflow, action, runtime.advisor_branch)
+        _, assignment = _assignment(runtime.workflow, action, runtime.advisor_branch)
         if runtime.role == "student" and assignment.student != requester:
             raise PermissionError("a student request must reference its own assignment")
         envelope = SupervisorEnvelope(
@@ -317,8 +317,7 @@ class SupervisorGateway:
         config = self.config
         if request.target != self.recipient:
             raise PermissionError("Supervisor request targets a different pod")
-        # A queued repair accepts commits pushed after its request.
-        assignment = _assignment(
+        pull, assignment = _assignment(
             self.workflow, request, config.advisor_branch, allow_newer_head=True
         )
         branch = (
@@ -329,8 +328,9 @@ class SupervisorGateway:
                 "Supervisor repair requires the target's current checkout; no branch will be switched"
             )
         if config.role == "student":
-            requested = request.assignment.expected_pr_head_sha
-            run_git(config.workspace, "merge-base", "--is-ancestor", requested, "HEAD")
+            run_git(
+                config.workspace, "merge-base", "--is-ancestor", pull.head_sha, "HEAD"
+            )
 
     def prepare(self, envelope: SupervisorEnvelope) -> str:
         request = envelope.request

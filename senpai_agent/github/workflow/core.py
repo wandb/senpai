@@ -187,9 +187,10 @@ class WorkflowCore:
         """Return the live PR head after GitHub proves it descends from ``sha``."""
         head_sha = self.pull_request(number).head_sha
         if head_sha != sha:
+            base = quote(sha, safe="")
             comparison = self._request(
                 "GET",
-                f"/repos/{self._repo}/compare/{sha}...{head_sha}?per_page=1",
+                f"/repos/{self._repo}/compare/{base}...{head_sha}?per_page=1",
                 expected_statuses={200},
             ).json_body
             if comparison["status"] != "ahead":

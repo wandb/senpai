@@ -247,7 +247,11 @@ class FakeGitHub:
 
         compare_prefix = f"/repos/{REPO}/compare/"
         if method == "GET" and path.startswith(compare_prefix):
-            status = self.comparisons[path.removeprefix(compare_prefix)]
+            base, head = unquote(path.removeprefix(compare_prefix)).split("...")
+            if base == head:
+                return HttpResponse(200, {"status": "identical"})
+            if (status := self.comparisons.get(f"{base}...{head}")) is None:
+                return HttpResponse(404, {"message": "Not Found"})
             return HttpResponse(200, {"status": status})
 
         if method == "GET" and path == issue_path and self.issue is not None:
