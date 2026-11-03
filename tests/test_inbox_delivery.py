@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import sqlite3
 from collections import Counter
 from pathlib import Path
@@ -19,6 +20,7 @@ from senpai_agent.inbox import (
     InboxTurnQuarantined,
     PersistentInbox,
     deliver_turn_messages,
+    strip_delivery_stamp,
     turn_has_finished_response,
 )
 
@@ -111,6 +113,38 @@ def test_stable_sender_verifies_payload_after_crash_between_append_and_receipt(
     )
     with pytest.raises(RuntimeError, match="payload mismatch"):
         deliver_turn_messages(tampered, PersistentInbox(inbox.path), turn.turn_id)
+
+
+def test_event_deliveries_carry_the_delivery_time_and_verify_without_it(
+    tmp_path: Path,
+):
+    """
+    Requirement: every event the model receives says when it was delivered,
+    while the inbox record and its digest stay unstamped so recovery still
+    recognizes an appended message.
+    """
+    inbox = PersistentInbox(tmp_path / "inbox.sqlite3")
+    inbox.enqueue(CONVERSATION_ID, "event:1", "canonical event")
+    turn = inbox.next_turn(CONVERSATION_ID, "controller prompt")
+    assert turn is not None
+    conversation = Conversation()
+
+    deliver_turn_messages(conversation, inbox, turn.turn_id)
+
+    prompt, event = conversation.sent
+    assert prompt[0] == "controller prompt"
+    assert re.fullmatch(
+        r"canonical event\n\nDelivered at \(UTC\): "
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+        event[0],
+    )
+    assert strip_delivery_stamp(event[0]) == "canonical event"
+    assert inbox.turn(turn.turn_id).events[0].body == "canonical event"
+
+    # A resume after a crash sees the stamped message on the branch and
+    # recognizes it as the recorded delivery.
+    deliver_turn_messages(conversation, PersistentInbox(inbox.path), turn.turn_id)
+    assert len(conversation.sent) == 2
 
 
 def test_event_identity_cannot_hide_a_changed_payload(tmp_path: Path):
@@ -276,7 +310,9 @@ def test_crash_before_append_reuses_turn_and_appends_each_message_once(tmp_path:
     conversation = Conversation()
     deliver_turn_messages(conversation, PersistentInbox(path), after_restart.turn_id)
     deliver_turn_messages(conversation, PersistentInbox(path), after_restart.turn_id)
-    assert [message for message, _sender in conversation.sent] == [
+    assert [
+        strip_delivery_stamp(message) for message, _sender in conversation.sent
+    ] == [
         "controller prompt",
         "first event",
     ]
@@ -420,7 +456,9 @@ def test_human_steering_joins_the_active_turn_and_resets_its_budget(tmp_path: Pa
     assert inbox.turn(active.turn_id).event_keys == ("event:first", "human:1")
     assert not inbox.terminal_recovery_due(active.turn_id, max_attempts=3)
     deliver_turn_messages(conversation, inbox, active.turn_id)
-    assert [message for message, _sender in conversation.sent] == [
+    assert [
+        strip_delivery_stamp(message) for message, _sender in conversation.sent
+    ] == [
         "controller prompt",
         "first",
         "change direction",
@@ -914,7 +952,9 @@ def test_108_events_and_four_failed_resumes_leave_one_visible_copy_per_event(
         inbox.acknowledge(turn.turn_id)
         turn_number += 1
 
-    visible = Counter(message for message, _sender in conversation.sent)
+    visible = Counter(
+        strip_delivery_stamp(message) for message, _sender in conversation.sent
+    )
     assert all(visible[event_message(index)] == 1 for index in range(108))
 
 

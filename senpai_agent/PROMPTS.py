@@ -179,6 +179,8 @@ EVENT_PROMPT = """## {{KIND}}
 
 {{PAYLOAD}}"""
 
+DELIVERY_TIME_PROMPT = """Delivered at (UTC): {{CURRENT_TIME}}"""
+
 STUDENT_AVAILABLE_FOR_ASSIGNMENT_PROMPT = """## Student available for assignment: `{{STUDENT}}`
 
 `{{STUDENT}}` has no open `status:wip` or `status:review` assignment."""

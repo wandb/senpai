@@ -68,9 +68,13 @@ from senpai_agent.supervisor import LEASE_ENV, ProgressLease
 from senpai_agent.workspace import StudentWorkspaceReconciler, WorkspaceDivergence
 
 
+# Delivered when first observed and again only after the condition clears and
+# returns. Student availability is one: a student with no assignment is told
+# once, not every poll, so an idle roster does not wake the advisor for nothing.
 _EDGE_TRIGGERED_EVENT_KINDS = EXACT_ONCE_EVENT_KINDS | {
     "research_base_changed",
     "student_assignment_comment",
+    "student_available_for_assignment",
 }
 _SUPERSEDED_NOTICE_PREFIX = "assignment_superseded:"
 _ACTIVITY_LEASE_RENEWAL_SECONDS = 30
