@@ -151,6 +151,8 @@ Not all ideas are equal. Prioritize:
 
 Maintain a current, pruned synthesis of the research focus, live hypotheses, human direction, and promising next directions. Use the provided research-state skill to update and publish durable advisor-owned records safely when evidence, human guidance, or dataset understanding changes.
 
+Also keep the compact typed state current with `update_research_state` after every merge, kill, assignment, operator instruction, or budget change. The harness re-sends that file verbatim after each context compaction, so it is what you will remember; the prose notes are for the record.
+
 ## Writing style
 
 When writing PRs or commenting on PRs or Github Issues, ensure your technical prose matches STE-style (i.e. ASD-STE100) clarity. Prefer active, single-action sentences. Use one consistent verb for each action. Expand long noun clusters to make relationships explicit. Preserve all facts, conditions, ordering constraints, identifiers, and necessary domain terms. Do not guess when text is ambiguous; flag the ambiguity. Do not rewrite text that is already clear. Technical terms from machine learning, AI, science, computer science and mathematics are of course permitted given the technical nature of this work. Remove all mannered prose.

@@ -16,6 +16,7 @@ from openhands.sdk.llm.llm import MIN_CONTEXT_WINDOW_TOKENS
 from pydantic import SecretStr
 
 from senpai_agent.custom_openai import MIN_INPUT_TOKENS
+from senpai_agent.PROMPTS import COMPACTION_SUMMARY_PROMPT
 from senpai_agent.openhands_runner import (
     EVENT_TEXT_LIMIT,
     CustomOpenAIEndpoint,
@@ -531,7 +532,7 @@ def test_pro_mode_is_only_enabled_by_openai_max(model, effort):
             "anthropic/claude-opus-4-8",
             {
                 "anthropic_compact_threshold": TEST_COMPACTION_TRIGGER_TOKENS,
-                "anthropic_compaction_instructions": None,
+                "anthropic_compaction_instructions": COMPACTION_SUMMARY_PROMPT,
             },
         ),
         ("gemini/gemini-3-pro", {}),
@@ -571,7 +572,9 @@ def test_universal_compaction_configuration_reaches_anthropic_sdk():
         configuration["anthropic_compact_threshold"]
         == TEST_COMPACTION_TRIGGER_TOKENS
     )
-    assert configuration["anthropic_compaction_instructions"] is None
+    assert configuration["anthropic_compaction_instructions"] == (
+        COMPACTION_SUMMARY_PROMPT
+    )
     assert llm.uses_anthropic_compaction() is True
     assert call_kwargs["context_management"] == {
         "edits": [
@@ -581,6 +584,7 @@ def test_universal_compaction_configuration_reaches_anthropic_sdk():
                     "type": "input_tokens",
                     "value": TEST_COMPACTION_TRIGGER_TOKENS,
                 },
+                "instructions": COMPACTION_SUMMARY_PROMPT,
             }
         ]
     }

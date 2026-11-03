@@ -47,6 +47,7 @@ from senpai_agent.inbox import (
     events_after_turn_delivery,
     turn_has_finished_response,
 )
+from senpai_agent.research_state import compaction_event
 from senpai_agent.secrets import (
     BUILTIN_CONVERSATION_SECRET_ENV_NAMES,
     GITHUB_TOKEN_ENV_NAMES,
@@ -75,6 +76,7 @@ from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
 from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.conversation import ConversationExecutionStatus, ConversationState
 from openhands.sdk.event import ActionEvent, MessageEvent, ObservationEvent
+from openhands.sdk.event.condenser import Condensation
 from openhands.sdk.llm import Message, TextContent
 from openhands.sdk.plugin import PluginSource
 from openhands.sdk.skills import (
@@ -123,6 +125,7 @@ from senpai_agent.program_context import (
 )
 from senpai_agent.reasoning_effort import REASONING_EFFORTS, openhands_reasoning_effort
 from senpai_agent.PROMPTS import (
+    COMPACTION_SUMMARY_PROMPT,
     DELEGATED_RESULT_SUMMARY_PROMPT,
     RECOVERED_ACTION_PROMPT,
     SUPERVISOR_ROLE_PROMPT,
@@ -1164,7 +1167,7 @@ def compaction_configuration(
     if provider == "anthropic":
         return {
             "anthropic_compact_threshold": trigger_tokens,
-            "anthropic_compaction_instructions": None,
+            "anthropic_compaction_instructions": COMPACTION_SUMMARY_PROMPT,
         }
     return {}
 
@@ -1278,6 +1281,46 @@ def local_event_db_path(config: RunnerConfig) -> Path:
     return config.state_dir / f"{config.role}-events.sqlite3"
 
 
+def compaction_trigger(event: object) -> str | None:
+    """Name the compaction an event records, if it records one.
+
+    The OpenHands condenser appends a Condensation event; Anthropic's
+    server-side compaction returns a compaction block on the action produced
+    by the request that compacted the context.
+    """
+
+    if isinstance(event, Condensation):
+        return "condenser"
+    if getattr(event, "anthropic_compaction_blocks", None):
+        return "anthropic"
+    return None
+
+
+def announce_compaction(config: RunnerConfig, event: object) -> bool:
+    """Queue the saved research state for the advisor after a compaction.
+
+    The event pump and the controller deliver it like any other local event,
+    so the state reaches the model at the next safe step boundary.
+    """
+
+    trigger = compaction_trigger(event)
+    if trigger is None or config.role != "advisor" or config.child:
+        return False
+    notice = compaction_event(
+        config.state_dir,
+        trigger=trigger,
+        event_id=str(getattr(event, "id", "")) or uuid.uuid4().hex,
+    )
+    with LocalEventStore(local_event_db_path(config)) as store:
+        store.enqueue(notice)
+    print(
+        f"OPENHANDS_COMPACTION trigger={trigger} event_key={notice.dedupe_key}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return True
+
+
 def scrub_model_credentials(
     environment: MutableMapping[str, str],
     config: RunnerConfig,
@@ -1334,6 +1377,13 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
     if not config.child:
         tools.append(Tool(name="delegate_agent", params=delegation_params))
         tools.append(Tool(name="get_cluster_capacity"))
+    if config.role == "advisor" and not config.child:
+        tools.append(
+            Tool(
+                name="update_research_state",
+                params={"state_dir": str(config.state_dir)},
+            )
+        )
     tools.extend(
         Tool(name=name, params=delegation_params)
         for name in (
@@ -2009,6 +2059,7 @@ def run_openhands[ResponseT: BaseModel](
             if on_activity is not None:
                 on_activity()
             print_event(event)
+            announce_compaction(config, event)
 
         conversation = LocalConversation(
             agent=agent,
