@@ -353,6 +353,7 @@ class TrainingResultObservation(Observation):
     process_group_id: int | None = None
     process_start_time: float | None = None
     exit_code: int | None = None
+    expected_exit_codes: tuple[int, ...] = (0,)
     elapsed_seconds: float
     log_path: str
     wandb_run_ids: tuple[str, ...] = ()
@@ -409,6 +410,8 @@ class TrainingResultObservation(Observation):
             "log_path": self.log_path,
             "wandb_run_ids": self.wandb_run_ids,
         }
+        if self.expected_exit_codes != (0,):
+            result["expected_exit_codes"] = self.expected_exit_codes
         if self.log_stalled_since is not None:
             result["log_stalled_since"] = self.log_stalled_since
         if self.last_log_line:
@@ -670,6 +673,9 @@ class RunTrainingTool(ToolDefinition[RunTrainingAction, TrainingResultObservatio
                     "or scratch scripts (ignored paths excepted) are allowed, named in "
                     "the result and stored in a worktree snapshot commit beside HEAD. "
                     "A remote worker runs from HEAD without them. "
+                    "spec.expected_exit_codes declares the exit codes that complete "
+                    "the run as designed, such as [0, 3] for a gate that exits 3 on a "
+                    "failed check; other codes record the run as failed. "
                     "Only the current assignment revision conversation may launch. "
                     "Use monitor_training only to add metric gates or staleness "
                     "policy; use get_training_status for a bounded check or, with "

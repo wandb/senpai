@@ -1,7 +1,10 @@
+import json
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from git_workflow_support import commit_file, repository
+from git_workflow_support import commit_file, git, repository
 
 from senpai_agent.models import (
     AssignmentKey,
@@ -13,6 +16,7 @@ from senpai_agent.github.http import GitHubReadError
 from senpai_agent.provenance import (
     GitHubCommitLookup,
     IdentifierProvenance,
+    ObservedIdentifiers,
     ProvenanceError,
 )
 from senpai_agent.training import TrainingResult, TrainingState
@@ -530,3 +534,263 @@ def test_github_commit_lookup_reads_the_commit_endpoint():
         lookup.commit_sha("main")
     with pytest.raises(ValueError):
         GitHubCommitLookup("acme", reader)
+
+
+# --- Classes the 2026-11-03 campaign review found refused or let through ---
+
+SHA256 = "391730cf" + "0a1b2c3d" * 7
+CORRUPTED = SHA256[:-1] + "e"
+BLOB = "9daeafb9864cf43055ae93beb0afd6c7d144bfa4"
+
+
+class Event(SimpleNamespace):
+    """Duck-typed stand-in for one OpenHands event."""
+
+
+def observation(text: str, *, action_id: str = "a0", tool_name: str = "terminal") -> Event:
+    return Event(
+        id=f"o-{action_id}",
+        action_id=action_id,
+        tool_name=tool_name,
+        observation=SimpleNamespace(model_dump_json=lambda: json.dumps({"content": text})),
+    )
+
+
+def action(text: str, *, event_id: str = "a0") -> Event:
+    return Event(
+        id=event_id,
+        tool_name="terminal",
+        action=SimpleNamespace(model_dump_json=lambda: json.dumps({"command": text})),
+        thought=[SimpleNamespace(text="")],
+    )
+
+
+def message(text: str, *, source: str = "user") -> Event:
+    return Event(
+        source=source,
+        llm_message=SimpleNamespace(content=[SimpleNamespace(text=text)]),
+    )
+
+
+def conversation(*events: Event) -> SimpleNamespace:
+    return SimpleNamespace(id=uuid.uuid4(), state=SimpleNamespace(events=list(events)))
+
+
+def observed(*events: Event) -> ObservedIdentifiers:
+    return ObservedIdentifiers(list(events))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"SHA-256 {SHA256} of submission.py",
+        f"file SHA-256 `{SHA256[:8]}…` matches the judge's copy",
+        f"sha256sum: {SHA256[:12]}",
+        f"`{SHA256}` is the shipped digest",
+        f"the digest {SHA256[:16]} is unchanged",
+    ],
+)
+def test_digests_a_tool_printed_pass_as_digests_and_as_prefixes(case, text):
+    provenance, lookup, _ = case
+    index = observed(action("sha256sum submission.py"), observation(f"{SHA256}  submission.py"))
+
+    provenance.check_text(text, source="comment", observed=index)
+
+    assert lookup.calls == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"SHA-256 {CORRUPTED} of submission.py",
+        f"`{CORRUPTED}` is the shipped digest",
+        "digest 391730cf1a2b differs from HEAD's file",
+    ],
+)
+def test_digests_no_tool_printed_are_refused_by_class(case, text):
+    provenance, _, _ = case
+    index = observed(observation(f"{SHA256}  submission.py"))
+
+    with pytest.raises(ProvenanceError, match="^digest '.*not printed by any tool.*sha256sum"):
+        provenance.check_text(text, source="comment", observed=index)
+
+
+def test_digests_are_left_alone_without_the_conversations_tool_output(case):
+    provenance, lookup, _ = case
+
+    provenance.check_text(f"SHA-256 {CORRUPTED} of submission.py", source="comment")
+    provenance.check_text(f"`{CORRUPTED}` is the shipped digest", source="comment")
+
+    assert lookup.calls == []
+
+
+def test_an_echo_of_the_agents_own_command_does_not_vouch_for_a_digest(case):
+    provenance, _, _ = case
+    index = observed(
+        action(f"echo 'digest {CORRUPTED}' >> RESULTS.md", event_id="a1"),
+        observation(f"$ echo 'digest {CORRUPTED}' >> RESULTS.md", action_id="a1"),
+        action("sha256sum submission.py", event_id="a2"),
+        observation(f"{SHA256}  submission.py", action_id="a2"),
+    )
+
+    with pytest.raises(ProvenanceError, match="^digest"):
+        provenance.check_text(f"digest {CORRUPTED}", source="comment", observed=index)
+    provenance.check_text(f"digest {SHA256}", source="comment", observed=index)
+
+
+def test_delivered_messages_count_and_agent_messages_do_not(case):
+    provenance, _, _ = case
+    from_advisor = observed(message(f"The judge's copy has digest {SHA256}."))
+    from_self = observed(message(f"I believe the digest is {SHA256}.", source="agent"))
+
+    provenance.check_text(f"digest {SHA256[:10]}", source="comment", observed=from_advisor)
+    with pytest.raises(ProvenanceError, match="^digest"):
+        provenance.check_text(f"digest {SHA256[:10]}", source="comment", observed=from_self)
+
+
+def test_the_index_scans_new_events_incrementally(case):
+    provenance, _, _ = case
+    events = [observation("nothing yet")]
+    index = ObservedIdentifiers(events)
+
+    with pytest.raises(ProvenanceError, match="^digest"):
+        provenance.check_text(f"digest {SHA256}", source="comment", observed=index)
+    events.append(observation(f"{SHA256}  submission.py", action_id="a9"))
+    provenance.check_text(f"digest {SHA256}", source="comment", observed=index)
+
+
+def test_git_object_ids_pass_from_the_worktree_or_tool_output(case):
+    provenance, lookup, head = case
+    blob = git(provenance.workspace, "rev-parse", f"{head}:model.py")
+    printed = observed(observation(f"{BLOB}  tmp/scratch.py", tool_name="terminal"))
+
+    provenance.check_text(f"blob {blob} is model.py at HEAD", source="comment")
+    provenance.check_text(f"git hash-object gave {BLOB[:12]}", source="comment", observed=printed)
+    provenance.check_text(f"ls-tree row: 100644 blob {blob[:10]}", source="comment", observed=printed)
+    # Without tool output a hash-object id cannot be checked and is left alone.
+    provenance.check_text(f"git hash-object gave {BLOB}", source="comment")
+
+    with pytest.raises(ProvenanceError, match="^blob id '.*neither in this conversation.*hash-object"):
+        provenance.check_text(f"blob {BLOB}", source="comment", observed=observed())
+    assert lookup.calls == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "okc job `a1b2c3d4` scored 2.447",
+        "job id a1b2c3d4 passed",
+        "the official run 8b7803d1a6e04f78 is the submission",
+    ],
+)
+def test_job_system_ids_are_not_looked_up_in_wandb(case, text):
+    provenance, lookup, _ = case
+
+    provenance.check_text(text, source="comment", observed=observed())
+
+    assert lookup.calls == []
+
+
+def test_training_id_prefixes_are_checked_against_the_run_records(case):
+    provenance, lookup, _ = case
+    write_record(provenance.training_dir, state=TrainingState.FINISHED, run_ids=("ab12cd34",))
+    prefix = TRAINING_ID[:8]
+
+    provenance.check_text(f"training {prefix} finished in 40 s", source="comment")
+    provenance.check_text(f"training run {prefix} finished", source="comment")
+    provenance.check_text(f"run_training id {prefix}", source="comment")
+    # "training run <W&B id>" still names the W&B run of a training; the
+    # record vouches for this one, so W&B is not asked.
+    provenance.check_text("the training run ab12cd34 finished", source="comment")
+    with pytest.raises(ProvenanceError, match="^W&B run id '58vh6sck'"):
+        provenance.check_text("the training run 58vh6sck finished", source="comment")
+    assert lookup.calls == [("acme", "cfd", "58vh6sck")]
+
+    with pytest.raises(ProvenanceError, match=f"^training {TRAINING_ID} is recorded as finished"):
+        provenance.check_text(f"training {prefix} failed", source="comment")
+    with pytest.raises(ProvenanceError, match="^training id '0123abcd'.*matches no run record.*training_id"):
+        provenance.check_text("training 0123abcd finished", source="comment")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "run ab12cd34: 12 passed, 0 failed",
+        "run ab12cd34 reports failed=0 and finished=12",
+        "run ab12cd34 (3 failed: 0)",
+    ],
+)
+def test_counted_outcomes_are_not_the_runs_state(case, text):
+    provenance, _, _ = case
+
+    provenance.check_text(text, source="comment")
+
+    with pytest.raises(ProvenanceError, match="ab12cd34 is finished in W&B.*failed"):
+        provenance.check_text("run ab12cd34 failed after 3 steps", source="comment")
+
+
+def test_unlabelled_hex_tokens_must_match_a_source_when_tool_output_is_known(case):
+    provenance, lookup, head = case
+    write_record(provenance.training_dir, state=TrainingState.FINISHED, run_ids=("0123456789abcdef",))
+    index = observed(observation(f"commit {head}\nAuthor: Student\n\n    baseline"))
+
+    # A tool printed it, a record starts with it, or it resolves as a commit.
+    provenance.check_text(f"{head[:7]} is the candidate", source="comment", observed=index)
+    provenance.check_text(f"see {head}", source="comment", observed=index)
+    provenance.check_text(f"{TRAINING_ID[:8]} and 0123456789ab", source="comment", observed=index)
+    # Words spelt in hex letters and numbers are not identifiers.
+    provenance.check_text("defaced and deadbeef bytes at 20261103", source="comment", observed=index)
+
+    # A commit prefix with an invented eighth character matches nothing.
+    invented = head[:7] + ("f" if head[7] != "f" else "e")
+    with pytest.raises(ProvenanceError, match=f"^'{invented}'.*has no label and matches no commit.*label them"):
+        provenance.check_text(f"{invented} is the candidate", source="comment", observed=index)
+    assert lookup.calls == []
+
+
+def test_without_tool_output_only_a_full_unlabelled_sha_is_checked(case):
+    provenance, lookup, head = case
+
+    provenance.check_text(f"{head[:7] + 'f'} is the candidate", source="comment")
+    with pytest.raises(ProvenanceError, match=f"^commit '{'0' * 40}'.*does not resolve"):
+        provenance.check_text(f"see {'0' * 40}", source="comment")
+    assert lookup.calls == []
+
+
+def test_a_sentence_final_full_stop_does_not_hide_a_token(case):
+    provenance, _, head = case
+
+    provenance.check_text(f"The candidate is commit {head[:7]}.", source="comment")
+    provenance.check_text("Rebuilt from model.abc1234.py and run.0747eaa0 files.", source="comment")
+    with pytest.raises(ProvenanceError, match="^commit '0747eaa'"):
+        provenance.check_text("The twin is commit 0747eaa.", source="comment")
+
+
+def test_the_observed_index_is_built_once_per_conversation(case):
+    provenance, _, _ = case
+    talk = conversation(observation(f"{SHA256}  submission.py"))
+
+    first = provenance.observed(talk)
+    assert first is provenance.observed(talk)
+    assert first is not None and first.contains(SHA256)
+    assert provenance.observed(SimpleNamespace()) is None
+
+    provenance.check_text(f"digest {SHA256}", source="comment", observed=first)
+
+
+def test_every_refusal_names_its_class_and_fix(case):
+    provenance, _, head = case
+    index = observed()
+    cases = {
+        "W&B run `58vh6sck` finished": ("W&B run id '58vh6sck'", "full run URL"),
+        "commit 0747eaa adds the twin": ("commit '0747eaa'", "by its URL"),
+        f"digest {CORRUPTED}": ("digest '", "sha256sum"),
+        f"blob {BLOB}": ("blob id '", "hash-object"),
+        "training 0123abcd finished": ("training id '0123abcd'", "training_id"),
+        f"{head[:7] + 'f'} is the candidate": ("has no label", "label them"),
+    }
+    for text, (klass, fix) in cases.items():
+        with pytest.raises(ProvenanceError) as error:
+            provenance.check_text(text, source="comment", observed=index)
+        assert klass in str(error.value), text
+        assert fix in str(error.value), text

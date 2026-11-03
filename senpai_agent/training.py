@@ -199,6 +199,15 @@ class TrainingSpec(BaseModel):
     argv: tuple[str, ...] = Field(min_length=1)
     cwd: Path
     timeout_seconds: int = Field(gt=0)
+    expected_exit_codes: tuple[int, ...] = Field(
+        default=(0,),
+        min_length=1,
+        description=(
+            "Exit codes that mean the process completed as designed, for example "
+            "[0, 3] for a gate that exits 3 when its check fails. Any other code "
+            "records the run as failed. Applies to runs supervised in this pod."
+        ),
+    )
 
 
 class TrainingResult(BaseModel):
@@ -210,6 +219,8 @@ class TrainingResult(BaseModel):
     process_group_id: int | None = Field(default=None, gt=0)
     process_start_time: float | None = Field(default=None, gt=0)
     exit_code: int | None
+    # Exit codes the launch declared as completing the run as designed.
+    expected_exit_codes: tuple[int, ...] = (0,)
     elapsed_seconds: float
     log_path: str
     wandb_run_ids: tuple[str, ...] = ()
@@ -259,6 +270,7 @@ class _ActiveTraining:
     timeout_seconds: int
     log_path: Path
     worktree: dict[str, object]
+    expected_exit_codes: tuple[int, ...] = (0,)
     cancelled: bool = False
     thread: threading.Thread | None = None
     output_thread: threading.Thread | None = None
@@ -382,6 +394,7 @@ class TrainingSupervisor:
             process_group_id=process_group_id,
             process_start_time=process_start_time,
             exit_code=None,
+            expected_exit_codes=spec.expected_exit_codes,
             elapsed_seconds=0,
             log_path=str(log_path),
             **worktree_fields,
@@ -395,6 +408,7 @@ class TrainingSupervisor:
             timeout_seconds=spec.timeout_seconds,
             log_path=log_path,
             worktree=worktree_fields,
+            expected_exit_codes=spec.expected_exit_codes,
         )
         thread = threading.Thread(
             target=self._monitor,
@@ -530,6 +544,7 @@ class TrainingSupervisor:
                             process_group_id=active.process_group_id,
                             process_start_time=active.process_start_time,
                             exit_code=None,
+                            expected_exit_codes=active.expected_exit_codes,
                             elapsed_seconds=now - active.started,
                             log_path=str(active.log_path),
                             wandb_run_ids=discovered_run_ids,
@@ -563,7 +578,7 @@ class TrainingSupervisor:
                         if active.cancelled
                         else (
                             TrainingState.FINISHED
-                            if exit_code == 0
+                            if exit_code in active.expected_exit_codes
                             else TrainingState.FAILED
                         )
                     )
@@ -612,6 +627,7 @@ class TrainingSupervisor:
             process_group_id=active.process_group_id,
             process_start_time=active.process_start_time,
             exit_code=exit_code,
+            expected_exit_codes=active.expected_exit_codes,
             elapsed_seconds=time.monotonic() - active.started,
             log_path=str(active.log_path),
             wandb_run_ids=tuple(run_ids),

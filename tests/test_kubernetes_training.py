@@ -666,6 +666,21 @@ def test_source_bundle_ignores_replace_refs_and_replaces_poisoned_artifacts(
     assert (checkout / "tracked.txt").read_text() == "committed\n"
 
 
+def test_remote_training_rejects_declared_exit_codes(tmp_path, monkeypatch):
+    runtime, workspace, _snapshot_root = supervisor(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="expected_exit_codes applies to runs supervised"):
+        runtime.run_training(
+            TrainingSpec(
+                argv=(sys.executable, "-c", "pass"),
+                cwd=workspace,
+                timeout_seconds=5,
+                expected_exit_codes=(0, 3),
+            )
+        )
+    runtime.close()
+
+
 def test_supervisor_allows_only_one_active_run_and_cancellation_deletes_remote(
     tmp_path,
     monkeypatch,

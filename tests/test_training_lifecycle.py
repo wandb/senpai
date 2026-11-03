@@ -68,6 +68,37 @@ def test_worktree_facts_survive_every_record_rewrite(tmp_path: Path):
     assert wait_for_terminal(supervisor, plain.training_id).source_commit is None
 
 
+@pytest.mark.parametrize(
+    ("expected", "code", "state"),
+    [
+        ((0,), 3, TrainingState.FAILED),
+        ((0, 3), 3, TrainingState.FINISHED),
+        ((0, 3), 0, TrainingState.FINISHED),
+        ((0, 3), 1, TrainingState.FAILED),
+    ],
+)
+def test_a_declared_exit_code_completes_the_run(tmp_path: Path, expected, code, state):
+    workspace, supervisor = make_supervisor(tmp_path)
+
+    running = supervisor.run_training(
+        TrainingSpec(
+            argv=(sys.executable, "-c", f"print('gate', flush=True); raise SystemExit({code})"),
+            cwd=workspace,
+            timeout_seconds=20,
+            expected_exit_codes=expected,
+        )
+    )
+    terminal = wait_for_terminal(supervisor, running.training_id)
+
+    assert running.expected_exit_codes == expected
+    assert (terminal.state, terminal.exit_code, terminal.expected_exit_codes) == (
+        state, code, expected,
+    )
+    assert (terminal.error_tail == "") is (state is TrainingState.FINISHED)
+    reopened = TrainingSupervisor(workspace=workspace, state_dir=tmp_path / "state")
+    assert reopened.get_training_status(running.training_id).expected_exit_codes == expected
+
+
 def test_recovery_ignores_non_training_json_sidecars(tmp_path: Path):
     workspace = tmp_path / "workspace"
     state_dir = tmp_path / "state"
