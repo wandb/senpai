@@ -743,6 +743,22 @@ class Controller:
                             )
                             continue
                     batch_events = (*batch_events, conflict.event)
+                except Exception as error:  # noqa: BLE001
+                    # A fetch that failed in transit, or a remote that did not
+                    # answer, says nothing about the workspace. Forget the
+                    # batch so the next poll delivers it again and reconciles
+                    # afresh; exiting would restart the container for nothing.
+                    print(
+                        "SENPAI_RECONCILE_ERROR "
+                        f"conversation_id={conversation_id} "
+                        f"event_keys={','.join(event.dedupe_key for event in batch_events)} "
+                        f"error={type(error).__name__}: {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    for event in batch_events:
+                        self._visible.pop(event.dedupe_key, None)
+                    continue
                 else:
                     if any(
                         event.kind == "student_assignment" for event in batch_events

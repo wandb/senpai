@@ -256,6 +256,12 @@ def test_stalled_log_emits_one_signal_without_raw_log_output():
     assert "step 40" not in signal.detail
     assert "get_training_status returns its last log line" in signal.detail
     assert "cancel_training" in signal.detail
+    # Quiet measurement sessions are normal: the signal asks for a look at GPU
+    # utilisation and the expected duration before anything is cancelled.
+    assert "quiet log is normal" in signal.detail
+    assert "GPU utilisation" in signal.detail
+    assert "expected duration" in signal.detail
+    assert "only if it is hung" in signal.detail
 
     quiet, _ = evaluate_monitor(
         spec,

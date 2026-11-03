@@ -690,6 +690,15 @@ def test_get_training_status_delivers_complete_structured_pod_evidence(tmp_path,
     assert training.status_checks == ['training-17']
 
 
+def test_log_stall_interval_defaults_to_half_an_hour():
+    from senpai_agent.training import DEFAULT_LOG_STALL_SECONDS, log_stall_seconds
+
+    assert DEFAULT_LOG_STALL_SECONDS == 1800
+    assert log_stall_seconds({}) == 1800
+    assert log_stall_seconds({"SENPAI_TRAINING_LOG_STALL_SECONDS": " "}) == 1800
+    assert log_stall_seconds({"SENPAI_TRAINING_LOG_STALL_SECONDS": "2400"}) == 2400
+
+
 def test_training_runtime_reads_the_log_stall_interval_from_the_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

@@ -670,6 +670,24 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         assert config["SENPAI_COMPACTION_TRIGGER_EVENTS"] == "600"
 
 
+def test_students_receive_the_training_log_stall_interval_from_the_launch_config():
+    _config, _deployment, _secret = render_role("advisor")
+    student_config, _deployment, _secret = render_role("student")
+    student = yaml.safe_load(student_config)["data"]
+    advisor = yaml.safe_load(_config)["data"]
+
+    assert student["SENPAI_TRAINING_LOG_STALL_SECONDS"] == "1800"
+    assert "SENPAI_TRAINING_LOG_STALL_SECONDS" not in advisor
+
+    tuned, _deployment, _secret = render_role(
+        "student", launch_args(training_log_stall_seconds=2400)
+    )
+    assert yaml.safe_load(tuned)["data"]["SENPAI_TRAINING_LOG_STALL_SECONDS"] == "2400"
+
+    with pytest.raises(SystemExit, match="training_log_stall_seconds must be at least 1"):
+        launch.validate_timing_args(launch_args(training_log_stall_seconds=0))
+
+
 def test_launch_rejects_a_compaction_trigger_below_provider_minimum():
     args = launch_args(compaction_trigger_tokens=49_999)
 

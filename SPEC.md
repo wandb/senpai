@@ -645,14 +645,21 @@ Before posting, `post_assignment_comment` and `submit_experiment_result` check
 the identifiers the student quotes. A W&B run id counts when it is in a run
 page URL, in a table column whose header names runs, or within a few words of
 `run`, `W&B` or `wandb` in the same clause; it must be in the student's
-training records or in the run's W&B project. A commit SHA counts when it is
-40 hexadecimal characters, or an abbreviated SHA near a commit word; it must
-resolve in the assignment worktree. A state word in the same clause as a run
+training records or in the run's W&B project. A run-shaped token within reach
+of `job`, `check`, `official`, `scored`, `submission` or `judge` is a judge's
+or job system's id, not a W&B run, and is not looked up. A commit SHA counts
+when it is 40 hexadecimal characters, or an abbreviated SHA near a commit
+word; it must resolve in the assignment worktree or, when the worktree has
+not fetched it, in the repository on GitHub, so a peer's PR head counts. A
+token whose nearest context word names a file digest (`SHA-256`, `sha256`,
+`digest`, `checksum`, `file`) is neither a commit nor a run; the `SHA` of
+`SHA-256` is not a commit word. A state word in the same clause as a run
 id must match the run's state class (running, finished, or stopped). The
 record vouches for the state only of the last W&B run of a terminal process;
 otherwise W&B does. Bare numbers are never SHAs. A refusal names the
-identifier and how to cite one the checks cannot see, by URL. A failed W&B
-lookup refuses the call as unchecked, so nothing unverified is published.
+identifier and how to cite one the checks cannot see, by URL. A failed W&B or
+GitHub lookup refuses the call as unchecked, so nothing unverified is
+published.
 `push_experiment_commit` and `submit_experiment_result` resolve abbreviated
 SHAs to the full commit before their other checks, and push and report the
 full SHA. `post_peer_comment` and `broadcast_message` are not checked.
@@ -841,7 +848,12 @@ waits for the requested number, and `change` returns when any selected task
 changes state or immediately when one has an uncollected terminal result. Its
 timeout is required and capped at 300 seconds; expiry returns
 `satisfied=false`, current records, elapsed time, and next-step guidance without
-cancelling unfinished work. Any terminal results included in that response are
+cancelling unfinished work. The guidance of a timed-out wait reports the
+wall-clock time, the wait's place in the run of consecutive timeouts on the
+same tasks, the total time waited, and each task's state, age, last record
+change and last log growth, so no two timeout observations are alike; the SDK
+reads a repeated identical action and observation as a stuck agent and ends
+the turn. Any terminal results included in that response are
 marked collected so a later event does not repeat them. `agent_status` is a
 non-blocking snapshot. With no
 task IDs, it returns up to eight direct tasks that are active or have an
@@ -1024,9 +1036,13 @@ The controller samples metrics only for monitors that are due, but evaluates
 a run's terminal record as soon as it polls. The training supervisor wakes
 the controller from its idle sleep when a run ends, so the student resumes
 within seconds of the terminal state instead of at the next poll tick. A
-local run whose log stops growing for the supervisor's stall interval is
-flagged in its record with its last log line, wakes the controller the same
-way, and raises one `log_stalled` signal per stall. The
+local run whose log stops growing for the supervisor's stall interval
+(`SENPAI_TRAINING_LOG_STALL_SECONDS`, 1800 s by default, set per launch with
+`--training_log_stall_seconds`) is flagged in its record with its last log
+line, wakes the controller the same way, and raises one informational
+`log_stalled` signal per stall, which says that a quiet measurement session is
+normal and asks the student to check GPU utilisation and the run's expected
+duration before cancelling. The
 controller fetches one latest selected metric value from W&B, evaluates
 deterministic threshold/change/staleness and terminal-state rules, and
 persists deduplicated compact signals. Ordinary polls use no LLM tokens.

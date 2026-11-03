@@ -61,6 +61,7 @@ from senpai_agent.custom_openai import (
 )
 from senpai_agent.reasoning_effort import openhands_reasoning_effort
 from senpai_agent.secrets import validate_custom_secret_env_names
+from senpai_agent.training import DEFAULT_LOG_STALL_SECONDS
 
 from capacity_observer import (
     CAPACITY_SNAPSHOT_PATH,
@@ -206,6 +207,7 @@ class Args:
         ""  # shared operator instructions: a .md file path or literal text
     )
     timeout_minutes: float = 30.0  # wall-clock policy in the launch context
+    training_log_stall_seconds: int = int(DEFAULT_LOG_STALL_SECONDS)  # seconds a local training log may stop growing before the student is told
     max_epochs: int = 50  # epoch policy in the launch context
     custom_secret_env_names: list[str] = field(
         default_factory=list
@@ -501,6 +503,8 @@ def validate_timing_args(args: Args) -> None:
         sys.exit("ERROR: --max_epochs must be at least 1")
     if args.poll_interval_s < 1:
         sys.exit("ERROR: --poll_interval_s must be at least 1")
+    if args.training_log_stall_seconds < 1:
+        sys.exit("ERROR: --training_log_stall_seconds must be at least 1")
     for name in ("poll_jitter_s", "stale_wip_seconds"):
         if getattr(args, name) < 0:
             sys.exit(f"ERROR: --{name} must be non-negative")
@@ -879,6 +883,7 @@ def render_student(
             "SENPAI_MAX_TRAINING_TIMEOUT_SECONDS": str(
                 round(args.timeout_minutes * 60)
             ),
+            "SENPAI_TRAINING_LOG_STALL_SECONDS": str(args.training_log_stall_seconds),
             "PVC_CLAIM_NAME": args.pvc_claim_name,
             "SENPAI_LAUNCH_SECRET_NAME": secret_name,
             **student_gpu_placement_config(args),

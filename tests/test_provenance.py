@@ -9,7 +9,12 @@ from senpai_agent.models import (
     ResultStatus,
     WandbRunRef,
 )
-from senpai_agent.provenance import IdentifierProvenance, ProvenanceError
+from senpai_agent.github.http import GitHubReadError
+from senpai_agent.provenance import (
+    GitHubCommitLookup,
+    IdentifierProvenance,
+    ProvenanceError,
+)
 from senpai_agent.training import TrainingResult, TrainingState
 
 TRAINING_ID = "b81440b1-b803-471e-9fe0-6dcabd756b83"
@@ -23,6 +28,22 @@ class FakeLookup:
     def run_state(self, entity: str, project: str, run_id: str) -> str | None:
         self.calls.append((entity, project, run_id))
         return self.states.get(run_id)
+
+
+class FakeCommitLookup:
+    def __init__(self, commits: dict[str, str] | None = None, error: Exception | None = None):
+        self.commits = commits or {}
+        self.error = error
+        self.calls: list[str] = []
+
+    def commit_sha(self, sha: str) -> str | None:
+        self.calls.append(sha)
+        if self.error is not None:
+            raise self.error
+        return next(
+            (full for full in self.commits.values() if full.startswith(sha)),
+            None,
+        )
 
 
 def write_record(training_dir: Path, *, state: TrainingState, run_ids=()) -> None:
@@ -381,3 +402,131 @@ def test_failed_wandb_lookup_is_reported_as_unchecked(case):
         match="Could not check W&B run 'ab12cd34'.*ConnectionError.*Nothing was published",
     ):
         unreachable.check_text("run ab12cd34 finished", source="comment")
+
+
+PEER_HEAD = "e162d688f945e668a759bbe6c02b73fa24cfe505"
+DIGEST = "391730cf" + "0a1b2c3d" * 7
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The file SHA-256 `391730cf…` matches the judge's copy.",
+        f"file SHA-256 {DIGEST} (full)",
+        f"sha256 digest {DIGEST[:12]} of baseline.py",
+        "checksum 391730cf unchanged after the rebase",
+        "the digest 391730cf1a2b differs from HEAD's file",
+    ],
+)
+def test_file_digests_and_their_prefixes_are_neither_commits_nor_runs(case, text):
+    provenance, lookup, _ = case
+
+    provenance.check_text(text, source="comment")
+
+    assert lookup.calls == []
+
+
+def test_a_commit_word_nearer_than_the_digest_word_still_names_a_commit(case):
+    provenance, _, head = case
+
+    provenance.check_text(f"the file at commit {head[:7]} is fine", source="comment")
+    with pytest.raises(ProvenanceError, match="'0747eaa'.*does not resolve"):
+        provenance.check_text("the file at commit 0747eaa is fine", source="comment")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "official run `8b7803d1a6e04f78` scored 118.2 µs",
+        "the scored run `4e0029a22c034d2a` finished at 09:41",
+        "check `4e0029a22c034d2a` passed every shape",
+        "check run 4e0029a22c034d2a: correctness ok",
+        "job 8b7803d1a6e04f78 is the official submission",
+        "official run 58vh6sck, submission 3",
+    ],
+)
+def test_judge_job_ids_near_a_job_word_are_not_looked_up_in_wandb(case, text):
+    provenance, lookup, _ = case
+
+    provenance.check_text(text, source="comment")
+
+    assert lookup.calls == []
+
+
+def test_a_run_word_alone_still_sends_a_sixteen_hex_id_to_wandb(case):
+    provenance, lookup, _ = case
+
+    with pytest.raises(ProvenanceError, match="'8b7803d1a6e04f78'.*acme/cfd"):
+        provenance.check_text("W&B run `8b7803d1a6e04f78` finished", source="comment")
+
+    assert lookup.calls == [("acme", "cfd", "8b7803d1a6e04f78")]
+
+
+def test_commits_the_worktree_has_not_fetched_resolve_at_the_repository(case):
+    provenance, _, head = case
+    commits = FakeCommitLookup({"peer": PEER_HEAD, "old": "739f3ed" + "c" * 33})
+    checked = IdentifierProvenance(
+        workspace=provenance.workspace,
+        wandb_entity="acme",
+        wandb_project="cfd",
+        lookup=provenance.lookup,
+        commit_lookup=commits,
+    )
+
+    checked.check_text(f"peer PR head {PEER_HEAD} beats commit 739f3ed", source="comment")
+    assert checked.resolve_commit("739f3ed", field="x") == "739f3ed" + "c" * 33
+    # The worktree answers first; the repository is asked only for what it lacks.
+    assert checked.resolve_commit(head[:7], field="x") == head
+    assert commits.calls == [PEER_HEAD, "739f3ed", "739f3ed"]
+
+    with pytest.raises(ProvenanceError, match="'0747eaa'.*does not resolve"):
+        checked.check_text("commit 0747eaa adds the twin", source="comment")
+
+
+def test_a_failed_repository_lookup_refuses_as_unchecked(case):
+    provenance, _, _ = case
+    checked = IdentifierProvenance(
+        workspace=provenance.workspace,
+        commit_lookup=FakeCommitLookup(error=TimeoutError("api.github.com")),
+    )
+
+    with pytest.raises(ProvenanceError, match="Could not check.*TimeoutError.*retry"):
+        checked.check_text(f"commit {PEER_HEAD} from the peer", source="comment")
+
+
+class FakeReader:
+    def __init__(self, responses: dict[str, object]):
+        self.responses = responses
+        self.paths: list[str] = []
+
+    def get(self, path: str) -> object:
+        self.paths.append(path)
+        response = self.responses[path]
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def test_github_commit_lookup_reads_the_commit_endpoint():
+    reader = FakeReader(
+        {
+            f"/repos/acme/cfd/commits/{PEER_HEAD[:7]}": {"sha": PEER_HEAD},
+            "/repos/acme/cfd/commits/0747eaa": GitHubReadError("HTTP 422", status_code=422),
+            "/repos/acme/cfd/commits/deadbeef": GitHubReadError("HTTP 404", status_code=404),
+            "/repos/acme/cfd/commits/abc1234": {"sha": "f" * 40},
+            "/repos/acme/cfd/commits/cafe": GitHubReadError("HTTP 500", status_code=500),
+        }
+    )
+    lookup = GitHubCommitLookup("acme/cfd", reader)
+
+    assert lookup.commit_sha(PEER_HEAD[:7]) == PEER_HEAD
+    assert lookup.commit_sha("0747eaa") is None
+    assert lookup.commit_sha("deadbeef") is None
+    # A branch named like a SHA is not that commit.
+    assert lookup.commit_sha("abc1234") is None
+    with pytest.raises(GitHubReadError, match="500"):
+        lookup.commit_sha("cafe")
+    with pytest.raises(ValueError):
+        lookup.commit_sha("main")
+    with pytest.raises(ValueError):
+        GitHubCommitLookup("acme", reader)

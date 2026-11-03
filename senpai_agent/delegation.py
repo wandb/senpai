@@ -16,6 +16,7 @@ from base64 import b64encode
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, Self
 
@@ -1919,12 +1920,18 @@ class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservatio
     def __init__(self, manager: DelegationManager):
         self.manager = manager
         self._interrupted = threading.Event()
+        # Consecutive timed-out waits on one set of tasks: the task ids, when
+        # the first began, and how many there have been. Every timeout
+        # observation reports them, so no two are alike: the SDK reads a
+        # repeated identical action and observation as a stuck agent.
+        self._timeouts: tuple[frozenset[str], float, int] | None = None
 
     def __call__(self, action, conversation=None) -> AwaitAgentsObservation:
         if conversation is None:
             raise ValueError("await_agents requires its parent conversation")
         self._interrupted.clear()
         started = time.monotonic()
+        started_at = time.time()
         inherited = self.manager.config.deadline_epoch or float("inf")
         deadline = min(time.time() + action.timeout_seconds, inherited)
         tasks, uncollected_terminal = self.manager.await_snapshot(
@@ -1950,6 +1957,7 @@ class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservatio
                 satisfied = terminal >= required
             if satisfied:
                 self._acknowledge(tasks)
+                self._timeouts = None
                 return AwaitAgentsObservation(
                     join=action.join,
                     satisfied=True,
@@ -1969,7 +1977,7 @@ class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservatio
                     tasks=tasks,
                     changed_task_ids=changed,
                     waited_seconds=round(time.monotonic() - started, 3),
-                    guidance=AWAIT_AGENTS_TIMEOUT_PROMPT,
+                    guidance=self._timeout_guidance(action, tasks, started_at),
                 )
             tasks, uncollected_terminal = self.manager.await_snapshot(
                 action.task_ids,
@@ -1987,8 +1995,79 @@ class _AwaitAgentsExecutor(ToolExecutor[AwaitAgentsAction, AwaitAgentsObservatio
                     for task_id in terminal:
                         store.acknowledge(f"agent_result:{task_id}")
 
+    def _timeout_guidance(
+        self,
+        action: AwaitAgentsAction,
+        tasks: Sequence[AgentTaskState],
+        started_at: float,
+    ) -> str:
+        task_ids = frozenset(action.task_ids)
+        if self._timeouts is not None and self._timeouts[0] == task_ids:
+            _, since, count = self._timeouts
+            count += 1
+        else:
+            since, count = started_at, 1
+        self._timeouts = (task_ids, since, count)
+        now = time.time()
+        progress = _await_progress(
+            self.manager.registry, tasks, now=now, since=since, count=count
+        )
+        return f"{AWAIT_AGENTS_TIMEOUT_PROMPT} {progress}"
+
     def interrupt(self) -> None:
         self._interrupted.set()
+
+
+def _await_progress(
+    registry: DelegationRegistry,
+    tasks: Sequence[AgentTaskState],
+    *,
+    now: float,
+    since: float,
+    count: int,
+) -> str:
+    """Describe a timed-out wait so that consecutive reports differ.
+
+    The report carries the wall-clock time, the wait's place in the run of
+    consecutive timeouts on these tasks, the total time waited, and for each
+    task its state, age, last record change and last log growth. Log content
+    is not quoted: it is raw child output outside the conversation's secret
+    masking.
+    """
+
+    rows = {row["task_id"]: row for row in registry.rows([task.task_id for task in tasks])}
+    stamp = datetime.fromtimestamp(now, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    head = (
+        f"As of {stamp} this is timed-out wait {count} in a row on these tasks, "
+        f"{max(0, round(now - since))} s in total."
+    )
+    details = []
+    for task in tasks:
+        detail = task.status
+        row = rows.get(task.task_id)
+        if row is not None:
+            if task.status not in TERMINAL_TASK_STATUSES:
+                detail += f" for {max(0, round(now - row['created_at']))} s"
+            detail += f", record changed {max(0, round(now - row['updated_at']))} s ago"
+            log = _child_log_progress(row, now)
+            if log:
+                detail += f", {log}"
+        details.append(f"{task.task_id} {detail}")
+    return f"{head} {'; '.join(details)}."
+
+
+def _child_log_progress(row: sqlite3.Row, now: float) -> str:
+    """Report when a child's log last grew and how large it is, not its text."""
+
+    state_dir = row["state_dir"]
+    if not state_dir:
+        return ""
+    log_path = Path(state_dir).parent / f"{row['task_id']}.log"
+    try:
+        stat = log_path.stat()
+    except OSError:
+        return ""
+    return f"log grew {max(0, round(now - stat.st_mtime))} s ago ({stat.st_size} bytes)"
 
 
 class _AgentStatusExecutor(ToolExecutor[AgentStatusAction, AgentStatusObservation]):

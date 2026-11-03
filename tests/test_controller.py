@@ -24,6 +24,7 @@ from senpai_agent.controller import (
     _inference_state_lease,
     _provider_retry_delay,
 )
+from senpai_agent.git_transport import GitWorkflowPreconditionError
 from senpai_agent.inbox import (
     DeliveryState,
     InboxTurnQuarantined,
@@ -1319,6 +1320,40 @@ def student_assignment_event():
             "revision_id": "revision-2",
         },
     )
+
+
+def test_a_transient_reconcile_failure_is_retried_on_the_next_poll(capsys):
+    event = student_assignment_event()
+    attempts = []
+
+    def reconcile(events):
+        attempts.append(tuple(item.dedupe_key for item in events))
+        if len(attempts) == 1:
+            raise GitWorkflowPreconditionError(
+                "git fetch --no-tags failed: Failure when receiving data from the peer"
+            )
+
+    turns = Turns()
+    controller(
+        Mailbox([(event,), (event,)]),
+        turns,
+        role="student",
+        reconcile=reconcile,
+    ).run(max_cycles=2)
+
+    # The first poll's batch was not delivered; the second poll's was, after
+    # the workspace reconciled. The post-turn poll reconciles an empty batch.
+    assert attempts == [(event.dedupe_key,), (event.dedupe_key,), ()]
+    assert len(turns.calls) == 1
+    assert turns.calls[0][2] == frozenset({event.dedupe_key})
+    error_lines = [
+        line for line in capsys.readouterr().err.splitlines()
+        if line.startswith("SENPAI_RECONCILE_ERROR")
+    ]
+    assert len(error_lines) == 1
+    assert "GitWorkflowPreconditionError" in error_lines[0]
+    assert "receiving data from the peer" in error_lines[0]
+    assert event.dedupe_key in error_lines[0]
 
 
 def test_identical_workspace_divergence_does_not_rewake_on_reminders(
