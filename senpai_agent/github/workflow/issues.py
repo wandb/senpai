@@ -92,13 +92,29 @@ class HumanIssueMixin:
                 validate_existing(existing.body or "")
                 return False, existing
             body = render_body()
-            self._mutate(
+            response = self._mutate(
                 "POST",
                 f"/repos/{self._repo}/issues",
                 json_body={"title": title, "body": body, "labels": sorted(labels)},
                 expected_statuses={201},
             )
-            created = self._created_marked_issue(prefix)
+            if response is not None:
+                # The creation response is the proof. The issue listing lags
+                # behind a write, so reading it back here failed every first
+                # attempt and succeeded only on the retry.
+                created = validated_response(
+                    CreatedIssueResponse, response.json_body, "human issue"
+                )
+                actor = self._actor()
+                if created.user.login.casefold() != actor.casefold() or (
+                    not authoritative_marker_line(created.body or "").startswith(prefix)
+                ):
+                    raise ReconciliationError(
+                        "GitHub created an issue that does not match the request"
+                    )
+            else:
+                # The response was lost in transit; the listing must show the write.
+                created = self._created_marked_issue(prefix)
             if (
                 created is None
                 or created.title != title

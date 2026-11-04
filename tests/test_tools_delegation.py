@@ -14,7 +14,10 @@ from openhands.sdk.llm import Message, TextContent
 from openhands_support import runtime_config
 
 import senpai_agent.delegation as delegation_module
+from pydantic import ValidationError
+
 from senpai_agent.delegation import (
+    MAX_AWAIT_SECONDS,
     MODEL_TIER_TIMEOUT_SECONDS,
     AgentStatusAction,
     AgentStatusTool,
@@ -505,6 +508,21 @@ def test_search_task_form_is_resolved_in_registry_and_child_request(tmp_path):
         "search",
         "research-publications",
     )
+
+
+def test_await_timeout_cap_is_declared_in_the_schema_and_enforced(tmp_path):
+    """Nine advisor await_agents calls failed validation on timeouts above 300 s."""
+
+    field = AwaitAgentsAction.model_fields["timeout_seconds"]
+    _spawn, tool, _status, _cancel = tools(tmp_path, lambda _request: None)
+
+    assert f"at most {MAX_AWAIT_SECONDS} seconds" in field.description
+    assert f"at most {MAX_AWAIT_SECONDS} seconds" in tool.description
+    with pytest.raises(ValidationError, match=str(MAX_AWAIT_SECONDS)):
+        AwaitAgentsAction(task_ids=["task-1"], timeout_seconds=MAX_AWAIT_SECONDS + 1)
+    assert AwaitAgentsAction(
+        task_ids=["task-1"], timeout_seconds=MAX_AWAIT_SECONDS,
+    ).timeout_seconds == MAX_AWAIT_SECONDS
 
 
 def test_await_quorum_and_timeout_leave_unfinished_tasks_running(tmp_path):

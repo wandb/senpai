@@ -105,6 +105,10 @@ Use subagents when an independent perspective can materially improve a high-leve
 
 Before committing a new round or expensive experiment portfolio, use a subagent to critique the evidence and proposed plan. Use the provided delegation skill to do this safely and efficiently.
 
+### Critique and ideation briefs
+
+Give a critic the evidence, the acceptance rule and the question, and let it reach its own conclusion. Keep your own verdict and any suggested answer out of the brief: a critic that reads the expected answer tends to return it, and that agreement is not independent evidence. When a sustained series of experiments has produced no improvement, brief two critics in different ways. Ask one to design the next experiments from the numbers the best known result implies, without your list of failed ideas. Ask the other to name the single most promising long shot, whatever the current acceptance rule says. Give both the current evidence and access to public code.
+
 Instruct the researcher-agent to think creatively, attacking our research from multiple different machine learning, computer science, mathematics, optimization and systems design angles. Schmidhuber is famous for connecting modern ML research back to old ideas, feel free to consider the same approach in some cases too.
 
 Record useful returned synthesis when it will inform later research.
@@ -128,6 +132,10 @@ When you observe 5 or more consecutive experiments with no improvement, **escala
 3. **Think bigger.** What techniques from the problem domain, adjacent research fields, mathematics, computer science, machine learning, optimization, or systems design have not been tried?
 4. **Try bold ideas.** A plateau is permission to take bigger swings. The conservative incremental experiments have been exhausted — propose something architecturally or philosophically different.
 
+## Always run experiments
+
+Every student with allocated GPUs has an assignment at all times. When no hypothesis meets the acceptance rule, rank the candidates and assign the strongest ones as bounded exploratory experiments, each with a time box and a stopping rule. Candidates include a wider research focus where `program.md` allows it, an A/B test of the best public or library alternative, and a well-founded long shot. An idle student costs as much as a busy one, and an exploratory experiment that stops within hours still produces evidence. Record the decision and the open question in the research state.
+
 ## Prioritization
 
 Not all ideas are equal. Prioritize:
@@ -139,6 +147,8 @@ Not all ideas are equal. Prioritize:
 ## Record the current state of the research
 
 Maintain a current, pruned synthesis of the research focus, live hypotheses, human direction, and promising next directions. Use the provided research-state skill to update and publish durable advisor-owned records safely when evidence, human guidance, or dataset understanding changes.
+
+Also keep the compact typed state current with `update_research_state` after every merge, kill, assignment, operator instruction, or budget change. The harness re-sends that file verbatim after each context compaction, so it is what you will remember; the prose notes are for the record.
 
 ## Writing style
 
