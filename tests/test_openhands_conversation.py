@@ -1041,7 +1041,7 @@ REPORT = (
 @pytest.mark.parametrize(
     ("thought", "message", "expected"),
     [
-        (REPORT, "Report delivered above.", f"{REPORT}\n\nReport delivered above."),
+        (REPORT, "Report delivered above.", f"{REPORT}\n\n## Finish message\n\nReport delivered above."),
         (REPORT, REPORT, REPORT),
         (REPORT, f"{REPORT}\n\nDone.", f"{REPORT}\n\nDone."),
         ("", "Short answer only.", "Short answer only."),
@@ -1100,7 +1100,7 @@ def test_child_report_written_before_the_finish_call_reaches_the_parent(
     assert run_openhands("critique the plan", config) == 0
 
     result = _output_record(capsys.readouterr().out, "OPENHANDS_RESULT ")
-    assert result["result"] == f"{REPORT}\n\nReport delivered above."
+    assert result["result"] == f"{REPORT}\n\n## Finish message\n\nReport delivered above."
 
 
 def _output_record(output, prefix):

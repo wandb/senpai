@@ -1665,7 +1665,8 @@ def _final_action_report(event: ActionEvent, message: str) -> str:
 
     A child often writes its report as the text before its finish call and
     sends a one-line finish message such as "Report delivered above". Only
-    the message used to reach the parent, so the report was lost.
+    the message used to reach the parent, so the report was lost. A header
+    separates the two texts when both are returned.
     """
 
     message = message.strip()
@@ -1678,7 +1679,7 @@ def _final_action_report(event: ActionEvent, message: str) -> str:
         return message
     if message in thought:
         return thought
-    return f"{thought}\n\n{message}"
+    return f"{thought}\n\n## Finish message\n\n{message}"
 
 
 def _result_token_count(llm: LLM, result: str) -> int:
