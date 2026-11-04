@@ -112,7 +112,7 @@ def test_student_on_base_image_is_built_in_ci_but_never_published():
     # Targets publish their own base-image students; Senpai takes no inputs for one.
     assert events["workflow_dispatch"] in (None, "", {})
     assert "if" not in job
-    assert job["permissions"] == {"contents": "read"}
+    assert job["permissions"] == {"contents": "read", "pull-requests": "read"}
     assert not any("login" in step.get("uses", "") for step in job["steps"])
     assert re.fullmatch(r"python:3\.12-slim-bookworm@sha256:[0-9a-f]{64}", job["env"]["CHECK_BASE_IMAGE"])
     build = steps["Build without publishing"]["with"]
@@ -189,7 +189,7 @@ def test_images_install_the_runner_and_protect_runtime_assets(role: str):
     root_setup = dockerfile.split("USER 10001:10001", 1)[0].replace("\\\n", " ")
 
     assert (
-        'uv pip install --python "$SENPAI_PYTHON" --no-deps --compile-bytecode /tmp/senpai'
+        'uv pip install --python "$SENPAI_PYTHON" --no-deps /tmp/senpai "pip==25.3"'
         in root_setup
     )
     # Dependencies are compiled when they are installed; the runner layer
@@ -272,30 +272,37 @@ CODE_CHANGES = ["senpai_agent/controller.py", "plugins/senpai/SKILL.md", "Docker
 
 
 @pytest.mark.parametrize(
-    ("event", "role", "changed", "expected"),
+    ("job", "role", "event", "changed", "expected"),
     [
-        ("push", "student", [], True),
-        ("workflow_dispatch", "student", [], True),
-        ("pull_request", "advisor", CODE_CHANGES, True),
-        ("pull_request", "student", CODE_CHANGES, False),
-        ("pull_request", "student", ["Dockerfile.student"], True),
-        ("pull_request", "student", ["uv.lock"], True),
-        ("pull_request", "student", ["pyproject.toml"], True),
-        ("pull_request", "student", ["scripts/senpai-gpu-smoke-test.py"], True),
-        ("pull_request", "student", [".github/workflows/build.yaml"], True),
+        ("build", "student", "push", [], True),
+        ("build", "student", "workflow_dispatch", [], True),
+        ("build", "advisor", "pull_request", CODE_CHANGES, True),
+        ("build", "student", "pull_request", CODE_CHANGES, False),
+        ("build", "student", "pull_request", ["Dockerfile.student"], True),
+        ("build", "student", "pull_request", ["Dockerfile.student-on-base"], False),
+        ("build", "student", "pull_request", ["uv.lock"], True),
+        ("build", "student", "pull_request", ["pyproject.toml"], True),
+        ("build", "student", "pull_request", ["scripts/senpai-gpu-smoke-test.py"], True),
+        ("build", "student", "pull_request", [".github/workflows/build.yaml"], True),
+        ("build-student-on-base", None, "push", [], True),
+        ("build-student-on-base", None, "pull_request", CODE_CHANGES, False),
+        ("build-student-on-base", None, "pull_request", ["Dockerfile.student"], False),
+        ("build-student-on-base", None, "pull_request", ["Dockerfile.student-on-base"], True),
+        ("build-student-on-base", None, "pull_request", ["uv.lock"], True),
     ],
 )
-def test_a_pull_request_builds_the_student_image_only_when_its_inputs_change(
+def test_a_pull_request_builds_a_student_image_only_when_its_inputs_change(
     tmp_path: Path,
+    job: str,
+    role: str | None,
     event: str,
-    role: str,
     changed: list[str],
     expected: bool,
 ):
     workflow = yaml.safe_load(
         (ROOT / ".github" / "workflows" / "build.yaml").read_text(encoding="utf-8")
     )
-    step = workflow["jobs"]["build"]["steps"][0]
+    step = workflow["jobs"][job]["steps"][0]
     assert step["id"] == "image"
 
     # Stand in for the GitHub API listing of the pull request's files.
@@ -313,12 +320,13 @@ def test_a_pull_request_builds_the_student_image_only_when_its_inputs_change(
     env = {
         **os.environ,
         "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-        "STUDENT_INPUTS": step["env"]["STUDENT_INPUTS"],
-        "ROLE": role,
+        "IMAGE_INPUTS": step["env"]["IMAGE_INPUTS"],
         "EVENT_NAME": event,
         "PULL_REQUEST_FILES": "repos/wandb/senpai/pulls/7/files",
         "GITHUB_OUTPUT": str(output),
     }
+    if role is not None:
+        env["ROLE"] = role
 
     subprocess.run(["bash", "-e", "-c", step["run"]], check=True, env=env)
 
