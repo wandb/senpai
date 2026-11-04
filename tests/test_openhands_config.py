@@ -155,6 +155,22 @@ def test_main_agent_context_appends_program_after_harness_and_role():
     assert context.load_project_skills is False
 
 
+def test_student_charter_requires_pasted_identifiers_and_labelled_derived_numbers():
+    instructions = (ROOT / "system_instructions" / "STUDENT.md").read_text()
+    assert "## Report and submit" in instructions and "## Writing style" in instructions
+    report = instructions.split("## Report and submit", 1)[1].split("## Writing style", 1)[0]
+
+    # One copy rule, stated once, covering every identifier class.
+    assert report.count("never from memory") == 1
+    assert "Copy every W&B run id, commit SHA, digest, training id, job id and run state" in report
+    assert "A prefix of a printed value is fine; a retyped one is not." in report
+    assert "A condensation summary is not tool output" in report
+    assert "run the command or tool that prints it, or cite it by URL" in report
+    assert "Label any number you computed yourself as derived and show the arithmetic" in report
+    assert "`derived:" in report and "baseline" in report and "candidate" in report
+    assert "precision the tool printed and no more" in report
+
+
 def test_student_charter_requires_typed_workflow_and_training_tools():
     instructions = (ROOT / "system_instructions" / "STUDENT.md").read_text()
     submission_skill = (
