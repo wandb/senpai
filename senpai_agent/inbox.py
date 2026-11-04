@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import sys
 import threading
@@ -11,11 +12,14 @@ import uuid
 from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
 from typing import Self
 from uuid import UUID
+
+from senpai_agent.PROMPTS import DELIVERY_TIME_PROMPT, render_prompt
 
 
 MAX_EVENTS_PER_TURN = 16
@@ -1662,12 +1666,41 @@ class _Transaction:
             self.lock.release()
 
 
+_DELIVERY_STAMP = re.compile(
+    r"\n\nDelivered at \(UTC\): \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z"
+)
+
+
+def stamp_delivery(body: str, now: datetime | None = None) -> str:
+    """Append the delivery time to an event so the model need not ask the clock.
+
+    The stored body and its digest stay unstamped: the stamp is added when
+    the message is appended to the conversation and ignored when a branch is
+    compared with the inbox record.
+    """
+
+    moment = (now or datetime.now(UTC)).astimezone(UTC)
+    stamp = render_prompt(
+        DELIVERY_TIME_PROMPT,
+        CURRENT_TIME=moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    return f"{body}\n\n{stamp}"
+
+
+def strip_delivery_stamp(body: str) -> str:
+    return _DELIVERY_STAMP.sub("", body, count=1)
+
+
 def deliver_turn_messages(
     conversation: object,
     inbox: PersistentInbox,
     turn_id: str,
 ) -> InboxTurn:
-    """Append one turn's messages exactly once on the active branch."""
+    """Append one turn's messages exactly once on the active branch.
+
+    Event messages are appended with the delivery time; the turn prompt
+    already carries the time the controller built it.
+    """
 
     turn = inbox.turn(turn_id)
     if turn.state is DeliveryState.PROCESSED:
@@ -1706,13 +1739,18 @@ def deliver_turn_messages(
                     f"duplicate sender {message.sender!r} on active branch"
                 )
             if existing:
-                body = _event_body(existing[0])
+                body = strip_delivery_stamp(_event_body(existing[0]))
                 if body != message.body:
                     raise RuntimeError(
                         f"delivery {message.delivery_id} payload mismatch on active branch"
                     )
             else:
-                conversation.send_message(message.body, sender=message.sender)
+                conversation.send_message(
+                    stamp_delivery(message.body)
+                    if message.event_key is not None
+                    else message.body,
+                    sender=message.sender,
+                )
             inbox.record_delivered(message.delivery_id, message.body)
     return inbox.turn(turn_id)
 

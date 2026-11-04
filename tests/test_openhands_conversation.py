@@ -27,6 +27,7 @@ from senpai_agent.inbox import (
     DeliveryState,
     InboxTurnQuarantined,
     PersistentInbox,
+    strip_delivery_stamp,
 )
 from senpai_agent.inference_heartbeat import (
     InferenceHeartbeat,
@@ -326,7 +327,7 @@ def test_provider_timeout_resumes_inference_without_resending_the_turn(
         inbox_turn_id=turn.turn_id,
     ) == 0
 
-    assert [message for message, _sender in sent] == [
+    assert [strip_delivery_stamp(message) for message, _sender in sent] == [
         "controller prompt",
         "first event",
     ]
@@ -657,7 +658,9 @@ def test_stalled_recovery_is_bounded_and_quarantined_with_the_full_brief(
     assert [name for name, _value in calls].count("navigate") == 1
     assert "complete initial controller context" in active[0].message
     assert "Conversation context recovery" in active[0].message
-    assert [event.message for event in active[1:]] == ["canonical event"]
+    assert [
+        strip_delivery_stamp(event.message) for event in active[1:]
+    ] == ["canonical event"]
 
     with pytest.raises(InboxTurnQuarantined, match="recovery budget exhausted"):
         turns.run(
@@ -967,7 +970,7 @@ def test_restart_after_recovery_commit_resets_before_delivering(tmp_path, monkey
     ) == 0
 
     assert [name for name, _value in calls[:3]] == ["navigate", "send", "send"]
-    assert [event.message for event in active] == [
+    assert [strip_delivery_stamp(event.message) for event in active] == [
         "recovery prompt",
         "canonical event",
     ]

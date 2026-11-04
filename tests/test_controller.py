@@ -30,6 +30,7 @@ from senpai_agent.inbox import (
     InboxTurnQuarantined,
     PersistentInbox,
     deliver_turn_messages,
+    strip_delivery_stamp,
 )
 from senpai_agent.mailbox import (
     ControllerEvent,
@@ -386,6 +387,75 @@ def test_post_turn_snapshot_retracts_availability_queued_during_active_turn(
     assert source.calls == 2
 
 
+def availability_event(student="student-1"):
+    return ControllerEvent(
+        kind="student_available_for_assignment",
+        dedupe_key=f"student_available_for_assignment:{student}",
+        payload={"student": student},
+    )
+
+
+def test_unchanged_student_availability_is_delivered_once(monkeypatch):
+    """1,052 availability notices woke an advisor whose students stayed idle."""
+
+    clock = [0.0]
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+    idle = (availability_event("fern"), availability_event("nezuko"))
+
+    class IdleRosterMailbox(Mailbox):
+        def poll(self):
+            self.calls += 1
+            return idle
+
+    turns = Turns()
+    controller_module.Controller(
+        role="advisor",
+        mailbox=IdleRosterMailbox([]),
+        turns=turns,
+        conversation_id=CONVERSATION_ID,
+        full_prompt="programme",
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        poll_interval_seconds=300,
+        jitter_seconds=0,
+        event_reminder_seconds=300,
+    ).run(max_cycles=12)
+
+    assert [call[2] for call in turns.calls] == [
+        frozenset(event.dedupe_key for event in idle),
+    ]
+
+
+def test_student_availability_is_delivered_again_after_an_assignment(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+    available = availability_event("fern")
+    mailbox = Mailbox([
+        (available,),  # idle: delivered once
+        (available,),  # still idle: no new turn
+        (),  # assigned: availability clears
+        (available,),  # idle again: delivered again
+        (available,),
+    ])
+
+    turns = Turns()
+    controller_module.Controller(
+        role="advisor",
+        mailbox=mailbox,
+        turns=turns,
+        conversation_id=CONVERSATION_ID,
+        full_prompt="programme",
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        poll_interval_seconds=300,
+        jitter_seconds=0,
+        event_reminder_seconds=300,
+    ).run(max_cycles=5)
+
+    assert [call[2] for call in turns.calls] == [
+        frozenset({available.dedupe_key}),
+        frozenset({available.dedupe_key}),
+    ]
+
+
 def test_post_turn_poll_at_reminder_boundary_only_delivers_new_state(
     monkeypatch,
 ):
@@ -511,7 +581,7 @@ def test_108_events_survive_four_failed_inferences_without_visible_replay(
         max_consecutive_turn_failures=5,
     ).run(max_cycles=5)
 
-    visible = Counter(turns.conversation.sent)
+    visible = Counter(strip_delivery_stamp(sent) for sent in turns.conversation.sent)
     assert turns.calls == 11
     assert all(visible[event.to_prompt()] == 1 for event in events)
 
