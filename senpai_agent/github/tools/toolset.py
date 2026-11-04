@@ -13,6 +13,7 @@ from senpai_agent.github.workflow import GitHubWorkflow
 from senpai_agent.provenance import GitHubCommitLookup, IdentifierProvenance
 
 from .broadcast import BroadcastMessageTool
+from .fetch import FetchBranchTool
 from .definitions import (
     AcceptResultOnCurrentBaseTool,
     CloseExperimentTool,
@@ -139,6 +140,7 @@ class GitHubWorkflowToolSet(
         if role == "student":
             return (
                 *common,
+                *FetchBranchTool.create(runtime),
                 *PostAssignmentCommentTool.create(runtime),
                 *PostPeerCommentTool.create(runtime),
                 *BroadcastMessageTool.create(runtime),
@@ -147,6 +149,7 @@ class GitHubWorkflowToolSet(
             )
         return (
             *common,
+            *FetchBranchTool.create(runtime),
             *CreateAssignmentTool.create(runtime),
             *SyncAdvisorBranchTool.create(runtime),
             *PublishAdvisorBranchTool.create(runtime),

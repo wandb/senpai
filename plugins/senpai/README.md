@@ -24,8 +24,8 @@ the current role:
   `merge_experiment`, and `close_experiment`;
 - students receive `push_experiment_commit`, `post_assignment_comment`,
   `post_peer_comment`, `broadcast_message`, and `submit_experiment_result`; and
-- both roles receive `get_prs`, `get_pr_source`, `create_human_issue`,
-  `respond_to_human_issue`, and `request_supervisor`.
+- both roles receive `get_prs`, `get_pr_source`, `fetch_branch`,
+  `create_human_issue`, `respond_to_human_issue`, and `request_supervisor`.
 
 Each tool has one operation-specific schema without a union wrapper and a
 complete model-facing description. The

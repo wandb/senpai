@@ -681,6 +681,14 @@ alike, so the next call can be corrected without guessing.
 
 `get_prs` returns complete PR bodies and discussions. Up to five PRs are returned in context by default; larger selections become a Markdown artifact outside the target checkout so long histories do not pollute the main conversation.
 
+`fetch_branch` lets a student or the advisor fetch one branch of the target
+repository, such as a PR's head branch or the advisor branch, into
+`refs/remotes/origin/<branch>` of its checkout without changing the checkout. The
+agent shells hold no GitHub credential, so `git fetch` and `git pull` are denied
+there with a pointer to this tool; the fetch runs with the controller's token in a disposable repository and
+the checkout receives the objects over a local file fetch, as `sync_advisor_branch`
+does for the advisor.
+
 `get_pr_source` lets advisors and students inspect private PR code using the
 runtime's credentials. Supply the exact PR base and head SHAs from `get_prs` to
 list changed files, then select paths to retrieve complete source and text diffs

@@ -61,6 +61,18 @@ def test_policy_allows_explicit_local_git_and_read_only_github_commands(
     assert is_allowed(command) is True
 
 
+@pytest.mark.parametrize(
+    "command",
+    ["git fetch origin student-two/fold4", "git fetch", "git pull --rebase origin main"],
+)
+def test_shell_fetches_are_denied_with_the_fetch_tool_named(command: str):
+    decision = terminal_policy(command, "student", WORKSPACE)
+
+    assert decision.allowed is False
+    assert "no GitHub credential" in decision.reason
+    assert "fetch_branch(branch=...)" in decision.reason
+
+
 def test_one_shot_git_alias_cannot_hide_a_push():
     assert is_allowed("git -c alias.ship=push ship origin experiment") is False
 
