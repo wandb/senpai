@@ -136,10 +136,9 @@ _DETACHED_GPU_REASON = (
     "nothing to poll for."
 )
 _GIT_FETCH_REASON = (
-    "This shell holds no GitHub credential, so `git fetch` and `git pull` cannot "
-    "reach the assignment repository. Call fetch_branch(branch=...) (students) "
-    "or sync_advisor_branch (advisor) to fetch a branch read-only into "
-    "refs/remotes/origin/<branch>, then inspect it with git log, diff or show."
+    "This shell has no GitHub credential. Call fetch_branch(branch=...) to fetch "
+    "a branch read-only into refs/remotes/origin/<branch>, then inspect it with "
+    "git log, diff or show; sync_advisor_branch refreshes the advisor's own branch."
 )
 # `uv run` options that take a separate value before the program.
 _UV_RUN_VALUE_OPTIONS = {

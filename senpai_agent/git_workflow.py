@@ -84,6 +84,10 @@ def sync_remote_branch(
         remote, authenticated_remote, token, "a credentialed fetch"
     )
     tracking_sha = _local_ref_head(workspace, tracking_ref)
+    # A branch this checkout never fetched has no tracking ref to negotiate
+    # from. HEAD is a commit the checkout holds, and any shared history keeps
+    # the rest of the repository off the network on that first fetch.
+    negotiate_from = tracking_sha or _git(workspace, "rev-parse", "HEAD")
     # A fetch follows a checkout-controlled symbolic ref into whatever branch it
     # names, so fetch into a private ref and move the tracking ref ourselves.
     transfer_ref = f"refs/senpai/sync/{uuid.uuid4().hex}"
@@ -92,7 +96,7 @@ def sync_remote_branch(
         remote=network_remote,
         refs=((f"refs/heads/{branch}", transfer_ref),),
         token=token,
-        have=tracking_sha or None,
+        have=negotiate_from,
     )
     head_sha = _local_ref_head(workspace, transfer_ref)
     _git(workspace, "update-ref", "--no-deref", "-d", transfer_ref)
@@ -101,6 +105,8 @@ def sync_remote_branch(
             workspace,
             "update-ref",
             "--no-deref",
+            "-m",
+            f"senpai sync {branch}",
             tracking_ref,
             head_sha,
             tracking_sha,

@@ -149,6 +149,7 @@ class GitHubWorkflowToolSet(
             )
         return (
             *common,
+            *FetchBranchTool.create(runtime),
             *CreateAssignmentTool.create(runtime),
             *SyncAdvisorBranchTool.create(runtime),
             *PublishAdvisorBranchTool.create(runtime),

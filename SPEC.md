@@ -587,7 +587,7 @@ on GitHub, so the tool can reject a change made after the student read the PR:
 | `send_assignment_feedback` | advisor | `feedback_id`, `comment` |
 | `push_experiment_commit` | student | `local_commit_sha`, which must identify the current local commit (HEAD), with no uncommitted changes |
 | `post_assignment_comment` | student | `comment_id`, `comment` |
-| `fetch_branch` | student | `branch`; fetches that branch of the target repository into `refs/remotes/origin/<branch>` of the checkout, read-only, and returns its head SHA |
+| `fetch_branch` | student, advisor | `branch`; fetches that branch of the target repository into `refs/remotes/origin/<branch>` of the checkout, read-only, and returns its head SHA |
 | `post_peer_comment` | student | `target_pr_number`, `comment_id`, `comment`; `assignment` identifies the sender's own current PR |
 | `broadcast_message` | student | `broadcast_id`, `message` (at most 1,500 characters); `assignment` identifies the sender's own current PR |
 | `request_assignment_revision` | advisor | `new_revision_id`, `required_base_sha`, `comment` |

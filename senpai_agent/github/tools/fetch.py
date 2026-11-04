@@ -1,11 +1,11 @@
 """Read-only fetch of one assignment-repository branch into the checkout.
 
-The student shell holds no GitHub credential, so `git fetch` cannot reach the
-repository and a peer's branch, the advisor branch or a commit cited by the
-advisor stays invisible. This tool fetches one branch with the controller's
-token through the same two-hop copy as the advisor's sync: authenticated Git
-runs in a throwaway repository and the checkout receives the objects over a
-local file fetch, so the token never reaches the worktree or the model.
+The agent shells hold no GitHub credential, so `git fetch` cannot reach the
+repository and another agent's branch or a cited commit stays invisible. This
+tool fetches one branch with the controller's token through the same two-hop
+copy as the advisor's sync: authenticated Git runs in a throwaway repository
+and the checkout receives the objects over a local file fetch, so the token
+never reaches the worktree or the model.
 """
 
 from __future__ import annotations
@@ -24,6 +24,9 @@ from .runtime import GitHubToolRuntime, tool_annotations
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation import LocalConversation
+
+# Git's own words for a branch that does not exist or cannot be named.
+_BRANCH_NAME_ERRORS = ("couldn't find remote ref", "check-ref-format")
 
 
 class FetchBranchAction(Action):
@@ -48,7 +51,7 @@ class FetchBranchObservation(Observation):
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
-        objects = "new objects were copied" if self.changed else "nothing had changed"
+        objects = "the branch had moved" if self.changed else "nothing had changed"
         return [
             TextContent(
                 text=(
@@ -79,11 +82,16 @@ class FetchBranchExecutor(ToolExecutor[FetchBranchAction, FetchBranchObservation
                 token=self.runtime.git_token,
             )
         except GitWorkflowPreconditionError as error:
+            if any(words in str(error) for words in _BRANCH_NAME_ERRORS):
+                hint = (
+                    "Branch names come from get_prs (a PR's head branch) or the "
+                    "advisor branch; a commit on no branch cannot be fetched."
+                )
+            else:
+                hint = "Retry once; if it fails again, report the error."
             raise GitWorkflowPreconditionError(
                 f"fetch_branch could not fetch {action.branch!r} from "
-                f"{self.runtime.workflow.repo}: {error}. Branch names come from "
-                "get_prs (a PR's head branch) or the advisor branch; a commit on no "
-                "branch cannot be fetched."
+                f"{self.runtime.workflow.repo}: {error}. {hint}"
             ) from error
         return FetchBranchObservation(
             branch=synced.branch,
@@ -101,9 +109,9 @@ class FetchBranchTool(ToolDefinition[FetchBranchAction, FetchBranchObservation])
                 description=(
                     "Fetch one branch of the assignment repository into "
                     "refs/remotes/origin/<branch> without changing the checkout, "
-                    "so another student's PR branch, the advisor branch or a commit "
-                    "the advisor cites can be read with git log, diff and show. The "
-                    "terminal has no GitHub credential, so `git fetch` cannot do this."
+                    "so a student's PR branch, the advisor branch or a cited commit "
+                    "can be read with git log, diff and show. The terminal has no "
+                    "GitHub credential, so `git fetch` cannot do this."
                 ),
                 action_type=FetchBranchAction,
                 observation_type=FetchBranchObservation,
