@@ -123,8 +123,9 @@ def test_runtime_loads_explicit_assets_without_ambient_plugins(
     assert "ambient" not in agent.mcp_config
     assert not marker.exists()
     if child:
+        # A child's terminal spec says it has no training tools.
         assert [(tool.name, tool.params) for tool in agent.tools] == [
-            ("senpai_terminal", {"role": "advisor"}),
+            ("senpai_terminal", {"role": "advisor", "child": True}),
         ]
         assert "research" in agent.mcp_config
 

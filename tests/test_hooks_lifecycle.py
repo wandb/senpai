@@ -83,6 +83,24 @@ def test_pre_tool_hook_denies_a_detached_gpu_launch_with_the_supervised_path(
     assert "detached" in output["reason"]
 
 
+def test_pre_tool_hook_tells_a_student_child_to_wait_without_training_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    event = {"tool_input": {"command": "sleep 30"}, "working_dir": str(tmp_path)}
+    student = {"SENPAI_ROLE": "student"}
+    child = {**student, "SENPAI_DELEGATION_TASK_ID": "task-1"}
+
+    _, main_output = invoke_hook("pre-tool-use", event, monkeypatch, capsys, student)
+    exit_code, child_output = invoke_hook("pre-tool-use", event, monkeypatch, capsys, child)
+
+    assert "get_training_status" in main_output["reason"]
+    assert (exit_code, child_output["decision"]) == (2, "deny")
+    assert "get_training_status" not in child_output["reason"]
+    assert "await_agents" in child_output["reason"]
+
+
 def test_pre_tool_hook_fails_closed_on_invalid_input(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

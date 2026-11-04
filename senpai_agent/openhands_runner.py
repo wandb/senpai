@@ -1353,7 +1353,7 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
     ]
     tools.extend(
         (
-            Tool(name="senpai_terminal", params={"role": config.role}),
+            senpai_terminal_spec(config.role, child=config.child),
             Tool(
                 name="senpai_github",
                 params={
@@ -1399,13 +1399,23 @@ def build_main_tools(config: RunnerConfig) -> list[Tool]:
     return tools
 
 
-def senpai_terminal_tools(tools: Sequence[Tool], role: str) -> list[Tool]:
+def senpai_terminal_spec(role: str, *, child: bool) -> Tool:
+    """Spec the policy terminal; a main agent's persisted spec stays unchanged."""
+
+    params: dict[str, object] = {"role": role}
+    if child:
+        # A child subagent has no training tools, so its denials say so.
+        params["child"] = True
+    return Tool(name="senpai_terminal", params=params)
+
+
+def senpai_terminal_tools(
+    tools: Sequence[Tool], role: str, *, child: bool = False
+) -> list[Tool]:
     """Route a file-defined agent's terminal through Senpai's policy and target env."""
 
     return [
-        Tool(name="senpai_terminal", params={"role": role})
-        if tool.name == "terminal"
-        else tool
+        senpai_terminal_spec(role, child=child) if tool.name == "terminal" else tool
         for tool in tools
     ]
 
@@ -2024,7 +2034,9 @@ def run_openhands[ResponseT: BaseModel](
             agent = agent.model_copy(
                 update={
                     "llm": apply_reasoning_profile(agent.llm),
-                    "tools": senpai_terminal_tools(agent.tools, config.role),
+                    "tools": senpai_terminal_tools(
+                        agent.tools, config.role, child=config.child
+                    ),
                     "agent_context": (
                         agent.agent_context or AgentContext()
                     ).model_copy(update={"skills": resolved_skills}),

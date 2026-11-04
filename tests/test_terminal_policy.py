@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-PackageName: senpai
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,18 @@ import pytest
 from senpai_agent.hooks import terminal_policy
 
 WORKSPACE = Path("/workspace")
+ASSIGNMENT_REPOSITORY = "https://github.com/example-lab/assignment.git"
+
+
+@pytest.fixture
+def checkout(tmp_path: Path) -> Path:
+    """A student checkout whose origin is the assignment repository."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin", ASSIGNMENT_REPOSITORY],
+        check=True,
+    )
+    return tmp_path
 
 
 def is_allowed(command: str) -> bool:
@@ -71,6 +84,52 @@ def test_shell_fetches_are_denied_with_the_fetch_tool_named(command: str):
     assert decision.allowed is False
     assert "no GitHub credential" in decision.reason
     assert "fetch_branch(branch=...)" in decision.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git ls-remote",
+        "git ls-remote --heads origin",
+        "git ls-remote --sort=-v:refname https://github.com/example-lab/assignment.git",
+        "git ls-remote git@github.com:Example-Lab/Assignment main",
+        "git clone https://github.com/example-lab/assignment /tmp/second-copy",
+        "git clone -b main --depth 1 https://github.com/example-lab/assignment.git",
+        "git clone https://token@github.com/example-lab/assignment.git",
+        "git submodule update --remote",
+        "git submodule --quiet update --init --remote vendor/data",
+    ],
+)
+def test_reads_of_the_assignment_repository_are_denied_with_the_fetch_tool_named(
+    command: str,
+    checkout: Path,
+):
+    decision = terminal_policy(command, "student", checkout)
+
+    assert decision.allowed is False
+    assert "no GitHub credential for origin" in decision.reason
+    assert "fetch_branch(branch=...)" in decision.reason
+    assert "other repositories" in decision.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git ls-remote https://github.com/other-lab/public-data.git",
+        "git ls-remote --heads git@github.com:other-lab/public-data.git main",
+        "git clone https://github.com/other-lab/public-data.git /tmp/public-data",
+        "git clone --depth 1 -b v1.0 https://github.com/other-lab/public-data",
+        "git clone ../reference-checkout",
+        "git submodule status",
+        "git submodule update --init",
+    ],
+)
+def test_other_repositories_stay_reachable_from_the_shell(command: str, checkout: Path):
+    assert terminal_policy(command, "student", checkout).allowed is True
+
+
+def test_clone_of_another_repository_is_allowed_outside_a_checkout():
+    assert is_allowed("git clone https://github.com/other-lab/public-data.git") is True
 
 
 def test_one_shot_git_alias_cannot_hide_a_push():
@@ -171,16 +230,34 @@ def test_log_stream_denial_names_a_bounded_read_and_the_wait_tool():
     assert "get_training_status(training_id, wait_seconds)" in decision.reason
 
 
-@pytest.mark.parametrize("role", ["advisor", ""])
-def test_agents_without_training_tools_are_told_to_finish_the_turn(role: str):
-    polling = terminal_policy("sleep 30", role, WORKSPACE)
-    streaming = terminal_policy("tail -f agent.log", role, WORKSPACE)
+@pytest.mark.parametrize(
+    ("role", "child"),
+    [("advisor", False), ("", False), ("student", True), ("advisor", True)],
+)
+def test_agents_without_training_tools_are_told_to_finish_the_turn(
+    role: str,
+    child: bool,
+):
+    polling = terminal_policy("sleep 30", role, WORKSPACE, child=child)
+    streaming = terminal_policy("tail -f agent.log", role, WORKSPACE, child=child)
 
     assert polling.allowed is False and streaming.allowed is False
     assert "get_training_status" not in polling.reason + streaming.reason
     assert "Finish the turn" in polling.reason
     assert "await_agents" in polling.reason
     assert "tail -n 50" in streaming.reason
+
+
+def test_a_student_child_keeps_every_other_student_decision():
+    for command in (
+        "git fetch origin main",
+        "python train.py --epochs 10",
+        "nohup python bench.py > bench.log 2>&1 &",
+        "git status --short",
+    ):
+        main = terminal_policy(command, "student", WORKSPACE)
+        child = terminal_policy(command, "student", WORKSPACE, child=True)
+        assert (child.allowed, child.reason) == (main.allowed, main.reason), command
 
 
 def test_tail_follow_with_retry_is_denied_like_follow():

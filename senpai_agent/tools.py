@@ -932,12 +932,14 @@ class SenpaiTerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         *,
         role: str,
         workspace: Path,
+        child: bool = False,
         foreground_timeout_seconds: int = 600,
     ):
         if foreground_timeout_seconds <= 0:
             raise ValueError("terminal foreground timeout must be positive")
         self.delegate = delegate
         self.role = role
+        self.child = child
         self.workspace = Path(workspace)
         self.foreground_timeout_seconds = foreground_timeout_seconds
 
@@ -957,6 +959,7 @@ class SenpaiTerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 action.command,
                 self.role,
                 self.workspace,
+                child=self.child,
             )
             if not decision.allowed:
                 reason = decision.reason or "No policy reason was provided."
@@ -1003,6 +1006,7 @@ class SenpaiTerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
         conv_state: object,
         *,
         role: str | None = None,
+        child: bool = False,
     ) -> Sequence[ToolDefinition]:
         role = role or os.environ.get("SENPAI_ROLE")
         if role not in {"advisor", "student"}:
@@ -1036,6 +1040,7 @@ class SenpaiTerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
                     native.executor,
                     role=role,
                     workspace=Path(conv_state.workspace.working_dir),
+                    child=child,
                     foreground_timeout_seconds=foreground_timeout,
                 )
             )
