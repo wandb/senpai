@@ -67,6 +67,7 @@ EXPECTED_FIELDS = {
         "assignment",
         "expected_current_base_sha",
         "merge_method",
+        "deliverable_paths",
     },
     "close_experiment": {"assignment", "reason"},
     "create_human_issue": {"issue_id", "title", "body"},
@@ -81,7 +82,7 @@ EXPECTED_FIELDS = {
 
 OPTIONAL_FIELDS = {
     "repair_assignment_routing": {"blockers"},
-    "merge_experiment": {"merge_method"},
+    "merge_experiment": {"merge_method", "deliverable_paths"},
     "request_supervisor": {"assignment", "context_prs"},
 }
 

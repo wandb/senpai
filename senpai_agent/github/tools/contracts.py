@@ -264,6 +264,16 @@ class MergeExperimentAction(Action):
         default="squash",
         description="GitHub merge method to apply after all workflow checks pass.",
     )
+    deliverable_paths: tuple[str, ...] = Field(
+        default=(),
+        max_length=32,
+        description=(
+            "Repository paths or glob patterns the assignment declared as its "
+            "deliverable. Blocking review findings are limited to these files; "
+            "findings on other files become notes. Empty means every changed "
+            "file is in scope."
+        ),
+    )
 
 
 class CloseExperimentAction(Action):

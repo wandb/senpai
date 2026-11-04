@@ -801,6 +801,11 @@ without inherited conversation history, and returns actionable feedback.
 Each completed merge review of a current, open PR posts a comment labeled
 "Senpai Supervisor — merge review" with its verdict, summary, and reviewed commits. Approval comments
 must publish successfully before merging. Review comments do not wake the student.
+Blocking findings are limited to the files the advisor passes as `deliverable_paths`;
+findings elsewhere are posted as notes. A PR is rejected at most
+`SENPAI_MAX_BLOCKING_REVIEW_ROUNDS` times (default 2, set per launch with
+`--max_blocking_review_rounds`); after that the remaining findings are posted as
+notes and the merge proceeds, except unsafe code or a rule violation.
 
 This LLM agent is separate from the process and training supervisors. A student
 can request a Supervisor that executes code on the advisor's checkout. The

@@ -43,7 +43,8 @@ conclusion. Then choose the appropriate next step:
     "expected_pr_head_sha": "CURRENT_PR_HEAD_SHA"
   },
   "expected_current_base_sha": "CURRENT_BASE_SHA",
-  "merge_method": "squash"
+  "merge_method": "squash",
+  "deliverable_paths": ["path/to/deliverable.py", "docs/README.md"]
 }
 ```
 
@@ -53,6 +54,11 @@ context from the PR discussion and target program. It uses the configured smart
 model and reasoning effort for a fresh
 code quality review. Unnecessary code, unrelated docs, and other scope problems
 block merging; docs, tests, and complexity justified by the task remain valid.
+`deliverable_paths` names the files the assignment delivers: blocking findings
+are limited to them, and findings on other files become notes. A PR is rejected
+at most `SENPAI_MAX_BLOCKING_REVIEW_ROUNDS` times (default 2); later findings
+are posted as notes and the merge proceeds, except unsafe code or a rule
+violation, which always blocks.
 The worker posts blocking findings to the current PR and sends you its outcome
 through a completion event. Use `agent_status` or `cancel_agents` with the task
 ID when needed. Do not treat a queued task as a completed merge.

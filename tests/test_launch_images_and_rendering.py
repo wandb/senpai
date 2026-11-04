@@ -670,6 +670,24 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         assert config["SENPAI_COMPACTION_TRIGGER_EVENTS"] == "600"
 
 
+def test_advisor_receives_the_blocking_review_round_cap_from_the_launch_config():
+    advisor_config, _deployment, _secret = render_role("advisor")
+    student_config, _deployment, _secret = render_role("student")
+    advisor = yaml.safe_load(advisor_config)["data"]
+    student = yaml.safe_load(student_config)["data"]
+
+    assert advisor["SENPAI_MAX_BLOCKING_REVIEW_ROUNDS"] == "2"
+    assert "SENPAI_MAX_BLOCKING_REVIEW_ROUNDS" not in student
+
+    tuned, _deployment, _secret = render_role(
+        "advisor", launch_args(max_blocking_review_rounds=3)
+    )
+    assert yaml.safe_load(tuned)["data"]["SENPAI_MAX_BLOCKING_REVIEW_ROUNDS"] == "3"
+
+    with pytest.raises(SystemExit, match="max_blocking_review_rounds must be at least 1"):
+        launch.validate_timing_args(launch_args(max_blocking_review_rounds=0))
+
+
 def test_students_receive_the_training_log_stall_interval_from_the_launch_config():
     _config, _deployment, _secret = render_role("advisor")
     student_config, _deployment, _secret = render_role("student")

@@ -84,7 +84,12 @@ artifacts, and experiment leftovers, and approves with non-blocking notes for
 docs, naming, flags, and style. Notes need no new revision. It merges only after
 approval and fresh workflow checks. A review without a verdict retries once with
 less context. Findings and notes are posted on the PR, and a rejection's
-findings return to you in a completion event. Use
+findings return to you in a completion event. Pass the assignment's deliverable
+files as `deliverable_paths`: blocking findings are limited to those files, and
+findings on lane tooling, notes or other files become notes. A PR is rejected at
+most a configured number of times (default two); after that the remaining
+findings are posted as notes and the merge proceeds, except for unsafe code or a
+rule violation. Use
 `agent_status` or `cancel_agents` with the task ID when needed. A queued task is
 not a completed merge; wait for its outcome before updating the baseline.
 

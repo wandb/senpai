@@ -119,6 +119,10 @@ The PR body and its most recent discussion below provide context and history of 
 
 {{PR_CONTEXT}}
 
+## Deliverable
+
+{{DELIVERABLE}}
+
 ## Shipping
 
 Ensure this PR ships a minimal, powerful change with clean, useful code. Scientific validity is outside the scope of this review.
@@ -130,6 +134,8 @@ Block only problems that would leave the research branch wrong, unsafe, or mater
 - a violation of the target program's rules or file boundaries;
 - generated artifacts or files unrelated to the task, such as logs, checkpoints, or scratch outputs;
 - dead code paths or configs left by unsuccessful experiments, or substantial unnecessary complexity in the code this change adds.
+
+Judge the deliverable files above to that standard. Lane tooling, measurement scripts, notes and other files outside the deliverable get notes, not blocking findings, unless the problem is unsafe or breaks a rule; the harness turns a blocking finding on such a file into a note. Give every finding the repository path it concerns.
 
 Report everything else as non-blocking notes and approve: documentation length or wording, naming, CLI flag names or small unused options, formatting, and minor simplifications. The advisor can tidy these later. Allow additions justified by the task or target program.
 

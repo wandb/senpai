@@ -75,6 +75,7 @@ def merge_with_review(
         nonlocal review_report
         verdict = review_code_quality(
             pull, base_sha=action.expected_current_base_sha, token=token, config=config,
+            deliverable_paths=action.deliverable_paths,
         )
         review_report = verdict.report()
 
