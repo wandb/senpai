@@ -54,11 +54,16 @@ context from the PR discussion and target program. It uses the configured smart
 model and reasoning effort for a fresh
 code quality review. Unnecessary code, unrelated docs, and other scope problems
 block merging; docs, tests, and complexity justified by the task remain valid.
-`deliverable_paths` names the files the assignment delivers: blocking findings
-are limited to them, and findings on other files become notes. A PR is rejected
-at most `SENPAI_MAX_BLOCKING_REVIEW_ROUNDS` times (default 2); later findings
-are posted as notes and the merge proceeds, except unsafe code or a rule
-violation, which always blocks.
+`deliverable_paths` lists the files the assignment delivers, as repository
+paths or glob patterns; a directory path covers every file under it. The
+reviewer can block the merge only for findings on those files. A finding on
+any other changed file is posted as a non-blocking note and the merge proceeds.
+Leave the list empty when every changed file is the deliverable. A PR can be
+rejected at most `SENPAI_MAX_BLOCKING_REVIEW_ROUNDS` times; after that the
+reviewer posts its remaining findings as notes and the merge proceeds. Two
+kinds of finding are never waived and block in every round, wherever they are:
+exposed credentials or destructive commands, and a violation of the target
+program's rules or file boundaries.
 The worker posts blocking findings to the current PR and sends you its outcome
 through a completion event. Use `agent_status` or `cancel_agents` with the task
 ID when needed. Do not treat a queued task as a completed merge.
